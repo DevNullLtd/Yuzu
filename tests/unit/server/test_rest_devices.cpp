@@ -35,6 +35,7 @@
 #include "response_store.hpp"
 #include "rest_api_v1.hpp"
 #include "authz_gates.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -117,12 +118,16 @@ struct DeviceRestHarness {
 
     std::vector<AuditRecord> audit_log;
     yuzu::MetricsRegistry metrics;
+    // #4990: the caller's Forensics visibility for the group-preview count (admin by default).
+    yuzu::server::test::ForensicsCaller forensics;
     RestApiV1 api;
 
     /// @param response_store the store behind agent-count-preview (nullptr = unwired); borrowed,
     ///        must outlive the harness.
     explicit DeviceRestHarness(bool wire_fleet_read_fn = true,
                                ResponseStore* response_store = nullptr) {
+        api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
+        api.set_forensics_visibility_fn(forensics.fn());
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response& res) -> std::optional<auth::Session> {
             if (!auth_ok) {
@@ -575,4 +580,83 @@ TEST_CASE("GET /api/v1/management-groups/agent-count-preview — a real filter a
                           "?command_id=cmd-1&plugin=procfetch&pid=1234");
     REQUIRE(res != nullptr);
     CHECK(res->status == 503);
+}
+
+// #4990: the preview count is a membership oracle over response output (how many agents returned
+// this value), so it must be computed over the rows the caller may read. Real PG-backed store,
+// exact counts, and an ordinary-plugin control row.
+TEST_CASE("agent-count-preview: an Unknown Forensics decision is a retryable 503, not a count",
+          "[pg][rest][devices][facets][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-rest-preview-unknown";
+    StoredResponse r;
+    r.instruction_id = command_id;
+    r.agent_id = "agent-c";
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.output = "same-value";
+    r.plugin = yuzu::server::test::kOrdinaryPlugin;
+    rs.store(r);
+
+    DeviceRestHarness h(/*wire_fleet_read_fn=*/true, &rs);
+    const std::string url = std::string(kPreviewPath) + "?command_id=" + command_id +
+                            "&plugin=registry&output=same-value";
+    h.forensics.unknown();
+    auto res = h.sink.Get(url);
+    REQUIRE(res != nullptr);
+    REQUIRE(res->status == 503);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["retry_after_ms"] == 5000);
+    CHECK(body["error"]["message"].get<std::string>().find("could not be resolved") !=
+          std::string::npos);
+    CHECK(res->body.find("agent_count") == std::string::npos);
+
+    h.forensics.viewer(); // control
+    auto ok = h.sink.Get(url);
+    REQUIRE(ok != nullptr);
+    CHECK(ok->status == 200);
+    CHECK(nlohmann::json::parse(ok->body)["data"]["agent_count"].get<int64_t>() == 1);
+}
+
+TEST_CASE("agent-count-preview: Forensics rows are not counted for a caller without Forensics:Read",
+          "[pg][rest][devices][facets][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-rest-preview-tier";
+    auto put = [&](const std::string& agent, const std::string& plugin) {
+        StoredResponse r;
+        r.instruction_id = command_id;
+        r.agent_id = agent;
+        r.received_at_ms = 1000;
+        r.status = 0;
+        r.output = "same-value";
+        r.plugin = plugin;
+        rs.store(r);
+    };
+    put("agent-a", yuzu::server::test::kForensicsPlugin);
+    put("agent-b", yuzu::server::test::kForensicsPlugin);
+    put("agent-c", yuzu::server::test::kOrdinaryPlugin);
+
+    DeviceRestHarness h(/*wire_fleet_read_fn=*/true, &rs);
+    // `plugin` here selects the column layout used to resolve the filter key (default: output).
+    const std::string url = std::string(kPreviewPath) + "?command_id=" + command_id +
+                            "&plugin=registry&output=same-value";
+    auto count = [&] {
+        auto res = h.sink.Get(url);
+        REQUIRE(res != nullptr);
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body)["data"]["agent_count"].get<int64_t>();
+    };
+
+    h.forensics.viewer();
+    CHECK(count() == 1); // agent-c only
+    h.forensics.admin();
+    CHECK(count() == 3);
+    h.forensics.unsupported_subset({"agent-a"}); // unsupported: fails closed like a viewer
+    CHECK(count() == 1); // agent-c only
 }

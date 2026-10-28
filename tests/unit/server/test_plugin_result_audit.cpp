@@ -36,9 +36,12 @@
 #include "grpc_audit_signal.hpp"
 #include "pg/pg_pool.hpp"
 #include "plugin_result_audit.hpp"
+#include "result_parsing.hpp"
 #include "../../../agents/plugins/registry/src/registry_parsers.hpp"
+#include "../../../agents/plugins/registry/src/registry_plan.hpp"
 #include "test_auth_db_pg_helper.hpp"
 #include "test_principal_lock_gate.hpp"
+#include "test_provenance_fake.hpp" // #4990: harness record source when no tracker is wired
 #include "test_tracker_scope.hpp"
 #include "web_utils.hpp"
 #include "../test_helpers.hpp"
@@ -398,7 +401,8 @@ TEST_CASE("registry audit: the plugin's exception literal mints one failed row p
     // What a mutating action leaves when an exception ends it (execute_guarded's catch): a fixed 19-field line, so
     // the server records a failed registry.write row for a write whose reply could not be built.
     unsigned n = 40;
-    for (const std::string_view action : {"set_value", "delete_value", "delete_key"}) {
+    for (const std::string_view action :
+         {"set_value", "delete_value", "delete_key", "set_user_value", "delete_user_value", "apply"}) {
         INFO(action);
         const std::string line{yuzu::registry::exception_audit_line(action)};
         REQUIRE_FALSE(line.empty());
@@ -409,7 +413,95 @@ TEST_CASE("registry audit: the plugin's exception literal mints one failed row p
         CHECK(frame.events[0].result == "failure");
         CHECK(frame.events[0].action == "registry.write");
         CHECK(frame.events[0].detail == "agent=agent-1 cut=0 " + line);
+        // all 19 fields, op= naming the action, and nothing but `-` after the exception verdict
+        CHECK(std::ranges::count(line, '|') == 19); // the tag and 19 fields: 20 parts
+        CHECK(line.starts_with("audit|op=" + std::string{action} + "|hive=-|result=failed|reason=exception|verify=-|"));
     }
+}
+
+TEST_CASE("registry audit: the apply per-user and dry-run lines the plugin renders extract like any other row",
+          "[server][registry_audit]") {
+    // `result=` is read before key= and the caller-sized fields, whichever action rendered the line; a dry run's
+    // success row says dry_run=1 in its detail (a reader filtering result=success must also read dry_run).
+    yuzu::registry::AuditRecord r;
+    r.op = "apply.set_value";
+    r.hive = "HKLM";
+    r.key = "SOFTWARE\\Acme";
+    r.name = "Ver";
+    r.type_name = "REG_DWORD";
+    r.len = 4;
+    r.result = "ok";
+    r.dry_run = 1;
+    r.created = 0;
+    r.old_state = "present";
+    r.old_type = "REG_DWORD";
+    r.old_bytes = {1, 0, 0, 0};
+    r.old_total = 4;
+    r.has_old = true;
+    r.new_bytes = {2, 0, 0, 0};
+    r.new_total = 4;
+    r.has_new = true;
+    SECTION("an apply item under a dry run") {
+        const std::string line = yuzu::registry::render_audit_line(r);
+        REQUIRE(line.starts_with("audit|op=apply.set_value|hive=HKLM|result=ok|reason=-|verify=-|key="));
+        CHECK(registry_audit_result(line) == "ok");
+        const auto frame = registry_audit_events_for_frame("a1", rid(60), "registry", "apply", line + "\n", 5);
+        REQUIRE(frame.events.size() == 1);
+        CHECK(frame.events[0].result == "success");
+        CHECK(frame.events[0].detail.find("|dry_run=1|") != std::string::npos);
+        CHECK(frame.events[0].detail.ends_with("|old=01000000|new=02000000"));
+    }
+    SECTION("a per-user write names the hive HKU and the sid; a refused one is a failure row") {
+        r.op = "set_user_value";
+        r.hive = "HKU";
+        r.dry_run = -1;
+        r.sid = "S-1-5-21-1-2-3-1001";
+        std::string line = yuzu::registry::render_audit_line(r);
+        REQUIRE(line.starts_with("audit|op=set_user_value|hive=HKU|result=ok|"));
+        CHECK(line.find("|sid=S-1-5-21-1-2-3-1001|") != std::string::npos);
+        auto frame = registry_audit_events_for_frame("a1", rid(61), "registry", "set_user_value", line + "\n", 5);
+        REQUIRE(frame.events.size() == 1);
+        CHECK(frame.events[0].result == "success");
+        r.result = "refused";
+        r.reason = "hive_mount_failed";
+        line = yuzu::registry::render_audit_line(r);
+        frame = registry_audit_events_for_frame("a1", rid(62), "registry", "set_user_value", line + "\n", 5);
+        REQUIRE(frame.events.size() == 1);
+        CHECK(frame.events[0].result == "failure");
+        CHECK(frame.events[0].detail.find("|reason=hive_mount_failed|") != std::string::npos);
+    }
+    SECTION("a full plan (kMaxPlanItems items) is that many rows from one frame, none truncated") {
+        std::string text;
+        for (std::size_t i = 0; i < yuzu::registry::kMaxPlanItems; ++i)
+            text += yuzu::registry::render_audit_line(r) + "\nitem|0|x\n";
+        const auto frame = registry_audit_events_for_frame("a1", rid(63), "registry", "apply", text, 300);
+        CHECK(frame.events.size() == yuzu::registry::kMaxPlanItems);
+        CHECK_FALSE(frame.truncated);
+    }
+}
+
+// The plugin's plan bound and the server's bounds, tied by the compiler rather than by prose: a full plan's audit lines
+// fit one frame's line bound, and a dry run plus the real run of one full plan (2 x kMaxPlanItems rows) fit one agent's
+// row budget (the agent may still split a reply across frames at its 64 KiB flush; the budget is the binding bound).
+static_assert(yuzu::registry::kMaxPlanItems <= kMaxRegistryAuditLinesPerFrame);
+static_assert(yuzu::registry::kMaxPlanItems * 2 <= kRegistryAuditBudgetRows);
+
+TEST_CASE("registry audit: a refused apply item row with a trailing backslash still splits into 14 cells",
+          "[server][registry_audit]") {
+    // mutant: row_field keeps a trailing backslash (find_unescaped_pipe reads `\|` as escaped and merges two cells)
+    yuzu::registry::ItemRow row;
+    row.index = 3;
+    row.op = "delete_value";
+    row.hive = "HKLM";
+    row.key = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Installer\\Folders";
+    row.name = "C:\\Windows\\Installer\\";
+    row.verdict = "refused";
+    row.reason = "unrepresentable_name";
+    const auto cells = split_fields("registry", yuzu::registry::render_item_row(row));
+    REQUIRE(cells.size() == 14);
+    CHECK(cells[5] == "C:\\Windows\\Installer_");
+    CHECK(cells[6] == "refused");
+    CHECK(cells[7] == "unrepresentable_name");
 }
 
 TEST_CASE("registry audit: a string and a binary value reach the row as raw hex, capped with ~<total>",
@@ -452,18 +544,19 @@ TEST_CASE("registry audit: a string and a binary value reach the row as raw hex,
 
 // ── the binding ──────────────────────────────────────────────────────────
 
-TEST_CASE("registry audit: only the three mutating actions of the registry plugin mint rows",
+TEST_CASE("registry audit: only the six mutating actions of the registry plugin mint rows",
           "[server][registry_audit]") {
     const std::string output = "status|ok\n" + std::string{kOkLine} + "\n";
     const auto events = [&](std::string_view plugin, std::string_view action) {
         return registry_audit_events_for_frame("agent-1", rid(9), plugin, action, output, 5)
             .events;
     };
-    for (const char* a : {"set_value", "delete_value", "delete_key"}) {
+    for (const char* a : {"set_value", "delete_value", "delete_key", "set_user_value", "delete_user_value", "apply"}) {
         INFO(a);
         CHECK(events("registry", a).size() == 1);
         CHECK(is_registry_mutating_action(a));
     }
+    CHECK(kRegistryMutatingActions.size() == 6);
     SECTION("read actions, an empty action (an old agent) and unknown actions mint nothing") {
         for (const char* a :
              {"get_value", "key_exists", "enumerate_keys", "enumerate_values", "get_user_value",
@@ -490,8 +583,7 @@ TEST_CASE("registry audit: only the three mutating actions of the registry plugi
         for (const char* spelling : {"Registry", "REGISTRY", "rEgIsTrY"}) {
             const auto id = rid(9, spelling);
             INFO(id);
-            CHECK(registry_audit_events_for_frame("agent-1", id, extract_plugin(id), "set_value",
-                                                  output, 5)
+            CHECK(registry_audit_events_for_frame("agent-1", id, spelling, "set_value", output, 5)
                       .events.size() == 1);
         }
         CHECK(events("registr", "set_value").empty());
@@ -634,7 +726,8 @@ TEST_CASE("registry audit: the mutating-action list matches the capability catal
             CHECK(is_registry_mutating_action(r.action) == mutating);
         }
     }
-    CHECK(registry_rows == 9);
+    CHECK(registry_rows == 12);
+    CHECK(mutating_rows == 6);
     CHECK(mutating_rows == kRegistryMutatingActions.size());
 }
 
@@ -725,6 +818,9 @@ struct IngestHarness {
         audit = std::make_shared<AuditStore>(pool);
         REQUIRE(audit->is_open());
         svc.set_registry_audit_store(audit);
+        // #4990: the frame's plugin comes from a dispatch record; this harness answers with the
+        // id's prefix (a TrackerScope clears it and reads real records).
+        yuzu::test::use_prefix_provenance(svc);
     }
     static apb::CommandResponse frame(const std::string& command_id,
                                       apb::CommandResponse::Status status,
@@ -815,6 +911,36 @@ TEST_CASE("registry audit live ingest: a refused write is a failure row and read
     CHECK(h.rows().size() == 1);
 }
 
+TEST_CASE("registry audit live ingest: the plugin that gates the rows is the recorded one (#4990)",
+          "[pg][server][registry_audit][provenance]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
+    IngestHarness h(db.dsn());
+    const std::string line = line_with_result("ok");
+
+    // An unrecorded `registry-<hex>` id: the server never dispatched it, so the frame is
+    // unverified and owes no registry.write row (the id's own prefix is not trusted).
+    h.svc.override_command_record_lookup({});
+    h.svc.process_gateway_response(
+        "agent-1", IngestHarness::frame(rid(0xf1), apb::CommandResponse::RUNNING, "set_value", line));
+    CHECK(h.rows().empty());
+
+    // The same id once the server's record names the registry plugin owes its row.
+    h.svc.override_command_record_lookup([](const std::string&, std::string*) {
+        return std::optional<yuzu::server::CommandRecord>{{"registry", ""}};
+    });
+    h.svc.process_gateway_response(
+        "agent-1", IngestHarness::frame(rid(0xf1), apb::CommandResponse::RUNNING, "set_value", line));
+    CHECK(h.rows().size() == 1);
+
+    // A record that names ANOTHER plugin for a registry-looking id owes none.
+    h.svc.override_command_record_lookup([](const std::string&, std::string*) {
+        return std::optional<yuzu::server::CommandRecord>{{"filesystem", ""}};
+    });
+    h.svc.process_gateway_response(
+        "agent-1", IngestHarness::frame(rid(0xf2), apb::CommandResponse::RUNNING, "set_value", line));
+    CHECK(h.rows().size() == 1);
+}
+
 TEST_CASE("registry audit live ingest: a terminal frame that does carry output still owes its rows",
           "[pg][server][registry_audit]") {
     YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
@@ -861,6 +987,7 @@ TEST_CASE("registry audit live ingest: no audit store means no audit work and no
                          auto_approve,
                          metrics,
                          /*gateway_mode=*/false};
+    yuzu::test::use_prefix_provenance(svc); // #4990: see IngestHarness
 
     yuzu::test::LogCapture cap;
     svc.process_gateway_response("agent-1",
@@ -1373,7 +1500,7 @@ TEST_CASE("registry audit live ingest: the row is written before the execution a
     ExecutionEventBus exec_bus;
     yuzu::test::TrackerScope ts{h.svc, h.pool, &exec_bus};
     const auto id = ts.make_exec();
-    h.svc.record_execution_id(rid(0xe1), id);
+    h.svc.record_command_dispatch(rid(0xe1), "registry", id);
 
     // The tracker publishes `agent-transition` synchronously from inside the ingest, so the
     // listener sees exactly what a live operator watching the execution would.
@@ -1439,6 +1566,7 @@ struct LiveHarness {
         audit = std::make_shared<AuditStore>(pool);
         REQUIRE(audit->is_open());
         svc.set_registry_audit_store(audit);
+        yuzu::test::use_prefix_provenance(svc); // #4990: see IngestHarness
         if (configure)
             configure(svc);
         grpc::ServerBuilder builder;

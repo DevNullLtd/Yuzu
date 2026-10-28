@@ -54,6 +54,9 @@
     "windows.registry.set_value":             "destructive",
     "windows.registry.delete_value":          "destructive",
     "windows.registry.delete_key":            "destructive",
+    "windows.registry.set_user_value":        "destructive",
+    "windows.registry.delete_user_value":     "destructive",
+    "windows.registry.apply":                 "destructive",
 
     "crossplatform.service.set_start_mode":   "destructive",
 

@@ -99,7 +99,7 @@ versus one that could not be read at all:
   (`SeBackupPrivilege`/`SeRestorePrivilege` couldn't be enabled on the
   process token), `mount_failed` (`RegLoadKeyW` itself failed for the
   offline arm), or a `hive_*` reason from the default offline hive-file guard
-  (`hive_owner_unexpected`, `hive_path_reparse_ancestor`,
+  (`hive_hardlinked`, `hive_owner_unexpected`, `hive_path_reparse_ancestor`,
   `hive_path_redirected`, `hive_not_resident`, `hive_oversized`,
   `hive_sidecar_reparse`, `hive_sidecar_hardlinked`, `hive_sidecar_count`,
   `hive_identity_changed`, or `hive_stat_failed:win32_<n>`) when the guard

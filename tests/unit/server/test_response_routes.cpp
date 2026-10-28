@@ -24,6 +24,7 @@
 #include "response_query_params.hpp"
 #include "response_routes.hpp"
 #include "test_export_cap_guard.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 
 #include "audit_store.hpp"
@@ -46,6 +47,9 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <numeric>
+#include <set>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
@@ -55,6 +59,12 @@
 #include <utility>
 
 using namespace yuzu::server;
+
+// #4990: reads in this file are test oracles, not an operator surface, so they take no tier
+// restriction (the tier itself is pinned in test_response_store.cpp / test_response_tier_filter.cpp).
+namespace {
+const auto kAllRows = yuzu::server::ResponseTierFilter::unrestricted_internal_consumer();
+} // namespace
 using json = nlohmann::json;
 
 namespace {
@@ -84,11 +94,20 @@ struct Harness {
     bool audit_succeeds{true};
     std::vector<AuditRow> audits;
 
+    // #4990: the caller's Forensics visibility. Admin by default so the cases that are not about
+    // the tier keep their meaning; `wire_forensics = false` leaves the tier unwired (fail closed).
+    yuzu::server::test::ForensicsCaller forensics;
+    bool wire_forensics{true};
+
     yuzu::server::test::TestRouteSink sink;
 
     void wire() {
         response::Deps deps;
         deps.store = store;
+        if (wire_forensics) {
+            deps.forensics_plugins = &yuzu::server::test::forensics_plugin_set();
+            deps.forensics_visibility_fn = forensics.fn();
+        }
         deps.fleet_read_fn = [this](const httplib::Request&, httplib::Response& res,
                                     const std::string& type,
                                     const std::string& op) -> authz::FleetReadGate {
@@ -246,9 +265,14 @@ struct PgHarness {
 
     yuzu::MetricsRegistry metrics; // #4644/#4703 counters; outlives the sink's handlers
 
+    // #4990: the caller's Forensics visibility, wired into the routes below. Admin by default so
+    // the cases that are not about the tier keep their meaning.
+    yuzu::server::test::ForensicsCaller forensics;
+
     yuzu::server::test::TestRouteSink sink; // LAST — see file header.
 
-    PgHarness() {
+    // `wire_fn` / `wire_set` = false leave the Forensics resolver / plugin set unwired (#4990).
+    explicit PgHarness(bool wire_fn = true, bool wire_set = true) {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
@@ -262,6 +286,10 @@ struct PgHarness {
         response::Deps deps;
         deps.store = store.get();
         deps.metrics = &metrics;
+        if (wire_set)
+            deps.forensics_plugins = &yuzu::server::test::forensics_plugin_set();
+        if (wire_fn)
+            deps.forensics_visibility_fn = forensics.fn();
         yuzu::server::seed_response_metrics(metrics);
         deps.fleet_read_fn = [this](const httplib::Request&, httplib::Response&,
                                     const std::string&, const std::string&) -> authz::FleetReadGate {
@@ -282,12 +310,14 @@ struct PgHarness {
         response::register_response_routes(sink, deps);
     }
 
-    void seed(const std::string& instruction_id, const std::string& agent_id, int status = 1) {
+    void seed(const std::string& instruction_id, const std::string& agent_id, int status = 1,
+              const std::string& plugin = "", const std::string& output = "ok") {
         StoredResponse resp;
         resp.instruction_id = instruction_id;
         resp.agent_id = agent_id;
         resp.status = status;
-        resp.output = "ok";
+        resp.output = output;
+        resp.plugin = plugin;
         store->store(resp);
     }
 };
@@ -726,7 +756,7 @@ TEST_CASE("GET /api/responses/:id/export: the SERIALIZATION backstop alone flags
     {
         ResponseQuery q;
         q.limit = 10000;
-        auto sql_only = h.store->query_bounded("instr-backstop", q, std::nullopt, 150);
+        auto sql_only = h.store->query_bounded("instr-backstop", kAllRows, q, std::nullopt, 150);
         REQUIRE(sql_only.has_value());
         REQUIRE(sql_only->rows.size() == 2);
         REQUIRE_FALSE(sql_only->byte_cap_hit);
@@ -1489,4 +1519,281 @@ TEST_CASE("AuthRoutes::audit_log: a hostile target_id is neutralised in the pers
     CHECK(body.find('\r') == std::string::npos);
     CHECK(body.find('\n') == std::string::npos);
     CHECK(logs.find("evil\r") == std::string::npos);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4990: the Forensics tier on the legacy response reads. Real PG-backed store, exact rendered
+// rows, and a non-Forensics control row in every case: a stub that only recorded the filter it was
+// handed would stay green with the SQL clause deleted.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+using yuzu::server::test::kForensicsPlugin;
+using yuzu::server::test::kOrdinaryPlugin;
+
+// agent-A and agent-B each answered with a Forensics row; agent-A and agent-C with an ordinary one.
+void seed_tier_rows(PgHarness& h, const std::string& id) {
+    h.seed(id, "agent-A", 1, kForensicsPlugin, "forensics-A");
+    h.seed(id, "agent-B", 1, kForensicsPlugin, "forensics-B");
+    h.seed(id, "agent-A", 1, kOrdinaryPlugin, "ordinary-A");
+    h.seed(id, "agent-C", 1, kOrdinaryPlugin, "ordinary-C");
+}
+
+std::set<std::string> served_outputs(const std::unique_ptr<httplib::Response>& res) {
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    std::set<std::string> out;
+    for (const auto& r : body["responses"])
+        out.insert(r["output"].get<std::string>());
+    CHECK(body["count"].get<std::size_t>() == body["responses"].size());
+    return out;
+}
+
+using Outputs = std::set<std::string>;
+const Outputs kAllFour{"forensics-A", "forensics-B", "ordinary-A", "ordinary-C"};
+const Outputs kOrdinaryOnly{"ordinary-A", "ordinary-C"};
+} // namespace
+
+TEST_CASE("GET /api/responses/:id (catch-all): Forensics rows follow the caller's Forensics visibility",
+          "[server][routes][response_routes][rest][pg][security][forensics]") {
+    PgHarness h;
+    seed_tier_rows(h, "instr-tier");
+
+    SECTION("a caller without Forensics:Read gets exactly the non-Forensics rows") {
+        h.forensics.viewer();
+        CHECK(served_outputs(h.sink.Get("/api/responses/instr-tier")) == kOrdinaryOnly);
+    }
+    SECTION("a global Forensics:Read gets every row") {
+        h.forensics.admin();
+        CHECK(served_outputs(h.sink.Get("/api/responses/instr-tier")) == kAllFour);
+    }
+    SECTION("a per-agent subset is unsupported and fails closed: no Forensics row, named agent or not") {
+        h.forensics.unsupported_subset({"agent-A"});
+        CHECK(served_outputs(h.sink.Get("/api/responses/instr-tier")) == kOrdinaryOnly);
+    }
+    SECTION("an unwired resolver behaves as present-empty") {
+        PgHarness unwired(/*wire_fn=*/false, /*wire_set=*/true);
+        seed_tier_rows(unwired, "instr-tier");
+        CHECK(served_outputs(unwired.sink.Get("/api/responses/instr-tier")) == kOrdinaryOnly);
+    }
+    SECTION("an unwired plugin set refuses every row") {
+        PgHarness unwired(/*wire_fn=*/true, /*wire_set=*/false);
+        seed_tier_rows(unwired, "instr-tier");
+        CHECK(served_outputs(unwired.sink.Get("/api/responses/instr-tier")).empty());
+    }
+}
+
+TEST_CASE("GET /api/responses/:id (catch-all): a filtered row looks absent, with no scope-drop trace",
+          "[server][routes][response_routes][rest][pg][security][forensics]") {
+    PgHarness h;
+    seed_tier_rows(h, "instr-tier-abs");
+    h.forensics.viewer();
+    // A confined caller: the scope-drop count must not see rows the tier already removed.
+    h.fleet_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-A", "agent-C"}};
+
+    auto res = h.sink.Get("/api/responses/instr-tier-abs");
+    CHECK(served_outputs(res) == kOrdinaryOnly);
+    // agent-B answered only with a Forensics row: it must not show up as a dropped agent.
+    for (const auto& a : h.audits)
+        CHECK(a.result != "denied");
+}
+
+TEST_CASE("GET /api/responses/:id/aggregate: counts are computed from the permitted rows only",
+          "[server][routes][response_routes][rest][pg][security][forensics]") {
+    PgHarness h;
+    seed_tier_rows(h, "instr-tier-agg");
+
+    auto counts_by_agent = [&](const char* group_by) {
+        auto res = h.sink.Get(std::string("/api/responses/instr-tier-agg/aggregate?group_by=") +
+                              group_by);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        std::map<std::string, int> m;
+        for (const auto& g : body["groups"])
+            m[g["group_value"].get<std::string>()] = g["count"].get<int>();
+        CHECK(body["total_rows"].get<int>() ==
+              std::accumulate(m.begin(), m.end(), 0,
+                              [](int a, const auto& kv) { return a + kv.second; }));
+        return m;
+    };
+
+    h.forensics.viewer();
+    CHECK(counts_by_agent("agent_id") == std::map<std::string, int>{{"agent-A", 1}, {"agent-C", 1}});
+    h.forensics.admin();
+    CHECK(counts_by_agent("agent_id") ==
+          std::map<std::string, int>{{"agent-A", 2}, {"agent-B", 1}, {"agent-C", 1}});
+    h.forensics.unsupported_subset({"agent-B"}); // unsupported: fails closed like a viewer
+    CHECK(counts_by_agent("agent_id") == std::map<std::string, int>{{"agent-A", 1}, {"agent-C", 1}});
+}
+
+TEST_CASE("GET /api/responses/:id/export: rows and the truncation flag come from the permitted set",
+          "[server][routes][response_routes][rest][pg][security][forensics]") {
+    PgHarness h;
+    // Three Forensics rows and one ordinary row; limit=2 cuts the full set but not the ordinary one.
+    h.seed("instr-tier-exp", "agent-A", 1, kForensicsPlugin, "forensics-1");
+    h.seed("instr-tier-exp", "agent-B", 1, kForensicsPlugin, "forensics-2");
+    h.seed("instr-tier-exp", "agent-C", 1, kForensicsPlugin, "forensics-3");
+    h.seed("instr-tier-exp", "agent-A", 1, kOrdinaryPlugin, "ordinary-1");
+
+    auto export_json = [&](const char* q) {
+        auto res = h.sink.Get(std::string("/api/responses/instr-tier-exp/export") + q);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        return body;
+    };
+
+    h.forensics.viewer();
+    {
+        const auto body = export_json("?limit=2");
+        REQUIRE(body["responses"].size() == 1);
+        CHECK(body["responses"][0]["output"] == "ordinary-1");
+        CHECK(body["count"] == 1);
+        CHECK_FALSE(body.contains("result_truncated_by_cap"));
+    }
+    h.forensics.admin();
+    {
+        const auto body = export_json("?limit=2");
+        CHECK(body["responses"].size() == 2);
+        CHECK(body.contains("result_truncated_by_cap"));
+    }
+    SECTION("csv carries the same permitted set") {
+        h.forensics.viewer();
+        auto res = h.sink.Get("/api/responses/instr-tier-exp/export?format=csv");
+        REQUIRE(res);
+        CHECK(res->body.find("ordinary-1") != std::string::npos);
+        CHECK(res->body.find("forensics-") == std::string::npos);
+    }
+}
+
+TEST_CASE("legacy response reads: an Unknown Forensics decision is a retryable 503, never a partial 200",
+          "[server][routes][response_routes][rest][pg][security][forensics]") {
+    PgHarness h;
+    seed_tier_rows(h, "instr-tier-unk");
+    h.forensics.unknown();
+
+    for (const std::string path : {"/api/responses/instr-tier-unk",
+                                   "/api/responses/instr-tier-unk/aggregate?group_by=agent_id",
+                                   "/api/responses/instr-tier-unk/export",
+                                   "/api/responses/instr-tier-unk/export?format=csv"}) {
+        INFO(path);
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        REQUIRE(res->status == 503);
+        const auto body = json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK(body["error"]["code"] == 503);
+        CHECK(body["error"]["retry_after_ms"] == 5000);
+        // A grant would not fix an outage: the refusal never names a permission to acquire.
+        CHECK_FALSE(body["error"].contains("permission"));
+        // Not one row, ordinary or Forensics, is served on a refusal.
+        CHECK(res->body.find("ordinary-") == std::string::npos);
+        CHECK(res->body.find("forensics-") == std::string::npos);
+    }
+    // A refusal serves nothing, so it leaves no read row of any kind.
+    CHECK(h.audits.empty());
+
+    // Control: the same harness answers 200 with the ordinary rows once the decision is Denied.
+    h.forensics.viewer();
+    CHECK(served_outputs(h.sink.Get("/api/responses/instr-tier-unk")) == kOrdinaryOnly);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4990: the `response.forensics.read` audit row on the legacy row-returning reads. Asserted on the
+// RECORDED audit rows (never on a mock having been called), over a real store, with an ordinary
+// control row in every case.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+std::vector<AuditRow> forensics_audits(const PgHarness& h) {
+    std::vector<AuditRow> out;
+    for (const auto& a : h.audits)
+        if (a.action == "response.forensics.read")
+            out.push_back(a);
+    return out;
+}
+
+struct LegacyRowRoute {
+    const char* name;
+    const char* suffix; // after /api/responses/<id>
+};
+constexpr LegacyRowRoute kLegacyRowRoutes[] = {
+    {"get", ""}, {"export json", "/export"}, {"export csv", "/export?format=csv"}};
+} // namespace
+
+TEST_CASE("legacy row reads: response.forensics.read is written only when Forensics rows are served",
+          "[server][routes][response_routes][rest][pg][audit][security][forensics]") {
+    PgHarness h;
+    seed_tier_rows(h, "instr-faud");
+
+    for (const auto& route : kLegacyRowRoutes) {
+        INFO(route.name);
+        const std::string path = std::string("/api/responses/instr-faud") + route.suffix;
+
+        SECTION(std::string(route.name) + ": a caller without Forensics:Read leaves no verb row") {
+            h.forensics.viewer();
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(forensics_audits(h).empty());
+        }
+        SECTION(std::string(route.name) + ": a global grant leaves exactly one row with the count") {
+            h.forensics.admin();
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            const auto rows = forensics_audits(h);
+            REQUIRE(rows.size() == 1);
+            CHECK(rows[0].result == "success");
+            CHECK(rows[0].target_type == "Execution");
+            CHECK(rows[0].target_id == "instr-faud");
+            CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory surface=legacy");
+        }
+        SECTION(std::string(route.name) + ": a per-agent subset (unsupported) serves no Forensics row and writes none") {
+            h.forensics.unsupported_subset({"agent-A"});
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(forensics_audits(h).empty());
+        }
+        SECTION(std::string(route.name) + ": a persist failure is a 503 and serves no data") {
+            h.forensics.admin();
+            h.audit_succeeds = false;
+            h.audit_fail_after = 1; // the response.read row persists, the verb row does not
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->status == 503);
+            CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+            CHECK(res->body.find("forensics-") == std::string::npos);
+            CHECK(res->body.find("ordinary-") == std::string::npos);
+            CHECK(forensics_audits(h).size() == 1); // attempted once, not retried
+        }
+    }
+}
+
+TEST_CASE("legacy row reads: a result of ordinary rows only writes no verb row, and aggregate never does",
+          "[server][routes][response_routes][rest][pg][audit][security][forensics]") {
+    PgHarness h;
+    h.seed("instr-faud-ord", "agent-A", 1, kOrdinaryPlugin, "ordinary-A");
+    h.forensics.admin();
+    for (const auto& route : kLegacyRowRoutes) {
+        INFO(route.name);
+        auto res = h.sink.Get(std::string("/api/responses/instr-faud-ord") + route.suffix);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+    CHECK(forensics_audits(h).empty());
+
+    PgHarness agg;
+    seed_tier_rows(agg, "instr-faud-agg");
+    agg.forensics.admin();
+    auto res = agg.sink.Get("/api/responses/instr-faud-agg/aggregate?group_by=agent_id");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(forensics_audits(agg).empty());
 }

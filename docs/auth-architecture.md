@@ -1198,12 +1198,14 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   by `AuthManager::reap_expired_elevation` at the `AuthRoutes::resolve_session`
   cookie chokepoint, on the FIRST authenticated request the operator makes
   *after* the window has lapsed. `elevated_until` is cleared to the sentinel on
-  that first observing call, so emission is exactly-once — a request that finds
+  that first observing call, so on a single server replica emission is exact (the
+  clear is rechecked under the exclusive session lock); with several replicas a rare
+  duplicate is possible (effectively-once, ADR-2002). A request that finds
   the sentinel already cleared (a prior reap, or a manual
   `revoke_elevation`/`revoke_user_elevations`, which clear to the same
   sentinel) emits nothing, so a manual step-down never ALSO produces a spurious
-  `expired` row. **The `role.elevation.expired` emission is itself best-effort
-  / at-most-once** (governance hardening round, UP-3): `elevated_until` is
+  `expired` row. **The `role.elevation.expired` emission is itself best-effort:
+  it is never retried, so it can be lost** (governance hardening round, UP-3). `elevated_until` is
   cleared to the sentinel BEFORE the audit call, so a store failure loses only
   the confirmatory `expired` row, never the reap itself (the session still
   correctly reverts to base role) — and the window's end remains
@@ -3237,7 +3239,7 @@ counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
 
 ## Granular RBAC (Phase 3)
 
-- 7 roles, 39 securable types, per-operation permissions, deny-override logic.
+- 8 roles (adds `ForensicsAnalyst`, the read-only delegable Forensics tier, #4990), 39 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO**: Full PKCE flow, OIDC Discovery, JWT validation, group-to-role mapping. Endpoints and `jwks_uri` are never derived from the issuer: `OidcProvider::ensure_discovered` reads them lazily from the issuer's discovery document (an explicit `OidcConfig` field is authoritative for that one field), fails closed with no fallback, and applies one validation, shared with the Settings "Test Connection" button: `issuer` byte-equal to the configured issuer (OIDC Discovery 4.3, the mix-up defense) and every endpoint an absolute URL on the issuer's scheme, at most 2048 bytes, with a well-formed `host[:port]` authority. Test Connection shares only the fetch and validation functions: it never reads or clears the provider's discovery state, so it is a connectivity check and not a guarantee of what a sign-in will hit.
   - All IdP GETs go through one bounded primitive (`http_get_bounded`): 5 s per-operation timeouts and a total bound of 2 x that timeout, 10 s by default, from the start of the request, covering name resolution (on POSIX the resolver is capped at the per-operation timeout where httplib's non-blocking resolver is compiled in: the Linux build; not checked on macOS. On Windows `resolve_host_addresses` runs its own overlapped `GetAddrInfoExW` lookup, canceled at that timeout rounded up to whole seconds, with up to 5 s more for the canceled lookup to complete; a lookup still not complete then is not freed (the OS may still write into it) but handed to a process-wide ledger that destroys it once its event is signaled, holds at most 16 such requests plus lookups in flight, and makes a new lookup fail closed with "the host name did not resolve" while 16 are stuck: `oidc_abandoned_ledger.hpp`), connect and the response; 256 KiB body cap, redirects not followed.
   - A watchdog thread shuts the socket down at that deadline, and again every 50 ms because a pre-connect shutdown does not persist on macOS (measured), so the bound also covers the TLS handshake, which httplib's own `set_max_timeout` does not. On POSIX the watchdog holds a descriptor it reserved before the client existed (an alias of the socket, made by dup2 from httplib's socket-options callback, so exhaustion fails the request closed with `request failed: no file descriptor available` rather than leaving it unwatched). On Windows it takes a private duplicate of the socket (`WSADuplicateSocketW`, so it never touches a socket number httplib may close and Windows may reuse), and a duplicate that cannot be taken fails the request closed with the same text; from the deadline it calls `CancelIoEx` on the duplicate and shuts the connection down every 50 ms, and after 10 such cuts (500 ms) closes the duplicate with `SO_LINGER` zero, an abortive close that resets the connection (the count restarts for each socket httplib hands it). httplib 0.37.1 waits with `WSAPoll` on Windows; the evidence for the cut is the end-to-end Windows drip test. Per-OS test provenance is in `docs/test-coverage.md`.
@@ -3434,11 +3436,18 @@ ADR-0041, currently at v3).
 
 ## Render-time permission probes (capability hints)
 
-Five `AuthRoutes` methods answer a permission question without writing a denial row for an
+Six `AuthRoutes` methods answer a permission question without writing a denial row for an
 interactive sign-in, for pages
 that decide what to DRAW: `has_permission` (the verdict only), `probe_permission` (the verdict
-with the gate's own response kept, so "denied" and "store unavailable" stay distinguishable),
-`probe_admin` (`require_admin`'s decision), `probe_fleet_read` (`require_fleet_read`'s decision and
+with the gate's own response kept: it receives the 401/403/503 the gate wrote, and the 503 appears
+only where the gate itself writes one, such as an engine principal with the store not open; an RBAC
+read that fails (breaker open, pool timeout, a failed role or permission query) is a `403` here and
+cannot be told apart from a refusal), `probe_permission_unavailable_aware` (`probe_permission`
+with one difference: such a failed RBAC read is answered with a retryable `503`, `retry_after_ms`
+5000 and no `permission` field. It exists for the one consumer whose correctness depends on telling
+"could not determine" from "definitively denied", the Forensics-tier resolver, where a collapsed
+answer would serve a `200` with the Forensics rows silently missing; a new caller needs the same
+justification, and `require_permission` itself stays a `403` on a degrade, ADR-0041), `probe_admin` (`require_admin`'s decision), `probe_fleet_read` (`require_fleet_read`'s decision and
 scope) and `probe_global_list_read` (`require_list_read`'s decision, with a management-group-
 confined admission refused as a denial, for a resource that is not agent-scoped; its loud twin
 `require_global_list_read` is the gate of the plugin-config REST list). Each runs the gate's own
@@ -3637,7 +3646,7 @@ header, so these names stay rejected on client ingress permanently.
 ## API tokens and automation
 
 - **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens (see `docs/mcp-server.md`) use the same table with mandatory expiration (max 90 days).
-- **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; the global `admin` role is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
+- **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; an effective `admin` role (the global `admin` role, or a session holding a JIT admin elevation) is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
 
 ### Device tokens (`DeviceTokenStore`, ADR-0052, capability 18.8) — currently dormant, docs/user-manual/rest-api.md "Device Tokens"
 
@@ -3945,15 +3954,18 @@ walkthrough.
   behind a one-time secret-reveal panel, revoked rows showing `superseded_by` +
   revoke detail).
 - **REST gating:** every *mutating* route is human-admin + MFA-step-up gated;
-  the three read routes are human-admin + RBAC gated but not step-up gated —
-  list and get on `EnginePrincipal:Read` (moved off the over-broad
+  the read routes are human-admin + RBAC gated but not step-up gated: list,
+  get and the roles list on `EnginePrincipal:Read` (moved off the over-broad
   `Security:Read` by #2376, see "The authorization topology floor" above), and
   `audit/no-admin` on `AuditLog:Read` (floored under RBAC-off by #5771, so
-  the auditor route is admin-only on a default install). Every route —
-  reads included — structurally denies a caller whose own session is
+  the auditor route is admin-only on a default install). Every route, reads
+  included, structurally denies a caller whose own session is
   engine-classed (`principal_kind="engine"` / `auth_source="engine_token"`, the
-  §9 belt): an engine principal can never read or mutate its own or another
-  engine principal's lifecycle surface.
+  §9 belt), with one exception: `GET /engine-principals/{id}/roles` (list)
+  relies on `EnginePrincipal:Read` alone, and the role assign and unassign
+  routes are refused at the central step-up check. Apart from that list, an
+  engine principal can never read or mutate its own or another engine
+  principal's lifecycle surface.
 - **MCP gating:** the 6 mutating tools all gate on `Security:Write`
   (`mint_engine_credential`/`rotate_engine_credential` included — aligned with
   their REST twins, not `Security:Execute`), require the `supervised` tier,
@@ -4199,8 +4211,7 @@ this section does not restate them.
   token stays a 30-day token measured from its own original grant) — never
   recomputed as `now + 90d`, which would silently extend authorization
   lifetime through what should be a lateral credential swap. The store-level
-  API retains an internal `successor_expires_at` override parameter (reused
-  by the engine arm's own successor-TTL logic), but the REST route
+  API retains an internal `successor_expires_at` override parameter, but the REST route
   deliberately does not expose it — a senior-architecture ruling, recorded
   in the security review, that rotation must read as lifetime-neutral in
   CC6.3 evidence with no caller-controlled escape hatch. A caller that
@@ -4422,7 +4433,7 @@ CIDR containment in `cidr_match.{hpp,cpp}`.
 
 **Gateway origin-IP attribution (#1064).** On the gateway `ProxyRegister` path
 the server's transport peer is the *gateway's* IP, so audit rows would
-mis-attribute the source (SOC 2 IR-2). `RegisterRequest.gateway_observed_peer`
+mis-attribute the source (SOC 2 CC7.2). `RegisterRequest.gateway_observed_peer`
 (an optional, gateway-authoritative, transport-agnostic field — carried in the
 message, not in transport metadata) carries the agent's origin IP; the server records
 `source_ip`=agent origin and `gateway_ip`=transport peer, falling back to the
@@ -4430,11 +4441,22 @@ gateway IP (`origin_observed=false`) when absent. The *direct* Register path
 ignores the field, so a *direct* agent cannot forge a source IP. It is **not** a
 defence against a compromised gateway (which is inside the trust boundary and
 can set any value) — both `source_ip` and the gateway's `gateway_ip` are
-recorded so an auditor can cross-check. **Server-side consumption ships now; the
-gateway-side population is a follow-up** — today's grpcbox transport can only
-source it from `x-forwarded-for` (proxied deployments); grpcbox does not yet
-expose the transport peer to the gateway's handlers, and the vendored accessor
-that will is #1172.
+recorded so an auditor can cross-check. **The gateway sets the field itself and
+discards whatever the agent sent** (`yuzu_gw_agent_service:register/2`): the value
+is the call's origin address as the gateway's own gRPC layer decides it — the
+transport peer by default, or the address a trusted proxy vouched for when the
+listener is configured with an `origin` mode (`proxy_protocol` or `forwarded_for`,
+judged by who connected, never by whether the claim matches; a claim from a peer
+that is not a configured proxy is ignored, and attributed to its TCP peer) — as a
+bare IP text. Empty means no observation: on a listener configured as proxied, a
+trusted proxy that gave no usable address (a PROXY `LOCAL`, a missing or unusable
+`x-forwarded-for`) is sent as empty rather than attributed to the proxy itself, and the
+server then records `source_ip`=the gateway node with `origin_observed=false`. A
+listener left in `transport` mode behind a proxy that was never configured records the
+proxy's address and nothing flags it. The server cannot tell a gateway that overwrites
+the field from an older one that forwards the agent's value, so all gateways must be
+upgraded before `source_ip` is relied on. See `docs/user-manual/gateway.md`,
+"Client addresses behind a proxy".
 
 ## HTTPS and bind defaults (hard invariants)
 
@@ -4487,8 +4509,9 @@ issued leaf's `CN` *is* the `agent_id` the server already checks.
 Issuance happens on **both** the direct `Register` and the gateway-proxied
 `ProxyRegister` paths (PKI PR5d — both share one `sign_agent_csr` chokepoint); see
 `docs/pki-architecture.md` "Per-agent enrollment through the gateway" for the
-gateway specifics (the agent↔gateway hop is one-way TLS in M1, so through-gateway
-identity stays the app-layer `gateway_observed_peer` until gateway mTLS lands).
+gateway specifics (the agent↔gateway hop is one-way TLS in M1, so through the gateway the
+agent's address is attributed by the app-layer `gateway_observed_peer` — attribution, not
+authentication — until gateway mTLS lands).
 
 **Bootstrap (chicken-and-egg) — resolved on one port.** The agent has no client
 cert on first boot, but the data plane requires one. Resolution:
@@ -4652,8 +4675,9 @@ direct-connect-authoritative caveat called out in `docs/pki-architecture.md`
 **Gateway CSR-swap forgery (R-5, accepted M1 residual).** Wiring `ProxyRegister`
 to sign forwarded CSRs makes the gateway a bounded **confused deputy**. The
 server signs the relayed CSR's public key under the **gateway-supplied**
-`agent_id` (the through-gateway identity is the app-layer `gateway_observed_peer`,
-not a transport-cryptographic binding in M1), so a compromised or on-path gateway
+`agent_id` (through the gateway the `agent_id` is a gateway-supplied message field and the
+agent's address is the app-layer `gateway_observed_peer`: attribution, not authentication,
+and not a transport-cryptographic binding in M1), so a compromised or on-path gateway
 can relay a *victim's* `agent_id` paired with its *own* CSR and obtain a real
 CA-signed leaf for that `agent_id`. Worse than a transient relay: that leaf is a
 durable credential the attacker can present for **persistent direct mTLS
@@ -5070,7 +5094,7 @@ DENYING reasons (`pool_acquire_timeout` / `query_error` /
 `generation_refresh_failed`): each failed read denies the request that
 needed it (operator permission and list-read checks on a permission-cache
 miss, service-scoped tokens on every `require_fleet_read` or
-`require_scoped_permission` request whose `ITServiceOwner` ceiling read fails), so a non-zero rate on one of these is an authorization-availability
+`require_scoped_permission` request whose `ITServiceOwner` ceiling read fails). A failed role query, the read that precedes a permission check, counts `query_error` and books a breaker failure on every path that makes it (`require_permission`'s RBAC branch included; `get_effective_permissions`, a display read that denies nobody, counts it too), while the `ITServiceOwner` ceiling read inside `require_permission` is uncounted. So a non-zero rate on one of these is an authorization-availability
 event, though not necessarily one that denies every caller, and the
 `YuzuRbacReadDegraded` alert pages on exactly this subset.
 Two OBSERVE-ONLY reasons share the same metric but deny nothing — the read

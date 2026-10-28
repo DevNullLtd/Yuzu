@@ -891,7 +891,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `get.fragments-devices-list` recorded the same pair as `twinned`; it moves
      to the same exception so the ledger holds one answer for the pair
      (untwinned 214 to 215). The pins are `(4041, "2027-01-31")` for both rows in
-     `STRICT_EXCEPTION_PINS`; like the 2026-10-22 entry this is a session
+     `STRICT_EXCEPTION_PINS`; like the 2026-10-22 API-parity ledger reconcile entry this is a session
      statement by the ADR owner, not a signed decision.
 
    - **2026-10-23 - DEX customer score policy (`GET`, `PUT` and `DELETE
@@ -916,6 +916,72 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        entry does not fence MCP tokens.
      - Wire reference: `docs/user-manual/rest-api.md`, "GET / PUT / DELETE
        /api/v1/dex/score-policy"; audit rows: `docs/user-manual/audit-log.md`.
+
+   - **2026-10-22 - the OpenAPI group guides (`?guides=true`) have no MCP path.**
+     A "no" on Decision 1's both-surfaces requirement for one query-parameter
+     form. `GET /api/v1/openapi.json?guides=true` returns the OpenAPI document
+     with the per-group guide text (`x-yuzu-guide` on the top-level `tags`),
+     and the dashboard `/swagger` page loads that form. The MCP resource
+     `yuzu://openapi` and the discover tools serve only the default form,
+     which leaves the guides out, and no MCP tool or resource takes a
+     `guides` argument.
+     - **Reason.** The guides are prose written for people reading the
+       reference page, and the guide text would make the document larger for
+       every reader of the MCP resource. The default document does not carry
+       everything the guides carry. Counted by parsing the document when this
+       entry was written (it then had 259 operations), 40 operations have no
+       description, and 73 operations in all have descriptions that name no
+       securable permission. The permission and
+       audit prose in each guide's access block is present only in the
+       `guides=true` form.
+     - **Scope.** The exception covers the guide text only. The operations,
+       parameters, schemas and `operationId` values are identical on both
+       surfaces, and the `/swagger` page adds no capability beyond what the
+       REST document describes. The page and the `guides` parameter take the
+       same `Infrastructure:Read` gate as the MCP resource.
+     - **Not visible to the parity check.** `scripts/ci/check-api-parity.py`
+       reads routes and tool names, so it cannot see a query-parameter variant
+       or the `/swagger` page. This entry is the record that the gap is
+       deliberate.
+     - **Acceptance.** Accepted by the ADR owner (Dave Rae) on 2026-10-23, as
+       a session statement like the entries above and not a signed decision.
+       Revisit by 2026-12-19, eight weeks after acceptance, as the ADR owner
+       directed on 2026-10-24 (a session statement). Issue #6359 carries the
+       conditions for revisiting it: an agentic worker shown to need guide
+       text the default document lacks, or the first release that ships the
+       `/swagger` page. The date is not machine-checked.
+   - **2026-10-24 - `get_me` as the MCP twin of `GET /api/v1/me`, and one
+     `GATE_PARITY_NO_GATE_ALLOWED` entry. Confirmed 2026-10-24 by the ADR owner,
+     as written.** Three parts.
+     First, `get.api-me` flips from `planned:#2146` to `twinned` (untwinned 215
+     to 214, generic `planned:#2146` 86 to 85; these are the figures at the time
+     of this ruling, and the runtime configuration twins that merged later moved
+     them, so the live pins are the ones in
+     `scripts/ci/check-api-parity.py`). Second, the gate-parity check
+     reads `GET /api/v1/me` as a route with no gate call it can read: the
+     handler calls `auth_fn` alone, because the route is session-only
+     self-description with no per-resource authority, so there is nothing to
+     gate on. The tool's `Infrastructure:Read` row drives MCP tier
+     classification only. Reason: adding an artificial REST gate would invent
+     an authority the route does not have. The legacy `GET /api/me` was already
+     reviewed as a document-only disposition (it returns only the caller's own
+     identity metadata; `service-scope-flip-route-inventory-2026-08.md`, the
+     "Document-only dispositions" table); `GET /api/v1/me` shares the same
+     builder (`me_response.hpp`) but the inventory does not list it. One entry,
+     `("GET", "/api/v1/me", "get_me")`, is added to
+     `GATE_PARITY_NO_GATE_ALLOWED` and `GATE_PARITY_NO_GATE_MAX` rises from 12
+     to 13. Third, the one asymmetry this leaves: REST lets a service-scoped
+     token describe itself, while `get_me` has service-scope class `denied` and
+     refuses it. That is the conservative default for a new tool, and it is a
+     documented difference rather than a defect; a self-only service-scope
+     policy that would let both transports agree is the follow-up, recorded as
+     `exception:#6432 revisit:2026-11-30` (revisit date confirmed by the owner;
+     issue filed as #6432). Scope of the twin: `rbac_enabled` is the server's
+     cached view of the RBAC switch and does not report the degraded state in
+     which enforcement fails closed; that bit is owned by #6033, not by this twin.
+     The owner gave the confirmation in the authoring session and this entry
+     records it; like the entries above it is not a separately signed
+     decision.
 
 ## Interim rules (until the named follow-ups ship)
 

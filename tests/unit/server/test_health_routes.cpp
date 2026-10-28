@@ -27,6 +27,8 @@
 #include "health_routes.hpp"
 #include "http_route_sink.hpp"
 #include "key_provider.hpp"
+#include "leader_elector.hpp"
+#include "leader_metrics.hpp"
 #include "pg/secret_codec.hpp"
 #include "pg_reachability_probe.hpp"
 #include "plugin_config_store.hpp"
@@ -102,6 +104,8 @@ struct Harness {
     DefaultCertSet default_cert_set{};
     std::atomic<bool> draining{false};
     PgReachabilityProbe* pg_probe{nullptr}; // HA WS-8: null = fail-closed
+    const LeaderElector* leader{nullptr}; // HA WS-11: /metrics only; null = no elector
+    const std::atomic<std::uint64_t>* leader_loop_errors{nullptr}; // HA WS-11
     NvdDatabase* nvd_db{nullptr}; // null unless a case wires one
     EnablementStore* enablement_store{nullptr}; // null unless a case wires one
 
@@ -200,6 +204,8 @@ struct Harness {
         deps.default_cert_set = &default_cert_set;
         deps.draining = &draining;
         deps.pg_reachability_probe = pg_probe;
+        deps.leader_elector = leader;
+        deps.leader_loop_errors = leader_loop_errors;
         deps.server_start_time = std::chrono::steady_clock::now();
         deps.nvd_db = nvd_db;
         deps.enablement_store = enablement_store;
@@ -1563,6 +1569,154 @@ TEST_CASE("health_routes: /metrics exports the reachability gauges on scrape",
     CHECK(r->body.find("yuzu_server_pg_reachable 1") != std::string::npos);
     CHECK(r->body.find("yuzu_server_pg_reachability_last_success_age_seconds") !=
           std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// HA WS-11 (#4014): leader-election observability on /metrics, and the recorded
+// decision that LEADERSHIP IS NOT READINESS.
+// ---------------------------------------------------------------------------
+
+namespace {
+// A fail-closed elector (empty dsn) is constructible with no Postgres and is the
+// "elector never opened" condition the YuzuLeaderNoLeader alert exists for.
+std::unique_ptr<LeaderElector> make_closed_elector() {
+    return std::make_unique<LeaderElector>(
+        LeaderElector::Config{.dsn = "", .holder_id = "holder-a"});
+}
+} // namespace
+
+TEST_CASE("health_routes: /metrics exports the seeded leader series for a non-open elector",
+          "[server][routes][health_routes][leader-metrics]") {
+    auto elector = make_closed_elector();
+    REQUIRE_FALSE(elector->is_open());
+    (void)elector->try_acquire(); // one failed connect attempt
+    std::atomic<std::uint64_t> loop_errors{3};
+    Harness h;
+    seed_leader_metrics(h.metrics);
+    h.leader = elector.get();
+    h.leader_loop_errors = &loop_errors;
+    h.wire();
+    auto r = h.sink.Get("/metrics");
+    REQUIRE(r);
+    CHECK(r->body.find("yuzu_server_leader_is_leader 0\n") != std::string::npos);
+    CHECK(r->body.find("yuzu_server_leader_epoch 0\n") != std::string::npos);
+    CHECK(r->body.find("yuzu_server_leader_acquire_failures_total{cause=\"connect\"} 1\n") !=
+          std::string::npos);
+    CHECK(r->body.find("yuzu_server_leader_acquire_failures_total{cause=\"lock_query\"} 0\n") !=
+          std::string::npos);
+    CHECK(r->body.find("yuzu_server_leader_loop_errors_total 3\n") != std::string::npos);
+    // Never answered a query: ABSENT, not a fabricated 0.
+    CHECK(r->body.find("yuzu_server_leader_last_ok_age_seconds ") == std::string::npos);
+
+    // A second scrape of an unchanged elector does not move the counters.
+    auto r2 = h.sink.Get("/metrics");
+    REQUIRE(r2);
+    CHECK(r2->body.find("yuzu_server_leader_acquire_failures_total{cause=\"connect\"} 1\n") !=
+          std::string::npos);
+    // The next failed attempt shows on the next scrape (pull model).
+    (void)elector->try_acquire();
+    auto r3 = h.sink.Get("/metrics");
+    REQUIRE(r3);
+    CHECK(r3->body.find("yuzu_server_leader_acquire_failures_total{cause=\"connect\"} 2\n") !=
+          std::string::npos);
+}
+
+TEST_CASE("health_routes: /metrics with no elector wired exports no leader series and survives",
+          "[server][routes][health_routes][leader-metrics]") {
+    Harness h; // leader == nullptr, nothing seeded: a server with no elector
+    h.wire();
+    auto r = h.sink.Get("/metrics");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->body.find("yuzu_server_leader_") == std::string::npos);
+}
+
+TEST_CASE("health_routes: LEADERSHIP IS NOT READINESS -- a non-open elector changes neither "
+          "/readyz nor /health",
+          "[server][routes][health_routes][readyz][leader-metrics]") {
+    // DECISION PIN (#4014, extended to "the elector is not open"): a replica that
+    // cannot lead is a ready follower. The harness cannot make every store ok (they
+    // need Postgres), so the pin compares the full response with and without a
+    // non-open elector wired: any readiness input derived from the elector changes
+    // the status, a body field, or the failed list.
+    auto elector = make_closed_elector();
+    REQUIRE_FALSE(elector->is_open());
+    PgReachabilityProbe probe(fixed_ping(PgReachabilityProbe::PingResult::Kind::Ok));
+    probe.probe_once();
+
+    Harness without;
+    without.pg_probe = &probe;
+    without.wire();
+    Harness with;
+    with.pg_probe = &probe;
+    with.leader = elector.get();
+    with.wire();
+
+    for (const char* path : {"/readyz", "/health"}) {
+        INFO(path);
+        auto a = without.sink.Get(path);
+        auto b = with.sink.Get(path);
+        REQUIRE(a);
+        REQUIRE(b);
+        CHECK(a->status == b->status);
+        auto ja = json::parse(a->body);
+        auto jb = json::parse(b->body);
+        // Volatile fields (uptime) legitimately differ between two harnesses.
+        for (auto* j : {&ja, &jb}) {
+            j->erase("uptime_seconds");
+            j->erase("uptime");
+        }
+        CHECK(ja == jb);
+        CHECK(b->body.find("leader") == std::string::npos);
+    }
+}
+
+TEST_CASE("health_routes: leader wiring pins -- /metrics reads the elector only through stats()",
+          "[server][routes][health_routes][leader-metrics]") {
+    const auto code = strip_comments(read_server_src("health_routes.cpp"));
+    // Every reference to the elector is `if (deps.leader_elector)` or
+    // `deps.leader_elector->stats()`. In particular never is_open() (takes the
+    // elector's mu_, which the election loop holds across blocking libpq calls:
+    // a stalled coordination probe would stall every scrape), is_leader(),
+    // heartbeat() or try_acquire(). Scoped to the `deps.leader_elector` token so
+    // the unrelated command_outbox_store->is_open() on the same handler does not
+    // false-fire it.
+    const std::string tok = "deps.leader_elector";
+    std::size_t refs = 0;
+    for (auto pos = code.find(tok); pos != std::string::npos; pos = code.find(tok, pos + 1)) {
+        ++refs;
+        const auto rest = code.substr(pos + tok.size(), 16);
+        INFO("reference: " << tok << rest);
+        const bool null_check = rest.rfind(")", 0) == 0;
+        const bool stats_call = rest.rfind("->stats()", 0) == 0;
+        CHECK((null_check || stats_call));
+    }
+    CHECK(refs == 2);
+    // And it is never a /readyz or /health store check.
+    const auto flat = squeeze_ws(code);
+    CHECK(flat.find("{\"leader") == std::string::npos);
+    CHECK(flat.find("deps.leader_elector&&") == std::string::npos);
+    // The scrape-time age is `now - last_ok`. The handler must hand the publisher
+    // the Stats snapshot AND the elector's own clock, as the last argument: a 0 or
+    // a different clock here pins the age at 0 (or garbage) and silently kills
+    // YuzuLeaderCoordinationStale, and the closed non-open elector these route
+    // tests can build never has a last_ok to expose it. Pinned lexically.
+    CHECK(flat.find("leader_publisher->publish(*deps.metrics,deps.leader_elector->stats(),") !=
+          std::string::npos);
+    CHECK(flat.find("yuzu::server::LeaderMetricsPublisher::steady_now_ns());") != std::string::npos);
+    CHECK(count_of(flat, "steady_now_ns()") == 1);
+
+    const auto server = squeeze_ws(strip_comments(read_server_src("server.cpp")));
+    const auto occurrences = [&](const std::string& needle) {
+        const auto n = squeeze_ws(needle);
+        std::size_t count = 0;
+        for (auto pos = server.find(n); pos != std::string::npos; pos = server.find(n, pos + 1))
+            ++count;
+        return count;
+    };
+    CHECK(occurrences(".leader_elector = leader_elector_.get()") == 1);
+    CHECK(occurrences(".leader_loop_errors = &leader_loop_errors_") == 1);
+    CHECK(occurrences("seed_leader_metrics(metrics_);") == 1);
 }
 
 // ---------------------------------------------------------------------------

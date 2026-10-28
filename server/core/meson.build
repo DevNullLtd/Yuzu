@@ -324,6 +324,21 @@ yuzu_estate_js_embed = custom_target(
   ],
 )
 
+# TAR retention tier defaults (checked-in mirror of the agent's schema registry,
+# drift-tested in the tar suite). Symbol: kTarRetentionTiersTsv.
+tar_retention_tiers_tsv_embed = custom_target(
+  'tar_retention_tiers_tsv',
+  input: files('../../docs/capability-registries/tar_retention_tiers.tsv'),
+  output: 'tar_retention_tiers_tsv.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'TarRetentionTiersTsv',
+  ],
+)
+
 # TAR timeline page (hidden; /static/yuzu-tar-timeline.js). Symbol: kYuzuTarTimelineJs.
 yuzu_tar_timeline_js_embed = custom_target(
   'yuzu_tar_timeline_js_bundle',
@@ -598,6 +613,7 @@ yuzu_server_core_lib = static_library(
    yuzu_system_js_embed,
    yuzu_developer_js_embed,
    yuzu_tar_timeline_js_embed,
+   tar_retention_tiers_tsv_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
@@ -659,6 +675,7 @@ yuzu_server_core_lib = static_library(
     'src/ota_signature_sidecar.cpp',
     'src/update_registry.cpp',
     'src/response_store.cpp',
+    'src/forensics_visibility.cpp', # #4990: ForensicsVisibilityFn + the production resolver
     'src/response_routes.cpp',
     'src/response_query_model.cpp', # #2146 A2-R2: shared REST v1 + MCP builder for the
                                      # instruction/command-ID-keyed response query/aggregate/export surface
@@ -704,6 +721,7 @@ yuzu_server_core_lib = static_library(
     'src/schedule_model.cpp', # ADR-0031 WS-A4: seventh per-family seam, pure JSON row builder
     'src/schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam
     'src/help_ui.cpp',
+    'src/swagger_page_ui.cpp',
     'src/home_ui.cpp',     # Home (/home): the sign-in landing page, rendered per request
     'src/home_render.cpp', # Dashboard panels: pure value structs + renderers
     'src/home_routes.cpp', # Dashboard: GET /fragments/dashboard/summary over injected seams

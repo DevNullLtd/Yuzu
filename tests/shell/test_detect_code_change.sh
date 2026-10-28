@@ -46,7 +46,7 @@ expect true  "workflow change (ci.yml itself)"    1 $'.github/workflows/ci.yml'
 # --- root-anchored semantics (C3 / K1): nested != root ---
 expect true  "nested markdown is code-side"       1 $'sdk/README.md'
 expect true  "changelog fragment (nested .md)"    1 $'changelog.d/1978-fix.fixed.md'
-expect true  "nested LICENSE is code-side"        1 $'gateway/_checkouts/grpcbox/LICENSE'
+expect true  "nested LICENSE is code-side"        1 $'server/core/vendor/inter/LICENSE.txt'
 
 # --- more root-anchored / boundary cases (K3) ---
 expect false "root LICENSE.md (root *.md, not README)" 1 $'LICENSE.md'

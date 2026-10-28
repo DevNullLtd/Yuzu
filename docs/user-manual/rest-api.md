@@ -394,9 +394,12 @@ All endpoints are under the `/api/v1/` prefix.
 
 #### `GET /api/v1/me`
 
-Returns the authenticated user's identity, role and what the server will honour for this session.
+Returns the authenticated caller's identity, legacy role and session context (not an authority summary: see `role` below).
+The MCP twin is `get_me`.
 
-**Permission:** Authenticated session (no specific RBAC permission required).
+**Permission:** Authenticated session (no specific RBAC permission required). The route is
+session-only self-description and writes no audit row. A service-scoped token may call it and
+describe itself; the MCP twin `get_me` refuses service-scoped tokens (a documented asymmetry, tracked in #6432).
 
 **Response:**
 
@@ -406,29 +409,48 @@ Returns the authenticated user's identity, role and what the server will honour 
     "username": "alice",
     "display_name": "Alice",
     "role": "user",
+    "principal_kind": "human",
+    "auth_source": "local",
+    "mcp_tier": "",
+    "scope_service": "",
     "rbac_enabled": false,
     "rbac_role": "Viewer",
-    "effective_role": "admin",
-    "elevated": true,
-    "elevated_until": "2026-10-13T22:31:54Z",
-    "can_access_settings": true
+    "rbac_roles": [],
+    "rbac_roles_resolved": true,
+    "effective_role": "user",
+    "elevated": false,
+    "can_access_settings": false
   },
   "meta": { "api_version": "v1" }
 }
 ```
 
+While a just-in-time elevation is active, `effective_role` is `admin`, `elevated` is `true`,
+`elevated_until` (ISO-8601 UTC) is added and `can_access_settings` is `true` for a local session.
+
 | Field | Meaning |
 |---|---|
-| `role` | The persisted legacy role (`admin` or `user`). Never the elevated view. |
-| `effective_role` | The role the server enforces now: `admin` while a just-in-time elevation is active, otherwise `role`. |
-| `elevated` | `true` while a just-in-time elevation is active. Always `false` for API, MCP and service-scoped tokens. |
+| `username` | The stable authorization principal (for an SSO session an opaque `oidc:<iss>#<sub>` id). |
+| `display_name` | A readable label; falls back to `username`. |
+| `role` | The persisted legacy role (`admin` or `user`). Never the elevated view. This and `effective_role` are the legacy session view, not a summary of authority: with RBAC on, authority is decided per permission (use `POST /api/v1/rbac/check`), and an engine principal's real authority is its `rbac_roles`. |
+| `principal_kind` | `human` or `engine`, and nothing else. This is the classification the server applies: `engine` when the session records that kind or was authenticated by an engine token, `human` otherwise. An engine principal is looked up under RBAC principal type `engine`. |
+| `auth_source` | Always present. How the session authenticated: `local`, `oidc`, `saml`, `api_token`, `mcp_token` or `engine_token`. |
+| `mcp_tier` | The MCP authorization tier of an MCP token; an empty string for any other session. |
+| `scope_service` | The service tag of a service-scoped token; an empty string when the session is not service-scoped. |
+| `rbac_enabled` | The server's cached view of the RBAC switch. It can lag a change made on another replica, and it does not report the degraded state in which enforcement fails closed (tracked in #6033). |
+| `rbac_role` | Deprecated display field: the first DIRECT role assignment in role-name order. Omitted for an engine principal while RBAC is off, for an engine principal with no grant while RBAC is on, and when the role-store read failed. For a human with no direct role it shows the legacy label `Administrator` or `Viewer`, including while RBAC is on; that label is not a grant and not authority. Read `rbac_roles` instead. |
+| `rbac_roles` | The principal's DIRECT role assignments only; roles held through a group grant are not listed. It is not access-review evidence: the access-review export (`AccessReview:Read`) is. With RBAC off it is `[]`. Omitted when the role-store read failed. |
+| `rbac_roles_resolved` | `false` only when the role-store read failed; it is `true` otherwise, including with RBAC off (no read is made then, so `true` is not proof that enforcement is off). When `false` the route still answers `200` and omits `rbac_role` and `rbac_roles`; treat an absent list as unknown, not as "no roles". |
+| `effective_role` | The effective legacy session role: `admin` while a just-in-time elevation is active, otherwise `role`. Like `role`, it is not a summary of authority. |
+| `elevated` | `true` while a just-in-time elevation is active. Always `false` for API and MCP token sessions. |
 | `elevated_until` | End of the elevation window, ISO-8601 UTC. Present only when `elevated` is `true`. |
-| `can_access_settings` | `true` when `GET /settings` would render for this session. MCP-tier and service-scoped tokens are always `false`. A display hint only: every route is still gated server-side. |
+| `can_access_settings` | `true` when `GET /settings` would render for this session. Always `false` for an MCP-tier or service-scoped token, because the admin gate refuses either before it tests the role; for an MCP token `effective_role` therefore equals `role`. A display hint only: every route is still gated server-side. |
 
-The response is sent with `Cache-Control: no-store, private`. During a rolling
-upgrade an older replica omits the four new fields; clients should treat a
-missing `can_access_settings` as `false`. `GET /api/me` returns the same keys
-without the `data` envelope.
+Keys appear in the order shown; do not depend on it. The response is sent with
+`Cache-Control: no-store, private`. During a rolling upgrade an older replica omits the newer
+keys (`principal_kind`, `auth_source`, `mcp_tier`, `scope_service`, `rbac_roles`, `rbac_roles_resolved` and the
+session fields); clients should treat a missing `can_access_settings` as `false`.
+[`GET /api/me`](#get-apime) returns the same keys without the `data` envelope.
 
 ---
 
@@ -1014,6 +1036,12 @@ none is. Such a value is not indexed in newly stored responses, so when the arra
 `agent_count` can be 0 or an undercount. The array names keys only, never the values. `agent_count`
 and every status code are unchanged, including the `503` when the response store is degraded.
 
+**Forensics-tier rows (#4990).** Rows written by a Forensics-tier plugin are counted only for a caller who also
+holds `Forensics:Read` (see "Forensics-tier rows" under Command/Instruction Responses). For any other caller they are
+absent from the count with no marker, so a low or zero `agent_count` does not prove that no matching data exists. If
+the caller's Forensics authority cannot be determined the route answers a retryable `503` with `retry_after_ms`
+instead of a partial count. The route writes no audit row of its own.
+
 ---
 
 ### API Tokens
@@ -1076,7 +1104,7 @@ The `expires_at` above is a placeholder epoch: with `mcp_tier` set it must be in
 | `expires_at` | integer | No | Unix epoch seconds, in the future. `0` or omitted = never expires. **Required** for MCP tokens (max 90 days). Must be one JSON integer: a string, float, boolean, `null`, a negative or past value, or one above 9223372036854775807 is `400` and mints nothing. |
 | `mcp_tier` | string | No | MCP authorization tier: `"readonly"`, `"operator"`, or `"supervised"`. Omit for standard API tokens. When set, `expires_at` is mandatory. |
 
-`mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at` within the 90-day cap. Setting `scope_service` requires RBAC to be enabled and either a global `ManagementGroup:Write` grant or `ITServiceOwner` on the `"Service: <scope_service>"` management group — see [Service-Scoped Tokens](authentication.md#service-scoped-tokens).
+`mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at`; the 90-day cap applies to tiered (`mcp_tier` set) tokens only, so a service-scoped token without a tier may expire later than that. Setting `scope_service` requires RBAC to be enabled and either a global `ManagementGroup:Write` grant or `ITServiceOwner` on the `"Service: <scope_service>"` management group — see [Service-Scoped Tokens](authentication.md#service-scoped-tokens).
 
 **Validation errors (`400`):**
 
@@ -1113,9 +1141,9 @@ Revoke an API token. The token becomes immediately unusable.
 
 **Permission:** `ApiToken:Delete`
 
-**Ownership constraint:** A caller with `ApiToken:Delete` may only revoke tokens they created. The global `admin` role is the sole bypass and may revoke any token. Attempting to revoke another user's token returns `404 token not found` — identical to the response for a token that does not exist — so the endpoint cannot be used as an enumeration oracle by a non-owner with `ApiToken:Delete`. Denied attempts are recorded in the audit log with `action=api_token.revoke`, `result=denied`, and `detail=owner=<real owner>` so forensics can distinguish a probe from a legitimate self-revoke.
+**Ownership constraint:** A caller with `ApiToken:Delete` may only revoke tokens they created. The global `admin` role, or a session with an active just-in-time admin elevation, is the only bypass and may revoke any token. Attempting to revoke another user's token returns `404 token not found` — identical to the response for a token that does not exist — so the endpoint cannot be used as an enumeration oracle by a non-owner with `ApiToken:Delete`. Denied attempts are recorded in the audit log with `action=api_token.revoke`, `result=denied`, and `detail=owner=<real owner>` so forensics can distinguish a probe from a legitimate self-revoke.
 
-The same ownership constraint applies to the HTMX dashboard path `DELETE /api/settings/api-tokens/{token_id}`.
+The same ownership constraint applies to the HTMX dashboard path `DELETE /api/settings/api-tokens/{token_id}`. The same bypass applies there: the global `admin` role or a just-in-time-elevated session may revoke any token.
 
 **Response:**
 
@@ -1239,7 +1267,7 @@ Explicit maker-checker confirmation that a rotation's successor secret has been 
 
 Engine principals are the durable identities behind autonomous use-case-engine modules (ADR-1005 item 2b) — a distinct principal class from human users and human-created API tokens, with a named responsible human owner, a grant justification captured at creation, and a required `internal`/`external` classification. Design reference: `docs/auth-engine-principals-design.md`. Every credential minted against an engine principal is hard-locked to MCP tier `readonly` and can never be granted the `admin`/`Administrator` role or any built-in role (assignment refuses them). A custom role that covers every permission is **not** refused at assignment (maintainer ruling 2026-10-23, #2485); it is detected afterwards by the pull-only auditor route below.
 
-**Every *mutating* route is admin + MFA-step-up gated.** The read routes (`GET`/list, `GET /{id}`, and `GET /audit/no-admin`) are admin + RBAC gated (`EnginePrincipal:Read` for the two engine-principal reads, `AuditLog:Read` for `/audit/no-admin`) but do **not** require a fresh MFA step-up. Beyond that, every route, reads included, structurally denies a caller whose *own* session is engine-classed (`principal_kind="engine"` or `auth_source="engine_token"`): an engine principal can never enumerate, read, or mutate any entry on this surface, not even itself. A denied engine-classed caller gets `403`. On the read routes the handler issues it and the corresponding audit verb is recorded with `result=denied`. On the mutating routes the `403` is issued by the central step-up check, before the handler runs and before any role grant is consulted, so the handler's own audit verb is never written; the only audit row is the step-up refusal `mfa.step_up.required` (`result=error`) whose `detail` carries `reason=engine_principal_denied` and `stage=pre_authz`.
+**Every *mutating* route is admin + MFA-step-up gated.** The read routes (`GET`/list, `GET /{id}`, and `GET /audit/no-admin`) are admin + RBAC gated (`EnginePrincipal:Read` for the two engine-principal reads, `AuditLog:Read` for `/audit/no-admin`) but do **not** require a fresh MFA step-up. Beyond that, every route, reads included, structurally denies a caller whose *own* session is engine-classed (`principal_kind="engine"` or `auth_source="engine_token"`), with one exception: `GET /api/v1/engine-principals/{id}/roles` carries no engine-session check and relies on its `EnginePrincipal:Read` gate alone. The two role mutations (`POST` and `DELETE`) are step-up-gated like every other mutating route here, so they refuse an engine-classed session at the central check. An engine-classed session can therefore not list, read or mutate engine principals through the other routes, not even its own. A denied engine-classed caller gets `403`. On the read routes the handler issues it and the corresponding audit verb is recorded with `result=denied`. On the mutating routes the `403` is issued by the central step-up check, before the handler runs and before any role grant is consulted, so the handler's own audit verb is never written; the only audit row is the step-up refusal `mfa.step_up.required` (`result=error`) whose `detail` carries `reason=engine_principal_denied` and `stage=pre_authz`.
 
 **Storage failure:** if the engine-principal store failed to open at startup (no PostgreSQL configured, or a migration failure), every route on this surface returns `503 service unavailable`.
 
@@ -1410,11 +1438,11 @@ Overlap-pair rotation (design doc §7): mints a successor credential while the e
 { "overlap_secs": 604800 }
 ```
 
-`overlap_secs` defaults to 7 days (`604800`). The overlap window has a **24-hour floor** and a 10-year ceiling — a value below the floor (or above the ceiling) is rejected outright (`400`), never silently truncated up to the floor. `overlap_secs` must be a JSON integer when present, and a non-blank body must be a JSON object: a string, float, boolean or `null` value, or a truncated or non-object body, is `400` and rotates nothing (an empty or whitespace-only body keeps the default).
+`overlap_secs` defaults to 7 days (`604800`). The overlap window has a **24-hour floor** and a 10-year ceiling — a value below the floor (or above the ceiling) is rejected outright (`400`), never silently truncated up to the floor. The window must also end before the predecessor expires and before the successor does, and the successor expires 90 days after the rotation, so in practice the window is shorter than 90 days; a longer one is `400` as well. `overlap_secs` must be a JSON integer when present, and a non-blank body must be a JSON object: a string, float, boolean or `null` value, or a truncated or non-object body, is `400` and rotates nothing (an empty or whitespace-only body keeps the default).
 
 **Grace-window re-serve:** a same-caller retry within a ~120-second grace window after the original mint re-serves the **same** successor secret (rather than erroring or minting a second successor). Each successful return — the original reveal or a grace-window re-serve — is independently recorded under its own `engine_principal.credential.reveal` audit row, since every time the raw secret leaves the server is independently on the audit chain, whether or not the bytes are new. Once the grace window lapses, a further rotate call while a rotation is already in flight errors — the caller must fall back to `credentials/confirm` (below) or the principal-level revoke-and-replace runbook, never an indefinite retry loop.
 
-**Response:** same no-store headers as the mint route; the `data` object adds `overlap_expires_at` (the epoch at which the predecessor is auto-revoked) alongside `token`, `token_id`, and `expires_at`.
+**Response:** same no-store headers as the mint route; the `data` object carries `token`, `token_id`, `expires_at` and `overlap_expires_at`. `expires_at` is 90 days from the rotation; it is not inherited from the predecessor. `overlap_expires_at` is the successor row's own stamp and is always `0`, because only the predecessor is stamped; read the predecessor's stamp on its entry in `active_credentials` of `GET /api/v1/engine-principals/{id}`.
 
 **No `404` path:** unlike `credentials` (mint) and `transfer-owner`, this route never looks up `{id}` via a `get()` call before acting — it drives the rotation state machine straight off the principal's active credential rows. An unknown or revoked `{id}` therefore does **not** 404.
 
@@ -1630,7 +1658,7 @@ curl -s -X DELETE \
 
 Self-revoke "Sign out everywhere". Wipes every cookie session belonging to the authenticated caller AND revokes every API token they own. This is intended as the lost-device recovery flow: every credential bearing the caller's identity is killed in one call.
 
-**Permission:** Any interactive authenticated session (cookie). MCP-tier tokens and service-scoped automation tokens are explicitly rejected with 403 — those credential classes have no other write privilege and accepting them here would create a novel DoS surface against the human owner. Use the dashboard or a fresh password-authenticated session.
+**Permission:** Any authenticated caller: a cookie session or a plain API token (one with no `mcp_tier` and no service scope) is accepted. MCP-tier tokens and service-scoped automation tokens are explicitly rejected with 403 — those credential classes have no other write privilege and accepting them here would create a novel DoS surface against the human owner. Use the dashboard, a fresh password-authenticated session or a plain API token.
 
 **Example:**
 
@@ -1665,7 +1693,7 @@ The caller authenticated with an MCP-tier token (`X-Yuzu-Token` carrying a non-e
 {
   "error": {
     "code": 403,
-    "message": "self-revoke requires an interactive session, not an API token"
+    "message": "self-revoke requires an interactive session, not an MCP-tier or service-scoped token"
   },
   "meta": { "api_version": "v1" }
 }
@@ -2860,7 +2888,7 @@ List the fleet-wide roles currently assigned to an engine principal.
 ```json
 {
   "data": [
-    { "principal_id": "engine:vuln-viewer", "role_name": "Viewer" }
+    { "principal_id": "engine:vuln-viewer", "role": "Viewer" }
   ],
   "meta": { "api_version": "v1" }
 }
@@ -2903,7 +2931,7 @@ a principal).
 **Errors:** `400` — invalid JSON, missing `role`, unknown role name, or the
 role is admin/built-in/otherwise rejected by `validate_assignment` (design
 §4.2 — always a `4xx`, never a `500`); `401`/`403` — not authenticated, missing
-`Security:Write`, or MFA step-up required/failed; `404` — no active (live,
+`Security:Write`, an engine session, or MFA step-up required/failed; `404` — no active (live,
 non-revoked) engine principal exists at `{id}`; `503` — the RBAC or
 engine-principal store is unavailable. A rejected assignment is audited
 `engine_principal.role.assigned` with `result=denied`; success with
@@ -2928,9 +2956,11 @@ Unassign a fleet-wide role from an engine principal.
 }
 ```
 
-**Errors:** `400` — the role was not assigned to this principal (store-returned
-error); `401`/`403` — not authenticated, missing `Security:Write`, or MFA
-step-up required/failed; `503` — the RBAC store is unavailable. Audited
+**Errors:** the call is idempotent: a role that was not held also answers `200`
+(`removed=false` appears only in the audit detail). `401` or `403`: not
+authenticated, missing `Security:Write`, an engine session, or MFA step-up
+required or failed. `503`: the RBAC store is unavailable or the query failed.
+Audited
 `engine_principal.role.unassigned` on success. `503` + `Sec-Audit-Failed: true`
 — the unassign audit row could not persist (see *Audit-persist failure* above):
 the grant may already be removed, so reconcile via `GET /{id}/roles`.
@@ -3128,9 +3158,9 @@ Self-audited as `rbac.assignments.list`.
 
 #### `POST /api/v1/rbac/roles/{name}/assignments`
 
-Grant one of the 6 fleet-wide-assignable built-in RBAC roles (`Administrator`,
-`PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`) to a
-human user, fleet-wide. See "Fleet-Wide Role Assignment (Built-in Roles)" in
+Grant one of the 7 fleet-wide-assignable built-in RBAC roles (`Administrator`,
+`PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`,
+`ForensicsAnalyst`) to a human user, fleet-wide. See "Fleet-Wide Role Assignment (Built-in Roles)" in
 `docs/user-manual/rbac.md` for the full narrative (key constraints, examples,
 and why this is a separate surface from `POST /api/v1/rbac/check`'s
 `perm_fn`-gated siblings above).
@@ -3187,7 +3217,7 @@ is never misreported as "no active account."
 array or scalar), missing `principal_id`, a `principal_type`/`principal_id`
 field present with the wrong JSON type (degrades to "missing"/"invalid",
 never an uncaught exception), `principal_type` other than `"user"`, a
-malformed `principal_id`, `{name}` is not one of the 6 assignable roles
+malformed `principal_id`, `{name}` is not one of the 7 assignable roles
 (`ITServiceOwner` and a genuinely unknown/custom role name return the
 identical client-facing message — no role-catalog oracle; the specific
 reason is audited server-side only; use `POST
@@ -3203,7 +3233,9 @@ Administrator role, does not hold authority under the regime that is durably
 true right now, is a service-scoped/engine session, presented an
 MCP-tier bearer token of any tier (use the `assign_rbac_role` MCP tool
 instead), or made a cross-site cookie-session call (`cross-site request
-refused`); `503` — the RBAC or `AuthDB` store is unavailable (including when
+refused`); `409` — a role that is not a built-in role holds the name of the
+built-in role (a name collision; nothing is assigned, and the upgrade guide,
+"Role name collision", has the remedy); `503` — the RBAC or `AuthDB` store is unavailable (including when
 the admin gate itself cannot confirm durable authority — now logged and
 audited as a `denied` row, not silently invisible), a genuine store/query
 fault while writing the grant (as opposed to a client-validation rejection,
@@ -3338,12 +3370,10 @@ administrator after the switch (enabling: no fleet-wide `Administrator`
 grant; disabling: local account role is not `admin`) — the response's
 `remediation` field names the exact follow-up call; `503` — the RBAC or
 `AuthDB` store is unavailable, or (on an otherwise-successful toggle) its
-audit row could not persist — treat the change as unconfirmed and reconcile
-via `GET /api/v1/me`. Audited `rbac.enforcement_changed` — see
+audit row could not persist: treat the change as unconfirmed and check it with the access-review export's `rbac_enforcement` label (`GET /api/v1/access-reviews/export`, `AccessReview:Read`). `GET /api/v1/me` (`rbac_enabled`) is only the cached view; it can lag on another replica and does not report the unconfirmed (degraded) state (#6033). Audited `rbac.enforcement_changed` — see
 `docs/user-manual/audit-log.md`.
 
-There is no `GET` twin: read the current state via `GET /api/v1/me`
-(`rbac_enabled`) or this route's own response.
+There is no `GET` twin: this route's own response echoes the authoritative post-write value, and the access-review export's `rbac_enforcement` label (`enabled`, `disabled` or `degraded`; `GET /api/v1/access-reviews/export`, which also writes an `access_review.exported` audit row) is the strongest available read. It is still the serving replica's view (see the degrade-versus-outage note in `docs/user-manual/rbac.md`). `GET /api/v1/me` (`rbac_enabled`) is the cached view only: it can lag on another replica and does not report the degraded state (#6033).
 
 MCP twin: `set_rbac_enforcement` — see `docs/user-manual/mcp.md`.
 
@@ -4031,7 +4061,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `scope.evaluation_aborted` | Emitted when a scoped dispatch is aborted fail-closed before any device is targeted. `result=failure`. Reasons: `db_degraded` (a `from_result_set:<id>` alias/owner/membership read against the result-set store could not answer — ADR-0036 — **or** a `props.<key>`/`tag:<key>` bulk preload against the custom-properties/tag store could not answer — ADR-0045; all abort the same way and share this reason value), `owner_check_failed` (a referenced set is absent, expired, or not owned — paired with per-ref `instruction.scope_resolution_failed` rows; as of #4981 PR-1 this ALSO fires, with its own paired per-ref row, when the set was deleted in the window between the pre-dispatch owner-check gate and the registry's own later membership read — a TOCTOU case the pre-#4981 code could not detect at all, see ADR-0036's 2026-09-26 Update), `principal_unresolved` (a tracked/MCP dispatch could not recover the dispatching operator), `presence_degraded` (#4981 PR-1 — the cross-replica presence read backing fleet-wide scope evaluation could not answer), `unresolvable` (a `from_result_set:`/`props.<key>` atom referenced a store that was never wired at this call site — unreachable on the real production dispatch ladder, both stores are always wired there, but a defensively-labelled case rather than a misleading `db_degraded`). `target_type` on the audit row is `result_set` for `owner_check_failed` (the only reason actually about a specific result set) and `scope` for every other reason. Fires on all three scoped dispatch paths, plus the no-principal tracked-closure guard (principal_unresolved only). |
 | `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
 | `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`. `result=dispatched` (reached the agent) or `result=no_agents` (reached zero agents → `dispatch_failed` on collate). A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). Emitted on **both** the REST and MCP surfaces (the per-step verb is transport-agnostic; the MCP tool-call envelope additionally audits as `mcp.execute_bundle`). |
-| `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). |
+| `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). A collation that serves a Forensics-tier step's output also writes `response.forensics.read` with `surface=bundle` (see `response.forensics.read` in the [Audit log](audit-log.md) guide). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
 | `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `error`}. Success detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058, or #4981 PR-1's scope-evaluation abort) DOES audit, `result=error`, detail = the specific underlying-cause string (not a fixed literal — see the route's own 503 documentation) — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
 | `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>` (`agents` = delivered count, see the route doc); denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents, a target is already claimed for remediation, or a target has reached its fix-retry cap for this policy); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
@@ -5021,7 +5051,7 @@ the store's unfiltered fleet-wide aggregate. MCP twin: `get_policy_agent_statuse
 this API's general behavioural-PII posture (see [`Sec-Audit-Failed` and the
 behavioural-PII audit posture](#sec-audit-failed-and-the-behavioural-pii-audit-posture)
 above). Unlike the five sibling routes above it, this route's `check_result`
-field carries the raw, unrestricted output of whatever instruction the
+field carries the output of whatever instruction the
 bound fragment's `check_instruction` names — free-form and
 operator-authored at fragment-creation time, not a fixed machine-scope
 shape — so it cannot make the same "not behavioural PII" claim
@@ -5029,6 +5059,14 @@ shape — so it cannot make the same "not behavioural PII" claim
 (`get_policy_agent_statuses`) is unaffected: it follows MCP's own
 convention of surfacing the same gap via an `audit_persisted:false` body
 field rather than a header/status code.
+
+**Forensics-tier checks.** The one case where `check_result` is not the check's output: when
+the check instruction runs a Forensics-tier plugin (`app_usage`, `browser_inventory`,
+`execution_artifacts`, `privacy_permissions`, `remote_access_audit`), the agent's `status` is
+`unknown` and `check_result` is empty, because the evaluator does not read or store that plugin's
+output. `unknown` there says nothing about the device. Check output of such a policy is never
+stored. See "Forensics-tier rows" in the
+Command/Instruction Responses section.
 
 ---
 
@@ -5555,14 +5593,44 @@ REST-only — see the #520 note above.
 
 Response, audit and Guardian-event data retention windows, in days.
 
-**Permission:** `ServerConfig:Read`. **Audit:** none — lowest sensitivity of the eight (a few
-integers).
+**Permission:** `ServerConfig:Read`. **Audit:** none — lowest sensitivity of the eight (integers
+and fixed registry strings).
 
 The top-level fields are the configured/stored values. `enforced` holds the window each store is
 actually applying, in days (`0` or less means rows never expire); a value is `null` when the store
 is absent or not open, which is "unknown", not zero. The two differ after a runtime
 `PUT /api/config/<key>`, which is stored but not applied (see
 [When a change takes effect](#when-a-change-takes-effect)).
+
+`tar` publishes the TAR warehouse retention tiers: `tick_seconds` (the agent's prune
+tick, 900) and `tiers`, one row per source and tier (`live`, `hourly`, `daily`, `monthly`,
+`boot`). Each row has `limit_kind` (`rows` or `seconds`), `limit`, `bucket_seconds` (the
+roll-up bucket: 0 for `live`/`boot`, 3600, 86400, or 2678400 for a month, the 31-day worst
+case) and `guaranteed_depth_seconds`. Roll-up rows age from the start of their bucket, so
+a time-based tier is guaranteed for `limit - bucket_seconds` (a 365-day monthly tier is
+guaranteed for 334 days). It is `null` for `rows` tiers, whose time depth depends on how
+fast a device writes. `guaranteed_depth_seconds` is a floor on how long a record is kept, not
+where it sits: a record is still in its finer tier until the coarser roll-up closes. It is a
+floor on rows that exist, not on coverage: after an agent is offline longer than a tier's
+roll-up catch-up window (2 h hourly, 2 d daily, about 62 d monthly) the missed span is a gap in
+that tier, not a deeper tier. The
+`usage`/`live` row is a backstop, not an operative bound: the usage fold bounds its own open
+set (20,000 runs) before this limit can apply.
+
+These are the registry **defaults** an agent of this server's release applies (agents on other
+releases may differ), not per-device readings: TAR prunes on the agent, so the server has no
+live value. Every source's tiers are declared on every OS; where a source does not run on the
+agent's OS (see the OS compatibility matrix in the TAR manual) its tier applies to an empty
+table. A paused or errored source is never pruned (per-device paused sources: [`GET /api/v1/tar/retention-paused`](#get-apiv1tarretention-paused)); while the agent is running, rows may
+outlive their limit by up to `tick_seconds` (an offline agent or a disabled plugin prunes
+nothing), longer when the retention clock guard declines a prune, shorter by any plausible
+forward skew of the endpoint clock, which the guard does not decline (the depth is measured on
+the agent's own clock), and longer still while a backlog drains through the per-pass delete cap
+(5,000 rows per table per tick). `tar` is `null` only if the server's embedded table cannot be read. A server older than this release omits `tar`; treat absent like `null`.
+
+The order of `tiers` is unspecified; match rows by (`source`, `tier`). Clients must tolerate
+unknown `tier` and `limit_kind` values: a new tier is an additive change. A per-device or
+server-enforced reading, if one ever ships, lands under a new key, never by redefining `tiers`.
 
 ```json
 {
@@ -5574,6 +5642,15 @@ is absent or not open, which is "unknown", not zero. The two differ after a runt
       "response_retention_days": 90,
       "audit_retention_days": 365,
       "guardian_event_retention_days": 30
+    },
+    "tar": {
+      "tick_seconds": 900,
+      "tiers": [
+        { "source": "process", "tier": "live", "limit_kind": "rows", "limit": 100000,
+          "bucket_seconds": 0, "guaranteed_depth_seconds": null },
+        { "source": "process", "tier": "daily", "limit_kind": "seconds", "limit": 2678400,
+          "bucket_seconds": 86400, "guaranteed_depth_seconds": 2592000 }
+      ]
     }
   },
   "meta": { "api_version": "v1" }
@@ -5864,7 +5941,7 @@ validation failures (invalid key, unrecognized type, an invalid/oversized valida
 
 ### Webhooks
 
-Webhooks deliver real-time HTTP POST notifications to external systems when events occur in Yuzu (e.g., agent registration, command completion, policy compliance changes).
+Webhooks deliver real-time HTTP POST notifications to external systems when events occur in Yuzu (e.g., agent registration, a command response arriving, a DEX signal).
 
 #### `GET /api/webhooks`
 
@@ -5878,7 +5955,7 @@ List all configured webhooks.
     {
       "id": 1,
       "url": "https://example.com/hooks/yuzu",
-      "event_types": ["agent.registered", "command.completed"],
+      "event_types": ["agent.registered", "execution.completed"],
       "has_secret": true,
       "enabled": true,
       "created_at": 1710849600
@@ -5898,7 +5975,7 @@ Create a new webhook subscription.
 ```json
 {
   "url": "https://example.com/hooks/yuzu",
-  "event_types": ["agent.registered", "command.completed", "policy.violation"],
+  "event_types": ["agent.registered", "execution.completed", "dex.signal"],
   "secret": "optional-hmac-secret"
 }
 ```
@@ -5914,10 +5991,11 @@ Create a new webhook subscription.
 | Event type | Fired when | Notable payload fields |
 |---|---|---|
 | `agent.registered` | An agent enrolls or re-enrolls | `agent_id`, `hostname`, `os`, `arch`, `agent_version` |
-| `command.completed` / `execution.completed` | An instruction finishes across its targets | command/execution identifiers |
-| `policy.violation` | A policy evaluation finds a non-compliant device | policy + device identifiers |
+| `execution.completed` | Once per agent response to a command, not once per instruction: each target agent that answers produces its own event | `command_id`, `agent_id`, `status`, `exit_code` (and `error` when the response carries one) |
 | `dex.blast_radius` | N distinct devices report the same DEX signal `(obs_type, subject)` within the window — thresholds are operator-tunable on the DEX → Alerts tab (defaults 5 devices / 15 min; see [DEX fleet incident alerts](dex.md#fleet-incident-alerts-blast-radius)) | `obs_type`, `subject`, `device_count`, `window_seconds` |
 | `dex.signal` | A device reports a DEX signal type the operator routed to alerts (DEX → Alerts tab; once per device per hour — see [Routing signals to alerts](dex.md#routing-signals-to-alerts)) | `obs_type`, `subject`, `agent_id` |
+
+These four (`agent.registered`, `execution.completed`, `dex.blast_radius`, `dex.signal`) are the only event types the server fires; no other event is ever sent.
 
 `agent.registered` fires on *every* gRPC reconnect, not only first enrollment — a server restart, a network blip, or a gateway bounce that strands and reconnects a fleet produces one delivery per reconnecting agent, not one per genuinely new device. A target wired to a low-tolerance channel (e.g. a Slack alert intended for "new device joined the fleet") should filter or debounce on the receiving end if reconnect noise matters; the dashboard's own "Agent Enrolled" notification does not have this problem (it fires once, on first enrollment only).
 
@@ -6024,7 +6102,7 @@ Create a new offload target. Returns 201 + `{id, status}` on success, 400 when v
 | `auth_type` | string | No (`none`) | One of `none`, `bearer`, `basic`, `hmac`. |
 | `auth_credential` | string | No | Bearer token (Bearer), `user:pass` (Basic), shared secret (Hmac). Never returned by any endpoint. |
 | `event_types` | string | No (`*`) | Comma-separated list of event types or `*` for all. Same semantics as webhooks. |
-| `batch_size` | int | No (1) | Accumulate up to N events into a single POST body. `1` = no batching. Must be `1`..`10000` (read as a 64-bit value, so an oversized number is rejected rather than wrapped; a float such as `5.5`, a string, a boolean or `null` is `400` `invalid_field_type`, where a float used to be truncated); the per-target buffer flushes only at this size and has no other cap, so the store refuses a larger value (the same range MCP `create_offload_target` enforces). |
+| `batch_size` | int | No (1) | Accumulate up to N events into a single POST body. `1` = no batching. Must be `1`..`10000` (read as a 64-bit value, so an oversized number is rejected rather than wrapped; a float such as `5.5`, a string, a boolean or `null` is `400` `invalid_field_type`, where a float used to be truncated); the per-target buffer flushes only when it reaches this size and at graceful server shutdown (there is no timer flush, so a partly filled buffer waits for more events and is dropped on a crash or when the target is deleted) and has no other cap, so the store refuses a larger value (the same range MCP `create_offload_target` enforces). |
 | `enabled` | bool | No (true) | When false, no events are dispatched until re-enabled. |
 
 **Auth headers (set per `auth_type`):**
@@ -6775,6 +6853,59 @@ row cap and the export byte cap. `GET
 (`response_query_row_json`, `docs/api-twin-recipe.md` Rule 1); `GET /api/v1/responses/{id}/aggregate`
 and MCP `aggregate_responses` share another (`response_aggregate_row_json`).
 
+**Forensics-tier rows (#4990).** Rows written by Forensics-tier plugins (`app_usage`,
+`browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`; the set is
+derived from the capability catalogue) are served only to callers who hold `Forensics:Read` in
+addition to `Response:Read`. This applies to every route that reads stored responses: the legacy
+`GET /api/responses/{id}[/aggregate|/export]`, the v1 twins above, `GET
+/api/v1/executions/{id}/responses`, `GET /api/v1/executions/{id}/visualization`, `GET
+/api/v1/bundles/{id}` (a Forensics step stays `pending` with an empty output for a caller without a
+global grant, so that bundle never reports `complete=true` to that caller), and the `GET
+/api/v1/management-groups/agent-count-preview` count. To any other caller those rows are absent,
+not marked: there is no extra field or flag, and the row cap, the truncation flags, the aggregate
+counts and the agent counts are all computed over the rows the caller may read, so **an empty or
+short result does not imply that no data exists**. The one error is the unresolved case: if the
+server cannot determine whether the caller may read Forensics rows (the authorization store is
+unavailable; this applies to sessions, API tokens, MCP tokens and engine principals (an engine principal once its cached RBAC view is older than 5 seconds: an explicit grant is then admitted and a missing one is `403`; the authorization model reference has the condition), while a service-scoped token is
+default-denied with a definitive `403`), the route answers a retryable A4 `503` (`retry_after_ms` 5000, no
+`permission` field) instead of a result with those rows silently missing; that shape is the Forensics check's own, and
+when a whole-store outage fails the route's earlier `Response:Read` gate first, that gate's own answer is returned
+in its own shape (it can name a `permission`). `yuzu_server_rbac_read_degrade_total`
+(alert `YuzuRbacReadDegraded`) is the correlated signal. `Forensics:Read` is a global grant only: there is
+no management-group scoped read tier on these stored-response routes, and a hand-authored scoped grant reads
+nothing from them (the per-device application-usage read is a separate data set and keeps its own scoped gate). Service-scoped tokens,
+MCP-tier tokens and engine principals need the global grant like everyone else. With RBAC enforcement off, `Forensics:Read` is
+administrator-only, so a non-administrator session does not receive these rows. The built-in
+`ForensicsAnalyst` role is the delegable read-only holder (see `rbac.md`). A served read that
+includes at least one such row also writes a `response.forensics.read` audit row
+(`detail=forensics_rows=<n> plugins=<names> surface=<s>`, `surface` being `rest` for the v1 routes
+and `legacy` for the unversioned ones), fail-closed like the neighboring `response.read` row
+(`503` + `Sec-Audit-Failed: true`, no data); aggregate, facet-option and count reads write none. For an export the
+`forensics_rows` count is taken before the byte cap trims the file, so it can exceed the rows the file holds. When the
+`response.forensics.read` row cannot persist and the route answers `503`, the attempt has already left its
+neighboring success row (`response.read` or `execution.detail.fetch`, written first), and a retry leaves a second one. A caller using
+an API token, an MCP token or an engine principal that does not hold a global `Forensics:Read`
+also leaves one `auth.permission_required` denied audit row per read attempt (an interactive
+browser sign-in does not), so expect denial rows from automation that polls stored responses.
+The filter is per plugin, because only the `plugin` name is stored with a row, and it is a rule
+about these plugins' rows, not about a kind of data: other plugins can return comparable
+information under their own securables, and their stored rows stay under `Response:Read`. The same filter is applied to the
+server's own consumers of these rows: policy check output (such a policy scores `unknown`), result
+set membership (a set sourced from such a command materializes empty) and the live output stream,
+which publishes no row of a Forensics-tier plugin on `GET /events`, `GET /sse/executions/{id}` or
+`GET /api/v1/events`. (Such a frame publishes nothing to the live output stream, not a row and not a notice, and
+nothing is published there when the plugin set is unwired or the frame carries no output. The timing and
+command-status events, which carry no plugin output, still go out, and a dashboard dispatch still resets the Console to
+"Waiting for results..."; the Console's results table therefore stays on that placeholder for such an action,
+so open the execution results instead.) The per-agent `error_detail` of a Forensics-tier command (execution routes,
+`include=agents`) is a short machine token (`scope:cause[:detail]`) or the fixed value
+`forensics_error`; status and exit code are unchanged. The failure notification, the analytics
+event and the webhook and offload payload carry the same reduced text. A response is labelled with the
+plugin the server recorded when it dispatched the command, not with the command id the agent echoes; a
+response with no server record is labelled `~unverified`, which is part of the Forensics set, so it is
+withheld from a caller without `Forensics:Read` like any other Forensics row (see "Provenance" in
+`docs/authz-model.md`).
+
 **Numeric query parameters are parsed strictly (#4644), on these routes AND the legacy
 `GET /api/responses/{id}[/aggregate|/export]` routes.** `status`, `since`, `until`, `limit` (and the
 legacy catch-all route's `offset`) must each be one complete base-10 integer, or the route answers
@@ -6937,7 +7068,12 @@ the query route above. The v1 twin of `GET /api/responses/{id}/aggregate` above,
 `min`/`max` (default `count`); `op_column` (only meaningful for `sum`/`avg`/`min`/`max`) is one of
 `timestamp`/`status`/`id`, defaulting to `id` when omitted. An invalid `group_by`/`op_column` is a
 `400`, validated against `ResponseStore`'s own allow-list before the aggregate query runs — never
-mapped to a `503` (a client typo must not read as store degradation).
+mapped to a `503` (a client typo must not read as store degradation). A `503` (with `retry_after_ms`)
+means the response store is degraded or not initialized, the `response.read` audit row could not persist,
+or the caller's Forensics authority could not be determined (retryable). Rows of Forensics-tier plugins
+are absent from every group and total for a caller without `Forensics:Read`, with no marker, so a small or
+zero total does not prove that no data exists; an aggregate writes no `response.forensics.read` row (see
+"Forensics-tier rows" above).
 
 **Response:**
 
@@ -7005,6 +7141,24 @@ Returns the OpenAPI/Swagger specification for the v1 API as JSON.
 **Permission:** `Infrastructure:Read` (#2057 — was unauthenticated; now matches the MCP `yuzu://openapi` resource twin's gate, `mcp_server.cpp`).
 
 **Response:** OpenAPI 3.x JSON document describing all v1 endpoints, schemas, and authentication methods.
+
+**Query parameter:** `guides` (default off). By default the document leaves out the per-group guides, the `x-yuzu-guide` text on the top-level `tags`, which are written for people reading the `/swagger` page. The parameter turns them on only when its value is exactly `true` or `1`, in lower case; any other value, such as `TRUE` or `yes`, returns the default form. If the parameter is repeated, only the first value is read. The two forms are not the same text with a filter applied: `?guides=true` returns the document exactly as it is written in the server, while the default form is parsed and written out again without the guides, so key order and whitespace can differ although the content is the same apart from the guides. The MCP resource `yuzu://openapi` and the discover tools always serve the default form, so an agentic worker does not read the guide text.
+
+**Caching.** Each form carries its own strong `ETag` (a hash of the bytes served) and `Cache-Control: no-cache, private`, so a client stores the document but asks the server before each reuse, and a shared cache never stores a document that only an authorised caller may read. Send the `ETag` back in `If-None-Match` and a document that has not changed answers `304` with no body, which spares the server re-sending and compressing a large document. The comparison is exact: `If-None-Match` must equal the `ETag` of the form requested, byte for byte. A weak validator (`W/"..."`), a list of validators, `*`, or the `ETag` of the other form is answered with the full document and a `200`, so a proxy that weakens or merges validators costs the saving, not correctness. The permission check runs first, so a caller with no session gets `401`, and a caller without `Infrastructure:Read` gets the `403`, whatever it sends in `If-None-Match`. Building the response is not free: the server compresses the document with brotli for a client that accepts it, once per request that is not answered `304`, and does not cache the compressed bytes (see [Upgrading](upgrading.md)).
+
+**Extensions and identifiers in the document.** Every operation has an `operationId`, unique across the document. It is the lower-case method followed by the path in PascalCase, with each path parameter written as `By` and the parameter name, and the `/api/v1` base left out: `GET /hardware/{id}` is `getHardwareById`, `POST /hardware/{id}/sync` is `postHardwareByIdSync`, and `DELETE /upload-grants/{grant_id}` is `deleteUploadGrantsByGrantId`. An operation that the running server does not serve, because the store behind it is not started, carries an `x-yuzu-unavailable` string explaining that it is documented but not registered; 14 operations carry it today. Group guides live under `x-yuzu-guide` on the top-level `tags`, as described above.
+
+#### `GET /swagger` (dashboard)
+
+A browsable reference for the same document, in the dashboard. It lists every operation grouped by tag, with a search box and filters for method, group and whether the operation declares a typed response schema. Each operation expands to show its description, a `curl` request (with `-g` so the braces of a path parameter are not globbed, and for POST, PUT and PATCH a JSON content type and a placeholder `-d '{}'` body), its parameters, its request body and its responses, with response schemas laid out property by property. A link such as `/swagger#GET%20%2Fhardware` opens one operation directly.
+
+Each group opens with a one-sentence summary and a **Guide** button. The guide says what the group is for, how its data gets there where there is a flow, what it holds, which permissions and audit records apply, and what a caller should watch for, followed by the data model as expandable field tables. Selecting a group in the filter opens its guide, and `/swagger#g-Hardware` links straight to one.
+
+The page loads `/api/v1/openapi.json?guides=true` with your own session, so it shows exactly what that route returns. It takes the same `Infrastructure:Read` gate; an operator without it gets a `403`. An unauthenticated visitor is redirected by the server's pre-routing session check to the sign-in landing page, `/home` (`/swagger` is not a screen the landing page can return to, so the redirect carries no `next` key). It has no sidebar entry, and a successful load writes no audit row. The Developer page links to it for administrators only, but the page is not admin-only: anyone with `Infrastructure:Read` can open `/swagger` by its address, because it shows nothing the same holder cannot already read from `/api/v1/openapi.json`.
+
+**When the page cannot load.** The permission check runs before the page is sent, so an operator without `Infrastructure:Read` never sees the page shell: the browser tab shows the raw `403` JSON error body from the server. Once the page is open, a failed fetch of the document replaces the loading text with a message that names the HTTP status, plus the correlation id when the server sent one (from the error body, or from the `X-Correlation-Id` header when the body is not JSON), and a **Retry** button that fetches again. A `401` adds a note that the session may have ended, and a `403` adds a note naming the `Infrastructure:Read` permission. The fetch is abandoned after 30 seconds and the page then reports that the description took too long to load, again with **Retry**.
+
+Operations the running server does not serve, because the store behind them is not wired in (the License Management, Device Tokens and Software Deployment groups today), are marked **unavailable** and say so at the top of their detail view. Operations whose success response has only a prose description are marked **untyped**.
 
 ---
 
@@ -7116,7 +7270,7 @@ How a client should read `input_schema`:
 
 #### `GET /api/v1/discover/routes`
 
-REST route catalog — a subset of the SAME OpenAPI document `GET /api/v1/openapi.json` serves (they read the identical compiled-in spec, so they cannot disagree), reshaped to `{method, path, summary, tags, description}` rows.
+REST route catalog — a subset of the SAME OpenAPI document `GET /api/v1/openapi.json` serves (they read the identical compiled-in spec, so they cannot disagree), reshaped to `{method, path, summary, tags, description}` rows. An operation that is documented but not registered on a running server (see the `x-yuzu-unavailable` extension under `GET /api/v1/openapi.json`) also carries an `unavailable` string with the same text; the field is absent on every other row. Do not call a row that has it.
 
 **Permission:** `Infrastructure:Read`
 
@@ -7257,8 +7411,8 @@ Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` con
 
 Settings > Developer and API (`GET /settings/developer`, administrators only; others are redirected to the dashboard) is a front for the discovery routes above, plus a load generator control. It adds no REST route and no MCP tool: its four read panels are `GET /fragments/settings/developer/api`, `.../routes`, `.../permissions` and `.../plugins` (plus `.../plugins/observed`, loaded on request), which call the same builders in process. Every fragment is administrators only, like the page, and then takes the same `Infrastructure:Read` gate as the REST twins. The role grid in the permissions panel needs `UserManagement:Read` and is otherwise replaced by a note; that check is a draw-time decision and writes no denial row for a dashboard session (a token caller keeps its denial row).
 
-- **API:** the OpenAPI document link and a live count of documented operations. The count is path x method pairs in the hand-maintained OpenAPI document, not the number of registered routes.
-- **Routes:** the `/discover/routes` catalogue with a path/summary filter, capped at 300 rows. A route's free-text `description` is not shown.
+- **API:** the OpenAPI document link, an **Open API reference** button that opens the `/swagger` page in a new tab, and a live count of documented operations. The count is path x method pairs in the hand-maintained OpenAPI document, not the number of registered routes, so it includes the operations marked unavailable.
+- **Routes:** the `/discover/routes` catalogue with a path/summary filter, capped at 300 rows. A route's free-text `description` is not shown. An operation the document lists but this build does not serve (the `unavailable` field of the catalogue) keeps its row and carries an **unavailable** marker with the reason, so it is not mistaken for a callable route.
 - **Permissions:** each `Securable:Operation` pair with the roles that allow it. The role grid needs `UserManagement:Read`, as on `/discover/permissions`; without it the page says so instead of listing nothing.
 - **Plugins:** the build-embedded manifests with per-OS support. The list of plugins connected devices currently report is a separate, on-request list: no connected device is not the same as no plugins.
 
@@ -7269,6 +7423,8 @@ The process data fetch control is not part of this page.
 ### Inventory
 
 Inventory data is structured per-plugin telemetry collected from agents and stored server-side. The generic store (`InventoryStore`, ADR-0037) is Postgres-backed with an AUTHORITATIVE read posture — a store/pool/query degrade returns **503**, never a silent empty result.
+
+The generic store never returns the typed daily-sync sources (`installed_software`, `app_perf`, `device_ci`, `software_licensing`, `app_usage` and the reserved `certificate_inventory`; ADR-0070 D12). They are absent from the table list and from query results, and a `GET` of one for an agent is **404**, as for any source the agent has not reported. Each has its own typed route and gate, for example the software inventory and app-usage routes; `certificate_inventory` is reserved, and its route arrives with its store.
 
 #### `GET /api/v1/inventory/tables`
 
@@ -7418,7 +7574,7 @@ re-eval, unchanged.
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` with `"kind":"tar_rows_ge"` whose `n` is present but not a JSON integer from `1` to `2147483647` (a wrong type or a wrapped value used to throw in the maintenance tick, which re-threw every 2 seconds and starved the result-set GC; an `n` or `kind` already stored that is malformed, or an `n` below 1, now matches no device). A `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too, and so is a column matcher (no `kind`) whose `column`, `op` or `value` is present but not a string or whose `value_set` is present but not an array (`{"column":5,"op":"eq"}` used to qualify every responder; a stored one now matches no device, while a MISSING key keeps the accept-all default so a typo cannot silently empty the set); it used to be dropped, which meant every responder qualified (omit `matcher` for that default). Nothing is dispatched (#4644) |
-| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` that carries `declared_columns` or `plugin`. These two keys are server-authored: when the matcher's `column` is a column the instruction definition declares in its `result_schema`, the server stores them (`declared_columns` = field names in output order, `plugin` = the definition's plugin) so a column matcher works on any plugin's pipe-row output, not only TAR or JSON. The header row and short status rows (`status\|not_found`, `not_available\|<reason>`) are skipped. A column the definition does not declare stores nothing extra |
+| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` that carries `declared_columns`, `plugin` or `row_discriminator`. These three keys are server-authored: when the matcher's `column` is a column the instruction definition declares in its `result_schema`, the server stores them (`declared_columns` = field names in output order, `plugin` = the definition's plugin) so a column matcher works on any plugin's pipe-row output, not only TAR or JSON. The header row and short status rows (`status\|not_found`, `not_available\|<reason>`) are skipped. A column the definition does not declare stores nothing extra |
 | 400 | `sql`/`instruction_id`/`name` present but not a JSON string (a clean 400 rather than an uncaught exception, #4406); `name` over 256 bytes on `from-tar-query` or `from-instruction-result` |
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
 | 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
@@ -8320,7 +8476,7 @@ Pin (exempt from TTL expiry) or unpin a result set.
 
 ### Forensics
 
-The **per-agent app-usage** discovery surface (Wave 7 PR7.2, ADR-0016 §5). Data is derived on the agent from TAR's `usage_daily` fold via the read-only `app_usage` plugin and synced daily into `AppUsageStore`, projecting each executable's retained-window first/last-seen plus a trailing-30-day run-count/total-seconds window. `Forensics` is **Administrator-only by design** — deliberately absent from the seeded Viewer read-list.
+The **per-agent app-usage** discovery surface (Wave 7 PR7.2, ADR-0016 §5). Data is derived on the agent from TAR's `usage_daily` fold via the read-only `app_usage` plugin and synced daily into `AppUsageStore`, projecting each executable's retained-window first/last-seen plus a trailing-30-day run-count/total-seconds window. `Forensics` is **held by default only by Administrator and the read-only `ForensicsAnalyst` role** — deliberately absent from the seeded Viewer read-list.
 
 #### `GET /api/v1/forensics/agents/{agent_id}/app-usage`
 
@@ -8704,7 +8860,7 @@ Steps are returned in **request order** (not arrival order), so duplicate or sam
 | `404` | Bundle not found, **or** the caller did not dispatch it and is not an admin. The two are deliberately indistinguishable (no enumeration oracle); the real reason is recorded in the audit log. |
 | `503` | The bundle manifest WAS found and owned, but the response store could not be read (transient Postgres degrade) — distinct from a 404, and retryable: `retry_after_ms:5000` in the A4 body. Poll again after the hint rather than treating this as terminal. |
 
-**Audit:** `bundle.collate` (`target_type=Execution`, `target_id=<id>`), `result=success` (carrying `complete=0|1`), `result=denied` (not found / not owned), or `result=failure` (response store degraded, the 503 case above).
+**Audit:** `bundle.collate` (`target_type=Execution`, `target_id=<id>`), `result=success` (carrying `complete=0|1`), `result=denied` (not found / not owned), or `result=failure` (response store degraded, the 503 case above). When the collation serves the output of a Forensics-tier step (a step of a plugin on the `Forensics` securable that has responded), it also writes `response.forensics.read` (`target_type=Execution`, `target_id=<id>`, detail `forensics_rows=<n> plugins=<names> surface=bundle`); it fails closed like the other REST reads: if that row cannot persist the response is `503` with `Sec-Audit-Failed: true` and no result is returned, and a later poll writes the row again. A bundle with no served Forensics-tier step writes no such row.
 
 **Notes:**
 
@@ -8714,6 +8870,7 @@ Steps are returned in **request order** (not arrival order), so duplicate or sam
 **Error handling and retry (for integrators):**
 
 - **Poll cadence:** poll `GET /api/v1/bundles/{id}` with a short backoff (e.g. 1s, 2s, 4s) until `complete` is `true`, then read `succeeded`/`steps`.
+- **A bundle with a Forensics-tier step may never complete for a caller who cannot read it.** For a caller without a global `Forensics:Read` that step stays `pending` with an empty output and carries no marker, so the bundle stays `complete=false` for that caller (an approval ticket to dispatch the step does not imply the right to read its output). The REST result carries no `retry_after_ms`; the MCP `get_bundle_result` twin does keep advertising one while the bundle is incomplete. Because each collate refreshes the manifest window (next bullet), a poller that never stops keeps the manifest alive, so bound the polling with a deadline of your own.
 - **Manifest TTL ≈ 10 minutes, sliding.** Each successful collate refreshes the window, so a bundle you are actively polling never expires; only an abandoned bundle (no poll for the full window) is swept.
 - **A 404 on a poll that previously returned 200** means the manifest expired (you stopped polling past the TTL) **or** the server restarted (in-memory state lost). The correct recovery is to **re-dispatch the bundle** — the already-executed step responses are harmless (idempotent reads). Do not treat the 404 as a hard failure.
 
@@ -9453,6 +9610,8 @@ To suppress process-level visibility for specific agents (privacy-sensitive host
 
 These overlays are in addition to the standard browser console entry. Previous releases (PR 5 and earlier) left the scene blank on every error condition.
 
+The `413` overlay text names a `--viz-machines-max` flag and a management group, but neither is a remedy: no such flag exists, and `machines_max` is a query parameter on the REST route (default `5000`, ceiling `100000`, see below) that the page does not send. The topology call is gated by a global `Response:Read` check and is not narrowed by management group, so scoping the request that way does not shrink the snapshot. To read a fleet above the default cap, call the REST route directly with a larger `machines_max`.
+
 #### `GET /api/v1/viz/fleet/topology`
 
 Returns the full topology as JSON.
@@ -9653,6 +9812,8 @@ Get an aggregated view of fleet execution statistics.
   "meta": { "api_version": "v1" }
 }
 ```
+
+A failed read of the execution store answers `503` with `retry_after_ms: 2000`, never a zeroed summary (see [Execution Statistics](#execution-statistics)).
 
 ---
 
@@ -9885,7 +10046,7 @@ the MCP `list_upload_grants` tool. The engine denial is audited as `auth.permiss
 
 Revoke a grant before it is redeemed. **Permission:** `UploadGrant:Delete`.
 Returns `204` on success, `404` if the grant does not exist or is no longer
-revocable (already redeemed, expired, or already revoked).
+revocable (already redeemed or already revoked). An expired grant that was never redeemed is still revocable, so it can be revoked to clear it.
 
 The agent then redeems the grant and streams the file over the agent-facing
 upload session routes (`/api/v1/uploads*`), documented under [Uploads](#uploads).
@@ -11139,7 +11300,7 @@ Render the Users panel: one row per active account (name, source, account role).
 Render the Roles panel: one row per role in the catalogue (name, description, whether it is built in).
 
 - **Permission:** `UserManagement:Read`, the same securable and the same checked store read as `GET /api/v1/rbac/roles`.
-- **Response (200):** HTML fragment. A role store that does not answer is a red "could not be read" box with a Retry button and no table, still with status 200. An empty catalogue (which the store never produces: it seeds seven roles) is drawn as the same red box, never as "no roles".
+- **Response (200):** HTML fragment. A role store that does not answer is a red "could not be read" box with a Retry button and no table, still with status 200. An empty catalogue (which the store never produces: it seeds eight roles) is drawn as the same red box, never as "no roles".
 - **Response (403):** The caller lacks the permission; the panel shows a "not available to your account" note.
 - **Headers:** `Cache-Control: no-store`. No success audit row (the REST twin writes none).
 
@@ -11310,7 +11471,7 @@ write a `command.dispatch` audit row with `result=denied` and `detail=reason=<re
 must be a JSON object; anything else is `400`.
 
 **Destructive-class capabilities require explicit, non-empty `agent_ids` — broadcast and `scope`
-fan-out are refused (#3685).** The command catalogue currently classifies 19 `plugin.action` pairs
+fan-out are refused (#3685).** The command catalogue currently classifies 21 `plugin.action` pairs
 `Destructive` (e.g. `tar.purge_source`, `filesystem.delete_lines`, `registry.delete_key`); dispatching
 any of them with `agent_ids` omitted or empty, or with `scope` present at all — including
 `"__all__"` — is refused **before** the command reaches an agent. This is a narrower carve-out
@@ -12322,10 +12483,13 @@ exist. `POST /query` returns `400` on a malformed request body.
 
 #### `GET /api/me`
 
-Returns current user info (legacy version; prefer `/api/v1/me`). The flat body carries
-`username`, `display_name`, `role`, `rbac_enabled`, `rbac_role`, `effective_role`, `elevated`,
-`elevated_until` (only while elevated) and `can_access_settings`, with the same meaning as the
-`data` object of [`GET /api/v1/me`](#get-apiv1me). Sent with `Cache-Control: no-store, private`.
+Returns current user info (legacy version; prefer `/api/v1/me`). The body is the `data` object of
+[`GET /api/v1/me`](#get-apiv1me) with no envelope: the same keys with the same meaning, including
+`principal_kind`, `auth_source`, `mcp_tier`, `scope_service`, `rbac_roles` and `rbac_roles_resolved`,
+and the same engine-principal and role-store-fault behaviour (an engine principal gets no invented
+`rbac_role`; a role-store fault answers `200` with `rbac_roles_resolved: false` and no role keys).
+Keys are emitted in insertion order, not alphabetically, so a JSON consumer must not depend on key
+order. Sent with `Cache-Control: no-store, private`.
 
 #### `GET /api/analytics/status`
 
@@ -12434,7 +12598,7 @@ backport-aware matching (M1b/OVAL) lands.
 
 #### `GET /events`
 
-Server-Sent Events stream for real-time dashboard updates. Events include agent connections/disconnections, command responses, and system notifications.
+Server-Sent Events stream for real-time dashboard updates. Events include agent connections/disconnections, command responses, and system notifications. Live output events never carry a row written by a Forensics-tier plugin (see "Forensics-tier rows" under Command/Instruction Responses); a Forensics-tier frame publishes nothing to the live output stream (no row, no notice; the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder; open the execution results instead.
 
 **Example (curl):**
 
@@ -12461,6 +12625,8 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 - **`{id}`:** the execution id returned by `POST /api/instructions/:id/execute` or visible in the executions list (regex: `[A-Za-z0-9_-]{1,128}`).
 - **Content-Type:** `text/event-stream`
 - **Headers:** `Cache-Control: no-cache`, `X-Accel-Buffering: no` (so reverse proxies don't buffer the stream into chunks).
+
+**Forensics-tier output is not published (#4990).** The live output events never carry a row written by a Forensics-tier plugin (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`), whoever is subscribed, and the failure text in the execution events of such a command is a short machine token or the fixed value `forensics_error`. Read the rows through the response routes, which require `Forensics:Read`. Such a frame publishes nothing to the live output stream, not even a notice (the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder for such an action; open the execution results instead.
 
 **Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check — a management-group-confined operator is admitted and then sees only their in-scope agents' events. The caller who **dispatched** the execution is always admitted to the stream (visibility only — avoids a false 404 on a just-dispatched execution with zero responses yet), but that ownership never bypasses the per-event redaction below. RBAC-off → unrestricted (legacy-open). **This gate is evaluated once, at subscribe time** — it is not re-checked for the life of the connection. If your scope is narrowed, or your session is revoked, mid-stream, an already-open subscription is not automatically disconnected (tracked: #3788); a full server restart is the only thing that currently drops every live stream.
 
@@ -12551,6 +12717,8 @@ The browser-oriented `/sse/executions/{id}` route is preserved for the dashboard
 
 **Permission:** `Execution:Read`.
 **Auth:** Bearer token, `X-Yuzu-Token` header, or session cookie. Same auth surface as every other `/api/v1/*` endpoint.
+
+**Forensics-tier output is not published (#4990).** The live output events never carry a row written by a Forensics-tier plugin (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`), whoever is subscribed, and the failure text in the execution events of such a command is a short machine token or the fixed value `forensics_error`. Read the rows through the response routes, which require `Forensics:Read`. Such a frame publishes nothing to the live output stream, not even a notice (the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder for such an action; open the execution results instead.
 
 **Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check — a management-group-confined operator is admitted and then sees only their in-scope agents' events. The execution's dispatcher is always admitted to the stream (visibility only — avoids a false 404 on a just-dispatched execution with zero responses yet), never a bypass of the per-event redaction below. RBAC-off → unrestricted (legacy-open). This route shares one event projector (`execution_event_scope.hpp`) with the dashboard's `/sse/executions/{id}` sibling — see that section for the drop/sanitize table (`agent-transition` filtered by `agent_id`, `execution-progress` dropped, `execution-completed` sanitized to `status` only), and for the same subscribe-time-only gate staleness caveat (tracked: #3788) — this route shares that gap.
 
@@ -13433,7 +13601,7 @@ curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
 
 #### `POST /api/v1/elevate/revoke`
 
-Step an active elevation down early (reduces privilege; no MFA step-up required). Body: none. Always `200 {"status":"ok"}`; whether a window was actually active is recorded as `was_elevated=<bool>` in the `role.elevation.revoked` audit detail, not the response body.
+Step an active elevation down early (reduces privilege; no MFA step-up required). Body: none. Answers `200 {"status":"ok"}` once the elevation is cleared, whether or not a window was active; that is recorded as `was_elevated=<bool>` in the `role.elevation.revoked` audit detail, not the response body. If the server cannot durably clear the elevation it answers `503` (retry) and writes the same action with `result=error`, because the elevation may still be live.
 
 #### `POST /logout`
 
