@@ -1029,7 +1029,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 
     - **2026-10-28 - mixed-version admission during a rolling upgrade (scope
       exception recorded by the maintainer, #6079; superseded by the
-      2026-10-29 entry below, a DRAFT pending the maintainer's approval, which
+      2026-10-28 hard-cutover entry below, a DRAFT pending the maintainer's approval, which
       ships the change as a hard cutover with no rolling window).** The approver gate
       (`require_enrolled_fresh_mfa`) runs on each server replica and no
       minimum-version check exists. While a rolling upgrade is in progress, or
@@ -1043,7 +1043,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
       case and is not a statement that multi-replica operation is supported.
       Operator wording: `docs/user-manual/upgrading.md` "Mixed-version
       admission" (that section no longer exists: the cutover ruling of the
-      2026-10-29 entry below (a DRAFT pending the maintainer's approval) supersedes
+      2026-10-28 hard-cutover entry below (a DRAFT pending the maintainer's approval) supersedes
       this wording, and the marker query it
       cites was removed with it).
      - **Conditions of this exception.** The upgrade is controlled: the
@@ -1090,7 +1090,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      old and new names. The ledger records the retirement because the policy
      requires it.
 
-  - **2026-10-29 (ruling of 2026-10-24) - MFA factor binding ships as a hard
+  - **2026-10-28 (ruling of 2026-10-24) - MFA factor binding ships as a hard
     cutover (#6079 PR 2).**
     **STATUS: DRAFT, not accepted until the maintainer approves it.**
     The factor-generation binding (`auth` schema v3, `session_store` schema v2)
@@ -1131,7 +1131,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
       exceeds `kMcpPendingBaselineMax`, which equals the frozen baseline and
       only goes down).
     - **Acceptance.** Acceptor: Dave Rae (maintainer). Ruling date:
-      2026-10-24; entry authored 2026-10-29. Ruling source: the maintainer's
+      2026-10-24; entry authored 2026-10-28. Ruling source: the maintainer's
       ruling in the #6079 working session that the change ships as a hard
       cutover. The ruling is accepted for that scope only. Acceptance of the
       Conditions and the Residual exposure is NOT YET GIVEN: they are put

@@ -1653,8 +1653,9 @@ them. A gated route answers **`503`** and does not run in four cases:
   generation is not positive (a tampered row, or a data-only restore of a pre-v3 dump, see
   [Post-restore verification](#post-restore-verification)). Reason `mfa_binding_unenforced`: the
   database trigger that binds a proof to the factor generation is **not observed in force** on the
-  account store. The ordinary read fault is transient. The other causes are sticky and do not clear by
-  themselves: the two trigger failures are the incident in
+  account store. The ordinary read fault is transient, and so is an inconclusive trigger validation (a
+  catalog query that could not run: it is answered with `mfa_binding_unenforced` until a later check
+  succeeds). The remaining causes are sticky and do not clear by themselves: the two trigger failures are the incident in
   [MFA binding enforcement failed](#mfa-binding-enforcement-failed) (a SIEM rule for it must key on both
   tokens, and `mfa_proof_unavailable` also covers the ordinary read fault, so read the gauges before
   concluding), and a non-positive generation is repaired per account as described under

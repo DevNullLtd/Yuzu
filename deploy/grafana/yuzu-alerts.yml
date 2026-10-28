@@ -1,6 +1,7 @@
 # Yuzu Prometheus Alert Rules
 # Import into Prometheus or Grafana alerting.
-# This file is a curated subset of docs/prometheus/yuzu-alerts.yml (the complete rule set); a rule absent here is not absent from the product.
+# This file carries a curated subset of docs/prometheus/yuzu-alerts.yml plus a few gateway and fleet
+# alerts that exist only here; a rule absent here is not absent from the product.
 
 groups:
   - name: yuzu.rules

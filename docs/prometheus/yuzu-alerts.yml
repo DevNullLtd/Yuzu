@@ -6203,8 +6203,9 @@ groups:
       # stored proof could not be read, the session rebind guard is not in force, or
       # the account is enrolled with a non-positive factor generation (all
       # mfa_proof_unavailable) or the MFA binding
-      # trigger is not observed in force (mfa_binding_unenforced, which persists
-      # until repaired and restarted and co-fires YuzuMfaBindingNotEnforced), or the
+      # trigger is not observed in force (mfa_binding_unenforced: when the trigger is observed
+      # not in force it persists until repaired and restarted and co-fires YuzuMfaBindingNotEnforced; the
+      # same reason is answered transiently while the trigger validation is inconclusive), or the
       # check itself threw or could not fingerprint the session (chokepoint_exception). The counter is
       # zero-seeded over its closed label set, so increase() is meaningful from the
       # first scrape. The >= 3 debounce
