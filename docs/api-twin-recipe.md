@@ -383,18 +383,21 @@ cannot scan, and the retry-hints check also fails closed on a missing `handle_<n
 
 **Limits, stated plainly.** A handler gets no store, registry or agent access. What it can reach is
 `ctx.deps`, a `ToolDeps` (`mcp_tool_deps.hpp`) of provider closures: the `fleet_read_fn` gate, the
-domain-verb `audit_fn`, and the same roster, CI-detail, DEX-score and quarantine-list closures the REST
-`HardwareRoutes` receives (one instance wired into both in `server.cpp`), so a twin reuses the route's
-composition instead of re-deriving it from a store. `ctx.deps` is `nullptr` when unwired and each closure
+domain-verb `audit_fn`, the same roster, CI-detail, DEX-score and quarantine-list closures the REST
+`HardwareRoutes` receives (one instance wired into both in `server.cpp`), and the `/crypto` closures (five
+forwards to the `CryptoApi` instance `CryptoRoutes` serves, `crypto_access_fn`, and `username_fn`, which
+re-resolves the caller's username from the request because the registry path carries no session), so a
+twin reuses the route's composition instead of re-deriving it from a store. `ctx.deps` is `nullptr` when unwired and each closure
 may be empty: a handler checks both and answers an internal error, never an empty result. A tool that
-needs a store, `AgentRegistry` or a write-capable callable (other than the audit-row writer `audit_fn`) still belongs on the legacy path, and a lexical
+needs a store, `AgentRegistry` or a write-capable callable (other than the audit-row writer `audit_fn` and a closure meeting the criterion in `mcp_tool_deps.hpp`: a pure forward of the REST twin's own `*Api` method, the gate stays central, the handler audits "attempted" first and refuses to run without a sink) still belongs on the legacy path, and a lexical
 test fails an `mcp_tools_*.cpp` that includes a `*_store.hpp`, `agent_registry.hpp`, `mcp_server.hpp`,
 `auth_db*` or `pg/` header. Tools are compiled in-tree with no runtime or plugin registration, and a fork adding a domain file must edit
 `registered_tool_records()` itself. **Served order:** `tools/list` lists the merged legacy and registry
 tools in tool-name order (sorted once in `build_catalogue`), so a migration does not move a tool; clients
 key by name, and `tools/list` advertises `listChanged:false`. The legacy path above remains valid, and is
-the only path for every tool not yet moved (the first moved tool is `discover_routes`, in
-`mcp_tools_discovery.cpp`); #2422 is not closed by this seam alone.
+the only path for every tool not yet moved (`discover_routes`, in `mcp_tools_discovery.cpp`, was the first;
+the seven `/crypto` tools, in `mcp_tools_crypto.cpp`, are the pilot carve of the multi-family
+`mcp_server.cpp`); #2422 is not closed by this seam alone.
 
 ### Tier vs RBAC — and the lesson already paid for once
 
