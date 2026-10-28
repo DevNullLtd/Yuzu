@@ -393,9 +393,12 @@ All endpoints are under the `/api/v1/` prefix.
 
 #### `GET /api/v1/me`
 
-Returns the authenticated user's identity, role and what the server will honour for this session.
+Returns the authenticated caller's identity, legacy role and session context (not an authority summary: see `role` below).
+The MCP twin is `get_me`.
 
-**Permission:** Authenticated session (no specific RBAC permission required).
+**Permission:** Authenticated session (no specific RBAC permission required). The route is
+session-only self-description and writes no audit row. A service-scoped token may call it and
+describe itself; the MCP twin `get_me` refuses service-scoped tokens (a documented asymmetry, tracked in #6432).
 
 **Response:**
 
@@ -405,29 +408,48 @@ Returns the authenticated user's identity, role and what the server will honour 
     "username": "alice",
     "display_name": "Alice",
     "role": "user",
+    "principal_kind": "human",
+    "auth_source": "local",
+    "mcp_tier": "",
+    "scope_service": "",
     "rbac_enabled": false,
     "rbac_role": "Viewer",
-    "effective_role": "admin",
-    "elevated": true,
-    "elevated_until": "2026-10-13T22:31:54Z",
-    "can_access_settings": true
+    "rbac_roles": [],
+    "rbac_roles_resolved": true,
+    "effective_role": "user",
+    "elevated": false,
+    "can_access_settings": false
   },
   "meta": { "api_version": "v1" }
 }
 ```
 
+While a just-in-time elevation is active, `effective_role` is `admin`, `elevated` is `true`,
+`elevated_until` (ISO-8601 UTC) is added and `can_access_settings` is `true` for a local session.
+
 | Field | Meaning |
 |---|---|
-| `role` | The persisted legacy role (`admin` or `user`). Never the elevated view. |
-| `effective_role` | The role the server enforces now: `admin` while a just-in-time elevation is active, otherwise `role`. |
-| `elevated` | `true` while a just-in-time elevation is active. Always `false` for API, MCP and service-scoped tokens. |
+| `username` | The stable authorization principal (for an SSO session an opaque `oidc:<iss>#<sub>` id). |
+| `display_name` | A readable label; falls back to `username`. |
+| `role` | The persisted legacy role (`admin` or `user`). Never the elevated view. This and `effective_role` are the legacy session view, not a summary of authority: with RBAC on, authority is decided per permission (use `POST /api/v1/rbac/check`), and an engine principal's real authority is its `rbac_roles`. |
+| `principal_kind` | `human` or `engine`, and nothing else. This is the classification the server applies: `engine` when the session records that kind or was authenticated by an engine token, `human` otherwise. An engine principal is looked up under RBAC principal type `engine`. |
+| `auth_source` | Always present. How the session authenticated: `local`, `oidc`, `saml`, `api_token`, `mcp_token` or `engine_token`. |
+| `mcp_tier` | The MCP authorization tier of an MCP token; an empty string for any other session. |
+| `scope_service` | The service tag of a service-scoped token; an empty string when the session is not service-scoped. |
+| `rbac_enabled` | The server's cached view of the RBAC switch. It can lag a change made on another replica, and it does not report the degraded state in which enforcement fails closed (tracked in #6033). |
+| `rbac_role` | Deprecated display field: the first DIRECT role assignment in role-name order. Omitted for an engine principal while RBAC is off, for an engine principal with no grant while RBAC is on, and when the role-store read failed. For a human with no direct role it shows the legacy label `Administrator` or `Viewer`, including while RBAC is on; that label is not a grant and not authority. Read `rbac_roles` instead. |
+| `rbac_roles` | The principal's DIRECT role assignments only; roles held through a group grant are not listed. It is not access-review evidence: the access-review export (`AccessReview:Read`) is. With RBAC off it is `[]`. Omitted when the role-store read failed. |
+| `rbac_roles_resolved` | `false` only when the role-store read failed; it is `true` otherwise, including with RBAC off (no read is made then, so `true` is not proof that enforcement is off). When `false` the route still answers `200` and omits `rbac_role` and `rbac_roles`; treat an absent list as unknown, not as "no roles". |
+| `effective_role` | The effective legacy session role: `admin` while a just-in-time elevation is active, otherwise `role`. Like `role`, it is not a summary of authority. |
+| `elevated` | `true` while a just-in-time elevation is active. Always `false` for API and MCP token sessions. |
 | `elevated_until` | End of the elevation window, ISO-8601 UTC. Present only when `elevated` is `true`. |
-| `can_access_settings` | `true` when `GET /settings` would render for this session. MCP-tier and service-scoped tokens are always `false`. A display hint only: every route is still gated server-side. |
+| `can_access_settings` | `true` when `GET /settings` would render for this session. Always `false` for an MCP-tier or service-scoped token, because the admin gate refuses either before it tests the role; for an MCP token `effective_role` therefore equals `role`. A display hint only: every route is still gated server-side. |
 
-The response is sent with `Cache-Control: no-store, private`. During a rolling
-upgrade an older replica omits the four new fields; clients should treat a
-missing `can_access_settings` as `false`. `GET /api/me` returns the same keys
-without the `data` envelope.
+Keys appear in the order shown; do not depend on it. The response is sent with
+`Cache-Control: no-store, private`. During a rolling upgrade an older replica omits the newer
+keys (`principal_kind`, `auth_source`, `mcp_tier`, `scope_service`, `rbac_roles`, `rbac_roles_resolved` and the
+session fields); clients should treat a missing `can_access_settings` as `false`.
+[`GET /api/me`](#get-apime) returns the same keys without the `data` envelope.
 
 ---
 
@@ -3347,12 +3369,10 @@ administrator after the switch (enabling: no fleet-wide `Administrator`
 grant; disabling: local account role is not `admin`) — the response's
 `remediation` field names the exact follow-up call; `503` — the RBAC or
 `AuthDB` store is unavailable, or (on an otherwise-successful toggle) its
-audit row could not persist — treat the change as unconfirmed and reconcile
-via `GET /api/v1/me`. Audited `rbac.enforcement_changed` — see
+audit row could not persist: treat the change as unconfirmed and check it with the access-review export's `rbac_enforcement` label (`GET /api/v1/access-reviews/export`, `AccessReview:Read`). `GET /api/v1/me` (`rbac_enabled`) is only the cached view; it can lag on another replica and does not report the unconfirmed (degraded) state (#6033). Audited `rbac.enforcement_changed` — see
 `docs/user-manual/audit-log.md`.
 
-There is no `GET` twin: read the current state via `GET /api/v1/me`
-(`rbac_enabled`) or this route's own response.
+There is no `GET` twin: this route's own response echoes the authoritative post-write value, and the access-review export's `rbac_enforcement` label (`enabled`, `disabled` or `degraded`; `GET /api/v1/access-reviews/export`, which also writes an `access_review.exported` audit row) is the strongest available read. It is still the serving replica's view (see the degrade-versus-outage note in `docs/user-manual/rbac.md`). `GET /api/v1/me` (`rbac_enabled`) is the cached view only: it can lag on another replica and does not report the degraded state (#6033).
 
 MCP twin: `set_rbac_enforcement` — see `docs/user-manual/mcp.md`.
 
@@ -7402,6 +7422,8 @@ The process data fetch control is not part of this page.
 ### Inventory
 
 Inventory data is structured per-plugin telemetry collected from agents and stored server-side. The generic store (`InventoryStore`, ADR-0037) is Postgres-backed with an AUTHORITATIVE read posture — a store/pool/query degrade returns **503**, never a silent empty result.
+
+The generic store never returns the typed daily-sync sources (`installed_software`, `app_perf`, `device_ci`, `software_licensing`, `app_usage` and the reserved `certificate_inventory`; ADR-0070 D12). They are absent from the table list and from query results, and a `GET` of one for an agent is **404**, as for any source the agent has not reported. Each has its own typed route and gate, for example the software inventory and app-usage routes; `certificate_inventory` is reserved, and its route arrives with its store.
 
 #### `GET /api/v1/inventory/tables`
 
@@ -12363,10 +12385,13 @@ exist. `POST /query` returns `400` on a malformed request body.
 
 #### `GET /api/me`
 
-Returns current user info (legacy version; prefer `/api/v1/me`). The flat body carries
-`username`, `display_name`, `role`, `rbac_enabled`, `rbac_role`, `effective_role`, `elevated`,
-`elevated_until` (only while elevated) and `can_access_settings`, with the same meaning as the
-`data` object of [`GET /api/v1/me`](#get-apiv1me). Sent with `Cache-Control: no-store, private`.
+Returns current user info (legacy version; prefer `/api/v1/me`). The body is the `data` object of
+[`GET /api/v1/me`](#get-apiv1me) with no envelope: the same keys with the same meaning, including
+`principal_kind`, `auth_source`, `mcp_tier`, `scope_service`, `rbac_roles` and `rbac_roles_resolved`,
+and the same engine-principal and role-store-fault behaviour (an engine principal gets no invented
+`rbac_role`; a role-store fault answers `200` with `rbac_roles_resolved: false` and no role keys).
+Keys are emitted in insertion order, not alphabetically, so a JSON consumer must not depend on key
+order. Sent with `Cache-Control: no-store, private`.
 
 #### `GET /api/analytics/status`
 
