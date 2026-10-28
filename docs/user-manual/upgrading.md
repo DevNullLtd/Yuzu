@@ -638,7 +638,8 @@ repopulates its rows on its next report until the decommission tombstone ships i
 
 No agent sends `certificate_inventory` yet; agents start only once the server advertises that it
 accepts the source, in a separate later change. The server's gateway path (`ProxyInventory`), which
-on earlier builds discarded such a blob, now stores it in this typed store exactly as the direct
+2a-1 and later builds before this release discarded such a blob (builds before 2a-1 stored it in the
+generic store, which 2a-1's read filter and boot purge now exclude), now stores it in this typed store exactly as the direct
 `ReportInventory` path does; it still never reaches the generic inventory store.
 
 **Rolling back** leaves the `certificate_inventory_store` schema in the database; it is harmless to

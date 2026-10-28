@@ -1040,8 +1040,8 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     server_capabilities = 9`), and the server advertises it only while its certificate store
     opened. Absent means never sent, so the gate fails closed and is stateless. The server
     capability is planned for a separate slice-2 PR, 2a-2a-cap, and the agent gate for 2a-2e. Neither is on `dev`
-    (on 2026-10-28 `RegisterResponse` ends at field 8), so R17's closure depends on 2a-1 (PR
-    #6563) and 2a-2a-cap merging, and on 2a-2e for the agent side. Not adopted: (a) accepting the
+    (on 2026-10-28 `RegisterResponse` ends at field 8). 2a-1 (PR #6563) has merged, so R17's
+    closure depends on 2a-2a-cap merging, and on 2a-2e for the agent side. Not adopted: (a) accepting the
     window and closing it by deploy order (servers first, never roll back, a merge-order test
     and an `upgrading.md` note), because it relies on operators following an order nothing
     enforces and amends D12; (b) a reserved `__sync__` enable action persisted on the agent,
