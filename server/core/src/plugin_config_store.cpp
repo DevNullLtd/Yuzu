@@ -147,6 +147,26 @@ const std::vector<pg::PgMigration>& migrations() {
          "  regressed_at TIMESTAMPTZ NULL,"
          "  regressed_reason TEXT NOT NULL DEFAULT '');"
          "INSERT INTO enablement_meta (id, store_id) VALUES (1, gen_random_uuid()::text);"},
+        // v4 (Echo rename, upgrade window): operator config, kill switches and enablement rules
+        // follow the renamed plugin. A kill switch's scope_key is `<plugin>[.<action>][@<os>]`
+        // (kill_switch_scope_key), so swapping the 3-character plugin prefix covers every form
+        // (`tar`, `tar.<a>`, `tar@<os>`, `tar.<a>@<os>`) and keeps the UNIQUE scope_key identity.
+        // Rows whose target already exists are left (the NOT EXISTS guards) rather than failing the
+        // migration. `secrets` is deliberately NOT touched: scope_key is the SecretCodec AAD, so
+        // rewriting it would make every sealed value undecryptable (the echo plugin declares no
+        // secret keys, so there is nothing to carry over). Idempotent.
+        {4,
+         "UPDATE configs SET plugin = 'echo' WHERE plugin = 'tar' AND NOT EXISTS ("
+         "  SELECT 1 FROM configs c2 WHERE c2.plugin = 'echo' AND c2.key = configs.key);"
+         "UPDATE kill_switches SET plugin = 'echo', scope_key = 'echo' || substr(scope_key, 4) "
+         "WHERE plugin = 'tar' AND scope_key LIKE 'tar%' AND NOT EXISTS ("
+         "  SELECT 1 FROM kill_switches k2 "
+         "  WHERE k2.scope_key = 'echo' || substr(kill_switches.scope_key, 4));"
+         "UPDATE enablement_rules SET units = ARRAY("
+         "  SELECT CASE WHEN u = 'tar' THEN 'echo' "
+         "              WHEN u LIKE 'tar.%' THEN 'echo.' || substr(u, 5) ELSE u END "
+         "  FROM unnest(units) WITH ORDINALITY AS t(u, ord) ORDER BY ord) "
+         "WHERE 'tar' = ANY(units) OR EXISTS (SELECT 1 FROM unnest(units) AS u WHERE u LIKE 'tar.%');"},
     };
     return kMigrations;
 }

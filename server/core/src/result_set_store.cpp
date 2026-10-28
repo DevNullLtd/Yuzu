@@ -192,6 +192,12 @@ const std::vector<pg::PgMigration>& migrations() {
         // no longer has a writer. Version-bumped (not edited into v1) because v1 has
         // actually run against real dev/UAT databases — see ADR-0036's Update.
         {2, "DROP TABLE IF EXISTS sqlite_backfill;"},
+        // v3 (Echo rename, upgrade window): a persisted result set's source kind and matcher
+        // follow the renamed vocabulary. Idempotent.
+        {3,
+         "UPDATE result_sets SET source_kind = 'echo_query' WHERE source_kind = 'tar_query';"
+         "UPDATE result_sets SET matcher = replace(matcher, 'tar_rows_ge', 'echo_rows_ge') "
+         "WHERE matcher LIKE '%tar_rows_ge%';"},
     };
     return kMigrations;
 }

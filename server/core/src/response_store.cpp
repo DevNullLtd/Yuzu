@@ -397,6 +397,17 @@ const std::vector<pg::PgMigration>& migrations() {
         {2, R"(
             ALTER TABLE responses ADD COLUMN plugin_result_status INTEGER NOT NULL DEFAULT 0;
         )"},
+        // v3 (Echo rename, upgrade window): stored responses and their facets follow the renamed
+        // definition ids so the per-instruction response views keep pre-rename rows. A one-off
+        // UPDATE bounded by response retention; idempotent.
+        {3, R"(
+            UPDATE responses SET instruction_id = replace(instruction_id,
+                'crossplatform.tar.', 'crossplatform.echo.')
+                WHERE instruction_id LIKE 'crossplatform.tar.%';
+            UPDATE response_facets SET instruction_id = replace(instruction_id,
+                'crossplatform.tar.', 'crossplatform.echo.')
+                WHERE instruction_id LIKE 'crossplatform.tar.%';
+        )"},
     };
     return kMigrations;
 }

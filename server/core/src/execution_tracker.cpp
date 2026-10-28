@@ -557,6 +557,15 @@ const std::vector<pg::PgMigration>& migrations() {
         // deployment contract. The `executions(parent_id)` index (#4624) is a separate item above.
         {7,
          "CREATE INDEX idx_command_execution_execution_id ON command_execution(execution_id);"},
+        // v8 (Echo rename, upgrade window): history and in-flight claims follow the renamed
+        // definition ids; the server-recorded dispatch label follows the renamed plugin.
+        // Idempotent (every UPDATE is guarded by its own predicate).
+        {8,
+         "UPDATE executions SET definition_id = replace(definition_id, "
+         "'crossplatform.tar.', 'crossplatform.echo.') WHERE definition_id LIKE 'crossplatform.tar.%';"
+         "UPDATE concurrency_claims SET definition_id = replace(definition_id, "
+         "'crossplatform.tar.', 'crossplatform.echo.') WHERE definition_id LIKE 'crossplatform.tar.%';"
+         "UPDATE command_execution SET plugin = 'echo' WHERE plugin = 'tar';"},
     };
     return kMigrations;
 }
