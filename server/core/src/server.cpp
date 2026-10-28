@@ -7761,11 +7761,11 @@ public:
                 // newer-agent/older-server window where a typed blob landed here
                 // before the exclusion took effect (or before a source was
                 // promoted to typed at all). Never fails closed on a purge miss —
-                // the exclusion, not the purge, is what a caller must rely on.
-                for (const char* s : {"installed_software", "app_perf", "device_ci",
-                                      "software_licensing", "app_usage"}) {
-                    if (!is_typed_inventory_source(s))
-                        continue;
+                // the exclusion and the read filter, not the purge, are what a caller
+                // must rely on.
+                // Iterates kTypedInventorySources, the one list the gateway skip and
+                // the read filter also use; never a second hand-written list here.
+                for (const std::string_view s : kTypedInventorySources) {
                     if (!inventory_store_->delete_source(s))
                         spdlog::warn("[PG] Boot purge: InventoryStore::delete_source(\"{}\") "
                                      "reported failure (non-fatal — hygiene sweep, not a startup "
