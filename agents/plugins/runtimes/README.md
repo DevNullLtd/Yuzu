@@ -3,11 +3,11 @@
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
 | | |
 |---|---|
-| **What it does** | Installed .NET and JVM runtime inventory |
+| **What it does** | Installed .NET, JVM and Python runtime inventory |
 | **Version** | 1.0.0 |
-| **Kind** | Collector · read-only · gathered (crossplatform.runtimes.dotnet, crossplatform.runtimes.jvm) |
-| **Platforms** | Windows 🟡 planned · macOS 🟡 planned · Linux ✅ |
-| **Actions** | `dotnet` (definition `crossplatform.runtimes.dotnet`) · `jvm` (definition `crossplatform.runtimes.jvm`) |
+| **Kind** | Collector · read-only · gathered (crossplatform.runtimes.dotnet, crossplatform.runtimes.jvm, crossplatform.runtimes.python) |
+| **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
+| **Actions** | `dotnet` (definition `crossplatform.runtimes.dotnet`) · `jvm` (definition `crossplatform.runtimes.jvm`) · `python` (definition `crossplatform.runtimes.python`) |
 | **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
@@ -85,6 +85,7 @@ A home with no `release` file is only reported when a java binary proves it is a
 |---|---|---|---|
 | `dotnet` | 🟡 planned · rung 1 · NDP release-key table + dotnet InstalledVersions + Program Files walk | 🟡 planned · rung 1 · /usr/local/share/dotnet/shared walk | ✅ supported · rung 1 · /usr/share/dotnet, /usr/lib/dotnet, /usr/lib64/dotnet shared/<framework>/<version> and sdk/<version> directory walk; network mounts skipped via /proc/self/mountinfo |
 | `jvm` | 🟡 planned · rung 1 · JavaSoft keys + Program Files\\Java walk | 🟡 planned · rung 1 · /Library/Java/JavaVirtualMachines/*/Contents/Info.plist JavaVM dict + Contents/Home/release | ✅ supported · rung 1 · <home>/release file reads under /usr/lib/jvm, /opt/java, /usr/lib64/jvm, /var/opt/java (bin/java probe when a home has no release); network mounts skipped via /proc/self/mountinfo |
+| `python` | ✅ supported · rung 1 · HKLM\\SOFTWARE\\Python\\PythonCore\\<tag> Version/SysVersion/InstallPath in both registry views (PEP 514); per-user hives never read | ✅ supported · rung 1 · single-level listing of /Library/Frameworks/Python.framework/Versions; version from each version's Resources/Info.plist | 🟡 constrained · rung 1 · single-level listing of /usr/bin and /usr/local/bin for python3.<minor> regular files; version is major.minor from the name (patch level not read); network mounts skipped via /proc/self/mountinfo |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
@@ -92,6 +93,7 @@ A home with no `release` file is only reported when a java binary proves it is a
 - **`dotnet` / macOS** — planned; the action answers a single unsupported status row on this OS
 - **`jvm` / Windows** — planned; the action answers a single unsupported status row on this OS
 - **`jvm` / macOS** — planned; the action answers a single unsupported status row on this OS
+- **`python` / Linux** — patch level unavailable without running the interpreter
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -136,6 +138,16 @@ Every row is pipe-delimited. The first row is always `status|<action>|<level>|<r
 | `version` | string | - | Linux | `17.0.20` | JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION. A release file with neither key yields no row and a release_unparsable constraint; a home with a java binary but no release file yields - and a release_missing constraint. Status rows: the level (supported, constrained or unsupported). |
 | `install_path` | string | - | Linux | `/opt/java/openjdk` | Absolute path of the JVM home directory. Status rows: the comma-joined failure tokens, or -. |
 | `vendor` | string | - | Linux | `Eclipse Adoptium` | IMPLEMENTOR from the release file (e.g. Eclipse Adoptium, Debian), self-reported by the build and not verified, or "-" when the key is absent (or the home has no release file). |
+
+**`crossplatform.runtimes.python` — `row_kind|flavour|version|install_path|vendor`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | `status` `python` | Windows, macOS, Linux | `python` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), python (one per interpreter found). |
+| `flavour` | string | `cpython` `unmodelled` | Windows, macOS, Linux | `cpython` | Interpreter kind. Values: cpython (a python.org PythonCore registry tag on Windows, or the python.org framework on macOS, identified by its bundle identifier), unmodelled (any other bundle identifier on macOS; every Linux row — a file name does not say what implementation it is). Status rows: the action name. |
+| `version` | string | - | Windows, macOS, Linux | `3.14.6` | Interpreter version. Windows: the PythonCore Version value (x.y.z), else SysVersion, else the tag's major.minor. macOS: the full x.y.z from Info.plist, else the version directory name (x.y). Linux: major.minor from the python3.<minor> file name — the patch level is not available. - when none could be determined. Status rows: the level (supported, constrained or unsupported). |
+| `install_path` | string | - | Windows, macOS, Linux | `/usr/bin/python3.11` | Windows: the InstallPath key's default value (backslashes are written as /), or - when the tag has none. macOS: the framework version directory. Linux: the interpreter file. Status rows: the comma-joined failure tokens, or -. |
+| `vendor` | string | - | Windows, macOS, Linux | `PythonCore` | Windows: PythonCore. macOS: the framework's CFBundleIdentifier (org.python.python), or - when the plist could not be read. Linux: always "-". |
 <!-- END GENERATED -->
 
 ### Result status
@@ -158,7 +170,40 @@ Every read sets a typed result status; a degraded read is `CONSTRAINED`, never a
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-24 · euid 0 · leg-hash 5cadaa03e74e
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-28 · interactive user (elevated) · leg-hash a3f4c5ca7477
+
+```
+== action=dotnet
+status|dotnet|unsupported|windows:planned
+[result_status] UNAVAILABLE / PARTIAL / windows:planned
+
+== action=jvm
+status|jvm|unsupported|windows:planned
+[result_status] UNAVAILABLE / PARTIAL / windows:planned
+
+== action=python
+status|python|supported|-
+python|cpython|3.14.6|C:/Python314/|PythonCore
+[result_status] OK / FULL
+```
+
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-28 · euid 501 · leg-hash a3f4c5ca7477
+
+```
+== action=dotnet
+status|dotnet|unsupported|macos:planned
+[result_status] UNAVAILABLE / PARTIAL / macos:planned
+
+== action=jvm
+status|jvm|unsupported|macos:planned
+[result_status] UNAVAILABLE / PARTIAL / macos:planned
+
+== action=python
+status|python|supported|-
+[result_status] OK / FULL
+```
+
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-28 · euid 0 · leg-hash a3f4c5ca7477
 
 ```
 == action=dotnet
@@ -167,6 +212,11 @@ status|dotnet|supported|-
 
 == action=jvm
 status|jvm|supported|-
+[result_status] OK / FULL
+
+== action=python
+status|python|supported|-
+python|unmodelled|3.14|/usr/bin/python3.14|-
 [result_status] OK / FULL
 ```
 <!-- END GENERATED -->
@@ -182,11 +232,12 @@ status|jvm|supported|-
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/runtimes/src/runtimes_legs.hpp` · `agents/plugins/runtimes/src/runtimes_linux.cpp` · `agents/plugins/runtimes/src/runtimes_linux_parsers.hpp` · `agents/plugins/runtimes/src/runtimes_macos.cpp` · `agents/plugins/runtimes/src/runtimes_parsers.hpp` · `agents/plugins/runtimes/src/runtimes_plugin.cpp` · `agents/plugins/runtimes/src/runtimes_win.cpp`
+- Plugin: `agents/plugins/runtimes/src/runtimes_legs.hpp` · `agents/plugins/runtimes/src/runtimes_linux.cpp` · `agents/plugins/runtimes/src/runtimes_linux_parsers.hpp` · `agents/plugins/runtimes/src/runtimes_macos.cpp` · `agents/plugins/runtimes/src/runtimes_macos_parsers.hpp` · `agents/plugins/runtimes/src/runtimes_parsers.hpp` · `agents/plugins/runtimes/src/runtimes_plugin.cpp` · `agents/plugins/runtimes/src/runtimes_python_parsers.hpp` · `agents/plugins/runtimes/src/runtimes_win.cpp` · `agents/plugins/runtimes/src/runtimes_win_parsers.hpp`
 - Definitions: `content/definitions/runtimes.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp`
-- Tests: `tests/test_runtimes_definition.py` · `tests/unit/test_runtimes_linux_parsers.cpp` · `tests/unit/test_runtimes_local_dispatcher.cpp` · `tests/unit/test_runtimes_parsers.cpp`
+- Tests: `tests/test_runtimes_definition.py` · `tests/unit/test_runtimes_linux_parsers.cpp` · `tests/unit/test_runtimes_local_dispatcher.cpp` · `tests/unit/test_runtimes_parsers.cpp` · `tests/unit/test_runtimes_python_parsers.cpp` · `tests/unit/test_runtimes_win_walk.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
+- Changelog: `changelog.d/sam1-runtimes-python.added.md`
 <!-- END GENERATED -->
 6. **Linux `python` reports major.minor only.** The row version is taken from the file name (`python3.11` reads `3.11`); the patch level is not stored in any file the plugin can read without starting the interpreter, and it never starts one, so it is not guessed. The Linux descriptor leg is declared `constrained` for this reason; the status row stays `supported` because the limit is known and constant, not a failed read. A symlinked `python3.X` entry (some distributions alias a minor to another) is skipped, as `python3` itself is: only regular files count.
 7. **A missing or unreadable version file never raises a constraint.** On macOS a version directory whose `Info.plist` is absent, binary, oversized or unreadable still produces a row, with the directory's `x.y` as the version and vendor `-`; on Windows a tag with no `Version` or `SysVersion` value reports the tag's `major.minor`. Only a failure to open or list a root (or a cap) makes the result `constrained`.
