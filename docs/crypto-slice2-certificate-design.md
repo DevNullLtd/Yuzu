@@ -96,11 +96,12 @@ counter or a store rather than a read, the PR says so, and the next PR in the ch
 |---|---|---|---|---|
 | 2a-1 | Typed-source read filter | One exported array of typed source names in `typed_inventory_sources.hpp`, **already including the reserved name `certificate_inventory`**, used by the predicate (and so the gateway skip), the boot purge and a new read-time filter on every generic `InventoryStore` read. No certificate code. Amends the app-usage read-surface routed-concern row in the same change. | It closes today's accepted stray-row window for `app_usage` and `device_ci` (see [Typed set](#typed-set-purge-and-read-filter)). D12 forbids that window for certificates, so it must exist, with the certificate source name reserved, before any agent sends the source. | — |
 | 2a-1b | Background typed-source purge | The boot purge becomes a bounded, batched background pass, classified in `background_jobs.hpp`, started at every boot and no longer awaited before serving. | Boot no longer waits on an unbounded delete; the pass's progress is counted. | 2a-1 |
-| 2a-2a | Certificate store and ingest | `CertificateInventoryStore` (schema `certificate_inventory_store`) and the shared ingest seam on the direct and gateway paths: blob parse, hash-skip, per-store replace rules, the per-agent lock, decommission cascade membership (erase only; no tombstone), `/readyz` membership, `yuzu_server_cert_inventory_ingest_total`, the schema lint, the `certificate_inventory_v1` server capability in `RegisterResponse` (`server_capabilities = 9`, advertised only while the store opened), and the SOC 2 data-inventory row for `certificate_inventory_store`. | A report from an agent (or a test) is stored, counted by result and reason, erased on decommission, and covered by `/readyz`. | 2a-1 |
+| 2a-2a | Certificate store and ingest | `CertificateInventoryStore` (schema `certificate_inventory_store`) and the shared ingest seam on the direct and gateway paths: blob parse, hash-skip, per-store replace rules, the per-agent lock, decommission cascade membership (erase only; no tombstone), `/readyz` membership, `yuzu_server_cert_inventory_ingest_total`, the schema lint, and the SOC 2 data-inventory row for `certificate_inventory_store`. It advertises no capability (owner ruling 2026-10-28). | A report from an agent (or a test) is stored, counted by result and reason, erased on decommission, and covered by `/readyz`. | 2a-1 |
+| 2a-2a-cap | Certificate capability and gateway enforcement | The `certificate_inventory_v1` server capability in `RegisterResponse` (`server_capabilities = 9`, advertised only while the store opened), and the gateway's per-upstream-connection enforcement of it, redesigned for the gateway's `yuzu_grpc_client` (gun) upstream client on `dev`. Split from 2a-2a by owner ruling 2026-10-28. | The server advertises the capability while its certificate store is open; the gateway strips the source on a connection that does not list it. | 2a-2a |
 | 2a-2b | Certificate read surface | The `CertificateInventory` securable, its seeding and floor entry; the per-certificate read and the raw-value summary (REST + MCP + `/crypto` fragment) with every filter in [Parameters](#parameters-strict-or-free-text-the-same-on-both-twins); admission, truncation, audit (OD-2), the D10 lint, the `cert_inventory.fleet_store_status` gauge job, and the `dn_dict` name table with its SOC 2 data-inventory row. | Operators read fleet certificates, including the [one-CA queries](#finding-one-cas-certificates). | 2a-2a |
 | 2a-2c | Decommission tombstones | The decommission tombstone itself (written by `delete_agent`, checked by ingest), the admin-only tombstone list and purge (REST + MCP, OD-4), `coverage.tombstoned_agents_registered`, and the cross-schema enrolment clear (`CertificateEnrolmentTombstoneOwner`) at every approval write. | An administrator lists and purges tombstones; approving a tombstoned agent clears it. | 2a-2b, and the DPIA screening |
 | 2a-2d | Certificate retention prune | The [prune](#retention-and-the-prune), at store and location grain, with its metrics and its clock-guarded-retention register entry. | Stores unread for 30 days are pruned and counted. | 2a-2a |
-| 2a-2e | Agent collector: action, daily-sync source and Linux | `certificates.list_inventory` (no catalogue row, OD-1), the `certificate_inventory` daily-sync source and blob writer, and the Linux store reads on a dedicated worker thread (the sync thread waits at most 75 s, then skips the source with `walk_stalled` (`walk_unavailable` when the worker cannot start); a stuck worker blocks only itself and no second worker starts while one is stuck; shutdown uses the existing `hard_exit` grace path; the stall is signalled by the agent heartbeat tag `yuzu.cert_walk_stalled` and a log line only, with no fleet gauge or alert, see [decision 11](#decisions)), the agent gate that sends the source only when the server advertises `certificate_inventory_v1`; the daily sync never sends one report over the transport limit (the certificate blob is sent on its own when the combined report would exceed it). | A Linux agent reports its certificates daily. | 2a-2b, 2a-2c, 2a-2d |
+| 2a-2e | Agent collector: action, daily-sync source and Linux | `certificates.list_inventory` (no catalogue row, OD-1), the `certificate_inventory` daily-sync source and blob writer, and the Linux store reads on a dedicated worker thread (the sync thread waits at most 75 s, then skips the source with `walk_stalled` (`walk_unavailable` when the worker cannot start); a stuck worker blocks only itself and no second worker starts while one is stuck; shutdown uses the existing `hard_exit` grace path; the stall is signalled by the agent heartbeat tag `yuzu.cert_walk_stalled` and a log line only, with no fleet gauge or alert, see [decision 11](#decisions)), the agent gate that sends the source only when the server advertises `certificate_inventory_v1`; the daily sync never sends one report over the transport limit (the certificate blob is sent on its own when the combined report would exceed it). | A Linux agent reports its certificates daily. | 2a-2a-cap, 2a-2b, 2a-2c, 2a-2d |
 | 2a-2f | Agent collector: Windows | The Windows machine-store reads and the private-key metadata. | A Windows agent reports its certificates. | 2a-2e |
 | 2a-2g | Agent collector: macOS | The System keychain and SystemRoots reads. | A macOS agent reports its certificates. | 2a-2e |
 | 2a-3 | D13 certificate counts | The counts read (REST + MCP), the snapshot export, the D13 condition-1 lint entries and the recompute test; the data the certificate widgets read. | Operators see the counts on `/crypto` and through MCP. | 2a-2b |
@@ -115,7 +116,8 @@ this design amendment need nothing and can be raised together. 2a-3 imports the 
 constants and edge predicates the widgets work landed in `crypto_widget_catalogue.hpp` (ADR-0070
 R5/R7/R10/R14). 2b-3 is optional and comes last. Agents are the last link of the server chain:
 2a-2e waits for the read surface, the tombstone and the prune, so no device reports certificate
-data before it can be read, erased and retained as this design states. The DPIA screening is
+data before it can be read, erased and retained as this design states, and 2a-2e also waits for
+2a-2a-cap, so the agent gate has a capability to read. The DPIA screening is
 recorded before 2a-2c merges: the tombstone is the first stored personal data (an `agent_id`), and
 2a-2e, the first PR that processes real certificate data, comes after it. No PR writes
 durable state whose only remover arrives in a later PR.
@@ -126,14 +128,14 @@ says which PR carries each item. "2b-1" likewise means 2b-1a and 2b-1b.
 **Deploy order** is server before agents, as for blob v2 of `installed_software`
 (`docs/adr/0016-agent-daily-sync-framework.md`, "Deploy order: server before agents"), but this
 design does not rely on it. The window is to be closed in code (ADR-0070 R17, decision 8). That
-closure depends on 2a-1 (PR #6563) and 2a-2a merging, and on 2a-2e for the agent side; none has
-merged yet:
+closure depends on 2a-1 (PR #6563) and 2a-2a-cap merging, and on 2a-2e for the agent side; none
+has merged yet:
 - From 2a-1 on, `certificate_inventory` is in the typed set before any agent sends it. A server at
   2a-1 or later never stores the blob in the generic store on the gateway path, and its read filter
   hides any stray row.
-- 2a-2a makes the server advertise `certificate_inventory_v1` in `RegisterResponse` while its
+- 2a-2a-cap makes the server advertise `certificate_inventory_v1` in `RegisterResponse` while its
   certificate store is open, and 2a-2e makes the agent send the source only when it sees that
-  capability. A server older than 2a-2a, a rolled-back server, or a server whose store did not
+  capability. 2a-2a itself advertises nothing. A server older than 2a-2a-cap, a rolled-back server, or a server whose store did not
   open advertises nothing, so the agent never sends. There is no remaining window, except the
   owner-accepted L7 balancer residual that ADR-0070 R17 names (decision 8): behind an L7
   (gRPC-aware) balancer that spreads one connection's requests across backends, every backend
@@ -147,7 +149,8 @@ merged yet:
 |---|---|
 | 2a-1 | `upgrading.md`: the `app_usage`/`device_ci` behaviour change (stray generic rows stop being readable). The app-usage read-surface routed-concern row: its accepted mixed-version window becomes closed. A changelog fragment. |
 | 2a-1b | The purge metric where inventory metrics are documented, and `upgrading.md` (boot no longer waits on the purge). |
-| 2a-2a | `rest-api.md`/`server-admin.md` for the ingest metric and `/readyz` membership; `inventory.md` for the server side of the new daily-sync source and the `certificate_inventory_v1` capability; the SOC 2 data-inventory row (`docs/enterprise-readiness-soc2-first-customer.md`) for `certificate_inventory_store`; the SOC 2 risk-register entry for the L7 balancer residual (review-by 2027-01-31; 2a-2a is the PR that carries it); and the L7 operator note (no L7 per-call balancer in front of a mixed set; never roll a backend back below 2a-1), already written on the unmerged 2a-2a branch in `gateway.md`, `inventory.md` and `upgrading.md` (cite them; do not re-author). |
+| 2a-2a | `rest-api.md`/`server-admin.md` for the ingest metric and `/readyz` membership; `inventory.md` for the server side of the new daily-sync source; the SOC 2 data-inventory row (`docs/enterprise-readiness-soc2-first-customer.md`) for `certificate_inventory_store`. |
+| 2a-2a-cap | `inventory.md` for the `certificate_inventory_v1` capability; the SOC 2 risk-register entry for the L7 balancer residual (review-by 2027-01-31; 2a-2a-cap is the PR that carries it) and its data-classification row; and the L7 operator note (no L7 per-call balancer in front of a mixed set; never roll a backend back below 2a-1) in `gateway.md`, `inventory.md` and `upgrading.md`. Drafts of these notes are on the unmerged 2a-2a branch; reuse them, revised for the redesigned gateway enforcement. |
 | 2a-2b | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (the read verbs), `rbac.md` and the SOC 2 access-control inventory (`CertificateInventory`); the SOC 2 data-inventory row for `dn_dict`; `crypto.md` states the pool bound for the per-certificate read (pool under 4 refuses, 4 to 7 gives one slot); `crypto.md` states that every certificate fact is agent-reported and unverified by the server until the revocation statements (2b-2). |
 | 2a-2c | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (`crypto.certificates.tombstones.view`, `crypto.certificates.tombstone_purge`), plus the decision 12 sweep and its audit verb `crypto.certificates.decommission_sweep` (`crypto.md`, `audit-log.md`, `upgrading.md`; the operator text, including the never-erased classes, is on `feat/cert-inventory-tombstones`). The A2/A1 RBAC-administration routed-concern row (`.claude/routed-concerns-access-control.md`), amended for the new `is_rbac_administrator()` call sites, as that row requires. |
 | 2a-2d | `crypto.md` (retention) and the clock-guarded-retention adoption register, with a separate decision for the location grain, whose cutoff compares two stored receipt times (`status_at`, `last_seen`) rather than the pass's own `now()`. |
@@ -1991,8 +1994,8 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
    `certificate_inventory` only when the server's `RegisterResponse` advertises
    `certificate_inventory_v1` (new field `repeated string server_capabilities = 9`); the server
    advertises it only while its certificate store opened. Absent means never sent, so the gate
-   fails closed. The server capability is planned for 2a-2a and the agent gate for 2a-2e; neither
-   is on `dev`, so the closure depends on 2a-1 (PR #6563) and 2a-2a merging, and on 2a-2e for the
+   fails closed. The server capability is planned for 2a-2a-cap and the agent gate for 2a-2e; neither
+   is on `dev`, so the closure depends on 2a-1 (PR #6563) and 2a-2a-cap merging, and on 2a-2e for the
    agent side. D12's "the mixed-version window is not acceptable" stands, with one exception: the owner-accepted L7
    balancer residual below and in ADR R17 (every backend at 2a-1 or later; never roll a backend
    back below 2a-1 while certificate-collecting agents report). Not adopted: (a)
@@ -2004,8 +2007,9 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
    on deploy order, except for the L7 balancer residual below, which does rely on one
    condition: no backend is rolled back below 2a-1 while certificate-collecting agents report.
 
-    **The gateway layer (planned for 2a-2a and implemented on its unmerged branch; owner
-    acceptance 2026-10-27).** The gateway enforces
+    **The gateway layer (owner acceptance 2026-10-27; planned for 2a-2a-cap by owner ruling
+    2026-10-28).** A first version is on the unmerged 2a-2a branch, written for the grpcbox client;
+    2a-2a-cap redesigns it for `dev`'s `yuzu_grpc_client` (gun) client. The gateway enforces
     the capability itself, per upstream connection. It records each connection's
     `server_capabilities` from the latest accepted `ProxyRegister` answer, live or replayed, and
     drops the record when the connection closes. It strips the `certificate_inventory` source from
