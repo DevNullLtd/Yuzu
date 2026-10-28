@@ -202,81 +202,46 @@ TEST_SHARDS = max(1, min(4, os.cpu_count() or 1))
 _YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 
 
-def _scalar_texts(yaml, node, out: list[str]) -> list[str]:
-    """Every scalar's SPELLED text under `node`, depth first. Raises ValueError
-    on a merge key, which PyYAML expands and promtool may not."""
+def _signature(yaml, node):
+    """What promtool's YAML reader can see of `node`: every scalar's tag,
+    quoting style and spelled text, and the shape around them. Raises
+    ValueError on a merge key, which PyYAML expands and promtool may not."""
     if isinstance(node, yaml.ScalarNode):
         if node.tag == _YAML_MERGE_TAG:
             raise ValueError("merge key")
-        out.append(node.value)
-    elif isinstance(node, yaml.SequenceNode):
-        for child in node.value:
-            _scalar_texts(yaml, child, out)
-    elif isinstance(node, yaml.MappingNode):
-        for key, value in node.value:
-            _scalar_texts(yaml, key, out)
-            _scalar_texts(yaml, value, out)
-    return out
+        return ("s", node.tag, node.style, node.value)
+    if isinstance(node, yaml.SequenceNode):
+        return ("q", node.tag, tuple(_signature(yaml, c) for c in node.value))
+    return ("m", node.tag, tuple((_signature(yaml, k), _signature(yaml, v))
+                                 for k, v in node.value))
 
 
-def _reserialises_faithfully(yaml, text: str, doc: dict) -> bool:
-    """True only if dumping `doc` back out spells every scalar exactly as `text`.
+def plan_shards(text: str, max_shards: int) -> list[str] | None:
+    """Split the test file `text` into up to `max_shards` complete test files,
+    or return None when it cannot be split SAFELY (the caller then lets
+    promtool read the original).
 
-    This is the second way a PyYAML round trip is a weaker parser than promtool:
-    YAML 1.1 coercion. promtool reads `on`, `0755`, `1.10`, `2026-01-01T00:00:00Z`
-    into string fields as the text written; PyYAML loads them as bool, int,
-    float and datetime and `safe_dump` spells them `true`, `493`, `1.1` and
-    `2026-01-01 00:00:00+00:00`. Measured with the pinned image: a case whose
-    rule emits the canonical spelling but whose test writes the original passes
-    in a shard and fails unsplit (rc 0 vs rc 1). Comparing the spelled text of
-    the original against the dump catches every such rewrite, whatever its type.
-    Anchors, aliases and merge keys are refused outright: their expansion is
-    PyYAML's, not promtool's.
-    """
-    try:
-        if any(isinstance(e, yaml.NodeEvent) and e.anchor is not None
-               for e in yaml.parse(text)):
-            return False
-        root = yaml.compose(text)
-        if not isinstance(root, yaml.MappingNode) or len(root.value) != len(doc):
-            return False
-        for (key_node, value_node), (key, value) in zip(root.value, doc.items()):
-            if not isinstance(key_node, yaml.ScalarNode):
-                return False
-            if key == "tests":
-                if (not isinstance(value_node, yaml.SequenceNode)
-                        or not isinstance(value, list)
-                        or len(value_node.value) != len(value)):
-                    return False
-                pairs = zip(value_node.value, value)
-                for item_node, case in pairs:
-                    dumped = yaml.compose(yaml.safe_dump(case, sort_keys=False))
-                    if _scalar_texts(yaml, item_node, []) != _scalar_texts(yaml, dumped, []):
-                        return False
-            else:
-                dumped = yaml.compose(yaml.safe_dump({key: value}, sort_keys=False))
-                spelled = _scalar_texts(yaml, key_node, []) + _scalar_texts(yaml, value_node, [])
-                if spelled != _scalar_texts(yaml, dumped, []):
-                    return False
-    except (yaml.YAMLError, ValueError, TypeError, RecursionError):
-        return False
-    return True
+    THE SPLIT HAPPENS ON YAML NODES, NOT ON PYTHON OBJECTS. Three rounds of
+    governance found three ways a `safe_load` + `safe_dump` round trip is a
+    weaker parser than promtool, each measured against the pinned image as a
+    shard run that passes where the unsplit file fails (rc 0 vs rc 1):
+      - a repeated mapping key (promtool: `field interval already set`;
+        PyYAML keeps the last value and drops the earlier assertion);
+      - YAML 1.1 coercion (`on`, `0755`, `1.10`, `2026-01-01T00:00:00Z` load as
+        bool, int, float, datetime and are dumped as `true`, `493`, `1.1`, ...);
+      - a quoted string dumped PLAIN (`'0.1e1'` -> `0.1e1`), which promtool's
+        resolver then reads as a float.
+    Each fix closed one instance and the next round found another, because the
+    round trip itself is lossy. So nothing here is re-dumped: the original
+    nodes keep their tag, quoting style and text, only the `tests` sequence is
+    sliced, and `yaml.serialize` writes them back out.
 
-
-def load_strict_yaml(text: str) -> dict | None:
-    """Parse `text`, or return None when it cannot be split SAFELY.
-
-    None means "let promtool read the original": PyYAML is missing, the text
-    does not parse, a mapping repeats a key, or re-serialising it would not
-    spell every scalar as written (see `_reserialises_faithfully`). The repeated
-    key is why this is not `yaml.safe_load`. promtool unmarshals strictly and
-    REJECTS a repeated key (`field interval already set in type
-    main.testGroup`, rc 1, measured on 3.13.1), but `safe_load` silently keeps
-    the last value, so re-serialising such a file into shards turned a rejected
-    test file into a green run and dropped the earlier assertion. Sharding must
-    never be a weaker parser than the tool it feeds. The cost of a refusal is
-    speed only: an unquoted `on`, `0755` or `1.10` in a test file makes the run
-    unsplit, so quote such values to keep sharding.
+    That is not trusted either. The text of EVERY shard is parsed again and its
+    scalar signature (tag, style, text) must equal the node tree it came from,
+    else None. A repeated key (`Strict`, because PyYAML would silently keep the
+    last), an anchor or alias, a merge key, a duplicate or non-sequence
+    `tests`, an unparseable file, a missing PyYAML and fewer than two cases all
+    give None, so promtool gives the verdict on the file as written.
     """
     try:
         import yaml
@@ -295,11 +260,38 @@ def load_strict_yaml(text: str) -> dict | None:
 
     try:
         doc = yaml.load(text, Loader=Strict)  # noqa: S506 - SafeLoader subclass
+        if any(isinstance(e, yaml.NodeEvent) and e.anchor is not None
+               for e in yaml.parse(text)):
+            return None
+        root = yaml.compose(text)
+        if not isinstance(doc, dict) or not isinstance(root, yaml.MappingNode):
+            return None
+        cases = doc.get("tests")
+        at = [i for i, (k, _) in enumerate(root.value)
+              if isinstance(k, yaml.ScalarNode) and k.value == "tests"]
+        if len(at) != 1 or not isinstance(cases, list):
+            return None
+        index = at[0]
+        key_node, seq = root.value[index]
+        n = min(max_shards, len(cases))
+        if (n <= 1 or not isinstance(seq, yaml.SequenceNode)
+                or len(seq.value) != len(cases)):
+            return None
+        shards = []
+        for k in range(n):
+            part = yaml.SequenceNode(seq.tag, seq.value[k::n], seq.start_mark,
+                                     seq.end_mark, flow_style=seq.flow_style)
+            entries = list(root.value)
+            entries[index] = (key_node, part)
+            shard = yaml.MappingNode(root.tag, entries, root.start_mark,
+                                     root.end_mark, flow_style=root.flow_style)
+            shard_text = yaml.serialize(shard, Dumper=yaml.SafeDumper)
+            if _signature(yaml, yaml.compose(shard_text)) != _signature(yaml, shard):
+                return None
+            shards.append(shard_text)
     except (yaml.YAMLError, ValueError, TypeError, RecursionError):
         return None
-    if not isinstance(doc, dict) or not _reserialises_faithfully(yaml, text, doc):
-        return None
-    return doc
+    return shards
 
 
 def run_test_rules(promtool_argv: list[str], tests_argv: str, tests_host: Path, *,
@@ -308,48 +300,46 @@ def run_test_rules(promtool_argv: list[str], tests_argv: str, tests_host: Path, 
 
     `tests_argv` is the same file as promtool sees it (a /w/... path under
     docker, the host path natively); `tests_host` is where THIS process can read
-    it. Each shard is a copy holding a subset of the cases and every other
-    top-level key verbatim, written BESIDE the original so its `rule_files:`
-    resolves to the same rules file - promtool resolves it relative to the test
-    file. A shard is deleted when the run ends.
+    it. `plan_shards` produces the shard texts; each is written BESIDE the
+    original so its `rule_files:` resolves to the same rules file - promtool
+    resolves it relative to the test file. A shard is deleted when the run ends.
 
     Returns `(rc, combined output)` like `run()`: rc is the first non-zero shard
     rc, and the output is every shard's, so `check_gate_output`'s "no file match
-    pattern" scan covers all of them. It runs the ORIGINAL file unsplit, so
-    promtool gives the verdict, when there is one case or fewer or
-    `load_strict_yaml` returns None (PyYAML missing, unparseable, a repeated
-    key, a scalar a re-dump would respell, an anchor or merge key). Without
-    PyYAML `gate()`'s strict `inspect_test_file` then fails the run.
+    pattern" scan covers all of them. When `plan_shards` returns None it runs
+    the ORIGINAL file unsplit, so promtool gives the verdict, and says so. A
+    refused file costs speed only. Without PyYAML `gate()`'s strict
+    `inspect_test_file` then fails the run.
     """
-    doc = None
+    shard_texts = None
     try:
-        doc = load_strict_yaml(tests_host.read_text(encoding="utf-8"))
+        shard_texts = plan_shards(tests_host.read_text(encoding="utf-8"), TEST_SHARDS)
     except (OSError, ValueError):
         pass
-    cases = doc.get("tests") if doc is not None else None
-    n = min(TEST_SHARDS, len(cases)) if isinstance(cases, list) else 1
-    if n <= 1:
+    if shard_texts is None:
+        print(f"running {Path(tests_argv).name} unsplit (sharding is off, or the file "
+              f"has fewer than two cases, or it cannot be re-emitted unchanged: a "
+              f"repeated key, an anchor, a merge key, unparseable text, no PyYAML)",
+              flush=True)
         return run(promtool_argv + ["test", "rules", tests_argv],
                    timeout=timeout, quiet=quiet)
 
-    import yaml
-    shards = [cases[k::n] for k in range(n)]
-    print(f"sharding {len(cases)} cases into {n} shard files beside {Path(tests_argv).name}",
-          flush=True)
+    print(f"sharding {Path(tests_argv).name} into {len(shard_texts)} parallel "
+          f"promtool runs", flush=True)
     argv_dir = tests_argv[:len(tests_argv) - len(Path(tests_argv).name)]
     paths: list[Path] = []
     try:
-        for sh in shards:
+        for shard_text in shard_texts:
             fd, name = tempfile.mkstemp(dir=tests_host.parent, prefix=".promtool-shard-",
                                         suffix=".test.yml")
             path = Path(name)
             paths.append(path)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                yaml.safe_dump({**doc, "tests": sh}, fh, sort_keys=False)
+                fh.write(shard_text)
             # Same umask hazard as build_canary_tree: uid 65534 must be able to
             # read it through the read-only mount.
             path.chmod(0o644)
-        with ThreadPoolExecutor(max_workers=n) as pool:
+        with ThreadPoolExecutor(max_workers=len(paths)) as pool:
             results = list(pool.map(
                 lambda path: run(promtool_argv + ["test", "rules", argv_dir + path.name],
                                  timeout=timeout, quiet=True),
@@ -976,23 +966,34 @@ def docker_argv(root: Path = REPO_ROOT) -> list[str]:
 # Fake promtool for `sharding_selftest`: argv[-1] is the file it was handed. It
 # first leaves a "<LOG>.<name>.call" marker (before it parses anything, so a run
 # that crashes is still seen to have been invoked), then a "<LOG>.<name>.rec"
-# record of the case names and top-level keys it saw. One file per invocation,
-# never a shared append, so concurrent shards cannot overwrite one another on
-# Windows. It exits 1 if a case is named FAIL* and prints the no-match warning
-# if one is named NOMATCH*.
+# record of what it was handed: each case's `name` scalar as (style, TEXT) read
+# from the YAML nodes, never from loaded Python values, so a quoted string that
+# came back plain or an `on` that came back `true` is visible; the top-level
+# entries; and the file's mode. One file per invocation, never a shared append,
+# so concurrent shards cannot overwrite one another on Windows. It exits 1 if a
+# case is named FAIL* and prints the no-match warning if one is named NOMATCH*.
 _FAKE_PROMTOOL = r"""
 import json, pathlib, sys
 p = pathlib.Path(sys.argv[-1])
 open(LOG + "." + p.name + ".call", "w").close()
 import yaml
-d = yaml.safe_load(p.read_text())
-names = [c["name"] for c in d["tests"]]
+root = yaml.compose(p.read_text())
+def flat(n):
+    if isinstance(n, yaml.ScalarNode): return n.value
+    if isinstance(n, yaml.SequenceNode): return [flat(c) for c in n.value]
+    return {k.value: flat(v) for k, v in n.value}
+tops = {k.value: v for k, v in root.value}
+names = []
+for case in tops["tests"].value:
+    fields = {k.value: v for k, v in case.value}
+    node = fields.get("name")
+    names.append([node.style, node.value] if node is not None else [None, None])
 with open(LOG + "." + p.name + ".rec", "w") as fh:
-    json.dump({"file": p.name, "names": names,
-               "top": {k: v for k, v in d.items() if k != "tests"}}, fh, default=str)
-if any(str(n).startswith("NOMATCH") for n in names):
+    json.dump({"file": p.name, "names": names, "mode": p.stat().st_mode & 0o044,
+               "top": {k: flat(v) for k, v in tops.items() if k != "tests"}}, fh)
+if any(str(n[1]).startswith("NOMATCH") for n in names):
     print("WARNING: no file match pattern /w/gone.yml")
-if any(str(n).startswith("FAIL") for n in names):
+if any(str(n[1]).startswith("FAIL") for n in names):
     print("  FAILED: boom"); sys.exit(1)
 print("  SUCCESS")
 """
@@ -1005,7 +1006,9 @@ def sharding_selftest(failures: list[str]) -> None:
     `gate()` fails that case itself). Forces TEST_SHARDS so a 1-vCPU box still
     exercises the sharded path. Every "runs the original unsplit" row asserts
     the fake was invoked EXACTLY ONCE, on the original file: a run that crashed
-    before invoking anything must not read as a fallback.
+    before invoking anything must not read as a fallback. Every "must shard" row
+    compares what the fake READ OUT OF THE SHARD (style and spelled text), so
+    it is not blind to a round trip that re-types a scalar.
     """
     global TEST_SHARDS, run
     try:
@@ -1045,19 +1048,24 @@ def sharding_selftest(failures: list[str]) -> None:
     def ok(res) -> bool:
         return not isinstance(res, BaseException)
 
-    def sharded(res, recs, calls, f, names) -> bool:
-        seen = [n for r in recs for n in r["names"]]
-        return (ok(res) and sorted(seen) == sorted(names) and len(recs) > 1
-                and f.name not in calls and all(r["names"] for r in recs))
+    def seen(recs) -> list:
+        return sorted((tuple(n) for r in recs for n in r["names"]), key=repr)
+
+    def sharded(res, recs, calls, f, want) -> bool:
+        return (ok(res) and seen(recs) == sorted(want, key=repr) and len(recs) > 1
+                and f.name not in calls and all(r["names"] for r in recs)
+                and all(r["mode"] == 0o044 for r in recs))
 
     names = [f"c{i}" for i in range(10)]
+    plain = [(None, n) for n in names]
     try:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_promtool_shard_") as td:
             tmp = Path(td)
             # Union of the shards == the original, none empty, the original never
-            # run, top-level keys verbatim, nothing left behind.
+            # run, readable by the container user, top-level keys verbatim,
+            # nothing left behind.
             res, recs, calls, left, f = go(tmp, doc(names))
-            if not (sharded(res, recs, calls, f, names) and len(recs) == 3 and res[0] == 0):
+            if not (sharded(res, recs, calls, f, plain) and len(recs) == 3 and res[0] == 0):
                 fail(f"partition wrong: {res!r} recs={recs!r} calls={calls!r}")
             if any(r["top"] != top for r in recs):
                 fail("top-level keys not preserved in every shard")
@@ -1090,13 +1098,19 @@ def sharding_selftest(failures: list[str]) -> None:
                 fail(f"an exception was not propagated: {res!r}")
             if left:
                 fail(f"shard files left after an exception: {left}")
-            # Scalars PyYAML would respell (YAML 1.1 coercion) force the unsplit
-            # run; the same values QUOTED are strings and shard normally.
-            quoted = ["on", "0755", "1.10", "2026-01-01T00:00:00Z", "x", "y"]
-            qtext = "".join(f"- name: {yaml.safe_dump(q).splitlines()[0]}\n" for q in quoted)
-            res, recs, calls, _, f = go(tmp, "rule_files: [r.yml]\ntests:\n" + qtext)
-            if not sharded(res, recs, calls, f, quoted):
-                fail(f"quoted ambiguous scalars were not sharded: {res!r} {calls!r}")
+            # Scalars a PyYAML round trip would re-type are written back EXACTLY
+            # as the file spells them, quoting included: `on` stays plain,
+            # '0.1e1' stays quoted (promtool reads a plain 0.1e1 as a float).
+            spelled = [(None, "on"), (None, "yes"), (None, "0755"), (None, "1.10"),
+                       (None, "2026-01-01T00:00:00Z"), (None, "~"), ("'", "0.1e1"),
+                       ('"', "1e3"), ("'", "y"), ("'", "on"), ("|", "lit\n"), (None, "x")]
+            text = ("rule_files: [r.yml]\ntests:\n- name: on\n- name: yes\n- name: 0755\n"
+                    "- name: 1.10\n- name: 2026-01-01T00:00:00Z\n- name: ~\n"
+                    "- name: '0.1e1'\n- name: \"1e3\"\n- name: 'y'\n- name: 'on'\n"
+                    "- name: |\n    lit\n- name: x\n")
+            res, recs, calls, left, f = go(tmp, text, shards=4)
+            if not sharded(res, recs, calls, f, spelled):
+                fail(f"scalar spelling or style changed in a shard: {seen(recs)!r} / {res!r}")
             # Runs the ORIGINAL file, once, unsplit.
             unsplit = (
                 ("one case", doc(["only"]), 3),
@@ -1109,14 +1123,9 @@ def sharding_selftest(failures: list[str]) -> None:
                 ("tests not a list", "evaluation_interval: 1m\ntests: 5\n", 3),
                 ("no tests key", "evaluation_interval: 1m\n", 3),
                 ("an anchor and alias", "tests:\n- name: &a x\n- name: *a\n- name: z\n", 3),
-                ("a bare bool", "tests:\n- name: on\n- name: y\n- name: z\n", 3),
-                ("a bare octal", "tests:\n- name: 0755\n- name: y\n- name: z\n", 3),
-                ("a bare float", "tests:\n- name: 1.10\n- name: y\n- name: z\n", 3),
-                ("a bare timestamp",
-                 "tests:\n- name: 2026-01-01T00:00:00Z\n- name: y\n- name: z\n", 3),
-                ("a bare null", "tests:\n- name: ~\n- name: y\n- name: z\n", 3),
-                ("an ambiguous top-level scalar",
-                 "evaluation_interval: 1m\nflag: on\ntests:\n- name: y\n- name: z\n", 3),
+                ("an inline merge key", "tests:\n- <<: {name: a}\n- name: y\n- name: z\n", 3),
+                ("a bad date", "tests:\n- name: 2026-13-45\n- name: y\n- name: z\n", 3),
+                ("deep nesting", "tests: " + "[" * 3000 + "]" * 3000 + "\n", 3),
             )
             for label, text, shards in unsplit:
                 res, recs, calls, left, f = go(tmp, text, shards=shards)
@@ -1144,8 +1153,9 @@ def selftest() -> int:
     """No promtool, no docker, no network. It DOES read the repo tree:
     `inspect_test_file()` opens the shipped test file and can exit on a broken
     one, and `sharding_selftest()` writes temp files and launches short Python
-    child processes as a fake promtool. An earlier version of this line claimed "no filesystem", which is the
-    sentence a reviewer would use to conclude this is platform-independent."""
+    child processes as a fake promtool. An earlier version of this line claimed
+    "no filesystem", which is the sentence a reviewer would use to conclude this
+    is platform-independent."""
     failures = []
 
     def check(name: str, got, want):
