@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-27 · LocalSystem (elevated) · leg-hash 5f4b0195a1f5
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-27 · LocalSystem (elevated) · leg-hash c78d09361368
 == action=manufacturer
 manufacturer|Micro Computer (HK) Tech Limited
 [result_status] UNDECLARED / UNKNOWN / 

@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash adfc0598de14
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 3abb2323b0be
 == action=smart
 smart|-|-|unknown|unknown|unsupported|-|-|drive health is not implemented on Linux in this release; no mechanism was bound against real hardware
 [result_status] UNAVAILABLE / PARTIAL / linux:smart

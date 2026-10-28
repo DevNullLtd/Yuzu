@@ -1,9 +1,12 @@
 /**
- * planned_leg.hpp -- the ONE reporter for a leg that is declared but not implemented yet.
+ * planned_leg.hpp -- the shared reporter for new plugins whose legs are declared but not
+ * implemented yet.
  *
  * A plugin action whose descriptor leg is YUZU_SUPPORT_PLANNED must still answer when it
  * is dispatched: never an empty success, never `unknown`. The contract, shared by every
- * plugin so the grammar cannot drift (first written for shares_legs.hpp):
+ * plugin that uses this header so the grammar cannot drift, is the one shares_legs.hpp
+ * report_list uses for an unsupported leg (UNAVAILABLE/UNKNOWN); browser_inventory and
+ * runtimes keep their own reporters, which pair UNAVAILABLE with PARTIAL completeness:
  *
  *   status|<action>|unsupported|<os>:planned      (exactly one row)
  *   result status UNAVAILABLE / completeness UNKNOWN / provenance "<os>:planned"

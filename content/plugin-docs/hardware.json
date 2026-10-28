@@ -8,19 +8,19 @@
       "legs": {
         "linux": {
           "fallback": "not read yet: one unsupported status row, linux:planned",
-          "mechanism": "/sys/class/dmi/id/board_{vendor,name,serial} + SMBIOS type 2 (H.11)",
+          "mechanism": "/sys/class/dmi/id/board_{vendor,name,serial} + SMBIOS type 2",
           "rung": "1",
           "support": "planned"
         },
         "macos": {
           "fallback": "not read yet: one unsupported status row, macos:planned",
-          "mechanism": "no public source on Apple hardware (S-H1); H.13 declares it unsupported",
+          "mechanism": "no public source on Apple hardware; a later change declares it unsupported",
           "rung": "1",
           "support": "planned"
         },
         "windows": {
           "fallback": "not read yet: one unsupported status row, windows:planned",
-          "mechanism": "GetSystemFirmwareTable('RSMB') SMBIOS type 2 via the shared walker (H.1/H.5)",
+          "mechanism": "GetSystemFirmwareTable('RSMB') SMBIOS type 2 via the shared SMBIOS walker",
           "rung": "1",
           "support": "planned"
         }
@@ -60,19 +60,19 @@
       "legs": {
         "linux": {
           "fallback": "not read yet: one unsupported status row, linux:planned",
-          "mechanism": "/sys/class/dmi/id/chassis_{type,serial,asset_tag} + SMBIOS type 3 (H.11)",
+          "mechanism": "/sys/class/dmi/id/chassis_{type,serial,asset_tag} + SMBIOS type 3",
           "rung": "1",
           "support": "planned"
         },
         "macos": {
           "fallback": "not read yet: one unsupported status row, macos:planned",
-          "mechanism": "no public source on Apple hardware (S-H1); H.13 declares it unsupported",
+          "mechanism": "no public source on Apple hardware; a later change declares it unsupported",
           "rung": "1",
           "support": "planned"
         },
         "windows": {
           "fallback": "not read yet: one unsupported status row, windows:planned",
-          "mechanism": "GetSystemFirmwareTable('RSMB') SMBIOS type 3 via the shared walker (H.1/H.5)",
+          "mechanism": "GetSystemFirmwareTable('RSMB') SMBIOS type 3 via the shared SMBIOS walker",
           "rung": "1",
           "support": "planned"
         }
@@ -138,19 +138,19 @@
       "legs": {
         "linux": {
           "fallback": "not read yet: one unsupported status row, linux:planned",
-          "mechanism": "keyed hash of /etc/machine-id (H.11)",
+          "mechanism": "keyed hash of /etc/machine-id",
           "rung": "1",
           "support": "planned"
         },
         "macos": {
           "fallback": "not read yet: one unsupported status row, macos:planned",
-          "mechanism": "no public source beyond the hardware UUID `system` already reports (S-H1); H.13 declares it unsupported",
+          "mechanism": "no public source beyond the hardware UUID `system` already reports; a later change declares it unsupported",
           "rung": "1",
           "support": "planned"
         },
         "windows": {
           "fallback": "not read yet: one unsupported status row, windows:planned",
-          "mechanism": "keyed hash of the registry MachineGuid (H.5)",
+          "mechanism": "keyed hash of the registry MachineGuid",
           "rung": "1",
           "support": "planned"
         }
@@ -268,19 +268,19 @@
       "legs": {
         "linux": {
           "fallback": "not read yet: one unsupported status row, linux:planned",
-          "mechanism": "/proc/swaps (H.11)",
+          "mechanism": "/proc/swaps",
           "rung": "1",
           "support": "planned"
         },
         "macos": {
           "fallback": "not read yet: one unsupported status row, macos:planned",
-          "mechanism": "sysctlbyname(vm.swapusage) (H.13)",
+          "mechanism": "sysctlbyname(vm.swapusage)",
           "rung": "1",
           "support": "planned"
         },
         "windows": {
           "fallback": "not read yet: one unsupported status row, windows:planned",
-          "mechanism": "WMI Win32_PageFileUsage (H.5)",
+          "mechanism": "WMI Win32_PageFileUsage",
           "rung": "1",
           "support": "planned"
         }
@@ -318,7 +318,7 @@
     "**Two legs are partial: `drivers` on macOS, `memory` on Linux and macOS.** `drivers` is not implemented on macOS. No public per-driver/kext enumeration API exists; the descriptor declares it `YUZU_SUPPORT_UNSUPPORTED` (`hardware_plugin.cpp:858`) and the macOS sample shows the house `unknown` row rather than a capture. `memory` is aggregate-only on Linux and macOS. Linux needs `dmidecode` (typically root) for per-DIMM detail and falls back to `/proc/meminfo`'s total when unavailable or unprivileged; the Linux sample (captured as root/euid 0 in a container) still shows the aggregate `total` row, meaning `dmidecode` itself found nothing usable in that environment even with root. macOS has no public per-DIMM API at all and always reports the aggregate.",
     "**A connected-but-empty WMI query now emits an explicit `unknown` row instead of silently emitting nothing** — a deliberate divergence from the plugin's pre-#3404 behavior, made so a consumer can distinguish \"the probe ran and found nothing\" from an unrelated dispatch failure (`hardware_plugin.cpp:190-205`). Do not revert this to match the old silent-gap behavior.",
     "**Windows `disks.interface` reports the WMI-layer bus (`SCSI`), not the physical bus** — both drives in the Windows sample are NVMe/SATA but report `SCSI`, because `Win32_DiskDrive.InterfaceType` reports the storage stack layer WMI actually asks, not the physical connector. `disk_actions.smart` decodes the true bus (`nvme`/`sata`/`usb`) via a lower-level IOCTL and is the more accurate source when that distinction matters.",
-    "**Some planned actions can never have a source.** On macOS there is no public source for `chassis`, `baseboard` or `machine_id` (the hardware UUID from `system` already identifies the machine), yet all four new actions are advertised `planned` on every OS. The per-OS leg PRs (H.5 Windows, H.11 Linux, H.13 macOS) move such legs to a typed `unsupported` with a reason; until then a consumer must read `<os>:planned` as \"not read\", never as \"this host has no value\". The appended `cpu`/`dimm` columns are likewise always `-`: `socket_designation`, `stepping`, `manufacturer`, `part_number` and `serial` ride on every `cpu`/`dimm` row so downstream schemas are final, but no leg fills them yet."
+    "**Some planned actions can never have a source.** On macOS there is no public source for `chassis`, `baseboard` or `machine_id` (the hardware UUID from `system` already identifies the machine), yet all four new actions are advertised `planned` on every OS. The per-OS leg PRs move such legs to a typed `unsupported` with a reason; until then a consumer must read `<os>:planned` as \"not read\", never as \"this host has no value\". The appended `cpu`/`dimm` columns are likewise always `-`: `socket_designation`, `stepping`, `manufacturer`, `part_number` and `serial` ride on every `cpu`/`dimm` row so downstream schemas are final, but no leg fills them yet."
   ],
   "definitions": [
     {
@@ -326,7 +326,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports the baseboard (motherboard) vendor, product and serial number. Not read yet on any OS: every dispatch answers one unsupported status row (windows:planned, linux:planned or macos:planned) until its leg lands (H.5 Windows, H.11 Linux). macOS has no public source and moves to a typed unsupported (H.13). On-demand only; it is not part of any daily sync.",
+      "description": "Reports the baseboard (motherboard) vendor, product and serial number. Not read yet on any OS: every dispatch answers one unsupported status row (windows:planned, linux:planned or macos:planned) until its leg lands. macOS has no public source and will move to a typed unsupported. On-demand only; it is not part of any daily sync.",
       "display_name": "Baseboard",
       "execute_roles": [
         "endpoint-admin",
@@ -366,7 +366,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports the chassis type, serial number and asset tag. Not read yet on any OS: every dispatch answers one unsupported status row (windows:planned, linux:planned or macos:planned) until its leg lands (H.5 Windows, H.11 Linux). macOS has no public source and moves to a typed unsupported (H.13). On-demand only; it is not part of any daily sync.",
+      "description": "Reports the chassis type, serial number and asset tag. Not read yet on any OS: every dispatch answers one unsupported status row (windows:planned, linux:planned or macos:planned) until its leg lands. macOS has no public source and will move to a typed unsupported. On-demand only; it is not part of any daily sync.",
       "display_name": "Chassis",
       "execute_roles": [
         "endpoint-admin",
@@ -426,7 +426,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports a keyed hash of the operating system machine identifier. The raw identifier never leaves the host. Not read yet on any OS: every dispatch answers one unsupported status row (windows:planned, linux:planned or macos:planned) until its leg lands (H.5 Windows, H.11 Linux); macOS has no source beyond the hardware UUID that device.hardware.system reports and moves to a typed unsupported (H.13). On-demand only; it is not part of any daily sync.",
+      "description": "Reports a keyed hash of the operating system machine identifier. The raw identifier never leaves the host. Not read yet on any OS: every dispatch answers one unsupported status row (windows:planned, linux:planned or macos:planned) until its leg lands; macOS has no source beyond the hardware UUID that device.hardware.system reports and will move to a typed unsupported. On-demand only; it is not part of any daily sync.",
       "display_name": "Machine Identifier (Keyed Hash)",
       "execute_roles": [
         "endpoint-admin",
@@ -529,7 +529,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports swap devices and page files with total and used size in MB. Not read yet on any OS: every dispatch answers one unsupported status row (windows:planned, linux:planned or macos:planned) until its leg lands (H.5 Windows, H.11 Linux, H.13 macOS). On-demand only; it is not part of any daily sync.",
+      "description": "Reports swap devices and page files with total and used size in MB. Not read yet on any OS: every dispatch answers one unsupported status row (windows:planned, linux:planned or macos:planned) until its leg lands. On-demand only; it is not part of any daily sync.",
       "display_name": "Swap and Page Files",
       "execute_roles": [
         "endpoint-admin",
@@ -573,7 +573,7 @@
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "5f4b0195a1f5",
+  "leg_hash": "c78d09361368",
   "manifest_version": 1,
   "name": "hardware",
   "outputs": [
@@ -1009,7 +1009,7 @@
           "values": null
         },
         {
-          "description": "DIMM manufacturer. Always \"-\" until a leg reads it (H.5 Windows, H.11 Linux). Values: \"-\".",
+          "description": "DIMM manufacturer. Always \"-\" until a leg reads it. Values: \"-\".",
           "example": "-",
           "name": "manufacturer",
           "platforms": [
@@ -1020,7 +1020,7 @@
           "values": null
         },
         {
-          "description": "DIMM part number. Always \"-\" until a leg reads it (H.5 Windows, H.11 Linux). Values: \"-\".",
+          "description": "DIMM part number. Always \"-\" until a leg reads it. Values: \"-\".",
           "example": "-",
           "name": "part_number",
           "platforms": [
@@ -1031,7 +1031,7 @@
           "values": null
         },
         {
-          "description": "DIMM serial number. Always \"-\" in this release: a per-module serial is audited personal data, so the column is carried for the schema and no leg emits a value yet. Values: \"-\".",
+          "description": "DIMM serial number. Always \"-\" in this release: a per-module serial is personal data, classified with the system serial, and is not read in this release. Values: \"-\".",
           "example": "-",
           "name": "serial",
           "platforms": [
@@ -1124,7 +1124,7 @@
           "values": null
         },
         {
-          "description": "Socket label (e.g. \"CPU 1\"). Always \"-\" until a leg reads it (H.5 Windows, H.11 Linux, H.13 macOS). Values: \"-\".",
+          "description": "Socket label (e.g. \"CPU 1\"). Always \"-\" until a leg reads it. Values: \"-\".",
           "example": "-",
           "name": "socket_designation",
           "platforms": [
@@ -1136,7 +1136,7 @@
           "values": null
         },
         {
-          "description": "CPU stepping. Always \"-\" until a leg reads it (H.5 Windows, H.11 Linux, H.13 macOS). Values: \"-\".",
+          "description": "CPU stepping. Always \"-\" until a leg reads it. Values: \"-\".",
           "example": "-",
           "name": "stepping",
           "platforms": [
@@ -1248,7 +1248,7 @@
       "definition_id": "device.hardware.system"
     }
   ],
-  "outputs_note": "Pipe-delimited rows, one per record via `write_output()`. Scalar actions (`manufacturer`, `model`) emit `key|value`; the rest emit one or more `key|field1|field2|...` rows. A field the underlying probe could not read is the literal string `unknown` rather than an omitted field or an empty row — this applies to every read action's identity/value fields (`manufacturer`, `model`, `bios`, `processors`, `memory`, `disks`, `system`); `processors` rows end in two appended columns (`socket_designation`, `stepping`) and `memory` rows in three (`manufacturer`, `part_number`, `serial`), every one the literal `-` until a leg reads it (a DIMM serial is audited personal data and no leg emits one yet). The four planned actions emit one typed status row (`status|<action>|unsupported|<os>:planned`) and nothing else. `drivers` additionally emits `__truncated__` in the name field when the Windows WMI row cap (512, `agents/shared/wmi_bounded.hpp`) is hit (`hardware_plugin.cpp:746-753`).",
+  "outputs_note": "Pipe-delimited rows, one per record via `write_output()`. Scalar actions (`manufacturer`, `model`) emit `key|value`; the rest emit one or more `key|field1|field2|...` rows. A field the underlying probe could not read is the literal string `unknown` rather than an omitted field or an empty row — this applies to every read action's identity/value fields (`manufacturer`, `model`, `bios`, `processors`, `memory`, `disks`, `system`); `processors` rows end in two appended columns (`socket_designation`, `stepping`) and `memory` rows in three (`manufacturer`, `part_number`, `serial`), every one the literal `-` until a leg reads it (a DIMM serial is personal data, classified with the system serial, and is not read in this release). The four planned actions emit one typed status row (`status|<action>|unsupported|<os>:planned`) and nothing else. `drivers` additionally emits `__truncated__` in the name field when the Windows WMI row cap (512, `agents/shared/wmi_bounded.hpp`) is hit (`hardware_plugin.cpp:746-753`).",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -1256,14 +1256,14 @@
   },
   "privileges": [
     {
-      "grant": "None documented for this plugin (`docs/agent-privilege-model.md:88`)",
+      "grant": "None documented for this plugin (`docs/agent-privilege-model.md:96`)",
       "if_refused": "WMI query returns `error`, action falls back to its `unknown` sentinel row (`wmi_query`, `hardware_plugin.cpp:216-235`)",
       "measured": "2026-10-27, bare-metal, `LocalSystem (elevated)` (sample stamp)",
       "os": "Windows",
       "runs_as": "agent service account (LocalSystem today, #1442)"
     },
     {
-      "grant": "None (`docs/agent-privilege-model.md:88`)",
+      "grant": "None (`docs/agent-privilege-model.md:96`)",
       "if_refused": "native call/subprocess fails, action emits `unknown`/sentinel row",
       "measured": "2026-10-27, bare-metal, euid 501 (unprivileged, sample stamp)",
       "os": "macOS",
@@ -1274,7 +1274,7 @@
       "if_refused": "file read fails, action emits `unknown`",
       "measured": "2026-10-27, vm, euid 0 (sample stamp — root, so the `cap_dac_read_search` gate is not exercised by this capture; WSL VM, no DMI)",
       "os": "Linux",
-      "runs_as": "agent daemon, default, except `system` needs `cap_dac_read_search` (`docs/agent-privilege-model.md:89`)"
+      "runs_as": "agent daemon, default, except `system` needs `cap_dac_read_search` (`docs/agent-privilege-model.md:97`)"
     }
   ],
   "readme": "agents/plugins/hardware/README.md",
@@ -1488,7 +1488,7 @@
       "stamp": {
         "date": "2026-10-27",
         "host_class": "vm",
-        "leg_hash": "5f4b0195a1f5",
+        "leg_hash": "c78d09361368",
         "os": "linux",
         "os_version": "Ubuntu 26.04.1 LTS x86_64",
         "privilege": "euid 0"
@@ -1695,7 +1695,7 @@
       "stamp": {
         "date": "2026-10-27",
         "host_class": "bare-metal",
-        "leg_hash": "5f4b0195a1f5",
+        "leg_hash": "c78d09361368",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -1906,7 +1906,7 @@
       "stamp": {
         "date": "2026-10-27",
         "host_class": "bare-metal",
-        "leg_hash": "5f4b0195a1f5",
+        "leg_hash": "c78d09361368",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "LocalSystem (elevated)"
@@ -2056,7 +2056,7 @@
   },
   "version": "1.0.0",
   "where_the_data_goes": [
-    "**Instruction result, plus a daily-sync consumer for seven of the eight actions.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. The `device_ci` daily-sync source (ADR-0016) additionally invokes `manufacturer`, `model`, `system`, `bios`, `processors`, `memory`, and `disks` in-process via `LocalDispatcher` and folds their output into its canonical CI record (`agents/core/src/sync_source_device_ci.hpp:62-68`), which the server reconstructs field-for-field (`server/core/src/device_ci_ingestion.cpp:94-115`). `drivers` is the only action not part of that record. `content/definitions/hardware.yaml:517-518` documents this for the `system` action specifically.",
+    "**Instruction result, plus a daily-sync consumer for seven of the twelve actions.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. The `device_ci` daily-sync source (ADR-0016) additionally invokes `manufacturer`, `model`, `system`, `bios`, `processors`, `memory`, and `disks` in-process via `LocalDispatcher` and folds their output into its canonical CI record (`agents/core/src/sync_source_device_ci.hpp:62-68`), which the server reconstructs field-for-field (`server/core/src/device_ci_ingestion.cpp:94-115`). `drivers` and the four planned actions (`chassis`, `baseboard`, `swap`, `machine_id`; on-demand only, no gather block) are not part of that record. `content/definitions/hardware.yaml:517-518` documents this for the `system` action specifically.",
     "**Not consumed by** TAR, DEX, or metrics. `manufacturer`/`model`/`bios`/`processors`/`memory`/`disks` gather on a 3600s TTL; `drivers` and `system` on an 86400s TTL (`content/definitions/hardware.yaml`); nothing polls continuously.",
     "**Sensitivity.** `system` rows carry the hardware serial number and SMBIOS/firmware UUID — direct, stable device identifiers; `manufacturer`/`model`/`bios`/`disks` name the specific hardware but not a person; `drivers` rows name installed driver software (`name`/`provider`) — a software inventory by another route. No row carries a username or account name.",
     "**Siblings:** `device_identity` (domain/OU join state, same Wave 3 native-acquisition migration), `disk_actions` (SMART health and volume-to-drive mapping — `hardware.disks` reports the drive inventory, `disk_actions` reports its health and logical mounts).",

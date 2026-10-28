@@ -18,7 +18,7 @@
 
 `volumes` is deliberately not a third volume inventory. `hardware.disks` already lists physical devices and `filesystem_posture.mounts` already lists mounts. This action carries only the join between them, which is what lets a failing-drive alert name the drive letters or mount points it affects.
 
-`partitions` and `topology` read nothing yet: on every OS each answers with exactly one `status|<action>|unsupported|<os>:planned` row from the shared planned-leg reporter (`agents/shared/planned_leg.hpp`), until their leg PRs land (partitions: H.5 Windows, H.12 Linux, H.13 macOS; topology: H.12 Linux LVM/md/multipath, H.13 macOS APFS containers; Windows has no topology source ruled yet).
+`partitions` and `topology` read nothing yet: on every OS each answers with exactly one `status|<action>|unsupported|<os>:planned` row from the shared planned-leg reporter (`agents/shared/planned_leg.hpp`), until their leg PRs land (partitions on every OS; topology on Linux for LVM/md/multipath and on macOS for APFS containers; Windows has no topology source ruled yet).
 
 Every mechanism was bound by a spike against real hardware before the leg was written. Where a mechanism could not be bound (Linux) or is only reachable through a private OS interface (macOS health), the leg says so in its result rather than guessing.
 
@@ -40,9 +40,9 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `partitions` | 🟡 planned · rung 1 · Win32_DiskPartition + Win32_LogicalDisk (H.5) | 🟡 planned · rung 1 · diskutil list + getmntinfo (H.13) | 🟡 planned · rung 1 · /proc/self/mountinfo + /sys/block/*/<part> (H.12) |
+| `partitions` | 🟡 planned · rung 1 · Win32_DiskPartition + Win32_LogicalDisk | 🟡 planned · rung 1 · diskutil list + getmntinfo | 🟡 planned · rung 1 · /proc/self/mountinfo + /sys/block/*/<part> |
 | `smart` | ✅ supported · rung 1 · IOCTL_STORAGE_QUERY_PROPERTY (StorageDeviceProperty + StorageDeviceSeekPenaltyProperty + StorageDeviceProtocolSpecificProperty, NVMe log page 0x02) | 🟡 constrained · rung 1 · IOKit IOBlockStorageDevice device characteristics | ⛔ unsupported |
-| `topology` | 🟡 planned · rung 1 · no source ruled; stays planned | 🟡 planned · rung 1 · diskutil apfs list (H.13) | 🟡 planned · rung 1 · /sys/block/dm-*/dm/{name,uuid}, md*/md, slaves (H.12) |
+| `topology` | 🟡 planned · rung 1 · no source ruled; stays planned | 🟡 planned · rung 1 · diskutil apfs list | 🟡 planned · rung 1 · /sys/block/dm-*/dm/{name,uuid}, md*/md, slaves |
 | `volumes` | 🟡 constrained · rung 1 · FindFirstVolumeW + IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS + GetVolumePathNamesForVolumeNameW | 🟡 constrained · rung 1 · IOKit IOMedia provider walk + getmntinfo_r_np(3) MNT_NOWAIT | ⛔ unsupported |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
@@ -155,7 +155,7 @@ Surfaced as `plugin_result_status` on the command response.
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-07 · interactive user (elevated) · leg-hash adfc0598de14
+**Windows** — captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-07 · interactive user (elevated) · leg-hash 3abb2323b0be
 
 ```
 == action=smart
@@ -172,7 +172,7 @@ volume|//?/Volume{b188886e-39bb-4915-a893-d61a3ca3c707}/|-|PhysicalDrive0|FAT32|
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 · leg-hash adfc0598de14
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 · leg-hash 3abb2323b0be
 
 ```
 == action=smart
@@ -196,7 +196,7 @@ volume|disk2s2|-|disk0|-|5368664064|-
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash adfc0598de14
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 3abb2323b0be
 
 ```
 == action=smart
@@ -226,4 +226,3 @@ volume|-|-|-|-|-|physical-to-logical volume mapping is not implemented on Linux 
 - Tests: `tests/test_disk_actions_definition.py` · `tests/unit/test_disk_actions_local_dispatcher.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->
-

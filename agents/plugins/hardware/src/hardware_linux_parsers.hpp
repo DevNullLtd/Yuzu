@@ -32,8 +32,8 @@ namespace yuzu::hardware::linuxutil {
 
 // Parses `dmidecode -t memory` text into 8-field
 // "dimm|slot|size_mb|type|speed_mhz|manufacturer|part_number|serial" rows (the last three are
-// always "-" until a leg reads them). Returns {} both when dmi is unusable (empty, or no "Size:" field --
-// the same gate do_memory() used inline pre-Wave-3 to decide whether to fall
+// always "-" until a leg reads them). Returns {} both when dmi is unusable (empty, or no
+// "Size:" field -- the same gate do_memory() used inline pre-Wave-3 to decide whether to fall
 // back to /proc/meminfo) and when it parses to zero installed-module rows;
 // callers distinguish those the same way the original code did (an empty
 // result triggers the /proc/meminfo fallback).

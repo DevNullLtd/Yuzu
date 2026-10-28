@@ -238,8 +238,7 @@ metadata:
     Reports the partitions of each physical disk with size, partition type and
     mount points. Not read yet on any OS: every dispatch answers one unsupported
     status row (windows:planned, linux:planned or macos:planned) until its leg
-    lands (H.5 Windows, H.12 Linux, H.13 macOS). On-demand only; it is not part
-    of any daily sync.
+    lands. On-demand only; it is not part of any daily sync.
   tags: [storage, disk, partitions]
 
 spec:
@@ -322,9 +321,9 @@ metadata:
     Reports the logical storage layers above the physical disks: LVM volume
     groups and logical volumes, md arrays, multipath maps and APFS containers.
     Not read yet on any OS: every dispatch answers one unsupported status row
-    (windows:planned, linux:planned or macos:planned) until its leg lands (H.12
-    Linux, H.13 macOS); Windows has no source ruled yet and stays planned. On-demand
-    only; it is not part of any daily sync.
+    (windows:planned, linux:planned or macos:planned) until its leg lands;
+    Windows has no source ruled yet and stays planned. On-demand only; it is not
+    part of any daily sync.
   tags: [storage, disk, topology]
 
 spec:

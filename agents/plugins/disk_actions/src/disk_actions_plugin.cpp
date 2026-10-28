@@ -108,22 +108,22 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "partitions",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_PLANNED, 1, "/proc/self/mountinfo + /sys/block/*/<part> (H.12)",
+        {YUZU_SUPPORT_PLANNED, 1, "/proc/self/mountinfo + /sys/block/*/<part>",
          "not read yet: one unsupported status row, linux:planned"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_PLANNED, 1, "diskutil list + getmntinfo (H.13)",
+        {YUZU_SUPPORT_PLANNED, 1, "diskutil list + getmntinfo",
          "not read yet: one unsupported status row, macos:planned"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "Win32_DiskPartition + Win32_LogicalDisk (H.5)",
+        {YUZU_SUPPORT_PLANNED, 1, "Win32_DiskPartition + Win32_LogicalDisk",
          "not read yet: one unsupported status row, windows:planned"},
     },
     {
         /* .action      = */ "topology",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_PLANNED, 1, "/sys/block/dm-*/dm/{name,uuid}, md*/md, slaves (H.12)",
+        {YUZU_SUPPORT_PLANNED, 1, "/sys/block/dm-*/dm/{name,uuid}, md*/md, slaves",
          "not read yet: one unsupported status row, linux:planned"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_PLANNED, 1, "diskutil apfs list (H.13)",
+        {YUZU_SUPPORT_PLANNED, 1, "diskutil apfs list",
          "not read yet: one unsupported status row, macos:planned"},
         /* .windows_leg = */
         {YUZU_SUPPORT_PLANNED, 1, "no source ruled; stays planned",

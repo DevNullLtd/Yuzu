@@ -228,12 +228,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: socket_designation
         type: string
-        description: 'Socket label (e.g. "CPU 1"). Always "-" until a leg reads it (H.5 Windows, H.11 Linux, H.13 macOS). Values: "-".'
+        description: 'Socket label (e.g. "CPU 1"). Always "-" until a leg reads it. Values: "-".'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: stepping
         type: string
-        description: 'CPU stepping. Always "-" until a leg reads it (H.5 Windows, H.11 Linux, H.13 macOS). Values: "-".'
+        description: 'CPU stepping. Always "-" until a leg reads it. Values: "-".'
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -307,17 +307,17 @@ spec:
         platforms: [windows, linux]
       - name: manufacturer
         type: string
-        description: 'DIMM manufacturer. Always "-" until a leg reads it (H.5 Windows, H.11 Linux). Values: "-".'
+        description: 'DIMM manufacturer. Always "-" until a leg reads it. Values: "-".'
         example: "-"
         platforms: [windows, linux]
       - name: part_number
         type: string
-        description: 'DIMM part number. Always "-" until a leg reads it (H.5 Windows, H.11 Linux). Values: "-".'
+        description: 'DIMM part number. Always "-" until a leg reads it. Values: "-".'
         example: "-"
         platforms: [windows, linux]
       - name: serial
         type: string
-        description: 'DIMM serial number. Always "-" in this release: a per-module serial is audited personal data, so the column is carried for the schema and no leg emits a value yet. Values: "-".'
+        description: 'DIMM serial number. Always "-" in this release: a per-module serial is personal data, classified with the system serial, and is not read in this release. Values: "-".'
         example: "-"
         platforms: [windows, linux]
 
@@ -573,9 +573,9 @@ metadata:
   description: >
     Reports the chassis type, serial number and asset tag. Not read yet on any OS:
     every dispatch answers one unsupported status row (windows:planned,
-    linux:planned or macos:planned) until its leg lands (H.5 Windows, H.11
-    Linux). macOS has no public source and moves to a typed unsupported (H.13).
-    On-demand only; it is not part of any daily sync.
+    linux:planned or macos:planned) until its leg lands.
+    macOS has no public source and will move to a typed unsupported. On-demand
+    only; it is not part of any daily sync.
   tags: [hardware, inventory, chassis]
 
 spec:
@@ -648,9 +648,9 @@ metadata:
   description: >
     Reports the baseboard (motherboard) vendor, product and serial number. Not
     read yet on any OS: every dispatch answers one unsupported status row
-    (windows:planned, linux:planned or macos:planned) until its leg lands (H.5
-    Windows, H.11 Linux). macOS has no public source and moves to a typed
-    unsupported (H.13). On-demand only; it is not part of any daily sync.
+    (windows:planned, linux:planned or macos:planned) until its leg lands.
+    macOS has no public source and will move to a typed unsupported. On-demand
+    only; it is not part of any daily sync.
   tags: [hardware, inventory, baseboard]
 
 spec:
@@ -723,9 +723,8 @@ metadata:
   description: >
     Reports swap devices and page files with total and used size in MB. Not read
     yet on any OS: every dispatch answers one unsupported status row
-    (windows:planned, linux:planned or macos:planned) until its leg lands (H.5
-    Windows, H.11 Linux, H.13 macOS). On-demand only; it is not part of any
-    daily sync.
+    (windows:planned, linux:planned or macos:planned) until its leg lands.
+    On-demand only; it is not part of any daily sync.
   tags: [hardware, inventory, swap]
 
 spec:
@@ -799,9 +798,9 @@ metadata:
     Reports a keyed hash of the operating system machine identifier. The raw
     identifier never leaves the host. Not read yet on any OS: every dispatch
     answers one unsupported status row (windows:planned, linux:planned or
-    macos:planned) until its leg lands (H.5 Windows, H.11 Linux); macOS has no
+    macos:planned) until its leg lands; macOS has no
     source beyond the hardware UUID that device.hardware.system reports and
-    moves to a typed unsupported (H.13). On-demand only; it is not part of any
+    will move to a typed unsupported. On-demand only; it is not part of any
     daily sync.
   tags: [hardware, inventory, machine-id]
 

@@ -8,19 +8,19 @@
       "legs": {
         "linux": {
           "fallback": "not read yet: one unsupported status row, linux:planned",
-          "mechanism": "/proc/self/mountinfo + /sys/block/*/<part> (H.12)",
+          "mechanism": "/proc/self/mountinfo + /sys/block/*/<part>",
           "rung": "1",
           "support": "planned"
         },
         "macos": {
           "fallback": "not read yet: one unsupported status row, macos:planned",
-          "mechanism": "diskutil list + getmntinfo (H.13)",
+          "mechanism": "diskutil list + getmntinfo",
           "rung": "1",
           "support": "planned"
         },
         "windows": {
           "fallback": "not read yet: one unsupported status row, windows:planned",
-          "mechanism": "Win32_DiskPartition + Win32_LogicalDisk (H.5)",
+          "mechanism": "Win32_DiskPartition + Win32_LogicalDisk",
           "rung": "1",
           "support": "planned"
         }
@@ -60,13 +60,13 @@
       "legs": {
         "linux": {
           "fallback": "not read yet: one unsupported status row, linux:planned",
-          "mechanism": "/sys/block/dm-*/dm/{name,uuid}, md*/md, slaves (H.12)",
+          "mechanism": "/sys/block/dm-*/dm/{name,uuid}, md*/md, slaves",
           "rung": "1",
           "support": "planned"
         },
         "macos": {
           "fallback": "not read yet: one unsupported status row, macos:planned",
-          "mechanism": "diskutil apfs list (H.13)",
+          "mechanism": "diskutil apfs list",
           "rung": "1",
           "support": "planned"
         },
@@ -118,7 +118,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports the partitions of each physical disk with size, partition type and mount points. Not read yet on any OS: every dispatch answers one unsupported status row (windows:planned, linux:planned or macos:planned) until its leg lands (H.5 Windows, H.12 Linux, H.13 macOS). On-demand only; it is not part of any daily sync.",
+      "description": "Reports the partitions of each physical disk with size, partition type and mount points. Not read yet on any OS: every dispatch answers one unsupported status row (windows:planned, linux:planned or macos:planned) until its leg lands. On-demand only; it is not part of any daily sync.",
       "display_name": "Partitions",
       "execute_roles": [
         "endpoint-admin",
@@ -155,7 +155,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports the logical storage layers above the physical disks: LVM volume groups and logical volumes, md arrays, multipath maps and APFS containers. Not read yet on any OS: every dispatch answers one unsupported status row (windows:planned, linux:planned or macos:planned) until its leg lands (H.12 Linux, H.13 macOS); Windows has no source ruled yet and stays planned. On-demand only; it is not part of any daily sync.",
+      "description": "Reports the logical storage layers above the physical disks: LVM volume groups and logical volumes, md arrays, multipath maps and APFS containers. Not read yet on any OS: every dispatch answers one unsupported status row (windows:planned, linux:planned or macos:planned) until its leg lands; Windows has no source ruled yet and stays planned. On-demand only; it is not part of any daily sync.",
       "display_name": "Storage Topology",
       "execute_roles": [
         "endpoint-admin",
@@ -189,14 +189,14 @@
     }
   ],
   "description": "Reports physical drive health and the mapping between drives and the logical volumes they back",
-  "how_it_works": "`smart` and `volumes` are reads. `smart` enumerates the physical drives the OS knows about and asks each for identity (model, transport, SSD or HDD). On Windows, NVMe drives additionally answer with SMART log page 0x02, which the plugin decodes into a wear percentage, available spare and a health verdict. `volumes` enumerates logical volumes and resolves two things for each: the physical drive that backs it and the mount points it serves.\n\n`volumes` is deliberately not a third volume inventory. `hardware.disks` already lists physical devices and `filesystem_posture.mounts` already lists mounts. This action carries only the join between them, which is what lets a failing-drive alert name the drive letters or mount points it affects.\n\n`partitions` and `topology` read nothing yet: on every OS each answers with exactly one `status|<action>|unsupported|<os>:planned` row from the shared planned-leg reporter (`agents/shared/planned_leg.hpp`), until their leg PRs land (partitions: H.5 Windows, H.12 Linux, H.13 macOS; topology: H.12 Linux LVM/md/multipath, H.13 macOS APFS containers; Windows has no topology source ruled yet).\n\nEvery mechanism was bound by a spike against real hardware before the leg was written. Where a mechanism could not be bound (Linux) or is only reachable through a private OS interface (macOS health), the leg says so in its result rather than guessing.",
+  "how_it_works": "`smart` and `volumes` are reads. `smart` enumerates the physical drives the OS knows about and asks each for identity (model, transport, SSD or HDD). On Windows, NVMe drives additionally answer with SMART log page 0x02, which the plugin decodes into a wear percentage, available spare and a health verdict. `volumes` enumerates logical volumes and resolves two things for each: the physical drive that backs it and the mount points it serves.\n\n`volumes` is deliberately not a third volume inventory. `hardware.disks` already lists physical devices and `filesystem_posture.mounts` already lists mounts. This action carries only the join between them, which is what lets a failing-drive alert name the drive letters or mount points it affects.\n\n`partitions` and `topology` read nothing yet: on every OS each answers with exactly one `status|<action>|unsupported|<os>:planned` row from the shared planned-leg reporter (`agents/shared/planned_leg.hpp`), until their leg PRs land (partitions on every OS; topology on Linux for LVM/md/multipath and on macOS for APFS containers; Windows has no topology source ruled yet).\n\nEvery mechanism was bound by a spike against real hardware before the leg was written. Where a mechanism could not be bound (Linux) or is only reachable through a private OS interface (macOS health), the leg says so in its result rather than guessing.",
   "inputs": [],
   "kind": {
     "collector": true,
     "gathered": false,
     "mutating": false
   },
-  "leg_hash": "adfc0598de14",
+  "leg_hash": "3abb2323b0be",
   "manifest_version": 1,
   "name": "disk_actions",
   "outputs": [
@@ -646,7 +646,7 @@
       "stamp": {
         "date": "2026-09-06",
         "host_class": "container",
-        "leg_hash": "adfc0598de14",
+        "leg_hash": "3abb2323b0be",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -694,7 +694,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "adfc0598de14",
+        "leg_hash": "3abb2323b0be",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -743,7 +743,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "adfc0598de14",
+        "leg_hash": "3abb2323b0be",
         "os": "windows",
         "os_version": "Windows 11 Pro 10.0.26200",
         "privilege": "interactive user (elevated)"

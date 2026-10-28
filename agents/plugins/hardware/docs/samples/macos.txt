@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-27 · euid 501 · leg-hash 5f4b0195a1f5
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-27 · euid 501 · leg-hash c78d09361368
 == action=manufacturer
 manufacturer|Apple Inc.
 [result_status] UNDECLARED / UNKNOWN / 

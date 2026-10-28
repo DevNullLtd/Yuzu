@@ -1,4 +1,4 @@
-captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-27 · euid 0 · leg-hash 5f4b0195a1f5
+captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-27 · euid 0 · leg-hash c78d09361368
 == action=manufacturer
 manufacturer|unknown
 [result_status] UNDECLARED / UNKNOWN / 

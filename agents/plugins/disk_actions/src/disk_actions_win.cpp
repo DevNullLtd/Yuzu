@@ -868,7 +868,8 @@ int emit_volumes(yuzu::CommandContext& ctx) {
 }
 
 // PLANNED (partitions/topology): one `status|<action>|unsupported|windows:planned` row until
-// H.5 (partitions; topology stays planned until a Windows source is ruled) lands. The shared reporter owns the grammar (agents/shared/planned_leg.hpp).
+// H.5 (partitions; topology stays planned until a Windows source is ruled) lands. The shared
+// reporter owns the grammar (agents/shared/planned_leg.hpp).
 int emit_partitions(yuzu::CommandContext& ctx) {
     return yuzu::shared::report_planned(ctx, "partitions");
 }

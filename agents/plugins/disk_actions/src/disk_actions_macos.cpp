@@ -472,7 +472,8 @@ int emit_volumes(yuzu::CommandContext& ctx) {
 }
 
 // PLANNED (partitions/topology): one `status|<action>|unsupported|macos:planned` row until
-// H.13 (partitions, APFS topology) lands. The shared reporter owns the grammar (agents/shared/planned_leg.hpp).
+// H.13 (partitions, APFS topology) lands. The shared reporter owns the grammar
+// (agents/shared/planned_leg.hpp).
 int emit_partitions(yuzu::CommandContext& ctx) {
     return yuzu::shared::report_planned(ctx, "partitions");
 }

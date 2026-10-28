@@ -876,56 +876,56 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .action      = */ "chassis",
         /* .linux_leg   = */
         {YUZU_SUPPORT_PLANNED, 1,
-         "/sys/class/dmi/id/chassis_{type,serial,asset_tag} + SMBIOS type 3 (H.11)",
+         "/sys/class/dmi/id/chassis_{type,serial,asset_tag} + SMBIOS type 3",
          "not read yet: one unsupported status row, linux:planned"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_PLANNED, 1,
-         "no public source on Apple hardware (S-H1); H.13 declares it unsupported",
+         "no public source on Apple hardware; a later change declares it unsupported",
          "not read yet: one unsupported status row, macos:planned"},
         /* .windows_leg = */
         {YUZU_SUPPORT_PLANNED, 1,
-         "GetSystemFirmwareTable('RSMB') SMBIOS type 3 via the shared walker (H.1/H.5)",
+         "GetSystemFirmwareTable('RSMB') SMBIOS type 3 via the shared SMBIOS walker",
          "not read yet: one unsupported status row, windows:planned"},
     },
     {
         /* .action      = */ "baseboard",
         /* .linux_leg   = */
         {YUZU_SUPPORT_PLANNED, 1,
-         "/sys/class/dmi/id/board_{vendor,name,serial} + SMBIOS type 2 (H.11)",
+         "/sys/class/dmi/id/board_{vendor,name,serial} + SMBIOS type 2",
          "not read yet: one unsupported status row, linux:planned"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_PLANNED, 1,
-         "no public source on Apple hardware (S-H1); H.13 declares it unsupported",
+         "no public source on Apple hardware; a later change declares it unsupported",
          "not read yet: one unsupported status row, macos:planned"},
         /* .windows_leg = */
         {YUZU_SUPPORT_PLANNED, 1,
-         "GetSystemFirmwareTable('RSMB') SMBIOS type 2 via the shared walker (H.1/H.5)",
+         "GetSystemFirmwareTable('RSMB') SMBIOS type 2 via the shared SMBIOS walker",
          "not read yet: one unsupported status row, windows:planned"},
     },
     {
         /* .action      = */ "swap",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_PLANNED, 1, "/proc/swaps (H.11)",
+        {YUZU_SUPPORT_PLANNED, 1, "/proc/swaps",
          "not read yet: one unsupported status row, linux:planned"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_PLANNED, 1, "sysctlbyname(vm.swapusage) (H.13)",
+        {YUZU_SUPPORT_PLANNED, 1, "sysctlbyname(vm.swapusage)",
          "not read yet: one unsupported status row, macos:planned"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "WMI Win32_PageFileUsage (H.5)",
+        {YUZU_SUPPORT_PLANNED, 1, "WMI Win32_PageFileUsage",
          "not read yet: one unsupported status row, windows:planned"},
     },
     {
         /* .action      = */ "machine_id",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_PLANNED, 1, "keyed hash of /etc/machine-id (H.11)",
+        {YUZU_SUPPORT_PLANNED, 1, "keyed hash of /etc/machine-id",
          "not read yet: one unsupported status row, linux:planned"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_PLANNED, 1,
-         "no public source beyond the hardware UUID `system` already reports (S-H1); H.13 "
-         "declares it unsupported",
+         "no public source beyond the hardware UUID `system` already reports; a later "
+         "change declares it unsupported",
          "not read yet: one unsupported status row, macos:planned"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "keyed hash of the registry MachineGuid (H.5)",
+        {YUZU_SUPPORT_PLANNED, 1, "keyed hash of the registry MachineGuid",
          "not read yet: one unsupported status row, windows:planned"},
     },
 };

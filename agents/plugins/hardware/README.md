@@ -33,17 +33,17 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `baseboard` | 🟡 planned · rung 1 · GetSystemFirmwareTable('RSMB') SMBIOS type 2 via the shared walker (H.1/H.5) | 🟡 planned · rung 1 · no public source on Apple hardware (S-H1); H.13 declares it unsupported | 🟡 planned · rung 1 · /sys/class/dmi/id/board_{vendor,name,serial} + SMBIOS type 2 (H.11) |
+| `baseboard` | 🟡 planned · rung 1 · GetSystemFirmwareTable('RSMB') SMBIOS type 2 via the shared SMBIOS walker | 🟡 planned · rung 1 · no public source on Apple hardware; a later change declares it unsupported | 🟡 planned · rung 1 · /sys/class/dmi/id/board_{vendor,name,serial} + SMBIOS type 2 |
 | `bios` | ✅ supported · rung 1 · WMI Win32_BIOS | ✅ supported · rung 2 · run_bounded_subprocess(system_profiler SPHardwareDataType) + native parser (hardware_macos_bios.hpp) | ✅ supported · rung 1 · /sys/class/dmi/id/bios_vendor + bios_version + bios_date |
-| `chassis` | 🟡 planned · rung 1 · GetSystemFirmwareTable('RSMB') SMBIOS type 3 via the shared walker (H.1/H.5) | 🟡 planned · rung 1 · no public source on Apple hardware (S-H1); H.13 declares it unsupported | 🟡 planned · rung 1 · /sys/class/dmi/id/chassis_{type,serial,asset_tag} + SMBIOS type 3 (H.11) |
+| `chassis` | 🟡 planned · rung 1 · GetSystemFirmwareTable('RSMB') SMBIOS type 3 via the shared SMBIOS walker | 🟡 planned · rung 1 · no public source on Apple hardware; a later change declares it unsupported | 🟡 planned · rung 1 · /sys/class/dmi/id/chassis_{type,serial,asset_tag} + SMBIOS type 3 |
 | `disks` | ✅ supported · rung 1 · WMI Win32_DiskDrive | ✅ supported · rung 2 · run_bounded_subprocess(system_profiler SPStorageDataType SPNVMeDataType SPSerialATADataType -json) + native parser (hardware_disks_macos.hpp) | ✅ supported · rung 1 · /sys/block/*/{size,device/model} native walk |
 | `drivers` | ✅ supported · rung 1 · WMI Win32_PnPSignedDriver | ⛔ unsupported | ✅ supported · rung 1 · /proc/modules |
-| `machine_id` | 🟡 planned · rung 1 · keyed hash of the registry MachineGuid (H.5) | 🟡 planned · rung 1 · no public source beyond the hardware UUID `system` already reports (S-H1); H.13 declares it unsupported | 🟡 planned · rung 1 · keyed hash of /etc/machine-id (H.11) |
+| `machine_id` | 🟡 planned · rung 1 · keyed hash of the registry MachineGuid | 🟡 planned · rung 1 · no public source beyond the hardware UUID `system` already reports; a later change declares it unsupported | 🟡 planned · rung 1 · keyed hash of /etc/machine-id |
 | `manufacturer` | ✅ supported · rung 1 · WMI Win32_ComputerSystem.Manufacturer | ✅ supported · rung 1 · sysctlbyname(hw.manufacturer) | ✅ supported · rung 1 · /sys/class/dmi/id/sys_vendor |
 | `memory` | ✅ supported · rung 1 · WMI Win32_PhysicalMemory | 🟡 constrained · rung 1 · sysctlbyname(hw.memsize) | 🟡 constrained · rung 2 · run_bounded_subprocess(dmidecode -t memory) |
 | `model` | ✅ supported · rung 1 · WMI Win32_ComputerSystem.Model | ✅ supported · rung 1 · sysctlbyname(hw.model) | ✅ supported · rung 1 · /sys/class/dmi/id/product_name |
 | `processors` | ✅ supported · rung 1 · WMI Win32_Processor | ✅ supported · rung 1 · sysctlbyname(machdep.cpu.*, hw.*cpu*) | ✅ supported · rung 1 · /proc/cpuinfo |
-| `swap` | 🟡 planned · rung 1 · WMI Win32_PageFileUsage (H.5) | 🟡 planned · rung 1 · sysctlbyname(vm.swapusage) (H.13) | 🟡 planned · rung 1 · /proc/swaps (H.11) |
+| `swap` | 🟡 planned · rung 1 · WMI Win32_PageFileUsage | 🟡 planned · rung 1 · sysctlbyname(vm.swapusage) | 🟡 planned · rung 1 · /proc/swaps |
 | `system` | ✅ supported · rung 1 · WMI Win32_BIOS.SerialNumber + Win32_ComputerSystemProduct.UUID | ✅ supported · rung 1 · IOServiceGetMatchingService(IOPlatformExpertDevice) + IORegistryEntryCreateCFProperty(kIOPlatformSerialNumberKey/kIOPlatformUUIDKey) | ✅ supported · rung 1 · /sys/class/dmi/id/product_serial + product_uuid |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
@@ -68,9 +68,9 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | None documented for this plugin (`docs/agent-privilege-model.md:88`) | 2026-10-27, bare-metal, `LocalSystem (elevated)` (sample stamp) | WMI query returns `error`, action falls back to its `unknown` sentinel row (`wmi_query`, `hardware_plugin.cpp:216-235`) |
-| macOS | agent daemon, default (no extra entitlement) | None (`docs/agent-privilege-model.md:88`) | 2026-10-27, bare-metal, euid 501 (unprivileged, sample stamp) | native call/subprocess fails, action emits `unknown`/sentinel row |
-| Linux | agent daemon, default, except `system` needs `cap_dac_read_search` (`docs/agent-privilege-model.md:89`) | `system` reads `/sys/class/dmi/id/product_serial` + `product_uuid` (mode `0400`); the agent binary carries `cap_dac_read_search+eip` by default install (`hardware_plugin.cpp:365-371`). Without it, or with `--no-setcap`, both fields read back `unknown`. `memory`'s `dmidecode` branch typically needs root and fails EPERM unprivileged, silently falling through to the `/proc/meminfo` total (`hardware_plugin.cpp:506-509`). | 2026-10-27, vm, euid 0 (sample stamp — root, so the `cap_dac_read_search` gate is not exercised by this capture; WSL VM, no DMI) | file read fails, action emits `unknown` |
+| Windows | agent service account (LocalSystem today, #1442) | None documented for this plugin (`docs/agent-privilege-model.md:96`) | 2026-10-27, bare-metal, `LocalSystem (elevated)` (sample stamp) | WMI query returns `error`, action falls back to its `unknown` sentinel row (`wmi_query`, `hardware_plugin.cpp:216-235`) |
+| macOS | agent daemon, default (no extra entitlement) | None (`docs/agent-privilege-model.md:96`) | 2026-10-27, bare-metal, euid 501 (unprivileged, sample stamp) | native call/subprocess fails, action emits `unknown`/sentinel row |
+| Linux | agent daemon, default, except `system` needs `cap_dac_read_search` (`docs/agent-privilege-model.md:97`) | `system` reads `/sys/class/dmi/id/product_serial` + `product_uuid` (mode `0400`); the agent binary carries `cap_dac_read_search+eip` by default install (`hardware_plugin.cpp:365-371`). Without it, or with `--no-setcap`, both fields read back `unknown`. `memory`'s `dmidecode` branch typically needs root and fails EPERM unprivileged, silently falling through to the `/proc/meminfo` total (`hardware_plugin.cpp:506-509`). | 2026-10-27, vm, euid 0 (sample stamp — root, so the `cap_dac_read_search` gate is not exercised by this capture; WSL VM, no DMI) | file read fails, action emits `unknown` |
 
 The four planned actions (`chassis`, `baseboard`, `swap`, `machine_id`) read nothing on any OS and need no grant.
 
@@ -86,7 +86,7 @@ No action takes parameters.
 
 ### Outputs
 
-Pipe-delimited rows, one per record via `write_output()`. Scalar actions (`manufacturer`, `model`) emit `key|value`; the rest emit one or more `key|field1|field2|...` rows. A field the underlying probe could not read is the literal string `unknown` rather than an omitted field or an empty row — this applies to every read action's identity/value fields (`manufacturer`, `model`, `bios`, `processors`, `memory`, `disks`, `system`); `processors` rows end in two appended columns (`socket_designation`, `stepping`) and `memory` rows in three (`manufacturer`, `part_number`, `serial`), every one the literal `-` until a leg reads it (a DIMM serial is audited personal data and no leg emits one yet). The four planned actions emit one typed status row (`status|<action>|unsupported|<os>:planned`) and nothing else. `drivers` additionally emits `__truncated__` in the name field when the Windows WMI row cap (512, `agents/shared/wmi_bounded.hpp`) is hit (`hardware_plugin.cpp:746-753`).
+Pipe-delimited rows, one per record via `write_output()`. Scalar actions (`manufacturer`, `model`) emit `key|value`; the rest emit one or more `key|field1|field2|...` rows. A field the underlying probe could not read is the literal string `unknown` rather than an omitted field or an empty row — this applies to every read action's identity/value fields (`manufacturer`, `model`, `bios`, `processors`, `memory`, `disks`, `system`); `processors` rows end in two appended columns (`socket_designation`, `stepping`) and `memory` rows in three (`manufacturer`, `part_number`, `serial`), every one the literal `-` until a leg reads it (a DIMM serial is personal data, classified with the system serial, and is not read in this release). The four planned actions emit one typed status row (`status|<action>|unsupported|<os>:planned`) and nothing else. `drivers` additionally emits `__truncated__` in the name field when the Windows WMI row cap (512, `agents/shared/wmi_bounded.hpp`) is hit (`hardware_plugin.cpp:746-753`).
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`device.hardware.baseboard` — `row_kind|vendor|product|serial|source`**
@@ -161,9 +161,9 @@ Pipe-delimited rows, one per record via `write_output()`. Scalar actions (`manuf
 | `size_mb` | int64 | - | Windows, Linux, macOS | `8192` | Module capacity in MB, or the aggregate total in MB on an aggregate-only row. Values: integer. |
 | `type` | string | - | Windows, Linux | `DDR4` | Memory type (DDR2/DDR3/DDR4/DDR5); "unknown" on every aggregate-only row (macOS, and the Linux /proc/meminfo fallback carry no type). Values: DDR2, DDR3, DDR4, DDR5, or the sentinel "unknown". |
 | `speed_mhz` | int32 | - | Windows, Linux | `3600` | Module speed in MHz; 0 on every aggregate-only row. Values: integer, or 0 on an aggregate-only row. |
-| `manufacturer` | string | - | Windows, Linux | `-` | DIMM manufacturer. Always "-" until a leg reads it (H.5 Windows, H.11 Linux). Values: "-". |
-| `part_number` | string | - | Windows, Linux | `-` | DIMM part number. Always "-" until a leg reads it (H.5 Windows, H.11 Linux). Values: "-". |
-| `serial` | string | - | Windows, Linux | `-` | DIMM serial number. Always "-" in this release: a per-module serial is audited personal data, so the column is carried for the schema and no leg emits a value yet. Values: "-". |
+| `manufacturer` | string | - | Windows, Linux | `-` | DIMM manufacturer. Always "-" until a leg reads it. Values: "-". |
+| `part_number` | string | - | Windows, Linux | `-` | DIMM part number. Always "-" until a leg reads it. Values: "-". |
+| `serial` | string | - | Windows, Linux | `-` | DIMM serial number. Always "-" in this release: a per-module serial is personal data, classified with the system serial, and is not read in this release. Values: "-". |
 
 **`device.hardware.model` — `model`**
 
@@ -180,8 +180,8 @@ Pipe-delimited rows, one per record via `write_output()`. Scalar actions (`manuf
 | `cores` | int32 | - | Windows, Linux, macOS | `12` | Physical core count for this socket. Values: integer. |
 | `threads` | int32 | - | Windows, Linux, macOS | `24` | Logical thread count for this socket. Values: integer. |
 | `clock_mhz` | int32 | - | Windows, Linux, macOS | `4200` | Reported/maximum clock speed in MHz; 0 when the OS exposes no frequency (e.g. Apple Silicon has no hw.cpufrequency). Values: integer, or 0 when unreadable. |
-| `socket_designation` | string | - | Windows, Linux, macOS | `-` | Socket label (e.g. "CPU 1"). Always "-" until a leg reads it (H.5 Windows, H.11 Linux, H.13 macOS). Values: "-". |
-| `stepping` | string | - | Windows, Linux, macOS | `-` | CPU stepping. Always "-" until a leg reads it (H.5 Windows, H.11 Linux, H.13 macOS). Values: "-". |
+| `socket_designation` | string | - | Windows, Linux, macOS | `-` | Socket label (e.g. "CPU 1"). Always "-" until a leg reads it. Values: "-". |
+| `stepping` | string | - | Windows, Linux, macOS | `-` | CPU stepping. Always "-" until a leg reads it. Values: "-". |
 
 **`device.hardware.swap` — `row_kind|device|total_mb|used_mb|source`**
 
@@ -207,7 +207,7 @@ Only the four planned actions set a typed result status: `UNAVAILABLE` / `UNKNOW
 
 ### Where the data goes
 
-- **Instruction result, plus a daily-sync consumer for seven of the eight actions.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. The `device_ci` daily-sync source (ADR-0016) additionally invokes `manufacturer`, `model`, `system`, `bios`, `processors`, `memory`, and `disks` in-process via `LocalDispatcher` and folds their output into its canonical CI record (`agents/core/src/sync_source_device_ci.hpp:62-68`), which the server reconstructs field-for-field (`server/core/src/device_ci_ingestion.cpp:94-115`). `drivers` is the only action not part of that record. `content/definitions/hardware.yaml:517-518` documents this for the `system` action specifically.
+- **Instruction result, plus a daily-sync consumer for seven of the twelve actions.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. The `device_ci` daily-sync source (ADR-0016) additionally invokes `manufacturer`, `model`, `system`, `bios`, `processors`, `memory`, and `disks` in-process via `LocalDispatcher` and folds their output into its canonical CI record (`agents/core/src/sync_source_device_ci.hpp:62-68`), which the server reconstructs field-for-field (`server/core/src/device_ci_ingestion.cpp:94-115`). `drivers` and the four planned actions (`chassis`, `baseboard`, `swap`, `machine_id`; on-demand only, no gather block) are not part of that record. `content/definitions/hardware.yaml:517-518` documents this for the `system` action specifically.
 - **Not consumed by** TAR, DEX, or metrics. `manufacturer`/`model`/`bios`/`processors`/`memory`/`disks` gather on a 3600s TTL; `drivers` and `system` on an 86400s TTL (`content/definitions/hardware.yaml`); nothing polls continuously.
 - **Sensitivity.** `system` rows carry the hardware serial number and SMBIOS/firmware UUID — direct, stable device identifiers; `manufacturer`/`model`/`bios`/`disks` name the specific hardware but not a person; `drivers` rows name installed driver software (`name`/`provider`) — a software inventory by another route. No row carries a username or account name.
 - **Siblings:** `device_identity` (domain/OU join state, same Wave 3 native-acquisition migration), `disk_actions` (SMART health and volume-to-drive mapping — `hardware.disks` reports the drive inventory, `disk_actions` reports its health and logical mounts).
@@ -216,7 +216,7 @@ Only the four planned actions set a typed result status: `UNAVAILABLE` / `UNKNOW
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-27 · LocalSystem (elevated) · leg-hash 5f4b0195a1f5
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-27 · LocalSystem (elevated) · leg-hash c78d09361368
 
 ```
 == action=manufacturer
@@ -283,7 +283,7 @@ status|machine_id|unsupported|windows:planned
 [result_status] UNAVAILABLE / UNKNOWN / windows:planned
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-27 · euid 501 · leg-hash 5f4b0195a1f5
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-27 · euid 501 · leg-hash c78d09361368
 
 ```
 == action=manufacturer
@@ -338,7 +338,7 @@ status|machine_id|unsupported|macos:planned
 [result_status] UNAVAILABLE / UNKNOWN / macos:planned
 ```
 
-**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-27 · euid 0 · leg-hash 5f4b0195a1f5
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-27 · euid 0 · leg-hash c78d09361368
 
 ```
 == action=manufacturer
@@ -415,7 +415,7 @@ status|machine_id|unsupported|linux:planned
 2. **Two legs are partial: `drivers` on macOS, `memory` on Linux and macOS.** `drivers` is not implemented on macOS. No public per-driver/kext enumeration API exists; the descriptor declares it `YUZU_SUPPORT_UNSUPPORTED` (`hardware_plugin.cpp:858`) and the macOS sample shows the house `unknown` row rather than a capture. `memory` is aggregate-only on Linux and macOS. Linux needs `dmidecode` (typically root) for per-DIMM detail and falls back to `/proc/meminfo`'s total when unavailable or unprivileged; the Linux sample (captured as root/euid 0 in a container) still shows the aggregate `total` row, meaning `dmidecode` itself found nothing usable in that environment even with root. macOS has no public per-DIMM API at all and always reports the aggregate.
 3. **A connected-but-empty WMI query now emits an explicit `unknown` row instead of silently emitting nothing** — a deliberate divergence from the plugin's pre-#3404 behavior, made so a consumer can distinguish "the probe ran and found nothing" from an unrelated dispatch failure (`hardware_plugin.cpp:190-205`). Do not revert this to match the old silent-gap behavior.
 4. **Windows `disks.interface` reports the WMI-layer bus (`SCSI`), not the physical bus** — both drives in the Windows sample are NVMe/SATA but report `SCSI`, because `Win32_DiskDrive.InterfaceType` reports the storage stack layer WMI actually asks, not the physical connector. `disk_actions.smart` decodes the true bus (`nvme`/`sata`/`usb`) via a lower-level IOCTL and is the more accurate source when that distinction matters.
-5. **Some planned actions can never have a source.** On macOS there is no public source for `chassis`, `baseboard` or `machine_id` (the hardware UUID from `system` already identifies the machine), yet all four new actions are advertised `planned` on every OS. The per-OS leg PRs (H.5 Windows, H.11 Linux, H.13 macOS) move such legs to a typed `unsupported` with a reason; until then a consumer must read `<os>:planned` as "not read", never as "this host has no value". The appended `cpu`/`dimm` columns are likewise always `-`: `socket_designation`, `stepping`, `manufacturer`, `part_number` and `serial` ride on every `cpu`/`dimm` row so downstream schemas are final, but no leg fills them yet.
+5. **Some planned actions can never have a source.** On macOS there is no public source for `chassis`, `baseboard` or `machine_id` (the hardware UUID from `system` already identifies the machine), yet all four new actions are advertised `planned` on every OS. The per-OS leg PRs move such legs to a typed `unsupported` with a reason; until then a consumer must read `<os>:planned` as "not read", never as "this host has no value". The appended `cpu`/`dimm` columns are likewise always `-`: `socket_designation`, `stepping`, `manufacturer`, `part_number` and `serial` ride on every `cpu`/`dimm` row so downstream schemas are final, but no leg fills them yet.
 
 ## Source and tests
 
