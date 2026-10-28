@@ -268,9 +268,10 @@ TEST_CASE("groups page: the template's group-panel sentences are the renderer's 
           "[groups][page]") {
     // The template is a const char* literal and cannot name the constexpr views, so pin them.
     const std::string t = kGroupsTemplate;
-    CHECK_THAT(t, ContainsSubstring("data-denied=\"" + std::string(groups::kGroupsDenied) + "\""));
-    CHECK_THAT(t, ContainsSubstring("data-unavailable=\"" + std::string(groups::kGroupsUnavailable) + "\""));
-    CHECK_THAT(t, ContainsSubstring("data-unavailable=\"" + std::string(groups::kDetailUnavailable) + "\""));
+    // The list and the selected-group panels share the denied sentence, so it appears twice.
+    CHECK(count_of(t, "data-denied=\"" + std::string(groups::kGroupsDenied) + "\"") == 2);
+    CHECK(count_of(t, "data-unavailable=\"" + std::string(groups::kGroupsUnavailable) + "\"") == 1);
+    CHECK(count_of(t, "data-unavailable=\"" + std::string(groups::kDetailUnavailable) + "\"") == 1);
 }
 
 TEST_CASE("groups page: the Groups entry is first in Estate and lights up on /groups",
@@ -297,7 +298,7 @@ TEST_CASE("groups page: the Groups entry is first in Estate and lights up on /gr
 
 // ---- Fragments ---------------------------------------------------------------------------
 
-TEST_CASE("groups fragments: list is gated, honest about a failed read, and never no-store-less",
+TEST_CASE("groups fragments: the list is gated and honest about a failed read and always no-store",
           "[groups][page][fragment]") {
     auto f = std::make_shared<Fakes>();
     TestRouteSink sink;

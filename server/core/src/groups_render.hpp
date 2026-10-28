@@ -60,13 +60,14 @@ inline constexpr std::string_view kMembersUnavailable =
 inline constexpr std::string_view kSelectGroup = "Select a group to see its details.";
 inline constexpr std::string_view kNoSuchGroup = "No such group. It may have been removed.";
 inline constexpr std::string_view kDynamicNoMembers =
-    "No members yet. Membership of rule-based groups is not computed automatically at this release.";
+    "No members yet. Membership of a rule-based group is not kept up to date from its rule; "
+    "see the manual for how each kind is filled.";
 inline constexpr std::string_view kScopedMembers = "Only members within your scope are shown.";
 inline constexpr std::string_view kRuleNote =
-    "Shown as stored. Rule-based membership is not computed automatically at this release.";
+    "Shown as stored. Membership is not kept up to date from this rule.";
 
 /// True for a group id the routes accept: 1-64 of `[a-f0-9]`.
-bool is_group_id(std::string_view id);
+[[nodiscard]] bool is_group_id(std::string_view id);
 
 struct TreeRow {
     const ManagementGroup* group; ///< points into the vector handed to `group_tree`
@@ -74,7 +75,7 @@ struct TreeRow {
 };
 
 /// The whole list in display order (see the header comment for the post-condition).
-std::vector<TreeRow> group_tree(const std::vector<ManagementGroup>& groups);
+[[nodiscard]] std::vector<TreeRow> group_tree(const std::vector<ManagementGroup>& groups);
 
 struct GroupList {
     std::vector<ManagementGroup> groups;

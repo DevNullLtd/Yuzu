@@ -73,7 +73,7 @@ void check_complete(const std::vector<ManagementGroup>& in, const std::vector<Tr
 
 } // namespace
 
-TEST_CASE("group_tree: root first, then by name, children by name, depth increments",
+TEST_CASE("group_tree: root first; top-level and children by name; depth increments",
           "[groups][render]") {
     const std::vector<ManagementGroup> in = {
         grp("0c", "Zulu", "000000000000"),    grp("0a", "Alpha", "000000000000"),
@@ -98,7 +98,7 @@ TEST_CASE("group_tree: root first, then by name, children by name, depth increme
     CHECK(orphan->depth == 0);
 }
 
-TEST_CASE("group_tree: a rootless cycle and an over-deep chain are swept in, never dropped",
+TEST_CASE("group_tree: a rootless cycle and an over-deep chain are swept in and never dropped",
           "[groups][render]") {
     SECTION("2-cycle") {
         const std::vector<ManagementGroup> in = {grp("0a", "A", "0b"), grp("0b", "B", "0a")};
@@ -147,7 +147,7 @@ TEST_CASE("is_group_id: 1-64 lowercase hex only", "[groups][render]") {
     CHECK_FALSE(is_group_id("xyz"));
 }
 
-TEST_CASE("render_group_list: rows, select buttons, type pill, counts, escaping", "[groups][render]") {
+TEST_CASE("render_group_list: rows; select buttons; type pill; counts; escaping", "[groups][render]") {
     GroupList l;
     l.groups = {grp("000000000000", "Root"), grp("0a", std::string("Dyn") + kXss, "000000000000", "dynamic")};
     l.member_counts = {{"000000000000", 7}};
@@ -163,7 +163,7 @@ TEST_CASE("render_group_list: rows, select buttons, type pill, counts, escaping"
     CHECK_THAT(html, ContainsSubstring("&lt;img"));
 }
 
-TEST_CASE("render_group_list: cap, empty and unavailable stay distinct", "[groups][render]") {
+TEST_CASE("render_group_list: cap; empty; unavailable stay distinct", "[groups][render]") {
     SECTION("501 groups -> 500 rows and a note") {
         GroupList l;
         for (int i = 0; i < 501; ++i)
@@ -186,7 +186,7 @@ TEST_CASE("render_group_list: cap, empty and unavailable stay distinct", "[group
     }
 }
 
-TEST_CASE("render_group_detail: fields, parent forms, dynamic rule", "[groups][render]") {
+TEST_CASE("render_group_detail: fields; parent forms; dynamic rule", "[groups][render]") {
     SECTION("static group with a resolved parent") {
         GroupDetail d{grp("0a", "Child", "0b"), std::string("Parent Name")};
         d.group.description = "About";
@@ -224,7 +224,7 @@ TEST_CASE("render_group_detail: fields, parent forms, dynamic rule", "[groups][r
     }
 }
 
-TEST_CASE("render_group_detail: NotFound, Unavailable and the placeholder are distinct",
+TEST_CASE("render_group_detail: NotFound; Unavailable and the placeholder are distinct",
           "[groups][render]") {
     const auto nf = render_group_detail(NotFound{});
     const auto un = render_group_detail(Unavailable{});
@@ -252,7 +252,7 @@ TEST_CASE("render_group_detail: the members loader shell is its own panel", "[gr
     CHECK_THAT(html, ContainsSubstring("data-unavailable=\""));
 }
 
-TEST_CASE("render_members: rows, links, source, heading count", "[groups][render]") {
+TEST_CASE("render_members: rows; links; source; heading count", "[groups][render]") {
     MembersView v;
     v.membership_type = "static";
     v.rows = {member("agent a&b", "static"), member("agent-2", "dynamic")};
@@ -286,7 +286,7 @@ TEST_CASE("render_members: a scoped caller sees the fixed sentence and no exclud
     CHECK_THAT(render_members(v), !ContainsSubstring(std::string(kScopedMembers)));
 }
 
-TEST_CASE("render_members: cap, empty copy and unavailable", "[groups][render]") {
+TEST_CASE("render_members: cap; empty copy; unavailable", "[groups][render]") {
     SECTION("201 rows -> 200 drawn with a note") {
         MembersView v;
         v.membership_type = "static";

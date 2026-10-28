@@ -942,7 +942,7 @@ TEST_CASE("ManagementGroupStore: get_group_checked distinguishes a genuine "
 // The groups page reads the tree and the per-group member counts through degrade-distinguishable
 // twins, so a failed read cannot render as "no groups" or "0 members".
 TEST_CASE("ManagementGroupStore: list_groups_checked and count_members_by_group_checked degrade "
-          "on a closed store, list_groups stays fail-soft",
+          "on a closed store; list_groups stays fail-soft",
           "[management_group][degrade]") {
     PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
     ManagementGroupStore store{pool};

@@ -10,11 +10,11 @@
 ///   /fragments/groups/detail      one group, ?id=            ManagementGroup:Read (perm_fn)
 ///   /fragments/groups/members     its members, ?id=          ManagementGroup:Read (fleet_read_fn)
 ///
-/// The three fragments are read-only and are gated exactly like their REST twins
-/// (`GET /api/v1/management-groups[/{id}]`). The members fragment is gated on `fleet_read_fn`
-/// ALONE (admit-then-filter, ADR-0017): rows are narrowed with `authz::in_scope` and neither a
-/// count nor any other figure derived from the excluded rows is returned. `perm_fn` is never
-/// stacked on it.
+/// The three fragments are read-only. List and detail are gated exactly like their REST twins
+/// (`GET /api/v1/management-groups[/{id}]`); members is gated on `fleet_read_fn` alone, which is
+/// narrower than the unfiltered REST detail. That gate is admit-then-filter (ADR-0017): rows are
+/// narrowed with `authz::in_scope` and neither a count nor any other figure derived from the
+/// excluded rows is returned. `perm_fn` is never stacked on it.
 ///
 /// Every fragment handler sets `Cache-Control: no-store` as its first statement, so a gate's
 /// 401/403/503 and the 400 for a malformed `id` carry it too. A malformed `id` is a 400 before

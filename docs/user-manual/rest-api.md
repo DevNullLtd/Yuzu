@@ -11145,35 +11145,35 @@ Render the Account panel for one active account.
 
 ### Estate — Groups and enrolment
 
-These endpoints back the management-group panels of the **Estate → Groups and enrolment** page (`/groups`). They return HTMX fragments, not the JSON envelope. All three are read-only: the page offers no control that creates, changes or deletes a group (that stays in Settings). A malformed `id` is a `400` with a one-line plain-text body, answered before any permission check and before any store read. None of them writes a success audit row (the REST twins write none). Every response, including a refusal and the `400`, sends `Cache-Control: no-store`. Each read materialises its result as the REST twin does (the whole group table, one group's members), bounded by the store's read timeout; the display caps below only bound the HTML.
+These endpoints back the management-group panels of the **Estate → Groups and enrolment** page (`/groups`). They return HTMX fragments, not the JSON envelope. All three are read-only: the page offers no control that creates, changes or deletes a group (that stays in Settings). A malformed `id` is a `400` with a one-line plain-text body, answered before any permission check and before any store read. None of them writes a success audit row (the REST twins write none). A refused request writes the gate's ordinary denial audit row (`auth.permission_required` for the list and detail, `auth.fleet_read_required` for the members), as the REST twins do; opening `/groups` without `ManagementGroup:Read` therefore leaves one row, for the list panel, because the detail and members panels load only after a group is selected. Every response, including a refusal and the `400`, sends `Cache-Control: no-store`. Each read materialises its result as the REST twin does (the whole group table, one group's members), bounded by the store's read timeout; the display caps below only bound the HTML.
 
 **`GET /fragments/groups/list`**
 
 Render the Management groups panel: the group tree (name, type, member count).
 
-- **Permission:** `ManagementGroup:Read`, the same securable and the same checked store reads as `GET /api/v1/management-groups`.
-- **Response (200):** HTML fragment. At most 500 rows are drawn; a note states the true count when more exist. A groups read or a member-count read that does not answer is a red "could not be read" box with a Retry button and **no table**, still with status 200: it is never an empty tree and never a column of zero counts. A group whose parent is not in the list, or that sits in a cycle or beyond the display depth, is drawn as a top-level row rather than dropped.
-- **Response (403):** The caller lacks the permission; the panel shows a "not available to your account" note.
+- **Permission:** `ManagementGroup:Read`, the same securable and permission check as `GET /api/v1/management-groups`; unlike that route, a failed read is reported, not rendered as an empty list. The per-group member counts have no field on `GET /api/v1/management-groups`; a machine derives them from each group's member list.
+- **Response (200):** HTML fragment. At most 500 rows are drawn; a note states the true count when more exist, and a group beyond the 500th row cannot be selected from the page. A groups read or a member-count read that does not answer is a red "could not be read" box with a Retry button and **no table**, still with status 200: it is never an empty tree and never a column of zero counts. A group whose parent is not in the list, or that sits in a cycle or beyond the display depth, is drawn as a top-level row rather than dropped.
+- **Response (401 / 403):** Not signed in / the caller lacks the permission. On a 403 the panel shows the heading "Not available to your account" above the sentence "Your account cannot read management groups."
 - **Headers:** `Cache-Control: no-store`.
 
 **`GET /fragments/groups/detail?id=<group id>`**
 
-Render the selected group: name, type, parent, description, the stored rule of a rule-based group, who created it and when. A rule-based group's rule is shown as stored, with a note that its membership is not computed automatically at this release. The panel also carries the loader for the members panel.
+Render the selected group: name, type, parent, description, the stored rule of a rule-based group, who created it and when. A rule-based group's (type `dynamic`) rule is shown as stored, with a note that its membership is not kept up to date from the rule. The panel also carries the loader for the members panel.
 
 - **Query:** `id` — 1 to 64 of `a-f` and `0-9`. Empty or absent returns the "select a group" placeholder (still permission-checked).
 - **Permission:** `ManagementGroup:Read`, as for the list.
 - **Response (200):** HTML fragment: the detail, "No such group" (the store answered and holds no such id), or the red unreadable box with a Retry button. The three are never confused.
-- **Response (400 / 403):** malformed `id` / the caller lacks the permission.
+- **Response (400 / 401 / 403):** malformed `id` / not signed in / the caller lacks the permission. On a 403 the panel shows the heading "Not available to your account" above the sentence "Your account cannot read management groups."
 - **Headers:** `Cache-Control: no-store`.
 
 **`GET /fragments/groups/members?id=<group id>`**
 
 Render one group's members (agent id, source, when added).
 
-- **Query:** `id`, as for the detail.
-- **Permission:** `ManagementGroup:Read` through the fleet-read gate (ADR-0017) as the **only** gate. A caller whose visibility is narrowed to some management groups sees only the members inside that visibility. Rows outside it are omitted and **no count or other figure derived from them is returned**: the panel states "Only members within your scope are shown." and its heading counts only the rows the caller may see.
-- **Response (200):** HTML fragment, at most 200 rows with a note stating how many the caller can see. A group with no members says so; for a rule-based group the text says membership is not computed automatically at this release. A members read that does not answer is a red unreadable box with a Retry button and no count, still 200. An unknown group is "No such group".
-- **Response (400 / 401 / 403 / 503):** malformed `id` / not signed in / lacks the permission / the authorization topology could not be read.
+- **Query:** `id` — required, 1 to 64 of `a-f` and `0-9`; empty or absent is a `400` (unlike the detail, which treats an empty `id` as the placeholder).
+- **Permission:** `ManagementGroup:Read` through the fleet-read gate (ADR-0017) as the **only** gate. A caller whose visibility is narrowed to some management groups sees only the members inside that visibility. Rows outside it are omitted and **no count or other figure derived from them is returned**: the panel states "Only members within your scope are shown." and its heading counts only the rows the caller may see. A service-scoped API token (RBAC on) whose ITServiceOwner ceiling holds `ManagementGroup:Read` passes this gate and sees the members within its service scope; the list and detail refuse such a token with `403`. The REST and MCP twin (`GET /api/v1/management-groups/{id}`, `get_management_group`) returns the whole member list, not narrowed, to any caller passing `ManagementGroup:Read`; narrowing it is a follow-up.
+- **Response (200):** HTML fragment, at most 200 rows with a note stating how many the caller can see. A group with no members says so; for a rule-based group the text says membership is not kept up to date from its rule. A members read that does not answer is a red unreadable box with a Retry button and no count, still 200. An unknown group is "No such group".
+- **Response (400 / 401 / 403 / 503):** malformed or missing `id` / not signed in / lacks the permission / the authorization topology could not be read. On a 403 the panel shows the heading "Not available to your account" above the sentence "Your account cannot read the members of this group."
 - **Headers:** `Cache-Control: no-store`.
 
 ### Access — Tokens and principals

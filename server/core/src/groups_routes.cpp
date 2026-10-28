@@ -6,10 +6,9 @@
 #include "groups_ui.hpp"
 #include "http_route_sink.hpp"
 
-#include <spdlog/spdlog.h>
-
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -61,6 +60,9 @@ void register_groups_routes(HttpRouteSink& sink, Deps deps) {
         res.set_content(kYuzuGroupsJs, "application/javascript; charset=utf-8");
     });
 
+    // A store read that did not answer is already counted and sampled-logged by the store
+    // (note_read_degrade), so the handlers below add no log line of their own.
+    //
     // Same gate as GET /api/v1/management-groups and the Settings fragment. Both reads must
     // answer: a failed count read is a failed list, never a column of zeros.
     sink.Get("/fragments/groups/list", [deps](const httplib::Request& req, httplib::Response& res) {
@@ -70,8 +72,6 @@ void register_groups_routes(HttpRouteSink& sink, Deps deps) {
         auto groups = deps.list_groups_fn();
         auto counts = deps.member_counts_fn();
         if (!groups || !counts) {
-            spdlog::warn("/fragments/groups/list: store did not answer (groups={}, counts={})",
-                         groups.has_value(), counts.has_value());
             respond_fragment(res, render_group_list(Unavailable{}));
             return;
         }
@@ -92,7 +92,6 @@ void register_groups_routes(HttpRouteSink& sink, Deps deps) {
                  }
                  auto found = deps.group_fn(id);
                  if (!found) {
-                     spdlog::warn("/fragments/groups/detail: {}", found.error());
                      respond_fragment(res, render_group_detail(Unavailable{}));
                      return;
                  }
@@ -124,7 +123,6 @@ void register_groups_routes(HttpRouteSink& sink, Deps deps) {
                      return;
                  auto found = deps.group_fn(id);
                  if (!found) {
-                     spdlog::warn("/fragments/groups/members: {}", found.error());
                      respond_fragment(res, render_members(Unavailable{}));
                      return;
                  }
@@ -134,7 +132,6 @@ void register_groups_routes(HttpRouteSink& sink, Deps deps) {
                  }
                  auto rows = deps.members_fn(id);
                  if (!rows) {
-                     spdlog::warn("/fragments/groups/members: members read failed");
                      respond_fragment(res, render_members(Unavailable{}));
                      return;
                  }
