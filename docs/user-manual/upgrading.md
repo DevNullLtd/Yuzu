@@ -621,6 +621,26 @@ spent or expired.
 
 **How to fix.** Pass an explicit `0` for `max_uses` and/or `ttl_hours` to keep the old
 unlimited/no-expiry behaviour, or size them to the rollout window and the number of machines.
+
+## Behaviour change: generic inventory reads never return a typed source's rows
+
+**What changed.** The generic inventory store's reads (`query_inventory`, `get_agent_inventory`, `list_inventory_tables` and their REST twins, `POST /api/v1/inventory/evaluate`, and the inventory-query result-set source) no longer return rows for the typed daily-sync sources: `installed_software`, `app_perf`, `device_ci`, `software_licensing`, `app_usage`, and the reserved `certificate_inventory`. Those sources have their own stores and gates. Before this change, a typed source's blob that reached the generic store through an older server's gateway path could be read there under `Infrastructure:Read` or `Inventory:Read` until the next boot purge removed it. That window is now closed on every server at this release or later (see the per-server note below). The gateway also drops a `certificate_inventory` blob, a source no agent sends yet, instead of storing it generically.
+
+**Who notices.** Only a caller that read one of those six source names from the generic store. Their data was never meant to be there. Use the typed surface instead, which is unchanged:
+
+| Source | REST | MCP |
+|---|---|---|
+| `installed_software` | `GET /api/v1/inventory/software` | `query_installed_software` |
+| `device_ci` | `GET /api/v1/hardware/{id}` | `get_hardware_ci`, `list_hardware_ci` |
+| `app_perf` | `GET /api/v1/dex/perf/apps` and the other `/api/v1/dex/perf/app*` routes | `list_dex_perf_apps`, `get_dex_app_perf` |
+| `software_licensing` | `GET /api/v1/sle/agents/{agent_id}` | `query_software_licenses` |
+| `app_usage` | `GET /api/v1/forensics/agents/{agent_id}/app-usage` | `get_agent_app_usage` |
+| `certificate_inventory` | reserved; its routes arrive with its store | — |
+
+**Deploy order, and what is per server.** The filter protects reads served by a server at this release or later, and nothing else. Every server older than this release, or rolled back below it, keeps storing typed-source blobs that arrive through a gateway attached to it, and keeps serving them under `Infrastructure:Read` or `Inventory:Read`. In a multi-replica deployment that means the exposure is not closed until every replica runs this release: during a rolling upgrade, reads routed to an older replica still return those rows, and rows an older replica writes after an upgraded replica's boot purge stay in the table (unreadable through upgraded replicas) until a purge runs again. Upgrade servers before agents, finish the rolling upgrade promptly, and never roll a server back below this release once agents send `certificate_inventory` (none does yet).
+
+**No action on upgrade.** There is no schema change, and the boot purge still removes any stray typed rows.
+
 ## Behaviour change: the DEX score policy document carries a version (#6085, #6086)
 
 **What changed.** The canonical text of the `dex_score_policy` document now includes `"version": 1`, and `version` is a recognised key. A document without the field reads as version 1. A server that meets a version above the one it supports scores under the shipped defaults, reports `fault: unsupported_version at version: N above the supported 1` on every Apps response, and logs it once. It never applies part of a document, and the revision stays the hash of the stored text. `PUT /api/v1/dex/score-policy` writes the document from this release. A build that predates the score policy reader ignores it. A development build that has the reader but predates this change refuses a `version` key as an unknown key and serves the shipped defaults with a fault for any document that carries it.
@@ -1471,6 +1491,19 @@ the Settings link is hidden for every user, administrators included, whenever
 `/api/me` is answered by an older replica; open `/settings` directly by URL (it is
 unaffected) or wait for the upgrade to finish. Tabs opened before the upgrade keep
 the old shell until reloaded. No configuration change is needed.
+
+## Behaviour change: `GET /api/v1/me` and `GET /api/me` no longer invent a role (#2146)
+
+This is listed as a behaviour change rather than a break because the value that goes away was fabricated, was never documented for an engine principal, and `rbac_role` is now documented as an optional key.
+
+- An engine principal's `rbac_role` is now absent where it used to read `Viewer` (or `Administrator`, taken from its legacy session role). The endpoints now look an engine principal up under its own RBAC principal type.
+- With RBAC on, an engine principal's grants now appear in `rbac_roles`. An engine principal with no grant has no `rbac_role`.
+- If the role store cannot be read, the call answers `200` with `rbac_roles_resolved: false` and neither `rbac_role` nor `rbac_roles`, instead of a made-up role. Treat an absent list as unknown, not as "no roles".
+- `rbac_role` is deprecated. Read `rbac_roles` (direct assignments only; group grants are not listed) instead.
+- Browser users: no action is needed. If the role store cannot be read during a page load, the navigation badge shows the lowercase legacy `role` (`admin` or `user`) instead of `Administrator` or `Viewer`; the Settings link is unaffected.
+- New keys are additive: `principal_kind` (`human` or `engine`), `auth_source`, `mcp_tier`, `scope_service`, `rbac_roles` and `rbac_roles_resolved`. `GET /api/me` now emits its keys in insertion order rather than alphabetically; a JSON consumer must not depend on key order.
+- A new MCP tool, `get_me`, is the twin of `GET /api/v1/me`.
+- During a rolling upgrade an older replica omits the new keys, still reports `Viewer` for an engine principal, and has no `get_me` tool (it answers unknown-tool).
 
 ## ⚠️ Breaking: the audit log is admin-only while RBAC is off, and audit reads are bounded (#5771)
 
