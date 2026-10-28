@@ -1145,7 +1145,10 @@ seconds, first/last-seen, and a distinct-user count over a 30-day sliding window
 
 A further daily-sync source, **`certificate_inventory`**, is received by the server
 (ADR-0070 D12; the agent collector and the read surface ship in later changes, so on
-its own this change stores reports and exposes nothing). It is persisted in the typed
+its own this change stores reports and exposes nothing). No agent sends
+`certificate_inventory` yet: an agent starts only once the server advertises that it
+accepts the source, which ships in a separate later change, so until then this store
+stays empty. It is persisted in the typed
 Postgres schema **`certificate_inventory_store`**: one row per (device, certificate) with its X.509
 facts, the places it was seen (store and path), and its SANs, EKUs and CRL distribution
 points. It never lands in the generic inventory store, on either path.

@@ -636,6 +636,11 @@ that key; it did not erase certificate rows. Re-issue the DELETE once every repl
 same advice as for the presence row, #5682). Erasure is not durable yet: a still-running agent
 repopulates its rows on its next report until the decommission tombstone ships in a later change.
 
+No agent sends `certificate_inventory` yet; agents start only once the server advertises that it
+accepts the source, in a separate later change. The server's gateway path (`ProxyInventory`), which
+on earlier builds discarded such a blob, now stores it in this typed store exactly as the direct
+`ReportInventory` path does; it still never reaches the generic inventory store.
+
 **Rolling back** leaves the `certificate_inventory_store` schema in the database; it is harmless to
 the older binary and is not read. Plan capacity before agents start reporting: DER is optional and
 bounded at 1 MiB per device, so a large fleet is storage- and WAL-heavy (see
