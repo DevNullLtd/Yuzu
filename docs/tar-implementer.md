@@ -458,8 +458,9 @@ cursor.** What it adds to the pattern:
   correlated, not verified.** A candidate is held only while `now - window_hi <
   kEtwSettle100ns` (5 s), and a notify window closes 1 s after the last notify, so a
   burst that ended more than about 6 s before the tick is written in that same tick;
-  a burst nearer the tick, and every reconcile-found change (its window ends at the
-  end of the read, after `now`), is held to the next one. A change whose marker
+  a burst nearer the tick, and every change found without a key-watch notify (the
+  hourly reconcile, or a root with no live watch: its window ends at the end of the
+  read, after `now`), is held to the next one. A change whose marker
   cannot depend on a later event (`attr:off`, `attr:lost-restart`: both are decided
   before any event is consulted and only ever become more true within a run) is not
   held at all and is written in the tick that sees it, so a restart's whole
@@ -494,9 +495,17 @@ cursor.** What it adds to the pattern:
   `max(window_base, first - slack)` (the pending stamps are passed to
   `retention_watermark`; the same floor ages the loss epochs). The pin ends when
   the root is read, which the fair rotation bounds. A root that was complete once
-  and then stays Capped keeps its last `window_base` and so holds the watermark
-  there: the buffer fills to the cap and the eviction shows as recurring
-  `gap:loss` rows and `attr:degraded` (no volume guard is added).
+  keeps its last `window_base` whatever its status afterwards (`retention_watermark`
+  is status-blind on purpose: its next wide-window diff, hourly or on recovery,
+  would otherwise be correlated to a bystander with no loss recorded). An idle root
+  therefore holds the watermark up to an hour back, since the hourly reconcile
+  re-reads every root, and one that stays Unreadable or Capped holds it there for as
+  long as it does. The buffer fills to the cap (65536 events: about 18 host-wide
+  registry writes per second against a root last read an hour ago, about 110 against
+  one last read ten minutes ago) and the eviction shows as recurring `gap:loss`
+  rows and `attr:degraded`, marked and never silent (no volume guard is added).
+  Lifting the pin would need a retained-floor marker in the cursor and a stitch rule
+  that a window starting below it is `attr:degraded`: a design change, not a fix.
 - **The cursor row is a third content store.** Besides the rows and the
   baselines, `held` carries each waiting candidate's rendered old and new values
   until the next tick at most (readable through `tar.sql` as `tar_cursor`; erased by
@@ -524,13 +533,19 @@ cursor.** What it adds to the pattern:
   CloseTrace (it unblocks `ProcessTrace`), join, then stop the session. A
   session that cannot open is degrade-not-fail (`registry_capture_method` =
   `notify`, rows `attr:off`; the start-failure warning carries the Win32 error);
-  one that dies after it opened is not restarted. The session takes the default
+  one that dies after it opened is logged once and not restarted. The session takes the default
   ETW security descriptor (the sibling sessions set none either), so members of
   Performance Log Users can attach to the stream (value names, pids and sizes,
   system-wide) or stop it; a stop is detected (`ProcessTrace` returns) and shows
   as `attr:off`. The image name is looked up once per pid when its first event is
   delivered, refused when the process was created after the event (the pid was
-  reused), and cached for five minutes, so it can be stale under pid reuse.
+  reused), and cached for five minutes, so it can be stale under pid reuse. The
+  session name is salted with the agent's pid, so a crash leaks the session until
+  the host restarts and only a successor with the same pid stops it (the
+  `ERROR_ALREADY_EXISTS` retry); the sibling `YuzuTarProcEtw` and `YuzuTarModuleEtw`
+  sessions leak the same way and nothing sweeps `YuzuTar*` sessions at start. The
+  operator runbook (`logman query -ets`, `logman stop <name> -ets`) is in the
+  manual's Health bullet.
 - **Windows warehouse columns are NOT NULL.** "Not applicable" is `''`/`0`, and an
   empty `data_type` distinguishes an absent value from an empty one.
 

@@ -1135,9 +1135,10 @@ TEST_CASE("registry source: baseline tick writes baselines and no rows; a change
     CHECK(second.outcome == CursorOutcome::Advanced);
     CHECK(second.events_emitted == 0);
     CHECK(count_rows(t.db) == 0);
-    const std::int64_t read_end = f.clock; // the Fake's last now_ts(): the end of that read
     const auto cur = read_cursor(t.db);
     REQUIRE(cur.held.size() == 1);
+    // The end of that read, as the cursor recorded it (the loss query takes a stamp after it).
+    const std::int64_t read_end = cur.roots.at(kRoot).read_end;
     CHECK(cur.held[0].window_lo == T0 + 96 * SEC); // first notify - 1 s slack
     CHECK(cur.held[0].window_hi == T0 + 99 * SEC); // last notify + 1 s slack, inside read_end
     CHECK(cur.held[0].source == "notify");
@@ -1679,6 +1680,74 @@ TEST_CASE("registry source: an eviction during loss sampling cannot select the s
     CHECK(rows.rows[0][0] == "0"); // never the survivor
     CHECK(rows.rows[0][1].empty());
     CHECK(rows.rows[0][2] == "attr:ambiguous:2");
+}
+
+TEST_CASE("registry source: a kernel loss counted after the reads lies inside its epoch",
+          "[tar][registry][lifecycle]") {
+    // `now` is taken before the per-root reads, which can run to the snapshot deadline; the
+    // session's counters are read after them. A loss that query reports happened in between,
+    // so the epoch must end at a stamp taken AFTER the query. Ended at `now`, it leaves
+    // (now, query] in no epoch, and a window that opens after `now` (a notify that arrived
+    // during the reads) then correlates to its one same-signature bystander with no loss
+    // recorded, though the true writer's event may be the one lost.
+    for (const bool lose : {false, true}) {
+        INFO("lose=" << lose);
+        auto t = make_db();
+        Fake f;
+        auto reader = f.reader();
+        auto inner = reader.read_subtree;
+        reader.read_subtree = [&f, inner](const std::string& root, std::int64_t deadline) {
+            auto r = inner(root, deadline);
+            f.clock += 5 * SEC; // a slow read
+            return r;
+        };
+        auto src = make_registry_cursor_source(scope1(), std::move(reader));
+        f.reads[kRoot] = svc(1);
+        REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
+
+        f.clock = T0 + 100 * SEC; // this tick's `now` is just after it
+        f.reads[kRoot] = svc(2);
+        // The notify arrived while the root was being read: the change's window is
+        // (T0 + 102 s, T0 + 105 s], entirely after `now`.
+        burst(f, kRoot, T0 + 103 * SEC, T0 + 104 * SEC);
+        src->push_event_for_test(
+           ev(T0 + 104 * SEC, 77, RegistryEtwOp::Set, "Start", 4, 4, "bystander.exe"));
+        bool fired = false;
+        f.on_loss_query = [&] {
+            if (fired)
+                return;
+            fired = true;
+            f.clock += 2 * SEC; // the counters are read later than `now`
+            if (lose)
+                f.loss.events_lost = 3; // a loss somewhere in the interval since the last query
+        };
+        tick(t.db, *src);
+        REQUIRE(fired);
+        const auto cur = read_cursor(t.db);
+        REQUIRE(cur.held.size() == 1);
+        REQUIRE(cur.held[0].window_lo > T0 + 100 * SEC + 10'000); // opens after `now`
+        if (lose) {
+            // the positive control: the loss was counted this tick, and as an epoch ...
+            CHECK(t.db.get_config("registry_etw_lost", "") == "3");
+            REQUIRE(cur.loss.size() == 1);
+            // ... that reaches past the end of the held window (it ended at `now` before)
+            CHECK(cur.loss[0].hi >= cur.held[0].window_hi);
+        } else {
+            CHECK(cur.loss.empty());
+        }
+
+        f.clock = T0 + 300 * SEC; // the window has settled; no new loss is reported
+        tick(t.db, *src);
+        const auto rows = q(t.db, "SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
+        REQUIRE(rows.rows.size() == 1);
+        if (lose) {
+            CHECK(rows.rows[0][0] == "0"); // never the bystander across a reported loss
+            CHECK(rows.rows[0][1] == "attr:degraded");
+        } else { // the control: the same setup names the bystander when nothing was lost
+            CHECK(rows.rows[0][0] == "77");
+            CHECK(rows.rows[0][1] == "attr:corr");
+        }
+    }
 }
 
 TEST_CASE("registry source: an idle root that stays Capped does not pin the event buffer",

@@ -336,6 +336,12 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
         // loss query is itself loss: the session's counters are then unknown.
         const auto drops = reader_.buffer->drop_info();
         const SessionLoss sl = reader_.session_loss();
+        // `now` was taken before the reads, which can run to the snapshot deadline, so the
+        // counters above describe an instant later than it. A kernel loss in (now, here]
+        // would lie in no epoch, and a window ending there could be correlated to a
+        // bystander: the epoch ends at a stamp taken after the query, which is at or after
+        // the instant the counter was read.
+        const std::int64_t qnow = reader_.now_ts();
         const std::uint64_t fail_now = sl.query_ok ? 0 : 1;
         const std::uint64_t kernel_total =
            sl.events_lost + sl.rt_buffers_lost + sl.decode_failed + query_failures_ + fail_now;
@@ -347,7 +353,7 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
         if (drop_delta > 0)
             append_loss_epoch(epochs, {drops.ts_lo, drops.ts_hi});
         if (kernel_delta > 0) // where inside the interval since the last query the loss lies is unknown
-            append_loss_epoch(epochs, {last_query_ts_, now});
+            append_loss_epoch(epochs, {last_query_ts_, qnow});
         if (drop_delta + kernel_delta > 0)
             rows.push_back(registry_gap_row("loss", std::to_string(now),
                                             std::format("gap:loss:{}", drop_delta + kernel_delta),
@@ -401,6 +407,9 @@ CursorCollectResult RegistryCursorSource::collect(TarDatabase& db,
         last_reported_drops_ = drops.count;
         last_reported_kernel_ = kernel_total;
         query_failures_ += fail_now;
+        // The next epoch starts at this tick's `now`, not at `qnow`: it overlaps these reads
+        // on purpose, so a loss the next query reports still reaches a window that closed
+        // while they ran (its events may have been dropped after this query).
         last_query_ts_ = now;
         pending_gap_ = false;
         force_all_ = false;
@@ -758,7 +767,11 @@ struct WinEtw {
                 } catch (...) {
                     // nothing to release; fall through to the not-running mark
                 }
-                running.store(false, std::memory_order_relaxed);
+                // teardown_locked() clears `running` before CloseTrace, so finding it still
+                // set means the session ended on its own: say so once.
+                if (running.exchange(false))
+                    spdlog::warn("TAR registry: Kernel-Registry ETW session ended on its own; "
+                                 "attribution reads attr:off until the agent restarts");
             });
             return ERROR_SUCCESS;
         } catch (...) {

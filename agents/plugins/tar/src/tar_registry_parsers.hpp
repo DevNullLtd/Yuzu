@@ -35,7 +35,9 @@
 //     same holds for the per-value `removed` rows of a deleted KEY: deleting a key
 //     emits one DeleteKey event and no DeleteValue event for its values, so each such
 //     row can be correlated to an unrelated process that deleted a same-named value in
-//     the window (the key_removed row itself is always attr:none);
+//     the window (the key_removed row itself never names a process: it is attr:none
+//     when the session is up and no loss applies, and attr:lost-restart, attr:off and
+//     attr:degraded take precedence over it as over every outcome);
 //   - an event delivered more than kEtwSettle100ns after its window closed, with no
 //     counted loss (a starved consumer, suspend/resume), misses the stitch, and one
 //     unrelated same-signature writer can then be correlated instead;
