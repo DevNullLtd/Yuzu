@@ -65,11 +65,13 @@ struct ApproverMfaOutcome {
 static_assert(ApproverMfaOutcome{}.kind == ApproverMfaOutcome::Kind::kRefuse,
               "a value-initialised outcome must refuse");
 
-// Pin the enumerator set. `handle_review` (approval_routes.cpp) switches on Kind and sends every
-// enumerator it does not name through its `default:` refuse arm, so a new enumerator would
-// silently refuse with the generic 403 instead of getting its own arm. Adding one fails the
-// build here: add its `case` to `handle_review`, add a row to the Sec-Audit-Failed table in
-// test_approval_routes.cpp, then extend these pins.
+// Pin the enumerator values. `handle_review` (approval_routes.cpp) switches on Kind and sends
+// every enumerator it does not name through its `default:` refuse arm, so a new enumerator
+// would silently refuse with the generic 403 (fail closed) instead of getting its own arm.
+// Reordering the five, or inserting one before kPass, fails the build here. APPENDING one
+// does NOT: the five values stay unchanged. In either case the next editor must add a `case`
+// to `handle_review`, add a row to the Sec-Audit-Failed table in test_approval_routes.cpp,
+// and extend these pins.
 namespace approver_mfa_kind_pin {
 using Kind = ApproverMfaOutcome::Kind;
 static_assert(static_cast<int>(Kind::kRefuse) == 0 &&

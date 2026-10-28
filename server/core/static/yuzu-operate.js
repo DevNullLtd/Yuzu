@@ -245,11 +245,15 @@
     }
 
     // #6079: a 503 from the decision route (MFA state unreadable, clock fault, audit store down)
-    // carries error.remediation naming the next step. Show it; without one the caller keeps the
-    // generic text.
-    function unavailableRemediationText(env) {
+    // carries error.message (the problem) and error.remediation (the next step; on its own it
+    // can read as "retry the request" with no problem named). Show both as ONE text: the
+    // message, a full stop, then the remediation; either alone when only one is a non-empty
+    // string; '' when neither, so the caller keeps the generic text.
+    function unavailableText(env) {
       var e = env && env.error;
-      return e && typeof e.remediation === 'string' && e.remediation ? e.remediation : '';
+      var m = e && typeof e.message === 'string' ? e.message : '';
+      var r = e && typeof e.remediation === 'string' ? e.remediation : '';
+      return m && r ? m.replace(/[.\s]+$/, '') + '. ' + r : m || r;
     }
 
     // Approve / reject dialog for the selected pending request. The facts are the row's
@@ -306,7 +310,7 @@
               if (r.status === 401) return 'Your session has expired. Sign in again.';
               if (r.status === 403) return approverRefusalText(r.data) ||
                 'You do not have permission to decide approvals.';
-              if (r.status === 503) return unavailableRemediationText(r.data) ||
+              if (r.status === 503) return unavailableText(r.data) ||
                 'Could not confirm the decision. Refresh to see the current state.';
               return 'Could not confirm the decision. Refresh to see the current state.';
             });

@@ -158,8 +158,10 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
         return store_unavailable("mfa_status");
     case MfaFactorState::kNoIdpProof:
         // The cached anchor of an SSO session is left empty both when the IdP attested no
-        // second factor AND when the stored proof is dated after the database clock (a
-        // replica or IdP clock ahead of the database; derive_session_deadlines drops it).
+        // second factor AND when the stored proof is dated after the database clock (the
+        // sign-in replica's clock is ahead of the database clock: /auth/callback clamps the
+        // ID-token iat to that replica's own clock, so an identity provider running ahead
+        // cannot future-date the proof by itself; derive_session_deadlines drops it).
         // Order matters and every arm is a refusal; no path passes:
         //  1. a degraded durable read cannot tell either case apart: store-unavailable (503),
         //     counted like any other store fault;
@@ -173,9 +175,9 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
             return store_unavailable("durable mfa proof");
         if (durable.source == Source::kRow && durable.mfa_verified_ms > durable.db_now_ms) {
             spdlog::error("require_enrolled_fresh_mfa: approver MFA proof is dated after the "
-                          "database clock (clock skew between the replica/IdP and the database); "
-                          "refusing with 503 rather than telling the approver to sign in again "
-                          "(user={})",
+                          "database clock (clock skew: the sign-in replica's clock is ahead of the "
+                          "database clock); refusing with 503 rather than telling the approver to "
+                          "sign in again (user={})",
                           log_safe(session.username));
             return {Kind::kProofClockSkew, probe.state};
         }

@@ -1033,6 +1033,12 @@ TEST_CASE("approval_routes: the not-enrolled remediation names the role-appropri
               .find(" If it repeats, ask your administrator to check clock synchronisation "
                     "between the identity provider, the Yuzu server and its database.") !=
           std::string::npos);
+    // The provider-side advice names a property to preserve (require MFA, report it in amr),
+    // not a claim to assert unconditionally.
+    CHECK(no_proof.find("Sign in again through your identity provider with MFA, or ask an "
+                        "administrator to have the provider require MFA for approvers and "
+                        "report it in amr.") != std::string::npos);
+    CHECK(no_proof.find("assert amr") == std::string::npos);
     CHECK(remediation(auth::Role::admin, MfaFactorState::kSamlUnsupported).find("#4935") !=
           std::string::npos);
     CHECK(remediation(auth::Role::admin, MfaFactorState::kAccountUnavailable)
@@ -2001,7 +2007,8 @@ TEST_CASE("approval_routes: wiring -- server.cpp passes approver_mfa_fn and csrf
     CHECK(closure.find("session.username", read) != std::string::npos);
     CHECK(read < closure.find("require_enrolled_fresh_mfa("));
     CHECK(closure.find("action_label, durable,") != std::string::npos);
-    // The route="approval" 503 counter depends on the registry being handed to the gate: a nullptr here compiles and silently loses the series.
+    // The route="approval" 503 counter depends on the registry being handed to the gate: a
+    // nullptr here compiles and silently loses the series.
     CHECK(closure.find("action_label, durable, &metrics_)") != std::string::npos);
     // ...and the closure has no other way to build one: a synthetic proof literal here would
     // age the session on a clock the database does not own.

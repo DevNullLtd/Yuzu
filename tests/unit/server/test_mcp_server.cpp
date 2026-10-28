@@ -2012,7 +2012,8 @@ TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the REST en
                         "window at 0") != std::string::npos);
         CHECK(desc.find("account_unavailable (deactivated or deleted account) surfaces with "
                         "the step-up window at 0, or when the account is removed between the "
-                        "approver rule's two reads") != std::string::npos);
+                        "central step-up check's read and the approver rule's read") !=
+              std::string::npos);
         CHECK(desc.find("mfa_proof_missing (an OIDC login with no MFA amr) surfaces with the "
                         "step-up window at 0 or when MFA enforcement does not cover the "
                         "caller's role") != std::string::npos);

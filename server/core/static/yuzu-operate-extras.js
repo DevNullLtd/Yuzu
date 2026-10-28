@@ -511,11 +511,15 @@
         typeof e.remediation === 'string' && e.remediation) return e.remediation;
     return '';
   }
-  /* #6079: a 503 (MFA state unreadable, clock fault, audit store down) names the next step in
-     error.remediation. Same textContent-only path as the 403 text above. */
-  function unavailableRemediationText(env) {
+  /* #6079: a 503 (MFA state unreadable, clock fault, audit store down) carries error.message
+     (the problem) and error.remediation (the next step). Show both as ONE text: the message, a
+     full stop, then the remediation; either alone when only one is a non-empty string; '' when
+     neither. Same textContent-only path as the 403 text above. */
+  function unavailableText(env) {
     var e = env && env.error;
-    return e && typeof e.remediation === 'string' && e.remediation ? e.remediation : '';
+    var m = e && typeof e.message === 'string' ? e.message : '';
+    var r = e && typeof e.remediation === 'string' ? e.remediation : '';
+    return m && r ? m.replace(/[.\s]+$/, '') + '. ' + r : m || r;
   }
   doc.body.addEventListener('htmx:responseError', function (evt) {
     var d = evt.detail;
@@ -529,7 +533,10 @@
     try { env = JSON.parse(x.responseText); } catch (e) { env = null; }
     var msg = env && env.error && typeof env.error.message === 'string' ? env.error.message : '';
     if (x.status === 503) {
-      toast(unavailableRemediationText(env) ||
+      // The central step-up check answers its own 503 with an HX-Trigger toast carrying the
+      // message; htmx shows that one, so a second toast here would double it.
+      if (x.getResponseHeader('HX-Trigger')) return;
+      toast(unavailableText(env) ||
             'Could not confirm the decision. Refresh to see the current state.', 'error');
       return;
     }
@@ -552,7 +559,7 @@
       } else if (r.status === 400) {
         toast(r.message || 'The request was refused.', 'error');
       } else if (r.status === 503) {
-        toast(unavailableRemediationText(r.data) ||
+        toast(unavailableText(r.data) ||
               'Could not confirm the decision. Refresh to see the current state.', 'error');
       } else {
         toast('Could not confirm the decision. Refresh to see the current state.', 'error');

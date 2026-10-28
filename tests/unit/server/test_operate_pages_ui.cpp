@@ -252,13 +252,14 @@ TEST_CASE("operate pages: the Approvals dialog shows an approver refusal's remed
     CHECK(has(js, "e.message.indexOf('approver_assurance_required:') === 0"));
     CHECK(has(js, "typeof e.remediation === 'string' && e.remediation) return e.remediation;\n      return '';"));
     CHECK(has(js, "if (r.status === 403) return approverRefusalText(r.data) ||"));
-    // A 503 shows error.remediation (MFA state unreadable, clock fault, audit store down), with
-    // the generic text as the fallback; 400/401/403 keep their own text.
-    CHECK(count_of(js, "function unavailableRemediationText(env)") == 1);
-    CHECK(has(js, "return e && typeof e.remediation === 'string' && e.remediation ? "
-                  "e.remediation : '';"));
-    CHECK(has(js, "if (r.status === 503) return unavailableRemediationText(r.data) ||\n"
-                  "                'Could not confirm the decision. Refresh to see the current state.';"));
+    // A 503 shows error.message and error.remediation together as one text (MFA state
+    // unreadable, clock fault, audit store down), with the generic text as the fallback;
+    // 400/401/403 keep their own text.
+    CHECK(count_of(js, "function unavailableText(env)") == 1);
+    CHECK(has(js, "return m && r ? m.replace(/[.\\s]+$/, '') + '. ' + r : m || r;"));
+    CHECK(has(js, "if (r.status === 503) return unavailableText(r.data) ||\n"
+                  "                'Could not confirm the decision. Refresh to see the current "
+                  "state.';"));
     CHECK(has(js, "if (r.status === 401) return 'Your session has expired. Sign in again.';"));
     // The text reaches the page through textContent only (the toast sink the comment relies on).
     CHECK(has(js, "t.textContent = msg;"));

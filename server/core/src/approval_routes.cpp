@@ -57,9 +57,9 @@ std::string mfa_refusal_remediation(approval::ApproverRefusal refusal,
         return "your single sign-on login left no usable second-factor proof: the identity "
                "provider sent no MFA amr, or the clocks of the identity provider, the Yuzu server "
                "and its database disagree. Sign in again through your identity provider with MFA, "
-               "or ask an administrator to have the provider assert amr for approvers. If it "
-               "repeats, ask your administrator to check clock synchronisation between the "
-               "identity provider, the Yuzu server and its database.";
+               "or ask an administrator to have the provider require MFA for approvers and report "
+               "it in amr. If it repeats, ask your administrator to check clock synchronisation "
+               "between the identity provider, the Yuzu server and its database.";
     case approval::ApproverRefusal::kSamlMfaUnsupported:
         return "MFA attestation is not available for SAML sessions (#4935); decide the request "
                "from a local or OIDC session.";

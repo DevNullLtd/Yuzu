@@ -214,18 +214,22 @@ TEST_CASE("instruction extras ui: both 403 branches of the Approvals tab show an
     CHECK(has(js, "toast(approverRefusalText(env) || msg || 'You do not have permission to decide approvals.', 'error');"));
     CHECK(has(js, "toast(approverRefusalText(r.data) || r.message || 'You do not have permission to decide approvals.', 'error');"));
     CHECK(count_of(js, "approverRefusalText(") == 3); // definition + the two call sites
-    // A 503 (MFA state unreadable, clock fault, audit store down) shows error.remediation, on
-    // the initial response and on the response after the step-up retry; the generic text is the
-    // fallback. The 503 branch sits before the 403 one and never touches the 400/401/403 text.
-    CHECK(count_of(js, "function unavailableRemediationText(env)") == 1);
-    CHECK(has(js, "return e && typeof e.remediation === 'string' && e.remediation ? "
-                  "e.remediation : '';"));
+    // A 503 (MFA state unreadable, clock fault, audit store down) shows error.message and
+    // error.remediation together as one text, on the initial response and on the response after
+    // the step-up retry; the generic text is the fallback. The 503 branch sits before the 403
+    // one and never touches the 400/401/403 text. A response that already carries an HX-Trigger
+    // header (the central step-up check's own toast) adds no second toast.
+    CHECK(count_of(js, "function unavailableText(env)") == 1);
+    CHECK(has(js, "return m && r ? m.replace(/[.\\s]+$/, '') + '. ' + r : m || r;"));
     CHECK(has(js, "x.status !== 401 && x.status !== 403 && x.status !== 503"));
-    CHECK(has(js, "if (x.status === 503) {\n      toast(unavailableRemediationText(env) ||\n"
-                  "            'Could not confirm the decision. Refresh to see the current state.', "
-                  "'error');"));
-    CHECK(has(js, "} else if (r.status === 503) {\n        toast(unavailableRemediationText(r.data) ||"));
-    CHECK(count_of(js, "unavailableRemediationText(") == 3); // definition + the two call sites
+    CHECK(has(js, "if (x.status === 503) {\n"));
+    CHECK(has(js, "if (x.getResponseHeader('HX-Trigger')) return;\n"
+                  "      toast(unavailableText(env) ||\n"
+                  "            'Could not confirm the decision. Refresh to see the current "
+                  "state.', 'error');"));
+    CHECK(has(js, "} else if (r.status === 503) {\n"
+                  "        toast(unavailableText(r.data) ||"));
+    CHECK(count_of(js, "unavailableText(") == 3); // definition + the two call sites
 }
 
 TEST_CASE("instruction extras ui: sets panel and set select stamp controls only when allowed",
