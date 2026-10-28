@@ -120,7 +120,6 @@ Two additions:
   - `docs/architecture.md` → loaded by `architect` on cross-cutting design changes
   - `docs/asset-tagging-guide.md` → loaded by `dsl-engineer` on scope/tag-DSL changes
   - `docs/agentic-first-principle.md` → loaded by `consistency-auditor` on every PR (new invariant gate)
-  - `docs/tachyon-parity-plan.md` → loaded by `architect` on capability-map / roadmap changes
 
 Do **not** add the user-manual docs to routing — they're user-facing and load via `docs-writer` already.
 

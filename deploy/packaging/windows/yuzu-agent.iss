@@ -273,6 +273,11 @@ Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Com
 ; delete closes that.
 [InstallDelete]
 Type: files; Name: "{app}\plugins\sockwho.dll"
+; The activity-record plugin was renamed from tar to echo. The old DLL must not survive an
+; upgrade: the loader globs the plugin directory, so a stale tar.dll would load beside echo.dll
+; and register the retired plugin name. (deb/rpm file lists and the macOS package manifest
+; already remove the old binary.)
+Type: files; Name: "{app}\plugins\tar.dll"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\logs"

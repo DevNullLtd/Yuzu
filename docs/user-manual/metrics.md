@@ -731,6 +731,8 @@ distinguishable from a scrape failure.
 
 ## Echo dashboard metrics
 
+The Echo metrics were named `yuzu_tar_*` (and `yuzu_fleet_tar_db_corruption_agents`) before 2026-10. There is no alias: dashboards, alert rules and recording rules that use the old series names must be updated to the `yuzu_echo_*` names below.
+
 | Metric | Type | Meaning |
 |---|---|---|
 | `yuzu_echo_retention_paused_devices{source}` | gauge | Devices reporting a paused Echo source, by `source` (`process` / `tcp` / `service` / `user`). Set each time the retention-paused page renders, from the rows of the viewing operator's own most recent scan (limited to the agents that operator can see), so it is a per-render view, not a fleet total. A scan whose response read was cut by its 10,000-row / 50 MiB cap (`result_truncated_by_cap` on `GET /api/v1/echo/retention-paused`) does not update it: its rows would under-count (it could read `0` with paused sources present on the dropped agents), so the gauge keeps the last value from an uncut scan and can be stale. |

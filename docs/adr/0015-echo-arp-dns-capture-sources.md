@@ -5,6 +5,9 @@
 **Component:** Echo (Telemetry, Acquisition, Response) — Capture Source Layer
 **Authors:** Alex (Security Architecture)
 
+> **Naming (2026-10).** The feature this record describes was renamed to Echo, and this file was
+> renamed with it. The body uses the current spelling throughout; the decision itself is unchanged.
+
 > Supersedes the proposal that was mis-numbered "ADR-0010" (0010 is
 > `secrets-at-rest-envelope-encryption`). This is the accepted record; it amends
 > the original proposal per the decisions in "Amendments" below.

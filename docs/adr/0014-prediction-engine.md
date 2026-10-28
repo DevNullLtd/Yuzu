@@ -24,7 +24,7 @@ of them away — but reports them reactively. The observer surfaces the disk tha
 the battery *already* below 80% of design, the perf breach happening *now*. By the time the signal
 fires the employee has already felt the pain.
 
-The forward motion in the DEX market (Nexthink, 1E, ControlUp, Microsoft Endpoint Analytics) is
+The forward motion in the DEX market (commercial DEX and endpoint-analytics products) is
 toward getting ahead of the failure: tell the operator a disk will fail, a battery will cross the
 replace-threshold, a volume will fill, *before* the ticket exists. The inputs for this already sit
 in the on-device warehouse — `$Perf_Hourly`, the `storage.low` free-space series, the
@@ -62,7 +62,7 @@ not fleet size — so it scales to the 1.2M-host target for free.
   - **Battery EOL** — capacity-fade over `FullChargedCapacity / DesignedCapacity` + `CycleCount`.
   - **Storage-full date** — least-squares slope on the `storage.low` free-space series.
   - **Disk failure** — `disk.smart_failure` (the vendor's own predictive flag) + a rising-rate
-    trend on `disk.error` / `disk.port_reset`. The Backblaze / hyperscaler SMART-to-failure
+    trend on `disk.error` / `disk.port_reset`. The published large-fleet drive-failure statistics and hyperscaler SMART-to-failure
     literature gives this class **public, labelled ground truth**, which is why it qualifies for
     Tier 1.
 
@@ -121,12 +121,12 @@ the two are separate features.)
 - **Productivity protection.** Storage-full and perf-degradation forecasts catch the cliff before
   the user is blocked — cost that never appears in a ticket queue.
 - **Sales / displacement.** "DEX that gets ahead of the failure" is the named criterion in
-  Nexthink/1E/ControlUp displacement; predictive-*and*-privacy-preserving is a wedge in EU /
+  displacement of commercial DEX products; predictive-*and*-privacy-preserving is a wedge in EU /
   works-council-sensitive accounts. Natural feeder for the agentic self-remediation track.
 
 ## Competitive comparison
 
-| Capability | Nexthink / 1E / ControlUp | MS Intune + Endpoint Analytics | **Yuzu Prediction Engine** |
+| Capability | Commercial DEX products | Platform-vendor endpoint analytics | **Yuzu Prediction Engine** |
 |---|---|---|---|
 | Failure *forecasting* (a horizon, not a current score) | Partial — anomaly scoring, largely reactive | Battery/startup anomaly flags; no failure-date | **Tier-1 horizons + Tier-2 trends** |
 | Where it computes | Centralised cloud ingestion | Cloud-only, Windows-centric | **Edge-computed; only thin facts centralise** |
@@ -136,7 +136,7 @@ the two are separate features.)
 | Cross-platform parity | Windows-strong, mixed elsewhere | Windows-only in practice | **Same obs_types Win/Linux/macOS** |
 
 The external precedent for Tier 1 is not the endpoint vendors but the **storage-ops literature** —
-Backblaze's published drive-failure statistics and the hyperscaler SMART models prove disk-failure
+Published large-fleet drive-failure statistics and the hyperscaler SMART models prove disk-failure
 prediction is real *and* give it public ground truth. Yuzu's differentiator is bringing that rigor
 to the endpoint with **edge computation + works-council-grade privacy + explainable forecasts +
 an agentic-remediation seam**.

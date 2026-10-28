@@ -4,7 +4,7 @@
 
 ## What this document is
 
-A capability-and-agentic-readiness audit of Yuzu against two bars: (1) feature parity with mature commercial endpoint-management platforms (Tanium, BigFix, Intune, ServiceNow Discovery, Ansible Tower, CrowdStrike), and (2) the **agentic-first** thesis — every operation a human can perform via the dashboard must be performable by an authenticated LLM-driven worker through a documented, discoverable, machine-readable surface.
+A capability-and-agentic-readiness audit of Yuzu against two bars: (1) feature parity with mature commercial endpoint-management platforms (real-time endpoint query and response, patch and configuration management, cloud device management, IT discovery, automation and orchestration, and endpoint detection and response products), and (2) the **agentic-first** thesis — every operation a human can perform via the dashboard must be performable by an authenticated LLM-driven worker through a documented, discoverable, machine-readable surface.
 
 Companion docs:
 

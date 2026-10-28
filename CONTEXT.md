@@ -62,7 +62,7 @@ Applying Guardian policy to devices. Deploying a Baseline **converges every assi
 
 ## Echo
 
-Echo activity record. Echo captures ordered endpoint activity and response history so operators and agentic workers can reconstruct what happened during investigation, remediation, and audit workflows.
+The agent-local record of ordered endpoint activity and response history, so operators and agentic workers can reconstruct what happened during investigation, remediation, and audit workflows. Echo was named TAR before 2026-10.
 
 ## Gateway
 

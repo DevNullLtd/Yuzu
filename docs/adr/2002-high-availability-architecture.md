@@ -334,7 +334,11 @@ cluster unit; intra-zone scale is more nodes.
   `ProxyRegister` with **conditional (CAS) register/deregister** keyed on `connection_epoch` — a
   delayed replay from an *older* connection **cannot overwrite** a newer re-home (the bug an
   unconditional self-healing write would create). A lease that expires without renewal marks the
-  route stale.
+  route stale. Upgrade window (Echo rename; removed in a later change): the directory row also
+  carries a `legacy_echo_wire_name` flag, set at `ProxyRegister` from the agent's reported plugin
+  inventory, so a replica that holds no session for an agent can still address it by the
+  pre-rename plugin name `tar` until the agent upgrades. The column stays after the write and read
+  are removed.
 - **Net-new intra-cluster routing (corrected claim).** Today `yuzu_gw_router:send_command` resolves an
   agent via node-local ETS (`yuzu_gw_registry.erl:90`) and returns `not_connected` on a miss — a
   targeted command landing on the wrong node of the right cluster fails even though a sibling holds
