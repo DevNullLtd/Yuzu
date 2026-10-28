@@ -745,9 +745,11 @@ public:
         /// with an altered body (validated at boot and behind a 60 s memo). STICKY until restart:
         /// generation changes made while the trigger was not firing are not reconstructable, so a
         /// re-enable must not silently re-admit. Also false from construction for a recovery-
-        /// bypassed instance (`MfaBindingCheck::kBypassForRecovery`), and for ONE read when the
-        /// catalog check could not run (the next read re-validates). A gate that compares
-        /// generations MUST answer store-unavailable while this is false.
+        /// bypassed instance (`MfaBindingCheck::kBypassForRecovery`), and for EVERY read while the
+        /// last catalog check could not run (a latch cleared by the next check that returns Valid;
+        /// the next read retries at once). A caller that arrives while the first inconclusive
+        /// check is still in flight reads the previous state (bounded by one catalog query). A
+        /// gate that compares generations MUST answer store-unavailable while this is false.
         bool binding_enforced{true};
     };
 
@@ -797,8 +799,10 @@ public:
     /// round trip (the `yuzu_auth_mfa_binding_enforcement_ok{store="auth"}` gauge samples it).
     /// False only after a validation has OBSERVED the generation trigger not in force, or from
     /// construction for a recovery-bypassed instance; it does not run a validation itself, so it
-    /// reads true until a `mfa_status` call finds the fault. A single catalog check that could
-    /// not run does NOT set it (that read alone reports not-enforced).
+    /// reads true until a `mfa_status` call finds the fault. A catalog check that could not run
+    /// does NOT set it: `mfa_status` reports not-enforced for every read until a later check
+    /// returns Valid (so the gauge reads 1 during that latch; only the step-up refusal counters
+    /// and the audit `reason=` show it).
     [[nodiscard]] bool mfa_binding_enforced() const noexcept;
 
     /// Generate a fresh TOTP secret and write it as provisional (encrypted).
@@ -934,6 +938,11 @@ public:
     /// returns `unexpected(WriteFailed)` and publishes nothing, exactly as a lost acknowledgement
     /// would. The write itself persists (counter advanced / code consumed / account enrolled).
     void set_commit_ack_lost_for_test(bool lost) noexcept;
+
+    /// Runs inside `mfa_status`'s trigger validation when the forced-Unknown seam is set, BEFORE
+    /// the inconclusive result is recorded, so a test can hold the compare-exchange winner
+    /// mid-check while a second thread reads. Production never sets it.
+    void set_binding_check_hook_for_test(std::function<void()> hook);
 
     /// Makes the next trigger validation in `mfa_status` come back inconclusive (as if the
     /// catalog query could not run), until cleared. Production never sets it.

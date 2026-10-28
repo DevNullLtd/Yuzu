@@ -3292,6 +3292,7 @@ struct ChainFixture {
         return detail::apply_step_up_chokepoint(req, res, deps);
     }
     std::unique_ptr<httplib::Request> pass_req;
+    int in_handler_durable_reads{0};
 
     // What the Settings recovery-codes handler does behind an admitting gate. Returns the new
     // codes, or nullopt when the gate refused (nothing is written then).
@@ -3324,7 +3325,13 @@ struct ChainFixture {
         const auto session = mgr.validate_session(token);
         REQUIRE(session.has_value());
         httplib::Response in_handler_res;
-        const DurableProofFn durable = durable_fn();
+        // Counts the stored-proof reads the in-handler wrapper performs: a consumed pass reads
+        // none, whereas a wrapper that skipped the pass and re-evaluated would read it (and also
+        // fill `admitted`, which is why `admitted` alone cannot tell the two apart).
+        const DurableProofFn durable = [this](const httplib::Request& r, const auth::Session& s) {
+            ++in_handler_durable_reads;
+            return durable_fn()(r, s);
+        };
         return detail::run_in_handler_step_up(
             *pass_req, in_handler_res, *session, "POST /api/settings/mfa/recovery-codes", db.get(),
             /*window_secs=*/300, audit_fn, "optional", &metrics, &durable, &admitted);
@@ -3442,6 +3449,32 @@ TEST_CASE("the chain: a survivor of a factor replacement cannot regenerate the r
     CHECK(status == 200);
 }
 
+TEST_CASE("the central 503 for an unverifiable binding names the runbook and does not ask the "
+          "caller to re-prove (a plain store outage keeps its old text)",
+          "[stepup][gate][refusal_text]") {
+    for (const char* reason : {"mfa_proof_unavailable", "mfa_binding_unenforced"}) {
+        INFO(reason);
+        StepUpVerdict v;
+        v.decision = StepUpDecision::kStoreUnavailable;
+        v.reason = reason;
+        const auto err = nlohmann::json::parse(step_up_refusal_json_rpc_error(v, "cid-1"));
+        CHECK(err["message"] == "this account's second-factor state cannot be verified");
+        CHECK(err["data"]["http_status"] == 503);
+        CHECK(err["data"]["mfa_step_up_required"] == false);
+        const std::string remediation = err["data"]["remediation"].get<std::string>();
+        CHECK(remediation.find("runbook") != std::string::npos);
+        CHECK(remediation.find("--mfa-reset") != std::string::npos);
+        CHECK(remediation.find("retry shortly") == std::string::npos);
+        CHECK_FALSE(err["data"].contains("challenge_url"));
+    }
+    // No reason: an ordinary store outage keeps the historical text and its retry promise.
+    StepUpVerdict plain;
+    plain.decision = StepUpDecision::kStoreUnavailable;
+    const auto err = nlohmann::json::parse(step_up_refusal_json_rpc_error(plain, "cid-2"));
+    CHECK(err["message"] == "authentication store is temporarily unavailable");
+    CHECK(err["data"]["mfa_step_up_required"] == true);
+}
+
 TEST_CASE("run_in_handler_step_up hands the armed pass's admission back to a factor-credential "
           "handler (qe-Q1)",
           "[pg][stepup][gate][binding][chain]") {
@@ -3449,6 +3482,7 @@ TEST_CASE("run_in_handler_step_up hands the armed pass's admission back to a fac
     const auto token = f.session_bound();
     StepUpAdmission admitted;
     REQUIRE(f.run_in_handler_admits(token, admitted));
+    CHECK(f.in_handler_durable_reads == 0); // the armed pass was consumed, not re-evaluated
     CHECK(admitted.local);
     CHECK(admitted.factor_gen == f.gen_of("alice"));
     CHECK(admitted.factor_gen > 0);

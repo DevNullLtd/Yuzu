@@ -17391,8 +17391,9 @@ private:
         // use the quiet admin probe, as the Users page does: a non-administrator's page view
         // must not write an auth.admin_required row per panel. Mutating routes keep the loud
         // require_admin bound above. Wired before the listener starts.
-        // mfa.disable audits after ending the actor's own session (#6079), so it needs the
-        // session-bound writer, not the request-resolving one.
+        // The Settings disable ends the actor's own session (#6079), so the error and denied
+        // rows it writes after the clear need the session-bound writer, not the request-resolving
+        // one (the success row is written inside the owner's transaction).
         settings_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
         // #6079: the recovery-codes and disable handlers use this gate instead of `step_up_fn`:
         // the same decision (`run_in_handler_step_up`), but it also returns the factor generation

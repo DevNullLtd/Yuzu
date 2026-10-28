@@ -356,7 +356,7 @@ inline constexpr auto kWallSanitySkew = std::chrono::minutes(5);
 /// without Postgres), so that shape is a wiring fault and is reported as an unavailable read,
 /// never aged on a replica clock. A LOCAL session's read is also turned `kUnavailable` by
 /// `AuthRoutes::durable_mfa_proof_for` while the session store's rebind guard is not observed in
-/// force (`AuthManager::stored_binding_trustworthy`), and for the one read whose validation could
+/// force (`AuthManager::stored_binding_trustworthy`), and for the read whose validation could
 /// not run (`guard_unverified`, `AuthManager::stored_binding_read_confirmed`): a binding that
 /// cannot be trusted is never read as one. The raw `read_durable_mfa_proof` does not apply that,
 /// because an SSO session carries no binding.

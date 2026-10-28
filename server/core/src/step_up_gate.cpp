@@ -46,18 +46,20 @@ RefusalText refusal_text(const StepUpVerdict& v) {
                 {},
                 false};
     case StepUpDecision::kStoreUnavailable:
-        // A binding decision that could not be made is NOT always a blip: an account enrolled
-        // before the factor-generation cutover (generation 0), or a trigger that is not in
-        // force, refuses every attempt until an administrator acts. Say so instead of
-        // promising that a retry helps (the audit row carries the same `reason=` token).
+        // A binding decision that could not be made is a blip for some causes (a failed read,
+        // an inconclusive trigger validation) and persistent for others (an account enrolled
+        // before the factor-generation cutover, generation 0; a trigger that is not in force).
+        // The text must not promise that a retry helps and must not tell the caller to re-prove
+        // (re-proving cannot help: the proof cannot be judged), so `mfa_step_up_required` is
+        // false; the audit row carries the same `reason=` token that tells the causes apart.
         if (!v.reason.empty()) {
             return {503,
                     "this account's second-factor state cannot be verified",
-                    "retry once; if it persists an administrator must follow the MFA binding "
+                    "if retrying does not clear it, an administrator must follow the MFA binding "
                     "enforcement runbook (an account enrolled before the upgrade needs "
                     "`yuzu-server --mfa-reset`)",
                     {},
-                    true};
+                    false};
         }
         [[fallthrough]];
     case StepUpDecision::kUnwired:

@@ -38,6 +38,8 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <condition_variable>
+#include <mutex>
 #include <atomic>
 #include <barrier>
 #include <chrono>
@@ -3611,11 +3613,13 @@ TEST_CASE("AuthDB trigger validation is sticky once it observes tampering",
     CHECK(fresh.mfa_status("t1")->binding_enforced);
 }
 
-// cpps-3 / up-2 (#6079 Gate 3/4): an inconclusive validation must not be visible as "enforced" to
-// ANY caller. Only the compare-exchange winner runs the catalog query; before the latch the
-// losers (and every caller until the memo lapsed) read the stale "enforced". The forced-Unknown
-// seam stands in for a catalog query that cannot run.
-TEST_CASE("AuthDB inconclusive trigger validation reads not-enforced for every concurrent caller",
+// cpps-3 / up-2 (#6079 Gate 3/4/8): once ONE validation has come back inconclusive, no reader may
+// see "enforced" until a later check returns Valid. Only the compare-exchange winner runs the
+// catalog query; before the latch, a loser that arrived while a winner's query was in flight
+// read the stale "enforced". The forced-Unknown seam stands in for a catalog query that cannot
+// run, and the hook holds the winner INSIDE that check so the loser provably reads mid-flight.
+TEST_CASE("AuthDB inconclusive trigger validation reads not-enforced for a reader that loses the "
+          "exchange while the winner's check is in flight",
           "[pg][auth_db][mfa_binding]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
@@ -3623,31 +3627,68 @@ TEST_CASE("AuthDB inconclusive trigger validation reads not-enforced for every c
     REQUIRE(h.db.upsert_user("u1", "h", "s", yuzu::server::auth::Role::user).has_value());
     CHECK(h.db.mfa_status("u1")->binding_enforced); // memo armed, check Valid
 
-    h.db.set_binding_check_unknown_for_test(true); // memo due now; the next check is inconclusive
-    // The first read runs the (inconclusive) check and latches; only then do the racers start,
-    // so the assertion below is about the LATCH, not about who wins the very first exchange.
+    h.db.set_binding_check_unknown_for_test(true); // memo due now; every check is inconclusive
+    // First episode: latches (nothing in flight, so a plain sequential read).
     CHECK_FALSE(h.db.mfa_status("u1")->binding_enforced);
-    constexpr int kThreads = 16;
+    CHECK(h.db.mfa_binding_enforced()); // the sticky gauge flag is NOT touched by an Unknown
+
+    // Second episode, mid-flight: the winner is held inside its inconclusive check; a second
+    // reader loses the exchange and must still read "not enforced" (the latch from episode 1).
+    std::mutex mu;
+    std::condition_variable cv;
+    bool in_check = false;
+    bool release = false;
+    h.db.set_binding_check_hook_for_test([&] {
+        std::unique_lock lk(mu);
+        in_check = true;
+        cv.notify_all();
+        cv.wait(lk, [&] { return release; });
+    });
+    std::optional<bool> winner_enforced;
+    std::optional<bool> loser_enforced;
+    {
+        std::jthread winner([&] {
+            auto s = h.db.mfa_status("u1");
+            if (s)
+                winner_enforced = s->binding_enforced;
+        });
+        {
+            std::unique_lock lk(mu);
+            REQUIRE(cv.wait_for(lk, std::chrono::seconds(10), [&] { return in_check; }));
+        }
+        // The winner is inside the check and has advanced the memo: this read loses the exchange.
+        auto s = h.db.mfa_status("u1");
+        if (s)
+            loser_enforced = s->binding_enforced;
+        {
+            std::lock_guard lk(mu);
+            release = true;
+        }
+        cv.notify_all();
+    } // the winner joins here, before any assertion about it
+    h.db.set_binding_check_hook_for_test({});
+    REQUIRE(winner_enforced.has_value());
+    REQUIRE(loser_enforced.has_value());
+    CHECK_FALSE(*winner_enforced);
+    CHECK_FALSE(*loser_enforced); // pre-fix: the loser read the stale "enforced"
+
+    // A concurrent burst while the fault persists: every reader that gets an answer refuses.
+    // (Four threads on a pool of four; a busy store is not asserted on.)
     std::atomic<int> enforced{0};
-    std::atomic<int> failed{0};
     {
         std::vector<std::jthread> workers;
-        workers.reserve(kThreads);
-        for (int i = 0; i < kThreads; ++i) {
+        workers.reserve(4);
+        for (int i = 0; i < 4; ++i) {
             workers.emplace_back([&] {
                 for (int round = 0; round < 20; ++round) {
                     auto s = h.db.mfa_status("u1");
-                    if (!s) {
-                        ++failed;
-                    } else if (s->binding_enforced) {
+                    if (s && s->binding_enforced)
                         ++enforced;
-                    }
                 }
             });
         }
     } // jthreads join here, before any assertion
-    CHECK(failed.load() == 0);
-    CHECK(enforced.load() == 0); // a loser must not read "enforced" while the check cannot run
+    CHECK(enforced.load() == 0);
 
     // Recovery: the latch clears on the next Valid check (the process was never poisoned).
     h.db.set_binding_check_unknown_for_test(false);

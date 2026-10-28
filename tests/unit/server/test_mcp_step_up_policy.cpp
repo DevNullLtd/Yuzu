@@ -281,7 +281,8 @@ TEST_CASE("mcp step-up policy: a twin exists in the REST table and the tool is n
         INFO("twin: " << std::string(e.rest_method) << " " << std::string(e.rest_pattern));
         const auto* twin = step_up_policy_for(e.rest_method, e.rest_pattern);
         REQUIRE(twin != nullptr);
-        if (twin->cls == StepUpClass::kRequired || twin->cls == StepUpClass::kPendingRuling)
+        if (twin->cls == StepUpClass::kRequired || twin->cls == StepUpClass::kFactorCredential ||
+            twin->cls == StepUpClass::kPendingRuling)
             CHECK(e.cls != StepUpClass::kExempt);
     }
 }

@@ -671,14 +671,17 @@ struct AuthDB::Impl {
     std::atomic<std::int64_t> binding_memo_ns{
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::seconds(60)).count()};
     // Set while the last validation could not run (BindingCheck::Unknown); cleared by the next
-    // Valid result. Every `mfa_status` reports "not enforced" while it is set, so a concurrent
-    // reader that lost the compare-exchange cannot read "enforced" in the window where the
-    // winner's check is inconclusive (mirrors SessionStore::last_validation_inconclusive_).
+    // Valid result. Every `mfa_status` reports "not enforced" while it is set, so once ONE
+    // check has come back inconclusive no reader (a compare-exchange loser included) reads
+    // "enforced" until a later check returns Valid. A loser that arrives while the FIRST
+    // inconclusive check is still in flight reads the previous state: that window is one catalog
+    // query (mirrors SessionStore::last_validation_inconclusive_).
     std::atomic<bool> binding_inconclusive{false};
 
     // Test seams (never set in production).
     std::atomic<bool> commit_ack_lost{false};
     std::atomic<bool> force_binding_unknown{false}; // forces BindingCheck::Unknown in mfa_status
+    std::function<void()> binding_check_hook;       // runs inside the forced-Unknown check
     std::mutex hook_mu;
     std::function<void()> enrolment_pre_txn_hook;
 
@@ -858,6 +861,13 @@ void AuthDB::set_binding_check_unknown_for_test(bool unknown) noexcept {
         return;
     impl_->force_binding_unknown.store(unknown, std::memory_order_release);
     impl_->binding_next_check_ns.store(0); // due now
+}
+
+void AuthDB::set_binding_check_hook_for_test(std::function<void()> hook) {
+    if (!impl_)
+        return;
+    std::lock_guard lk(impl_->hook_mu);
+    impl_->binding_check_hook = std::move(hook);
 }
 
 void AuthDB::set_enrolment_pre_txn_hook_for_test(std::function<void()> hook) {
@@ -1766,9 +1776,18 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
         if (now_ns >= due &&
             impl_->binding_next_check_ns.compare_exchange_strong(
                 due, now_ns + impl_->binding_memo_ns.load(std::memory_order_relaxed))) {
-            const BindingCheck checked = impl_->force_binding_unknown.load(std::memory_order_acquire)
-                                             ? BindingCheck::Unknown
-                                             : check_factor_trigger(lease.get());
+            BindingCheck checked = BindingCheck::Unknown;
+            if (impl_->force_binding_unknown.load(std::memory_order_acquire)) {
+                std::function<void()> hook;
+                {
+                    std::lock_guard lk(impl_->hook_mu);
+                    hook = impl_->binding_check_hook;
+                }
+                if (hook)
+                    hook(); // test seam: hold the winner mid-check
+            } else {
+                checked = check_factor_trigger(lease.get());
+            }
             switch (checked) {
             case BindingCheck::Valid:
                 impl_->binding_inconclusive.store(false, std::memory_order_release);
@@ -1780,7 +1799,13 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
                               "decisions fail closed until the server restarts");
                 break;
             case BindingCheck::Unknown:
-                impl_->binding_inconclusive.store(true, std::memory_order_release);
+                // One warning per episode (not per read): the gauge reads 1 during this latch, so
+                // the log line and the step-up refusal counters are the operator's signal.
+                if (!impl_->binding_inconclusive.exchange(true, std::memory_order_acq_rel)) {
+                    spdlog::warn("AuthDB: the MFA factor-generation trigger validation could not "
+                                 "run (catalog query failed); factor-bound MFA decisions refuse "
+                                 "until a later validation succeeds");
+                }
                 impl_->binding_next_check_ns.store(0, std::memory_order_release); // retry next read
                 break;
             }
