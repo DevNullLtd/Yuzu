@@ -822,15 +822,21 @@ static const ToolDef kTools[] = {
      "Query GENERIC per-source inventory blobs across agents (filter by agent or plugin). For the "
      "typed installed-software inventory (name/version/publisher per device, fleet-queryable), use "
      "query_installed_software instead. `limit` is 1..1000 (default 100): a value above 1000 is "
-     "clamped to 1000 and a value below 1 falls back to the default.",
+     "clamped to 1000 and a value below 1 falls back to the default. The typed daily-sync sources "
+     "(installed_software, app_perf, device_ci, software_licensing, app_usage, "
+     "certificate_inventory) are never returned here; use their typed tools.",
      R"({"type":"object","properties":{"agent_id":{"type":"string"},"plugin":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Page size, 1..1000. Out of range does not error: above 1000 is clamped to 1000, below 1 uses the default"}}})",
      R"j({"type":"object","properties":{"records":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"plugin":{"type":"string"},"data":{"type":"string"},"collected_at":{"type":"integer"}},"required":["agent_id","plugin","data","collected_at"]}},"result_truncated_by_cap":{"type":"boolean"}},"required":["records","result_truncated_by_cap"]})j"},
 
-    {"list_inventory_tables", "List available inventory data types with agent counts.",
+    {"list_inventory_tables",
+     "List available generic inventory data types with agent counts. The typed daily-sync sources "
+     "are not listed; use their typed tools.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"tables":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"agent_count":{"type":"integer"},"last_collected":{"type":"integer"}},"required":["plugin","agent_count","last_collected"]}}},"required":["tables"]})j"},
 
-    {"get_agent_inventory", "Get all inventory data for a specific agent.",
+    {"get_agent_inventory",
+     "Get all generic inventory data for a specific agent. The typed daily-sync sources are not "
+     "returned; use their typed tools.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"description":"Agent ID"}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"records":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"data":{"type":"string"},"collected_at":{"type":"integer"}},"required":["plugin","data","collected_at"]}},"result_truncated_by_cap":{"type":"boolean"}},"required":["records","result_truncated_by_cap"]})j"},
 

@@ -1805,8 +1805,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
 
     // Generic per-source blob persistence (sync-framework baseline; backs the
     // kInventoryQuery scope source + the inventory eval engine). The TYPED sources
-    // (installed_software / app_perf / device_ci / software_licensing) are persisted
-    // via their own normalized stores + shared seams below — skip them here, or they
+    // (kTypedInventorySources, typed_inventory_sources.hpp) are persisted via their
+    // own normalized stores + shared seams below — skip them here, or they
     // double-store into the generic InventoryStore. That generic store is read on
     // Infrastructure:Read (query_inventory/get_agent_inventory), so a typed source
     // leaking into it bypasses its own securable AND breaks direct/gateway parity
