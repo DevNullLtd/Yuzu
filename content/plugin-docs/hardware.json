@@ -1258,21 +1258,21 @@
     {
       "grant": "None documented for this plugin (`docs/agent-privilege-model.md:88`)",
       "if_refused": "WMI query returns `error`, action falls back to its `unknown` sentinel row (`wmi_query`, `hardware_plugin.cpp:216-235`)",
-      "measured": "2026-09-07, bare-metal, `SYSTEM` (sample stamp)",
+      "measured": "2026-10-27, bare-metal, `LocalSystem (elevated)` (sample stamp)",
       "os": "Windows",
       "runs_as": "agent service account (LocalSystem today, #1442)"
     },
     {
       "grant": "None (`docs/agent-privilege-model.md:88`)",
       "if_refused": "native call/subprocess fails, action emits `unknown`/sentinel row",
-      "measured": "2026-09-07, bare-metal, euid 501 (unprivileged, sample stamp)",
+      "measured": "2026-10-27, bare-metal, euid 501 (unprivileged, sample stamp)",
       "os": "macOS",
       "runs_as": "agent daemon, default (no extra entitlement)"
     },
     {
       "grant": "`system` reads `/sys/class/dmi/id/product_serial` + `product_uuid` (mode `0400`); the agent binary carries `cap_dac_read_search+eip` by default install (`hardware_plugin.cpp:365-371`). Without it, or with `--no-setcap`, both fields read back `unknown`. `memory`'s `dmidecode` branch typically needs root and fails EPERM unprivileged, silently falling through to the `/proc/meminfo` total (`hardware_plugin.cpp:506-509`).",
       "if_refused": "file read fails, action emits `unknown`",
-      "measured": "2026-09-06, container, euid 0 (sample stamp — root, so the `cap_dac_read_search` gate is not exercised by this capture)",
+      "measured": "2026-10-27, vm, euid 0 (sample stamp — root, so the `cap_dac_read_search` gate is not exercised by this capture; WSL VM, no DMI)",
       "os": "Linux",
       "runs_as": "agent daemon, default, except `system` needs `cap_dac_read_search` (`docs/agent-privilege-model.md:89`)"
     }
@@ -2042,6 +2042,7 @@
     ],
     "privilege_row": true,
     "tests": [
+      "tests/test_hardware_definition.py",
       "tests/unit/server/test_hardware_list_model.cpp",
       "tests/unit/server/test_hardware_routes.cpp",
       "tests/unit/server/test_hardware_sync_routes.cpp",

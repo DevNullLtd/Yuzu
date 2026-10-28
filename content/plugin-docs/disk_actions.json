@@ -806,6 +806,7 @@
     ],
     "privilege_row": true,
     "tests": [
+      "tests/test_disk_actions_definition.py",
       "tests/unit/test_disk_actions_local_dispatcher.cpp"
     ]
   },

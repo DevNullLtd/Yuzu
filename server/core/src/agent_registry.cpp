@@ -930,6 +930,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"hardware.baseboard", "Baseboard vendor, product and serial (planned on every OS this release; one unsupported status row)"},
         {"hardware.swap", "Swap devices and page files with total and used size (planned on every OS this release; one unsupported status row)"},
         {"hardware.machine_id", "Keyed hash of the OS machine identifier (planned on every OS this release; one unsupported status row)"},
+        // disk_actions
+        {"disk_actions.smart", "Per-physical-drive health: model, transport, media type and, where the OS exposes it, wear indicators"},
+        {"disk_actions.volumes", "Mapping between physical drives and the logical volumes they back, with mount points"},
+        {"disk_actions.partitions", "Partitions of each physical disk with size, type and mount points (planned on every OS this release; one unsupported status row)"},
+        {"disk_actions.topology", "LVM, md, multipath and APFS container layers above the physical disks (planned on every OS this release; one unsupported status row)"},
         // os_info
         {"os_info.os_name", "Full OS product name"},
         {"os_info.os_version", "OS version string"},

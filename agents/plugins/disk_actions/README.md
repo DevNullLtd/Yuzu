@@ -223,7 +223,7 @@ volume|-|-|-|-|-|physical-to-logical volume mapping is not implemented on Linux 
 - Plugin: `agents/plugins/disk_actions/src/disk_actions_legs.hpp` · `agents/plugins/disk_actions/src/disk_actions_linux.cpp` · `agents/plugins/disk_actions/src/disk_actions_macos.cpp` · `agents/plugins/disk_actions/src/disk_actions_parsers.hpp` · `agents/plugins/disk_actions/src/disk_actions_plugin.cpp` · `agents/plugins/disk_actions/src/disk_actions_win.cpp`
 - Definitions: `content/definitions/disk_actions.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_disk_actions.hpp`
-- Tests: `tests/unit/test_disk_actions_local_dispatcher.cpp`
+- Tests: `tests/test_disk_actions_definition.py` · `tests/unit/test_disk_actions_local_dispatcher.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->
 
