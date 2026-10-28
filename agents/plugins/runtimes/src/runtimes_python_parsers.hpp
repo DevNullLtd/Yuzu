@@ -24,6 +24,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace yuzu::runtimes {
@@ -164,6 +165,16 @@ inline void dedupe_python_rows(std::vector<PythonRecord>& recs) {
         if (!dup) out.push_back(std::move(r));
     }
     recs = std::move(out);
+}
+
+/// Stable output order for a walk whose enumeration order is not (RegEnumKeyEx is documented as
+/// unordered): by version string, then install path, plain byte order like the Linux/macOS legs'
+/// name-sorted listings. Run it AFTER dedupe_python_rows, so which view's record survives a
+/// duplicate never depends on the sort.
+inline void sort_python_rows(std::vector<PythonRecord>& recs) {
+    std::stable_sort(recs.begin(), recs.end(), [](const PythonRecord& a, const PythonRecord& b) {
+        return std::tie(a.version, a.install_path) < std::tie(b.version, b.install_path);
+    });
 }
 
 } // namespace yuzu::runtimes

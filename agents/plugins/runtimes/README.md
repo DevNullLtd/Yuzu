@@ -237,7 +237,7 @@ python|unmodelled|3.14|/usr/bin/python3.14|-
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp`
 - Tests: `tests/test_runtimes_definition.py` · `tests/unit/test_runtimes_linux_parsers.cpp` · `tests/unit/test_runtimes_local_dispatcher.cpp` · `tests/unit/test_runtimes_parsers.cpp` · `tests/unit/test_runtimes_python_parsers.cpp` · `tests/unit/test_runtimes_win_walk.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/sam1-runtimes-python.added.md`
+- Changelog: `changelog.d/2026-10-28-runtimes-python.added.md`
 <!-- END GENERATED -->
 6. **Linux `python` reports major.minor only.** The row version is taken from the file name (`python3.11` reads `3.11`); the patch level is not stored in any file the plugin can read without starting the interpreter, and it never starts one, so it is not guessed. The Linux descriptor leg is declared `constrained` for this reason; the status row stays `supported` because the limit is known and constant, not a failed read. A symlinked `python3.X` entry (some distributions alias a minor to another) is skipped, as `python3` itself is: only regular files count.
 7. **A missing or unreadable version file never raises a constraint.** On macOS a version directory whose `Info.plist` is absent, binary, oversized or unreadable still produces a row, with the directory's `x.y` as the version and vendor `-`; on Windows a tag with no `Version` or `SysVersion` value reports the tag's `major.minor`. Only a failure to open or list a root (or a cap) makes the result `constrained`.

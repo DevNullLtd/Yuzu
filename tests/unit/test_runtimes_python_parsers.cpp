@@ -1,6 +1,6 @@
 /**
- * test_runtimes_python_parsers.cpp -- tests for the runtimes plugin's `python` action
- * (SAM.1): the pure decision layer (runtimes_python_parsers.hpp) on EVERY OS, and the macOS
+ * test_runtimes_python_parsers.cpp -- tests for the runtimes plugin's `python` action:
+ * the pure decision layer (runtimes_python_parsers.hpp) on EVERY OS, and the macOS
  * framework walk (runtimes_macos_parsers.hpp) over a materialized fixture tree on POSIX. The
  * Linux walk's python cases live in test_runtimes_linux_parsers.cpp (they share its harness); the
  * Windows registry walk is test_runtimes_win_walk.cpp.
@@ -33,8 +33,12 @@
 #include <vector>
 
 #if !defined(_WIN32)
+#include "local_dispatcher.hpp" // yuzu::agent::LocalDispatcher (a real CommandContext)
 #include "runtimes_macos_parsers.hpp"
 
+#include <yuzu/plugin.h>
+
+#include <sstream>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -206,6 +210,34 @@ TEST_CASE("python: dedupe_python_rows keeps the first record per install path", 
     CHECK(recs[3].version == "3.9.1");
 }
 
+TEST_CASE("python: sort_python_rows orders by version then install path and is stable on ties",
+          "[runtimes][python]") {
+    using rt::PythonFlavour;
+    std::vector<rt::PythonRecord> recs{
+        {PythonFlavour::cpython, "3.14.6", "C:\\B\\", "PythonCore"},
+        {PythonFlavour::cpython, "3.12.4", "C:\\Z\\", "PythonCore"},
+        {PythonFlavour::cpython, "3.14.6", "C:\\A\\", "PythonCore"},
+        {PythonFlavour::cpython, "3.12.4", "C:\\Z\\", "second"}, // an exact tie keeps input order
+    };
+    rt::sort_python_rows(recs);
+    REQUIRE(recs.size() == 4);
+    CHECK(recs[0].install_path == "C:\\Z\\");
+    CHECK(recs[0].vendor == "PythonCore");
+    CHECK(recs[1].vendor == "second");
+    CHECK(recs[2].install_path == "C:\\A\\");
+    CHECK(recs[3].install_path == "C:\\B\\");
+    // Sorting after the dedupe leaves the survivor of a duplicate path independent of the sort: the
+    // first (64-bit) record stays even though the 32-bit one's version string sorts lower.
+    std::vector<rt::PythonRecord> both{
+        {PythonFlavour::cpython, "3.14.6", "C:\\Python314\\", "PythonCore"},
+        {PythonFlavour::cpython, "3.14", "C:\\Python314\\", "PythonCore"},
+    };
+    rt::dedupe_python_rows(both);
+    rt::sort_python_rows(both);
+    REQUIRE(both.size() == 1);
+    CHECK(both[0].version == "3.14.6");
+}
+
 TEST_CASE("python: python_row renders five fields and cannot be shifted by hostile text",
           "[runtimes][python]") {
     // safe_output_field folds a literal backslash to '/' (documented lossy wire behaviour).
@@ -367,6 +399,88 @@ TEST_CASE("python: the macOS row budget bounds the rows and reports row_cap (SYN
     const auto rows = mac::python_rows_at(dir.path, acc, cfg);
     CHECK(rows.size() == 2);
     CHECK(acc.reason() == "macos:runtimes:row_cap");
+}
+
+namespace {
+
+// -- CommandContext-level harness ---------------------------------------------------------
+// Drives the PRODUCTION macOS leg body (mac::run_macos_at) through a real CommandContext via
+// LocalDispatcher (the test_runtimes_linux_parsers.cpp precedent), so what is asserted is the rows
+// the command emits AND the typed result status it reports, not only the walk's return values.
+
+struct LegRun {
+    int rc = -1;
+    std::vector<std::string> rows;
+    YuzuResultStatus status = YUZU_RESULT_STATUS_UNDECLARED;
+    YuzuResultCompleteness completeness = YUZU_RESULT_COMPLETENESS_UNKNOWN;
+    std::string provenance;
+};
+
+const fs::path* g_leg_root = nullptr;
+
+int leg_execute(YuzuCommandContext* raw, const char* action, const YuzuParam* /*params*/,
+                std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx{raw};
+    const auto a = rt::parse_action(action);
+    if (!a) return 1;
+    return mac::run_macos_at(ctx, *a, *g_leg_root);
+}
+
+LegRun run_leg(rt::Action action, const fs::path& root) {
+    g_leg_root = &root;
+    yuzu::test::ScopeExit reset{[] { g_leg_root = nullptr; }}; // even if the run throws
+    YuzuPluginDescriptor descriptor{};
+    descriptor.execute = &leg_execute;
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(&descriptor, rt::action_name(action));
+
+    LegRun out;
+    out.rc = result.rc;
+    out.status = result.result_status;
+    out.completeness = result.result_completeness;
+    out.provenance = result.result_provenance;
+    std::istringstream lines(result.captured);
+    for (std::string line; std::getline(lines, line);)
+        if (!line.empty()) out.rows.push_back(line);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("python: run_macos_at emits the status row first and reports OK/FULL for a clean read",
+          "[runtimes][python][macos]") {
+    // MUTATION: reporting CONSTRAINED regardless, dropping the status row, or discarding the rows
+    // before emit_read turns this red.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_pymac_leg_"};
+    std::string err;
+    REQUIRE(materialize_manifest_file(dir.path, err, macos_fixture()));
+    const auto run = run_leg(rt::Action::python, dir.path);
+    CHECK(run.rc == 0);
+    CHECK(run.rows == std::vector<std::string>{"status|python|supported|-", kRow311, kRow312, kRow313});
+    CHECK(run.status == YUZU_RESULT_STATUS_OK);
+    CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(run.provenance.empty());
+}
+
+TEST_CASE("python: a refused framework hop is a constrained status row and CONSTRAINED/PARTIAL "
+          "through the dispatch (SYNTHETIC)",
+          "[runtimes][python][macos]") {
+    // A symlink needs no permission bits, so this holds at euid 0 too. MUTATION: reporting OK/FULL
+    // regardless of the accumulator, or emitting no status row, turns this red.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_pymac_legfail_"};
+    write_file(dir.path / "elsewhere/Python.framework/Versions/3.99/Resources/Info.plist",
+               "<key>CFBundleVersion</key><string>3.99.1</string>");
+    fs::create_directories(dir.path / "Library");
+    std::error_code ec;
+    fs::create_symlink("../elsewhere", dir.path / "Library/Frameworks", ec);
+    REQUIRE_FALSE(ec);
+    const auto run = run_leg(rt::Action::python, dir.path);
+    CHECK(run.rc == 0);
+    CHECK(run.rows ==
+          std::vector<std::string>{"status|python|constrained|macos:runtimes:symlink_refused"});
+    CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(run.provenance == "macos:runtimes:symlink_refused");
 }
 
 TEST_CASE("python: mac::forward_tokens re-spells linux: causes as macos: causes", "[runtimes][python][macos]") {

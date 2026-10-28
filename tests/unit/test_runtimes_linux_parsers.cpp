@@ -1341,7 +1341,7 @@ TEST_CASE("runtimes linux: an action with no walk arm is a visible failure, neve
     CHECK(acc.reason() == "internal_error");
 }
 
-// == python (SAM.1) ===========================================================================
+// == python ===================================================================================
 
 namespace {
 const char* kDebianPythonRow = "python|unmodelled|3.11|/usr/bin/python3.11|-";

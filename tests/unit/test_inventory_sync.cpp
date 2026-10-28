@@ -1278,7 +1278,8 @@ struct FakeOut {
     std::map<std::string, std::tuple<YuzuResultStatus, YuzuResultCompleteness, std::string>>
         result_status;
 };
-FakeOut g_fake[4]; // 0 installed_apps, 1 pkg_inventory, 2 windows_optional_features, 3 msi_packages
+FakeOut g_fake[5]; // 0 installed_apps, 1 pkg_inventory, 2 windows_optional_features, 3 msi_packages,
+                   // 4 runtimes
 
 template <int I>
 int fake_execute(YuzuCommandContext* ctx, const char* action, const YuzuParam* /*params*/,
@@ -1301,6 +1302,7 @@ const char* const kFakeIaActions[] = {"list_inventory", nullptr};
 const char* const kFakePkgActions[] = {"managers", "packages", "store_packages", nullptr};
 const char* const kFakeWofActions[] = {"list", nullptr};
 const char* const kFakeMsiActions[] = {"list_inventory", nullptr};
+const char* const kFakeRtActions[] = {"python", nullptr};
 
 #define YUZU_FAKE_DESC(var, plugin_name, actions, idx)                                            \
     const YuzuPluginDescriptor var = {YUZU_PLUGIN_ABI_VERSION, plugin_name, "1.0.0", "test fake", \
@@ -1310,13 +1312,15 @@ YUZU_FAKE_DESC(kFakeIa, "installed_apps", kFakeIaActions, 0);
 YUZU_FAKE_DESC(kFakePkg, "pkg_inventory", kFakePkgActions, 1);
 YUZU_FAKE_DESC(kFakeWof, "windows_optional_features", kFakeWofActions, 2);
 YUZU_FAKE_DESC(kFakeMsi, "msi_packages", kFakeMsiActions, 3);
+YUZU_FAKE_DESC(kFakeRt, "runtimes", kFakeRtActions, 4);
 #undef YUZU_FAKE_DESC
 
 SyncPluginMap all_plugins() {
     return {{"installed_apps", &kFakeIa},
             {"pkg_inventory", &kFakePkg},
             {"windows_optional_features", &kFakeWof},
-            {"msi_packages", &kFakeMsi}};
+            {"msi_packages", &kFakeMsi},
+            {"runtimes", &kFakeRt}};
 }
 
 void reset_fakes() {
@@ -1326,6 +1330,10 @@ void reset_fakes() {
         f.rc.clear();
         f.result_status.clear();
     }
+    // runtimes.python defaults to a clean empty read (the sample-shaped runs below pin digests that
+    // carry no python rows); the runtimes cases override it.
+    g_fake[4].out["python"] =
+        yuzu::shared::format_status_row("python", yuzu::shared::StatusLevel::supported, "") + "\n";
 }
 
 void fake_mac() {
@@ -2917,7 +2925,8 @@ TEST_CASE("characterisation: collector skip reasons per status mix",
          "package|snap|btop|1.4.7|app|1073|-|-|active"},
         {1, "pkg_inventory", "managers", false, ""},
         {3, "msi_packages", "list_inventory", true,
-         "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|Pub"}};
+         "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|Pub"},
+        {4, "runtimes", "python", false, "python|cpython|3.14.6|C:/P/|PythonCore"}};
     for (const auto& c : cases) {
         INFO(c.plugin << "." << c.action);
         const std::string source = std::string(c.plugin) + "." + c.action;
@@ -3018,6 +3027,65 @@ TEST_CASE("manager-ecosystem table: each row maps through its own action only",
                                          std::string("manager|") + m + "|present|1|/|-|-"}))) ==
                   res("ok", "tok"));
         }
+    }
+}
+
+// runtimes.python through the COLLECTOR (the adapter cases below call the parser directly): the
+// table row is what wires the plugin in, so removing it, or flipping its ConstrainedPolicy away
+// from fail, turns a section here red.
+TEST_CASE("collector: runtimes.python contributes sourced rows and an incomplete Python read aborts "
+          "the cycle",
+          "[sync][collector][runtimes]") {
+    const std::string python_row =
+        "python|cpython|3.13.1|/Library/Frameworks/Python.framework/Versions/3.13|org.python.python";
+    const auto python_records = [](const std::string& blob) {
+        std::size_t n = 0;
+        for (const auto& rec : records_of(blob)) {
+            const auto f = fields_of(rec);
+            REQUIRE(f.size() == 16);
+            // Every record sourced runtimes.python is a python-ecosystem Python entry, and back.
+            CHECK((f[15] == "runtimes.python") == (f[5] == "python"));
+            if (f[15] != "runtimes.python") continue;
+            ++n;
+            CHECK(f[0] == "Python");
+            CHECK(f[1] == "3.13.1");
+            CHECK(f[4] == "app");
+        }
+        return n;
+    };
+    SECTION("a python row becomes one sourced python record beside the other sources") {
+        fake_mac();
+        g_fake[4].out["python"] = nl({supported_status("python"), python_row});
+        const auto got = collect_with(all_plugins());
+        REQUIRE(got.has_value());
+        CHECK(python_records(got->first) == 1);
+        CHECK(records_of(got->first).size() == 393 + 70 + 1 + 1);
+    }
+    SECTION("a clean empty read contributes nothing and does not skip the cycle") {
+        fake_mac();
+        const auto got = collect_with(all_plugins());
+        REQUIRE(got.has_value());
+        CHECK(python_records(got->first) == 0);
+        CHECK(records_of(got->first).size() == 393 + 70 + 1);
+    }
+    SECTION("a constrained status skips the cycle even when it carries a row") {
+        fake_mac();
+        g_fake[4].out["python"] =
+            nl({st("python", "constrained", "linux:runtimes:permission_denied"), python_row});
+        auto src = make_installed_software_source(all_plugins());
+        REQUIRE(src.skip_reason);
+        CHECK_FALSE(src.collect().has_value());
+        CHECK(src.skip_reason() == "runtimes.python:linux:runtimes:permission_denied");
+    }
+    SECTION("a supported status with typed PARTIAL completeness skips the cycle") {
+        fake_mac();
+        g_fake[4].out["python"] = nl({supported_status("python"), python_row});
+        g_fake[4].result_status["python"] = {YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                             "x"};
+        auto src = make_installed_software_source(all_plugins());
+        REQUIRE(src.skip_reason);
+        CHECK_FALSE(src.collect().has_value());
+        CHECK(src.skip_reason() == "runtimes.python:partial");
     }
 }
 

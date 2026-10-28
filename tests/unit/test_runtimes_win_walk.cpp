@@ -1,11 +1,13 @@
 /**
  * test_runtimes_win_walk.cpp -- the runtimes plugin's Windows PythonCore (PEP 514) registry walk
- * (runtimes_win_parsers.hpp, SAM.1).
+ * (runtimes_win_parsers.hpp).
  *
  * Two layers, both Windows-only (the walk does not exist elsewhere; a no-op TU on macOS/Linux):
  *   - a scripted FakeOps injected through the walk's registry-call seam drives every branch
  *     deterministically (absent / denied roots, a view present on one side only, a missing Version,
- *     ERROR_MORE_DATA on a tag name, the tag cap across both views, handle accounting);
+ *     ERROR_MORE_DATA on a tag name, the tag cap across both views, the row-byte budget, the sorted
+ *     output order, handle accounting), plus the leg body (run_windows_with) through a real
+ *     CommandContext so the typed result status is asserted too;
  *   - one end-to-end case reads a planted tag under an isolated, process-suffixed HKCU scratch key
  *     through RealRegOps (Reg*W only), so the real registry decode path runs once.
  *
@@ -17,13 +19,19 @@
 
 #ifdef _WIN32
 
+#include "local_dispatcher.hpp" // yuzu::agent::LocalDispatcher (a real CommandContext)
 #include "runtimes_win_parsers.hpp"
+#include "test_helpers.hpp" // yuzu::test::ScopeExit
 
 #include <win_reg_handle.hpp>
+#include <yuzu/plugin.h>
 
+#include <algorithm>
 #include <cstring>
 #include <cwchar>
 #include <map>
+#include <numeric>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -125,9 +133,10 @@ TEST_CASE("runtimes win: a tag present in one view only is a row; the same insta
     ConstraintAccumulator acc;
     const auto rows = rwin::python_rows(ops, acc);
     CHECK_FALSE(acc.any_failure());
-    // 64-bit view first; the duplicate path keeps the first (full-version) record.
-    CHECK(rows == std::vector<std::string>{"python|cpython|3.14.6|C:/Python314/|PythonCore",
-                                           "python|cpython|3.12.4|C:/Python312-32/|PythonCore"});
+    // The duplicate path keeps the first (64-bit, full-version) record; rows come out sorted by
+    // (version, install path), so the 32-bit 3.12.4 precedes the 64-bit 3.14.6.
+    CHECK(rows == std::vector<std::string>{"python|cpython|3.12.4|C:/Python312-32/|PythonCore",
+                                           "python|cpython|3.14.6|C:/Python314/|PythonCore"});
     CHECK(ops.opened == ops.closed);
 }
 
@@ -234,11 +243,151 @@ TEST_CASE("runtimes win: the tag cap spans both views and reports row_cap, keepi
     CHECK(ops.opened == ops.closed);
 }
 
+TEST_CASE("runtimes win: rows are sorted by (version, install path) whatever the enumeration order",
+          "[runtimes][python][windows]") {
+    // RegEnumKeyEx order is unspecified, so the walk sorts after the dedupe. MUTATION: dropping the
+    // sort emits enumeration order (64-bit view first), which differs between the two fakes below.
+    struct Plant {
+        const wchar_t* view;
+        const wchar_t* tag;
+        const char* version;
+        const char* path;
+    };
+    const std::vector<Plant> plants{
+        {L"64", L"3.14", "3.14.6", "C:\\Python314\\"},
+        {L"64", L"3.10", "3.10.2", "C:\\Python310\\"},
+        {L"32", L"3.12-32", "3.12.4", "C:\\Python312-32\\"},
+        {L"32", L"3.10-32", "3.10.2", "C:\\Python310-32\\"},
+    };
+    // Both 3.10.2 rows tie on version; '-' (0x2D) sorts before a backslash (0x5C), so 310-32 is first.
+    const std::vector<std::string> sorted{
+        "python|cpython|3.10.2|C:/Python310-32/|PythonCore",
+        "python|cpython|3.10.2|C:/Python310/|PythonCore",
+        "python|cpython|3.12.4|C:/Python312-32/|PythonCore",
+        "python|cpython|3.14.6|C:/Python314/|PythonCore"};
+    for (const bool reversed : {false, true}) {
+        INFO("tags planted " << (reversed ? "in reverse" : "in listed order"));
+        FakeOps ops;
+        if (reversed) {
+            for (auto it = plants.rbegin(); it != plants.rend(); ++it)
+                ops.add_tag(it->view, it->tag, it->version, "", it->path);
+        } else {
+            for (const auto& p : plants) ops.add_tag(p.view, p.tag, p.version, "", p.path);
+        }
+        ConstraintAccumulator acc;
+        CHECK(rwin::python_rows(ops, acc) == sorted);
+        CHECK_FALSE(acc.any_failure());
+        CHECK(ops.opened == ops.closed);
+    }
+}
+
+TEST_CASE("runtimes win: rows past the byte budget are refused with row_cap and nothing later is admitted",
+          "[runtimes][python][windows]") {
+    // 500 tags (under the tag cap) whose rows are ~2.2 KiB each overrun the 1 MiB RowByteBudget.
+    // The short tag sorts LAST (version 9.9.9) and would fit on its own: it is absent only because
+    // the walk stops at the first refusal. MUTATION: `continue` instead of `break` admits it;
+    // dropping the charge emits all 501 rows.
+    FakeOps ops;
+    constexpr std::size_t kLong = 500;
+    for (std::size_t i = 0; i < kLong; ++i)
+        ops.add_tag(L"64", L"3." + std::to_wstring(i), "3." + std::to_string(i) + ".0", "",
+                    "C:\\P" + std::to_string(i) + "\\" + std::string(2200, 'p') + "\\");
+    ops.add_tag(L"64", L"9.9", "9.9.9", "", "C:\\Short\\");
+    ConstraintAccumulator acc;
+    const auto rows = rwin::python_rows(ops, acc);
+    CHECK(acc.reason() == std::string{rwin::kTokRowCap});
+    const std::size_t total = std::accumulate(rows.begin(), rows.end(), std::size_t{0},
+                                              [](std::size_t n, const std::string& r) { return n + r.size(); });
+    CHECK(total <= rwin::kMaxRowBytes);
+    CHECK_FALSE(rows.empty());
+    CHECK(rows.size() < kLong);
+    CHECK(std::none_of(rows.begin(), rows.end(),
+                       [](const std::string& r) { return r.find("9.9.9") != std::string::npos; }));
+    CHECK(ops.opened == ops.closed);
+}
+
+// -- CommandContext-level harness ---------------------------------------------------------
+// Drives the PRODUCTION leg body (win::run_windows_with) through a real CommandContext via
+// LocalDispatcher (the test_runtimes_linux_parsers.cpp precedent), over the scripted FakeOps, so
+// what is asserted is the rows the command emits AND the typed result status it reports.
+namespace {
+
+struct LegRun {
+    int rc = -1;
+    std::vector<std::string> rows;
+    YuzuResultStatus status = YUZU_RESULT_STATUS_UNDECLARED;
+    YuzuResultCompleteness completeness = YUZU_RESULT_COMPLETENESS_UNKNOWN;
+    std::string provenance;
+};
+
+const FakeOps* g_leg_ops = nullptr;
+
+int leg_execute(YuzuCommandContext* raw, const char* action, const YuzuParam* /*params*/,
+                std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx{raw};
+    const auto a = yuzu::runtimes::parse_action(action);
+    if (!a) return 1;
+    return rwin::run_windows_with(ctx, *a, *g_leg_ops);
+}
+
+LegRun run_leg(yuzu::runtimes::Action action, const FakeOps& ops) {
+    g_leg_ops = &ops;
+    yuzu::test::ScopeExit reset{[] { g_leg_ops = nullptr; }}; // even if the run throws
+    YuzuPluginDescriptor descriptor{};
+    descriptor.execute = &leg_execute;
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(&descriptor, yuzu::runtimes::action_name(action));
+
+    LegRun out;
+    out.rc = result.rc;
+    out.status = result.result_status;
+    out.completeness = result.result_completeness;
+    out.provenance = result.result_provenance;
+    std::istringstream lines(result.captured);
+    for (std::string line; std::getline(lines, line);)
+        if (!line.empty()) out.rows.push_back(line);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("runtimes win: run_windows_with emits the status row first and reports OK/FULL for a clean read",
+          "[runtimes][python][windows]") {
+    // MUTATION: reporting CONSTRAINED regardless, dropping the status row, or discarding the rows
+    // before emit_read turns this red.
+    FakeOps ops;
+    ops.add_tag(L"64", L"3.14", "3.14.6", "3.14", "C:\\Python314\\");
+    const auto run = run_leg(yuzu::runtimes::Action::python, ops);
+    CHECK(run.rc == 0);
+    CHECK(run.rows == std::vector<std::string>{"status|python|supported|-",
+                                               "python|cpython|3.14.6|C:/Python314/|PythonCore"});
+    CHECK(run.status == YUZU_RESULT_STATUS_OK);
+    CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(run.provenance.empty());
+}
+
+TEST_CASE("runtimes win: a denied view is a constrained status row and CONSTRAINED/PARTIAL through the dispatch",
+          "[runtimes][python][windows]") {
+    // MUTATION: reporting OK/FULL regardless of the accumulator, or emitting no status row, turns
+    // this red. The other view is still read, so its row follows the constrained status row.
+    FakeOps ops;
+    ops.node(L"64", kCore).open_rc = ERROR_ACCESS_DENIED;
+    ops.add_tag(L"32", L"3.12", "3.12.4", "3.12", "C:\\Python312\\");
+    const auto run = run_leg(yuzu::runtimes::Action::python, ops);
+    CHECK(run.rc == 0);
+    CHECK(run.rows ==
+          std::vector<std::string>{"status|python|constrained|windows:runtimes:python_reg:access_denied",
+                                   "python|cpython|3.12.4|C:/Python312/|PythonCore"});
+    CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(run.provenance == std::string{rwin::kTokAccessDenied});
+}
+
 TEST_CASE("runtimes win: RealRegOps reads a planted PythonCore tag from an isolated scratch key",
           "[runtimes][python][windows]") {
     // The real Reg*W decode path, once: a process-suffixed key under HKCU stands in for HKLM
     // (python_rows takes the root as a parameter; production never opens HKCU). HKCU\Software is not
-    // WOW-redirected, so both views see the same key and the dedupe leaves one row.
+    // WOW-redirected, so both views see the same key and the dedupe leaves one row per install path.
     const std::wstring sub =
         L"SOFTWARE\\YuzuTest\\RuntimesPython_" + std::to_wstring(GetCurrentProcessId());
     const std::wstring core = sub + L"\\PythonCore";
@@ -263,12 +412,23 @@ TEST_CASE("runtimes win: RealRegOps reads a planted PythonCore tag from an isola
         set_sz(tag.get(), L"SysVersion", L"3.99");
         const auto ip = create(core + L"\\3.99\\InstallPath");
         set_sz(ip.get(), nullptr, L"C:\\YuzuTestPython399\\");
+        // An InstallPath over kMaxValueBytes (40000 WCHARs = ~80 KB > 64 KiB) reads as absent: the
+        // row keeps its version, reports the path as unknown and raises no token.
+        const auto big_tag = create(core + L"\\3.98");
+        set_sz(big_tag.get(), L"Version", L"3.98.1");
+        const auto big_ip = create(core + L"\\3.98\\InstallPath");
+        set_sz(big_ip.get(), nullptr, std::wstring(40000, L'p').c_str());
     }
     ConstraintAccumulator acc;
     const auto rows =
         rwin::python_rows(rwin::RealRegOps{}, acc, HKEY_CURRENT_USER, core.c_str());
     CHECK_FALSE(acc.any_failure());
-    CHECK(rows == std::vector<std::string>{"python|cpython|3.99.1|C:/YuzuTestPython399/|PythonCore"});
+    CHECK(acc.reason().empty());
+    // Sorted by version: 3.98 first. A path-less record is never merged, and this scratch key is
+    // visible through both registry views, so the path-less 3.98 row appears once per view.
+    CHECK(rows == std::vector<std::string>{"python|cpython|3.98.1|-|PythonCore",
+                                           "python|cpython|3.98.1|-|PythonCore",
+                                           "python|cpython|3.99.1|C:/YuzuTestPython399/|PythonCore"});
 }
 
 #endif // _WIN32

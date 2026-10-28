@@ -233,7 +233,7 @@ FRAGMENT_FILES = [
 # 235, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a baseline.
 # registry 2.1.0: +3 (set_user_value Mutating, delete_user_value Destructive, apply Destructive; all
 # Infrastructure, gate AdminOrApproval) on top of that 235 = 238, re-derived the same way.
-# SAM.1: +1 (runtimes.python ReadOnly, Inventory, gate None) on top of that 238 = 239, re-derived the same way.
+# runtimes python: +1 (runtimes.python ReadOnly, Inventory, gate None) on top of that 238 = 239, re-derived the same way.
 EXPECTED_TOTAL_ROWS = 239
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair

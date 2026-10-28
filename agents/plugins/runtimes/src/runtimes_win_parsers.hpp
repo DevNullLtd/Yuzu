@@ -6,8 +6,9 @@
  * WHAT IS READ (rung 1, zero subprocess): HKLM\SOFTWARE\Python\PythonCore\<tag>, in BOTH registry
  * views (64-bit first, then WOW6432Node): `Version`, `SysVersion` and the default value of the
  * `InstallPath` subkey. One row per tag; the same install path seen through both views is one row
- * (the 64-bit one). HKCU and per-user hives are NEVER opened (machine scope only). Only the
- * `PythonCore` company (python.org) is walked: other PEP 514 companies (Anaconda, ...) are not.
+ * (the 64-bit one), and rows are emitted sorted by (version, install path). HKCU and per-user
+ * hives are NEVER opened (machine scope only). Only the `PythonCore` company (python.org) is
+ * walked: other PEP 514 companies (Anaconda, ...) are not.
  *
  * FAILURE NEVER READS AS ABSENT. An absent PythonCore key is silent (`supported` + zero rows: no
  * python.org install). Any other failed open, an enumeration error, a tag name too long for the name
@@ -167,6 +168,7 @@ template <class Ops>
         }
     }
     dedupe_python_rows(recs);
+    sort_python_rows(recs); // registry enumeration order is unspecified: emit a stable order
     yuzu::shared::RowByteBudget budget{kMaxTagsVisited, kMaxRowBytes};
     std::vector<std::string> rows;
     for (const auto& r : recs) {
