@@ -778,6 +778,55 @@ int KvStore::del_keys(std::string_view plugin, const std::vector<std::string>& k
     return deleted;
 }
 
+bool KvStore::rename_plugin(std::string_view from, std::string_view to) {
+    CallLock lock(mu_);
+    if (!db_)
+        return false;
+
+    if (sqlite3_exec(db_, "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        spdlog::error("KvStore::rename_plugin BEGIN failed: {}", sqlite3_errmsg(db_));
+        return false;
+    }
+    // ROLLBACK on any early return before a successful COMMIT (same shape as del_keys).
+    struct TxnGuard {
+        sqlite3* db;
+        bool committed{false};
+        ~TxnGuard() {
+            if (!committed)
+                sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        }
+    } txn{db_};
+
+    static constexpr const char* kSql[] = {
+        "INSERT OR IGNORE INTO kv_store(plugin, key, value, updated_at) "
+        "SELECT ?2, key, value, updated_at FROM kv_store WHERE plugin = ?1",
+        "DELETE FROM kv_store WHERE plugin = ?1",
+    };
+    for (const char* sql : kSql) {
+        sqlite3_stmt* raw_stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
+            spdlog::error("KvStore::rename_plugin prepare failed: {}", sqlite3_errmsg(db_));
+            return false;
+        }
+        StmtPtr stmt(raw_stmt);
+        sqlite3_bind_text(stmt.get(), 1, from.data(), static_cast<int>(from.size()),
+                          SQLITE_STATIC);
+        if (sqlite3_bind_parameter_count(stmt.get()) >= 2)
+            sqlite3_bind_text(stmt.get(), 2, to.data(), static_cast<int>(to.size()),
+                              SQLITE_STATIC);
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            spdlog::error("KvStore::rename_plugin step failed: {}", sqlite3_errmsg(db_));
+            return false;
+        }
+    }
+    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        spdlog::error("KvStore::rename_plugin COMMIT failed: {}", sqlite3_errmsg(db_));
+        return false;
+    }
+    txn.committed = true;
+    return true;
+}
+
 int KvStore::pragma_synchronous() {
     CallLock lock(mu_);
     if (!db_)

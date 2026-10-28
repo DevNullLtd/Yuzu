@@ -609,6 +609,58 @@ EchoDatabase& EchoDatabase::operator=(EchoDatabase&& other) noexcept {
     return *this;
 }
 
+namespace {
+
+bool table_exists(sqlite3* db, const char* name) {
+    sqlite3_stmt* raw = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", -1,
+                           &raw, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    StmtPtr stmt(raw);
+    sqlite3_bind_text(stmt.get(), 1, name, -1, SQLITE_STATIC);
+    return sqlite3_step(stmt.get()) == SQLITE_ROW;
+}
+
+// Schema v9 (upgrade window, removed with the legacy-name shims): a database written before the
+// rename holds tar_state / tar_config / tar_cursor. Rename whichever of them exist, atomically, in
+// one savepoint. Skipped when echo_config already exists (a fresh or already-renamed file).
+// Returns an error message on failure; the caller then refuses the open.
+std::optional<std::string> rename_legacy_tables(sqlite3* db) {
+    if (!table_exists(db, "tar_config") || table_exists(db, "echo_config"))
+        return std::nullopt;
+    static constexpr std::array<std::pair<const char*, const char*>, 3> kPairs = {{
+        {"tar_state", "echo_state"},
+        {"tar_config", "echo_config"},
+        {"tar_cursor", "echo_cursor"},
+    }};
+    if (sqlite3_exec(db, "SAVEPOINT v9_rename", nullptr, nullptr, nullptr) != SQLITE_OK)
+        return std::format("SAVEPOINT: {}", sqlite3_errmsg(db));
+    std::optional<std::string> failure;
+    for (const auto& [from, to] : kPairs) {
+        if (!table_exists(db, from) || table_exists(db, to))
+            continue;
+        const std::string sql = std::format("ALTER TABLE {} RENAME TO {}", from, to);
+        if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK) {
+            failure = std::format("{}: {}", sql, sqlite3_errmsg(db));
+            break;
+        }
+    }
+    if (!failure && sqlite3_exec(db, "RELEASE v9_rename", nullptr, nullptr, nullptr) != SQLITE_OK)
+        failure = std::format("RELEASE: {}", sqlite3_errmsg(db));
+    if (failure) {
+        // Outermost savepoint: RELEASE would COMMIT the partial work, so unwind first and fall
+        // back to a plain ROLLBACK if that fails (it fails harmlessly with no transaction open).
+        if (sqlite3_exec(db, "ROLLBACK TO v9_rename", nullptr, nullptr, nullptr) == SQLITE_OK)
+            sqlite3_exec(db, "RELEASE v9_rename", nullptr, nullptr, nullptr);
+        else
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+    }
+    return failure;
+}
+
+} // namespace
+
 std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesystem::path& path) {
     // Ensure parent directory exists
     std::error_code ec;
@@ -619,6 +671,18 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
             return std::unexpected(
                 std::format("failed to create directory {}: {}", parent.string(), ec.message()));
         }
+    }
+
+    // Upgrade window (removed with the legacy-name shims): agent core adopts a legacy tar.db as
+    // echo.db at boot, before any plugin initialises (adopt_legacy_echo_db). If echo.db is absent
+    // and an unadopted tar.db sits beside it, creating a fresh echo.db here would boot the agent
+    // with default config and re-enable operator-paused sources (the #559 class). Fail closed.
+    if (std::error_code lec; !std::filesystem::exists(path, lec) && !lec &&
+                             std::filesystem::exists(path.parent_path() / "tar.db", lec)) {
+        return std::unexpected(
+            std::format("legacy tar.db present at {} and not adopted - refusing to initialise a "
+                        "fresh echo.db beside it",
+                        (path.parent_path() / "tar.db").string()));
     }
 
     // #1567 — set when this open quarantined a corrupt file; persisted into the
@@ -727,6 +791,14 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         return std::unexpected(std::format("failed to enable secure_delete: {}", err));
     }
     sqlite3_free(err_msg);
+
+    // Schema v9: the base tables were renamed tar_* -> echo_*. This must run BEFORE the base
+    // schema below, which would otherwise create empty echo_* tables beside the populated tar_*
+    // ones and boot the agent with default config. Failure is fail-closed for the same reason.
+    if (auto rename_err = rename_legacy_tables(raw_db)) {
+        sqlite3_close(raw_db);
+        return std::unexpected(std::format("failed to rename legacy tar_* tables: {}", *rename_err));
+    }
 
     // Create schema — one transaction, not one per statement (see
     // exec_ddl_batch: ~75 fsync'd commits otherwise, #2093).
@@ -1117,6 +1189,14 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
                 }
             }
         }
+    }
+
+    // Schema v9: the tar_* -> echo_* table rename ran above (before the base schema), so every
+    // file that reaches this point has echo_* tables. Only the version marker is left. Fresh and
+    // renamed databases both read 9; the roll-up migration that follows takes v10.
+    if (db.schema_version() == 8) {
+        db.set_config("schema_version", "9");
+        spdlog::info("EchoDatabase: migrated to schema version 9 (tables renamed)");
     }
 
 #ifndef _WIN32
