@@ -23,13 +23,21 @@ Invariants:
 
   agent_service_impl.cpp
     4. Exactly four `response_store_->store(` calls (a fifth output-storing site needs a hook, or
-       a ruling that it owes none) and exactly four `audit_registry_frame(agent_id, resp)` calls.
-    5. Each hook is IMMEDIATELY followed by its failure signal and then by
-       `notify_exec_tracker(resp.command_id(), agent_id, resp);`: the audit row is written
-       before the execution advances. Two Subscribe forms, which add the audit-failed trailer
-       once per stream through `audit_failed_signalled`, and two gateway forms,
-       `(void)audit_registry_frame(agent_id, resp);` (the hook logs and counts every failure
-       itself and the gateway has no trailer, so it adds no second line).
+       a ruling that it owes none) and exactly four `audit_registry_frame(agent_id, resp, <plugin>)`
+       calls, where `<plugin>` is `plugin` or `prov.plugin` and nothing else (#4990).
+    4a. The plugin argument is the one the SERVER recorded at dispatch, never one parsed from the
+       command id the agent echoes: `prov.plugin` is only legal when the nearest preceding `prov`
+       declaration is `const ResponseProvenance prov = resolve_response_provenance(resp.command_id()`
+       and a bare `plugin` only when the nearest preceding `plugin` declaration is
+       `const std::string& plugin = prov.plugin;` and `plugin` is never assigned afterwards. That
+       alias is declared exactly twice (the two RUNNING sites) and `prov` is resolved exactly four
+       times (one per frame arm, the keepalive pair included).
+    5. Each hook is a whole statement (never the body of an `if`/`else`) IMMEDIATELY followed by its
+       failure signal and then by `notify_exec_tracker(resp.command_id(), agent_id, resp, prov);`:
+       the audit row is written before the execution advances. Two Subscribe forms, which add the
+       audit-failed trailer once per stream through `audit_failed_signalled`, and two gateway forms,
+       `(void)audit_registry_frame(agent_id, resp, <plugin>);` (the hook logs and counts every
+       failure itself and the gateway has no trailer, so it adds no second line).
     6. `audit_failed_signalled` is declared exactly once, BEFORE the Subscribe read loop: declared
        inside it, it would be re-armed per frame and the trailer would be added per failed frame.
     7. The hook body reads the store only through the statement
@@ -71,8 +79,9 @@ Invariants:
 
 `//` comments are stripped and whitespace runs collapsed before matching, so line wrapping and
 comment text cannot satisfy or break a check. The self-test applies in-memory mutations (a
-deleted stamp call, a deleted initialiser, a hook moved after the notification, a dropped failure
-signal, a flag that is never set or is re-armed per frame, a raw store read beside the weak lock or
+deleted stamp call, a deleted initialiser, a hook moved after the notification, a hook made
+conditional, a plugin argument (or the `plugin` alias) derived from the agent-echoed command id, a
+dropped failure signal, a flag that is never set or is re-armed per frame, a raw store read beside the weak lock or
 in the forwarder entry, a verdict outside the try, a charge without the overflow key, a missing
 factory call, a deleted or cleared weak-store wiring, the rundown gate's entry deleted or moved
 after the lock, its per-row check deleted or moved before the charge, the owed count moved after
@@ -115,8 +124,13 @@ AGENT_ONCE = (
     ".action = cmd.action(),",
 )
 
-HOOK = "audit_registry_frame(agent_id, resp)"
-NOTIFY = "notify_exec_tracker(resp.command_id(), agent_id, resp);"
+HOOK_HEAD = "audit_registry_frame(agent_id, resp, "
+# The only legal third arguments: the recorded plugin (or the alias that is pinned to it below).
+HOOK_ARGS = ("plugin", "prov.plugin")
+HOOK_CALL_RE = re.compile(r"audit_registry_frame\(agent_id, resp, (.*?)\)(?=&&|;)")
+NOTIFY = "notify_exec_tracker(resp.command_id(), agent_id, resp, prov);"
+PLUGIN_ALIAS = "const std::string& plugin = prov.plugin;"
+PROV_DECL = "const ResponseProvenance prov = resolve_response_provenance(resp.command_id()"
 FLAG_DECL = "bool audit_failed_signalled = false;"
 HOOK_SIG = "bool AgentServiceImpl::audit_registry_frame("
 FORWARDER_SIG = "void AgentServiceImpl::process_gateway_response("
@@ -138,11 +152,58 @@ CHARGE = "registry_audit_budget_->try_admit(agent_id, overflow)"
 BUDGET_CTOR = "registry_audit_budget_ = make_registry_audit_budget();"
 WIRING = "agent_service_.set_registry_audit_store(audit_store_);"
 READ_LOOP = "while (stream->Read(&resp))"
-SUBSCRIBE_FORM = normalise(
-    f"if (!{HOOK} && !audit_failed_signalled) {{ signal_grpc_audit_failed(context);"
-    f" audit_failed_signalled = true; }} {NOTIFY}"
-)
-GATEWAY_FORM = normalise(f"(void){HOOK}; {NOTIFY}")
+# A hook is a whole statement: it follows a `;`, `{` or `}` (never `if (...)`, `else` or a label), so
+# it cannot be made conditional without this gate noticing.
+BOUNDARY = r"(?:^|[;{}] ?)"  # normalise() drops a space that sits before a `(`
+
+
+def subscribe_form(arg):
+    return normalise(
+        f"if (!{HOOK_HEAD}{arg}) && !audit_failed_signalled) {{ signal_grpc_audit_failed(context);"
+        f" audit_failed_signalled = true; }} {NOTIFY}"
+    )
+
+
+def gateway_form(arg):
+    return normalise(f"(void){HOOK_HEAD}{arg}); {NOTIFY}")
+
+
+def count_forms(t, make):
+    return sum(len(re.findall(BOUNDARY + re.escape(make(a)), t)) for a in HOOK_ARGS)
+
+
+def last_decl(before, type_re, name):
+    """The text from the nearest preceding declaration of `name` up to its `;` (or None)."""
+    found = list(re.finditer(rf"(?<![\w:.]){type_re}&? {name}\b", before))
+    if not found:
+        return None
+    rest = before[found[-1].start() :]
+    return rest[: rest.find(";") + 1] if ";" in rest else rest
+
+
+def plugin_binding_problems(t):
+    """Every hook's plugin argument traces to the server-recorded provenance."""
+    bad = []
+    alias = normalise(PLUGIN_ALIAS)
+    for m in HOOK_CALL_RE.finditer(t):
+        arg, before = m.group(1), t[: m.start()]
+        if arg not in HOOK_ARGS:
+            bad.append(f"third argument `{arg}`")
+            continue
+        if not (last_decl(before, r"const ResponseProvenance", "prov") or "").startswith(
+            normalise(PROV_DECL)
+        ):
+            bad.append(f"`{arg}` at a hook whose nearest `prov` is not the resolver's")
+        if arg == "plugin" and last_decl(before, r"(?:const )?(?:std::string|auto)", "plugin") != alias:
+            bad.append("a bare `plugin` whose nearest declaration is not the `prov.plugin` alias")
+    if t.count(alias) != 2 or t.count(normalise(PROV_DECL)) != 4:
+        bad.append(
+            f"expected two `{PLUGIN_ALIAS}` aliases and four `{PROV_DECL}` resolutions"
+            f" (found {t.count(alias)} and {t.count(normalise(PROV_DECL))})"
+        )
+    if re.search(r"(?<![\w.>])plugin ?= ", t.replace(alias, "")):
+        bad.append("`plugin` is assigned somewhere other than its alias declaration")
+    return bad
 
 
 def agent_problems(src):
@@ -280,22 +341,32 @@ def server_problems(src):
             f"agent_service_impl.cpp: expected exactly 4 `response_store_->store(` sites, found {stores}"
             " (a new output-storing site needs an audit_registry_frame hook before its notify)"
         )
-    hooks = t.count(normalise(HOOK))
+    hooks = t.count(normalise(HOOK_HEAD))
     if hooks != 4:
-        out.append(f"agent_service_impl.cpp: expected exactly 4 `{HOOK}` hook calls, found {hooks}")
-    subscribe = t.count(SUBSCRIBE_FORM)
+        out.append(
+            f"agent_service_impl.cpp: expected exactly 4 `{HOOK_HEAD}<plugin>)` hook calls, found {hooks}"
+        )
+    bad = plugin_binding_problems(t)
+    if bad:
+        out.append(
+            "agent_service_impl.cpp: the plugin that gates the registry.write rows must be the one"
+            " the SERVER recorded at dispatch (`prov.plugin`, or the alias declared as exactly"
+            f" `{PLUGIN_ALIAS}`), never one parsed from the agent-echoed command id: "
+            + "; ".join(bad)
+        )
+    subscribe = count_forms(t, subscribe_form)
     if subscribe != 2:
         out.append(
             f"agent_service_impl.cpp: expected exactly two Subscribe hooks of the form"
-            f" `{SUBSCRIBE_FORM}` (found {subscribe}): the row is written before the execution"
-            " advances, and the trailer is added once per stream"
+            f" `{subscribe_form('<plugin>')}` as whole statements (found {subscribe}): the row is"
+            " written before the execution advances, and the trailer is added once per stream"
         )
-    gateway = t.count(GATEWAY_FORM)
+    gateway = count_forms(t, gateway_form)
     if gateway != 2:
         out.append(
             f"agent_service_impl.cpp: expected exactly two gateway hooks of the form"
-            f" `(void){HOOK}; {NOTIFY}` (found {gateway}): the row is written before the"
-            " execution advances"
+            f" `{gateway_form('<plugin>')}` as whole statements (found {gateway}): the row is"
+            " written before the execution advances"
         )
     decls = t.count(FLAG_DECL)
     loops = t.count(normalise(READ_LOOP))
@@ -324,13 +395,13 @@ AGENT_MUTATIONS = [
 SERVER_MUTATIONS = [
     # a Subscribe hook deleted
     (
-        r"if \(!audit_registry_frame\(agent_id, resp\) && !audit_failed_signalled\) \{\s*"
+        r"if \(!audit_registry_frame\(agent_id, resp, (?:prov\.)?plugin\) && !audit_failed_signalled\) \{\s*"
         r"signal_grpc_audit_failed\(context\);\s*audit_failed_signalled = true;\s*\}",
         "",
     ),
     # the Subscribe failure signal dropped
     (
-        r"(if \(!audit_registry_frame\(agent_id, resp\) && !audit_failed_signalled\) \{)\s*"
+        r"(if \(!audit_registry_frame\(agent_id, resp, (?:prov\.)?plugin\) && !audit_failed_signalled\) \{)\s*"
         r"signal_grpc_audit_failed\(context\);",
         r"\1 (void)0;",
     ),
@@ -343,22 +414,93 @@ SERVER_MUTATIONS = [
     ),
     # a Subscribe hook moved after the notification
     (
-        r"(if \(!audit_registry_frame\(agent_id, resp\) && !audit_failed_signalled\) \{[^}]*\})"
-        r"(\s*(?://[^\n]*\n\s*)*)(notify_exec_tracker\(resp\.command_id\(\), agent_id, resp\);)",
+        r"(if \(!audit_registry_frame\(agent_id, resp, (?:prov\.)?plugin\) && !audit_failed_signalled\) \{[^}]*\})"
+        r"(\s*(?://[^\n]*\n\s*)*)(notify_exec_tracker\(resp\.command_id\(\), agent_id, resp, prov\);)",
         r"\3\2\1",
     ),
     # a gateway hook moved after the notification
     (
-        r"(\(void\)audit_registry_frame\(agent_id, resp\);)"
-        r"(\s*(?://[^\n]*\n\s*)*)(notify_exec_tracker\(resp\.command_id\(\), agent_id, resp\);)",
+        r"(\(void\)audit_registry_frame\(agent_id, resp, (?:prov\.)?plugin\);)"
+        r"(\s*(?://[^\n]*\n\s*)*)(notify_exec_tracker\(resp\.command_id\(\), agent_id, resp, prov\);)",
         r"\3\2\1",
     ),
     # a gateway hook deleted
-    (r"\(void\)audit_registry_frame\(agent_id, resp\);", ""),
+    (r"\(void\)audit_registry_frame\(agent_id, resp, (?:prov\.)?plugin\);", ""),
     # a gateway site logs the failure a second time
     (
-        r"\(void\)audit_registry_frame\(agent_id, resp\);",
-        'if (!audit_registry_frame(agent_id, resp)) spdlog::error("again");',
+        r"\(void\)audit_registry_frame\(agent_id, resp, plugin\);",
+        'if (!audit_registry_frame(agent_id, resp, plugin)) spdlog::error("again");',
+    ),
+    # each of the four hooks made conditional (skipped for a path): the whole-statement pin
+    (
+        r"\(void\)audit_registry_frame\(agent_id, resp, plugin\);",
+        "if (resp.status() == pb::CommandResponse::RUNNING) "
+        "(void)audit_registry_frame(agent_id, resp, plugin);",
+    ),
+    (
+        r"\(void\)audit_registry_frame\(agent_id, resp, prov\.plugin\);",
+        "if (resp.exit_code() == 0) (void)audit_registry_frame(agent_id, resp, prov.plugin);",
+    ),
+    (
+        r"if \(!audit_registry_frame\(agent_id, resp, plugin\) && !audit_failed_signalled\) \{",
+        "if (resp.status() == pb::CommandResponse::RUNNING)\n"
+        "            if (!audit_registry_frame(agent_id, resp, plugin) && !audit_failed_signalled) {",
+    ),
+    (
+        r"(?<!\S)if \(!audit_registry_frame\(agent_id, resp, prov\.plugin\) && !audit_failed_signalled\) \{",
+        "if (resp.exit_code() == 0)\n"
+        "            if (!audit_registry_frame(agent_id, resp, prov.plugin) && !audit_failed_signalled) {",
+    ),
+    # a hook skipped on the keepalive-style early path: an early return ahead of it is not lexical,
+    # but a hook placed inside a never-taken branch is
+    (
+        r"\(void\)audit_registry_frame\(agent_id, resp, prov\.plugin\);",
+        "if (false) { (void)audit_registry_frame(agent_id, resp, prov.plugin); }",
+    ),
+    # THE PLUGIN ARGUMENT (#4990): each of the four hooks fed by something derived from the
+    # agent-echoed command id instead of the server-recorded plugin
+    (
+        r"(\(void\)audit_registry_frame\(agent_id, resp, )plugin\)",
+        r"\1extract_plugin(resp.command_id()))",
+    ),
+    (
+        r"(\(void\)audit_registry_frame\(agent_id, resp, )prov\.plugin\)",
+        r"\1extract_plugin(resp.command_id()))",
+    ),
+    (
+        r"(if \(!audit_registry_frame\(agent_id, resp, )plugin\)",
+        r"\1extract_plugin(resp.command_id()))",
+    ),
+    (
+        r"(if \(!audit_registry_frame\(agent_id, resp, )prov\.plugin\)",
+        r"\1extract_plugin(resp.command_id()))",
+    ),
+    # ... or by a local the gate has not pinned to the recorded plugin
+    (r"(\(void\)audit_registry_frame\(agent_id, resp, )plugin\)", r"\1plugin_name)"),
+    # the `plugin` alias itself re-derived from the command id (first, then second declaration)
+    (
+        r"const std::string& plugin = prov\.plugin;",
+        "const std::string plugin = extract_plugin(resp.command_id());",
+    ),
+    (
+        r"(?s)(const std::string& plugin = prov\.plugin;.*?)const std::string& plugin = prov\.plugin;",
+        r"\1const std::string plugin = extract_plugin(resp.command_id());",
+    ),
+    # the alias repointed at another record, or shadowed after its declaration
+    (r"const std::string& plugin = prov\.plugin;", "const std::string& plugin = resp.command_id();"),
+    (
+        r"(const std::string& plugin = prov\.plugin;)",
+        r"\1\n        std::string plugin2 = plugin;\n        plugin = extract_plugin(resp.command_id());",
+    ),
+    # the provenance resolved from the agent-echoed id: no longer THE resolver call
+    (
+        r"const ResponseProvenance prov = resolve_response_provenance\(resp\.command_id\(\)\);",
+        "const ResponseProvenance prov = ResponseProvenance{extract_plugin(resp.command_id()), {}};",
+    ),
+    # the notification loses the provenance (the old three-argument form)
+    (
+        r"notify_exec_tracker\(resp\.command_id\(\), agent_id, resp, prov\);\s*\n\s*std::string status_str",
+        "notify_exec_tracker(resp.command_id(), agent_id, resp);\n\n        std::string status_str",
     ),
     # a fifth output-storing site appears
     (r"response_store_->store\(sr\);", "response_store_->store(sr);\nresponse_store_->store(sr);"),

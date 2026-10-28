@@ -846,8 +846,15 @@ TEST_CASE("execute_guarded turns a throwing action into rc 1 and one error|excep
 TEST_CASE("Win32Registry::query_value returns a REG_SZ stored without its terminator exactly as stored",
           "[registry][windows][internals]") {
     // The capture of a pre-existing value feeds the audit row's old= field: it must be the stored bytes. A
-    // RegQueryValueExW into a roomy buffer may append a terminator the stored value never had; this pins that
-    // the plugin's read does not report one.
+    // RegQueryValueExW into a roomy buffer may append a terminator the stored value never had; this pins that the
+    // plugin's read reports exactly the stored bytes: no appended terminator, nothing truncated.
+    //
+    // The write needs care too. Measured on weecolin (build 26100.2605, 2026-10-27): RegSetValueExW given a 4-byte
+    // REG_SZ, REG_EXPAND_SZ or REG_MULTI_SZ stores 6 bytes when the wchar_t just after those bytes in the caller's
+    // buffer is zero and 4 when it is 'X'; REG_BINARY never pads. The bare `wchar_t[2]` this test used before
+    // failed 8 of 8 there when run alone. Likely cause, not inspected: the stack after the array was zero in a
+    // fresh process (a release build run alone) and not zero in a dirtied one (the full suite, a debug build).
+    // The non-zero neighbour after the string pins the stored size at 4.
     const std::string root = scratch_root("unterminated");
     ScratchTree cleanup{root};
     yuzu::win::RegKey raw; // closes on every exit, a failed REQUIRE included
@@ -856,9 +863,19 @@ TEST_CASE("Win32Registry::query_value returns a REG_SZ stored without its termin
         skip_or_fail("not elevated -- HKLM scratch not writable");
         return;
     }
-    const wchar_t stored[2] = {L'a', L'b'}; // four bytes, no terminator
-    REQUIRE(RegSetValueExW(raw.get(), L"V", 0, REG_SZ, reinterpret_cast<const BYTE*>(stored), sizeof stored) ==
-            ERROR_SUCCESS);
+    const wchar_t stored[3] = {L'a', L'b', L'X'}; // four bytes passed, no terminator; 'X' is only the neighbour
+    REQUIRE(RegSetValueExW(raw.get(), L"V", 0, REG_SZ, reinterpret_cast<const BYTE*>(stored),
+                           sizeof stored - sizeof(wchar_t)) == ERROR_SUCCESS);
+    // The write precondition, asked of the OS directly so that a failure names the layer: the key holds the one
+    // value "V", so the longest value data is its stored size. The 4 must stay 4. If a Windows build pads a string
+    // it is asked to store unterminated, create the value another way (NtSetValueKey) rather than relax this: the
+    // case is the only pin on the audit old= capture reporting no invented terminator.
+    DWORD stored_bytes = 0;
+    REQUIRE(RegQueryInfoKeyW(raw.get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                             &stored_bytes, nullptr, nullptr) == ERROR_SUCCESS);
+    INFO("the OS stored " << stored_bytes << " bytes for the 4-byte REG_SZ write; anything but 4 points to the OS "
+         "padding the write, not to a fault in the plugin's read");
+    REQUIRE(stored_bytes == 4);
     Win32Registry reg;
     yuzu::registry::QueryResult q;
     REQUIRE(reg.query_value(as_handle(raw.get()), "V", 4096, q) == ERROR_SUCCESS);

@@ -86,6 +86,7 @@
 #include "data_export.hpp"
 #include "deployment_store.hpp"
 #include "developer_routes.hpp" // System > Developer and API page + fragments (read-only)
+#include "dispatch_record_policy.hpp" // #4990: per-loop latch + short lease budget for the dispatch-record write
 #include "discover_routes.hpp" // A2 discovery surface: /api/v1/discover/* (roadmap Issue 17.1)
 #include "discovered_devices_reader.hpp" // make_discovered_devices_reader (core wiring)
 #include "discovery_store.hpp"
@@ -153,6 +154,7 @@
 #include "quarantine_store.hpp"
 #include "quarantine_containment_reconciler.hpp" // #3425: reconnect re-application
 #include "result_set_matcher.hpp"
+#include "result_set_members.hpp" // #4990
 #include "result_set_store.hpp"
 #include "result_sets_ui.hpp"
 #include "scope_yaml.hpp"
@@ -198,6 +200,7 @@
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
 #include "capability_fragments.hpp" // YUZU_ALL_CAPABILITY_FRAGMENTS: every capability fragment, spelled once
+#include "forensics_plugin_set.hpp"   // #4990: catalogue-derived Forensics plugin set (response read tier)
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -2369,6 +2372,9 @@ public:
                                   "skipped_lock", "failed"})
             metrics_.counter("yuzu_server_response_reap_passes_total", {{"result", result}});
         seed_response_facet_metrics(metrics_);
+        // #4990: Forensics-tier reads withheld because the caller's authority could not be
+        // determined; the closed reason set is pre-seeded to 0 by the header that emits it.
+        yuzu::server::seed_forensics_tier_metrics(metrics_);
         // #4644/#4703 response-route observability: strict-parse rejections and cut
         // exports, closed label sets seeded by the same header the emit sites use.
         seed_response_metrics(metrics_);
@@ -3413,15 +3419,17 @@ public:
                           "--auth-mode=sso-only (the TOTP challenge still follows)",
                           "counter");
         metrics_.counter("yuzu_auth_break_glass_login_total");
-        // HA WS-1(1b), ADR-2002 section 5: command_id -> execution_id
-        // correlation-table retention (ExecutionTracker's PG-backed
-        // command_execution table, replacing AgentServiceImpl's former
-        // in-process cmd_execution_ids_ map). Mirrors the session-reap
-        // metric trio above — same clock-guarded-retention shape, a
-        // separate table/store, so a separate counter family.
+        // HA WS-1(1b), ADR-2002 section 5, and #4990: the dispatch-record
+        // table's retention (ExecutionTracker's PG-backed command_execution
+        // table: one row per dispatch carrying command_id -> plugin and
+        // execution_id, replacing AgentServiceImpl's former in-process
+        // cmd_execution_ids_ map). Mirrors the session-reap metric trio
+        // above — same clock-guarded-retention shape, a separate
+        // table/store, so a separate counter family. A pass that deletes
+        // exactly the per-pass cap (50,000) is a saturated pass.
         metrics_.describe("yuzu_exec_correlation_reap_total",
-                          "Aged-out command_id -> execution_id correlation-table rows deleted by "
-                          "the clock-guarded retention sweep (HA WS-1(1b))",
+                          "Aged-out dispatch records (command_id -> plugin and execution_id) "
+                          "deleted by the clock-guarded retention sweep (HA WS-1(1b))",
                           "counter");
         metrics_.counter("yuzu_exec_correlation_reap_total");
         metrics_.describe("yuzu_exec_correlation_reap_clock_anomaly_total",
@@ -3508,19 +3516,20 @@ public:
         for (const char* outcome : {"ok", "ok_capped", "recovered", "declined", "skipped", "error"})
             metrics_.counter("yuzu_server_gateway_route_reap_total", {{"outcome", outcome}});
         // Distinct from the reap-only counter above: this fires on the
-        // WRITE path (AgentServiceImpl::record_execution_id, dispatch-time),
+        // WRITE path (AgentServiceImpl::record_command_dispatch, dispatch-time),
         // not the retention sweep. Governance Gate 4/6 finding: previously
         // log-only, no counter, so a sustained write-side degrade (unlike a
         // reap failure) was invisible to Prometheus.
         metrics_.describe("yuzu_exec_correlation_write_degrade_total",
-                          "Command-dispatch-time command_id -> execution_id correlation writes "
-                          "that failed (pool exhausted or query error) - the executions drawer "
-                          "misses these commands' agent-transition events; dispatch itself is "
+                          "Command-dispatch-time command_id -> (plugin, execution_id) record "
+                          "writes that failed (pool exhausted or query error) - these commands' "
+                          "responses are stored as unverified (Forensics-tier) and the executions "
+                          "drawer misses their agent-transition events; dispatch itself is "
                           "unaffected",
                           "counter");
         metrics_.counter("yuzu_exec_correlation_write_degrade_total");
         // Distinct from both counters above: this fires on the READ path
-        // (AgentServiceImpl::resolve_execution_id, hit on every
+        // (AgentServiceImpl::resolve_response_provenance, hit on every
         // CommandResponse) — adversarial review Should-fix, PR #3780: a
         // degraded lookup was previously indistinguishable from the common
         // "out-of-band dispatch" nullopt case, so a sustained pool/query
@@ -3533,6 +3542,20 @@ public:
                           "counter");
         for (auto reason : {"pool_exhausted", "query_failed"})
             metrics_.counter("yuzu_exec_correlation_read_degrade_total", {{"reason", reason}});
+        // #4990 (UP-7): every response frame's provenance outcome, decided once per frame by
+        // AgentServiceImpl::resolve_response_provenance. Closed label set, seeded so absent()
+        // means "no frame yet", not "nobody looked". `unrecorded` and `lookup_degraded` frames are
+        // stored and treated as unverified (Forensics-tier): a sustained rate means failed
+        // dispatch-record writes, a record reaped under a long-running command, or an endpoint
+        // echoing ids the server never issued.
+        metrics_.describe("yuzu_server_response_provenance_total",
+                          "Command response frames by provenance outcome (verified: the server's "
+                          "dispatch record was found; unrecorded: no record, so the response is "
+                          "stored and treated as unverified/Forensics-tier; lookup_degraded: the "
+                          "record read failed twice, same treatment)",
+                          "counter");
+        for (auto outcome : {"verified", "unrecorded", "lookup_degraded"})
+            metrics_.counter("yuzu_server_response_provenance_total", {{"outcome", outcome}});
         // #4982: ExecutionTracker::set_agents_targeted / ::mark_cancelled were
         // log-only on failure at every REST/MCP call site — a sustained
         // pool/query degrade on either had no Prometheus signal, only an
@@ -4831,6 +4854,20 @@ public:
         // Wire up cross-references for AgentServiceImpl
         // (done after stores are created below)
 
+        // #4990: the Forensics plugin set the stored-response read tier excludes, derived ONCE
+        // from the composed capability registry (never a hand-kept list). An empty derivation
+        // would silently exclude nothing, so boot REFUSES, same posture as the substrate checks.
+        forensics_plugin_set_ = yuzu::server::derive_forensics_plugin_set(capability_registry_);
+        if (!forensics_plugin_set_) {
+            const auto defect = yuzu::server::forensics_catalogue_defect(capability_registry_);
+            spdlog::error("[Forensics] Refusing to start: {} (#4990) - fail-closed",
+                          defect ? *defect
+                                 : std::string{"the capability catalogue yields no plugin on the "
+                                               "Forensics securable, so the stored-response read "
+                                               "tier would exclude nothing"});
+            startup_failed_ = true;
+        }
+
         // PostgreSQL substrate (ADR-0006/0007): one shared pool, constructed
         // BEFORE any Postgres-backed store and validated by a probe checkout so
         // the server FAILS CLOSED — no SQLite fallback — when the DSN is empty
@@ -5498,10 +5535,12 @@ public:
         //    executions tracker is operator-facing; an automated cache
         //    refill happening every 60s would otherwise spam its history
         //    pane. record_send_time stays so the standard latency
-        //    histogram still observes these dispatches (sec-INFO-10:
-        //    intentionally opted out of the command_id -> execution_id
-        //    correlation, HA WS-1(1b)'s ExecutionTracker::command_execution
-        //    table).
+        //    histogram still observes these dispatches. The dispatch IS
+        //    recorded (command_id -> plugin, empty execution id) like every
+        //    other dispatch, by the build_classified_command chokepoint
+        //    (#4990), so the replies are labelled by the recorded plugin;
+        //    only the command_id -> execution_id correlation is empty
+        //    (sec-INFO-10).
         //  * forward_gateway_pending() drains commands queued for
         //    gateway-proxied agents so a fleet that mixes direct and
         //    gateway-connected hosts gets uniform dispatch.
@@ -5568,7 +5607,12 @@ public:
                     q.limit = static_cast<int>(dispatched.size()) + 16;
                     // Degrade → empty this iteration; the poll loop retries
                     // until the deadline (deny-or-benign, not authz — ADR-0039).
-                    auto rows = response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{});
+                    // #4990: internal consumer. Reads back the server's own system-caller
+                    // tar.fleet_snapshot dispatch for the topology graph; never returned as rows.
+                    auto rows = response_store_
+                                    ->query(command_id,
+                                            ResponseTierFilter::unrestricted_internal_consumer(), q)
+                                    .value_or(std::vector<StoredResponse>{});
                     for (const auto& r : rows) {
                         if (seen.insert(r.agent_id).second)
                             matched.push_back(r);
@@ -6371,6 +6415,8 @@ public:
         // Wire up store pointers for AgentServiceImpl
         if (response_store_)
             agent_service_.set_response_store(response_store_.get());
+        // #4990: the live "output" bus publishes no Forensics-tier row (unset fails closed).
+        agent_service_.set_forensics_plugin_set(forensics_plugins());
         if (tag_store_)
             agent_service_.set_tag_store(tag_store_.get());
         if (analytics_store_)
@@ -6494,6 +6540,7 @@ public:
             } else {
                 execution_tracker_->set_event_bus(execution_event_bus_.get());
                 execution_tracker_->set_metrics(&metrics_); // ADR-1007
+                execution_tracker_->set_forensics_plugin_set(forensics_plugins()); // #4990
                 // ADR-1007: pre-seed to 0 so absent-vs-zero is meaningful —
                 // a healthy fleet with zero concurrency collisions/anomalies
                 // must read as "wired, nothing happened" on a dashboard, not
@@ -12983,7 +13030,8 @@ private:
         const std::string& action, const std::string& command_id,
         const std::unordered_map<std::string, std::string>& parameters = {},
         const std::string& payload = {}, int stagger_seconds = 0, int delay_seconds = 0,
-        const std::string& target_arm = {}, const std::string& execution_id = {}) {
+        const std::string& target_arm = {}, const std::string& execution_id = {},
+        yuzu::server::DispatchRecordLatch* record_latch = nullptr) {
         auto decision = yuzu::server::detail::classify_and_authorize_dispatch(
             capability_registry_, caller, plugin, action,
             [this](std::string_view principal, std::string_view securable,
@@ -13063,6 +13111,39 @@ private:
                                                                    : caller.principal));
             return std::unexpected(finalized.error());
         }
+
+        // #4990 (UP-7): the SERVER's record of this dispatch, written once, here, at the one
+        // chokepoint every operator, background and system dispatch passes through (REST
+        // /api/command, dispatch_confined, the scheduler/outbox/workflow/policy/preflight/
+        // deployment/bundle/quarantine/TAR/DEX callers, the viz fetcher, the __guard__ push, the
+        // asset-tag and __sync__ pushes, the legacy forwarder), AFTER classification,
+        // authorization and the kill switch (a denied dispatch records nothing and sends
+        // nothing) and BEFORE any frame is sent (a sub-millisecond loopback agent can reply
+        // before any later registration). Both ingest paths label a response with the RECORDED
+        // plugin and stamp the recorded execution id; a response whose command id has no record
+        // (a forged or never-issued id, a failed write, a reaped record) is stored and treated as
+        // unverified, i.e. Forensics-tier (response_provenance.hpp). The plugin is the wire
+        // plugin the agent will be sent (the catalogue's canonical spelling), not the caller's raw
+        // string. One upsert, one attempt, never refused or retried on failure (a failure is
+        // counted: yuzu_exec_correlation_write_degrade_total).
+        //
+        // Its latency is bounded, but only for the lease acquire and only per call. A single
+        // dispatch keeps the tracker's ordinary lease budget (2 s). `record_latch`
+        // (dispatch_record_policy.hpp) is passed ONLY by a loop that builds one command per
+        // target (today only the operator Guardian push): such a write uses the short fan-out
+        // budget (250 ms) and, after the loop's first failed write, the rest of that loop's writes
+        // are skipped and counted, so an outage costs the loop one short wait instead of N long
+        // ones. The latch is a parameter, not a property of the caller:
+        // `DispatchCaller::system` also marks the policy evaluator, the preflight runner and the
+        // reconciler, which write one record per dispatch and keep the ordinary budget. Once a
+        // lease is held, the statement runs under the pool's server-side lock_timeout (10 s) and
+        // statement_timeout (30 s) for every caller (a held lock on the table was measured
+        // blocking the upsert for 10.04 s before it failed): that residual is once per latched
+        // loop, and once per call otherwise. Honest limit: the record proves the server issued
+        // this command id for this plugin; an endpoint it was sent to can still replay that id
+        // on a frame of its own, and the content of a frame is not validated.
+        agent_service_.record_command_dispatch(command_id, finalized->wire().plugin(),
+                                               execution_id, record_latch);
 
         return *finalized;
     }
@@ -13378,10 +13459,8 @@ private:
             return yuzu::server::ConfinedDispatchOutcome{.command_id = command_id};
 
         agent_service_.record_send_time(command_id);
-        // PR 2 / UP2-4: register command_id -> execution_id BEFORE any RPC.
-        if (!execution_id.empty()) {
-            agent_service_.record_execution_id(command_id, execution_id);
-        }
+        // PR 2 / UP2-4: command_id -> (plugin, execution_id) was recorded BEFORE any RPC, inside
+        // build_classified_command above (#4990).
 
         if (arm == DispatchArm::None && !broadcast_on_none) {
             // Shared closure: NO TARGET NAMED AT ALL — reach NOBODY, not
@@ -16019,6 +16098,17 @@ private:
             return yuzu::server::visibility::response_visible_set(
                 rbac_store_.get(), mgmt_group_store_.get(), username);
         };
+        // #4990: who may read Forensics-plugin rows out of the response store. ONE production
+        // resolver, wired into every surface that reads stored responses (REST, MCP, dashboard,
+        // executions drawer, hardware poll). Deliberately NOT built like response_visible_set_fn
+        // above: that returns nullopt whenever RBAC is off, which is right for Response:Read and
+        // wrong here (a global Forensics:Read is the only thing that admits; with RBAC off it is
+        // floored to administrators). See forensics_visibility.hpp.
+        yuzu::server::ForensicsVisibilityFn forensics_visibility_fn =
+            [this](const httplib::Request& req) -> yuzu::server::ForensicsVisibility {
+            return yuzu::server::resolve_forensics_visible(
+                {.auth_routes = auth_routes_.get(), .metrics = &metrics_}, req);
+        };
         // #4035 review fix's bespoke `dex_visible_fn` resolver (a global-Read
         // bypass + `RbacStore::visible_agents_for_permission` join) is
         // RETIRED (WS-A4 PR-1 fix round, sec-1/sec-2): this resolver's bare
@@ -16642,6 +16732,8 @@ private:
                              .fleet_read_fn = fleet_read_fn,
                              .audit_fn = audit_fn,
                              .store = response_store_.get(),
+                             .forensics_plugins = forensics_plugins(),
+                             .forensics_visibility_fn = forensics_visibility_fn,
                              .metrics = &metrics_,
                          });
 
@@ -17232,6 +17324,7 @@ private:
             .custom_properties_store = custom_properties_store_.get(),
             .mgmt_group_store = mgmt_group_store_.get(),
             .metrics = &metrics_,
+            .forensics_plugins = forensics_plugins(), // #4990
             .dispatch_fn = command_dispatch_fn,
             // #3495: lets a shutdown request stop tick() from starting
             // further dispatch_instruction() calls once stop_requested_
@@ -17822,8 +17915,9 @@ private:
                 // The event_outbox drains on a MUCH tighter cadence than the
                 // correlation table above: it receives ~2-3 rows per agent
                 // CommandResponse (agent-transition + progress + terminal),
-                // vs one row per command for command_execution, so on a busy
-                // fleet the hourly 5000-row cap cannot keep up (governance
+                // vs one row per dispatch for command_execution (which has its
+                // own 50,000-row cap, see kCmdExecutionReapCap), so on a busy
+                // fleet an hourly 5000-row cap could not keep up (governance
                 // Gate 3 performance/sre finding — insert rate can exceed a
                 // 5000/hr drain, growing the table unbounded). At ~60s the
                 // same 5000-row cap gives ~300k/hr of drain headroom, well
@@ -17960,22 +18054,17 @@ private:
                             // empty matcher = SUCCESS responders; tar_rows_ge
                             // = SUCCESS with ≥N rows; column/op/value = a
                             // matching output row (PR-D, design §3.3).
+                            // #4990: the read excludes the Forensics plugins (see
+                            // result_set_members.hpp); a degraded read skips this set for this
+                            // tick rather than risk a false-empty membership (ADR-0039) - it
+                            // retries on the next 2s tick.
                             std::vector<std::string> members;
-                            std::unordered_set<std::string> seen;
                             if (response_store_) {
-                                auto rows = response_store_->query_by_execution(p.source_execution_id);
-                                if (!rows) {
-                                    // Degraded read: skip materializing THIS pending set
-                                    // this tick rather than risk a false-empty membership
-                                    // (ADR-0039) — it retries on the next 2s tick.
+                                auto found =
+                                    result_set_members(*response_store_, forensics_plugins(), p);
+                                if (!found)
                                     continue;
-                                }
-                                for (const auto& r : *rows) {
-                                    if (!rs_matcher::response_matches(p.matcher, r.status, r.output))
-                                        continue;
-                                    if (seen.insert(r.agent_id).second)
-                                        members.push_back(r.agent_id);
-                                }
+                                members = std::move(*found);
                             }
                             if (result_set_store_->materialize(p.id, members)) {
                                 metrics_
@@ -18724,8 +18813,11 @@ private:
                     return out;
                 ResponseQuery q;
                 q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
-                for (const auto& r : response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{}))
-                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                // #4990: this poll reads back a command the route dispatched itself from a
+                // fixed non-Forensics plugin, so the Forensics tier is excluded outright.
+                const auto tier = ResponseTierFilter::for_fixed_plugin_poll(forensics_plugins());
+                for (const auto& r : response_store_->query(command_id, tier, q).value_or(std::vector<StoredResponse>{}))
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail, /*plugin=*/{}});
                 return out;
             },
             // Per-device scope gate (same require_scoped_permission the /device routes
@@ -18935,8 +19027,11 @@ private:
                     return out;
                 ResponseQuery q;
                 q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
-                for (const auto& r : response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{}))
-                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                // #4990: this poll reads back a command the route dispatched itself from a
+                // fixed non-Forensics plugin, so the Forensics tier is excluded outright.
+                const auto tier = ResponseTierFilter::for_fixed_plugin_poll(forensics_plugins());
+                for (const auto& r : response_store_->query(command_id, tier, q).value_or(std::vector<StoredResponse>{}))
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail, /*plugin=*/{}});
                 return out;
             },
             audit_fn);
@@ -19367,21 +19462,31 @@ private:
                                      return out;
                                  },
                              // Narrow ResponseStore seam for the Actions-lens result poll
-                             // (byte-identical shape to DexRoutes' own — #1634: scope the
-                             // poll read AT THE STORE SEAM).
+                             // (the same seam shape as DexRoutes' own responses_fn; the
+                             // caller supplies the tier filter — #1634: scope the poll read
+                             // AT THE STORE SEAM).
                              .responses_fn =
-                                 [this](const std::string& command_id, const std::string& agent_id)
-                                     -> std::vector<DexAgentResponse> {
+                                 [this](const std::string& command_id, const ResponseTierFilter& tier,
+                                        const std::string& agent_id) -> std::vector<DexAgentResponse> {
                                      std::vector<DexAgentResponse> out;
                                      if (!response_store_)
                                          return out;
                                      ResponseQuery q;
                                      q.agent_id = agent_id;
+                                     // #4990: the route derives `tier` (after its gates) from the
+                                     // caller's Forensics visibility; the store applies it in SQL.
                                      for (const auto& r :
-                                          response_store_->query(command_id, q)
+                                          response_store_->query(command_id, tier, q)
                                               .value_or(std::vector<StoredResponse>{}))
-                                         out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                                         out.push_back({r.agent_id, r.status, r.output,
+                                                        r.error_detail, r.plugin});
                                      return out;
+                                 },
+                             // #4990: the poll validates the plugin prefix of its command id
+                             // against the composed catalogue, never a list of its own.
+                             .known_plugin_fn =
+                                 [this](const std::string& plugin) {
+                                     return capability_registry_.knows_plugin(plugin);
                                  },
                              // Execute-permission PROBE against a throwaway Response — the
                              // Read gate above already ran; this is the stricter check
@@ -19428,6 +19533,8 @@ private:
                              .sync_perm_fn = perm_fn,
                              .sync_runner = software_sync_runner(),
                              .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
+                             .forensics_visibility_fn = forensics_visibility_fn,
+                             .forensics_plugins = forensics_plugins(),
                          });
 
         // DashboardSummaryRoutes — /fragments/dashboard/summary (readout, needs
@@ -19680,8 +19787,8 @@ private:
         // AppUsageRoutes — /api/v1/forensics/agents/{agent_id}/app-usage (Wave 7
         // PR7.2). Same fail-closed enforcement primitive as SleRoutes above
         // (sle_gate_usable/G-1) — a corrupt/load-failed rbac.db is REFUSED (503),
-        // never served a legacy-open Forensics read. Forensics is
-        // Administrator-only by design (absent from the seeded Viewer read-list,
+        // never served a legacy-open Forensics read. Forensics:Read is held by
+        // default only by Administrator and ForensicsAnalyst (absent from the seeded Viewer read-list,
         // docs/authz-model.md §4).
         auto app_usage_scoped_perm_fn = [this, sle_gate_usable](
                                             const httplib::Request& req, httplib::Response& res,
@@ -19897,8 +20004,12 @@ private:
                 q.limit = 50000; // > cohort cap (20000) with headroom; keyset paging is a follow-up
                 // Degrade → empty (ADR-0039 deny-or-benign): reads as "no agent
                 // has responded yet", never a fabricated stage transition.
+                // #4990: internal consumer. The deployment engine reads the status of its own
+                // content_dist dispatch (cohort re-authorized every tick); rows are scored, not shown.
                 return deployment::best_response_per_agent(
-                    response_store_->query_by_execution(execution_id, q)
+                    response_store_
+                        ->query_by_execution(execution_id,
+                                             ResponseTierFilter::unrestricted_internal_consumer(), q)
                         .value_or(std::vector<StoredResponse>{}));
             },
             audit_fn, preflight_run_store_.get(), deployment_run_store_.get(),
@@ -19946,8 +20057,11 @@ private:
                     return out;
                 ResponseQuery q;
                 q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
-                for (const auto& r : response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{}))
-                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                // #4990: this poll reads back a command the route dispatched itself from a
+                // fixed non-Forensics plugin, so the Forensics tier is excluded outright.
+                const auto tier = ResponseTierFilter::for_fixed_plugin_poll(forensics_plugins());
+                for (const auto& r : response_store_->query(command_id, tier, q).value_or(std::vector<StoredResponse>{}))
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail, /*plugin=*/{}});
                 return out;
             },
             audit_fn,
@@ -20015,6 +20129,8 @@ private:
         // above); wiring it here too so /fragments/results migrates onto
         // require_fleet_read as its sole gate.
         dashboard_routes_->set_fleet_read_fn(fleet_read_fn);
+        dashboard_routes_->set_forensics_plugin_set(forensics_plugins()); // #4990
+        dashboard_routes_->set_forensics_visibility_fn(forensics_visibility_fn);
         // PR6.0b — the SAME capability_registry_ classifier /api/command and MCP
         // execute_instruction consult, so the three operator-facing dispatch
         // surfaces cannot disagree about whether a plugin.action is Destructive.
@@ -20144,7 +20260,11 @@ private:
         // McpServer's query_installed_software and DashboardRoutes above;
         // used only by the executions-drawer detail route.
         wf_deps.fleet_read_fn = fleet_read_fn;
+        // #4990: the drawer's Response:Read probe is the QUIET fleet-read probe (no denial row for
+        // a cookie session, a 503 told apart from a refusal), never the loud `perm_fn`.
+        wf_deps.response_probe_fn = draw_fleet_read_fn;
         wf_deps.audit_fn = audit_fn;
+        wf_deps.persist_audit_fn = audit_fn; // #4990: the drawer's response.forensics.read row
         wf_deps.emit_fn = [this](const std::string& event_type, const httplib::Request& req) {
             emit_event(event_type, req);
         };
@@ -20200,6 +20320,8 @@ private:
         };
         wf_deps.approval_manager = approval_manager_.get();
         wf_deps.response_store = response_store_.get();
+        wf_deps.forensics_plugins = forensics_plugins(); // #4990
+        wf_deps.forensics_visibility_fn = forensics_visibility_fn;
         // PR 3 — SSE event bus for live execution updates. Server owns
         // the bus; ExecutionTracker publishes onto it; SSE handler
         // subscribes per-connection.
@@ -21175,6 +21297,10 @@ private:
         // BEFORE register_routes(), same timing contract as the two setters
         // immediately above.
         rest_api_v1_->set_scope_evaluate_fn(scope_evaluate_fn);
+        // #4990 - the Forensics plugin set feeding the response read tier; MUST run BEFORE
+        // register_routes() (captured by value at registration), same timing as the setters above.
+        rest_api_v1_->set_forensics_plugin_set(forensics_plugins());
+        rest_api_v1_->set_forensics_visibility_fn(forensics_visibility_fn);
         // #4983 — `POST /api/v1/result-sets`'s device_ids[] existence check.
         // registry_.all_ids() is presence-merged (HA WS-5), the SAME domain
         // scope_evaluate_fn's ScopePopulation::Fleet path above uses — NOT
@@ -21604,6 +21730,11 @@ private:
                 // receives only the enabled rules that target its OS and name it in
                 // scope, so a Linux box is no longer handed Windows registry guards.
                 int sent = 0;
+                // #4990: one dispatch record is written per target below. A degraded record store
+                // costs this loop ONE short wait (the first failed write trips the latch and the
+                // rest are skipped, still dispatched), never one lease wait per agent ahead of
+                // forward_gateway_pending(). Local to this loop: never carried into another push.
+                yuzu::server::DispatchRecordLatch record_latch{"operator Guardian push"};
                 for (const auto& aid : targets) {
                     auto sess = registry_.get_session(aid);
                     const std::string agent_os = sess ? sess->os : std::string{};
@@ -21624,7 +21755,9 @@ private:
                     // `system_reserved` (capdecls::core_dispatch_capabilities.hpp).
                     auto classified = build_classified_command(
                         yuzu::server::DispatchCaller{.system = true}, "__guard__", "push_rules",
-                        push_command_id, /*parameters=*/{}, push.SerializeAsString());
+                        push_command_id, /*parameters=*/{}, push.SerializeAsString(),
+                        /*stagger_seconds=*/0, /*delay_seconds=*/0, /*target_arm=*/{},
+                        /*execution_id=*/{}, &record_latch);
                     // #881: system_reserved internal push (__guard__.push_rules),
                     // not operator instruction dispatch — deliberately NOT
                     // quarantine-gated (see dispatch_confined_arms.hpp).
@@ -21889,6 +22022,8 @@ private:
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
+            mcp_server_->set_forensics_plugin_set(forensics_plugins()); // #4990
+            mcp_server_->set_forensics_visibility_fn(forensics_visibility_fn);
             // Registry tools reach the REST provider closures through ToolDeps: the SAME
             // closure instances HardwareRoutes::Deps received above (roster, CI detail,
             // DEX score, quarantine list, fleet_read_fn gate, audit_fn), never a store
@@ -22115,7 +22250,7 @@ private:
                 // #1088 — execution_id parameter added so the MCP tool's
                 // pre-created execution row is bridged into the
                 // command_id -> execution_id correlation (HA WS-1(1b):
-                // ExecutionTracker::record_command_execution) BEFORE any
+                // ExecutionTracker::record_command_dispatch) BEFORE any
                 // RPC fires (UP2-4 race close from PR 2). Empty
                 // execution_id is the legacy untracked path.
                 [this](const std::string& plugin, const std::string& action,
@@ -22678,6 +22813,14 @@ private:
     /// dependency on any other member, so declaration order carries no
     /// constraint.
     yuzu::server::CommandCapabilityRegistry capability_registry_{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    /// #4990: plugins whose stored response rows are Forensics-tier, derived from
+    /// `capability_registry_` in the constructor (empty derivation = startup_failed_). Declared
+    /// after the registry it is derived from; route classes borrow `&*forensics_plugin_set_`.
+    std::optional<yuzu::server::ForensicsPluginSet> forensics_plugin_set_;
+    /// #4990: the borrowed form route classes take (nullptr only when startup_failed_).
+    [[nodiscard]] const yuzu::server::ForensicsPluginSet* forensics_plugins() const noexcept {
+        return forensics_plugin_set_ ? &*forensics_plugin_set_ : nullptr;
+    }
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
     /// closed if the DSN is empty or unreachable), reset in stop() AFTER the

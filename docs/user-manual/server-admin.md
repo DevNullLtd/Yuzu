@@ -3251,9 +3251,11 @@ dashboard fragment) — a separate, additional new rejection path on all three s
 
 **Who this affects.** Any RBAC-**enabled** deployment where a non-admin principal creates a
 result set by supplying `device_ids` directly. Checked against this repository's actual seed
-grants (`RbacStore::seed_defaults`), of the 7 seeded built-in roles only **Administrator** and
+grants (`RbacStore::seed_defaults`), of the 8 seeded built-in roles only **Administrator** and
 **ITServiceOwner** hold `Infrastructure:Read` — **Viewer, Operator, PlatformEngineer,
-ApiTokenManager, and Reviewer do not**. A principal holding one of those five roles who could
+ApiTokenManager, Reviewer, and ForensicsAnalyst do not** (`ForensicsAnalyst` was added later, so
+it is not a role that could have created result sets with `device_ids` before this release). A principal holding one of the five roles that existed at that release
+(Viewer, Operator, PlatformEngineer, ApiTokenManager, Reviewer) who could
 previously create a result set with `device_ids` (the RBAC-enabled default before this release
 carried no permission check on this field at all) will now receive a new `403` on all three
 surfaces. This is a genuine, confirmed regression path, not a hypothetical one. A caller who omits
@@ -3272,8 +3274,8 @@ of `Viewer`, `Operator`, `PlatformEngineer`, `ApiTokenManager`, or `Reviewer` wh
 capability; each will start receiving `403` the moment this release is live, with no advance
 warning from the caller's own side.
 
-**What to do.** Of the 6 fleet-wide-assignable built-in roles, only `Administrator` holds
-`Infrastructure:Read` — `ITServiceOwner` (the 7th, management-group-scoped-only) also holds it. A
+**What to do.** Of the 7 fleet-wide-assignable built-in roles, only `Administrator` holds
+`Infrastructure:Read` — `ITServiceOwner` (the 8th, management-group-scoped-only) also holds it. A
 principal who needs to keep creating result sets with `device_ids` after this release needs one of
 those two roles; per `rbac.md`'s own current state, there is **no REST API or Settings UI yet for
 creating a custom role or editing an existing role's permission set** (tracked as planned, not

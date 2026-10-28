@@ -13,6 +13,7 @@
 #include "custom_properties_store.hpp"
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
 #include "execution_tracker.hpp"
+#include "forensics_visibility.hpp" // ForensicsVisibilityFn (#4990)
 #include "instruction_param_schema.hpp" // ParamValidatorCache (Deps::param_validators)
 #include "instruction_store.hpp"
 #include "policy_store.hpp"
@@ -57,6 +58,13 @@ public:
     using AuditFn = std::function<void(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
+    /// The persist-reporting twin of AuditFn (true == durably written, or audit off), for the one
+    /// row a route needs to know the fate of (#4990 `response.forensics.read`).
+    using PersistAuditFn = std::function<bool(const httplib::Request&, const std::string& action,
+                                              const std::string& result,
+                                              const std::string& target_type,
+                                              const std::string& target_id,
+                                              const std::string& detail)>;
     using EmitEventFn = std::function<void(const std::string& event_type,
                                            const httplib::Request& req)>;
 
@@ -162,7 +170,22 @@ public:
         /// GET /api/workflow-executions/{id}; the remaining routes in this
         /// file keep using `perm_fn` above unchanged.
         FleetReadFn fleet_read_fn;
+        /// #4990: the executions drawer's render-time probe for `Response:Read`, in the shape of
+        /// `fleet_read_fn` but QUIET: server.cpp wires the draw-time `probe_fleet_read` (no
+        /// `auth.permission_required` / `auth.fleet_read_required` denial row for an interactive
+        /// cookie session, which a drawer that refreshes every few seconds would otherwise fill the
+        /// audit log with). It never gates anything (the drawer is gated by `fleet_read_fn` on
+        /// Execution:Read); it decides whether the responses section is drawn: admitted => drawn,
+        /// over the probe's scope met with the Execution:Read scope; a 503 on its scratch response =>
+        /// the permission check could not be completed (a "try again" notice, never the
+        /// "requires Response:Read" text); anything else => the caller lacks Response:Read. Unwired
+        /// = nothing proven = the section is not drawn. Do not wire `perm_fn` here: that gate is loud.
+        FleetReadFn response_probe_fn;
         AuditFn audit_fn;
+        /// #4990: persist-reporting sink for the drawer's `response.forensics.read` row (set-and-
+        /// proceed: a failed persist sets `Sec-Audit-Failed` and the drawer still renders). Unwired
+        /// is audit-off, the established `AuditFn` contract (`rest_audit.hpp`): no row is written.
+        PersistAuditFn persist_audit_fn;
         /// `--csrf-trusted-origin` allowlist (#2537) for the same-site gate on the dashboard's
         /// `POST /api/instructions/{id}/execute`. Empty = same-host only.
         std::vector<std::string> csrf_trusted_origins;
@@ -227,6 +250,12 @@ public:
         CallerFn caller_fn;
         ApprovalManager* approval_manager{nullptr};
         ResponseStore* response_store{nullptr};
+        /// #4990: `ServerImpl::forensics_plugin_set_` (null = unwired: the drawer's response reads then
+        /// refuse every row, see `tier_filter_for`). Feeds the `ResponseTierFilter` they take.
+        const ForensicsPluginSet* forensics_plugins{nullptr};
+        /// #4990: who may read Forensics-plugin rows (see `forensics_visibility.hpp`). Unwired
+        /// (empty) resolves to present-empty at the use site.
+        ForensicsVisibilityFn forensics_visibility_fn;
         /// PR 3 — per-execution SSE event bus for `/sse/executions/{id}`.
         /// When non-null, `ExecutionTracker` publishers (update_agent_status,
         /// refresh_counts, mark_cancelled) emit transitions onto this bus

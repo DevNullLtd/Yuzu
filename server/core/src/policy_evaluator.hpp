@@ -73,6 +73,7 @@ namespace yuzu::server {
 class PolicyStore;
 class InstructionStore;
 class ResponseStore;
+class ForensicsPluginSet; // #4990 (response_tier_filter.hpp)
 class TagStore;
 class CustomPropertiesStore;
 class ManagementGroupStore;
@@ -106,6 +107,11 @@ public:
         CustomPropertiesStore* custom_properties_store{nullptr};
         ManagementGroupStore* mgmt_group_store{nullptr};
         yuzu::MetricsRegistry* metrics{nullptr}; // optional observability sink
+        /// #4990: the Forensics plugin set. A check's stored response is read with every
+        /// Forensics-tier plugin excluded, so a policy whose check instruction runs a Forensics
+        /// plugin scores `unknown` (never a verdict from, or a stored copy of, Forensics output).
+        /// Borrowed. Unset (a harness) refuses every row, so every verdict is `unknown`.
+        const ForensicsPluginSet* forensics_plugins{nullptr};
         CommandDispatchFn dispatch_fn;
         NowFn now_fn;                          // defaults to system clock if unset
         int64_t default_interval_seconds{3600}; // when a policy has no interval trigger

@@ -3380,7 +3380,7 @@ counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
 
 ## Granular RBAC (Phase 3)
 
-- 7 roles, 38 securable types, per-operation permissions, deny-override logic.
+- 8 roles (adds `ForensicsAnalyst`, the read-only delegable Forensics tier, #4990), 38 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO**: Full PKCE flow, OIDC Discovery, JWT validation, group-to-role mapping. Endpoints and `jwks_uri` are never derived from the issuer: `OidcProvider::ensure_discovered` reads them lazily from the issuer's discovery document (an explicit `OidcConfig` field is authoritative for that one field), fails closed with no fallback, and applies one validation, shared with the Settings "Test Connection" button: `issuer` byte-equal to the configured issuer (OIDC Discovery 4.3, the mix-up defense) and every endpoint an absolute URL on the issuer's scheme, at most 2048 bytes, with a well-formed `host[:port]` authority. Test Connection shares only the fetch and validation functions: it never reads or clears the provider's discovery state, so it is a connectivity check and not a guarantee of what a sign-in will hit.
   - All IdP GETs go through one bounded primitive (`http_get_bounded`): 5 s per-operation timeouts and a total bound of 2 x that timeout, 10 s by default, from the start of the request, covering name resolution (on POSIX the resolver is capped at the per-operation timeout where httplib's non-blocking resolver is compiled in: the Linux build; not checked on macOS. On Windows `resolve_host_addresses` runs its own overlapped `GetAddrInfoExW` lookup, canceled at that timeout rounded up to whole seconds, with up to 5 s more for the canceled lookup to complete; a lookup still not complete then is not freed (the OS may still write into it) but handed to a process-wide ledger that destroys it once its event is signaled, holds at most 16 such requests plus lookups in flight, and makes a new lookup fail closed with "the host name did not resolve" while 16 are stuck: `oidc_abandoned_ledger.hpp`), connect and the response; 256 KiB body cap, redirects not followed.
   - A watchdog thread shuts the socket down at that deadline, and again every 50 ms because a pre-connect shutdown does not persist on macOS (measured), so the bound also covers the TLS handshake, which httplib's own `set_max_timeout` does not. On POSIX the watchdog holds a descriptor it reserved before the client existed (an alias of the socket, made by dup2 from httplib's socket-options callback, so exhaustion fails the request closed with `request failed: no file descriptor available` rather than leaving it unwatched). On Windows it takes a private duplicate of the socket (`WSADuplicateSocketW`, so it never touches a socket number httplib may close and Windows may reuse), and a duplicate that cannot be taken fails the request closed with the same text; from the deadline it calls `CancelIoEx` on the duplicate and shuts the connection down every 50 ms, and after 10 such cuts (500 ms) closes the duplicate with `SO_LINGER` zero, an abortive close that resets the connection (the count restarts for each socket httplib hands it). httplib 0.37.1 waits with `WSAPoll` on Windows; the evidence for the cut is the end-to-end Windows drip test. Per-OS test provenance is in `docs/test-coverage.md`.
@@ -3568,11 +3568,18 @@ ADR-0041, currently at v3).
 
 ## Render-time permission probes (capability hints)
 
-Five `AuthRoutes` methods answer a permission question without writing a denial row for an
+Six `AuthRoutes` methods answer a permission question without writing a denial row for an
 interactive sign-in, for pages
 that decide what to DRAW: `has_permission` (the verdict only), `probe_permission` (the verdict
-with the gate's own response kept, so "denied" and "store unavailable" stay distinguishable),
-`probe_admin` (`require_admin`'s decision), `probe_fleet_read` (`require_fleet_read`'s decision and
+with the gate's own response kept: it receives the 401/403/503 the gate wrote, and the 503 appears
+only where the gate itself writes one, such as an engine principal with the store not open; an RBAC
+read that fails (breaker open, pool timeout, a failed role or permission query) is a `403` here and
+cannot be told apart from a refusal), `probe_permission_unavailable_aware` (`probe_permission`
+with one difference: such a failed RBAC read is answered with a retryable `503`, `retry_after_ms`
+5000 and no `permission` field. It exists for the one consumer whose correctness depends on telling
+"could not determine" from "definitively denied", the Forensics-tier resolver, where a collapsed
+answer would serve a `200` with the Forensics rows silently missing; a new caller needs the same
+justification, and `require_permission` itself stays a `403` on a degrade, ADR-0041), `probe_admin` (`require_admin`'s decision), `probe_fleet_read` (`require_fleet_read`'s decision and
 scope) and `probe_global_list_read` (`require_list_read`'s decision, with a management-group-
 confined admission refused as a denial, for a resource that is not agent-scoped; its loud twin
 `require_global_list_read` is the gate of the plugin-config REST list). Each runs the gate's own
@@ -5221,7 +5228,7 @@ DENYING reasons (`pool_acquire_timeout` / `query_error` /
 `generation_refresh_failed`): each failed read denies the request that
 needed it (operator permission and list-read checks on a permission-cache
 miss, service-scoped tokens on every `require_fleet_read` or
-`require_scoped_permission` request whose `ITServiceOwner` ceiling read fails), so a non-zero rate on one of these is an authorization-availability
+`require_scoped_permission` request whose `ITServiceOwner` ceiling read fails). A failed role query, the read that precedes a permission check, counts `query_error` and books a breaker failure on every path that makes it (`require_permission`'s RBAC branch included; `get_effective_permissions`, a display read that denies nobody, counts it too), while the `ITServiceOwner` ceiling read inside `require_permission` is uncounted. So a non-zero rate on one of these is an authorization-availability
 event, though not necessarily one that denies every caller, and the
 `YuzuRbacReadDegraded` alert pages on exactly this subset.
 Two OBSERVE-ONLY reasons share the same metric but deny nothing — the read
