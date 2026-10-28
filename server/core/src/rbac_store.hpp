@@ -1067,12 +1067,13 @@ enum class RbacEnforcementLabel {
 /// this reconciliation introduces.
 [[nodiscard]] RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept;
 
-/// The ONE grant decision of the two checked-read engine arms (`AuthRoutes::require_list_read`
-/// and the fleet-read gate): an engine principal's only authority is an explicit RBAC grant,
+/// The ONE grant decision of the checked-read engine arms (`AuthRoutes::require_list_read`,
+/// the fleet-read gate and `AuthRoutes::require_permission`): an engine principal's only authority is an explicit RBAC grant,
 /// so it is never admitted on a fresh disabled view. (A cached-ENABLED view that is stale
 /// still reads the grant: the documented fail-closed asymmetry above, not covered here.)
-/// The engine arms of `require_permission` and `require_scoped_permission` are deliberately
-/// plain deny-on-degrade (ADR-0041, #6437) and do not use this.
+/// `AuthRoutes::require_permission`'s engine arm (#4990) is a third consumer; the engine arm of
+/// `require_scoped_permission` alone is deliberately plain deny-on-degrade (ADR-0041, #6437)
+/// and does not use this.
 ///
 /// One `rbac_enforcement_label()` snapshot decides: `kEnabled` returns
 /// `check_permission_checked()` (a failed read is the error); `kDisabled` returns `false`

@@ -1779,9 +1779,10 @@ TEST_CASE("AuthRoutes: an engine principal's gate decides 'RBAC is off' from the
 // that the case above leaves unpinned (security-guardian pass 5b, Q4 a-d). Every section asserts
 // the exact outcome of BOTH mappings (the default `require_permission` and the opt-in
 // `probe_permission_unavailable_aware`): status, body, the audit row and the resolver's answer.
-TEST_CASE("AuthRoutes: an engine principal's gate - a degraded view with a healthy grant read admits "
-          "the granted engine, refuses an ungranted one; a stale-false view inside the bound is a "
-          "definitive 403; a store that is not open is a 503 (#4990)",
+TEST_CASE("AuthRoutes: an engine principal's gate - a degraded view admits no engine (403 by default, "
+          "a retryable 503 under the opt-in mapping) whatever the grant and whether RBAC is on or "
+          "off in the database; a stale-false view inside the bound is a definitive 403; a store "
+          "that is not open is a 503 (#4990)",
           "[pg][auth_routes][authz_topology_floor][forensics][engine_principal]") {
     ForensicsVisRig rig;
     REQUIRE_FALSE(rig.rbac.is_rbac_enabled()); // fresh install: RBAC off
@@ -1869,6 +1870,19 @@ TEST_CASE("AuthRoutes: an engine principal's gate - a degraded view with a healt
         CHECK(o.detail == "engine principal denied Forensics:Read");
         CHECK(o.result == "denied");
     };
+    // The opt-in mapping's answer when the enforcement state cannot be confirmed: still a
+    // refusal, but the retryable outage it is. No `permission` field (granting it cannot fix an
+    // outage) and a `retry_after_ms` hint; the audit row names the outage, never the grant.
+    auto expect_unavailable_503 = [&](const Outcome& o) {
+        CHECK_FALSE(o.ok);
+        CHECK(o.status == 503);
+        CHECK(o.body["error"]["code"] == 503);
+        CHECK(o.body["error"]["retry_after_ms"] == 5000);
+        CHECK_FALSE(o.body["error"].contains("permission"));
+        CHECK(o.rows_added == 1);
+        CHECK(o.detail == "engine principal denied: RBAC unavailable resolving Forensics:Read");
+        CHECK(o.result == "denied");
+    };
     auto no_withheld = [&] {
         for (const auto why : kForensicsUnknownReasons)
             CHECK(rig.withheld(std::string(to_string(why))) == 0.0);
@@ -1887,42 +1901,74 @@ TEST_CASE("AuthRoutes: an engine principal's gate - a degraded view with a healt
         REQUIRE(rbac_enforcement_label(&d.store) == RbacEnforcementLabel::kDegraded);
     };
 
-    SECTION("THE WIDENING: durable RBAC enabled, the cached false view degraded past the bound, the "
-            "refresh failing, the grant read healthy - the granted engine is admitted under both "
-            "mappings") {
+    SECTION("durable RBAC enabled, the cached false view degraded past the bound, the refresh "
+            "failing, the grant read healthy - the GRANTED engine is NOT admitted: a definitive "
+            "403 by default, a retryable 503 and an Unknown resolver answer under the opt-in") {
         DegradedReplica d(rig, &audit);
         rig.rbac.set_rbac_enabled(true);
         RoleReadFault fault(rig.rbac_bundle.dsn(), "rbac_meta");
         fault.arm();
         wait_until_view_degraded(d);
         CHECK(d.degrade("generation_refresh_failed") >= 1.0); // the refresh really is failing
-        // Before b3293b2d8 the raw flag (false) short-circuited to a definitive 403 here; the
-        // enforcement view (degraded => enforced) runs the typed check, which reads the explicit
-        // grant. Admission is exactly the grant (check_permission_checked never reads the flag),
-        // the same answer the ordinary RBAC branch gives.
-        expect_admitted(gate(d.ar, granted, /*opt_in=*/false));
-        expect_admitted(gate(d.ar, granted, /*opt_in=*/true));
+        // The enforcement state is unconfirmed, so `engine_grant_checked` refuses before it reads
+        // any grant (the same answer the list-read and fleet-read engine gates give). The default
+        // mapping keeps the terminal 403; only the opt-in mapping reports the outage.
+        expect_403(gate(d.ar, granted, /*opt_in=*/false));
+        expect_unavailable_503(gate(d.ar, granted, /*opt_in=*/true));
+        const auto before = rig.withheld("rbac_unavailable");
         std::size_t rows = 0;
-        CHECK(is_global(resolve(d, granted, rows)));
-        CHECK(rows == 0);
-        CHECK(d.degrade("query_error") == 0.0); // the grant read itself never failed
-        no_withheld();
+        CHECK(is_unknown(resolve(d, granted, rows), ForensicsUnknown::RbacUnavailable));
+        CHECK(rows == 1);
+        CHECK(rig.withheld("rbac_unavailable") == before + 1.0);
+        CHECK(d.degrade("query_error") == 0.0); // no grant read was attempted or failed
     }
 
-    SECTION("the same degraded view with NO grant: a definitive 403 under both mappings, never 503") {
+    SECTION("the same degraded view with NO grant: the same answers as the granted engine, because "
+            "no grant is read") {
         DegradedReplica d(rig, &audit);
         rig.rbac.set_rbac_enabled(true);
         RoleReadFault fault(rig.rbac_bundle.dsn(), "rbac_meta");
         fault.arm();
         wait_until_view_degraded(d);
-        // The typed check runs and answers a definitive false (an empty role set), which is a
-        // missing grant, not an unavailable read: the opt-in mapping does not turn it into 503.
         expect_403(gate(d.ar, ungranted, /*opt_in=*/false));
-        expect_403(gate(d.ar, ungranted, /*opt_in=*/true));
+        expect_unavailable_503(gate(d.ar, ungranted, /*opt_in=*/true));
+        const auto before = rig.withheld("rbac_unavailable");
         std::size_t rows = 0;
-        CHECK(is_present_empty(resolve(d, ungranted, rows)));
+        CHECK(is_unknown(resolve(d, ungranted, rows), ForensicsUnknown::RbacUnavailable));
         CHECK(rows == 1);
+        CHECK(rig.withheld("rbac_unavailable") == before + 1.0);
         CHECK(d.degrade("query_error") == 0.0);
+    }
+
+    SECTION("RBAC OFF in the database, the cached false view degraded past the bound, the grant "
+            "read healthy - the granted engine is NOT admitted") {
+        // The case the unconfirmed state exists for: the view cannot say whether RBAC is on, and
+        // here it is off. An engine holds no legacy fallback, so admitting it on its grant alone
+        // would grant authority a fresh view would refuse. (Durable RBAC stays off: no
+        // `set_rbac_enabled(true)`.)
+        DegradedReplica d(rig, &audit);
+        RoleReadFault fault(rig.rbac_bundle.dsn(), "rbac_meta");
+        fault.arm();
+        wait_until_view_degraded(d);
+        expect_403(gate(d.ar, granted, /*opt_in=*/false));
+        expect_unavailable_503(gate(d.ar, granted, /*opt_in=*/true));
+        const auto before = rig.withheld("rbac_unavailable");
+        std::size_t rows = 0;
+        CHECK(is_unknown(resolve(d, granted, rows), ForensicsUnknown::RbacUnavailable));
+        CHECK(rows == 1);
+        CHECK(rig.withheld("rbac_unavailable") == before + 1.0);
+    }
+
+    SECTION("a healthy, enforced view: the granted engine is admitted and the ungranted one is a "
+            "definitive 403, so the gate still admits on a confirmed view") {
+        rig.rbac.set_rbac_enabled(true);
+        // A fresh replica opened after enabling: the cached flag is true and not stale.
+        DegradedReplica fresh(rig, &audit);
+        REQUIRE(rbac_enforcement_label(&fresh.store) == RbacEnforcementLabel::kEnabled);
+        expect_admitted(gate(fresh.ar, granted, /*opt_in=*/false));
+        expect_admitted(gate(fresh.ar, granted, /*opt_in=*/true));
+        expect_403(gate(fresh.ar, ungranted, /*opt_in=*/false));
+        expect_403(gate(fresh.ar, ungranted, /*opt_in=*/true));
         no_withheld();
     }
 

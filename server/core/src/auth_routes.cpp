@@ -843,20 +843,20 @@ bool AuthRoutes::require_permission_impl(const httplib::Request& req, httplib::R
                             "application/json");
             return false;
         }
-        // The definitive "RBAC is off" refusal is decided exactly as the ordinary RBAC branch
-        // below decides it: `rbac_enforcement_in_effect`, never the raw cached flag. A replica
-        // that has not observed another replica's enable (or whose refresh is failing) holds a
-        // stale-false flag; the raw flag would answer a definitive 403 without ever running the
-        // typed check, so the unavailable answer could not surface. Only a view proven fresh and
-        // disabled is refused here; enforced or degraded runs the typed check. Engine authority
-        // stays RBAC-only: an engine is admitted solely through that check, never through a
-        // legacy or service-scoped path. `engine_unavailable` is set only when the read itself
-        // could not be completed.
+        // The engine decision is `engine_grant_checked`, the same chokepoint the list-read and
+        // fleet-read engine gates use. It reads the grant only on a view proven fresh and
+        // enforced; a view proven fresh and disabled admits nothing; a degraded view, whose
+        // enforcement state cannot be confirmed, is refused without reading a grant, because
+        // RBAC may be genuinely off and an engine has no legacy fallback to land on. Engine
+        // authority stays RBAC-only: an engine is admitted solely through that check, never
+        // through a legacy or service-scoped path. `engine_unavailable` is set when the answer
+        // could not be completed (a failed grant read or an unconfirmed state), so the opt-in
+        // retryable answer surfaces; the default stays 403.
         bool engine_unavailable = false;
         bool engine_admitted = false;
-        if (rbac_enforcement_in_effect(rbac_store_)) {
+        {
             const auto checked =
-                rbac_store_->check_permission_checked(session->username, securable_type, operation);
+                engine_grant_checked(rbac_store_, session->username, securable_type, operation);
             engine_unavailable = !checked && degrade == RbacDegradeMapping::UnavailableAs503;
             engine_admitted = checked.value_or(false);
         }
