@@ -154,7 +154,9 @@ def parse_vocab_table(text, name):
 
 def collector_sources(text):
     """`plugin.action` for every row of the collector's kInventoryActions, in order. A `.action`
-    is a literal or a `kAction*` string_view constant, resolved from its declaration."""
+    is a literal or a `kAction*` string_view constant, resolved from its declaration. Comment-
+    stripped like the table parsers: a commented-out action is not a collected source."""
+    text = re.sub(r"/\*.*?\*/|//[^\n]*", "", text, flags=re.S)
     consts = dict(re.findall(r'constexpr std::string_view (kAction\w+) = "([a-z_]+)";', text))
     m = re.search(r"kInventoryActions\[\] = \{(.*?)\n\};", text, re.S)
     if not m:
@@ -445,6 +447,14 @@ class GateParsers(unittest.TestCase):
                '    {.plugin = "q",\n     .action = kActionM,\n     .adapt = f},\n'
                '};\n')
         self.assertEqual(collector_sources(src), ["p.list", "q.managers"])
+
+    def test_collector_sources_ignores_commented_out_rows(self):
+        src = ('const InventoryAction kInventoryActions[] = {\n'
+               '    {.plugin = "p", .action = "list"},\n'
+               '    /* {.plugin = "b", .action = "blocked"}, */\n'
+               '    // {.plugin = "l", .action = "lined"},\n'
+               '};\n')
+        self.assertEqual(collector_sources(src), ["p.list"])
 
 
 if __name__ == "__main__":
