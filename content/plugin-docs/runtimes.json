@@ -464,7 +464,7 @@
         "leg_hash": "a3f4c5ca7477",
         "os": "linux",
         "os_version": "Ubuntu 26.04.1 LTS x86_64",
-        "privilege": "euid 0"
+        "privilege": "euid 1000"
       }
     },
     "macos": {
