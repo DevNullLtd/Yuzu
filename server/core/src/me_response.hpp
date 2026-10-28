@@ -104,7 +104,10 @@ struct RbacView {
     j["username"] = s.username;
     j["display_name"] = s.display_name.empty() ? s.username : s.display_name;
     j["role"] = auth::role_to_string(s.role);
-    j["principal_kind"] = s.principal_kind;
+    // The classification the server applies (the same predicate that picks the role
+    // namespace below), not the raw stored field: an auth_source-only engine session
+    // must not read as human while being looked up as an engine.
+    j["principal_kind"] = s.is_engine() ? "engine" : "human";
     j["auth_source"] = s.auth_source;
     j["mcp_tier"] = s.mcp_tier;
     j["scope_service"] = s.token_scope_service;

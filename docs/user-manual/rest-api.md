@@ -432,7 +432,7 @@ While a just-in-time elevation is active, `effective_role` is `admin`, `elevated
 | `username` | The stable authorization principal (for an SSO session an opaque `oidc:<iss>#<sub>` id). |
 | `display_name` | A readable label; falls back to `username`. |
 | `role` | The persisted legacy role (`admin` or `user`). Never the elevated view. This and `effective_role` are the legacy session view, not a summary of authority: with RBAC on, authority is decided per permission (use `POST /api/v1/rbac/check`), and an engine principal's real authority is its `rbac_roles`. |
-| `principal_kind` | `human` or `engine`, and nothing else. A session that does not record a kind reads `human`. An engine principal is looked up under RBAC principal type `engine`. |
+| `principal_kind` | `human` or `engine`, and nothing else: the classification the server applies, which is `engine` when the session records that kind or was authenticated by an engine token, and `human` otherwise. An engine principal is looked up under RBAC principal type `engine`. |
 | `auth_source` | Always present. How the session authenticated: `local`, `oidc`, `saml`, `api_token`, `mcp_token` or `engine_token`. |
 | `mcp_tier` | The MCP authorization tier of an MCP token; an empty string for any other session. |
 | `scope_service` | The service tag of a service-scoped token; an empty string when the session is not service-scoped. |

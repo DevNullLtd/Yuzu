@@ -954,7 +954,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `GATE_PARITY_NO_GATE_ALLOWED` entry. Confirmed 2026-10-24 by the ADR owner,
      as written.** Three parts.
      First, `get.api-me` flips from `planned:#2146` to `twinned` (untwinned 215
-     to 214, generic `planned:#2146` 86 to 85). Second, the gate-parity check
+     to 214, generic `planned:#2146` 86 to 85; the figures at the time of this
+     ruling, before the runtime configuration twins merged and moved the pins
+     to 212 and 83). Second, the gate-parity check
      reads `GET /api/v1/me` as a route with no gate call it can read: the
      handler calls `auth_fn` alone, because the route is session-only
      self-description with no per-resource authority, so there is nothing to
@@ -973,8 +975,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      documented difference rather than a defect; a self-only service-scope
      policy that would let both transports agree is the follow-up, recorded as
      `exception:#6432 revisit:2026-11-30` (revisit date
-     confirmed by the owner; the issue number is a placeholder to replace once
-     the issue is filed). Scope of the twin: `rbac_enabled` is the server's cached view of
+     confirmed by the owner; issue filed as #6432). Scope of the twin: `rbac_enabled` is the server's cached view of
      the RBAC switch and does not report the degraded state in which
      enforcement fails closed; that bit is owned by #6033, not by this twin.
      The owner gave the confirmation in the authoring session and this entry
