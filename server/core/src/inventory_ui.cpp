@@ -448,7 +448,7 @@ std::string chips_region(const SoftwarePageFilters& f, bool oob) {
             h += "<button type=\"button\" class=\"inv-chip\" data-g=\"" + std::string(g) +
                  "\" data-v=\"" + esc(c.v) + "\" aria-pressed=\"" +
                  (cur == c.v ? "true" : "false") + "\" title=\"" + esc(c.tooltip) + "\" " +
-                 (c.family.empty() ? std::string() : "data-f=\"" + c.family + "\" ") +
+                 (c.family.empty() ? std::string() : "data-f=\"" + esc(c.family) + "\" ") +
                  results_get(t) + ">" + esc(c.label) + "</button>";
         }
         h += "</div>";

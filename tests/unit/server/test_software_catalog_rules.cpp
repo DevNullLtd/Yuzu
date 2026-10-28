@@ -265,6 +265,14 @@ TEST_CASE("kSoftwareKinds and kSoftwareSources: UI vocabulary tables",
             values.emplace_back(k.value);
         CHECK(values == std::vector<std::string>{"app", "pkg", "package", "feat"});
     }
+    SECTION("the pkg tooltip names the MSI, snap and flatpak products it covers") {
+        const auto it = std::find_if(kSoftwareKinds.begin(), kSoftwareKinds.end(),
+                                     [](const auto& k) { return k.value == "pkg"; });
+        REQUIRE(it != kSoftwareKinds.end());
+        CHECK(it->tooltip.find("MSI") != std::string_view::npos);
+        CHECK(it->tooltip.find("snap") != std::string_view::npos);
+        CHECK(it->tooltip.find("flatpak") != std::string_view::npos);
+    }
     SECTION("sources are exactly the six collector sources, in order") {
         std::vector<std::string> values;
         for (const auto& s : kSoftwareSources)

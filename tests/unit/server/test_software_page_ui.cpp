@@ -13,6 +13,7 @@
 #include <cctype>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // The shared full-page shell /software is served from (guardian_page_ui.cpp, global scope).
@@ -253,6 +254,10 @@ TEST_CASE("software page: kind control, ecosystem and found-by chips", "[invento
         REQUIRE(p != std::string::npos);
         REQUIRE(p > kpos);
         kpos = p;
+        // The visible label is the table's title, matched inside this chip's own button.
+        const auto end = h.find("</button>", p);
+        REQUIRE(end != std::string::npos);
+        REQUIRE(h.substr(p, end - p).ends_with(">" + std::string(k.title)));
     }
     // One ecosystem chip per kEcosystemFamilies entry, in table order.
     std::size_t last = 0;
@@ -261,6 +266,14 @@ TEST_CASE("software page: kind control, ecosystem and found-by chips", "[invento
         REQUIRE(p != std::string::npos);
         REQUIRE(p > last);
         last = p;
+        // The family colour cue, hard-coded here rather than derived from the page's mapping.
+        const std::string cls = e.family == "windows" ? "win"
+                                : e.family == "macos" ? "mac"
+                                : e.family == "linux" ? "lin"
+                                                      : "oth";
+        const auto end = h.find("</button>", p);
+        REQUIRE(end != std::string::npos);
+        REQUIRE(has(h.substr(p, end - p), "data-f=\"" + cls + "\""));
     }
     REQUIRE(has(h, "data-g=\"eco\" data-v=\"brew\" aria-pressed=\"true\""));
     // One Found-by chip per kSoftwareSources entry, in table order (managers before packages).
@@ -281,6 +294,35 @@ TEST_CASE("software page: kind control, ecosystem and found-by chips", "[invento
     REQUIRE(has(h, "data-g=\"src\" data-v=\"msi_packages.list_inventory\""));
     // Ecosystem chips carry the family cue; the label stays the raw name.
     REQUIRE(has(h, "data-g=\"eco\" data-v=\"brew\" aria-pressed=\"true\" title=\"brew\" data-f=\"mac\""));
+}
+
+TEST_CASE("software page: every Found-by chip selects and clears its own source",
+          "[inventory][ui]") {
+    // The button for one source chip, from its data-v to its closing tag.
+    const auto chip = [](const std::string& h, std::string_view value) {
+        const auto p = h.find("data-g=\"src\" data-v=\"" + std::string(value) + "\"");
+        REQUIRE(p != std::string::npos);
+        return h.substr(p, h.find("</button>", p) - p);
+    };
+    for (const auto& src : software_catalog::kSoftwareSources) {
+        const std::string want = "source=" + std::string(src.value);
+        // Unselected: the chip's request sets its source and keeps the other filters.
+        SoftwarePageFilters f;
+        f.kind = "pkg";
+        f.ecosystem = "brew";
+        const auto off = chip(full(f, page()), src.value);
+        REQUIRE(has(off, "aria-pressed=\"false\""));
+        REQUIRE(has(off, want));
+        REQUIRE(has(off, "kind=pkg"));
+        REQUIRE(has(off, "ecosystem=brew"));
+        // Selected: pressed, and the chip's request clears the source but keeps the rest.
+        f.source = std::string(src.value);
+        const auto on = chip(full(f, page()), src.value);
+        REQUIRE(has(on, "aria-pressed=\"true\""));
+        REQUIRE_FALSE(has(on, "source="));
+        REQUIRE(has(on, "kind=pkg"));
+        REQUIRE(has(on, "ecosystem=brew"));
+    }
 }
 
 TEST_CASE("software page: controls reuse hx-include and never embed q or agent_id",

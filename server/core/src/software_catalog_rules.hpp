@@ -125,14 +125,14 @@ inline constexpr std::array<VocabEntry, 6> kSoftwareSources{{
     {"installed_apps.list_inventory", "installed_apps.list_inventory",
      "Windows Uninstall registry, Linux dpkg/rpm/pacman/apk, macOS applications and installer "
      "receipts"},
-    {"pkg_inventory.managers", "pkg_inventory.managers", "the Homebrew presence row (macOS)"},
+    {"pkg_inventory.managers", "pkg_inventory.managers", "The Homebrew presence row (macOS)"},
     {"pkg_inventory.packages", "pkg_inventory.packages", "Homebrew formulae and casks (macOS)"},
     {"pkg_inventory.store_packages", "pkg_inventory.store_packages",
-     "active snaps and flatpaks (Linux)"},
+     "Active snaps and flatpaks (Linux)"},
     {"windows_optional_features.list", "windows_optional_features.list",
      "Windows optional features (state in the version column)"},
     {"msi_packages.list_inventory", "msi_packages.list_inventory",
-     "machine-context Windows Installer (MSI) products"},
+     "Machine-context Windows Installer (MSI) products"},
 }};
 
 /// Non-empty, every value `[a-z_.]+` (the chips splice it into attributes and URLs), non-empty
