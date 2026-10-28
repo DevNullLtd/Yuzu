@@ -277,6 +277,47 @@ TEST_CASE("REST assign: a non-object top-level body (array/scalar) is "
     CHECK(h.rbac->get_principal_roles("user", "jane").empty());
 }
 
+TEST_CASE("assign: a hand-made non-built-in role holding the ForensicsAnalyst name is refused "
+          "on REST and MCP, never attached as the built-in role (#4990)",
+          "[pg][rest][mcp][rbac][a2][forensics_analyst]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    // The collision state: the seeded (system) row is gone and a site-authored role holds the
+    // name. The closed assignable list checks the NAME, so without the is_system check the
+    // assignment below would succeed and report the grant-less custom role as the built-in one.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DELETE FROM rbac_store.roles WHERE name = 'ForensicsAnalyst'")};
+        REQUIRE(d.ok());
+    }
+    REQUIRE(h.rbac->create_role({"ForensicsAnalyst", "site-authored", false, 0}).has_value());
+
+    SECTION("REST: 409, audited, nothing assigned") {
+        auto res = h.assign_rest("ForensicsAnalyst",
+                                 R"({"principal_type":"user","principal_id":"jane"})");
+        REQUIRE(res);
+        CHECK(res->status == 409);
+        CHECK(h.rbac->get_principal_roles("user", "jane").empty());
+        bool found = false;
+        for (const auto& a : h.audit_log)
+            if (a.action == "rbac.role.assigned" && a.result == "denied" &&
+                a.detail.find("name collision") != std::string::npos)
+                found = true;
+        CHECK(found);
+    }
+    SECTION("the built-in row is still assignable once it is the system role") {
+        REQUIRE(h.rbac->delete_role("ForensicsAnalyst").has_value());
+        yuzu::server::RbacStore adopt{h.auth_db.pool()};
+        REQUIRE(adopt.is_open());
+        auto res = h.assign_rest("ForensicsAnalyst",
+                                 R"({"principal_type":"user","principal_id":"jane"})");
+        REQUIRE(res);
+        CHECK(res->status == 201);
+    }
+}
+
 TEST_CASE("REST assign: a wrong-typed principal_type (number/bool/object/"
           "array) is rejected 400 with an audited denial, never an uncaught "
           "exception (PR #4985 finding #4)",

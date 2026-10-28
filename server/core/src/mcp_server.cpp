@@ -1100,8 +1100,7 @@ static const ToolDef kTools[] = {
      "plugin (an action on the Forensics securable) a failure message is kept only when it "
      "is a short machine token (scope:cause[:detail], e.g. windows:amcache:hive_locked); "
      "any other text is replaced by the fixed value forensics_error. Status and exit code are "
-     "unchanged, and a failure stored before this applied may still hold its original text "
-     "once its command correlation (24 hours) has aged out.",
+     "unchanged.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"},"include":{"type":"array","items":{"type":"string","enum":["agents"]},"description":"Optional; \"agents\" adds a confined per-agent array + kpi summary"}},"required":["execution_id"]})",
      R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"parameter_values":{"type":"string","description":"Redacted to \"(redacted - confined view)\" for a confined caller"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"completed_at":{"type":"integer"},"parent_id":{"type":"string"},"rerun_of":{"type":"string"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"},"agents":{"type":"array","description":"Present only when include contains \"agents\"","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"},"first_response_at":{"type":"integer"},"completed_at":{"type":"integer"},"exit_code":{"type":"integer"},"error_detail":{"type":"string"}}}},"kpi":{"type":"object","description":"Present only when include contains \"agents\"","properties":{"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"p50_ms":{"type":["number","null"]},"p95_ms":{"type":["number","null"]}}},"audit_persisted":{"type":"boolean","description":"Present and false only when the per-agent expansion's audit row failed to persist"}},"required":["id","definition_id","status","scope_expression","parameter_values","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct","completed_at","parent_id","rerun_of"]})j"},
 
@@ -26214,6 +26213,22 @@ McpServer::HandlerFn McpServer::build_handler(
                                  "missing from the store; escalate to an operator",
                                  "escalate to an operator",
                                  /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+
+                // #4990: see the REST route's own comment: the closed list is enforced by
+                // name, so a non-built-in role holding a built-in name is refused.
+                if (const auto role_row = rbac_store->get_role(role_name);
+                    role_row && !role_row->is_system) {
+                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
+                                   role_name + ": a non-built-in role holds this name (name "
+                                               "collision)");
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "a non-built-in role holds the name of this built-in role; "
+                                       "remove or replace it before assigning (see the upgrade "
+                                       "guide, role name collision)"),
                         "application/json");
                     return;
                 }
