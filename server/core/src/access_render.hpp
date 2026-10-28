@@ -74,7 +74,7 @@ std::string render_select_user();
 // ---- Roles and role permissions ---------------------------------------------------------
 
 /// `RbacStore::list_roles_checked()` rows. A store that did not answer is `Unavailable`; the
-/// store seeds seven roles, so an empty answer is treated as unreadable, never as "no roles".
+/// store seeds eight roles, so an empty answer is treated as unreadable, never as "no roles".
 struct RolesList {
     std::vector<RbacRole> roles;
 };

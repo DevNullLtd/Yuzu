@@ -376,7 +376,7 @@ to `cmd_dispatch_concurrency` — a pre-existing gap (CONSIST-2/sec-M2, tracked 
 in that file, predating this ADR) where workflow-step dispatch never wires real execution-id
 correlation at all. `claim_concurrency_slots` therefore stores the claim row under
 `execution_id=""`. This section originally documented the consequence as "release-by-TTL-only" —
-the terminal response arrives, but `agent_service_impl::record_execution_id` never populates
+the terminal response arrives, but `agent_service_impl::record_execution_id` (since removed, #4990) never populates
 `cmd_execution_ids_` for an empty `execution_id`, so `notify_exec_tracker` could not resolve one and
 `update_agent_status`/`release_concurrency_claim` were never reached.
 
@@ -436,7 +436,7 @@ definition's open claim when execution_id collides."
 historical.** This section describes the state of the world as it existed when UP-1/UP-2 were fixed,
 BEFORE this branch was reconciled onto 140 commits of `origin/dev` that included HA WS-1(1b)
 (ADR-2002 section 5): a PG-backed `command_id -> execution_id` correlation table
-(`ExecutionTracker::record_command_execution`/`lookup_execution_id`) that fully REPLACED
+(`ExecutionTracker::record_command_execution`/`lookup_execution_id`, since renamed `record_command_dispatch`/`lookup_command_record`, #4990) that fully REPLACED
 `cmd_execution_ids_` — the in-process map named throughout this section no longer exists in the
 shipped code. The by-command fallback this section introduces is still live and still needed, but
 its role narrowed: HA WS-1(1b)'s persisted, replica-safe lookup now handles the restart-survival
@@ -748,7 +748,7 @@ ledger alone.
 Between Gate 6 and this point, `origin/dev` was discovered to have moved 140 commits ahead of this
 branch's merge-base, including a change in the exact subsystem ADR-1007 touches: HA WS-1(1b) (ADR-2002
 section 5) shipped a PG-backed `command_id -> execution_id` correlation table
-(`ExecutionTracker::record_command_execution`/`lookup_execution_id`/`reap_command_execution_mappings`)
+(`ExecutionTracker::record_command_execution`/`lookup_execution_id`/`reap_command_execution_mappings`; the first two were renamed `record_command_dispatch`/`lookup_command_record` by #4990)
 that fully replaced the in-process `cmd_execution_ids_` map ADR-1007's UP-1 fix was built around. This
 branch's 15 commits were reconciled onto `origin/dev` as a single squashed patch (operator decision,
 given the same conflict shape would otherwise recur across most of those 15 commits) — see the

@@ -35,6 +35,7 @@
 #include "ota_total_admission.hpp"
 #include "principal_quota.hpp"
 #include "rate_limiter.hpp"
+#include "response_provenance.hpp"
 #include "rundown_gate.hpp"
 
 namespace yuzu::server {
@@ -64,6 +65,7 @@ inline void seed_register_invalid_agent_id_series(yuzu::MetricsRegistry& metrics
 
 // Forward declarations to avoid pulling in full store headers
 class ResponseStore;
+class ForensicsPluginSet; // #4990 (response_tier_filter.hpp)
 class TagStore;
 class AnalyticsEventStore;
 class AuditStore;
@@ -79,6 +81,7 @@ class SoftwareLicensingStore;
 class AppUsageStore;
 class UpdateRegistry;
 class ExecutionTracker;
+class DispatchRecordLatch; // dispatch_record_policy.hpp (#4990)
 class FleetTopologyStore;
 class HeartbeatIngestion;
 class GuaranteedStateStore;
@@ -195,6 +198,13 @@ public:
     /// false; only safe with per-agent client certs (see Config doc).
     void set_nat_trust_mtls_identity(bool enabled) { nat_trust_mtls_identity_ = enabled; }
     void set_response_store(ResponseStore* store) { response_store_ = store; }
+    /// #4990: the Forensics plugin set. The live `/events` `output` stream is shared by every
+    /// dashboard session, so rows of a Forensics-tier plugin are never published to it. Borrowed;
+    /// set before the listener starts. Unset (nullptr) FAILS CLOSED: no output row is published,
+    /// because without the set a Forensics row cannot be told apart from an ordinary one.
+    void set_forensics_plugin_set(const ForensicsPluginSet* plugins) {
+        forensics_plugins_ = plugins;
+    }
     void set_tag_store(TagStore* store) { tag_store_ = store; }
     void set_analytics_store(std::weak_ptr<AnalyticsEventStore> store) {
         analytics_store_ = std::move(store);
@@ -385,13 +395,38 @@ public:
     /// @return true if an entry was actually removed.
     bool discard_send_time(const std::string& command_id);
 
-    /// Register the executions-tracker row id that this command_id belongs
-    /// to (PR 2). Called by the dispatch path after `create_execution`
-    /// returns the new id. The mapping is consumed by the response-receipt
-    /// handlers and stamped onto every StoredResponse so the executions
-    /// detail drawer can correlate exactly via `query_by_execution`. Empty
-    /// `execution_id` removes any existing mapping for this command_id.
-    void record_execution_id(const std::string& command_id, const std::string& execution_id);
+    /// #4990 (UP-7): records the SERVER's dispatch record for one command id: the plugin it was
+    /// dispatched as, and the tracked execution (if any) its responses belong to. Called at the one
+    /// dispatch chokepoint (`ServerImpl::build_classified_command`), after the command is
+    /// classified and authorized and BEFORE any frame is sent. Both ingest paths resolve it
+    /// (`resolve_response_provenance`): the stored `plugin`, the read tier and every derived sink
+    /// take the RECORDED plugin, never one parsed from the id the agent echoes, and every
+    /// StoredResponse is stamped with the recorded execution id so the executions detail drawer can
+    /// correlate exactly via `query_by_execution`. Best-effort: a failed write is counted
+    /// (`yuzu_exec_correlation_write_degrade_total`), never propagated, and means this command's
+    /// responses are labelled unverified. A null tracker records nothing (the same unverified
+    /// outcome). An empty `execution_id` records "no execution" and never clears one already
+    /// recorded for the same command id.
+    ///
+    /// `latch` is for a loop that writes ONE record PER TARGET (see dispatch_record_policy.hpp):
+    /// with it the write uses the short fan-out lease budget and, after the loop's first failed
+    /// write, the remaining writes are skipped and counted as degrades (the commands are still
+    /// dispatched). Null for every other caller: the ordinary budget, never skipped.
+    void record_command_dispatch(const std::string& command_id, const std::string& plugin,
+                                 const std::string& execution_id,
+                                 DispatchRecordLatch* latch = nullptr);
+
+    /// Replaces the production command-record lookup (the execution tracker's) with `fn`. FOR UNIT
+    /// HARNESSES THAT HAVE NO POSTGRES ONLY: a service without a tracker and without this override
+    /// resolves every response as unverified (the safe production default), so a harness that wants
+    /// ordinary-plugin behaviour installs a fake record source here. `ServerImpl` MUST NEVER call
+    /// this (tests/test_forensics_tier_wiring_lexical.py pins its absence from server.cpp): it
+    /// would let a non-server record source decide the read tier. Not thread-safe against
+    /// in-flight frames; set before the first response is processed. Passing an empty function
+    /// restores the tracker-backed lookup.
+    void override_command_record_lookup(CommandRecordLookupFn fn) {
+        command_record_lookup_override_ = std::move(fn);
+    }
 
     // Process a CommandResponse forwarded from the gateway.
     void process_gateway_response(const std::string& agent_id, const pb::CommandResponse& resp);
@@ -501,8 +536,8 @@ private:
     void publish_send_times_gauge_locked();
     // The former in-process `cmd_execution_ids_` map (command_id ->
     // execution_id) moved to Postgres (HA WS-1(1b), ADR-2002 section 5) —
-    // see ExecutionTracker::record_command_execution /
-    // ::lookup_execution_id. It was replica-local: a response landing on a
+    // see ExecutionTracker::record_command_dispatch /
+    // ::lookup_command_record. It was replica-local: a response landing on a
     // DIFFERENT gateway-fronted replica than the one that dispatched found
     // no mapping and silently dropped the correlation. The PG-backed
     // version is shared across replicas and carries its own clock-guarded
@@ -599,6 +634,7 @@ private:
     grpc::Status require_positive_ota_identity(grpc::ServerContext* context, std::string_view rpc,
                                                const std::string& claimed_agent_id);
     ResponseStore* response_store_{nullptr};
+    const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990, borrowed
     TagStore* tag_store_{nullptr};
     std::weak_ptr<AnalyticsEventStore> analytics_store_;
     AuditStore* audit_store_{nullptr};
@@ -628,6 +664,9 @@ private:
     /// gateway-forward threads require the lock-free release/acquire
     /// pair instead of a plain raw pointer.
     std::atomic<ExecutionTracker*> execution_tracker_{nullptr};
+    /// Unit-harness-only replacement for the tracker-backed command-record lookup; see
+    /// `override_command_record_lookup`. Empty in production.
+    CommandRecordLookupFn command_record_lookup_override_;
 
     // PR3 per-agent mTLS (set post-bootstrap; empty = disabled / legacy path).
     AgentCertSigner agent_cert_signer_;
@@ -644,7 +683,6 @@ private:
                                      const std::vector<std::string>& rhs);
 
     void prune_expired_pending_locked();
-    static std::string extract_plugin(const std::string& command_id);
 
     /// PR3: if a Yuzu-issued client leaf is presented and revoked, return a
     /// non-OK status to send back; otherwise grpc::Status::OK. Lets the
@@ -655,17 +693,17 @@ private:
     grpc::Status reject_revoked_peer(grpc::ServerContext* context, std::string_view rpc);
 
     /// UAT 2026-05-06 #8: notify the executions tracker of a per-agent
-    /// state change for the given command_id. Resolves command_id →
-    /// execution_id via `ExecutionTracker::lookup_execution_id` (HA
-    /// WS-1(1b): PG-backed, shared across replicas — no longer an
-    /// in-process map) and calls `ExecutionTracker::update_agent_status`
+    /// state change for the given command_id. The execution id comes from
+    /// the frame's already-resolved `prov` (`resolve_response_provenance`:
+    /// the server's PG-backed dispatch record, shared across replicas; this
+    /// function does no lookup of its own) and calls `ExecutionTracker::update_agent_status`
     /// with a synthesised
     /// `AgentExecStatus` (status, exit_code, error_detail, timestamps).
     /// Each call publishes an `agent-transition` SSE event the drawer's
     /// client listens to for live-updates without a page reload.
     ///
     /// No-op on the executions-drawer/SSE side if the tracker isn't wired
-    /// or `lookup_execution_id` finds no mapping — ordinary out-of-band
+    /// or the dispatch record carries no execution id — ordinary out-of-band
     /// dispatch, a workflow-step dispatch (CONSIST-2/sec-M2, which never
     /// records one), a genuine degrade on the correlation table's own
     /// write/read side, or the correlation table's own bounded (24h)
@@ -681,7 +719,23 @@ private:
     /// (rides the wire response independent of the correlation table). See
     /// those methods' doc comments.
     void notify_exec_tracker(const std::string& command_id, const std::string& agent_id,
-                             const pb::CommandResponse& resp);
+                             const pb::CommandResponse& resp, const ResponseProvenance& prov);
+
+    /// #4990: the failure text of a terminal frame in the form the server's own derived sinks may
+    /// carry: the execution tracker (and through it the drawer, the event stream and the outbox),
+    /// the notification store, the analytics event, and the webhook / offload payload. Those sinks
+    /// are read below the Forensics tier of the plugin's own rows, so a Forensics-tier plugin keeps
+    /// only a bounded failure token (`sanitize_forensics_error_detail`); an unwired plugin set
+    /// cannot tell the plugins apart and sanitizes every plugin's message. Any other plugin keeps
+    /// its full text. Empty when the frame carries no error. Each ingest branch computes it once
+    /// per terminal response and feeds that value to the notification, the analytics event and the
+    /// webhook / offload payload; `notify_exec_tracker` applies this same function for the tracker.
+    /// A new sink of the failure text takes it from here, never from `resp.error().message()`.
+    /// `plugin` is the frame's RESOLVED plugin label (`ResponseProvenance::plugin`), never one
+    /// parsed from the command id; an unverified frame carries `kUnverifiedProvenanceLabel`, which
+    /// is in the Forensics set, so its text is reduced too.
+    [[nodiscard]] std::string failure_text_for_sinks(const std::string& plugin,
+                                                     const pb::CommandResponse& resp) const;
 
     /// Persists the `registry.write` audit rows one stored output frame owes (see
     /// plugin_result_audit.hpp for the binding). Called at every site that stores an
@@ -692,18 +746,27 @@ private:
     /// every failure itself and counts every failure whose rows it knows, so a caller only needs
     /// the signal: the Subscribe sites add the audit-failed trailer once per stream, and the
     /// gateway sites, which have none, ignore it.
+    /// `plugin` is the frame's resolved plugin label: only a frame whose recorded plugin is the
+    /// registry plugin owes rows, so an unrecorded `registry-<hex>` id mints none.
     [[nodiscard]] bool audit_registry_frame(const std::string& agent_id,
-                                            const pb::CommandResponse& resp);
+                                            const pb::CommandResponse& resp,
+                                            const std::string& plugin);
 
-    /// HA WS-1(1b), ADR-2002 section 5: the single chokepoint every
-    /// command_id -> execution_id read goes through (response-stamping in
-    /// process_gateway_response's four branches, plus notify_exec_tracker) —
-    /// resolves via `ExecutionTracker::lookup_execution_id`, or nullopt if
-    /// the tracker isn't wired / the read degrades / there is no mapping. A
-    /// second hand-rolled load-and-lookup at a new call site is the drift
-    /// this helper exists to prevent (mirrors this codebase's other single-
-    /// chokepoint conventions, e.g. `dispatch_confined_arms`).
-    std::optional<std::string> resolve_execution_id(const std::string& command_id) const;
+    /// #4990 (UP-7), on top of HA WS-1(1b) / ADR-2002 section 5: the ONE chokepoint every
+    /// response frame's provenance is decided at. Called exactly once per frame on each ingest
+    /// path (direct Subscribe and gateway proxy), and its result is passed to every consumer of
+    /// the frame (stored row, live output, failure text, analytics, tracker, registry audit). It
+    /// reads the server's dispatch record (`ExecutionTracker::lookup_command_record`, or the
+    /// harness override), applies `resolve_response_provenance` (response_provenance.hpp: one
+    /// bounded retry on a degraded read, then unverified) and counts the outcome
+    /// (`yuzu_server_response_provenance_total`) and any read degrade
+    /// (`yuzu_exec_correlation_read_degrade_total`). A second hand-rolled lookup, or a plugin
+    /// parsed from the command id, at a new call site is the defect this function exists to
+    /// prevent (the wiring gate pins both). `keepalive` is true only for a `__keepalive__`
+    /// heartbeat frame: it is resolved (the claim renewal needs the recorded execution id) but
+    /// labels no response, so it is not counted in the outcome metric and raises no unverified line.
+    [[nodiscard]] ResponseProvenance resolve_response_provenance(const std::string& command_id,
+                                                                 bool keepalive = false) const;
 };
 
 } // namespace yuzu::server::detail
