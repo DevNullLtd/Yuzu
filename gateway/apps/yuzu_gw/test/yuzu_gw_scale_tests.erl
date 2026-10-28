@@ -98,8 +98,7 @@ cleanup(_) ->
         end
     end, [yuzu_gw_router, yuzu_gw_heartbeat_buffer]),
     catch meck:unload(telemetry),
-    catch meck:unload(grpcbox_channel),
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     ok.
 
 %%%===================================================================
@@ -124,8 +123,16 @@ fanout_count() ->
 
 bulk_register() ->
     N = scale_count(),
-    %% Spawn N dummy processes and register them.
-    {Pids, Ids} = spawn_and_register(N),
+    %% Spawn N dummy processes and register them, each with the 69 plugins of
+    %% a full agent build (the registry used to make one pg call per plugin).
+    Plugins = yuzu_gw_registry_cost_tests:plugin_names(),
+    {TimeUs, {Pids, Ids}} =
+        timer:tc(fun() -> spawn_and_register_prefixed(N, <<"scale-">>, Plugins) end),
+    ?debugFmt("bulk_register: ~b agents with ~b plugins, ~.1f us per registration",
+              [N, length(Plugins), TimeUs / N]),
+    %% Nothing left queued behind the registrations.
+    ?assertEqual({message_queue_len, 0},
+                 process_info(whereis(yuzu_gw_registry), message_queue_len)),
 
     ?assertEqual(N, length(Pids)),
 
@@ -305,28 +312,25 @@ heartbeat_batch_scale() ->
     %% without blocking callers.
     N = 10000,
 
-    %% Defensive unload of grpcbox_channel/grpcbox_client before re-mocking.
+    %% Defensive unload of yuzu_grpc_client before re-mocking.
     %% setup() at the top of this module mocks only telemetry and does NOT
-    %% pre-unload these two — every other test in the file leaves them
-    %% alone, so on most discovery orders they are absent. But other test
+    %% pre-unload it — every other test in the file leaves it
+    %% alone, so on most discovery orders it is absent. But other test
     %% modules in apps/yuzu_gw/test (circuit_breaker_*, upstream, health,
     %% heartbeat_metrics, perf_helpers→perf_SUITE, integration, e2e,
-    %% metrics_e2e, fullstack) all mock grpcbox_client and rely on their
+    %% metrics_e2e, fullstack) all mock yuzu_grpc_client and rely on their
     %% own setup/teardown to balance. If any of them crash mid-test or
     %% are run with `--dir apps/yuzu_gw/test` discovery interleaving
-    %% scale_tests after them, grpcbox_client/grpcbox_channel are still
+    %% scale_tests after them, yuzu_grpc_client is still
     %% registered when we reach this line and `meck:new` aborts with
     %% `{already_started, <pid>}`. CI Linux saw this on first eunit run
     %% with the full module set; local WSL2 happened to discover scale
     %% before the leakers.
-    catch meck:unload(grpcbox_channel),
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
 
     %% Mock upstream so it doesn't actually connect.
-    meck:new(grpcbox_channel, [non_strict, no_link]),
-    meck:expect(grpcbox_channel, pick, fun(_, _) -> {ok, fake_ch} end),
-    meck:new(grpcbox_client, [non_strict, no_link]),
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 60000),
@@ -348,8 +352,8 @@ heartbeat_batch_scale() ->
     ?assert(TimeMs < 2000),
 
     %% Trigger flush and verify it sends all buffered.
-    meck:reset(grpcbox_client),
-    meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->
+    meck:reset(yuzu_grpc_client),
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, Req, _, _) ->
         case binary:match(Path, <<"BatchHeartbeat">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
@@ -366,8 +370,8 @@ heartbeat_batch_scale() ->
     %% fast", so the 5s deadline (above the 2s used elsewhere, for the N-sized
     %% backlog) changes nothing it asserts; a missing RPC still fails below.
     BatchReqsFun = fun() ->
-        [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _}
-                    <- meck:history(grpcbox_client),
+        [Req || {_, {yuzu_grpc_client, unary, [_, Path, Req, _, _]}, _}
+                    <- meck:history(yuzu_grpc_client),
                 binary:match(Path, <<"BatchHeartbeat">>) =/= nomatch]
     end,
     _ = wait_until(fun() -> BatchReqsFun() =/= [] end, 5000),
@@ -382,7 +386,7 @@ heartbeat_batch_scale() ->
             ?assert(false, "Expected BatchHeartbeat RPC call")
     end,
 
-    meck:unload([grpcbox_channel, grpcbox_client]).
+    meck:unload(yuzu_grpc_client).
 
 %%%===================================================================
 %%% Helpers
@@ -392,10 +396,13 @@ spawn_and_register(N) ->
     spawn_and_register_prefixed(N, <<"scale-">>).
 
 spawn_and_register_prefixed(N, Prefix) ->
+    spawn_and_register_prefixed(N, Prefix, []).
+
+spawn_and_register_prefixed(N, Prefix, Plugins) ->
     Ids = [iolist_to_binary([Prefix, integer_to_binary(I)]) || I <- lists:seq(1, N)],
     Pids = [spawn(fun() -> receive stop -> ok end end) || _ <- lists:seq(1, N)],
     lists:foreach(fun({Id, Pid}) ->
-        yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [], <<>>)
+        ok = yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, Plugins, <<>>)
     end, lists:zip(Ids, Pids)),
     {Pids, Ids}.
 

@@ -113,8 +113,10 @@ yuzu_gateway/
 ```erlang
 %% rebar.config
 {deps, [
-    {grpcbox,   "0.17.1"},     % gRPC server + client (HTTP/2, protobuf)
-    {gpb,       "4.21.7"},     % Protobuf compiler/runtime (grpcbox dep)
+    {cowboy,    "2.19.0"},     % HTTP/2 server under the gateway's own gRPC listeners (yuzu_grpc*); brings ranch
+    {gun,       "2.5.0"},      % HTTP/2 client under the gateway-to-server gRPC client (yuzu_grpc_client)
+    {ctx,       "0.6.0"},      % request-context type of the yuzu_grpc* layer
+    {gpb,       "4.21.7"},     % Protobuf compiler/runtime
     {telemetry,  "1.3.0"},     % Metrics event API
     {prometheus, "4.11.0"},    % Prometheus exposition (telemetry handler)
     {recon,      "2.5.5"}      % Production introspection
@@ -151,7 +153,9 @@ States:
 **Key properties:**
 
 - The process **owns** the gRPC stream writer handle. All writes to this agent
-  go through its mailbox — no mutex needed.
+  go through its mailbox — no mutex needed. (As shipped, the Subscribe handler
+  process owns the stream and the agent process sends it `{send_command, Cmd}`;
+  the sketch below shows that.)
 - Incoming `CommandRequest` messages are delivered via `gen_statem:cast/2`.
   The process writes to the stream immediately; backpressure is handled by
   the HTTP/2 flow control window.
@@ -166,7 +170,7 @@ States:
 -record(data, {
     agent_id    :: binary(),
     session_id  :: binary(),
-    stream_ref  :: grpcbox:stream_ref(),
+    stream_pid  :: pid(),                      % the Subscribe handler process that owns the stream
     plugins     :: [binary()],
     pending     :: #{command_id() => from()}   % who to send responses to
 }).
@@ -174,14 +178,14 @@ States:
 %% In 'streaming' state, handle command dispatch:
 streaming(cast, {dispatch, CommandReq, ReplyTo}, Data) ->
     CmdId = maps:get(command_id, CommandReq),
-    ok = grpcbox_client:send(Data#data.stream_ref, CommandReq),
+    Data#data.stream_pid ! {send_command, CommandReq},   % that process calls yuzu_grpc_stream:send/2
     telemetry:execute([yuzu, gw, command, dispatched],
                       #{count => 1},
                       #{agent_id => Data#data.agent_id, plugin => maps:get(plugin, CommandReq)}),
     {keep_state, Data#data{pending = maps:put(CmdId, ReplyTo, Data#data.pending)}};
 
 %% Incoming response from agent stream:
-streaming(info, {grpc_data, _StreamRef, ResponseFrame}, Data) ->
+streaming(info, {stream_data, ResponseFrame}, Data) ->
     CmdId  = maps:get(command_id, ResponseFrame),
     Status = maps:get(status, ResponseFrame),
     case maps:find(CmdId, Data#data.pending) of
@@ -209,15 +213,21 @@ streaming(info, {grpc_closed, _StreamRef}, Data) ->
 ```erlang
 %% Child spec
 #{id       => agent,
-  start    => {yuzu_gw_agent, start_link, []},
-  restart  => temporary,       % agent procs are ephemeral
+  start    => {yuzu_gw_agent, start_link_async, []},
+  restart  => transient,       % restarted after an abnormal exit only
   shutdown => 5000,
   type     => worker}.
 ```
 
-`temporary` restart: if an agent process crashes, the agent will reconnect
-naturally via a new Register → Subscribe cycle. No point restarting a process
-whose stream is already broken.
+`transient` restart (#5695; it was `temporary`): an agent process that crashes
+does not break the agent's stream (the Subscribe handler is a separate process
+that monitors it), so the supervisor restarts it. The restarted process sends
+the `DISCONNECTED` for its predecessor's session, re-attaches to the stream if
+it is still open and re-establishes the session; otherwise the agent
+reconnects by itself. A per-process budget (3 restarts in 60 s) ends a crash
+loop, and the fleet-wide restart intensity (`agent_restart_intensity`, 2000 in
+10 s) escalates only a crash of most agent processes. The full description is
+in the gateway manual, "When an agent's owner process crashes".
 
 ### 3. `yuzu_gw_router` — Command Fanout Coordinator
 
@@ -263,8 +273,9 @@ yuzu_gw_sup (one_for_one)
   ├── yuzu_gw_upstream          (gen_server — gRPC client pool to C++ server)
   ├── yuzu_gw_router            (gen_server — fanout coordinator)
   ├── yuzu_gw_agent_sup         (simple_one_for_one — agent processes)
-  ├── yuzu_gw_mgmt_service      (grpcbox service — operator-facing)
-  └── yuzu_gw_agent_service     (grpcbox service — agent-facing proxy)
+  └── yuzu_grpc_listener        (one per {yuzu_gw, grpc_listeners} entry, last children:
+                                 mgmt -> yuzu_gw_mgmt_service, operator-facing;
+                                 agent -> yuzu_gw_agent_service, agent-facing proxy)
 ```
 
 ---
@@ -291,32 +302,32 @@ ets:insert(yuzu_gw_agents, {AgentId, self(), node(), SessionId, Plugins, os:time
 ets:delete(yuzu_gw_agents, AgentId).
 ```
 
-**pg (process groups)** — efficient broadcast/multicast:
+**pg (process groups)** — one group per agent, for cross-node lookup only:
 
 ```erlang
-%% Every agent process joins the 'all_agents' group
-pg:join(yuzu_gw, all_agents, self()).
+%% The agent process joins its own group once the registry has accepted it
+%% (yuzu_gw_registry:join_agent_group/1). The registry itself makes no pg call.
+pg:join(yuzu_gw, {agent, AgentId}, self()).
 
-%% Plugin-specific groups for targeted fanout
-pg:join(yuzu_gw, {plugin, <<"inventory">>}, self()).
-pg:join(yuzu_gw, {plugin, <<"patch">>}, self()).
-
-%% Broadcast to all agents (returns list of pids across the cluster)
-Pids = pg:get_members(yuzu_gw, all_agents).
-
-%% Plugin-targeted command
-Pids = pg:get_members(yuzu_gw, {plugin, Plugin}).
+%% lookup/1 reads it only when the local ETS table has no live row.
+Pids = pg:get_members(yuzu_gw, {agent, AgentId}).
 ```
+
+Earlier versions also kept an `all_agents` group and one `{plugin, Name}` group
+per plugin, joined by the registry on the agent's behalf. Nothing read them in
+production (broadcast reads ETS), and each `pg:join/3` is a synchronous call
+with an infinite timeout: about 71 of them per registration of an agent with a
+full plugin set, all inside the registry singleton. They were removed for the
+5,000-agent work (PR #5695). Measure the cost before adding a group back.
 
 **Why both?**
 
 | Operation | Mechanism | Time complexity |
 |-----------|-----------|-----------------|
 | Send to one agent by ID | ETS lookup | O(1) |
-| Broadcast to all agents | pg group | O(1) to get member list |
-| Send to agents with plugin X | pg group | O(1) to get member list |
+| Broadcast to all agents | ETS (`yuzu_gw_registry:all_agents/0`) | O(n) |
 | List all agents (dashboard) | ETS `select` | O(n) but paginated via cursor |
-| Cross-node fanout | pg (cluster-aware) | Automatic via Erlang distribution |
+| Find an agent held by another node | pg `{agent, Id}` (cluster-aware) | O(1) |
 
 ### Cross-Node Routing (Clustering)
 
@@ -703,7 +714,7 @@ LB/DNS ────────├─── gw3 (1M agents) ───├──�
    list and updates `last_seen` in bulk.
 
 3. **Add the Erlang OTP project** under `gateway/` (or a separate repo).
-   Wire up `grpcbox` with the proto files using `gpb` for code generation.
+   Wire up the gateway's gRPC layer (`yuzu_grpc*` over Cowboy for the listeners; `yuzu_grpc_client` over gun for the upstream client) with the proto files using `gpb` for code generation.
 
 ### Phase 1: Shadow Mode (read-only gateway, agents still connect to C++)
 

@@ -109,6 +109,13 @@ struct ProfileInfo {
     return sid.size() > 4 && iequals_ascii(sid.substr(sid.size() - 4), ".bak");
 }
 
+/// Drops the `<SID>.bak` leftovers from a built list (see is_profile_backup_entry): the per-user WRITE path resolves its
+/// target from the filtered list, so it can neither write through a leftover nor have a leftover shadow the live profile
+/// of the same user name. Reads keep the unfiltered list.
+inline void remove_backup_entries(std::vector<ProfileInfo>& list) {
+    std::erase_if(list, [](const ProfileInfo& p) { return is_profile_backup_entry(p.sid); });
+}
+
 /// Last '\' or '/' separated component of `profile_image_path`, with any
 /// trailing separators stripped first (so "C:\Users\jsmith\" yields "jsmith",
 /// matching basename-style semantics). Returns "" only when the path is

@@ -8,24 +8,43 @@
 %%% command the fleet, so this module pins the mgmt peer to the C++
 %%% server's KEY, not merely its issuer.
 %%%
-%%% Wired as the grpcbox `auth_fun` on the mgmt listener ONLY (never the
-%%% :50051 agent listener, which is verify_none — grpcbox rejects a
-%%% certless peer whenever an auth_fun is installed, so an auth_fun there
-%%% would kill every agent connection). grpcbox invokes it per-stream,
-%%% before the service handler, with the peer's DER certificate; any
-%%% non-{true,_} return ends the stream UNAUTHENTICATED.
+%%% Wired as the `auth_fun` of the mgmt listener ONLY (never the :50051
+%%% agent listener, which is verify_none — a listener with an auth_fun
+%%% rejects a certless peer, so an auth_fun there would kill every agent
+%%% connection; yuzu_grpc_listener:validate/1 refuses the combination).
+%%% yuzu_grpc_stream_h invokes it per stream, before the service handler,
+%%% with the peer's DER certificate; any non-{true,_} return ends the
+%%% stream UNAUTHENTICATED.
 %%%
 %%% Pin model: `{yuzu_gw, mgmt_peer_pins}` is a list of
 %%%   {cert_file, Path}       — pin to the SPKI of the FIRST certificate in
 %%%                             the PEM at Path (default deployments point at
-%%%                             the shared-volume default-server.pem; re-read
-%%%                             when the file changes, so server leaf rotation
-%%%                             self-heals without a gateway restart), or
+%%%                             the shared-volume default-server.pem). The file
+%%%                             is watched by yuzu_gw_mgmt_pins, NOT read here:
+%%%                             that process re-reads it (content digest) every
+%%%                             mgmt_pin_refresh_ms (default 5 s) and publishes
+%%%                             its SPKI hash, so a rotated server leaf is
+%%%                             pinned within one interval without a gateway
+%%%                             restart, and this check does no file I/O; or
 %%%   {spki_sha256, Hex}      — a literal SHA-256 of the peer's DER-encoded
 %%%                             SubjectPublicKeyInfo (64 hex chars; for
 %%%                             bring-your-own-cert installs / split hosts
 %%%                             where the server cert file isn't mounted).
 %%% Two or more pins may be listed so a rotation can overlap.
+%%%
+%%% No file I/O on the stream path (M1(b), #5696): this callback runs in the
+%%% Cowboy connection process, once per stream, and a stat there (through the
+%%% node-wide file server) would let a stalled cert volume stall the decoding
+%%% of every stream on the connection. A `cert_file' pin resolves to the key
+%%% yuzu_gw_mgmt_pins last read from the file (a persistent_term read): it is
+%%% kept if the file later fails to read or parse (the watcher flags the source
+%%% unhealthy; deleting or damaging the file does NOT revoke the key, see
+%%% yuzu_gw_mgmt_pins), and a path that has never resolved contributes no pin,
+%%% so with no pin resolved every peer is refused. Between
+%%% a rotation and the watcher's next tick the new server leaf is refused (fail
+%%% closed). The server does not retry that refusal: the commands it forwards
+%%% in that window fail terminally (`gateway_unauthenticated'); commands after
+%%% the tick go through.
 %%%
 %%% Why SPKI and not the subject CN: `agent_id` is only length-checked and
 %%% is chosen by the endpoint (`--agent-id`), and sign_agent_csr puts it in
@@ -47,21 +66,19 @@
 -module(yuzu_gw_authz).
 
 -include_lib("public_key/include/public_key.hrl").
--include_lib("kernel/include/file.hrl").
 
--export([check_mgmt_peer/1]).
-%% exported for testing
--export([check_peer/2, spki_sha256/1, has_server_auth_eku/1,
-         resolve_pin/1, pem_file_spki/1]).
+-export([check_mgmt_peer/1, init_log_limits/0]).
+%% exported for testing (spki_sha256/1 is also yuzu_gw_mgmt_pins')
+-export([check_peer/2, spki_sha256/1, has_server_auth_eku/1, resolve_pin/1]).
 
 -define(IDENTITY, <<"yuzu-server">>).
 
 %%--------------------------------------------------------------------
-%% grpcbox auth_fun entry point
+%% auth_fun entry point
 %%--------------------------------------------------------------------
 
-%% @doc grpcbox auth_fun for the mgmt listener. Total: any throw/error
-%% rejects rather than crashing the stream process.
+%% @doc The auth_fun of the mgmt listener. Total: any throw/error rejects
+%% rather than crashing the connection process.
 -spec check_mgmt_peer(public_key:der_encoded()) -> {true, binary()} | false.
 check_mgmt_peer(DerCert) ->
     try
@@ -170,58 +187,10 @@ resolve_pin({spki_sha256, Hex}) when is_binary(Hex), byte_size(Hex) =:= 64 ->
     catch _:_ -> error
     end;
 resolve_pin({cert_file, Path}) when is_list(Path); is_binary(Path) ->
-    cached_file_spki(Path);
+    %% What yuzu_gw_mgmt_pins last published for Path: no file I/O here.
+    yuzu_gw_mgmt_pins:lookup(Path);
 resolve_pin(_) ->
     error.
-
-%% @private SPKI of the first certificate in the PEM at Path, cached in
-%% persistent_term keyed by {mtime, size} so the shared-volume default
-%% server leaf is re-read after the C++ server rotates it (no gateway
-%% restart needed). persistent_term:put triggers a global GC scan, but the
-%% token only changes on rotation, so puts are rare by construction.
-%% Granularity note: a same-second, SAME-SIZE rewrite is not detected — and
-%% a re-minted same-type key typically yields a same-length DER, so the size
-%% half of the token does NOT catch that case. What bounds the risk is that
-%% rotation is rare, the miss direction is fail-closed (stale pin rejects
-%% the new leaf, never admits a wrong one), and a gateway restart recovers.
--spec cached_file_spki(file:name_all()) -> {ok, binary()} | error.
-cached_file_spki(Path) ->
-    Token = file_token(Path),
-    Key = {?MODULE, cert_file, Path},
-    case {Token, persistent_term:get(Key, undefined)} of
-        {error, _} ->
-            error;
-        {_, {Token, Hash}} ->
-            {ok, Hash};
-        {_, _} ->
-            case pem_file_spki(Path) of
-                {ok, Hash} ->
-                    persistent_term:put(Key, {Token, Hash}),
-                    {ok, Hash};
-                error ->
-                    error
-            end
-    end.
-
-%% @doc Uncached read: SPKI SHA-256 of the first PEM certificate in Path.
--spec pem_file_spki(file:name_all()) -> {ok, binary()} | error.
-pem_file_spki(Path) ->
-    case file:read_file(Path) of
-        {ok, Pem} ->
-            case [D || {'Certificate', D, not_encrypted} <- public_key:pem_decode(Pem)] of
-                [Der | _] -> spki_sha256(Der);
-                []        -> error
-            end;
-        {error, _} ->
-            error
-    end.
-
--spec file_token(file:name_all()) -> {calendar:datetime(), non_neg_integer()} | error.
-file_token(Path) ->
-    case file:read_file_info(Path, [{time, universal}]) of
-        {ok, #file_info{mtime = M, size = S}} -> {M, S};
-        {error, _}                            -> error
-    end.
 
 %%--------------------------------------------------------------------
 %% Rejection
@@ -232,14 +201,32 @@ file_token(Path) ->
 %% the log or the metric labels. Event name lives in yuzu_gw_telemetry's
 %% ?EVENTS ([yuzu, gw, ...] namespace) — an unlisted name would fire into
 %% the void and the advertised counter would never move.
+%%
+%% Every rejection is COUNTED; the log line is limited to one per reason per
+%% second (yuzu_gw_safe_call:warn_limited/3, the gateway's per-kind WARN
+%% limiter), and the line after a quiet interval says how many were not
+%% logged. Any holder of an install-CA certificate that reaches the port can
+%% make this path run once per stream, so an unlimited line was a log-flood
+%% lever (N4). The counter, not the log, is the record of how many there were.
 -spec reject(atom()) -> false.
 reject(Reason) ->
     telemetry:execute([yuzu, gw, mgmt_auth, rejected], #{count => 1},
                       #{reason => Reason}),
-    logger:notice("mgmt-plane peer rejected: ~p (CA-issued cert is not "
-                  "authorization to command the fleet — see mgmt_peer_pins)",
-                  [Reason]),
+    yuzu_gw_safe_call:warn_limited(
+      {mgmt_peer_rejected, Reason},
+      "mgmt-plane peer rejected: ~p (CA-issued cert is not "
+      "authorization to command the fleet — see mgmt_peer_pins)",
+      [Reason]),
     false.
+
+%% @doc Create the per-reason stamps of the rejection line's log limit before
+%% the first stream can be refused (yuzu_gw_mgmt_pins:init/1 calls it, ahead of
+%% the listeners). Stamps created by the first rejections instead would race:
+%% each racer writes its own line and replaces the persistent_term.
+-spec init_log_limits() -> ok.
+init_log_limits() ->
+    yuzu_gw_safe_call:init_kinds([{mgmt_peer_rejected, R}
+                                  || R <- yuzu_gw_telemetry:mgmt_auth_reject_reasons()]).
 
 %% @private A configured pin entry did not resolve. Counted on every auth
 %% attempt (so a dashboard sees it move), logged once per BEAM per distinct

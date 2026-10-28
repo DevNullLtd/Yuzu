@@ -575,12 +575,32 @@ def parse_bullets(text: str) -> list[str]:
     return items
 
 
+def how_it_works_text(readme: str) -> str:
+    """Everything under ``## How it works`` up to the next ``##`` heading, ``###``
+    subsections included (``split_sections`` stops at the first ``###``, which would
+    leave the manifest with only the lead paragraph). Fenced blocks are opaque."""
+    buf: list[str] = []
+    in_fence = False
+    inside = False
+    for line in readme.splitlines():
+        if line.startswith("```"):
+            in_fence = not in_fence
+        if not in_fence and line.startswith("## "):
+            if inside:
+                break
+            inside = line.strip() == "## How it works"
+            continue
+        if inside:
+            buf.append(line)
+    return "\n".join(buf).strip()
+
+
 def hand_sections_to_manifest(readme: str) -> dict:
     sec = split_sections(readme)
     priv_rows = parse_md_table(sec.get("## Privileges and prerequisites", ""))
     status_rows = parse_md_table(sec.get("### Result status", ""))
     return {
-        "how_it_works": strip_fences(strip_generated(sec.get("## How it works", ""))),
+        "how_it_works": re.sub(r"\n{3,}", "\n\n", strip_fences(strip_generated(how_it_works_text(readme)))),
         "outputs_note": strip_fences(strip_generated(sec.get("### Outputs", ""))),
         "privileges": [dict(zip(("os", "runs_as", "grant", "measured", "if_refused"), r + [""] * 5))
                        for r in priv_rows],

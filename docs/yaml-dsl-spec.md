@@ -222,7 +222,7 @@ Each column object:
 server-side representation: `executeRoles`' labels (`endpoint-admin`,
 `security-admin`, ...) are a content-authoring convention that matches no
 seeded RBAC role (`Administrator`/`PlatformEngineer`/`Operator`/
-`ApiTokenManager`/`ITServiceOwner`/`Viewer`/`Reviewer`), and `embed_content.py`
+`ApiTokenManager`/`ITServiceOwner`/`Viewer`/`Reviewer`/`ForensicsAnalyst`), and `embed_content.py`
 drops the entire `permissions` block at build time -- it never reaches the
 running server. Actual execute-time enforcement is `spec.approval.mode` (see
 above); actual author-time enforcement is the `InstructionDefinition:Write`
@@ -1767,6 +1767,9 @@ This section enumerates the stable builtin primitives that content authors targe
 | `registry.enumerate_values` | `registry` | Y | - | - | Verified |
 | `registry.get_user_value` | `registry` | Y | - | - | Verified |
 | `registry.list_profiles` | `registry` | Y | - | - | Verified |
+| `registry.set_user_value` | `registry` | Y | - | - | Verified |
+| `registry.delete_user_value` | `registry` | Y | - | - | Verified |
+| `registry.apply` | `registry` | Y | - | - | Verified |
 | `wmi.query` | `wmi` | Y | - | - | Verified |
 | `wmi.get_instance` | `wmi` | Y | - | - | Verified |
 | `rdp_control.set_state` | `rdp_control` | Y | - | - | Verified |

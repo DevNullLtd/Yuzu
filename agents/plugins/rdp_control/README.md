@@ -18,12 +18,12 @@
 
 ```mermaid
 flowchart LR
-  OP[Operator / ITSM change window] --> SRV[Server<br/>authz: Security.Write set_state<br/>authz: Security.Read status]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[rdp_control.execute]
-  EX --> WIN[Windows leg<br/>registry + INetFwPolicy2 COM + SCM]
-  EX --> MAC[macOS leg<br/>honest UNSUPPORTED sentinel<br/>no mechanism]
-  EX --> LIN[Linux leg<br/>honest UNSUPPORTED sentinel<br/>no mechanism]
-  WIN & MAC & LIN --> ROWS[key|value rows +<br/>result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator / ITSM change window"] --> SRV["Server - authz: Security.Write set_state, Security.Read status"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"] --> EX["rdp_control.execute"]
+  EX --> WIN["Windows leg - registry + INetFwPolicy2 COM + SCM"]
+  EX --> MAC["macOS leg - honest UNSUPPORTED sentinel, no mechanism"]
+  EX --> LIN["Linux leg - honest UNSUPPORTED sentinel, no mechanism"]
+  WIN & MAC & LIN --> ROWS["key|value rows + result status"] --> RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
 
 ## OS capability
