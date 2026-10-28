@@ -8174,7 +8174,11 @@ void RestApiV1::register_routes(
             // hand-edited store) would silently create an orphan grant that
             // resolves as a no-op hole, discoverable only by confusion, not
             // by an error.
-            if (!rbac_store->get_role(role_name)) {
+            // ONE read serves both checks below: `get_role` answers nullopt for a failed read and for
+            // a missing row alike, so a second read could fail where this one succeeded and skip the
+            // collision check (#4990).
+            const auto role_row = rbac_store->get_role(role_name);
+            if (!role_row) {
                 // Doomgoose external review, PR #4985 IMPORTANT finding #3:
                 // reclassified from 400 to 503 — `role_name` has ALREADY
                 // passed the closed allow-list above, so the
@@ -8197,8 +8201,7 @@ void RestApiV1::register_routes(
             // #4990: the closed list is enforced by NAME. A hand-made non-built-in role that holds
             // a built-in name (the ForensicsAnalyst collision) would otherwise be attached here
             // and reported as the built-in role, so only the is_system row is assignable.
-            if (const auto role_row = rbac_store->get_role(role_name);
-                role_row && !role_row->is_system) {
+            if (!role_row->is_system) {
                 (void)detail::emit_behavioral_audit(
                     audit_fn, req, res, "rbac.role.assigned", "denied", "User", audit_target_id,
                     role_name + ": a non-built-in role holds this name (name collision)");

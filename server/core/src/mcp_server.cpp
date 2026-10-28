@@ -26196,7 +26196,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 // Defense-in-depth — see the REST route's own comment.
-                if (!rbac_store->get_role(role_name)) {
+                // ONE read serves both checks below (see the REST route's own comment).
+                const auto role_row = rbac_store->get_role(role_name);
+                if (!role_row) {
                     // Doomgoose external review, PR #4985 IMPORTANT finding
                     // #3: reclassified from kInvalidParams to kInternalError
                     // (503-analog, retryable) — role_name has ALREADY passed
@@ -26219,8 +26221,7 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 // #4990: see the REST route's own comment: the closed list is enforced by
                 // name, so a non-built-in role holding a built-in name is refused.
-                if (const auto role_row = rbac_store->get_role(role_name);
-                    role_row && !role_row->is_system) {
+                if (!role_row->is_system) {
                     (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
                                    role_name + ": a non-built-in role holds this name (name "
                                                "collision)");

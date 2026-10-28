@@ -307,6 +307,23 @@ TEST_CASE("assign: a hand-made non-built-in role holding the ForensicsAnalyst na
                 found = true;
         CHECK(found);
     }
+    SECTION("MCP: invalid params, audited, nothing assigned") {
+        auto res = h.mcp_call_tool_approved(
+            "assign_rbac_role",
+            {{"principal_type", "user"}, {"principal_id", "jane"}, {"role", "ForensicsAnalyst"}});
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(h.rbac->get_principal_roles("user", "jane").empty());
+        bool found = false;
+        for (const auto& a : h.audit_log)
+            if (a.action == "rbac.role.assigned" && a.result == "denied" &&
+                a.detail.find("name collision") != std::string::npos)
+                found = true;
+        CHECK(found);
+    }
     SECTION("the built-in row is still assignable once it is the system role") {
         REQUIRE(h.rbac->delete_role("ForensicsAnalyst").has_value());
         yuzu::server::RbacStore adopt{h.auth_db.pool()};
