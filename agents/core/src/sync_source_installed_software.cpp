@@ -4,6 +4,7 @@
 #include "sync_canonical.hpp" // sanitize_utf8_strict / clamp_field / sha256_hex
 
 #include <inventory_status_row.hpp> // the status-row grammar shared with the producing plugins
+#include <middleware_products.hpp>  // the middleware product table (title/vendor/ecosystem/kind)
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -119,11 +120,17 @@ template <class Fn> void for_each_line(const std::string& out, Fn&& fn) {
 }
 
 // Split on '|' into at most `max` tokens; anything past the max-th token is dropped.
-std::vector<std::string_view> split_tokens(std::string_view line, std::size_t max) {
+// `escaped` additionally treats `\|` as field text, not a separator (the wire form
+// yuzu::util::safe_output_field gives a literal pipe; a literal backslash is never emitted, it
+// is replaced by '/'). Tokens stay views of the raw line, so an escaped pipe keeps its `\`.
+std::vector<std::string_view> split_tokens(std::string_view line, std::size_t max,
+                                           bool escaped = false) {
     std::vector<std::string_view> tok;
     std::size_t fp = 0;
     while (tok.size() < max) {
         std::size_t bar = line.find('|', fp);
+        while (escaped && bar != std::string_view::npos && bar > fp && line[bar - 1] == '\\')
+            bar = line.find('|', bar + 1);
         if (bar == std::string_view::npos) {
             tok.push_back(line.substr(fp));
             break;
@@ -167,7 +174,7 @@ AdaptedRows failed(std::string reason) {
 // as `reason` only under constrained; supported and unsupported leave it empty.
 template <class OnRow>
 AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action, OnRow on_row,
-                                ConstrainedPolicy policy) {
+                                ConstrainedPolicy policy, bool escaped = false) {
     AdaptedRows res;
     int status_rows = 0;
     std::optional<yuzu::shared::StatusLevel> level;
@@ -176,7 +183,7 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
     for_each_line(out, [&](std::string_view line) {
         // One more than the widest row (store rows are nine tokens) so an over-wide row
         // fails the `!= N` width checks instead of being truncated to a valid width.
-        const auto tok = split_tokens(line, 10);
+        const auto tok = split_tokens(line, 10, escaped);
         if (yuzu::shared::is_status_line(tok)) {
             if (auto row = yuzu::shared::parse_status_row(tok, action)) {
                 ++status_rows;
@@ -193,6 +200,15 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
         return failed("bad status");
     if (*level == yuzu::shared::StatusLevel::constrained) {
         // Keeping rows is the opt-in: any other value (an out-of-range cast too) fails closed.
+        if (policy == ConstrainedPolicy::drop_source) {
+            // A known-incomplete set is never published: no rows, the cycle continues. The
+            // cycle's aggregate replaces the stored inventory, so these rows are
+            // REMOVED from the stored inventory until the source recovers (see the header).
+            res.entries.clear();
+            res.status = AdaptedRows::Status::withheld;
+            res.reason = std::move(reason);
+            return res;
+        }
         if (policy != ConstrainedPolicy::keep_rows_if_present_seen || seen == 0)
             return failed(reason);
         res.reason = reason; // ok + non-empty reason = constrained, rows kept
@@ -297,6 +313,14 @@ const InventoryAction kInventoryActions[] = {
     {.plugin = "msi_packages",
      .action = "list_inventory",
      .adapt = parse_msi_packages_list_inventory_output},
+    // Metadata-only source whose steady-state constraint is a permission fact: a constrained
+    // answer drops just that source (rows withheld) instead of failing the whole cycle.
+    {.plugin = "middleware",
+     .action = "ibm_mq",
+     .adapt = [](const std::string& o, ConstrainedPolicy pol) {
+         return parse_middleware_output(o, "ibm_mq", pol);
+     },
+     .constrained = ConstrainedPolicy::drop_source},
 };
 
 } // namespace
@@ -462,6 +486,35 @@ AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out,
     }, policy);
 }
 
+AdaptedRows parse_middleware_output(const std::string& out, std::string_view action,
+                                    ConstrainedPolicy policy) {
+    // <id>|<title>|<name>|<version or ->|<install_path>|<edition or ->  (install_path and
+    // edition are not carried). Free-text fields arrive escape-aware (a path may hold `\|`), so
+    // the split is too. Name, publisher, kind and ecosystem come from the plugin's own product
+    // table, never from the row.
+    const yuzu::middleware::Product* p = yuzu::middleware::find_product(action);
+    if (p == nullptr)
+        return failed("unknown middleware product");
+    return adapt_pkg_inventory(out, action,
+                               [p, action](const std::vector<std::string_view>& tok,
+                                           std::vector<SwEntry>& entries) {
+        if (tok[0] != action || tok.size() != 6)
+            return false;
+        // The title column is fixed vocabulary from the table: with no per-product title span a
+        // row can only carry p->title, anything else is seen but not mapped (siblings kept).
+        if (tok[1] == p->title) {
+            SwEntry e;
+            e.name = p->title;
+            e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
+            e.publisher = p->vendor;
+            e.kind = p->kind;
+            e.ecosystem = p->ecosystem;
+            entries.push_back(std::move(e));
+        }
+        return true;
+    }, policy, /*escaped=*/true);
+}
+
 AdaptedRows parse_windows_optional_features_output(const std::string& out) {
     // windows_optional_features_parsers.hpp: `feature|<name>|<state>|<0/1>` per
     // feature (no status row in this grammar); sentinels are 3-token
@@ -618,6 +671,11 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
             if (rows.status == AdaptedRows::Status::unsupported) {
                 spdlog::debug("sync: {}.{} unsupported on this OS — skipped", row.plugin,
                               row.action);
+                continue;
+            }
+            if (rows.status == AdaptedRows::Status::withheld) {
+                spdlog::warn("sync: {}.{} constrained ({}) — rows withheld this cycle", row.plugin,
+                             row.action, rows.reason);
                 continue;
             }
             if (rows.status == AdaptedRows::Status::failed) {

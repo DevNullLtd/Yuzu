@@ -36,6 +36,7 @@
 #include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_middleware.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
@@ -170,6 +171,7 @@ struct LabeledSpan {
         {"mgmt_posture", capdecls::plugin_action_catalogue_mgmt_posture(), false},
         {"shares", capdecls::plugin_action_catalogue_shares(), false},
         {"remote_access_audit", capdecls::plugin_action_catalogue_remote_access_audit(), false},
+        {"middleware", capdecls::plugin_action_catalogue_middleware(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -208,6 +210,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_mgmt_posture(),
         capdecls::plugin_action_catalogue_shares(),
         capdecls::plugin_action_catalogue_remote_access_audit(),
+        capdecls::plugin_action_catalogue_middleware(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -770,4 +773,23 @@ TEST_CASE("capability catalogue: no plugin name can collide with the unverified 
     }
     CHECK(rows > 0);
     CHECK(kUnverifiedProvenanceLabel.front() == '~');
+}
+
+/// Exact-row pin for `middleware.ibm_mq`: ReadOnly/None on the `Inventory` securable (an
+/// installed-software fact, not a posture fact). The generic invariants accept ANY seeded
+/// securable and ANY dispatch class, so without this pin a silent re-typing ships green.
+TEST_CASE("capability catalogue: middleware.ibm_mq pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_middleware();
+    REQUIRE(rows.size() == 1);
+    const auto& row = rows.front();
+    CHECK(row.plugin == "middleware");
+    CHECK(row.action == "ibm_mq");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Inventory");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::None);
 }

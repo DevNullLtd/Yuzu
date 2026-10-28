@@ -14,6 +14,9 @@
 
 #include <inventory_status_row.hpp>
 
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
+
 #include <yuzu/plugin.h>
 
 #include <algorithm>
@@ -37,6 +40,7 @@ using yuzu::agent::AdaptedRows;
 using yuzu::agent::ConstrainedPolicy;
 using yuzu::agent::installed_software_canonical_blob;
 using yuzu::agent::make_installed_software_source;
+using yuzu::agent::parse_middleware_output;
 using yuzu::agent::parse_msi_packages_list_inventory_output;
 using yuzu::agent::parse_pkg_inventory_managers_output;
 using yuzu::agent::parse_pkg_inventory_packages_output;
@@ -1277,7 +1281,7 @@ struct FakeOut {
     std::map<std::string, std::tuple<YuzuResultStatus, YuzuResultCompleteness, std::string>>
         result_status;
 };
-FakeOut g_fake[4]; // 0 installed_apps, 1 pkg_inventory, 2 windows_optional_features, 3 msi_packages
+FakeOut g_fake[5]; // 0 installed_apps, 1 pkg_inventory, 2 windows_optional_features, 3 msi_packages, 4 middleware (not in all_plugins())
 
 template <int I>
 int fake_execute(YuzuCommandContext* ctx, const char* action, const YuzuParam* /*params*/,
@@ -1300,6 +1304,7 @@ const char* const kFakeIaActions[] = {"list_inventory", nullptr};
 const char* const kFakePkgActions[] = {"managers", "packages", "store_packages", nullptr};
 const char* const kFakeWofActions[] = {"list", nullptr};
 const char* const kFakeMsiActions[] = {"list_inventory", nullptr};
+const char* const kFakeMiddlewareActions[] = {"ibm_mq", nullptr};
 
 #define YUZU_FAKE_DESC(var, plugin_name, actions, idx)                                            \
     const YuzuPluginDescriptor var = {YUZU_PLUGIN_ABI_VERSION, plugin_name, "1.0.0", "test fake", \
@@ -1309,6 +1314,7 @@ YUZU_FAKE_DESC(kFakeIa, "installed_apps", kFakeIaActions, 0);
 YUZU_FAKE_DESC(kFakePkg, "pkg_inventory", kFakePkgActions, 1);
 YUZU_FAKE_DESC(kFakeWof, "windows_optional_features", kFakeWofActions, 2);
 YUZU_FAKE_DESC(kFakeMsi, "msi_packages", kFakeMsiActions, 3);
+YUZU_FAKE_DESC(kFakeMiddleware, "middleware", kFakeMiddlewareActions, 4);
 #undef YUZU_FAKE_DESC
 
 SyncPluginMap all_plugins() {
@@ -2520,6 +2526,7 @@ std::string show_entry(const SwEntry& e) {
 std::string show(const AdaptedRows& r) {
     std::string s = r.status == Status::ok            ? "ok"
                     : r.status == Status::unsupported ? "unsupported"
+                    : r.status == Status::withheld    ? "withheld"
                                                       : "failed";
     s += "|reason=" + r.reason + "|n=" + std::to_string(r.entries.size());
     for (const auto& e : r.entries)
@@ -3018,4 +3025,257 @@ TEST_CASE("manager-ecosystem table: each row maps through its own action only",
                   res("ok", "tok"));
         }
     }
+}
+
+// --- middleware (SAM.2): the generic product adapter, ConstrainedPolicy::drop_source ---
+
+namespace {
+constexpr ConstrainedPolicy kDropPolicy = ConstrainedPolicy::drop_source;
+
+// REAL-CAPTURE-shaped row (IBM MQ 9.4.5.0 registered install):
+// <id>|<title>|<name>|<version or ->|<install_path>|<edition or ->
+constexpr const char* kMqRow = "ibm_mq|IBM MQ|Installation1|9.4.5.0|/opt/mqm|-";
+
+AdaptedRows bind_mq(const std::string& s) { return parse_middleware_output(s, "ibm_mq", kDropPolicy); }
+
+// Captures every spdlog payload logged while it lives (the collector logs on the calling thread).
+struct LogCapture {
+    std::ostringstream text;
+    std::shared_ptr<spdlog::logger> prev = spdlog::default_logger();
+    LogCapture() {
+        auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(text);
+        auto logger = std::make_shared<spdlog::logger>("capture", sink);
+        logger->set_level(spdlog::level::warn); // independent of any level an earlier test set
+        spdlog::set_default_logger(std::move(logger));
+    }
+    ~LogCapture() { spdlog::set_default_logger(prev); }
+    LogCapture(const LogCapture&) = delete;
+    LogCapture& operator=(const LogCapture&) = delete;
+    [[nodiscard]] std::size_t count(std::string_view needle) const {
+        const std::string t = text.str();
+        std::size_t n = 0;
+        for (auto at = t.find(needle); at != std::string::npos; at = t.find(needle, at + 1))
+            ++n;
+        return n;
+    }
+};
+
+SyncPluginMap with_middleware() {
+    SyncPluginMap m = all_plugins();
+    m["middleware"] = &kFakeMiddleware;
+    return m;
+}
+
+std::size_t count_source(const std::string& blob, std::string_view source) {
+    std::size_t n = 0;
+    for (const auto& rec : records_of(blob))
+        if (fields_of(rec)[15] == source)
+            ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("middleware adapter: a row maps to the product table's entry",
+          "[sync][parse][adapter][middleware]") {
+    CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"), kMqRow}))) ==
+          res("ok", "", {entry_of("IBM MQ", "9.4.5.0", "IBM", "app", "ibm_mq")}));
+    // `-` is the wire spelling of "no version": the honest-empty field is the empty string.
+    CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"),
+                           "ibm_mq|IBM MQ|Installation2|-|/opt/mqm2|-"}))) ==
+          res("ok", "", {entry_of("IBM MQ", "", "IBM", "app", "ibm_mq")}));
+    // the edition column is not carried
+    CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"),
+                           "ibm_mq|IBM MQ|Installation3|9.3.5.0|/opt/mqm3|Advanced"}))) ==
+          res("ok", "", {entry_of("IBM MQ", "9.3.5.0", "IBM", "app", "ibm_mq")}));
+    // two installations are two entries
+    CHECK(bind_mq(nl({st("ibm_mq", "supported", "-"), kMqRow,
+                      "ibm_mq|IBM MQ|Installation2|9.3.5.0|/opt/mqm2|-"}))
+              .entries.size() == 2);
+    // zero rows + supported is a legitimate "none installed"
+    CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-")}))) == res("ok", ""));
+}
+
+TEST_CASE("middleware adapter: an action that is not in the product table fails",
+          "[sync][parse][adapter][middleware]") {
+    CHECK(show(parse_middleware_output(nl({st("nope", "supported", "-"), "nope|IBM MQ|n|1|/p|-"}),
+                                       "nope", kDropPolicy)) ==
+          res("failed", "unknown middleware product"));
+    CHECK(show(parse_middleware_output("", "", kDropPolicy)) ==
+          res("failed", "unknown middleware product"));
+}
+
+TEST_CASE("middleware adapter: a row is accepted only when its title equals the table title",
+          "[sync][parse][adapter][middleware]") {
+    const std::string good = kMqRow;
+    CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"), good}))) ==
+          res("ok", "", {entry_of("IBM MQ", "9.4.5.0", "IBM", "app", "ibm_mq")}));
+    for (const char* title : {"-", "", "ibm mq", "IBM MQ ", " IBM MQ", "IBM  MQ", "Oracle"}) {
+        INFO("title=[" << title << "]");
+        const std::string bad = std::string("ibm_mq|") + title + "|InstallationX|1.0|/opt/x|-";
+        // dropped, siblings kept, the source stays ok
+        CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"), bad, good, bad}))) ==
+              res("ok", "", {entry_of("IBM MQ", "9.4.5.0", "IBM", "app", "ibm_mq")}));
+        CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"), bad}))) == res("ok", ""));
+        // dropped rows are COUNTED (seen, not mapped): under keep_rows_if_present_seen a
+        // constrained answer holding only such rows is kept, not failed
+        CHECK(show(parse_middleware_output(nl({st("ibm_mq", "constrained", "tok"), bad}), "ibm_mq",
+                                           ConstrainedPolicy::keep_rows_if_present_seen)) ==
+              res("ok", "tok"));
+    }
+}
+
+TEST_CASE("middleware adapter: an escaped pipe in a free-text field is one field, not two",
+          "[sync][parse][adapter][middleware]") {
+    // safe_output_field writes a literal '|' as `\|`; a raw-pipe split would see seven tokens
+    // and silently drop the row although the status is supported.
+    CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"),
+                           "ibm_mq|IBM MQ|Inst\\|1|9.4.5.0|/opt/mq\\|east|-"}))) ==
+          res("ok", "", {entry_of("IBM MQ", "9.4.5.0", "IBM", "app", "ibm_mq")}));
+    // an escaped pipe does not hide a real extra field: still seven tokens, still rejected
+    CHECK(bind_mq(nl({st("ibm_mq", "supported", "-"), "ibm_mq|IBM MQ|I\\|1|9.4|/p|-|extra"}))
+              .entries.empty());
+}
+
+TEST_CASE("middleware adapter: status grammar, row shape and the drop_source policy",
+          "[sync][parse][adapter][middleware]") {
+    const std::string bad = res("failed", "bad status");
+    // bad or missing status fails the cycle (it is not a constrained answer)
+    CHECK(show(bind_mq(nl({kMqRow}))) == bad);
+    CHECK(show(bind_mq("")) == bad);
+    CHECK(show(bind_mq(nl({"status|ibm_mq|supported", kMqRow}))) == bad);
+    CHECK(show(bind_mq(nl({st("ibm_mq", "bogus", "-"), kMqRow}))) == bad);
+    CHECK(show(bind_mq(nl({st("oracle", "supported", "-"), kMqRow}))) == bad);
+    CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"), st("ibm_mq", "supported", "-"), kMqRow}))) ==
+          bad);
+    // unsupported: skipped silently, zero entries, no reason
+    CHECK(show(bind_mq(nl({st("ibm_mq", "unsupported", "macos:planned"), kMqRow}))) ==
+          res("unsupported", ""));
+    // constrained under drop_source: zero entries, reason = the tokens, status withheld --
+    // with rows, without rows, and with a row the adapter would not even see
+    const std::string tok = "linux:middleware:mqinst_permission_denied";
+    CHECK(show(bind_mq(nl({st("ibm_mq", "constrained", tok), kMqRow}))) == res("withheld", tok));
+    CHECK(show(bind_mq(nl({st("ibm_mq", "constrained", tok)}))) == res("withheld", tok));
+    CHECK(show(bind_mq(nl({st("ibm_mq", "constrained", tok), "garbage"}))) == res("withheld", tok));
+    CHECK(show(bind_mq(crlf(nl({st("ibm_mq", "constrained", tok), kMqRow})))) ==
+          res("withheld", tok));
+    // row shape: only exactly six tokens with this action's tag are rows
+    const std::string r = kMqRow;
+    CHECK(bind_mq(nl({st("ibm_mq", "supported", "-"), r + "|extra"})).entries.empty()); // 7 tokens
+    CHECK(bind_mq(nl({st("ibm_mq", "supported", "-"), r.substr(0, r.rfind('|'))})).entries.empty()); // 5
+    CHECK(bind_mq(nl({st("ibm_mq", "supported", "-"), "oracle" + r.substr(6)})).entries.empty());
+    // over-wide rows (more than the splitter's ten tokens) are rejected, never truncated
+    CHECK(bind_mq(nl({st("ibm_mq", "supported", "-"), r + "|1|2|3|4|5|6|7"})).entries.empty());
+    // the policy is the only difference: the same constrained answer fails under `fail`
+    CHECK(show(parse_middleware_output(nl({st("ibm_mq", "constrained", "tok"), kMqRow}), "ibm_mq",
+                                       kFailPolicy)) == res("failed", "tok"));
+}
+
+TEST_CASE("collector: middleware.ibm_mq publishes its mapped fields; a withheld one contributes "
+          "nothing and the cycle continues",
+          "[sync][collector][middleware]") {
+    SECTION("a supported answer publishes IBM MQ with source middleware.ibm_mq") {
+        fake_windows();
+        g_fake[4].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
+        auto src = make_installed_software_source(with_middleware());
+        const auto got = src.collect();
+        REQUIRE(got.has_value());
+        CHECK(count_source(got->first, "middleware.ibm_mq") == 1);
+        CHECK(count_source(got->first, "msi_packages.list_inventory") > 0);
+        for (const auto& rec : records_of(got->first)) {
+            const auto f = fields_of(rec);
+            if (f[15] != "middleware.ibm_mq")
+                continue;
+            CHECK(f[0] == "IBM MQ");
+            CHECK(f[1] == "9.4.5.0");
+            CHECK(f[2] == "IBM");
+            CHECK(f[4] == "app");
+            CHECK(f[5] == "ibm_mq");
+        }
+    }
+    SECTION("a constrained answer is withheld: the blob equals the no-middleware baseline") {
+        fake_windows();
+        const auto baseline = collect_with(all_plugins());
+        REQUIRE(baseline.has_value());
+        g_fake[4].out["ibm_mq"] = nl({st("ibm_mq", "constrained", "linux:middleware:mqinst_permission_denied"),
+                                      kMqRow});
+        // the typed answer a constrained read carries; a withheld source never reaches the
+        // PARTIAL check, so the cycle is not skipped for it
+        g_fake[4].result_status["ibm_mq"] = {YUZU_RESULT_STATUS_CONSTRAINED,
+                                             YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                             "linux:middleware:mqinst_permission_denied"};
+        auto src = make_installed_software_source(with_middleware());
+        const auto got = src.collect();
+        REQUIRE(got.has_value());
+        CHECK(got->second == baseline->second); // identical hash: nothing from middleware
+        CHECK(got->first == baseline->first);
+        REQUIRE(src.skip_reason);
+        CHECK(src.skip_reason().empty());
+    }
+    SECTION("an unsupported answer contributes nothing and the cycle continues") {
+        fake_windows();
+        const auto baseline = collect_with(all_plugins());
+        REQUIRE(baseline.has_value());
+        g_fake[4].out["ibm_mq"] = nl({st("ibm_mq", "unsupported", "macos:planned")});
+        const auto got = collect_with(with_middleware());
+        REQUIRE(got.has_value());
+        CHECK(got->first == baseline->first);
+    }
+    SECTION("a failing source still skips the cycle, beside a healthy middleware") {
+        fake_windows();
+        g_fake[4].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
+        g_fake[3].out["list_inventory"] = "status|list_inventory|constrained|windows:msi_enum:5\n";
+        auto src = make_installed_software_source(with_middleware());
+        CHECK_FALSE(src.collect().has_value());
+        CHECK(src.skip_reason() == "msi_packages.list_inventory:windows:msi_enum:5");
+    }
+    SECTION("a malformed middleware status is a failure, not a withheld source") {
+        fake_windows();
+        g_fake[4].out["ibm_mq"] = nl({kMqRow}); // no status row
+        auto src = make_installed_software_source(with_middleware());
+        CHECK_FALSE(src.collect().has_value());
+        CHECK(src.skip_reason() == "middleware.ibm_mq:bad status");
+    }
+    SECTION("a middleware rc != 0 skips the cycle") {
+        fake_windows();
+        g_fake[4].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-")});
+        g_fake[4].rc["ibm_mq"] = 1;
+        CHECK_FALSE(collect_with(with_middleware()).has_value());
+    }
+}
+
+TEST_CASE("collector: populated -> constrained -> recovered middleware cycles",
+          "[sync][collector][middleware]") {
+    // Each cycle replaces the agent's whole stored inventory server-side, so a constrained cycle
+    // must publish the no-middleware blob (the IBM MQ rows go away) and recovery must restore it.
+    fake_windows();
+    const auto baseline = collect_with(all_plugins());
+    REQUIRE(baseline.has_value());
+    LogCapture log;
+    const auto populated = [] {
+        g_fake[4].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
+        g_fake[4].result_status.erase("ibm_mq");
+    };
+
+    populated();
+    const auto c1 = collect_with(with_middleware());
+    REQUIRE(c1.has_value());
+    CHECK(count_source(c1->first, "middleware.ibm_mq") == 1);
+    CHECK(c1->second != baseline->second);
+    CHECK(log.count("rows withheld this cycle") == 0);
+
+    g_fake[4].out["ibm_mq"] = nl({st("ibm_mq", "constrained", "linux:middleware:mqinst_permission_denied")});
+    const auto c2 = collect_with(with_middleware());
+    REQUIRE(c2.has_value());
+    CHECK(count_source(c2->first, "middleware.ibm_mq") == 0);
+    CHECK(c2->second == baseline->second);
+    CHECK(c2->first == baseline->first);
+    CHECK(count_source(c2->first, "msi_packages.list_inventory") > 0); // the other sources stayed
+    CHECK(log.count("rows withheld this cycle") == 1);
+
+    populated();
+    const auto c3 = collect_with(with_middleware());
+    REQUIRE(c3.has_value());
+    CHECK(c3->second == c1->second);
+    CHECK(c3->first == c1->first);
+    CHECK(log.count("rows withheld this cycle") == 1); // fired once, in cycle 2 only
 }

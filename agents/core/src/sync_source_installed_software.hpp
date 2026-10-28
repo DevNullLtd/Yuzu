@@ -13,6 +13,7 @@
 ///   pkg_inventory.store_packages            active snaps/flatpaks (ecosystems `snap`, `flatpak`)
 ///   windows_optional_features.list          every DISM feature, state in `version`
 ///   msi_packages.list_inventory             machine-context MSI products (ecosystem `msi`)
+///   middleware.ibm_mq   installed IBM MQ (ecosystem ibm_mq; title->name, vendor->publisher from the product table)
 /// Every row carries `source` = "<plugin>.<action>". NO per-user data (machine
 /// scope only — no PII).
 
@@ -58,14 +59,23 @@ using SyncPluginMap = std::map<std::string, const YuzuPluginDescriptor*, std::le
 
 /// What a `constrained` status answer does to its action (the `constrained` column of the
 /// collector's action table; the status row itself is parsed by
-/// agents/shared/inventory_status_row.hpp). A third value is deliberately absent: the
-/// collector's cycle is all-or-nothing, so a source that cannot answer skips the report.
+/// agents/shared/inventory_status_row.hpp). The collector's cycle is all-or-nothing, so a source
+/// that cannot answer skips the report -- except `drop_source`, which exists for the middleware
+/// rows only.
 enum class ConstrainedPolicy {
     /// The action fails the cycle: a partial roster would delete stored rows.
     fail,
     /// The rows are kept (status ok, reason = the status token) iff at least one PRESENT data
     /// row of the action's kind was seen, mapped or not; zero such rows still fails.
     keep_rows_if_present_seen,
+    // drop_source: the source contributes zero rows and the cycle continues. The cycle's aggregate
+    // replaces the agent's whole stored inventory (server/core/src/software_inventory_store.cpp
+    // replace: DELETE agent rows + INSERT), so rows withheld this cycle are
+    // REMOVED from the stored inventory until the source recovers: a constrained cycle shows as
+    // the source's rows missing plus its warn line, never as stale rows. For the middleware rows
+    // only: their steady-state constraint is a permission fact, and failing the whole cycle would
+    // freeze every other source for ever.
+    drop_source,
 };
 
 /// Result of a pure action adapter. `ok` with zero entries is a legitimate
@@ -78,12 +88,14 @@ enum class ConstrainedPolicy {
 /// still evidence the read worked; zero present rows still fails); a constrained
 /// store_packages, packages or msi list_inventory answer always fails (a partial roster would
 /// delete stored rows); typed PARTIAL completeness skips the cycle unless the action opts in
-/// (an in-band `unsupported` answer wins first); an absent plugin is warned.
+/// (an in-band `unsupported` answer wins first); an absent plugin is warned. `withheld` =
+/// a constrained answer under ConstrainedPolicy::drop_source: zero entries, `reason` = the status
+/// tokens, the source is skipped and the cycle continues.
 struct AdaptedRows {
-    enum class Status { ok, unsupported, failed };
+    enum class Status { ok, unsupported, failed, withheld };
     Status status{Status::ok};
     std::vector<SwEntry> entries;
-    std::string reason; // failed: why (logged); ok: the constraint token of the kept row
+    std::string reason; // failed/withheld: why (logged); ok: the constraint token of the kept row
 };
 
 /// Parse `installed_apps` `list_inventory` output (pipe-delimited
@@ -141,6 +153,16 @@ YUZU_EXPORT AdaptedRows parse_msi_packages_list_inventory_output(const std::stri
 /// #5186 territory). `feature|unsupported|...` -> unsupported;
 /// `feature|unavailable|<token>` or no feature rows at all -> failed.
 YUZU_EXPORT AdaptedRows parse_windows_optional_features_output(const std::string& out);
+
+/// Adapt `middleware` product output for the product table row `action` names (`status|<id>|<level>|...`
+/// plus six-token `<id>|<title>|<name>|<version or ->|<install_path>|<edition or ->`). A row maps
+/// to {name=title, publisher=vendor, kind, ecosystem} from agents/shared/middleware_products.hpp
+/// ONLY when its title column equals the table title; any other row is dropped and counted, its
+/// siblings kept. install_path and edition are not carried. An unknown `action` -> failed.
+/// The collector's table row uses ConstrainedPolicy::drop_source: a `constrained` answer
+/// contributes no rows (Status::withheld) and the cycle continues; `unsupported` is skipped.
+YUZU_EXPORT AdaptedRows parse_middleware_output(const std::string& out, std::string_view action,
+                                                ConstrainedPolicy policy);
 
 /// The action table's (plugin, action) names in table order, as views into static literals —
 /// for the descriptor pin test (tests/unit/test_inventory_sync_action_table.cpp).

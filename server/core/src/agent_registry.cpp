@@ -1118,6 +1118,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"runtimes.jvm",
          "List installed JVMs by image type, version, home and vendor from each home's "
          "release file (Linux only; standard roots only, no subprocess)"},
+        // middleware
+        {"middleware.ibm_mq",
+         "List installed IBM MQ installations by version and install path from installer metadata "
+         "(Linux: mqinst.ini + swidtag names; no subprocess; Windows and macOS planned)"},
         // storage
         {"storage.set", "Store a key-value pair in persistent storage"},
         {"storage.get", "Retrieve a value by key from persistent storage"},
