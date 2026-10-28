@@ -275,6 +275,10 @@ COUNTED: list[tuple[str, str, int, str]] = [
      "the web thread starts at exactly one site (ORDER_ANCHORS measures against it)"),
 ]
 
+# COUNTED rows whose count is EXACT, not a minimum: a second occurrence of one of these anchors
+# would let the "before" ordering rows be satisfied against the wrong site.
+COUNTED_EXACT: frozenset[str] = frozenset({"anchor-listener-start", "anchor-web-thread"})
+
 # Spellings that open an unwired hatch. Each must NOT occur.
 FORBIDDEN: list[tuple[str, str, str]] = [
     ("null-set-setter", r"set_forensics_plugin_set\((nullptr|NULL|0)\)",
@@ -640,8 +644,9 @@ def problems_canonical(t: str) -> list[tuple[str, str]]:
             out.append((rid, f"{rid}: {why}"))
     for rid, pat, want, why in COUNTED:
         got = len(re.findall(pat, t, re.S))
-        if got < want:
-            out.append((rid, f"{rid}: expected {want} occurrences, found {got}: {why}"))
+        if got < want or (rid in COUNTED_EXACT and got != want):
+            out.append((rid, f"{rid}: expected {'exactly ' if rid in COUNTED_EXACT else ''}"
+                             f"{want} occurrences, found {got}: {why}"))
     for rid, pat, why in FORBIDDEN:
         if re.search(pat, t, re.S):
             out.append((rid, f"{rid}: {why}"))

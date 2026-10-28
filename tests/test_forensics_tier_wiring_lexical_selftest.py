@@ -72,6 +72,13 @@ def main() -> int:
             mutated = t[:a] + "(void)0" + t[b:]
             expect(rid in ids(g.problems_canonical(mutated)),
                    f"{rid}: deleting one counted site was NOT detected")
+            if rid in g.COUNTED_EXACT:
+                # An EXACT anchor must also fire when a second copy appears (the minimum-count
+                # check alone cannot see it).
+                a_, b_ = ms[0].span("k")
+                duplicated = t[:b_] + t[a_:b_] + t[b_:]
+                expect(rid in ids(g.problems_canonical(duplicated)),
+                       f"{rid}: a duplicated exact anchor was NOT detected")
 
     # Forbidden hatches.
     hatches = {
@@ -279,6 +286,10 @@ def main() -> int:
         "prov-live-output-by-resolved-plugin": ("agent_service_impl.cpp",
                                                 "publish_output_rows(agent_id, plugin, resp.output());"),
         "prov-chokepoint-records-once": ("server.cpp", "agent_service_.record_command_dispatch(c, p, e);"),
+        "prov-finalize-one-caller": ("server.cpp",
+                                    "auto f2 = yuzu::server::detail::finalize_classified_command(c, d);"),
+        "prov-classified-command-mentions": ("server.cpp", "void zz(const detail::ClassifiedCommand& c);"),
+        "prov-classified-command-no-construction": ("server.cpp", "detail::ClassifiedCommand zz{x};"),
         "prov-no-old-record-api": ("server.cpp", "agent_service_.record_execution_id(c, e);"),
         "prov-plugin-immutable": ("execution_tracker.cpp", 'const char* kSql = "SET plugin = EXCLUDED.plugin";'),
         "prov-tracker-scrub-by-recorded-plugin": ("execution_tracker.cpp",
