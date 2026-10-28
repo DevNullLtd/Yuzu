@@ -162,11 +162,6 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
         }
         return {Kind::kStoreUnavailable, MfaFactorState::kStoreUnavailable, persistent};
     };
-    const auto store_unavailable = [&](const char* what) -> ApproverMfaOutcome {
-        spdlog::error("require_enrolled_fresh_mfa: {}({}) unavailable - failing closed", what,
-                      log_safe(session.username));
-        return unavailable();
-    };
     switch (probe.state) {
     case MfaFactorState::kEnrolledLocal:
     case MfaFactorState::kIdpAttested:
