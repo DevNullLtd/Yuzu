@@ -43,10 +43,10 @@ circuit_breaker_nf_test_() ->
      ]}.
 
 setup() ->
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     catch meck:unload(telemetry),
-    meck:new(grpcbox_client, [non_strict, no_link]),
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{}, #{}}
     end),
     %% Capture telemetry calls for later inspection via meck:history.
@@ -71,7 +71,7 @@ cleanup(Pid) ->
     %% test module's setup — see issue #336.
     catch unlink(Pid),
     catch gen_server:stop(Pid, shutdown, 5000),
-    meck:unload([grpcbox_client, telemetry]),
+    meck:unload([yuzu_grpc_client, telemetry]),
     ok.
 
 %%%===================================================================
@@ -79,7 +79,7 @@ cleanup(Pid) ->
 %%%===================================================================
 
 trip_circuit() ->
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
@@ -214,7 +214,7 @@ backoff_capped() ->
 
 concurrent_rejection() ->
     trip_circuit(),
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
 
     %% Fire 100 concurrent RPCs. All should be rejected.
     Self = self(),
@@ -234,15 +234,15 @@ concurrent_rejection() ->
     CircuitOpenCount = length([R || R <- Results, R =:= {error, circuit_open}]),
     ?assertEqual(N, CircuitOpenCount),
 
-    %% grpcbox should NOT have been called at all.
-    ?assertEqual(0, meck:num_calls(grpcbox_client, unary, '_')).
+    %% yuzu_grpc_client should NOT have been called at all.
+    ?assertEqual(0, meck:num_calls(yuzu_grpc_client, unary, '_')).
 
 concurrent_half_open_probe() ->
     trip_circuit(),
     ?assertEqual(half_open, await_state(half_open)),
 
-    %% Make grpcbox succeed but add a small delay to simulate real RPC.
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    %% Make yuzu_grpc_client succeed but add a small delay to simulate real RPC.
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         timer:sleep(10),
         {ok, #{session_id => <<"probe">>}, #{}}
     end),
@@ -271,7 +271,7 @@ concurrent_half_open_probe() ->
 
 rejection_throughput() ->
     trip_circuit(),
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
 
     %% Measure how fast we can reject 10,000 RPCs.
     N = 10000,
@@ -285,8 +285,8 @@ rejection_throughput() ->
     %% 10K gen_server call roundtrips should complete in < 5 seconds.
     ?assert(TimeMs < 5000),
 
-    %% grpcbox should not have been called.
-    ?assertEqual(0, meck:num_calls(grpcbox_client, unary, '_')).
+    %% yuzu_grpc_client should not have been called.
+    ?assertEqual(0, meck:num_calls(yuzu_grpc_client, unary, '_')).
 
 telemetry_on_open() ->
     meck:reset(telemetry),
@@ -306,7 +306,7 @@ telemetry_on_close() ->
     trip_circuit(),
     ?assertEqual(half_open, await_state(half_open)),
     %% Probe succeeds -> close.
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{session_id => <<"ok">>}, #{}}
     end),
     {ok, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),
@@ -316,7 +316,7 @@ telemetry_on_close() ->
 failure_counter_resets() ->
     %% 2 failures, then a success, then 2 more failures.
     %% Should NOT trip because the success reset the counter.
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
@@ -324,14 +324,14 @@ failure_counter_resets() ->
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
 
     %% Success resets counter.
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{}, #{}}
     end),
     {ok, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
 
     %% 2 more failures — still closed (threshold is 3).
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),

@@ -18,12 +18,12 @@
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Security.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[ioc.execute]
-  EX --> WIN[Windows leg<br/>GetExtendedTcpTable/UdpTable<br/>DnsGetCacheDataTable<br/>GetFileAttributesEx-family]
-  EX --> MAC[macOS leg<br/>libproc via macos_socket_walk.hpp<br/>/etc/hosts + stat]
-  EX --> LIN[Linux leg<br/>/proc/net/tcp[6] + /etc/hosts + stat]
-  WIN & MAC & LIN --> ROWS[pipe rows +<br/>UNDECLARED status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator / workflow"] --> SRV["Server - authz: Security.Read"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"] --> EX["ioc.execute"]
+  EX --> WIN["Windows leg - GetExtendedTcpTable/UdpTable, DnsGetCacheDataTable, GetFileAttributesEx-family"]
+  EX --> MAC["macOS leg - libproc via macos_socket_walk.hpp, /etc/hosts + stat"]
+  EX --> LIN["Linux leg - /proc/net/tcp[6] + /etc/hosts + stat"]
+  WIN & MAC & LIN --> ROWS["pipe rows + UNDECLARED status"] --> RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
 
 ## OS capability

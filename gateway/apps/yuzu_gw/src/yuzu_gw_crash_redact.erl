@@ -12,6 +12,16 @@
 %%% yuzu_gw_heartbeat_buffer: its mailbox and, in a crash, the stacktrace
 %%% arguments hold buffered heartbeats (status tags and fleet snapshots:
 %%% telemetry, not credentials).
+%%% Two more process classes belong to the upstream CLIENT (yuzu_grpc_client):
+%%%   - gun connection processes (callback module `gun'), one per upstream
+%%%     connection: each is a gen_statem whose queued events hold the request in
+%%%     flight (a ProxyRegister carries the enrollment token, certificate and
+%%%     CSR) and whose state holds the TLS options. gun has no format_status, so
+%%%     its terminate report prints the last event, the queue, the postponed
+%%%     events, the state and the log verbatim; nothing but this filter stands
+%%%     between a crash of that process and those bytes in the log;
+%%%   - yuzu_grpc_client_channel, the owner of those connections (its state
+%%%     holds the TLS option lists, with the key file paths).
 %%% Each has a format_status/1 that redacts what OTP passes through that
 %%% callback, but three things reach the log from raw data outside it:
 %%%   - the `messages' (the whole mailbox) and the `error_info' exception of
@@ -61,7 +71,11 @@
 %% (its mailbox holds SendCommand requests, whose plugin parameters may be
 %% secrets) and the heartbeat buffer (fleet telemetry: status tags and snapshots).
 -define(PROTECTED, [yuzu_gw_upstream, yuzu_gw_agent, yuzu_gw_registry,
-                    yuzu_gw_router, yuzu_gw_heartbeat_buffer]).
+                    yuzu_gw_router, yuzu_gw_heartbeat_buffer,
+                    gun, yuzu_grpc_client_channel]).
+%% The protected gen_statem modules with NO format_status/1 of their own: the
+%% data of their terminate report is redacted here instead.
+-define(NO_FORMAT_STATUS, [gun]).
 
 %% @doc Add the primary filter. Idempotent: already present is success.
 -spec install() -> ok.
@@ -107,7 +121,12 @@ rewrite(#{msg := {report, #{label := {gen_server, terminate}, name := Name,
 rewrite(#{msg := {report, #{label := {gen_statem, terminate}, modules := Modules,
                             reason := Reason} = R}} = Event) when is_list(Modules) ->
     case lists:any(fun is_protected_module/1, Modules) of
-        true  -> Event#{msg := {report, R#{reason := redact_statem_reason(Reason)}}};
+        true  -> R1 = R#{reason := redact_statem_reason(Reason)},
+                 R2 = case lists:any(fun(M) -> lists:member(M, ?NO_FORMAT_STATUS) end, Modules) of
+                          true  -> redact_statem_data(R1);
+                          false -> R1
+                      end,
+                 Event#{msg := {report, R2}};
         false -> Event
     end;
 rewrite(#{msg := {report, #{label := {supervisor, _}, report := Props} = R}} = Event)
@@ -175,6 +194,30 @@ redact_statem_reason({Class, Why, Stack}) when is_atom(Class) ->
     {Class, ?UPSTREAM:redact_why(Why), ?UPSTREAM:redact_stack(Stack)};
 redact_statem_reason(_Other) ->
     '$redacted'.
+
+%% The data of a gen_statem terminate report: the events (the last one and the
+%% queue, which hold the request), the state, the log and the timeouts. The
+%% report is still FORMATTED by gen_statem:format_log/2, which expects the
+%% queue and the postponed events as lists of {EventType, Content} (and the log
+%% and timeouts in their own shapes); a value of another shape makes it raise,
+%% and logger then prints the whole raw report map in its place. So every key
+%% keeps its shape and loses its content: one {internal, '$redacted'} per
+%% queued event, no log entries, the timeouts emptied, the state replaced. The
+%% other keys (name, modules, callback_mode, client_info: a pid and a name) hold
+%% no request data.
+redact_statem_data(Report) ->
+    maps:fold(fun(Key, Value, Acc) -> redact_statem_key(Key, Value, Acc) end, Report, Report).
+
+redact_statem_key(Key, Value, Acc) when Key =:= queue; Key =:= postponed ->
+    case is_list(Value) of
+        true  -> Acc#{Key := [{internal, '$redacted'} || _ <- Value]};
+        false -> Acc#{Key := []}
+    end;
+redact_statem_key(log, _Value, Acc) -> Acc#{log := []};
+redact_statem_key(timeouts, _Value, Acc) -> Acc#{timeouts := {0, []}};
+redact_statem_key(Key, _Value, Acc) when Key =:= state; Key =:= data ->
+    Acc#{Key := '$redacted'};
+redact_statem_key(_Key, _Value, Acc) -> Acc.
 
 redact_proc(ProcInfo) ->
     [redact_item(Item) || Item <- ProcInfo].

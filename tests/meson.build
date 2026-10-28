@@ -258,6 +258,8 @@ agent_test_exe = executable(
     'unit/test_filesystem_read.cpp',
     'unit/test_filesystem_actions.cpp',
     'unit/test_filesystem_local_dispatcher.cpp', # #4728: real filesystem plugin via LocalDispatcher -- `replace` through the shared atomic write
+    'unit/test_filesystem_find_by_hash.cpp',  # #5624: pure find_by_hash walk core (limits, injected clock/cancel/hasher) + real no-follow fd hasher over TempDir
+    'unit/test_filesystem_find_by_hash_dispatcher.cpp',  # #5624: real filesystem plugin via LocalDispatcher -- byte-identical clean output, trailer + CONSTRAINED/PARTIAL
     'unit/test_confined_fs_rules.cpp',
     'unit/test_confined_fs_walk.cpp',
     'unit/test_confined_fs_posix.cpp',
@@ -410,6 +412,7 @@ agent_test_exe = executable(
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
     'unit/test_registry_parsers.cpp',          # registry value encoders, validators and the audit line (pure, every host)
+    'unit/test_registry_plan.cpp',             # apply plan parser and the item/undo/summary row renderers (pure, every host)
     'unit/test_registry_core.cpp',             # registry write logic over an in-memory fake registry (checked open, fast open, verify, delete_key; every host)
     'unit/test_registry_write_local_dispatcher.cpp', # real registry.dll writes via LocalDispatcher (Windows branch, elevated); descriptor/version/sentinel pins on every host
     'unit/test_registry_win_internals.cpp',    # TU-inclusion seam over registry_win.cpp -- Win32Registry on a dangling link and the final_name/root_name calls (Windows-only body, elevated; empty TU elsewhere)
@@ -1286,6 +1289,7 @@ tar_test_exe = executable(
     'unit/test_tar_store.cpp',
     'unit/test_tar_schema_registry.cpp',
     'unit/test_tar_capability_table.cpp',
+    'unit/test_tar_retention_tiers_table.cpp',
     'unit/test_tar_warehouse.cpp',
     'unit/test_tar_aggregator.cpp',
     'unit/test_tar_usage.cpp',
@@ -1400,6 +1404,10 @@ if build_server
       'unit/server/test_https_config.cpp',
       'unit/server/test_healthcheck_probe.cpp', # #5906: --healthcheck target/verdict rules + loopback TLS probe
       'unit/server/test_response_store.cpp',
+      'unit/server/test_response_tier_filter.cpp', # #4990: the Forensics tier on response reads (filter type + catalogue-derived plugin set)
+      'unit/server/test_forensics_ingest_leaks.cpp', # #4990: Forensics output outside the ResponseStore seam (live bus, tracker error_detail, policy evaluator, bundle collate, result-set materializer)
+      'unit/server/test_response_provenance.cpp', # #4990 (UP-7): server-authored response provenance (the pure decision; both ingest paths against the real record, stores and sinks)
+      'unit/server/test_dispatch_record_policy.cpp', # #4990: caller-keyed fast-fail + per-loop latch on the dispatch-record write
       'unit/server/test_response_routes.cpp', # #2542 PR-11: the 3-route legacy pre-v1 Responses API, extracted onto the HttpRouteSink seam
       'unit/server/test_query_int_parse.cpp', # #4644: the shared strict integer primitive (query_int_parse.hpp)
       'unit/server/test_preflight_parse.cpp',
@@ -1445,6 +1453,7 @@ if build_server
       'unit/server/test_notification_routes.cpp',
       'unit/server/test_command_routes.cpp',
       'unit/server/test_page_routes.cpp',
+      'unit/server/test_swagger_page.cpp',
       'unit/server/test_dialog_module.cpp',
       'unit/server/test_dashboard_api_routes.cpp',
       'unit/server/test_developer_render.cpp', # System > Developer and API: pure renderers
@@ -1495,6 +1504,7 @@ if build_server
       'unit/server/test_home_panels_routes.cpp', # HM-2: Dashboard policies + events fragments
       'unit/server/test_leader_elector.cpp',
       'unit/server/test_leader_gate.cpp',
+      'unit/server/test_leader_metrics.cpp', # HA WS-11 (#4014): yuzu_server_leader_* seed + scrape-time publisher
       'unit/server/test_coord_dsn.cpp',
       'unit/server/test_pg_reachability_probe.cpp', # HA WS-8: /readyz pg_reachable rule + probe
       'unit/server/test_multi_host_dsn.cpp', # HA WS-8: multi-host DSN target_session_attrs guard
@@ -1834,6 +1844,7 @@ if build_server
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
       'unit/server/test_settings_read_twins.cpp',   # #4028 — REST v1 read-twin route coverage
+      'unit/server/test_tar_retention_tiers.cpp',   # TAR retention tier TSV parser + depth arithmetic (pure)
       'unit/server/test_settings_page_ui.cpp',      # pure-string pins: 21 panels + static h1 on the /settings page
       'unit/server/test_settings_general.cpp',      # System General page: runtime/events renderers, routes, page pins
       'unit/server/test_plugin_signing_helpers.cpp',
@@ -3210,6 +3221,15 @@ test('ensure-erlang strict-mode callers',
   timeout: 180,
 )
 
+# docs/ build inputs of Meson targets are re-included in /.dockerignore (the image
+# builds `COPY . .` with docs/ otherwise excluded).
+test('docker context re-includes embedded docs inputs',
+  _python3_test,
+  args: [files('test_docker_context_embeds_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Every script target uses yuzu_python (no ad-hoc find_program for python).
 test('meson python lookup is yuzu_python',
   _python3_test,
@@ -3282,6 +3302,16 @@ test('agent installer enrollment-token lint',
 test('compose certs volume',
   _python3_test,
   args: [files('test_compose_certs_volume.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Gateway scrape (#5695): every Prometheus config under deploy/prometheus/ and
+# every compose stack that runs a Prometheus next to a gateway scrapes the
+# gateway's metrics port. Stdlib only, no Docker.
+test('gateway prometheus scrape',
+  _python3_test,
+  args: [files('test_gateway_prometheus_scrape.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -3488,6 +3518,16 @@ test('runtimes definition columns',
   timeout: 30,
 )
 
+# filesystem.find_by_hash's definition (content/definitions/filesystem.yaml): version 0.4.0, the
+# three declared columns and the row_kind values the declared-column result matcher binds to
+# (#5624); the C++ matcher test keeps a copy of the schema, this pins it to the shipped definition.
+test('filesystem definition columns',
+  _python3_test,
+  args: [files('test_filesystem_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # browser_policy's definition-column contract (content/definitions/browser_policy.yaml):
 # row_kind first and the column order match the wire row browser_policy_parsers.hpp emits;
 # parses the YAML directly -- catches a reordered or renamed column the C++ test's
@@ -3632,6 +3672,19 @@ test('gateway wrapper guard selftest',
   args: [files('test_gateway_test_summary.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Pins the gateway eunit shard partition (scripts/gateway_eunit_shards.py):
+# the root meson.build `gateway eunit shard <X>` tests together run every
+# top-level apps/yuzu_gw/test module exactly once (what the old whole-suite
+# `--dir` run did), a new module lands in one shard, and the meson shard
+# table, scripts/ci/assert-gateway-tests.py and the wrapper's `--shard`
+# handling agree. Hermetic (a fake rebar3; no Erlang), so every leg runs it.
+test('gateway eunit partition selftest',
+  _python3_test,
+  args: [files('test_gateway_eunit_shards.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # #4853: pins the run-private epmd (scripts/gateway_epmd.py) the gateway test
@@ -3909,6 +3962,16 @@ test('alert runbook anchors resolve',
   timeout: 30,
 )
 
+# HA WS-11 (#4014): the leader-election alerts, their promtool cases and the metrics reference may
+# name only series leader_metrics.hpp really exports (promtool cannot know the exporter), and the
+# reference must document every exported name and cause label. Source-text only, so Python.
+test('leader alert metric names match the exporter',
+  _python3_test,
+  args: [files('test_leader_alert_metric_names.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Access reviews: pins the production wiring in server.cpp (the loud perm_fn gate, the scratch-response
 # Attest probe, the fail-closed store reads, the grant-table read). Source-text only, so Python.
 test('access reviews production wiring lexical gate',
@@ -3958,6 +4021,37 @@ test('gateway-upstream guard registration lexical gate',
   args: [files('test_gateway_peer_registration_lexical.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Static lexical gate: every raw-string segment of the OpenAPI document literal in
+# rest_api_v1.cpp stays under 15,000 bytes (MSVC C2026 rejects a string token over 16,380; the
+# Linux and macOS compilers do not, so only the Windows leg would notice). Carries its own
+# in-memory self-test. No build required. Suite 'docs' for the same reason as the gates above.
+test('OpenAPI literal segment size lexical gate',
+  _python3_test,
+  args: [files('test_openapi_literal_segments.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Lexical gate: the OpenAPI x-yuzu-unavailable markers agree with the stores server.cpp passes to
+# register_routes (a store passed as nullptr <=> its group is marked). Carries its own in-memory
+# mutation self-test. No build required.
+test('OpenAPI unavailable markers match store wiring lexical gate',
+  _python3_test,
+  args: [files('test_unavailable_store_wiring.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The /swagger page's renderer, run under node against a fake DOM and a queued fetch: panels and rows,
+# the typed / untyped / unavailable pills, guides built on demand, oneOf tables, hostile spec text kept as
+# text, a malformed URL fragment, the v2 curl path and the failure view with Retry. Skips (77) without node.
+test('swagger page behaviour',
+  _python3_test,
+  args: [files('test_swagger_page_behaviour.py')],
+  suite: ['server', 'docs'],
+  timeout: 60,
 )
 
 # #6016: static lexical gate pinning that only default_certs.cpp mints the server identity URI
@@ -4167,6 +4261,43 @@ test('split interlock tripwire',
 test('split interlock tripwire selftest',
   _python3_test,
   args: [files('test_split_interlock_tripwire_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #4990: stored-response reads and the Forensics tier. The tripwire pins the exact set of
+# ResponseStore read methods (each must take a ResponseTierFilter) and the exact set of
+# unrestricted_internal_consumer() call sites; the self-test proves it fails on each mutation. Both
+# also run in .github/workflows/docs-lint.yml on every PR; registered here for local `meson test
+# --suite docs` parity with the sibling python doc-tests.
+test('response store read tripwire',
+  _python3_test,
+  args: [files('test_response_store_read_tripwire.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('response store read tripwire selftest',
+  _python3_test,
+  args: [files('test_response_store_read_tripwire_selftest.py')],
+  suite: 'docs',
+  # Runs the scan over a mutated copy of the whole server tree once per mutation. Memoised per file
+  # it takes a few seconds; the headroom is for a loaded shared CI box, not for the work.
+  timeout: 120,
+)
+
+# #4990: server.cpp must keep wiring the Forensics plugin set and the visibility resolver into every
+# surface that reads stored responses (a route class built without them fails CLOSED and would
+# silently lose Forensics rows for every caller). Lexical gate + a selftest that deletes each
+# required statement in memory; both also run in .github/workflows/docs-lint.yml.
+test('forensics tier wiring lexical',
+  _python3_test,
+  args: [files('test_forensics_tier_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('forensics tier wiring lexical selftest',
+  _python3_test,
+  args: [files('test_forensics_tier_wiring_lexical_selftest.py')],
   suite: 'docs',
   timeout: 30,
 )

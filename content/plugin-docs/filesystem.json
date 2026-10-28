@@ -164,14 +164,14 @@
       "legs": {
         "linux": {
           "fallback": "",
-          "mechanism": "std::filesystem+subprocess_runner:sha256sum",
-          "rung": "2",
+          "mechanism": "std::filesystem+sha256_nofollow_fd",
+          "rung": "1",
           "support": "supported"
         },
         "macos": {
           "fallback": "",
-          "mechanism": "std::filesystem+subprocess_runner:shasum",
-          "rung": "2",
+          "mechanism": "std::filesystem+sha256_nofollow_fd",
+          "rung": "1",
           "support": "supported"
         },
         "windows": {
@@ -420,11 +420,11 @@
     }
   ],
   "caveats": [
-    "**`executeRoles` in the YAML is advisory, not enforced.** Since #1398, raw dispatch authorizes on the compiled `(plugin,action)` pair's securable/operation plus its `ExecuteGate` — `permissions.executeRoles` in `InstructionDefinition` YAML is retired to documentation only (`changelog.d/1398-dispatch-approval-gate.security.md`). Do not treat the Roles row above as an access-control guarantee; the real gate is the Security row.",
-    "**`delete_lines`'s output field names don't match its own YAML.** The plugin emits `lines_deleted|total_lines_before|total_lines_after` (`do_delete_lines`), but `content/definitions/t2_capabilities.yaml:571-576` declares `lines_deleted`/`lines_before`/`lines_after` — a genuine drift between the shipped result and its own schema. This README's Outputs table uses the runtime field names; `t2_capabilities.yaml` is out of this PR's ownership scope, so the mismatch is flagged here rather than silently \"corrected\" in either direction.",
-    "**The tests beside this plugin are easy to misread as coverage of the real plugin, and only `replace` and `get_acl` run through it.** `filesystem_posture` is a separate, read-only plugin for `mounts`/`quotas`/`snapshots` with a confusingly similar name; two of its test files (`test_filesystem_posture_local_dispatcher.cpp`, `test_filesystem_posture_parsers.cpp`) sit alongside this plugin's own tests in `tests/unit/` and are not filesystem's own coverage — see *Source and tests*. Of this plugin's own tests, `tests/unit/test_filesystem_local_dispatcher.cpp` loads `filesystem.dylib`/`.so`/`.dll` via `LocalDispatcher` and drives `replace` through `atomic_write_file` (the replacement lands by rename onto a new inode, the retired fixed `.yuzu_tmp` name is never touched, no temp survives, creation mode follows the umask), and `tests/unit/test_filesystem_get_acl_dispatcher.cpp` does the same for `get_acl`. Every other action is covered only by `test_filesystem_actions.cpp` and `test_filesystem_read.cpp`, which replicate the plugin's helper logic (`validate_path`, `glob_match`, etc.) in the test TU's own anonymous namespace (`tests/unit/test_filesystem_actions.cpp:12-13`, `tests/unit/test_filesystem_read.cpp:5-6`) — a regression in the real `.cpp` that the replica doesn't share would not be caught by those suites. `atomic_write_file` is not replicated: it is a thin adapter over the production `yuzu::shared::write_file_atomic`, and the test-local adapter in `test_filesystem_actions.cpp` calls that same primitive.",
-    "**macOS/Linux `get_signature`/`get_version_info`'s TOCTOU re-check is a narrowing, not a fix.** The BR-006 comments in the code say so explicitly: an unprivileged writer inside `base_dir` can still win a race between the re-validate call and codesign's/plutil's own `open()`, because both are path-based external tools (the re-validate step in `do_get_signature`/`do_get_version_info`). `base_dir` must not be writable by lower-privileged principals.",
-    "**`get_acl` decodes what the OS reports and no more.** Object ACEs are decoded by layout only; conditional ACE expressions are not decoded (the SID and mask are real, the condition blob is ignored), and any other undecoded Windows type prints `other` with principal and mask `-`. The SACL is not read (it needs `SeSecurityPrivilege`). A Windows file with a NULL DACL (no ACL, everyone allowed) reports the SDDL and control rows and no ACE rows. A failure returns an `error|` row and a non-zero code: on Linux and macOS before any row (the whole ACL is acquired first), on Windows possibly after the SDDL and earlier ACE rows. On Linux, when an ACL exists the `permissions|`/`mode|` group bits are the ACL mask, and `acl|none` means no extended entries beyond the mode bits. A POSIX ACL over 64 KiB is `error|acl too large (over 64 KiB)`. Qualifier names are resolved once per distinct id and only for the first 64 ids; the rest print the numeric id, because name lookup goes through NSS, which has no deadline (a dead directory service can still stall the owner and group lookups). On macOS, names resolve through membership lookups inside `acl_to_text`, which are also unbounded; entries are listed in the order the OS stores them (deny first in the sample), an unresolved principal is its UUID, and `ENOENT` (no ACL, and also what FAT and exFAT volumes return) is `acl|none`. The stat and the ACL read are separate path lookups, so a path swapped between them can mix two files' answers (the same `base_dir` posture as the other actions). Free-text fields are escaped for the row grammar: CR/LF fold to a space, pipes are escaped and a trailing backslash becomes `/`."
+    "**Size and count limits apply, and most stop without a marker.** `read`, `search`, `replace` and `delete_lines` refuse a file over 100 MB, and `write_content` refuses content over 100 MB, each with an `error|` row; `file_hash` refuses a file over 10 GB; `append` has no size check. `list_dir` stops at 1000 entries and says so with a `warning|` row, but `search_dir` (default 100 results, at most 1000) and `search` (default 100 lines, at most 10000) simply stop at their cap, so a count equal to the cap in force (the default unless you raised it) means there may be more.",
+    "**`find_by_hash` is a bounded sweep, not proof of absence.** Whichever of 20 seconds, 50,000 entries visited or 100 matches comes first ends the walk, at most 4 GiB is hashed (a file larger than what is left is skipped and the reason becomes `byte_cap`), it goes at most 10 levels deep (`max_depth`, default 3; the agent reads a value below 1 as 1, above 10 as 10 and one with no leading integer as 3), and these bounds are fixed in the plugin. What it skipped is counted in the `truncated` row, but `matches_found|0` still means only \"not found in the part examined\" (Result status). The deadline is checked between system calls, so a single blocked read or directory listing is not interrupted, and only the agent's shutdown cancels a running search, never a single command (#4875). Residuals: on Windows, and on Linux without `openat2` (a kernel before 5.6, or a seccomp profile that denies it), only the final path component is opened no-follow (#6348); a directory whose permissions change after the readability check is skipped without being counted (a symlink swapped in between that check's `access()` and its no-follow directory open is refused there and counted unreadable); on macOS a directory swapped for a symlink between its classification and its descent is listed (names only: each child then fails its own no-follow open) and can block on a dead mount. The mount guard is a deny-list of filesystem names read once at the start, so a stacked filesystem, a bare `fuse` mount and a mount made mid-walk are not caught, and a root reached through a symlink, or spelt in a different letter case on macOS, reaches `validate_path` before the canonical re-check can refuse it (#4875). Windows hands the walk no mount list: only the root's own spelling and drive type are judged, so a root that is itself a link to a share is not refused. When the mount table cannot be read in full (an unreadable or over-16 MiB `/proc/self/mountinfo`, a failed `getmntinfo_r_np`) the walk runs unguarded, logs once and reports `network_mount_guard|unavailable` and `CONSTRAINED`. A Windows drive letter that does not exist is answered `directory is not accessible`, not as a mount. An agent older than this release still runs the unbounded, symlink-following walk.",
+    "**`append` reports a stale `total_size`.** The size is read while the written bytes are still buffered, so on the captured 20-byte file it reported `total_size|20` after appending 22 bytes; treat it as the size before the append and use `exists` or `read` to get the real size. Because the same check runs before the buffer is flushed, a write failure at flush time (for example a full disk) can still print `status|ok`.",
+    "**`base_dir` is the caller's own narrowing, and path checks leave a small race.** It is an optional parameter on each request, not an agent-side policy, so a request that omits it is not restricted, and `find_by_hash` and `create_temp` do not take it at all. The re-validation just before `codesign` and `plutil` narrows but cannot close the window in which a writer inside `base_dir` swaps the path for a symlink, so `base_dir` must not be writable by lower-privileged principals.",
+    "**Signature and version answers are narrow.** On Windows `get_signature` verifies only an embedded Authenticode signature and does not check revocation, so a file signed only through a Windows catalog is expected to report `unsigned`; the captured sample shows `notepad.exe` reporting `unsigned`, which is consistent with that (the cause is inferred, not shown). On macOS `valid` means the code signature's seal is intact, not that the code is trusted or notarized, and a timed-out or truncated `codesign` or `plutil` run is reported as `unknown` or `not_available` rather than as a failure."
   ],
   "definitions": [
     {
@@ -554,7 +554,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Search a directory tree for files matching a specific SHA256 hash. Useful for IOC hunting, malware detection, and file integrity verification. Walks the directory recursively up to the specified depth limit. Returns matching file paths and sizes.",
+      "description": "Search a directory tree for files matching a specific SHA256 hash. Useful for IOC hunting, malware detection, and file integrity verification. Walks the directory recursively up to the specified depth limit and returns matching file paths and sizes. The walk is bounded: it stops after 20 seconds, 50,000 directory entries visited or 4 GiB hashed, and after 100 matches (a search ordinarily ends within 20 seconds; a single blocked read or directory listing is not interrupted). A file larger than the remaining byte budget is skipped and the result reports byte_cap. Below the search root a symlink is never followed (the whole path on macOS and Linux 5.6 or later, the final component only on older Linux kernels and on Windows), a file that is not a regular file is never opened, a file over 10 GB is skipped, pseudo-filesystems such as /proc and /sys are never entered, and a subtree on a network mount is skipped before anything under it is read; when the mount table cannot be read the walk runs without that guard, says so with a network_mount_guard|unavailable row ahead of the count, and is reported constrained and partial. On Windows the root drive is judged (a root on any non-fixed drive, or a UNC root, is refused) and a mounted folder below it is a reparse point, skipped as a junction; compressed and deduplicated files are hashed, while cloud placeholders and other reparse points are counted unreadable. When anything was skipped or the walk stopped early, one trailing row truncated|reason|visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N says what was not examined (reason is deadline, file_cap, byte_cap, cancelled or max_results; none means no bound tripped and the counters say what was skipped); a clean run writes no such row. The result is reported as constrained and partial when a bound tripped, an entry could not be read, or a network mount was skipped, but only the status number is stored on the server: the truncated and network_mount_guard rows are the operator-visible signal, and matches_found|0 beside either means not found in the part examined. Only match rows are data rows to a column matcher. Only the shutdown signal cancels a running search; there is no per-command cancel. A path whose last character is a backslash is reported with a forward slash in its place. An agent older than this release still runs the unbounded, symlink-following walk.",
       "display_name": "Find File By SHA256 Hash",
       "execute_roles": [
         "endpoint-admin"
@@ -793,7 +793,7 @@
     }
   ],
   "description": "Filesystem operations — exists, list_dir, file_hash, search_dir, text ops (admin-only)",
-  "how_it_works": "Every action funnels its `path`/`root`/`directory` parameter through `validate_path` or `validate_path_or_parent`, which resolve symlinks via `fs::canonical` and, when `base_dir` is set, refuse anything that resolves outside it (`validate_path`, `validate_path_or_parent`). Reads never touch the target; the three write actions (`replace`, `write_content` on an existing file, `delete_lines`) go through `atomic_write_file` — writes stage through a randomly-named, exclusively-created sibling temp that is fsync'd (POSIX only — `F_FULLFSYNC`, then `fsync`, on macOS; the Windows leg writes through `std::ofstream` and does not fsync) and renamed into place (`agents/shared/atomic_file_write.hpp`) at the ordinary `0666 & ~umask` creation mode for a new file; an existing regular file keeps its rwx bits on POSIX (owner, group, ACLs and hard links are not preserved — the rename replaces the inode); a pre-existing file at the temp path fails the write rather than being followed or overwritten — while `append`, `create_temp`, `create_temp_dir`, and a fresh `write_content` open the target directly. `file_hash`/`find_by_hash` hash in-process via BCrypt on Windows (`compute_hash_win`) and by exec'ing an absolute-path `sha256sum`/`sha1sum`/`shasum` through the bounded subprocess runner on POSIX, never a shell (`compute_hash_unix`). `get_signature`/`get_version_info` are Windows/macOS-only: native `WinVerifyTrust`/`GetFileVersionInfoW` calls on Windows (`do_get_signature`, `do_get_version_info`), `/usr/bin/codesign`/`/usr/bin/plutil` exec'd through the same runner on macOS, each preceded by a BR-006 immediate re-validate-before-exec check that narrows (but does not eliminate) a TOCTOU window (the re-validate step in `do_get_signature`/`do_get_version_info`); both report an honest unsupported/`not_available` result on Linux (the final `#else` of `do_get_signature`/`do_get_version_info`). `search_dir`/`search`/`replace` share a ReDoS guard that rejects nested-quantifier regexes (`has_nested_quantifiers`); `search_dir`'s glob mode uses a hand-rolled matcher (`glob_match`).\n\n`get_acl` reads the extended ACL with a different native call per OS, then prints the same `ace|<type>|<principal>|<perms>|<flags>` row shape. Windows calls `GetNamedSecurityInfoW` for `OWNER|DACL`, emits the SDDL string and the DACL control flags, and walks the ACEs with `GetAce`, resolving each SID with `LookupAccountSidW` (falling back to the string SID). Linux reads the `system.posix_acl_access` attribute and, for a directory, `system.posix_acl_default` with `getxattr` (glibc, no libacl), decoding the binary value in the pure `filesystem_acl_parsers.hpp`; user and group ids are resolved with `getpwuid_r`/`getgrgid_r`. macOS calls `acl_get_file(ACL_TYPE_EXTENDED)` and parses the text from `acl_to_text`; a file with no extended ACL returns `ENOENT`, reported as `acl|none|-`. On Linux and macOS the whole ACL is acquired before any row is written, so a failure is one `error|` row and never a partial listing.\n\nThe plugin deliberately never calls a typed result-status setter — no `set_result_status`/`yuzu_ctx_set_result_status` call exists anywhere in `filesystem_plugin.cpp` — so every action's outcome is carried entirely in its pipe-delimited rows and return code; see *Result status* below. It also deliberately stops at line-range deletion and ACL *reads* (see the `get_acl` paragraph above): there is no whole-file delete, no rename, and no ACL/DACL *write* action anywhere in the action list.",
+  "how_it_works": "The filesystem plugin reads, inspects and edits files on the device the agent runs on. Its 16 actions fall into four groups: look (`exists`, `list_dir`, `read`, `search`, `search_dir`), identify (`file_hash`, `find_by_hash`, `get_signature`, `get_version_info`, `get_acl`), create (`create_temp`, `create_temp_dir`) and change (`write_content`, `replace`, `append`, `delete_lines`). Most actions turn the caller's path into its canonical form, following symlinks, and, if the caller also passes `base_dir`, refuse a path that resolves outside that directory. The exceptions: `find_by_hash` and `create_temp` take no `base_dir`, and `exists` and a new-file `write_content` canonicalise only the parent directory when the target does not exist yet. Reads never alter the target. Changes to an existing file (`replace`, `delete_lines`, and `write_content` with `overwrite=true`) are written to a new sibling file and renamed over the target, so a reader sees either the old or the new content. `append`, `write_content` creating a new file, and the temp-file actions open the target directly. It is deliberately not a file manager: there is no whole-file delete, rename or copy, and no ACL write; `get_acl` only reads.\n\nHow the main actions work:\n\n- **Hashing one file.** `file_hash` hashes in process on Windows (BCrypt). On macOS and Linux it runs `shasum` or `sha256sum`/`sha1sum` by absolute path, with no shell, through the bounded subprocess runner (`compute_hash_unix`, 300 second deadline).\n- **Finding a file by hash.** `find_by_hash` hashes in process on every OS and starts no subprocess (`filesystem_find_by_hash.hpp`). It walks the tree under fixed bounds (20 seconds, 50,000 entries visited, 4 GiB hashed, 100 matches), does not follow a symlink it meets below the search root (on Windows and on older Linux only the final component is opened no-follow, Caveat 2), reads nothing but a regular file, and refuses a root on a network mount (on macOS and Linux also a network mount below it) before touching it. What it skipped is counted in one trailing `truncated|...` row and, when that matters, a `CONSTRAINED` result status; the diagram below and Result status say how to read it.\n- **Signature and version.** `get_signature` and `get_version_info` exist on Windows and macOS only. Windows uses `WinVerifyTrust` and `GetFileVersionInfoW` in process; macOS runs `/usr/bin/codesign` and `/usr/bin/plutil` through the same runner, re-validating the path immediately before the exec. On Linux both answer `error|` with a non-zero return code.\n- **Search.** `search`, `search_dir` and `replace` reject regexes with nested quantifiers (`has_nested_quantifiers`) to avoid catastrophic backtracking, and limit patterns to 256 characters. `search_dir` matches entry names only, as a glob (`glob_match`) or a regex, never file contents.\n- **Atomic writes.** The temporary file is created exclusively with a random name, written, flushed to disk with `fsync` on macOS and Linux (`F_FULLFSYNC` first on macOS; the Windows leg does not fsync), then renamed into place (`atomic_write_file`). A new file gets the usual `0666` minus umask; an existing file keeps its permission bits on POSIX, but its owner, group, ACLs and hard links are not carried over because the rename replaces the file. A leftover file at the temp path fails the write rather than being followed.\n- **`get_acl`.** Each OS reads its native ACL (see the table below) and prints it in the same `ace|<type>|<principal>|<access>|<flags>` row shape.\n\nOnly `find_by_hash` sets a typed result status, and only when it could not examine part of the tree or ran without its network-mount guard; every other outcome is carried in the rows and return code (see Result status).\n\n### What you can decide with it\n\n| Question | Action | What you get and its limits |\n|---|---|---|\n| Is there a file or directory here, and how big? | `exists`, `list_dir` | `exists` reports `true` or `false`, the type and size. `list_dir` returns one `entry` row per item and stops at 1000 entries with a `warning\\|` row. |\n| What does this text file say? | `read`, `search` | `read` returns 100 lines per call by default (`limit`, at most 10000) from a 1-based offset and refuses a file whose first 512 bytes contain a NUL byte; `search` returns 100 matching lines by default (`max_matches`, at most 10000). Both refuse a file over 100 MB. |\n| Where is a directory or file named like this? | `search_dir` | Name matches under a root: depth 5 by default (`max_depth`, at most 20), 100 results by default (`max_results`, at most 1000). It does not look inside files. |\n| Is this the file I expect, or does a known file exist anywhere here? | `file_hash`, `find_by_hash` | SHA-256 or SHA-1 of one file (up to 10 GB). `find_by_hash` sweeps a directory tree for a SHA-256 within a fixed budget and says what it did not examine; see Caveat 2 for what a \"no match\" means. |\n| Is it signed, and which version is it? | `get_signature`, `get_version_info` | Windows and macOS only, with narrow meanings (Caveat 5). Linux has no equivalent and answers an error. |\n| Who can touch it? | `get_acl` | Per-OS decode below. |\n| Make a change | `write_content`, `replace`, `append`, `delete_lines`, `create_temp`, `create_temp_dir` | See the safe workflow below. All need an administrator or an approval. |\n\n**Safe workflow for changes.** There is no backup and no undo: a change overwrites the file, and the old content is gone unless you kept a copy elsewhere. Work in this order: confirm the target with `exists` and `read` (or `search` to find the line); use `replace` with `dry_run=true` to see how many replacements it would make, since the other change actions have no preview; apply the change; verify by `read`, `search` or `file_hash`. Target rules: the path must already exist, except `write_content` with `create=true`, whose parent directory must exist. `write_content` refuses to touch an existing file unless `overwrite=true`, and refuses to create one unless `create=true`. `replace`, `append` and `delete_lines` need a regular file, and the text actions treat the file as lines (`delete_lines` rewrites the file so it ends with a newline, unless no lines remain). With `regex=true`, `replace` expands `$1`-style references in the replacement only when `max_replacements` is 0; with a limit it inserts the replacement text literally, so the same replacement string can behave differently with and without a limit.\n\n**`get_acl` by OS.**\n\n| OS | Source | What you see | Not shown |\n|---|---|---|---|\n| Windows | `GetNamedSecurityInfoW` owner and DACL | `sddl`, `control` flags, one `ace` row per entry (allow, deny, conditional and object types; principal as `DOMAIN\\name` or SID; hex access mask; inherit flags) | The SACL (needs `SeSecurityPrivilege`); condition expressions are ignored. A NULL DACL (everyone allowed) prints no `ace` rows. |\n| Linux | `system.posix_acl_access` and, for a directory, `system.posix_acl_default` | owner, group, `permissions`, `mode`, `acl\\|none\\|extended`, one `ace` row per entry | An ACL over 64 KiB is an error. Only the first 64 distinct ids are resolved to names; the rest print as numbers. |\n| macOS | `acl_get_file(ACL_TYPE_EXTENDED)` | owner, group, `permissions`, `mode`, `acl` row, one `ace` row per entry in stored order | No extended ACL prints `acl\\|none`; a file system that cannot return ACLs prints `acl\\|unsupported`. An unresolved principal prints as its UUID. |\n\nOn Linux and macOS the whole ACL is read before any row is written, so a failure is one `error|` row. On Windows an error part-way through the entries can follow rows already written.\n\n### Diagrams\n\n#### Write path\n\n`replace`, `delete_lines` and `write_content` on an existing file all follow the atomic path above. `append` and `write_content` on a new file skip the temp-and-rename step and write straight into the target, so an interrupted write can leave a partial file. The size cap is checked before anything is read, and the result is built entirely in memory.\n\n#### find_by_hash\n\nThe mount check is a string comparison that runs before any call touching a path, because an open or listing on a dead hard-mounted server would hold one of the agent's shared command workers with no deadline. Every skip the walk sees lands in a counter of the trailing `truncated|<reason>|visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N` row, written only when something was skipped or the walk stopped early (`reason` is `none` when no bound tripped). `hashed=` counts bytes admitted to the hasher, including a file abandoned part-way (no match is reported for it). Empty files are hashed. Stopping at 100 matches counts as a bound only when entries remained, so exactly 100 matches in a fully walked tree is clean. A search root that cannot be listed is not an `error|` line either: it answers return code 0 with `skipped_unreadable=1` and `CONSTRAINED`. Caveat 2 lists the races that can still skip a directory uncounted.\n\nHow the \"never followed\" holds per OS. macOS opens every candidate with `O_NOFOLLOW_ANY` (no symlink in any path component) and turns the thread's dataless-file materialisation off for the walk, so an iCloud or File Provider item that is not downloaded fails to open and is counted unreadable instead of being fetched. Linux 5.6 or later opens with `openat2(RESOLVE_NO_SYMLINKS)`; on an older kernel, or where a seccomp profile denies `openat2`, it falls back to `O_NOFOLLOW` on the final component only, for the rest of the process's life once `openat2` has been refused (an architecture with no known `openat2` number always uses the fallback). Windows opens the final component with `FILE_FLAG_OPEN_REPARSE_POINT` and classifies the handle before any read: a symlink, junction or other name-surrogate reparse point is a link, a compressed (WOF) or deduplicated file is hashed through a handle reopened without the reparse flag, and a cloud placeholder, an offline file or any other reparse tag is counted unreadable and never recalled. On Windows a mounted folder below the root is a reparse point and is skipped as a junction, and a `\\\\?\\` root reads as a UNC path and is refused. A relative `directory` is judged by its absolute spelling (the working directory joined lexically), so pass absolute paths.",
   "inputs": [
     {
       "constraints": {
@@ -1640,7 +1640,7 @@
     "gathered": true,
     "mutating": true
   },
-  "leg_hash": "c8a3100adc66",
+  "leg_hash": "802f5467fb09",
   "manifest_version": 1,
   "name": "filesystem",
   "outputs": [
@@ -1878,7 +1878,24 @@
     {
       "columns": [
         {
-          "description": "Full path of a file whose SHA-256 matches the target hash. Values: free text (path).",
+          "description": "Row shape discriminator (the wire row's leading tag). Values: match (one per file whose SHA-256 equals the target), truncated (at most one, only when something was skipped or the walk stopped early), matches_found (exactly one, always last), network_mount_guard (at most one, after any match rows and ahead of the other two, only when the mount table could not be read in full). Only match rows are data rows to column matchers; the other kinds have a different field count and never match.",
+          "example": "match",
+          "name": "row_kind",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "match",
+            "truncated",
+            "matches_found",
+            "network_mount_guard"
+          ]
+        },
+        {
+          "description": "match rows: full path of a file whose SHA-256 matches the target hash. (A truncated row carries its stop reason in this position -- deadline, file_cap, byte_cap, cancelled, max_results, or none when no bound tripped -- and a matches_found row the count; neither is a data row to a column matcher.)",
           "example": "C:\\Windows\\System32\\drivers\\etc\\hosts",
           "name": "path",
           "platforms": [
@@ -1890,7 +1907,7 @@
           "values": null
         },
         {
-          "description": "Matching file's size in bytes. Values: integer (bytes).",
+          "description": "match rows: the matching file's size in bytes. (A truncated row carries its counters here and in the fields after it, visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N, and matches_found|N is a two-field summary; neither is a data row to a column matcher.)",
           "example": "1405",
           "name": "size",
           "platforms": [
@@ -1899,18 +1916,6 @@
             "darwin"
           ],
           "type": "int64",
-          "values": null
-        },
-        {
-          "description": "Total number of matching files found, repeated on the trailing summary row. Values: integer.",
-          "example": "1",
-          "name": "matches_found",
-          "platforms": [
-            "windows",
-            "linux",
-            "darwin"
-          ],
-          "type": "int32",
           "values": null
         }
       ],
@@ -2568,7 +2573,7 @@
       "definition_id": "workflow.version_compliance_check"
     }
   ],
-  "outputs_note": "Every action writes pipe-delimited `key|value` lines via `ctx.write_output()`. A *repeating* row (`list_dir`'s entries, `get_acl`'s ACEs (every OS), `search`/`search_dir`/`find_by_hash`'s matches, `read`'s lines) is prefixed with a literal discriminator word naming the row's kind, then its fields; a single-value field is its own `key|value` line with no discriminator. There is no shared placeholder row for \"found nothing\" — a zero-hit action reports only its trailing count (`total_matches|0`, `matches_found|0`) with no rows above it. Failure always ends with an `error|<message>` line and a non-zero return code, never a placeholder success row (see *Result status*); on Windows `get_acl` the SDDL, control and earlier ACE rows may already have been written before a mid-walk failure (`GetAce`, `GetAclInformation`, a malformed ACE). For `get_acl` the `ace` row is repeating on every OS (`ace|<type>|<principal>|<access>|<flags>`, `-` for an empty field; `<access>` is the permission text on Linux and macOS and a hex access mask on Windows, `-` for an ACE type the plugin does not decode); `acl|<none|extended|unsupported>|<acl flags or ->` (Linux, macOS) and `control|<flags or ->` (Windows) are single-value rows.",
+  "outputs_note": "Every action writes pipe-delimited lines. A repeating row (`list_dir`'s `entry` rows, `get_acl`'s `ace` rows on every OS, `search_dir`'s `result` rows, `find_by_hash`'s `match` rows, `read`'s and `search`'s line rows) starts with a literal word naming its kind, then its fields; a single-value field is its own `key|value` line. There is no placeholder row for \"found nothing\": a zero-hit action reports only its trailing count (`total_matches|0`, `matches_found|0`). `find_by_hash` adds up to two rows between its `match` rows and its count: `network_mount_guard|unavailable` when the mount table could not be read, then one `truncated|...` row when it skipped anything or stopped early; only `match` rows have the three fields a column matcher reads. A `match` path containing CR or LF shows a space in its place, `|` is escaped, and a trailing backslash becomes `/`. Failure ends with an `error|<message>` line and a non-zero return code, never a placeholder success row (see Result status), with two exceptions: `get_signature` reports its verdict in `signature_status` (including `unknown` and `error_0x...`) and `get_version_info` on macOS reports `version_status|not_available`, both with return code 0. An unknown action name writes `unknown action: <name>` with return code 1. For `get_acl` the `ace` row is `ace|<type>|<principal>|<access>|<flags>`, with `-` for an empty field and `<access>` as permission text on Linux and macOS but a hex access mask on Windows; `acl|<none|extended|unsupported>|<acl flags or ->` (Linux, macOS) and `control|<flags or ->` (Windows) are single-value rows.\n\nTwo places where the emitted rows and the declared columns differ, so match on the emitted names. `delete_lines` emits `lines_deleted`, `total_lines_before` and `total_lines_after`, while its definition declares `lines_before` and `lines_after`. `append`'s `total_size` is not the size after the append (see Caveat 3).",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -2576,29 +2581,42 @@
   },
   "privileges": [
     {
-      "grant": "None for any read action. `write_content`/`replace`/`append`/`delete_lines` against a path the running account cannot already write need that account to be an `Administrators` member; default install grants nothing (`docs/agent-privilege-model.md:118`)",
-      "if_refused": "a single `error|<message>` line + return code 1 (e.g. `error|GetNamedSecurityInfo failed (error N)`) — no typed status is set",
-      "measured": "2026-10-04, bare metal, as `LocalSystem (elevated)` (`docs/samples/windows.txt:1`)",
+      "grant": "None for any read action. `write_content`, `replace`, `append` and `delete_lines` against a path the running account cannot already write need that account to be an `Administrators` member; the default install grants nothing",
+      "if_refused": "a single `error|<message>` line and return code 1 (for example `error|GetNamedSecurityInfo failed (error N)`); no typed status is set",
+      "measured": "2026-10-04, bare metal, as `LocalSystem (elevated)`",
       "os": "Windows",
-      "runs_as": "**LocalSystem today** (`docs/agent-privilege-model.md:70`, tracked #1442; target is the virtual service account `NT SERVICE\\YuzuAgent`)"
+      "runs_as": "**LocalSystem today** (`docs/agent-privilege-model.md`, tracked #1442; the target is the virtual service account `NT SERVICE\\YuzuAgent`)"
     },
     {
-      "grant": "None for any read action. Write actions against a path with no operator-authored per-path sudo entry are refused by the OS itself at `open()`/`rename()`; default install grants nothing (`docs/agent-privilege-model.md:118`)",
-      "if_refused": "same `error|<message>` + rc 1 shape",
-      "measured": "2026-10-04, bare metal, **unprivileged** at euid 501 (jsmith) — the capture ran through `LocalDispatcher`/`PluginHandle::load`, not the real root daemon (`docs/samples/macos.txt:1`)",
+      "grant": "None for any read action. The plugin never calls `sudo`; the agent runs as root today, so a write succeeds on any path the OS lets root write. Under the planned unprivileged account it would succeed only where that account can already write",
+      "if_refused": "same `error|<message>` and return code 1",
+      "measured": "2026-10-04, bare metal, **unprivileged** at euid 501; the capture ran through `LocalDispatcher`, not the root daemon",
       "os": "macOS",
-      "runs_as": "**root** — the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md:14`)"
+      "runs_as": "**root** today: the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md`)"
     },
     {
-      "grant": "None for any read action. Write actions against system paths need an operator-authored per-path sudo entry; default install grants nothing (`docs/agent-privilege-model.md:118`)",
-      "if_refused": "same `error|<message>` + rc 1 shape",
-      "measured": "2026-10-04, container, as euid 0 (root) (`docs/samples/linux.txt:1`) — also not the least-privilege `yuzu` account",
+      "grant": "None for any read action. The plugin never calls `sudo`: a write succeeds only on a path the `yuzu-agent` account can already write, and the OS refuses it on a system path",
+      "if_refused": "same `error|<message>` and return code 1",
+      "measured": "2026-10-04, container, as euid 0 (root), so not the least-privilege `yuzu-agent` account",
       "os": "Linux",
-      "runs_as": "`yuzu` unprivileged system account (`docs/agent-privilege-model.md:12,52`)"
+      "runs_as": "`yuzu-agent` unprivileged system account on the packaged unit (`docs/agent-privilege-model.md`)"
     }
   ],
   "readme": "agents/plugins/filesystem/README.md",
-  "result_status": [],
+  "result_status": [
+    {
+      "completeness": "`UNKNOWN`",
+      "provenance": "(empty)",
+      "status": "`UNDECLARED`",
+      "when": "every action other than `find_by_hash`, on every OS; and a `find_by_hash` run that hit no bound, read its mount table in full and skipped nothing, or skipped only by design (a symlink, a FIFO or device, a file over 10 GB: its `truncated` row still counts them). A refusal (bad path, missing parameter, wrong file type, tool failure) is one `error|<message>` output line with return code 1, so a caller must parse that line, not a status field, to detect failure"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`filesystem:deadline`, `filesystem:file_cap`, `filesystem:byte_cap`, `filesystem:cancelled`, `filesystem:max_results`, `filesystem:mount_table_unreadable`, `filesystem:skipped_unreadable` or `filesystem:skipped_network_mount` (the first that applies, in that order)",
+      "status": "`CONSTRAINED`",
+      "when": "`find_by_hash` only, return code 0: a bound tripped, the mount table could not be read in full so the network-mount guard was off, an entry or directory could not be read, or a network mount was refused"
+    }
+  ],
   "samples": {
     "linux": {
       "actions": [
@@ -2751,16 +2769,17 @@
         {
           "action": "find_by_hash",
           "not_captured": null,
-          "params": "directory=/etc sha256=5ed49ae76ca451e9f063a9b28d11f6e8784a851e983664cb495206b75453c412",
+          "params": "directory=/etc sha256=ed9ab7f958d4c01aa81e80a108e2c69db299b3e7cd6577b286905f1ee4c47b4c",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 2,
+          "row_count": 3,
           "rows": [
-            "match|/etc/hosts|177",
+            "match|/etc/hosts|413",
+            "truncated|none|visited=1676|hashed=1922709|skipped_unreadable=0|skipped_symlink=720|skipped_not_regular=0|skipped_oversize=0|skipped_network_mount=0",
             "matches_found|1"
           ],
           "truncated": false
@@ -2891,7 +2910,7 @@
       "stamp": {
         "date": "2026-10-04",
         "host_class": "container",
-        "leg_hash": "c8a3100adc66",
+        "leg_hash": "802f5467fb09",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -3051,13 +3070,14 @@
           "params": "directory=/etc sha256=c7dd0e2ed261ce76d76f852596c5b54026b9a894fa481381ffd399b556c0e2da",
           "rc": 0,
           "result_status": {
-            "completeness": "UNKNOWN",
-            "provenance": "",
-            "status": "UNDECLARED"
+            "completeness": "PARTIAL",
+            "provenance": "filesystem:skipped_unreadable",
+            "status": "CONSTRAINED"
           },
-          "row_count": 2,
+          "row_count": 3,
           "rows": [
             "match|/private/etc/hosts|213",
+            "truncated|none|visited=261|hashed=2997701|skipped_unreadable=17|skipped_symlink=4|skipped_not_regular=0|skipped_oversize=0|skipped_network_mount=0",
             "matches_found|1"
           ],
           "truncated": false
@@ -3189,7 +3209,7 @@
       "stamp": {
         "date": "2026-10-04",
         "host_class": "bare-metal",
-        "leg_hash": "c8a3100adc66",
+        "leg_hash": "802f5467fb09",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501 (jsmith)"
@@ -3344,7 +3364,7 @@
         {
           "action": "find_by_hash",
           "not_captured": null,
-          "params": "directory=C:\\Windows\\System32\\drivers\\etc sha256=9321feab332edbba521c7ea3eb978d9844cb4f62a4730dab9cf60fb79649037d",
+          "params": "directory=C:\\Windows\\System32\\drivers\\etc sha256=031da282a9436540be78beab34801f32c1429491e881838b0ddf4f8c16e122cc",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
@@ -3353,7 +3373,7 @@
           },
           "row_count": 2,
           "rows": [
-            "match|C:\\Windows\\System32\\drivers\\etc\\hosts|1405",
+            "match|C:\\Windows\\System32\\drivers\\etc\\hosts|1224",
             "matches_found|1"
           ],
           "truncated": false
@@ -3489,7 +3509,7 @@
       "stamp": {
         "date": "2026-10-04",
         "host_class": "bare-metal",
-        "leg_hash": "c8a3100adc66",
+        "leg_hash": "802f5467fb09",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "LocalSystem (elevated)"
@@ -3656,13 +3676,17 @@
     ],
     "plugin": [
       "agents/plugins/filesystem/src/filesystem_acl_parsers.hpp",
+      "agents/plugins/filesystem/src/filesystem_find_by_hash.hpp",
       "agents/plugins/filesystem/src/filesystem_macos_sig.hpp",
       "agents/plugins/filesystem/src/filesystem_plugin.cpp"
     ],
     "privilege_row": true,
     "tests": [
+      "tests/test_filesystem_definition.py",
       "tests/unit/test_filesystem_acl_parsers.cpp",
       "tests/unit/test_filesystem_actions.cpp",
+      "tests/unit/test_filesystem_find_by_hash.cpp",
+      "tests/unit/test_filesystem_find_by_hash_dispatcher.cpp",
       "tests/unit/test_filesystem_get_acl_dispatcher.cpp",
       "tests/unit/test_filesystem_local_dispatcher.cpp",
       "tests/unit/test_filesystem_macos_sig.cpp",
@@ -3673,10 +3697,10 @@
   },
   "version": "0.4.0",
   "where_the_data_goes": [
-    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention, `server/core/src/response_store.hpp:8,152`), queryable at `/api/responses/{id}`.",
-    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — grepping the server tree for `device.filesystem.` and for the plugin name outside the capability catalogue and generic result-parsing table (`server/core/src/result_parsing.hpp:66`) finds no sync-source, TAR, or DEX consumer. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its 16 definitions.",
-    "**Sensitivity.** `get_acl` rows carry local account names (`owner`/`group` on Linux and macOS, and the principal of every `ace` row on all three OSes — potentially real usernames, not just built-in principals) and `get_version_info`/`get_signature` rows name specific installed software (`company_name`, `product_name`, `file_description`) — an installed-software inventory by another route; every action's `path`/`content` fields carry whatever the operator pointed at, which can include usernames embedded in home-directory paths or arbitrary personal data in file contents.",
-    "**Siblings:** `filesystem_posture.mounts`/`.quotas`/`.snapshots` — a separate, similarly-named, read-only plugin (mount/quota/snapshot inventory only; no read-file, hash, or write actions) — do not confuse the two (see Caveats). Two shipped workflow definitions chain this plugin's actions: `workflow.config_search_and_replace` (`content/definitions/t2_chaining_examples.yaml:15`) searches a config file then dispatches `filesystem.replace`, and `workflow.version_compliance_check` (`content/definitions/t2_chaining_examples.yaml:206`) dispatches `filesystem.get_version_info` and compares the result against a minimum version.",
-    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.filesystem.file_hash\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention), queryable at `/api/responses/{id}`.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX or metrics: no sync source, TAR or DEX consumer reads `device.filesystem.*` results, only the generic result parser does. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its 16 definitions.",
+    "**Sensitivity.** `get_acl` rows carry local account names (`owner` and `group` on Linux and macOS, and the principal of every `ace` row on all three OSes), potentially real usernames. `get_version_info` and `get_signature` rows name specific installed software (`company_name`, `product_name`, `file_description`), an installed-software inventory by another route. `read`, `search` and `write_content` carry whatever the operator pointed them at, which can include credentials or personal data in file contents or usernames in paths.",
+    "**Siblings:** `filesystem_posture.mounts`, `.quotas` and `.snapshots` are a separate, similarly named, read-only plugin (mount, quota and snapshot inventory only; no read, hash or write actions); do not confuse the two. Two shipped workflow definitions chain this plugin's actions: `workflow.config_search_and_replace` (in `t2_chaining_examples.yaml`) searches a config file then dispatches `replace`, and `workflow.version_compliance_check` dispatches `get_version_info` and compares the result against a minimum version.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary), then `yuzu://plugin-docs` (this page as data), then `discover_instructions` or `get_definition(\"device.filesystem.file_hash\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
   ]
 }

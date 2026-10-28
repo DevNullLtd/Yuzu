@@ -4,6 +4,7 @@
 #include "bundle_service.hpp" // BundleStepSpec, DispatchedStep, BundleAggregate
 #include "dispatch_caller.hpp" // PR1.9c: DispatchCaller — DispatchFn's caller param
 #include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome — DispatchFn's return type
+#include "response_tier_filter.hpp" // #4990: collate() takes the caller's tier filter
 
 #include <cstddef>
 #include <cstdint>
@@ -152,8 +153,16 @@ public:
     /// Returns `unexpected(kDegraded)` when the manifest was found and owned
     /// but the underlying ResponseStore read failed — the caller maps THIS to
     /// a retryable 503/kInternalError, distinct from the terminal 404 above.
+    ///
+    /// #4990: `tier` is the CALLER's Forensics-tier decision (`tier_filter_for(...)` on the
+    /// request), with no default, exactly like the other `ResponseStore` reads. Owning a bundle
+    /// (or holding the approval that let a Forensics step dispatch) does not imply reading its
+    /// Forensics output: a step whose rows the filter excludes collates as if it had no row.
+    /// A caller that cannot resolve the caller's visibility passes `refuse_unwired()` or
+    /// `exclude(set, authz::deny_all())`, never an unrestricted filter.
     [[nodiscard]] std::expected<BundleAggregate, CollateError>
-    collate(const std::string& correlation_id, const std::string& principal, bool is_admin);
+    collate(const std::string& correlation_id, const std::string& principal, bool is_admin,
+            const ResponseTierFilter& tier);
 
     /// Correlation-id prefix. `notify_exec_tracker` skips ids with this prefix
     /// (mirroring the `polchk-` guard) because a bundle is NOT a tracker

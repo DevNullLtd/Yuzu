@@ -1,8 +1,8 @@
 /**
  * registry_plugin.cpp -- Windows Registry plugin for Yuzu (dispatch and capability declarations).
  *
- * The nine actions are listed in actions() below and documented in README.md. The logic lives in
- * registry_parsers.hpp (pure) and registry_core.hpp (over an injected registry); registry_win.cpp is the
+ * The twelve actions are listed in actions() below and documented in README.md. The logic lives in
+ * registry_parsers.hpp and registry_plan.hpp (pure) and registry_core.hpp (over an injected registry); registry_win.cpp is the
  * Windows shell. Windows-only: the other platforms answer every action with the honest
  * registry|unsupported|... sentinel below (the macOS plist and Linux dconf legs are PLANNED, not built).
  */
@@ -28,7 +28,7 @@ namespace {
 // ── ABI4 capability declarations (#2204) ─────────────────────────────────
 //
 // One row per entry in actions() below, same names/order. The Windows legs are native in-process Win32
-// Reg*W (rung 1; get_user_value adds RegLoadKeyW for an offline NTUSER.DAT). macOS and Linux have an
+// Reg*W (rung 1; the per-user actions add RegLoadKeyW for an offline NTUSER.DAT). macOS and Linux have an
 // equivalent store (CFPreferences / dconf) that this plugin does not read or write yet, so those legs
 // are PLANNED and every action there answers with the registry|unsupported|... sentinel.
 constexpr const char* kPlannedNote = "planned stub: not implemented, the action answers registry|unsupported|...";
@@ -46,6 +46,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {"get_user_value", kLinuxPlanned, kMacosPlanned,
      {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry+hive_mount", nullptr}},
     {"list_profiles", kLinuxPlanned, kMacosPlanned, {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr}},
+    {"set_user_value", kLinuxPlanned, kMacosPlanned,
+     {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry+hive_mount", nullptr}},
+    {"delete_user_value", kLinuxPlanned, kMacosPlanned,
+     {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry+hive_mount", nullptr}},
+    {"apply", kLinuxPlanned, kMacosPlanned, {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr}},
 };
 
 } // namespace
@@ -53,16 +58,17 @@ const YuzuActionDescriptor kActionDescriptors[] = {
 class RegistryPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "registry"; }
-    std::string_view version() const noexcept override { return "2.0.1"; }
+    std::string_view version() const noexcept override { return "2.1.0"; }
     std::string_view description() const noexcept override {
-        return "Windows Registry -- get, set (six types, verified), delete value, delete key, "
-               "enumerate, per-user reads";
+        return "Windows Registry -- get, set (six types, verified), delete value, delete key (optionally "
+               "recursive), enumerate, per-user reads and writes, bulk apply with an undo manifest";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"get_value",       "set_value",      "delete_value",
-                                     "delete_key",      "key_exists",     "enumerate_keys",
-                                     "enumerate_values", "get_user_value", "list_profiles", nullptr};
+        static const char* acts[] = {"get_value",       "set_value",        "delete_value",
+                                     "delete_key",      "key_exists",       "enumerate_keys",
+                                     "enumerate_values", "get_user_value",  "list_profiles",
+                                     "set_user_value",  "delete_user_value", "apply", nullptr};
         return acts;
     }
 
@@ -99,7 +105,8 @@ public:
                 ctx.write_output("error|unknown action: " + yuzu::profiles::sanitize_field(action));
                 return 1;
             }
-            static constexpr std::string_view kMutatingActions[] = {"set_value", "delete_value", "delete_key"};
+            static constexpr std::string_view kMutatingActions[] = {
+                "set_value", "delete_value", "delete_key", "set_user_value", "delete_user_value", "apply"};
             const bool is_mutator = std::ranges::find(kMutatingActions, action) != std::end(kMutatingActions);
 
 #if defined(__APPLE__)

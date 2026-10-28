@@ -501,7 +501,8 @@ TEST_CASE("SoftwareLicensing securable seeds the D-9 matrix EXACTLY", "[sle][rba
     CHECK_FALSE(role_can(s, "ITServiceOwner", "Decommission", "Execute"));
     CHECK_FALSE(role_can(s, "ITServiceOwner", "Decommission", "Approve"));
     for (const auto* role :
-         {"Operator", "Viewer", "PlatformEngineer", "ApiTokenManager", "Reviewer"})
+         {"Operator", "Viewer", "PlatformEngineer", "ApiTokenManager", "Reviewer",
+          "ForensicsAnalyst"})
         CHECK_FALSE(role_can(s, role, "Decommission", "Delete"));
 }
 

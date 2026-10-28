@@ -14,62 +14,217 @@
 
 ## How it works
 
-TAR is the agent's local telemetry warehouse. Four scheduled collectors diff each cycle's OS
-snapshot against the previous baseline and append change events to a local SQLite database
-(`tar.db`): `collect_fast` (process + network, default 60s), `collect_slow` (service + user
-session, default 300s), `collect_perf` (device CPU/memory/disk/network counters, default 30s) and
-`collect_software` (installed-software inventory, default hourly) — all four triggers are
-registered in `init()` (`tar_plugin.cpp:601-644`). `collect_slow` also drives a generic cursor-model
-loop (`tar_plugin.cpp:2122-2130`) over the sources `make_cursor_sources()` constructs
-(`tar_cursor_sources.cpp:30-35`): `power` (sleep/wake/AC-power transitions — Windows
-`PowerRegisterSuspendResumeNotification`/`WM_POWERBROADCAST`, Linux `systemd-logind`
-PrepareForSleep + power-supply sysfs/udev, macOS `pmset -g log` replay) and `removable`
-(removable-media attach/detach plus exec-from-removable correlation — Windows `EvtQuery` over the
-Partition/Diagnostic and Kernel-PnP channels, Linux a udev netlink monitor, macOS DiskArbitration
-`DADiskAppeared`/`Disappeared`; `tar_removable_diskarb.mm`) — and, on Windows only, `registry`
-(registry value and key changes under a curated persistence/policy key list: a
-`RegNotifyChangeKeyValue` subtree watch finds what changed against a per-root baseline, giving
-each value's old and new data; the process that made a change is not recorded yet, so `actor_pid`
-is 0 on every row until attribution follows in a later release. **Stored values are unmasked**;
-`tar_registry_source.cpp`). The plugin has 17 registered
-capture sources and every one ships **on by default** on every OS (`default_enabled` in
-`tar_schema_registry.cpp`, enforced by a registry-wide test); an operator can disable any source
-per host with `configure`. `rollup` runs every 15 minutes: it always
-aggregates live rows into hourly/daily/monthly tiers first, then unconditionally enforces
-retention on every tier, deleting aged rows (`tar_plugin.cpp:3619-3627`) — the ordering is
-load-bearing and the reason the capability declaration marks this action Destructive/Irreversible.
-Reads go through `status` (health + the retention clock-guard counters), `query`/`export` (the
-core process/network/service/user/software union, or one type behind an explicit filter — arp,
-dns and mapdrive are device-state sources reachable only that way, never the default feed) and `sql`
-(an arbitrary `SELECT` against `$`-prefixed warehouse tables, validated SELECT-only and translated
-to real table names — `tar_sql_executor.cpp:205-244`). `snapshot` forces an out-of-cycle full
-collection across all four collectors and reports `complete` or `partial|<sources>` if any source
-retained a stale baseline instead. `fleet_snapshot` is a separate on-demand full re-enumeration
-that bypasses the warehouse entirely, feeding the 3D fleet-topology view. `configure` rewrites
-around 25 collection knobs (retention, intervals, per-source enable flags, redaction patterns).
-`purge_source` deletes every warehouse row for one named source, but only once that source is
-already disabled — closing the scan-then-purge race a still-collecting source would otherwise hit
-(`tar_plugin.cpp:2987-3031`).
+TAR is the agent's local telemetry warehouse. Each capture source has a collector that reads current
+OS state on a timer, compares it with the baseline saved at the previous tick and appends only the
+differences, as change events, to a SQLite database (`tar.db`) on the device. Four interval triggers
+run the collectors and a fifth rolls the live rows up into hourly, daily and monthly tiers and then
+trims every tier to its limit. Three sources (`power`, `removable`, `registry`) do not diff a
+snapshot: they follow a saved position in an OS log or callback stream, and when that position is
+lost they record a `capture_gap` row and start again from the log's current end instead of replaying
+history. All 17 sources are on by default on every OS (`default_enabled` in `tar_schema_registry.cpp`,
+enforced by a registry-wide test). `configure` turns any of them off per host, which stops capture
+and keeps the rows already stored; `purge_source` then deletes that source's rows. Reads are on
+demand and local: `status`, `query`, `export` and `sql` read `tar.db`, `snapshot` forces an
+out-of-cycle collection, and `fleet_snapshot` re-enumerates processes and connections without
+touching `tar.db`.
 
-Deliberately not: TAR does not stream events to the server in real time — everything lands in the
-local warehouse first and is pulled on `query`/`export`/`sql`/`status`. It does not replay history
-from zero when a cursor-model source's log position is lost or wraps — it re-baselines forward and
-records a `capture_gap` (`tar_cursor.hpp:25-75`). It never fabricates OS support: a leg without a
-bound mechanism reports `planned`, not a guessed read.
+Deliberately not: TAR does not stream events to the server in real time (everything lands in the
+local warehouse first and is pulled by a read action), it does not replay history from zero when a
+cursor-model source loses its position, and it never fabricates OS support (a leg with no collector
+reports `planned`, not a guessed read).
+
+| Trigger | Default cadence | Action | What it drives |
+|---|---|---|---|
+| `tar.fast` | 60 s (10-3600) | `collect_fast` | `process`, `tcp`, `arp`, `dns`, `netqual`, `module` and the derived `usage` fold |
+| `tar.slow` | 300 s (30-7200) | `collect_slow` | `service`, `user`, `netconn`, `mapdrive` and the cursor sources `power`, `removable`, `registry` |
+| `tar.perf` | 30 s | `collect_perf` | `perf`, `procperf` (device and per-application counters, sampled rather than diffed) |
+| `tar.software` | 3600 s (0 removes the trigger, otherwise 300-86400) | `collect_software` | `software` |
+| `tar.rollup` | 900 s | `rollup` | aggregation into hourly, daily and monthly tiers, then retention |
+
+The fast interval must stay below the slow interval. A diffed source's first tick records its baseline and
+no events, so a quiet first tick is not evidence about the past.
+
+### What you can decide with it
+
+| Question | Use | What you get, and the limit |
+|---|---|---|
+| Is TAR healthy on this device? | `status` | Storage state, row counts, per-source `last_status`, `consecutive_failures` and `last_status_at`, and the retention clock-guard counters. `status` is the only fleet-readable health signal (the agent has no `/metrics` endpoint for TAR). |
+| What can this OS do? | `compatibility` | One row per source and OS, with status `supported`, `constrained`, `planned` or `unsupported` and the capture method. |
+| What ran, and when did it start or stop? | `query type=process`, `recent_processes`, `process_tree`, `hourly_process_summary`, `daily_process_summary` | Windows records start and stop from a gap-free ETW stream, names only. Linux polls `/proc` every fast interval and keeps the command line (redacted by pattern), so a process shorter than the interval can be missed. macOS uses Endpoint Security when root and the entitlement are present and a poll otherwise, names only. |
+| Who talked to this address, and what is listening? | `connections_to_ip`, `tcp_by_process`, `listening_ports`, `daily_connection_summary` | Polled connection tables on every OS; a connection that opens and closes inside one interval is not seen. macOS sees every flow only with root. |
+| Did a service change state, who logged on? | `service_state_changes`, `user_sessions` | Windows is complete. Linux and macOS are constrained: no start type, and `utmp` or `utmpx` can miss GUI logins and containers without them. |
+| Which software was installed or removed? | `query type=software` | Windows only (machine-wide Uninstall keys). Empty on Linux and macOS means not collected. |
+| Did a persistence or policy registry value change? | `sql` over `$Registry_Live` | Windows only. Old and new data of each change, unmasked, with no acting process. |
+| Did the device sleep, wake, change power source, or have media attached? | `sql` over `$Power_Live`, `$Removable_Live` | `capture_gap` rows mark any stretch the agent could not see. |
+| Who is on the network segment, what did it resolve, which shares are mapped? | `recent_arp`, `recent_dns`, `recent_mapdrive`, or `query` with type arp, dns or mapdrive | `dns` is Windows only; `mapdrive` outbound live only on macOS. These are device-state sources: they are never part of the default `query` feed. |
+| Anything else in the warehouse | `sql` | A single SELECT against `$`-prefixed tables, validated by `validate_and_translate_sql` and run through the read-only `execute_user_query`. The `usage` tables are not queryable here. |
+| Pull a time range out for another tool | `export` | JSON array of events, same filters as `query`. `limit` defaults to 1000; a value above 10000 (or zero or less) falls back to 1000. |
+
+What a result proves. A row says the collector saw that change at that tick; it does not say nothing
+else happened. An empty table on a `planned` leg means TAR is not collecting there, never that
+nothing occurred. An empty table on a live leg can also mean the source is disabled (check
+`<source>_enabled` in `status`), the first tick was a baseline, or the last tick reported
+`capture_incomplete`. `snapshot` answers `complete` or `partial|<sources>`; a partial answer names
+the sources that kept a stale baseline.
+
+Safe workflow for the changing actions:
+
+1. `configure` (Write, admin only): run `compatibility` and `status` first, apply the setting, then
+   read `status` again. The setting is undone by writing the old value back; rows already stored are
+   not touched, and re-enabling a source re-baselines it so nothing is invented for the paused
+   window.
+2. `purge_source` (Delete, irreversible): `export` what you need, disable the source with
+   `configure`, run `purge_source`, then confirm with `status` that its row count is zero. It accepts
+   only a registered source name that is confirmed disabled.
+3. `rollup` (Delete, irreversible): runs by itself every 900 s; a manual run only brings that
+   same pass forward. The server refuses to dispatch a Destructive action fleet-wide, so
+   both `rollup` and `purge_source` need explicit device ids.
+
+### Capture sources by OS
+
+`live` means the collector is wired and is the primary mechanism; `constrained` means it works with
+a stated limit; `planned` means the leg is declared with no collector (its tables are queryable and
+empty); `n/a` means the source does not apply to that OS. The table is read from the schema registry
+(`build_sources()` in `tar_schema_registry.cpp`); `compatibility` reports the same data on a host.
+
+| Source | Records | Windows | macOS | Linux |
+|---|---|---|---|---|
+| `process` | process start and stop | live: ETW, poll fallback | constrained: Endpoint Security (root and entitlement), else poll | live: procfs |
+| `tcp` | TCP and UDP connection changes | live: iphlpapi poll | constrained: nstat (root), else `proc_pidfdinfo` poll | live: procfs poll |
+| `service` | service state changes | live: SCM | constrained: `launchctl`, no start type | constrained: `systemctl`, start type `unknown`, systemd only |
+| `user` | logon sessions | live: WTS | constrained: `utmpx` | constrained: `utmp` |
+| `perf` | device CPU, memory, disk, network rates | live: kernel counters | planned | live: procfs |
+| `procperf` | top-N per-application CPU and memory | live: `NtQuerySystemInformation` | planned | live: procfs, version empty |
+| `netqual` | per-connection TCP quality | constrained: TCP ESTATS, elevated agent only | constrained: nstat, root only | live: netlink `INET_DIAG` |
+| `module` | image and driver loads with signing verdict | live: ETW | planned | planned |
+| `software` | installed-software changes | live: HKLM Uninstall keys | planned | planned |
+| `arp` | neighbour-table changes | live: `GetIpNetTable2` | constrained: `entry_type` always `unknown` | live: `/proc/net/arp`, IPv4 |
+| `dns` | resolver-cache changes | live: DNS client cache | planned | planned |
+| `netconn` | connectivity transitions | live: event logs, backfills history | planned | planned |
+| `mapdrive` | mapped network shares, both directions | live: outbound, history and inbound (inbound needs local admin) | constrained: outbound live only | constrained: mounts and fstab, inbound needs Samba |
+| `power` | sleep, wake, AC transitions (cursor) | constrained: power broadcast | live: `pmset -g log` replay | constrained: logind, needs the libsystemd build, AC read always |
+| `removable` | media attach and detach, exec from removable (cursor) | live: event-log channels | constrained: DiskArbitration | constrained: udev netlink |
+| `registry` | registry value and key changes (cursor) | live: `RegNotifyChangeKeyValue` | n/a | n/a |
+| `usage` | per-executable runs, derived from `process` | live | constrained: inherits `process` | live |
+
+### Source notes
+
+- **Retention.** Live tables are row-count capped; the hourly, daily and monthly tiers are
+  time-based (typically 24 hours, 31 days and about a year; a few tiers differ). Each pass deletes at
+  most 5000 rows per table, and a disabled source's rows are never pruned.
+- **`netconn` and `power`/`removable` history.** On first enablement the read can reach back into
+  OS-retained history, bounded by `netconn_lookback_seconds`, `power_lookback_seconds` (effective on
+  macOS only) and `removable_lookback_seconds` (default 7 days, `0` means forward-only). If the
+  setting cannot be read, TAR reads forward-only.
+- **`mapdrive` history backfill.** A one-time historical pass runs at agent init. A profile it could
+  not read is retried individually, at most 7 attempts in total and no more than once per 24 hours,
+  until it resolves or is abandoned. A hive mount that exceeds its 30 s bound ends that run's
+  mounting. The stuck mount's thread cannot be stopped: until it returns it keeps the process-wide
+  offline-hive lock (every other per-user hive read on the agent waits behind it) and keeps the
+  backup and restore privileges enabled on the agent process, and if it stalls after the hive has
+  loaded, that hive stays mounted and the profile's `NTUSER.DAT` stays locked. The plugin module is
+  pinned in memory before the first mount; if the pin fails no hive is read, and while a stuck
+  mount is still running later runs do not start new mounts. `purge_source mapdrive` also clears the
+  pending-retry list so a retry cannot re-insert purged rows.
+- **`registry`.** Values are stored unmasked and rows carry `actor_pid` 0; see Caveats.
+
+### Diagrams
+
+#### Dispatch and read path
 
 ```mermaid
 flowchart LR
-  TRIG[Internal triggers<br/>60s / 300s / 30s / 3600s / 900s] --> EX
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Infrastructure.* / Response.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[tar.execute<br/>gate: db_ must be open]
-  EX --> COL[Collectors<br/>ETW / Endpoint Security / procfs<br/>SCM / systemctl+launchctl / iphlpapi]
-  COL --> DB[(tar.db SQLite warehouse)]
-  EX --> FS[fleet_snapshot<br/>bypasses the warehouse]
-  DB --> READ[status / query / export / sql / rollup / purge_source]
-  READ --> RS[(ResponseStore)]
+  TRIG["Internal triggers: 60 s, 300 s, 30 s, 3600 s, 900 s"] --> EX
+  OP["Operator or workflow"] --> SRV["Server: authorizes Infrastructure Read, Write or Delete, or Response Read for fleet_snapshot, and records the audit row"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"] --> EX["tar execute: refuses when tar.db is not open"]
+  EX --> COL["Collectors: ETW, Endpoint Security, procfs, SCM, systemctl, launchctl, iphlpapi"]
+  COL --> DB[("tar.db SQLite warehouse")]
+  EX --> FS["fleet_snapshot: bypasses the warehouse"]
+  DB --> READ["status, query, export, sql, rollup, purge_source"]
+  READ --> RS[("ResponseStore")]
   FS --> RS
-  RS --> API[REST /api/responses · /tar dashboard]
+  RS --> API["REST /api/responses and the /tar dashboard"]
 ```
+
+Operators reach the plugin through the server, which authorizes and audits the dispatch. The
+triggers call the same entry point inside the agent. Every action except `fleet_snapshot` works on
+`tar.db`, and every result comes back as a normal instruction response.
+
+#### Collector pipeline and retention
+
+```mermaid
+flowchart TD
+  T["tar.fast, tar.slow, tar.perf, tar.software"] --> G{"Source enabled and flag readable?"}
+  G -->|"no"| SK["Skip the tick: rows and baseline are kept"]
+  G -->|"yes"| E["Enumerate current OS state"]
+  E --> D["Diff against the baseline in tar_state, first tick records the baseline only"]
+  D --> L[("Live tables in tar.db")]
+  R["tar.rollup every 900 s"] --> A["run_aggregation: live to hourly to daily to monthly"]
+  L --> A
+  A --> H[("Hourly, daily and monthly tables")]
+  A --> C{"run_retention: clock guard on time-based tiers"}
+  C -->|"plausible clock"| X["Delete aged rows, at most 5000 per table per pass"]
+  C -->|"anomaly, first time seen"| N["Decline that table and count it in status"]
+  C -->|"same anomaly seen again"| X
+```
+
+Collectors write only the difference from the last complete snapshot, and a failed or partial read
+keeps the old baseline rather than inventing events. Aggregation always runs before retention so each
+tier is consumed before the tier below it can be trimmed. The clock guard declines a time-based pass
+that looks like a wall-clock jump (a pass that would wipe a table, more than 30 days since the last
+pass, a stored reading ahead of now, or no stored reading) and counts it in
+`retention_guard_declines_total`. It declines once per distinct anomaly: while the same anomaly
+persists, later passes delete again but never more than 5000 rows per table per pass. Row-count
+trimming needs no clock and is not clock-guarded, though it has the same per-pass cap.
+
+#### Disable, then purge a source
+
+```mermaid
+sequenceDiagram
+  participant Op as Operator
+  participant P as tar plugin
+  participant DB as tar.db
+  Op->>P: configure process_enabled=false
+  P->>DB: one transaction: set flag, paused_at, clear baseline
+  P-->>Op: config line for the new value
+  Note over P,DB: collectors skip the source and retention leaves its rows alone
+  Op->>P: purge_source source=process
+  P->>P: take collect_mu_ so no re-enable can interleave
+  P->>DB: read the enable flag once
+  alt flag unreadable
+    P-->>Op: error config_unreadable
+  else flag still true
+    P-->>Op: error source_not_paused
+  else flag confirmed false
+    P->>DB: delete every tier, commit, truncate the write-ahead log
+    P-->>Op: JSON with rows_deleted and status purged
+  end
+```
+
+The enable check and the delete happen under the same collector lock that `configure` takes, so a
+concurrent re-enable cannot slip between them and have a collecting source purged. An unreadable
+flag is treated as unconfirmed and refused, never as disabled. The best-effort truncation of the
+SQLite write-ahead log (WAL) clears the purged pages from that log so the erasure is complete.
+
+#### Cursor source states
+
+```mermaid
+stateDiagram-v2
+  [*] --> NoCursor
+  NoCursor --> Ok: first read, token baseline
+  Ok --> Ok: cursor_advanced, events and cursor commit together
+  Ok --> Ok: capture_incomplete, transient failure, cursor kept
+  Ok --> Gap: cursor_lost, log wrapped or cursor invalid
+  Gap --> Ok: capture_gap row stored, cursor moved to log end
+  Ok --> Paused: source disabled, buffered events discarded
+  Paused --> Gap: source re-enabled, one gap covers the pause
+```
+
+`power`, `removable` and `registry` keep one saved position each in the `tar_cursor` table (readable
+through `sql`). A transient read failure raises an incomplete-capture error (`IncompleteCaptureError`), which keeps the cursor so
+the next tick retries from the same place. A lost cursor or wrapped log writes a single
+`capture_gap` row and re-baselines at the log's current end, never a replay from zero, and the
+window of a disable is likewise reported only as a gap, never as its own events.
 
 ## OS capability
 
@@ -106,22 +261,21 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | Agent service account, granted `SeBackupPrivilege` (read regardless of DACL) and `Performance Log Users` group membership (`docs/agent-privilege-model.md:94`) | **None beyond install-time grants.** `SeBackupPrivilege` and the ETW-enabling group membership are already provisioned; the `software` source needs no extra privilege beyond the account's existing registry-read access. | 2026-09-07, bare-metal, captured as `SYSTEM` — broader privilege than the deployed service account; no OS-level read was reached in this capture (see Caveats) | Not observed in this capture. The Windows legs never fall back to a poll (they are all `supported`, not `constrained`) — a refused read would surface as an `error\|` line from the underlying Win32 call, not a degrade. |
-| macOS | **root** (LaunchDaemon, no `UserName` — `docs/agent-privilege-model.md:94`) | Endpoint Security process capture needs root **and** the `com.apple.developer.endpoint-security.client` entitlement; without both, `es_new_client`/`es_subscribe` fails and the process/tcp legs self-heal to the `KERN_PROC_ALL`/`proc_pidfdinfo` poll (`tar_proc_es.cpp:302-307`). | 2026-09-07, bare-metal, captured at **euid 501 (jsmith)** — unprivileged; the root LaunchDaemon path was not exercised by this capture. | A missing entitlement/privilege never blocks the leg outright — it logs a warning and falls back to the poll (`tar_proc_es.cpp:302-307`). |
-| Linux | Agent account with `cap_dac_read_search` set on the binary (`docs/agent-privilege-model.md:94`); not root | None beyond the binary capability. Service enumeration (`systemctl`) runs as bounded argv under the agent account, not elevated. | 2026-09-06, container, captured at **euid 0 (root)** — broader than the deployed `cap_dac_read_search` account. | Not observed in this capture. |
+| Windows | Agent service account (LocalSystem today, #1442; the `tar.*` row of `docs/agent-privilege-model.md` lists `SeBackupPrivilege` and `Performance Log Users` for the intended account; the only TAR code that enables `SeBackupPrivilege` and `SeRestorePrivilege` is the `mapdrive` history backfill, and only for the span of mounting a logged-out profile's offline `NTUSER.DAT`) | **None beyond the service account's own rights.** LocalSystem already satisfies the ETW session requirements; the `software` source needs no extra privilege beyond the account's existing registry-read access. The `netqual` source needs an elevated agent: a non-elevated agent records nothing and `status` reports `netqual_capture_method=none`. | 2026-09-07, bare-metal, captured as `SYSTEM` — broader privilege than the deployed service account; no OS-level read was reached in this capture (see Caveats) | Not observed in this capture. Not every Windows leg is plain `supported`: `process` falls back to a `CreateToolhelp32Snapshot` poll if the ETW session cannot start, and `netqual` and `power` are `constrained`. For the other Windows legs a refused read is expected to surface as an `error\|` line from the underlying Win32 call rather than a degrade (inferred from the code, not shown in the capture). |
+| macOS | **root** (LaunchDaemon, no `UserName`; see the TL;DR and the `tar.*` row of `docs/agent-privilege-model.md`) | Endpoint Security process capture needs root **and** the `com.apple.developer.endpoint-security.client` entitlement; without both, `es_new_client`/`es_subscribe` fails and the process/tcp legs self-heal to the `KERN_PROC_ALL`/`proc_pidfdinfo` poll (`ProcEsCollector::start`). The `nstat` flow source (`tcp`, `netqual`) likewise needs root for system-wide visibility. | 2026-09-07, bare-metal, captured at **euid 501**, an ordinary user account; the root LaunchDaemon path was not exercised by this capture. | A missing entitlement/privilege never blocks the leg outright — it logs a warning and falls back to the poll (`ProcEsCollector::start`). |
+| Linux | Agent account (`yuzu-agent` on the packaged unit); not root. The `tar.*` row of `docs/agent-privilege-model.md` assumes `cap_dac_read_search` set on the binary by `scripts/install-agent-user.sh` | A file capability on the binary does not take effect under the packaged unit's `NoNewPrivileges=true`, so on the packaged unit the working route is `AmbientCapabilities=CAP_DAC_READ_SEARCH` in a drop-in (not measured for this plugin). Service enumeration (`systemctl`) runs as bounded argv under the agent account, not elevated. | 2026-09-06, container, captured at **euid 0 (root)** — broader than the deployed unprivileged account. | Not observed in this capture. |
 
 Binaries/subprocesses/network: `systemctl list-units --type=service --all --plain --no-pager --no-legend` and
-`launchctl list` (both via the shared bounded-argv runner `yuzu::agent::run_bounded_subprocess`,
-never a shell string — `tar_service_collector.cpp:244-247,277,305-306,329`; the same runner
-executes `smbstatus` and `wevtutil` for the mapdrive collector, in `enumerate_mapdrive` and
-`enumerate_mapdrive_history`); a
-Windows ETW session on provider `Microsoft-Windows-Kernel-Process`
-(`tar_proc_etw.cpp:48-49,337,349,370,383,397`) and a second ETW session for module-load capture
-(`ModuleEtwCollector::start()` in `tar_module_etw.cpp`); an in-process macOS Endpoint Security client
-(`tar_proc_es.cpp:295-300,309-314`); raw sockets — `PF_SYSTEM`/`SYSPROTO_CONTROL` for the macOS nstat
-client (`tar_netqual_nstat.cpp:906,938`) and `AF_NETLINK`/`NETLINK_SOCK_DIAG` on Linux
-(`tar_network_collector.cpp:529`). No `popen`, `CreateProcess`, or `posix_spawn` call exists
-anywhere in the plugin's 48 source files.
+`launchctl list` (both through the shared bounded-argv runner `yuzu::agent::run_bounded_subprocess`,
+never a shell string; see `enumerate_services`). The same runner executes `smbstatus`, `wevtutil`
+and `journalctl` for the mapdrive collector (`enumerate_mapdrive`, `enumerate_mapdrive_history`).
+Windows runs an ETW session on provider `Microsoft-Windows-Kernel-Process`
+(`ProcEtwCollector::start`) and a second session for module-load capture
+(`ModuleEtwCollector::start`). macOS runs an in-process Endpoint Security client
+(`ProcEsCollector::start`) and a `PF_SYSTEM`/`SYSPROTO_CONTROL` socket for the nstat client
+(`NstatClient::start`); Linux opens an `AF_NETLINK`/`NETLINK_SOCK_DIAG` socket for TCP quality
+(`collect_tcp_quality`). No `popen`, `CreateProcess` or `posix_spawn` call exists anywhere under
+`agents/plugins/tar/src`.
 
 ## Data contract
 
@@ -186,10 +340,10 @@ anywhere in the plugin's 48 source files.
 
 Every action writes its response as a sequence of independent lines (one `ctx.write_output` call
 per line); most, but not all, actions follow the plugin-wide `discriminator\|field\|field...`
-pipe-delimited convention (`tar_status_format.hpp:3-20`, `tar_collectors.hpp:39-57`). The four
+pipe-delimited convention (see `tar_status_format.hpp` and `tar_collectors.hpp`). The four
 collection actions share one line shape, `tar\|collect_<leg>\|<events_recorded>\|<token>`, where
 `<token>` is one of `source_disabled`, `unsupported_platform`, `baseline`, `sample_recorded`,
-`apps_recorded`, `cursor_advanced`, `cursor_lost`, `capture_incomplete`, `counters_unavailable`, `state_unreadable` (the `kCollectStatus*` tokens in `tar_collectors.hpp`; `state_unreadable` is emitted by `skip_token()` in `tar_plugin.cpp`).
+`apps_recorded`, `cursor_advanced`, `cursor_lost`, `capture_incomplete`, `counters_unavailable`, `state_unreadable` (the `kCollectStatus*` tokens in `tar_collectors.hpp`; `state_unreadable` is emitted by `skip_token()` in `tar_plugin.cpp`). Cursor sources (`power`, `removable`, `registry`) add their own `tar|collect_<source>|<n>|<token>` line to the `collect_slow` stream.
 `status`'s wire format is line-oriented `key\|value` pairs (`storage_state\|ok`,
 `record_count\|<n>`, `config\|<key>\|<value>`, ...), not one positional row — the five YAML columns
 below correspond to five of those lines; the rest (`config\|*`, `retention_guard\|*`,
@@ -369,19 +523,18 @@ same convention. A failed perf/procperf counter read reports `counters_unavailab
 `{"source":"<name>","rows_deleted":<n>,"status":"purged"}` (see `do_purge_source` in `tar_plugin.cpp`), or an
 `error|` line if the named source is unknown, still enabled, or its enable flag cannot be read (`config_unreadable`).
 
-**Empty-result / not-yet-collected convention.** `module` (image-load capture) has a Windows collector
-(ETW); on Linux and macOS it ships its schema and config key with no collector registered yet —
-the `$Module_*` tables stay queryable and empty there, which means "not yet collecting," never
-"nothing happened" (`tar.yaml` `module_enabled` description). `power` and `removable` were in this state until PRs #4017/#4023 landed real
-collectors for all three OSes on both (the `power` and `removable` entries of `build_sources()` in
-`tar_schema_registry.cpp`); see How it works.
+**Empty-result / not-yet-collected convention.** A `planned` leg (see Capture sources by OS) ships
+its schema and config key with no collector, so its `$..._*` tables stay queryable and empty,
+which means "not yet collecting", never "nothing happened". `module` is the clearest case: Windows
+has a collector (ETW), Linux and macOS do not. The `registry` source is `unsupported` off Windows:
+the Windows registry does not exist there, so it records nothing and `compatibility` says so.
 
 ### Result status
 
 TAR sets a typed `plugin_result_status` in exactly one place in the whole plugin: `do_snapshot`
 calls `ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
 "tar:snapshot_skipped_sources")` when any capture source retained a stale baseline instead of
-collecting during a forced snapshot (`tar_plugin.cpp:2889-2894`). No other action — including
+collecting during a forced snapshot. No other action — including
 `status`, `query`, `sql`, `rollup`, `collect_fast`/`collect_slow`, and the early `db_` guard that
 every action shares — ever calls the setter, so the agent records the default `UNDECLARED` /
 `UNKNOWN` for everything else, exactly as every sample below shows.
@@ -390,8 +543,8 @@ every action shares — ever calls the setter, so the agent records the default 
 |---|---|---|---|
 | `CONSTRAINED` | `PARTIAL` | `tar:snapshot_skipped_sources` | `snapshot` only, when `collect_or_retain` skipped at least one enabled source this pass. |
 | `UNDECLARED` (default) | `UNKNOWN` | *(empty)* | Every other action and every early-return path, including the `db_`-not-open guard. |
-| *(not a `set_result_status` call)* | *(n/a)* | `linux:netlink:remove:` | Not an action-level result status — the literal prefix of the per-row `evidence` column the Linux `removable` cursor-source writes on a normal `detached` device event (udev netlink), followed by the device name; the event itself is a successful capture, not a degraded read (`tar_removable_collector.cpp:898`). |
-| *(not a `set_result_status` call)* | *(n/a)* | `macos:diskarbitration:` | Same, on macOS: the literal prefix of `evidence` the DiskArbitration `removable` cursor-source writes on a normal `attached`/`detached` device event, followed by the BSD device name (`tar_removable_collector.cpp:477`). |
+| *(not a `set_result_status` call)* | *(n/a)* | `linux:netlink:remove:` | Not an action-level result status — the literal prefix of the per-row `evidence` column the Linux `removable` cursor-source writes on a normal `detached` device event (udev netlink), followed by the device name; the event itself is a successful capture, not a degraded read (`tar_removable_collector.cpp`). |
+| *(not a `set_result_status` call)* | *(n/a)* | `macos:diskarbitration:` | Same, on macOS: the literal prefix of `evidence` the DiskArbitration `removable` cursor-source writes on a normal `attached`/`detached` device event, followed by the BSD device name (`tar_removable_collector.cpp`). |
 
 ### Where the data goes
 
@@ -400,19 +553,20 @@ every action shares — ever calls the setter, so the agent records the default 
   queryable at `/api/responses/{id}` and rendered by the `/tar` dashboard
   (`docs/tar-dashboard.md`, `docs/tar-implementer.md`).
 - **`fleet_snapshot`** feeds the server-side `FleetTopologyStore` on a cache miss, assembling the
-  3D `/viz/fleet` topology view (`tar.yaml:900-901`); it is not itself a warehouse read.
+  3D `/viz/fleet` topology view (the `fleet_snapshot` definition in `tar.yaml`); it is not itself a warehouse read.
 - **`rollup`/`purge_source`** mutate `tar.db` directly (aggregation, retention, source purge) — their
   effect is visible through later `status`/`query`/`sql` reads, not a separate sink.
 - **Not consumed by** daily-sync inventory, DEX, or metrics — TAR has no `/metrics` endpoint;
   `status`'s retention-guard counters are the plugin's only fleet-readable health signal
-  (`tar_plugin.cpp:2424-2431`).
+  (`do_status` in `tar_plugin.cpp` and `format_retention_guard_lines` in `tar_aggregator.hpp`).
 - **Sensitivity.** `user` events name the logged-in account; `process` events carry the invoking
-  user and full command line (redacted only against the configured `*password*`-style substring
-  patterns); `network`/`arp` events carry remote IP/MAC addresses (device identifiers) and
+  user and, on Linux only, the command line (Windows and macOS capture names only; where a command
+  line is kept it is redacted only against the configured `*password*`-style substring patterns); `network`/`arp` events carry remote IP/MAC addresses (device identifiers) and
   the owning `process_name`; the `software` source is an installed-software inventory
   (name/publisher/version) reachable via `query type=software`/`sql`; `dns`/`mapdrive` add
   resolved hostnames and mapped-drive usernames/remote hosts; `removable` events name an
-  attached device's vendor/product/serial and its BSD/udev device name.
+  attached device's vendor/product/serial and its BSD/udev device name; `registry` rows hold the
+  old and new data of every changed watched value, unmasked.
 - **Siblings:** `crossplatform.tar.*` (this plugin) is standalone; the `installed_software`
   daily-sync source (ADR-0016) is a separate, machine-scope inventory feed, distinct from TAR's
   `software` capture source.
@@ -636,72 +790,30 @@ three broken legs; it is one chokepoint. See Caveats item 1.
 
 ## Caveats and known gaps
 
-1. **One `db_` chokepoint gates all 14 actions, and the capture driver never opens it.**
-   `execute()` returns `error|TAR database not initialized` / rc 1 before the 14-way action dispatch
-   whenever the member `db_` is null (`tar_plugin.cpp:1037-1041`); `db_` is populated only inside
-   `init()`, which opens `tar.db` via `TarDatabase::open` (`tar_plugin.cpp:580-586`). The
-   `plugin-capture` driver loads the plugin through `PluginHandle::load` + `LocalDispatcher::run`
-   without calling `init()`, so every action in the samples above — including `compatibility`,
-   which needs no database at all — fails identically at the same guard rather than exercising its
-   own OS leg.
-2. **`rollup` is Destructive/Irreversible, and its wire format does not match its declared
-   columns.** `do_rollup` always runs `run_aggregation()` before unconditionally calling
-   `run_retention()`, which permanently deletes aged rows (`tar_plugin.cpp:3619-3627`) — the basis
-   for its `Destructive`/`Irreversible` capability declaration. Its actual response line is
-   `tar|rollup|<n>|rows_aggregated`, a single positional line; the declared `status` column is
-   never populated. `snapshot`'s declared `events_recorded` column has the same gap — its line is
-   `tar|snapshot|complete`/`partial|<sources>` with no numeric count (`tar_capture_status.hpp:210-220`).
-3. **`purge_source` refuses to run while its source is enabled, or while its enable flag cannot be read
-   (`config_unreadable`: it cannot confirm the source is disabled).** It requires the named source to
-   already be disabled, holding `collect_mu_` (and `software_collect_mu_` for `software`) across
-   both the enabled-check and the delete to close the scan-then-purge race a concurrent re-enable
-   would otherwise open (`do_purge_source` in `tar_plugin.cpp`).
-4. **Several legs are declared but not implemented.** `collect_perf` on macOS (`host_statistics`)
-   and `collect_software` on Linux/macOS (`dpkg_rpm`/`pkgutil`) are `planned`, not `constrained` —
-   no macOS code path exists in `tar_perf.cpp` or `tar_proc_perf.cpp` at all
-   (confirmed absent by direct read, not merely unused), and the non-Windows branch of
-   `tar_software_collector.cpp` is a stub returning empty. `netconn` and `dns` are likewise
-   `planned` (no-op) on Linux and macOS. A `planned` leg's table is queryable and empty, which
-   means "not yet collecting," never "nothing happened."
-5. **Cursor-model sources never silently replay or wipe.** `power` and `removable` are the first
-   two live `CursorSource` instances (`tar_cursor_sources.cpp:30-35`); a lost/invalid cursor or a
-   wrapped log emits a `capture_gap` event and re-baselines forward at the log's current end rather
-   than replaying from zero (`tar_cursor.hpp:25-75`); a transient read failure throws
-   `IncompleteCaptureError` and retains the cursor instead. The same discipline applies to bulk
-   deletes: `run_retention`'s clock guard *declines* a pass that looks like a wall-clock jump
-   (counted in `retention_guard_declines_total`) rather than deleting on an implausible reading,
-   and separately counts read/delete failures (`retention_guard_failures_total`) so a silently
-   unretained table is still visible on `status` (`tar_aggregator.hpp:147-252`). The mapped-drive
-   historical backfill applies the same never-silently-lose-it discipline to its own gap: a
-   profile the init-time first pass could not read — not_found, privilege_missing, mount_failed, a
-   refused hive file (the default offline hive-file guard, related issue #5291), a failed inner
-   registry read, or a walk the row cap cut short, not_found included — is retried individually
-   afterwards, up to 7 acquisition attempts in total (the first pass counts as attempt 1), no more
-   often than once per 24 h per profile, checked at service start and again before each slow-tick
-   collection but never inside the shared collection lock (the retry's own enumeration runs
-   unlocked; only its claim and its commit take `collect_mu_`, each briefly), until it resolves or
-   is abandoned without a further mount. A walk that reads a profile only up to the row cap
-   counts that read as an attempt like any other. A hive mount that exceeds its 30 s bound counts
-   as one attempt and ends that run's mounting: the profiles after it are listed but not tried
-   and not charged an attempt. The abandoned mount thread is not stopped: it keeps the
-   process-wide hive lock and the backup/restore privileges, and a thread stuck after a successful
-   load keeps that profile's hive mounted and its `NTUSER.DAT` locked, until the mount returns;
-   no new mount is started while it is still running, so no profile is charged for waiting behind
-   it. Because any mount thread, abandoned or not, can still be running plugin code when the agent
-   shuts down, the plugin module is pinned in memory before the first mount and stays loaded for
-   the life of the process. If the pin cannot be taken (logged at error level), no hive is read
-   until the agent is restarted, live profiles included, and every profile stays pending. While an
-   abandoned mount is still running, later runs read no hive either and charge no profile. The
-   retry's insert is duplicate-free against what is already recorded (`mapdrive_live`'s `origin='historical'` rows): a mapping already recorded
-   keeps its first-recorded timestamp, never overwritten by a later retry that re-observes it. A
-   ProfileList walk that is itself permanently incomplete (a terminating registry error on every
-   attempt) leaves its pending profiles neither resolved nor retried further that run; tracked as
-   a follow-up, not fixed here. An operator purge of this source (`tar.purge_source mapdrive`)
-   also clears the pending-retry list, not just the warehouse rows it deletes — left alone, a
-   still-pending profile's next retry would otherwise re-enumerate and re-insert exactly the rows
-   the purge just removed; the retry's own commit phase separately re-checks that its claim on the
-   pending list is still the one it made before inserting or overwriting anything, so a purge
-   racing an in-flight retry is dropped rather than resurrected either.
+1. **No sample exercises a real action.** `execute()` returns `error|TAR database not initialized`
+   with rc 1 whenever the plugin's database handle is null, and that handle is opened only by
+   `init()` (through `TarDatabase::open`), which the `plugin-capture` driver never calls. Every
+   action in the samples above, including `compatibility` which needs no database, fails at that
+   one guard, so the samples show only that the plugin loads.
+2. **`rollup` is Destructive/Irreversible and its output is positional.** `do_rollup` always runs
+   `run_aggregation()` before `run_retention()`, which permanently deletes aged rows. Its response
+   is the single line `tar|rollup|<n>|rows_aggregated`, so the declared `status` column is never
+   populated, and `snapshot` has the same gap (`tar|snapshot|complete` or `partial|<sources>`
+   carries no event count).
+3. **`retention_days` does not set how long data is kept.** The setting is validated, stored and
+   echoed by `status`, but `run_retention` prunes each tier against the window in the schema
+   registry (row-count caps on live tables, typically 24 hours for hourly, 31 days for daily and
+   about a year for monthly). Changing it alters nothing that is deleted.
+4. **Several legs are declared but have no collector.** `perf` and `procperf` on macOS,
+   `software` on Linux and macOS, `module` on Linux and macOS, and `dns` and `netconn` on Linux and
+   macOS are `planned`: no code path exists for them (confirmed absent in `tar_perf.cpp`,
+   `tar_proc_perf.cpp` and the non-Windows branch of `tar_software_collector.cpp`). A `planned`
+   leg's table is queryable and empty, which means "not yet collecting", never "nothing happened".
+5. **Registry capture stores values unmasked and does not name the writer.** Every watched value,
+   changed or not, is readable through `sql` (the per-key baseline in `tar_state` holds the current
+   values, for example a Winlogon autologon `DefaultPassword`), and every row's `actor_pid` is 0.
+   A value written and reverted between two reads is not recorded, and a user hive that loads at
+   logon is baselined silently at its first read.
 
 ## Source and tests
 
@@ -709,7 +821,7 @@ three broken legs; it is one chokepoint. See Caveats item 1.
 - Plugin: `agents/plugins/tar/src/tar_aggregator.cpp` · `agents/plugins/tar/src/tar_aggregator.hpp` · `agents/plugins/tar/src/tar_arp_collector.cpp` · `agents/plugins/tar/src/tar_arp_parsers.hpp` · `agents/plugins/tar/src/tar_capture_status.hpp` · `agents/plugins/tar/src/tar_collectors.hpp` · `agents/plugins/tar/src/tar_cursor.hpp` · `agents/plugins/tar/src/tar_cursor_sources.cpp` · `agents/plugins/tar/src/tar_db.cpp` · `agents/plugins/tar/src/tar_db.hpp` · `agents/plugins/tar/src/tar_diff.cpp` · `agents/plugins/tar/src/tar_dns_collector.cpp` · `agents/plugins/tar/src/tar_fleet_snapshot.cpp` · `agents/plugins/tar/src/tar_fleet_snapshot.hpp` · `agents/plugins/tar/src/tar_local_image_path.hpp` · `agents/plugins/tar/src/tar_mapdrive_backfill.hpp` · `agents/plugins/tar/src/tar_mapdrive_collector.cpp` · `agents/plugins/tar/src/tar_mapdrive_macos_parsers.hpp` · `agents/plugins/tar/src/tar_module_etw.cpp` · `agents/plugins/tar/src/tar_module_etw.hpp` · `agents/plugins/tar/src/tar_module_stream.cpp` · `agents/plugins/tar/src/tar_module_stream.hpp` · `agents/plugins/tar/src/tar_netconn.hpp` · `agents/plugins/tar/src/tar_netconn_win.cpp` · `agents/plugins/tar/src/tar_netqual.hpp` · `agents/plugins/tar/src/tar_netqual_boot.cpp` · `agents/plugins/tar/src/tar_netqual_boot.hpp` · `agents/plugins/tar/src/tar_netqual_nstat.cpp` · `agents/plugins/tar/src/tar_netqual_nstat.hpp` · `agents/plugins/tar/src/tar_network_collector.cpp` · `agents/plugins/tar/src/tar_perf.cpp` · `agents/plugins/tar/src/tar_perf.hpp` · `agents/plugins/tar/src/tar_plugin.cpp` · `agents/plugins/tar/src/tar_power_collector.cpp` · `agents/plugins/tar/src/tar_power_parsers.hpp` · `agents/plugins/tar/src/tar_proc_es.cpp` · `agents/plugins/tar/src/tar_proc_es.hpp` · `agents/plugins/tar/src/tar_proc_etw.cpp` · `agents/plugins/tar/src/tar_proc_etw.hpp` · `agents/plugins/tar/src/tar_proc_perf.cpp` · `agents/plugins/tar/src/tar_proc_perf.hpp` · `agents/plugins/tar/src/tar_proc_stream.cpp` · `agents/plugins/tar/src/tar_proc_stream.hpp` · `agents/plugins/tar/src/tar_registry_parsers.hpp` · `agents/plugins/tar/src/tar_registry_source.cpp` · `agents/plugins/tar/src/tar_registry_source.hpp` · `agents/plugins/tar/src/tar_removable_collector.cpp` · `agents/plugins/tar/src/tar_removable_diskarb.mm` · `agents/plugins/tar/src/tar_removable_parsers.hpp` · `agents/plugins/tar/src/tar_schema_registry.cpp` · `agents/plugins/tar/src/tar_schema_registry.hpp` · `agents/plugins/tar/src/tar_service_collector.cpp` · `agents/plugins/tar/src/tar_service_parsers.hpp` · `agents/plugins/tar/src/tar_software_collector.cpp` · `agents/plugins/tar/src/tar_software_core.cpp` · `agents/plugins/tar/src/tar_software_core.hpp` · `agents/plugins/tar/src/tar_source_health.hpp` · `agents/plugins/tar/src/tar_sql_executor.cpp` · `agents/plugins/tar/src/tar_sql_executor.hpp` · `agents/plugins/tar/src/tar_status_format.hpp` · `agents/plugins/tar/src/tar_usage.cpp` · `agents/plugins/tar/src/tar_usage.hpp` · `agents/plugins/tar/src/tar_user_collector.cpp` · `agents/plugins/tar/src/tar_version.hpp` · `agents/plugins/tar/src/tar_win_raii_guards.hpp`
 - Definitions: `content/definitions/tar.yaml` · `content/definitions/tar_warehouse.yaml`
 - Capability rows: `server/core/src/capability_decls/core_dispatch_capabilities.hpp` · `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
-- Tests: `tests/test_tar_mapdrive_pin_lexical.py` · `tests/test_tar_timeline_script_behaviour.py` · `tests/unit/server/test_tar_process_tree.cpp` · `tests/unit/server/test_tar_timeline_page.cpp` · `tests/unit/server/test_tar_timeline_render.cpp` · `tests/unit/server/test_tar_tree_routes.cpp` · `tests/unit/test_tar_aggregator.cpp` · `tests/unit/test_tar_arp.cpp` · `tests/unit/test_tar_capability_table.cpp` · `tests/unit/test_tar_capture_status.cpp` · `tests/unit/test_tar_cursor.cpp` · `tests/unit/test_tar_diff.cpp` · `tests/unit/test_tar_local_dispatcher.cpp` · `tests/unit/test_tar_mapdrive.cpp` · `tests/unit/test_tar_module_etw.cpp` · `tests/unit/test_tar_module_stream.cpp` · `tests/unit/test_tar_netconn.cpp` · `tests/unit/test_tar_netqual_nstat.cpp` · `tests/unit/test_tar_perf.cpp` · `tests/unit/test_tar_power.cpp` · `tests/unit/test_tar_proc_es.cpp` · `tests/unit/test_tar_proc_etw.cpp` · `tests/unit/test_tar_proc_perf.cpp` · `tests/unit/test_tar_registry_source.cpp` · `tests/unit/test_tar_removable.cpp` · `tests/unit/test_tar_schema_registry.cpp` · `tests/unit/test_tar_service.cpp` · `tests/unit/test_tar_software.cpp` · `tests/unit/test_tar_source_health.cpp` · `tests/unit/test_tar_store.cpp` · `tests/unit/test_tar_usage.cpp` · `tests/unit/test_tar_warehouse.cpp` · `tests/unit/test_tar_win_raii_guards.cpp`
+- Tests: `tests/test_tar_mapdrive_pin_lexical.py` · `tests/test_tar_timeline_script_behaviour.py` · `tests/unit/server/test_tar_process_tree.cpp` · `tests/unit/server/test_tar_retention_tiers.cpp` · `tests/unit/server/test_tar_timeline_page.cpp` · `tests/unit/server/test_tar_timeline_render.cpp` · `tests/unit/server/test_tar_tree_routes.cpp` · `tests/unit/test_tar_aggregator.cpp` · `tests/unit/test_tar_arp.cpp` · `tests/unit/test_tar_capability_table.cpp` · `tests/unit/test_tar_capture_status.cpp` · `tests/unit/test_tar_cursor.cpp` · `tests/unit/test_tar_diff.cpp` · `tests/unit/test_tar_local_dispatcher.cpp` · `tests/unit/test_tar_mapdrive.cpp` · `tests/unit/test_tar_module_etw.cpp` · `tests/unit/test_tar_module_stream.cpp` · `tests/unit/test_tar_netconn.cpp` · `tests/unit/test_tar_netqual_nstat.cpp` · `tests/unit/test_tar_perf.cpp` · `tests/unit/test_tar_power.cpp` · `tests/unit/test_tar_proc_es.cpp` · `tests/unit/test_tar_proc_etw.cpp` · `tests/unit/test_tar_proc_perf.cpp` · `tests/unit/test_tar_registry_source.cpp` · `tests/unit/test_tar_removable.cpp` · `tests/unit/test_tar_retention_tiers_table.cpp` · `tests/unit/test_tar_schema_registry.cpp` · `tests/unit/test_tar_service.cpp` · `tests/unit/test_tar_software.cpp` · `tests/unit/test_tar_source_health.cpp` · `tests/unit/test_tar_store.cpp` · `tests/unit/test_tar_usage.cpp` · `tests/unit/test_tar_warehouse.cpp` · `tests/unit/test_tar_win_raii_guards.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-14-dex-tar-titles.changed.md` · `changelog.d/2026-10-21-tar-all-sources-default-on.changed.md` · `changelog.d/2026-10-21-tar-mapdrive-history-backfill.fixed.md` · `changelog.d/2026-10-21-tar-timeline-render.added.md` · `changelog.d/2026-10-21-tar-windows-image-db-hardening.security.md` · `changelog.d/2026-10-23-tar-timeline-page.added.md` · `changelog.d/2026-10-25-tar-regchange-source.added.md` · `changelog.d/20261014-tar-adhoc-sql-moved.changed.md` · `changelog.d/20261021-tar-capture-sources-paused-core.fixed.md`
+- Changelog: `changelog.d/2026-10-14-dex-tar-titles.changed.md` · `changelog.d/2026-10-21-tar-all-sources-default-on.changed.md` · `changelog.d/2026-10-21-tar-mapdrive-history-backfill.fixed.md` · `changelog.d/2026-10-21-tar-timeline-render.added.md` · `changelog.d/2026-10-21-tar-windows-image-db-hardening.security.md` · `changelog.d/2026-10-23-tar-timeline-page.added.md` · `changelog.d/2026-10-25-tar-regchange-source.added.md` · `changelog.d/2026-10-25-tar-retention-tiers-api.added.md` · `changelog.d/2026-10-26-tar-tiers-data-page.added.md` · `changelog.d/20261014-tar-adhoc-sql-moved.changed.md` · `changelog.d/20261021-tar-capture-sources-paused-core.fixed.md`
 <!-- END GENERATED -->

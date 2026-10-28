@@ -7,10 +7,9 @@
  *
  * Pins three contracts called out in #117 (response-streaming coverage):
  *
- *   1. record_execution_id() registers the command_id → execution_id
+ *   1. record_command_dispatch() registers the command_id → (plugin, execution_id)
  *      mapping consumed at response receipt; passing an empty
- *      execution_id removes the entry (the documented "clear" semantics
- *      from agent_service_impl.cpp:586).
+ *      execution_id keeps the recorded one (it never clears it).
  *
  *   2. process_gateway_response() stamps execution_id onto every
  *      StoredResponse (RUNNING and terminal branches both), so the
@@ -48,7 +47,9 @@
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "test_auth_db_pg_helper.hpp" // WS-6 6.2: enrollment state is PG-backed
+#include "test_forensics_tier_fixture.hpp" // #4990: the catalogue-derived Forensics plugin set
 #include "test_offload_target_store_pg_helper.hpp"
+#include "test_provenance_fake.hpp" // #4990: harness record source when no tracker is wired
 #include "test_tracker_scope.hpp"
 #include "test_webhook_store_pg_helper.hpp"
 #include "typed_inventory_sources.hpp"
@@ -84,6 +85,12 @@ using yuzu::server::OffloadAuthType;
 using yuzu::server::OffloadTargetStore;
 using yuzu::server::ResponseStore;
 using yuzu::server::StoredResponse;
+
+// #4990: reads in this file are test oracles, not an operator surface, so they take no tier
+// restriction (the tier itself is pinned in test_response_store.cpp / test_response_tier_filter.cpp).
+namespace {
+const auto kAllRows = yuzu::server::ResponseTierFilter::unrestricted_internal_consumer();
+} // namespace
 using yuzu::server::WebhookStore;
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::AgentServiceImpl;
@@ -178,6 +185,12 @@ struct GatewayResponseHarness {
         REQUIRE(audit->is_open());
         svc.set_response_store(&responses);
         svc.set_audit_store(audit.get());
+        // #4990: unwired fails closed (error_detail is sanitized for every plugin), so the
+        // ordinary-plugin cases below need the set wired like production.
+        svc.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
+        // #4990: a frame's plugin comes from a dispatch record; without a tracker this harness
+        // answers with the id's prefix (a TrackerScope clears it and reads real records).
+        yuzu::test::use_prefix_provenance(svc);
     }
 
     static apb::CommandResponse make_response(const std::string& command_id,
@@ -204,23 +217,23 @@ struct GatewayResponseHarness {
 // in svc is nulled before the tracker destructs (mirrors the production
 // shutdown contract documented on AgentServiceImpl::set_execution_tracker).
 
-// ── record_execution_id ────────────────────────────────────────────────────
+// ── record_command_dispatch ────────────────────────────────────────────────
 
-TEST_CASE("record_execution_id: terminal response stamps mapped execution_id",
+TEST_CASE("record_command_dispatch: terminal response stamps mapped execution_id",
           "[pg][agent_service][executions][pr2]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
-    // HA WS-1(1b): record_execution_id now routes through ExecutionTracker
+    // HA WS-1(1b): record_command_dispatch routes through ExecutionTracker
     // (PG-backed), so this test needs one wired — mirrors the #872 tests.
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-A", "exec-42");
+    h.svc.record_command_dispatch("cmd-A", "echo", "exec-42");
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS,
                                                       /*output=*/"", /*exit_code=*/0);
     h.svc.process_gateway_response("agent-1", resp);
 
-    auto rows_opt = h.responses.query_by_execution("exec-42");
+    auto rows_opt = h.responses.query_by_execution("exec-42", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
@@ -230,26 +243,25 @@ TEST_CASE("record_execution_id: terminal response stamps mapped execution_id",
     CHECK(rows[0].status == static_cast<int>(apb::CommandResponse::SUCCESS));
 }
 
-TEST_CASE("record_execution_id: empty execution_id removes the mapping",
+TEST_CASE("record_command_dispatch: an empty execution_id never erases a recorded one",
           "[pg][agent_service][executions][pr2]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-A", "exec-42");
-    h.svc.record_execution_id("cmd-A", ""); // documented clear semantics
+    h.svc.record_command_dispatch("cmd-A", "echo", "exec-42");
+    // A re-drive of the same occurrence that does not carry the execution id (#4990): the record
+    // keeps the correlation, and the plugin stays the first writer's.
+    h.svc.record_command_dispatch("cmd-A", "echo", "");
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", resp);
 
-    auto by_exec = h.responses.query_by_execution("exec-42");
+    auto by_exec = h.responses.query_by_execution("exec-42", kAllRows);
     REQUIRE(by_exec.has_value());
-    CHECK(by_exec->empty()); // mapping cleared → row not tagged
-    auto by_cmd_opt = h.responses.get_by_instruction("cmd-A");
-    REQUIRE(by_cmd_opt.has_value());
-    const auto& by_cmd = *by_cmd_opt;
-    REQUIRE(by_cmd.size() == 1);
-    CHECK(by_cmd[0].execution_id.empty());
+    REQUIRE(by_exec->size() == 1);
+    CHECK((*by_exec)[0].execution_id == "exec-42");
+    CHECK((*by_exec)[0].plugin == "echo");
 }
 
 // ── process_gateway_response: per-status branches ──────────────────────────
@@ -264,14 +276,14 @@ TEST_CASE("process_gateway_response: RUNNING streaming row carries execution_id"
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-stream", "exec-stream");
+    h.svc.record_command_dispatch("cmd-stream", "echo", "exec-stream");
 
     auto running =
         GatewayResponseHarness::make_response("cmd-stream", apb::CommandResponse::RUNNING,
                                               /*output=*/"row-1");
     h.svc.process_gateway_response("agent-1", running);
 
-    auto rows_opt = h.responses.query_by_execution("exec-stream");
+    auto rows_opt = h.responses.query_by_execution("exec-stream", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
@@ -285,7 +297,7 @@ TEST_CASE("process_gateway_response: FAILURE preserves error_detail and executio
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-fail", "exec-fail");
+    h.svc.record_command_dispatch("cmd-fail", "echo", "exec-fail");
 
     auto resp = GatewayResponseHarness::make_response("cmd-fail", apb::CommandResponse::FAILURE,
                                                       /*output=*/"",
@@ -293,7 +305,7 @@ TEST_CASE("process_gateway_response: FAILURE preserves error_detail and executio
     resp.mutable_error()->set_message("plugin returned non-zero");
     h.svc.process_gateway_response("agent-1", resp);
 
-    auto rows_opt = h.responses.query_by_execution("exec-fail");
+    auto rows_opt = h.responses.query_by_execution("exec-fail", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
@@ -322,7 +334,7 @@ TEST_CASE("process_gateway_response: a #4672 synthetic gateway-forward terminal 
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-gwfwd", "exec-gwfwd");
+    h.svc.record_command_dispatch("cmd-gwfwd", "echo", "exec-gwfwd");
 
     auto synth = yuzu::server::build_gateway_forward_terminal_failure(
         "cmd-gwfwd", "gateway_unauthenticated",
@@ -330,7 +342,7 @@ TEST_CASE("process_gateway_response: a #4672 synthetic gateway-forward terminal 
         "not delivered");
     h.svc.process_gateway_response("agent-1", synth);
 
-    auto rows_opt = h.responses.query_by_execution("exec-gwfwd");
+    auto rows_opt = h.responses.query_by_execution("exec-gwfwd", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
@@ -362,7 +374,7 @@ TEST_CASE("process_gateway_response: a command left RUNNING then hit by a #4672 
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-stuck", "exec-stuck");
+    h.svc.record_command_dispatch("cmd-stuck", "echo", "exec-stuck");
 
     auto running = GatewayResponseHarness::make_response(
         "cmd-stuck", apb::CommandResponse::RUNNING, /*output=*/"still going");
@@ -373,7 +385,7 @@ TEST_CASE("process_gateway_response: a command left RUNNING then hit by a #4672 
         "Gateway unreachable after 3 attempts — command not delivered");
     h.svc.process_gateway_response("agent-1", synth);
 
-    auto rows_opt = h.responses.query_by_execution("exec-stuck");
+    auto rows_opt = h.responses.query_by_execution("exec-stuck", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1); // updated in place, not a second orphaned row
@@ -411,7 +423,7 @@ TEST_CASE("process_gateway_response: each of the five #4672 reason codes produce
             yuzu::server::build_gateway_forward_terminal_failure(c.command_id, c.reason, c.reason);
         h.svc.process_gateway_response("agent-1", synth);
 
-        auto by_cmd_opt = h.responses.get_by_instruction(c.command_id);
+        auto by_cmd_opt = h.responses.get_by_instruction(c.command_id, kAllRows);
         REQUIRE(by_cmd_opt.has_value());
         const auto& by_cmd = *by_cmd_opt;
         REQUIRE(by_cmd.size() == 1);
@@ -423,7 +435,7 @@ TEST_CASE("process_gateway_response: each of the five #4672 reason codes produce
 TEST_CASE("process_gateway_response: unmapped command_id stamps empty execution_id",
           "[pg][agent_service][executions][pr2]") {
     // Out-of-band dispatch (CLI / direct gRPC) bypasses the dispatch path
-    // that calls record_execution_id. The receipt path must degrade to an
+    // that calls record_command_dispatch. The receipt path must degrade to an
     // empty execution_id rather than crashing or inventing a value.
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -435,7 +447,7 @@ TEST_CASE("process_gateway_response: unmapped command_id stamps empty execution_
     auto resp = GatewayResponseHarness::make_response("cmd-orphan", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", resp);
 
-    auto by_cmd_opt = h.responses.get_by_instruction("cmd-orphan");
+    auto by_cmd_opt = h.responses.get_by_instruction("cmd-orphan", kAllRows);
     REQUIRE(by_cmd_opt.has_value());
     const auto& by_cmd = *by_cmd_opt;
     REQUIRE(by_cmd.size() == 1);
@@ -470,7 +482,7 @@ TEST_CASE("process_gateway_response: terminal branch does NOT erase mapping "
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-fan", "exec-fan");
+    h.svc.record_command_dispatch("cmd-fan", "echo", "exec-fan");
 
     struct AgentTerminal {
         const char* agent;
@@ -487,7 +499,7 @@ TEST_CASE("process_gateway_response: terminal branch does NOT erase mapping "
         h.svc.process_gateway_response(t.agent, r);
     }
 
-    auto rows_opt = h.responses.query_by_execution("exec-fan");
+    auto rows_opt = h.responses.query_by_execution("exec-fan", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 4);
@@ -511,16 +523,16 @@ TEST_CASE("process_gateway_response: __timing__ sentinel takes the early-return 
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-time", "exec-time");
+    h.svc.record_command_dispatch("cmd-time", "echo", "exec-time");
 
     auto timing = GatewayResponseHarness::make_response("cmd-time", apb::CommandResponse::RUNNING,
                                                         /*output=*/"__timing__|elapsed=42");
     h.svc.process_gateway_response("agent-1", timing);
 
-    auto time_by_exec = h.responses.query_by_execution("exec-time");
+    auto time_by_exec = h.responses.query_by_execution("exec-time", kAllRows);
     REQUIRE(time_by_exec.has_value());
     CHECK(time_by_exec->empty());
-    auto time_by_cmd = h.responses.get_by_instruction("cmd-time");
+    auto time_by_cmd = h.responses.get_by_instruction("cmd-time", kAllRows);
     REQUIRE(time_by_cmd.has_value());
     CHECK(time_by_cmd->empty());
 }
@@ -538,7 +550,7 @@ TEST_CASE("process_gateway_response: terminal SUCCESS folds into existing RUNNIN
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-mix", "exec-mix");
+    h.svc.record_command_dispatch("cmd-mix", "echo", "exec-mix");
 
     auto r1 = GatewayResponseHarness::make_response("cmd-mix", apb::CommandResponse::RUNNING,
                                                     /*output=*/"line-1");
@@ -549,7 +561,7 @@ TEST_CASE("process_gateway_response: terminal SUCCESS folds into existing RUNNIN
     auto r3 = GatewayResponseHarness::make_response("cmd-mix", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", r3);
 
-    auto rows_opt = h.responses.query_by_execution("exec-mix");
+    auto rows_opt = h.responses.query_by_execution("exec-mix", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 2);
@@ -569,12 +581,12 @@ TEST_CASE("process_gateway_response: terminal frame WITH output still inserts",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-direct", "exec-direct");
+    h.svc.record_command_dispatch("cmd-direct", "echo", "exec-direct");
     auto only = GatewayResponseHarness::make_response("cmd-direct", apb::CommandResponse::SUCCESS,
                                                       /*output=*/"final-data");
     h.svc.process_gateway_response("agent-1", only);
 
-    auto rows_opt = h.responses.query_by_execution("exec-direct");
+    auto rows_opt = h.responses.query_by_execution("exec-direct", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
@@ -598,22 +610,22 @@ TEST_CASE("process_gateway_response: re-mapping a command_id updates the stamp",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-re", "exec-old");
+    h.svc.record_command_dispatch("cmd-re", "echo", "exec-old");
     auto first = GatewayResponseHarness::make_response("cmd-re", apb::CommandResponse::RUNNING,
                                                        /*output=*/"old");
     h.svc.process_gateway_response("agent-1", first);
 
-    h.svc.record_execution_id("cmd-re", "exec-new");
+    h.svc.record_command_dispatch("cmd-re", "echo", "exec-new");
     auto second = GatewayResponseHarness::make_response("cmd-re", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", second);
 
-    auto old_rows_opt = h.responses.query_by_execution("exec-old");
+    auto old_rows_opt = h.responses.query_by_execution("exec-old", kAllRows);
     REQUIRE(old_rows_opt.has_value());
     const auto& old_rows = *old_rows_opt;
     REQUIRE(old_rows.size() == 1);
     CHECK(old_rows[0].status == static_cast<int>(apb::CommandResponse::RUNNING));
 
-    auto new_rows_opt = h.responses.query_by_execution("exec-new");
+    auto new_rows_opt = h.responses.query_by_execution("exec-new", kAllRows);
     REQUIRE(new_rows_opt.has_value());
     const auto& new_rows = *new_rows_opt;
     REQUIRE(new_rows.size() == 1);
@@ -2760,7 +2772,7 @@ TEST_CASE("notify_exec_tracker: RUNNING maps to status='running' with "
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
-    h.svc.record_execution_id("cmd-A", exec_id);
+    h.svc.record_command_dispatch("cmd-A", "echo", exec_id);
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::RUNNING,
                                                       /*output=*/"row-1");
@@ -2789,7 +2801,7 @@ TEST_CASE("process_gateway_response: the __keepalive__ sentinel renews the concu
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
-    h.svc.record_execution_id("cmd-keepalive", exec_id);
+    h.svc.record_command_dispatch("cmd-keepalive", "echo", exec_id);
 
     auto ping = GatewayResponseHarness::make_response("cmd-keepalive", apb::CommandResponse::RUNNING,
                                                        /*output=*/"__keepalive__");
@@ -2805,7 +2817,7 @@ TEST_CASE("process_gateway_response: the __keepalive__ sentinel renews the concu
     CHECK(ka_statuses[0].completed_at == 0);
 
     // Did NOT reach ResponseStore::store — no row landed for the drawer/SSE.
-    auto rows_opt = h.responses.query_by_execution(exec_id);
+    auto rows_opt = h.responses.query_by_execution(exec_id, kAllRows);
     REQUIRE(rows_opt.has_value());
     CHECK(rows_opt->empty());
 }
@@ -2818,11 +2830,11 @@ TEST_CASE("notify_exec_tracker: the by-command concurrency-claim fallback fires 
     // renew_concurrency_claim_by_command restore claim release/renewal...",
     // test_execution_tracker.cpp) proves the fallback methods work in
     // isolation. It does NOT prove notify_exec_tracker's own decision logic
-    // (the RUNNING-vs-terminal switch, the resolve_execution_id-miss branch
+    // (the RUNNING-vs-terminal switch, the unrecorded-execution-id branch
     // condition) actually reaches them correctly when driven through the
     // real AgentServiceImpl entry point a live agent connection uses. This
-    // test closes that gap: deliberately never calls record_execution_id
-    // (so resolve_execution_id genuinely misses, matching an unresolved
+    // test closes that gap: deliberately never calls record_command_dispatch
+    // (so the provenance lookup genuinely misses, matching an unresolved
     // workflow-step dispatch or a correlation-table degrade), claims a slot
     // directly on the tracker, then drives real CommandResponses through
     // process_gateway_response and asserts the claim renews then releases.
@@ -2869,7 +2881,7 @@ TEST_CASE("notify_exec_tracker: the by-command concurrency-claim fallback fires 
     // Confirms nothing leaked into the normal execution_id-resolved path
     // (no agent_exec_status row, since no execution was ever created/
     // correlated for this command_id).
-    CHECK(h.responses.query_by_execution("exec-unresolved")->empty());
+    CHECK(h.responses.query_by_execution("exec-unresolved", kAllRows)->empty());
 }
 
 TEST_CASE("notify_exec_tracker: a __guard__- command_id short-circuits the by-command fallback "
@@ -2914,7 +2926,7 @@ TEST_CASE("notify_exec_tracker: SUCCESS maps to status='success' and stamps "
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
-    h.svc.record_execution_id("cmd-A", exec_id);
+    h.svc.record_command_dispatch("cmd-A", "echo", exec_id);
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS,
                                                       /*output=*/"", /*exit_code=*/0);
@@ -2935,7 +2947,7 @@ TEST_CASE("notify_exec_tracker: FAILURE preserves error_detail and exit_code",
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
-    h.svc.record_execution_id("cmd-A", exec_id);
+    h.svc.record_command_dispatch("cmd-A", "echo", exec_id);
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::FAILURE,
                                                       /*output=*/"", /*exit_code=*/3);
@@ -2957,7 +2969,7 @@ TEST_CASE("notify_exec_tracker: TIMEOUT maps to status='timeout'",
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
-    h.svc.record_execution_id("cmd-A", exec_id);
+    h.svc.record_command_dispatch("cmd-A", "echo", exec_id);
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::TIMEOUT);
     h.svc.process_gateway_response("agent-1", resp);
@@ -2990,7 +3002,7 @@ TEST_CASE("notify_exec_tracker: REJECTED maps to status='rejected'",
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
-    h.svc.record_execution_id("cmd-A", exec_id);
+    h.svc.record_command_dispatch("cmd-A", "echo", exec_id);
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::REJECTED);
     h.svc.process_gateway_response("agent-1", resp);
@@ -3014,7 +3026,7 @@ TEST_CASE("notify_exec_tracker: REJECTED maps to status='rejected'",
 
 TEST_CASE("notify_exec_tracker: unmapped command_id is a no-op",
           "[pg][agent_service][executions][issue872]") {
-    // Out-of-band dispatch (CLI / direct gRPC) never calls record_execution_id.
+    // Out-of-band dispatch (CLI / direct gRPC) never calls record_command_dispatch.
     // notify_exec_tracker must early-return on empty execution_id rather than
     // upserting under a fabricated id — those rows would be invisible to every
     // tracker query (all filter by execution_id) but would still bloat the
@@ -3025,7 +3037,7 @@ TEST_CASE("notify_exec_tracker: unmapped command_id is a no-op",
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
-    // Deliberately do NOT call record_execution_id — cmd-orphan is unmapped.
+    // Deliberately do NOT call record_command_dispatch — cmd-orphan is unmapped.
 
     auto resp = GatewayResponseHarness::make_response("cmd-orphan", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", resp);
@@ -3045,7 +3057,7 @@ TEST_CASE("notify_exec_tracker: non-tracked correlation-id prefixes produce "
     // agent-transition SSE event. test_execution_tracker.cpp proves the
     // STORE round-trips these values opaquely; THIS test proves the
     // actual DECISION SITE (notify_exec_tracker, reached only through
-    // resolve_execution_id -> ExecutionTracker::lookup_execution_id, the
+    // resolve_response_provenance -> ExecutionTracker::lookup_command_record, the
     // PG-backed path this PR migrated) still honours the skip — the
     // property a prior version of this PR's own test claimed to prove
     // but didn't (it looked up an unwritten key, never exercising this
@@ -3059,7 +3071,7 @@ TEST_CASE("notify_exec_tracker: non-tracked correlation-id prefixes produce "
          {"polchk-abc123", "bundle-def456", "preflight-run1-check2", "deployment-xyz-stage"}) {
         CAPTURE(execution_id);
         const std::string command_id = "plugin-cmd-" + execution_id;
-        h.svc.record_execution_id(command_id, execution_id);
+        h.svc.record_command_dispatch(command_id, "echo", execution_id);
 
         auto resp = GatewayResponseHarness::make_response(command_id, apb::CommandResponse::SUCCESS);
         h.svc.process_gateway_response("agent-1", resp);
@@ -3068,7 +3080,7 @@ TEST_CASE("notify_exec_tracker: non-tracked correlation-id prefixes produce "
     }
 }
 
-TEST_CASE("resolve_execution_id bumps yuzu_exec_correlation_read_degrade_total "
+TEST_CASE("resolve_response_provenance bumps yuzu_exec_correlation_read_degrade_total "
           "by reason (adversarial review, PR #3780)",
           "[pg][agent_service][executions]") {
     // The read-degrade counter is the only signal for a sustained lookup
@@ -3083,7 +3095,7 @@ TEST_CASE("resolve_execution_id bumps yuzu_exec_correlation_read_degrade_total "
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
 
-    h.svc.record_execution_id("cmd-A", "exec-42"); // a mapping DOES exist...
+    h.svc.record_command_dispatch("cmd-A", "echo", "exec-42"); // a mapping DOES exist...
 
     {
         auto lease = pool.acquire();
@@ -3098,13 +3110,19 @@ TEST_CASE("resolve_execution_id bumps yuzu_exec_correlation_read_degrade_total "
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", resp);
 
-    // A terminal response resolves execution_id from TWO independent call
-    // sites (response-store stamping at agent_service_impl.cpp:1577, then
-    // again inside notify_exec_tracker at :1606) — both hit the dropped
-    // table, so the counter increments twice per response, not once.
+    // A frame's provenance is resolved ONCE (#4990), with one bounded retry on a degraded read:
+    // both attempts hit the dropped table, so the counter increments twice per response, and the
+    // frame is counted as lookup_degraded and stored as unverified, never as ordinary.
     CHECK(h.metrics
               .counter("yuzu_exec_correlation_read_degrade_total", {{"reason", "query_failed"}})
               .value() == 2.0);
+    CHECK(h.metrics
+              .counter("yuzu_server_response_provenance_total", {{"outcome", "lookup_degraded"}})
+              .value() == 1.0);
+    auto rows = h.responses.get_by_instruction("cmd-A", kAllRows);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].plugin == std::string(yuzu::server::kUnverifiedProvenanceLabel));
 }
 
 TEST_CASE("notify_exec_tracker: null tracker pointer is a no-op (shutdown contract)",
@@ -3124,7 +3142,7 @@ TEST_CASE("notify_exec_tracker: null tracker pointer is a no-op (shutdown contra
         // ~TrackerScope calls set_execution_tracker(nullptr) before destroying
         // the tracker, leaving svc.execution_tracker_ at nullptr.
     }
-    h.svc.record_execution_id("cmd-A", "exec-42");
+    h.svc.record_command_dispatch("cmd-A", "echo", "exec-42");
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS);
     // Must not crash, must not dereference the destroyed tracker.

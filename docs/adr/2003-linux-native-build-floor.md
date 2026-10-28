@@ -1,6 +1,6 @@
 # ADR-2003 — Linux native build floors: a glibc 2.28 (EL8) image for all C++, an EL9 image for the gateway's OTP
 
-**Status:** Proposed (rev 5, 2026-10-19 — the reviewer answered all ten questions on PR #5631 and stated that implementation can proceed on that basis; this revision records the answers; acceptance is by merge of PR #5631). Slices S1–S4 start on the operator's go, not on this revision.
+**Status:** Accepted (2026-10-19, by merge of PR #5631 at rev 5 — the reviewer answered all ten questions on that PR and stated that implementation can proceed on that basis). Slices S1–S4 start on the operator's go, not on this acceptance.
 **Authors:** Fraser Jarvis (@fjarvis); design adjudication and spike by the enterprise-architect (Fable) review, 2026-10-09 and 2026-10-10
 **Date:** 2026-10-10
 **Relates to:** #5143 (glibc/libstdc++ floor), #5171 (gateway RPM cannot boot on RHEL-family), the v0.14.1 release notes (both listed as known issues), `docs/user-manual/README.md` "Supported Platforms", `docs/build-guide.md`, `docs/ci-architecture.md`, `docs/agent-bundle.md`, ADR-0008 (static vcpkg libpq/CRT picks)

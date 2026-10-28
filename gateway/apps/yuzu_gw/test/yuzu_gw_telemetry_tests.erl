@@ -20,6 +20,130 @@
 -module(yuzu_gw_telemetry_tests).
 -include_lib("eunit/include/eunit.hrl").
 
+%% The gRPC layer's events reach the counters (same blind spot as above: the
+%% producer's own tests only see that the event was emitted).
+grpc_layer_metrics_test_() ->
+    {setup,
+     fun() ->
+        {ok, Started} = application:ensure_all_started(prometheus),
+        {ok, Started2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        ok = yuzu_gw_telemetry:setup(),
+        Started ++ Started2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"an ignored origin claim reaches the counter, labelled by mode and reason",
+       fun() ->
+           Labels = [<<"proxy_protocol">>, <<"untrusted_source">>],
+           Before = counter_val(yuzu_gw_grpc_origin_ignored_total, Labels),
+           telemetry:execute([yuzu, gw, grpc, origin_ignored], #{count => 1},
+                             #{mode => proxy_protocol, reason => untrusted_source}),
+           ?assertEqual(Before + 1, counter_val(yuzu_gw_grpc_origin_ignored_total, Labels))
+       end},
+      {"every {mode, reason} the origin module can report has a series at 0 from boot",
+       fun() ->
+           [?assert(is_integer(counter_val(yuzu_gw_grpc_origin_ignored_total,
+                                           [atom_to_binary(M, utf8), atom_to_binary(R, utf8)])))
+            || {M, R} <- yuzu_gw_telemetry:origin_ignored_labels()]
+       end},
+      {"dropped request bytes reach the counter by reason",
+       fun() ->
+           Labels = [<<"extra_request_data">>],
+           Before = counter_val(yuzu_gw_grpc_dropped_data_bytes_total, Labels),
+           telemetry:execute([yuzu, gw, grpc, dropped_data], #{bytes => 123},
+                             #{reason => extra_request_data, method => <<"/x/Y">>}),
+           ?assertEqual(Before + 123, counter_val(yuzu_gw_grpc_dropped_data_bytes_total, Labels))
+       end},
+      {"the labels on both counters are exactly the atoms the layer emits",
+       fun() ->
+           %% yuzu_grpc_origin reports no other note for a proxy mode; a new one
+           %% needs a series here, or its first occurrence is invisible to increase().
+           ?assertEqual(lists:sort([untrusted_source, no_claim, bad_claim]),
+                        lists:usort([R || {_, R} <- yuzu_gw_telemetry:origin_ignored_labels()])),
+           ?assertEqual([extra_request_data, stream_ended],
+                        lists:sort(yuzu_gw_telemetry:dropped_data_reasons()))
+       end}
+     ]}.
+
+%% yuzu_gw_upstream_calls_dropped_total{rpc_name}: queued upstream calls skipped
+%% because the requesting call had ended. The series exist from boot (or the
+%% first drop is invisible to increase()), each event moves the series of its
+%% own name by its own count, and the label is called rpc_name on the wire.
+call_dropped_metric_test_() ->
+    Name = yuzu_gw_upstream_calls_dropped_total,
+    Value = fun(Rpc) -> prometheus_counter:value(Name, [Rpc]) end,
+    Drop = fun(N, Meta) -> telemetry:execute([yuzu, gw, upstream, call_dropped], #{count => N}, Meta) end,
+    {setup,
+     fun() ->
+        {ok, Started} = application:ensure_all_started(prometheus),
+        {ok, Started2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        %% Whatever an earlier module left in the series: the first case then
+        %% sees what setup() itself creates.
+        _ = prometheus_counter:deregister(Name),
+        ok = yuzu_gw_telemetry:setup(),
+        Started ++ Started2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"the series of both names exist straight after setup, and no other",
+       fun() ->
+           ?assertEqual([inventory, register], lists:sort(yuzu_gw_telemetry:upstream_dropped_rpcs())),
+           ?assertEqual(0, Value(<<"register">>)),
+           ?assertEqual(0, Value(<<"inventory">>)),
+           ?assertEqual(undefined, Value(<<"unknown">>))
+       end},
+      {"the scrape carries the metric, its HELP and the label name rpc_name",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           ?assertNotEqual(nomatch, binary:match(Out, <<"# HELP yuzu_gw_upstream_calls_dropped_total ">>)),
+           ?assertNotEqual(nomatch, binary:match(Out, <<"# TYPE yuzu_gw_upstream_calls_dropped_total counter">>)),
+           ?assertNotEqual(nomatch,
+                           binary:match(Out, <<"yuzu_gw_upstream_calls_dropped_total{rpc_name=\"register\"} ">>)),
+           ?assertNotEqual(nomatch,
+                           binary:match(Out, <<"yuzu_gw_upstream_calls_dropped_total{rpc_name=\"inventory\"} ">>))
+       end},
+      {"a dropped register call moves the register series only",
+       fun() ->
+           {R0, I0} = {Value(<<"register">>), Value(<<"inventory">>)},
+           Drop(1, #{rpc_name => <<"register">>}),
+           ?assertEqual({R0 + 1, I0}, {Value(<<"register">>), Value(<<"inventory">>)})
+       end},
+      {"a dropped inventory call moves the inventory series only, by the event's count",
+       fun() ->
+           {R0, I0} = {Value(<<"register">>), Value(<<"inventory">>)},
+           Drop(3, #{rpc_name => <<"inventory">>}),
+           ?assertEqual({R0, I0 + 3}, {Value(<<"register">>), Value(<<"inventory">>)})
+       end},
+      {"a name given as an atom is the same series as the binary",
+       fun() ->
+           {R0, I0} = {Value(<<"register">>), Value(<<"inventory">>)},
+           Drop(2, #{rpc_name => inventory}),
+           Drop(1, #{rpc_name => register}),
+           ?assertEqual({R0 + 1, I0 + 2}, {Value(<<"register">>), Value(<<"inventory">>)})
+       end},
+      {"any other kind of name is counted as unknown and the handler stays attached",
+       fun() ->
+           lists:foreach(
+             fun(Bad) ->
+                 U0 = case Value(<<"unknown">>) of undefined -> 0; V -> V end,
+                 Drop(1, #{rpc_name => Bad}),
+                 ?assertEqual(U0 + 1, Value(<<"unknown">>), Bad)
+             end, [42, "register", {register}, [register], 1.5]),
+           %% a missing name is the same
+           U1 = Value(<<"unknown">>),
+           Drop(1, #{}),
+           ?assertEqual(U1 + 1, Value(<<"unknown">>)),
+           %% and the handler still serves a real drop afterwards
+           R0 = Value(<<"register">>),
+           Drop(1, #{rpc_name => <<"register">>}),
+           ?assertEqual(R0 + 1, Value(<<"register">>)),
+           ?assert(lists:any(fun(#{id := Id}) -> Id =:= yuzu_gw_prometheus end,
+                             telemetry:list_handlers([yuzu, gw, upstream, call_dropped])))
+       end}
+     ]}.
+
 notify_dropped_test_() ->
     {setup,
      fun() ->
@@ -262,7 +386,28 @@ heartbeat_admission_series_test_() ->
            %% connection_mismatch is its own family, so it is not a `reason'.
            ?assertEqual(lists:usort([connection_mismatch |
                                      yuzu_gw_telemetry:heartbeat_reject_reasons()]),
-                        Returned)
+                        Returned),
+           %% The inventory family has no separate security family: every
+           %% reason, connection_mismatch included, is a `reason' there.
+           ?assertEqual(Returned,
+                        lists:usort(yuzu_gw_telemetry:inventory_reject_reasons()))
+       end},
+      {"every inventory rejection reason has a series from startup (#5695)",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           [?assertNotEqual(nomatch,
+                            binary:match(Out, iolist_to_binary(
+                              ["yuzu_gw_inventory_rejected_total{reason=\"",
+                               atom_to_binary(R, utf8), "\"} 0"])))
+            || R <- yuzu_gw_telemetry:inventory_reject_reasons()]
+       end},
+      {"an inventory rejection event increments its reason's series",
+       fun() ->
+           Read = fun(R) -> prometheus_counter:value(yuzu_gw_inventory_rejected_total, [R]) end,
+           B = Read(<<"connection_mismatch">>),
+           telemetry:execute([yuzu, gw, inventory, rejected], #{count => 1},
+                             #{reason => connection_mismatch}),
+           ?assertEqual(B + 1, Read(<<"connection_mismatch">>))
        end}
      ]}.
 
@@ -300,6 +445,8 @@ verdict_families_test_() ->
            [?assertNotEqual(nomatch, binary:match(Out, Line))
             || Line <- [<<"yuzu_gw_registration_replay_triggered_total{trigger=\"breaker\"} ">>,
                         <<"yuzu_gw_registration_replay_triggered_total{trigger=\"heartbeat\"} ">>,
+                        <<"yuzu_gw_registration_replay_triggered_total{trigger=\"server_lost_state\"} ">>,
+                        <<"yuzu_gw_registration_replay_triggered_total{trigger=\"manual\"} ">>,
                         <<"yuzu_gw_heartbeat_unknown_truncated_total ">>,
                         <<"yuzu_gw_heartbeat_verdict_dropped_total{reason=\"malformed\"} ">>,
                         <<"yuzu_gw_heartbeat_verdict_dropped_total{reason=\"not_local\"} ">>,
@@ -315,7 +462,13 @@ verdict_families_test_() ->
            ?assertEqual({H0 + 1, B0}, {Read(<<"heartbeat">>), Read(<<"breaker">>)}),
            telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
                              #{count => 1}, #{trigger => breaker}),
-           ?assertEqual({H0 + 1, B0 + 1}, {Read(<<"heartbeat">>), Read(<<"breaker">>)})
+           ?assertEqual({H0 + 1, B0 + 1}, {Read(<<"heartbeat">>), Read(<<"breaker">>)}),
+           S0 = Read(<<"server_lost_state">>), M0 = Read(<<"manual">>),
+           telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
+                             #{count => 1}, #{trigger => server_lost_state}),
+           telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
+                             #{count => 1}, #{trigger => manual}),
+           ?assertEqual({S0 + 1, M0 + 1}, {Read(<<"server_lost_state">>), Read(<<"manual">>)})
        end},
       {"a trigger or reason outside the closed set goes to unknown and the handler stays attached",
        fun() ->
@@ -418,6 +571,68 @@ verdict_families_test_() ->
                              #{replayed => 0, queue_depth => 7}, #{}),
            ?assertEqual(C0, prometheus_counter:value(yuzu_gw_registration_replay_total, [])),
            ?assertEqual(7, prometheus_gauge:value(yuzu_gw_registration_replay_queue_depth, [node()]))
+       end}
+     ]}.
+
+%% The slow-server metrics (yuzu_gw_upstream_pressure): present from the first
+%% scrape, driven by the two events, and the per-lane series exist for the closed
+%% set of lanes the sampler can name.
+backpressure_metrics_test_() ->
+    Seconds = yuzu_gw_upstream_backpressure_seconds_total,
+    Lane = yuzu_gw_upstream_lane_saturated_seconds_total,
+    LaneValue = fun(L) -> prometheus_counter:value(Lane, [L]) end,
+    {setup,
+     fun() ->
+        {ok, Started} = application:ensure_all_started(prometheus),
+        {ok, Started2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        _ = prometheus_counter:deregister(Seconds),
+        _ = prometheus_counter:deregister(Lane),
+        ok = yuzu_gw_telemetry:setup(),
+        Started ++ Started2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"every series exists straight after setup, at zero",
+       fun() ->
+           ?assertEqual(0, prometheus_counter:value(Seconds, [])),
+           ?assertEqual([guardian, notify, permits], lists:sort(yuzu_gw_upstream_pressure:lanes())),
+           [?assertEqual(0, LaneValue(atom_to_binary(L, utf8))) || L <- yuzu_gw_upstream_pressure:lanes()],
+           ?assertEqual(0.0, prometheus_gauge:value(yuzu_gw_upstream_backpressure_duty_cycle, [])),
+           ?assertEqual(0, prometheus_gauge:value(yuzu_gw_upstream_slow, []))
+       end},
+      {"the scrape carries all four metrics with their types",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           [?assertNotEqual(nomatch, binary:match(Out, <<"# TYPE ", N/binary, " ", T/binary>>))
+            || {N, T} <- [{<<"yuzu_gw_upstream_backpressure_seconds_total">>, <<"counter">>},
+                          {<<"yuzu_gw_upstream_lane_saturated_seconds_total">>, <<"counter">>},
+                          {<<"yuzu_gw_upstream_backpressure_duty_cycle">>, <<"gauge">>},
+                          {<<"yuzu_gw_upstream_slow">>, <<"gauge">>}]],
+           ?assertNotEqual(nomatch,
+                           binary:match(Out, <<"yuzu_gw_upstream_lane_saturated_seconds_total{lane=\"permits\"} ">>))
+       end},
+      {"the counter event adds its milliseconds as seconds, per lane and for the whole",
+       fun() ->
+           S0 = prometheus_counter:value(Seconds, []),
+           {Se0, N0, G0} = {LaneValue(<<"permits">>), LaneValue(<<"notify">>), LaneValue(<<"guardian">>)},
+           telemetry:execute([yuzu, gw, upstream, backpressure],
+                             #{any_ms => 1500, permits_ms => 1000, notify_ms => 1500, guardian_ms => 0}, #{}),
+           ?assert(abs(prometheus_counter:value(Seconds, []) - (S0 + 1.5)) < 1.0e-9),
+           ?assert(abs(LaneValue(<<"permits">>) - (Se0 + 1.0)) < 1.0e-9),
+           ?assert(abs(LaneValue(<<"notify">>) - (N0 + 1.5)) < 1.0e-9),
+           ?assert(G0 == LaneValue(<<"guardian">>))
+       end},
+      {"the state event sets both gauges, and a later one replaces them",
+       fun() ->
+           telemetry:execute([yuzu, gw, upstream, backpressure_state],
+                             #{duty_cycle => 0.75, slow => 1}, #{}),
+           ?assertEqual(0.75, prometheus_gauge:value(yuzu_gw_upstream_backpressure_duty_cycle, [])),
+           ?assertEqual(1, prometheus_gauge:value(yuzu_gw_upstream_slow, [])),
+           telemetry:execute([yuzu, gw, upstream, backpressure_state],
+                             #{duty_cycle => 0.1, slow => 0}, #{}),
+           ?assertEqual(0.1, prometheus_gauge:value(yuzu_gw_upstream_backpressure_duty_cycle, [])),
+           ?assertEqual(0, prometheus_gauge:value(yuzu_gw_upstream_slow, []))
        end}
      ]}.
 
@@ -576,5 +791,112 @@ register_refused_families_test_() ->
                               <<"yuzu_gw_upstream_rpc_errors_total{rpc_name=\"register\",code=\"encode\"} ">>,
                               <<"yuzu_gw_upstream_rpc_errors_total{rpc_name=\"inventory\",code=\"exception\"} ">>,
                               <<"yuzu_gw_upstream_rpc_errors_total{rpc_name=\"batch_heartbeat\",code=\"exception\"} ">>])
+       end}
+     ]}.
+
+%% S3: the breaker transition counter is pre-seeded for its three states. A
+%% series born at 1 is invisible to increase(), so without the seed the first
+%% open of a fresh gateway process (a crash-looping gateway opens only once per
+%% life) never raised YuzuGatewayUpstreamCircuitOpened. The series are removed
+%% before setup() so "exists at 0" proves the seed, not an earlier increment.
+circuit_transitions_seeded_test_() ->
+    States = [<<"closed">>, <<"open">>, <<"half_open">>],
+    {setup,
+     fun() ->
+        {ok, S1} = application:ensure_all_started(prometheus),
+        {ok, S2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        [catch prometheus_counter:remove(yuzu_gw_upstream_circuit_transitions_total, [S])
+         || S <- States],
+        ok = yuzu_gw_telemetry:setup(),
+        S1 ++ S2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"closed, open and half_open exist at 0 straight after setup",
+       fun() ->
+           [?assertEqual({S, 0},
+                         {S, prometheus_counter:value(yuzu_gw_upstream_circuit_transitions_total,
+                                                      [S])})
+            || S <- States]
+       end},
+      {"the first open of the process moves the seeded series 0 -> 1",
+       fun() ->
+           telemetry:execute([yuzu, gw, upstream, circuit_state], #{count => 1},
+                             #{state => <<"open">>}),
+           ?assertEqual(1, prometheus_counter:value(yuzu_gw_upstream_circuit_transitions_total,
+                                                    [<<"open">>])),
+           assert_scrape_has(
+             [<<"yuzu_gw_upstream_circuit_transitions_total{state=\"closed\"} 0">>,
+              <<"yuzu_gw_upstream_circuit_transitions_total{state=\"half_open\"} 0">>,
+              <<"yuzu_gw_upstream_circuit_transitions_total{state=\"open\"} 1">>])
+       end}
+     ]}.
+
+%% Certificate rotation and expiry gauges. The rotation timestamp is seeded at
+%% 0 (the YuzuGatewayMgmtPinMismatch alert reads 0 as "no rotation observed",
+%% so a seeded series must not suppress it); the per-file gauges are set by
+%% the watcher's [yuzu, gw, cert_file, state] event. An event without a
+%% notAfter (nothing has ever been read from the file) leaves the expiry gauge
+%% as it is while the readable gauge drops to 0.
+cert_gauges_test_() ->
+    Labels = [<<"listener">>, <<"telemetry_test">>],
+    {setup,
+     fun() ->
+        {ok, S1} = application:ensure_all_started(prometheus),
+        {ok, S2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        catch prometheus_gauge:remove(yuzu_gw_mgmt_pin_rotated_timestamp_seconds, []),
+        ok = yuzu_gw_telemetry:setup(),
+        S1 ++ S2
+     end,
+     fun(_) ->
+        catch prometheus_gauge:remove(yuzu_gw_cert_expiry_timestamp_seconds, Labels),
+        catch prometheus_gauge:remove(yuzu_gw_cert_file_readable, Labels),
+        catch telemetry:detach(yuzu_gw_prometheus)
+     end,
+     [
+      {"the rotation timestamp exists at 0 straight after setup",
+       fun() ->
+           %% prometheus_gauge stores a float: compare numerically
+           ?assert(0 == prometheus_gauge:value(yuzu_gw_mgmt_pin_rotated_timestamp_seconds, []))
+       end},
+      {"a rotation event sets the rotation timestamp",
+       fun() ->
+           telemetry:execute([yuzu, gw, mgmt_pins, rotated], #{system_time => 1760000000}, #{}),
+           ?assert(1760000000 ==
+                       prometheus_gauge:value(yuzu_gw_mgmt_pin_rotated_timestamp_seconds, []))
+       end},
+      {"a cert_file state event sets readable and expiry; one without notAfter keeps the expiry",
+       fun() ->
+           Meta = #{role => <<"listener">>, name => <<"telemetry_test">>},
+           telemetry:execute([yuzu, gw, cert_file, state],
+                             #{readable => 1, not_after => 1900000000}, Meta),
+           ?assert(1 == prometheus_gauge:value(yuzu_gw_cert_file_readable, Labels)),
+           ?assert(1900000000 ==
+                       prometheus_gauge:value(yuzu_gw_cert_expiry_timestamp_seconds, Labels)),
+           telemetry:execute([yuzu, gw, cert_file, state], #{readable => 0}, Meta),
+           ?assert(0 == prometheus_gauge:value(yuzu_gw_cert_file_readable, Labels)),
+           ?assert(1900000000 ==
+                       prometheus_gauge:value(yuzu_gw_cert_expiry_timestamp_seconds, Labels)),
+           assert_scrape_has(
+             [<<"# HELP yuzu_gw_mgmt_pin_rotated_timestamp_seconds ">>,
+              <<"# HELP yuzu_gw_cert_expiry_timestamp_seconds ">>,
+              <<"# HELP yuzu_gw_cert_file_readable ">>,
+              <<"yuzu_gw_cert_expiry_timestamp_seconds{role=\"listener\",name=\"telemetry_test\"} 1900000000">>])
+       end},
+      {"an event with an unknown expiry removes the expiry series; readable stays as sent",
+       fun() ->
+           %% A file that now holds a certificate whose notAfter cannot be
+           %% parsed: the old value would describe a certificate no longer
+           %% there, so the series goes (unknown), and the file is readable.
+           Meta = #{role => <<"listener">>, name => <<"telemetry_test">>},
+           telemetry:execute([yuzu, gw, cert_file, state],
+                             #{readable => 1, not_after => 1900000000}, Meta),
+           telemetry:execute([yuzu, gw, cert_file, state],
+                             #{readable => 1, expiry_unknown => 1}, Meta),
+           ?assert(1 == prometheus_gauge:value(yuzu_gw_cert_file_readable, Labels)),
+           ?assertEqual(undefined,
+                        prometheus_gauge:value(yuzu_gw_cert_expiry_timestamp_seconds, Labels))
        end}
      ]}.

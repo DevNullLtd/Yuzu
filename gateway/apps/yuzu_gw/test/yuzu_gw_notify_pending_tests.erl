@@ -23,19 +23,19 @@
 %%%   - an untrappable worker death and an upstream restart
 %%%   - notify_pending_max validation and a 1000 agent burst
 %%%
-%%% The mock of grpcbox_client:unary/5 parks every NotifyStreamStatus worker in
+%%% The mock of yuzu_grpc_client:unary/5 parks every NotifyStreamStatus worker in
 %%% the mock until the test releases it, so "in flight" is something the test
 %%% controls. Waits are event driven: the mock and the telemetry handler message
 %%% the test process, and every wait has a bounded deadline. There is no
 %%% wall-clock margin anywhere.
 %%%
 %%% Real: yuzu_gw_registry, telemetry (a handler of this module records the
-%%% three notify events). Mock: grpcbox_client.
+%%% three notify events). Mock: yuzu_grpc_client.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_notify_pending_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("grpcbox/include/grpcbox.hrl").
+-include("yuzu_grpc_client.hrl").
 
 -export([handle_event/4, log/2]).  %% telemetry handler and logger handler callbacks
 
@@ -55,6 +55,7 @@
                    notify_probe_timeout_ms,
                    cluster_id,
                    registration_replay_spacing_ms,
+                   registration_replay_start_jitter_ms,
                    circuit_breaker_failure_threshold,
                    circuit_breaker_reset_timeout_ms,
                    circuit_breaker_max_reset_timeout_ms]).
@@ -116,10 +117,11 @@ closed_test_() ->
         60, fun burst_free_running/0)
      ]}.
 
-%% Cap 3.
+%% Cap 13: the ten sends in flight hold ten slots back (each event may come
+%% back to be retried, #5695), so three keys can be held.
 cap_test_() ->
     {foreach,
-     fun() -> setup([{notify_pending_max, 3}]) end,
+     fun() -> setup([{notify_pending_max, 13}]) end,
      fun cleanup/1,
      [
       t("the cap counts keys: the overflow is dropped and counted, a replacement is not",
@@ -133,7 +135,7 @@ env_test_() ->
      fun() -> setup_logs([]) end,
      fun cleanup_logs/1,
      [
-      t("a bad notify_pending_max warns naming the key and falls back to 10000",
+      t("a bad notify_pending_max warns naming the key and falls back to the derived default (15000 with no agent listener)",
         fun env_invalid_falls_back/0),
       t("a notify_pending_max inside 1..1000000 is kept, logged, and does not warn",
         fun env_valid_is_kept/0),
@@ -145,7 +147,7 @@ env_test_() ->
         fun reset_timeout_invalid_falls_back/0),
       t("a circuit_breaker_reset_timeout_ms inside 100..3600000 is kept and does not warn",
         fun reset_timeout_valid_is_kept/0),
-      t("a bad circuit_breaker_max_reset_timeout_ms warns naming the key and falls back to 300000",
+      t("a bad circuit_breaker_max_reset_timeout_ms warns naming the key and falls back to 30000",
         fun max_reset_timeout_invalid_falls_back/0),
       t("a circuit_breaker_max_reset_timeout_ms inside 100..3600000 is kept and does not warn",
         fun max_reset_timeout_valid_is_kept/0),
@@ -163,28 +165,26 @@ env_test_() ->
         fun max_out_of_range_names_the_default_not_the_rejected_value/0)
      ]}.
 
-%% A registration replay that is active while the pending store is refilled.
-%% Replay spacing 1 ms so the drip retries quickly.
+%% A registration replay while every notify slot is held and a backlog is held.
 replay_test_() ->
     {foreach,
-     fun() -> setup([{registration_replay_spacing_ms, 1}]) end,
+     fun() -> setup([]) end,
      fun cleanup/1,
      [
-      t("a refilled backlog does not starve an active replay: the replay head advances",
-        fun replay_advances_while_the_backlog_is_refilled/0),
+      t("a replay does not wait for notify slots: with every slot held it runs at once",
+        fun replay_runs_while_every_notify_slot_is_held/0),
       t("a replayed registration that cannot be encoded does not touch the breaker",
         fun replay_local_encode_exception_leaves_the_breaker_alone/0)
      ]}.
 
-%% The reserved replay slot has a size, and a long replay spacing keeps the
-%% drip parked (queue non-empty, nothing advancing) so the size can be observed.
+%% No notify slot is held back for a replay (it no longer waits on them).
 replay_reserve_test_() ->
     {foreach,
-     fun() -> setup([{registration_replay_spacing_ms, 60000}]) end,
+     fun() -> setup([]) end,
      fun cleanup/1,
      [
-      t("while a replay is active the reserve is exactly one slot: refills stop at nine",
-        fun replay_reserve_is_exactly_one_slot/0)
+      t("no notify slot is held back during a replay: refills go to ten",
+        fun replay_holds_no_notify_slot_back/0)
      ]}.
 
 %% The half_open probe (#4632). The breaker's reset timer is a long way off (the
@@ -200,8 +200,8 @@ probe_test_() ->
      fun() -> setup(probe_env([])) end,
      fun cleanup/1,
      [
-      t("probe success closes the breaker, drains the held keys in order and fires the replay",
-        fun probe_success_closes_drains_and_replays/0),
+      t("probe success closes the breaker and drains the held keys in order; nothing is replayed",
+        fun probe_success_closes_and_drains_without_replay/0),
       t("probe error reopens the breaker with doubled backoff and requeues the event at the head",
         fun probe_error_reopens_and_requeues_at_the_head/0),
       t("a probe result after a call path RPC closed the circuit leaves the breaker alone (ok)",
@@ -358,7 +358,7 @@ probe_cap_test_() ->
 setup(Env) ->
     {ok, _} = application:ensure_all_started(telemetry),
     yuzu_gw_test_registry:ensure(),
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     catch meck:unload(telemetry),
     %% A prior module may have leaked the real upstream. Stop it (stop_upstream/0
     %% does so silently, it does not report the leak) so this fixture owns the
@@ -369,6 +369,8 @@ setup(Env) ->
     application:unset_env(yuzu_gw, notify_pending_max),
     application:unset_env(yuzu_gw, notify_probe_timeout_ms),
     application:unset_env(yuzu_gw, registration_replay_spacing_ms),
+    %% A full replay starts at once (no start jitter).
+    application:set_env(yuzu_gw, registration_replay_start_jitter_ms, 0),
     yuzu_gw_test_upstream:set_breaker_env(3),
     lists:foreach(fun({K, V}) -> application:set_env(yuzu_gw, K, V) end, Env),
     %% Public tables and counters shared with the mock, which runs in the
@@ -380,7 +382,7 @@ setup(Env) ->
     Ctx = #{log => Log, workers => Workers, atoms => Atoms, prev_env => Prev},
     persistent_term:put(?CTXK, Ctx),
     persistent_term:erase(?SUBK),
-    meck:new(grpcbox_client, [non_strict, no_link]),
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
     mock(ok),
     %% Attach before the upstream starts: init/1 emits the first gauge.
     catch telemetry:detach(?TELEMETRY_HANDLER),
@@ -406,7 +408,7 @@ cleanup(#{log := Log, workers := Workers, atoms := Atoms, prev_env := Prev}) ->
     %% behind for the next test.
     Dead = guarded(fun() -> await_dead([W || {W} <- ets:tab2list(Workers)]) end),
     catch telemetry:detach(?TELEMETRY_HANDLER),
-    meck:unload(grpcbox_client),
+    meck:unload(yuzu_grpc_client),
     Cleared = guarded(fun clear_registry/0),
     ets:delete(Log),
     ets:delete(Workers),
@@ -486,14 +488,14 @@ settled(Log) ->
 %% `fail' (a transport error, which feeds the breaker) or `encode' (the real
 %% encoder runs on the request first, as for NotifyStreamStatus, then `ok').
 mock(ProxyMode) ->
-    meck:expect(grpcbox_client, unary, fun(_Ctx, Path, Req, Def, _Opts) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_Ctx, Path, Req, Def, _Opts) ->
         case lists:last(binary:split(Path, <<"/">>, [global])) of
             <<"NotifyStreamStatus">> ->
                 %% The real encoder runs here, in the calling worker, as it does
-                %% inside grpcbox_client:unary/5 (send_msg calls the marshal fun
+                %% inside yuzu_grpc_client:unary/5 (send_msg calls the marshal fun
                 %% in the caller), so an unencodable field raises out of this
                 %% mock exactly as it does out of the real client.
-                marshal_like_grpcbox(Def, Req),
+                marshal_like_the_client(Def, Req),
                 notify_rpc(Req);
             _Other when ProxyMode =:= ok ->
                 notify({proxied, Path}),
@@ -510,7 +512,7 @@ mock(ProxyMode) ->
 %% Runs the request through the marshal fun yuzu_gw_upstream handed the client.
 %% On a raise the test hears {marshal_failed, AgentId} first, then the original
 %% exception continues to the caller (do_rpc turns it into an error result).
-marshal_like_grpcbox(#grpcbox_def{marshal_fun = Marshal}, Req) ->
+marshal_like_the_client(#{marshal := Marshal}, Req) ->
     try Marshal(Req)
     catch Class:Why:Stack ->
         notify({marshal_failed, maps:get(agent_id, Req)}),
@@ -519,13 +521,13 @@ marshal_like_grpcbox(#grpcbox_def{marshal_fun = Marshal}, Req) ->
 
 %% The same for a request that has no agent id of its own (ProxyRegister,
 %% ProxyInventory): the marshal fun runs and any raise continues to the caller.
-marshal_only(#grpcbox_def{marshal_fun = Marshal}, Req) ->
+marshal_only(#{marshal := Marshal}, Req) ->
     _ = Marshal(Req),
     ok.
 
 %% Runs in the worker the upstream spawned. Counts itself in, tells the test it
 %% entered, then parks until released (or until the gates are open). `release'
-%% answers ok; `{release, Answer}' answers with Answer, a grpcbox_client:unary/5
+%% answers ok; `{release, Answer}' answers with Answer, a yuzu_grpc_client:unary/5
 %% return, so a test can fail one worker.
 notify_rpc(Req) ->
     #{log := Log, workers := Workers, atoms := Atoms} = ctx(),
@@ -728,7 +730,7 @@ cap_drops_overflow_and_never_a_replacement() ->
     Live0 = fill_slots(),
     [cast_connected(agent(I)) || I <- lists:seq(1, 5)],
     sync(),
-    %% Keys 1..3 held, 4 and 5 over the cap of 3.
+    %% Keys 1..3 held, 4 and 5 over the cap (3 held + 10 in flight = 13).
     ?assertEqual({3, ?INFLIGHT_MAX}, last_gauge()),
     ?assertEqual(3, pending_len()),
     ?assertEqual([<<"at_capacity">>, <<"at_capacity">>], dropped_reasons()),
@@ -828,56 +830,43 @@ half_open_circuit_sends_one_probe_and_holds_the_rest() ->
     await_until(fun() -> last_gauge() =:= {0, 0} end).
 
 %% Ten workers are parked and 30 distinct keys are held, then a replay of three
-%% agents is armed. Releasing one worker at a time frees one slot, and without a
-%% reserved slot the freed slot is refilled from the backlog at once, so the
-%% replay drip never sees fewer than ten workers until the backlog is empty.
-%% The replay head must reach the mock while keys are still held.
-replay_advances_while_the_backlog_is_refilled() ->
+%% agents is armed. A replay waits only for held-notification headroom (the
+%% store under half its cap), never for a notify slot: all three ProxyRegister
+%% calls go out while every slot is still held and the backlog is untouched.
+replay_runs_while_every_notify_slot_is_held() ->
     watch(),
     Live0 = fill_slots(),
     Backlog = 30,
     [cast_connected(agent(I)) || I <- lists:seq(1, Backlog)],
     Sids = [bind_replay_agent(I) || I <- lists:seq(1, 3)],
     ok = yuzu_gw_upstream:replay_sessions(Sids),
-    sync(),
-    ?assertEqual({Backlog, ?INFLIGHT_MAX}, last_gauge()),
-    ?assertMatch([_, _, _], up_get(replay_queue)),
-    Refills = release_until_proxied(Live0, 0),
-    ?assertMatch(N when N < Backlog, Refills),
-    ?assert(pending_len() > 0),
-    %% The other two agents follow, and once the replay is over the reserved
-    %% slot is spent on the backlog again.
     [receive {proxied, _} -> ok
-     after ?AWAIT_MS -> erlang:error(replay_did_not_continue)
-     end || _ <- [2, 3]],
-    await_until(fun() -> last_gauge() =:= {Backlog - Refills - 1, ?INFLIGHT_MAX} end),
-    ?assertEqual([], up_get(replay_queue)).
+     after ?AWAIT_MS -> erlang:error(replay_waited_for_a_notify_slot)
+     end || _ <- [1, 2, 3]],
+    sync(),
+    ?assertEqual(?INFLIGHT_MAX, map_size(up_get(notify_pids))),
+    ?assertEqual(Backlog, pending_len()),
+    [W ! release || W <- Live0],
+    ok.
 
-%% Ten workers are parked, 30 keys are held and a replay of three agents is armed;
-%% the 60 s spacing leaves the drip waiting, so the replay queue stays non-empty.
-%% Three workers finish. The first leaves nine in flight, which is the budget while
-%% the replay is active, so nothing is refilled; each of the next two leaves eight
-%% and is refilled to nine from the backlog. A reserve of more than one slot would
-%% stop at fewer than nine, and no reserve would refill to ten.
-replay_reserve_is_exactly_one_slot() ->
+%% Ten workers are parked, 30 keys are held and a replay of three agents is
+%% armed. Three workers finish: each freed slot is refilled from the backlog at
+%% once, back to ten (no slot is reserved for the replay).
+replay_holds_no_notify_slot_back() ->
     watch(),
     Live0 = fill_slots(),
     Backlog = 30,
     [cast_connected(agent(I)) || I <- lists:seq(1, Backlog)],
     Sids = [bind_replay_agent(I) || I <- lists:seq(1, 3)],
     ok = yuzu_gw_upstream:replay_sessions(Sids),
-    sync(),
-    ?assertEqual({Backlog, ?INFLIGHT_MAX}, last_gauge()),
-    ?assertMatch([_, _, _], up_get(replay_queue)),
     [W1, W2, W3 | _] = Live0,
     W1 ! release,
     W2 ! release,
     W3 ! release,
-    await_until(fun() -> last_gauge() =:= {Backlog - 2, ?INFLIGHT_MAX - 1} end),
+    await_until(fun() -> last_gauge() =:= {Backlog - 3, ?INFLIGHT_MAX} end),
     sync(),
-    ?assertEqual(?INFLIGHT_MAX - 1, map_size(up_get(notify_pids))),
-    ?assertEqual(Backlog - 2, pending_len()),
-    ?assertMatch([_, _, _], up_get(replay_queue)).
+    ?assertEqual(?INFLIGHT_MAX, map_size(up_get(notify_pids))),
+    ?assertEqual(Backlog - 3, pending_len()).
 
 gauges_follow_a_burst() ->
     watch(),
@@ -1034,7 +1023,7 @@ env_case(Val, Kind) ->
                   binary:match(T, <<"notify_pending_max">>) =/= nomatch],
     case Kind of
         invalid ->
-            ?assertEqual(10000, up_get(notify_pending_max)),
+            ?assertEqual(15000, up_get(notify_pending_max)),
             ?assertNotEqual([], Named);
         valid ->
             ?assertEqual(Val, up_get(notify_pending_max)),
@@ -1071,11 +1060,11 @@ reset_timeout_valid_is_kept() ->
      end || Good <- [100, 101, 10000, 3600000]].
 
 max_reset_timeout_invalid_falls_back() ->
-    %% A base of 100 keeps the default cap (300000) at or above it.
+    %% A base of 100 keeps the default cap (30000, #5695) at or above it.
     [begin
          Named = env_key_case(circuit_breaker_max_reset_timeout_ms, Bad,
                               [{circuit_breaker_reset_timeout_ms, 100}]),
-         ?assertEqual(300000, up_get(cb_max_timeout)),
+         ?assertEqual(30000, up_get(cb_max_timeout)),
          ?assertMatch([_], Named)
      end || Bad <- [0, 1, 99, -1, 3600001, "300000", 2.5, undefined_atom]].
 
@@ -1119,7 +1108,7 @@ max_below_base_is_clamped_with_a_warning() ->
     trip_breaker(),
     ?assertEqual({open, 0, 3, 600000}, breaker()).
 
-%% With no cap set the effective cap is the default (300000), a value the operator
+%% With no cap set the effective cap is the default (30000), a value the operator
 %% never wrote. The warning says the default is what was raised and never prints
 %% it as the configured value of the cap key.
 max_unset_below_base_names_the_default() ->
@@ -1130,7 +1119,7 @@ max_unset_below_base_names_the_default() ->
     ?assertNotEqual(nomatch, binary:match(Warning, <<"circuit_breaker_max_reset_timeout_ms">>)),
     ?assertNotEqual(nomatch, binary:match(Warning, <<"default">>)),
     ?assertNotEqual(nomatch, binary:match(Warning, <<"600000">>)),
-    ?assertEqual(nomatch, binary:match(Warning, <<"circuit_breaker_max_reset_timeout_ms (300000)">>)),
+    ?assertEqual(nomatch, binary:match(Warning, <<"circuit_breaker_max_reset_timeout_ms (30000)">>)),
     ?assertEqual(600000, up_get(cb_max_timeout)).
 
 %% A cap the operator set OUTSIDE 100..3600000 is rejected (one warning naming
@@ -1193,9 +1182,10 @@ env_key_case(Key, Val, Extra) ->
 %%%===================================================================
 
 %% Twelve keys are held behind an open breaker. half_open sends the head as the
-%% probe; its success closes the breaker, casts the replay, and the held keys
-%% drain first in first out. The replay is observed as its ProxyRegister.
-probe_success_closes_drains_and_replays() ->
+%% probe; its success closes the breaker and the held keys drain first in first
+%% out. Nothing is replayed (#5695: a recovery used to replay every agent; the
+%% bound agent would have been re-proxied).
+probe_success_closes_and_drains_without_replay() ->
     watch(),
     _ = bind_replay_agent(1),
     trip_breaker(),
@@ -1212,20 +1202,17 @@ probe_success_closes_drains_and_replays() ->
     Probe ! release,
     First = await_entered(?INFLIGHT_MAX),
     await_until(fun() -> last_gauge() =:= {1, ?INFLIGHT_MAX} end),
-    %% The gauge is reported after the replay cast was enqueued, and a call is
-    %% answered after it: the replay queue holds the one agent.
     sync(),
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
-    ?assertMatch([_], up_get(replay_queue)),
     ?assertEqual(lists:sort(lists:sublist(Keys, 2, ?INFLIGHT_MAX)),
                  lists:sort([maps:get(agent_id, Req) || {_, Req} <- First])),
-    %% Ten workers are in flight, so the replay waits; one slot opens and the
-    %% replay head goes out, then the last held key.
+    %% No replay: no ProxyRegister arrives. One slot opens and the last held
+    %% key goes out.
+    receive {proxied, _} -> erlang:error(replay_ran)
+    after 200 -> ok
+    end,
     {W, _} = hd(First),
     W ! release,
-    receive {proxied, _} -> ok
-    after ?AWAIT_MS -> erlang:error(replay_did_not_run)
-    end,
     {_, Last} = await_entered(),
     ?assertEqual(agent(12), maps:get(agent_id, Last)),
     open_and_release_all(),
@@ -1880,12 +1867,13 @@ replay_local_encode_exception_leaves_the_breaker_alone() ->
     Fresh = breaker(),
     ?assertMatch({closed, 0, 0, _}, Fresh),
     ok = yuzu_gw_upstream:replay_sessions([Sid]),
-    %% replay_next is queued behind the first call by the cast handler, and the
-    %% second call is behind replay_next.
-    sync(),
+    %% The replay runs in a worker: wait until its result has been handled
+    %% (polled: nothing is logged after the result is handled).
+    ok = wait_until(fun() -> meck:num_calls(yuzu_grpc_client, unary, '_') >= 1
+                                 andalso up_get(replay_pids) =:= #{} end, 5000),
     sync(),
     ?assertEqual([], up_get(replay_queue)),
-    ?assertEqual(1, meck:num_calls(grpcbox_client, unary, '_')),
+    ?assertEqual(1, meck:num_calls(yuzu_grpc_client, unary, '_')),
     ?assertEqual(Fresh, breaker()).
 
 %% A held notification whose payload cannot be encoded (an agent supplied peer
@@ -2319,18 +2307,6 @@ bind_replay_agent(I, RegisterReq) ->
     ok = yuzu_gw_registry:register_agent(Id, Pid, Sid, [<<"svc">>], <<"host">>,
                                          RegisterReq, conn_test),
     Sid.
-
-%% Release the oldest parked worker and wait for what follows: a new notify
-%% worker entering the mock (the freed slot was refilled from the backlog, one
-%% refill counted) or a ProxyRegister (the replay head advanced). Returns the
-%% number of refills seen before the first ProxyRegister.
-release_until_proxied([W | Rest], Refills) ->
-    W ! release,
-    receive
-        {proxied, _}       -> Refills;
-        {entered, W2, _Req} -> release_until_proxied(Rest ++ [W2], Refills + 1)
-    after ?AWAIT_MS -> erlang:error({replay_never_advanced, Refills})
-    end.
 
 %% half_open by hand (the reset timer is far away). The call is answered after
 %% the message was handled and the probe, if any, was started.

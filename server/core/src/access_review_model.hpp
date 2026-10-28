@@ -55,7 +55,7 @@
 /// hardened): `RbacStore::get_effective_permissions(username)` is
 /// USER-keyed — it resolves direct user grants, group-membership-derived
 /// grants, AND direct engine grants via one three-way UNION
-/// (`RbacStore::collect_roles_locked`). Calling it with a GROUP name would
+/// (`RbacStore::collect_roles`). Calling it with a GROUP name would
 /// silently look up `principal_type='user' AND principal_id=<group name>`
 /// plus a (vacuous) group-membership check for a "user" named after the
 /// group — never the group's own grants. This model therefore NEVER calls
@@ -69,7 +69,7 @@
 /// re-queried per role per principal, which is the perf fix for the N×M
 /// fan-out the prior per-roster-member walk incurred. For an ENGINE
 /// principal this produces the SAME result `get_effective_permissions
-/// (engine_id)` would (the engine UNION arm in `collect_roles_locked` only
+/// (engine_id)` would (the engine UNION arm in `collect_roles` only
 /// ever contributes an engine principal's own direct grants — engines are
 /// never group members). For a USER this is narrower than
 /// `get_effective_permissions` (it excludes group-inherited roles) — a
@@ -118,7 +118,8 @@ struct AccessReviewRow {
     int effective_permission_count{0}; ///< distinct (securable_type,operation) allow-permissions
                                         ///< the `roles` above grant, computed type-correctly
     std::int64_t last_activity_ms{0};  ///< epoch ms; 0 when unknown/not applicable
-    std::string last_activity_kind;    ///< "last_login" | "last_used" | "n/a"
+    std::string last_activity_kind;    ///< "last_used" | "n/a"; only an engine principal with a
+                                       ///< recorded use is "last_used"
     std::string classification;        ///< engine: "internal"|"external"; else ""
     std::string lifecycle_state;       ///< engine: "active"|"revoked"; user: "active"|"disabled"
                                         ///< (per AuthDB::list_users_including_inactive's is_active

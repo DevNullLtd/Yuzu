@@ -22,12 +22,12 @@ Neither action shells out or spawns a subprocess; both are native, in-process fi
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: PluginSecret.Read get_log<br/>Security.Read get_key_files]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[agent_logging.execute]
-  EX --> WIN[Windows leg<br/>ifstream tail read /<br/>GetModuleFileNameA]
-  EX --> MAC[macOS leg<br/>ifstream tail read /<br/>_NSGetExecutablePath + realpath]
-  EX --> LIN[Linux leg<br/>ifstream tail read /<br/>proc self exe symlink]
-  WIN & MAC & LIN --> ROWS[key|value rows,<br/>no typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator / workflow"] --> SRV["Server - authz: PluginSecret.Read get_log, Security.Read get_key_files"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"] --> EX["agent_logging.execute"]
+  EX --> WIN["Windows leg - ifstream tail read / GetModuleFileNameA"]
+  EX --> MAC["macOS leg - ifstream tail read / _NSGetExecutablePath + realpath"]
+  EX --> LIN["Linux leg - ifstream tail read / proc self exe symlink"]
+  WIN & MAC & LIN --> ROWS["key|value rows, no typed result status"] --> RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
 
 ## OS capability

@@ -552,6 +552,9 @@ TAR is designed for minimal performance overhead:
   Each tier's window comes from the schema registry's per-granularity default,
   **not** from the `retention_days` configure key -- that key is stored and
   reported by `status` but is not what the warehouse tiers prune against.
+  The per-tier defaults are published by `GET /api/v1/settings/data-retention`
+  (`tar.tiers`) and shown on Settings > Data and retention (the `live` tier under
+  the Exact column) with a "Look again after" floor per source.
 
 ### The retention clock guard
 
