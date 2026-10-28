@@ -1,0 +1,380 @@
+/**
+ * test_runtimes_python_parsers.cpp -- tests for the runtimes plugin's `python` action
+ * (SAM.1): the pure decision layer (runtimes_python_parsers.hpp) on EVERY OS, and the macOS
+ * framework walk (runtimes_macos_parsers.hpp) over a materialized fixture tree on POSIX. The
+ * Linux walk's python cases live in test_runtimes_linux_parsers.cpp (they share its harness); the
+ * Windows registry walk is test_runtimes_win_walk.cpp.
+ *
+ * SCOPED GUARD (reasoned exception to the never-guard-a-test-TU rule): the macOS walk is built on
+ * the POSIX-only walk layer, so those cases sit in one `#if !defined(_WIN32)` region. The pure
+ * cases are unguarded.
+ *
+ * FIXTURE. tests/unit/fixtures/wave10/runtimes/macos/python_framework.manifest -- the python.org
+ * 3.13.1 framework Info.plist as a REAL CAPTURE (provenance in the manifest header), plus
+ * RECONSTRUCTION entries it names itself (a binary plist, a version directory with no Resources).
+ *
+ * MUTATION NOTES: accepting CFBundleShortVersionString without the full-version test returns
+ * "3.13.1, (c) ..." as the version; reading Info.plist with the path-form open follows the
+ * planted symlink and surfaces the sibling tree; dropping the Frameworks hop's O_NOFOLLOW lists
+ * the sibling tree's python; dropping the dedupe keeps both registry views' row.
+ */
+#include <catch2/catch_test_macros.hpp>
+
+#include "runtimes_fixture_tree.hpp"
+#include "runtimes_legs.hpp"
+#include "runtimes_python_parsers.hpp"
+
+#include "test_helpers.hpp" // yuzu::test::TempDir
+
+#include <filesystem>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#if !defined(_WIN32)
+#include "runtimes_macos_parsers.hpp"
+
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+namespace rt = yuzu::runtimes;
+namespace fs = std::filesystem;
+using namespace runtimes_fixture;
+
+namespace {
+
+fs::path macos_fixture() {
+#ifdef YUZU_TEST_FIXTURE_DIR
+    return fs::path(YUZU_TEST_FIXTURE_DIR) / "wave10" / "runtimes" / "macos" /
+           "python_framework.manifest";
+#else
+    return fs::path("tests/unit/fixtures/wave10/runtimes/macos/python_framework.manifest");
+#endif
+}
+
+constexpr const char* kPlistRel =
+    "Library/Frameworks/Python.framework/Versions/3.13/Resources/Info.plist";
+
+/// The captured python.org Info.plist text, decoded from the manifest (portable: no filesystem
+/// materialization), REQUIREd to exist so a missing fixture fails rather than skips.
+std::string captured_plist() {
+    std::ifstream in(macos_fixture(), std::ios::binary);
+    REQUIRE(in.good());
+    for (std::string line; std::getline(in, line);) {
+        const auto p = parse_manifest_line(line);
+        if (p.outcome == LineOutcome::entry && p.entry.rel == kPlistRel) return p.entry.payload;
+    }
+    FAIL("Info.plist entry not found in " << macos_fixture().string());
+    return {};
+}
+
+std::vector<std::string> split_fields_escape_aware(const std::string& row) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (std::size_t i = 0; i < row.size(); ++i) {
+        if (row[i] == '\\' && i + 1 < row.size() && row[i + 1] == '|') {
+            cur += '|';
+            ++i;
+        } else if (row[i] == '|') {
+            out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += row[i];
+        }
+    }
+    out.push_back(cur);
+    return out;
+}
+
+} // namespace
+
+// == pure layer (every OS) ======================================================================
+
+TEST_CASE("python: python3_minor_from_name accepts exactly python3.<digits>", "[runtimes][python]") {
+    CHECK(rt::python3_minor_from_name("python3.12") == "3.12");
+    CHECK(rt::python3_minor_from_name("python3.9") == "3.9");
+    CHECK(rt::python3_minor_from_name("python3.130") == "3.130");
+    for (const char* no : {"python3", "python3.", "python3.12-config", "python3.12m", "python2.7",
+                           "python312", "python3.x", "Python3.12", "xpython3.12", "python3.12.1", ""}) {
+        INFO("name: " << no);
+        CHECK_FALSE(rt::python3_minor_from_name(no).has_value());
+    }
+}
+
+TEST_CASE("python: version shape predicates", "[runtimes][python]") {
+    CHECK(rt::looks_like_major_minor("3.12"));
+    CHECK_FALSE(rt::looks_like_major_minor("3.12.4"));
+    CHECK_FALSE(rt::looks_like_major_minor("3"));
+    CHECK_FALSE(rt::looks_like_major_minor(""));
+    CHECK_FALSE(rt::looks_like_major_minor("3."));
+    CHECK_FALSE(rt::looks_like_major_minor(".12"));
+    CHECK(rt::looks_like_full_version("3.12.4"));
+    CHECK_FALSE(rt::looks_like_full_version("3.12"));
+    CHECK_FALSE(rt::looks_like_full_version("3.12.4rc1"));
+    CHECK_FALSE(rt::looks_like_full_version("3.12.4, (c) 2001"));
+    CHECK_FALSE(rt::looks_like_full_version(" 3.12.4"));
+    CHECK_FALSE(rt::looks_like_full_version("3.12.4.1"));
+    CHECK_FALSE(rt::looks_like_full_version(""));
+}
+
+TEST_CASE("python: the REAL CAPTURE python.org Info.plist yields its full version and identifier "
+          "(REAL CAPTURE)",
+          "[runtimes][python][plist]") {
+    const auto plist = captured_plist();
+    // CFBundleVersion is the full x.y.z; the short string carries a licence suffix.
+    CHECK(rt::python_version_from_plist(plist) == "3.13.1");
+    CHECK(rt::plist_string_value(plist, "CFBundleShortVersionString") ==
+          "3.13.1, (c) 2001-2024 Python Software Foundation.");
+    CHECK(rt::plist_string_value(plist, "CFBundleIdentifier") == "org.python.python");
+    // A key whose value is not a <string> (CFBundleAllowMixedLocalizations is <true/>) is a miss.
+    CHECK_FALSE(rt::plist_string_value(plist, "CFBundleAllowMixedLocalizations").has_value());
+    CHECK_FALSE(rt::plist_string_value(plist, "NoSuchKey").has_value());
+}
+
+TEST_CASE("python: python_version_from_plist rejects suffixed values and unreadable shapes (SYNTHETIC)",
+          "[runtimes][python][plist]") {
+    const auto doc = [](std::string_view body) {
+        return "<?xml version=\"1.0\"?><plist><dict>" + std::string{body} + "</dict></plist>";
+    };
+    // Suffixed short string alone: not a version, so the leg falls back to the directory name.
+    CHECK_FALSE(rt::python_version_from_plist(
+                    doc("<key>CFBundleShortVersionString</key><string>3.12.4, (c) PSF</string>"))
+                    .has_value());
+    // Suffixed short string beside a clean CFBundleVersion: the latter wins.
+    CHECK(rt::python_version_from_plist(
+              doc("<key>CFBundleShortVersionString</key><string>3.12.4, (c) PSF</string>"
+                  "<key>CFBundleVersion</key><string>3.12.4</string>")) == "3.12.4");
+    // A clean short string is used when CFBundleVersion is missing or not a full version.
+    CHECK(rt::python_version_from_plist(
+              doc("<key>CFBundleVersion</key><string>312</string>"
+                  "<key>CFBundleShortVersionString</key><string>3.12.4</string>")) == "3.12.4");
+    // major.minor only is not a full version.
+    CHECK_FALSE(
+        rt::python_version_from_plist(doc("<key>CFBundleVersion</key><string>3.12</string>")).has_value());
+    // Binary plist, empty, entity, control character: nothing.
+    CHECK_FALSE(rt::python_version_from_plist("bplist00\x01\x02<key>CFBundleVersion</key><string>3.1.2</string>")
+                    .has_value());
+    CHECK_FALSE(rt::python_version_from_plist("").has_value());
+    CHECK_FALSE(rt::python_version_from_plist(doc("<key>CFBundleVersion</key><string>3.1&amp;2</string>"))
+                    .has_value());
+    CHECK_FALSE(rt::python_version_from_plist(doc("<key>CFBundleVersion</key><string>3.1.2\x01</string>"))
+                    .has_value());
+}
+
+TEST_CASE("python: the plist reader never reads past an unterminated buffer (SYNTHETIC)",
+          "[runtimes][python][plist]") {
+    for (const std::string_view cut :
+         {"<key>CFBundleVersion</key><string>3.1.2", "<key>CFBundleVersion</key><string",
+          "<key>CFBundleVersion</key>", "<key>CFBundleVersion</key", "<key>CFBundleVersion",
+          "<key>"}) {
+        INFO("buffer: " << cut);
+        CHECK_FALSE(rt::python_version_from_plist(cut).has_value());
+    }
+    // The view is a slice of a larger buffer: bytes after its end must not be consulted.
+    const std::string big = "<key>CFBundleVersion</key><string>3.1.2</string>";
+    CHECK_FALSE(rt::python_version_from_plist(std::string_view{big}.substr(0, big.size() - 9)).has_value());
+}
+
+TEST_CASE("python: python_version_from_pep514 prefers Version, then SysVersion, then the tag",
+          "[runtimes][python][pep514]") {
+    CHECK(rt::python_version_from_pep514("3.14.6", "3.14", "3.14") == "3.14.6");
+    CHECK(rt::python_version_from_pep514("", "3.14", "3.14") == "3.14");
+    CHECK(rt::python_version_from_pep514("garbage", "3.14", "3.14-32") == "3.14");
+    CHECK(rt::python_version_from_pep514("", "", "3.14-32") == "3.14");
+    CHECK(rt::python_version_from_pep514("", "", "3.14") == "3.14");
+    CHECK(rt::python_version_from_pep514("", "", "3.14.2") == "3.14");
+    CHECK_FALSE(rt::python_version_from_pep514("x", "y", "z").has_value());
+    CHECK_FALSE(rt::python_version_from_pep514("", "", "3").has_value());
+    CHECK_FALSE(rt::python_version_from_pep514("", "", "").has_value());
+}
+
+TEST_CASE("python: dedupe_python_rows keeps the first record per install path", "[runtimes][python]") {
+    rt::PythonRecord a{rt::PythonFlavour::cpython, "3.14.6", "C:\\Python314\\", "PythonCore"};
+    rt::PythonRecord b = a; // the same install through the 32-bit view
+    b.version = "3.14";
+    rt::PythonRecord other{rt::PythonFlavour::cpython, "3.12.1", "C:\\Python312\\", "PythonCore"};
+    rt::PythonRecord no_path_1{rt::PythonFlavour::cpython, "3.10.1", "", "PythonCore"};
+    rt::PythonRecord no_path_2{rt::PythonFlavour::cpython, "3.9.1", "", "PythonCore"};
+    std::vector<rt::PythonRecord> recs{a, b, other, no_path_1, no_path_2};
+    rt::dedupe_python_rows(recs);
+    REQUIRE(recs.size() == 4);
+    CHECK(recs[0].version == "3.14.6"); // the first (64-bit) view's record survives
+    CHECK(recs[1].version == "3.12.1");
+    CHECK(recs[2].version == "3.10.1"); // path-less records are never merged
+    CHECK(recs[3].version == "3.9.1");
+}
+
+TEST_CASE("python: python_row renders five fields and cannot be shifted by hostile text",
+          "[runtimes][python]") {
+    // safe_output_field folds a literal backslash to '/' (documented lossy wire behaviour).
+    CHECK(rt::python_row({rt::PythonFlavour::cpython, "3.14.6", "C:\\Python314\\", "PythonCore"}) ==
+          "python|cpython|3.14.6|C:/Python314/|PythonCore");
+    CHECK(rt::python_row({rt::PythonFlavour::unmodelled, "", "", ""}) == "python|unmodelled|-|-|-");
+    const auto piped = rt::python_row({rt::PythonFlavour::cpython, "3.1|2", "/opt/we|ird/", "a|b"});
+    const auto f = split_fields_escape_aware(piped);
+    REQUIRE(f.size() == 5);
+    CHECK(f[2] == "3.1|2");
+    CHECK(f[3] == "/opt/we|ird/");
+    CHECK(f[4] == "a|b");
+    CHECK(rt::flavour_token(rt::PythonFlavour::cpython) == "cpython");
+    CHECK(rt::flavour_token(rt::PythonFlavour::unmodelled) == "unmodelled");
+}
+
+TEST_CASE("python: the action name round-trips", "[runtimes][python]") {
+    CHECK(rt::action_name(rt::Action::python) == "python");
+    CHECK(rt::parse_action("python") == rt::Action::python);
+}
+
+// == macOS framework walk over the fixture tree (POSIX) =========================================
+
+#if !defined(_WIN32)
+
+namespace {
+
+namespace mac = yuzu::runtimes::mac;
+using Acc = yuzu::shared::ConstraintAccumulator;
+
+constexpr const char* kVersions = "Library/Frameworks/Python.framework/Versions";
+constexpr const char* kRow313 = "python|cpython|3.13.1|/Library/Frameworks/Python.framework/Versions/3.13|"
+                                "org.python.python";
+constexpr const char* kRow312 = "python|unmodelled|3.12|/Library/Frameworks/Python.framework/Versions/3.12|-";
+constexpr const char* kRow311 = "python|unmodelled|3.11|/Library/Frameworks/Python.framework/Versions/3.11|-";
+
+void write_file(const fs::path& p, const std::string& text) {
+    std::error_code ec;
+    fs::create_directories(p.parent_path(), ec);
+    REQUIRE_FALSE(ec);
+    std::ofstream out(p, std::ios::binary);
+    REQUIRE(out.good());
+    out << text;
+}
+
+bool privileged() { return ::geteuid() == 0; }
+
+struct PermRestore {
+    fs::path path;
+    ~PermRestore() { ::chmod(path.c_str(), 0755); }
+};
+
+} // namespace
+
+TEST_CASE("python: mac::python_rows_at reads each framework version (REAL CAPTURE + labelled "
+          "reconstructions)",
+          "[runtimes][python][macos]") {
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_pymac_"};
+    std::string err;
+    REQUIRE(materialize_manifest_file(dir.path, err, macos_fixture()));
+    Acc acc;
+    const auto rows = mac::python_rows_at(dir.path, acc);
+    // Sorted by directory name: 3.11 (no Resources) and 3.12 (binary plist) fall back to the
+    // directory's x.y with no token; 3.13 is the real plist. `Current` (symlink) and `Headers`
+    // (not a version) are skipped silently.
+    CHECK(rows == std::vector<std::string>{kRow311, kRow312, kRow313});
+    CHECK_FALSE(acc.any_failure());
+}
+
+TEST_CASE("python: an absent framework is supported with zero rows", "[runtimes][python][macos]") {
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_pymac_absent_"};
+    Acc acc;
+    CHECK(mac::python_rows_at(dir.path, acc).empty());
+    CHECK_FALSE(acc.any_failure());
+}
+
+TEST_CASE("python: a symlinked Frameworks hop is refused and the sibling tree is never listed "
+          "(SYNTHETIC)",
+          "[runtimes][python][macos]") {
+    // MUTATION: opening the Versions directory with a path-form open follows `Library/Frameworks`
+    // and lists the sibling tree (the canary 3.99 row).
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_pymac_link_"};
+    write_file(dir.path / "elsewhere/Python.framework/Versions/3.99/Resources/Info.plist",
+               "<key>CFBundleVersion</key><string>3.99.1</string>");
+    fs::create_directories(dir.path / "Library");
+    std::error_code ec;
+    fs::create_symlink("../elsewhere", dir.path / "Library/Frameworks", ec);
+    REQUIRE_FALSE(ec);
+    Acc acc;
+    CHECK(mac::python_rows_at(dir.path, acc).empty());
+    CHECK(acc.reason() == "macos:runtimes:symlink_refused");
+}
+
+TEST_CASE("python: a symlinked Versions directory and a symlinked version entry (SYNTHETIC)",
+          "[runtimes][python][macos]") {
+    SECTION("Versions itself is a symlink: refused") {
+        yuzu::test::TempDir dir{"yuzu_test_runtimes_pymac_vlink_"};
+        write_file(dir.path / "srv/3.99/Resources/Info.plist", "x");
+        fs::create_directories(dir.path / "Library/Frameworks/Python.framework");
+        std::error_code ec;
+        fs::create_symlink("../../../srv", dir.path / kVersions, ec);
+        REQUIRE_FALSE(ec);
+        Acc acc;
+        CHECK(mac::python_rows_at(dir.path, acc).empty());
+        CHECK(acc.reason() == "macos:runtimes:symlink_refused");
+    }
+    SECTION("a version-named symlink entry is skipped silently, never followed") {
+        yuzu::test::TempDir dir{"yuzu_test_runtimes_pymac_elink_"};
+        fs::create_directories(dir.path / kVersions / "3.12");
+        std::error_code ec;
+        fs::create_symlink("3.12", dir.path / kVersions / "3.12.9", ec); // not x.y anyway
+        fs::create_symlink("3.12", dir.path / kVersions / "3.13", ec);   // x.y but a symlink
+        REQUIRE_FALSE(ec);
+        Acc acc;
+        CHECK(mac::python_rows_at(dir.path, acc) == std::vector<std::string>{kRow312});
+        CHECK_FALSE(acc.any_failure());
+    }
+}
+
+TEST_CASE("python: an unreadable or hostile Info.plist keeps the row at the directory version with no "
+          "token (SYNTHETIC)",
+          "[runtimes][python][macos]") {
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_pymac_plist_"};
+    const fs::path v = dir.path / kVersions;
+    fs::create_directories(v / "3.10/Resources/Info.plist"); // a directory named Info.plist
+    write_file(v / "3.11/secret.txt", "<key>CFBundleVersion</key><string>9.9.9</string>");
+    fs::create_directories(v / "3.11/Resources");
+    std::error_code ec;
+    fs::create_symlink("../secret.txt", v / "3.11/Resources/Info.plist", ec); // never followed
+    REQUIRE_FALSE(ec);
+    write_file(v / "3.12/Resources/Info.plist", std::string(256 * 1024 + 1, 'x')); // over the bound
+    Acc acc;
+    CHECK(mac::python_rows_at(dir.path, acc) ==
+          std::vector<std::string>{
+              "python|unmodelled|3.10|/Library/Frameworks/Python.framework/Versions/3.10|-", kRow311,
+              kRow312});
+    CHECK_FALSE(acc.any_failure());
+}
+
+TEST_CASE("python: an unopenable Versions directory is permission_denied, never absent (SYNTHETIC)",
+          "[runtimes][python][macos]") {
+    if (privileged()) SKIP("permission bits are bypassed at euid 0");
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_pymac_eacces_"};
+    fs::create_directories(dir.path / kVersions / "3.13");
+    const PermRestore restore{dir.path / kVersions};
+    REQUIRE(::chmod((dir.path / kVersions).c_str(), 0000) == 0);
+    Acc acc;
+    CHECK(mac::python_rows_at(dir.path, acc).empty());
+    CHECK(acc.reason() == "macos:runtimes:permission_denied");
+}
+
+TEST_CASE("python: the macOS row budget bounds the rows and reports row_cap (SYNTHETIC)",
+          "[runtimes][python][macos][cap]") {
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_pymac_cap_"};
+    for (const char* v : {"3.10", "3.11", "3.12"}) fs::create_directories(dir.path / kVersions / v);
+    yuzu::runtimes::lnx::WalkConfig cfg;
+    cfg.limits.rows = 2;
+    Acc acc;
+    const auto rows = mac::python_rows_at(dir.path, acc, cfg);
+    CHECK(rows.size() == 2);
+    CHECK(acc.reason() == "macos:runtimes:row_cap");
+}
+
+TEST_CASE("python: mac::forward_tokens re-spells linux: causes as macos: causes", "[runtimes][python][macos]") {
+    Acc from, to;
+    from.add_failure("linux:runtimes:permission_denied");
+    from.add_failure("linux:runtimes:row_cap");
+    mac::forward_tokens(from, to);
+    CHECK(to.reason() == "macos:runtimes:permission_denied,macos:runtimes:row_cap");
+}
+
+#endif // !defined(_WIN32)

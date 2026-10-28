@@ -11,13 +11,14 @@ cadences.
 
 - **Machine-wide installed software** (blob contract v2): name, version,
   publisher, install date, plus the package-manager fields below. The daily
-  sync calls six inventory actions in-process and merges their rows:
+  sync calls seven inventory actions in-process and merges their rows:
   `installed_apps` `list_inventory` (Windows: `HKLM` + the agent service
   account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
   `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew) and
   `store_packages` (Linux snaps and flatpaks), and
   `windows_optional_features` `list` and `msi_packages` `list_inventory`
-  (Windows machine-context MSI products). An action whose plugin is not loaded, or
+  (Windows machine-context MSI products), and `runtimes` `python` (installed
+  Python interpreters). An action whose plugin is not loaded, or
   that answers "unsupported on this OS", is skipped. A plugin that is not
   loaded is logged at warn (the rows its action produced are removed on the next
   report); without `installed_apps` the source stays idle and sends nothing,
@@ -41,7 +42,8 @@ cadences.
   `source` names the
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `pkg_inventory.store_packages`,
-  `windows_optional_features.list`, `msi_packages.list_inventory`); `package_id`
+  `windows_optional_features.list`, `msi_packages.list_inventory`,
+  `runtimes.python`); `package_id`
   is empty for these producers except `msi_packages.list_inventory`, where it is
   the MSI product code. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
@@ -80,19 +82,19 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product |
-  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` | — |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -149,6 +151,23 @@ cadences.
   and the machine-context guarantee. Install location and uninstall string are
   not collected (wire slots 13-14 stay reserved and empty, #5186). If the
   enumeration itself fails the cycle is skipped (see Troubleshooting).
+
+  **Python interpreters** are collected through `runtimes` `python` (all three OSes;
+  `source` `runtimes.python`) as one `app` row per interpreter, `name` `Python`,
+  `ecosystem` `python`, `version` the interpreter version; publisher and the other
+  package fields are empty. No process is started: each OS answers from install
+  metadata. Windows reads the PEP 514 `HKLM\SOFTWARE\Python\PythonCore` keys in both
+  registry views (python.org installs; per-user installs and other PEP 514
+  publishers are not listed) and reports the full `x.y.z`. macOS reads the
+  python.org framework under `/Library/Frameworks/Python.framework/Versions` and
+  reports the full `x.y.z` from each version's `Info.plist`. Linux lists
+  `python3.<minor>` files in `/usr/bin` and `/usr/local/bin` and reports
+  **major.minor only** (for example `3.11`): the patch level is not stored anywhere
+  without running the interpreter, so it is not guessed. Homebrew, pyenv, conda,
+  virtual environments and Xcode's Python are not walked. An unreadable root makes
+  the roster constrained, so the cycle is skipped rather than the rows silently
+  disappearing; a missing or unreadable version file never does, the row reports
+  the version it could determine.
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,

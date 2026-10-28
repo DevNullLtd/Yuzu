@@ -41,6 +41,7 @@ using yuzu::agent::parse_msi_packages_list_inventory_output;
 using yuzu::agent::parse_pkg_inventory_managers_output;
 using yuzu::agent::parse_pkg_inventory_packages_output;
 using yuzu::agent::parse_pkg_inventory_store_packages_output;
+using yuzu::agent::parse_runtimes_python_output;
 using yuzu::agent::parse_windows_optional_features_output;
 using yuzu::agent::parse_installed_apps_output;
 using yuzu::agent::sha256_hex;
@@ -3018,4 +3019,62 @@ TEST_CASE("manager-ecosystem table: each row maps through its own action only",
                   res("ok", "tok"));
         }
     }
+}
+
+// runtimes.python adapter
+TEST_CASE("runtimes python adapter: real-capture rows map to Python / app / python",
+          "[sync][parse][adapter][runtimes]") {
+    using Status = AdaptedRows::Status;
+    // Rows as the plugin emits them over the committed captures: the debian:bookworm listing
+    // (major.minor only on Linux), the python.org 3.13.1 framework plist (macOS) and a Windows
+    // PythonCore tag (flavour/path/vendor are dropped: no installed_software slot).
+    const auto r = parse_runtimes_python_output(
+        nl({"status|python|supported|-",
+            "python|unmodelled|3.11|/usr/bin/python3.11|-",
+            "python|cpython|3.13.1|/Library/Frameworks/Python.framework/Versions/3.13|org.python.python",
+            "python|cpython|3.14.6|C:/Python314/|PythonCore"}),
+        kFailPolicy);
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 3);
+    const char* versions[] = {"3.11", "3.13.1", "3.14.6"};
+    for (std::size_t i = 0; i < 3; ++i) {
+        CHECK(r.entries[i].name == "Python");
+        CHECK(r.entries[i].version == versions[i]);
+        CHECK(r.entries[i].kind == "app");
+        CHECK(r.entries[i].ecosystem == "python");
+        CHECK(r.entries[i].publisher.empty());
+    }
+}
+
+TEST_CASE("runtimes python adapter: `-` version is empty; malformed rows are dropped",
+          "[sync][parse][adapter][runtimes]") {
+    using Status = AdaptedRows::Status;
+    const auto r = parse_runtimes_python_output(
+        nl({"status|python|supported|-", "python|unmodelled|-|/usr/bin/python3.x|-",
+            "python|cpython|3.1|/p", "jvm|jdk|17|/x|-", "python|cpython|3.2|/p|v|extra"}),
+        kFailPolicy);
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 1);
+    CHECK(r.entries[0].version.empty());
+    CHECK(r.entries[0].ecosystem == "python");
+}
+
+TEST_CASE("runtimes python adapter: status grammar decides the answer", "[sync][parse][adapter][runtimes]") {
+    using Status = AdaptedRows::Status;
+    // No status row, or one for another action: bad status.
+    CHECK(parse_runtimes_python_output(nl({"python|cpython|3.14.6|C:/P/|PythonCore"}), kFailPolicy).status ==
+          Status::failed);
+    CHECK(parse_runtimes_python_output(nl({"status|jvm|supported|-"}), kFailPolicy).status ==
+          Status::failed);
+    // constrained fails the cycle under the table row's policy and carries the reason.
+    const auto c = parse_runtimes_python_output(
+        nl({"status|python|constrained|linux:runtimes:permission_denied",
+            "python|unmodelled|3.11|/usr/bin/python3.11|-"}),
+        ConstrainedPolicy::fail);
+    CHECK(c.status == Status::failed);
+    CHECK(c.reason == "linux:runtimes:permission_denied");
+    // unsupported is skipped with no entries.
+    const auto u = parse_runtimes_python_output(nl({"status|python|unsupported|macos:planned"}), kFailPolicy);
+    CHECK(u.status == Status::unsupported);
+    CHECK(u.entries.empty());
 }

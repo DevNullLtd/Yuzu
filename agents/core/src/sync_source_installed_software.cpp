@@ -297,6 +297,7 @@ const InventoryAction kInventoryActions[] = {
     {.plugin = "msi_packages",
      .action = "list_inventory",
      .adapt = parse_msi_packages_list_inventory_output},
+    {.plugin = "runtimes", .action = "python", .adapt = parse_runtimes_python_output},
 };
 
 } // namespace
@@ -457,6 +458,30 @@ AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out,
         e.kind = "pkg";
         e.ecosystem = "msi";
         e.package_id = clamp_field(tok[1], kMaxFieldLen);
+        entries.push_back(std::move(e));
+        return true;
+    }, policy);
+}
+
+AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPolicy policy) {
+    // python|<flavour>|<version or ->|<install_path or ->|<vendor or ->, one row per interpreter the
+    // runtimes plugin found at the standard machine roots (agents/plugins/runtimes/src/
+    // runtimes_python_parsers.hpp). The status row is the shared inventory grammar. Every row
+    // becomes one {name Python, kind app, ecosystem python} entry whose version is the row's
+    // (`-` = unknown -> empty; on Linux it is major.minor, the patch level is not available there).
+    // The flavour, path and vendor have no installed_software slot and are dropped. A constrained
+    // status (an unreadable root, a cap) fails the cycle (the table row's ConstrainedPolicy::fail):
+    // a partial roster would delete the stored python rows beyond the failure point.
+    return adapt_pkg_inventory(out, "python",
+                               [](const std::vector<std::string_view>& tok,
+                                  std::vector<SwEntry>& entries) {
+        if (tok[0] != "python" || tok.size() != 5)
+            return false;
+        SwEntry e;
+        e.name = "Python";
+        e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
+        e.kind = "app";
+        e.ecosystem = "python";
         entries.push_back(std::move(e));
         return true;
     }, policy);

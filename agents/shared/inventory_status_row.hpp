@@ -6,9 +6,9 @@
 //
 //   status|<action>|<supported|constrained|unsupported>|<tokens or ->
 //
-// row followed by its data rows. Other plugins keep their own status rows:
-// runtimes (its own StatusLevel in runtimes_parsers.hpp), the StatusState plugins
-// and browser_policy. None of them feeds the collector. This header owns the
+// row followed by its data rows. runtimes uses this header's formatter; the StatusState
+// plugins and browser_policy keep their own status rows and none of them feeds the
+// collector. This header owns the
 // collector's grammar in both directions so the producers and the consumer
 // cannot drift:
 //
