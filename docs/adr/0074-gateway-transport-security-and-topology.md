@@ -167,6 +167,8 @@ This replaces the 8 KiB-per-connection goal set on 2026-10-26.
 
 The memory measures in this ADR's companion change apply to both TLS paths: a garbage collection of the large processes after an agent-count drop, plus a second pass 30 seconds later; a periodic `malloc_trim(0)`; `+MMmcs 0`; `MALLOC_ARENA_MAX=2`.
 
+`malloc_trim` and `MALLOC_ARENA_MAX` are glibc features. They act on the chiselled Ubuntu image (`Dockerfile.gateway.chisel`), where they were measured. The default image (`Dockerfile.gateway`) is Alpine with musl: `MALLOC_ARENA_MAX` does nothing there, and musl has no `malloc_trim`. musl's allocator returns freed memory differently, and that is not yet measured. Building any NIF (the kTLS one or a `malloc_trim` one) also adds a C toolchain to both builder stages and to the Meson-driven gateway build, none of which compile C today.
+
 ## Conflicts this ADR creates, to resolve in wave 0
 
 1. **Cluster affinity against free gateway choice.** #4669 made an agent's home cluster sticky (`agent_routes.home_cluster_id`), so another cluster cannot claim and answer for it. D9 and D11 move agents between gateways freely, possibly across clusters.
