@@ -6078,8 +6078,13 @@ groups:
           description: >-
             A durable session-store operation ({{ $labels.op }}) hit a degraded
             PostgreSQL read/write for 10m. A `validate` degrade fails requests
-            closed (401); `create`/`elevate`/`mark_mfa`/`invalidate`/
-            `invalidate_user` degrades fail the privileged op closed; a sustained
+            closed (401; the approve and reject routes answer 503 when they cannot read
+            the session's stored MFA proof); `create`/`elevate`/`mark_mfa`/`invalidate`/
+            `invalidate_user` degrades fail the privileged op closed, except an
+            `invalidate_user` after an MFA clear that already committed (Settings MFA
+            disable), which leaves the clear in place and ends `partial`; a single
+            event does not hold this alert's 10m condition, so look for
+            `mfa.disabled` rows with result `partial` in the audit log; a sustained
             `generation_refresh` degrade drops the validate cache past the
             stale-serve bound. Usually PostgreSQL pool saturation / failover —
             correlate with the pool metrics.

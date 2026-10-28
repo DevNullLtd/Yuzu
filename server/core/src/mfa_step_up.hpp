@@ -71,10 +71,12 @@
 ///     `user=<name> reason=<token>`. A central-chokepoint row appends ` cid=<id>
 ///     stage=pre_authz`; a row written by an in-handler call carries neither.
 
+#include "mfa_factor_state.hpp"
 #include "rest_a4_envelope.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 
+#include <chrono>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -115,6 +117,44 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
                          std::string_view mfa_enforcement = "optional",
                          yuzu::MetricsRegistry* metrics = nullptr);
 
+/// Classify the second factor `session` stands on (see `MfaFactorState`). The
+/// session's OWN factor only: an OIDC or bearer session is never looked up by
+/// username, so an unrelated local account that happens to share the name cannot
+/// lend it a factor. Only a `local` session reads the store (`mfa_status`), and a
+/// store outage or undecryptable secret is `kStoreUnavailable`, never "not enrolled".
+[[nodiscard]] MfaFactorProbe probe_mfa_factor(const auth::Session& session, AuthDB& auth_db);
+
+/// Approver gate (#6079): the caller must stand on an enrolled factor AND hold a
+/// proof no older than `approver_step_up_window(configured_window_secs)`. Unlike
+/// `require_mfa_step_up` there is no `window_secs <= 0` escape hatch, no bearer
+/// exemption, no pass for an un-enrolled account and no enforcement-dependent OIDC
+/// pass. A local proof stamped before the current enrolment (the factor was cleared
+/// and re-enrolled since) does not count.
+///
+/// The ceiling is hard and measured on the database clock. `durable` is the caller's
+/// authoritative read of the session's stored proof (`AuthManager::read_durable_mfa_proof`):
+/// with a `kRow` the proof age is `db_now_ms - mfa_verified_ms` and must lie in
+/// [0, window] with no skew allowance, in addition to the cached monotonic check, so a
+/// suspended host or paused VM (which freezes the monotonic anchor) cannot extend it.
+/// `kUnavailable` is `kStoreUnavailable` (503), which includes an `AuthManager` with no
+/// SessionStore attached (never reachable in a serving process: the server refuses to boot
+/// without Postgres); `kAbsent` is a challenge. No replica clock stands in for the database
+/// clock, so there is no store-less fallback.
+///
+/// Only `kChallengeWritten` writes to `res` (the 401 step-up envelope plus one
+/// `mfa.step_up.required` row; the challenge reports the EFFECTIVE window).
+/// `kStoreUnavailable` also increments `yuzu_auth_secret_unavailable_total{route="approval"}`
+/// when `metrics` is set. `kProofClockSkew` is an SSO session whose cached anchor is empty and
+/// whose stored proof is dated after the database clock: it writes nothing, is NOT counted (the
+/// counter is a store-fault signal) and the route answers it 503 with no retry hint. A degraded
+/// durable read for such a session is `kStoreUnavailable`, decided first.
+[[nodiscard]] ApproverMfaOutcome
+require_enrolled_fresh_mfa(const httplib::Request& req, httplib::Response& res,
+                           const auth::Session& session, AuthDB& auth_db,
+                           int configured_window_secs, const StepUpAuditFn& audit_fn,
+                           const std::string& action_label, const auth::DurableMfaProof& durable,
+                           yuzu::MetricsRegistry* metrics = nullptr);
+
 /// True if the IdP `amr` claim attests a multi-factor (or otherwise
 /// strong) authentication that should seed a session's MFA-verified
 /// timestamp. The allowlist follows RFC 8176 plus Entra's non-standard
@@ -132,6 +172,44 @@ bool amr_asserts_mfa(const std::vector<std::string>& amr);
 /// `required || (admin-only && admin)` logic lives in exactly one place
 /// (governance arch-S1 — was duplicated and drift-prone).
 bool mfa_enforcement_protects(std::string_view mode, auth::Role role);
+
+namespace detail {
+
+/// Result of ageing a session's MFA proof on the cached monotonic anchor. The same age
+/// arithmetic exists in two copies that must stay in step: this one, whose only production
+/// consumer is the approver gate (`require_enrolled_fresh_mfa`, which uses the monotonic half
+/// and adds its own durable, database-clock ceiling on top), and the generic gate's own copy in
+/// `decide_step_up` (step_up_gate.cpp), which is what `require_mfa_step_up` and the central
+/// chokepoint decide on.
+struct ProofAge {
+    bool no_proof{true};    ///< no usable proof: absent, or future-dated (derive left it {})
+    bool fresh{false};      ///< a proof exists, is within the window, and is not wall-stale
+    long long age_secs{-1}; ///< whole seconds on the monotonic anchor; -1 when `no_proof`
+    /// Milliseconds on the monotonic anchor; -1 when `no_proof`. `fresh` compares the
+    /// whole-second age (a proof 300.5 s old is still fresh in a 300 s window); a caller
+    /// needing a hard ceiling compares this instead. The approver gate compares it (with
+    /// `no_proof`) and adds its own durable, database-clock ceiling; it does not consult
+    /// `wall_stale`.
+    long long age_ms{-1};
+    bool wall_stale{false}; ///< the absolute (wall) proof age is grossly past the window
+};
+
+/// Age `session`'s proof against `effective_window` (monotonic anchor plus the wall
+/// suspend backstop; see the definition). The wall figure (`wall_stale`) is computed from the
+/// replica's system_clock but is not decisional for the approver gate, which ignores it.
+[[nodiscard]] ProofAge mfa_proof_age(const auth::Session& session,
+                                     std::chrono::seconds effective_window);
+
+/// Write the 401 step-up envelope (challenge_url differs for OIDC vs local) and emit
+/// one `mfa.step_up.required` row. `extra_detail`, when non-empty, is appended to the
+/// row's detail. An audit failure or throw is logged and otherwise ignored.
+void write_step_up_challenge(const httplib::Request& req, httplib::Response& res,
+                             const auth::Session& session, bool is_oidc,
+                             const StepUpAuditFn& audit_fn, const std::string& action_label,
+                             long long age_secs, int window_secs,
+                             std::string_view extra_detail = {});
+
+} // namespace detail
 
 /// Per-surface adapter — wires AuthDB + window_secs + audit_fn into a
 /// 3-argument callable that downstream `register_routes` overloads can
