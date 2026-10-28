@@ -1,0 +1,89 @@
+Provenance of tests/unit/fixtures/middleware/linux/*
+Two captures, both 2026-10-28, both verbatim (no fixture file is edited after capture):
+  A. unregistered "unzipped" developer images (swidtag.listing sections 10.0.1 / 9.3.5 / 9.2.5 / 9.1.5,
+     tree.manifest), taken on a macOS host (Docker Desktop, --platform linux/amd64);
+  B. a REGISTERED install (mqinst.ini, swidtag.listing section 9.4.5), taken on a Windows 11 + WSL2
+     Ubuntu host (docker 29.1.3 inside WSL).
+
+== A. IBM MQ developer images (swidtag.listing, tree.manifest) ==
+method     `docker run --entrypoint /bin/bash <image> -c '<ls|cat|find>'` only: no MQ binary was
+           executed (no dspmqver, dspmqinst, ...).
+images     four IBM MQ Advanced for Developers images checked (tag, digest):
+           icr.io/ibm-messaging/mq:9.1.5.0-r2   sha256:84d87c8b4291a2142882f8d06b94110f14a7212429087503daa56c1d92611187
+           icr.io/ibm-messaging/mq:9.2.5.0-r3   sha256:febe3fbf180fd844e9d94fb48b954b84a0f20a0c1dd6052f3ce4e1545d379c9a
+           icr.io/ibm-messaging/mq:9.3.5.1-r2   sha256:70b2028551de81a16eb250b30eec6b1cb4064309c68ebec3d6851e806c3459e6 (RHEL 8.9)
+           icr.io/ibm-messaging/mq:latest       sha256:129d1d736e94bae071039136585734b7ccc6cfd6e1cc7dacb9af59e60d0a57c2
+                                                = 10.0.1.0-r1, RHEL 10.2
+identity   uid=1001 gid=0(root) (the image default user; not host root)
+command    ls -ln /opt/mqm/swidtag ; ls -lnd /etc/opt/mqm /etc/opt/mqm/mqinst.ini
+           (9.2.5 and 9.1.5 whole listing in swidtag.listing; the 10.0.1 and 9.3.5 sections hold the
+           .swidtag line only. The 9.3.5 directory also holds 21 *.mqtag files (ls -ln, 511-594 bytes):
+           IBM_MQ-9.3.5, IBM_MQ_Advanced-9.3.5, IBM_MQ_GSKit-8.0.55, IBM_MQ_JRE-1.8.0,
+           IBM_MQ_Java_Messaging-9.3.5, IBM_MQ_Runtime-9.3.5, IBM_MQ_Samples-9.3.5, IBM_MQ_WebUI-9.3.5
+           and 13 IBM_MQ_Messages_<Language>-9.3.5.)
+tree.manifest  the `/opt/mqm` line of `ls -ln /opt` (the install root every candidate in the run_leg
+           tests points at).
+FINDING    Swidtag names. Each of the four directories holds exactly ONE .swidtag, named
+           ibm.com_IBM_MQ_Advanced_for_Developers_Non-Warranted-<v>.swidtag, <v> = 10.0.1, 9.3.5,
+           9.2.5, 9.1.5 (the 9.1.5 image DOES hold one: 686 bytes). 9.1.5, 9.2.5 and 9.3.5 also hold
+           IBM_MQ-<v>.mqtag plus ~20 component .mqtag files; 10.0.1 holds no .mqtag. The 10.0.1
+           swidtag's version="10.0.1" equals its filename suffix.
+FINDING    None of the four images has /etc/opt/mqm or /etc/opt/mqm/mqinst.ini: they are
+           "unzipped" installs that are not registered with the operating system (their generated
+           /root/IBM/MQ/data/mqs.ini says "an installation not registered with the operating system").
+           As root in the 10.0.1.0-r1 image, `setmqinst -i -p /opt/mqm` is refused with AMQ7027E ("not
+           valid for an unregistered or non-installed version", rc 36), and `crtmqinst` is not shipped
+           (/opt/mqm/bin holds only dspmqinst, mqinstconf, setmqinst; ls -ln confirmed 2026-10-28).
+           Registration needs the deb/rpm scriptlets of the full developer tarball, hence capture B.
+
+== B. REGISTERED install: mqinst.ini is a REAL capture (mqinst.ini, swidtag.listing section 9.4.5) ==
+host       Windows 11 + WSL2 Ubuntu 26.04; docker 29.1.3 in WSL; `docker run --rm`, container removed
+           afterwards.
+container  ubuntu:24.04 (Ubuntu 24.04.5 LTS)
+           digest ubuntu@sha256:24737cef17f4e22b1977df7d9a05e77c4e28b7da5b8911f8d8ccda136bf3573c
+date       2026-10-28, ~15:30-15:40 UTC
+product    IBM MQ Advanced for Developers 9.4.5.0, Ubuntu x86-64
+           https://public.dhe.ibm.com/ibmdl/export/pub/software/websphere/messaging/mqadv/9.4.5.0-IBM-MQ-Advanced-for-Developers-UbuntuLinuxX64.tar.gz
+           tarball sha256 4dceaca116fd50a21600651dc35203a13b7491c921ad422c8b65ef4aed85aff9 (547082320 bytes)
+install    debs installed in order with dpkg -i: ibmmq-runtime, ibmmq-gskit, ibmmq-server (all 9.4.5.0;
+           a single-pass `dpkg -i a b c` fails because the server deb pre-depends on a configured
+           runtime). Licence accepted with ./mqlicense.sh -accept; the mqm group and user were created
+           first. No queue manager was created or started.
+identity   the install and the root-level reads ran as root in the container; the unprivileged reads ran
+           as a throwaway container account (uid 1001, no groups beyond its own) through `su`.
+command    cat /etc/opt/mqm/mqinst.ini ; stat -c '%a %U:%G %s' /etc/opt/mqm/mqinst.ini ;
+           ls -ln /etc/opt/mqm /opt/mqm/swidtag ; stat -c '%a %U:%G' /etc/opt/mqm /opt/mqm/swidtag ;
+           su <unprivileged> -c 'cat /etc/opt/mqm/mqinst.ini; ls /opt/mqm/swidtag' ;
+           and, as a cross-check only, /opt/mqm/bin/dspmqinst (the one MQ binary this capture ran).
+mqinst.ini REAL, byte-exact, sha256 1b1c19a3295a5c5fb4c208c116150a99fae38e77e54db006a0252e38ae31ed78,
+           153 bytes, mode 644 root:root, ends in a newline. Header line `Installation:`; keys are
+           indented 3 spaces: Name=Installation1, Description= (the value is 64 TRAILING SPACES, so
+           parsed values MUST be trimmed; the fixture keeps them), Identifier=1, FilePath=/opt/mqm.
+           There is NO `Primary=` key on a fresh install (dspmqinst reports Primary: No), so nothing may
+           require it. One stanza.
+privilege  MEASURED: /etc/opt/mqm is 755 root:root, mqinst.ini is 644 root:root, and the unprivileged
+           account read mqinst.ini and listed /opt/mqm/swidtag. /opt/mqm/swidtag is 555 mqm:mqm and
+           holds four 444 files (owner 999 mqm, group 1001): IBM_MQ-9.4.5.mqtag,
+           IBM_MQ_GSKit-9.0.0.mqtag, IBM_MQ_Runtime-9.4.5.mqtag and
+           ibm.com_IBM_MQ_Advanced_for_Developers_Non-Warranted-9.4.5.swidtag. IBM_MQ-9.4.5.mqtag is
+           the product tag; IBM_MQ_GSKit-9.0.0.mqtag and IBM_MQ_Runtime-9.4.5.mqtag are component tags.
+dspmqinst  InstName Installation1, Identifier 1, InstPath /opt/mqm, Version 9.4.5.0, Primary No,
+           State Available, LicenseType Developer (agrees with the file; dspmqinst is not used by the
+           plugin).
+FINDING    IBM's documentation page "Installation configuration file, mqinst.ini" (ibm.com/docs,
+           IBM MQ 9.4.x, multiplatforms) says the file lives in /etc/opt/mqm and holds, per
+           installation, the name, description, identifier and path, plus which installation is the
+           primary one. IBM also states the file's format is NOT fixed and that it must not be read
+           directly (dspmqinst is the supported interface). The `Installation:` header and the Name /
+           Description / Identifier / FilePath spellings are therefore confirmed on ONE version
+           (9.4.5.0, Ubuntu debs) only; another version or platform may differ, and any divergence
+           surfaces as `linux:middleware:mqinst_ini:malformed` (text with content but no
+           `Installation:` line) or as a dropped stanza plus the same token (Name or FilePath
+           missing), never as a silent empty inventory.
+inline     Tests that need a SECOND installation use a clearly labelled inline string in
+           test_middleware_parsers.cpp: a registered install holds one stanza, so a two-installation
+           file is not captured anywhere.
+
+== Personal data ==
+No account names beyond throwaway container accounts (mqm, one unprivileged probe account) and
+numeric ids, no hostnames, no e-mail addresses.
