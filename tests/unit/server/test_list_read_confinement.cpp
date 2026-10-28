@@ -593,24 +593,23 @@ TEST_CASE("every live is_rbac_enabled() call site is display-only "
          }},
         {"auth_routes.cpp",
          {
-             // security-guardian (Gate 8, MEDIUM): auth_routes.cpp had 4 of
-             // its own is_rbac_enabled() call sites, entirely unscanned
-             // before this entry. All 4 are single-target require_permission/
-             // require_scoped_permission preconditions ("RBAC must be
-             // enabled for this token/grant kind"), not the list-read/
-             // visible-agents confinement class this test otherwise guards —
-             // same disposition as rest_api_v1.cpp's precondition site above.
-             // Each is a deny-first compound gate (`!is_rbac_enabled() ||
-             // !check_...(...)`), so a stale raw view here can only ever
-             // bias toward wrongly DENYING a request, never toward
-             // over-disclosure. Two distinct trimmed shapes cover all 4
-             // sites (2 occurrences each).
+             // security-guardian (Gate 8, MEDIUM): auth_routes.cpp's remaining raw-flag site
+             // is the ENGINE-principal gate of require_scoped_permission (the shape appears
+             // exactly once; require_list_read's engine gate reads engine_grant_checked). It is a single-target
+             // precondition ("RBAC must be enabled for this grant kind"), not the
+             // list-read/visible-agents confinement class this test otherwise guards, and each
+             // is a deny-first compound gate (`!is_rbac_enabled() || !check_...(...)`), so a
+             // stale raw view here can only ever bias toward wrongly DENYING a request, never
+             // toward over-disclosure. require_permission's engine gate is NOT here: it decides
+             // its definitive refusal with rbac_enforcement_in_effect (the typed unavailable
+             // answer, #4990). The line text alone cannot tell the sites apart, so the exact
+             // count of one is pinned below; a second occurrence is an offender.
              "if (!rbac_store_->is_rbac_enabled() ||",
-             "if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {",
          }},
     };
 
     std::vector<std::string> offenders;
+    int auth_routes_engine_gate_shape = 0;
     for (const auto& [filename, allowlist] : allowlists) {
         const auto path = src_dir / filename;
         std::ifstream in(path);
@@ -633,6 +632,9 @@ TEST_CASE("every live is_rbac_enabled() call site is display-only "
                 continue;
             std::string trimmed =
                 line.substr(first_nonspace == std::string::npos ? 0 : first_nonspace);
+            if (filename == "auth_routes.cpp" &&
+                trimmed == "if (!rbac_store_->is_rbac_enabled() ||")
+                ++auth_routes_engine_gate_shape;
             if (allowlist.count(trimmed))
                 continue;
             offenders.push_back(filename + ":" + std::to_string(lineno) + ": " + trimmed);
@@ -647,4 +649,9 @@ TEST_CASE("every live is_rbac_enabled() call site is display-only "
     for (const auto& o : offenders)
         UNSCOPED_INFO(o);
     CHECK(offenders.empty());
+    // The allowlisted auth_routes.cpp shape is the engine gate of require_scoped_permission. A
+    // second occurrence (for example the require_permission engine gate regressing to the raw
+    // flag, which would answer a stale-false view with a definitive denial before the typed check
+    // runs) matches the same line text, so it is pinned by count.
+    CHECK(auth_routes_engine_gate_shape == 1);
 }
