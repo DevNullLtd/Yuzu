@@ -277,6 +277,8 @@ constexpr bool records_well_formed(std::span<const ToolRecord> records) {
 }
 
 // One accessor per domain file, each over that file's constexpr kToolRecords[].
+// The pairing is by NAME: `<domain>_tool_records()` is defined in `mcp_tools_<domain>.cpp`
+// (scripts/ci/check-seam-closure.py checks it in both directions).
 // mcp_server.cpp's registered_tool_records() lists them in a fixed order; a new
 // accessor must be added there too (an unlisted file serves nothing).
 std::span<const ToolRecord> discovery_tool_records();

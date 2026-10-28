@@ -2708,7 +2708,10 @@ def registry_floor_errors(count):
     return [f"registry files: found {count} mcp_tools_*.cpp file(s) under server/core/src but "
             f"MIN_REGISTRY_FILES is {MIN_REGISTRY_FILES} - set MIN_REGISTRY_FILES to {count} in THIS "
             f"change (a new registry file bumps it, a removed one lowers it) and move the C++ twin "
-            f"constant kRegistryDomainFiles in tests/unit/server/test_mcp_dispatch_coverage.cpp with it; "
+            f"constant kRegistryDomainFiles in tests/unit/server/test_mcp_dispatch_coverage.cpp with it, "
+            f"and the seam-closure lane pins (MCP_REGISTRY_EXPECTED_TU_COUNT in "
+            f"scripts/ci/check-seam-closure.py; EXPECTED_MCP_REGISTRY_TU_COUNT and "
+            f"EXPECTED_MCP_REGISTRY_CPPS in tests/test_seam_closure_selftest.py); "
             f"a new mcp_tool*.hpp header needs kToolHeaderFiles there, not this constant"]
 
 
