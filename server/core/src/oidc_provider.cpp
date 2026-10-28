@@ -1094,9 +1094,10 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
 // The host vet resolves through the bounded resolver (bounded_resolver.hpp), NOT httplib's
 // getaddrinfo_with_timeout: that one hands glibc's async resolver a request that lives on the
 // CALLER's stack and, on timeout, returns without waiting for the resolver, which later writes into
-// the dead frame. The bounded resolver's worker owns every byte it touches. The pool is this
-// provider's own (cap 8), so a stuck resolver here never takes a slot from the NAT64 probe's pool
-// or from another subsystem's lookups. A busy pool is "did not resolve" (the fetch is refused).
+// the dead frame. The bounded resolver's worker owns every byte it touches. The pool is the OIDC
+// host vet's own PROCESS-WIDE pool (cap 8, oidc_resolver_pool() above), shared by every provider,
+// so a stuck resolver here never takes a slot from the NAT64 probe's pool or from another
+// subsystem's lookups, but one stuck lookup does take a slot from every OIDC provider. A busy pool is "did not resolve" (the fetch is refused).
 bool resolve_host_addresses(const std::string& host, int timeout_sec,
                             std::vector<ResolvedAddress>& out) {
     const auto r = ::yuzu::server::net::bounded_resolve(

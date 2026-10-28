@@ -19,12 +19,12 @@
 ///
 /// An INCONCLUSIVE outcome is never remembered, so it cannot persist: the next call looks again (the
 /// resolver pool's cap bounds the cost). A resolver that is busy or too slow for every caller's
-/// budget therefore stays inconclusive (classified without the learned set, or refused by a
-/// consumer that fails closed) until it recovers, which is the intended behaviour.
+/// budget therefore stays inconclusive (classified with the prefixes already learned and still
+/// refused while the set is in overflow, or refused by a consumer that fails closed) until it recovers, which is the intended behaviour.
 ///
 /// A caller must also treat "no lookup has EVER answered" (`ever_answered == false`) as unknown,
-/// not as "no translator": the OIDC path logs and proceeds (its historical behaviour), the
-/// a consumer that gates admission may refuse with a retryable error.
+/// not as "no translator": the OIDC path logs and proceeds (its historical behaviour), while a
+/// consumer that gates admission may refuse with a retryable error.
 
 #include "oidc_egress_policy.hpp"
 
