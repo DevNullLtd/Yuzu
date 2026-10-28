@@ -377,9 +377,9 @@
       "runs_as": "agent daemon, dedicated unprivileged account"
     },
     {
-      "grant": "None expected: the stock install trees under `/usr`, `/opt` and `/var/opt/java` are expected to be world-readable (0755 directories, 0644 `release` files; inferred, not measured as `yuzu-agent`)",
+      "grant": "None expected: the stock install trees under `/usr`, `/opt` and `/var/opt/java` are expected to be world-readable (0755 directories, 0644 `release` files; the `python3.<minor>` listing under `/usr/bin` was read successfully by an unprivileged user in the live capture, the `dotnet`/`jvm` trees are inferred)",
       "if_refused": "`status|<action>|constrained|linux:runtimes:permission_denied`; rows read before the refusal are still returned, and a later readable root never hides it",
-      "measured": "Walked trees are captured as test fixtures (`tests/unit/fixtures/wave10/runtimes/linux/provenance.txt`); the live sample was taken as `euid 0` in a container, not as `yuzu-agent`",
+      "measured": "Walked trees are captured as test fixtures (`tests/unit/fixtures/wave10/runtimes/linux/provenance.txt`); the live sample was taken as an unprivileged user (`euid 1000`) in a WSL2 VM, not as the packaged unit's `yuzu-agent` account",
       "os": "Linux",
       "runs_as": "agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`)"
     }
