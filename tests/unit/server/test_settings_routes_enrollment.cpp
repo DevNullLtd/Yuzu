@@ -296,8 +296,17 @@ TEST_CASE("settings enrollment: batch create returns N tokens and audits ids onl
     CHECK(row.detail.find("by=admin") != std::string::npos);
     for (const auto& t : j["tokens"])
         CHECK_FALSE(h.audit_mentions(t.get<std::string>()));
-    // The ids listed in the audit row are real token ids.
-    for (const auto& t : h.auth_mgr.list_enrollment_tokens().value())
+    // Every stored token's id appears in the audit row (the harness store holds only this batch).
+    // Named local, not a range-for over `list_enrollment_tokens().value()`: on a compiler without
+    // P2718R0 (GCC <= 14, Clang <= 18, and MSVC per its conformance table) the returned
+    // std::expected is destroyed before the loop body runs (#5924).
+    const auto tokens = h.auth_mgr.list_enrollment_tokens();
+    {
+        INFO("list_enrollment_tokens StoreError: " << (tokens ? -1 : static_cast<int>(tokens.error())));
+        REQUIRE(tokens.has_value());
+    }
+    REQUIRE(tokens->size() == 3);
+    for (const auto& t : *tokens)
         CHECK(row.detail.find(t.token_id) != std::string::npos);
 }
 

@@ -2,6 +2,7 @@
 
 #include "agent_registry.hpp"
 #include "bundled_content.hpp"
+#include "content_etag.hpp"
 #include "http_route_sink.hpp"
 #include "instruction_param_schema.hpp" // canonicalise_param_schema: the enforced shape, published as input_schema
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
@@ -86,21 +87,6 @@ const PluginDocsIndex& plugin_docs_index() {
         return out;
     }();
     return idx;
-}
-
-// FNV-1a 64-bit content hash -> a strong ETag, same idiom as
-// guardian_schema_registry.cpp's content_etag (not shared directly — that
-// helper is TU-local to a different file and the two catalogs have no other
-// coupling reason to share a translation unit).
-std::string content_etag(const std::string& body) {
-    std::uint64_t h = 1469598103934665603ull;
-    for (unsigned char c : body) {
-        h ^= c;
-        h *= 1099511628211ull;
-    }
-    char buf[19];
-    int n = std::snprintf(buf, sizeof(buf), "\"%016llx\"", static_cast<unsigned long long>(h));
-    return std::string(buf, static_cast<std::size_t>(n));
 }
 
 DiscoveryDoc build_discovery_doc(json body) {
@@ -406,7 +392,7 @@ DiscoveryDoc build_routes_catalog(const std::string& openapi_json) {
                     continue;
                 const auto& op = ops[method];
                 json tags = op.value("tags", json::array());
-                routes_arr.push_back({
+                json entry = {
                     {"method", std::string(method) == "get" ? "GET"
                               : std::string(method) == "post" ? "POST"
                               : std::string(method) == "put" ? "PUT"
@@ -417,7 +403,14 @@ DiscoveryDoc build_routes_catalog(const std::string& openapi_json) {
                     {"summary", op.value("summary", "")},
                     {"tags", std::move(tags)},
                     {"description", op.value("description", "")},
-                });
+                };
+                // An operation documented but not registered carries a marker string. Pass
+                // it through so the catalog does not list an unserved route as callable.
+                // The field is present only on those entries.
+                if (const auto it = op.find("x-yuzu-unavailable");
+                    it != op.end() && it->is_string())
+                    entry["unavailable"] = *it;
+                routes_arr.push_back(std::move(entry));
             }
         }
     }
@@ -433,7 +426,8 @@ DiscoveryDoc build_routes_catalog(const std::string& openapi_json) {
          "generated from the live route table. A route that exists but was never "
          "documented in the OpenAPI spec will be under-reported here too. Per-route "
          "RBAC requirement is embedded in each entry's free-text 'description' "
-         "(no structured field yet)."},
+         "(no structured field yet). An entry with an 'unavailable' field is documented "
+         "but not registered on this server: skip it, do not call it."},
         {"count", routes_arr.size()},
         {"routes", std::move(routes_arr)},
     };

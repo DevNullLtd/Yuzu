@@ -117,7 +117,8 @@ DiscoveryDoc build_instructions_catalog(
 /// {method, path, summary, tags, description} per operation. Carries
 /// `"source":"openapi"` plus a caveat string: the OpenAPI document is
 /// hand-maintained, not generated from the live route table, and can
-/// under-report. `openapi_json` is the raw OpenAPI document body (caller
+/// under-report. `openapi_json` is the OpenAPI document body, normally
+/// the default form without the per-group guides (caller
 /// supplies it so this function has no direct dependency on rest_api_v1.*).
 DiscoveryDoc build_routes_catalog(const std::string& openapi_json);
 

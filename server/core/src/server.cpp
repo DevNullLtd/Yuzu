@@ -8132,8 +8132,9 @@ public:
         // B-4 (#1238): the default CA + leaves are 10-year with NO auto-renewal,
         // so their eventual expiry is otherwise a silent outage. Publish the
         // absolute notAfter as a timestamp gauge so the yuzu-tls alert rules
-        // (warn @7d / crit @1d) fire ahead of it. The leaves are sized to the CA's
-        // notAfter, so cert="default-ca" is the binding expiry for the whole set.
+        // (warning from 30 d, critical from 7 d and again from 24 h) fire ahead of
+        // it. The leaves are sized to the CA's notAfter, so cert="default-ca" is
+        // the binding expiry for the whole set.
         if (default_cert_set_.ca_expires_at.time_since_epoch().count() != 0) {
             const auto exp_ts = std::chrono::duration_cast<std::chrono::seconds>(
                                     default_cert_set_.ca_expires_at.time_since_epoch())
@@ -11574,7 +11575,7 @@ private:
     // policy): verify_peer authenticates to the CA, NOT to a specific identity.
     //
     // #1422: the gateway side no longer stops at the CA check. Its mgmt
-    // listener's grpcbox auth_fun (yuzu_gw_authz:check_mgmt_peer/1) pins the
+    // listener's auth_fun (yuzu_gw_authz:check_mgmt_peer/1) pins the
     // peer to THIS server's key — SPKI SHA-256 of the presented leaf against
     // {yuzu_gw, mgmt_peer_pins} (default: the default-server.pem in the shared
     // cert volume), plus a serverAuth-EKU requirement agent leaves can never
@@ -13510,7 +13511,9 @@ private:
             registry_.to_json_obj(), rbac_store_.get(), mgmt_group_store_.get(), username);
     }
 
-    /// Auto-create a dynamic management group for a service tag value.
+    /// Auto-create a dynamic management group for a service tag value. Membership is a
+    /// SNAPSHOT taken once, when the group is created: if the group already exists this returns
+    /// early, so a later `service` tag write never adds or removes members.
     void ensure_service_management_group(const std::string& service_value) {
         if (!mgmt_group_store_ || service_value.empty())
             return;
@@ -13534,11 +13537,15 @@ private:
             // so a degraded tag read must never refresh the group to empty.
             // Prior membership is retained; there is NO automatic
             // repopulation pass (governance UP-5 — an earlier comment here
-            // claimed one) — membership refreshes only when this ensure
-            // helper next runs, i.e. on the next `service`-tag write. There
-            // is no dedicated recovery runbook for this; a degraded tag
-            // store is a `TagStore::agents_with_tag` failure, diagnosed the
-            // same way as any other store-degrade log line.
+            // claimed one), and this is the ONLY call to
+            // refresh_dynamic_membership: the helper returns early once the
+            // group exists, so a skipped refresh here leaves the group
+            // without those members until an operator adds them with
+            // POST /api/v1/management-groups/{id}/members, or the group is
+            // deleted and re-created. There is no dedicated recovery
+            // runbook for this; a degraded tag store is a
+            // `TagStore::agents_with_tag` failure, diagnosed the same way as
+            // any other store-degrade log line.
             if (tag_store_) {
                 if (auto agents = tag_store_->agents_with_tag("service", service_value)) {
                     mgmt_group_store_->refresh_dynamic_membership(*result, *agents);
@@ -13916,8 +13923,10 @@ private:
                         return; // success — done
                     }
                     // #1422: the gateway's mgmt-plane peer pin rejects with
-                    // UNAUTHENTICATED and an EMPTY message (grpcbox sends no
-                    // grpc-message when an auth_fun rejects) — the generic
+                    // UNAUTHENTICATED and, from a gateway built before the yuzu_grpc
+                    // listener, an EMPTY message (the old listener sent no
+                    // grpc-message when an auth_fun rejected; the current one
+                    // sends "unauthenticated") — the generic
                     // warn below would render as "failed:  (16)", which is
                     // invisible as the fleet-wide forwarding outage it
                     // actually is. Name the cause and the fix.
