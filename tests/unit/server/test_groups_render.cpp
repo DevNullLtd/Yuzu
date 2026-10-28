@@ -11,6 +11,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <algorithm>
+#include <optional>
 #include <regex>
 #include <set>
 #include <string>
@@ -156,6 +157,7 @@ TEST_CASE("render_group_list: rows, select buttons, type pill, counts, escaping"
     CHECK_THAT(html, ContainsSubstring("<span class=\"pill tag\">dynamic</span>"));
     CHECK_THAT(html, ContainsSubstring("<td>7</td>"));
     CHECK_THAT(html, ContainsSubstring("<td>0</td>")); // absent from the map
+    CHECK_THAT(html, ContainsSubstring("2 groups, 7 memberships"));
     CHECK_THAT(html, ContainsSubstring("<span class=\"d1\">"));
     CHECK_THAT(html, !ContainsSubstring("<img"));
     CHECK_THAT(html, ContainsSubstring("&lt;img"));
@@ -349,5 +351,90 @@ TEST_CASE("renderers: no mutating control in any state", "[groups][render]") {
         // No button carries an hx-get: a Retry is the page's own data-gact=reload.
         for (auto p = html.find("<button"); p != std::string::npos; p = html.find("<button", p + 1))
             CHECK(html.substr(p, html.find('>', p) - p).find("hx-get") == std::string::npos);
+    }
+}
+
+namespace {
+
+std::string list_of(ManagementGroup g) {
+    GroupList l;
+    l.groups = {std::move(g)};
+    return render_group_list(l);
+}
+
+std::string detail_of(ManagementGroup g, std::optional<std::string> parent_name = std::nullopt) {
+    return render_group_detail(GroupDetail{std::move(g), std::move(parent_name)});
+}
+
+std::string members_of(ManagementGroupMember m) {
+    MembersView v;
+    v.rows = {std::move(m)};
+    return render_members(v);
+}
+
+} // namespace
+
+// Every dynamic value reaches the page escaped. One hostile value (it also closes an attribute) is
+// placed in each field on its own, so a field that skips esc() fails by name. A value emitted only
+// inside a URL is percent-encoded instead, and must stay ONE query value.
+TEST_CASE("renderers: a hostile value in any single field is escaped", "[groups][render][xss]") {
+    struct Field {
+        const char* name;
+        std::string (*render)(const std::string&);
+        const char* expect;     // the escaped spelling that must appear
+        const char* url_prefix; // non-empty: the one URL attribute is this plus the encoded value
+    };
+    static const Field kFields[] = {
+        {"list id", [](const std::string& x) { return list_of(grp(x, "G")); }, "&lt;img", ""},
+        {"list name", [](const std::string& x) { return list_of(grp("0a", x)); }, "&lt;img", ""},
+        {"list membership_type",
+         [](const std::string& x) { return list_of(grp("0a", "G", "", x)); }, "&lt;img", ""},
+        {"detail id", [](const std::string& x) { return detail_of(grp(x, "G")); }, "%3Cimg",
+         "/fragments/groups/members?id="},
+        {"detail name", [](const std::string& x) { return detail_of(grp("0a", x)); }, "&lt;img",
+         ""},
+        {"detail membership_type",
+         [](const std::string& x) { return detail_of(grp("0a", "G", "", x)); }, "&lt;img", ""},
+        {"detail parent_name",
+         [](const std::string& x) { return detail_of(grp("0a", "G", "0b"), x); }, "&lt;img", ""},
+        {"detail parent_id (unresolved)",
+         [](const std::string& x) { return detail_of(grp("0a", "G", x)); }, "&lt;img", ""},
+        {"detail description",
+         [](const std::string& x) {
+             auto g = grp("0a", "G");
+             g.description = x;
+             return detail_of(g);
+         },
+         "&lt;img", ""},
+        {"detail scope_expression",
+         [](const std::string& x) {
+             auto g = grp("0a", "G", "", "dynamic");
+             g.scope_expression = x;
+             return detail_of(g);
+         },
+         "&lt;img", ""},
+        {"detail created_by",
+         [](const std::string& x) {
+             auto g = grp("0a", "G");
+             g.created_by = x;
+             return detail_of(g);
+         },
+         "&lt;img", ""},
+        {"member agent_id", [](const std::string& x) { return members_of(member(x)); },
+         "&lt;img", "/hardware/ci?id="},
+        {"member source", [](const std::string& x) { return members_of(member("a1", x)); },
+         "&lt;img", ""},
+    };
+    const std::string bad = "\"><img src=x onerror=1>";
+    for (const auto& f : kFields) {
+        INFO(f.name);
+        const auto html = f.render(bad);
+        CHECK_THAT(html, !ContainsSubstring("<img"));
+        CHECK_THAT(html, ContainsSubstring(f.expect));
+        if (*f.url_prefix) {
+            const auto urls = yuzu::test::url_attr_values(html);
+            REQUIRE(urls.size() == 1);
+            CHECK(urls[0] == std::string(f.url_prefix) + url_query_value(bad));
+        }
     }
 }

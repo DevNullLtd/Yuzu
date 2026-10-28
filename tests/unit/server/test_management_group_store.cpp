@@ -24,6 +24,8 @@
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
@@ -946,9 +948,44 @@ TEST_CASE("ManagementGroupStore: list_groups_checked and count_members_by_group_
     ManagementGroupStore store{pool};
     REQUIRE(!store.is_open());
 
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
     CHECK(!store.list_groups_checked().has_value());
     CHECK(!store.count_members_by_group_checked().has_value());
     CHECK(store.list_groups().empty());
+    // Three degraded reads, three counts: the legacy list_groups() now delegates to the checked
+    // twin, so its degrade is counted too (it was silent before).
+    CHECK(metrics
+              .counter("yuzu_server_mgmt_group_read_degrade_total", {{"reason", "store_not_open"}})
+              .value() == 3.0);
+}
+
+TEST_CASE("ManagementGroupStore: a failed query degrades both checked reads and is counted",
+          "[pg][management_group][degrade]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    const auto query_errors = [&] {
+        return metrics
+            .counter("yuzu_server_mgmt_group_read_degrade_total", {{"reason", "query_error"}})
+            .value();
+    };
+
+    // DROP ... CASCADE on the groups table removes only the foreign keys that reference it, so
+    // the members table survives: the group list degrades while the member counts still answer.
+    exec_sql(db.dsn(), "DROP TABLE management_group_store.management_groups CASCADE");
+    CHECK(!store.list_groups_checked().has_value());
+    CHECK(query_errors() == 1.0);
+    CHECK(store.count_members_by_group_checked().has_value());
+
+    exec_sql(db.dsn(), "DROP TABLE management_group_store.management_group_members");
+    CHECK(!store.count_members_by_group_checked().has_value());
+    CHECK(query_errors() == 2.0);
 }
 
 TEST_CASE("ManagementGroupStore: list_groups_checked lists groups and "

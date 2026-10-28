@@ -563,7 +563,7 @@ What each kind of caller sees (RBAC enforcement off is the default install):
 | Legacy `user` account, RBAC enforcement off | Yes | All |
 | Viewer, RBAC on | Yes | Those in their scope |
 | `ITServiceOwner` on the root group (global) | Yes | Those in their scope |
-| `ITServiceOwner` on one group only | No (`403`) | Reachable only through the list, so not from this page |
+| `ITServiceOwner` on one group only | No (`403`) | Those in their scope if the fragment is called directly; the page cannot reach it because the list is refused |
 | Operator scoped to a group | No (`403`): Operator holds no `ManagementGroup` permission | Not reachable |
 
 A page of "not available" notes is therefore the honest result for an operator who is scoped to a

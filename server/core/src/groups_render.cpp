@@ -174,8 +174,15 @@ std::string render_group_list(const std::variant<GroupList, Unavailable>& state)
                failbox("Groups could not be read.", kGroupsUnavailable, "grp-list") + "</div>";
 
     const std::size_t total = list->groups.size();
+    // Summed over the groups listed, so the header equals the Members column below it.
+    std::size_t memberships = 0;
+    for (const auto& g : list->groups)
+        if (const auto it = list->member_counts.find(g.id); it != list->member_counts.end())
+            memberships += it->second;
     std::string out = "<div class=\"hd\"><h2>Management groups</h2><span class=\"sub\">" +
-                      std::to_string(total) + (total == 1 ? " group" : " groups") + "</span></div>";
+                      std::to_string(total) + (total == 1 ? " group, " : " groups, ") +
+                      std::to_string(memberships) + (memberships == 1 ? " membership" : " memberships") +
+                      "</span></div>";
     if (total == 0)
         return out + empty_box("No groups.");
     if (total > kGroupsRenderCap)

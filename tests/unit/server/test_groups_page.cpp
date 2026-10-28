@@ -264,6 +264,15 @@ TEST_CASE("groups page: every loader panel carries its own denied and unavailabl
     CHECK_THAT(t, ContainsSubstring("This is not an empty list."));
 }
 
+TEST_CASE("groups page: the template's group-panel sentences are the renderer's constants",
+          "[groups][page]") {
+    // The template is a const char* literal and cannot name the constexpr views, so pin them.
+    const std::string t = kGroupsTemplate;
+    CHECK_THAT(t, ContainsSubstring("data-denied=\"" + std::string(groups::kGroupsDenied) + "\""));
+    CHECK_THAT(t, ContainsSubstring("data-unavailable=\"" + std::string(groups::kGroupsUnavailable) + "\""));
+    CHECK_THAT(t, ContainsSubstring("data-unavailable=\"" + std::string(groups::kDetailUnavailable) + "\""));
+}
+
 TEST_CASE("groups page: the Groups entry is first in Estate and lights up on /groups",
           "[groups][page]") {
     const auto groups_nav = yuzu::server::shell::nav_groups();
@@ -412,6 +421,7 @@ TEST_CASE("groups fragments: members are narrowed to the caller's scope with no 
         auto res = sink.Get("/fragments/groups/members?id=ZZ");
         REQUIRE(res);
         CHECK(res->status == 400);
+        CHECK(res->get_header_value("Content-Type") == "text/plain; charset=utf-8");
         CHECK(res->get_header_value("Cache-Control") == "no-store");
         CHECK(f->fleet_calls == 0);
         CHECK(f->member_reads == 0);
