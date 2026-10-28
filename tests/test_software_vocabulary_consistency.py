@@ -139,7 +139,8 @@ def parse_ecosystem_table(text):
 def parse_vocab_table(text, name):
     """The (value, title, tooltip) rows of `std::array<VocabEntry, N> k<name>{{...}};` in `text`,
     in order. Comment-stripped like parse_ecosystem_table; anti-vacuous: parsed rows must equal the
-    declared size."""
+    declared size. The stripper is not string-aware, so a tooltip must not contain `//` or `/*`:
+    it would eat the closing quote and fail loud on the size check."""
     m = re.search(rf"std::array<VocabEntry, (\d+)> k{name}\{{\{{(.*?)\}}\}};", text, re.S)
     if not m:
         raise AssertionError(f"k{name} not found in {CATALOG_RULES}")
@@ -153,15 +154,22 @@ def parse_vocab_table(text, name):
 
 
 def collector_sources(text):
-    """`plugin.action` for every row of the collector's kInventoryActions, in order. A `.action`
-    is a literal or a `kAction*` string_view constant, resolved from its declaration. Comment-
-    stripped like the table parsers: a commented-out action is not a collected source."""
+    """`plugin.action` for every row of the collector's kInventoryActions, in order. A `.plugin`
+    is a string literal; a `.action` is a literal or a `kAction*` string_view constant, resolved
+    from its declaration. Comment-stripped like the table parsers: a commented-out action is not a
+    collected source. Anti-vacuous: every `{.plugin =` row opener must parse into a pair, so a row
+    spelled any other way (a named-constant plugin, a runtime action) fails loud instead of
+    vanishing from the expected chip list."""
     text = re.sub(r"/\*.*?\*/|//[^\n]*", "", text, flags=re.S)
-    consts = dict(re.findall(r'constexpr std::string_view (kAction\w+) = "([a-z_]+)";', text))
+    consts = dict(re.findall(r'constexpr std::string_view (kAction\w+) = "([a-z0-9_]+)";', text))
     m = re.search(r"kInventoryActions\[\] = \{(.*?)\n\};", text, re.S)
     if not m:
         raise AssertionError("kInventoryActions not found")
-    pairs = re.findall(r'\.plugin = "([a-z_]+)",\s*\.action = ("[a-z_]+"|kAction\w+)', m.group(1))
+    pairs = re.findall(r'\.plugin = "([a-z0-9_]+)",\s*\.action = ("[a-z0-9_]+"|kAction\w+)', m.group(1))
+    openers = len(re.findall(r"\{\s*\.plugin\s*=", m.group(1)))
+    if openers != len(pairs):
+        raise AssertionError(f"parsed {len(pairs)} kInventoryActions rows, found {openers} rows: "
+                             f"each needs a string-literal .plugin and a literal or kAction* .action")
     out = []
     for plugin, action in pairs:
         if action.startswith('"'):
@@ -347,6 +355,21 @@ class GateParsers(unittest.TestCase):
 
     def enums(self, spec, field="ecosystem"):
         return [e for _, e in openapi_field_enums(spec, field)]
+
+    @staticmethod
+    def _actions(*rows):
+        return "kInventoryActions[] = {\n" + "\n".join(rows) + "\n};"
+
+    def test_collector_sources_reads_digit_names_and_comments(self):
+        src = self._actions('    {.plugin = "q2", .action = "list_v2", .adapt = a},',
+                            '    // {.plugin = "gone", .action = "x", .adapt = a},')
+        self.assertEqual(collector_sources(src), ["q2.list_v2"])
+
+    def test_collector_sources_fails_loud_on_an_unparseable_row(self):
+        for row in ('{.plugin = kPlugin, .action = "list", .adapt = a},',
+                    '{.plugin = "p", .action = std::string_view{}, .adapt = a},'):
+            with self.assertRaises(AssertionError):
+                collector_sources(self._actions('{.plugin = "p", .action = "ok", .adapt = a},', row))
 
     def test_token_parameter_is_a_token(self):
         (enum,) = self.enums(_doc([self.TOKEN_PARAM]))

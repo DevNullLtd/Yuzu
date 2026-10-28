@@ -236,7 +236,7 @@ TEST_CASE("software page: search box carries the CSP-safe htmx wiring", "[invent
         REQUIRE(h.substr(p, h.find('"', p + 12) - p).find('[') == std::string::npos);
 }
 
-TEST_CASE("software page: kind control, ecosystem and found-by chips", "[inventory][ui]") {
+TEST_CASE("software page: kind control and the ecosystem and found-by chips", "[inventory][ui]") {
     SoftwarePageFilters f;
     f.kind = "pkg";
     f.ecosystem = "brew";
@@ -323,6 +323,25 @@ TEST_CASE("software page: every Found-by chip selects and clears its own source"
         REQUIRE(has(on, "kind=pkg"));
         REQUIRE(has(on, "ecosystem=brew"));
     }
+}
+
+TEST_CASE("software page: an unknown source leaves every Found-by chip unpressed",
+          "[inventory][ui]") {
+    SoftwarePageFilters f;
+    f.source = "nope.not_a_source";
+    const auto h = full(f, page());
+    REQUIRE(count_of(h, "data-g=\"src\" data-v=") == software_catalog::kSoftwareSources.size());
+    // Each chip's pressed state sits in its own tag: none of the src chips is "true".
+    std::size_t pos = 0, pressed = 0;
+    while ((pos = h.find("data-g=\"src\"", pos)) != std::string::npos) {
+        const auto end = h.find('>', pos);
+        if (h.substr(pos, end - pos).find("aria-pressed=\"true\"") != std::string::npos) ++pressed;
+        pos = end;
+    }
+    REQUIRE(pressed == 0);
+    // The value still shows in the active pill and the hidden state input.
+    REQUIRE(has(h, "found by: nope.not_a_source"));
+    REQUIRE(has(h, "name=\"source\" value=\"nope.not_a_source\""));
 }
 
 TEST_CASE("software page: controls reuse hx-include and never embed q or agent_id",
