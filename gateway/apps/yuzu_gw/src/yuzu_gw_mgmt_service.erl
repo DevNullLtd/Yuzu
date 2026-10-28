@@ -12,17 +12,22 @@
 %%% - QueryInventory: answered from the local registry
 %%%
 %%% AUTHORIZATION lives at the listener, not here: none of these handlers
-%%% inspects the caller (grpcbox hands unary handlers no socket/peer-cert
-%%% access), so the :50063 listener's grpcbox auth_fun
-%%% (yuzu_gw_authz:check_mgmt_peer/1, #1422) is the ONLY gate between an
+%%% inspects the caller, so the :50063 listener's `auth_fun'
+%%% (yuzu_gw_authz:check_mgmt_peer/1, #1422), which yuzu_grpc_stream_h runs on
+%%% the peer certificate before a handler exists, is the ONLY gate between an
 %%% mTLS-admitted peer and fleet-wide command fan-out. A new listener
 %%% serving this module MUST wire that auth_fun; the yuzu_gw_app boot
 %%% guard refuses a non-loopback management_pb listener without it.
+%%%
+%%% Handler contract (yuzu_grpc_runner): a unary function is called as
+%%% `F(Ctx, Request)' and returns `{ok, Response}' or `{grpc_error, {Status,
+%%% Message}}'; a server-streaming function as `F(Request, Stream)' and returns
+%%% `ok' or `{grpc_error, {Status, Message}}'. Any other return is INTERNAL.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_mgmt_service).
 
-%% grpcbox service callbacks
+%% service callbacks (yuzu_grpc_runner)
 -export([send_command/2,
          list_agents/2,
          get_agent/2,
@@ -30,6 +35,8 @@
          query_inventory/2]).
 
 -export([json_escape/1]).
+
+-include("yuzu_grpc.hrl").
 
 %%--------------------------------------------------------------------
 %% SendCommand — fan out to agents, stream responses back
@@ -70,20 +77,18 @@ send_command(Request, Stream) ->
             %% UNAVAILABLE (a client may retry). yuzu_gw_safe_call has already
             %% logged one rate-limited WARN naming only the class of the exit
             %% (noproc, timeout, other): the request is never logged.
-            {error, #{status => 14,  %% UNAVAILABLE
-                      message => <<"Command router unavailable">>}};
+            {grpc_error, {?GRPC_STATUS_UNAVAILABLE, <<"Command router unavailable">>}};
 
         {error, Reason} ->
-            {error, #{status => 13,
-                      message => iolist_to_binary(
-                          io_lib:format("Fanout failed: ~p", [Reason]))}}
+            {grpc_error, {?GRPC_STATUS_INTERNAL,
+                          iolist_to_binary(io_lib:format("Fanout failed: ~p", [Reason]))}}
     end.
 
 %%--------------------------------------------------------------------
 %% ListAgents — answered entirely from the gateway's ETS table
 %%--------------------------------------------------------------------
 
-list_agents(Request, Ctx) ->
+list_agents(Ctx, Request) ->
     Limit  = maps:get(limit, Request, maps:get(<<"limit">>, Request, 100)),
     Cursor = maps:get(cursor, Request, maps:get(<<"cursor">>, Request, undefined)),
 
@@ -111,7 +116,7 @@ list_agents(Request, Ctx) ->
 %% GetAgent — query the agent process directly
 %%--------------------------------------------------------------------
 
-get_agent(Request, Ctx) ->
+get_agent(Ctx, Request) ->
     AgentId = maps:get(agent_id, Request,
                        maps:get(<<"agent_id">>, Request, undefined)),
 
@@ -125,7 +130,7 @@ get_agent(Request, Ctx) ->
             %% `exit({noproc, _})` (dead process) or `exit({nodedown, _})` /
             %% `exit({noconnection, _})` (node genuinely disconnected) instead
             %% of returning `{error, _}` — uncaught, that would crash this
-            %% grpcbox request handler instead of reaching either `case`
+            %% request handler instead of reaching either `case`
             %% branch below. The router's fire-and-forget dispatch path
             %% self-heals the same staleness via the 300s `fanout_timeout`;
             %% this synchronous RPC has no such fallback and must map it to
@@ -144,20 +149,17 @@ get_agent(Request, Ctx) ->
                     },
                     {ok, Response, Ctx};
                 {error, Reason} ->
-                    {error, #{status => 13,
-                              message => iolist_to_binary(
-                                  io_lib:format("Agent query failed: ~p", [Reason]))}}
+                    {grpc_error, {?GRPC_STATUS_INTERNAL,
+                                  iolist_to_binary(
+                                      io_lib:format("Agent query failed: ~p", [Reason]))}}
             catch
                 exit:{noproc, _} ->
-                    {error, #{status => 5,  %% NOT_FOUND
-                              message => <<"Agent not connected">>}};
+                    {grpc_error, {?GRPC_STATUS_NOT_FOUND, <<"Agent not connected">>}};
                 exit:{Reason, _} when Reason =:= nodedown; Reason =:= noconnection ->
-                    {error, #{status => 5,  %% NOT_FOUND
-                              message => <<"Agent not connected">>}}
+                    {grpc_error, {?GRPC_STATUS_NOT_FOUND, <<"Agent not connected">>}}
             end;
         error ->
-            {error, #{status => 5,  %% NOT_FOUND
-                      message => <<"Agent not connected">>}}
+            {grpc_error, {?GRPC_STATUS_NOT_FOUND, <<"Agent not connected">>}}
     end.
 
 %%--------------------------------------------------------------------
@@ -175,7 +177,7 @@ watch_events(Request, Stream) ->
 %% QueryInventory — return agents connected to this gateway instance
 %%--------------------------------------------------------------------
 
-query_inventory(Request, Ctx) ->
+query_inventory(Ctx, Request) ->
     ReqAgentId = maps:get(agent_id, Request,
                            maps:get(<<"agent_id">>, Request, <<>>)),
     Plugin     = maps:get(plugin, Request,
@@ -221,7 +223,7 @@ watch_event_loop(Stream, FilterIds) ->
                 Ids -> lists:member(AgentId, Ids)
             end,
             case ShouldSend of
-                true  -> grpcbox_stream:send(Event, Stream);
+                true  -> yuzu_grpc_stream:send(Stream, Event);
                 false -> ok
             end,
             watch_event_loop(Stream, FilterIds);
@@ -274,14 +276,14 @@ json_escape_chars(<<C, Rest/binary>>, Acc) ->
     json_escape_chars(Rest, <<Acc/binary, C>>).
 
 %% Stream command responses back to the operator until fanout completes.
-%% grpcbox server-streaming: send(Message, State), stream ends on process exit.
+%% Server-streaming: yuzu_grpc_stream:send(Stream, Message); the call ends when this returns.
 %% CommandId (HA WS-4 4.3): stamped on a command_error-derived response —
 %% see send_command/2's comment.
 stream_responses(Stream, FanoutRef, CommandId) ->
     receive
         {command_response, FanoutRef, AgentId, Response} ->
             Msg = #{agent_id => AgentId, response => Response},
-            grpcbox_stream:send(Msg, Stream),
+            yuzu_grpc_stream:send(Stream, Msg),
             stream_responses(Stream, FanoutRef, CommandId);
 
         {command_error, FanoutRef, AgentId, Reason} ->
@@ -291,13 +293,13 @@ stream_responses(Stream, FanoutRef, CommandId) ->
                                         output     => iolist_to_binary(
                                             io_lib:format("~p", [Reason])),
                                         exit_code  => -1}},
-            grpcbox_stream:send(ErrorResp, Stream),
+            yuzu_grpc_stream:send(Stream, ErrorResp),
             stream_responses(Stream, FanoutRef, CommandId);
 
         {fanout_complete, FanoutRef, _Summary} ->
-            %% Normal return — grpcbox auto-sends end_stream on process exit.
+            %% Normal return: the runner ends the call with status 0.
             ok
     after 600000 ->
         %% Safety timeout: 10 minutes max per fanout.
-        grpcbox_stream:error(<<"4">>, <<"Fanout timed out">>)
+        yuzu_grpc_stream:error(?GRPC_STATUS_DEADLINE_EXCEEDED, <<"Fanout timed out">>)
     end.

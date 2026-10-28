@@ -22,13 +22,13 @@ A call can fail when another process holds `kv_store.db` locked: the agent waits
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Infrastructure.Read/Write/Delete<br/>concurrency: per-device]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host<br/>calls StoragePlugin::init() first]
-  HOST --> EX[storage.execute]
-  EX --> WIN[Windows leg<br/>in-process agent KV store]
-  EX --> MAC[macOS leg<br/>in-process agent KV store]
-  EX --> LIN[Linux leg<br/>in-process agent KV store]
-  WIN & MAC & LIN --> ROWS[rows + UNDECLARED status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator / workflow"] --> SRV["Server - authz: Infrastructure.Read/Write/Delete, concurrency: per-device"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host - calls StoragePlugin::init() first"]
+  HOST --> EX["storage.execute"]
+  EX --> WIN["Windows leg - in-process agent KV store"]
+  EX --> MAC["macOS leg - in-process agent KV store"]
+  EX --> LIN["Linux leg - in-process agent KV store"]
+  WIN & MAC & LIN --> ROWS["rows + UNDECLARED status"] --> RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
 
 ## OS capability

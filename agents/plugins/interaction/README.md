@@ -18,16 +18,16 @@ Four of the five actions dispatch a platform-native dialog or notification mecha
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Infrastructure.Write]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[interaction.execute]
-  EX --> DND{DND active?<br/>notify/survey only}
-  DND -- yes --> SUP[status suppressed]
-  DND -- no / n-a --> VAL{required params present?}
-  VAL -- no --> ERR[status error]
-  VAL -- yes --> WIN[Windows leg<br/>Shell_NotifyIconW / MessageBoxW /<br/>PowerShell InputBox / WinForms]
-  VAL -- yes --> MAC[macOS leg<br/>osascript display notification / dialog]
-  VAL -- yes --> LIN[Linux leg<br/>notify-send / zenity]
-  SUP & ERR & WIN & MAC & LIN --> ROWS[key|value rows] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator / workflow"] --> SRV["Server - authz: Infrastructure.Write"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"] --> EX["interaction.execute"]
+  EX --> DND{"DND active? notify and survey only"}
+  DND -->|"yes"| SUP["status suppressed"]
+  DND -->|"no / n-a"| VAL{"required params present?"}
+  VAL -->|"no"| ERR["status error"]
+  VAL -->|"yes"| WIN["Windows leg - Shell_NotifyIconW / MessageBoxW / PowerShell InputBox / WinForms"]
+  VAL -->|"yes"| MAC["macOS leg - osascript display notification / dialog"]
+  VAL -->|"yes"| LIN["Linux leg - notify-send / zenity"]
+  SUP & ERR & WIN & MAC & LIN --> ROWS["key|value rows"] --> RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
 
 ## OS capability

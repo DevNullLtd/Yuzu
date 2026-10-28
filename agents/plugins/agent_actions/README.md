@@ -18,12 +18,12 @@
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Infrastructure.Write or .Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[agent_actions.execute]
-  EX --> WIN[Windows leg<br/>spdlog_runtime / agent_config_read]
-  EX --> MAC[macOS leg<br/>spdlog_runtime / agent_config_read]
-  EX --> LIN[Linux leg<br/>spdlog_runtime / agent_config_read]
-  WIN & MAC & LIN --> ROWS[key|value rows] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator / workflow"] --> SRV["Server - authz: Infrastructure.Write or Infrastructure.Read"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"] --> EX["agent_actions.execute"]
+  EX --> WIN["Windows leg - spdlog_runtime / agent_config_read"]
+  EX --> MAC["macOS leg - spdlog_runtime / agent_config_read"]
+  EX --> LIN["Linux leg - spdlog_runtime / agent_config_read"]
+  WIN & MAC & LIN --> ROWS["key|value rows"] --> RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
 
 ## OS capability

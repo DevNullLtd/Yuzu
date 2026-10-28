@@ -164,8 +164,8 @@ struct RetentionEnforced {
 
 /// `GET /fragments/settings/data-retention` + `GET /api/v1/settings/data-retention`.
 /// ServerConfig:Read. {response_retention_days, audit_retention_days,
-/// guardian_event_retention_days, enforced:{<same three>: int|null}} — a handful
-/// of integers, lowest sensitivity of the eight (#4028 Evidence). The top-level
+/// guardian_event_retention_days, enforced:{<same three>: int|null}} — integers
+/// and fixed registry strings, lowest sensitivity of the eight (#4028 Evidence). The top-level
 /// three are the configured/stored values (unchanged keys); `enforced` is what
 /// the stores really apply. `tar` = {tick_seconds, tiers:[{source, tier,
 /// limit_kind: rows|seconds, limit, bucket_seconds, guaranteed_depth_seconds:
@@ -179,8 +179,17 @@ struct RetentionEnforced {
 /// Input is `build_data_retention_settings`' JSON. Per window: enforced N > 0
 /// "N days", N <= 0 "No expiry", unknown an idle "Unknown" pill (never "0"); a
 /// stored value that differs from the enforced one adds a warn pill and the
-/// action-bearing hint. Followed by the cleanup-semantics hint.
+/// action-bearing hint. Followed by the cleanup-semantics hint. When `tar` is an
+/// object, a second table follows (caption "TAR capture sources"; columns
+/// Exact/Hourly/Daily/Monthly/Boot/Look again after; one row per source; a blank
+/// cell for an absent (source, tier) pair; no pill). `tar` null or absent adds
+/// nothing, so the output is byte-identical to the three-row form.
 [[nodiscard]] std::string render_retention_table(const nlohmann::json& retention);
+
+/// Whole-unit duration text for the TAR tier table. Bands: < 1 h "Under an
+/// hour"; < 1 day "N hours"; < 14 days "N days"; < 60 days "N weeks" when
+/// divisible by 7, else "N days"; >= 60 days "N months" (30-day months, floor).
+[[nodiscard]] std::string tar_duration_text(std::int64_t seconds);
 
 /// `GET /fragments/settings/analytics` + `GET /api/v1/settings/analytics`.
 /// AnalyticsConfig:Read. {enabled, drain_interval_seconds, batch_size,

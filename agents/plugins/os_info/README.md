@@ -20,12 +20,12 @@ Every leg is native in-process (ADR-3002 rung 1, zero subprocesses) — includin
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow / live panel] --> SRV[Server<br/>authz: Inventory.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[os_info.execute]
-  EX --> WIN[Windows leg<br/>Reg*W CurrentVersion + RtlGetVersion<br/>GetNativeSystemInfo + GetTickCount64]
-  EX --> MAC[macOS leg<br/>SystemVersion.plist + sysctlbyname<br/>uname(2) + sysctl KERN_BOOTTIME]
-  EX --> LIN[Linux leg<br/>/etc/os-release + /proc/version<br/>uname(2) + /proc/uptime]
-  WIN & MAC & LIN --> ROWS[key\|value rows<br/>UNDECLARED status] --> RS[(ResponseStore)] --> API[REST /api/responses · live JSON]
+  OP["Operator / workflow / live panel"] --> SRV["Server - authz: Inventory.Read"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"] --> EX["os_info.execute"]
+  EX --> WIN["Windows leg - Reg*W CurrentVersion + RtlGetVersion, GetNativeSystemInfo + GetTickCount64"]
+  EX --> MAC["macOS leg - SystemVersion.plist + sysctlbyname, uname(2) + sysctl KERN_BOOTTIME"]
+  EX --> LIN["Linux leg - /etc/os-release + /proc/version, uname(2) + /proc/uptime"]
+  WIN & MAC & LIN --> ROWS["key|value rows, UNDECLARED status"] --> RS[("ResponseStore")] --> API["REST /api/responses, live JSON"]
 ```
 
 ## OS capability

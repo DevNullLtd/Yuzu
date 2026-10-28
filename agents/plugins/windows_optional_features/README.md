@@ -14,20 +14,78 @@
 
 ## How it works
 
-Both actions run the same DISM session lifecycle, in order, entirely inside one bounded call on a worker thread: acquire agent-core's process-global slot (`DismSlot`, at most one DISM call in flight at a time) → `DismInitialize` → `DismOpenSession(DISM_ONLINE_IMAGE)` → `DismGetFeatures` (`list`) or `DismGetFeatureInfo` (`info`) → map each `DismPackageFeatureState`/`DismRestartType` int to a named state → `DismCloseSession` → `DismShutdown` → release the slot. `DismApi.dll` is never linked; its eight exports are resolved once at runtime from `System32` (see the source header comment for why). The dispatching thread only ever tries to acquire the slot and waits on the bounded call — the DISM session lifecycle, the slot, and the bounded-call wrapping itself all live in agent-core (never unloaded), not this plugin, so a worker that outlives this plugin's own shutdown quiesce never executes plugin-resident code.
-
-**What it is NOT.** No enable, disable, add, remove or commit — the eight resolved exports are the plugin's whole DISM surface, and none of them mutates. No `dism.exe` subprocess: everything is an in-process API call. No WMI: `Win32_OptionalFeature` is not used.
+The plugin reads which optional Windows features (Telnet client, TFTP, the IIS web server role, Virtual Machine Platform, .NET 3.5 and so on) are enabled, disabled or waiting on a restart, and changes nothing. `list` returns every feature with its state, optionally narrowed by a `state` filter; `info` returns one named feature with its display name, description and restart requirement. Both go through the Windows servicing API (DISM) in-process: no `dism.exe`, no WMI, no PowerShell.
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Inventory.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[windows_optional_features.execute]
-  EX --> SLOT[DismSlot<br/>acquire in-process slot]
-  SLOT --> WIN[Windows leg<br/>DismInitialize → DismOpenSession → DismGetFeatures/DismGetFeatureInfo → DismCloseSession → DismShutdown]
-  EX --> MAC[macOS leg<br/>honest 'unsupported' sentinel]
-  EX --> LIN[Linux leg<br/>honest 'unsupported' sentinel]
-  WIN & MAC & LIN --> ROWS[rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator or workflow"] --> SRV["Server, authz Inventory Read"]
+  SRV -->|"gRPC over mTLS"| EX["windows_optional_features execute: list or info"]
+  EX --> SLOT["Windows leg: resolve the DismApi.dll exports, then acquire the agent-core DISM slot"]
+  SLOT -->|"acquired"| WIN["17 second bounded worker: DismInitialize, DismOpenSession, DismGetFeatures or DismGetFeatureInfo, DismCloseSession, DismShutdown"]
+  SLOT -->|"exports missing, busy or abandoned"| SENT["sentinel row, status UNAVAILABLE or CONSTRAINED"]
+  WIN --> ROWS["feature rows, status UNDECLARED on success, else a sentinel row with UNAVAILABLE, CONSTRAINED or PERMISSION_DENIED"]
+  EX --> MAC["macOS leg: no OS call"]
+  EX --> LIN["Linux leg: no OS call"]
+  MAC & LIN --> UNS["unsupported row, status UNAVAILABLE"]
+  ROWS & SENT & UNS --> RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
+
+Each call takes the agent's single DISM slot on the dispatching thread, then runs the same lifecycle on a worker thread: `DismInitialize`, `DismOpenSession` on the running OS, `DismGetFeatures` (`list`) or `DismGetFeatureInfo` (`info`), map each state number to a name, `DismCloseSession`, `DismShutdown`, release the slot. The whole call is bounded to 17 seconds. `DismApi.dll` is never linked; its eight exports are resolved from `System32` on first use. The slot, the session and the timeout all live in agent-core, which is never unloaded, so a worker that outlives a timeout never runs code belonging to a plugin that has been unloaded. Only one DISM call can be in flight in the agent at a time.
+
+What it is not: no enable, disable, add, remove or commit (the eight resolved exports are the plugin's whole DISM surface and none of them mutates), no `dism.exe` subprocess, and no use of `Win32_OptionalFeature`.
+
+### What you can decide with it
+
+| Question | Action | How to read it |
+|---|---|---|
+| Is a risky legacy feature switched on (for example `SMB1Protocol` or `TelnetClient`)? | `list`, or `info` with `feature=<name>` | `state` is `enabled` |
+| How many feature rows are in each state across the fleet? | `list`, grouped by `state` | `list` aggregates by `state` and counts feature rows. To count devices that have one named feature enabled, filter the `name` column (for example `SMB1Protocol`) and `state=enabled` |
+| Is a feature change waiting for a restart? | `list` with `state=pending`, or `info` | `pending_enable` or `pending_disable`, and `restart_required` is 1 on `list` |
+| What is this feature, and will changing it need a restart? | `info` | `display_name`, `description`, and `restart_type` of `no`, `possible`, `required` or `unknown` |
+
+On Windows you get the answer from the running OS's own servicing store. On macOS and Linux you get a single `unsupported` row and nothing else (a malformed `feature` on `info` is still refused first, with an `invalid` row). A clean read proves what DISM reports as the configured state; it does not prove the feature's binaries are running, healthy or in use. `disabled` does not distinguish a feature whose payload is staged on disk from one that is removed (see caveat 4), and `list` says nothing about installed applications, MSI packages or patches (see the sibling plugins below).
+
+### Diagrams
+
+The behaviour that matters operationally is the slot: what a second caller, or a call after a timeout, sees.
+
+```mermaid
+sequenceDiagram
+  participant D as Dispatching thread
+  participant S as DISM slot in agent-core
+  participant W as Bounded worker in agent-core
+  participant API as DISM API
+  D->>S: try to acquire
+  alt a call is running
+    S-->>D: busy, row windows:dism:busy
+  else a timed-out call has not returned
+    S-->>D: abandoned, row windows:dism:abandoned
+  else free
+    D->>W: start the bounded call, 17 second limit
+    W->>API: Initialize, OpenSession, GetFeatures or GetFeatureInfo
+    API-->>W: features or an HRESULT
+    W->>API: CloseSession, Shutdown
+    W->>S: release the slot
+    W-->>D: rows or a failure outcome
+  end
+```
+
+A caller that finds the slot taken never touches DISM; it reports `busy` or `abandoned` and returns. The slot is released by the worker after DISM teardown, so the next caller never overlaps a half-closed session. The only exception is a call the agent-wide bounded-call ceiling refuses before it starts (64 outstanding calls): it never reaches DISM, the dispatching thread releases the slot, and the row is `windows:dism:busy`.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Free
+  Free --> Busy: caller acquires
+  Busy --> Free: worker finishes and releases
+  Busy --> TimedOut: 17 seconds pass with no result
+  TimedOut --> Free: worker finally returns and releases
+  note right of TimedOut
+    new callers see abandoned
+    cleared only when DISM returns
+  end note
+```
+
+After a timeout the dispatching thread reports `windows:dism:timeout` and moves the slot to `TimedOut`; every later call reports `abandoned` until the original worker returns. If DISM never returns, only an agent service restart clears it.
 
 ## OS capability
 
@@ -51,11 +109,11 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | **Elevated token.** The DISM API refuses an unprivileged caller (`E_ACCESSDENIED`); LocalSystem already satisfies it, so no new grant is needed under the current deployment model. | 2026-09-08, bare-metal, `NT AUTHORITY\SYSTEM` (the-rig, S4U scheduled task) | rows report `feature\|unavailable\|windows:dism:access_denied` / `feature_info\|unavailable\|windows:dism:access_denied`; result status `PERMISSION_DENIED` |
-| macOS | agent daemon, unprivileged | n/a — action returns the honest-unsupported sentinel unconditionally | not applicable (Windows-only plugin) | n/a — no DISM call is attempted |
+| Windows | agent service account (LocalSystem today, #1442) | **Elevated token.** The DISM API refuses an unprivileged caller (`E_ACCESSDENIED`); LocalSystem already satisfies it, so no new grant is needed under the current deployment model. | 2026-09-08, bare-metal, `NT AUTHORITY\SYSTEM` (S4U scheduled task) | rows report `feature\|unavailable\|windows:dism:access_denied` / `feature_info\|unavailable\|windows:dism:access_denied`; result status `PERMISSION_DENIED` |
+| macOS | agent daemon, root today (the LaunchDaemon carries no `UserName` key, see `docs/agent-privilege-model.md`) | n/a — action returns the honest-unsupported sentinel unconditionally | not applicable (Windows-only plugin) | n/a — no DISM call is attempted |
 | Linux | agent daemon, unprivileged | n/a — action returns the honest-unsupported sentinel unconditionally | not applicable (Windows-only plugin) | n/a — no DISM call is attempted |
 
-No subprocesses and no network access. `DismApi.dll` is resolved once at process startup via `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)` + `GetProcAddress` against eight exports, never `DismApi.lib`/`#include <dismapi.h>` — no Windows ADK dependency (see `tests/unit/fixtures/wave9/probes/the-rig-dism-findings.md`).
+No subprocesses and no network access. `DismApi.dll` is resolved once, on first use, via `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)` + `GetProcAddress` against eight exports, never `DismApi.lib`/`#include <dismapi.h>` — no Windows ADK dependency (capture and provenance: `tests/unit/fixtures/wave9/windows_optional_features/dism_features_system.txt.provenance.txt`).
 
 ## Data contract
 
@@ -70,7 +128,7 @@ No subprocesses and no network access. `DismApi.dll` is resolved once at process
 
 ### Outputs
 
-Pipe-delimited rows via `write_output()`. `list` writes one `feature|` row per feature (or per matching feature when `state` filters); `info` writes exactly one `feature_info|` row. On an unsupported or unavailable leg, both actions instead write a single sentinel row: `feature|unsupported|<os>:dism:unsupported` / `feature|unavailable|windows:dism:<token>` (or the `feature_info` equivalent for `info`) — never a blank or omitted row.
+Pipe-delimited rows via `write_output()`. `list` writes one `feature|` row per feature (or per matching feature when `state` filters; an unrecognised filter value is treated as no filter); `info` writes exactly one `feature_info|` row. An invalid `feature` value is refused before any DISM call with `feature_info|invalid|invalid 'feature' parameter: '<value>'` and exit code 1. On `list`, `restart_required` is 1 only for `pending_enable` and `pending_disable`; `info` reports DISM's own restart type. On an unsupported or unavailable leg, both actions instead write a single sentinel row: `feature|unsupported|<os>:dism:unsupported` / `feature|unavailable|windows:dism:<token>` (or the `feature_info` equivalent for `info`) — never a blank or omitted row.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`windows.features.info` — `name|display_name|state|restart_type|description`**
@@ -93,6 +151,8 @@ Pipe-delimited rows via `write_output()`. `list` writes one `feature|` row per f
 <!-- END GENERATED -->
 
 ### Result status
+
+A failed or constrained read still exits 0 (only an invalid parameter or an unhandled exception exits 1), so a consumer must key on the typed status, not the exit code. The `windows:dism:*` tokens below are carried in the sentinel row (`feature|unavailable|<token>`); the status reason is human text, and for a DISM failure it is `hr=0x<code>` plus DISM's last error message.
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
@@ -145,11 +205,11 @@ feature_info|NetFx3|.NET Framework 3.5 (includes .NET 2.0 and 3.0)|enabled|possi
 
 ## Caveats and known gaps
 
-1. **DISM is process-global and single-session.** The Windows DISM API does not support concurrent sessions safely from the same process; every `list`/`info` call is serialised through agent-core's process-global `DismSlot` (at most one DISM call in flight), reporting `windows:dism:busy` to a second caller rather than risking undefined concurrent-session behaviour.
-2. **A timed-out call is `abandoned`, not cleared, until the worker returns.** If `DismGetFeatures`/`DismGetFeatureInfo` exceeds the 17s bounded timeout, the dispatching thread reports `windows:dism:timeout` and marks the slot abandoned; every subsequent call reports `windows:dism:abandoned` until the original worker thread actually finishes and releases the slot — permanently, if DISM itself never returns, cleared only by a service restart.
-3. **Pending states come from the feature enum, not a reboot-pending registry key.** `pending_enable`/`pending_disable` reflect `DismPackageFeatureState`'s `InstallPending`/`UninstallPending` values as reported by DISM itself, not an independent reboot-pending check.
-4. **Feature names are DISM's internal names, not Control Panel labels.** `NetFx3`, `SMB1Protocol`, `TelnetClient` etc. are the `FeatureName` DISM uses internally; the `info` action's `display_name` field carries the operator-visible label.
-5. **The macOS/Linux rows are placeholders by design.** DISM has no equivalent on either platform — both legs return the honest `unsupported` row unconditionally, never an empty read or a fabricated value.
+1. **DISM is process-global and single-session.** The DISM API cannot safely run concurrent sessions from one process, so every `list` or `info` call is serialised through agent-core's `DismSlot`. A second caller receives `windows:dism:busy` rather than risking undefined behaviour, and a call rejected by the bounded-call outstanding-call ceiling is reported the same way.
+2. **A timed-out call is `abandoned`, not cleared, until the worker returns.** If `DismGetFeatures` or `DismGetFeatureInfo` exceeds the 17 second limit, the dispatching thread reports `windows:dism:timeout` and marks the slot abandoned. Every later call reports `windows:dism:abandoned` until the original worker finishes, which is permanent if DISM itself never returns and is cleared only by a service restart.
+3. **Pending states come from the feature enum, not a reboot-pending registry key.** `pending_enable` and `pending_disable` reflect DISM's `InstallPending` and `UninstallPending` values, and `list` sets `restart_required` to 1 only for those two states. `info` reports DISM's own `restart_type`, so an enabled feature can show `restart_required` 0 on `list` and `possible` on `info`.
+4. **Feature names are DISM's internal names, and `disabled` covers three states.** `NetFx3`, `SMB1Protocol` and `TelnetClient` are the `FeatureName` values DISM uses, not Control Panel labels; `info` carries the operator-visible `display_name`. The `disabled` state also covers features whose payload is staged or removed, which the plugin does not tell apart.
+5. **The macOS and Linux rows are placeholders by design.** DISM has no equivalent on either platform, so both legs return the `unsupported` row unconditionally, never an empty read or a fabricated value.
 
 ## Source and tests
 
