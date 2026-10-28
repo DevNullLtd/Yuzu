@@ -13158,7 +13158,8 @@ private:
         return yuzu::server::ConfinedDispatchSink{
             [this, &cmd, route_fallback](const std::string& aid) {
                 if (auto cluster = route_fallback->cluster_for(aid))
-                    return registry_.send_via_directory(aid, cmd, *cluster);
+                    return registry_.send_via_directory(aid, cmd, *cluster,
+                                                    route_fallback->legacy_wire_for(aid));
                 return registry_.send_to(aid, cmd);
             },
             [this, &cmd] { return registry_.send_to_all(cmd); },
@@ -22631,7 +22632,8 @@ private:
         const yuzu::server::ConfinedDispatchSink sink{
             [&](const std::string& aid) {
                 if (auto cluster = legacy_route_fallback->cluster_for(aid))
-                    return registry_.send_via_directory(aid, *classified, *cluster);
+                    return registry_.send_via_directory(
+                        aid, *classified, *cluster, legacy_route_fallback->legacy_wire_for(aid));
                 return registry_.send_to(aid, *classified);
             },
             [&] { return registry_.send_to_all(*classified); },

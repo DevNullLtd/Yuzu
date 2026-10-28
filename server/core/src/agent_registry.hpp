@@ -375,6 +375,18 @@ private:
     std::unordered_set<std::string> kill_switched_os_;
 };
 
+/// Upgrade-window shim, removed in PR 7 of the Echo programme. The wire command for a session
+/// that registered the pre-rename plugin name `tar` must carry `tar`, not `echo`, or the agent
+/// reports plugin-not-found. Returns the command unchanged (a copy) for every other session and
+/// every other plugin. dispatch_tag is deliberately left as computed: the agent never reads it.
+[[nodiscard]] inline pb::CommandRequest wire_for(bool legacy_echo_wire_name,
+                                                 const ClassifiedCommand& cmd) {
+    pb::CommandRequest out = cmd.wire();
+    if (legacy_echo_wire_name && out.plugin() == "echo")
+        out.set_plugin("tar");
+    return out;
+}
+
 /// #3687 (Gate 6 governance fix): the per-action kill-switch DECISION
 /// `finalize_classified_command` applies (below), extracted to its own
 /// function for the IDENTICAL reason `finalize_classified_command` itself was
@@ -552,6 +564,10 @@ struct AgentSession {
     std::string agent_version;
     std::vector<std::string> plugin_names;
     std::vector<PluginMeta> plugin_meta;
+    /// Upgrade-window shim, removed in PR 7 of the Echo programme: the agent registered the
+    /// pre-rename plugin name `tar` (normalised to `echo` in plugin_names/plugin_meta). Commands
+    /// for `echo` are written to it as `tar` (see wire_for). Set only by register_agent.
+    bool legacy_echo_wire_name = false;
     std::unordered_map<std::string, std::string> scopable_tags;
     std::string gateway_node; // Non-empty if agent is connected via gateway
     /// HA WS-4 4.3: the gateway cluster this session's most recent CONNECTED
@@ -946,8 +962,10 @@ public:
     // `send_to` is the sole path for that (this method has no capability
     // advertisement to check, because there is no session to have
     // advertised one).
+    /// `legacy_wire` (Echo-rename upgrade window, removed in PR 7) is the directory row's
+    /// `legacy_echo_wire_name`: the target agent registered the pre-rename plugin name `tar`.
     bool send_via_directory(const std::string& agent_id, const ClassifiedCommand& cmd,
-                            const std::string& cluster_id);
+                            const std::string& cluster_id, bool legacy_wire);
 
     struct GatewayPendingCmd {
         std::string agent_id;
