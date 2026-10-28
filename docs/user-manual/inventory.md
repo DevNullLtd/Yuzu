@@ -636,6 +636,8 @@ place, **Hardware** and **Software**, each its own page:
     exact REST call the view corresponds to is shown with a copy button. The filter box on an
     expanded devices table filters only the rows already loaded; the catalogue search
     and chips are server-side.
+    The chip rows are built from the server's vocabulary tables, so **Found by** lists every
+    collector source and each chip's tooltip says what it covers.
   - **The table** lists titles most-installed first, 100 at a time with a keyset
     **Load more**. **Installs** is the exact number of distinct devices carrying the
     title under the active filters (a device carrying one title through two sources

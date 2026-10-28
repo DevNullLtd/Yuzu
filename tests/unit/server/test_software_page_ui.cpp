@@ -242,10 +242,18 @@ TEST_CASE("software page: kind control, ecosystem and found-by chips", "[invento
     f.source = "pkg_inventory.packages";
     const std::string h = full(f, page());
     REQUIRE(has(h, "<button type=\"button\" class=\"inv-chip\" data-g=\"kind\" data-v=\"\""));
-    REQUIRE(has(h, "class=\"inv-chip\" data-g=\"kind\" data-v=\"pkg\" aria-pressed=\"true\" "
-                   "title=\"macOS pkgutil and Homebrew packages\""));
     REQUIRE(has(h, "data-g=\"kind\" data-v=\"\" aria-pressed=\"false\""));
-    REQUIRE(has(h, "title=\"OS packages (rpm, deb, apk, pacman)\""));
+    // One kind chip per kSoftwareKinds entry, in table order; the tooltip is the table's.
+    std::size_t kpos = 0;
+    for (const auto& k : software_catalog::kSoftwareKinds) {
+        const std::string pre = "data-g=\"kind\" data-v=\"" + std::string(k.value) +
+                                "\" aria-pressed=\"" + (k.value == "pkg" ? "true" : "false") +
+                                "\" title=\"" + std::string(k.tooltip) + "\"";
+        const auto p = h.find(pre);
+        REQUIRE(p != std::string::npos);
+        REQUIRE(p > kpos);
+        kpos = p;
+    }
     // One ecosystem chip per kEcosystemFamilies entry, in table order.
     std::size_t last = 0;
     for (const auto& e : software_catalog::kEcosystemFamilies) {
@@ -255,9 +263,24 @@ TEST_CASE("software page: kind control, ecosystem and found-by chips", "[invento
         last = p;
     }
     REQUIRE(has(h, "data-g=\"eco\" data-v=\"brew\" aria-pressed=\"true\""));
-    REQUIRE(has(h, "data-g=\"src\" data-v=\"installed_apps.list_inventory\" aria-pressed=\"false\""));
-    REQUIRE(has(h, "data-g=\"src\" data-v=\"windows_optional_features.list\""));
-    REQUIRE(count_of(h, "data-g=\"src\"") == 4);
+    // One Found-by chip per kSoftwareSources entry, in table order (managers before packages).
+    std::size_t spos = 0;
+    for (const auto& src : software_catalog::kSoftwareSources) {
+        const std::string pre = "data-g=\"src\" data-v=\"" + std::string(src.value) +
+                                "\" aria-pressed=\"" +
+                                (src.value == "pkg_inventory.packages" ? "true" : "false") +
+                                "\" title=\"" + std::string(src.tooltip) + "\"";
+        const auto p = h.find(pre);
+        REQUIRE(p != std::string::npos);
+        REQUIRE(p > spos);
+        spos = p;
+        REQUIRE(has(h, ">" + std::string(src.title) + "</button>"));
+    }
+    REQUIRE(count_of(h, "data-g=\"src\"") == software_catalog::kSoftwareSources.size());
+    REQUIRE(has(h, "data-g=\"src\" data-v=\"pkg_inventory.store_packages\""));
+    REQUIRE(has(h, "data-g=\"src\" data-v=\"msi_packages.list_inventory\""));
+    // Ecosystem chips carry the family cue; the label stays the raw name.
+    REQUIRE(has(h, "data-g=\"eco\" data-v=\"brew\" aria-pressed=\"true\" title=\"brew\" data-f=\"mac\""));
 }
 
 TEST_CASE("software page: controls reuse hx-include and never embed q or agent_id",

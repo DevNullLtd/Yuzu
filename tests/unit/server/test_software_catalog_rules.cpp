@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <set>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -255,4 +256,31 @@ TEST_CASE("expand_ecosystem_tokens: one exact-size allocation",
     REQUIRE(out.find("@@") == std::string::npos);
     // reserve(peak) on an empty string never doubles: allocator rounding only.
     CHECK(out.capacity() - out.size() < 64);
+}
+
+TEST_CASE("kSoftwareKinds and kSoftwareSources: UI vocabulary tables",
+          "[server][software_catalog][ui_vocab]") {
+    SECTION("kinds are exactly app, pkg, package, feat, each with a tooltip") {
+        std::vector<std::string> values;
+        for (const auto& k : kSoftwareKinds) {
+            values.emplace_back(k.value);
+            CHECK_FALSE(k.title.empty());
+            CHECK_FALSE(k.tooltip.empty());
+        }
+        CHECK(values == std::vector<std::string>{"app", "pkg", "package", "feat"});
+    }
+    SECTION("sources are unique, [a-z_.], tooltipped and cover the six collector sources") {
+        std::set<std::string> seen;
+        for (const auto& s : kSoftwareSources) {
+            CHECK_FALSE(s.tooltip.empty());
+            CHECK(std::ranges::all_of(
+                s.value, [](char c) { return (c >= 'a' && c <= 'z') || c == '_' || c == '.'; }));
+            CHECK(seen.insert(std::string(s.value)).second);
+        }
+        for (const char* want :
+             {"installed_apps.list_inventory", "pkg_inventory.managers", "pkg_inventory.packages",
+              "pkg_inventory.store_packages", "windows_optional_features.list",
+              "msi_packages.list_inventory"})
+            CHECK(seen.count(want) == 1);
+    }
 }

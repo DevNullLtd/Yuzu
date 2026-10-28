@@ -146,6 +146,8 @@ std::string inv_style() {
   .inv-frow .lab{min-width:88px;font-size:13px;font-weight:500;color:var(--ink2)}
   .inv-chip{height:28px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--mut);font:inherit;font-size:13px;font-weight:500;cursor:pointer}
   .inv-chip[data-g=src]{font-family:var(--mds-font-family-mono);font-size:12.5px;font-weight:400}
+  .inv-chip[data-f=win]{box-shadow:inset 3px 0 0 var(--c1)}.inv-chip[data-f=mac]{box-shadow:inset 3px 0 0 var(--c2)}
+  .inv-chip[data-f=lin]{box-shadow:inset 3px 0 0 var(--c3)}.inv-chip[data-f=oth]{box-shadow:inset 3px 0 0 var(--mut)}
   .inv-chip:hover{background:var(--surface2);color:var(--ink)}
   .inv-chip[aria-pressed=true]{border-color:var(--primary);background:color-mix(in srgb,var(--primary) 14%,transparent);color:var(--ink)}
   .inv-active{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
@@ -257,16 +259,6 @@ std::string eco_pill(std::string_view eco) {
     return std::string("<span class=\"inv-pill ") + family_cls(eco_family(eco)) + "\">" +
            esc(std::string(eco)) + "</span>";
 }
-
-constexpr std::array<std::pair<const char*, const char*>, 4> kKinds{{
-    {"app", "applications"},
-    {"pkg", "macOS pkgutil and Homebrew packages"},
-    {"package", "OS packages (rpm, deb, apk, pacman)"},
-    {"feat", "Windows optional features"},
-}};
-constexpr std::array<const char*, 4> kSources{"installed_apps.list_inventory",
-                                              "pkg_inventory.packages", "pkg_inventory.managers",
-                                              "windows_optional_features.list"};
 
 bool any_filter(const SoftwarePageFilters& f) {
     return !f.q.empty() || !f.kind.empty() || !f.ecosystem.empty() || !f.source.empty() ||
@@ -441,25 +433,36 @@ std::string chips_region(const SoftwarePageFilters& f, bool oob) {
                results_get(t) + ">" + esc(label) + "</button>";
     };
     h += kind_chip("", "All", "every kind");
-    for (const auto& [k, title] : kKinds)
-        h += kind_chip(k, k, title);
+    for (const auto& k : software_catalog::kSoftwareKinds)
+        h += kind_chip(std::string(k.value), std::string(k.title), std::string(k.tooltip));
     h += "</div></div>";
-    const auto chip_row = [&](const char* lab, const char* g, const std::string& cur, auto&& values) {
+    struct Chip {
+        std::string v, label, tooltip, family;
+    };
+    const auto chip_row = [&](const char* lab, const char* g, const std::string& cur,
+                              const std::vector<Chip>& chips) {
         h += std::string("<div class=\"inv-frow\"><span class=\"lab\">") + lab + "</span>";
-        for (const std::string v : values) {
+        for (const auto& c : chips) {
             SoftwarePageFilters t = f;
-            (std::string_view(g) == "eco" ? t.ecosystem : t.source) = (cur == v ? "" : v);
-            h += "<button type=\"button\" class=\"inv-chip\" data-g=\"" + std::string(g) + "\" data-v=\"" +
-                 esc(v) + "\" aria-pressed=\"" + (cur == v ? "true" : "false") + "\" title=\"" +
-                 esc(v) + "\" " + results_get(t) + ">" + esc(v) + "</button>";
+            (std::string_view(g) == "eco" ? t.ecosystem : t.source) = (cur == c.v ? "" : c.v);
+            h += "<button type=\"button\" class=\"inv-chip\" data-g=\"" + std::string(g) +
+                 "\" data-v=\"" + esc(c.v) + "\" aria-pressed=\"" +
+                 (cur == c.v ? "true" : "false") + "\" title=\"" + esc(c.tooltip) + "\" " +
+                 (c.family.empty() ? std::string() : "data-f=\"" + c.family + "\" ") +
+                 results_get(t) + ">" + esc(c.label) + "</button>";
         }
         h += "</div>";
     };
-    std::vector<std::string> ecos;
-    for (const auto& e : software_catalog::kEcosystemFamilies)
-        ecos.emplace_back(e.ecosystem);
+    std::vector<Chip> ecos, srcs;
+    for (const auto& e : software_catalog::kEcosystemFamilies) {
+        const std::string eco(e.ecosystem);
+        const std::string cls = family_cls(e.family);
+        ecos.push_back({eco, eco, eco, cls.empty() ? "oth" : cls});
+    }
+    for (const auto& s : software_catalog::kSoftwareSources)
+        srcs.push_back({std::string(s.value), std::string(s.title), std::string(s.tooltip), ""});
     chip_row("Ecosystem", "eco", f.ecosystem, ecos);
-    chip_row("Found by", "src", f.source, std::vector<std::string>(kSources.begin(), kSources.end()));
+    chip_row("Found by", "src", f.source, srcs);
     h += "<span id=\"sw-state\" hidden><input type=\"hidden\" name=\"kind\" value=\"" + esc(f.kind) +
          "\"><input type=\"hidden\" name=\"ecosystem\" value=\"" + esc(f.ecosystem) +
          "\"><input type=\"hidden\" name=\"source\" value=\"" + esc(f.source) +
