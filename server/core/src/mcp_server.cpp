@@ -2634,7 +2634,7 @@ static const ToolDef kTools[] = {
      R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
      R"j("overlap_days":{"type":"integer","default":7,"minimum":1,"maximum":3650,"description":"Overlap window before the predecessor auto-revokes; rejected outright (never truncated) if it would fall below the 24h floor"})j"
      R"j(},"required":["principal_id"]})j",
-     R"j({"type":"object","properties":{"token_id":{"type":"string"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"principal_id":{"type":"string"},"overlap_expires_at":{"type":"integer"}},"required":["token_id","raw_token","principal_id"]})j"},
+     R"j({"type":"object","properties":{"token_id":{"type":"string"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"principal_id":{"type":"string"},"overlap_expires_at":{"type":"integer","description":"Always 0 here: only the predecessor is stamped. No MCP tool available to the rotating operator returns the predecessor's stamp; the REST twin GET /api/v1/engine-principals/{id} does, per entry of active_credentials (get_engine_principal returns only a count)"}},"required":["token_id","raw_token","principal_id"]})j"},
 
     {"confirm_engine_rotation",
      "Explicit maker-checker confirmation that a rotation's successor secret has been received/"
@@ -3004,7 +3004,8 @@ static const ToolDef kTools[] = {
      "standing authority it currently grants that autonomous module. Mirrors DELETE "
      "/api/v1/engine-principals/{id}/roles/{role}. Destructive — it takes away access a "
      "module may be actively relying on; verify the module doesn't need this role before "
-     "calling. Requires Security:Write (supervised MCP tier; approval-gated).",
+     "calling. Idempotent: unassigned is true even when the role was not held. Requires "
+     "Security:Write (supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","pattern":"^[a-z0-9._-]+$","description":"Engine principal slug WITHOUT the engine: prefix"},)j"
      R"j("role":{"type":"string","minLength":1,"description":"The role name to revoke"})j"
@@ -6047,9 +6048,9 @@ static const ResourceDef kResources[] = {
     {"yuzu://golden-prompts/enterprise-it-v1", "Enterprise IT Golden Prompts v1",
      "Versioned prompt/eval catalogue for enterprise incident workflows", "application/json"},
     {"yuzu://openapi", "OpenAPI Specification",
-     "REST API v1 OpenAPI spec, raw — byte-identical to GET /api/v1/openapi.json; the "
-     "discover_routes tool serves the same source wrapped in a distinct routes-catalog "
-     "projection, not this shape",
+     "REST API v1 OpenAPI spec, byte-identical to GET /api/v1/openapi.json (default form, "
+     "without the ?guides=true group guides); discover_routes wraps the same source in a "
+     "different routes-catalog shape",
      "application/json"},
     {"yuzu://scope-dsl", "Scope DSL Reference",
      "Scope-kind and comparison-operator catalog — same builder as GET "
@@ -7385,8 +7386,9 @@ McpServer::HandlerFn McpServer::build_handler(
             }
             // 2g PR 4 (specs-as-resources): yuzu://openapi and yuzu://scope-dsl reuse the
             // SAME source builder as their REST /discover/* and MCP discover_* tool twins
-            // (A2 shared-builder principle). yuzu://openapi serves openapi_spec_json() raw —
-            // byte-identical to REST GET /api/v1/openapi.json's body, NOT to discover_routes'
+            // (A2 shared-builder principle). yuzu://openapi serves openapi_spec_json(),
+            // byte-identical to the body of REST GET /api/v1/openapi.json in its DEFAULT form
+            // (without ?guides=true, which adds the per-group guides), NOT to discover_routes'
             // output, which wraps the same source in build_routes_catalog() as a distinct
             // projection ({"source":"openapi", routes:[...]}). yuzu://scope-dsl serves
             // scope_kinds_catalog().json raw, which IS byte-identical to both
@@ -7439,8 +7441,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     emit_compiled_json_resource(text);
             };
             if (uri == "yuzu://openapi") {
-                // Raw openapi_spec_json(): byte-identical to REST GET /api/v1/openapi.json,
-                // a different projection than discover_routes (see the block comment above).
+                // openapi_spec_json(): byte-identical to REST GET /api/v1/openapi.json without
+                // ?guides=true (the guides are not served here), a different projection than
+                // discover_routes (see the block comment above).
                 serve_compiled_json_resource(yuzu::server::openapi_spec_json());
                 return;
             }

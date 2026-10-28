@@ -80,6 +80,7 @@ yuzu-agent --cert-store MY --cert-subject "agent-001"
 | 50051 | TCP | Inbound | Agent gRPC | Agent network |
 | 50052 | TCP | Inbound | Management gRPC | Admin network |
 | 50055 | TCP | Inbound | Gateway upstream (mutual TLS plus an SPKI public-key pin of the gateway's key, or an acknowledged-disabled plaintext rig) | Gateway hosts only |
+| 50063 | TCP | Inbound | Gateway management (server to gateway command fan-out; mutual TLS plus a peer pin) | Server hosts only; never publish it |
 | 9568 | TCP | Inbound | Gateway Prometheus | Monitoring network |
 
 **Recommendations:**
@@ -111,8 +112,9 @@ Run each component under its own system user:
 > The gateway is the command fan-out plane — a plaintext, untrusted-network-reachable
 > agent listener lets an on-path attacker inject commands (fleet RCE).
 > **One-way (server-authenticated) TLS now exists for it (PKI PR5c)** — enable it on
-> the agent listener (`transport_opts` with `verify => verify_none`,
-> `fail_if_no_peer_cert => false`; see `gateway/config/sys.config.prod`) and ship the
+> the agent listener (a `tls` map in its `{yuzu_gw, grpc_listeners}` entry with
+> `verify => verify_none`, `fail_if_no_peer_cert => false`; see
+> `gateway/config/sys.config.prod`) and ship the
 > CA to your agents. `docker-compose.reference-gateway.yml` ships it (#1314); the
 > cluster compose boots the image default `sys.config` and the demo and UAT composes use their own UAT/demo `sys.config`; all of those listen in plaintext.
 
@@ -122,17 +124,26 @@ PR5c one-way TLS above (and distribute the CA), **or** at the network layer:
   an L4 virtual IP or a TLS-passthrough proxy that keeps one TCP connection per agent
   end to end), with the gateway agent listener itself running the one-way TLS above.
   A reverse proxy or L7 load balancer that terminates TLS or HTTP/2 in front of
-  `:50051` is no longer a supported way to protect this edge: the gateway binds each
-  agent's heartbeats to the connection that opened its session, and such a proxy can
-  spread one agent's calls over several connections (see
-  [Heartbeat admission](gateway.md#heartbeat-admission)), **or**
+  `:50051` is a supported way to protect this edge only when it keeps each client
+  connection on its own backend connection for as long as the client connection lives
+  (see [Keeping each agent on one backend connection](gateway.md#keeping-each-agent-on-one-backend-connection)):
+  the gateway binds each agent's heartbeats to the connection that opened its session,
+  and a proxy that pools backend connections can spread one agent's calls over several
+  connections (see [Heartbeat admission](gateway.md#heartbeat-admission)), **or**
 - keep `:50051` on a **trusted network** (VPN / private subnet / a mesh policy that does not
   terminate HTTP/2; see [Heartbeat admission](gateway.md#heartbeat-admission)), never
   directly internet-exposed.
 
 The gateway→server **upstream** hop supports mutual TLS (`gateway/config/sys.config.prod`
-`{https,...}`), and the gateway **fails closed** if that channel is configured `https`
-without `verify_peer`. The server's gateway-upstream service additionally requires an
+`{https,...}`). The canonical answer for this hop: mutual TLS with the SPKI pin below is
+enforced **by the server**; the gateway's own check is only that it will talk TLS to a server it
+has verified. A plaintext upstream (`http`) is a lab/UAT posture and needs the server's explicit
+acknowledgement flag (`--insecure-gateway-peer`). The gateway refuses to boot (fails closed) on
+the legacy `{grpcbox, [{client, ...}]}` key, on any `https` endpoint without `verify_peer` and a
+`cacertfile` / `cacerts` of its own, and on a channel that lists both `http` and `https`
+endpoints; a gateway that boots without a client certificate is refused by the server.
+Production is `https`, `verify_peer`, a CA-pinned `cacertfile`, and a client certificate and key.
+The server's gateway-upstream service additionally requires an
 authorized gateway peer: the gateway's client certificate must carry `serverAuth`, be inside
 its validity window and have a public key that matches a configured SPKI pin (automatic on
 the generated default certificates, explicit with `--gateway-peer-pin` /
@@ -149,6 +160,13 @@ Direct agent→server connections (no gateway) use TLS. Full detail + the deploy
 "TLS posture" and `docs/pki-architecture.md` "Gateway TLS".
 
 The agent listener authenticates the gateway to agents, not agents to the gateway.
+Requesting a client certificate on this edge is a configuration change that enforces
+nothing yet, and enforcing one needs a separate design (see
+[Moving the agent edge to mutual TLS](gateway.md#moving-the-agent-edge-to-mutual-tls)).
+The address the gateway reports for an agent is the TCP peer unless the listener is told
+which proxies to trust, and it discards whatever the agent sent (a forged address passes
+through an older gateway that does not: upgrade every gateway; see
+[Client addresses behind a proxy](gateway.md#client-addresses-behind-a-proxy)).
 The gateway admits an agent `Heartbeat` only on the connection that opened the
 session's `Subscribe` stream, and only for a session that gateway node holds
 (a rejected heartbeat is answered `NOT_FOUND`, counted, and not forwarded).
@@ -160,7 +178,7 @@ disclosure of session ids in logs; some log lines still include session ids.
 The gateway **management plane** (`:50063`) — the port the server's command
 forwarding dials — is the highest-value gateway surface: whoever it admits can
 run commands on every connected agent. Its secure shape is strict mTLS **plus a
-peer pin** (#1422): the listener's `auth_fun` accepts only a client cert whose
+peer pin** (#1422): the listener's `auth_fun` (run by the gateway's gRPC layer before any handler exists) accepts only a client cert whose
 key matches `{yuzu_gw, mgmt_peer_pins}` (your server's cert) AND carries the
 `serverAuth` EKU — a CA-issued cert alone (any agent's leaf, the gateway's own
 leaf) is rejected with `UNAUTHENTICATED`. The gateway **refuses to boot** when a
@@ -168,6 +186,31 @@ network-reachable mgmt listener lacks this posture; never set
 `{allow_insecure_mgmt, true}` outside an isolated lab rig, and never publish
 `:50063` from a plaintext stack. See `docs/user-manual/gateway.md` "TLS posture"
 for pin configuration and rotation.
+
+**Firewall the management port (known, accepted limitation).** The management listener
+holds at most 256 connections (`limits.max_connections`), and that is a file-descriptor
+bound, not protection. Before the TLS handshake, anyone with layer-4 reach to the port can
+hold a slot for up to the 10 s handshake timeout; after the handshake, any holder of a
+certificate issued by the install CA (every enrolled agent has one) can hold it for as long
+as `PING`s keep the connection busy, because the SPKI peer pin runs later, per stream. About
+256 held connections would stop the server making **new** connections to the gateway;
+connections already established are unaffected. The gateway does not fix this; you must
+restrict `:50063` (and any alternative port set by `YUZU_GW_MGMT_PORT`) so that only the
+server replicas can reach it, set the management listener's `listen.ip` to the management
+interface's address so the port is not bound on the agent-facing interface, and where you can,
+multi-home the server so that the interface it uses for gateway management traffic is not
+the one that faces agents or the database. The shipped composes do not publish it, and the
+gateway cannot verify the firewall or the interface separation. To detect a flood, count
+`ss -Htn state established '( sport = :50063 )'` on the gateway host against the number of
+server replicas, and watch `yuzu_server_gateway_forward_total{status="unavailable"}` on the
+server (commands dropped after three attempts; an alert on its `increase` is recommended and
+none ships). To recover, block the source at the firewall; a process restart does not
+clear it. The agent listener has the matching
+residual risk: its 60000-connection ceiling bounds file descriptors, but a peer that
+completes the handshake and keeps sending can hold connections open and fill it, after which
+new connections wait in the kernel backlog (agents already connected are unaffected until
+they reconnect). Limit connections per source address at the L4 balancer or firewall; see
+[Connection ceilings and the unauthenticated ports](gateway.md#grpc-listeners).
 
 ## Secret Management
 

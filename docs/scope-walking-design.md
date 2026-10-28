@@ -163,14 +163,14 @@ rs_01HXYZ resolved to 2,798 devices (3 dropped: 2 offline > 24h, 1 decommissione
 
 ## 5. Materialisation vs. lazy evaluation
 
-The default is **materialisation at create time** — the device IDs are written to `result_set_members` and never re-derived from the source query unless the operator triggers live re-eval. Trade-offs:
+The default is **materialisation at create time** — the device IDs are written to `result_set_members` and never re-derived from the source query. An operator can run a live re-eval, which creates a new sibling set and leaves the original unchanged (only `tar_query` and `instruction_result` sets can be re-run). Trade-offs:
 
 | Approach | Pros | Cons | Decision |
 |---|---|---|---|
 | **Materialise** | Stable, reproducible, audit-friendly, fast resolve | Membership goes stale as estate mutates | Default — operators *want* a stable target during IR |
-| **Lazy** | Always fresh | Re-evaluates a possibly-expensive query on every action; results shift mid-chain | Available via `?live=true` query param on resolve |
+| **Lazy** | Always fresh | Re-evaluates a possibly-expensive query on every action; results shift mid-chain | Not implemented. No route takes a `live` parameter; the only refresh is `POST /api/v1/result-sets/{id}/re-eval` |
 
-The dashboard surfaces the materialisation timestamp (`Created 09:42 UTC, 17m ago — Re-eval`) on every result-set chip so the operator knows what they are aiming at. Live re-eval is a one-click action that produces a *new* result set ID; the original stays put.
+The dashboard surfaces the materialisation timestamp on the result-set detail, so the operator knows what they are aiming at. Live re-eval is a one-click **Re-evaluate** button, shown only for the source kinds that can be re-run, that produces a *new* result set ID; the original stays put.
 
 ## 6. REST API
 
@@ -178,18 +178,20 @@ Base path: `/api/v1/result-sets`. All routes require an authenticated session an
 
 | Method | Path | Body | Returns | Notes |
 |---|---|---|---|---|
-| `POST` | `/api/v1/result-sets` | `{name?, source_kind, source_payload, device_ids[]}` | `{id, ttl_at, device_count}` | Direct create — operator passes pre-computed members. Used by dashboard for "I have a CSV" import. |
-| `POST` | `/api/v1/result-sets/from-inventory-query` | `{name?, query, parent_id?}` | `{id, ttl_at, device_count}` | Server runs the inventory query inside `parent_id`'s scope (or `__all__`) and persists the result. Reads the Postgres-backed generic `InventoryStore` (ADR-0037); returns **503** on a store degrade rather than persisting a result set built from a silent-empty read. |
-| `POST` | `/api/v1/result-sets/from-tar-query` | `{name?, sql, parent_id?}` | `{id, ttl_at, device_count}` | Dispatches the SQL to TAR agents in `parent_id`'s scope; the device-ID set is the union of agents that returned ≥1 row (default) or all agents that responded (`include_empty=true`). |
-| `POST` | `/api/v1/result-sets/from-instruction-result` | `{name?, instruction_id, params, matcher, parent_id?}` | `{id, ttl_at, device_count}` | Runs the instruction in `parent_id`'s scope; the device set is filtered by `matcher`. Mirrors the Chrome hash-check step. |
-| `GET` | `/api/v1/result-sets` | — | `{result_sets: [...]}` | Pagination by `?cursor=`. Default sort: `created_at DESC`. |
-| `GET` | `/api/v1/result-sets/{id}` | — | `{id, name, owner_principal, created_at, ttl_at, pinned, parent_id, source_kind, source_payload, device_count}` | |
-| `GET` | `/api/v1/result-sets/{id}/members` | — | `{device_ids: [...]}` | Pagination by `?cursor=`. |
-| `GET` | `/api/v1/result-sets/{id}/lineage` | — | `{chain: [{id, name, source_kind, device_count, narrowing}, ...]}` | Walks `parent_id` to root. The dashboard breadcrumb does **not** call this REST route — it is rendered server-side via `/fragments/result-sets/*`, which calls the plain `lineage()` store wrapper directly, with no HTTP hop through the REST API. |
-| `POST` | `/api/v1/result-sets/{id}/pin` | — | `{ttl_at, pinned}` | |
-| `POST` | `/api/v1/result-sets/{id}/unpin` | — | `{ttl_at, pinned}` | |
-| `POST` | `/api/v1/result-sets/{id}/re-eval` | — | `{new_id, device_count_delta}` | Re-runs `source_payload` and creates a new set with `parent_id = original.parent_id` (sibling, not child). |
-| `DELETE` | `/api/v1/result-sets/{id}` | — | `204` | Pinned sets must be unpinned first. |
+| `POST` | `/api/v1/result-sets` | `{name?, source_kind, source_payload, device_ids[], parent_id?}` | `201` and the full set record | Direct create — operator passes pre-computed members; an optional `parent_id` parents the new set onto an owned set. Used by dashboard for "I have a CSV" import. |
+| `POST` | `/api/v1/result-sets/from-inventory-query` | `{name?, combine?, conditions[], parent_id?}` | `201` and the full set record | Server runs the inventory query inside `parent_id`'s scope (or `__all__`) and persists the result. Reads the Postgres-backed generic `InventoryStore` (ADR-0037); returns **503** on a store degrade rather than persisting a result set built from a silent-empty read. |
+| `POST` | `/api/v1/result-sets/from-tar-query` | `{name?, sql, parent_id?}` | `202` and the full set record (`status` shows progress) | Dispatches the SQL to TAR agents in `parent_id`'s scope; the device-ID set is the union of agents that returned ≥1 row (default) or all agents that responded (`include_empty=true`). |
+| `POST` | `/api/v1/result-sets/from-instruction-result` | `{name?, instruction_id, params, matcher, parent_id?}` | `202` and the full set record (`status` shows progress) | Runs the instruction in `parent_id`'s scope; the device set is filtered by `matcher`. Mirrors the Chrome hash-check step. |
+| `GET` | `/api/v1/result-sets` | — | `{result_sets: [...], next_cursor}` | Pagination by `?cursor=`. Default sort: `created_at DESC`. |
+| `GET` | `/api/v1/result-sets/{id}` | — | `{id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}` | |
+| `GET` | `/api/v1/result-sets/{id}/members` | — | `{device_ids: [...], next_cursor}` | Pagination by `?cursor=`. |
+| `GET` | `/api/v1/result-sets/{id}/lineage` | — | `{chain: [{id, name, source_kind, device_count}, ...]}` | Walks `parent_id` to root. The dashboard breadcrumb does **not** call this REST route — it is rendered server-side via `/fragments/result-sets/*`, which calls the plain `lineage()` store wrapper directly, with no HTTP hop through the REST API. |
+| `POST` | `/api/v1/result-sets/{id}/pin` | — | the full set record | |
+| `POST` | `/api/v1/result-sets/{id}/unpin` | — | the full set record | |
+| `POST` | `/api/v1/result-sets/{id}/re-eval` | — | `202` and the full set record of the new set | Re-runs `source_payload` and creates a new set with `parent_id = original.parent_id` (sibling, not child). Only `tar_query` and `instruction_result` sets can be re-run; any other source kind is refused with `400`. |
+| `DELETE` | `/api/v1/result-sets/{id}` | — | `{deleted: true}` | Pinned sets must be unpinned first. |
+
+**Shipped behaviour (the table above is brought in line with it).** Every route answers inside the usual `{data, meta}` envelope. Create answers `201` with the full set record (`id`, `name`, `owner_principal`, `created_at`, `ttl_at`, `last_used_at`, `pinned`, `parent_id`, `source_kind`, `status`, `source_execution_id`, `device_count`); the two producers that dispatch to agents and `re-eval` answer `202` with that record while the set fills. `GET /api/v1/result-sets/{id}` does not return `source_payload`. `DELETE` answers `200` with `{"deleted": true}`; an unknown id is `404` and a pinned set `409`. Lineage nodes carry `id`, `name`, `source_kind` and `device_count` but no `narrowing`. `re-eval` writes the audit verb `result_set.create`; the `result_set.live_reeval` verb in the audit table below is not written by any handler.
 
 **`parent_id` is a targeting argument, and omitted is not the same as empty (#2500).** Omit
 `parent_id` to run against `__all__` deliberately. A **supplied** `parent_id` that is an empty
@@ -354,7 +356,7 @@ Every state transition writes an `AuditEvent` per `docs/observability-convention
 | Action | Result | Notes |
 |---|---|---|
 | `result_set.create` | `success` / `failure` / `denied` | Includes source_kind (plus `execution_id` and the dispatched-agent count on the async producers); parent_id and device_count are not yet recorded (#4088). `denied` when a supplied `parent_id` names no parent set (#2500), with `detail=reason=parent_id_type\|parent_id_empty`, or when it exceeds 64 bytes (#4734), with `detail=reason=parent_id_too_long[ source_kind=<src_kind>]` -- audited on all five create surfaces but, unlike the shape-check refusal just named, never counted on `yuzu_server_dispatch_target_rejected_total`; also `denied` on `{id}/re-eval` when the original's live parent is gone but its persisted `scope_input_id` shows it was narrowed at creation (#4306), with `detail=reason=parent_gone source_kind=<orig source_kind> scope_input_id=<stale value>`, target_id=`<original id>` (`scope_input_id` added in the #4306 governance follow-up, run through `audit_token()`/`log_token` neutralisation like every other caller-influenced audit-detail token in this file, so the erased target is still forensically identifiable after the originating row TTL-expires when it is a canonical `rs_` id; when it is an ALIAS rather than a canonical id, the recorded string is only the caller's typed reference at creation time -- `resolve_alias`'s newest-wins lookup means the same alias may since be re-bound to a different set, so it must never be re-resolved later to mean "the erased target," only read as "what the caller typed"). `failure` on the inventory-query producer (#4496, extended by the #4496 follow-up) with `detail=reason=store_degraded\|query_truncated\|poison_excluded\|parse_error_excluded source_kind=inventory_query` |
-| `result_set.live_reeval` | `success` / `failure` | Includes original_id, new_id, device_count_delta |
+| `result_set.live_reeval` | `success` / `failure` | Design only: no shipped handler writes this verb (`re-eval` writes `result_set.create`). Would include original_id, new_id, device_count_delta |
 | `result_set.heal` | `success` / `failure` | #4493: written by REST `/re-eval` and MCP `reevaluate_result_set` when the stored `source_payload` is found nested past `kMcpMaxJsonDepth`. `success` = `heal_poisoned_payload` discarded the poisoned payload; `failure` = the caller's own depth check found poison but `heal_poisoned_payload`'s return was `false` - a genuine write failure (row unchanged, still poisoned), a benign race where a concurrent caller already healed the row first (row unchanged, already healthy), or the row was deleted between heal's own SELECT and UPDATE (#4540: a concurrent `delete_set` or the TTL GC sweep, neither holding a shared lock) and no longer exists at all - the three are not currently distinguished (#4524). Not written on a row already healthy at the caller's own check (heal is a no-op there, nothing to audit). |
 | `result_set.pin` / `result_set.unpin` | `success` | |
 | `result_set.delete` | `success` | Pinned sets require explicit unpin first; `delete` of an unpinned set is single-action |

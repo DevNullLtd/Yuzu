@@ -14,6 +14,7 @@ extern const char* const kDashboardIndexHtml;
 
 // Help and Instruction management pages (separate TUs).
 extern const char* const kHelpHtml;
+extern const char* const kSwaggerPageHtml;
 extern const char* const kInstructionPageHtml;
 extern const char* const kApprovalsPageHtml; // server/core/src/approvals_ui.cpp (Operate O1)
 extern const char* const kExecutionsPageHtml; // server/core/src/executions_ui.cpp (Operate O1)
@@ -301,6 +302,26 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     // -- Help page --------------------------------------------------------
     sink.Get("/help", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(kHelpHtml, "text/html; charset=utf-8");
+    });
+
+    // -- API reference (/swagger) ----------------------------------------
+    // Renders GET /api/v1/openapi.json?guides=true in the browser. No store, no audit (the
+    // spec route itself is unaudited). The page carries the same Infrastructure:Read gate as
+    // that route and shows no more than it returns, so a denied operator gets the 403 here
+    // rather than a shell whose only fetch would fail. No nav entry. The signed-out redirect
+    // below is home_ui::sign_in_location, the same one the pre-routing gate and the other
+    // pages registered in this file use; with no nav entry it resolves to plain /home. Pages
+    // registered in other files (device, DEX, network, access tokens, compliance) redirect to
+    // a literal /login instead, which forwards to the same landing page.
+    sink.Get("/swagger", [deps](const httplib::Request& req, httplib::Response& res) {
+        auto session = deps.auth_fn(req, res);
+        if (!session) {
+            res.set_redirect(home_ui::sign_in_location(req.path));
+            return;
+        }
+        if (!deps.perm_fn(req, res, "Infrastructure", "Read"))
+            return;
+        res.set_content(kSwaggerPageHtml, "text/html; charset=utf-8");
     });
 
     // -- TAR dashboard page (Phase 15.A — issue #547) --------------------

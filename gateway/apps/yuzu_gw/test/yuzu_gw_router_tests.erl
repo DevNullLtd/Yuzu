@@ -28,6 +28,8 @@ router_test_() ->
       {"all agents missing completes immediately", fun fanout_all_missing/0},
       {"timeout fires when agents don't respond", fun fanout_timeout/0},
       {"completion fires when all respond", fun fanout_all_respond/0},
+      {"the fan-outs in flight are reported when a fan-out starts and when it ends",
+       fun fanouts_inflight_reported/0},
       {"a negative or zero timeout does not crash the router and uses the default",
        fun non_positive_timeout_uses_default/0},
       {"a huge timeout is clamped to 3600 seconds",
@@ -261,6 +263,30 @@ fanout_all_respond() ->
         ?assert(false, "Expected fanout_complete with all received")
     end,
     lists:foreach(fun({Pid, _}) -> kill_fake(Pid) end, Agents).
+
+%% The router reports how many fan-outs it holds whenever that changes: one more
+%% when a fan-out with a dispatched agent starts, one fewer when it completes.
+%% (Other cases of this fixture leave fan-outs in flight, so the test reads the
+%% change, not the absolute count.)
+fanouts_inflight_reported() ->
+    meck:reset(telemetry),
+    {AgentPid, AgentId} = register_fake_agent(<<"fi-1">>),
+    {ok, FanoutRef} = yuzu_gw_router:send_command(
+                        [AgentId], #{command_id => <<"cmd-fi">>, plugin => <<"svc">>}, #{}),
+    yuzu_gw_router ! {fanout_terminal, FanoutRef, AgentId},
+    receive {fanout_complete, FanoutRef, _} -> ok
+    after 2000 -> ?assert(false, "Expected fanout_complete")
+    end,
+    %% the router reports the new count after it has told the caller
+    _ = sys:get_state(yuzu_gw_router),
+    Reported = [N || {_, {telemetry, execute,
+                          [[yuzu, gw, router, fanouts], #{inflight := N}, _]}, _}
+                         <- meck:history(telemetry)],
+    ?assertMatch([_, _], Reported),
+    [Up, Down] = Reported,
+    ?assert(Up >= 1),
+    ?assertEqual(Up - 1, Down),
+    kill_fake(AgentPid).
 
 %%%===================================================================
 %%% Fake agent process

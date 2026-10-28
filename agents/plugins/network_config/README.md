@@ -14,31 +14,79 @@
 
 ## How it works
 
-`adapters` enumerates NICs (name, MAC, link speed, up/down). `ip_addresses` enumerates unicast
-addresses per adapter plus the default gateway. `dns_servers` reads the configured resolvers.
-`proxy` reads the system HTTP/PAC proxy and bypass list. `dns_cache` dumps the resolver cache —
-Windows and Linux only; macOS has no OS-level access to cache contents and returns an honest
-`unsupported` sentinel rather than attempting a doomed read. `arp` reads the host ARP/neighbour
-table, capped at 20,000 rows on every OS to bound a large or forged table. `routes` reads the full
-routing table — IPv4 and IPv6 together, with destination prefix, gateway, interface, metric, table,
-type and origin — capped at 20,000 rows; it reports the configured routes, not the host's own
-addresses (see Caveats).
+The plugin reports how a device is attached to its network: its adapters, addresses, resolvers, proxy, resolver cache, neighbour (ARP) table and routing table. Every action is one local read with no state, no network traffic and no background collection; the definitions' `gather.ttlSeconds` (30 to 120 seconds) is the time the agent has to answer, not a cache. Each OS answers through its own native interface rather than by parsing command output, with one exception: the Linux resolver cache runs `resolvectl`. Nothing here captures packets or tests connectivity: the plugin says what the host is configured to do, not what the network does.
 
-Every action is a single read with no state and no scheduled trigger; `gather.ttlSeconds` (30–120s
-per action) only caches a result for that long, it does not fire a background collection. The
-plugin deliberately does not attempt a live packet capture. `ip_addresses` still reports only the
-primary default gateway on Linux/macOS (one value, repeated per row); `routes` is the action that
-reports every route.
+| Action | Windows | macOS | Linux |
+|---|---|---|---|
+| `adapters` | `GetAdaptersAddresses`; loopback and tunnel-type adapters are left out | `getifaddrs` and `SIOCGIFMEDIA`; `lo0` is listed | rtnetlink link dump; `lo` is left out |
+| `ip_addresses` | `GetAdaptersAddresses`; each adapter's own first gateway | `getifaddrs` plus the routing-socket default route; one host-wide gateway | rtnetlink address and route dump; one host-wide default gateway |
+| `dns_servers` | each adapter's DNS list | SystemConfiguration dynamic store | `nameserver` lines of `/etc/resolv.conf` |
+| `proxy` | WinHTTP Internet Explorer settings of the agent account | SystemConfiguration proxy settings (HTTP and PAC only) | `*_proxy` variables in the agent's own environment |
+| `dns_cache` | `DnsGetCacheDataTable` | not supported (returns an `unsupported` row) | `resolvectl cache`, else `systemd-resolve --statistics` |
+| `arp` | `GetIpNetTable2` | routing-socket neighbour dump | `/proc/net/arp` (IPv4 only) |
+| `routes` | `GetIpForwardTable2` | routing-socket `NET_RT_DUMP` | rtnetlink `RTM_GETROUTE` for IPv4 and IPv6 |
+
+`arp` and `routes` each stop at 20,000 rows so a very large or forged table cannot grow a response without bound. `routes` reports the configured table (IPv4 and IPv6 together, with destination prefix, gateway, interface, metric, table, route type and origin), not the host's own addresses, and only after per-OS filtering described under Caveat 5. A read that fails or is cut short is reported through the result status, never as an empty success.
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Infrastructure.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[network_config.execute]
-  EX --> WIN[Windows leg<br/>GetAdaptersAddresses / WinHTTP / DnsGetCacheDataTable / GetIpNetTable2 / GetIpForwardTable2]
-  EX --> MAC[macOS leg<br/>getifaddrs+SIOCGIFMEDIA / PF_ROUTE sysctl (default route, ARP, NET_RT_DUMP) / SCDynamicStore]
-  EX --> LIN[Linux leg<br/>rtnetlink (links, addresses, routes) / resolv.conf / resolvectl / proc-net-arp]
-  WIN & MAC & LIN --> ROWS[rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator or workflow"] --> SRV["Server: authz Infrastructure.Read"]
+  SRV -- "gRPC mTLS" --> HOST["Agent plugin host"] --> EX["network_config.execute"]
+  EX --> WIN["Windows leg: IP Helper, WinHTTP, dnsapi"]
+  EX --> MAC["macOS leg: getifaddrs, routing-socket sysctl, SystemConfiguration"]
+  EX --> LIN["Linux leg: rtnetlink, resolv.conf, resolvectl, proc net arp"]
+  WIN --> ROWS["Rows and typed result status"]
+  MAC --> ROWS
+  LIN --> ROWS
+  ROWS --> RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
+
+### What you can decide with it
+
+| Question | Action | How to read it, and what it cannot tell you |
+|---|---|---|
+| Is this device sending all its traffic through a VPN? | `routes` | Look at the default routes (`prefix_len` 0, destination `0.0.0.0` or `::`) and at the split-default pair `0.0.0.0/1` and `128.0.0.0/1` (IPv6 `::/1` and `8000::/1`) that many VPN clients install. A default or split-default route whose `interface` is the VPN adapter means a full tunnel; routes for specific networks via the VPN with a different default means a split tunnel. The table lists routes, it does not work out which route wins for a destination, and on Linux the policy rules that steer traffic between tables are not read. |
+| Is there an unexpected default route (a second gateway, a hijacked path)? | `routes` | Count the rows with `prefix_len` 0 per `family` and compare `gateway`, `interface` and `metric`. Windows and Linux give a metric; macOS has none and lists interface-scoped defaults (such as one per VPN tunnel) as ordinary rows. |
+| Which networks go via which gateway? | `routes` | Non-default rows with a `gateway` are routed hops; a `gateway` of `-` is directly attached. `origin` says who installed the route, with a different vocabulary per OS (Caveat 5). |
+| What are this device's addresses, MACs and link state? | `adapters`, `ip_addresses` | Per adapter. Tunnel-type adapters and loopback are skipped on Windows; see Caveat 2. |
+| Which resolvers does it use? | `dns_servers` | Windows: per adapter. macOS: the dynamic store. Linux: only what `/etc/resolv.conf` lists, which on a host that runs a local resolver stub is the stub address, not the upstream servers. |
+| Does it use a proxy? | `proxy` | Windows reports the agent account's settings (LocalSystem today), macOS reports HTTP and PAC only, Linux reports only variables the agent process inherited. A result of `none` is not a statement about any user's browser. |
+| Who is on the local subnet? | `arp` | A cache of recently seen neighbours, not a scan. Linux shows IPv4 only; macOS rows have no interface name. |
+| What names has the host resolved lately? | `dns_cache` | Windows and Linux only. An empty cache is not the same as "no lookups". |
+
+### Diagrams
+
+#### routes, by OS
+
+```mermaid
+flowchart TD
+  R["routes"] --> OS{"Which OS?"}
+  OS -- "Linux" --> L["One RTM_GETROUTE dump over rtnetlink, IPv4 and IPv6"]
+  OS -- "macOS" --> M["One NET_RT_DUMP sysctl, bounded to 64 MiB"]
+  OS -- "Windows" --> W["GetIpForwardTable2, IPv4 and IPv6"]
+  L --> FL["Drop local table, cloned and host-local route types"]
+  M --> FM["Drop neighbour, cloned, multicast, broadcast and own-address entries"]
+  W --> FW["Drop the host's own, broadcast and multicast prefixes"]
+  FL --> CAP["Stop at 20,000 routes"]
+  FM --> CAP
+  FW --> CAP
+  CAP --> ST{"Table read in full?"}
+  ST -- "yes" --> OK["OK, full"]
+  ST -- "partly" --> CO["CONSTRAINED, partial, with a reason token"]
+  ST -- "not at all" --> UN["UNAVAILABLE, partial, with a reason token"]
+```
+
+The three OS legs end in the same decision. A table that was read but cut short or reduced (row cap, a malformed record, a multipath route shown by its first hop only) is `CONSTRAINED`; a table that could not be read, or whose dump failed before any route was decoded, is `UNAVAILABLE`; only a complete read is `OK`, and then zero rows is a genuinely empty table. An exception inside a leg is reported with return code 1.
+
+#### Gateway meaning in `ip_addresses`
+
+| OS | Where `gateway` comes from | Consequence |
+|---|---|---|
+| Windows | each adapter's own first gateway | a multi-homed host can show a different gateway on each adapter |
+| macOS | one system default gateway, resolved once | the same value is repeated on every row |
+| Linux | one main-table default gateway, resolved once | the same value is repeated on every row |
+
+On macOS and Linux a host with several default routes still shows a single gateway here; `routes` is the action that shows all of them.
 
 ## OS capability
 
@@ -69,16 +117,11 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | **None.** Every leg is a native Win32 read API; none requires elevation. | 2026-09-07 on bare metal as `SYSTEM`; `routes` 2026-10-03 on bare metal as `SYSTEM` | no dedicated `PERMISSION_DENIED` path — a failed API call returns `rc=1` with an in-band error row (adapters/ip_addresses/dns_servers) or `GetIpNetTable2 failed (rc=N)` (arp); `routes` instead returns `rc=0` with `UNAVAILABLE`/`PARTIAL` `network_config:routes_table_unavailable` |
-| macOS | agent daemon, root (no `_yuzu` account yet, #1455) | **None.** `getifaddrs`/`ioctl(SIOCGIFMEDIA)`/PF_ROUTE sysctl reads and `SCDynamicStore` reads all work unprivileged. | 2026-09-07 at euid 501 (`jsmith`) — captured **unprivileged**, below the agent's actual root runtime; `routes` 2026-10-03, also at euid 501 | `UNAVAILABLE`/`PARTIAL` with a named provenance (e.g. `network_config:getifaddrs_failed`, `network_config:pf_route_arp_sysctl_failed`, `network_config:pf_route_dump_failed`) |
-| Linux | agent's own unprivileged account (`yuzu`) | **None** for adapters/ip_addresses/dns_servers/proxy/arp/routes (native reads only). `dns_cache` shells out to `resolvectl`/`systemd-resolve` via the bounded direct-argv runner (ADR-3002 rung 2) — no elevation required, but the tool must be present. | 2026-09-06 in a container as `euid 0` (root) — more privileged than the agent's real unprivileged runtime; `routes` 2026-10-03, also `euid 0` (an RTM_GETROUTE dump is an unprivileged read by design, but it was not measured below root) | `UNAVAILABLE`/`PARTIAL` with a named provenance (e.g. `network_config:resolv_conf_unreadable`, `network_config:proc_net_arp_unreadable`, `network_config:rtnetlink_routes_dump_incomplete`) |
+| Windows | agent service account (LocalSystem today, #1442) | **None.** Every leg is a native Win32 read API; none requires elevation. | 2026-09-07 on bare metal as `SYSTEM`; `routes` 2026-10-03 on bare metal as `SYSTEM` | no dedicated `PERMISSION_DENIED` path: a failed API call returns `rc=1` with an in-band error row (adapters, ip_addresses, dns_servers) or `GetIpNetTable2 failed (rc=N)` (arp); `routes` instead returns `rc=0` with `UNAVAILABLE`/`PARTIAL` `network_config:routes_table_unavailable` |
+| macOS | agent daemon, root (no `_yuzu` account yet, #1455) | **None.** `getifaddrs`, `ioctl(SIOCGIFMEDIA)`, routing-socket sysctl reads and `SCDynamicStore` reads all work unprivileged. | 2026-09-07 as an unprivileged user (euid 501), below the agent's actual root runtime; `routes` 2026-10-03, also euid 501 | `UNAVAILABLE`/`PARTIAL` with a named provenance (for example `network_config:getifaddrs_failed`, `network_config:pf_route_arp_sysctl_failed`, `network_config:pf_route_dump_failed`) |
+| Linux | agent's own unprivileged account (`yuzu-agent` on the packaged unit) | **None** for adapters, ip_addresses, dns_servers, proxy, arp and routes (native reads only). `dns_cache` runs `resolvectl` or `systemd-resolve` through the bounded direct-argv runner (no elevation needed, but the tool must be present). | 2026-09-06 in a container as euid 0 (root), more privileged than the agent's real runtime; `routes` 2026-10-03, also euid 0 (an `RTM_GETROUTE` dump is an unprivileged read by design, but it was not measured below root) | `UNAVAILABLE`/`PARTIAL` with a named provenance (for example `network_config:resolv_conf_unreadable`, `network_config:proc_net_arp_unreadable`, `network_config:rtnetlink_routes_dump_incomplete`) |
 
-Binaries/subprocesses: only the Linux `dns_cache` leg spawns a subprocess — `resolvectl cache`, falling
-back to `systemd-resolve --statistics`, both via the bounded direct-argv runner (no `/bin/sh`)
-(`network_config_plugin.cpp:1834-1882`). No other action on any OS spawns a process — `routes` included. Sockets used:
-a raw `AF_NETLINK` socket (Linux adapters/ip_addresses/routes), a throwaway `AF_INET` datagram socket for
-`ioctl(SIOCGIFMEDIA)` and a `PF_ROUTE` sysctl (macOS adapters/ip_addresses/arp/routes). No outbound network
-traffic on any leg — every read is local to the host.
+Binaries and subprocesses: only the Linux `dns_cache` leg spawns a process, `resolvectl cache` falling back to `systemd-resolve --statistics`, both through the bounded direct-argv runner with no `/bin/sh` (`do_dns_cache`). No other action on any OS spawns a process, `routes` included. Sockets used: a raw `AF_NETLINK` socket (Linux adapters, ip_addresses, routes), a throwaway `AF_INET` datagram socket for `ioctl(SIOCGIFMEDIA)` and a routing-socket sysctl (macOS adapters, ip_addresses, arp, routes). No outbound network traffic on any leg; every read is local to the host.
 
 ## Data contract
 
@@ -175,14 +218,7 @@ several — see Caveats.
 | `proxy_address` | string | `host:port`, a PAC URL, or the raw env-var value (L) | W, M, L | not observed in the captured samples — omitted whenever `proxy_type` is `none`/`auto_detect` |
 | `bypass` | string | comma-separated free text | W, M, L | `*.local,169.254/16` |
 
-**`dns_cache` — no shared row shape across platforms.** Windows: `cache_entry|name|record_type|0|`
-(the literal `0` is a hardcoded placeholder, not a real TTL, and the trailing field is always empty
-— `network_config_plugin.cpp:1818`). Linux (`resolvectl` path): `cache_entry|<raw resolvectl line>`
-— one opaque field, not split into name/type/ttl (`network_config_plugin.cpp:1846`). Linux
-(`systemd-resolve` fallback): `dns_stats|<raw statistics line>` — a different discriminator entirely
-(`network_config_plugin.cpp:1878`). Every platform also has sentinel rows: `dns_cache|empty` (W, zero
-entries), `dns_cache|not_available|<reason>` (W/L, tool missing or query failed), `dns_cache|unsupported|<reason>`
-(M, always). The three schema-mapped fields below apply to the Windows structured row only.
+**`dns_cache` — no shared row shape across platforms.** Windows: `cache_entry|name|record_type|0|` (the literal `0` is a hardcoded placeholder, not a real TTL, and the trailing field is always empty; `do_dns_cache`). Linux (`resolvectl` path): `cache_entry|<raw resolvectl line>`, one opaque field, not split into name, type and TTL. Linux (`systemd-resolve` fallback): `dns_stats|<raw statistics line>`, a different discriminator entirely. Every platform also has sentinel rows: `dns_cache|empty` (Windows, zero entries), `dns_cache|not_available|<reason>` (Windows and Linux, tool missing or query failed), `dns_cache|unsupported|<reason>` (macOS, always). The three schema-mapped fields below apply to the Windows structured row only.
 
 | Field | Type | Values | Available | Example |
 |---|---|---|---|---|
@@ -191,6 +227,8 @@ entries), `dns_cache|not_available|<reason>` (W/L, tool missing or query failed)
 | `ttl` | int | literal `0` | W only | `0` |
 
 ### Result status
+
+Read the table by its first column. `OK` means the read was complete, and then zero rows is a real empty answer. `CONSTRAINED` means rows were returned but the read was cut short or reduced, with the reason in the provenance column. `UNAVAILABLE` means the source could not be read at all. Every non-`OK` status here is `PARTIAL`, and only actions that set a status appear below.
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
@@ -222,49 +260,17 @@ entries), `dns_cache|not_available|<reason>` (W/L, tool missing or query failed)
 | `CONSTRAINED` / `PARTIAL` | partial | `subprocess_runner:signaled` | Linux `dns_cache`, the `resolvectl`/`systemd-resolve` child was killed by a signal rather than exiting cleanly |
 | `OK` / `PARTIAL` | partial | `subprocess_runner:line_limit` | Linux `dns_cache`, the runner capped `resolvectl`/`systemd-resolve` output at its line limit and killed the still-producing child — a deliberate bounded stop, not a failure |
 
-Windows never sets a typed status on `adapters`/`ip_addresses`/`dns_servers`/`proxy`/`dns_cache` — a
-failed API call there returns `rc=1` with an in-band error row instead (see Privileges above); `arp`
-and `routes` are the Windows actions that do (`arp`: row-cap `CONSTRAINED`; `routes`: row cap, an
-unavailable table, an unformattable row). No action on any OS ever sets
-`PERMISSION_DENIED` — grep for it in `network_config_plugin.cpp` returns nothing.
+Windows never sets a typed status on `adapters`, `ip_addresses`, `dns_servers`, `proxy` or `dns_cache`: a failed API call there returns `rc=1` with an in-band error row (see Privileges above). `arp` and `routes` are the Windows actions that do set one (`arp`: row-cap `CONSTRAINED`; `routes`: row cap, an unavailable table, an unformattable row). No action on any OS sets `PERMISSION_DENIED`: a refused read surfaces as `UNAVAILABLE` or `CONSTRAINED` with a named reason, or as an in-band error row.
 
 ### Where the data goes
 
-- **Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and
-  land in the ResponseStore, queryable at `/api/responses/{id}`.
-- **Device page "Get live info".** `ip_addresses`, `arp`, and `dns_cache` back three of the device
-  page's live-snapshot cards (`device.live.netconfig` "Adapters & IP", `device.live.arp` "ARP",
-  `device.live.dns_cache` "DNS cache" — `server/core/src/device_routes.cpp:84,86,88`), dispatched
-  through the shared "Get live info" chokepoint. This dispatch is deliberately **untracked**
-  (`execution_id=""`, no ExecutionTracker row, not in the executions drawer) because it auto-fires
-  one query per card on every click (`server/core/src/server.cpp:19698-19708`).
-- **Daily-sync device_ci source (ADR-0016).** `adapters` is one of the four plugin reads
-  (`hardware`/`device_identity`/`os_info`/`network_config`) the `device_ci` daily-sync source
-  invokes in-process to build the device's CI (config-item) record — its MAC addresses are deduped,
-  sorted, and the first becomes the record's primary MAC (`agents/core/src/sync_source_device_ci.hpp:7-8,76`,
-  `agents/core/src/sync_source_device_ci.cpp:197-209`, `agents/core/src/agent.cpp:2076,2095`). MAC
-  address is device-identifying data, so this source is GDPR-personal-data/behavioural-PII tier per
-  the daily-sync routed concern. A failed `adapters` read aborts the whole CI sync cycle rather than
-  syncing a partial record (`sync_source_device_ci.cpp:268-277`).
-- **Not consumed by** TAR, DEX, or Prometheus metrics.
-- **Sensitivity.** `adapters` rows carry the host's own MAC addresses, and `arp` rows carry the MAC
-  and IP address of every other device currently seen on the local subnet — device-identifying data
-  by another route. `routes` rows carry the host's routing topology — internal networks, the
-  next-hop addresses and interface names of VPN and internal gateways — infrastructure detail, not
-  personal data. `ip_addresses`/`dns_servers` rows carry only this host's own IP/resolver
-  configuration. `dns_cache` entries can include hostnames of other devices actually contacted on the
-  network (for example the names of phones or workstations on the LAN) — potentially device-identifying, not personal.
-  `proxy` rows carry network configuration only, nothing that identifies a person or installed
-  software.
-- **Siblings:** `tar/status` and `tar`'s own ARP collector (`agents/plugins/tar/src/tar_arp_collector.cpp`)
-  perform an independent Windows ARP enumeration for the TAR capture surface — it duplicates similar
-  RAII-guard logic for `GetIpNetTable2` but is not a consumer of this plugin's `arp` action
-  (`tar_arp_collector.cpp:130-131`). `network_diag` covers listening ports and active connections,
-  a distinct surface from this plugin's adapter/address/DNS/ARP inventory.
-- **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) →
-  `discover_instructions` / `get_definition("device.network_config.arp")`. Run:
-  `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`, or the device page's
-  "Get live info" snapshot for `ip_addresses`/`arp`/`dns_cache`.
+- **Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`.
+- **Device page "Get live info".** `ip_addresses`, `arp` and `dns_cache` back three of the device page's live-snapshot cards (`device.live.netconfig` "Adapters & IP", `device.live.arp` "ARP", `device.live.dns_cache` "DNS cache"), dispatched through the shared "Get live info" chokepoint. This dispatch is deliberately untracked (no ExecutionTracker row, not in the executions drawer) because it fires one query per card on every click.
+- **Daily-sync device_ci source (ADR-0016).** `adapters` is one of the four plugin reads (`hardware`, `device_identity`, `os_info`, `network_config`) the `device_ci` daily-sync source invokes in process to build the device's configuration-item record; its MAC addresses are deduped and sorted, and the first becomes the record's primary MAC. A MAC address is device-identifying data, so this source is in the GDPR personal-data and behavioural-PII tier of the daily-sync routed concern. A failed `adapters` read aborts the whole sync cycle rather than syncing a partial record.
+- **Not consumed by** TAR, DEX or Prometheus metrics.
+- **Sensitivity.** `adapters` rows carry the host's own MAC addresses, and `arp` rows carry the MAC and IP address of every other device currently seen on the local subnet: device-identifying data by another route. `routes` rows carry the host's routing topology (internal networks, and the next-hop addresses and interface names of VPN and internal gateways), which is infrastructure detail rather than personal data. `ip_addresses` and `dns_servers` rows carry only this host's own address and resolver configuration. `dns_cache` entries can include hostnames of other devices the host has contacted (for example the names of phones or workstations on the LAN), which is potentially device-identifying. `proxy` rows carry network configuration only.
+- **Siblings:** `tar` has its own ARP collector that enumerates Windows ARP independently for the TAR capture surface; it is not a consumer of this plugin's `arp` action. `network_diag` covers listening ports and active connections, a distinct surface from this plugin's adapter, address, DNS and ARP inventory.
+- **MCP / REST.** Discover: `discover_plugins` (summary), then `yuzu://plugin-docs` (this page as data), then `discover_instructions` or `get_definition("device.network_config.arp")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`, or the device page's "Get live info" snapshot for `ip_addresses`, `arp` and `dns_cache`.
 
 ## Sample output
 
@@ -482,52 +488,15 @@ route|ipv4|172.17.0.0|16|-|eth0|0|main|unicast|kernel
 ```
 <!-- END GENERATED -->
 
-The Linux `arp` block shows zero rows with no `[not captured]`/`[rc]` marker — a genuinely empty
-`/proc/net/arp` table on this container host, not a capture failure (the unit tests deliberately do
-not assert row count for the same reason: `tests/unit/test_network_config_local_dispatcher.cpp:14-18`).
+The Linux `arp` block shows zero rows with no `[not captured]` or `[rc]` marker: a genuinely empty `/proc/net/arp` table on this container host, not a capture failure.
 
 ## Caveats and known gaps
 
-1. **Windows `speed_mbps` is not clamped for an unknown-speed adapter.** `TransmitLinkSpeed` is
-   divided by 1,000,000 with no sentinel check (`network_config_plugin.cpp:762`); when the API
-   reports its "unknown speed" sentinel (`ULONG64_MAX`), the row emits `18446744073709` instead of
-   `0` — visible on four of nine adapters in the real Windows capture above (`Ethernet 2`, `WiFi`,
-   `Local Area Connection* 1`, `Local Area Connection* 2`). Any consumer treating `speed_mbps` as a
-   real Mbps figure must guard against this value.
-2. **Some row shapes differ by platform and are not normalised.** `dns_cache` has no shared shape:
-   Windows emits a structured `name|type|0|` row (`network_config_plugin.cpp:1818`); Linux's
-   `resolvectl` path emits one raw, unparsed line under the same `cache_entry|` prefix
-   (`network_config_plugin.cpp:1846`); Linux's `systemd-resolve` fallback uses a different
-   discriminator, `dns_stats|` (`network_config_plugin.cpp:1878`); macOS never populates the three
-   schema columns at all — a consumer that parses `cache_entry|` as `name|record_type|ttl` on every
-   platform will misparse Linux's output. And Linux `proxy_type` is the raw environment-variable name,
-   not a normalised type: Windows and macOS emit `none`/`http`/`pac`/`auto_detect`, Linux emits the
-   literal variable it read (`http_proxy`, `HTTPS_PROXY`, …) and can emit several
-   `proxy_type`/`proxy_address` pairs in one response if more than one is set
-   (`network_config_plugin.cpp:1211-1230`).
-3. **`ip_addresses.gateway` is per-adapter on Windows, host-wide on macOS/Linux.** Windows reads
-   each adapter's own `FirstGatewayAddress` (`network_config_plugin.cpp:894-902`); macOS and Linux
-   each resolve a single system-wide default gateway once and repeat it on every row
-   (`network_config_plugin.cpp:921-932`, `967-976`). A multi-homed Windows host can show different
-   gateways per adapter; macOS/Linux never do.
-4. **The `adapters` loopback asymmetry is deliberate — do not "align" it.** Linux filters `lo`
-   (matching the pre-migration `ip -o link show` parse); macOS reports `lo0` as a real adapter
-   (matching the pre-migration `ifconfig -a` parse). The predates-this-migration asymmetry is
-   called out explicitly in-code and verified against both legacy legs
-   (`network_config_plugin.cpp:813-819`) — changing either side silently alters what the fleet
-   reports.
-5. **`routes` is the configured table, not a byte-for-byte copy of the kernel's, and it differs by OS.**
-   Linux reports the main and custom tables; it drops the local table, cloned cache entries and the
-   local/broadcast/anycast/multicast route types, reports only the FIRST nexthop of a multipath route,
-   and shows an `ip nexthop`-object route's gateway as `nhid:<n>` (both are flagged in the result
-   status, never silent). macOS has no route metric and no table id (`metric` and `table` are `-`),
-   its `origin` is `static` when RTF_STATIC is set (the kernel sets it on connected-interface routes too, which Linux calls `kernel` and Windows `local`, so `origin == static` matches different routes per OS), `dynamic` for RTF_DYNAMIC or RTF_MODIFIED, else `other`; interface-scoped routes (RTF_IFSCOPE, such as one default per VPN tunnel) are listed like any other and cannot be told from unscoped ones, so "the" default route is not one row; it drops entries
-   flagged as neighbour (RTF_LLINFO), cloned, multicast, broadcast or own-address (RTF_LOCAL) —
-   the limited-broadcast `255.255.255.255/32` route carries none of those flags and is reported. Windows reports the ROUTE metric alone —
-   Windows adds the interface metric when ranking routes and that sum is not shown — and drops the
-   host's own and broadcast addresses (Protocol `Local` with a full-length prefix) and the multicast
-   prefixes, but keeps connected-subnet routes (Protocol `Local` with a shorter prefix). A consumer
-   comparing the three OSes must not assume the same filter or the same `origin` vocabulary.
+1. **Windows `speed_mbps` is not clamped for an unknown-speed adapter.** `TransmitLinkSpeed` is divided by 1,000,000 with no sentinel check (`do_adapters`); when the API reports its "unknown speed" value (`ULONG64_MAX`) the row shows `18446744073709` instead of `0`, as on three of the nine adapters in the Windows sample (`WiFi`, `Local Area Connection* 1`, `Local Area Connection* 2`). Any consumer treating `speed_mbps` as a real figure must guard against that value.
+2. **Each action sees less than its name suggests.** On Windows `adapters`, `ip_addresses` and `dns_servers` skip loopback and tunnel-type adapters (other VPN adapter types, such as the Tailscale adapter in the sample, are listed), and `proxy` returns the agent account's settings, not a signed-in user's. On Linux `dns_servers` reads only `/etc/resolv.conf` and `proxy` only the agent's inherited environment, so a resolver or proxy managed elsewhere is not reported.
+3. **Some row shapes differ by platform and are not normalised.** `dns_cache` has no shared shape (a structured `name|type|0|` row on Windows, one raw line under `cache_entry|` or a `dns_stats|` line on Linux, an `unsupported` row on macOS), so a consumer that parses `cache_entry|` as name, type and TTL everywhere will misparse Linux. Linux `proxy_type` is the raw environment-variable name (`http_proxy`, `HTTPS_PROXY`, ...) and can appear several times in one response, where Windows and macOS emit `none`, `http`, `pac` or `auto_detect` once. `ip_addresses.gateway` is per adapter on Windows but one host-wide value repeated on every row on macOS and Linux.
+4. **The `adapters` loopback asymmetry is deliberate; do not "align" it.** Linux leaves out `lo`, while macOS reports `lo0` as a real adapter. Changing either side silently alters what the fleet reports.
+5. **`routes` is the configured table, filtered differently on each OS.** Linux reports the main and custom tables but drops the local table, cloned entries and local, broadcast, anycast and multicast route types, shows only the first nexthop of a multipath route, and shows an `ip nexthop`-object route's gateway as `nhid:<n>` (the last two are flagged in the result status). macOS has no metric or table id (both `-`), calls a route `static` whenever the kernel sets `RTF_STATIC` (which includes connected-interface routes that Linux calls `kernel` and Windows `local`), lists interface-scoped routes like any other, and drops the entries the kernel flags as neighbour, cloned, multicast, broadcast or own-address (the filter is flag-based, so an ordinary host route such as `255.255.255.255/32` can still appear). Windows reports the route metric alone (the interface metric Windows adds when ranking routes is not shown) and drops the host's own, broadcast and multicast prefixes while keeping connected-subnet routes, so a cross-OS comparison must not assume the same filter or the same `origin` vocabulary.
 
 ## Source and tests
 

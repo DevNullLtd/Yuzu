@@ -46,7 +46,7 @@ Tone: concise plain English readable at senior-executive level, present tense, n
 | `definitions` | YAML | `[{"id","display_name","description","platforms","approval_mode","execute_roles","author_roles","gather"}]` |
 | `inputs` | YAML `spec.parameters` | `[{"definition_id","name","type","required","default","constraints","description"}]` — `constraints` is the parameter's `validation` object verbatim, or null |
 | `outputs` | YAML `result.columns` | `[{"definition_id","columns":[{"name","type","description","values","example","platforms"}]}]` |
-| `how_it_works` | README §2 | text with the mermaid fence removed |
+| `how_it_works` | README §2 | text with the mermaid fences removed, `###` subsections included (everything up to the next `##`) |
 | `outputs_note` | README §5 `### Outputs` hand paragraph | text: the row format, discriminator field and placeholder convention a consumer needs to map `samples[].rows` onto `outputs[].columns` |
 | `privileges` | README §4 table | `[{"os","runs_as","grant","measured","if_refused"}]` |
 | `result_status` | README §5 table | `[{"status","completeness","provenance","when"}]` |

@@ -63,9 +63,13 @@ three-model adversarial review's strongest, unanimous finding:
 > **A second server replica may be enabled only when WS-0, WS-1, WS-2(2a
 > outbox), WS-3, WS-4, WS-5, WS-6, WS-10 are done, WS-8's per-tier
 > `/readyz` exists, the WS-11 leader-observability subset (#4014:
-> leader/epoch metrics and the split-brain alert) ships, AND, for
+> leader/epoch metrics and the split-brain alert; **shipped**) ships, AND, for
 > gateway-fronted fleets, WS-13 is done.** (The last two clauses were added
-> 2026-10-13; the rest of WS-11 does not gate.)
+> 2026-10-13; the rest of WS-11 does not gate. Shipping #4014 satisfies only
+> that one clause: **the gate is NOT lifted**, and a durable cluster-capability
+> admission gate, #6528, is separately unbuilt, and the epoch fence is not
+> monotonic across a lossy asynchronous Postgres promotion, #6535, which must be
+> closed or explicitly accepted by the owner before the gate is lifted.)
 
 Miss any one and the failure is **not cosmetic**:
 - No **WS-3** (fenced leader) → both replicas run the singleton workers →
@@ -131,6 +135,12 @@ Source of truth: `docs/ha-delivery-matrix.md`. Read it before this skill
 claims a status. WS-0…WS-10 come from ADR-2002 §Decomposition; WS-11…WS-14 are
 delivery/ops workstreams the three-model review surfaced as missing; WS-15 (gateway
 failback/rebalance, roadmap 7.1.1, #5759) was added 2026-10-13 as WS-13's pair.
+
+**WS-3 / WS-11 re-stamped 2026-10-26 (#4014):** ONLY those two rows were re-audited (against `origin/dev`
+`931842654` plus the unmerged #4014 branch, and `gh`; re-stamp at merge); no other row was. The WS-11 leader-observability subset shipped (metrics published at
+scrape time from a lock-free `LeaderElector::Stats`, the `yuzu-ha-leader` alerts; leadership and the elector
+being open stay out of `/readyz`). Follow-ups: #6526 (remediation-claim lifecycle counters), #6527 (CRL
+freshness gauge), #6528 (durable cluster-capability admission gate), #6535 (epoch fence not monotonic across a lossy async promotion; must close or be explicitly accepted before the gate lifts). The safe-to-scale gate is NOT lifted.
 
 **WS-6 re-stamped 2026-09-23 (PR #4833):** slice 6.1 (cross-replica CRL publication, #4126) in
 review; 6.1b / 6.2 / 6.3 planned; the operator decisions (shared CA key custody, not
@@ -329,7 +339,8 @@ gateway-fronted fleets.**
 > the server answered authoritatively) and calls `disconnect/1` to force
 > the agent-driven reconnect the FORWARD NOTE requires. Also fixed a latent,
 > pre-existing crash in `do_rpc`'s error-clause pattern (never matched what
-> `grpcbox_client:unary/5` actually returns; unreachable before 4.4 since
+> `grpcbox_client:unary/5` (the upstream client at the time; replaced by
+> `yuzu_grpc_client`, which keeps the same result shapes) actually returned; unreachable before 4.4 since
 > this RPC never previously returned a real non-OK, non-transport grpc
 > status). **Round-2 Fable review found 3 more real bugs before push**: F1
 > (BLOCKING) — the adopt decision let an in-memory `gateway_sessions_` hit
@@ -388,7 +399,7 @@ gateway-fronted fleets.**
 | **WS-0** | Durable agent-side command idempotency **+ terminal-outcome replay** (dup replays stored result, not bare `REJECTED`) | — | **Y** | `cpp-safety`+`cpp-expert` | P0 | **done (PR #3662 merged)** |
 | **WS-1** | Server-plane state → Postgres: (1a) sessions DB-time; (1b) `execution_tracker`+command-correlation atomic counters; (1c) HA-critical store subset | migration ladder (serializes at the migration-version counter) | **Y** | `authdb`+`security-guardian` (1a); `architect`+`sre`+`cpp-safety` (1b/1c) | P0 | **done — 1a+1b+1c** |
 | **WS-2** | (2a) durable **event outbox** + NOTIFY fan-out [monolith-OK]; (2b) **core→presentation event spine** [*defers to ADR-1005*]; MCP session/replay durability | 2a: WS-1(1b); 2b: ADR-1005 split | **Y** (2a) | `architect`+`sre`+`security-guardian`(MCP)+`docs-writer` | P1 | **2a done (2a-1 + 2a-2 #3924); 2b/MCP outstanding** |
-| **WS-3** | Coordination seam: **fenced `LeaderElector`** (monotonic epoch in claim txn) + leader/**transactional-outbox**/receiver-idempotency worker refactor incl. policy remediation | **WS-0, WS-1, WS-2(2a)** | **Y** | `architect`+`cpp-safety`+`security-guardian` | P1 | **3.1 done (#4011); 3.2 done (#4134); 3.3 done (#4169); 3.4 done (#4194)** |
+| **WS-3** | Coordination seam: **fenced `LeaderElector`** (monotonic epoch in claim txn) + leader/**transactional-outbox**/receiver-idempotency worker refactor incl. policy remediation | **WS-0, WS-1, WS-2(2a)** | **Y** | `architect`+`cpp-safety`+`security-guardian` | P1 | **3.1 done (#4011); 3.2 done (#4134); 3.3 done (#4169); 3.4 done (#4194); #4014 leader observability shipped (metrics + alerts; gate not lifted)** |
 | **WS-4** | Gateway routing + multi-cluster: fenced `agent→cluster` directory, **net-new distributed intra-cluster agent→node routing**, `gateway_node` convergence | **WS-1, WS-3, WS-0** | **Y** | `gateway-erlang`+`security-guardian`+`architect`+`cpp-safety` | P1 | **4.1 + 4.2a + 4.2b Tasks A–D + `#4324` per-home stream-generation fence + `#4555` cluster formation + 4.3a intra-cluster lookup + 4.4 (`gateway_node` convergence + `#4246` #6 writeback) all MERGED to `origin/dev`; rest of 4.3 (cross-cluster fan-out) / WS-5 cross-replica lookup remain — see `docs/ha-delivery-matrix.md`** |
 | **WS-5** | Shared agent presence / health / **scope-eval population** across core replicas | **WS-4, WS-1, WS-3, WS-10** | **Y** | `security-guardian`+`architect`+`sre`+`docs-writer` | P1 | **slice 1 MERGED (#4745); slice 2 (durable cross-replica session resolution, `#4246` #3) MERGED (PR #5694); follow-ups PR #5736 (decommission cascade, #5682) and PR #5743 (#5684, #5686) MERGED; capability visibility / fleet gauge / #5685 / #5278 / WS-9 scenarios remain; #5683 (unique session index) done, the tombstoned-victim residual remains (#6339); gate NOT lifted** |
 | **WS-6** | PKI/CA HA: shared CA key custody + node admission (**NOT** a `SecretCodec` blob — ADR-2002 §8 Update 2026-09-23, keeps ADR-0010 Decision 6), `CaStore` → PG (**already done**, ADR-0053), **durable CRL numbering + publication state machine**, KEK versioning/rollout/rollback, enrollment → PG (one-time `.cfg` import) | WS-3 (freshness pass); `ca_store` migration done | **Y** | `security-guardian`+`cpp-safety`+`docs-writer` (+`authdb` on 6.2) | P1 | **6.1 CRL publication (#4126, PR #4833) + WS-9 #4832 done; 6.2 enrollment/pending → PG done (97e24ec6e..a81938ada) incl. its own WS-9 scenario; 6.1b / 6.3 planned** — see `docs/ha-delivery-matrix.md` |
@@ -396,7 +407,7 @@ gateway-fronted fleets.**
 | **WS-8** | Per-tier health contract (`/livez` vs `/readyz`; presentation→operator LB, core→presentation routing). **BYO-LB doc** + LB/session semantics | conceptual on WS-1/WS-2; readyz before LB fronts replicas | **Y** (readyz) | `docs-writer`+`release-deploy`+`sre` | P0 readyz / P2 doc | **readyz DONE (monolith, 2026-09-24): `pg_reachable` probe + drain grace; tier-split with the split; BYO-LB doc (P2) planned** |
 | **WS-9** | **Failover test harness** — continuous, incremental scenarios added as each feature lands (not a final gate): session survival, no double-dispatch, effectively-once, cursor-poll no-loss, re-home races, quorum-degrade, standby loss | scenarios track WS-0…WS-7 as they land | N | `build-ci`+`release-deploy`; scenarios by `chaos-injector` | P1 (continuous) | in-progress: scenarios for WS-6, WS-7, WS-8 landed; WS-0…WS-5 and WS-10 have none yet |
 | **WS-10** | **Background-job replica-safety classification** — checked-in, CI-auditable table (job → fenced-leader-only / replica-safe / disabled-until-fixed); bring #2508 wall-clock passes to clock-guard | audit+disable need nothing; `fenced-leader-only` enforcement needs WS-3 | **Y** | `cpp-safety`+`sre`+`compliance-officer` | P0 | **10.1/10.2 done (#4092); 10.3 enforcement wired by WS-3 3.2** |
-| **WS-11** | **HA-state observability** (NEW): leader identity/epoch, replica lag, quorum state, outbox backlog, failover duration, routing re-homes, split-brain alerts — Prometheus metrics + rules | WS-3, WS-7 | N, except the #4014 leader-observability subset, which **gates** (2026-10-13); the rest ships *with* the 2nd replica | `sre`+`docs-writer` (+ alert-rule gate) | P1 | planned |
+| **WS-11** | **HA-state observability** (NEW): leader identity/epoch, replica lag, quorum state, outbox backlog, failover duration, routing re-homes, split-brain alerts — Prometheus metrics + rules | WS-3, WS-7 | N, except the #4014 leader-observability subset, which **gates** (2026-10-13) and is now shipped (the gate is not lifted); the rest ships *with* the 2nd replica | `sre`+`docs-writer` (+ alert-rule gate) | P1 | **leader-observability subset DONE (#4014: `yuzu_server_leader_*` + the four `yuzu-ha-leader` alerts; `SplitBrain` promtool-verified only); the rest planned; #6526 / #6527 / #6528 open** |
 | **WS-12** | **Single→HA cutover + DR** (NEW): runbook to move an existing single deployment to HA-PG + gateway-front rollout; **backup/PITR/WAL under HA-PG** (replaces superseded `disaster-recovery.md`) | WS-7 | N | `release-deploy`+`sre`+`docs-writer` | P1 | planned |
 | **WS-13** | **Agent-side gateway failover rollout** (NEW): agent endpoint discovery/failover + fleet rollout flipping direct-connect fleets to gateway-front. **Tracker #291** (roadmap 14.2). Failover is one-way without WS-15 | WS-4 | Y (gateway-fronted fleets) | `cross-platform`+`security-guardian` | P1 | planned |
 | **WS-14** | **Coordination-substrate security & capacity review** (NEW): threat review of advisory locks / etcd / Patroni / HAProxy / fencing tokens; capacity + failure-domain + sync-quorum latency validation | WS-3, WS-7 | N | `security-guardian`+`sre` | P2 | planned |
