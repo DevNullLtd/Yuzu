@@ -637,10 +637,11 @@ same advice as for the presence row, #5682). Erasure is not durable yet: a still
 repopulates its rows on its next report until the decommission tombstone ships in a later change.
 
 No agent sends `certificate_inventory` yet; agents start only once the server advertises that it
-accepts the source, in a separate later change. The server's gateway path (`ProxyInventory`), which
-2a-1 and later builds before this release discarded such a blob (builds before 2a-1 stored it in the
-generic store, which 2a-1's read filter and boot purge now exclude), now stores it in this typed store exactly as the direct
-`ReportInventory` path does; it still never reaches the generic inventory store.
+accepts the source, in a separate later change. The server's gateway path (`ProxyInventory`) now
+stores such a blob in this typed store, exactly as the direct `ReportInventory` path does. The
+previous release discarded it there; releases before the typed-source read filter (see "Behaviour change: generic
+inventory reads never return a typed source's rows" below) stored it in the generic store, which that
+filter and the boot purge now exclude. It never reaches the generic inventory store.
 
 **Rolling back** leaves the `certificate_inventory_store` schema in the database; it is harmless to
 the older binary and is not read. Plan capacity before agents start reporting: DER is optional and
@@ -649,7 +650,7 @@ bounded at 1 MiB per device, so a large fleet is storage- and WAL-heavy (see
 
 ## Behaviour change: generic inventory reads never return a typed source's rows
 
-**What changed.** The generic inventory store's reads (`query_inventory`, `get_agent_inventory`, `list_inventory_tables` and their REST twins, `POST /api/v1/inventory/evaluate`, and the inventory-query result-set source) no longer return rows for the typed daily-sync sources: `installed_software`, `app_perf`, `device_ci`, `software_licensing`, `app_usage`, and the reserved `certificate_inventory`. Those sources have their own stores and gates. Before this change, a typed source's blob that reached the generic store through an older server's gateway path could be read there under `Infrastructure:Read` or `Inventory:Read` until the next boot purge removed it. That window is now closed on every server at this release or later (see the per-server note below). The gateway also drops a `certificate_inventory` blob, a source no agent sends yet, instead of storing it generically.
+**What changed.** The generic inventory store's reads (`query_inventory`, `get_agent_inventory`, `list_inventory_tables` and their REST twins, `POST /api/v1/inventory/evaluate`, and the inventory-query result-set source) no longer return rows for the typed daily-sync sources: `installed_software`, `app_perf`, `device_ci`, `software_licensing`, `app_usage`, and the reserved `certificate_inventory`. Those sources have their own stores and gates. Before this change, a typed source's blob that reached the generic store through an older server's gateway path could be read there under `Infrastructure:Read` or `Inventory:Read` until the next boot purge removed it. That window is now closed on every server at this release or later (see the per-server note below). A `certificate_inventory` blob, a source no agent sends yet, arriving through a gateway is stored only in the certificate inventory's own typed store (see the certificate inventory note above), never generically.
 
 **Who notices.** Only a caller that read one of those six source names from the generic store. Their data was never meant to be there. Use the typed surface instead, which is unchanged:
 
