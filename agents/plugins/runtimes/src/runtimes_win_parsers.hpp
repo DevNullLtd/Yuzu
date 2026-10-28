@@ -15,9 +15,10 @@
  * unparsable VALUE is a per-item metadata shortfall: the row reports what was found (down to the
  * tag's major.minor) and raises no token.
  *
- * BOUNDED. ONE RowByteBudget (rows, bytes) and one kMaxTagsVisited counter across both views;
- * exhausting either records `windows:runtimes:python_reg:row_cap` and stops. A value is read up to
- * kMaxValueBytes, longer reads as absent.
+ * BOUNDED. One kMaxTagsVisited counter across both views (one record per tag, so it also caps the
+ * rows) and ONE RowByteBudget of kMaxTagsVisited rows and kMaxRowBytes bytes; exhausting either
+ * records `windows:runtimes:python_reg:row_cap` and stops. A value is read up to kMaxValueBytes,
+ * longer reads as absent.
  */
 #pragma once
 
@@ -49,7 +50,6 @@ inline constexpr std::string_view kTokEnumFailed = "windows:runtimes:python_reg:
 inline constexpr std::string_view kTokNameTooLong = "windows:runtimes:python_reg:name_too_long";
 inline constexpr std::string_view kTokRowCap = "windows:runtimes:python_reg:row_cap";
 
-inline constexpr std::size_t kMaxRows = 4096;
 inline constexpr std::size_t kMaxRowBytes = 1024 * 1024;
 inline constexpr std::size_t kMaxTagsVisited = 512;
 inline constexpr DWORD kMaxValueBytes = 64 * 1024;
@@ -167,7 +167,7 @@ template <class Ops>
         }
     }
     dedupe_python_rows(recs);
-    yuzu::shared::RowByteBudget budget{kMaxRows, kMaxRowBytes};
+    yuzu::shared::RowByteBudget budget{kMaxTagsVisited, kMaxRowBytes};
     std::vector<std::string> rows;
     for (const auto& r : recs) {
         auto row = python_row(r);
