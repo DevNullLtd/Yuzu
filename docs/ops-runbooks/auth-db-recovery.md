@@ -1008,16 +1008,30 @@ does not talk to the running process.
 
 ### Fallback: direct SQL
 
-Use it in three cases: no `yuzu-server` binary is available on the host; `--mfa-reset` fails with
-`kek_orphaned` because the stored secret's header names a
+Use it in three cases: no `yuzu-server` binary is available on the host;
+`--mfa-reset` fails with `kek_orphaned` because the stored secret's header names a
 key version that is not registered and that header is corrupt (see
 [Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version),
-where a restore of the paired backup comes first when the version once existed); or the audit store is
-unwritable, in which case `--mfa-reset` refuses fail-closed ("the audit record could not be written")
-and will not clear the factor without evidence.
-**Writes no audit row** in any of the three, so record the action in your incident record or
-change-management system (and, for the unwritable-audit case, note that the audit store itself needs
-repair).
+where a restore of the paired backup comes first when the version once existed); or
+`--mfa-reset` refuses because the audit store does not open or does not accept the audit row
+(`error: audit store unavailable; refusing to clear MFA without an audit record`, or
+`error: MFA was not cleared (...)` naming the audit row) while an
+operator is locked out and the audit store cannot be restored in the time available.
+**Last resort. It writes no audit row.** In the third case restore the audit store first
+and re-run `--mfa-reset`, which is the audited path; use this SQL only when that cannot be done,
+because it removes exactly the audit guarantee the CLI's refusal exists to keep.
+
+Because the database leaves no record of this path, the change-management record that
+follows it is the only evidence. It must state: who ran it (the OS account and the named
+person), when (date, time and time zone), why (the lockout and why neither `--mfa-reset` nor
+an audit-store restore was possible), the ticket reference, the account that was changed,
+the full SQL transcript (the `psql` session output, including the `COMMIT`), and who approved
+running it. The approver must be a different person from the one who ran the SQL. Approval comes before execution; where it
+could only be given afterwards, record it as a retroactive exception. Record the post-change verification too: the
+account's `mfa_enrolled_at` is NULL and the "Check that no session remains" query returns 0. The transcript is
+self-reported, so corroborate it with Postgres statement logging (or pgaudit) where it is enabled. Where the audit store
+later recovers, insert the reconciling audit row described below and add a note to that ticket saying that the
+row was written by hand.
 
 ```bash
 psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" <<'SQL'

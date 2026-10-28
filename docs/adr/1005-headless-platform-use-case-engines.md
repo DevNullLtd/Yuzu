@@ -1029,8 +1029,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 
     - **2026-10-28 - mixed-version admission during a rolling upgrade (scope
       exception recorded by the maintainer, #6079; superseded by the
-      2026-10-29 entry below, which ships the change as a hard cutover with no
-      rolling window).** The approver gate
+      2026-10-29 entry below, a DRAFT pending the maintainer's approval, which
+      ships the change as a hard cutover with no rolling window).** The approver gate
       (`require_enrolled_fresh_mfa`) runs on each server replica and no
       minimum-version check exists. While a rolling upgrade is in progress, or
       after a replica is rolled back, a replica that predates the gate can admit
@@ -1043,7 +1043,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
       case and is not a statement that multi-replica operation is supported.
       Operator wording: `docs/user-manual/upgrading.md` "Mixed-version
       admission" (that section no longer exists: the cutover ruling of the
-      2026-10-24 entry above supersedes this wording, and the marker query it
+      2026-10-29 entry below (a DRAFT pending the maintainer's approval) supersedes
+      this wording, and the marker query it
       cites was removed with it).
      - **Conditions of this exception.** The upgrade is controlled: the
        operator records each replica's upgrade timestamp (UTC) in the change

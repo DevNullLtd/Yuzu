@@ -288,7 +288,7 @@ public:
     /// Fetch one session by token hash, WITH the DB clock at read time in the same
     /// atomic SELECT. nullopt = definitively absent; unexpected = DB degraded (the
     /// caller must NOT treat this as "invalid session", and must NOT treat a
-    /// missing db_now_ms as 0 — both fail the request instead). A served row carries
+    /// missing db_now_ms as 0: both fail the request instead). A served row carries
     /// `guard_unverified` while the rebind-guard check cannot run (see `FoundSession`).
     [[nodiscard]] std::expected<std::optional<FoundSession>, Error>
     find(const std::string& token_hash) const;
