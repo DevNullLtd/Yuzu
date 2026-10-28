@@ -635,6 +635,9 @@ TEST_CASE("KvStore::pragma_synchronous reports a valid level", "[kv_store][entri
 TEST_CASE("KvStore::open leaves synchronous at FULL or stronger", "[kv_store][entries]") {
     // UP-14: the Guardian boot-epoch claim refuses a store that does not report FULL, so open()
     // sets it explicitly rather than relying on SQLite's compile-time default. FULL is 2.
+    // This asserts the invariant on a real store. It also passes in a build whose SQLite default
+    // is already FULL, so it cannot show the explicit setter is present; rule R5 of
+    // tests/test_guardian_emit_stamp_lexical.py pins the setter in kv_store.cpp.
     yuzu::test::TempDbFile db{"yuzu_test_kv_sync-"};
     auto result = KvStore::open(db.path);
     REQUIRE(result.has_value());

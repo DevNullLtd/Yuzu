@@ -1018,10 +1018,12 @@ Known limits of the boot epoch:
     re-locked); on Windows share mode 0 forbids removing the held file;
   - on Windows any other program holding the file open (a backup or security product) is
     reported as `contended` with `native_error=32`;
-  - a local principal that can open the file before the agent starts can hold it and leave the
-    agent at 0/0 for that process lifetime (accepted: the result is the pre-feature timestamp
-    ordering, and the agent logs `contended`; on POSIX the requested mode 0600 limits this to
-    the agent's account and root);
+  - a local principal that can open the file before the agent starts can hold it (POSIX: lock
+    it; Windows: keep it open) and leave the agent at 0/0 for that process lifetime (accepted:
+    the result is the pre-feature timestamp ordering, and the agent logs `contended`; on POSIX
+    the requested mode 0600 limits this to the agent's account and root unless the mode was
+    changed or the file already existed with a looser one; on Windows it depends on the data
+    directory ACL, which was not measured);
   - a file system that does not support the lock, or a lock file the agent's account cannot
     open, is `failed`.
 

@@ -52,16 +52,28 @@ Invariants (the numbered rules below; each failure message starts with its rule 
       block (the text between them never closes a block opened before the acquire and never
       mentions the member); no local of the same name shadows the member; and the member is
       declared after `kv_store_` and before `guardian_` (destroyed after the engine, before the
-      store). Without the assignment every boot loses the lock and the whole fleet runs
+      store). The member is mentioned exactly three times (the acquire assignment, the claim
+      argument, the declaration), so an assignment, move or `release()` after the claim cannot
+      slip in. Without the assignment every boot loses the lock and the whole fleet runs
       unordered (0/0) with every other test green.
-  R3d The lock file name `guardian_boot_epoch.lock` is pinned on the raw source of the acquire.
   R3c The test seam `acquire_for_test` is named only in guardian_boot_epoch.{hpp,cpp}: no other
       production source under agents/core may call it (it can alter lock semantics).
+  R3d The lock file name `guardian_boot_epoch.lock` is pinned in the comment-stripped (string
+      literals kept) source of agent.cpp: the one acquire call must name it, and a comment that
+      quotes the call cannot satisfy the rule. A raw string literal quoting the call would still
+      satisfy it (review-enforced).
   R4  agents/core/src/guardian_engine.cpp: every legacy executor is built through
       `make_legacy_sink_executor(` (no direct `make_unique<GuardianLegacySinkExecutor>` outside
       that helper, every `legacy_sink_executor_` init/assign goes through it), the helper copies
       the engine's `emit_seq_source_` into the Config, and `wire_spark_engine` assigns
       `emit_seq_source` into the runtime Config before the runtime is constructed.
+  R5  agents/core/src/kv_store.cpp (UP-14 durability gate): `KvStore::open` sets
+      `PRAGMA synchronous=FULL` through exactly one `sqlite3_exec(raw_db, ...)` call that
+      precedes the `PRAGMA synchronous` read-back, and no weaker level (OFF, NORMAL, 0, 1) is
+      set anywhere in the file. The Catch2 test of the level cannot discriminate this: it also
+      passes in a build whose SQLite default is already FULL, so the setter is pinned here.
+      Checked on the comment-stripped source with string literals kept (the PRAGMA text is a
+      string literal, which `normalise` blanks).
 
 Robustness: comments (`//`, `/* */`), string literals, raw strings and char literals are removed
 and whitespace is collapsed before matching, so line wrapping, re-indentation and a comment or
@@ -103,7 +115,8 @@ SEND = "src/guardian_spark_send.cpp"
 EMIT_SEQ = "src/guardian_emit_seq.hpp"
 ENGINE = "src/guardian_engine.cpp"
 AGENT = "src/agent.cpp"
-REQUIRED = (RUNTIME, EXECUTOR, SEND, EMIT_SEQ, ENGINE, AGENT)
+KVSTORE = "src/kv_store.cpp"
+REQUIRED = (RUNTIME, EXECUTOR, SEND, EMIT_SEQ, ENGINE, AGENT, KVSTORE)
 
 _SCAN_SUFFIXES = {".cpp", ".hpp", ".h", ".cc", ".mm", ".m"}
 
@@ -135,6 +148,17 @@ def normalise(src):
     t = _STRIP.sub(_blank, src)
     t = re.sub(r"[ \t\n\r\f\v]+", " ", t)
     return re.sub(r" ?([(){};,]) ?", r"\1", t)
+
+
+def _keep_non_comments(m):
+    s = m.group(0)
+    return " " if s.startswith("/") else s
+
+
+def strip_comments(src):
+    """Blank comments only. String and char literals are kept verbatim (a `//` inside a string is
+    consumed by the string alternative first), for rules that must read a literal's text."""
+    return _STRIP.sub(_keep_non_comments, src)
 
 
 def match_close(t, i):
@@ -438,6 +462,11 @@ def _rule3(t, out):
                            "(a conditional or nested acquire can skip the lock)")
     if re.search(r"(?:auto|GuardianInstanceLock)[&* ]+guardian_instance_lock_ ?[=({]", t):
         out.append(f"R3b: a local declaration shadows the guardian_instance_lock_ member in {AGENT}")
+    mentions = len(re.findall(r"(?<![A-Za-z0-9_])guardian_instance_lock_(?![A-Za-z0-9_])", t))
+    if mentions != 3:
+        out.append(f"R3b: guardian_instance_lock_ must be mentioned exactly 3 times in {AGENT} (the "
+                   f"acquire assignment, the claim argument, the declaration), found {mentions}: "
+                   "any other use, such as a move or release() after the claim, can drop the lock")
     kv = re.search(r"std::unique_ptr<KvStore> kv_store_;", t)
     lk = re.search(r"GuardianInstanceLock guardian_instance_lock_;", t)
     gd = re.search(r"std::unique_ptr<GuardianEngine> guardian_;", t)
@@ -485,11 +514,12 @@ def _rule3(t, out):
 
 
 def _rule3d(raw_agent, out):
-    # The normaliser blanks string literals, so the lock FILE NAME is pinned on the raw text: the
-    # one acquire call must name guardian_boot_epoch.lock (the header, manual, upgrade note and
-    # SOC 2 row all name that file).
+    # The normaliser blanks string literals, so the lock FILE NAME is pinned on the source with
+    # comments stripped and literals kept: the one acquire call must name guardian_boot_epoch.lock
+    # (the header, manual, upgrade note and SOC 2 row all name that file), and a comment that
+    # quotes the call cannot satisfy this.
     if not re.search(r"GuardianInstanceLock::acquire\(\s*cfg_\.data_dir\s*/\s*\"guardian_boot_epoch\.lock\"\s*,",
-                     raw_agent):
+                     strip_comments(raw_agent)):
         out.append(f"R3d: the GuardianInstanceLock::acquire( call in {AGENT} must name "
                    '`cfg_.data_dir / "guardian_boot_epoch.lock"` (the documented file name)')
 
@@ -541,6 +571,23 @@ def _rule4(t, out):
             out.append("R4: wire_spark_engine assigns emit_seq_source after constructing the runtime")
 
 
+def _rule5(raw_kv, out):
+    t = strip_comments(raw_kv)
+    sets = list(re.finditer(r'sqlite3_exec\(\s*raw_db\s*,\s*"PRAGMA synchronous\s*=\s*FULL"', t))
+    if len(sets) != 1:
+        out.append(f"R5: expected exactly one sqlite3_exec(raw_db, \"PRAGMA synchronous=FULL\" in "
+                   f"{KVSTORE} (KvStore::open must set the level the boot-epoch gate requires), "
+                   f"found {len(sets)}")
+    weak = re.search(r'"PRAGMA synchronous\s*=\s*(?:OFF|NORMAL|0|1)\s*"', t, re.I)
+    if weak:
+        out.append(f"R5: {KVSTORE} sets a synchronous level below FULL ({weak.group(0)})")
+    read = re.search(r'sqlite3_prepare_v2\(\s*raw_db\s*,\s*"PRAGMA synchronous"', t)
+    if not read:
+        out.append(f"R5: no `PRAGMA synchronous` read-back on raw_db in {KVSTORE}")
+    elif sets and sets[0].start() > read.start():
+        out.append(f"R5: the synchronous=FULL setter must precede the read-back in {KVSTORE}")
+
+
 def problems(srcs):
     """One message per violated invariant; [] when clean. `srcs` maps agents/core-relative paths
     to raw source text and must contain every file in REQUIRED."""
@@ -561,6 +608,7 @@ def problems(srcs):
     _rule3c(srcs, out)
     _rule3d(srcs[AGENT], out)
     _rule4(norm(ENGINE), out)
+    _rule5(srcs[KVSTORE], out)
     return out
 
 
@@ -751,6 +799,27 @@ MUTATIONS = [
     ("R3d lock file renamed", AGENT,
      r"cfg_\.data_dir / \"guardian_boot_epoch\.lock\"", "cfg_.data_dir / \"epoch.lock\"", 1, 0,
      "R3d: the GuardianInstanceLock::acquire( call"),
+    ("R3b member reassigned after the claim", AGENT,
+     r"(const auto boot_epoch_claim =\s*claim_guardian_boot_epoch\([^;]*;)",
+     r"\1 guardian_instance_lock_ = GuardianInstanceLock{};", 1, 0,
+     "must be mentioned exactly 3 times"),
+    ("R3b member released after the claim", AGENT,
+     r"(const auto boot_epoch_claim =\s*claim_guardian_boot_epoch\([^;]*;)",
+     r"\1 (void)guardian_instance_lock_.release();", 1, 0, "must be mentioned exactly 3 times"),
+    ("R5 synchronous setter removed", KVSTORE,
+     r'rc = sqlite3_exec\(raw_db, "PRAGMA synchronous=FULL", nullptr, nullptr, &sync_err\);',
+     "rc = SQLITE_OK;", 1, 0, "R5: expected exactly one sqlite3_exec(raw_db"),
+    ("R5 synchronous setter weakened", KVSTORE,
+     r'"PRAGMA synchronous=FULL", nullptr, nullptr, &sync_err', '"PRAGMA synchronous=NORMAL", nullptr, nullptr, &sync_err',
+     1, 0, "R5: expected exactly one sqlite3_exec(raw_db"),
+    ("R5 extra weaker setter", KVSTORE,
+     r'(rc = sqlite3_exec\(raw_db, "PRAGMA journal_mode=WAL", nullptr, nullptr, &err_msg\);)',
+     r'\1 sqlite3_exec(raw_db, "PRAGMA synchronous=OFF", nullptr, nullptr, nullptr);', 1, 0,
+     "sets a synchronous level below FULL"),
+    ("R5 setter after the read-back", KVSTORE,
+     r'(sqlite3_stmt\* raw_stmt = nullptr;\s*)(if \(sqlite3_prepare_v2\(raw_db, "PRAGMA synchronous")',
+     r'\1sqlite3_exec(raw_db, "PRAGMA synchronous=FULL", nullptr, nullptr, nullptr); \2', 1, 0,
+     "R5: expected exactly one sqlite3_exec(raw_db"),
     ("R3b member declared before kv_store_", AGENT,
      r"(std::unique_ptr<KvStore> kv_store_;)(.*?)(GuardianInstanceLock guardian_instance_lock_;)",
      r"\3\n    \1\2", 1, 0, "member order"),
@@ -814,6 +883,14 @@ class GuardianEmitStampLexical(unittest.TestCase):
         self.assertTrue(function_bodies(normalise(self.srcs[SEND]), "set_common"))
         self.assertTrue(function_bodies(normalise(self.srcs[ENGINE]), "make_legacy_sink_executor"))
         self.assertTrue(function_bodies(normalise(self.srcs[ENGINE]), "wire_spark_engine"))
+        agent = normalise(self.srcs[AGENT])
+        self.assertEqual(len(re.findall(r"(?<![A-Za-z0-9_])guardian_instance_lock_(?![A-Za-z0-9_])",
+                                        agent)), 3)
+        self.assertTrue(re.search(r"GuardianInstanceLock::acquire\(cfg_\.data_dir / \"\"", agent))
+        self.assertTrue(re.search(r"std::chrono::seconds\{[1-9][0-9]*\}\)", agent))
+        kvs = strip_comments(self.srcs[KVSTORE])
+        self.assertEqual(len(re.findall(r'"PRAGMA synchronous=FULL"', kvs)), 1)
+        self.assertEqual(len(re.findall(r'sqlite3_prepare_v2\(raw_db, "PRAGMA synchronous"', kvs)), 1)
 
     def test_comment_and_string_tokens_cannot_satisfy_a_rule(self):
         base = self.srcs
@@ -837,6 +914,14 @@ class GuardianEmitStampLexical(unittest.TestCase):
              r"const auto boot_epoch_claim =\s*claim_guardian_boot_epoch\(kv_store_\.get\(\), now_unix_s, guardian_instance_lock_\);",
              "// const auto boot_epoch_claim = claim_guardian_boot_epoch(kv_store_.get(), now_unix_s);",
              "expected exactly one `<id> = claim_guardian_boot_epoch(`"),
+            ("R3d lock file name only in a comment", AGENT,
+             r'(guardian_instance_lock_ = GuardianInstanceLock::acquire\(\s*)cfg_\.data_dir / "guardian_boot_epoch\.lock"',
+             '// GuardianInstanceLock::acquire(cfg_.data_dir / "guardian_boot_epoch.lock", wait)\n'
+             r'\1cfg_.data_dir / "epoch.lock"', "R3d: the GuardianInstanceLock::acquire( call"),
+            ("R5 setter only in a comment", KVSTORE,
+             r'rc = sqlite3_exec\(raw_db, "PRAGMA synchronous=FULL", nullptr, nullptr, &sync_err\);',
+             'rc = SQLITE_OK; // sqlite3_exec(raw_db, "PRAGMA synchronous=FULL", nullptr, nullptr, &sync_err);',
+             "R5: expected exactly one sqlite3_exec(raw_db"),
             ("R4 emit_seq_source only in a comment", ENGINE,
              r"spark_runtime_cfg\.emit_seq_source = emit_seq_source_;",
              "// spark_runtime_cfg.emit_seq_source = emit_seq_source_;",

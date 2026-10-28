@@ -93,14 +93,18 @@
 //     file the service account cannot open (EACCES, for example one created earlier by
 //     another account), is Failed. Either way the claim is unordered (epoch 0) rather than a
 //     guess.
-//   * a local principal that can open the lock file before the agent starts can hold it open
-//     and leave that agent unordered (epoch 0, 0/0) for its process lifetime: the agent's own
-//     open or flock is then refused (a sharing violation on Windows, EWOULDBLOCK on POSIX). On
-//     POSIX the file is requested at mode 0600, which limits this to the agent's account and
-//     root unless the mode was changed or the file already existed with a looser one; on
-//     Windows who can open it depends on the data directory's ACL, which was not measured.
-//     Accepted: the result is the timestamp ordering the agent used before it stamped the pair,
-//     and the claim fails loudly (instance_lock=contended).
+//   * a local principal that can open the lock file before the agent starts can hold it (on
+//     POSIX by taking the flock, on Windows by keeping it open) and leave that agent
+//     unordered (epoch 0, 0/0) for its process lifetime: the agent's own flock or open is then
+//     refused (EWOULDBLOCK on POSIX, a sharing violation on Windows), and the claim fails
+//     loudly (instance_lock=contended). On POSIX the file is requested at mode 0600, which
+//     limits this to the agent's account and root unless the mode was changed or the file
+//     already existed with a looser one; on Windows who can open it depends on the data
+//     directory's ACL, which was not measured. A principal with write access to the data
+//     directory can also replace the file before the agent starts (the agent then reports
+//     failed if it cannot open the replacement), but that principal can already rewrite
+//     kv_store.db. Accepted: the result is the timestamp ordering the agent used before it
+//     stamped the pair.
 //   * the lock guards the epoch claim only, not the rest of the data directory (the identity
 //     and command-dedup stores have never been exclusive).
 //   * there is no in-process recovery: a process that lost the lock stays at epoch 0 until it

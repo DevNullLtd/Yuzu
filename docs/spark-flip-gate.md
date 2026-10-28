@@ -2900,12 +2900,15 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
      verdict at timestamp 90), in both arrival orders and with subsequent live events; and two
      live senders sharing one agent_id, a lock holder stamping a pair while a process that
      was refused the data-directory lock (`instance_lock_not_held`) or an older build sends
-     0/0, and two stamping senders on separate data directories under one fixed agent id
-     (independent epochs): the mixture must not make the comparator non-transitive (a verdict ranked above
-     one that is in turn ranked above it), the outcome is stated, and a test covers it. The
-     server also counts accepted events that carry no pair, per agent, and exposes the count
-     (a metric or an API field), so an agent that runs unordered is visible fleet-wide; the
-     agent's own signal is one error-level log line.
+     0/0: the mixture must not make the comparator non-transitive (a verdict ranked above one
+     that is in turn ranked above it), the outcome is stated, and a test covers it. Two
+     stamping senders on separate data directories under one fixed agent id (independent
+     epochs) still order totally, but their events rank against each other by numbers that
+     mean nothing across instances, and the count below cannot see them because both send a
+     pair: for that case too the outcome is stated and a test covers it. The server also
+     counts accepted events that carry no pair, per agent, and exposes the count (a metric or
+     an API field), so an agent that runs unordered is visible fleet-wide; the agent's own
+     signal is one error-level log line.
      For every case above, tests show that stale state is not silently presented as the current
      verdict. When the available ordering information cannot establish freshness, the server
      exposes that uncertainty or obtains fresh state; timestamp fallback, metadata retention, or
