@@ -104,9 +104,10 @@ struct RbacView {
     j["username"] = s.username;
     j["display_name"] = s.display_name.empty() ? s.username : s.display_name;
     j["role"] = auth::role_to_string(s.role);
-    // The classification the server applies (the same predicate that picks the role
-    // namespace below), not the raw stored field: an auth_source-only engine session
-    // must not read as human while being looked up as an engine.
+    // Publish the classification the server applies (Session::is_engine(), the same
+    // predicate that selects the RBAC principal type), not the raw stored field: a
+    // session authenticated by an engine token must not read as human while its roles
+    // are looked up under the engine namespace.
     j["principal_kind"] = s.is_engine() ? "engine" : "human";
     j["auth_source"] = s.auth_source;
     j["mcp_tier"] = s.mcp_tier;

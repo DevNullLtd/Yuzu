@@ -216,7 +216,7 @@ TEST_CASE("me_response: the principal namespace comes from the session kind, nev
         CHECK(r.calls[0].first == "engine");
         CHECK(r.calls[0].second == "engine:solo");
         CHECK(j["principal_kind"] == "engine"); // the classification applied, not the stored field
-        CHECK_FALSE(j.contains("rbac_role"));  // no grant: never a fabricated Viewer
+        CHECK_FALSE(j.contains("rbac_role"));   // no grant: never a fabricated Viewer
     }
 }
 
