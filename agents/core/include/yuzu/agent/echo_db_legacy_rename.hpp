@@ -15,6 +15,14 @@
 // interrupted adoption therefore always looks like "tar.db present, echo.db absent" and resumes
 // on the next boot, and echo.db can never be opened while its WAL still carries the old name.
 //
+// Accepted limit of that resume state: when tar.db is present, its own sidecar is absent and the
+// echo.db sidecar exists, the helper takes the echo.db sidecar to be tar.db's own, already moved.
+// It cannot tell that from a stale one: if an older agent is run against tar.db between the
+// interruption and the next boot, writes, and cleanly checkpoints and deletes its WAL, the
+// re-upgrade pairs the newer tar.db with the earlier echo.db WAL and replays it over the newer
+// file. No cheap check separates the two (a checkpoint writes tar.db after the WAL's last frame,
+// so an mtime or header comparison would refuse legitimate resumes), so the residual is accepted.
+//
 // If both main files exist they are two independent databases (an agent downgraded after the
 // rename, then upgraded again). Nothing is touched: echo.db wins, tar.db and its sidecars are
 // left for the operator, and one warning names them. Old tar.db.corrupt-* quarantine files are
@@ -28,13 +36,13 @@
 // file nothing can be mispaired, so a stray legacy sidecar is only warned about and left.
 #pragma once
 
-#include <spdlog/spdlog.h>
-
 #include <expected>
 #include <filesystem>
 #include <format>
 #include <string>
 #include <system_error>
+
+#include <spdlog/spdlog.h>
 
 namespace yuzu::agent {
 

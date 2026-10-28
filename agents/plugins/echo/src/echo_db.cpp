@@ -646,13 +646,13 @@ std::expected<bool, std::string> rename_pending(sqlite3* db, const char* from, c
 // Schema v9 (upgrade window, removed with the legacy-name shims): a database written before the
 // rename holds tar_state / tar_config / tar_cursor. Rename whichever of them exist, atomically, in
 // one transaction. Skipped when echo_config already exists (a fresh or already-renamed file).
-// Returns an error message on failure; the caller then refuses the open.
-std::optional<std::string> rename_legacy_tables(sqlite3* db) {
+// An error return makes the caller refuse the open.
+std::expected<void, std::string> rename_legacy_tables(sqlite3* db) {
     auto legacy = rename_pending(db, "tar_config", "echo_config");
     if (!legacy)
-        return std::move(legacy.error());
+        return std::unexpected(std::move(legacy.error()));
     if (!*legacy)
-        return std::nullopt;
+        return {};
     static constexpr std::array<std::pair<const char*, const char*>, 3> kPairs = {{
         {"tar_state", "echo_state"},
         {"tar_config", "echo_config"},
@@ -662,27 +662,27 @@ std::optional<std::string> rename_legacy_tables(sqlite3* db) {
     // DEFERRED, for the reason given in exec_ddl_batch: ALTER TABLE is a write, and a deferred
     // BEGIN in WAL can fail SQLITE_BUSY_SNAPSHOT without the busy handler.
     if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
-        return std::format("BEGIN: {}", sqlite3_errmsg(db));
-    std::optional<std::string> failure;
+        return std::unexpected(std::format("BEGIN: {}", sqlite3_errmsg(db)));
+    std::expected<void, std::string> result;
     for (const auto& [from, to] : kPairs) {
         auto pending = rename_pending(db, from, to);
         if (!pending) {
-            failure = std::move(pending.error());
+            result = std::unexpected(std::move(pending.error()));
             break;
         }
         if (!*pending)
             continue;
         const std::string sql = std::format("ALTER TABLE {} RENAME TO {}", from, to);
         if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK) {
-            failure = std::format("{}: {}", sql, sqlite3_errmsg(db));
+            result = std::unexpected(std::format("{}: {}", sql, sqlite3_errmsg(db)));
             break;
         }
     }
-    if (!failure && sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
-        failure = std::format("COMMIT: {}", sqlite3_errmsg(db));
-    if (failure)
+    if (result && sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
+        result = std::unexpected(std::format("COMMIT: {}", sqlite3_errmsg(db)));
+    if (!result)
         sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-    return failure;
+    return result;
 }
 
 } // namespace
@@ -821,9 +821,10 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // Schema v9: the base tables were renamed tar_* -> echo_*. This must run BEFORE the base
     // schema below, which would otherwise create empty echo_* tables beside the populated tar_*
     // ones and boot the agent with default config. Failure is fail-closed for the same reason.
-    if (auto rename_err = rename_legacy_tables(raw_db)) {
+    if (auto renamed = rename_legacy_tables(raw_db); !renamed) {
         sqlite3_close(raw_db);
-        return std::unexpected(std::format("failed to rename legacy tar_* tables: {}", *rename_err));
+        return std::unexpected(
+            std::format("failed to rename legacy tar_* tables: {}", renamed.error()));
     }
 
     // Create schema — one transaction, not one per statement (see

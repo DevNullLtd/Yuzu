@@ -404,7 +404,8 @@ TEST_CASE("ProxyRegister: an inventory reporting the pre-rename plugin tar write
     gateway_svc.set_gateway_route_store(&store);
 
     for (const auto& [agent_id, plugin, want_legacy] :
-         {std::tuple{"agent-legacy-tar", "tar", true}, std::tuple{"agent-current-echo", "echo", false}}) {
+         {std::tuple{"agent-legacy-tar", "tar", true},
+          std::tuple{"agent-current-echo", "echo", false}}) {
         INFO(agent_id);
         auto req = make_gw_register(auth_mgr, agent_id);
         req.mutable_info()->add_plugins()->set_name(plugin);
