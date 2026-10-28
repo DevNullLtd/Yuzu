@@ -1067,19 +1067,23 @@ enum class RbacEnforcementLabel {
 /// this reconciliation introduces.
 [[nodiscard]] RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept;
 
-/// The ONE grant decision of the checked-read engine arms (`AuthRoutes::require_list_read`,
-/// the fleet-read gate and `AuthRoutes::require_permission`): an engine principal's only authority is an explicit RBAC grant,
-/// so it is never admitted on a fresh disabled view. (A cached-ENABLED view that is stale
-/// still reads the grant: the documented fail-closed asymmetry above, not covered here.)
-/// `AuthRoutes::require_permission`'s engine arm (#4990) is a third consumer; the engine arm of
-/// `require_scoped_permission` alone is deliberately plain deny-on-degrade (ADR-0041, #6437)
-/// and does not use this.
+/// The ONE grant decision of the checked-read engine arms: `AuthRoutes::require_list_read`,
+/// the fleet-read gate and (#4990) `AuthRoutes::require_permission`. An engine principal's only
+/// authority is an explicit RBAC grant, so it is never admitted on a fresh disabled view. (A
+/// cached-ENABLED view that is stale still reads the grant: the documented fail-closed
+/// asymmetry above, not covered here.) The engine arm of `require_scoped_permission` alone is
+/// deliberately plain deny-on-degrade (ADR-0041, #6437) and does not use this. The
+/// username-keyed visibility resolvers (`engine_aware_visibility.hpp`,
+/// `RbacStore::authorize_list_read`, `compose_exec_visible`, `schedule_arming_check.hpp`)
+/// keep `rbac_enforcement_in_effect()` (#6204): they only narrow or decide dispatch
+/// permission, and they are not changed here.
 ///
 /// One `rbac_enforcement_label()` snapshot decides: `kEnabled` returns
 /// `check_permission_checked()` (a failed read is the error); `kDisabled` returns `false`
 /// (a genuine "no": RBAC is off and the view is fresh); `kDegraded` returns an error (the
 /// enforcement state could not be confirmed, a stale cached-disabled view included), so the
-/// caller answers a retryable 503 instead of a terminal 403. It admits exactly when the
+/// caller answers a retryable 503 instead of a terminal 403 (`require_permission` answers
+/// the 503 only under its opt-in mapping and keeps the 403 by default). It admits exactly when the
 /// raw `is_rbac_enabled()` accessor did and the grant read succeeds, so the SET OF INPUTS
 /// THAT ADMIT is unchanged; only which non-admitting answer is given differs (the
 /// admission-input-set test that the `RbacEnforcementLabel` doc above sets for a new

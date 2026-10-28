@@ -416,14 +416,14 @@ long-term target it covers up to two fleet-wide per-agent events a day (1.0M row
 rows of other dispatches; a third event (1.5M rows) is above the reclaim rate. A burst is drained over
 the following passes (a 500,000-row burst past the window takes ten), but a SUSTAINED inflow above
 1.2M rows/day saturates the cap on every pass and the table then grows by the difference (about
-210 bytes a row measured before the `execution_id` index of migration 7, roughly 250 for a tracked row with it: reasoned, not measured). The same ceiling applies to API-driven dispatch: a sustained rate
+210 bytes a row, measured before the `execution_id` index of migration 7; roughly 250 for a tracked row with it, which is reasoned and not measured). The same ceiling applies to API-driven dispatch: a sustained rate
 above about 14 a second saturates it, and a per-principal or per-address inflow quota is NOT part of
 this bound (it is tracked as a separate follow-up).
 
 The pass deletes with `DELETE .. WHERE ctid = ANY(ARRAY(SELECT ctid .. WHERE created_at < cutoff
 ORDER BY created_at LIMIT cap)) AND created_at < cutoff`. Measured on synthetic time-ordered tables
 (PostgreSQL 16, the exact statement, rolled back and repeated 5 to 6 times, cap 50,000): median 34 ms
-at 1M rows and 35 ms at 10M. The earlier `IN (SELECT command_id .. LIMIT n)` form planned a Hash Semi
+at 1M rows and 35 ms at 10M (measured before migration 7; the pass reads the created-at index, so the new index adds insert and vacuum cost rather than pass cost). The earlier `IN (SELECT command_id .. LIMIT n)` form planned a Hash Semi
 Join over a Seq Scan of the whole table, so its cost followed the table, not the cap (180 ms at 1M
 rows, 1.74 s at 10M); the `ctid` form reads only the cap's worth of index entries, so the pass cost
 follows the cap. The repeated `created_at < cutoff` test in the outer statement keeps a record that

@@ -3210,7 +3210,9 @@ Administrator role, does not hold authority under the regime that is durably
 true right now, is a service-scoped/engine session, presented an
 MCP-tier bearer token of any tier (use the `assign_rbac_role` MCP tool
 instead), or made a cross-site cookie-session call (`cross-site request
-refused`); `503` — the RBAC or `AuthDB` store is unavailable (including when
+refused`); `409` — a role that is not a built-in role holds the name of the
+built-in role (a name collision; nothing is assigned, and the upgrade guide,
+"Role name collision", has the remedy); `503` — the RBAC or `AuthDB` store is unavailable (including when
 the admin gate itself cannot confirm durable authority — now logged and
 audited as a `denied` row, not silently invisible), a genuine store/query
 fault while writing the grant (as opposed to a client-validation rejection,

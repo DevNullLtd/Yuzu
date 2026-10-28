@@ -553,7 +553,7 @@ const std::vector<pg::PgMigration>& migrations() {
         // release is a fresh-database deployment, where the table is empty when the index is
         // built (the playbook's empty-table rule). On an already-populated table the build holds
         // a SHARE lock and can hit the pool's lock or statement timeout, which rolls the
-        // migration back and leaves the tracker closed; that population is outside the
+        // migration back and makes the server refuse to start; that population is outside the
         // deployment contract. The `executions(parent_id)` index (#4624) is a separate item above.
         {7,
          "CREATE INDEX idx_command_execution_execution_id ON command_execution(execution_id);"},

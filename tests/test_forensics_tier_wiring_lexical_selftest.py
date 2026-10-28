@@ -63,6 +63,9 @@ def main() -> int:
         found = ids(g.problems_canonical(mutated))
         expect(rid in found, f"{rid}: deleting its statement was NOT detected")
 
+    # An exact row must name a counted row, or its exactness is silently lost.
+    expect(g.COUNTED_EXACT <= {r[0] for r in g.COUNTED},
+           "COUNTED_EXACT names a row that is not in COUNTED")
     # Counted sites: delete the first occurrence.
     for rid, pat, want, _why in g.COUNTED:
         ms = list(re.finditer(pat, t, re.S))

@@ -1154,6 +1154,10 @@ TEST_CASE("live output bus: the direct Subscribe path publishes nothing for a Fo
         std::lock_guard lock(mu);
         seen.push_back(e);
     });
+    // A failed REQUIRE inside the ingest helper throws with the listener still registered; the
+    // harness server may still be publishing to it while `mu` and `seen` unwind. Unsubscribe on
+    // every exit path (the call below is idempotent).
+    yuzu::test::ScopeExit unsubscribe_on_exit{[&] { h.bus.unsubscribe(sub); }};
     constexpr const char* kForensicRow = "marker-4990-forensics-row";
     h.ingest_direct_frames({running_frame(std::string{test::kOrdinaryPlugin} + "-0f1", kMarker),
                             running_frame(std::string{test::kForensicsPlugin} + "-0f2", kForensicRow),
@@ -1226,6 +1230,10 @@ TEST_CASE("timing stat: the direct Subscribe path relays only a plain millisecon
         std::lock_guard lock(mu);
         seen.push_back(e);
     });
+    // A failed REQUIRE inside the ingest helper throws with the listener still registered; the
+    // harness server may still be publishing to it while `mu` and `seen` unwind. Unsubscribe on
+    // every exit path (the call below is idempotent).
+    yuzu::test::ScopeExit unsubscribe_on_exit{[&] { h.bus.unsubscribe(sub); }};
     h.ingest_direct_frames({running_frame("echo-0d1", "__timing__|exec_ms=42"),
                             running_frame("echo-0d2", "__timing__|exec_ms=999999999999"),
                             running_frame("echo-0d3", "__timing__|exec_ms=1000000000000"),

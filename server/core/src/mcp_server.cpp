@@ -3090,7 +3090,9 @@ static const ToolDef kTools[] = {
      "must be \"user\" (group-scoped assignment is not supported yet). 'ITServiceOwner' is "
      "REJECTED for this fleet-wide surface — its confinement model requires a "
      "management-group scope this tool does not carry; use the management-group role route "
-     "instead. Assigning to a username with no existing account is allowed "
+     "instead. A role that is not a built-in role but holds a built-in role's name is "
+     "refused with invalid params and nothing is assigned. Assigning to a username with "
+     "no existing account is allowed "
      "(pre-provisioning) and reported via target_provisioned. Requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"

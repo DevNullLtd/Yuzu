@@ -18,8 +18,8 @@
 /// loop, and keep the ordinary budget; the pool already clamps an acquire on a saturated pool to
 /// 500 ms. The quarantine containment reconciler's tick is another per-device loop (up to
 /// `kMaxDispatchesPerTick` serial single dispatches) that is NOT latched today: each pays the
-/// ordinary budget, so a contended pool delays re-containment, never refuses it (tracked in the
-/// follow-up for the remaining push sites). Every other `build_classified_command` caller builds
+/// ordinary budget, so a contended pool delays re-containment, never refuses it (an item of the dispatch-record
+/// hardening follow-up, which has no issue number yet). Every other `build_classified_command` caller builds
 /// ONE command and fans that same object out, so it is one write per dispatch however many
 /// agents it reaches.)
 ///
