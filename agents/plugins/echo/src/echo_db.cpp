@@ -624,7 +624,7 @@ bool table_exists(sqlite3* db, const char* name) {
 
 // Schema v9 (upgrade window, removed with the legacy-name shims): a database written before the
 // rename holds tar_state / tar_config / tar_cursor. Rename whichever of them exist, atomically, in
-// one savepoint. Skipped when echo_config already exists (a fresh or already-renamed file).
+// one transaction. Skipped when echo_config already exists (a fresh or already-renamed file).
 // Returns an error message on failure; the caller then refuses the open.
 std::optional<std::string> rename_legacy_tables(sqlite3* db) {
     if (!table_exists(db, "tar_config") || table_exists(db, "echo_config"))
@@ -634,8 +634,11 @@ std::optional<std::string> rename_legacy_tables(sqlite3* db) {
         {"tar_config", "echo_config"},
         {"tar_cursor", "echo_cursor"},
     }};
-    if (sqlite3_exec(db, "SAVEPOINT v9_rename", nullptr, nullptr, nullptr) != SQLITE_OK)
-        return std::format("SAVEPOINT: {}", sqlite3_errmsg(db));
+    // open() calls this on a fresh connection, so no transaction is open. IMMEDIATE, not
+    // DEFERRED, for the reason given in exec_ddl_batch: ALTER TABLE is a write, and a deferred
+    // BEGIN in WAL can fail SQLITE_BUSY_SNAPSHOT without the busy handler.
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
+        return std::format("BEGIN: {}", sqlite3_errmsg(db));
     std::optional<std::string> failure;
     for (const auto& [from, to] : kPairs) {
         if (!table_exists(db, from) || table_exists(db, to))
@@ -646,16 +649,10 @@ std::optional<std::string> rename_legacy_tables(sqlite3* db) {
             break;
         }
     }
-    if (!failure && sqlite3_exec(db, "RELEASE v9_rename", nullptr, nullptr, nullptr) != SQLITE_OK)
-        failure = std::format("RELEASE: {}", sqlite3_errmsg(db));
-    if (failure) {
-        // Outermost savepoint: RELEASE would COMMIT the partial work, so unwind first and fall
-        // back to a plain ROLLBACK if that fails (it fails harmlessly with no transaction open).
-        if (sqlite3_exec(db, "ROLLBACK TO v9_rename", nullptr, nullptr, nullptr) == SQLITE_OK)
-            sqlite3_exec(db, "RELEASE v9_rename", nullptr, nullptr, nullptr);
-        else
-            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-    }
+    if (!failure && sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
+        failure = std::format("COMMIT: {}", sqlite3_errmsg(db));
+    if (failure)
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
     return failure;
 }
 

@@ -126,8 +126,6 @@ PROTECT_RES = [re.compile(p) for p in PROTECT]
 ARTICLE = re.compile(
     r"\b([Aa]) (?=[*_`\"'(\[]*(?:tar(?![A-Za-z])|TAR(?![A-Za-z])|Tar(?=[A-Z])|(?:Timeline|Telemetry) Activity))"
 )
-# "a Echo" is never right; also repairs text rewritten before the markup-tolerant ARTICLE existed.
-ARTICLE_AFTER = re.compile(r"\b([Aa]) (?=[*_`\"'(\[]*(?:Echo|ECHO)(?![a-z]))")
 RULES: list[tuple[re.Pattern[str], str]] = [
     # display phrases
     (re.compile(r"(?:Timeline|Telemetry) Activity Record \(TAR\)"), "Echo"),
@@ -183,7 +181,6 @@ def transform_line(line: str, ext: str) -> str:
         out = _LOG_PREFIX.sub("ECHO:", out)
     out = _BARE_TAR_UPPER.sub("Echo", out)
     out = _BARE_TAR_LOWER.sub("echo", out)
-    out = ARTICLE_AFTER.sub(lambda m: m.group(1) + "n ", out)
     while _SENTINEL.search(out):
         out = _SENTINEL.sub(lambda m: spans[int(m.group(1))], out)
     return out
@@ -212,23 +209,6 @@ def repo_root() -> Path:
 def tracked_files(root: Path) -> list[str]:
     raw = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z"])
     return [p for p in raw.decode("utf-8", "surrogateescape").split("\0") if p]
-
-
-def _window(before: str, after: str, width: int = 110) -> tuple[str, str]:
-    p = 0
-    while p < min(len(before), len(after)) and before[p] == after[p]:
-        p += 1
-    s = 0
-    while s < min(len(before), len(after)) - p and before[-1 - s] == after[-1 - s]:
-        s += 1
-    lo = max(0, p - width)
-    hi_b = len(before) - s + width
-    hi_a = len(after) - s + width
-    pre = "..." if lo else ""
-    return (
-        pre + before[lo:hi_b].strip() + ("..." if hi_b < len(before) else ""),
-        pre + after[lo:hi_a].strip() + ("..." if hi_a < len(after) else ""),
-    )
 
 
 APPLIED_MARKER = "agents/shared/echo_db_legacy_rename.hpp"
@@ -274,8 +254,7 @@ def run(dry_run: bool) -> int:
         if not edits:
             continue
         for lineno, before, after in edits:
-            b, a = _window(before, after)
-            print(f"{cur}:{lineno}: {b} -> {a}")
+            print(f"{cur}:{lineno}: {before.strip()} -> {after.strip()}")
         edit_count += len(edits)
         if not dry_run:
             path.write_bytes(new_text.encode("utf-8", "surrogateescape"))
@@ -318,7 +297,6 @@ MUST_CHANGE = [
     ("applyTarTreeFilters(tarTreeState)", "applyEchoTreeFilters(echoTreeState)", "js"),
     ("a TAR capture source", "an Echo capture source", "md"),
     ("denied on a **TAR frame's picker**", "denied on an **Echo frame's picker**", "md"),
-    ("shipped as a **Echo capture source**", "shipped as an **Echo capture source**", "md"),
     ("TAR (Timeline Activity Record) plugin", "Echo plugin", "md"),
     ("Timeline Activity Record -- continuous", "Echo activity record -- continuous", "md"),
     ("[pg][server][tar][purge]", "[pg][server][echo][purge]", "cpp"),

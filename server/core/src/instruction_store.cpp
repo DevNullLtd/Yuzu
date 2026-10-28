@@ -224,12 +224,10 @@ std::string echo_rename_definitions_sql() {
         "UPDATE instruction_definitions SET yaml_source = "
         "regexp_replace("
         " regexp_replace("
-        "  regexp_replace("
-        "   regexp_replace(replace(yaml_source, 'crossplatform.tar.', 'crossplatform.echo.'),"
-        "    '(plugin:[ \t]*[\"'']?)tar([\"'']?)[ \t]*$', '\\1echo\\2', 'gn'),"
-        "   '(requiredPlugins:[ \t]*\\[[^\\]]*)\\mtar\\M', '\\1echo', 'g'),"
-        "  '(^[ \t]*-[ \t]*[\"'']?)tar([\"'']?[ \t]*)$', '\\1echo\\2', 'gn'),"
-        " 'crossplatform\\.tar\\.', 'crossplatform.echo.', 'g') "
+        "  regexp_replace(replace(yaml_source, 'crossplatform.tar.', 'crossplatform.echo.'),"
+        "   '(plugin:[ \t]*[\"'']?)tar([\"'']?)[ \t]*$', '\\1echo\\2', 'gn'),"
+        "  '(requiredPlugins:[ \t]*\\[[^\\]]*)\\mtar\\M', '\\1echo', 'g'),"
+        " '(^[ \t]*-[ \t]*[\"'']?)tar([\"'']?[ \t]*)$', '\\1echo\\2', 'gn') "
         "WHERE yaml_source LIKE '%tar%';";
     // 3. Identity columns, for every row.
     sql +=

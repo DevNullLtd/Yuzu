@@ -35,9 +35,6 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
     namespace fs = std::filesystem;
     constexpr const char* kSidecars[] = {"-journal", "-wal", "-shm"};
     const fs::path legacy = echo_db.parent_path() / "tar.db";
-    const auto with = [](const fs::path& base, const char* suffix) {
-        return fs::path{base.string() + suffix};
-    };
 
     std::error_code ec;
     const bool echo_present = fs::exists(echo_db, ec);
@@ -56,8 +53,8 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
 
     // Sidecars first. A source that does not exist is already moved (or never was): success.
     for (const char* suffix : kSidecars) {
-        const fs::path from = with(legacy, suffix);
-        const fs::path to = with(echo_db, suffix);
+        const fs::path from{legacy.string() + suffix};
+        const fs::path to{echo_db.string() + suffix};
         if (!fs::exists(from, ec)) {
             if (ec)
                 return std::unexpected(
