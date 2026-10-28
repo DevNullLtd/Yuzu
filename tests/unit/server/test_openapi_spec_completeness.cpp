@@ -1342,7 +1342,8 @@ TEST_CASE("openapi documents: no text cites an issue, an ADR, a build wave or th
         R"((^|[^/A-Za-z0-9])A[1-5]([^A-Za-z0-9]|$)|A4Error|)"
         R"(\b(ExecutionTracker|WorkflowEngine|SessionStore|TagStore|AuthFn|ExecutionEventBus|MachineNode|ClientValidation)\b|)"
         R"(\(M[0-9]\b|capability [0-9]+\.[0-9]|UAT non-functional|tracked open|\b(shared|same|one|row)( [A-Za-z_]+)? builder\b|)"
-        R"(authorization-topology floor|\b(ledger|ladder)\b|docs/[a-z-]*(ladder|invariants)\.md)");
+        R"(authorization-topology floor|\b(ledger|ladder)\b|docs/[a-z-]*(ladder|invariants)\.md|)"
+        R"(\bBRD\b|\bF[0-9]+[a-z]\b|\bSprint\b|\bADR [0-9]|\bGH-[0-9]|\b[Tt]icket [0-9]|\bJira\b|\bEpic [0-9]|\bslice [0-9])");
     // The line an operator reads first is held to more: no control number, gate word or label.
     static const std::regex kSummary(R"(SOC ?2|\bCC-?[0-9]|\bGate\b|\bADR\b|\([A-B][0-9]\)|(^|[^A-Za-z0-9])#[0-9]|\bA[1-5]\b|capability [0-9])");
     for (const bool with_guides : {false, true}) {
@@ -1357,8 +1358,12 @@ TEST_CASE("openapi documents: no text cites an issue, an ADR, a build wave or th
                     const std::string text = node.get<std::string>();
                     // The one retained schema reference names A4ErrorEnvelope (renaming it would
                     // change generated clients); no prose may.
-                    if (text != "#/components/schemas/A4ErrorEnvelope")
-                        CHECK_FALSE(std::regex_search(text, kInternal));
+                    if (text != "#/components/schemas/A4ErrorEnvelope") {
+                        std::smatch hit;
+                        const bool internal = std::regex_search(text, hit, kInternal);
+                        INFO("matched: " << hit.str());
+                        CHECK_FALSE(internal);
+                    }
                 } else if (node.is_array()) {
                     for (std::size_t i = 0; i < node.size(); ++i)
                         walk(node[i], where + "/" + std::to_string(i));
