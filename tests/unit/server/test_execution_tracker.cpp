@@ -25,6 +25,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <functional>
 #include <thread>
 #include <vector>
 
@@ -1589,6 +1590,18 @@ TEST_CASE("ExecutionTracker: the 24h sweep does not delete a record a live dispa
 
     std::optional<std::expected<CommandExecutionReapOutcome, std::string>> reaped;
     std::thread sweeper([&] { reaped = tracker.reap_command_execution_mappings(); });
+    // A failed REQUIRE below throws while the sweeper is joinable (and blocked on the writer's
+    // row lock): destroying a joinable std::thread calls std::terminate and would abort the whole
+    // test binary. Release the lock and join on every exit path instead.
+    struct SweeperCleanup {
+        std::function<void()> fn;
+        ~SweeperCleanup() { fn(); }
+    } sweeper_cleanup{[&] {
+        if (sweeper.joinable()) {
+            (void)pg::exec_params(writer.get(), "ROLLBACK", std::vector<std::string>{});
+            sweeper.join();
+        }
+    }};
 
     // Wait (bounded) until the sweep is blocked on the writer's row lock.
     bool blocked = false;
