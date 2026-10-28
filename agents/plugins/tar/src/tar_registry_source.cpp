@@ -769,9 +769,14 @@ struct WinEtw {
                 }
                 // teardown_locked() clears `running` before CloseTrace, so finding it still
                 // set means the session ended on its own: say so once.
-                if (running.exchange(false))
-                    spdlog::warn("TAR registry: Kernel-Registry ETW session ended on its own; "
-                                 "attribution reads attr:off until the agent restarts");
+                if (running.exchange(false)) {
+                    try {
+                        spdlog::warn("TAR registry: Kernel-Registry ETW session ended on its own; "
+                                     "attribution reads attr:off until the agent restarts");
+                    } catch (...) {
+                        // a log failure must not terminate the agent from this thread
+                    }
+                }
             });
             return ERROR_SUCCESS;
         } catch (...) {

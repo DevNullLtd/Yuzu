@@ -312,7 +312,7 @@ private:
     std::uint64_t last_reported_drops_{0};
     std::uint64_t last_reported_kernel_{0};
     std::uint64_t query_failures_{0};
-    std::int64_t last_query_ts_{0}; // a stamp taken after the last committed loss query
+    std::int64_t last_query_ts_{0}; // collect-start stamp of the last committed tick
 
     StitchCounters totals_; // cumulative attribution quality (status keys)
     std::map<std::string, std::string> last_status_written_;
