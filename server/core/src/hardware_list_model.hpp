@@ -7,11 +7,11 @@
 /// mandates, docs/api-twin-recipe.md §1). No gRPC, and nothing in THIS file calls
 /// into httplib — every function here is a pure transform over already-fetched
 /// data (roster/query in, page/JSON out). Its row types come from the store-free
-/// `*_types.hpp` headers (ADR-0031 seam closure, #6558), so neither httplib nor
-/// any store header is reachable from THIS HEADER: it must stay includable from a plain
-/// unit test with zero network/store dependencies and from the MCP registry lane,
-/// which the seam-closure gate holds to a store-free include closure. That is a statement
-/// about includes, not linkage: `hardware_list_model.cpp` includes `tag_store.hpp` for
+/// `*_types.hpp` headers (ADR-0031 seam closure, #6558), so no store header is reachable
+/// from THIS HEADER (held by the MCP registry lane of the seam-closure gate; httplib is
+/// likewise not reachable today, but nothing gates that half): it must stay includable from
+/// a plain unit test with zero network/store dependencies and from the MCP registry lane.
+/// That is a statement about includes, not linkage: `hardware_list_model.cpp` includes `tag_store.hpp` for
 /// `TagStore::validate_key`, so the object file still links the store.
 ///
 /// Roster rows are `InventoryDeviceRow`s (declared in inventory_types.hpp), built by
