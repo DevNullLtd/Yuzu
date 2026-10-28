@@ -2,7 +2,7 @@
 
 Scope: `nat64_discovery.hpp`, `nat64_probe.hpp`, `resolver_errors.hpp`, `bounded_resolver.hpp` and
 the OIDC egress path of `oidc_provider.cpp` (the `ipv4only.arpa` probe and the host-name check).
-Provenance: split from PR #6583 (prior ledger `governance.d/2b-1a-revocation-sources.P1fYNb.jsonl`). Routed row: `.claude/routed-concerns-security-posture.md`. This record covers the OIDC change
+Provenance: PR #6674, split from PR #6583 at review (prior ledger `governance.d/2b-1a-revocation-sources.P1fYNb.jsonl`; this change's ledger `governance.d/oidc-bounded-resolver-nat64.pykMks.jsonl`). Routed row: `.claude/routed-concerns-security-posture.md`. This record covers the OIDC change
 only; features that later read the same cache (a CRL source registry and fetcher) add their own
 consumer section here when they land.
 
