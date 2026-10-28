@@ -540,6 +540,35 @@ Settings uses, so the two stay equivalent.
   message with a Retry button. It never shows an empty list in that case, so a degraded store
   cannot be mistaken for "nobody is here".
 
+## Managing groups from the dashboard
+
+The **Groups and enrolment** page (`/groups`, in the **Estate** section of the sidebar) reads the
+management-group tree, one group's details and its members. These three panels are read-only.
+Creating, changing and deleting groups stays in Settings and the REST API. The roles held on a
+group are not on this page yet.
+
+- **Groups list and details** need the `ManagementGroup:Read` permission, the same check as
+  `GET /api/v1/management-groups`. Every holder sees every group's name, type and member count.
+- **Members** go through the fleet-read check (ADR-0017). A caller whose visibility is narrowed
+  to some management groups sees only the members inside that visibility. The panel says "Only
+  members within your scope are shown." and counts only the rows it shows; it never reveals how
+  many were left out.
+- **A refused panel** says it is not available to the account. It does not break the others.
+
+What each kind of caller sees (RBAC enforcement off is the default install):
+
+| Caller | Groups list and details | Members |
+|---|---|---|
+| Administrator, or a session elevated to it | Yes | All |
+| Legacy `user` account, RBAC enforcement off | Yes | All |
+| Viewer, RBAC on | Yes | Those in their scope |
+| `ITServiceOwner` on the root group (global) | Yes | Those in their scope |
+| `ITServiceOwner` on one group only | No (`403`) | Reachable only through the list, so not from this page |
+| Operator scoped to a group | No (`403`): Operator holds no `ManagementGroup` permission | Not reachable |
+
+A page of "not available" notes is therefore the honest result for an operator who is scoped to a
+group and holds no global `ManagementGroup:Read`: the page cannot offer a "my groups" view.
+
 ## Concepts
 
 | Concept | Description |

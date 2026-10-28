@@ -15911,11 +15911,6 @@ private:
             .registry = &registry_,
         });
 
-        // Groups and enrolment page (Phase 2 UI): GET /groups and its script. The page's
-        // panels are the existing /fragments/settings/{tokens,pending,auto-approve}.
-        yuzu::server::groups::register_groups_routes(
-            inline_sink, yuzu::server::groups::Deps{.auth_fn = auth_fn});
-
         // #2542 follow-up: 7 dashboard/API routes with no single owning store
         // (/api/me, /api/agents, /api/audit, /api/export/json-to-csv,
         // /api/scope/validate, /api/analytics/{status,recent}), extracted
@@ -15965,6 +15960,41 @@ private:
                                     const std::string& op) -> yuzu::server::authz::FleetReadGate {
             return require_fleet_read(req, res, type, op);
         };
+        // Groups and enrolment page (Phase 2 UI): GET /groups, its script and the read-only
+        // management-group fragments. The enrolment panels are the existing
+        // /fragments/settings/{tokens,pending,auto-approve}. Registered here, after
+        // fleet_read_fn, because the members fragment's sole gate is that closure. Every store
+        // read is the degrade-distinguishable "_checked" twin; a null store reads as a degrade.
+        yuzu::server::groups::register_groups_routes(
+            inline_sink,
+            yuzu::server::groups::Deps{
+                .auth_fn = auth_fn,
+                .perm_fn = perm_fn,
+                .fleet_read_fn = fleet_read_fn,
+                .list_groups_fn =
+                    [this] {
+                        return mgmt_group_store_ ? mgmt_group_store_->list_groups_checked()
+                                                 : std::nullopt;
+                    },
+                .group_fn =
+                    [this](const std::string& id)
+                        -> std::expected<std::optional<ManagementGroup>, std::string> {
+                    if (!mgmt_group_store_)
+                        return std::unexpected(std::string("store not constructed"));
+                    return mgmt_group_store_->get_group_checked(id);
+                },
+                .members_fn =
+                    [this](const std::string& id) {
+                        return mgmt_group_store_ ? mgmt_group_store_->get_members_checked(id)
+                                                 : std::nullopt;
+                    },
+                .member_counts_fn =
+                    [this] {
+                        return mgmt_group_store_
+                                   ? mgmt_group_store_->count_members_by_group_checked()
+                                   : std::nullopt;
+                    },
+            });
         // Panel variants for the Dashboard fragments: same decision path, no denial audit
         // row (a page that renders panels per caller must not write rows for figures it
         // merely chose not to draw). The decision is identical to the loud gate's; only the

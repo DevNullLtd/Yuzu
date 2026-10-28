@@ -11143,6 +11143,39 @@ Render the Account panel for one active account.
 - **Query:** `username` — URL-encoded (an SSO principal such as `oidc:https://idp/x#sub` must encode `#` as `%23`). Empty or absent returns the "select a user" placeholder.
 - **Permission, statuses, headers:** as for the list. An unknown name is a 200 "No such user" panel, distinct from the red unreadable-store box.
 
+### Estate — Groups and enrolment
+
+These endpoints back the management-group panels of the **Estate → Groups and enrolment** page (`/groups`). They return HTMX fragments, not the JSON envelope. All three are read-only: the page offers no control that creates, changes or deletes a group (that stays in Settings). A malformed `id` is a `400` with a one-line plain-text body, answered before any permission check and before any store read. None of them writes a success audit row (the REST twins write none). Every response, including a refusal and the `400`, sends `Cache-Control: no-store`. Each read materialises its result as the REST twin does (the whole group table, one group's members), bounded by the store's read timeout; the display caps below only bound the HTML.
+
+**`GET /fragments/groups/list`**
+
+Render the Management groups panel: the group tree (name, type, member count).
+
+- **Permission:** `ManagementGroup:Read`, the same securable and the same checked store reads as `GET /api/v1/management-groups`.
+- **Response (200):** HTML fragment. At most 500 rows are drawn; a note states the true count when more exist. A groups read or a member-count read that does not answer is a red "could not be read" box with a Retry button and **no table**, still with status 200: it is never an empty tree and never a column of zero counts. A group whose parent is not in the list, or that sits in a cycle or beyond the display depth, is drawn as a top-level row rather than dropped.
+- **Response (403):** The caller lacks the permission; the panel shows a "not available to your account" note.
+- **Headers:** `Cache-Control: no-store`.
+
+**`GET /fragments/groups/detail?id=<group id>`**
+
+Render the selected group: name, type, parent, description, the stored rule of a rule-based group, who created it and when. A rule-based group's rule is shown as stored, with a note that its membership is not computed automatically at this release. The panel also carries the loader for the members panel.
+
+- **Query:** `id` — 1 to 64 of `a-f` and `0-9`. Empty or absent returns the "select a group" placeholder (still permission-checked).
+- **Permission:** `ManagementGroup:Read`, as for the list.
+- **Response (200):** HTML fragment: the detail, "No such group" (the store answered and holds no such id), or the red unreadable box with a Retry button. The three are never confused.
+- **Response (400 / 403):** malformed `id` / the caller lacks the permission.
+- **Headers:** `Cache-Control: no-store`.
+
+**`GET /fragments/groups/members?id=<group id>`**
+
+Render one group's members (agent id, source, when added).
+
+- **Query:** `id`, as for the detail.
+- **Permission:** `ManagementGroup:Read` through the fleet-read gate (ADR-0017) as the **only** gate. A caller whose visibility is narrowed to some management groups sees only the members inside that visibility. Rows outside it are omitted and **no count or other figure derived from them is returned**: the panel states "Only members within your scope are shown." and its heading counts only the rows the caller may see.
+- **Response (200):** HTML fragment, at most 200 rows with a note stating how many the caller can see. A group with no members says so; for a rule-based group the text says membership is not computed automatically at this release. A members read that does not answer is a red unreadable box with a Retry button and no count, still 200. An unknown group is "No such group".
+- **Response (400 / 401 / 403 / 503):** malformed `id` / not signed in / lacks the permission / the authorization topology could not be read.
+- **Headers:** `Cache-Control: no-store`.
+
 ### Access — Tokens and principals
 
 These endpoints back the **Access → Tokens and principals** page (`/access/tokens`). They return HTMX fragments, not the JSON envelope. None of them changes anything: every change the page makes is a call to an existing REST v1 route (`/api/v1/tokens*`, `/api/v1/engine-principals*`), which keeps its own permission, step-up, validation and audit. The 200 fragments send `Cache-Control: no-store, private` and `Vary: Cookie`; the 403 and 500 responses send `no-store`. The fragments also decide which controls to draw, using quiet permission probes (a refused browser session writes no audit row); the server stays authoritative.

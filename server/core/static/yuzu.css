@@ -993,6 +993,9 @@ td .sub { display: block; overflow: hidden; text-overflow: ellipsis; color: var(
 .revealrow code { flex: 1 1 260px; min-width: 0; overflow-wrap: anywhere; user-select: all; padding: 6px 8px;
                   background: var(--bg); border: 1px solid var(--line2); border-radius: var(--rad-ctl); }
 #token-section > .note { margin: 16px 16px 0; }
+.grp-tree .d1 { padding-left: 18px; } .grp-tree .d2 { padding-left: 36px; } .grp-tree .d3 { padding-left: 54px; }
+.grp-tree .d4 { padding-left: 72px; } .grp-tree .d5 { padding-left: 90px; }
+.grp-tree .btn.link { padding: 0; }
 /* -- end Groups and enrolment ------------------------------------------------------------ */
 /* System: security */
 .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 22px; align-items: start; }

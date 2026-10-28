@@ -936,3 +936,56 @@ TEST_CASE("ManagementGroupStore: get_group_checked distinguishes a genuine "
     CHECK((*found)->name == "get-group-checked-found");
 }
 
+
+// The groups page reads the tree and the per-group member counts through degrade-distinguishable
+// twins, so a failed read cannot render as "no groups" or "0 members".
+TEST_CASE("ManagementGroupStore: list_groups_checked and count_members_by_group_checked degrade "
+          "on a closed store, list_groups stays fail-soft",
+          "[management_group][degrade]") {
+    PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    ManagementGroupStore store{pool};
+    REQUIRE(!store.is_open());
+
+    CHECK(!store.list_groups_checked().has_value());
+    CHECK(!store.count_members_by_group_checked().has_value());
+    CHECK(store.list_groups().empty());
+}
+
+TEST_CASE("ManagementGroupStore: list_groups_checked lists groups and "
+          "count_members_by_group_checked counts members in one read",
+          "[pg][management_group][degrade]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto baseline = store.list_groups_checked();
+    REQUIRE(baseline.has_value());
+
+    ManagementGroup full;
+    full.name = "counts-full";
+    full.membership_type = "static";
+    full.created_by = "tester";
+    auto full_id = store.create_group(full);
+    REQUIRE(full_id.has_value());
+    ManagementGroup empty;
+    empty.name = "counts-empty";
+    empty.membership_type = "static";
+    empty.created_by = "tester";
+    auto empty_id = store.create_group(empty);
+    REQUIRE(empty_id.has_value());
+    REQUIRE(store.add_member(*full_id, "agent-a").has_value());
+    REQUIRE(store.add_member(*full_id, "agent-b").has_value());
+    REQUIRE(store.add_member(*full_id, "agent-c").has_value());
+
+    const auto groups = store.list_groups_checked();
+    REQUIRE(groups.has_value());
+    CHECK(groups->size() == baseline->size() + 2);
+
+    const auto counts = store.count_members_by_group_checked();
+    REQUIRE(counts.has_value());
+    REQUIRE(counts->contains(*full_id));
+    CHECK(counts->at(*full_id) == 3);
+    CHECK_FALSE(counts->contains(*empty_id));
+}

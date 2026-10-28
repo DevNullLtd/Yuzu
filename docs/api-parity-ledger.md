@@ -201,7 +201,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
-| devices | 21 | 10 | 11 |
+| devices | 24 | 13 | 11 |
 | inventory | 4 | 4 | 0 |
 | dex | 27 | 18 | 9 |
 | guardian | 18 | 10 | 8 |
@@ -225,7 +225,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | enrollment | 21 | 4 | 17 |
 | crypto | 5 | 5 | 0 |
 | other | 82 | 26 | 56 |
-| **Total** | **344** | **131** | **213** |
+| **Total** | **347** | **134** | **213** |
 
 Registered `/api/vN/*` routes: 265. OpenAPI `paths` entries: 264. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 205.
 

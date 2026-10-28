@@ -34,9 +34,13 @@ extern const char* const kGroupsTemplate =
   </header>
   <div class="split">
     <div class="grow">
-      <section class="panel" id="grp-list">
+      <section class="panel" id="grp-list" hx-get="/fragments/groups/list"
+               hx-trigger="load, refreshGroups from:body" hx-swap="innerHTML"
+               data-src="/fragments/groups/list"
+               data-denied="Your account cannot read management groups."
+               data-unavailable="Groups could not be read. This is not an empty list.">
         <div class="hd"><h2>Management groups</h2></div>
-        <div class="pb"><p class="hint">Management groups are managed in <a href="/settings">Settings</a> for now.</p></div>
+        <p class="hint pad">Loading...</p>
       </section>
       <section class="panel" hx-ext="sse" sse-connect="/events">
         <div class="hd"><h2>Agents waiting for approval</h2></div>
@@ -60,6 +64,14 @@ extern const char* const kGroupsTemplate =
       </section>
     </div>
     <div class="side2">
+      <div id="grp-side" data-src=""
+           data-denied="Your account cannot read management groups."
+           data-unavailable="This group could not be read.">
+        <section class="panel">
+          <div class="hd"><h2>Selected group</h2></div>
+          <div class="empty"><span>Select a group to see its details.</span></div>
+        </section>
+      </div>
       <section class="panel">
         <div class="hd"><h2>Enrolment tokens</h2></div>
         <div id="token-section" hx-get="/fragments/settings/tokens"
