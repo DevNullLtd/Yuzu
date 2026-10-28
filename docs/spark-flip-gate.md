@@ -2903,16 +2903,16 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
      0/0: the mixture must not make the comparator non-transitive (a verdict ranked above one
      that is in turn ranked above it), the outcome is stated, and a test covers it. Two
      stamping senders on separate data directories under one fixed agent id (independent
-     epochs) still order totally, but their events rank against each other by numbers that
-     mean nothing across instances, and the count below cannot see them because both send a
+     epochs) still order totally, but their events rank against each other by epochs that
+     are unrelated across instances, and the count below cannot see them because both send a
      pair: for that case too the outcome is stated and a test covers it. The server also
      counts accepted events that carry no pair, per agent, and exposes the count (a metric or
      an API field), so an agent that runs unordered is visible fleet-wide; the agent's own
      signal is one error-level log line.
      For every case above, tests show that stale state is not silently presented as the current
      verdict. When the available ordering information cannot establish freshness, the server
-     exposes that uncertainty or obtains fresh state; timestamp fallback, metadata retention, or
-     documenting the selected result alone does not satisfy this criterion.
+     exposes that uncertainty or obtains fresh state; timestamp fallback, metadata retention,
+     or documenting the selected result alone does not satisfy this criterion.
   5. The server change's hunk for fields 24 and 25 is the authority (the agreed split: the
      server change owns the fields); the agent change takes the server change's version of
      the hunk when it merges origin/dev. That comment must say boot_epoch is not guaranteed

@@ -69,11 +69,14 @@ Invariants (the numbered rules below; each failure message starts with its rule 
       `emit_seq_source` into the runtime Config before the runtime is constructed.
   R5  agents/core/src/kv_store.cpp (UP-14 durability gate): `KvStore::open` sets
       `PRAGMA synchronous=FULL` through exactly one `sqlite3_exec(raw_db, ...)` call that
-      precedes the `PRAGMA synchronous` read-back, and no weaker level (OFF, NORMAL, 0, 1) is
-      set anywhere in the file. The Catch2 test of the level cannot discriminate this: it also
-      passes in a build whose SQLite default is already FULL, so the setter is pinned here.
-      Checked on the comment-stripped source with string literals kept (the PRAGMA text is a
-      string literal, which `normalise` blanks).
+      precedes the `PRAGMA synchronous` read-back, and no literal `PRAGMA synchronous=` setter
+      naming OFF, NORMAL, 0 or 1 appears in the file. This is a literal scan, not a proof: a
+      level spelled another way, built from pieces or placed in dead code is not seen, and the
+      runtime claim gate (which refuses a store that is not FULL) is the backstop. The Catch2
+      test of the level cannot discriminate this: it also passes in a build whose SQLite
+      default is already FULL, so the setter is pinned here. Checked on the comment-stripped
+      source with string literals kept (the PRAGMA text is a string literal, which
+      `normalise` blanks).
 
 Robustness: comments (`//`, `/* */`), string literals, raw strings and char literals are removed
 and whitespace is collapsed before matching, so line wrapping, re-indentation and a comment or
@@ -578,7 +581,7 @@ def _rule5(raw_kv, out):
         out.append(f"R5: expected exactly one sqlite3_exec(raw_db, \"PRAGMA synchronous=FULL\" in "
                    f"{KVSTORE} (KvStore::open must set the level the boot-epoch gate requires), "
                    f"found {len(sets)}")
-    weak = re.search(r'"PRAGMA synchronous\s*=\s*(?:OFF|NORMAL|0|1)\s*"', t, re.I)
+    weak = re.search(r'PRAGMA\s+(?:\w+\.)?synchronous\s*=\s*\'?(?:OFF|NORMAL|0|1)\b', t, re.I)
     if weak:
         out.append(f"R5: {KVSTORE} sets a synchronous level below FULL ({weak.group(0)})")
     read = re.search(r'sqlite3_prepare_v2\(\s*raw_db\s*,\s*"PRAGMA synchronous"', t)
@@ -816,10 +819,14 @@ MUTATIONS = [
      r'(rc = sqlite3_exec\(raw_db, "PRAGMA journal_mode=WAL", nullptr, nullptr, &err_msg\);)',
      r'\1 sqlite3_exec(raw_db, "PRAGMA synchronous=OFF", nullptr, nullptr, nullptr);', 1, 0,
      "sets a synchronous level below FULL"),
-    ("R5 setter after the read-back", KVSTORE,
-     r'(sqlite3_stmt\* raw_stmt = nullptr;\s*)(if \(sqlite3_prepare_v2\(raw_db, "PRAGMA synchronous")',
-     r'\1sqlite3_exec(raw_db, "PRAGMA synchronous=FULL", nullptr, nullptr, nullptr); \2', 1, 0,
-     "R5: expected exactly one sqlite3_exec(raw_db"),
+    ("R5 setter moved after the read-back", KVSTORE,
+     r'(rc = sqlite3_exec\(raw_db, "PRAGMA synchronous=FULL", nullptr, nullptr, &sync_err\);)(.*?)(\n\s*if \(level < 2\))',
+     r'\2 sqlite3_exec(raw_db, "PRAGMA synchronous=FULL", nullptr, nullptr, &sync_err);\3', 1, 0,
+     "R5: the synchronous=FULL setter must precede the read-back"),
+    ("R5 weaker setter with a trailing semicolon", KVSTORE,
+     r'(rc = sqlite3_exec\(raw_db, "PRAGMA journal_mode=WAL", nullptr, nullptr, &err_msg\);)',
+     r'\1 sqlite3_exec(raw_db, "PRAGMA main.synchronous=OFF;", nullptr, nullptr, nullptr);', 1, 0,
+     "sets a synchronous level below FULL"),
     ("R3b member declared before kv_store_", AGENT,
      r"(std::unique_ptr<KvStore> kv_store_;)(.*?)(GuardianInstanceLock guardian_instance_lock_;)",
      r"\3\n    \1\2", 1, 0, "member order"),
