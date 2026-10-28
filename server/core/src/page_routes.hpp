@@ -50,6 +50,7 @@
 ///   GET /api/help/autocomplete              (perm_fn Infrastructure:Read)
 ///   GET /api/help/palette                   (perm_fn Infrastructure:Read)
 ///   GET /help                               -
+///   GET /swagger                            (auth_fn + perm_fn Infrastructure:Read)
 ///   GET /tar                                (auth_fn)
 ///   GET /tar/timeline                       (auth_fn; only when Deps::tar_timeline_ui)
 ///   GET /static/yuzu-tar-timeline.js        -  (only when Deps::tar_timeline_ui)

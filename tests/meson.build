@@ -1456,6 +1456,7 @@ if build_server
       'unit/server/test_notification_routes.cpp',
       'unit/server/test_command_routes.cpp',
       'unit/server/test_page_routes.cpp',
+      'unit/server/test_swagger_page.cpp',
       'unit/server/test_dialog_module.cpp',
       'unit/server/test_dashboard_api_routes.cpp',
       'unit/server/test_developer_render.cpp', # System > Developer and API: pure renderers
@@ -3308,6 +3309,16 @@ test('compose certs volume',
   timeout: 30,
 )
 
+# Gateway scrape (#5695): every Prometheus config under deploy/prometheus/ and
+# every compose stack that runs a Prometheus next to a gateway scrapes the
+# gateway's metrics port. Stdlib only, no Docker.
+test('gateway prometheus scrape',
+  _python3_test,
+  args: [files('test_gateway_prometheus_scrape.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Compose Wizard (#5420): every generated mode gives the server a writable,
 # persistent /etc/yuzu/certs (KEK + internal CA), and Operator mode mounts the
 # operator's PEMs read-only at /etc/yuzu/tls instead of over it. Runs the real
@@ -3666,6 +3677,19 @@ test('gateway wrapper guard selftest',
   timeout: 30,
 )
 
+# Pins the gateway eunit shard partition (scripts/gateway_eunit_shards.py):
+# the root meson.build `gateway eunit shard <X>` tests together run every
+# top-level apps/yuzu_gw/test module exactly once (what the old whole-suite
+# `--dir` run did), a new module lands in one shard, and the meson shard
+# table, scripts/ci/assert-gateway-tests.py and the wrapper's `--shard`
+# handling agree. Hermetic (a fake rebar3; no Erlang), so every leg runs it.
+test('gateway eunit partition selftest',
+  _python3_test,
+  args: [files('test_gateway_eunit_shards.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # #4853: pins the run-private epmd (scripts/gateway_epmd.py) the gateway test
 # wrapper gives every eunit/ct run, so another job's end-of-job orphan cleanup
 # on a shared self-hosted box cannot kill the epmd the multinode eunit modules'
@@ -4000,6 +4024,37 @@ test('gateway-upstream guard registration lexical gate',
   args: [files('test_gateway_peer_registration_lexical.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Static lexical gate: every raw-string segment of the OpenAPI document literal in
+# rest_api_v1.cpp stays under 15,000 bytes (MSVC C2026 rejects a string token over 16,380; the
+# Linux and macOS compilers do not, so only the Windows leg would notice). Carries its own
+# in-memory self-test. No build required. Suite 'docs' for the same reason as the gates above.
+test('OpenAPI literal segment size lexical gate',
+  _python3_test,
+  args: [files('test_openapi_literal_segments.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Lexical gate: the OpenAPI x-yuzu-unavailable markers agree with the stores server.cpp passes to
+# register_routes (a store passed as nullptr <=> its group is marked). Carries its own in-memory
+# mutation self-test. No build required.
+test('OpenAPI unavailable markers match store wiring lexical gate',
+  _python3_test,
+  args: [files('test_unavailable_store_wiring.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The /swagger page's renderer, run under node against a fake DOM and a queued fetch: panels and rows,
+# the typed / untyped / unavailable pills, guides built on demand, oneOf tables, hostile spec text kept as
+# text, a malformed URL fragment, the v2 curl path and the failure view with Retry. Skips (77) without node.
+test('swagger page behaviour',
+  _python3_test,
+  args: [files('test_swagger_page_behaviour.py')],
+  suite: ['server', 'docs'],
+  timeout: 60,
 )
 
 # #6016: static lexical gate pinning that only default_certs.cpp mints the server identity URI

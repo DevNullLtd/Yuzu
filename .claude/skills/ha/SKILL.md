@@ -339,7 +339,8 @@ gateway-fronted fleets.**
 > the server answered authoritatively) and calls `disconnect/1` to force
 > the agent-driven reconnect the FORWARD NOTE requires. Also fixed a latent,
 > pre-existing crash in `do_rpc`'s error-clause pattern (never matched what
-> `grpcbox_client:unary/5` actually returns; unreachable before 4.4 since
+> `grpcbox_client:unary/5` (the upstream client at the time; replaced by
+> `yuzu_grpc_client`, which keeps the same result shapes) actually returned; unreachable before 4.4 since
 > this RPC never previously returned a real non-OK, non-transport grpc
 > status). **Round-2 Fable review found 3 more real bugs before push**: F1
 > (BLOCKING) — the adopt decision let an in-memory `gateway_sessions_` hit
