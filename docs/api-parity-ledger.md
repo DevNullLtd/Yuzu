@@ -70,10 +70,9 @@ ledger and is held to the OpenAPI check instead.
 
 The legacy approval pair `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject`
 (`scripts/ci/api-parity/other.json`) carries `exception:#6061 revisit:2027-01-18`: approving is a
-human-session act (an interactive cookie session plus the MFA step-up gate, which an account with no
-enrolled factor passes, #6079), so neither has a REST v1 or MCP twin (the MCP tools `approve_request` /
-`reject_request` stay registered and always refuse). The reasoning, including that pass-through, is the
-2026-10-18 entry in ADR-1005's exception ledger.
+human-session act (an interactive cookie session plus an enrolled MFA factor with a fresh proof, #6079), so neither has a REST v1 or MCP twin (the MCP tools `approve_request` /
+`reject_request` stay registered and always refuse). The reasoning is the
+2026-10-18 entry in ADR-1005's exception ledger (its pass-through note is superseded by #6079).
 
 **What populated this first PR.** Every row was extracted mechanically by
 `check-api-parity.py`'s lexical scanner (verified self-consistent against
