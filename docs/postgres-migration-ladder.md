@@ -50,6 +50,17 @@ for a non-`*Store`-suffixed class (the Wave-4 ladder-blind-spot components below
 > moved to `## Done` below); `InstructionDbPool` (the trio's shared SQLite pool) is deleted and
 > `instructions.db` is retired. Wave 4 is closed.**
 
+> **Cross-store data migrations (Echo rename, 2026-10-28).** One idempotent upgrade-window step per
+> store rewrites the pre-rename plugin name `tar` to `echo` in stored references:
+> `instruction_store` v3, `schedule_engine` v2, `execution_tracker` v8, `approval_manager` v4,
+> `device_token_store` v2, `plugin_config_store` v4, `result_set_store` v3, `policy_store` v5,
+> `workflow_engine` v2, `response_store` v3 and `command_outbox_store` v3 (`gateway_route_store` v6
+> is a schema change only: one additive column). Each is data-only and matches nothing on a fresh
+> database; the two that scan all-time history (`response_store` v3 and `execution_tracker` v8)
+> lift the pool's statement timeout for their own transaction. They run against a carried-forward
+> database only: the deployment contract is a fresh database (`docs/user-manual/upgrading.md`).
+> The removal tracker for the upgrade-window shims is #6694.
+
 ## Done
 
 | Store | Schema | Notes |

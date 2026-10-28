@@ -3,6 +3,8 @@
 #include "response_templates_engine.hpp"
 #include "result_parsing.hpp"
 
+#include <yuzu/log_token.hpp>
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -274,8 +276,15 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json) {
             return std::string("matcher.") + key + " is server-authored and cannot be supplied";
     if (!m.contains("kind"))
         return column_shape_defect(m);
-    if (m["kind"].get<std::string>() != "echo_rows_ge")
+    const auto kind = m["kind"].get<std::string>();
+    // A closed set: an unknown kind would be admitted and then match nobody at evaluation
+    // (below), so a stale client still sending the pre-rename `tar_rows_ge` would get a 202 and
+    // an empty set indistinguishable from "no device matched". Refuse it at admission instead.
+    if (kind == "any_response")
         return std::nullopt;
+    if (kind != "echo_rows_ge")
+        return "matcher.kind must be \"any_response\" or \"echo_rows_ge\" (got \"" +
+               ::yuzu::log_id_token(kind) + "\")";
     const auto n = read_row_threshold(m);
     if (!n || *n < 1)
         return "matcher.n must be a JSON integer between 1 and 2147483647";

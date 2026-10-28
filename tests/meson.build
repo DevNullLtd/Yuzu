@@ -73,6 +73,17 @@ invalid_name_fixture_plugin = shared_library(
   install: false,
 )
 
+# ── Test fixture: plugin with the retired pre-rename name ────────────────────
+# Declares `tar` (the Echo plugin's name before the rename); test_plugin_loader.cpp
+# scans against it to verify the upgrade-window rejection of a stale plugin.
+retired_name_fixture_plugin = shared_library(
+  'retired_name_fixture_plugin',
+  files('unit/fixtures/retired_name_plugin.cpp'),
+  name_prefix: '',
+  dependencies: [yuzu_sdk_dep, yuzu_agent_core_dep],
+  install: false,
+)
+
 # PLAN-08: test_native_raii.cpp (PR1.3) includes <IOKit/IOKitLib.h> and
 # <CoreFoundation/CoreFoundation.h> for the ScopedIOObject/ScopedCFRef vectors.
 # agent-core links IOKit (a hard dependency, C0) and Security/CoreFoundation (A0's optional
@@ -811,6 +822,7 @@ agent_test_exe = executable(
                 os_info_plugin_lib,
                 processes_plugin_lib,
                 reserved_name_fixture_plugin,
+                retired_name_fixture_plugin,
                 sccm_plugin_lib,
                 script_exec_plugin_lib,
                 software_actions_plugin_lib,
@@ -1087,7 +1099,7 @@ agent_shard_specs = {
   'B': ','.join(_agent_b_terms),
   'C': _agent_a_excl + _agent_b_excl + agent_shard_suffix,
 }
-agent_shard_deps = [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin]
+agent_shard_deps = [reserved_name_fixture_plugin, invalid_name_fixture_plugin, retired_name_fixture_plugin, abi3_fixture_plugin]
 foreach shard, spec : agent_shard_specs
   test(
     'agent unit tests shard ' + shard,
@@ -1175,7 +1187,7 @@ if get_option('b_sanitize') != 'none'
     suite: 'agent',
     timeout: 600,
     is_parallel: tsan_heavy_checkpoints_is_parallel,
-    depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin],
+    depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, retired_name_fixture_plugin, abi3_fixture_plugin],
   )
 endif
 

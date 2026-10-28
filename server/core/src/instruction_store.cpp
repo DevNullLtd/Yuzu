@@ -27,6 +27,8 @@
 #include <cstdio>
 #include <format>
 #include <random>
+#include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 
@@ -223,17 +225,26 @@ std::string echo_rename_definitions_sql() {
     sql += ", plugin = 'echo' WHERE plugin = 'tar' AND id LIKE 'crossplatform.tar.%';"
            "UPDATE instruction_definitions SET plugin = 'echo' WHERE plugin = 'tar';";
     // 2. Every row: operator-authored definitions may still name the renamed plugin in
-    //    their YAML (a quoted `plugin: "tar"`, `requiredPlugins: [..tar..]`, a block-list `- tar`,
-    //    or a `crossplatform.tar.` id reference). Only those anchored forms change, so a shell step
-    //    that runs the archive tool is left alone.
+    //    their YAML (a quoted `plugin: "tar"`, `requiredPlugins: [..tar..]`, a block-list item
+    //    under `requiredPlugins:` / `tags:`, or a `crossplatform.tar.` id reference). Only those
+    //    anchored forms change, so a shell step that runs the archive tool, and a bare `- tar`
+    //    item under any other key (an archive-format enum, a package list), are left alone.
+    //    The two line-anchored rules tolerate a trailing `# comment` and CRLF line endings (the
+    //    ordinary dashboard-textarea case); the tail is captured and written back unchanged.
+    //    The block-list rule walks from the key line through only list-item, comment and blank
+    //    lines, so it can never reach a `- tar` under a different key. Postgres ARE: the whole
+    //    pattern is greedy (the first quantified atom decides), which only matters for a block
+    //    naming `tar` twice - the last such item is the one rewritten.
     sql +=
         "UPDATE instruction_definitions SET yaml_source = "
         "regexp_replace("
         " regexp_replace("
         "  regexp_replace(replace(yaml_source, 'crossplatform.tar.', 'crossplatform.echo.'),"
-        "   '(plugin:[ \t]*[\"'']?)tar([\"'']?)[ \t]*$', '\\1echo\\2', 'gn'),"
+        "   '(plugin:[ \t]*[\"'']?)tar([\"'']?[ \t]*(?:#[^\r\n]*)?\r?)$', '\\1echo\\2', 'gn'),"
         "  '(requiredPlugins:[ \t]*\\[[^\\]]*)\\mtar\\M', '\\1echo', 'g'),"
-        " '(^[ \t]*-[ \t]*[\"'']?)tar([\"'']?[ \t]*)$', '\\1echo\\2', 'gn') "
+        " '(^[ \t]*(?:requiredPlugins|tags):[ \t]*(?:#[^\r\n]*)?\r?\n"
+        "(?:[ \t]*(?:-[^\r\n]*)?(?:#[^\r\n]*)?\r?\n)*"
+        "[ \t]*-[ \t]*[\"'']?)tar([\"'']?[ \t]*(?:#[^\r\n]*)?\r?)$', '\\1echo\\2', 'gn') "
         "WHERE yaml_source LIKE '%tar%';";
     // 3. Identity columns, for every row.
     sql +=

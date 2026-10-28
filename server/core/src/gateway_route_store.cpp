@@ -280,8 +280,8 @@ DROP INDEX IF EXISTS agent_routes_session_id_idx;
         // v6 (Echo rename, upgrade window): whether the agent registered with the pre-rename
         // plugin name `tar`, so the HA directory dispatch path (which has no session to consult)
         // can still put the legacy name on the wire. Written by register_fresh only. Removing the
-        // other legacy-name shims drops the write and the read; the column stays (DEFAULT FALSE
-        // is harmless), the same posture as stream_home_id (v3).
+        // other legacy-name shims drops the write and the read; the column stays as an additive
+        // column (DEFAULT FALSE is harmless; this codebase has no DROP COLUMN).
         {6, R"(
 ALTER TABLE agent_routes ADD COLUMN legacy_echo_wire_name BOOLEAN NOT NULL DEFAULT FALSE;
 )"},

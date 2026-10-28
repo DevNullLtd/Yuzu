@@ -731,7 +731,7 @@ distinguishable from a scrape failure.
 
 ## Echo dashboard metrics
 
-The Echo metrics were named `yuzu_tar_*` (and `yuzu_fleet_tar_db_corruption_agents`) before 2026-10. There is no alias: dashboards, alert rules and recording rules that use the old series names must be updated to the `yuzu_echo_*` names below.
+The Echo metrics were named `yuzu_tar_*` (and `yuzu_fleet_tar_db_corruption_agents`) before 2026-10. There is no alias: dashboards, alert rules and recording rules that use the old series names must be updated to the `yuzu_echo_*` names (for example the series below).
 
 | Metric | Type | Meaning |
 |---|---|---|
@@ -2658,6 +2658,7 @@ the literal label values, not substring matches.
 | `reserved_name` | Plugin declared a reserved name (`__guard__`, `__system__`, `__update__`, `__guardian_journal__`, `__guardian__`, `__sync__`). Possible plugin-author error or a malicious shadowing attempt (#453; the `kv_store`-namespace names added in #2303). | Investigate the plugin source / drop. |
 | `invalid_name` | Plugin declared a name that is empty, longer than 64 bytes, or outside `[A-Za-z0-9_]` (#822). The offending name is deliberately not logged: a crafted name can carry control bytes. | Investigate the plugin source / drop; a crafted name is a possible malicious-load attempt. |
 | `duplicate_name` | A second file in the plugin directory declared a name another file in the same scan had already claimed; the first file the directory walk encountered keeps the name, the later file is rejected and immediately unloaded without its plugin init being called. | Remove the duplicate from `--plugin-dir` (two builds of one plugin); which copy wins is filesystem order, so do not rely on it. |
+| `retired_name` | Plugin declared the retired pre-rename name `tar` (the Echo plugin before the rename): a stale `tar.dll` / `tar.so` / `tar.dylib` left beside or instead of `echo.<ext>`. Rejected so it cannot run against the renamed agent. | Remove the stale file and install `echo.<ext>`; until it is installed the agent also defers adopting `tar.db`. |
 | `load_failed` | `dlopen` / `LoadLibrary` failed, missing `yuzu_plugin_descriptor` export, or ABI version mismatch. | Check the agent log for the dlopen error and rebuild the plugin against the current SDK ABI. |
 | `signature_missing` | `--plugin-trust-bundle` is set, `--plugin-require-signature` is set, and a plugin has no `<plugin>.so.sig` sibling. | Sign the plugin, deploy the `.sig` alongside, or relax the require flag. |
 | `signature_invalid` | `.sig` file exists but the CMS verification failed at the signature/digest layer (most commonly: the plugin file was modified after signing). | Re-sign the plugin or investigate tampering. |

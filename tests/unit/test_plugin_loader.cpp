@@ -448,6 +448,48 @@ TEST_CASE("PluginLoader rejects a plugin declaring an invalid name",
     fs::remove_all(tmp);
 }
 
+TEST_CASE("is_retired_plugin_name matches only the pre-rename Echo name",
+          "[plugin_loader][retired_name]") {
+    CHECK(yuzu::agent::is_retired_plugin_name("tar"));
+    CHECK_FALSE(yuzu::agent::is_retired_plugin_name("echo"));
+    CHECK_FALSE(yuzu::agent::is_retired_plugin_name("Tar"));
+    CHECK_FALSE(yuzu::agent::is_retired_plugin_name("tar_x"));
+    CHECK_FALSE(yuzu::agent::is_retired_plugin_name(""));
+    // Not a reserved name: that list doubles as the KV-namespace contract.
+    CHECK_FALSE(yuzu::agent::is_reserved_plugin_name("tar"));
+}
+
+TEST_CASE("PluginLoader rejects a stale plugin declaring the retired pre-rename name",
+          "[plugin_loader][retired_name]") {
+    auto fixture = find_fixture_plugin("retired_name_fixture_plugin");
+    if (fixture.empty()) {
+        WARN("retired_name_fixture_plugin not found - skipping behavioral scan test");
+        SUCCEED();
+        return;
+    }
+
+    // Scan an isolated copy so the result reflects only this fixture. `tmp` is declared before
+    // `result`, so the dlopen handle is released before the directory is removed.
+    yuzu::test::TempDir tmp{"yuzu_test_retired_plugin_"};
+    fs::create_directories(tmp.path);
+    const auto staged = tmp.path / fixture.filename();
+    std::error_code ec;
+    fs::copy_file(fixture, staged, fs::copy_options::overwrite_existing, ec);
+    REQUIRE_FALSE(ec);
+
+    auto result = yuzu::agent::PluginLoader::scan(tmp.path);
+
+    // The stale plugin must not reach the dispatcher...
+    REQUIRE(result.loaded.empty());
+    // ...and must surface as one error under the stable reason prefix that the agent metric
+    // (reason="retired_name") and the OTA adoption deferral both key on.
+    REQUIRE(result.errors.size() == 1);
+    const auto& err = result.errors.front();
+    CHECK(err.path == staged.string());
+    REQUIRE(err.reason.starts_with(yuzu::agent::kRetiredNameReason));
+    CHECK(err.reason.find("tar") != std::string::npos);
+}
+
 // ─── Plugin config-sync (covers agent.cpp post-load sync invariant) ─────────
 //
 // The fix at agent.cpp ~line 564 (sync_master_config_to_plugins) is the

@@ -715,6 +715,48 @@ TEST_CASE("AuditStore: an echo. action_prefix matches both spellings; other pref
     CHECK((*ar)[0].action == "auth.login");
 }
 
+// The bind arithmetic: an `echo.` exact action adds a SECOND bound parameter (the tar. twin), so
+// every filter after it shifts by one, and a prefix list mixing an `echo.` entry with others adds
+// one OR-term per echo entry. A principal filter ahead of the action, and a non-echo prefix beside
+// an echo one, are the shapes that would expose an off-by-one in the placeholder numbering.
+TEST_CASE("AuditStore: the echo. twin keeps later binds aligned with a principal filter and mixed prefixes",
+          "[pg][audit_store][echo_rename]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    CHECK(store.log(mk("admin", "tar.status.scan")));
+    CHECK(store.log(mk("admin", "echo.status.scan")));
+    CHECK(store.log(mk("other", "tar.status.scan")));
+    CHECK(store.log(mk("other", "echo.status.scan")));
+    CHECK(store.log(mk("admin", "auth.login")));
+    CHECK(store.log(mk("other", "auth.login")));
+
+    // principal ahead of the action pair: both spellings, this principal only.
+    AuditQuery pq;
+    pq.principal = "admin";
+    pq.action = "echo.status.scan";
+    auto pr = store.query(pq);
+    REQUIRE(pr.has_value());
+    REQUIRE(pr->size() == 2);
+    for (const auto& e : *pr)
+        CHECK(e.principal == "admin");
+
+    // A mixed prefix list: auth. rows plus both spellings of the echo. rows, nothing else.
+    AuditQuery mq;
+    mq.action_prefixes = {"auth.", "echo."};
+    auto mr = store.query(mq);
+    REQUIRE(mr.has_value());
+    CHECK(mr->size() == 6);
+
+    // The same list with the principal filter first: the later binds still line up.
+    mq.principal = "other";
+    auto mpr = store.query(mq);
+    REQUIRE(mpr.has_value());
+    REQUIRE(mpr->size() == 3);
+    for (const auto& e : *mpr)
+        CHECK(e.principal == "other");
+}
+
 TEST_CASE("AuditStore: random_sample over the scan cap is recency-capped + bounded by limit",
           "[pg][audit_store][auth-sample][slow]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);

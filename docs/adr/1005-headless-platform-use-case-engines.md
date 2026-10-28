@@ -983,6 +983,26 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      records it; like the entries above it is not a separately signed
      decision.
 
+   - **2026-10-28 - the Echo rename retires every TAR-named surface with no
+     deprecation window.** `docs/api-versioning-policy.md` treats an endpoint or
+     tool rename as a Breaking change that keeps the old name for a window; this
+     rename retires the old names outside that cycle, by the owner's ruling at the
+     rename's planning (2026-10-28): a hard cut, no aliases. Scope: the REST
+     routes `/api/v1/tar/...` and `/api/dashboard/tar-*`, the MCP tools
+     `*_tar_*`, the metrics `yuzu_tar_*`, the audit actions `tar.*` (no longer
+     written; old rows keep their spelling and the `echo.*` filters match both),
+     the instruction ids `crossplatform.tar.*`, the result-set matcher kind
+     `tar_rows_ge` and the agent plugin name `tar`. Replacement names substitute
+     `echo` for `tar` (`/api/v1/echo/...`, `*_echo_*`, `yuzu_echo_*`, `echo.*`,
+     `crossplatform.echo.*`, `echo_rows_ge`, plugin `echo`). The only retained
+     compatibility is the upgrade-window plugin-name shim (the server accepts an
+     agent that still reports `tar` and writes that name on the wire to it),
+     removed with the other legacy-name shims. Rationale: the feature is renamed
+     outright, so a retained alias would keep the old name alive in every
+     surface; the migration guide (`docs/user-manual/upgrading.md`) lists the
+     old and new names. The ledger records the retirement because the policy
+     requires it.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

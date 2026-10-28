@@ -10,6 +10,7 @@
 #include "echo_netqual_boot.hpp"
 #include "echo_sql_executor.hpp"
 #include "test_helpers.hpp"
+#include "test_log_capture.hpp"
 
 #include <yuzu/agent/echo_db_legacy_rename.hpp> // tar.db -> echo.db adoption
 
@@ -3363,6 +3364,11 @@ void make_legacy_tar_db_with_wal(const fs::path& dst) {
     REQUIRE(fs::exists(src.path / "tar.db-wal"));
     fs::copy_file(src.path / "tar.db", dst / "tar.db");
     fs::copy_file(src.path / "tar.db-wal", dst / "tar.db-wal");
+    // Positive control: the marker row exists ONLY in the WAL. If a checkpoint ever lands before
+    // the copy, the main file would carry it and every "WAL-only row survives" claim built on
+    // this helper would pass vacuously.
+    REQUIRE(slurp_file(dst / "tar.db").find("wal_marker") == std::string::npos);
+    REQUIRE(slurp_file(dst / "tar.db-wal").find("wal_marker") != std::string::npos);
 }
 
 struct ScratchDir {
@@ -3453,7 +3459,12 @@ TEST_CASE("adopt_legacy_echo_db: both main files present is two databases and no
     for (const char* f : files)
         before.push_back(slurp_file(d.path() / f));
 
+    // The warning is the operator's only signal; its phrase is quoted in docs/user-manual/upgrading.md.
+    // The adopter is header-only, so it logs through this binary's own spdlog (LogCapture reaches it).
+    yuzu::test::LogCapture logs;
     REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+    logs.stop();
+    CHECK(logs.text().find("two independent databases") != std::string::npos);
     for (std::size_t i = 0; i < files.size(); ++i) {
         INFO(files[i]);
         REQUIRE(fs::exists(d.path() / files[i]));
@@ -3486,10 +3497,12 @@ TEST_CASE("adopt_legacy_echo_db: a WAL at both names fails closed and moves noth
         CHECK(slurp_file(d.path() / files[i]) == before[i]); // the committed WAL-only row is intact
     }
 
-    // The state is the same fail-closed one an interrupted adoption leaves: open() refuses.
+    // The state is the same fail-closed one an interrupted adoption leaves: open() refuses. The
+    // phrase is quoted verbatim in docs/user-manual/upgrading.md; this pin keeps the two in step.
     auto refused = EchoDatabase::open(d.path() / "echo.db");
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().find("tar.db") != std::string::npos);
+    CHECK(refused.error().find("not adopted - refusing") != std::string::npos);
 }
 
 TEST_CASE("EchoDatabase::open refuses to create a fresh echo.db beside an unadopted tar.db",
@@ -3501,6 +3514,7 @@ TEST_CASE("EchoDatabase::open refuses to create a fresh echo.db beside an unadop
     auto refused = EchoDatabase::open(echo_db);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().find("tar.db") != std::string::npos);
+    CHECK(refused.error().find("not adopted - refusing") != std::string::npos); // quoted in the guide
     CHECK_FALSE(fs::exists(echo_db));
 
     REQUIRE(yuzu::agent::adopt_legacy_echo_db(echo_db).has_value());

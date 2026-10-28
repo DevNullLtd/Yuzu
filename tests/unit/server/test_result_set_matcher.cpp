@@ -82,6 +82,27 @@ TEST_CASE("matcher: unknown kind excludes conservatively", "[result_set][matcher
     REQUIRE_FALSE(response_matches(R"({"kind":"does_not_exist"})", kOk, echo_rows(9)));
 }
 
+// Echo rename: a stale client still sending the pre-rename kind literal used to be admitted (202)
+// and then match nobody - an empty set indistinguishable from "no device matched". Admission now
+// refuses any kind outside the closed set {any_response, echo_rows_ge}.
+TEST_CASE("matcher: validate_matcher refuses a kind outside the closed set and names it",
+          "[result_set][matcher][echo_rename]") {
+    const std::string old_kind = R"({"kind":"tar_rows_ge","n":1})"; // legacy spelling, on purpose
+    const auto err = validate_matcher(old_kind);
+    REQUIRE(err.has_value());
+    CHECK(err->find("tar_rows_ge") != std::string::npos);
+    CHECK(err->find("echo_rows_ge") != std::string::npos);
+    CHECK(validate_matcher_object(nlohmann::json::parse(old_kind)).has_value());
+    CHECK(validate_matcher(R"({"kind":""})").has_value());
+    CHECK(validate_matcher(R"({"kind":"does_not_exist"})").has_value());
+
+    // The renamed kind is admitted and matches on the same output the old literal would have.
+    const auto out = echo_rows(2);
+    CHECK_FALSE(validate_matcher(R"({"kind":"echo_rows_ge","n":1})").has_value());
+    CHECK(response_matches(R"({"kind":"echo_rows_ge","n":1})", kOk, out));
+    CHECK_FALSE(validate_matcher(R"({"kind":"any_response"})").has_value());
+}
+
 TEST_CASE("matcher: column op over echo pipe shape", "[result_set][matcher]") {
     std::string out = "__schema__|pid|sha256\n42|abc\n43|def\n__total__|2";
     REQUIRE(response_matches(R"({"column":"sha256","op":"eq","value":"abc"})", kOk, out));

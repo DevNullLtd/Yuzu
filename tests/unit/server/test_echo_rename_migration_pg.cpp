@@ -157,8 +157,8 @@ const std::vector<std::string_view>& selector_kinds() {
 
 } // namespace
 
-TEST_CASE("Echo rename: instruction_store v3 rewrites ids, plugin, requiredPlugins and every "
-          "YAML form; controls are untouched",
+TEST_CASE("Echo rename: instruction_store v3 rewrites ids and plugin and requiredPlugins and "
+          "every YAML form; controls are untouched",
           "[pg][echo][migration][instruction_store]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
@@ -233,7 +233,9 @@ TEST_CASE("Echo rename: instruction_store v3 rewrites ids, plugin, requiredPlugi
     const auto custom = col("custom.quoted", "yaml_source");
     CHECK(custom.find("plugin: \"echo\"") != std::string::npos);
     CHECK(custom.find("requiredPlugins: [\"echo\", \"other\"]") != std::string::npos);
-    CHECK(custom.find("    - echo\n    - other") != std::string::npos);
+    // A bare list item under an unrelated key is left as written (the block-list rule is scoped
+    // to `requiredPlugins:` / `tags:`; see the dedicated case below).
+    CHECK(custom.find("  needs:\n    - tar\n    - other") != std::string::npos);
     CHECK(custom.find("ref: crossplatform.echo.status") != std::string::npos);
     CHECK(custom.find("run: tar -czf out.tar.gz dir") != std::string::npos); // archive tool kept
     CHECK(col("custom.quoted", "required_plugins") == "other,echo");
@@ -260,6 +262,73 @@ TEST_CASE("Echo rename: instruction_store v3 rewrites ids, plugin, requiredPlugi
         REQUIRE(store.is_open());
     }
     CHECK(snapshot() == before);
+}
+
+TEST_CASE("Echo rename: instruction_store v3 scopes the block-list rule and tolerates CRLF "
+          "and trailing comments",
+          "[pg][echo][migration][instruction_store]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        yuzu::server::InstructionStore store{pool};
+        REQUIRE(store.is_open());
+    }
+    const std::string& dsn = db.dsn();
+
+    // CH-10: a bare `- tar` list item that is NOT a plugin reference (an archive-format enum, a
+    // package list, a list under a key that merely follows requiredPlugins) must stay as written.
+    exec_sql(dsn,
+             "INSERT INTO instruction_store.instruction_definitions "
+             "(id, name, type, plugin, required_plugins, yaml_source) VALUES "
+             "('ops.enum', 'Enum', 'action', 'shell', 'shell', "
+             " E'spec:\\n  plugin: shell\\n  parameters:\\n    format:\\n      validation:\\n"
+             "        enum:\\n          - zip\\n          - tar\\n          - gz\\n"
+             "  packages:\\n    - tar\\n'), "
+             "('ops.after', 'After', 'action', 'shell', 'shell', "
+             " E'spec:\\n  requiredPlugins:\\n    - shell\\n  steps:\\n    - tar\\n')");
+    // The same shapes that ARE plugin references: block lists under requiredPlugins: and tags:,
+    // with a blank line, a comment line and a trailing comment between and after the items.
+    exec_sql(dsn,
+             "INSERT INTO instruction_store.instruction_definitions "
+             "(id, name, type, plugin, required_plugins, yaml_source) VALUES "
+             "('ops.block', 'Block', 'question', 'other', 'other', "
+             " E'spec:\\n  compatibility:\\n    requiredPlugins:\\n      - other\\n\\n"
+             "      # the activity plugin\\n      - tar # first\\n  tags:\\n    - \"tar\"\\n    - ops\\n')");
+    // CH-8: CRLF line endings (the ordinary dashboard-textarea case) and a trailing comment on a
+    // `plugin:` line. The CR and the comment are preserved byte for byte.
+    exec_sql(dsn,
+             "INSERT INTO instruction_store.instruction_definitions "
+             "(id, name, type, plugin, required_plugins, yaml_source) VALUES "
+             "('ops.crlf', 'Crlf', 'question', 'other', 'other', "
+             " E'spec:\\r\\n  plugin: tar   # activity plugin\\r\\n  requiredPlugins:\\r\\n"
+             "    - tar # first\\r\\n    - other\\r\\n')");
+
+    roll_back(dsn, "instruction_store", 2);
+    {
+        PgPool pool{{.conninfo = dsn, .size = 2}};
+        yuzu::server::InstructionStore store{pool};
+        REQUIRE(store.is_open());
+    }
+    CHECK(version_of(dsn, "instruction_store") == "3");
+
+    const auto yaml = [&](const char* id) {
+        return one(dsn, std::string("SELECT yaml_source FROM "
+                                    "instruction_store.instruction_definitions WHERE id = '") +
+                            id + "'");
+    };
+    // CH-10 controls: byte-identical.
+    CHECK(yaml("ops.enum") == "spec:\n  plugin: shell\n  parameters:\n    format:\n      validation:\n"
+                              "        enum:\n          - zip\n          - tar\n          - gz\n"
+                              "  packages:\n    - tar\n");
+    CHECK(yaml("ops.after") == "spec:\n  requiredPlugins:\n    - shell\n  steps:\n    - tar\n");
+    // The scoped block lists are rewritten, comments and blank lines intact.
+    CHECK(yaml("ops.block") ==
+          "spec:\n  compatibility:\n    requiredPlugins:\n      - other\n\n"
+          "      # the activity plugin\n      - echo # first\n  tags:\n    - \"echo\"\n    - ops\n");
+    // CH-8: CRLF and trailing comments no longer defeat the line anchors.
+    CHECK(yaml("ops.crlf") ==
+          "spec:\r\n  plugin: echo   # activity plugin\r\n  requiredPlugins:\r\n"
+          "    - echo # first\r\n    - other\r\n");
 }
 
 TEST_CASE("Echo rename: instruction_store v3 moves an operator Echo definition's plugin and "
@@ -381,8 +450,8 @@ TEST_CASE("Echo rename: the migrated crossplatform.tar.query row equals the fres
     CHECK(differs("yaml_source") == "1");
 }
 
-TEST_CASE("Echo rename: definition-id references follow in schedules, executions, approvals, "
-          "device tokens, workflows, policies and responses",
+TEST_CASE("Echo rename: definition-id references follow in schedules and executions and "
+          "approvals and device tokens and workflows and policies and responses",
           "[pg][echo][migration][references]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     const std::string& dsn = db.dsn();
@@ -544,8 +613,8 @@ TEST_CASE("Echo rename: definition-id references follow in schedules, executions
     CHECK(snap() == before);
 }
 
-TEST_CASE("Echo rename: plugin_config_store v4 moves configs, every kill-switch scope form and "
-          "enablement units; secrets are left alone",
+TEST_CASE("Echo rename: plugin_config_store v4 moves configs and every kill-switch scope form "
+          "and enablement units; secrets are left alone",
           "[pg][echo][migration][plugin_config_store]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     const std::string& dsn = db.dsn();
@@ -659,9 +728,11 @@ TEST_CASE("Echo rename: result_set_store v3 rewrites the source kind and matcher
     }
     exec_sql(dsn, "INSERT INTO result_set_store.result_sets (id, owner_principal, created_at, "
                   "ttl_at, last_used_at, source_kind, source_payload, matcher) VALUES "
-                  "('rs_legacy1', 'p', 1, 2, 1, 'tar_query', '{}', "
+                  "('rs_legacy1', 'p', 1, 2, 1, 'tar_query', "
+                  " '{\"instruction_id\":\"crossplatform.tar.query\"}', "
                   " '{\"kind\":\"tar_rows_ge\",\"n\":1}'), "
-                  "('rs_control1', 'p', 1, 2, 1, 'plugin_query', '{}', '{\"kind\":\"rows_ge\"}')");
+                  "('rs_control1', 'p', 1, 2, 1, 'plugin_query', "
+                  " '{\"instruction_id\":\"crossplatform.o.q\"}', '{\"kind\":\"rows_ge\"}')");
     roll_back(dsn, "result_set_store", 2);
     {
         PgPool pool{{.conninfo = dsn, .size = 2}};
@@ -673,4 +744,71 @@ TEST_CASE("Echo rename: result_set_store v3 rewrites the source kind and matcher
                    "id = 'rs_legacy1'") == "echo_query|{\"kind\":\"echo_rows_ge\",\"n\":1}");
     CHECK(one(dsn, "SELECT source_kind || '|' || matcher FROM result_set_store.result_sets WHERE "
                    "id = 'rs_control1'") == "plugin_query|{\"kind\":\"rows_ge\"}");
+    // CH-11: the payload carries the producing instruction id; a re-evaluation of a pre-rename
+    // set resolves it only if the id follows the rename.
+    CHECK(one(dsn, "SELECT source_payload FROM result_set_store.result_sets WHERE id = "
+                   "'rs_legacy1'") == "{\"instruction_id\":\"crossplatform.echo.query\"}");
+    CHECK(one(dsn, "SELECT source_payload FROM result_set_store.result_sets WHERE id = "
+                   "'rs_control1'") == "{\"instruction_id\":\"crossplatform.o.q\"}");
+}
+
+// CH-5: the two steps that scan all-time history (response_store v3 and execution_tracker v8) lift
+// the pool's per-lease statement_timeout for their own transaction. Without that, a multi-million
+// row store runs past the 30 s cap, the step is cancelled (SQLSTATE 57014), the version rolls back
+// and the store logs "disabled" and carries on: the server boots with response persistence and the
+// execution tracker off. A BEFORE UPDATE trigger that sleeps per matching row makes each step
+// outlast the 200 ms pool timeout deterministically, whatever the machine speed or data volume.
+TEST_CASE("Echo rename: the history scans of response_store v3 and execution_tracker v8 outlast a "
+          "200 ms statement timeout",
+          "[pg][echo][migration][chaos][statement_timeout]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    const std::string& dsn = db.dsn();
+    {
+        PgPool pool{{.conninfo = dsn, .size = 2}};
+        yuzu::server::ResponseStore responses{pool};
+        yuzu::server::ExecutionTracker tracker{pool};
+        REQUIRE(responses.is_open());
+        REQUIRE(tracker.is_open());
+    }
+    exec_sql(dsn, "INSERT INTO response_store.responses (instruction_id, agent_id, timestamp, status, "
+                  "output, plugin) VALUES ('crossplatform.tar.query', 'a1', 1, 0, 'x', 'tar')");
+    exec_sql(dsn, "INSERT INTO execution_tracker.executions (id, definition_id) VALUES "
+                  "('e1', 'crossplatform.tar.export')");
+    exec_sql(dsn, R"SQL(
+        CREATE FUNCTION public.yuzu_test_slow_row() RETURNS trigger LANGUAGE plpgsql AS
+            $$ BEGIN PERFORM pg_sleep(0.5); RETURN NEW; END $$;
+        CREATE TRIGGER yuzu_test_slow BEFORE UPDATE ON response_store.responses
+            FOR EACH ROW WHEN (OLD.instruction_id LIKE 'crossplatform.tar.%')
+            EXECUTE FUNCTION public.yuzu_test_slow_row();
+        CREATE TRIGGER yuzu_test_slow BEFORE UPDATE ON execution_tracker.executions
+            FOR EACH ROW WHEN (OLD.definition_id LIKE 'crossplatform.tar.%')
+            EXECUTE FUNCTION public.yuzu_test_slow_row();)SQL");
+
+    PgPool pool{{.conninfo = dsn, .size = 2, .statement_timeout_ms = 200}};
+
+    // Positive control: under this pool an UPDATE of the same shape IS cancelled with 57014, so a
+    // green run below means the migrations lifted the timeout, not that nothing was slow.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        PgResult r{PQexec(lease.get(), "UPDATE response_store.responses SET plugin = plugin WHERE "
+                                       "instruction_id LIKE 'crossplatform.tar.%'")};
+        REQUIRE(PQresultStatus(r.get()) == PGRES_FATAL_ERROR);
+        const char* state = PQresultErrorField(r.get(), PG_DIAG_SQLSTATE);
+        REQUIRE(state != nullptr);
+        CHECK(std::string_view{state} == "57014");
+    }
+
+    roll_back(dsn, "response_store", 2);
+    roll_back(dsn, "execution_tracker", 7);
+    yuzu::server::ResponseStore responses{pool};
+    yuzu::server::ExecutionTracker tracker{pool};
+    REQUIRE(responses.is_open());
+    REQUIRE(tracker.is_open());
+    CHECK(version_of(dsn, "response_store") == "3");
+    CHECK(version_of(dsn, "execution_tracker") == "8");
+    CHECK(one(dsn, "SELECT instruction_id || '/' || plugin FROM response_store.responses") ==
+          "crossplatform.echo.query/echo");
+    CHECK(one(dsn, "SELECT definition_id FROM execution_tracker.executions WHERE id = 'e1'") ==
+          "crossplatform.echo.export");
 }

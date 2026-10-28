@@ -5620,7 +5620,7 @@ These are the registry **defaults** an agent of this server's release applies (a
 releases may differ), not per-device readings: Echo prunes on the agent, so the server has no
 live value. Every source's tiers are declared on every OS; where a source does not run on the
 agent's OS (see the OS compatibility matrix in the Echo manual) its tier applies to an empty
-table. A paused or errored source is never pruned (per-device paused sources: [`GET /api/v1/echo/retention-paused`](#get-apiv1tarretention-paused)); while the agent is running, rows may
+table. A paused or errored source is never pruned (per-device paused sources: [`GET /api/v1/echo/retention-paused`](#get-apiv1echoretention-paused)); while the agent is running, rows may
 outlive their limit by up to `tick_seconds` (an offline agent or a disabled plugin prunes
 nothing), longer when the retention clock guard declines a prune, shorter by any plausible
 forward skew of the endpoint clock, which the guard does not decline (the depth is measured on
@@ -12758,6 +12758,8 @@ data: {"execution_id":"exec-abc123","event_id":119,"timestamp_ms":...,"type":"ag
 ---
 
 ### Dashboard Echo
+
+The Echo routes were named `tar` before 2026-10 (`/api/v1/tar/...`, `/api/dashboard/tar-execute`). There is no alias for the old paths; see the Echo section of [Upgrading](upgrading.md).
 
 #### `POST /api/dashboard/echo-execute`
 

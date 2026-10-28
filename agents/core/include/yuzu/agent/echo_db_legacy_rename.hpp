@@ -9,7 +9,9 @@
 // opens a database before init). That placement is the exclusion: no process-wide lock exists
 // across plugin dylibs, so no plugin ever adopts, and nothing can have the database open while
 // it is moved. EchoDatabase::open() refuses to create a fresh echo.db beside an unadopted
-// tar.db, so a failed adoption fails closed instead of booting with default config.
+// tar.db, so a failed adoption fails closed instead of booting with default config. The caller
+// defers adoption entirely while the plugin dir holds only the retired tar plugin (an OTA
+// replaces the agent binary alone): the next start after echo.<ext> is installed adopts.
 //
 // Order is load-bearing: sidecars (-journal, -wal, -shm) move BEFORE the main file. An
 // interrupted adoption therefore always looks like "tar.db present, echo.db absent" and resumes
@@ -69,8 +71,12 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
 
     // Sidecars first. A source that does not exist is already moved (or never was): success.
     for (const char* suffix : kSidecars) {
-        const fs::path from{legacy.string() + suffix};
-        const fs::path to{echo_db.string() + suffix};
+        // path::operator+= appends in the native character type; string() + suffix would narrow
+        // a wide Windows path through the ANSI code page first.
+        fs::path from = legacy;
+        from += suffix;
+        fs::path to = echo_db;
+        to += suffix;
         if (!fs::exists(from, ec)) {
             if (ec)
                 return std::unexpected(

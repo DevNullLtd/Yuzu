@@ -588,7 +588,27 @@ TEST_CASE("legacy inventory: an agent reporting `echo` is not flagged legacy",
     CHECK_FALSE(session->legacy_echo_wire_name);
 }
 
-TEST_CASE("wire_for rewrites echo -> tar for a legacy session only, leaving the tag alone",
+TEST_CASE("legacy inventory: an agent advertising both `tar` and `echo` is not flagged legacy",
+          "[server][dispatch][plugin_presence][registry][echo_rename]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    auto info = make_presence_test_info("dev-both");
+    info.add_plugins()->set_name("tar");
+    info.add_plugins()->set_name("echo");
+    (void)registry.register_agent(info);
+
+    const auto session = registry.get_session("dev-both");
+    REQUIRE(session);
+    // A stale tar plugin beside the real echo one: echo commands must keep the new wire name so
+    // the real echo plugin receives them, and `tar` is not folded into a second `echo` entry.
+    CHECK_FALSE(session->legacy_echo_wire_name);
+    CHECK(std::ranges::count(session->plugin_names, "echo") == 1);
+    CHECK(std::ranges::find(session->plugin_names, "tar") != session->plugin_names.end());
+    CHECK_FALSE(registry.ids_missing_plugin("echo", "sql").contains("dev-both"));
+}
+
+TEST_CASE("wire_for rewrites echo -> tar for a legacy session only and leaves the tag alone",
           "[server][dispatch][registry][echo_rename]") {
     const auto classified = ClassifiedCommandTestAccess::make(echo_wire_cmd("wf-1"));
     const auto legacy = yuzu::server::detail::wire_for(true, classified);

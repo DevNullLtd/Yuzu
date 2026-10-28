@@ -334,7 +334,7 @@ cluster unit; intra-zone scale is more nodes.
   `ProxyRegister` with **conditional (CAS) register/deregister** keyed on `connection_epoch` — a
   delayed replay from an *older* connection **cannot overwrite** a newer re-home (the bug an
   unconditional self-healing write would create). A lease that expires without renewal marks the
-  route stale. Upgrade window (Echo rename; removed in a later change): the directory row also
+  route stale. Upgrade window (Echo rename; removed with the other legacy-name shims): the directory row also
   carries a `legacy_echo_wire_name` flag, set at `ProxyRegister` from the agent's reported plugin
   inventory, so a replica that holds no session for an agent can still address it by the
   pre-rename plugin name `tar` until the agent upgrades. The column stays after the write and read

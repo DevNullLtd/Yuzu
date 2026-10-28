@@ -83,6 +83,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <unistd.h>      // gethostname
 #endif
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -857,11 +858,32 @@ public:
         // rename - so nothing can have the database open while it moves, and
         // EchoDatabase::open refuses to create a fresh echo.db beside an unadopted tar.db.
         // Neither step is fatal: a failed adoption leaves the echo plugin refusing to open.
-        if (auto adopted = adopt_legacy_echo_db(cfg_.data_dir / "echo.db"); !adopted) {
-            spdlog::error("Legacy tar.db adoption failed: {}", adopted.error());
-        }
-        if (kv_store_ && !kv_store_->rename_plugin("tar", "echo")) {
-            spdlog::warn("KV namespace re-key tar -> echo failed; Echo health history restarts");
+        //
+        // Deferred while the plugin dir still holds only the retired tar plugin: OTA replaces the
+        // agent binary alone, so the renamed plugin may not be installed yet. Adopting now would
+        // strand the history under a plugin that is not there (and a roll-back of the binary
+        // would find no tar.db); the package install that brings echo.<ext> lets the next start
+        // adopt. The loader rejects the stale tar plugin, so it never runs against the renamed
+        // core; the rejection is how this block learns it is present.
+        const bool retired_tar_plugin_present = std::ranges::any_of(
+            scan.errors, [](const auto& err) {
+                return err.reason.starts_with(yuzu::agent::kRetiredNameReason);
+            });
+        const bool echo_plugin_loaded =
+            std::ranges::any_of(candidates, [](const PluginHandle& handle) {
+                return std::string_view{handle.descriptor()->name} == "echo";
+            });
+        if (retired_tar_plugin_present && !echo_plugin_loaded) {
+            spdlog::warn("legacy tar plugin still installed; adoption deferred until echo.<ext> is "
+                         "installed (tar.db and the tar KV namespace left as they are)");
+        } else {
+            if (auto adopted = adopt_legacy_echo_db(cfg_.data_dir / "echo.db"); !adopted) {
+                spdlog::error("Legacy tar.db adoption failed: {}", adopted.error());
+            }
+            if (kv_store_ && !kv_store_->rename_plugin("tar", "echo")) {
+                spdlog::warn(
+                    "KV namespace re-key tar -> echo failed; Echo health history restarts");
+            }
         }
 
         // 1b'. Open the durable command-dedup store (HA WS-0, ADR-2002). Survives
@@ -1003,6 +1025,8 @@ public:
                 // or outside [A-Za-z0-9_]) — distinct from a reserved-name
                 // attempt so operators can alert on crafted-name loads.
                 reason = "invalid_name";
+            } else if (err.reason.starts_with(yuzu::agent::kRetiredNameReason)) {
+                reason = "retired_name";
             } else if (err.reason.starts_with(yuzu::agent::kDuplicateNameReason)) {
                 reason = "duplicate_name";
             } else if (err.reason.starts_with(yuzu::agent::kSignatureMissingReason)) {

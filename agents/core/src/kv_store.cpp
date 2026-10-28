@@ -804,11 +804,16 @@ bool KvStore::rename_plugin(std::string_view from, std::string_view to) {
             return false;
         }
         StmtPtr stmt(raw_stmt);
-        sqlite3_bind_text(stmt.get(), 1, from.data(), static_cast<int>(from.size()),
-                          SQLITE_STATIC);
-        if (sqlite3_bind_parameter_count(stmt.get()) >= 2)
-            sqlite3_bind_text(stmt.get(), 2, to.data(), static_cast<int>(to.size()),
-                              SQLITE_STATIC);
+        // An unbound parameter is NULL: the copy would move nothing and the delete match nothing
+        // while the call reports success, so a failed bind aborts the whole transaction.
+        if (sqlite3_bind_text(stmt.get(), 1, from.data(), static_cast<int>(from.size()),
+                              SQLITE_STATIC) != SQLITE_OK ||
+            (sqlite3_bind_parameter_count(stmt.get()) >= 2 &&
+             sqlite3_bind_text(stmt.get(), 2, to.data(), static_cast<int>(to.size()),
+                               SQLITE_STATIC) != SQLITE_OK)) {
+            spdlog::error("KvStore::rename_plugin bind failed: {}", sqlite3_errmsg(db_));
+            return false;
+        }
         if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
             spdlog::error("KvStore::rename_plugin step failed: {}", sqlite3_errmsg(db_));
             return false;

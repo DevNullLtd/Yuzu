@@ -100,12 +100,26 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         }
         session->scopable_tags[k] = v;
     }
+    // Upgrade-window shim, removed with the other legacy-name shims: an agent that has not
+    // upgraded still reports the pre-rename plugin name `tar`. Normalise it so every inventory
+    // consumer (presence gate, help catalogue) sees `echo`, and remember to write `tar` back on
+    // the wire (wire_for). An inventory advertising BOTH names is not a pre-rename agent (an
+    // upgraded agent rejects a stale tar plugin at load; an old agent has no echo): leave `tar`
+    // un-normalised and the session on the new wire name, so the real echo plugin still receives
+    // its commands instead of the retired binary.
+    bool advertises_tar = false;
+    bool advertises_echo = false;
     for (const auto& p : info.plugins()) {
-        // Upgrade-window shim, removed with the other legacy-name shims: an agent that has not
-        // upgraded still reports the pre-rename plugin name `tar`. Normalise it so every
-        // inventory consumer (presence gate, help catalogue) sees `echo`, and remember to write
-        // `tar` back on the wire (wire_for).
-        const bool legacy_name = p.name() == "tar";
+        advertises_tar = advertises_tar || p.name() == "tar";
+        advertises_echo = advertises_echo || p.name() == "echo";
+    }
+    if (advertises_tar && advertises_echo) {
+        spdlog::warn("AgentRegistry::register_agent({}): inventory advertises both 'tar' and "
+                     "'echo' - not treating the session as a pre-rename agent",
+                     safe_agent_id);
+    }
+    for (const auto& p : info.plugins()) {
+        const bool legacy_name = p.name() == "tar" && !advertises_echo;
         if (legacy_name)
             session->legacy_echo_wire_name = true;
         const std::string name = legacy_name ? std::string{"echo"} : p.name();

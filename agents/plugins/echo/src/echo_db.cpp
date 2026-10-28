@@ -30,6 +30,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -621,7 +622,9 @@ std::expected<bool, std::string> table_exists(sqlite3* db, const char* name) {
         return std::unexpected(std::format("table lookup {}: {}", name, sqlite3_errmsg(db)));
     }
     StmtPtr stmt(raw);
-    sqlite3_bind_text(stmt.get(), 1, name, -1, SQLITE_STATIC);
+    // An unbound `?` is NULL and would read as "no such table" (the #559 class), so check it.
+    if (sqlite3_bind_text(stmt.get(), 1, name, -1, SQLITE_STATIC) != SQLITE_OK)
+        return std::unexpected(std::format("table lookup {}: bind: {}", name, sqlite3_errmsg(db)));
     const int rc = sqlite3_step(stmt.get());
     if (rc == SQLITE_ROW)
         return true;
@@ -703,8 +706,10 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // echo.db at boot, before any plugin initialises (adopt_legacy_echo_db). If echo.db is absent
     // and an unadopted tar.db sits beside it, creating a fresh echo.db here would boot the agent
     // with default config and re-enable operator-paused sources (the #559 class). Fail closed.
+    // A stat error on tar.db counts as present (`|| lec`): failing open here would create the
+    // fresh echo.db this check exists to prevent, the same way the echo.db stat above is guarded.
     if (std::error_code lec; !std::filesystem::exists(path, lec) && !lec &&
-                             std::filesystem::exists(path.parent_path() / "tar.db", lec)) {
+                             (std::filesystem::exists(path.parent_path() / "tar.db", lec) || lec)) {
         return std::unexpected(
             std::format("legacy tar.db present at {} and not adopted - refusing to initialise a "
                         "fresh echo.db beside it",

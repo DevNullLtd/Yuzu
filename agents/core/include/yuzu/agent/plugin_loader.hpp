@@ -74,6 +74,10 @@ inline constexpr std::size_t kMaxPluginNameLen = 64;
 /// bytes that would forge log lines / corrupt the error channel. See #822.
 inline constexpr std::string_view kInvalidNameReason = "invalid plugin name";
 
+/// Stable reason prefix recorded in LoadError::reason when a plugin is rejected because it
+/// declares the retired pre-rename name (see is_retired_plugin_name).
+inline constexpr std::string_view kRetiredNameReason = "retired plugin name";
+
 /// A second file in --plugin-dir declared a name already accepted in this scan;
 /// the first file the directory walk encountered keeps the name (filesystem
 /// order — two files declaring one name is an operator error, remove one), the
@@ -127,6 +131,18 @@ verify_plugin_signature(const std::filesystem::path& plugin_path,
         if (name == reserved) return true;
     }
     return false;
+}
+
+/// True if `name` is the pre-rename name of the Echo plugin (`tar`). Upgrade-window guard,
+/// removed with the other legacy-name shims: first-file-wins dedup is by declared NAME and `tar`
+/// differs from `echo`, so a stale tar.<ext> left beside echo.<ext> (an OTA that replaced only the
+/// binary, a --plugin-dir or tarball install, a failed installer delete) would otherwise load
+/// as a second plugin - and the server would relabel every Echo command to the retired binary.
+/// Deliberately NOT in kReservedPluginNames: that list is also the KV-namespace contract
+/// (guardian_lifecycle_journal.cpp, agent.cpp pin it), and `tar` is a namespace the agent
+/// re-keys to `echo`, not one it reserves.
+[[nodiscard]] constexpr bool is_retired_plugin_name(std::string_view name) noexcept {
+    return name == "tar";
 }
 
 /// True if `name` is a well-formed plugin identifier: non-empty, at most

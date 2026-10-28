@@ -152,7 +152,10 @@ const std::vector<pg::PgMigration>& migrations() {
         // (kill_switch_scope_key), so swapping the 3-character plugin prefix covers every form
         // (`tar`, `tar.<a>`, `tar@<os>`, `tar.<a>@<os>`) and keeps the UNIQUE scope_key identity.
         // Rows whose target already exists are left (the NOT EXISTS guards) rather than failing the
-        // migration. `secrets` is deliberately NOT touched: scope_key is the SecretCodec AAD, so
+        // migration. The guards are for idempotency only: no earlier build writes an `echo` row,
+        // and this step runs at construction before any seed, so a pre-existing `echo` row (which
+        // would leave the matching `tar` row un-migrated and inert) can only come from hand SQL.
+        // `secrets` is deliberately NOT touched: scope_key is the SecretCodec AAD, so
         // rewriting it would make every sealed value undecryptable (the echo plugin declares no
         // secret keys, so there is nothing to carry over). Idempotent.
         {4,
