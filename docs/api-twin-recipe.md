@@ -359,7 +359,14 @@ so the record is not a single point of truth: keep the two in step. (A confined 
    different cases; a tripwire, not a proof). A brand-new `mcp_tools_<domain>.cpp` also sets
    `MIN_REGISTRY_FILES` (an exact count) in `scripts/ci/check-api-parity.py` and `kRegistryDomainFiles`
    in `tests/unit/server/test_mcp_dispatch_coverage.cpp`, and a new `mcp_tool*.hpp` sets
-   `kToolHeaderFiles` there, in the same change.
+   `kToolHeaderFiles` there, in the same change. The seam-closure CI gate
+   (`scripts/ci/check-seam-closure.py`, "MCP registry lane") additionally include-closure-checks every
+   `mcp_tools_*.cpp`, the three shared `mcp_tool*.hpp` headers and the seven store-free `*_types.hpp`
+   headers against its store-header patterns, pins the file count (`MCP_REGISTRY_EXPECTED_TU_COUNT`, with
+   `EXPECTED_MCP_REGISTRY_TU_COUNT` and `EXPECTED_MCP_REGISTRY_CPPS` in its self-test — and
+   `MCP_REGISTRY_HEADERS` / `MCP_REGISTRY_TYPES_HEADERS` for a new shared or types header — which also
+   cross-checks the count against `MIN_REGISTRY_FILES` and `kRegistryDomainFiles`), and checks that each
+   `<domain>_tool_records()` accessor declared in `mcp_tool_registry.hpp` has its `mcp_tools_<domain>.cpp`.
 
 What rejects a mistake: building the catalogue (first done in the `ServerImpl` constructor, so it
 applies under `--mcp-disable` too) throws `std::logic_error` naming the record for a null handler, a
