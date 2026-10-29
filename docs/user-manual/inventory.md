@@ -153,9 +153,10 @@ cadences.
 
   **IBM MQ** is collected through the `middleware` plugin's `ibm_mq` action (Linux; `source`
   `middleware.ibm_mq`) with `kind` `app`, `ecosystem` `ibm_mq`, `name` `IBM MQ` and `publisher`
-  `IBM`, taken from the plugin's product table. `version` is the installation's version.
-  The install path and edition are shown by the `middleware` definition, not carried into
-  installed software. This is a metadata-only read with no subprocess: `mqinst.ini` and the
+  `IBM`, taken from the plugin's product table. `version` is VRM (version.release.modification,
+  for example `9.4.5`); the fix-pack level is not carried. The install path and edition
+  are shown by the `middleware` definition, not carried into installed software. This is a
+  metadata-only read with no subprocess: `mqinst.ini` and the
   swidtag file names, readable by an unprivileged agent. If the answer is `constrained` the
   collector withholds this source's rows for the cycle, logs a warning, and carries on with
   every other source, rather than failing the whole report. Because each cycle replaces the

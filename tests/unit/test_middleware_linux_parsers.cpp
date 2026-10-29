@@ -33,7 +33,7 @@
  * the leaf turns the symlinked mqinst.ini / swidtag rows red; a tokened per-item reason turns
  * check_run red; resetting the entries budget per listing turns the cross-installation budget case
  * red; a second RowByteBudget built from the raw limits turns the rows / row_bytes cases red, and
- * dropping the clamp in effective_budget turns the clamp case red; matching a component tag
+ * dropping the clamp in make_row_budget turns the clamp case red; matching a component tag
  * (IBM_MQ_Runtime-...) as the product turns the component-tags-only cases red. The chmod cases
  * SKIP at euid 0; the symlink, cap and oversize cases cover the same constrained paths there.
  */
@@ -438,7 +438,7 @@ TEST_CASE("middleware linux: production_config reads the network mounts and flag
 
 // == the budget ====================================================================================
 
-TEST_CASE("middleware linux: effective_budget is the injected limits clamped to the production ceilings",
+TEST_CASE("middleware linux: the leg's row budget is the injected limits clamped to the production ceilings",
           "[middleware][linux][caps]") {
     // The defaults ARE the ceilings (and the walk's own entries allowance), pinned by value.
     static_assert(lnx::WalkLimits{}.rows == mw::kMaxRows &&
@@ -450,7 +450,7 @@ TEST_CASE("middleware linux: effective_budget is the injected limits clamped to 
     lnx::WalkLimits above;
     above.rows = 100000;
     above.row_bytes = (std::numeric_limits<std::size_t>::max)();
-    auto b = lnx::effective_budget(above);
+    auto b = mw::make_row_budget(above.rows, above.row_bytes);
     CHECK(b.max_rows == mw::kMaxRows); // a test (or a config) can lower a cap, never raise one
     CHECK(b.max_bytes == mw::kMaxRowBytes);
     CHECK(b.rows == 0);
@@ -459,11 +459,12 @@ TEST_CASE("middleware linux: effective_budget is the injected limits clamped to 
     lnx::WalkLimits below;
     below.rows = 2;
     below.row_bytes = 10;
-    b = lnx::effective_budget(below);
+    b = mw::make_row_budget(below.rows, below.row_bytes);
     CHECK(b.max_rows == 2);
     CHECK(b.max_bytes == 10);
 
-    const auto def = lnx::effective_budget(lnx::WalkLimits{});
+    const lnx::WalkLimits defaults;
+    const auto def = mw::make_row_budget(defaults.rows, defaults.row_bytes);
     CHECK(def.max_rows == mw::kMaxRows);
     CHECK(def.max_bytes == mw::kMaxRowBytes);
 }
@@ -678,9 +679,8 @@ TEST_CASE("middleware linux: list_regular reports an entry it cannot examine as 
     const auto list = [&] {
         auto d = lnx::open_root((dir.path / "d").string());
         REQUIRE(d.out == lnx::Outcome::ok);
-        lnx::ConstraintAccumulator acc;
         lnx::WalkBudget budget{lnx::WalkLimits{}};
-        return lnx::list_regular(d.dir.get(), acc, budget, mw::kMaxDirEntries);
+        return lnx::list_regular(d.dir.get(), budget, mw::kMaxDirEntries);
     };
 
     ::chmod((dir.path / "d").c_str(), 0555); // control: readable and searchable

@@ -610,7 +610,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
     SyncSource src;
     src.name = "installed_software";
     src.interval = std::chrono::hours{24};
-    // A retry re-runs at most the six table actions in-process (no fan-out); the backoff
+    // A retry re-runs at most one call per table action in-process (no fan-out); the backoff
     // caps that at four extra runs per outage.
     src.skip_backoff = true;
     auto last_reason = std::make_shared<std::string>();

@@ -444,6 +444,20 @@ VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
 > cycle, like `pkg_inventory.packages`. The same product also appears as an
 > `installed_apps` `app`/`windows` row; the two are not de-duplicated.
 
+> **Update (2026-10-29):** `middleware.ibm_mq` is collected as ecosystem `ibm_mq`,
+> kind `app`. Name, publisher and kind come from the `middleware` plugin's product
+> table, never from the row; `version` is VRM (version.release.modification), the
+> fix-pack level not being visible in the installer metadata the agent reads.
+> The collector row sets `ConstrainedPolicy::drop_source`, a per-row policy and the
+> exception to the norm above that a source which cannot answer skips the cycle: a
+> `constrained` answer contributes zero rows and the cycle continues with every
+> other source. Because the cycle's aggregate replaces the agent's stored
+> inventory, that source's stored rows are removed server-side by the replace until
+> it answers again, and the server sees no signal (`skip_reason` stays empty; the
+> agent logs one warn line). The policy exists for a steady-state constraint that
+> is a permission fact, where skipping the cycle would freeze every other source
+> for ever.
+
 Mechanics:
 
 - The fields ride **inside** the `plugin_data["installed_software"]` blob — no

@@ -69,7 +69,7 @@ public:
 
     const char* const* actions() const noexcept override {
         // Literal because tests/test_capability_catalogue_complete.py reads this body from source;
-        // the static_asserts below the class pin it to the product table.
+        // the static_assert above the class pins it to the product table.
         static const char* const acts[] = {"ibm_mq", nullptr};
         return acts;
     }

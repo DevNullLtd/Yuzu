@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test_middleware_definition.py -- ties the C++ row-format contract
 (`<id>|<title>|<name>|<version>|<install_path>|<edition>`, six fields, formatted by the
-middleware parsers in agents/shared/middleware_parsers.hpp) to the definition YAML that
+middleware parsers in agents/plugins/middleware/src/middleware_parsers.hpp) to the definition YAML that
 actually ships it, so a reordered or renamed result column fails here rather than only in a
 dashboard.
 

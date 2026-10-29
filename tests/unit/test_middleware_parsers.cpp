@@ -207,9 +207,9 @@ struct FakeFs {
     std::map<std::string, mw::Read> files;     // abs path -> scripted read
     std::map<std::string, mw::Listing> dirs;   // "<base>|<subdir>" -> scripted listing
     std::size_t exhaust_after = SIZE_MAX;      // exhausted() once this many listings were made
+    std::size_t dir_cap = mw::kMaxDirEntries;  // the Fs's own per-listing cap (WalkLimits::dir_entries)
     std::vector<std::pair<std::string, std::size_t>> read_calls; // (path, cap)
     std::vector<std::string> list_calls;                         // "<base>|<subdir>"
-    std::vector<std::size_t> list_caps;
 
     void put_file(const std::string& path, std::string text) {
         files[path] = mw::Read{mw::Read::Outcome::ok, std::move(text)};
@@ -233,16 +233,15 @@ struct FakeFs {
             return mw::Read{mw::Read::Outcome::oversized, {}};
         return it->second;
     }
-    mw::Listing list_under(std::string_view base, std::string_view subdir, std::size_t cap) {
+    mw::Listing list_under(std::string_view base, std::string_view subdir) {
         const std::string key = std::string{base} + "|" + std::string{subdir};
         list_calls.push_back(key);
-        list_caps.push_back(cap);
         const auto it = dirs.find(key);
         if (it == dirs.end())
             return mw::Listing{{}, false, false, mw::Read::Outcome::absent};
         mw::Listing l = it->second;
-        if (l.names.size() > cap) {
-            l.names.resize(cap);
+        if (l.names.size() > dir_cap) {
+            l.names.resize(dir_cap);
             l.truncated = true;
         }
         return l;
@@ -348,11 +347,6 @@ constexpr std::array<Probe, 2> kProbesBadId = [] {
     a[1].id = "Swid-Tag";
     return a;
 }();
-constexpr std::array<Probe, 2> kProbesBadForm = [] {
-    std::array<Probe, 2> a{{mw::kIbmMqLinuxProbes[0], mw::kIbmMqLinuxProbes[1]}};
-    a[1].name_form = static_cast<mw::NameForm>(7);
-    return a;
-}();
 
 constexpr std::array<Product, 1> kGoodControl{
     {mutated([](Product& p) { p.linux.support = YUZU_SUPPORT_CONSTRAINED; })}};
@@ -387,21 +381,20 @@ constexpr std::array<Product, 1> kBadRelative{
     {mutated([](Product& p) { p.linux.probes = kProbesRelative; })}};
 constexpr std::array<Product, 1> kBadDupId{{mutated([](Product& p) { p.linux.probes = kProbesDupId; })}};
 constexpr std::array<Product, 1> kBadProbeId{{mutated([](Product& p) { p.linux.probes = kProbesBadId; })}};
-constexpr std::array<Product, 1> kBadForm{{mutated([](Product& p) { p.linux.probes = kProbesBadForm; })}};
 
-// -- a second, test-only table: kv_file with no stanza header and a version key ---------------------
+// -- a second, test-only table: its own stanza header, keys, sub-directory and tag name ------------
 
-constexpr std::array<Probe, 2> kKvVersionProbes{{
-    {"inst", mw::ProbeKind::kv_file, "/etc/acme.conf", nullptr, "Name", "Path", "Version", nullptr,
-     nullptr, mw::NameForm::exact},
-    {"tags", mw::ProbeKind::dir_name, "tags", nullptr, nullptr, nullptr, nullptr, "acme", ".tag",
+constexpr std::array<Probe, 2> kAcmeProbes{{
+    {"inst", mw::ProbeKind::kv_file, "/etc/acme.conf", "Instance:", "Name", "Path", nullptr, nullptr,
+     mw::NameForm::exact},
+    {"tags", mw::ProbeKind::dir_name, "tags", nullptr, nullptr, nullptr, "acme", ".tag",
      mw::NameForm::exact},
 }};
 constexpr std::array<Product, 1> kAcme{{mutated([](Product& p) {
     p.id = "acme";
     p.title = "Acme";
     p.ecosystem = "acme";
-    p.linux.probes = kKvVersionProbes;
+    p.linux.probes = kAcmeProbes;
 })}};
 static_assert(mw::products_well_formed(std::span<const Product>{kAcme}));
 
@@ -421,7 +414,7 @@ TEST_CASE("middleware products: the table is well-formed and find_product reads 
     CHECK(std::string_view{p->ecosystem} == "ibm_mq");
     CHECK(std::string_view{p->kind} == "app");
     CHECK(p->linux.support == YUZU_SUPPORT_SUPPORTED);
-    CHECK(p->linux.probes.size() == 4);
+    CHECK(p->linux.probes.size() == 3);
     CHECK(p->windows.support == YUZU_SUPPORT_PLANNED);
     CHECK(p->windows.probes.empty());
     CHECK(p->windows.note != nullptr);
@@ -433,9 +426,8 @@ TEST_CASE("middleware products: the table is well-formed and find_product reads 
     CHECK(probes[0].kind == mw::ProbeKind::kv_file);
     CHECK(std::string_view{probes[0].stanza} == "Installation:");
     CHECK(std::string_view{probes[1].id} == "swidtag");
-    CHECK(std::string_view{probes[2].id} == "swidtag_websphere");
-    CHECK(std::string_view{probes[3].id} == "mqtag");
-    CHECK(probes[3].name_form == mw::NameForm::exact);
+    CHECK(std::string_view{probes[2].id} == "mqtag");
+    CHECK(probes[2].name_form == mw::NameForm::exact);
 }
 
 TEST_CASE("middleware products: the same consteval check refuses a broken table", "[middleware]") {
@@ -467,12 +459,11 @@ TEST_CASE("middleware products: the same consteval check refuses a broken table"
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadNoKey}));
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRelative}));
     }
-    SECTION("probes[1..] must be dir_name probes with a single-component path and a real grammar") {
+    SECTION("probes[1..] must be dir_name probes with a single-component path and a name pattern") {
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadKvSecond}));
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadSlash}));
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadDotDot}));
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadEmptySuffix}));
-        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadForm}));
     }
     SECTION("probe ids are [a-z0-9_]+ and unique within the leg") {
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadDupId}));
@@ -495,7 +486,6 @@ TEST_CASE("middleware parsers: parse_kv_stanzas reads the REAL registered-instal
     mw::ParseReport rep;
     const auto st = mw::parse_kv_stanzas(raw, "Installation:", rep);
     REQUIRE(st.size() == 1);
-    CHECK(rep.seen == 1);
     CHECK(rep.dropped == 0);
     CHECK_FALSE(rep.truncated);
     CHECK_FALSE(rep.malformed);
@@ -513,7 +503,6 @@ TEST_CASE("middleware parsers: parse_kv_stanzas reads two installations as two s
     mw::ParseReport rep;
     const auto st = mw::parse_kv_stanzas(kTwoInstallationsInline, "Installation:", rep);
     REQUIRE(st.size() == 2);
-    CHECK(rep.seen == 2);
     CHECK(rep.dropped == 0);
     CHECK_FALSE(rep.truncated);
     CHECK_FALSE(rep.malformed);
@@ -627,36 +616,13 @@ TEST_CASE("middleware parsers: parse_kv_stanzas caps rows and bytes", "[middlewa
     }
 }
 
-TEST_CASE("middleware parsers: parse_kv_stanzas with no header makes the whole text one stanza",
-          "[middleware]") {
-    mw::ParseReport rep;
-    SECTION("oraInst.loc-shaped text") {
-        const auto st = mw::parse_kv_stanzas(
-            "inventory_loc=/opt/oracle/oraInventory\ninst_group=oinstall\n", nullptr, rep);
-        REQUIRE(st.size() == 1);
-        CHECK(*st[0].get("inventory_loc") == "/opt/oracle/oraInventory");
-        CHECK(*st[0].get("inst_group") == "oinstall");
-        CHECK_FALSE(rep.malformed);
-    }
-    SECTION("a repeated key stays in the one stanza, first wins") {
-        const auto st = mw::parse_kv_stanzas("k=/a\nk=/b\n", nullptr, rep);
-        REQUIRE(st.size() == 1);
-        CHECK(*st[0].get("k") == "/a");
-    }
-    SECTION("content without a single key=value is one empty stanza; no content is none") {
-        CHECK(mw::parse_kv_stanzas("garbage\n", nullptr, rep).size() == 1);
-        CHECK(mw::parse_kv_stanzas("# nothing\n", nullptr, rep).empty());
-    }
-}
-
 // =================================================================================================
 // version_from_file_name
 // =================================================================================================
 
 namespace {
 const mw::Probe& kSwid = mw::kIbmMqLinuxProbes[1];
-const mw::Probe& kWebSphere = mw::kIbmMqLinuxProbes[2];
-const mw::Probe& kMqtag = mw::kIbmMqLinuxProbes[3];
+const mw::Probe& kMqtag = mw::kIbmMqLinuxProbes[2];
 
 std::optional<std::string> ver(const mw::Probe& p, std::string_view name) {
     return mw::version_from_file_name(name, p.name_prefix, p.name_suffix, p.name_form);
@@ -678,7 +644,6 @@ TEST_CASE("middleware parsers: swidtag file names of the REAL listing yield thei
         CHECK(swid[0] == "ibm.com_IBM_MQ_Advanced_for_Developers_Non-Warranted-" +
                              std::string{expected} + ".swidtag");
         CHECK(ver(kSwid, swid[0]) == std::string{expected});
-        CHECK_FALSE(ver(kWebSphere, swid[0]).has_value());
         CHECK_FALSE(ver(kMqtag, swid[0]).has_value());
     }
 }
@@ -724,11 +689,9 @@ TEST_CASE("middleware parsers: only IBM_MQ-<v>.mqtag names the product (R1)", "[
             REQUIRE(std::find(mqtags.begin(), mqtags.end(), component) != mqtags.end());
             CHECK_FALSE(ver(kMqtag, component).has_value());
         }
-        // the swidtag grammars do not see .mqtag names at all
-        for (const auto& n : mqtags) {
+        // the swidtag grammar does not see .mqtag names at all
+        for (const auto& n : mqtags)
             CHECK_FALSE(ver(kSwid, n).has_value());
-            CHECK_FALSE(ver(kWebSphere, n).has_value());
-        }
     }
 }
 
@@ -737,12 +700,12 @@ TEST_CASE("middleware parsers: version_from_file_name accepts and rejects", "[mi
         CHECK(ver(kSwid, "ibm.com_IBM_MQ-9.2.5.swidtag") == std::string{"9.2.5"});
         CHECK(ver(kSwid, "ibm.com_IBM_MQ-9.3.5.1.swidtag") == std::string{"9.3.5.1"});
         CHECK(ver(kSwid, "ibm.com_IBM_MQ_Advanced-9.2.5.swidtag") == std::string{"9.2.5"});
-        CHECK(ver(kWebSphere, "ibm.com_IBM_WebSphere_MQ-8.0.0.swidtag") == std::string{"8.0.0"});
-        CHECK_FALSE(ver(kSwid, "ibm.com_IBM_WebSphere_MQ-8.0.0.swidtag").has_value());
     }
     SECTION("not the product: whole-token prefix, other vendor products, empty or odd versions") {
+        // the WebSphere spelling is here because no capture names the product that way
         for (const char* n :
              {"ibm.com_IBM_MQSeries-1.0.swidtag", "ibm.com_IBM_Db2-11.5.swidtag",
+              "ibm.com_IBM_WebSphere_MQ-8.0.0.swidtag",
               "ibm.com_IBM_MQ_Advanced-.swidtag", "ibm.com_IBM_MQ-.swidtag", "ibm.com_IBM_MQ.swidtag",
               "ibm.com_IBM_MQ-9.swidtag", "ibm.com_IBM_MQ-9.2.x.swidtag",
               "ibm.com_IBM_MQ-9.2.5.1.1.swidtag", "ibm.com_IBM_MQ-.5.swidtag",
@@ -795,13 +758,10 @@ TEST_CASE("middleware parsers: tokens carry only enumeration causes", "[middlewa
     }
     CHECK(mw::make_token("windows", "walk", mw::Cause::row_cap) == "windows:middleware:walk:row_cap");
 
-    const std::array<std::pair<mw::ItemReason, std::string_view>, 6> reasons{{
+    const std::array<std::pair<mw::ItemReason, std::string_view>, 3> reasons{{
         {mw::ItemReason::path_refused, "path_refused"},
         {mw::ItemReason::missing, "missing"},
         {mw::ItemReason::unreadable, "unreadable"},
-        {mw::ItemReason::oversized, "oversized"},
-        {mw::ItemReason::malformed, "malformed"},
-        {mw::ItemReason::network_fs_skipped, "network_fs_skipped"},
     }};
     for (const auto& [r, name] : reasons)
         CHECK(mw::item_reason_name(r) == name);
@@ -996,23 +956,16 @@ TEST_CASE("middleware runner: one candidate per stanza, versions from the REAL l
     CHECK(r.rows[1] == "ibm_mq|IBM MQ|Installation1|9.2.5|/opt/mqm|-");
     CHECK(r.rows[2] == "ibm_mq|IBM MQ|Installation2|10.0.1|/opt/mqm2|-");
     CHECK(r.events.empty());
-    // the three dir probes share one subdirectory: listed ONCE per candidate, with the dir cap
+    // the two dir probes share one subdirectory: listed ONCE per candidate
     CHECK(fs.list_calls == std::vector<std::string>{"/opt/mqm|swidtag", "/opt/mqm2|swidtag"});
-    CHECK(fs.list_caps == std::vector<std::size_t>{mw::kMaxDirEntries, mw::kMaxDirEntries});
 }
 
-TEST_CASE("middleware runner: the probe fallback order is swidtag, websphere swidtag, mqtag",
-          "[middleware]") {
+TEST_CASE("middleware runner: the probe fallback order is swidtag, then mqtag", "[middleware]") {
     FakeFs fs;
     fs.put_file(kIni, ini_of({{"I1", "/opt/mqm"}}));
-    SECTION("swidtag beats everything") {
-        fs.put_names("/opt/mqm", {"IBM_MQ-1.1.1.mqtag", "ibm.com_IBM_MQ-9.9.9.swidtag",
-                                  "ibm.com_IBM_WebSphere_MQ-7.5.0.swidtag"});
+    SECTION("swidtag beats the mqtag") {
+        fs.put_names("/opt/mqm", {"IBM_MQ-1.1.1.mqtag", "ibm.com_IBM_MQ-9.9.9.swidtag"});
         CHECK(run(fs).rows[1] == "ibm_mq|IBM MQ|I1|9.9.9|/opt/mqm|-");
-    }
-    SECTION("the WebSphere swidtag beats the mqtag") {
-        fs.put_names("/opt/mqm", {"IBM_MQ-1.1.1.mqtag", "ibm.com_IBM_WebSphere_MQ-7.5.0.swidtag"});
-        CHECK(run(fs).rows[1] == "ibm_mq|IBM MQ|I1|7.5.0|/opt/mqm|-");
     }
     SECTION("only IBM_MQ-<v>.mqtag present (beside its component tags): the mqtag version") {
         fs.put_names("/opt/mqm", {"IBM_MQ_GSKit-8.0.55.mqtag", "IBM_MQ-9.1.5.mqtag",
@@ -1186,7 +1139,7 @@ TEST_CASE("middleware runner: the caller-built budget and the Fs budget end in w
 // run_leg over a second, test-only table (the runner is generic)
 // =================================================================================================
 
-TEST_CASE("middleware runner: a whole-file stanza and a version key come from the table", "[middleware]") {
+TEST_CASE("middleware runner: a second product's table drives the same runner", "[middleware]") {
     const mw::Product& acme = kAcme[0];
     yuzu::shared::ConstraintAccumulator acc;
     auto budget = mw::make_row_budget();
@@ -1197,33 +1150,20 @@ TEST_CASE("middleware runner: a whole-file stanza and a version key come from th
     };
     FakeFs fs;
 
-    SECTION("the version key supplies the version: no directory is listed") {
-        fs.put_file("/etc/acme.conf", "Name=Acme One\nPath=/opt/acme\nVersion=3.4.5\n");
-        const auto rows = mw::run_leg(acme, acme.linux, fs, acc, budget, log);
-        CHECK(rows == std::vector<std::string>{"acme|Acme|Acme One|3.4.5|/opt/acme|-"});
-        CHECK(fs.list_calls.empty());
-        CHECK_FALSE(acc.any_failure());
-    }
-    SECTION("no version key value: the dir_name probe supplies it") {
-        fs.put_file("/etc/acme.conf", "Name=Acme One\nPath=/opt/acme\n");
+    SECTION("the table's own header, keys and sub-directory: the dir_name probe supplies the version") {
+        fs.put_file("/etc/acme.conf", "Instance:\nName=Acme One\nPath=/opt/acme\n");
         fs.put_dir("/opt/acme", "tags", mw::Listing{{"acme-1.2.3.tag", "acme_x-9.9.tag"}, false, false,
                                                     mw::Read::Outcome::ok});
         const auto rows = mw::run_leg(acme, acme.linux, fs, acc, budget, log);
         CHECK(rows == std::vector<std::string>{"acme|Acme|Acme One|1.2.3|/opt/acme|-"});
         CHECK(fs.list_calls == std::vector<std::string>{"/opt/acme|tags"});
+        CHECK_FALSE(acc.any_failure());
     }
     SECTION("a PLANNED leg reads nothing") {
         const auto rows = mw::run_leg(acme, acme.windows, fs, acc, budget, log);
         CHECK(rows.empty());
         CHECK(fs.read_calls.empty());
         CHECK_FALSE(acc.any_failure());
-    }
-    SECTION("an unvalidated table whose enumerator is not a kv_file is an internal_error token") {
-        const Product bad = mutated([](Product& p) { p.linux.probes = kProbesDirFirst; });
-        const auto rows = mw::run_leg(bad, bad.linux, fs, acc, budget, log);
-        CHECK(rows.empty());
-        CHECK(acc.reason() == "linux:middleware:swidtag:internal_error");
-        CHECK(fs.read_calls.empty());
     }
 }
 

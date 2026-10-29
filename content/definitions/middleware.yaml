@@ -78,7 +78,7 @@ spec:
         platforms: [linux]
       - name: version
         type: string
-        description: 'Installation version taken from the product tag file name (ibm.com_IBM_MQ*-<v>.swidtag, else IBM_MQ-<v>.mqtag; component tags such as GSKit or Runtime never name the product), or "-" when it cannot be read. Status rows: the comma-joined failure tokens, or -.'
+        description: 'Installation version taken from the product tag file name (ibm.com_IBM_MQ*-<v>.swidtag, else IBM_MQ-<v>.mqtag; component tags such as GSKit or Runtime never name the product), or "-" when it cannot be read. VRM (version.release.modification): the fix-pack level is not carried, so a fix pack 9.3.5.1 reports 9.3.5. Status rows: the comma-joined failure tokens, or -.'
         example: 9.4.5
         platforms: [linux]
       - name: install_path

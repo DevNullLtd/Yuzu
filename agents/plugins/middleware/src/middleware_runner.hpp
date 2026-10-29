@@ -13,9 +13,10 @@
  *
  *   Read    read_abs(std::string_view abs_path, std::size_t cap)
  *               the file's text, or why not. A file larger than `cap` is Outcome::oversized.
- *   Listing list_under(std::string_view base_abs_path, std::string_view subdir, std::size_t cap)
+ *   Listing list_under(std::string_view base_abs_path, std::string_view subdir)
  *               the file NAMES of `<base>/<subdir>`: `error` = the listing is unreliable, `truncated`
- *               = it was cut at `cap` entries or by the Fs budget; `out` carries a refusal.
+ *               = it was cut at the Fs's own per-directory cap or by its entries budget; `out`
+ *               carries a refusal.
  *   bool    exhausted() const        the Fs's entries-visited budget ran dry
  *   std::string_view os() const      "linux" | "windows" | "macos", the first token field
  *
@@ -60,11 +61,12 @@
 
 namespace yuzu::middleware {
 
-/// The most file names one swidtag-style listing may return before it is `truncated`.
+/// The production default of the most file names one swidtag-style listing may return before it is
+/// `truncated` (the Fs enforces it; a leg's WalkLimits can lower it).
 inline constexpr std::size_t kMaxDirEntries = 1024;
 
 struct Candidate {
-    std::string name, install_path, version, title;
+    std::string name, install_path, version;
 };
 
 struct Read {
@@ -83,7 +85,7 @@ struct Listing {
 template <class F>
 concept MiddlewareFs = requires(F& fs, const F& cfs) {
     { fs.read_abs(std::string_view{}, std::size_t{}) } -> std::same_as<Read>;
-    { fs.list_under(std::string_view{}, std::string_view{}, std::size_t{}) } -> std::same_as<Listing>;
+    { fs.list_under(std::string_view{}, std::string_view{}) } -> std::same_as<Listing>;
     { cfs.exhausted() } -> std::convertible_to<bool>;
     { cfs.os() } -> std::convertible_to<std::string_view>;
 };
@@ -146,11 +148,7 @@ template <MiddlewareFs Fs, class Log>
     };
 
     // 1. the enumerator: every stanza of probes[0] is a candidate.
-    const Probe& enumerator = leg.probes[0];
-    if (enumerator.kind != ProbeKind::kv_file) { // products_well_formed() rules this out
-        fail(enumerator.id, Cause::internal_error);
-        return rows;
-    }
+    const Probe& enumerator = leg.probes[0]; // products_well_formed() guarantees a kv_file
     Read file = fs.read_abs(enumerator.path, kMaxKvFileBytes);
     if (file.out == Read::Outcome::absent)
         return rows; // no such file: none found, and not a failure
@@ -172,9 +170,7 @@ template <MiddlewareFs Fs, class Log>
             ++report.dropped; // the stanza is dropped, its siblings are kept
             continue;
         }
-        const std::string* version =
-            enumerator.version_key != nullptr ? s.get(enumerator.version_key) : nullptr;
-        candidates.push_back({*name, *path, version != nullptr ? *version : std::string{}, p.title});
+        candidates.push_back({*name, *path, std::string{}});
     }
     if (report.dropped > 0)
         fail(enumerator.id, Cause::malformed);
@@ -195,7 +191,7 @@ template <MiddlewareFs Fs, class Log>
                 return m.subdir == pr.path;
             });
             if (it == memo.end()) {
-                Listing l = fs.list_under(c.install_path, pr.path, kMaxDirEntries);
+                Listing l = fs.list_under(c.install_path, pr.path);
                 memo.push_back({pr.path, {}, false});
                 it = std::prev(memo.end());
                 if (detail::path_refused(l.out))
@@ -227,7 +223,7 @@ template <MiddlewareFs Fs, class Log>
             note(*last, ItemReason::missing);
 
         // 3. the row.
-        std::string row = format_row(p.id, c.title, c.name, c.version, c.install_path, "");
+        std::string row = format_row(p.id, p.title, c.name, c.version, c.install_path, "");
         if (!budget.charge(row.size())) {
             fail("walk", Cause::row_cap);
             return rows;

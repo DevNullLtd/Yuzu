@@ -27,9 +27,7 @@
  *   ItemReason  per-item shortfalls (one installation's version unknown, one path refused). They go
  *               to the leg's LOG and degrade that one row's fields; they never constrain the whole
  *               host. make_token has no ItemReason overload, so a per-item reason cannot reach the
- *               accumulator by construction. The two enums share some spellings (malformed,
- *               unreadable, oversized, network_fs_skipped) because they name the same fact at two
- *               scopes; they never share a channel.
+ *               accumulator by construction.
  *
  * BOUNDS. A parser fed more than its byte cap parses NOTHING and reports `truncated` (no partial
  * data from a clipped read); a list past its row cap is cut with `truncated` set, and a cap-sized
@@ -68,12 +66,10 @@ inline constexpr std::size_t kMaxRowBytes = 1024 * 1024;
 // -- shared result shape ------------------------------------------------------------------------
 
 /// What a parser saw, so the caller can choose a status token without re-reading the text.
-///  seen       items examined (stanzas)
-///  dropped    seen items unusable (missing a required key); the CALLER counts these, siblings are kept
+///  dropped    stanzas unusable (missing a required key); the CALLER counts these, siblings are kept
 ///  truncated  the row cap or the byte cap cut the result (see BOUNDS)
 ///  malformed  structurally broken input (content but no stanza line at all)
 struct ParseReport {
-    std::size_t seen = 0;
     std::size_t dropped = 0;
     bool truncated = false;
     bool malformed = false;
@@ -91,14 +87,6 @@ template <class Fn> void for_each_line(std::string_view text, Fn&& fn) {
         fn(text.substr(pos, nl - pos));
         pos = nl + 1;
     }
-}
-
-[[nodiscard]] inline bool starts_with(std::string_view s, std::string_view p) noexcept {
-    return s.size() >= p.size() && s.substr(0, p.size()) == p;
-}
-
-[[nodiscard]] inline bool ends_with(std::string_view s, std::string_view p) noexcept {
-    return s.size() >= p.size() && s.substr(s.size() - p.size()) == p;
 }
 
 } // namespace detail
@@ -120,26 +108,23 @@ struct KvStanza {
 /// Splits `text` into stanzas of `key=value` lines (keys and values trimmed by ini_trim; blank lines
 /// and `#` / `;` comment lines skipped; CRLF tolerated).
 ///
-///  stanza != nullptr  a line equal to `stanza` (after trimming) opens a NEW stanza -- never merged
-///                     with an earlier one, which is why the shared INI model in ini_parse.hpp
-///                     (it merges a re-opened section) is not used. Any other `Word:` line (ends
-///                     in ':', no '=') closes the current stanza and opens none. A `key=value`
-///                     line outside a stanza is ignored. Text with content but no stanza line
-///                     sets `malformed`.
-///  stanza == nullptr  the whole text is ONE stanza, kept when the text has any content line.
+/// A line equal to `stanza` (after trimming) opens a NEW stanza -- never merged with an earlier one,
+/// which is why the shared INI model in ini_parse.hpp (it merges a re-opened section) is not used.
+/// Any other `Word:` line (ends in ':', no '=') closes the current stanza and opens none. A
+/// `key=value` line outside a stanza is ignored. Text with content but no stanza line sets
+/// `malformed`.
 ///
 /// A stanza is kept even when empty: the caller drops candidates lacking the keys it needs and
 /// counts them. Exactly kMaxRows stanzas complete; one more sets `truncated` and stops. Text over
 /// kMaxKvFileBytes parses nothing and sets `truncated`.
 [[nodiscard]] inline std::vector<KvStanza> parse_kv_stanzas(std::string_view text,
-                                                            const char* stanza,
+                                                            std::string_view stanza,
                                                             ParseReport& report) {
     std::vector<KvStanza> out;
     if (text.size() > kMaxKvFileBytes) {
         report.truncated = true;
         return out;
     }
-    const std::string_view header = stanza != nullptr ? std::string_view{stanza} : std::string_view{};
     bool any_content = false;
     bool saw_stanza = false;
     bool in_stanza = false;
@@ -152,13 +137,7 @@ struct KvStanza {
             return;
         any_content = true;
         const auto eq = line.find('=');
-        if (stanza == nullptr) { // whole text is one stanza
-            if (out.empty()) {
-                out.emplace_back();
-                ++report.seen;
-            }
-            in_stanza = true;
-        } else if (line == header) {
+        if (line == stanza) {
             saw_stanza = true;
             if (out.size() >= kMaxRows) {
                 report.truncated = true;
@@ -166,10 +145,10 @@ struct KvStanza {
                 return;
             }
             out.emplace_back();
-            ++report.seen;
             in_stanza = true;
             return;
-        } else if (eq == std::string::npos && line.back() == ':') {
+        }
+        if (eq == std::string::npos && line.back() == ':') {
             in_stanza = false;
             return;
         }
@@ -181,7 +160,7 @@ struct KvStanza {
         out.back().kv.emplace_back(std::move(key),
                                    yuzu::shared::ini_trim(std::string_view{line}.substr(eq + 1)));
     });
-    if (stanza != nullptr && any_content && !saw_stanza)
+    if (any_content && !saw_stanza)
         report.malformed = true;
     return out;
 }
@@ -215,8 +194,8 @@ struct KvStanza {
 [[nodiscard]] inline std::optional<std::string>
 version_from_file_name(std::string_view name, std::string_view prefix, std::string_view suffix,
                        NameForm form) {
-    if (name.size() <= prefix.size() + suffix.size() || !detail::starts_with(name, prefix) ||
-        !detail::ends_with(name, suffix))
+    if (name.size() <= prefix.size() + suffix.size() || !name.starts_with(prefix) ||
+        !name.ends_with(suffix))
         return std::nullopt;
     const std::string_view rest =
         name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
@@ -280,19 +259,13 @@ enum class ItemReason {
     path_refused,
     missing,
     unreadable,
-    oversized,
-    malformed,
-    network_fs_skipped,
 };
 
 [[nodiscard]] constexpr std::string_view item_reason_name(ItemReason r) noexcept {
     switch (r) {
-    case ItemReason::path_refused:       return "path_refused";
-    case ItemReason::missing:            return "missing";
-    case ItemReason::unreadable:         return "unreadable";
-    case ItemReason::oversized:          return "oversized";
-    case ItemReason::malformed:          return "malformed";
-    case ItemReason::network_fs_skipped: return "network_fs_skipped";
+    case ItemReason::path_refused: return "path_refused";
+    case ItemReason::missing:      return "missing";
+    case ItemReason::unreadable:   return "unreadable";
     }
     return "unreadable";
 }

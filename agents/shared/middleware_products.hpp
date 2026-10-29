@@ -8,8 +8,8 @@
  * middleware_runner.hpp) reads a leg's probes in order:
  *
  *   probes[0]   the ENUMERATOR, a kv_file probe: one absolute file holding one stanza per
- *               installation; every stanza yields a candidate (name_key, path_key and, optionally,
- *               version_key).
+ *               installation (opened by a header line); every stanza yields a candidate (name_key,
+ *               path_key).
  *   probes[1..] dir_name probes: per candidate, list `<install_path>/<path>` and read the version out
  *               of a FILE NAME in it (no file content is read). The first probe whose grammar matches
  *               a name wins.
@@ -50,20 +50,16 @@ enum class NameForm : std::uint8_t {
     product_suffix,
 };
 
-/// Which native reader a leg needs beyond the file probes (a later PR adds values).
-enum class Provider : std::uint8_t { none };
-
 struct Probe {
     const char* id; ///< [a-z0-9_]+, unique within the leg; the `<source>` of this probe's status tokens
     ProbeKind kind;
     /// kv_file: the absolute file. dir_name: the sub-directory under a candidate's install path
     /// (a single component, no separator).
     const char* path;
-    /// kv_file: the exact header line that opens a stanza, or nullptr = the whole file is one stanza.
+    /// kv_file: the exact header line that opens a stanza.
     const char* stanza;
     const char* name_key;    ///< kv_file: the key naming the installation
     const char* path_key;    ///< kv_file: the key holding its install path
-    const char* version_key; ///< kv_file: optional key holding its version, else nullptr
     const char* name_prefix; ///< dir_name: file-name prefix
     const char* name_suffix; ///< dir_name: file-name suffix
     NameForm name_form;      ///< dir_name: the grammar between prefix and suffix
@@ -74,7 +70,6 @@ struct OsLeg {
     const char* mechanism;    ///< what the leg reads, for the capability descriptor
     const char* note;         ///< capability note, or nullptr
     std::span<const Probe> probes; ///< empty exactly when support is PLANNED
-    Provider provider;
 };
 
 struct Product {
@@ -95,16 +90,16 @@ inline constexpr const char* kPlannedNote =
 /// IBM MQ on Linux: mqinst.ini names each registered installation; the product version is the file
 /// name of its swidtag (`ibm.com_IBM_MQ_<edition>-<v>.swidtag`) or, on installs that ship .mqtag
 /// files, `IBM_MQ-<v>.mqtag`. The component tags beside it (GSKit, JRE, ...) carry their own
-/// versions and are rejected by the `exact` grammar.
-inline constexpr std::array<Probe, 4> kIbmMqLinuxProbes{{
+/// versions and are rejected by the `exact` grammar. Every name is a captured one
+/// (tests/unit/fixtures/middleware/linux/swidtag.listing); the file name carries the
+/// version.release.modification level only, never a fix pack.
+inline constexpr std::array<Probe, 3> kIbmMqLinuxProbes{{
     {"mqinst_ini", ProbeKind::kv_file, "/etc/opt/mqm/mqinst.ini", "Installation:", "Name",
-     "FilePath", nullptr, nullptr, nullptr, NameForm::exact},
-    {"swidtag", ProbeKind::dir_name, "swidtag", nullptr, nullptr, nullptr, nullptr,
-     "ibm.com_IBM_MQ", ".swidtag", NameForm::product_suffix},
-    {"swidtag_websphere", ProbeKind::dir_name, "swidtag", nullptr, nullptr, nullptr, nullptr,
-     "ibm.com_IBM_WebSphere_MQ", ".swidtag", NameForm::product_suffix},
-    {"mqtag", ProbeKind::dir_name, "swidtag", nullptr, nullptr, nullptr, nullptr, "IBM_MQ",
-     ".mqtag", NameForm::exact},
+     "FilePath", nullptr, nullptr, NameForm::exact},
+    {"swidtag", ProbeKind::dir_name, "swidtag", nullptr, nullptr, nullptr, "ibm.com_IBM_MQ",
+     ".swidtag", NameForm::product_suffix},
+    {"mqtag", ProbeKind::dir_name, "swidtag", nullptr, nullptr, nullptr, "IBM_MQ", ".mqtag",
+     NameForm::exact},
 }};
 
 inline constexpr std::array<Product, 1> kProducts{{
@@ -116,11 +111,11 @@ inline constexpr std::array<Product, 1> kProducts{{
      .linux = {YUZU_SUPPORT_SUPPORTED,
                "/etc/opt/mqm/mqinst.ini Installation: stanzas; version from the swidtag file name "
                "under each installation's FilePath; no dspmqver",
-               nullptr, kIbmMqLinuxProbes, Provider::none},
+               nullptr, kIbmMqLinuxProbes},
      .windows = {YUZU_SUPPORT_PLANNED,
                  "HKLM\\SOFTWARE\\IBM\\WebSphere MQ\\Installation\\<name> FilePath/VRMF in both "
                  "registry views",
-                 kPlannedNote, {}, Provider::none}},
+                 kPlannedNote, {}}},
 }};
 
 [[nodiscard]] constexpr const Product* find_product(std::string_view id) noexcept {
@@ -156,17 +151,14 @@ namespace detail {
 
 [[nodiscard]] constexpr bool enumerator_well_formed(const Probe& p) noexcept {
     return p.kind == ProbeKind::kv_file && !sv(p.path).empty() && sv(p.path).front() == '/' &&
-           !sv(p.name_key).empty() && !sv(p.path_key).empty() &&
-           (p.stanza == nullptr || !sv(p.stanza).empty()) &&
-           (p.version_key == nullptr || !sv(p.version_key).empty());
+           !sv(p.name_key).empty() && !sv(p.path_key).empty() && !sv(p.stanza).empty();
 }
 
 [[nodiscard]] constexpr bool dir_probe_well_formed(const Probe& p) noexcept {
     const std::string_view path = sv(p.path);
     return p.kind == ProbeKind::dir_name && !path.empty() && path != "." && path != ".." &&
            path.find('/') == std::string_view::npos && path.find('\\') == std::string_view::npos &&
-           !sv(p.name_prefix).empty() && !sv(p.name_suffix).empty() &&
-           (p.name_form == NameForm::exact || p.name_form == NameForm::product_suffix);
+           !sv(p.name_prefix).empty() && !sv(p.name_suffix).empty();
 }
 
 [[nodiscard]] constexpr bool leg_well_formed(const OsLeg& leg) noexcept {
@@ -175,7 +167,7 @@ namespace detail {
         return false;
     if ((leg.support == YUZU_SUPPORT_PLANNED) != leg.probes.empty())
         return false;
-    if (sv(leg.mechanism).empty() || leg.provider != Provider::none)
+    if (sv(leg.mechanism).empty())
         return false;
     for (std::size_t i = 0; i < leg.probes.size(); ++i) {
         const Probe& p = leg.probes[i];
