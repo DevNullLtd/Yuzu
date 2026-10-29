@@ -2879,11 +2879,43 @@ void SettingsRoutes::register_routes(
     // (built alongside this task); this fragment refreshes on the
     // `refreshEnginePrincipals` body event that REST mutation's `HX-Trigger`
     // response header fires, mirroring the API-tokens block's refresh
-    // pattern. Admin-only, same posture as /fragments/settings/tokens.
+    // pattern.
+    //
+    // Gated EXACTLY as its REST twin GET /api/v1/engine-principals (#5882):
+    // EnginePrincipal:Read, then the session, then the engine-session belt.
+    // The /settings page itself stays administrator-only, so with RBAC on this
+    // panel admits a non-administrator holding the grant (a Viewer) and refuses
+    // an account administrator without it; the page script says so rather than
+    // leave the panel on "Loading..." (htmx does not swap a 4xx body). The
+    // panel auto-loads, so the gate is the quiet probe: a refused interactive
+    // cookie session writes no auth.permission_required row, a token or engine
+    // caller keeps its row. The store-open check is the renderer's own: an
+    // absent store is an in-page note on a 200 (the twin answers 503), because
+    // htmx would not swap the note otherwise.
     sink.Get("/fragments/settings/engine-principals",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!admin_fn_(req, res))
+                 if (!read_perm(req, res, "EnginePrincipal", "Read"))
                      return;
+                 auto session = auth_fn_(req, res);
+                 if (!session)
+                     return;
+                 // G1 (§9 deny belt), as the twin: an engine-classed session must not
+                 // enumerate the engine principals. Keyed on the persisted principal_kind
+                 // first, auth_source second. An MCP tier is NOT denied here: the twin
+                 // admits an administrator's MCP token on its creator's authority.
+                 if (session->principal_kind == "engine" || session->auth_source == "engine_token") {
+                     // As the twin: a dropped denial row is carried by Sec-Audit-Failed, the
+                     // 403 stands.
+                     (void)detail::emit_behavioral_audit(audit_read_fn_, req, res,
+                                                         "engine_principal.list", "denied",
+                                                         "EnginePrincipal", "",
+                                                         "engine_session_denied");
+                     res.status = 403;
+                     res.set_content(
+                         detail::a4_error(res, "engine principals cannot access this endpoint"),
+                         "application/json");
+                     return;
+                 }
                  res.set_content(render_engine_principals_fragment(), "text/html; charset=utf-8");
              });
 

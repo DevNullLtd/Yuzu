@@ -53,6 +53,7 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using Catch::Matchers::ContainsSubstring;
 using namespace yuzu::server;
@@ -100,6 +101,7 @@ struct Rig {
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider;
     std::unique_ptr<AuthRoutes> ar;
+    std::vector<std::string> fragment_audits; // "action/result/detail" from the panel's own belt
     SettingsRoutes settings;
     RestApiV1 api;
     yuzu::server::test::TestRouteSink sink; // LAST: handlers capture `this`
@@ -124,6 +126,9 @@ struct Rig {
 
         ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, api_tokens.get(), &audit_store,
                                           &*mgmt_bundle, nullptr, nullptr, oidc_mu, oidc_provider);
+        // Without this an engine bearer never authenticates (401): the persona would pass the
+        // refusal checks vacuously instead of reaching the permission gate and the belt.
+        ar->set_engine_principal_store(&engine_store);
 
         // Exactly the bindings server.cpp makes for the panel and for the twin.
         auto auth_fn = [this](const httplib::Request& q, httplib::Response& r) {
@@ -154,12 +159,21 @@ struct Rig {
         });
         auto settings_audit = [](const httplib::Request&, const std::string&, const std::string&,
                                  const std::string&, const std::string&, const std::string&) {};
+        // The fail-closed audit hook server.cpp binds (the engine-session belt writes through it).
+        auto settings_audit_read = [this](const httplib::Request&, const std::string& action,
+                                          const std::string& result, const std::string&,
+                                          const std::string&, const std::string& detail) -> bool {
+            fragment_audits.push_back(action + "/" + result + "/" + detail);
+            return true;
+        };
         settings.register_routes(sink, auth_fn, admin_fn, perm_fn, settings_audit, cfg, auth_mgr,
                                  auto_approve, api_tokens.get(), &*mgmt_bundle,
                                  /*tag_store=*/nullptr, /*update_registry=*/nullptr,
                                  /*runtime_config_store=*/nullptr, &audit_store,
                                  /*gateway_enabled=*/false, []() -> std::size_t { return 0; },
-                                 []() -> std::string { return "[]"; }, oidc_mu, oidc_provider);
+                                 []() -> std::string { return "[]"; }, oidc_mu, oidc_provider,
+                                 /*metrics_registry=*/nullptr, /*step_up_fn=*/{},
+                                 settings_audit_read);
 
         // The twin reads the store from this member (the trailing register_routes parameter is
         // a legacy slot it ignores).
@@ -261,6 +275,9 @@ struct Rig {
             CHECK_THAT(frag->body, ContainsSubstring(kSlug));
         } else {
             CHECK(frag->status == twin->status); // same gate, same 401/403
+            // 403 for any credential that authenticated, 401 only for no credential: a 401 for a
+            // bearer would mean it never authenticated and the persona proved nothing.
+            CHECK(frag->status == (how == 'a' ? 401 : 403));
             CHECK_THAT(frag->body, !ContainsSubstring(kSlug)); // nothing of the roster leaks
         }
     }
@@ -419,8 +436,8 @@ TEST_CASE("engine panel authz: a refused cookie session leaves no denial row on 
     CHECK(r.denied_rows("auth.permission_required") == 3);
 }
 
-TEST_CASE("engine panel authz: an engine session refused at the gate leaves a denial row on the "
-          "panel as on the twin",
+TEST_CASE("engine panel authz: an engine session refused at the permission gate leaves the gate's "
+          "denial row, as on the twin",
           "[pg][settings][engine_principal][authz][audit]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
     Rig r{db_.dsn()};
@@ -429,6 +446,31 @@ TEST_CASE("engine panel authz: an engine session refused at the gate leaves a de
     REQUIRE(frag);
     CHECK(frag->status == 403);
     CHECK(r.denied_rows("") >= 1); // an engine caller is never given the quiet treatment
+}
+
+TEST_CASE("engine panel authz: an engine session that DOES hold EnginePrincipal:Read is still "
+          "refused by the belt, with the twin's audit verb",
+          "[pg][settings][engine_principal][authz][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
+    Rig r{db_.dsn()};
+    // A custom role granting only the read (an engine principal may never hold admin/built-in
+    // roles; a narrow custom role is permitted).
+    REQUIRE(r.rbac.create_role({"EngineLister", "reads engine principals", false, 0}).has_value());
+    REQUIRE(r.rbac.set_permission({"EngineLister", "EnginePrincipal", "Read", "allow"}).has_value());
+    REQUIRE(r.rbac.assign_role({"engine", kSlug, "EngineLister"}).has_value());
+    r.rbac_on();
+    const auto raw = r.token("engine-bearer", kSlug, "readonly", "engine");
+
+    const auto frag = r.bearer_get(kFragment, raw);
+    const auto twin = r.bearer_get(kTwin, raw);
+    REQUIRE(frag);
+    REQUIRE(twin);
+    INFO("twin body: " << twin->body);
+    CHECK(frag->status == 403);
+    CHECK(twin->status == 403); // the permission is held; the belt is what refuses
+    CHECK_THAT(frag->body, !ContainsSubstring(kSlug));
+    REQUIRE(r.fragment_audits.size() == 1);
+    CHECK(r.fragment_audits[0] == "engine_principal.list/denied/engine_session_denied");
 }
 
 // ---- the page itself is unchanged -------------------------------------------------------------
