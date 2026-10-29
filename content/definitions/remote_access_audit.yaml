@@ -1,7 +1,8 @@
 ## Remote Access Audit Definitions
 ## Who can log in to this host over SSH, as CONFIGURED: the sshd_config values that matter for
 ## inbound access, a SHA-256 fingerprint of every public key in the authorized_keys of the homes
-## it walks, and whether the sshd service is enabled. Nothing is changed or fetched.
+## it walks that it can decode completely, and whether the sshd service is enabled. Nothing is
+## changed or fetched.
 ## Plugin: remote_access_audit | Actions: list
 ##
 ## Gated behind the SAME Forensics securable execution_artifacts and privacy_permissions use
@@ -62,8 +63,9 @@ metadata:
     applied, so this is configured access and not sshd's effective policy; a directive or value
     sshd would refuse is skipped or listed as written with no token, and only an unbalanced
     quote is flagged: sshd -t is the validity check). It reports a
-    SHA-256 fingerprint for every public key in the authorized_keys of the homes it walks (a
-    certificate reports the fingerprint of the key it carries) with the option names it uses,
+    SHA-256 fingerprint for every public key in the authorized_keys of the homes it walks that
+    it can decode completely (a certificate reports the fingerprint of the key it carries)
+    with the option names it uses,
     and whether the sshd service is enabled. A login that needs no key is governed by the
     config rows: password, keyboard-interactive and GSSAPI are reported as written; other
     no-key methods (KerberosAuthentication, a PAM-supplied method) are not read. It
@@ -129,7 +131,7 @@ spec:
         platforms: [linux, darwin]
       - name: field_5
         type: string
-        description: 'file: the number of lines sshd would not accept (unparseable key, unknown option, unknown key type, a truncated or trailing-byte blob, a certificate signature that is truncated or has trailing bytes, RSA under 1024 bits), "-" unless read. key: the key size in bits (RSA modulus, 256 for ed25519, the curve size for ECDSA).'
+        description: 'file: the number of lines this plugin refused as malformed (unparseable key, unknown option, unknown key type, a truncated or trailing-byte blob, a certificate signature that is truncated, has trailing bytes or is a WebAuthn signature it does not decode, RSA under 1024 bits), "-" unless read. key: the key size in bits (RSA modulus, 256 for ed25519, the curve size for ECDSA).'
         example: '256'
         platforms: [linux, darwin]
       - name: field_6

@@ -607,6 +607,7 @@ agent_test_exe = executable(
     'unit/test_remote_access_audit_local_dispatcher.cpp',  # remote_access_audit: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_firmware_posture_parsers.cpp',           # Wave 8 PR8.4: pure SMBIOS/DMI/fwupd/IODeviceTree decoders over REAL CAPTURE fixtures
     'unit/test_firmware_posture_local_dispatcher.cpp',  # Wave 8 PR8.4: real firmware_posture plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_hardware_local_dispatcher.cpp',  # H.2 scaffold: real hardware dylib/.so/.dll via LocalDispatcher, unguarded on every OS
     'unit/test_platform_security_parsers.cpp',            # Wave 8 PR8.1-a1: pure decoders/classifiers/status over REAL CAPTURE fixtures
     'unit/test_platform_security_win_parsers.cpp',        # Wave 8 PR8.1-a1: pure registry-state mappers + reg-export parser over the-rig REAL CAPTURE fixtures
     'unit/test_platform_security_local_dispatcher.cpp',   # Wave 8 PR8.1-a1: real platform_security dylib/.so/.dll via LocalDispatcher, unguarded on every OS
@@ -3604,6 +3605,27 @@ test('mgmt_posture definition columns',
 test('shares definition columns',
   _python3_test,
   args: [files('test_shares_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# hardware's planned-action definition contract (content/definitions/hardware.yaml): the four
+# on-demand definitions (no gather block, row_kind first, the final column schema) and the
+# columns appended to processors and memory (the test holds the expected literals; it does not
+# read the C++).
+test('hardware definition columns',
+  _python3_test,
+  args: [files('test_hardware_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# disk_actions' planned-action definition contract (content/definitions/disk_actions.yaml): the
+# two on-demand definitions (no gather block, row_kind first, the final column schema; the test
+# holds the expected literals; it does not read the C++).
+test('disk_actions definition columns',
+  _python3_test,
+  args: [files('test_disk_actions_definition.py')],
   suite: 'docs',
   timeout: 30,
 )
