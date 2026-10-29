@@ -1,13 +1,16 @@
 #include "device_ci_ingestion.hpp"
 
 #include "agent.pb.h"
+#include "device_ci_kinds.hpp"
 #include "device_inventory_store.hpp"
+#include "sha256_hex.hpp"
 #include "utf8_sanitize.hpp" // shared yuzu::server::sanitize_utf8_strict (server side of the pair)
 
 #include <yuzu/metrics.hpp>
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -15,6 +18,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -65,32 +70,25 @@ std::string clamp_field(std::string_view raw) {
     return out;
 }
 
-} // namespace
-
-DeviceCiRecord parse_device_ci_blob(const std::string& blob) {
-    DeviceCiRecord rec;
-    if (blob.size() > kMaxBlobBytes)
-        return rec; // defence-in-depth; caller caps + nacks before reaching here
-    // One record, terminated by the first 0x1E (the agent emits exactly one).
-    std::size_t rec_end = blob.find('\x1e');
-    if (rec_end == std::string::npos)
-        rec_end = blob.size();
-    std::string_view record(blob.data(), rec_end);
-
-    std::array<std::string, kFieldCount> f; // value-initialised to empty
-    std::size_t fi = 0;
+// Split one record on 0x1F into at most `max_fields` clamped fields (the rest are
+// ignored). An empty record yields one empty field, matching the v1 loop.
+std::vector<std::string> split_fields(std::string_view record, std::size_t max_fields) {
+    std::vector<std::string> out;
     std::size_t p = 0;
-    while (fi < kFieldCount) {
+    while (out.size() < max_fields) {
         std::size_t fe = record.find('\x1f', p);
         if (fe == std::string_view::npos)
             fe = record.size();
-        f[fi] = clamp_field(record.substr(p, fe - p));
-        ++fi;
+        out.push_back(clamp_field(record.substr(p, fe - p)));
         if (fe >= record.size())
             break;
         p = fe + 1;
     }
-    // Positional assignment — MUST match the agent's CiRecord order.
+    return out;
+}
+
+// Positions 0-21 — frozen across v1 and v2. MUST match the agent's CiRecord order.
+void assign_base_fields(DeviceCiRecord& rec, std::string* f) {
     rec.manufacturer = std::move(f[0]);
     rec.model = std::move(f[1]);
     rec.serial = std::move(f[2]);
@@ -113,6 +111,137 @@ DeviceCiRecord parse_device_ci_blob(const std::string& blob) {
     rec.os_version = std::move(f[19]);
     rec.os_build = std::move(f[20]);
     rec.arch = std::move(f[21]);
+}
+
+// v2: 0x02 scalar_record list_record* (see device_ci_kinds.hpp for the layout).
+DeviceCiRecord parse_v2(const std::string& blob) {
+    DeviceCiRecord rec;
+    rec.blob_version = 2;
+    // The agent's canonical bytes ARE the blob, so the server hashes what it received
+    // (never a re-serialisation that a cap/clamp mismatch could silently drift). A digest
+    // failure leaves the hash empty: canonical_hash returns "" and the store answers
+    // kError (nack need_full) rather than storing under a v1-shaped default.
+    if (auto h = sha256_hex(blob))
+        rec.content_hash = std::move(*h);
+    else
+        spdlog::warn("device_ci: sha256 of a v2 blob failed — record will be nacked");
+
+    std::string_view rest(blob.data() + 1, blob.size() - 1);
+    const auto next_record = [&rest]() -> std::optional<std::string_view> {
+        if (rest.empty())
+            return std::nullopt;
+        std::size_t e = rest.find('\x1e');
+        std::string_view r = rest.substr(0, e == std::string_view::npos ? rest.size() : e);
+        rest.remove_prefix(e == std::string_view::npos ? rest.size() : e + 1);
+        return r;
+    };
+
+    // Record 0: the 33 scalar positions (missing trailing stay blank, extras ignored).
+    // A blob that is only the version byte, or whose first record is empty, still yields
+    // an (all-blank) v2 record.
+    {
+        std::string_view r0;
+        if (auto r = next_record())
+            r0 = *r;
+        auto f = split_fields(r0, kDeviceCiScalarFields);
+        f.resize(kDeviceCiScalarFields);
+        assign_base_fields(rec, f.data());
+        rec.chassis_type = std::move(f[22]);
+        rec.chassis_serial = std::move(f[23]);
+        rec.chassis_asset_tag = std::move(f[24]);
+        rec.chassis_source = std::move(f[25]);
+        rec.board_vendor = std::move(f[26]);
+        rec.board_product = std::move(f[27]);
+        rec.board_serial = std::move(f[28]);
+        rec.board_source = std::move(f[29]);
+        rec.machine_id_hash = std::move(f[30]);
+        rec.machine_id_algorithm = std::move(f[31]);
+        rec.machine_id_source = std::move(f[32]);
+    }
+
+    struct Acc {
+        bool seen{false};
+        int dropped{0};
+        DeviceCiSection sec;
+    };
+    std::array<Acc, kDeviceCiSectionCount> acc;
+    // Widest record: the biggest list kind's columns plus the kind token.
+    std::size_t max_rec_fields = 4; // "status" section level reason
+    for (const auto& d : kDeviceCiSections)
+        max_rec_fields = std::max(max_rec_fields, static_cast<std::size_t>(d.n_fields) + 1);
+
+    const auto find_def = [](const std::string& name, bool list_only) -> int {
+        for (std::size_t i = 0; i < kDeviceCiSectionCount; ++i)
+            if (name == kDeviceCiSections[i].section &&
+                (!list_only || kDeviceCiSections[i].table != nullptr))
+                return static_cast<int>(i);
+        return -1;
+    };
+
+    while (auto r = next_record()) {
+        if (r->empty())
+            continue;
+        auto f = split_fields(*r, max_rec_fields);
+        if (f[0] == "status") {
+            if (f.size() < 2)
+                continue;
+            const int i = find_def(f[1], /*list_only=*/false);
+            if (i < 0)
+                continue; // unregistered section
+            auto& a = acc[static_cast<std::size_t>(i)];
+            a.seen = true;
+            a.sec.level = f.size() > 2 ? std::move(f[2]) : std::string{};
+            a.sec.reason = f.size() > 3 ? std::move(f[3]) : std::string{};
+            continue;
+        }
+        const int i = find_def(f[0], /*list_only=*/true);
+        if (i < 0)
+            continue; // unknown kind, or a row for a status-only section
+        const auto& def = kDeviceCiSections[i];
+        auto& a = acc[static_cast<std::size_t>(i)];
+        a.seen = true;
+        if (static_cast<int>(a.sec.rows.size()) >= def.row_cap) {
+            ++a.dropped;
+            continue;
+        }
+        std::vector<std::string> row(static_cast<std::size_t>(def.n_fields));
+        for (std::size_t c = 0; c < row.size() && c + 1 < f.size(); ++c)
+            row[c] = std::move(f[c + 1]);
+        a.sec.rows.push_back(std::move(row));
+    }
+
+    for (std::size_t i = 0; i < kDeviceCiSectionCount; ++i) {
+        auto& a = acc[i];
+        if (!a.seen)
+            continue;
+        a.sec.kind = kDeviceCiSections[i].section;
+        if (a.dropped > 0) {
+            // Disclose the server-side truncation on the persisted section so a hash-only
+            // ack of an unchanged blob never reads a bounded projection as complete.
+            const std::string cap = "server_cap:" + std::to_string(kDeviceCiSections[i].row_cap);
+            a.sec.level = "constrained";
+            a.sec.reason = a.sec.reason.empty() ? cap : a.sec.reason + ";" + cap;
+        }
+        rec.sections.push_back(std::move(a.sec));
+    }
+    return rec;
+}
+
+} // namespace
+
+DeviceCiRecord parse_device_ci_blob(const std::string& blob) {
+    DeviceCiRecord rec;
+    if (blob.size() > kMaxBlobBytes)
+        return rec; // defence-in-depth; caller caps + nacks before reaching here
+    if (!blob.empty() && blob[0] == kDeviceCiVersionByte)
+        return parse_v2(blob);
+    // v1: one record, terminated by the first 0x1E (the agent emits exactly one).
+    std::size_t rec_end = blob.find('\x1e');
+    if (rec_end == std::string::npos)
+        rec_end = blob.size();
+    auto f = split_fields(std::string_view(blob.data(), rec_end), kFieldCount);
+    f.resize(kFieldCount); // missing trailing fields stay empty
+    assign_base_fields(rec, f.data());
     return rec;
 }
 
