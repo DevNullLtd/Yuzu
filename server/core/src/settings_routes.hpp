@@ -338,7 +338,8 @@ private:
     /// `roster_count`, when given, is set to the number of principals rendered ONLY when the
     /// roster was actually read: the caller writes the `engine_principal.list` success row
     /// from it, and an absent store or an unreadable roster leaves it empty (no row).
-    /// Admin-only; a null `engine_principal_store_` renders an inert "not configured" panel.
+    /// The route gates the caller (EnginePrincipal:Read); a null `engine_principal_store_` renders an
+    /// inert "not configured" panel.
     std::string render_engine_principals_fragment(bool may_read_audit,
                                                   std::optional<std::size_t>* roster_count = nullptr);
 

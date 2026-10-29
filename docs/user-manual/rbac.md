@@ -548,7 +548,8 @@ Settings uses, so the two stay equivalent.
   2. Enforcement is on and the account does not hold the fleet-wide `Administrator` grant, as
      with an account administrator created after RBAC was enabled. Another Administrator assigns
      it. The affected account often cannot read the Role assignments panel itself (it needs
-     `AccessReview:Read`), so ask an Administrator or use the access-review export.
+     `AccessReview:Read`), so another Administrator has to check its grants there or in the
+     access-review export.
   3. The session is not a local account with an active row. SSO administrators, MCP-tier and
      service-scoped tokens and engine credentials are never offered the controls, and JIT
      elevation does not count. An account whose role is `user` that holds the grant sees the
