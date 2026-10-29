@@ -657,7 +657,7 @@
     var btnValidate = $('ox-validate');
     var btnPreview = $('ox-preview');
     var out = $('ox-expr-out');
-    var btnTar = $('ox-tar-open');
+    var btnTar = $('ox-echo-open');
 
     function setContext(msg, isError) {
       var c = $('result-context');
@@ -672,7 +672,7 @@
       return out;
     }
 
-    /* The picker selection is what Send and Run on TAR history consume. */
+    /* The picker selection is what Send and Run on Echo history consume. */
     function pickerItem() { return document.querySelector('.scope-item.selected'); }
     function pickerScope() {
       var it = pickerItem();
@@ -859,7 +859,7 @@
       });
     }
 
-    /* ---- H-16: htmx drops a 4xx body, so a 403 from Send or Run on TAR
+    /* ---- H-16: htmx drops a 4xx body, so a 403 from Send or Run on Echo
        history used to do nothing at all. Say why in the context line. ---- */
     body.addEventListener('htmx:responseError', function (evt) {
       var d = evt.detail;
@@ -868,7 +868,7 @@
       var path = (d.pathInfo && d.pathInfo.requestPath) ||
                  (d.requestConfig && d.requestConfig.path) || '';
       if (path.indexOf('/api/dashboard/execute') !== 0 &&
-          path.indexOf('/api/dashboard/tar-execute') !== 0) return;
+          path.indexOf('/api/dashboard/echo-execute') !== 0) return;
       if (x.status === 403) {
         setContext('Your role may not run instructions. Ask an administrator for the Execution permission.', true);
       } else if ((x.status === 400 || x.status === 503) && path.indexOf('/api/dashboard/execute') === 0) {
@@ -883,17 +883,17 @@
       }
     });
 
-    /* ---- Run on TAR history (D9): form, then a confirm that shows the SQL. ---- */
+    /* ---- Run on Echo history (D9): form, then a confirm that shows the SQL. ---- */
     function runTar(sql, scope) {
       if (!window.htmx) return;
-      window.htmx.ajax('POST', '/api/dashboard/tar-execute',
+      window.htmx.ajax('POST', '/api/dashboard/echo-execute',
         { values: { sql: sql, scope: scope }, swap: 'none', target: '#result-context' });
     }
 
-    function openTarForm() {
+    function openEchoForm() {
       var t = sendTarget();
       window.YuzuDialog.form({
-        title: 'Run on TAR history',
+        title: 'Run on Echo history',
         body: ['Target: ' + t.label + (t.count ? ' (' + t.count + ')' : '') +
                '. Results appear in the Results table; no result set is saved.',
                'Up to 4096 characters. The server refuses any text containing INSERT, UPDATE, ' +
@@ -917,7 +917,7 @@
         }).then(function (go) { if (go) runTar(sql, t.scope); });
       }, function () { /* dialog busy */ });
     }
-    if (btnTar) btnTar.addEventListener('click', openTarForm);
+    if (btnTar) btnTar.addEventListener('click', openEchoForm);
   }
 
   /* ---------------------------------------------------------------------- */
@@ -1078,11 +1078,11 @@
       });
     }
 
-    /* ---- R5 From TAR query: the home of the retired Ad-hoc TAR SQL frame ---- */
+    /* ---- R5 From Echo query: the home of the retired Ad-hoc Echo SQL frame ---- */
     function fromTar() {
       parentOptions().then(function (parents) {
         return window.YuzuDialog.form({
-          title: 'Create from a TAR query',
+          title: 'Create from an Echo query',
           body: ['Runs the SELECT on every device in the parent scope and keeps the devices ' +
                  'that return rows.'],
           fields: [
@@ -1110,7 +1110,7 @@
           danger: true
         }).then(function (ok) {
           if (!ok) return;
-          return send('/api/v1/result-sets/from-tar-query',
+          return send('/api/v1/result-sets/from-echo-query',
                       add({ sql: sql, include_empty: v.empty === 'yes' }, v), 'Result set');
         });
       });
@@ -1133,7 +1133,7 @@
 
     var b = $('ox-rs-instr'); if (b) b.addEventListener('click', fromInstruction);
     b = $('ox-rs-inv'); if (b) b.addEventListener('click', fromInventory);
-    b = $('ox-rs-tar'); if (b) b.addEventListener('click', fromTar);
+    b = $('ox-rs-echo'); if (b) b.addEventListener('click', fromTar);
 
     /* The detail pane is swapped by htmx, so its buttons are handled by delegation
        (the page CSP forbids inline handlers). */

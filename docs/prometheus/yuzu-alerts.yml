@@ -2999,7 +2999,7 @@ groups:
             — malformed_identity_field excluded, that's an agent sending a
             malformed identity field, not store unhealth; see
             YuzuResponseMalformedIdentityDrops for that case).
-            The executions ladder still tracks the commands, but drawer/TAR
+            The executions ladder still tracks the commands, but drawer/Echo
             result history is lossy — check PostgreSQL pool saturation / health.
 
       # Companion, informational: a NUL-byte-guard rejection is the security
@@ -6517,7 +6517,7 @@ groups:
       # within 2 s, lock or statement timeout, query error, tracker not open) still goes
       # out, but every response to it is stored `~unverified`: Forensics-tier, so it is
       # withheld from callers without Forensics:Read (an HTTP 200 with no marker) and
-      # hidden from fixed-plugin polls such as DEX, TAR and hardware. One failed write
+      # hidden from fixed-plugin polls such as DEX, Echo and hardware. One failed write
       # unverifies one command, which a blip can cause, so only a failure that keeps
       # recurring pages. Shape of YuzuForensicsTierUnresolved: `for: 10m` over a 5m rate
       # window; one failure keeps the expression true for under 5 minutes and a burst
@@ -6547,7 +6547,7 @@ groups:
             every response to a command whose record was not written is stored
             `~unverified`, which is Forensics-tier: legitimate responses of any plugin are
             withheld from callers without Forensics:Read (a normal 200 with the rows
-            missing) and hidden from fixed-plugin polls such as DEX, TAR and hardware, and
+            missing) and hidden from fixed-plugin polls such as DEX, Echo and hardware, and
             the executions drawer misses those commands' agent events. First check
             PostgreSQL health and the yuzu_pg_* pool and lock metrics (the write fails on a
             pool lease timeout, a lock or statement timeout or a query error), then
@@ -6582,7 +6582,7 @@ groups:
             Each such response is stored `~unverified`, which is Forensics-tier:
             legitimate responses of any plugin are withheld from callers without
             Forensics:Read (a normal 200 with the rows missing) and hidden from fixed-plugin
-            polls such as DEX, TAR and hardware. First check PostgreSQL health and the
+            polls such as DEX, Echo and hardware. First check PostgreSQL health and the
             yuzu_pg_* pool and lock metrics, then
             yuzu_server_response_provenance_total{outcome="lookup_degraded"} and
             yuzu_exec_correlation_read_degrade_total{reason} (pool_exhausted or

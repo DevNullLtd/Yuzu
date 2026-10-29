@@ -120,7 +120,7 @@ metadata:
     and size in bytes. The document field is the job's user-supplied
     title/filename — it is treated as instruction-result user content
     (server instruction-result retention only; never forwarded to
-    daily-sync, TAR, or DEX). It exists so an operator can identify which
+    daily-sync, Echo, or DEX). It exists so an operator can identify which
     job a subsequent clear_queue call should target.
   tags: [printing, inventory]
 

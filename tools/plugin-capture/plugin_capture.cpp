@@ -28,7 +28,7 @@
  * real plugin context (`yuzu::agent::StandalonePluginContext` — the
  * configuration map from `--config k=v`, no KV store, no trigger engine),
  * and `shutdown` runs after the last, the same order the agent host uses.
- * A plugin whose init needs the agent's KV store or the server (tags, tar,
+ * A plugin whose init needs the agent's KV store or the server (tags, echo,
  * content_dist, …) therefore fails closed here exactly as it would under a
  * host without those services; such a leg is recorded with a
  * `[not captured] agent-context: …` line instead (rule 5).

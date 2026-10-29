@@ -99,7 +99,7 @@ TEST_CASE("ApprovalManager bound: a row minted before migration v3 survives it a
           "[pg][approval_manager][bound]") {
     yuzu::test::ApprovalManagerPg bundle;
     auto& pool = bundle.pool();
-    REQUIRE(approval_store_version(pool) == 3);
+    REQUIRE(approval_store_version(pool) == 4);
 
     // Rewind the live schema to the state of a database already at #6096's v2: drop the
     // three bound columns and reset the recorded version, then mint an "old" row with only
@@ -125,7 +125,7 @@ TEST_CASE("ApprovalManager bound: a row minted before migration v3 survives it a
     // A fresh manager re-runs the ladder: v3 (and only v3) applies to a POPULATED table.
     ApprovalManager upgraded{pool};
     REQUIRE(upgraded.is_open());
-    CHECK(approval_store_version(pool) == 3);
+    CHECK(approval_store_version(pool) == 4);
     CHECK(approvals_has_column(pool, "request_json") == 1);
     CHECK(approvals_has_column(pool, "request_digest") == 1);
     CHECK(approvals_has_column(pool, "excluded_roots") == 1);
@@ -170,7 +170,7 @@ TEST_CASE("ApprovalManager bound: a database at v1 runs #6096's v2 and then v3, 
 
     ApprovalManager upgraded{pool};
     REQUIRE(upgraded.is_open());
-    CHECK(approval_store_version(pool) == 3);
+    CHECK(approval_store_version(pool) == 4);
     CHECK(approvals_has_column(pool, "request_json") == 1);
     CHECK(approvals_has_column(pool, "excluded_roots") == 1);
 
@@ -211,7 +211,7 @@ TEST_CASE("ApprovalManager bound: a database at v2 that already has the bound co
 
     ApprovalManager upgraded{pool};
     REQUIRE(upgraded.is_open());
-    CHECK(approval_store_version(pool) == 3);
+    CHECK(approval_store_version(pool) == 4);
 
     const auto after = upgraded.get(*bound);
     REQUIRE(after.has_value());

@@ -131,7 +131,7 @@ ESTATS — see its row.
 **heartbeat** layer Windows reports device throughput (`GetIfTable2`) and an
 interval retransmit rate (`GetTcpStatisticsEx`) but **not RTT** — the fleet
 gauge has no per-connection ESTATS sweep. **Per-connection smoothed RTT IS
-available on Windows** in the `netqual` TAR tier (below) via ESTATS
+available on Windows** in the `netqual` Echo tier (below) via ESTATS
 (`GetPerTcpConnectionEStats`: per-connection enable, **admin/elevated only**,
 ms-resolution — ADR-0020); it is a distinct, on-device warehouse tier, not a
 heartbeat gauge. **Two caveats on the Windows heartbeat retransmit rate:**
@@ -162,23 +162,23 @@ heartbeat facts.
 
 ### Per-connection tier (`netqual`)
 
-A separate **`netqual`** TAR capture source can record per-connection TCP
+A separate **`netqual`** Echo capture source can record per-connection TCP
 quality — smoothed RTT, jitter, and current-loss counters per ESTABLISHED
 connection, joined to the owning process — into the agent's **local edge
 warehouse** as `$NetQual_Live`. It is governed independently of the heartbeat:
 
-- **On by default.** Set the agent TAR config key **`netqual_enabled = false`**
+- **On by default.** Set the agent Echo config key **`netqual_enabled = false`**
   to disable it on a host (mirrors `procperf_enabled`).
 - **Bucket-only.** Only a coarse destination *class* — `loopback` / `private` /
   `public` — is stored. The raw remote address, port, and hostname are dropped
   at the collector edge and **never persisted**. The owning process is recorded
   as its image name only.
 - **On-device.** These rows stay in the local warehouse (queryable via the
-  Execute-gated TAR SQL surface as `$NetQual_Live`); they are not shipped to the
+  Execute-gated Echo SQL surface as `$NetQual_Live`); they are not shipped to the
   server. A per-tick top-N cap and a row-count retention ceiling bound storage.
 - **Linux, Windows, and macOS.** Linux reads netlink INET_DIAG; Windows reads
   TCP ESTATS (ADR-0020) and **requires an elevated agent** — non-elevated it
-  records nothing and `tar.status` reports `netqual_capture_method|none`.
+  records nothing and `echo.status` reports `netqual_capture_method|none`.
   Windows RTT is ms-resolution and `retrans`/`segs_out` count from first
   observation of the connection, not connection start (constraints listed in
   the compatibility matrix). **macOS reads per-socket `tcp_connection_info`
@@ -195,17 +195,17 @@ warehouse** as `$NetQual_Live`. It is governed independently of the heartbeat:
   `capture_method=none` on a layout mismatch rather than emit wrong values,
   and the mechanism is pending validation on real hardware (see
   `docs/darwin-compat.md` and the compatibility matrix in
-  [the TAR dashboard doc](tar.md)).
+  [the Echo dashboard doc](echo.md)).
 - **Retrospective companions (ADR-0020).** `$NetQual_Boot` records one row per
-  boot from since-boot OS counters — a coarse "network quality before TAR was
+  boot from since-boot OS counters — a coarse "network quality before Echo was
   running this boot" baseline — and the separate **`netconn`** source
   (`$NetConn_Live`, `netconn_enabled`) backfills OS-retained connectivity
   transitions (connect/disconnect, internet-capability changes, Wi-Fi drops with
-  reason codes) reaching days-to-weeks before TAR existed on the box, storing
+  reason codes) reaching days-to-weeks before Echo existed on the box, storing
   enum tokens and reason codes only.
 
 This tier has no dashboard consumer yet — it is the foundation for the deferred
-per-destination drill. See the [TAR dashboard](tar.md) for the query surface.
+per-destination drill. See the [Echo dashboard](echo.md) for the query surface.
 
 ## Metrics
 

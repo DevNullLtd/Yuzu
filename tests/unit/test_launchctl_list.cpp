@@ -1,9 +1,9 @@
 /**
  * test_launchctl_list.cpp -- fixture-fed tests for agents/shared/
  * launchctl_list.hpp's pure `launchctl list` row parser. Same discipline as
- * test_tar_service.cpp: every case feeds a fixed std::vector<std::string>
+ * test_echo_service.cpp: every case feeds a fixed std::vector<std::string>
  * straight to the pure parser, no spawn, no sleep. Real-capture fixture rows
- * are the same ones test_tar_service.cpp documents the provenance of
+ * are the same ones test_echo_service.cpp documents the provenance of
  * (launchctl rows captured 2026-08-24 on a macOS arm64 dev host -- see that
  * file's header comment) -- reused here rather than re-documented, since
  * it's the identical wire shape.
@@ -84,7 +84,7 @@ TEST_CASE("parse_launchctl_list: empty input (zero lines) is malformed, not a "
           "[launchctl_list]") {
     // UP2-2 (governance A0 fix round, HIGH): a real exit-0 capture always
     // has at least the header row, so zero lines signals a corrupted
-    // capture -- treating it as valid-empty would storm TAR's diff (every
+    // capture -- treating it as valid-empty would storm Echo's diff (every
     // known service reads as removed, then re-added next tick).
     auto result = parse_launchctl_list({});
     CHECK(result.rows.empty());

@@ -209,11 +209,11 @@ constexpr std::string_view kPreflightDeploy[] = {"list_preflight_runs", "get_dep
 // data model from an Execution (see get_workflow_execution's tool doc).
 constexpr std::string_view kWorkflows[] = {"list_workflows", "get_workflow",
                                            "list_workflow_executions", "get_workflow_execution"};
-// #4027 — TAR (Timeline / Activity Recorder) had zero MCP presence before this
+// #4027 — Echo (Timeline / Activity Recorder) had zero MCP presence before this
 // read-twin batch; its own family rather than folding into an unrelated one.
-constexpr std::string_view kTar[] = {"list_tar_process_tree_devices",
-                                     "list_tar_capture_sources_devices",
-                                     "list_tar_retention_paused"};
+constexpr std::string_view kEcho[] = {"list_echo_process_tree_devices",
+                                     "list_echo_capture_sources_devices",
+                                     "list_echo_retention_paused"};
 // #4031: AD/Entra directory-sync user listing + directory-sync status (last
 // sync time/health, NOT OIDC SSO config — that lives at REST-only
 // GET /api/v1/settings/oidc, deliberately with no MCP twin per #520) — both
@@ -231,7 +231,7 @@ constexpr std::string_view kDirectory[] = {"list_directory_users", "get_director
 constexpr std::string_view kResultSets[] = {"list_result_sets",
                                             "create_result_set",
                                             "create_result_set_from_inventory_query",
-                                            "create_result_set_from_tar_query",
+                                            "create_result_set_from_echo_query",
                                             "create_result_set_from_instruction_result",
                                             "reevaluate_result_set",
                                             "get_result_set",
@@ -330,7 +330,7 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
      kCompliance},
     {"Scope targeting", "validate a scope expression and preview the devices it selects", kScope},
     {"Result sets", "create, inspect, pin, and re-evaluate named scope-walking device sets "
-                    "(from a pre-computed list, an inventory query, a TAR SQL dispatch, or an "
+                    "(from a pre-computed list, an inventory query, an Echo SQL dispatch, or an "
                     "instruction-result dispatch); walk their lineage",
      kResultSets},
     {"Management groups",
@@ -388,10 +388,10 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
      kPreflightDeploy},
     {"Workflows", "multi-step workflow definitions and their per-step execution records",
      kWorkflows},
-    {"TAR process-tree & retention", "operator-scoped device pickers for the TAR process-tree "
+    {"Echo process-tree & retention", "operator-scoped device pickers for the Echo process-tree "
                                      "and capture-sources frames, and the caller's own "
                                      "retention-paused source scan",
-     kTar},
+     kEcho},
     {"Directory & identity", "AD/Entra directory-synced users and directory-sync status",
      kDirectory},
     {"Execution statistics", "fleet-wide, per-agent, and per-definition execution "

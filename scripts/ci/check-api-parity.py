@@ -623,8 +623,8 @@ GRANDFATHERED_LEGACY_EXCEPTIONS = frozenset({
     "get.fragments-auto-nvd",
     "get.fragments-settings-nvd",
     "post.api-v1-users-me-password",
-    "get.fragments-tar-process-tree-detail",
-    "get.fragments-tar-process-tree-result",
+    "get.fragments-echo-process-tree-detail",
+    "get.fragments-echo-process-tree-result",
 })
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
@@ -654,7 +654,7 @@ ALLOWLIST_OPENAPI_MISSING = [
 # in tests/unit/server/test_api_parity_ledger_catalogue.cpp and `kLedgerFiles` in
 # tests/unit/server/test_twin_completeness.cpp. Adding or removing a domain edits all three.
 DOMAINS = [
-    "devices", "inventory", "dex", "guardian", "tar", "auto-preflight",
+    "devices", "inventory", "dex", "guardian", "echo", "auto-preflight",
     "auto-deploy", "auto-verify", "network", "viz", "executions",
     "scope-result-sets", "instructions", "compliance-policy", "settings",
     "rbac", "auth-mfa", "engine-principals", "access-reviews", "ca-pki",
@@ -667,7 +667,7 @@ PATH_DOMAIN_RULES = [
     (re.compile(r"^/fragments/network/"), "network"),
     (re.compile(r"^/(fragments/)?device/guardian"), "guardian"),
     (re.compile(r"^/(fragments/)?guardian/"), "guardian"),
-    (re.compile(r"^/(fragments/)?tar/"), "tar"),
+    (re.compile(r"^/(fragments/)?echo/"), "echo"),
     (re.compile(r"^/fragments/auto/preflight"), "auto-preflight"),
     (re.compile(r"^/fragments/auto/deploy"), "auto-deploy"),
     (re.compile(r"^/fragments/auto/verify"), "auto-verify"),
@@ -677,7 +677,7 @@ PATH_DOMAIN_RULES = [
     (re.compile(r"^/fragments/device"), "devices"),
     (re.compile(r"^/fragments/devices"), "devices"),
     (re.compile(r"^/fragments/results"), "executions"),
-    (re.compile(r"^/api/dashboard/(execute|group-from-results|tar-execute)"), "executions"),
+    (re.compile(r"^/api/dashboard/(execute|group-from-results|echo-execute)"), "executions"),
     (re.compile(r"^/fragments/crypto/"), "crypto"),
     (re.compile(r"^/fragments/compliance"), "compliance-policy"),
     (re.compile(r"^/api/(compliance|polic(y|ies))"), "compliance-policy"),
@@ -719,7 +719,7 @@ OWNER_FILE_DOMAIN_FALLBACK = {
     "dex_perf_ui.cpp": "dex",
     "dex_app_perf_ui.cpp": "dex",
     "guardian_routes.cpp": "guardian",
-    "tar_tree_routes.cpp": "tar",
+    "echo_tree_routes.cpp": "echo",
     "preflight_routes.cpp": "auto-preflight",
     "deployment_routes.cpp": "auto-deploy",
     "deployment_ui.cpp": "auto-deploy",
@@ -3480,11 +3480,11 @@ def _selftest_body():
          ("must be a JSON object", "status must be a string", "must be strings")),
         ("twin-dict-fields", base_rows + [_mk("t4", "retire", rest_v1_twin={"method": "GET"})], {}, ("rest_v1_twin must be",)),
         ("domain-guard", base_rows, {"extra_files": {"foo.json": "[]"}}, ("not one of the declared domains",)),
-        ("top-level", base_rows, {"extra_files": {"tar.json": "5"}}, ("top level must be a JSON array",)),
-        ("bad-bytes", base_rows, {"extra_files": {"tar.json": b"\xff\xfe\x00["}}, ("invalid JSON",)),
-        ("bad-syntax", base_rows, {"extra_files": {"tar.json": "{bad"}}, ("invalid JSON",)),
-        ("huge-int", base_rows, {"extra_files": {"tar.json": "1" * 5000}}, ("invalid JSON",)),
-        ("too-deep", base_rows, {"extra_files": {"tar.json": "[" * 200000}}, ("invalid JSON",)),
+        ("top-level", base_rows, {"extra_files": {"echo.json": "5"}}, ("top level must be a JSON array",)),
+        ("bad-bytes", base_rows, {"extra_files": {"echo.json": b"\xff\xfe\x00["}}, ("invalid JSON",)),
+        ("bad-syntax", base_rows, {"extra_files": {"echo.json": "{bad"}}, ("invalid JSON",)),
+        ("huge-int", base_rows, {"extra_files": {"echo.json": "1" * 5000}}, ("invalid JSON",)),
+        ("too-deep", base_rows, {"extra_files": {"echo.json": "[" * 200000}}, ("invalid JSON",)),
         ("composed-of", base_rows + [_mk("c2", "composed-of:no.such.id")], {}, ("unknown capability id",)),
         ("plain-twinned", base_rows + [_mk("t2", "twinned", rest_v1_twin=rest_tw)], {}, ("plain twinned needs BOTH",)),
         ("bad-resource", base_rows + [_mk("t3", "twinned", rest_v1_twin=rest_tw, mcp_twin="resource:yuzu://gone")], {},
@@ -3591,7 +3591,7 @@ def _selftest_body():
            "method must be 1-16 upper-case", absent=("\n::error::injected",))
     expect("bad-path", _drive(base_rows + [_mk("bp", "retire", path="/x\n::error::injected")]), 1,
            "path must be", absent=("\n::error::injected",))
-    expect("missing-domain", _drive(base_rows, skip_domains=("tar",)), 1, "missing for declared domain")
+    expect("missing-domain", _drive(base_rows, skip_domains=("echo",)), 1, "missing for declared domain")
     expect("planned-lookalike", _drive(base_rows + [_mk("p21460", "planned:#21460")]), 0)
     # checks 6 and 7 are wired into the gate: a finding from the gate runner fails the run, a clean one
     # passes, and an AnchorError becomes a failure rather than a crash

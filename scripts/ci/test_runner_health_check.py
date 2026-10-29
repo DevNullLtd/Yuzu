@@ -453,12 +453,12 @@ class WorkflowWiringTests(unittest.TestCase):
         ]
         expected = (
             (
-                {"agent", "platform", "proto", "tar", "gateway", "server-nonpg", "server-checks"},
+                {"agent", "platform", "proto", "echo", "gateway", "server-nonpg", "server-checks"},
                 {"server-pg", "server-pg-smoke", "docs"},
             ),
             (
                 {"server-pg"},
-                {"agent", "docs", "proto", "tar", "gateway", "server-nonpg", "server-checks",
+                {"agent", "docs", "proto", "echo", "gateway", "server-nonpg", "server-checks",
                  "server-pg-smoke", "platform"},
             ),
         )
@@ -480,7 +480,7 @@ class WorkflowWiringTests(unittest.TestCase):
         """docs runs on the Linux leg only; the OS-contract entries live in suite
         `platform` and run on every leg (#4884)."""
         self.assertIn(
-            "--suite agent --suite docs --suite proto --suite tar --suite gateway --suite platform",
+            "--suite agent --suite docs --suite proto --suite echo --suite gateway --suite platform",
             self.job("ci.yml", "linux"),
         )
         self.assertIn("--no-suite docs", self.job("ci.yml", "macos"))

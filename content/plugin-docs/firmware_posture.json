@@ -336,7 +336,7 @@
   "version": "1.0.0",
   "where_the_data_goes": [
     "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `firmware` is also a gathered definition (`crossplatform.firmware_posture.firmware`, 300s TTL).",
-    "**Not consumed by** daily-sync, TAR, DEX, or metrics.",
+    "**Not consumed by** daily-sync, Echo, DEX, or metrics.",
     "**Sensitivity.** Rows carry firmware vendor, version, release date, ROM size and, on Linux, fwupd device names and versions (for example a laptop's embedded controller or an NVMe drive firmware). No username, path or process name. Firmware versions identify a specific hardware model and revision, and an out-of-date one tells an attacker which known firmware flaw applies, so treat the rows like other `Security` posture data.",
     "**Siblings:** `hardware` (its `bios` action reads the same DMI and WMI fields as an inventory fact without the update-pending verdict) and `bitlocker` (disk encryption posture)."
   ]
