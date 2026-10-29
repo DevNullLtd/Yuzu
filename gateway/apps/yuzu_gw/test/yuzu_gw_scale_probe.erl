@@ -479,7 +479,7 @@ linux_sockets(Ports) ->
 %% pages a cache holds (num_slabs * pagesperslab * page size) are not used for
 %% the groups, because a cache with free space in its existing slabs absorbs
 %% new objects without new pages, so the page count follows the host's
-%% history more than the connections (at 200 kTLS connections on rocky9 the
+%% history more than the connections (at 200 kTLS connections on Rocky Linux 9 the
 %% kmalloc pages grew 0.5 KB per connection for about 4 KB of objects); at
 %% thousands of connections the two converge. `slab_total' is every cache's
 %% pages, kept for reference. The caches a connection touches, in four groups:

@@ -466,7 +466,7 @@ Default settings: 150000 B snapshot on every 30 s heartbeat, 97 status tags, a
 9035 B RegisterRequest naming 69 plugins. Every point reached a steady state.
 KiB per connection, `(M(N) - M(0)) / N`.
 
-Linux (the judged platform): a rocky9 VM, EL9 kernel 5.14, x86_64, 16
+Linux (the judged platform): a Rocky Linux 9 VM, EL9 kernel 5.14, x86_64, 16
 schedulers, OTP 28.4.2. Run `20261026T172533-6I6BU`.
 
 | Transport | N | BEAM | of which processes / binary / ETS | OS anon | processes per agent |
@@ -512,6 +512,23 @@ The intended gate is a weekly Linux job running `YUZU_GW_IDLEMEM_SWEEP=0,10000`
 with `YUZU_GW_SCALE_GATE=1`. It waits until the coefficient of variation over
 five runs on the CI host is known, and the headroom is then set from it. A
 lint against `origin/dev` would refuse any change that raises a ceiling.
+
+### The CI check's heartbeat shape and threshold
+
+The CI check (owner decision, 2026-10-29) measures the ADR-0073 heartbeat:
+liveness only, no fleet snapshot, i.e. `YUZU_GW_IDLEMEM_SNAPSHOT_BYTES=0`. It
+judges `all_in` (OS anonymous memory plus the gateway's kernel share, see
+"What it reports") against 64 KiB per agent (`YUZU_GW_IDLEMEM_BUDGET_KIB`,
+ADR-0074 D14). For now it is reported only: the `budget ... PASS/FAIL` line
+never fails a run.
+
+Consequence: until ADR-0073's heartbeat ships, the check does not measure the
+heartbeat a shipped agent sends. Today's agent with the TAR plugin attaches a
+fleet snapshot to about every heartbeat (the harness default of 150000 B), and
+that costs more per agent: on one Linux host, 2026-10-29, the kTLS branch
+measured 60.4 KiB all-in at 5,000 agents with the 150000 B snapshot against
+38.4 KiB without it. Run the default (snapshot) setting as well when the
+shipped heartbeat's cost is the question.
 
 ## Results on 29a8e655b (before the fixes)
 
