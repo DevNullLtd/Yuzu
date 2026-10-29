@@ -4,8 +4,8 @@
 One scripted, idempotent, hard-cut rename. Phase A renames every tracked path
 that has a `tar` component (git mv, so history follows); phase B rewrites file
 contents line by line with an ordered token map. Archive-tool uses of `tar`
-(tar -xzf, .tar.gz, package lists), the legacy on-disk SQLite names
-(tar_events, idx_tar_events*) and historical evidence files stay verbatim.
+(tar -xzf, .tar.gz, package lists) and the legacy on-disk SQLite names
+(tar_events, idx_tar_events*) stay verbatim.
 
 Usage (from anywhere inside the checkout):
     python3 scripts/rename-tar-to-echo.py --self-test   # fixture table + idempotence
@@ -31,16 +31,15 @@ from pathlib import Path
 
 SELF = "scripts/rename-tar-to-echo.py"
 
-# Evidence and history kept verbatim: neither renamed nor rewritten.
+# Only build trees and this script are skipped. The first apply (2026-10-28) kept governance.d/,
+# changelog.d/, docs/reviews/, docs/plans/feat-tar-15f-* and CHANGELOG.md verbatim as evidence; the
+# owner widened the rename to them on 2026-10-29 ("a new branding exercise"), so a run on the
+# pre-rename tree now rewrites those too.
 VERBATIM_PREFIXES = (
-    "governance.d/",
-    "changelog.d/",
-    "docs/reviews/",
-    "docs/plans/feat-tar-15f-",
     "build-",
     "vcpkg_installed/",
 )
-VERBATIM_FILES = {"CHANGELOG.md", SELF}
+VERBATIM_FILES = {SELF}
 
 # --------------------------------------------------------------------------
 # Phase A: path components

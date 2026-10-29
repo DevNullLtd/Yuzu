@@ -16,7 +16,7 @@ Phase-15 item, **15.F**, plus correcting the stale status docs.
    in-process Catch2 e2e for the scope-walking chain, driving the real `/api/v1/result-sets`
    handlers via `TestRouteSink` with a real `ResultSetStore` + a recording fake dispatch
    (same harness pattern as `test_rest_result_sets_async.cpp`). It drives
-   ground(direct create) → `from-tar-query` narrow → `from-instruction-result` narrow →
+   ground(direct create) → `from-echo-query` narrow → `from-instruction-result` narrow →
    `materialize` (maintenance-thread stand-in) → pin, and asserts:
    - lineage is complete (`GET /{id}/lineage` reconstructs root→leaf);
    - the audit trail is complete (3× `result_set.create` + `result_set.pin`/`unpin`);

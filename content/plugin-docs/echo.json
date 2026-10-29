@@ -2813,7 +2813,19 @@
       "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
     ],
     "changelog": [
-      "changelog.d/2026-10-28-echo-rename.changed.md"
+      "changelog.d/2026-10-14-dex-echo-titles.changed.md",
+      "changelog.d/2026-10-21-echo-all-sources-default-on.changed.md",
+      "changelog.d/2026-10-21-echo-mapdrive-history-backfill.fixed.md",
+      "changelog.d/2026-10-21-echo-timeline-render.added.md",
+      "changelog.d/2026-10-21-echo-windows-image-db-hardening.security.md",
+      "changelog.d/2026-10-23-echo-timeline-page.added.md",
+      "changelog.d/2026-10-25-echo-regchange-source.added.md",
+      "changelog.d/2026-10-25-echo-retention-tiers-api.added.md",
+      "changelog.d/2026-10-26-echo-regchange-actor-attribution.added.md",
+      "changelog.d/2026-10-26-echo-tiers-data-page.added.md",
+      "changelog.d/2026-10-28-echo-rename.changed.md",
+      "changelog.d/20261014-echo-adhoc-sql-moved.changed.md",
+      "changelog.d/20261021-echo-capture-sources-paused-core.fixed.md"
     ],
     "definitions": [
       "content/definitions/echo.yaml",
