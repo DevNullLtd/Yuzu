@@ -13,6 +13,7 @@
 #include <openssl/evp.h>
 #include <spdlog/spdlog.h>
 
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -20,9 +21,9 @@
 #include <cstdlib>
 #include <expected>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -125,20 +126,20 @@ constexpr const char* kV2ScalarCols[] = {
 };
 
 // Split a kDeviceCiSections column list ("a,b,c") into names.
-std::vector<std::string> split_columns(const char* columns) {
+std::vector<std::string> split_columns(std::string_view columns) {
     std::vector<std::string> out;
-    std::string cur;
-    for (const char* p = columns; *p; ++p) {
-        if (*p == ',') {
-            out.push_back(std::move(cur));
-            cur.clear();
-        } else {
-            cur.push_back(*p);
-        }
-    }
-    if (!cur.empty())
-        out.push_back(std::move(cur));
+    for (const auto part : std::views::split(columns, ','))
+        out.emplace_back(part.begin(), part.end());
     return out;
+}
+
+// Registry index of a section/kind token, or kDeviceCiSectionCount when unregistered
+// (the trust-boundary test: only registered kinds reach a table, on write or on read).
+std::size_t section_index(std::string_view kind) {
+    std::size_t i = 0;
+    while (i < kDeviceCiSectionCount && kind != kDeviceCiSections[i].section)
+        ++i;
+    return i;
 }
 
 // Migration v2 (additive, online-safe: constant defaults make the ALTER metadata-only,
@@ -455,54 +456,34 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
             return false;
 
         // Only registered kinds persist (a hand-built record cannot smuggle a stray kind).
-        std::vector<const DeviceCiSection*> kept;
+        // One pass: each kept section's row INSERT runs inline while its status columns are
+        // collected for the single device_ci_section INSERT after the loop.
+        std::vector<std::string_view> kinds, levels, reasons;
         for (const auto& sec : r.sections) {
-            for (const auto& d : kDeviceCiSections)
-                if (sec.kind == d.section) {
-                    kept.push_back(&sec);
-                    break;
-                }
-        }
-        if (!kept.empty()) {
-            std::vector<std::string_view> kinds, levels, reasons;
-            for (const auto* sec : kept) {
-                kinds.emplace_back(sec->kind);
-                levels.emplace_back(sec->level);
-                reasons.emplace_back(sec->reason);
-            }
-            pg::PgResult si = pg::exec_params(
-                c,
-                "INSERT INTO device_inventory_store.device_ci_section (agent_id, kind, level, "
-                "reason) SELECT $1, k, l, r FROM unnest($2::text[], $3::text[], $4::text[]) "
-                "AS t(k, l, r)",
-                std::vector<std::string>{agent_id_s, pg::to_text_array(kinds),
-                                         pg::to_text_array(levels), pg::to_text_array(reasons)});
-            if (si.status() != PGRES_COMMAND_OK)
-                return false;
-        }
-
-        for (const auto* sec : kept) {
-            const DeviceCiSectionDef* def = nullptr;
-            for (const auto& d : kDeviceCiSections)
-                if (sec->kind == d.section)
-                    def = &d;
-            if (def == nullptr || def->table == nullptr || sec->rows.empty())
+            const std::size_t si = section_index(sec.kind);
+            if (si == kDeviceCiSectionCount)
                 continue;
-            const auto cols = split_columns(def->columns);
+            const auto& def = kDeviceCiSections[si];
+            kinds.emplace_back(sec.kind);
+            levels.emplace_back(sec.level);
+            reasons.emplace_back(sec.reason);
+            if (def.table == nullptr || sec.rows.empty())
+                continue;
+            const auto cols = split_columns(def.columns);
             const std::size_t ncol = cols.size();
             std::vector<std::string> ords;
-            ords.reserve(sec->rows.size());
+            ords.reserve(sec.rows.size());
             std::vector<std::vector<std::string_view>> arrays(ncol);
             for (auto& a : arrays)
-                a.reserve(sec->rows.size());
+                a.reserve(sec.rows.size());
             const std::string blank;
-            for (std::size_t i = 0; i < sec->rows.size(); ++i) {
+            for (std::size_t i = 0; i < sec.rows.size(); ++i) {
                 ords.push_back(std::to_string(i));
                 for (std::size_t k = 0; k < ncol; ++k)
-                    arrays[k].emplace_back(k < sec->rows[i].size() ? sec->rows[i][k] : blank);
+                    arrays[k].emplace_back(k < sec.rows[i].size() ? sec.rows[i][k] : blank);
             }
             std::vector<std::string_view> ord_views(ords.begin(), ords.end());
-            std::string sql = std::string("INSERT INTO device_inventory_store.") + def->table +
+            std::string sql = std::string("INSERT INTO device_inventory_store.") + def.table +
                               " (agent_id, ord";
             for (const auto& col : cols)
                 sql += ", " + col;
@@ -524,6 +505,17 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
                 params.push_back(pg::to_text_array(a));
             pg::PgResult ins = pg::exec_params(c, sql.c_str(), params);
             if (ins.status() != PGRES_COMMAND_OK)
+                return false;
+        }
+        if (!kinds.empty()) {
+            pg::PgResult si = pg::exec_params(
+                c,
+                "INSERT INTO device_inventory_store.device_ci_section (agent_id, kind, level, "
+                "reason) SELECT $1, k, l, r FROM unnest($2::text[], $3::text[], $4::text[]) "
+                "AS t(k, l, r)",
+                std::vector<std::string>{agent_id_s, pg::to_text_array(kinds),
+                                         pg::to_text_array(levels), pg::to_text_array(reasons)});
+            if (si.status() != PGRES_COMMAND_OK)
                 return false;
         }
         return true;
@@ -627,11 +619,11 @@ DeviceInventoryStore::get_device_ci_sections(std::string_view agent_id) {
     // One REPEATABLE READ transaction so the section SELECT and every per-kind SELECT share
     // ONE snapshot: a concurrent full replace committing between them can never mix
     // generations (a plain with_txn_for is READ COMMITTED — each statement re-snapshots).
-    struct StatusRow {
-        std::string level, reason;
-    };
-    std::unordered_map<std::string, StatusRow> status;
-    std::unordered_map<std::string, std::vector<std::vector<std::string>>> rows_by_kind;
+    // `sections` is indexed by registry position; a non-empty `kind` marks a section seen
+    // (a status row, or rows without one). with_txn_for runs the lambda exactly once, so the
+    // registry-order result is assembled inside it.
+    std::array<DeviceCiSection, kDeviceCiSectionCount> sections;
+    std::vector<DeviceCiSection> out;
     bool began = false;
     const bool ok = pool_.with_txn_for(kQueryAcquireTimeout, [&](PGconn* c) -> bool {
         began = true;
@@ -645,30 +637,42 @@ DeviceInventoryStore::get_device_ci_sections(std::string_view agent_id) {
             std::vector<std::string>{agent_id_s});
         if (sres.status() != PGRES_TUPLES_OK)
             return false;
-        for (int i = 0; i < PQntuples(sres.get()); ++i)
-            status[PQgetvalue(sres.get(), i, 0)] = {PQgetvalue(sres.get(), i, 1),
-                                                    PQgetvalue(sres.get(), i, 2)};
-        for (const auto& d : kDeviceCiSections) {
-            if (d.table == nullptr)
-                continue;
-            const std::string sql = std::string("SELECT ") + d.columns +
-                                    " FROM device_inventory_store." + d.table +
-                                    " WHERE agent_id = $1 ORDER BY ord";
-            pg::PgResult rres =
-                pg::exec_params(c, sql.c_str(), std::vector<std::string>{agent_id_s});
-            if (rres.status() != PGRES_TUPLES_OK)
-                return false;
-            auto& dst = rows_by_kind[d.section];
-            const int nrow = PQntuples(rres.get());
-            const int ncol = PQnfields(rres.get());
-            dst.reserve(static_cast<std::size_t>(nrow));
-            for (int i = 0; i < nrow; ++i) {
-                std::vector<std::string> row;
-                row.reserve(static_cast<std::size_t>(ncol));
-                for (int k = 0; k < ncol; ++k)
-                    row.emplace_back(PQgetvalue(rres.get(), i, k));
-                dst.push_back(std::move(row));
+        for (int i = 0; i < PQntuples(sres.get()); ++i) {
+            const std::size_t si = section_index(PQgetvalue(sres.get(), i, 0));
+            if (si == kDeviceCiSectionCount)
+                continue; // unregistered kind: never surfaced
+            sections[si].kind = kDeviceCiSections[si].section;
+            sections[si].level = PQgetvalue(sres.get(), i, 1);
+            sections[si].reason = PQgetvalue(sres.get(), i, 2);
+        }
+        // Registry order (deterministic). A kind with rows but no status row still surfaces,
+        // with a blank level.
+        for (std::size_t si = 0; si < kDeviceCiSectionCount; ++si) {
+            const auto& d = kDeviceCiSections[si];
+            auto& sec = sections[si];
+            if (d.table != nullptr) {
+                const std::string sql = std::string("SELECT ") + d.columns +
+                                        " FROM device_inventory_store." + d.table +
+                                        " WHERE agent_id = $1 ORDER BY ord";
+                pg::PgResult rres =
+                    pg::exec_params(c, sql.c_str(), std::vector<std::string>{agent_id_s});
+                if (rres.status() != PGRES_TUPLES_OK)
+                    return false;
+                const int nrow = PQntuples(rres.get());
+                const int ncol = PQnfields(rres.get());
+                sec.rows.reserve(static_cast<std::size_t>(nrow));
+                for (int i = 0; i < nrow; ++i) {
+                    std::vector<std::string> row;
+                    row.reserve(static_cast<std::size_t>(ncol));
+                    for (int k = 0; k < ncol; ++k)
+                        row.emplace_back(PQgetvalue(rres.get(), i, k));
+                    sec.rows.push_back(std::move(row));
+                }
             }
+            if (sec.kind.empty() && sec.rows.empty())
+                continue;
+            sec.kind = d.section;
+            out.push_back(std::move(sec));
         }
         return true;
     });
@@ -683,26 +687,6 @@ DeviceInventoryStore::get_device_ci_sections(std::string_view agent_id) {
             spdlog::warn("DeviceInventoryStore: sections get failed for agent={} ({})", agent_id,
                          pool_.last_error());
         return std::unexpected(CiReadError::kDegraded);
-    }
-
-    // Registry order (deterministic). A kind with rows but no status row still surfaces,
-    // with a blank level.
-    std::vector<DeviceCiSection> out;
-    for (const auto& d : kDeviceCiSections) {
-        const auto st = status.find(d.section);
-        auto rit = rows_by_kind.find(d.section);
-        const bool has_rows = rit != rows_by_kind.end() && !rit->second.empty();
-        if (st == status.end() && !has_rows)
-            continue;
-        DeviceCiSection sec;
-        sec.kind = d.section;
-        if (st != status.end()) {
-            sec.level = st->second.level;
-            sec.reason = st->second.reason;
-        }
-        if (has_rows)
-            sec.rows = std::move(rit->second);
-        out.push_back(std::move(sec));
     }
     return out;
 }
