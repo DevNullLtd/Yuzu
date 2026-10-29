@@ -163,7 +163,7 @@ Pipe-delimited rows, one per device or node, with the action name as the first f
 ### Where the data goes
 
 - **Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. Each of the three actions is also a gathered definition (`crossplatform.peripherals.usb`/`.pci`/`.thunderbolt`, 300s TTL).
-- **Not consumed by** daily-sync, TAR, DEX, or metrics.
+- **Not consumed by** daily-sync, Echo, DEX, or metrics.
 - **Sensitivity.** Rows carry hardware identifiers (USB/PCI vendor and product ids, serial numbers, Thunderbolt unique ids) that can fingerprint a specific device, and vendor/product strings that name installed peripheral hardware — a software/hardware inventory by another route. No row carries a username or account name.
 - **Siblings:** `hardware` (system/BIOS/CPU/memory/disk inventory — this plugin covers the bus-attached device tree `hardware` does not).
 

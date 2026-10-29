@@ -28,7 +28,7 @@ related: >-
   narrow cross-user file-read grant were considered and rejected against that model). The
   filesystem plugin (agents/plugins/filesystem/ — the better precedent for this plugin's internal
   bounded-synchronous-walk conventions than installed_apps, per Decision 2; corrected from an
-  earlier, false citation to tar's ProcStreamCollector during a fix pass, 2026-07-08 — this
+  earlier, false citation to echo's ProcStreamCollector during a fix pass, 2026-07-08 — this
   frontmatter line was the one place that fix pass missed, caught during governance re-review of
   the fix itself).
   docs/postgres-store-playbook.md and docs/postgres-migration-ladder.md (cited in Decision 8 for
@@ -318,7 +318,7 @@ on Linux; the intended `NT SERVICE\YuzuAgent` on Windows, though currently Local
 a tracked bug, #1442) specifically so a compromised agent or plugin has a small, auditable blast
 radius; macOS currently runs as root, which `docs/agent-privilege-model.md` itself flags as a state
 the team wants to close, not a foundation to build on (that doc cites #1455 for this; verified during
-adversarial review, 2026-07-08, that #1455's own scope is actually the macOS TAR Endpoint-Security
+adversarial review, 2026-07-08, that #1455's own scope is actually the macOS Echo Endpoint-Security
 entitlement/notarization pipeline, not de-rooting the agent — the substantive claim here, that macOS
 runs as root today and shouldn't be built on, holds regardless; `agent-privilege-model.md` is the
 citation to correct, not this ADR's reliance on it). Reaching another logged-in user's home directory
@@ -427,22 +427,22 @@ does the actual filesystem walking, binary parsing, and Electron/buildinfo detec
 
 **Internal-conventions precedent: model this plugin's bounded-walk safety on `filesystem`, not on
 `installed_apps` (corrected following Gate 3 plugin-architecture review, 2026-07-07; the citation
-itself corrected following adversarial review, 2026-07-08, which found the original `tar`
+itself corrected following adversarial review, 2026-07-08, which found the original `echo`
 citation below doesn't actually solve the problem it was cited for).** `installed_apps` is the
 right precedent for the agent-core/plugin *boundary* shape above (thin sync-source glue calling
 into a plugin action), but the wrong precedent for this plugin's *internal* conventions —
 `installed_apps` is a simple buffer-and-return collector, while this plugin's actual engineering
 risk is a `write_output` call that is synchronous with no progress/cancellation hook, so a
-multi-thousand-file walk needs to fit inside whatever command-timeout budget applies. **`tar`'s
-`ProcStreamCollector` (`docs/tar-module-loads.md`) does not solve this**, and is not the right
-precedent for it: checked directly against `tar_proc_stream.hpp`, it is a persistent, event-driven
+multi-thousand-file walk needs to fit inside whatever command-timeout budget applies. **`echo`'s
+`ProcStreamCollector` (`docs/echo-module-loads.md`) does not solve this**, and is not the right
+precedent for it: checked directly against `echo_proc_stream.hpp`, it is a persistent, event-driven
 collector that runs continuously and is drained on a tick, never invoked synchronously inside one
 command dispatch — the synchronous-timeout-budget problem this plugin actually faces doesn't arise
 for it by construction. The right precedent is `filesystem_plugin.cpp`
 (`agents/plugins/filesystem/src/`), which already does exactly this: a bounded, synchronous
 recursive walk returning through `write_output` within depth/size/time budgets (see the
 bound-checking-primitives reuse discussion above) — the shape this plugin's own walk needs, not
-`tar`'s streaming model. Separately, `sync_source_installed_software.cpp`'s existing behavior of
+`echo`'s streaming model. Separately, `sync_source_installed_software.cpp`'s existing behavior of
 dropping the **entire cycle** on capture-cap truncation (line ~306 in that file) is a materially
 bigger risk here given this tier's higher cardinality and heterogeneity — a truncated
 component-inventory cycle should not silently look like a small, complete one (see Decision 4's
@@ -1016,7 +1016,7 @@ above); it remains unnumbered future work.
 **The component inventory itself is current-state-only, replace-on-change — no row-level history
 kept centrally.** This follows the same precedent every other daily-sync store already
 established: ADR-0016 explicitly rejected full version history for `installed_software` in central
-Postgres ("history is TAR's edge concern," per ADR-0004's current-state-central /
+Postgres ("history is Echo's edge concern," per ADR-0004's current-state-central /
 history-on-edge boundary).
 
 **Correcting an inaccurate precedent claim (found during adversarial review, 2026-07-08): no
@@ -1175,8 +1175,8 @@ requirement on the inventory itself.
 
 **If genuine component-level historical/change-tracking is ever wanted** (a forensic "was this
 component present two weeks ago" question, distinct from vulnerability history) — that remains a
-TAR concern by the same boundary ADR-0016 already drew, plausibly a future `$ComponentInventory`
-TAR source analogous to the existing `$Software` source, not a reason to add history to this ADR's
+Echo concern by the same boundary ADR-0016 already drew, plausibly a future `$ComponentInventory`
+Echo source analogous to the existing `$Software` source, not a reason to add history to this ADR's
 central store.
 
 **Named limitation, not a defect: `first_seen`/`last_seen` alone cannot support a "we knew about
@@ -1405,7 +1405,7 @@ retirement PR itself.
 | 0016 (agent daily-sync framework) | Mechanism reused (SyncSource/scheduler/hash-skip); a new, separately-governed source (Decision 3) — independent budget/store even though its floor cadence is daily too, plus an event-linked trigger keyed to `installed_software`'s own change detection. **Open dependency (Decision 1):** `installed_apps`/`sync_source_installed_software` needs a small addition (capture `InstallLocation`/`.app` bundle path) to anchor this ADR's walk roots — must land before or alongside implementation (recommended: a dated ADR-0016 amendment section, matching the `device_ci`/blob-v2 precedent), not after. **Update (2026-09-21): PARTIALLY landed — the binding condition stays OPEN.** The operator `list` action now carries `install_location` + `bundle_id` (definition `crossplatform.software.inventory` 1.1.0); the `sync_source_installed_software`/blob-v3 addition Decision 1 names remains open and is deliberately NOT folded in, so a `component_inventory` PR that anchors on the daily-sync blob must either land that amendment first or amend Decision 1 to bless an in-process consumer of `list`. The columns are display-grade, not walk roots: `safe_output_field` is lossy (`\`→`/`, which on POSIX can synthesise `..` from a filename that contains `\`), REG_EXPAND_SZ is unexpanded, a macOS value can be `/Users/<account>/...` (a per-user root Decision 1 forbids), and the value is as reported by system_profiler/the registry — untrusted and non-canonical, and under a user's home controlled by that user (the text parser cannot exclude a line-injected record; tracked). The walker must canonicalise and validate every path before use. See the binding condition at :1458. |
 | 0029 (CVE source catalog & ingestion) | **Sibling, not a dependency in either direction** (corrected during governance review, 2026-07-07 — an earlier draft of 0029 incorrectly claimed this ADR as its consumer). Neither document depends on the other; the actual consumer of both is ADR-0023's matching engine, routed by regime. |
 | `vuln_scan` plugin (existing, not an ADR) | Considered and rejected as the host for this capability (Decision 2) — carries legacy pre-ADR-0018 code pending an unscheduled retirement; a new `component_inventory` plugin is built instead. **The name survives, the plugin doesn't:** the `security.vuln_scan.scan` instruction definition is kept and re-pointed at `component_inventory`'s action, so the operator-facing command an owner already associates with this capability keeps working through the plugin's retirement (Decision 2). |
-| `filesystem` plugin (existing, not an ADR) | The better precedent for this plugin's *internal* bounded-synchronous-walk conventions (Decision 2, citation corrected following adversarial review, 2026-07-08) — `installed_apps` is the right precedent for the agent-core/plugin boundary shape only; `tar`'s `ProcStreamCollector` was incorrectly cited here in an earlier draft, but it is a persistent async collector, never invoked synchronously inside one command dispatch, so it doesn't address the command-timeout-budget/partial-result problem this plugin's walk actually faces. `filesystem_plugin.cpp`'s own bounded, synchronous walk is the real precedent for that. |
+| `filesystem` plugin (existing, not an ADR) | The better precedent for this plugin's *internal* bounded-synchronous-walk conventions (Decision 2, citation corrected following adversarial review, 2026-07-08) — `installed_apps` is the right precedent for the agent-core/plugin boundary shape only; `echo`'s `ProcStreamCollector` was incorrectly cited here in an earlier draft, but it is a persistent async collector, never invoked synchronously inside one command dispatch, so it doesn't address the command-timeout-budget/partial-result problem this plugin's walk actually faces. `filesystem_plugin.cpp`'s own bounded, synchronous walk is the real precedent for that. |
 | 0018 / 0019 (server-authoritative matching / tri-state findings) | Downstream consumer — this ADR's output feeds the language-ecosystem regime of CVE matching. |
 | ADR-0023 (vuln correlation engine, PR #1914, merged 2026-07-07, `status: accepted`) | Downstream consumer of this ADR's schema; that document does not re-specify collection, it assumes this ADR's output as an input. **Open interface contract (Decision 2):** that document still needs an on-demand re-match trigger, keyed off the `component_inventory` action's completion for an agent/scope (not off the `vuln_scan.scan` instruction name specifically) to complete the ad-hoc "refresh a subset, see current vulnerabilities" workflow this ADR's collection half already supports. |
 | 1005 (headless platform / use-case engines, PR #1918/#1926 — merged the proposal text to `dev`; the ADR itself is `status: proposed`, not yet accepted) | This capability is *mechanism* under its Decision-2 test — unaffected by that ADR's outcome. |

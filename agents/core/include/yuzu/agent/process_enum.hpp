@@ -4,7 +4,7 @@
  * process_enum.hpp -- Cross-platform process enumeration for Yuzu agent
  *
  * Returns a vector of ProcessInfo with PID, PPID, name, command line, and user
- * for every running process. Used by the TAR plugin for snapshot-based diff
+ * for every running process. Used by the Echo plugin for snapshot-based diff
  * detection and available to any other component that needs process data.
  *
  * Platform implementations:
@@ -30,7 +30,7 @@ struct ProcessInfo {
     std::string cmdline;
     std::string user;
     // Canonical on-disk executable path (P-004, cursor-model seam
-    // agents/plugins/tar/src/tar_cursor.hpp) -- used to correlate a running
+    // agents/plugins/echo/src/echo_cursor.hpp) -- used to correlate a running
     // process to an `exec_from_removable` event by checking whether this path
     // resolves under a removable volume's mount point. Empty when the path
     // could not be resolved (permission denied, process already exited,

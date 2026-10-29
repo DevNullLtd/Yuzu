@@ -324,32 +324,32 @@ yuzu_estate_js_embed = custom_target(
   ],
 )
 
-# TAR retention tier defaults (checked-in mirror of the agent's schema registry,
-# drift-tested in the tar suite). Symbol: kTarRetentionTiersTsv.
-tar_retention_tiers_tsv_embed = custom_target(
-  'tar_retention_tiers_tsv',
-  input: files('../../docs/capability-registries/tar_retention_tiers.tsv'),
-  output: 'tar_retention_tiers_tsv.cpp',
+# Echo retention tier defaults (checked-in mirror of the agent's schema registry,
+# drift-tested in the echo suite). Symbol: kEchoRetentionTiersTsv.
+echo_retention_tiers_tsv_embed = custom_target(
+  'echo_retention_tiers_tsv',
+  input: files('../../docs/capability-registries/echo_retention_tiers.tsv'),
+  output: 'echo_retention_tiers_tsv.cpp',
   command: [
     yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
-    'TarRetentionTiersTsv',
+    'EchoRetentionTiersTsv',
   ],
 )
 
-# TAR timeline page (hidden; /static/yuzu-tar-timeline.js). Symbol: kYuzuTarTimelineJs.
-yuzu_tar_timeline_js_embed = custom_target(
-  'yuzu_tar_timeline_js_bundle',
-  input: 'static/yuzu-tar-timeline.js',
-  output: 'yuzu_tar_timeline_js_bundle.cpp',
+# Echo timeline page (hidden; /static/yuzu-echo-timeline.js). Symbol: kYuzuEchoTimelineJs.
+yuzu_echo_timeline_js_embed = custom_target(
+  'yuzu_echo_timeline_js_bundle',
+  input: 'static/yuzu-echo-timeline.js',
+  output: 'yuzu_echo_timeline_js_bundle.cpp',
   command: [
     yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
-    'YuzuTarTimelineJs',
+    'YuzuEchoTimelineJs',
   ],
 )
 
@@ -612,8 +612,8 @@ yuzu_server_core_lib = static_library(
    yuzu_groups_js_embed,
    yuzu_system_js_embed,
    yuzu_developer_js_embed,
-   yuzu_tar_timeline_js_embed,
-   tar_retention_tiers_tsv_embed,
+   yuzu_echo_timeline_js_embed,
+   echo_retention_tiers_tsv_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
@@ -727,8 +727,8 @@ yuzu_server_core_lib = static_library(
     'src/home_render.cpp', # Dashboard panels: pure value structs + renderers
     'src/home_routes.cpp', # Dashboard: GET /fragments/dashboard/summary over injected seams
     'src/instruction_ui.cpp',
-    'src/tar_page_ui.cpp',
-    'src/tar_timeline_page_ui.cpp', # hidden TAR timeline page shell (flag-gated route)
+    'src/echo_page_ui.cpp',
+    'src/echo_timeline_page_ui.cpp', # hidden Echo timeline page shell (flag-gated route)
     'src/result_sets_ui.cpp',
     'src/result_set_extras_render.cpp',
     'src/approvals_page_render.cpp', # Operate O1: the Approvals page's pure list renderer
@@ -866,9 +866,9 @@ yuzu_server_core_lib = static_library(
     'src/deployments_render.cpp',
     'src/deployment_run_store.cpp',
     'src/deployment_engine.cpp',
-    'src/tar_process_tree.cpp',
-    'src/tar_timeline_render.cpp',
-    'src/tar_tree_routes.cpp',
+    'src/echo_process_tree.cpp',
+    'src/echo_timeline_render.cpp',
+    'src/echo_tree_routes.cpp',
     'src/dashboard_routes.cpp',
     'src/workflow_routes.cpp',
     'src/notification_routes.cpp',

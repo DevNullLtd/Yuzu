@@ -314,8 +314,8 @@ TEST_CASE("data-retention REST twin and fragment report the ENFORCED windows fro
     CHECK(frag->body.find("Unknown") != std::string::npos);
 }
 
-TEST_CASE("GET /api/v1/settings/data-retention carries the TAR tier defaults and the fragment renders them",
-          "[settings][rest][settings-read-twins][retention][tar]") {
+TEST_CASE("GET /api/v1/settings/data-retention carries the Echo tier defaults and the fragment renders them",
+          "[settings][rest][settings-read-twins][retention][echo]") {
     SettingsReadTwinsHarness h;
 
     auto rest = h.sink.Get("/api/v1/settings/data-retention");
@@ -323,8 +323,8 @@ TEST_CASE("GET /api/v1/settings/data-retention carries the TAR tier defaults and
     auto data = nlohmann::json::parse(rest->body).at("data");
     CHECK(data.contains("response_retention_days"));
     CHECK(data.contains("enforced"));
-    CHECK(data.at("tar").at("tick_seconds").get<int>() == 900);
-    const auto& tiers = data.at("tar").at("tiers");
+    CHECK(data.at("echo").at("tick_seconds").get<int>() == 900);
+    const auto& tiers = data.at("echo").at("tiers");
     REQUIRE(tiers.is_array());
     bool found = false;
     for (const auto& t : tiers)
@@ -335,7 +335,7 @@ TEST_CASE("GET /api/v1/settings/data-retention carries the TAR tier defaults and
     auto frag = h.sink.Get("/fragments/settings/data-retention");
     REQUIRE(frag);
     CHECK(frag->status == 200);
-    CHECK(frag->body.find("TAR capture sources") != std::string::npos);
+    CHECK(frag->body.find("Echo capture sources") != std::string::npos);
     CHECK(frag->body.find("netqual") != std::string::npos);
     CHECK(frag->body.find("procperf") != std::string::npos);
     CHECK(frag->body.find("Look again after") != std::string::npos);
@@ -349,7 +349,7 @@ TEST_CASE("data-retention fragment shows Unknown for every window when no reader
     REQUIRE(frag);
     CHECK(frag->status == 200);
     CHECK(frag->body.find("Unknown") != std::string::npos);
-    // The three windows only: the TAR tier table below legitimately shows durations.
+    // The three windows only: the Echo tier table below legitimately shows durations.
     CHECK(frag->body.substr(0, frag->body.find("<caption")).find(" days") == std::string::npos);
 }
 

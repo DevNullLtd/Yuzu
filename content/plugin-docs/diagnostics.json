@@ -610,7 +610,7 @@
   "version": "0.2.0",
   "where_the_data_goes": [
     "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention, `server/core/src/response_store.hpp:153`), readable at `/api/responses/{id}`.",
-    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no server-side store or route reads `device.diagnostics.*` (grepped across `server/`); `server/core/src/agent_registry.cpp:922-925` only carries the action's one-line description for discovery/catalog display, not the result rows.",
+    "**Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics — no server-side store or route reads `device.diagnostics.*` (grepped across `server/`); `server/core/src/agent_registry.cpp:922-925` only carries the action's one-line description for discovery/catalog display, not the result rows.",
     "**Sensitivity.** `connection_info`'s `session_id` is the agent's live session credential — why that action sits behind the `PluginSecret` securable rather than `Inventory` — and `certificates`' `path` rows can reveal local filesystem layout; nothing here names a specific person or installed software.",
     "**Siblings:** none in this plugin group — `agent_logging` is the closest neighbor (`get_key_files` reports TLS/key file paths under the same `Security` securable; `get_log`/`connection_info` both expose the live session credential under `PluginSecret`).",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.diagnostics.connection_info\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
