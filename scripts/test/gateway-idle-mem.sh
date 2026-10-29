@@ -15,9 +15,15 @@
 # environment variable read by the suite; see docs/testing/gateway-scale-tests.md,
 # "Idle memory per connection". The ones most often changed:
 #   YUZU_GW_IDLEMEM_SWEEP=0,1000,5000,10000   the N points
-#   YUZU_GW_IDLEMEM_TRANSPORTS=tls,plain      tls | mtls | plain, in order
+#   YUZU_GW_IDLEMEM_TRANSPORTS=tls,plain      tls | mtls | ktls | plain, in order
+#   YUZU_GW_IDLEMEM_BUDGET_KIB=64             the all-in per-agent budget reported
 #   YUZU_GW_IDLEMEM_SNAPSHOT_BYTES=150000     fleet snapshot size (0 = none)
 #   YUZU_GW_SCALE_GATE=1                      fail on a per-conn ceiling breach
+#
+# The kernel part (socket buffers from ss, slab from /proc/slabinfo) needs
+# /proc/slabinfo readable: as root, or with passwordless `sudo -n cat`.
+# Without it only the socket buffers are counted and the summary's kernel
+# column understates (slab_source = none in the JSON).
 #
 # A full default run takes about 45 minutes: each point waits for a steady
 # state. Linux is the platform the 8 KiB goal is judged on; macOS numbers are

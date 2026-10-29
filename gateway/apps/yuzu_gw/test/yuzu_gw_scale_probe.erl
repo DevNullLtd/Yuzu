@@ -465,9 +465,89 @@ linux_sockets(Ports) ->
                    end;
                _ -> null
            end,
-    #{source => ss, sockets => length(Mems),
-      allocated => Sum([r, t, f, w, o, bl, d]), queued => Sum([r, t]),
-      limits => Sum([rb, tb]), host_tcp_mem => Host}.
+    Allocated = Sum([r, t, f, w, o, bl, d]),
+    Socks = #{source => ss, sockets => length(Mems),
+              allocated => Allocated, queued => Sum([r, t]),
+              limits => Sum([rb, tb]), host_tcp_mem => Host},
+    maps:merge(Socks, kernel_memory(Allocated, Host)).
+
+%% @doc The kernel's per-connection memory beyond the socket buffers: slab.
+%% Read from /proc/slabinfo (root only on most hosts, so `sudo -n cat' is
+%% tried when the plain read is refused; with neither, only the socket
+%% buffers are reported and `slab_source' says so). Each cache's memory is
+%% num_slabs * pagesperslab * page size (what the cache holds, slack
+%% included). The caches a connection touches, in four groups:
+%%
+%%   slab_pair      one object per socket at EACH end of a connection: TCP,
+%%                  TCPv6, sock_inode_cache, filp, dentry, eventpoll_epi,
+%%                  eventpoll_pwq, lsm_inode_cache, lsm_file_cache. The
+%%                  load generator runs on the same host, so its client
+%%                  sockets hold the same objects; the gateway's share is half.
+%%   slab_kmalloc   kmalloc-* (and kmalloc-cg-*, kmalloc-rcl-*): kTLS keeps
+%%                  its context, AEAD transforms and RX parser here (about
+%%                  4 KB per connection, measured 2026-10-28), plus small LSM
+%%                  and socket blobs of both ends. Counted whole (the
+%%                  client's small share makes this an overestimate).
+%%   slab_conntrack nf_conntrack*: one entry per flow when conntrack is loaded
+%%                  (a gateway host with conntrack pays it). Counted whole.
+%%   slab_net       skbuff_*, tcp_bind_bucket, request_sock_TCP*, tw_sock_TCP*,
+%%                  inet_peer_cache. Counted whole.
+%%
+%% kernel = slab_pair / 2 + slab_kmalloc + slab_conntrack + slab_net +
+%% the gateway sockets' own buffers (`allocated', from ss): the gateway's
+%% kernel memory. kernel_host = every group whole + /proc/net/sockstat's TCP
+%% memory: both ends of every connection on the host, an upper bound. Both
+%% are host-wide reads, so anything else on the host that allocates in these
+%% caches between M(0) and M(N) shows up; `slab_total' (every cache) is kept
+%% to make that visible.
+kernel_memory(Allocated, HostTcp) ->
+    case slabinfo() of
+        {Source, Rows} ->
+            G = fun(Pred) -> lists:sum([B || {Name, B} <- Rows, Pred(Name)]) end,
+            Pair = G(fun(N) -> lists:member(N, ["TCP", "TCPv6", "sock_inode_cache", "filp",
+                                                "dentry", "eventpoll_epi", "eventpoll_pwq",
+                                                "lsm_inode_cache", "lsm_file_cache"]) end),
+            Kmalloc = G(fun(N) -> lists:prefix("kmalloc-", N) end),
+            Ct = G(fun(N) -> lists:prefix("nf_conntrack", N) end),
+            Net = G(fun(N) -> lists:prefix("skbuff_", N) orelse lists:prefix("request_sock_TCP", N)
+                                  orelse lists:prefix("tw_sock_TCP", N)
+                                  orelse lists:member(N, ["tcp_bind_bucket", "inet_peer_cache"]) end),
+            HostTcpB = case HostTcp of null -> 0; _ -> HostTcp end,
+            #{slab_source => Source, slab_pair => Pair, slab_kmalloc => Kmalloc,
+              slab_conntrack => Ct, slab_net => Net, slab_total => G(fun(_) -> true end),
+              kernel => Pair div 2 + Kmalloc + Ct + Net + Allocated,
+              kernel_host => Pair + Kmalloc + Ct + Net + HostTcpB};
+        none ->
+            #{slab_source => none, kernel => Allocated}
+    end.
+
+slabinfo() ->
+    Text = case file:read_file("/proc/slabinfo") of
+               {ok, B} -> {proc, binary_to_list(B)};
+               {error, _} ->
+                   case os:cmd("sudo -n cat /proc/slabinfo 2>/dev/null") of
+                       "slabinfo" ++ _ = T -> {sudo, T};
+                       _ -> none
+                   end
+           end,
+    case Text of
+        none -> none;
+        {Src, T1} ->
+            Page = page_size(),
+            {Src, [{Name, NumSlabs * PagesPerSlab * Page}
+                   || L <- string:split(T1, "\n", all),
+                      [Name, _Active, _Num, _Size, _PerSlab, PPS | Rest] <- [string:lexemes(L, " ")],
+                      hd(Name) =/= $#, Name =/= "slabinfo",
+                      {PagesPerSlab, []} <- [string:to_integer(PPS)],
+                      ["slabdata", _ActiveSlabs, NS | _] <- [lists:dropwhile(fun(X) -> X =/= "slabdata" end, Rest)],
+                      {NumSlabs, []} <- [string:to_integer(NS)]]}
+    end.
+
+page_size() ->
+    case string:to_integer(string:trim(os:cmd("getconf PAGESIZE 2>/dev/null"))) of
+        {P, []} when P > 0 -> P;
+        _ -> 4096
+    end.
 
 %% ss lives in /usr/sbin on most distributions, which a non-root PATH (the
 %% node's, via os:cmd) often lacks.

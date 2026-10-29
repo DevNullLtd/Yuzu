@@ -742,7 +742,7 @@ idle_memory(Config) ->
                            register_plugins => length(Plugins)},
                runs => Runs},
     Ceil = idle_ceiling_check(Config, Result),
-    Final = Result#{ceiling => Ceil},
+    Final = Result#{ceiling => Ceil, budget => idle_budget(Result)},
     Dir = ?config(results_dir, Config),
     Base = filename:join(Dir, "yuzu_gw_idle_mem-" ++ ?config(run, Config)),
     ok = file:write_file(Base ++ ".json", json:encode(jsonable(Final))),
@@ -765,6 +765,22 @@ idle_memory(Config) ->
                 report -> {comment, Msg ++ " (report mode: recorded, not failed)"}
             end
     end.
+
+%% The per-agent budget check (ADR-0074 D14: 64 KiB per idle agent, all-in,
+%% the kernel's per-connection memory included): at the largest N of each
+%% transport, all_in = os_anon + kernel per connection against
+%% YUZU_GW_IDLEMEM_BUDGET_KIB. Reported, never failed: the check becomes a gate
+%% only once the common baseline (wave 0) has been measured on both rigs.
+idle_budget(#{runs := Runs}) ->
+    Lim = env_int("YUZU_GW_IDLEMEM_BUDGET_KIB", 64) * 1024,
+    [begin
+         #{n := N, per_conn := Pc} = lists:last(Points),
+         A = maps:get(all_in, Pc, null),
+         #{transport => T, n => N, all_in => A, os_anon => maps:get(os_anon, Pc, null),
+           kernel => maps:get(socket_kernel, Pc, null),
+           kernel_host => maps:get(socket_kernel_host, Pc, null), limit => Lim,
+           ok => case A of null -> null; _ -> A =< Lim end}
+     end || #{transport := T, points := Points} <- Runs, Points =/= [], lists:last(Points) =/= #{}].
 
 idle_opts() ->
     Hb = env_int("YUZU_GW_SCALE_HB_MS", 30000),
@@ -808,6 +824,7 @@ idle_run(Transport, Opts, Pki, Plugins, Tags, Snapshot, Config) ->
                        hb_tags => Tags, hb_snapshot => Snapshot,
                        hb_snapshot_every => maps:get(snapshot_every, Opts)}]),
     C = [{up, Up}, {up_port, UpPort}, {gw, Gw}, {load, Load} | Config],
+    idle_assert_transport(C, Transport),
     Ports = [P || {_, P} <- targets(Gw)],
     ct:pal("idle_memory ~p: gateway agent ~p, fds ~p", [Transport, targets(Gw),
                                                        ?PEER:fds(maps:get(peer, Gw))]),
@@ -835,6 +852,15 @@ idle_run(Transport, Opts, Pki, Plugins, Tags, Snapshot, Config) ->
       forced_gc_at_largest_n => #{sample => AfterGc,
                                   per_conn => per_conn(AfterGc, Base, Max)},
       loadgen => Fleet}.
+
+%% A `ktls' run must measure the kTLS transport, never fall back to ssl unseen.
+idle_assert_transport(C, ktls) ->
+    case gw_call(C, ranch, info, [{yuzu_grpc, agent}]) of
+        #{transport := yuzu_gw_ktls_transport} -> ok;
+        Info -> ct:fail("idle_memory ktls: the agent listener runs ~p, not yuzu_gw_ktls_transport",
+                        [maps:get(transport, Info, undefined)])
+    end;
+idle_assert_transport(_C, _T) -> ok.
 
 %% One sweep point: grow the fleet to N (ramped), wait for every agent live,
 %% settle, then sample until steady; M(N) is the mean of the last window.
@@ -936,7 +962,14 @@ idle_flat(#{beam := Beam, os := Os, sockets := Sock, heartbeat_buffer := Hb} = S
            end,
     K = maps:from_list([{list_to_atom("socket_" ++ atom_to_list(Key)), V}
                         || {Key, V} <- maps:to_list(Sock), is_integer(V)]),
-    lists:foldl(fun maps:merge/2, #{}, [B, O, Anon, K,
+    %% all_in: the gateway's OS anonymous memory plus its kernel memory
+    %% (socket buffers and slab, yuzu_gw_scale_probe:kernel_memory/2), the
+    %% figure the per-agent budget check judges.
+    AllIn = case {Anon, K} of
+                {#{os_anon := A1}, #{socket_kernel := Kn}} -> #{all_in => A1 + Kn};
+                _ -> #{}
+            end,
+    lists:foldl(fun maps:merge/2, #{}, [B, O, Anon, K, AllIn,
                                         #{process_count => maps:get(process_count, S),
                                           port_count => maps:get(port_count, S),
                                           hb_buffer_bytes => maps:get(buf_bytes, Hb, 0)}]).
@@ -987,7 +1020,7 @@ slope(_, _) -> #{}.
 idle_headline(#{points := Points}) ->
     #{n := N, per_conn := P} = lists:last(Points),
     maps:with([beam_total, beam_processes, beam_binary, beam_ets, os_anon, os_rss,
-               process_count], P#{n => N}).
+               socket_kernel, socket_kernel_host, all_in, process_count], P#{n => N}).
 
 %% TLS material for a run: a P-384 root and a P-256 gateway leaf (the shapes
 %% the server's first-boot PKI issues, x509_ca.cpp), and a P-256 client leaf
@@ -1035,6 +1068,12 @@ idle_pki(Dir) ->
 %% to mutual TLS (verify_peer, fail_if_no_peer_cert false, docs/user-manual/
 %% gateway.md); `plain' none.
 idle_listener_tls(plain, _) -> undefined;
+idle_listener_tls(ktls, Pki) ->
+    %% The kTLS agent listener (branch perf/gateway-idle-mem-ktls): the shipped
+    %% one-way options with the handshake in OpenSSL and the record layer in
+    %% the kernel. A gateway without the option refuses the listener; the case
+    %% also checks the listener's transport (idle_assert_ktls/2).
+    (idle_listener_tls(tls, Pki))#{ktls => true};
 idle_listener_tls(tls, #{server_cert := C, server_key := K, client_cacerts := Ca}) ->
     #{certfile => C, keyfile => K, cacertfile => Ca,
       verify => verify_none, fail_if_no_peer_cert => false};
@@ -1043,6 +1082,7 @@ idle_listener_tls(mtls, #{server_cert := C, server_key := K, client_cacerts := C
       verify => verify_peer, fail_if_no_peer_cert => false}.
 
 idle_client_tls(plain, _) -> false;
+idle_client_tls(ktls, Pki) -> idle_client_tls(tls, Pki);
 idle_client_tls(tls, #{server_cacerts := Ca, sni := Sni}) ->
     #{cacertfile => Ca, server_name => Sni};
 idle_client_tls(mtls, #{server_cacerts := Ca, sni := Sni, client_cert := C, client_key := K}) ->
@@ -1158,7 +1198,7 @@ idle_ceiling_check(Config, #{runs := Runs}) ->
     #{file => list_to_binary(File), os => OsName, checks => Checks}.
 
 %% The human summary.
-idle_summary(#{run := Run, host := Host, config := Cfg, runs := Runs, ceiling := Ceil}) ->
+idle_summary(#{run := Run, host := Host, config := Cfg, runs := Runs, ceiling := Ceil} = Result) ->
     KiB = fun(null) -> "-"; (undefined) -> "-";
              (B) -> io_lib:format("~.1f", [B / 1024]) end,
     MiB = fun(undefined) -> "-"; (B) -> io_lib:format("~.1f", [B / 1048576]) end,
@@ -1174,7 +1214,7 @@ idle_summary(#{run := Run, host := Host, config := Cfg, runs := Runs, ceiling :=
               maps:get(register_request_bytes, Cfg), maps:get(register_plugins, Cfg),
               maps:get(settle_ms, Cfg), maps:get(window_ms, Cfg), maps:get(sample_ms, Cfg),
               maps:get(steady_tol_pct, Cfg), maps:get(settle_max_ms, Cfg)]),
-    Cols = "~-6s ~7s ~7s ~9s ~9s | per conn KiB: ~7s ~13s ~7s ~7s ~7s ~7s ~7s | procs ~3s | sock KiB ~6s~n",
+    Cols = "~-6s ~7s ~7s ~9s ~9s | per conn KiB: ~7s ~13s ~7s ~7s ~7s ~7s ~7s | procs ~3s | kernel ~6s ~6s | all-in ~6s~n",
     Range = fun(#{per_conn_envelope := #{beam_total := #{min := Lo, max := Hi}}}) ->
                     io_lib:format("~b-~b", [Lo div 1024, Hi div 1024]);
                (_) -> "-"
@@ -1186,7 +1226,7 @@ idle_summary(#{run := Run, host := Host, config := Cfg, runs := Runs, ceiling :=
     Table = fun(#{transport := T, points := Points}) ->
                     [io_lib:format(Cols, ["", "N", "steady", "BEAM MiB", "anon MiB", "BEAM",
                                           "BEAM min-max", "procs", "binary", "ets", "anon", "rss",
-                                          "", "kernel"]),
+                                          "", "gw", "host", "KiB"]),
                      [begin
                           Pc = maps:get(per_conn, P),
                           io_lib:format(Cols,
@@ -1204,8 +1244,11 @@ idle_summary(#{run := Run, host := Host, config := Cfg, runs := Runs, ceiling :=
                                              #{process_count := Pn} -> integer_to_list(Pn);
                                              _ -> "-"
                                          end,
-                                         KiB(maps:get(socket_allocated, Pc,
-                                                      maps:get(socket_queued, Pc, undefined)))])
+                                         KiB(maps:get(socket_kernel, Pc,
+                                                      maps:get(socket_allocated, Pc,
+                                                               maps:get(socket_queued, Pc, undefined)))),
+                                         KiB(maps:get(socket_kernel_host, Pc, undefined)),
+                                         KiB(maps:get(all_in, Pc, undefined))])
                       end || #{n := N, mean := M} = P <- Points]]
             end,
     Roles = fun(#{transport := T, agent_roles := #{roles := R, total := Tot}}) ->
@@ -1236,8 +1279,14 @@ idle_summary(#{run := Run, host := Host, config := Cfg, runs := Runs, ceiling :=
                                          [T, M, V, C, case Ok of true -> "ok"; false -> "OVER" end])
                            || #{transport := T, metric := M, measured := V, ceiling := C, ok := Ok} <- Cs]
                 end,
+    Budget = [io_lib:format("budget ~p N=~b: all-in ~s KiB/agent (anon ~s + kernel ~s) against "
+                            "~b KiB: ~s~n",
+                            [T, N, KiB(A), KiB(An), KiB(Kn), Lim div 1024,
+                             case Ok of true -> "PASS"; false -> "FAIL"; null -> "no kernel figure" end])
+              || #{transport := T, n := N, all_in := A, os_anon := An, kernel := Kn,
+                   limit := Lim, ok := Ok} <- maps:get(budget, Result, [])],
     lists:flatten([Head, [Table(R) || R <- Runs], [Roles(R) || R <- Runs], [Gc(R) || R <- Runs],
-                   CeilLines]).
+                   CeilLines, Budget]).
 
 env_str(Name, Default) ->
     case os:getenv(Name) of
@@ -1641,7 +1690,7 @@ headline_re() ->
     "upstream_register_peak_inflight|upstream_wasted_register_rpcs|"
     "gateway_memory_per_connection_bytes|"
     "gateway_probe_mailbox_hwm_yuzu_gw_(upstream|registry|router)|"
-    "(tls|mtls|plain)_(beam_total|os_anon))_n[0-9]+$".
+    "(tls|mtls|ktls|plain)_(beam_total|os_anon|all_in|socket_kernel))_n[0-9]+$".
 
 flatten(Prefix, M) when is_map(M) ->
     lists:append([flatten(Prefix ++ "_" ++ key(K), V) || {K, V} <- lists:sort(maps:to_list(M)),
