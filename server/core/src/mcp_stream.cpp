@@ -1710,7 +1710,7 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
     const auto validated = sessions.validate_and_touch(sid, binding);
     if (validated != McpSessionRegistry::ValidateResult::kValid) {
         // Unknown / expired / bound to another principal / minted under another credential
-        // class — one WIRE answer for all four (no cross-principal existence oracle,
+        // class: one WIRE answer for all four (no cross-principal existence oracle,
         // Decision 15(a) / CH-8). Only the same-principal class mismatch is told apart, in
         // the audit row and the reject counter, because it is the signal that a weaker (or
         // otherwise different) credential of the owner is probing the session (#4754).

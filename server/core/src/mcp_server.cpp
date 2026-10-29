@@ -6923,7 +6923,7 @@ McpServer::HandlerFn McpServer::build_handler(
         // Any method other than initialize that carries an Mcp-Session-Id must
         // present a live one bound to this principal AND credential class; unknown /
         // expired / foreign / other-class → 404 and the client re-initializes (no
-        // cross-principal oracle — the wrong principal is indistinguishable from a
+        // cross-principal oracle: the wrong principal is indistinguishable from a
         // never-existed id, 15(a)/CH-8; a same-principal class mismatch answers
         // identically on the wire and differs only in the audit reason).
         if (streaming_on) {
@@ -8008,7 +8008,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // securable to perm_fn right after this deny — this helper's
             // deny decision itself is securable-agnostic, keyed only on
             // token_scope_service. `session` is already resolved once for
-            // the whole request above — no auth_fn call needed here. The
+            // the whole request above, so no auth_fn call is needed here. The
             // predicate and the audit-and-write sink are file-scope
             // (is_service_scoped_caller, write_service_scoped_denial), shared
             // with build_get_handler; this lambda only supplies the POST

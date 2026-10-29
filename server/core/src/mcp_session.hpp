@@ -142,7 +142,7 @@ public:
     // DELETE /mcp/v1/. Removes the session iff it exists AND is bound to exactly
     // `binding`; returns true on removal, false otherwise (same no-oracle posture as
     // validate; a class mismatch removes nothing). A live GET stream on that session is
-    // closed (kSessionTerminated) — the client learns why rather than seeing a bare EOF.
+    // closed (kSessionTerminated); the client learns why rather than seeing a bare EOF.
     // When `refusal` is given it is set to what refused a false return (kUnknown or
     // kCredentialMismatch) so the caller can audit the cause; untouched on success.
     bool terminate(const std::string& id, const McpSessionBinding& binding,

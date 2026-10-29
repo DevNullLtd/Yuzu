@@ -218,7 +218,7 @@ McpSessionRegistry::validate_and_touch(const std::string& id, const McpSessionBi
         auto it = sessions_.find(id);
         // Wrong principal is indistinguishable from unknown (no existence oracle,
         // CH-8). The extra string compare vs. a straight miss is negligible against
-        // network latency — "no gross timing divergence" per Decision 15(a). The same
+        // network latency ("no gross timing divergence" per Decision 15(a)). The same
         // principal under a different credential class is reported distinctly (for the
         // audit trail only; the wire answer is the same) and, like any non-valid result,
         // neither slides last_seen nor terminates the entry.
