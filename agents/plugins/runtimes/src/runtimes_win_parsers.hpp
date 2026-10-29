@@ -16,10 +16,10 @@
  * unparsable VALUE is a per-item metadata shortfall: the row reports what was found (down to the
  * tag's major.minor) and raises no token.
  *
- * BOUNDED. One kMaxTagsVisited counter across both views (one record per tag, so it also caps the
- * rows) and ONE RowByteBudget of kMaxTagsVisited rows and kMaxRowBytes bytes; exhausting either
- * records `windows:runtimes:python_reg:row_cap` and stops. A value is read up to kMaxValueBytes,
- * longer reads as absent.
+ * BOUNDED. One kMaxTagsVisited counter across both views (every enumerated name counts, an over-long
+ * one too; one record per tag, so it also caps the rows) and ONE RowByteBudget of kMaxTagsVisited
+ * rows and kMaxRowBytes bytes; exhausting either records `windows:runtimes:python_reg:row_cap` and
+ * stops. A value is read up to kMaxValueBytes, longer reads as absent.
  */
 #pragma once
 
@@ -101,10 +101,13 @@ template <class Ops>
 [[nodiscard]] std::vector<std::string> python_rows(
     const Ops& ops, yuzu::shared::ConstraintAccumulator& acc, HKEY root = HKEY_LOCAL_MACHINE,
     const wchar_t* subkey = L"SOFTWARE\\Python\\PythonCore") {
-    // Closes through `ops`, so a fake's handles never reach RegCloseKey.
+    // Closes through `ops`, so a fake's handles never reach RegCloseKey. Owns a raw HKEY, so it is
+    // not copyable (a copy would close the handle twice); the constructor keeps `Guard g{ops, h}`.
     struct Guard {
         const Ops& ops;
         HKEY h = nullptr;
+        Guard(const Ops& o, HKEY k) noexcept : ops(o), h(k) {}
+        Guard(const Guard&) = delete;
         ~Guard() {
             if (h) ops.close(h);
         }
@@ -128,18 +131,20 @@ template <class Ops>
             DWORD name_len = kNameLen;
             const LSTATUS erc = ops.enum_key(core, idx, name, &name_len);
             if (erc == ERROR_NO_MORE_ITEMS) break;
-            if (erc == ERROR_MORE_DATA) { // a >255-WCHAR tag name is not a Python version
-                acc.add_failure(kTokNameTooLong);
-                continue;
-            }
-            if (erc != ERROR_SUCCESS) {
+            if (erc != ERROR_SUCCESS && erc != ERROR_MORE_DATA) {
                 acc.add_failure(kTokEnumFailed);
                 break;
             }
+            // Every enumerated name counts, an over-long one too, so a key stuffed with them ends
+            // at the cap instead of looping to its last subkey.
             if (++tags_seen > kMaxTagsVisited) {
                 acc.add_failure(kTokRowCap);
                 capped = true;
                 break;
+            }
+            if (erc == ERROR_MORE_DATA) { // a >255-WCHAR tag name is not a Python version
+                acc.add_failure(kTokNameTooLong);
+                continue;
             }
             HKEY tag_key = nullptr;
             const LSTATUS trc = ops.open(core, name, KEY_READ | view, &tag_key);

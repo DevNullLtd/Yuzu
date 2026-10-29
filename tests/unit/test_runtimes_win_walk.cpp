@@ -5,9 +5,9 @@
  * Two layers, both Windows-only (the walk does not exist elsewhere; a no-op TU on macOS/Linux):
  *   - a scripted FakeOps injected through the walk's registry-call seam drives every branch
  *     deterministically (absent / denied roots, a view present on one side only, a missing Version,
- *     ERROR_MORE_DATA on a tag name, the tag cap across both views, the row-byte budget, the sorted
- *     output order, handle accounting), plus the leg body (run_windows_with) through a real
- *     CommandContext so the typed result status is asserted too;
+ *     ERROR_MORE_DATA on a tag name (also counted against the tag cap), the tag cap across both views,
+ *     the row-byte budget, the sorted output order, handle accounting), plus the leg body
+ *     (run_windows_with) through a real CommandContext so the typed result status is asserted too;
  *   - one end-to-end case reads a planted tag under an isolated, process-suffixed HKCU scratch key
  *     through RealRegOps (Reg*W only), so the real registry decode path runs once.
  *
@@ -240,6 +240,22 @@ TEST_CASE("runtimes win: the tag cap spans both views and reports row_cap, keepi
     const auto rows = rwin::python_rows(ops, acc);
     CHECK(acc.reason() == std::string{rwin::kTokRowCap});
     CHECK(rows.size() == rwin::kMaxTagsVisited); // the last tag was never visited
+    CHECK(ops.opened == ops.closed);
+}
+
+TEST_CASE("runtimes win: over-long tag names count against the tag cap too",
+          "[runtimes][python][windows]") {
+    // kMaxTagsVisited + 1 names of 300 WCHARs: every enumeration answers ERROR_MORE_DATA. MUTATION:
+    // taking the MORE_DATA `continue` before the counter lets a key stuffed with over-long names loop
+    // to its last subkey with no cap, so row_cap is never recorded.
+    FakeOps ops;
+    auto& core = ops.node(L"64", kCore);
+    for (std::size_t i = 0; i < rwin::kMaxTagsVisited + 1; ++i)
+        core.children.push_back(std::wstring(300, L'x'));
+    ConstraintAccumulator acc;
+    CHECK(rwin::python_rows(ops, acc).empty());
+    CHECK(acc.reason() ==
+          std::string{rwin::kTokNameTooLong} + "," + std::string{rwin::kTokRowCap});
     CHECK(ops.opened == ops.closed);
 }
 

@@ -2530,6 +2530,7 @@ std::string show_entry(const SwEntry& e) {
 std::string show(const AdaptedRows& r) {
     std::string s = r.status == Status::ok            ? "ok"
                     : r.status == Status::unsupported ? "unsupported"
+                    : r.status == Status::withheld    ? "withheld"
                                                       : "failed";
     s += "|reason=" + r.reason + "|n=" + std::to_string(r.entries.size());
     for (const auto& e : r.entries)
@@ -2919,6 +2920,7 @@ TEST_CASE("characterisation: collector skip reasons per status mix",
         const char* action;
         bool windows;       // which sample set the other actions come from
         const char* mapped; // a valid row the action maps; empty for managers (they keep it)
+        bool withholds = false; // table policy drop_source: constrained withholds the rows, not the cycle
     };
     const Case cases[] = {
         {1, "pkg_inventory", "packages", false, "package|homebrew|wget|1.24|formula"},
@@ -2927,7 +2929,7 @@ TEST_CASE("characterisation: collector skip reasons per status mix",
         {1, "pkg_inventory", "managers", false, ""},
         {3, "msi_packages", "list_inventory", true,
          "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|Pub"},
-        {4, "runtimes", "python", false, "python|cpython|3.14.6|C:/P/|PythonCore"}};
+        {4, "runtimes", "python", false, "python|cpython|3.14.6|C:/P/|PythonCore", true}};
     for (const auto& c : cases) {
         INFO(c.plugin << "." << c.action);
         const std::string source = std::string(c.plugin) + "." + c.action;
@@ -2942,18 +2944,21 @@ TEST_CASE("characterisation: collector skip reasons per status mix",
             return std::make_pair(collected, src.skip_reason());
         };
         const std::string a = c.action;
-        // constrained with no data row: skipped, the status token is the reason
-        CHECK(skip_with(nl({st(a, "constrained", "tok")})) ==
-              std::make_pair(false, source + ":tok"));
-        // constrained with a row of the wrong shape: still skipped
-        CHECK(skip_with(nl({st(a, "constrained", "tok"), "garbage|row"})) ==
-              std::make_pair(false, source + ":tok"));
-        // constrained with a row the adapter MAPS: still skipped, so the action table's
-        // `constrained` column (fail) is what is pinned, not just the zero-row fallback.
+        // What a constrained answer does to the cycle, per the action table's `constrained` column:
+        // fail skips it with the status token as the reason; drop_source (runtimes.python) lets it
+        // continue with only that source's rows withheld (the collector-level case in the
+        // runtimes.python test below pins the rows).
+        const auto constrained_outcome = c.withholds ? std::make_pair(true, std::string{})
+                                                     : std::make_pair(false, source + ":tok");
+        // constrained with no data row
+        CHECK(skip_with(nl({st(a, "constrained", "tok")})) == constrained_outcome);
+        // constrained with a row of the wrong shape: the same outcome
+        CHECK(skip_with(nl({st(a, "constrained", "tok"), "garbage|row"})) == constrained_outcome);
+        // constrained with a row the adapter MAPS: the same outcome, so the action table's
+        // `constrained` column is what is pinned, not just the zero-row fallback.
         // Managers is the one action that keeps such a cycle (cases below).
         if (c.mapped[0] != '\0') {
-            CHECK(skip_with(nl({st(a, "constrained", "tok"), c.mapped})) ==
-                  std::make_pair(false, source + ":tok"));
+            CHECK(skip_with(nl({st(a, "constrained", "tok"), c.mapped})) == constrained_outcome);
         }
         // zero, two, short and mis-levelled status rows
         CHECK(skip_with("") == std::make_pair(false, source + ":bad status"));
@@ -3033,9 +3038,9 @@ TEST_CASE("manager-ecosystem table: each row maps through its own action only",
 
 // runtimes.python through the COLLECTOR (the adapter cases below call the parser directly): the
 // table row is what wires the plugin in, so removing it, or flipping its ConstrainedPolicy away
-// from fail, turns a section here red.
-TEST_CASE("collector: runtimes.python contributes sourced rows and an incomplete Python read aborts "
-          "the cycle",
+// from drop_source, turns a section here red.
+TEST_CASE("collector: runtimes.python contributes sourced rows, a constrained Python read withholds "
+          "only them and a PARTIAL one aborts the cycle",
           "[sync][collector][runtimes]") {
     const std::string python_row =
         "python|cpython|3.13.1|/Library/Frameworks/Python.framework/Versions/3.13|org.python.python";
@@ -3086,14 +3091,17 @@ TEST_CASE("collector: runtimes.python contributes sourced rows and an incomplete
         CHECK(python_records(got->first) == 0);
         CHECK(records_of(got->first).size() == 393 + 70 + 1);
     }
-    SECTION("a constrained status skips the cycle even when it carries a row") {
+    SECTION("a constrained status withholds the python rows only, even one that carries a row") {
         fake_mac();
         g_fake[4].out["python"] =
             nl({st("python", "constrained", "linux:runtimes:permission_denied"), python_row});
         auto src = make_installed_software_source(all_plugins());
         REQUIRE(src.skip_reason);
-        CHECK_FALSE(src.collect().has_value());
-        CHECK(src.skip_reason() == "runtimes.python:linux:runtimes:permission_denied");
+        const auto got = src.collect();
+        REQUIRE(got.has_value()); // the cycle continues
+        CHECK(src.skip_reason().empty());
+        CHECK(python_records(got->first) == 0);
+        CHECK(records_of(got->first).size() == 393 + 70 + 1); // every other source's rows survive
     }
     SECTION("a supported status with typed PARTIAL completeness skips the cycle") {
         fake_mac();
@@ -3180,7 +3188,14 @@ TEST_CASE("runtimes python adapter: status grammar decides the answer", "[sync][
           Status::failed);
     CHECK(parse_runtimes_python_output(nl({"status|jvm|supported|-"}), kFailPolicy).status ==
           Status::failed);
-    // constrained fails the cycle under the table row's policy and carries the reason.
+    // constrained under the table row's drop_source policy: status withheld, zero entries even
+    // though a row was present, reason = the status tokens (what the collector logs).
+    const auto w = parse_runtimes_python_output(
+        nl({"status|python|constrained|linux:runtimes:permission_denied",
+            "python|unmodelled|3.11|/usr/bin/python3.11|-"}),
+        ConstrainedPolicy::drop_source);
+    CHECK(show(w) == res("withheld", "linux:runtimes:permission_denied"));
+    // the adapter still honours an explicit fail policy
     const auto c = parse_runtimes_python_output(
         nl({"status|python|constrained|linux:runtimes:permission_denied",
             "python|unmodelled|3.11|/usr/bin/python3.11|-"}),

@@ -161,13 +161,17 @@ cadences.
   publishers are not listed) and reports the full `x.y.z`. macOS reads the
   python.org framework under `/Library/Frameworks/Python.framework/Versions` and
   reports the full `x.y.z` from each version's `Info.plist`. Linux lists
-  `python3.<minor>` files in `/usr/bin` and `/usr/local/bin` and reports
-  **major.minor only** (for example `3.11`): the patch level is not stored anywhere
-  without running the interpreter, so it is not guessed. Homebrew, pyenv, conda,
-  virtual environments and Xcode's Python are not walked. An unreadable root makes
-  the roster constrained, so the cycle is skipped rather than the rows silently
-  disappearing; a missing or unreadable version file never does, the row reports
-  the version it could determine.
+  `python3.<minor>` files in `/usr/bin` and `/usr/local/bin` (`/var/usrlocal/bin` on
+  rpm-ostree hosts such as Fedora CoreOS and RHEL Edge, where `/usr/local` links to
+  `../var/usrlocal`) and reports **major.minor only** (for example `3.11`): the patch
+  level is not stored anywhere without running the interpreter, so it is not guessed.
+  Homebrew, pyenv, conda, virtual environments and Xcode's Python are not walked. A
+  read that cannot be completed (an unreadable or network-mounted root, a cap, an
+  access-denied registry key) withholds only the `python` rows from that day's report
+  and every other source is still sent; the report replaces the device's stored
+  software rows, so the stored `python` rows are removed until a read succeeds again
+  (see Troubleshooting). A missing or unreadable version file never does this, the
+  row reports the version it could determine.
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,
@@ -839,6 +843,22 @@ read more than 20000 rows` (or a merged-entry or 3 MiB blob cap) is not an
 action failure: that host reports more software rows than one report can carry,
 so its report is skipped rather than sent truncated; review the host's
 inventory rather than removing a plugin.
+
+**A device's Python rows vanished, but the rest of its software is still reported; its
+log shows `sync: runtimes.python constrained (<tokens>) — rows withheld this cycle`.**
+The `runtimes` `python` read was constrained, so the agent withheld only the Python rows
+rather than send a partial list. The report replaces the device's stored software rows,
+so its stored `python` rows are removed until a read succeeds again; no other source is
+affected and the cycle is not skipped. The tokens name the cause:
+`linux:runtimes:network_fs_skipped` (`/usr/bin`, `/usr/local/bin` or `/usr/local` is on a
+network mount, so it is never opened), `linux:runtimes:permission_denied`,
+`linux:runtimes:symlink_refused` (a symlink at a root that is not a same-action alias;
+the rpm-ostree `/usr/local -> ../var/usrlocal` link is covered and is not a cause),
+`linux:runtimes:mountinfo_unreadable` and `macos:runtimes:mountinfo_unreadable` (the
+mount table could not be read), `macos:runtimes:permission_denied`,
+`windows:runtimes:python_reg:access_denied` and any `<os>:runtimes:row_cap` or
+`windows:runtimes:python_reg:row_cap` (a walk cap was hit). Fix the named cause; the next
+daily sync restores the rows.
 
 **Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
 initial `installed_apps` plugin read the Windows registry with the ANSI `Reg*A`

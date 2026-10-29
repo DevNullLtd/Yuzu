@@ -85,7 +85,9 @@ namespace detail {
 /// The text of `<string>` that directly follows the first exact `<key>NAME</key>` of an XML property
 /// list. A bounded scan over a string_view (nothing reads past the buffer; an unterminated tag is a
 /// miss); a value carrying an entity or a control character is not returned. nullopt for a binary
-/// plist (`bplist00`), a missing key, or a key whose value is not a `<string>`.
+/// plist (`bplist00`), a missing key, or a key whose value is not a `<string>`. Not a plist
+/// tokenizer: the first textual match wins even inside a comment or a nested dict. Accepted: the
+/// framework directory is admin-writable only, and the caller still gates the value to a full version.
 [[nodiscard]] inline std::optional<std::string> plist_string_value(std::string_view xml,
                                                                    std::string_view key) {
     if (xml.substr(0, 8) == "bplist00") return std::nullopt;
@@ -153,7 +155,9 @@ struct PythonRecord {
 }
 
 /// One row per install path: the same path reached through both registry views keeps the FIRST
-/// (the 64-bit view, which the walk visits first). Records with no path are never merged.
+/// (the 64-bit view, which the walk visits first). Records with no path are never merged: under
+/// WOW64 HKLM\SOFTWARE\Python is redirected, not shared, so only a common install path proves one
+/// install; merging on tag+version could collapse a real 32-bit install into a 64-bit one.
 inline void dedupe_python_rows(std::vector<PythonRecord>& recs) {
     std::vector<PythonRecord> out;
     out.reserve(recs.size());

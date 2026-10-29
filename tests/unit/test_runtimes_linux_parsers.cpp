@@ -1463,6 +1463,36 @@ TEST_CASE("runtimes linux: run_linux_at(python) emits the status row first and O
     CHECK(run.provenance.empty());
 }
 
+TEST_CASE("runtimes linux: /usr/local -> ../var/usrlocal (rpm-ostree) is a covered alias through the "
+          "leg, not a constraint (SYNTHETIC)",
+          "[runtimes][linux][walk][python][wire]") {
+    // Fedora CoreOS/Silverblue/RHCOS/RHEL Edge link /usr/local to ../var/usrlocal. MUTATION: dropping
+    // var/usrlocal/bin from kPythonRoots reports symlink_refused (status constrained) on EVERY python
+    // dispatch of such a host, and the python3.13 installed there is lost.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_py_ostree_"};
+    write_text(dir.path / "usr/bin/python3.11", "");
+    std::error_code ec;
+    fs::create_symlink("../var/usrlocal", dir.path / "usr/local", ec);
+    REQUIRE_FALSE(ec);
+    SECTION("nothing installed under /var/usrlocal: silent, supported, only the distro interpreter") {
+        const auto run = run_leg(rt::Action::python, dir.path);
+        CHECK(run.rc == 0);
+        CHECK(run.rows == std::vector<std::string>{"status|python|supported|-", kDebianPythonRow});
+        CHECK(run.status == YUZU_RESULT_STATUS_OK);
+        CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    }
+    SECTION("a python3.13 under var/usrlocal/bin is found once, through its own candidate") {
+        write_text(dir.path / "var/usrlocal/bin/python3.13", "");
+        const auto run = run_leg(rt::Action::python, dir.path);
+        CHECK(run.rc == 0);
+        CHECK(run.rows == std::vector<std::string>{"status|python|supported|-", kDebianPythonRow,
+                                                   "python|unmodelled|3.13|/var/usrlocal/bin/python3.13|-"});
+        CHECK(run.status == YUZU_RESULT_STATUS_OK);
+        CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+        CHECK(run.provenance.empty());
+    }
+}
+
 TEST_CASE("runtimes linux: a refused python root is a recorded failure through the dispatch (SYNTHETIC)",
           "[runtimes][linux][walk][python]") {
     yuzu::test::TempDir dir{"yuzu_test_runtimes_py_refused_"};

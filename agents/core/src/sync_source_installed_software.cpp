@@ -199,6 +199,15 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
         return failed("bad status");
     if (*level == yuzu::shared::StatusLevel::constrained) {
         // Keeping rows is the opt-in: any other value (an out-of-range cast too) fails closed.
+        if (policy == ConstrainedPolicy::drop_source) {
+            // A known-incomplete set is never published: no rows, the cycle continues. The
+            // cycle's aggregate replaces the stored inventory, so these rows are
+            // REMOVED from the stored inventory until the source recovers (see the header).
+            res.entries.clear();
+            res.status = AdaptedRows::Status::withheld;
+            res.reason = std::move(reason);
+            return res;
+        }
         if (policy != ConstrainedPolicy::keep_rows_if_present_seen || seen == 0)
             return failed(reason);
         res.reason = reason; // ok + non-empty reason = constrained, rows kept
@@ -303,7 +312,12 @@ const InventoryAction kInventoryActions[] = {
     {.plugin = "msi_packages",
      .action = "list_inventory",
      .adapt = parse_msi_packages_list_inventory_output},
-    {.plugin = "runtimes", .action = "python", .adapt = parse_runtimes_python_output},
+    // Metadata-only source whose constraint is a host fact (an NFS /usr/local, a cap, an access-
+    // denied registry key): a constrained answer withholds just the python rows, not the cycle.
+    {.plugin = "runtimes",
+     .action = "python",
+     .adapt = parse_runtimes_python_output,
+     .constrained = ConstrainedPolicy::drop_source},
 };
 
 } // namespace
@@ -476,8 +490,9 @@ AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPoli
     // becomes one {name Python, kind app, ecosystem python} entry whose version is the row's
     // (`-` = unknown -> empty; on Linux it is major.minor, the patch level is not available there).
     // The flavour, path and vendor have no installed_software slot and are dropped. A constrained
-    // status (an unreadable root, a cap) fails the cycle (the table row's ConstrainedPolicy::fail):
-    // a partial roster would delete the stored python rows beyond the failure point.
+    // status (an unreadable root, a cap) withholds the python rows only (the table row's
+    // ConstrainedPolicy::drop_source): a partial roster is never published, the other sources'
+    // rows and the cycle continue, and the stored python rows are removed until it recovers.
     // The producer escapes a literal pipe in the free-text fields (runtimes_parsers.hpp
     // field_or_dash -> safe_output_field gives `\|`), so the split is escape-aware: width stays
     // strict (five logical fields) and only the version, which is dotted digits by construction
@@ -592,7 +607,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
     SyncSource src;
     src.name = "installed_software";
     src.interval = std::chrono::hours{24};
-    // A retry re-runs at most the six table actions in-process (no fan-out); the backoff
+    // A retry re-runs at most one call per table action in-process (no fan-out); the backoff
     // caps that at four extra runs per outage.
     src.skip_backoff = true;
     auto last_reason = std::make_shared<std::string>();
@@ -653,6 +668,11 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
             if (rows.status == AdaptedRows::Status::unsupported) {
                 spdlog::debug("sync: {}.{} unsupported on this OS — skipped", row.plugin,
                               row.action);
+                continue;
+            }
+            if (rows.status == AdaptedRows::Status::withheld) {
+                spdlog::warn("sync: {}.{} constrained ({}) — rows withheld this cycle", row.plugin,
+                             row.action, rows.reason);
                 continue;
             }
             if (rows.status == AdaptedRows::Status::failed) {

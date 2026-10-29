@@ -18,7 +18,8 @@
  *           <d>/release (parse_release_file). A home with no `release` file but a
  *           bin/java or jre/bin/java (some distro OpenJDK 8 packages, e.g. Ubuntu and
  *           Rocky, ship none) is reported with an unknown version and `release_missing`.
- *   python  usr/bin, usr/local/bin: the file NAMES `python3.<minor>` (regular files only). The
+ *   python  usr/bin, usr/local/bin and var/usrlocal/bin (rpm-ostree hosts, where /usr/local is a
+ *           symlink to ../var/usrlocal): the file NAMES `python3.<minor>` (regular files only). The
  *           version is major.minor from the name; the patch level is not read (it needs the
  *           interpreter) and that limit is documented, not a constraint token. A symlinked
  *           `python3.X` entry (a distro alias) is skipped, the alias rule below.
@@ -239,7 +240,11 @@ inline constexpr std::array<std::string_view, 4> kJvmRoots{"usr/lib/jvm", "opt/j
                                                            "var/opt/java"};
 // python: the distro interpreters (/usr/bin) and a source build's `make install` (/usr/local/bin). The
 // sibling alias rule applies: a symlinked /usr/local naming the other candidate is a covered alias.
-inline constexpr std::array<std::string_view, 2> kPythonRoots{"usr/bin", "usr/local/bin"};
+// var/usrlocal/bin: on rpm-ostree hosts (Fedora CoreOS, Silverblue, RHCOS, RHEL Edge) /usr/local is a
+// symlink to ../var/usrlocal, so without this candidate every python dispatch would report
+// `symlink_refused` for usr/local/bin; with it the link is a covered alias.
+inline constexpr std::array<std::string_view, 3> kPythonRoots{"usr/bin", "usr/local/bin",
+                                                              "var/usrlocal/bin"};
 
 /// Lexically normalises a root-relative path: empty and `.` components dropped,
 /// `..` pops one. nullopt when a `..` would climb above the root. Pure text --
@@ -816,12 +821,13 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
     return rows;
 }
 
-/// python: single-level listing of <root>/{usr/bin,usr/local/bin}; every REGULAR file named exactly
-/// `python3.<minor>` is a row `python|unmodelled|3.<minor>|/usr/bin/python3.<minor>|-`. A symlink
-/// (`python3`, a distro alias), `python3.12-config`, `python3.12m` and anything else produce nothing.
+/// python: single-level listing of <root>/{usr/bin,usr/local/bin,var/usrlocal/bin}; every REGULAR
+/// file named exactly `python3.<minor>` is a row
+/// `python|unmodelled|3.<minor>|/usr/bin/python3.<minor>|-`. A symlink (`python3`, a distro alias),
+/// `python3.12-config`, `python3.12m` and anything else produce nothing.
 /// The version is major.minor from the NAME: the patch level is not read (it would take running the
 /// interpreter), and a missing patch level is a documented limit of this leg, never a constraint
-/// token. The only walk here is the one listing per root, on one WalkBudget shared by both.
+/// token. The only walk here is the one listing per root, on one WalkBudget shared by all roots.
 [[nodiscard]] inline std::vector<std::string> python_rows_at(
     const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc,
     const WalkConfig& cfg = {}) {
