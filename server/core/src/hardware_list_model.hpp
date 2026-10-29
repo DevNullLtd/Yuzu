@@ -6,29 +6,31 @@
 /// fragment, the REST v1 twin, and the MCP twin (the "one builder" the twin recipe
 /// mandates, docs/api-twin-recipe.md §1). No gRPC, and nothing in THIS file calls
 /// into httplib — every function here is a pure transform over already-fetched
-/// data (roster/query in, page/JSON out). `inventory_routes.hpp` (below, for
-/// `InventoryDeviceRow`) transitively pulls in `<httplib.h>` for its own route
-/// types, so the symbol is reachable from this TU, but nothing declared in this
-/// file needs it — this header must stay includable from a plain unit test with
-/// zero network/store dependencies, and every function here is callable without
-/// ever touching an httplib type.
+/// data (roster/query in, page/JSON out). Its row types come from the store-free
+/// `*_types.hpp` headers (ADR-0031 seam closure, #6558), so no store header is reachable
+/// from THIS HEADER (held by the MCP registry lane of the seam-closure gate; httplib is
+/// likewise not reachable today, but nothing gates that half): it must stay includable from
+/// a plain unit test with zero network/store dependencies and from the MCP registry lane.
+/// That is a statement about includes, not linkage: `hardware_list_model.cpp` includes `tag_store.hpp` for
+/// `TagStore::validate_key`, so the object file still links the store.
 ///
-/// Roster rows are `InventoryDeviceRow`s (declared in inventory_routes.hpp), built by
+/// Roster rows are `InventoryDeviceRow`s (declared in inventory_types.hpp), built by
 /// server.cpp's `build_hw_roster` (endpoint_state + device_ci join); this header only
 /// orders, filters, and paginates that roster — it never fetches it.
 
 #include "authz_model.hpp"                // authz::VisibleSet
 #include "device_containment_render.hpp" // kContainmentUi
-#include "device_inventory_store.hpp"    // DeviceCiRecord, CiReadError
-#include "inventory_routes.hpp"          // InventoryDeviceRow
-#include "offline_endpoint_store.hpp"    // OfflineEndpoint, PresenceReadError (stdlib-only header)
-#include "software_inventory_store.hpp"  // SoftwareEntry
-#include "tag_store.hpp"                 // DeviceTag
+#include "device_inventory_types.hpp"    // DeviceCiRecord, CiReadError
+#include "inventory_types.hpp"           // InventoryDeviceRow
+#include "offline_endpoint_types.hpp"    // OfflineEndpoint, PresenceReadError, OfflineRosterRead
+#include "software_inventory_types.hpp"  // SoftwareEntry
+#include "tag_types.hpp"                 // DeviceTag, TagReadError
 
 #include <nlohmann/json.hpp>
 
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <functional>
