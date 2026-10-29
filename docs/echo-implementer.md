@@ -133,7 +133,7 @@ function, never in `applies_*` collectors.
 | **Uninstall** (`yuzu-agent --remove-service`, MSI uninstall) | echo.db is **left in place** by design. The data dir is operator-managed; uninstall removes the binary and service registration only. To wipe Echo data, delete `<data_dir>/echo.db` explicitly. |
 | **Reinstall over an existing data dir** | The new binary opens the existing echo.db, runs migration if the schema version differs, and resumes collection. State in `echo_state` may be stale (see §5). On Windows, files left by a different agent account are refused rather than adopted (`docs/user-manual/echo.md` "Data storage"). |
 | **`data_dir` change** (config update) | The new directory has no echo.db — the next collect_fast creates it from scratch. The old echo.db at the previous path is orphaned but not deleted. Operator concern, not Echo's. |
-| **Roll back to an older agent** | The older binary opens the same `echo.db` (the registry source adds no schema version) but does not know the `registry` source, so the `registry_live` table, the `registry` row of `echo_cursor` and every `registry:%` baseline in `echo_state` stay on disk, with the per-key baselines holding every watched value unmasked, and the older binary has no way to erase them. Run `echo.purge_source` on the paused `registry` source BEFORE the rollback. |
+| **Roll back to an older agent** | The older binary opens the same `echo.db` (the registry source adds no schema version) but does not know the `registry` source, so the `registry_live` table, the `registry` row of `echo_cursor` and every `registry:%` baseline in `echo_state` stay on disk, with the per-key baselines holding every watched value unmasked (and the cursor row, for about one tick, the rendered old and new values of changes still waiting for their writer), and the older binary has no way to erase them. An older agent that does know the `registry` source (the key-watch-only build) reads a cursor that holds changes (`held` or `loss`, written as cursor version 2) as lost: one `gap:cursorlost` row and a re-baseline, and those changes are never rows. Run `echo.purge_source` on the paused `registry` source BEFORE the rollback. |
 | **Corruption detected at open** (#559) | `EchoDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `echo.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `echo_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `echo.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — Echo refuses to load rather than trust the corrupt DB. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.echo.*` heartbeat tags; the server exposes `yuzu_fleet_echo_db_corruption_agents` and writes an `echo.db.corruption_quarantined` audit row — see docs/user-manual/echo.md "Fleet visibility". |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent
@@ -454,10 +454,98 @@ cursor.** What it adds to the pattern:
   hive loading and that read, up to one slow interval, are folded into the
   baseline and are not recorded; no per-root gap row is written, since a logon
   would add one per root per user.
-- **Rows land in the tick that observes the change.** A diff row is stamped with
-  the end of the read that saw it and written in that tick's transaction.
-  `actor_pid`/`actor_image` are in the schema but hold `0`/`''` until a later
-  change attributes writers; the row's `record_key` never depends on them.
+- **Rows land in the tick that observes the change, or the next one, and the writer is
+  correlated, not verified.** A candidate is held only while `now - window_hi <
+  kEtwSettle100ns` (5 s), and a notify window closes 1 s after the last notify, so a
+  burst that ended more than about 6 s before the tick is written in that same tick;
+  a burst nearer the tick, and every change found without a key-watch notify (the
+  hourly reconcile, or a root with no live watch: its window ends at the end of the
+  read, after `now`), is held to the next one. A change whose marker
+  cannot depend on a later event (`attr:off`, `attr:lost-restart`: both are decided
+  before any event is consulted and only ever become more true within a run) is not
+  held at all and is written in the tick that sees it, so a restart's whole
+  reconcile (every change in it is `attr:lost-restart`) never sits in the cursor
+  row; `attr:degraded` is held like any other, since a later tick can still record
+  a loss over its window. The mechanism, the `attr:*` precedence, loss epochs and
+  exactly what an attribution does and does not establish are written once, in the
+  banner of `echo_registry_parsers.hpp` (the row key: `registry_diff_record_key`),
+  with its residuals: a change that had no value-write event, an event delivered
+  more than the settle interval after its window closed with no counted loss (a
+  starved consumer, suspend/resume), an ambiguity any local process can force, and
+  an `actor_image` read when the event was delivered. Every user-manual sentence
+  must keep saying "a lead to verify, not proof".
+- **`RegistryEtwBuffer` is not `BoundedPendingQueue`.** It releases by sequence
+  identity like `ack_through`, but selectively: after a commit it retires the
+  events older than the minimum root `window_base` (`retention_watermark`) that
+  no held candidate's window covers (`release_event`). The events a held
+  candidate still needs are interleaved with ones it does not, which a prefix
+  release cannot express. `EventRing` (`echo_proc_stream.hpp`) was not reused for the
+  same reason: it evicts by position, and this buffer must release selectively by
+  sequence identity. It is not persisted: a restart, or a disable and
+  re-enable, loses it, and the candidates it would have attributed are written
+  `attr:lost-restart`. A root that is never completely read keeps its
+  `window_base` at 0 and is left out of the watermark while it has no unread
+  notify: every wide-window candidate of such a root has `window_lo` 0, before
+  `events_since`, so it finalises `attr:lost-restart` whatever the buffer holds,
+  and an idle one that stays Capped does not pin the buffer for the fleet. An
+  unread notify changes that. A root the read budget deferred, or one marked
+  again while it was being read, has no candidate yet, so the held-window test
+  protects nothing of it: its next read builds a narrow window from the first
+  unread notify, and until that read the floor stays at
+  `max(window_base, first - slack)` (the pending stamps are passed to
+  `retention_watermark`; the same floor ages the loss epochs). The pin ends when
+  the root is read, which the fair rotation bounds. A root that was complete once
+  keeps its last `window_base` whatever its status afterwards (`retention_watermark`
+  is status-blind on purpose: its next wide-window diff, hourly or on recovery,
+  would otherwise be correlated to a bystander with no loss recorded). An idle root
+  therefore holds the watermark up to an hour back, since the hourly reconcile
+  re-reads every root, and one that stays Unreadable or Capped holds it there for as
+  long as it does. The buffer fills to the cap (65536 events: about 18 host-wide
+  registry writes per second against a root last read an hour ago, about 110 against
+  one last read ten minutes ago) and the eviction shows as recurring `gap:loss`
+  rows and `attr:degraded`, marked and never silent (no volume guard is added).
+  Lifting the pin would need a retained-floor marker in the cursor and a stitch rule
+  that a window starting below it is `attr:degraded`: a design change, not a fix.
+- **The cursor row is a third content store.** Besides the rows and the
+  baselines, `held` carries each waiting candidate's rendered old and new values
+  until the next tick at most (readable through `echo.sql` as `echo_cursor`; erased by
+  `purge_source("registry")`). A candidate held when the source is disabled stays in
+  the row until re-enable (then written `attr:lost-restart` with its original
+  `observed_at`; the disable does not drop it, since it is a change observed before
+  the pause and the re-enable re-baselines silently) or `purge_source` on the paused
+  source. Cursor decode treats `window_base`, `held` and `loss` as optional so a
+  cursor written by the key-watch-only source decodes as present; a malformed one
+  would re-baseline every root. The cursor is written as version 2 whenever it
+  holds `held` or `loss` and as version 1 otherwise; decode accepts both and
+  takes any other version as lost (`gap:cursorlost`, re-baseline). That is what
+  makes a rollback loud: the key-watch-only build reads only version 1, so it
+  takes a cursor holding changes as lost, where a build that ignored the unknown
+  field would re-encode the cursor without them and drop changes whose baseline
+  had already advanced, with no row. Decode also clamps a held candidate's window
+  to a non-negative, ordered one, so a corrupt row cannot overflow the stitch's
+  `now - window_hi`.
+- **The Windows ETW code has no unit seam and no fault-injection test of the
+  callback.** `WinEtw` (the session and consumer handles each behind a RAII
+  owner, one `ProcessTrace` worker, a `noexcept` callback that contains every
+  exception and counts a decode failure) is covered by compile plus the
+  `[registry][windows]` live cases, which need an elevated agent and SKIP with a
+  named reason otherwise. Teardown order is explicit in `WinEtw::stop()`:
+  CloseTrace (it unblocks `ProcessTrace`), join, then stop the session. A
+  session that cannot open is degrade-not-fail (`registry_capture_method` =
+  `notify`, rows `attr:off`; the start-failure warning carries the Win32 error);
+  one that dies after it opened is logged once and not restarted. The session takes the default
+  ETW security descriptor (the sibling sessions set none either), so members of
+  Performance Log Users can attach to the stream (value names, pids and sizes,
+  system-wide) or stop it; a stop is detected (`ProcessTrace` returns) and shows
+  as `attr:off`. The image name is looked up once per pid when its first event is
+  delivered, refused when the process was created after the event (the pid was
+  reused), and cached for five minutes, so it can be stale under pid reuse. The
+  session name is salted with the agent's pid, so a crash leaks the session until
+  the host restarts and only a successor with the same pid stops it (the
+  `ERROR_ALREADY_EXISTS` retry); the sibling `YuzuEchoProcEtw` and `YuzuEchoModuleEtw`
+  sessions leak the same way and nothing sweeps `YuzuTar*` sessions at start. The
+  operator runbook (`logman query -ets`, `logman stop <name> -ets`) is in the
+  manual's Health bullet.
 - **Windows warehouse columns are NOT NULL.** "Not applicable" is `''`/`0`, and an
   empty `data_type` distinguishes an absent value from an empty one.
 

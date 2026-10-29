@@ -706,11 +706,24 @@ spec:
           not, is readable through echo.sql - the per-key baseline in echo_state
           stores every current value (for example a Winlogon autologon
           DefaultPassword) and $Registry_Live holds the old and new data of every
-          change. Treat both accordingly, or set "false" to opt out. Rows carry no acting process yet (actor_pid
-          is 0); naming it follows in a later release. Rows land at the slow
-          tick that observes the change (every slow_interval, 300 s by default);
-          a full re-read of every watched key runs every 12 slow ticks (hourly at
-          the default). A value written and reverted between two reads is not
+          change; the source's cursor row (echo_cursor) holds the old and new data
+          of a change still waiting for its writer. Treat all three accordingly,
+          or set "false" to opt out. The acting
+          process is CORRELATED to each change from a write-only Kernel-Registry
+          ETW session (value writes, value deletions and key deletions) by value
+          name, type, size and time window: actor_pid and actor_image name the
+          single process that made a matching write, which is a lead to verify
+          against $Process_Live, not proof, and detail says attr:corr,
+          attr:ambiguous, attr:none, attr:degraded, attr:off or attr:lost-restart.
+          The ETW session needs an elevated agent; without one rows say attr:off
+          and the key watch alone runs. A change is read at the slow tick that
+          sees it (every slow_interval, 300 s by default) and its row lands in
+          that tick once its writer is settled, or in the next one when the
+          write was within a few seconds of the tick or was found by the full
+          re-read of every watched key (every 12 slow ticks, hourly at the
+          default). A change whose marker cannot depend on a later event
+          (attr:off, attr:lost-restart) is written in the tick that sees it,
+          never held. A value written and reverted between two reads is not
           recorded. A key is baselined silently at its first read, so for a user
           hive that loads at logon (or a user who logs off and back on) anything
           written to its watched keys before that first read is not a row.

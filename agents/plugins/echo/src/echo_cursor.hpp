@@ -62,7 +62,10 @@
 //         tick: the cursor never advances, and the whole batch, including
 //         unrelated good events, is lost. `snapshot_id` is excluded from the
 //         comparison for exactly this reason, and `ts` is excluded for a
-//         `capture_gap` (see (b)); nothing else is.
+//         `capture_gap` (see (b)); nothing else is -- except that the registry
+//         store also leaves `actor_pid`, `actor_image` and `detail` out, because
+//         its record_key does not depend on attribution and a replay may derive
+//         a different one (echo_db.cpp, insert_registry_events_and_cursor).
 //
 //     (b) A `capture_gap`'s RECORD_KEY MUST ENCODE ITS WINDOW. Because `ts` is
 //         excluded for gaps -- a gap's ts is "when we noticed", not identity --

@@ -1983,7 +1983,8 @@ std::expected<void, EchoDatabase::CursorInsertError> EchoDatabase::insert_regist
                     // Ignored: a legitimate replay, or a collision. Only the stored
                     // IDENTITY (what changed) can tell them apart -- never the actor
                     // or detail columns, which are not identity and must not wedge
-                    // the source on a permanent KeyCollision.
+                    // the source on a permanent KeyCollision (the key is attribution-
+                    // independent: see registry_diff_record_key).
                     sqlite3_reset(dup.get());
                     sqlite3_clear_bindings(dup.get());
                     bind_text(dup.get(), 1, ev.record_key);
@@ -2223,10 +2224,11 @@ std::expected<int, std::string> EchoDatabase::purge_source(const std::string& so
 
     // registry (PR11.8): registry_live is not the only place the source keeps
     // captured content. Each root's BASELINE (`registry:<root>` echo_state rows)
-    // holds rendered values. Erase them, and the cursor row, in THIS transaction,
-    // or a purge that the operator expects to be permanent leaves the very values
-    // it removed. The cursor erase also means the next collect is a fresh Baseline
-    // (zero rows), never a diff against a baseline that no longer exists.
+    // holds rendered values, and the CURSOR row holds the rendered old and new values
+    // of changes still waiting for their attribution to settle. Erase them all in THIS
+    // transaction, or a purge that the operator expects to be permanent leaves the very
+    // values it removed. The cursor erase also means the next collect is a fresh
+    // Baseline (zero rows), never a diff against a baseline that no longer exists.
     // Bookkeeping rows are not counted in `total`.
     if (source == "registry") {
         for (const char* sql : {"DELETE FROM echo_cursor WHERE source = 'registry'",

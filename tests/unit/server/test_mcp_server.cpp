@@ -1984,9 +1984,13 @@ TEST_CASE("MCP 2g: orientation says approvals are decided in the dashboard/REST,
     for (const std::string* text : {&blob, &about}) {
         CHECK(text->find("approver_assurance_required:*") != std::string::npos);
         CHECK(text->find("human act") != std::string::npos);
-        // G8-AR-3: "step-up" is the existing gate with its pass-throughs, not a guarantee
-        // that the approver holds an enrolled factor; the handshake must say so (#6079).
+        // #6079: the REST route requires an enrolled factor with a proof inside the approver
+        // window (at most 300 s); the handshake must say so, and must not revive the old
+        // "un-enrolled passes" claim.
         CHECK(text->find("#6079") != std::string::npos);
+        CHECK(text->find("enrolled MFA factor with a proof no older than the approver window "
+                         "(at most 300 s)") != std::string::npos);
+        CHECK(text->find("an un-enrolled local user passes it") == std::string::npos);
     }
     // The old claim that an MCP caller can decide a ticket must not return.
     CHECK(blob.find("approve/reject maker-checker tickets") == std::string::npos);
@@ -1995,12 +1999,11 @@ TEST_CASE("MCP 2g: orientation says approvals are decided in the dashboard/REST,
     CHECK(blob.find("reject_request") != std::string::npos);
 }
 
-// R3-CA-2: the approve_request/reject_request descriptions state the OIDC no-amr pass-through
-// the way mfa_step_up.cpp implements it (`mfa_enforcement_protects(mode, role)`): it ends under
-// --mfa-enforcement=required AND under admin-only for an admin role. The machine-readable
-// refusal token stays exact.
-TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the OIDC pass-through "
-          "precisely (R3-CA-2)",
+// R3-CA-2 / #6079: the approve_request/reject_request descriptions state that the REST route
+// (not the tool) requires an enrolled factor with a proof <= 300 s, and that the MFA reasons
+// belong to the REST route only. The machine-readable refusal token stays exact.
+TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the REST enrolled-factor "
+          "requirement (R3-CA-2, #6079)",
           "[mcp][2g][approval]") {
     McpTestServer ts;
     ts.start();
@@ -2016,8 +2019,30 @@ TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the OIDC pa
         const auto desc = t["description"].get<std::string>();
         INFO(name);
         CHECK(desc.find("approver_assurance_required:<reason>") != std::string::npos);
-        CHECK(desc.find("--mfa-enforcement=required") != std::string::npos);
-        CHECK(desc.find("admin-only, for an admin role") != std::string::npos);
+        CHECK(desc.find("enrolled MFA factor with a proof no older than the approver window "
+                        "(at most 300 s) (#6079)") != std::string::npos);
+        CHECK(desc.find("--mfa-step-up-window-secs") == std::string::npos);
+        CHECK(desc.find("account_unavailable") != std::string::npos);
+        CHECK(desc.find("MFA reasons belong to the REST route only") != std::string::npos);
+        // The typed MFA refusals other than mfa_not_enrolled are conditional (C-1): the
+        // description must not call them unconditional.
+        CHECK(desc.find("always refuses an un-enrolled session with "
+                        "approver_assurance_required:mfa_not_enrolled") != std::string::npos);
+        // One clause per reason (S-2): the lumped sentence put all three under one condition.
+        CHECK(desc.find("conditional, because the generic step-up check can answer first") !=
+              std::string::npos);
+        CHECK(desc.find("saml_mfa_unsupported (SAML, #4935) surfaces only with the step-up "
+                        "window at 0") != std::string::npos);
+        CHECK(desc.find("account_unavailable (deactivated or deleted account) surfaces with "
+                        "the step-up window at 0, or when the account is removed between the "
+                        "central step-up check's read and the approver rule's read") !=
+              std::string::npos);
+        CHECK(desc.find("mfa_proof_missing (an OIDC login with no MFA amr) surfaces with the "
+                        "step-up window at 0 or when MFA enforcement does not cover the "
+                        "caller's role") != std::string::npos);
+        CHECK(desc.find("enforcement not protecting the route") == std::string::npos);
+        CHECK(desc.find("--mfa-enforcement=required") == std::string::npos);
+        CHECK(desc.find("is tracked in #6079") == std::string::npos);
     }
     CHECK(seen == 2);
 }
@@ -32104,6 +32129,10 @@ void check_mcp_approval_refused(McpTestServer& ts, const std::string& tool, int 
     CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
     CHECK(body["error"]["message"] == "approver_assurance_required:" + reason);
     CHECK(body["error"]["data"].contains("remediation"));
+    // The class-refusal text names the requirement the code enforces, not a gate it does not.
+    const auto remediation = body["error"]["data"]["remediation"].get<std::string>();
+    CHECK(remediation.find("enrolled MFA factor and a fresh proof") != std::string::npos);
+    CHECK(remediation.find("passing the MFA step-up gate") == std::string::npos);
     CHECK(!body.contains("result"));
     // The refused attempt is audited as a denial, with the stable reason in the detail.
     CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp." + tool + "|denied") !=
