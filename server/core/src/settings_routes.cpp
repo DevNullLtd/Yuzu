@@ -984,7 +984,7 @@ std::string SettingsRoutes::render_engine_principals_fragment(bool may_read_audi
             // store answered and had no committed revoke, "(unavailable)" when it
             // could not answer at all, "(withheld: needs AuditLog:Read)" when the
             // caller may not read the audit trail. Collapsing them would state a
-            // fact the read never established — the revocation facts beside it
+            // fact the read never established; the revocation facts beside it
             // come from the principal store and are unaffected either way.
             std::string revocation_cell = "—";
             if (!active) {

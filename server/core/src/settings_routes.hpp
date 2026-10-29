@@ -330,7 +330,7 @@ private:
     /// table; a credential count that cannot be read renders "unavailable" and the
     /// row offers neither Mint nor Rotate.
     /// Revoked rows surface the `superseded_by` linkage AND the recorded revoke detail
-    /// explicitly (design doc §3.1) — never a merged history that hides that a revocation
+    /// explicitly (design doc §3.1), never a merged history that hides that a revocation
     /// occurred. The detail is the audit trail's text, so it is looked up and shown only when
     /// `may_read_audit` (the caller passes the quiet AuditLog:Read probe); otherwise the cell
     /// says it is withheld. It is the ORIGINAL committed revoke (`committed_revoke_detail`,

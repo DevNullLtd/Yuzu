@@ -55,7 +55,13 @@ The panel needs `EnginePrincipal:Read`, the same permission as
 account; with RBAC enabled it means the grant (the built-in `Administrator`
 and `Viewer` roles hold it), so an account administrator who has been given a
 role without it sees "You do not have permission to view this panel" instead of
-the list. The Settings page itself still opens for administrator accounts only.
+the list. The same note appears when the permission check itself could not be
+completed (a degraded RBAC read is answered `403`, not `503`): reload once before
+changing any grant, and if it persists check the role store's health and the
+`YuzuRbacReadDegraded` alert. The Settings page itself still opens for
+administrator accounts only. An MCP-tier token is refused by the panel whatever
+its creator holds, and the revoked row's **Detail** is shown only to a caller who
+also holds `AuditLog:Read`.
 
 If the list or an engine principal's credentials cannot be read (for example
 while the database connection pool is exhausted), the panel says so: an

@@ -317,7 +317,7 @@ admitted; the floor never overrides a live RBAC grant.)
 |---|---|
 | `AccessReview:Read` | The fleet-wide access-review grant export (SOC 2 CC6.2 evidence), `GET /api/v1/access-reviews*`, and the lighter-weight live grant-table listing `GET /api/v1/rbac/roles/assignments` (+ MCP `list_rbac_role_assignments`) — same securable, same sensitivity class, not a management-group-confined view |
 | `UserManagement:Read` | `GET /api/v1/rbac/roles` and the rest of the RBAC role graph |
-| `EnginePrincipal:Read` | The engine-principal inventory and grant graph, `GET /api/v1/engine-principals*` and the `list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP tools, and the two dashboard views over the same list: the Settings **Engine Principals** panel (`GET /fragments/settings/engine-principals`) and the principal panels of the Access **Tokens and principals** page. The Settings panel decides exactly as the REST route does: with RBAC on, an account administrator without the grant is refused (the panel says so) and a non-administrator who holds it, such as a `Viewer`, is admitted, although the `/settings` page itself stays administrator-only |
+| `EnginePrincipal:Read` | The engine-principal inventory and grant graph, `GET /api/v1/engine-principals*` and the `list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP tools, and the two dashboard views over the same list: the Settings **Engine Principals** panel (`GET /fragments/settings/engine-principals`) and the principal panels of the Access **Tokens and principals** page. The Settings panel decides on the same permission test as the REST route: with RBAC on, an account administrator without the grant is refused (the panel says so) and a non-administrator who holds it, such as a `Viewer`, is admitted, although the `/settings` page itself stays administrator-only. It refuses an MCP-tier token that the route admits, and shows the revoke Detail only to a caller who also holds `AuditLog:Read` |
 | `Enrollment:Read` (#4031) | Auto-approve enrollment rules and pending-agent visibility, `GET /api/v1/enrollment/auto-approve-rules` and `GET /api/v1/enrollment/pending-agents` (service-scoped tokens are refused with `403` on both: the `ITServiceOwner` ceiling does not hold this pair) |
 | `OidcConfig:Read` (#4031) | OIDC SSO configuration status, `GET /api/v1/settings/oidc` |
 | `TlsConfig:Read` (#4028) | TLS settings read-twins, `GET /api/v1/settings/tls` and `GET /api/v1/settings/https` |
@@ -510,7 +510,7 @@ Settings uses, so the two stay equivalent.
   but which holds the Administrator grant is offered the controls, and an account administrator
   without the grant is not. If that check cannot be answered (a store is unavailable) the **Assign role**
   button is drawn disabled with "Your administrator authority could not be confirmed. Reload to try
-  again." rather than hidden. The drawn controls are a hint only: every click is checked again by the
+  again." rather than hidden, and the per-row **Remove** controls are left out. The drawn controls are a hint only: every click is checked again by the
   server, and its refusal (last administrator, your own Administrator grant, the enforcement-regime
   guard) is shown as it came. Only a plain local username can be removed here; a group, SSO or
   engine grant reads "Not removable here". After a server error the panel reloads, because the
@@ -534,7 +534,36 @@ Settings uses, so the two stay equivalent.
   not remain an administrator, or the source regime does not recognise you) are shown with their
   remediation text. When the server cannot confirm the setting the panel says **Unconfirmed**
   instead of On or Off; it treats enforcement as on until it can. See "Enabling RBAC" for the
-  lockout guards.
+  lockout guards. An administrator who signs in through single sign-on always sees the switch
+  disabled: the controls need a local account that holds the `Administrator` grant (see
+  "SSO-only fleets" under Enabling RBAC). After **Assign role** or **Remove** only the Role
+  assignments panel reloads, so the switch can lag (for example after you grant yourself
+  `Administrator`): reload the page once.
+- **Why is a control disabled or missing?** The Assign role button, the per-row Remove controls
+  and the Enforce roles switch are drawn from the server's own check, so the cause is one of
+  these:
+  1. Enforcement is off. The `Administrator` grant is inert while it is off; the account must be
+     an active local administrator account. The RBAC enforcement panel (or `rbac_enabled` in
+     `GET /api/v1/me`) shows which regime applies.
+  2. Enforcement is on and the account does not hold the fleet-wide `Administrator` grant, as
+     with an account administrator created after RBAC was enabled. Another Administrator assigns
+     it. The affected account often cannot read the Role assignments panel itself (it needs
+     `AccessReview:Read`), so ask an Administrator or use the access-review export.
+  3. The session is not a local account with an active row. SSO administrators, MCP-tier and
+     service-scoped tokens and engine credentials are never offered the controls, and JIT
+     elevation does not count. An account whose role is `user` that holds the grant sees the
+     controls but still reads "not available to your account" on the Users and Account panels,
+     which need the `Administrator` account role.
+  4. The controls are disabled with "Your administrator authority could not be confirmed.
+     Reload to try again.": a store behind the check did not answer. Check the RBAC store's
+     health (the health endpoint, the `YuzuRbacReadDegraded` alert and
+     `yuzu_server_rbac_read_degrade_total`). A hint stuck in this state does not move that
+     counter today.
+  5. The switch is live but the server answers `409` with a remediation. The hint decides who
+     may attempt the change, not whether it would leave you an administrator: with enforcement
+     off, a local administrator with no `Administrator` grant turning enforcement on ("assign
+     yourself Administrator first"), and with enforcement on, a `user`-role account holding the
+     grant turning it off. Nothing changes; follow the remediation text.
 - **Checking your own permission.** **Check your own permission** asks the server whether your
   role grants an area and operation (for example `UserManagement` and `Read`). It checks role
   grants only; while enforcement is off access follows your account role, so Denied does not by
