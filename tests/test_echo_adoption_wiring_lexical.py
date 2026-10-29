@@ -9,6 +9,9 @@ anchored on tokens (never line numbers):
      the first `descriptor()->init(`. The adoption is the ONLY adopter: a plugin that opens
      echo.db first would create a fresh file beside tar.db (EchoDatabase::open then refuses).
   2. `rename_plugin("tar", "echo")` occurs in the same window, after the adoption call.
+  3. `defer_legacy_echo_adoption(` (the pure decision, unit-tested in test_plugin_loader.cpp)
+     occurs after `KvStore::open(` and before the adoption call: dropping it is an unconditional
+     adoption that strands the history when only the retired tar plugin is installed.
 
 `//` comments are stripped and whitespace collapsed before matching. Lexical only: it cannot
 see a relocation that keeps the tokens in order but changes control flow (review-enforced).
@@ -26,20 +29,24 @@ AGENT_CPP = Path(__file__).resolve().parent.parent / "agents" / "core" / "src" /
 HINT = " (update tests/test_echo_adoption_wiring_lexical.py only if agent.cpp was legitimately restructured)"
 ADOPT = r'adopt_legacy_echo_db\( ?cfg_\.data_dir / "echo\.db" ?\)'
 REKEY = r'rename_plugin\( ?"tar", ?"echo" ?\)'
+DEFER = r"defer_legacy_echo_adoption\("
 
 
 def problems(src):
     t = re.sub(r"[ \t\n\r\f\v]+", " ", re.sub(r"//.*", "", src))
     pos = {k: [m.start() for m in re.finditer(p, t)]
-           for k, p in (("open", r"KvStore::open\("), ("adopt", ADOPT), ("rekey", REKEY),
-                        ("init", r"descriptor\(\)->init\("))}
+           for k, p in (("open", r"KvStore::open\("), ("defer", DEFER), ("adopt", ADOPT),
+                        ("rekey", REKEY), ("init", r"descriptor\(\)->init\("))}
     out = []
-    for k, what in (("open", "KvStore::open("), ("adopt", 'adopt_legacy_echo_db(cfg_.data_dir / "echo.db")'),
+    for k, what in (("open", "KvStore::open("), ("defer", "defer_legacy_echo_adoption("),
+                    ("adopt", 'adopt_legacy_echo_db(cfg_.data_dir / "echo.db")'),
                     ("rekey", 'rename_plugin("tar", "echo")'), ("init", "descriptor()->init(")):
         if not pos[k]:
             out.append(f"agent.cpp no longer contains {what}")
     if out:
         return out
+    if not pos["open"][0] < pos["defer"][0] < pos["adopt"][0]:
+        out.append("defer_legacy_echo_adoption must run after KvStore::open( and before adopt_legacy_echo_db")
     if not pos["open"][0] < pos["adopt"][0] < pos["init"][0]:
         out.append("adopt_legacy_echo_db must run after KvStore::open( and before the first descriptor()->init(")
     if not pos["adopt"][0] < pos["rekey"][0] < pos["init"][0]:
@@ -50,6 +57,9 @@ def problems(src):
 # (pattern, replacement, expected substring of the first problem)
 MUTATIONS = [
     (r"adopt_legacy_echo_db\(cfg_", "adopt_legacy_echo_db_x(cfg_", "no longer contains"),
+    (r"defer_legacy_echo_adoption\(", "defer_legacy_echo_adoption_x(", "no longer contains"),
+    (r"(?=if \(yuzu::agent::defer_legacy_echo_adoption)", 'adopt_legacy_echo_db(cfg_.data_dir / "echo.db"); ',
+     "defer_legacy_echo_adoption must run"),
     (r"(?=auto adopted = adopt_legacy_echo_db)", "handle.descriptor()->init(raw_pctx); ", "adopt_legacy_echo_db must run"),
     (r'rename_plugin\("tar", "echo"\)', 'rename_plugin("echo", "tar")', "no longer contains"),
     (r"(?=if \(kv_store_ && !kv_store_->rename_plugin)", "handle.descriptor()->init(raw_pctx); ", "rename_plugin"),

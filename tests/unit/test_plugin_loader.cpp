@@ -27,6 +27,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -479,6 +480,25 @@ TEST_CASE("PluginLoader rejects a stale plugin declaring the retired pre-rename 
     CHECK(err.reason.find("tar") != std::string::npos);
     // Rejected as retired, not as reserved: that list doubles as the KV-namespace contract.
     CHECK_FALSE(yuzu::agent::is_reserved_plugin_name("tar"));
+}
+
+TEST_CASE("defer_legacy_echo_adoption holds adoption only while the retired plugin has no successor",
+          "[plugin_loader][retired_name]") {
+    using yuzu::agent::LoadError;
+    const std::vector<LoadError> retired{
+        {"/p/tar.so", std::string{yuzu::agent::kRetiredNameReason} + ": tar"}};
+    const std::vector<LoadError> reserved_only{
+        {"/p/x.so", std::string{yuzu::agent::kReservedNameReason} + ": __guard__"}};
+    const std::vector<std::string_view> none;
+    const std::vector<std::string_view> echo{"echo", "other"};
+
+    // Only the retired tar plugin is installed: the history must stay under tar.db.
+    CHECK(yuzu::agent::defer_legacy_echo_adoption(retired, none));
+    // The renamed plugin loaded beside the stale one: adopt.
+    CHECK_FALSE(yuzu::agent::defer_legacy_echo_adoption(retired, echo));
+    // No retired plugin (any other rejection, or none): adopt as before.
+    CHECK_FALSE(yuzu::agent::defer_legacy_echo_adoption(reserved_only, none));
+    CHECK_FALSE(yuzu::agent::defer_legacy_echo_adoption({}, none));
 }
 
 // ─── Plugin config-sync (covers agent.cpp post-load sync invariant) ─────────

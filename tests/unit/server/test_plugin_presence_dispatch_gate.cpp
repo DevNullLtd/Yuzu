@@ -11,6 +11,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "../test_log_capture.hpp"
+
 #include <algorithm>
 #include <optional>
 #include <string>
@@ -596,7 +598,11 @@ TEST_CASE("legacy inventory: an agent advertising both `tar` and `echo` is not f
     auto info = make_presence_test_info("dev-both");
     info.add_plugins()->set_name("tar");
     info.add_plugins()->set_name("echo");
+    yuzu::test::LogCapture logs;
     (void)registry.register_agent(info);
+    logs.stop();
+    // The operator's only signal that a stale tar plugin sits beside echo on this agent.
+    CHECK(logs.text().find("advertises both 'tar' and 'echo'") != std::string::npos);
 
     const auto session = registry.get_session("dev-both");
     REQUIRE(session);

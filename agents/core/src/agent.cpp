@@ -865,15 +865,12 @@ public:
         // would find no tar.db); the package install that brings echo.<ext> lets the next start
         // adopt. The loader rejects the stale tar plugin, so it never runs against the renamed
         // core; the rejection is how this block learns it is present.
-        const bool retired_tar_plugin_present = std::ranges::any_of(
-            scan.errors, [](const auto& err) {
-                return err.reason.starts_with(yuzu::agent::kRetiredNameReason);
-            });
-        const bool echo_plugin_loaded =
-            std::ranges::any_of(candidates, [](const PluginHandle& handle) {
-                return std::string_view{handle.descriptor()->name} == "echo";
-            });
-        if (retired_tar_plugin_present && !echo_plugin_loaded) {
+        std::vector<std::string_view> loaded_plugin_names;
+        loaded_plugin_names.reserve(candidates.size());
+        for (const auto& handle : candidates) {
+            loaded_plugin_names.emplace_back(handle.descriptor()->name);
+        }
+        if (yuzu::agent::defer_legacy_echo_adoption(scan.errors, loaded_plugin_names)) {
             spdlog::warn("legacy tar plugin still installed; adoption deferred until echo.<ext> is "
                          "installed (tar.db and the tar KV namespace left as they are)");
         } else {

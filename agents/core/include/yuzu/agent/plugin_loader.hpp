@@ -2,6 +2,7 @@
 
 #include <yuzu/plugin.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint> // SIZE_MAX (sha256_file max_bytes default)
@@ -9,6 +10,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -143,6 +145,22 @@ verify_plugin_signature(const std::filesystem::path& plugin_path,
 /// re-keys to `echo`, not one it reserves.
 [[nodiscard]] constexpr bool is_retired_plugin_name(std::string_view name) noexcept {
     return name == "tar";
+}
+
+/// True when the agent must NOT yet adopt a pre-rename tar.db as echo.db: the scan rejected a stale
+/// retired-name plugin (`errors`) and no `echo` plugin is among the accepted ones (`loaded_names`).
+/// OTA replaces the agent binary alone, so the renamed plugin may not be installed yet; adopting
+/// now would strand the history under a plugin that is not there (and a roll-back of the binary
+/// would find no tar.db). Pure so the decision is unit-tested; the one caller is the agent boot
+/// step in agent.cpp (pinned by tests/test_echo_adoption_wiring_lexical.py). Removed with the
+/// other legacy-name shims.
+[[nodiscard]] inline bool
+defer_legacy_echo_adoption(const std::vector<LoadError>& errors,
+                           std::span<const std::string_view> loaded_names) {
+    const bool retired_rejected = std::ranges::any_of(
+        errors, [](const LoadError& err) { return err.reason.starts_with(kRetiredNameReason); });
+    return retired_rejected &&
+           std::ranges::find(loaded_names, std::string_view{"echo"}) == loaded_names.end();
 }
 
 /// True if `name` is a well-formed plugin identifier: non-empty, at most

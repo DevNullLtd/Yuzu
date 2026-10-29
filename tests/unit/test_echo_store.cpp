@@ -3503,6 +3503,16 @@ TEST_CASE("adopt_legacy_echo_db: a WAL at both names fails closed and moves noth
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().find("tar.db") != std::string::npos);
     CHECK(refused.error().find("not adopted - refusing") != std::string::npos);
+
+    // The documented remedy (upgrading.md): move the echo.db sidecar out, restart, and the
+    // adoption continues with the committed WAL-only row intact.
+    fs::remove(d.path() / "echo.db-wal");
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+    CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+    CHECK(fs::exists(d.path() / "echo.db-wal"));
+    auto resumed = EchoDatabase::open(d.path() / "echo.db");
+    REQUIRE(resumed.has_value());
+    CHECK(resumed->get_config("wal_marker", "") == "x");
 }
 
 TEST_CASE("EchoDatabase::open refuses to create a fresh echo.db beside an unadopted tar.db",

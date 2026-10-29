@@ -282,6 +282,9 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json) {
     // an empty set indistinguishable from "no device matched". Refuse it at admission instead.
     if (kind == "any_response")
         return std::nullopt;
+    // log_id_token is used here for its control-byte fold + length cap on caller input echoed
+    // into the error body, not as a Guardian-id token (the SDK's safe_output_field folds only
+    // backslash and CR/LF).
     if (kind != "echo_rows_ge")
         return "matcher.kind must be \"any_response\" or \"echo_rows_ge\" (got \"" +
                ::yuzu::log_id_token(kind) + "\")";

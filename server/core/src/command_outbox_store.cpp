@@ -120,8 +120,8 @@ CREATE INDEX outbox_approval_idx ON outbox (approval_id) WHERE approval_id <> ''
         // (the renamed plugin is `echo`) and fail with a note. Same one-line shape as the other
         // stores' rename steps, idempotent. SET LOCAL as in v2: nothing prunes this table, so the
         // sequential scan must not run under the pool's 30 s statement timeout.
-        {3, std::string("SET LOCAL statement_timeout = 0;") +
-                "UPDATE outbox SET plugin = 'echo' WHERE plugin = 'tar';"},
+        {3, "SET LOCAL statement_timeout = 0;"
+            "UPDATE outbox SET plugin = 'echo' WHERE plugin = 'tar';"},
     };
     return kMigrations;
 }
