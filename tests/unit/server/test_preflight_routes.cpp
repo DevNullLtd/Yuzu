@@ -787,3 +787,39 @@ TEST_CASE("preflight routes: GET /api/v1/preflight/runs 400s on an invalid limit
         CHECK(res->status == 400);
     }
 }
+
+TEST_CASE("preflight ui: /auto renders the Deployments tab strip, panels, refusal listener and "
+          "the empty-notice reveal fix",
+          "[preflight][routes][ui]") {
+    const std::string h = render_auto_config({}, {});
+    CHECK(contains(h, "id=\"auto-tabs\" role=\"tablist\""));
+    CHECK(contains(h, "<a href=\"#\" role=\"tab\" class=\"on\" aria-selected=\"true\""));
+    CHECK(contains(h, "<a href=\"#deployments\" role=\"tab\" aria-selected=\"false\" "
+                      "hx-get=\"/fragments/auto/deployments\" hx-target=\"#auto-list\""));
+    CHECK(contains(h, "hx-sync=\"this:replace\""));
+    const auto flow = h.find("<div id=\"auto-flow\">");
+    const auto cfg = h.find("id=\"auto-cfg\"");
+    const auto verify = h.find("id=\"auto-verify\"");
+    const auto panel = h.find("<div id=\"auto-deployments\" hidden>");
+    REQUIRE(flow != std::string::npos);
+    REQUIRE(panel != std::string::npos);
+    CHECK(flow < cfg);
+    CHECK(verify < panel);
+    CHECK(contains(h, "<div id=\"auto-list\" class=\"panel\">"));
+    CHECK(contains(h, "<div id=\"auto-detail\"></div>"));
+    // Refusal listener: once-guarded, scoped to the two targets, 401 login, 403 names the grant.
+    CHECK(contains(h, "if(!window.__pfDepErr){window.__pfDepErr=1;"));
+    CHECK(contains(h, "t.id!=='auto-list'&&t.id!=='auto-detail'"));
+    CHECK(contains(h, "location.href='/login'"));
+    CHECK(contains(h, "needs the SoftwareDeployment:Read permission."));
+    CHECK(contains(h, "Deployments could not be read just now."));
+    CHECK(contains(h, "htmx:sendError"));
+    // Deep link calls htmx.ajax (a click on a swapped anchor would run before htmx binds it).
+    CHECK(contains(h, "htmx.ajax('GET','/fragments/auto/deployments'"));
+    CHECK_FALSE(contains(h, "hx-on"));
+
+    // ISS-11: the empty notice is hidden by the stylesheet, so showing it needs 'block'.
+    const std::string r = render_auto_results({}, "cfg", "scope", "", true, "run-1", "");
+    CHECK(contains(r, "e.style.display=vis?'none':'block'"));
+    CHECK_FALSE(contains(r, "vis?'none':''"));
+}

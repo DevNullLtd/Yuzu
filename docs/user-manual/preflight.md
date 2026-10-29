@@ -304,6 +304,14 @@ they never create a run or a deployment.
   in this pipeline. The installer URL and arguments are never shown, only whether arguments are set.
   A service-scoped token is denied under `deployment.list.view` / `deployment.detail.view`.
 
+- **Deployments tab** — on the Deployments page (`/auto`), the **Deployments** tab beside
+  **Pre-flight and deploy** lists your deployments from the last 14 days, newest first. Select a
+  deployment's name to see its device grid below the list. The tab is read-only: it never advances
+  a running deployment, so counts for a **Running** deployment are as of the last advance, and a
+  running deployment advances only while its deploy results view (Pre-flight and deploy, then
+  Deploy) is open. Reading the list and detail needs `SoftwareDeployment:Read`; without it the tab
+  says so in place. `/auto#deployments` opens the tab directly.
+
 The REST routes above are unaudited on a successful read (the response is run scope/lifecycle metadata,
 not per-agent behavioural PII, matching the fragments' own posture) but audit a service-scoped-token
 denial under their own verb. Their MCP twins instead call the generic

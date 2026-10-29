@@ -156,14 +156,16 @@ TEST_CASE("render_deployment_detail: exact counts, no secrets, truncation note",
     CHECK(h.find("<img") == std::string::npos);
     CHECK(h.find("1603") != std::string::npos);
     CHECK(h.find("data-truncated") != std::string::npos);
-    CHECK(h.find("only while a Deployments page is open") != std::string::npos);
+    CHECK(h.find("this Deployments tab is read-only") != std::string::npos);
+    CHECK(h.find("deploy results view") != std::string::npos);
+    CHECK(h.find("only while a Deployments page is open") == std::string::npos);
     // The error text is bounded: 500 'x' must not appear in full.
     CHECK(h.find(std::string(300, 'x')) == std::string::npos);
 
     auto full_row = row();
     full_row.total = 0;
     const std::string done = render_deployment_detail(full_row, {});
-    CHECK(done.find("only while a Deployments page is open") == std::string::npos);
+    CHECK(done.find("Deployments tab is read-only") == std::string::npos);
     CHECK(done.find("data-truncated") == std::string::npos);
 }
 
@@ -173,4 +175,25 @@ TEST_CASE("render_deployments_failbox escapes its text and is never a table",
     CHECK(h.find("failbox") != std::string::npos);
     CHECK(h.find("&lt;read&gt;") != std::string::npos);
     CHECK(h.find("<table") == std::string::npos);
+}
+
+TEST_CASE("render_deployments_list: each name drills into the detail fragment with the id "
+          "query-encoded and escaped",
+          "[deployments][render]") {
+    auto plain = row("running");
+    const std::string h = render_deployments_list({plain}, {"Run one"}, false);
+    CHECK(h.find("<a href=\"#\" hx-get=\"/fragments/auto/deployments/detail?dep=00112233aabbccdd\" "
+                 "hx-target=\"#auto-detail\" hx-swap=\"innerHTML\" hx-sync=\"this:replace\">Chrome 132</a>") !=
+          std::string::npos);
+    CHECK(h.find("data-dep=\"00112233aabbccdd\"") != std::string::npos);
+
+    auto odd = row();
+    odd.deployment_id = "a&b c\"<x>";
+    const std::string e = render_deployments_list({odd}, {"t"}, false);
+    CHECK(e.find("detail?dep=a%26b%20c%22%3Cx%3E\"") != std::string::npos);
+    CHECK(e.find("<x>") == std::string::npos);
+    CHECK(e.find("data-dep=\"a&amp;b c&quot;&lt;x&gt;\"") != std::string::npos);
+
+    CHECK(render_deployments_list({}, {}, false).find("data-empty=\"deployments\"") != std::string::npos);
+    CHECK(render_deployments_list({plain}, {"t"}, true).find("data-truncated=\"1\"") != std::string::npos);
 }

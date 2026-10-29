@@ -1,0 +1,1 @@
+The Deployments page (`/auto`) gains a read-only **Deployments** tab listing your deployments with a drill into each one's device grid, a visible message when `SoftwareDeployment:Read` is missing or the read fails, and a truthful note on what advances a running deployment. Fixes the "No devices match this filter" notice never appearing in the pre-flight and deploy result grids.
