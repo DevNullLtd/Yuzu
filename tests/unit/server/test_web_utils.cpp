@@ -2,7 +2,7 @@
  * test_web_utils.cpp — Unit tests for server web utility functions
  *
  * Covers: base64_decode, html_escape, url_decode, extract_form_value,
- *         form_value_supplied, extract_plugin
+ *         form_value_supplied
  */
 
 #include "mcp_jsonrpc.hpp"
@@ -676,36 +676,6 @@ TEST_CASE("form_value_supplied: the real key after a decoy suffix key IS a match
     // `scope=` key also appears, it must be found even though the unanchored
     // decoy occurs first in the string.
     CHECK(form_value_supplied("myscope=x&scope=", "scope"));
-}
-
-// ── extract_plugin ──────────────────────────────────────────────────────────
-
-TEST_CASE("extract_plugin: standard command_id with timestamp", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("chargen-12345") == "chargen");
-    REQUIRE(extract_plugin("netstat-98765") == "netstat");
-    REQUIRE(extract_plugin("hardware-1234567890") == "hardware");
-}
-
-TEST_CASE("extract_plugin: no dash returns whole string", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("chargen") == "chargen");
-    REQUIRE(extract_plugin("netstat") == "netstat");
-}
-
-TEST_CASE("extract_plugin: empty string", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("") == "");
-}
-
-TEST_CASE("extract_plugin: multiple dashes uses first", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("my-plugin-12345") == "my");
-}
-
-TEST_CASE("extract_plugin: dash at start", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("-12345") == "");
-}
-
-TEST_CASE("extract_plugin: underscore plugin name", "[web_utils][plugin]") {
-    REQUIRE(extract_plugin("vuln_scan-12345") == "vuln_scan");
-    REQUIRE(extract_plugin("script_exec-12345") == "script_exec");
 }
 
 // ── Time formatters ─────────────────────────────────────────────────────────

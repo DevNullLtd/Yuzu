@@ -49,6 +49,8 @@
 #include <string_view>
 #include <vector>
 
+#include "response_tier_filter.hpp"
+
 namespace yuzu {
 class MetricsRegistry;
 }
@@ -327,6 +329,17 @@ public:
                                             const std::string& execution_id,
                                             int plugin_result_status);
 
+    // -- Reads: the Forensics tier (#4990) -------------------------------------------------------
+    //
+    // EVERY public read below takes a `const ResponseTierFilter& tier` as its second parameter
+    // (`total_count`: its only one) with NO default value, so a read cannot be written without
+    // deciding what the caller may see. The filter is pushed into the SQL beside the agent scope
+    // (before ORDER BY / LIMIT / OFFSET / GROUP BY), so paging, aggregates, facet distincts and the
+    // `query_bounded` cap flags are computed over the PERMITTED rows only; a filtered row is simply
+    // absent, exactly like a row that does not exist. `response_facets` carries no `plugin`, so the
+    // facet reads test the owning `responses` row with an EXISTS. `plugin` is compared lowercased
+    // (ingest stores it as the agent sent it). A NEW public read method must take the filter too.
+
     /// Degrade-distinguishable read: `std::nullopt` on a store/pool/query
     /// failure (see the file header's posture note); an engaged EMPTY vector
     /// is a genuine "no rows" result.
@@ -339,8 +352,8 @@ public:
     /// truncated them. `nullopt` (the default) is byte-identical to every
     /// pre-#1634 caller.
     [[nodiscard]] std::optional<std::vector<StoredResponse>>
-    query(const std::string& instruction_id, const ResponseQuery& q = {},
-         const AggregateScope& scope = std::nullopt) const;
+    query(const std::string& instruction_id, const ResponseTierFilter& tier,
+          const ResponseQuery& q = {}, const AggregateScope& scope = std::nullopt) const;
     /// Byte-aware variant of `query()` for the two EXPORT routes (#4703). Same
     /// predicates, same resolve-then-scope push-down (ADR-0017 INV-3: the scope clause is
     /// in the WHERE before any cut), but the cut is made IN SQL so neither libpq's
@@ -362,20 +375,23 @@ public:
     /// concurrent delete between the two steps is one statement, so the snapshot is
     /// consistent. Returns nullopt on store-degraded, exactly like `query()`.
     [[nodiscard]] std::optional<BoundedResponses>
-    query_bounded(const std::string& instruction_id, const ResponseQuery& q,
-                  const AggregateScope& scope, std::size_t max_payload_bytes) const;
+    query_bounded(const std::string& instruction_id, const ResponseTierFilter& tier,
+                  const ResponseQuery& q, const AggregateScope& scope,
+                  std::size_t max_payload_bytes) const;
     /// Exact-correlation lookup keyed on `execution_id` (PR 2). Empty
     /// `execution_id` is rejected (returns an engaged empty vector, NOT
     /// nullopt) — that sentinel is the legacy path; callers must fall back
     /// to `query()` if they support pre-PR-2 data. `scope`: see `query()`.
     [[nodiscard]] std::optional<std::vector<StoredResponse>>
-    query_by_execution(const std::string& execution_id, const ResponseQuery& q = {},
+    query_by_execution(const std::string& execution_id, const ResponseTierFilter& tier,
+                       const ResponseQuery& q = {},
                        const AggregateScope& scope = std::nullopt) const;
     [[nodiscard]] std::optional<std::vector<StoredResponse>>
-    get_by_instruction(const std::string& instruction_id) const;
+    get_by_instruction(const std::string& instruction_id, const ResponseTierFilter& tier) const;
     [[nodiscard]] std::optional<std::vector<AggregationResult>>
-    aggregate(const std::string& instruction_id, const AggregationQuery& aq,
-             const ResponseQuery& filter = {}, const AggregateScope& scope = std::nullopt) const;
+    aggregate(const std::string& instruction_id, const ResponseTierFilter& tier,
+              const AggregationQuery& aq, const ResponseQuery& filter = {},
+              const AggregateScope& scope = std::nullopt) const;
     /// `aggregate()`'s own `group_by`/`op_column` allow-lists, exposed so a
     /// route handler can validate CLIENT-supplied values before calling in
     /// (#2691, Doomgoose finding #2) — an allow-list miss inside `aggregate()`
@@ -399,17 +415,18 @@ public:
     /// an errored read as "no agents to drop" → unrestricted (governance
     /// #1634 unhappy-path UP-2).
     [[nodiscard]] std::optional<std::vector<std::string>>
-    distinct_agent_ids(const std::string& instruction_id) const;
+    distinct_agent_ids(const std::string& instruction_id, const ResponseTierFilter& tier) const;
     /// `execution_id`-keyed twin of `distinct_agent_ids` (#1634), same
     /// nullopt-on-error / fail-closed contract — for callers (MCP
     /// `query_responses`'s execution_id path) that key their query by
     /// `execution_id` rather than `instruction_id`.
     [[nodiscard]] std::optional<std::vector<std::string>>
-    distinct_agent_ids_by_execution(const std::string& execution_id) const;
+    distinct_agent_ids_by_execution(const std::string& execution_id,
+                                    const ResponseTierFilter& tier) const;
     /// Total response count. Degrades to 0 (matches the pre-migration
     /// contract; not in the ADR-0039 optional-wrapped set — this is an
     /// operator-facing gauge, not a fan-out/authz decision input).
-    [[nodiscard]] std::size_t total_count() const;
+    [[nodiscard]] std::size_t total_count(const ResponseTierFilter& tier) const;
 
     // -- Faceted queries (for dashboard filtering at scale) --------------------
 
@@ -423,12 +440,12 @@ public:
     /// confined IN SQL (`agent_id = ANY(...)`) before it runs (ADR-0017
     /// INV-3), never post-filtered in C++.
     [[nodiscard]] std::optional<std::vector<FacetValue>>
-    facet_values(const std::string& instruction_id, int col_idx,
-                const std::optional<std::vector<std::string>>& agent_scope = std::nullopt) const;
+    facet_values(const std::string& instruction_id, const ResponseTierFilter& tier, int col_idx,
+                 const std::optional<std::vector<std::string>>& agent_scope = std::nullopt) const;
 
     /// Distinct agent IDs that have a matching facet value.
     [[nodiscard]] std::optional<std::vector<std::string>>
-    facet_agent_ids(const std::string& instruction_id,
+    facet_agent_ids(const std::string& instruction_id, const ResponseTierFilter& tier,
                     const std::vector<FacetFilter>& filters) const;
 
     /// Count of distinct agents matching facet filters. `nullopt` on a
@@ -447,24 +464,25 @@ public:
     /// confined IN SQL (`agent_id = ANY(...)`) before it runs (ADR-0017
     /// INV-3), never post-filtered in C++.
     [[nodiscard]] std::optional<int64_t>
-    facet_agent_count(const std::string& instruction_id,
+    facet_agent_count(const std::string& instruction_id, const ResponseTierFilter& tier,
                       const std::vector<FacetFilter>& filters,
                       const std::optional<std::vector<std::string>>& agent_scope = std::nullopt) const;
 
     /// Total result line count matching facet filters. Same
     /// degrade-distinguishable posture as facet_agent_count (#2691).
     [[nodiscard]] std::optional<int64_t>
-    facet_line_count(const std::string& instruction_id,
+    facet_line_count(const std::string& instruction_id, const ResponseTierFilter& tier,
                      const std::vector<FacetFilter>& filters) const;
 
     /// Load specific responses by their IDs (for two-phase filtered display).
     [[nodiscard]] std::optional<std::vector<StoredResponse>>
-    query_by_ids(const std::vector<int64_t>& response_ids) const;
+    query_by_ids(const std::vector<int64_t>& response_ids, const ResponseTierFilter& tier) const;
 
     /// Response IDs that match all given facet filters.
     [[nodiscard]] std::optional<std::vector<int64_t>>
-    facet_response_ids(const std::string& instruction_id, const std::vector<FacetFilter>& filters,
-                       int limit = 200, int offset = 0) const;
+    facet_response_ids(const std::string& instruction_id, const ResponseTierFilter& tier,
+                       const std::vector<FacetFilter>& filters, int limit = 200,
+                       int offset = 0) const;
 
     /// Clock-guarded retention sweep (#2496 `gc_sweep` shape — ADR-0038's
     /// port to this store, ADR-0039). Called from the server's maintenance

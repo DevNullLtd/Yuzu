@@ -57,6 +57,12 @@ sourcetypes, or Excel pivot tables from exported data.
 Retrieve responses for a specific instruction execution with optional
 filtering and pagination.
 
+**Forensics-tier rows are served only to a caller who holds `Forensics:Read`.** The rows of
+`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions` and
+`remote_access_audit` are absent, with no marker, for any other caller, and counts and truncation
+flags cover only the rows that caller may read, so an empty result does not prove that no data
+exists. A stored response is labelled with the plugin the server recorded when it dispatched the command; one whose command id has no server record is stored as `~unverified`, which is served under the same tier. See "Forensics-tier rows" in the REST API guide. The dashboard's create-group-from-results action reads facets through the same tier; when the server cannot determine the caller's authority it creates nothing, answers HTTP `200`, and shows an error toast ("The permission check for this action could not be completed. Nothing was created. Retry shortly.") through an `HX-Trigger` `showToast` header, because the create-group form swaps no response body into the page; its store-degraded case answers `503` with its own error toast on the same channel and also creates nothing. The action writes `group.create_from_results` but no `response.forensics.read` row, even when the matching agents come from Forensics-tier rows (a documented gap in audit coverage; see the audit log guide).
+
 **Path parameters:**
 
 | Parameter | Type | Description |
@@ -209,6 +215,12 @@ curl -s -b cookies.txt \
 
 The CSV format includes the columns:
 `id`, `instruction_id`, `agent_id`, `timestamp`, `status`, `output`, `error_detail`.
+
+**An export omits the Forensics-tier rows a caller may not read.** For a caller without
+`Forensics:Read`, the rows of the five Forensics-tier plugins are left out of the file without a
+marker, so such an export can under-report and is not evidence that a plugin returned nothing. An
+export that does serve such rows writes a `response.forensics.read` audit row (see the Audit log
+guide).
 
 **A bounded export can be cut.** Besides the row limit, an export stops once the rows served
 carry 50 MiB of `output` plus `error_detail` (always on whole rows, and at least one row is

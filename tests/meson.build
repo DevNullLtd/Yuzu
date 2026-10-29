@@ -1411,6 +1411,10 @@ if build_server
       'unit/server/test_https_config.cpp',
       'unit/server/test_healthcheck_probe.cpp', # #5906: --healthcheck target/verdict rules + loopback TLS probe
       'unit/server/test_response_store.cpp',
+      'unit/server/test_response_tier_filter.cpp', # #4990: the Forensics tier on response reads (filter type + catalogue-derived plugin set)
+      'unit/server/test_forensics_ingest_leaks.cpp', # #4990: Forensics output outside the ResponseStore seam (live bus, tracker error_detail, policy evaluator, bundle collate, result-set materializer)
+      'unit/server/test_response_provenance.cpp', # #4990 (UP-7): server-authored response provenance (the pure decision; both ingest paths against the real record, stores and sinks)
+      'unit/server/test_dispatch_record_policy.cpp', # #4990: caller-keyed fast-fail + per-loop latch on the dispatch-record write
       'unit/server/test_response_routes.cpp', # #2542 PR-11: the 3-route legacy pre-v1 Responses API, extracted onto the HttpRouteSink seam
       'unit/server/test_query_int_parse.cpp', # #4644: the shared strict integer primitive (query_int_parse.hpp)
       'unit/server/test_preflight_parse.cpp',
@@ -1471,6 +1475,7 @@ if build_server
       'unit/server/test_access_tokens_js.cpp', # Tokens and principals page: string pins on template and glue
       'unit/server/test_access_tokens_authz.cpp', # Tokens and principals page: [pg] persona matrix through the real gates
       'unit/server/test_rest_me.cpp',               # /api/v1/me session self-description + admin_gate_verdict
+      'unit/server/test_me_response.cpp',           # shared /api/v1/me + /api/me + MCP get_me builder (pure, injected RBAC read)
       'unit/server/test_access_tokens_writes_render.cpp', # Tokens and principals page: write controls per caller and row, hostile ids
       'unit/server/test_access_tokens_actions_js.cpp', # Tokens and principals page: string pins on the write glue and reveal strip
       'unit/server/test_access_audit_render.cpp', # Audit and reviews page: pure renderers (log, sample, retention)
@@ -3659,11 +3664,15 @@ test('prometheus alert rules',
 # Pure-logic selftest for the harness above (version-banner parsing, docker argv
 # construction, the pin's own shape). No promtool, no docker, no network, so it
 # runs everywhere -- mirroring the flake-retry and plugin-spawn selftests below.
+# 60 s: the sharding rows launch 42 short Python children as a fake
+# promtool, about 2 s in total on an idle Linux box and about 6 s on a 2-CPU box
+# kept busy. CI runs this entry on the Linux leg only (the Windows and macOS
+# legs exclude the docs suite); the margin covers a local run on a slow box.
 test('prometheus harness selftest',
   _python3_test,
   args: [files('prometheus/run_promtool_tests.py'), '--selftest'],
   suite: 'docs',
-  timeout: 30,
+  timeout: 60,
 )
 
 # #4800: pins scripts/test_gateway.py's zero-executed guard, the ct --dir that
@@ -3954,6 +3963,16 @@ test('same-site gate production wiring lexical selftest',
   args: [files('test_same_site_wiring_lexical_selftest.py')],
   suite: 'docs',
   timeout: 60,
+)
+
+# A unit-test file marked "Whole file compiled out under TSan" must have nothing after its
+# `#ifndef YUZU_TSAN_BUILD` guard's closing `#endif`: no PR job builds with TSan, so a case added
+# there compiles everywhere except the nightly's TSan leg (#6419). Source-text only, so Python.
+test('TSan whole-file guard lexical gate',
+  _python3_test,
+  args: [files('test_tsan_whole_file_guard.py'), meson.current_source_dir()],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # Every repository-markdown runbook_url in the shipped alert rules that carries a #fragment names a
@@ -4264,6 +4283,43 @@ test('split interlock tripwire',
 test('split interlock tripwire selftest',
   _python3_test,
   args: [files('test_split_interlock_tripwire_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #4990: stored-response reads and the Forensics tier. The tripwire pins the exact set of
+# ResponseStore read methods (each must take a ResponseTierFilter) and the exact set of
+# unrestricted_internal_consumer() call sites; the self-test proves it fails on each mutation. Both
+# also run in .github/workflows/docs-lint.yml on every PR; registered here for local `meson test
+# --suite docs` parity with the sibling python doc-tests.
+test('response store read tripwire',
+  _python3_test,
+  args: [files('test_response_store_read_tripwire.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('response store read tripwire selftest',
+  _python3_test,
+  args: [files('test_response_store_read_tripwire_selftest.py')],
+  suite: 'docs',
+  # Runs the scan over a mutated copy of the whole server tree once per mutation. Memoised per file
+  # it takes a few seconds; the headroom is for a loaded shared CI box, not for the work.
+  timeout: 120,
+)
+
+# #4990: server.cpp must keep wiring the Forensics plugin set and the visibility resolver into every
+# surface that reads stored responses (a route class built without them fails CLOSED and would
+# silently lose Forensics rows for every caller). Lexical gate + a selftest that deletes each
+# required statement in memory; both also run in .github/workflows/docs-lint.yml.
+test('forensics tier wiring lexical',
+  _python3_test,
+  args: [files('test_forensics_tier_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('forensics tier wiring lexical selftest',
+  _python3_test,
+  args: [files('test_forensics_tier_wiring_lexical_selftest.py')],
   suite: 'docs',
   timeout: 30,
 )
