@@ -3121,7 +3121,7 @@ TEST_CASE("REST dex/apps: the platform scope selects the population and the cove
     CHECK(none["apps"][0]["subject"] == "chrome.exe");
     CHECK(none["apps"][0]["crashes"] == 2);
     CHECK(none["apps"][0]["distinct_devices"] == 2);
-    // The per-version rows merge across operating systems the same way (one unknown-version bucket).
+    // The per-version rows merge across operating systems the same way (one unversioned bucket).
     REQUIRE(none["apps"][0]["versions"].size() == 1);
     CHECK(none["apps"][0]["versions"][0]["version"] == "");
     CHECK(none["apps"][0]["versions"][0]["crashes"] == 2);

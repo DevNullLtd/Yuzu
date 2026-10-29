@@ -669,22 +669,45 @@ TEST_CASE("openapi_spec_json(): DexAppsList covers every population basis and th
         CHECK(std::find(enum_values.begin(), enum_values.end(), basis) != enum_values.end());
     }
 
-    // crash_source_coverage is always emitted, so it is a declared and required property whose keys
-    // and values cover what the builder can publish.
+    // crash_source_coverage is always emitted, so it is a declared and required property, and its
+    // schema is a closed object: the three platform keys, each exactly complete|partial.
     REQUIRE(props.contains("crash_source_coverage"));
     const auto& required = list["required"];
     CHECK(std::find(required.begin(), required.end(), json("crash_source_coverage")) !=
           required.end());
-    const auto& coverage_props = props["crash_source_coverage"]["properties"];
+    const auto& coverage = props["crash_source_coverage"];
+    CHECK(coverage["type"] == "object");
+    CHECK(coverage["additionalProperties"] == false);
+    REQUIRE(coverage.contains("properties"));
+    CHECK(coverage["properties"].size() == 3);
+    for (const char* os : {"windows", "macos", "linux"}) {
+        REQUIRE(coverage["properties"].contains(os));
+        CHECK(coverage["properties"][os]["enum"] == json::array({"complete", "partial"}));
+    }
+    // ... and it covers what the builder can publish under `all`.
     for (const auto& [os, value] :
          yuzu::server::dex_apps_crash_source_coverage(yuzu::server::kDexAppsScopeAll)) {
-        REQUIRE(coverage_props.contains(os));
-        const auto& allowed = coverage_props[os]["enum"];
+        REQUIRE(coverage["properties"].contains(os));
+        const auto& allowed = coverage["properties"][os]["enum"];
         CHECK(std::find(allowed.begin(), allowed.end(), json(value)) != allowed.end());
     }
 
-    // The component no longer calls the figures Windows-only (the default scope is every platform).
-    CHECK(list.dump().find("Windows only") == std::string::npos);
+    // The figures are no longer called Windows-only: each description the scope changed names the
+    // platform scope and none says Windows (the default scope is every platform).
+    const auto scoped = [](const json& node) {
+        const std::string d = node.value("description", "");
+        return d.find("scope") != std::string::npos && d.find("Windows") == std::string::npos;
+    };
+    CHECK(scoped(list));
+    CHECK(scoped(props["population"]));
+    CHECK(scoped(props["apps_total"]));
+    CHECK(scoped(props["population_basis"]));
+    const auto& app_figures = props["apps"]["items"]["properties"];
+    const auto& version_figures = app_figures["versions"]["items"]["properties"];
+    for (const char* key : {"crashes", "hangs", "distinct_devices"}) {
+        CHECK(scoped(app_figures[key]));
+        CHECK(scoped(version_figures[key]));
+    }
 }
 
 TEST_CASE("openapi_spec_json(): the execution-statistics reads document their degraded-read 503 "
