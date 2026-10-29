@@ -174,9 +174,9 @@ unchanged (`ITServiceOwner` holds the pairs they pass); `Enrollment:Read` (not h
 
 `GET /api/v1/upload-grants` (operator-facing list, `UploadGrant:Read`): not on `require_fleet_read`, and the "upload-grant planes" line in the document-only table above is a sweep heuristic that does not describe this route (it is session-authenticated, not pre-auth). Its only gate was `list_read_fn(session->username)`, which evaluates the MINTER's username, so a service-scoped token inherited its minter's `UploadGrant:Read` view (every grant, for a minter holding a global grant), while the MCP twin `list_upload_grants` refused a service token through `perm_fn`. `file_retrieval_routes.cpp`'s `register_list` now refuses a service-scoped session with `403` (no `permission` field, audit `upload_grant.list.access_denied`) before the store or the resolver is touched; pinned by `test_upload_grants_service_scope.cpp`.
 
-## Update (#4754): `GET /mcp/v1/` is a gate-less fleet-data route and now refuses a service-scoped token
+## Update (#4754, 2026-10-29): `GET /mcp/v1/` is a gate-less fleet-data route and now refuses a service-scoped token
 
-This file is a point-in-time review dated 2026-08-18, and its history above is left as written. The MCP sweep result above ("SSE tail replaying the caller's own session stream", 0 findings) classified the `GET /mcp/v1/` handler as self-scoped from its surrounding code shape (`sweep-heuristic`). That reading missed that the session's replay ring can hold execution progress frames for executions dispatched in other services' scope, and that the handler has no per-target parameter to confine them against. Disposition from #4754:
+This file is a point-in-time review dated 2026-08-18, and its history above is left as written. This addendum is dated 2026-10-29. The MCP sweep result above ("SSE tail replaying the caller's own session stream", 0 findings) classified the `GET /mcp/v1/` handler as self-scoped from its surrounding code shape (`sweep-heuristic`). That reading missed that the session's replay ring can hold execution progress frames for executions dispatched in other services' scope, and that the handler has no per-target parameter to confine them against. Disposition from #4754:
 
 | # | Route | File | Disposition | Depth |
 |---|---|---|---|---|

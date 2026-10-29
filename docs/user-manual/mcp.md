@@ -212,7 +212,10 @@ change: a notification POST now answers `202` instead of `204`).
   refused at `/mcp/v1/` once the tierless-human refusal (#4309) lands, which is
   the planned closure. Until then the session id (128-bit, returned only in the
   `initialize` response header) must be protected like a credential. Stream
-  liveness is principal-level; the class is checked at attach. Sessions are
+  liveness is principal-level: the class is checked when the stream attaches
+  and is not re-derived from the live credential afterwards (the per-tick
+  credential recheck compares the principal only, and the per-tick session
+  check compares the class captured at attach). Sessions are
   in-memory per server replica, so a server restart drops them
   (re-initialize). During a rolling upgrade, a replica not yet upgraded does not
   enforce the class binding or the service-scope deny; finish the roll
@@ -238,7 +241,9 @@ change: a notification POST now answers `202` instead of `204`).
   stream can use `GET /api/v1/events?execution_id=...`, which is gated by the
   fleet-read confinement instead and admits a service-scoped token when RBAC
   enforcement is in effect and the token's authority ceiling holds
-  `Execution:Read`. Otherwise it requires the
+  `Execution:Read` (known limit #5557: it also shows executions the token's
+  minter dispatched outside the service scope, with their id, definition,
+  status and timing visible). Otherwise it requires the
   session's `Mcp-Session-Id` (`400` if absent; `404` if unknown, expired, another
   principal's, or created by a different credential class) and `Accept: text/event-stream` (`-32011` / `406` otherwise — wildcards
   like `*/*` do not opt in). The stream sends a heartbeat on any ~3 s tick that delivers
@@ -1346,8 +1351,11 @@ same principal (authentication source, principal kind, MCP tier or service scope
 differs; all collapse to the same response — no cross-principal oracle). A
 client that sends both a session cookie and a Bearer token changes class when
 the cookie expires. Sessions are in-memory, so a **server restart** also drops
-them. A class mismatch is visible only in the audit log: filter
-`mcp.session.reject` for `reason=credential_mismatch`.
+them. A class mismatch is visible in the audit log (filter
+`mcp.session.reject` for `reason=credential_mismatch`) and, on a `GET` attach
+or resume only, also on the counter
+`yuzu_mcp_stream_rejects_total{reason="credential_mismatch"}`; a `POST` or
+`DELETE` mismatch is visible in the audit log alone.
 
 **Fix**: Re-run `initialize` with the credential you are going to use for the
 rest of the session, to mint a fresh `Mcp-Session-Id`, and retry. Sessions
@@ -1407,14 +1415,17 @@ never evicted to make room.
 **Fix**: End an unused session with `DELETE /mcp/v1/` (presenting its
 `Mcp-Session-Id`), or wait for an idle session to time out.
 
-The per-principal cap (default 8) counts sessions per principal, not per
-credential class. A client that switches class (for example from a cookie to a
-token, or to a token with a different tier) strands its old-class sessions: they
-stay counted until the 30-minute idle TTL passes, and the `DELETE` that the
+The per-principal cap (fixed at 8; there is no flag for it) counts sessions per
+principal, not per credential class. A client that switches class (for example
+from a cookie to a token, or to a token with a different tier) strands its
+old-class sessions: they stay counted until the 30-minute idle TTL passes (a
+stranded session that still has an attached stream is kept alive by the stream's
+per-tick liveness check, which slides the TTL, until that stream disconnects),
+and the `DELETE` that the
 `remediation` hint suggests cannot end them, because a `DELETE` presented with
 the new class answers `404`. Recover by sending `DELETE` with the old credential,
-by waiting out the idle TTL, or by restarting the server; there is no
-administrator reap path. Do not loop on `initialize` meanwhile, because each
+by waiting out the idle TTL once no stream is attached, or by restarting the
+server; there is no administrator reap path. Do not loop on `initialize` meanwhile, because each
 attempt meets the same cap.
 
 > **Same code, second cause (PR 4.4, ADR-1005 class engine principals).**
