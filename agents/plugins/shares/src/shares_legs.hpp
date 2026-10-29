@@ -9,9 +9,9 @@
  * result status/completeness, (c) execute_list, the plugin's whole execute() body
  * (dispatch + ABI containment), and (d) the OS-free DECISION logic, `list_linux` and
  * `list_windows` and `list_macos`, over injected boundaries (file readers, an exports.d lister,
- * a directory probe; a NetShareEnum page source; a bounded subprocess runner) so the refused-vs-absent and paging rules are
- * unit-tested with canned results and no disk, uid or Windows dependence. The leg TUs keep
- * only the OS shell.
+ * a directory probe; a NetShareEnum page source; a bounded subprocess runner) so the
+ * refused-vs-absent and paging rules are unit-tested with canned results and no disk, uid or
+ * Windows dependence. The leg TUs keep only the OS shell.
  *
  * Row contract (pipe rows, status row first):
  *   status|list|<supported|constrained|permission_denied|unsupported>|<tokens or ->
@@ -651,8 +651,9 @@ inline Listing list_macos(const MacFs& fs) {
         } else {
             n_sharing = sp.shares.size();
             if (sp.malformed_records > 0)
-                t.acc.add_failure(src_token("macos", "sharing",
-                                            "malformed_records_" + std::to_string(sp.malformed_records)));
+                t.acc.add_failure(src_token(
+                    "macos", "sharing",
+                    "malformed_records_" + std::to_string(sp.malformed_records)));
             t.take(sp);
         }
     }

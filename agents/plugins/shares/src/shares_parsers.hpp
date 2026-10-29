@@ -53,8 +53,9 @@ struct Share {
     std::string path;
     Access access = Access::unknown;
     std::optional<bool> anonymous;
-    /// closed vocabulary: hidden, unavailable, special, sealed (macOS: SMB encryption required),
-    /// no_root_squash, clients_<n>, and the Windows share kind (exactly one per row): disk, print, device, ipc, other; temporary.
+    /// closed vocabulary: hidden, unavailable, special, sealed (macOS: SMB encryption
+    /// required), no_root_squash, clients_<n>, and the Windows share kind (exactly one per
+    /// row): disk, print, device, ipc, other; temporary.
     /// Windows `hidden` is a non-special share whose name ends in `$`
     std::vector<std::string> flags;
     std::string source;

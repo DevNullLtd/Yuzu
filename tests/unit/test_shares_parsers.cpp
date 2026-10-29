@@ -1121,6 +1121,19 @@ TEST_CASE("shares sharing json: flags name fallback and typing", "[shares]") {
     CHECK(share_row(p.shares[0]) == "share|smb|k|/p|-|-|-|sharing");
 }
 
+TEST_CASE("shares sharing json: ACL permission and remark members are never read", "[shares]") {
+    const auto plain = sharing(R"({"k":{"path":"/p","smb_name":"n","smb_guest_access":1}})");
+    const auto extra = sharing(R"({"k":{"path":"/p","smb_name":"n","smb_guest_access":1,
+        "acl":"ACLMARK","permissions":"PERMMARK","remark":"REMARKMARK","afp_shared":1}})");
+    REQUIRE(plain.shares.size() == 1);
+    REQUIRE(extra.shares.size() == 1);
+    CHECK(extra.malformed_records == 0);
+    const auto row = share_row(extra.shares[0]);
+    CHECK(row == share_row(plain.shares[0]));
+    for (const char* mark : {"ACLMARK", "PERMMARK", "REMARKMARK"})
+        CHECK(row.find(mark) == std::string::npos);
+}
+
 TEST_CASE("shares sharing json: what is recognised and what is not", "[shares]") {
     for (const char* t : {"{}", "  {}\n", "No share point records.", "\n  No share point records.\n\n"}) {
         INFO(t);
