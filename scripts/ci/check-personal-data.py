@@ -423,10 +423,13 @@ def scan_repo(root: str):
 
 
 def renamed_paths(root: str, mb: str):
-    """{old path: new path} for files git detects as renamed between mb and HEAD."""
+    """{old path: new path} for files git detects as renamed between mb and HEAD.
+    Only git-detected renames qualify (default -M, 50% similarity); a move git cannot pair stays a
+    new entry, which fails closed. -l5000 raises git's exhaustive-rename-detection limit; past it git
+    skips inexact detection (and warns on stderr, which is left visible in the CI log)."""
     out = subprocess.run(["git", "-C", root, "diff", "-z", "-M", "-l5000", "--name-status",
-                          "--diff-filter=R", mb, "HEAD"], check=True,
-                         capture_output=True).stdout.decode("utf-8", "surrogateescape").split("\0")
+                          "--diff-filter=R", mb, "HEAD", "--"], check=True,
+                         stdout=subprocess.PIPE).stdout.decode("utf-8", "surrogateescape").split("\0")
     return dict(zip(out[1::3], out[2::3]))  # -z renames: "R<score>", old, new
 
 

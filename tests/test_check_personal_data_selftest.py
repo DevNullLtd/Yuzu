@@ -377,6 +377,7 @@ class T(unittest.TestCase):
         rc, out = self.r.run("--ratchet", "--base", "basebr")
         self.assertEqual(rc, 1, out)
         self.assertIn("baseline grew", out)
+        self.assertIn("max_hits 2 -> 3", out)  # compared against the RENAMED path's allowance
     def test_ratchet_shrink_and_equal_pass(self):
         self._ratchet_repo(2, 1)
         rc, out = self.r.run("--ratchet", "--base", "basebr")
