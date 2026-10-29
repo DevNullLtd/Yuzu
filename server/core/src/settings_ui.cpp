@@ -678,8 +678,9 @@ const char* const kSettingsPageTemplate =
       else {
         /* Not a reload: a freshly minted or rotated credential secret is shown outside this
            section and a reload discards it. The Retry control and its
-           wording are settings_routes.cpp's kEngineRetryControl, built as elements (textContent
-           only) so the note stays free of markup parsing. */
+           wording mirror settings_routes.cpp's kEngineRetryControl (a hand copy, pinned in
+           test_settings_page_ui.cpp), built as elements (textContent only) so the note stays
+           free of markup parsing. */
         el.textContent = 'This panel could not be loaded (HTTP ' + x.status + '). ';
         var retry = document.createElement('button');
         retry.type = 'button';

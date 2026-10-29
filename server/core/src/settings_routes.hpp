@@ -332,15 +332,21 @@ private:
     /// Revoked rows surface the `superseded_by` linkage AND the recorded revoke detail
     /// explicitly (design doc §3.1), never a merged history that hides that a revocation
     /// occurred. The detail is the audit trail's text, so it is looked up and shown only when
-    /// `may_read_audit` (the caller passes the quiet AuditLog:Read probe); otherwise the cell
-    /// says it is withheld. It is the ORIGINAL committed revoke (`committed_revoke_detail`,
-    /// shared with the Access tokens panel), never a later failed or retried attempt.
+    /// `may_read_audit` (the quiet AuditLog:Read probe) answers yes; otherwise the cell says it is
+    /// withheld, hedged as the Access tokens panel hedges it (the probe also answers no when the
+    /// permission read could not be confirmed). `may_read_audit` is called LAZILY, at most once
+    /// and only when a revoked row exists, so a roster with none issues no probe (a token caller
+    /// would otherwise write a denial row for a view with nothing to withhold); an empty one
+    /// means no. It is the ORIGINAL committed revoke (`committed_revoke_detail`, shared with the
+    /// Access tokens panel), never a later failed or retried attempt, and carries that panel's
+    /// truncation caveat when more than its window of revoke events exists. After the first
+    /// failed audit read the remaining revoked rows are not queried and read "(unavailable)".
     /// `roster_count`, when given, is set to the number of principals rendered ONLY when the
     /// roster was actually read: the caller writes the `engine_principal.list` success row
     /// from it, and an absent store or an unreadable roster leaves it empty (no row).
     /// The route gates the caller (EnginePrincipal:Read); a null `engine_principal_store_` renders an
     /// inert "not configured" panel.
-    std::string render_engine_principals_fragment(bool may_read_audit,
+    std::string render_engine_principals_fragment(const std::function<bool()>& may_read_audit,
                                                   std::optional<std::size_t>* roster_count = nullptr);
 
     /// Render the Access Reviews Settings fragment (SOC 2 CC6.2) — a

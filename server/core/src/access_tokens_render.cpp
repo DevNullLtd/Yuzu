@@ -282,6 +282,12 @@ RevokeDetail revoke_detail_from(std::vector<AuditEvent> newest_first) {
     return out;
 }
 
+std::string revoke_truncation_hint(bool have_detail) {
+    const auto win = std::to_string(kRevokeHistoryWindow);
+    return have_detail ? " <span class=\"hint\">(more than " + win + " revoke events: this is the oldest success among the newest " + win + ", not necessarily the original)</span>"
+                       : " <span class=\"hint\">(more than " + win + " revoke events and none of the newest " + win + " succeeded)</span>";
+}
+
 bool safe_token_id(std::string_view id) {
     if (id.empty() || id.size() > 128)
         return false;
@@ -469,11 +475,9 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
         else if (const auto& s = std::get<std::string>(d.revoke_detail); !s.empty())
             detail = esc(s);
         if (d.revoke_truncated) {
-            const auto win = std::to_string(kRevokeHistoryWindow);
             const bool have = std::holds_alternative<std::string>(d.revoke_detail) &&
                               !std::get<std::string>(d.revoke_detail).empty();
-            detail += have ? " <span class=\"hint\">(more than " + win + " revoke events: this is the oldest success among the newest " + win + ", not necessarily the original)</span>"
-                           : " <span class=\"hint\">(more than " + win + " revoke events and none of the newest " + win + " succeeded)</span>";
+            detail += revoke_truncation_hint(have);
         }
         out += kv("Revocation detail", detail);
     }

@@ -106,6 +106,13 @@ struct RevokeDetail {
 /// when the query returned the extra row (input is newest first, up to the query limit).
 [[nodiscard]] RevokeDetail revoke_detail_from(std::vector<AuditEvent> newest_first);
 
+/// The caveat every surface that shows a `RevokeDetail` appends when `truncated` is set (HTML,
+/// leading space included): the shown text is the oldest success among the newest window, which a
+/// retry may be rather than the original revoke, or no event in the window succeeded. `have_detail`
+/// is whether `text` was non-empty. ONE copy, shared by the Access tokens panel and the Settings
+/// Engine Principals panel, so the two cannot word the same fact differently.
+[[nodiscard]] std::string revoke_truncation_hint(bool have_detail);
+
 struct TokensView {
     std::vector<ApiToken> rows;  ///< store order (newest first)
     bool all_owners{false};      ///< true when rows span every owner

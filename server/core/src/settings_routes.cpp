@@ -889,7 +889,7 @@ constexpr const char* kEngineRetryControl =
     "credential secret shown above.</span>";
 } // namespace
 
-std::string SettingsRoutes::render_engine_principals_fragment(bool may_read_audit,
+std::string SettingsRoutes::render_engine_principals_fragment(const std::function<bool()>& may_read_audit,
                                                               std::optional<std::size_t>* roster_count) {
     if (roster_count)
         roster_count->reset();
@@ -932,6 +932,12 @@ std::string SettingsRoutes::render_engine_principals_fragment(bool may_read_audi
     // wired: either way no row can show a credential count, the row hint points at the Retry
     // control, and the revoke-detail lookups below are skipped.
     bool credentials_unreadable = (api_token_store_ == nullptr);
+    // The AuditLog:Read answer, asked once and only when a revoked row needs it. True from the
+    // first failed audit read: the remaining revoked rows are not queried (the same latch as
+    // `credentials_unreadable`, for the same reason: each failing read waits out its pool's
+    // timeout, so a per-row retry would hold this request for roughly N x that).
+    std::optional<bool> audit_readable;
+    bool audit_unreadable = false;
     if (principals.empty()) {
         html += "<tr><td colspan=\"8\" class=\"muted\">No engine principals</td></tr>";
     } else {
@@ -982,10 +988,12 @@ std::string SettingsRoutes::render_engine_principals_fragment(bool may_read_audi
             // handler's quiet one); everyone else gets the cell without it.
             // Three DIFFERENT outcomes, distinguished: "(not recorded)" when the
             // store answered and had no committed revoke, "(unavailable)" when it
-            // could not answer at all, "(withheld: needs AuditLog:Read)" when the
-            // caller may not read the audit trail. Collapsing them would state a
-            // fact the read never established; the revocation facts beside it
-            // come from the principal store and are unaffected either way.
+            // could not answer at all, "(withheld: ...)" when the caller may not
+            // read the audit trail or that could not be confirmed. Collapsing them
+            // would state a fact the read never established; the revocation facts
+            // beside it come from the principal store and are unaffected either way.
+            // A full window (more than kRevokeHistoryWindow events) adds the Access
+            // panel's caveat: the text may be a retry, not the original.
             std::string revocation_cell = "—";
             if (!active) {
                 std::string linkage =
@@ -993,10 +1001,14 @@ std::string SettingsRoutes::render_engine_principals_fragment(bool may_read_audi
                         ? "<em class=\"muted\">no successor recorded</em>"
                         : ("superseded by <code>" + html_escape(p.superseded_by) + "</code>");
                 std::string audit_detail = "(not recorded)";
-                if (!may_read_audit) {
-                    audit_detail = "(withheld: needs AuditLog:Read)";
-                } else if (credentials_unreadable) {
-                    // The pool is already failing reads; do not queue another lease wait per
+                bool truncated = false;
+                bool have_detail = false;
+                if (!audit_readable)
+                    audit_readable = may_read_audit && may_read_audit();
+                if (!*audit_readable) {
+                    audit_detail = "(withheld: needs AuditLog:Read, or it could not be confirmed)";
+                } else if (credentials_unreadable || audit_unreadable) {
+                    // A pool is already failing reads; do not queue another lease wait per
                     // revoked row (revoked rows are never pruned, so they only accumulate).
                     // "(unavailable)" here means "not looked up", not "the audit store failed":
                     // rows rendered before the first failed read still show their real detail.
@@ -1015,16 +1027,21 @@ std::string SettingsRoutes::render_engine_principals_fragment(bool may_read_audi
                     auto events = audit_store_->query(q);
                     if (!events) {
                         audit_detail = "(unavailable)";
+                        audit_unreadable = true;
                     } else {
-                        auto committed =
-                            access_tokens::revoke_detail_from(std::move(*events)).text;
-                        if (!committed.empty())
-                            audit_detail = std::move(committed);
+                        auto rd = access_tokens::revoke_detail_from(std::move(*events));
+                        truncated = rd.truncated;
+                        if (!rd.text.empty()) {
+                            audit_detail = std::move(rd.text);
+                            have_detail = true;
+                        }
                     }
                 }
-                revocation_cell = linkage +
-                                  "<br><span class=\"hint\">Detail: " +
-                                  html_escape(audit_detail) + "</span>";
+                std::string detail_html = html_escape(audit_detail);
+                if (truncated)
+                    detail_html += access_tokens::revoke_truncation_hint(have_detail);
+                revocation_cell = linkage + "<br><span class=\"hint\">Detail: " + detail_html +
+                                  "</span>";
                 if (p.revoked_at > 0) {
                     revocation_cell += "<br><span class=\"hint\">" +
                                         fmt_epoch(p.revoked_at) + "</span>";
@@ -2948,9 +2965,15 @@ void SettingsRoutes::register_routes(
                  }
                  // The revoke Detail is the audit trail's text: the quiet AuditLog:Read probe
                  // against a scratch response, so a refusal is not an error and writes nothing
-                 // for a cookie session. A degraded RBAC read answers "no", never "yes".
+                 // for a cookie session. A degraded RBAC read answers "no", never "yes". It is
+                 // asked LAZILY, by the renderer and only when a revoked row exists: a token
+                 // that lacks the grant keeps the probe's denial row (the quiet treatment is for
+                 // interactive cookie sessions only), and a roster with nothing to withhold
+                 // must not write one.
                  httplib::Response audit_probe;
-                 const bool may_read_audit = read_perm(req, audit_probe, "AuditLog", "Read");
+                 const auto may_read_audit = [this, &req, &audit_probe]() {
+                     return read_perm(req, audit_probe, "AuditLog", "Read");
+                 };
                  std::optional<std::size_t> roster_count;
                  res.set_content(render_engine_principals_fragment(may_read_audit, &roster_count),
                                  "text/html; charset=utf-8");
