@@ -1070,9 +1070,9 @@ public:
     /// Separate builders so tests can drive them without the httplib acceptor
     /// thread (#438), mirroring build_handler(). GET is the SSE channel (PR 2:
     /// heartbeats, Last-Event-ID resume, stream caps — the tail lives in
-    /// mcp_stream.cpp); DELETE terminates a principal-bound session. Both no-op
-    /// to 405 when streaming is disabled and to a kMcpDisabled JSON-RPC error
-    /// when MCP is disabled.
+    /// mcp_stream.cpp); DELETE terminates a session bound to the caller's principal
+    /// and credential class. Both no-op to 405 when streaming is disabled and to a
+    /// kMcpDisabled JSON-RPC error when MCP is disabled.
     ///
     /// `stream_budget` / `revalidate_fn` are trailing-defaulted for the test
     /// seams; PRODUCTION MUST WIRE BOTH — without the budget there is no

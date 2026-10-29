@@ -48,6 +48,7 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <utility>
 
 // ── the counter (verbatim from test_spark_alloc_budget.cpp) ────────────────
 namespace {
@@ -141,6 +142,11 @@ using yuzu::server::ExecutionEventBus;
 using Bridge = mcp::McpStreamBridge;
 using nlohmann::json;
 
+/// A binding that carries only the principal (an empty credential class).
+mcp::McpSessionBinding bound(std::string principal) {
+    return mcp::McpSessionBinding{.principal = std::move(principal)};
+}
+
 /// spdlog formats into heap buffers; nothing in the fault-free measured window
 /// should log at all, but silence it anyway so an unexpected log statement
 /// cannot be misread as engine cost (test_spark_alloc_budget.cpp precedent).
@@ -178,9 +184,9 @@ struct Fx {
     }
 
     std::string make_session(const std::string& principal) {
-        auto minted = sessions.mint(principal);
+        auto minted = sessions.mint(bound(principal));
         REQUIRE(minted.ok);
-        REQUIRE(sessions.stream_for(minted.session_id, principal) != nullptr);
+        REQUIRE(sessions.stream_for(minted.session_id, bound(principal)) != nullptr);
         return minted.session_id;
     }
 };
@@ -193,7 +199,7 @@ struct Fx {
 void park_one_streamed(Fx& fx, const std::string& session_id, const std::string& principal,
                        const std::string& exec_id) {
     REQUIRE(
-        fx.bridge->reserve(session_id, principal, json(1), json("t"), /*streamed=*/true).ok);
+        fx.bridge->reserve(session_id, bound(principal), json(1), json("t"), /*streamed=*/true).ok);
     REQUIRE(fx.bridge->subscribe(session_id, json(1), exec_id));
     REQUIRE(fx.bridge->arm(session_id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -215,7 +221,7 @@ TEST_CASE("the interposer actually reaches McpStreamBridge's allocations", "[mcp
     std::uint64_t n = 0;
     {
         AllocCount counting;
-        REQUIRE(fx.bridge->reserve(sid, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(sid, bound("alice"), json(1), json("t"), true).ok);
         n = counting.count();
     }
     CHECK(n > 0);

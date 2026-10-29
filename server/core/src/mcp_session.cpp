@@ -16,6 +16,14 @@ constexpr const char* kMetricSessionsActive = "yuzu_mcp_sessions_active";
 constexpr const char* kMetricSessionsOpened = "yuzu_mcp_sessions_opened_total";
 }  // namespace
 
+McpSessionBinding binding_for(const auth::Session& session) {
+    return McpSessionBinding{.principal = session.username,
+                             .auth_source = session.auth_source,
+                             .principal_kind = session.principal_kind,
+                             .mcp_tier = session.mcp_tier,
+                             .token_scope_service = session.token_scope_service};
+}
+
 McpSessionRegistry::McpSessionRegistry() : McpSessionRegistry(Config{}, {}, nullptr) {}
 
 McpSessionRegistry::McpSessionRegistry(Config cfg, ClockFn clock, yuzu::MetricsRegistry* metrics)
@@ -32,7 +40,7 @@ std::chrono::steady_clock::time_point McpSessionRegistry::now() const {
 std::size_t McpSessionRegistry::principal_count_locked(const std::string& p) const {
     std::size_t n = 0;
     for (const auto& [id, e] : sessions_) {
-        if (e.principal == p) {
+        if (e.binding.principal == p) {
             ++n;
         }
     }
@@ -131,7 +139,7 @@ std::size_t McpSessionRegistry::shutdown() noexcept {
     return grabbed.size();
 }
 
-McpSessionRegistry::MintResult McpSessionRegistry::mint(const std::string& principal) {
+McpSessionRegistry::MintResult McpSessionRegistry::mint(const McpSessionBinding& binding) {
     std::vector<std::shared_ptr<McpStreamState>> reaped;
     MintResult result;
     std::size_t active = 0;
@@ -150,7 +158,7 @@ McpSessionRegistry::MintResult McpSessionRegistry::mint(const std::string& princ
             result = {false, {}, "shutdown"};
         } else if (sessions_.size() >= cfg_.global_cap) {
             result = {false, {}, "global_cap"};
-        } else if (principal_count_locked(principal) >= cfg_.per_principal_cap) {
+        } else if (principal_count_locked(binding.principal) >= cfg_.per_principal_cap) {
             result = {false, {}, "per_principal_cap"};
         } else {
             // 16 CSPRNG bytes → 32 lowercase hex chars = 128-bit id. Regenerate on the
@@ -180,7 +188,7 @@ McpSessionRegistry::MintResult McpSessionRegistry::mint(const std::string& princ
                 // correlate against the audit log without putting the full session id in
                 // application logs.
                 stream->set_log_context("sid=" + id.substr(0, 8));
-                sessions_.emplace(id, Entry{principal, t, t, std::move(stream)});
+                sessions_.emplace(id, Entry{binding, t, t, std::move(stream)});
                 opened = true;
                 result = {true, id, {}};
             }
@@ -200,7 +208,7 @@ McpSessionRegistry::MintResult McpSessionRegistry::mint(const std::string& princ
 }
 
 McpSessionRegistry::ValidateResult
-McpSessionRegistry::validate_and_touch(const std::string& id, const std::string& principal) {
+McpSessionRegistry::validate_and_touch(const std::string& id, const McpSessionBinding& binding) {
     std::vector<std::shared_ptr<McpStreamState>> reaped;
     ValidateResult result = ValidateResult::kUnknown;
     std::size_t active = 0;
@@ -210,10 +218,17 @@ McpSessionRegistry::validate_and_touch(const std::string& id, const std::string&
         auto it = sessions_.find(id);
         // Wrong principal is indistinguishable from unknown (no existence oracle,
         // CH-8). The extra string compare vs. a straight miss is negligible against
-        // network latency — "no gross timing divergence" per Decision 15(a).
-        if (it != sessions_.end() && it->second.principal == principal) {
-            it->second.last_seen = now();
-            result = ValidateResult::kValid;
+        // network latency — "no gross timing divergence" per Decision 15(a). The same
+        // principal under a different credential class is reported distinctly (for the
+        // audit trail only; the wire answer is the same) and, like any non-valid result,
+        // neither slides last_seen nor terminates the entry.
+        if (it != sessions_.end() && it->second.binding.principal == binding.principal) {
+            if (it->second.binding == binding) {
+                it->second.last_seen = now();
+                result = ValidateResult::kValid;
+            } else {
+                result = ValidateResult::kCredentialMismatch;
+            }
         }
         active = sessions_.size();
     }
@@ -227,24 +242,34 @@ McpSessionRegistry::validate_and_touch(const std::string& id, const std::string&
 }
 
 std::shared_ptr<McpStreamState> McpSessionRegistry::stream_for(const std::string& id,
-                                                               const std::string& principal) {
+                                                               const McpSessionBinding& binding) {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = sessions_.find(id);
-    if (it == sessions_.end() || it->second.principal != principal) {
+    if (it == sessions_.end() || it->second.binding != binding) {
         return nullptr;  // same no-oracle answer as validate_and_touch
     }
     it->second.last_seen = now();
     return it->second.stream;
 }
 
-bool McpSessionRegistry::terminate(const std::string& id, const std::string& principal) {
+bool McpSessionRegistry::terminate(const std::string& id, const McpSessionBinding& binding,
+                                   ValidateResult* refusal) {
     std::shared_ptr<McpStreamState> stream;
     std::size_t active = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = sessions_.find(id);
-        if (it == sessions_.end() || it->second.principal != principal) {
+        if (it == sessions_.end() || it->second.binding.principal != binding.principal) {
+            if (refusal != nullptr) {
+                *refusal = ValidateResult::kUnknown;
+            }
             return false;
+        }
+        if (it->second.binding != binding) {
+            if (refusal != nullptr) {
+                *refusal = ValidateResult::kCredentialMismatch;
+            }
+            return false;  // a weaker/other-class credential never ends the owner's session
         }
         stream = std::move(it->second.stream);
         sessions_.erase(it);
@@ -265,10 +290,10 @@ std::size_t McpSessionRegistry::active_count() const {
     return sessions_.size();
 }
 
-bool McpSessionRegistry::exists(const std::string& id, const std::string& principal) const {
+bool McpSessionRegistry::exists(const std::string& id, const McpSessionBinding& binding) const {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = sessions_.find(id);
-    if (it == sessions_.end() || it->second.principal != principal) {
+    if (it == sessions_.end() || it->second.binding != binding) {
         return false;
     }
     return now() - it->second.last_seen <= cfg_.idle_ttl;  // gc_locked's predicate, negated

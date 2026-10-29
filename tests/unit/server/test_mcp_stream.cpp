@@ -36,6 +36,12 @@ namespace detail = yuzu::server::detail;
 
 namespace {
 
+// A binding that carries only the principal (an empty credential class). Tests that
+// exercise the class dimension build an McpSessionBinding explicitly.
+mcp::McpSessionBinding bound(std::string principal) {
+    return mcp::McpSessionBinding{.principal = std::move(principal)};
+}
+
 /// Captures everything the pump writes, so a test can assert on the wire bytes.
 struct FakeWire {
     std::string out;
@@ -1168,15 +1174,15 @@ TEST_CASE("McpStreamPump: a sink-queue overflow tells the client to resume, not 
 TEST_CASE("McpSessionRegistry: terminate closes the session's live stream",
           "[mcp][session][stream]") {
     mcp::McpSessionRegistry reg;
-    const auto minted = reg.mint("alice");
+    const auto minted = reg.mint(bound("alice"));
     REQUIRE(minted.ok);
 
-    auto stream = reg.stream_for(minted.session_id, "alice");
+    auto stream = reg.stream_for(minted.session_id, bound("alice"));
     REQUIRE(stream);
     auto attached = stream->attach_and_replay(0, nullptr, "alice");
     REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
 
-    REQUIRE(reg.terminate(minted.session_id, "alice"));
+    REQUIRE(reg.terminate(minted.session_id, bound("alice")));
     // The provider is woken and given a reason — a DELETE must not present as a
     // bare connection drop.
     CHECK(attached.sink->sse->closed.load());
@@ -1186,14 +1192,14 @@ TEST_CASE("McpSessionRegistry: terminate closes the session's live stream",
 TEST_CASE("McpSessionRegistry: stream_for is principal-bound (no oracle)",
           "[mcp][session][stream]") {
     mcp::McpSessionRegistry reg;
-    const auto minted = reg.mint("alice");
+    const auto minted = reg.mint(bound("alice"));
     REQUIRE(minted.ok);
 
-    CHECK(reg.stream_for(minted.session_id, "alice"));
+    CHECK(reg.stream_for(minted.session_id, bound("alice")));
     // A real session id under the wrong principal answers exactly as a made-up one
     // does — nullptr, no signal that the id exists.
-    CHECK_FALSE(reg.stream_for(minted.session_id, "mallory"));
-    CHECK_FALSE(reg.stream_for(std::string(32, 'f'), "mallory"));
+    CHECK_FALSE(reg.stream_for(minted.session_id, bound("mallory")));
+    CHECK_FALSE(reg.stream_for(std::string(32, 'f'), bound("mallory")));
 }
 
 TEST_CASE("McpSessionRegistry: idle GC closes the stream of a reaped session",
@@ -1201,9 +1207,9 @@ TEST_CASE("McpSessionRegistry: idle GC closes the stream of a reaped session",
     auto clock_now = std::chrono::steady_clock::now();
     mcp::McpSessionRegistry reg{{.idle_ttl = std::chrono::seconds(30)},
                                 [&clock_now] { return clock_now; }};
-    const auto minted = reg.mint("alice");
+    const auto minted = reg.mint(bound("alice"));
     REQUIRE(minted.ok);
-    auto stream = reg.stream_for(minted.session_id, "alice");
+    auto stream = reg.stream_for(minted.session_id, bound("alice"));
     auto attached = stream->attach_and_replay(0, nullptr, "alice");
     REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
 
@@ -1226,12 +1232,12 @@ TEST_CASE("McpSessionRegistry: a live stream's ticking keeps its session young",
     auto clock_now = std::chrono::steady_clock::now();
     mcp::McpSessionRegistry reg{{.idle_ttl = std::chrono::seconds(30)},
                                 [&clock_now] { return clock_now; }};
-    const auto minted = reg.mint("alice");
+    const auto minted = reg.mint(bound("alice"));
     REQUIRE(minted.ok);
 
     for (int i = 0; i < 4; ++i) {
         clock_now += std::chrono::seconds(20);
-        CHECK(reg.validate_and_touch(minted.session_id, "alice") ==
+        CHECK(reg.validate_and_touch(minted.session_id, bound("alice")) ==
               mcp::McpSessionRegistry::ValidateResult::kValid);
     }
     CHECK(reg.active_count() == 1); // 80 s elapsed, TTL 30 s, still alive
@@ -1247,10 +1253,10 @@ TEST_CASE("McpSessionRegistry: a live stream's ticking keeps its session young",
 TEST_CASE("McpSessionRegistry: shutdown wakes a live GET pump immediately, not a tick later",
           "[mcp][session][stream][race]") {
     mcp::McpSessionRegistry reg;
-    const auto minted = reg.mint("alice");
+    const auto minted = reg.mint(bound("alice"));
     REQUIRE(minted.ok);
     const auto sid = minted.session_id;
-    auto stream = reg.stream_for(sid, "alice");
+    auto stream = reg.stream_for(sid, bound("alice"));
     REQUIRE(stream);
     auto attached = stream->attach_and_replay(0, nullptr, "alice");
     REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
@@ -1264,7 +1270,7 @@ TEST_CASE("McpSessionRegistry: shutdown wakes a live GET pump immediately, not a
             // The real production wiring (mcp_server.cpp's session_alive closure),
             // not a hardcoded `true` — proves shutdown() reaches this pump via the
             // registry, not just via a direct state->close() call.
-            return reg.validate_and_touch(sid, "alice") ==
+            return reg.validate_and_touch(sid, bound("alice")) ==
                    mcp::McpSessionRegistry::ValidateResult::kValid;
         },
         cfg};
@@ -1302,7 +1308,7 @@ TEST_CASE("McpSessionRegistry: shutdown wakes a live GET pump immediately, not a
 TEST_CASE("McpSessionRegistry: shutdown closes a live streamed-POST pump within one tick",
           "[mcp][session][stream][race]") {
     mcp::McpSessionRegistry reg;
-    const auto minted = reg.mint("alice");
+    const auto minted = reg.mint(bound("alice"));
     REQUIRE(minted.ok);
     const auto sid = minted.session_id;
 
@@ -1315,7 +1321,7 @@ TEST_CASE("McpSessionRegistry: shutdown closes a live streamed-POST pump within 
         [] {},                                                                  // on_final_written
         [] { return mcp::StreamRevalidate::kValid; },
         [&reg, sid] {
-            return reg.validate_and_touch(sid, "alice") ==
+            return reg.validate_and_touch(sid, bound("alice")) ==
                    mcp::McpSessionRegistry::ValidateResult::kValid;
         },
         cfg};
@@ -1341,9 +1347,9 @@ TEST_CASE("McpSessionRegistry: shutdown mid-handover closes only the new live si
           "the superseded one is already closed",
           "[mcp][session][stream][race]") {
     mcp::McpSessionRegistry reg;
-    const auto minted = reg.mint("alice");
+    const auto minted = reg.mint(bound("alice"));
     REQUIRE(minted.ok);
-    auto stream = reg.stream_for(minted.session_id, "alice");
+    auto stream = reg.stream_for(minted.session_id, bound("alice"));
     REQUIRE(stream);
 
     auto first = stream->attach_and_replay(0, nullptr, "alice");
@@ -1416,15 +1422,15 @@ TEST_CASE("McpSessionRegistry: concurrent mint / stream_for / terminate is race-
         threads.emplace_back([&, t] {
             const std::string principal = "p" + std::to_string(t % 3);
             for (int i = 0; i < 100; ++i) {
-                auto m = reg.mint(principal);
+                auto m = reg.mint(bound(principal));
                 if (!m.ok) {
                     continue;
                 }
                 ++minted;
-                if (auto s = reg.stream_for(m.session_id, principal)) {
+                if (auto s = reg.stream_for(m.session_id, bound(principal))) {
                     s->publish("message", "x");
                 }
-                reg.terminate(m.session_id, principal);
+                reg.terminate(m.session_id, bound(principal));
             }
         });
     }

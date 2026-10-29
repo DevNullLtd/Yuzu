@@ -124,6 +124,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <regex>
 #include <set>
 #include <shared_mutex>
 #include <span>
@@ -33133,6 +33134,17 @@ std::string mint_session(McpTestServer& ts, int id = 1) {
     REQUIRE(res->status == 200);
     return res->get_header_value("Mcp-Session-Id");
 }
+
+// The binding McpTestServer's mock auth_fn presents for the default "test-user" caller:
+// local cookie-class credential, human principal, no service scope, with the MCP tier the
+// test installs the handler with (start() = empty, start_with_dispatch(..., "operator")).
+mcp::McpSessionBinding test_user_binding(std::string tier = {}) {
+    return mcp::McpSessionBinding{.principal = "test-user",
+                                  .auth_source = "local",
+                                  .principal_kind = "human",
+                                  .mcp_tier = std::move(tier),
+                                  .token_scope_service = {}};
+}
 } // namespace
 
 TEST_CASE("MCP 2f: notification answers 202 not 204 (spec MUST, streaming-agnostic)",
@@ -33223,7 +33235,7 @@ TEST_CASE("MCP 2f/CH-8: client-supplied session id on initialize is NOT adopted 
     const auto minted = res->get_header_value("Mcp-Session-Id");
     CHECK(minted.size() == 32);
     CHECK(minted != attacker_id);                       // a FRESH id, never the client's
-    CHECK(reg.validate_and_touch(attacker_id, "test-user") ==
+    CHECK(reg.validate_and_touch(attacker_id, test_user_binding()) ==
           mcp::McpSessionRegistry::ValidateResult::kUnknown); // attacker id never became live
 }
 
@@ -33567,7 +33579,7 @@ TEST_CASE("MCP 2f PR2/CH-2: a resume past the replay window 404s and re-inits �
     const auto sid = mint_session(ts);
     REQUIRE_FALSE(sid.empty());
 
-    auto stream = reg.stream_for(sid, "test-user");
+    auto stream = reg.stream_for(sid, test_user_binding());
     REQUIRE(stream);
     for (int i = 0; i < 5; ++i) {
         stream->publish("message", R"({"jsonrpc":"2.0"})");
@@ -33596,7 +33608,7 @@ TEST_CASE("MCP 2f PR2/CH-2: an in-window resume is admitted", "[mcp][transport][
     ts.session_registry_for_test = &reg;
     ts.start();
     const auto sid = mint_session(ts);
-    auto stream = reg.stream_for(sid, "test-user");
+    auto stream = reg.stream_for(sid, test_user_binding());
     REQUIRE(stream);
     for (int i = 0; i < 3; ++i) {
         stream->publish("message", "{}");
@@ -33802,7 +33814,7 @@ TEST_CASE("MCP #4754: a service-scoped token is refused on the GET stream channe
         // refused GET, the session is idle-expired. A deny that touched the registry would
         // have kept it alive.
         elapsed = std::chrono::seconds(40);
-        CHECK_FALSE(reg.exists(sid, "test-user"));
+        CHECK_FALSE(reg.exists(sid, test_user_binding()));
     }
     SECTION("a service-scoped GET with no Mcp-Session-Id answers 403, not 400") {
         ts.mock_token_scope_service = "printers";
@@ -33821,11 +33833,298 @@ TEST_CASE("MCP #4754: a service-scoped token is refused on the GET stream channe
         CHECK(count_of("service_scoped") == 0.0);
     }
     SECTION("DELETE is not service-scope denied (the ruling scopes the deny to GET)") {
+        // The scoped credential mints its own session: a session minted by an unscoped
+        // credential would be refused on the credential-class binding, not the scope.
         ts.mock_token_scope_service = "printers";
-        auto res = ts.call_raw("DELETE", "", {{"Mcp-Session-Id", sid}});
+        const auto scoped_sid = mint_session(ts, 2);
+        REQUIRE_FALSE(scoped_sid.empty());
+        auto res = ts.call_raw("DELETE", "", {{"Mcp-Session-Id", scoped_sid}});
         CHECK(res->status == 200);
-        CHECK(reg.active_count() == 0);
+        CHECK(reg.active_count() == 1); // only the unscoped credential's session remains
         CHECK(count_of("service_scoped") == 0.0);
+    }
+}
+
+// ── #4754: a session is bound to the principal AND the credential class ──────────────
+//
+// The session id is a bearer-like handle to a replay ring. A weaker credential of the same
+// user (a readonly token, a tierless token or cookie, a service-scoped token) that learns
+// the id must not be handed the ring the stronger credential's calls filled. The wire
+// answer is the unknown-session 404 either way; the audit row and the reject counter are
+// where the class mismatch is told apart.
+
+namespace {
+// What McpTestServer's mock auth_fn presents once mock_auth_source is "mcp_token".
+mcp::McpSessionBinding mcp_token_binding(std::string tier) {
+    return mcp::McpSessionBinding{.principal = "test-user",
+                                  .auth_source = "mcp_token",
+                                  .principal_kind = "human",
+                                  .mcp_tier = std::move(tier),
+                                  .token_scope_service = {}};
+}
+
+// The error body with the per-request correlation id blanked, so two refusals can be
+// compared for byte-identity apart from that id.
+nlohmann::json body_without_cid(const std::string& body) {
+    auto j = nlohmann::json::parse(body);
+    j["error"]["data"]["correlation_id"] = "";
+    return j;
+}
+} // namespace
+
+TEST_CASE("MCP #4754: a session presented by a weaker credential class answers the unknown-session "
+          "404 on GET and the owner's session is untouched",
+          "[mcp][transport][2f][stream][4754]") {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::chrono::seconds elapsed{0};
+    mcp::McpSessionRegistry reg({.idle_ttl = std::chrono::seconds(30)},
+                                [&] { return t0 + elapsed; });
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 4}};
+    yuzu::MetricsRegistry metrics;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.stream_budget_for_test = &budget;
+    ts.metrics_for_test = &metrics;
+    ts.mock_auth_source = "mcp_token";
+    ts.start("supervised");
+    const auto sid = mint_session(ts); // minted by a supervised MCP token
+    REQUIRE_FALSE(sid.empty());
+    const auto count_of = [&](const char* reason) {
+        return metrics.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}}).value();
+    };
+    const auto count_audit = [&](const std::string& entry) {
+        return std::count(ts.audit_log.begin(), ts.audit_log.end(), entry);
+    };
+    const auto get_with = [&](const std::string& session_id) {
+        return ts.call_raw("GET", "", {{"Mcp-Session-Id", session_id},
+                                       {"Accept", "text/event-stream"}});
+    };
+
+    SECTION("readonly token of the same user: identical 404 body, distinct audit, no side effects") {
+        // The reference answer for an id that never existed.
+        ts.mock_tier = "readonly";
+        auto unknown = get_with(std::string(32, 'a'));
+        REQUIRE(unknown->status == 404);
+        REQUIRE(count_of("unknown_session") == 1.0);
+
+        elapsed = std::chrono::seconds(20);
+        const auto audit_before = ts.audit_log.size();
+        auto res = get_with(sid);
+        CHECK(res->status == 404);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["code"] == mcp::kMcpUnknownSession);
+        CHECK(body["error"]["message"] == "Unknown or expired session");
+        // Byte-identical to the never-existed answer apart from the correlation id: the
+        // client learns nothing about the class split.
+        CHECK(body_without_cid(res->body) == body_without_cid(unknown->body));
+
+        // The distinction lives in the audit row: exact action, result, reason and an
+        // 8-character target (never the full id).
+        REQUIRE(ts.audit_log.size() == audit_before + 1);
+        CHECK(ts.audit_log.back() == "mcp.session.reject|failure");
+        CHECK(ts.audit_target_ids.back() == sid.substr(0, 8));
+        CHECK(ts.audit_target_types.back() == "McpSession");
+        CHECK(ts.audit_details.back().rfind("reason=credential_mismatch cid=req-", 0) == 0);
+        CHECK(count_audit("mcp.stream.attach|success") == 0);
+
+        // Counter: the mismatch is counted under its own reason, the unknown probe under its.
+        CHECK(count_of("credential_mismatch") == 1.0);
+        CHECK(count_of("unknown_session") == 1.0);
+        CHECK(budget.active() == 0); // no lease taken
+
+        // The registry was not touched: still one live session, and last_seen did not slide
+        // (40s after mint, past the 30s ttl; a slide at t=20 would keep it alive).
+        CHECK(reg.active_count() == 1);
+        elapsed = std::chrono::seconds(40);
+        CHECK_FALSE(reg.exists(sid, mcp_token_binding("supervised")));
+    }
+    SECTION("same case, same class: attaches and leases; a foreign principal is unknown, not "
+            "a mismatch") {
+        auto ok = get_with(sid);
+        CHECK(ok->status == 200);
+        CHECK(budget.active() == 1);
+        CHECK(count_audit("mcp.stream.attach|success") == 1);
+        CHECK(count_of("credential_mismatch") == 0.0);
+
+        ts.mock_username = "bob"; // same class, different principal
+        auto foreign = get_with(sid);
+        CHECK(foreign->status == 404);
+        CHECK(ts.audit_details.back().rfind("reason=unknown_session cid=req-", 0) == 0);
+        CHECK(count_of("unknown_session") == 1.0);
+        CHECK(count_of("credential_mismatch") == 0.0);
+    }
+    SECTION("same-class resume with Last-Event-ID is unchanged") {
+        auto stream = reg.stream_for(sid, mcp_token_binding("supervised"));
+        REQUIRE(stream);
+        for (int i = 0; i < 3; ++i) {
+            stream->publish("message", "{}");
+        }
+        auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "text/event-stream"},
+                                           {"Last-Event-ID", "2"}});
+        CHECK(res->status == 200);
+        CHECK(count_of("credential_mismatch") == 0.0);
+    }
+    SECTION("a tierless api_token and a cookie session are different classes, both ways") {
+        // Cookie class (auth_source local, no tier) mints; a tierless API token presents.
+        ts.mock_auth_source = "local";
+        ts.mock_tier = "";
+        const auto cookie_sid = mint_session(ts);
+        REQUIRE_FALSE(cookie_sid.empty());
+        ts.mock_auth_source = "api_token";
+        CHECK(get_with(cookie_sid)->status == 404);
+        CHECK(ts.audit_details.back().rfind("reason=credential_mismatch cid=", 0) == 0);
+
+        // And the reverse: minted by the tierless API token, presented by the cookie.
+        const auto token_sid = mint_session(ts);
+        REQUIRE_FALSE(token_sid.empty());
+        ts.mock_auth_source = "local";
+        CHECK(get_with(token_sid)->status == 404);
+        CHECK(ts.audit_details.back().rfind("reason=credential_mismatch cid=", 0) == 0);
+        CHECK(count_of("credential_mismatch") == 2.0);
+        CHECK(budget.active() == 0);
+
+        // Same-case controls: each owner's own class attaches.
+        CHECK(get_with(cookie_sid)->status == 200);
+        ts.mock_auth_source = "api_token";
+        CHECK(get_with(token_sid)->status == 200);
+    }
+}
+
+TEST_CASE("MCP #4754: POST and DELETE presenting a session from another credential class answer "
+          "404 and never end the owner's session",
+          "[mcp][transport][2f][stream][4754]") {
+    mcp::McpSessionRegistry reg;
+    yuzu::MetricsRegistry metrics;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.metrics_for_test = &metrics;
+    ts.mock_auth_source = "mcp_token";
+    ts.start("supervised");
+    const auto sid = mint_session(ts);
+    REQUIRE_FALSE(sid.empty());
+    ts.mock_tier = "readonly"; // the weaker credential of the same user
+
+    SECTION("POST tools/list carrying the owner's session id") {
+        const auto audit_before = ts.audit_log.size();
+        auto res = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"tools/list","id":7})",
+                               {{"Mcp-Session-Id", sid}});
+        CHECK(res->status == 404);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["code"] == mcp::kMcpUnknownSession);
+        CHECK(body["id"] == 7); // post-parse error echoes the request id
+        REQUIRE(ts.audit_log.size() == audit_before + 1);
+        CHECK(ts.audit_log.back() == "mcp.session.reject|failure");
+        CHECK(ts.audit_target_ids.back() == sid.substr(0, 8));
+        CHECK(ts.audit_details.back().rfind("reason=credential_mismatch cid=req-", 0) == 0);
+        // POST has no stream-reject counter for an unknown session today; none is added.
+        CHECK(metrics.counter("yuzu_mcp_stream_rejects_total", {{"reason", "credential_mismatch"}})
+                  .value() == 0.0);
+    }
+    SECTION("DELETE from the weaker class: 404, audited, and the victim's GET still attaches") {
+        const auto audit_before = ts.audit_log.size();
+        auto del = ts.call_raw("DELETE", "", {{"Mcp-Session-Id", sid}});
+        CHECK(del->status == 404);
+        CHECK(nlohmann::json::parse(del->body)["error"]["code"] == mcp::kMcpUnknownSession);
+        REQUIRE(ts.audit_log.size() == audit_before + 1);
+        CHECK(ts.audit_log.back() == "mcp.session.reject|failure");
+        CHECK(ts.audit_target_ids.back() == sid.substr(0, 8));
+        CHECK(ts.audit_details.back().rfind("reason=credential_mismatch cid=req-", 0) == 0);
+        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.close|success") == 0);
+
+        CHECK(reg.active_count() == 1);
+        ts.mock_tier = "supervised"; // the owner is back
+        auto get = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "text/event-stream"}});
+        CHECK(get->status == 200);
+    }
+    SECTION("same case, owner's class: POST proceeds and DELETE ends the session") {
+        ts.mock_tier = "supervised";
+        auto ok = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"tools/list","id":8})",
+                              {{"Mcp-Session-Id", sid}});
+        CHECK(ok->status == 200);
+        CHECK(ts.call_raw("DELETE", "", {{"Mcp-Session-Id", sid}})->status == 200);
+        CHECK(reg.active_count() == 0);
+    }
+}
+
+TEST_CASE("MCP #4754: session ids and credential classes stay out of logs and audit",
+          "[mcp][transport][2f][stream][4754]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.mock_auth_source = "mcp_token";
+    ts.start("supervised");
+
+    std::string sid_scoped;
+    std::string sid_attached;
+    std::string text;
+    {
+        yuzu::test::LogCapture cap;
+        {
+            // A service-scoped credential mints (initialize is not denied), then an
+            // unscoped credential of the same user presents the id.
+            ts.mock_token_scope_service = "zz-scope-marker";
+            sid_scoped = mint_session(ts);
+            ts.mock_token_scope_service.clear();
+            auto mismatch = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"tools/list","id":2})",
+                                        {{"Mcp-Session-Id", sid_scoped}});
+            CHECK(mismatch->status == 404);
+
+            // An unscoped session: attach, then a weaker credential probes it.
+            sid_attached = mint_session(ts, 3);
+            auto attached = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid_attached},
+                                                    {"Accept", "text/event-stream"}});
+            REQUIRE(attached->status == 200);
+            ts.mock_tier = "readonly";
+            CHECK(ts.call_raw("GET", "", {{"Mcp-Session-Id", sid_attached},
+                                          {"Accept", "text/event-stream"}})
+                      ->status == 404);
+            ts.mock_tier = "supervised";
+
+            // Positive control that the capture reaches library code at all: a dropped
+            // publish logs the session's 8-char prefix from McpStreamState.
+            auto stream = reg.stream_for(sid_attached, mcp_token_binding("supervised"));
+            REQUIRE(stream);
+            stream->inject_publish_fault_for_test(
+                mcp::McpStreamState::PublishFault::kPreCommit);
+            CHECK(stream->publish("message", "{}") == 0);
+        } // responses (and their stream releasers) destroyed before the capture stops
+        cap.stop();
+        text = cap.text();
+    }
+
+    REQUIRE_FALSE(sid_scoped.empty());
+    REQUIRE_FALSE(sid_attached.empty());
+    // The control: the library did log, and with the prefix only.
+    CHECK(text.find("sid=" + sid_attached.substr(0, 8)) != std::string::npos);
+    // No full session id anywhere in the captured logs, nor any 32-hex run that could be one.
+    CHECK(text.find(sid_scoped) == std::string::npos);
+    CHECK(text.find(sid_attached) == std::string::npos);
+    CHECK_FALSE(std::regex_search(text, std::regex("[0-9a-f]{32}")));
+
+    // Every McpSession audit row names at most the 8-char prefix, and no row (target or
+    // detail) carries a full id or any piece of the credential class.
+    REQUIRE(ts.audit_log.size() == ts.audit_target_ids.size());
+    std::size_t session_rows = 0;
+    for (std::size_t i = 0; i < ts.audit_log.size(); ++i) {
+        if (ts.audit_target_types[i] == "McpSession") {
+            ++session_rows;
+            CHECK(ts.audit_target_ids[i].size() <= 8);
+        }
+        for (const auto* field : {&ts.audit_target_ids[i], &ts.audit_details[i]}) {
+            CHECK(field->find(sid_scoped) == std::string::npos);
+            CHECK(field->find(sid_attached) == std::string::npos);
+            for (const char* class_marker : {"zz-scope-marker", "mcp_token", "supervised"}) {
+                INFO("audit row " << ts.audit_log[i] << " field leaks " << class_marker);
+                CHECK(field->find(class_marker) == std::string::npos);
+            }
+        }
+    }
+    CHECK(session_rows >= 4); // open x2, attach, two rejects (>= guards against a vacuous loop)
+    for (const char* class_marker : {"zz-scope-marker", "mcp_token", "supervised"}) {
+        INFO("log text leaks " << class_marker);
+        CHECK(text.find(class_marker) == std::string::npos);
     }
 }
 
@@ -33907,7 +34206,7 @@ TEST_CASE("MCP 2f/15(j): session cap hit rejects initialize with 429 (never evic
     CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") !=
           ts.audit_log.end());
     // the live session survived the cap rejection
-    CHECK(reg.validate_and_touch(first, "test-user") ==
+    CHECK(reg.validate_and_touch(first, test_user_binding()) ==
           mcp::McpSessionRegistry::ValidateResult::kValid);
 }
 
@@ -33967,10 +34266,10 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
     ts.session_registry_for_test = &sessions;
     ts.metrics_for_test = &metrics;
 
-    auto minted = sessions.mint("test-user"); // harness auth_fn's username
+    auto minted = sessions.mint(test_user_binding("operator")); // harness auth_fn's username
     REQUIRE(minted.ok);
     const auto sid = minted.session_id;
-    auto stream = sessions.stream_for(sid, "test-user");
+    auto stream = sessions.stream_for(sid, test_user_binding("operator"));
     REQUIRE(stream != nullptr);
 
     const auto call_exec = [&](const std::string& body) {
@@ -34412,7 +34711,7 @@ TEST_CASE("streamed POST opt-out: --no-mcp-streamed-post falls back to a plain r
     // harness's default-on setting.
     ts.streamed_post_enabled_ = false;
 
-    auto minted = sessions.mint("test-user");
+    auto minted = sessions.mint(test_user_binding("operator"));
     REQUIRE(minted.ok);
     const auto sid = minted.session_id;
 
@@ -34466,10 +34765,10 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
     ts.metrics_for_test = &metrics;
     ts.stream_budget_for_test = &budget;
 
-    auto minted = sessions.mint("test-user");
+    auto minted = sessions.mint(test_user_binding("operator"));
     REQUIRE(minted.ok);
     const auto sid = minted.session_id;
-    auto stream = sessions.stream_for(sid, "test-user");
+    auto stream = sessions.stream_for(sid, test_user_binding("operator"));
     REQUIRE(stream != nullptr);
 
     const auto exec_body = [](int id, bool with_token) {
@@ -34895,10 +35194,10 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
     ts.session_registry_for_test = &sessions;
     ts.metrics_for_test = &metrics;
 
-    auto minted = sessions.mint("test-user");
+    auto minted = sessions.mint(test_user_binding("operator"));
     REQUIRE(minted.ok);
     const auto sid = minted.session_id;
-    REQUIRE(sessions.stream_for(sid, "test-user") != nullptr);
+    REQUIRE(sessions.stream_for(sid, test_user_binding("operator")) != nullptr);
 
     const auto cancel_body = [](const std::string& request_id_json) {
         return std::string(
@@ -34935,7 +35234,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
         // Reserve leaves the record kArming, which is the only phase that has
         // anything to cancel - request_cancel records INTENT and arm()/abandon()
         // arbitrate it later.
-        REQUIRE(bridge.reserve(sid, "test-user", nlohmann::json(900), nlohmann::json("tok"),
+        REQUIRE(bridge.reserve(sid, test_user_binding("operator"), nlohmann::json(900), nlohmann::json("tok"),
                                /*streamed_intent=*/false)
                     .ok);
 
@@ -34972,7 +35271,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
                const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome { return {.sent = 2, .command_id = "cmd-c9"}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
-        REQUIRE(bridge.reserve(sid, "test-user", nlohmann::json(900), nlohmann::json("tok"),
+        REQUIRE(bridge.reserve(sid, test_user_binding("operator"), nlohmann::json(900), nlohmann::json("tok"),
                                /*streamed_intent=*/false)
                     .ok);
 
@@ -35093,10 +35392,10 @@ TEST_CASE("CH-5/CH-6: streamed POSTs debit the shared budget and leave the plain
     ts.session_registry_for_test = &sessions;
     ts.metrics_for_test = &metrics;
 
-    auto minted = sessions.mint("test-user");
+    auto minted = sessions.mint(test_user_binding("operator"));
     REQUIRE(minted.ok);
     const auto sid = minted.session_id;
-    REQUIRE(sessions.stream_for(sid, "test-user") != nullptr);
+    REQUIRE(sessions.stream_for(sid, test_user_binding("operator")) != nullptr);
 
     const auto exec_body = [](int id, bool with_token) {
         std::string meta = with_token ? R"(,"_meta":{"progressToken":"tok-1"})" : "";

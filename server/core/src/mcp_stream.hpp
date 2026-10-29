@@ -75,6 +75,7 @@ namespace yuzu::server::mcp {
 namespace sse_bus = ::yuzu::server::detail;
 
 class McpSessionRegistry;
+struct McpSessionBinding;
 
 /// Replay-ring capacity per session. Matches `sse_bus::kPerConnectionQueueCapDefault`
 /// so a full-ring replay fits the sink queue exactly and cannot trip the sink's
@@ -988,13 +989,20 @@ private:
 /// `budget` / `revalidate` may be null/empty in test seams; production wires
 /// both (the registration path warns when they are missing).
 ///
+/// `binding` is the authenticated caller's principal AND credential class. The session
+/// must have been minted under exactly that binding: a different principal and a
+/// different class of the same principal both answer the identical 404 (unknown_session
+/// body), and the class case is told apart only in the audit row and the
+/// `credential_mismatch` reject counter. `binding.principal` is what feeds the
+/// StreamBudget per-principal lease and the per-tick revalidation.
+///
 /// `per_principal_cap` is the operator's `--mcp-max-streams-per-principal`. It is a
 /// PARAMETER, not a constant read at the call site: threading it from Config is what
 /// makes the flag do anything. It was previously hardcoded to the default here, so the
 /// flag and its env var parsed, validated, logged and documented as a working control
 /// while having no effect at all.
 void handle_get_tail(const httplib::Request& req, httplib::Response& res,
-                     const std::string& principal, McpSessionRegistry& sessions,
+                     const McpSessionBinding& binding, McpSessionRegistry& sessions,
                      sse_bus::StreamBudget* budget, const StreamRevalidateFn& revalidate,
                      yuzu::MetricsRegistry* metrics, const StreamAuditFn& audit_fn,
                      std::size_t per_principal_cap = kMcpStreamsPerPrincipalDefault,

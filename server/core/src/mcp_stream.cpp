@@ -1661,11 +1661,15 @@ bool McpPostPump::pump_once_impl(const WriteFn& write) {
 // ── GET tail ────────────────────────────────────────────────────────────────
 
 void handle_get_tail(const httplib::Request& req, httplib::Response& res,
-                     const std::string& principal, McpSessionRegistry& sessions,
+                     const McpSessionBinding& binding, McpSessionRegistry& sessions,
                      sse_bus::StreamBudget* budget, const StreamRevalidateFn& revalidate,
                      yuzu::MetricsRegistry* metrics, const StreamAuditFn& audit_fn,
                      std::size_t per_principal_cap, StreamAuditPrincipal audit_principal,
                      const StreamPrincipalAuditFn& principal_audit_fn) {
+    // Everything below that is per-principal (the StreamBudget lease, the per-tick
+    // revalidation) keys on the username alone; the credential class only gates the
+    // session lookups.
+    const std::string& principal = binding.principal;
     const auto cid = yuzu::server::detail::make_correlation_id();
     const auto audit = [&](const char* action, const char* result, const std::string& target_id,
                            const std::string& detail) {
@@ -1703,10 +1707,18 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
              "initialize first, then send the returned Mcp-Session-Id on GET", std::nullopt, sid);
         return;
     }
-    if (sessions.validate_and_touch(sid, principal) != McpSessionRegistry::ValidateResult::kValid) {
-        // Unknown / expired / bound to another principal — one answer for all three
-        // (no cross-principal existence oracle, Decision 15(a) / CH-8).
-        deny(404, kMcpUnknownSession, "Unknown or expired session", "unknown_session",
+    const auto validated = sessions.validate_and_touch(sid, binding);
+    if (validated != McpSessionRegistry::ValidateResult::kValid) {
+        // Unknown / expired / bound to another principal / minted under another credential
+        // class — one WIRE answer for all four (no cross-principal existence oracle,
+        // Decision 15(a) / CH-8). Only the same-principal class mismatch is told apart, in
+        // the audit row and the reject counter, because it is the signal that a weaker (or
+        // otherwise different) credential of the owner is probing the session (#4754).
+        // The registry left the owner's session untouched.
+        deny(404, kMcpUnknownSession, "Unknown or expired session",
+             validated == McpSessionRegistry::ValidateResult::kCredentialMismatch
+                 ? "credential_mismatch"
+                 : "unknown_session",
              "re-initialize to mint a new session", std::nullopt, sid);
         return;
     }
@@ -1721,7 +1733,7 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
     const std::uint64_t last_event_id =
         parse_last_event_id(req.get_header_value("Last-Event-ID"));
 
-    auto stream = sessions.stream_for(sid, principal);
+    auto stream = sessions.stream_for(sid, binding);
     if (!stream) {
         deny(404, kMcpUnknownSession, "Unknown or expired session", "unknown_session",
              "re-initialize to mint a new session", std::nullopt, sid);
@@ -1733,7 +1745,7 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
         // The cursor's frames are gone. Terminate the session so the client's next
         // POST 404s too — one coherent "re-initialize" signal, and no abandoned
         // session lingering against the session cap.
-        (void)sessions.terminate(sid, principal);
+        (void)sessions.terminate(sid, binding);
         (void)audit("mcp.session.close", "success",
                     yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8)),
                     "reason=replay_window_exceeded cid=" + cid);
@@ -1850,8 +1862,8 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
     // `sessions` is a ServerImpl member; stop() joins the web workers before any member
     // destructs, so no provider can outlive it.
     auto* registry = &sessions;
-    auto session_alive = [registry, sid, principal]() {
-        return registry->validate_and_touch(sid, principal) ==
+    auto session_alive = [registry, sid, binding]() {
+        return registry->validate_and_touch(sid, binding) ==
                McpSessionRegistry::ValidateResult::kValid;
     };
     // Production config: spread the indeterminate-grace deadline by up to half the grace
