@@ -300,8 +300,10 @@ Each simulated agent:
   P-256 gateway leaf (the shapes the server's first-boot PKI issues), the agent
   verifying the gateway and sending SNI; `mtls` is the documented move to
   mutual TLS (`verify_peer`, `fail_if_no_peer_cert false`) with a client
-  certificate; `plain` is plaintext, for comparison. The management listener
-  and the upstream hop stay plaintext;
+  certificate; `ktls` is `tls` with `ktls => true` (the kernel-TLS agent
+  listener of branch `perf/gateway-idle-mem-ktls`; the case fails unless the
+  listener really runs `yuzu_gw_ktls_transport`); `plain` is plaintext, for
+  comparison. The management listener and the upstream hop stay plaintext;
 - registers with the 69-plugin `RegisterRequest` (about 9 KB encoded, as for
   every case);
 - holds `Subscribe` open;
@@ -336,12 +338,40 @@ Each sample, taken inside the gateway node (`yuzu_gw_scale_probe:idle_sample/1`)
   `Anonymous`, ...); on macOS `ps` RSS (`os_rss`) and the
   physical footprint from `footprint` (`os_anon`, the nearest macOS has to
   anonymous RSS; best effort);
-- kernel memory of the gateway's agent-listener sockets, outside the process
-  and outside the budget, reported so a regression there is still seen: on
-  Linux `ss -tmn` per socket (`socket_allocated`, the sum of the `skmem`
-  allocations; `socket_queued`; `socket_limits`, the autotuned buffer sizes)
-  and the host-wide TCP memory of `/proc/net/sockstat` (every socket on the
-  host, the load generator's included); on macOS the queued bytes only;
+- the kernel's memory for the gateway's connections, outside the process. On
+  Linux:
+  - socket buffers: `ss -tmn` per agent-listener socket (`socket_allocated`,
+    the sum of the `skmem` allocations; `socket_queued`; `socket_limits`, the
+    autotuned buffer sizes) and the host-wide TCP memory of
+    `/proc/net/sockstat` (`socket_host_tcp_mem`, every socket on the host);
+  - slab, from `/proc/slabinfo` (read directly, or with `sudo -n cat`; with
+    neither, `socket_slab_source` is `none` and only the buffers are
+    counted), as objects in use (`active_objs * objsize`) in four groups:
+    `socket_slab_pair` (TCP, TCPv6, sock_inode_cache, filp, dentry,
+    eventpoll_epi, eventpoll_pwq, lsm_inode_cache, lsm_file_cache: one object
+    per socket at each end of a connection), `socket_slab_kmalloc`
+    (`kmalloc-*`: kTLS's context, AEAD transforms and receive parser, about
+    4 KB a connection, and small blobs of both ends), `socket_slab_conntrack`
+    (`nf_conntrack*`) and `socket_slab_net` (`skbuff_*`, `tcp_bind_bucket`,
+    `request_sock_TCP*`, `tw_sock_TCP*`, `inet_peer_cache`).
+    `socket_slab_total` is every cache's pages, for reference. Objects, not
+    pages: a cache with free space in its slabs takes new objects without new
+    pages, so pages follow the host's history at small N;
+  - `socket_kernel` = `slab_pair / 2 + slab_kmalloc + slab_conntrack +
+    slab_net + socket_allocated`: the gateway's share. The load generator runs
+    on the same host and holds the other end of every connection, so the pair
+    caches are halved; the other groups are counted whole, which overstates
+    by the client's small kmalloc share. `socket_kernel_host` counts every
+    group whole plus `socket_host_tcp_mem`: both ends, an upper bound. Both
+    are host-wide reads: anything else allocating in these caches between
+    `M(0)` and `M(N)` shows up, so run on a host otherwise idle;
+  - `all_in` = `os_anon + socket_kernel`, the figure the per-agent budget
+    check judges (ADR-0074 D14: 64 KiB per idle agent, all-in). At the
+    largest N of each transport the summary prints `budget ... PASS/FAIL`
+    against `YUZU_GW_IDLEMEM_BUDGET_KIB`, and the JSON holds it as `budget`.
+    It is reported, never failed.
+
+  On macOS the queued bytes only;
 - the heartbeat buffer's size (`hb_buffer_bytes`) and drop counters. The
   buffer is bounded (64 MiB by default) and flushes at most about 24 MiB a
   second, so with large snapshots at 10,000 agents it fills and evicts
@@ -373,7 +403,8 @@ Settings (all optional):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `YUZU_GW_IDLEMEM_TRANSPORTS` | `tls,plain` | transports, in order: `tls`, `mtls`, `plain` |
+| `YUZU_GW_IDLEMEM_TRANSPORTS` | `tls,plain` | transports, in order: `tls`, `mtls`, `ktls`, `plain` |
+| `YUZU_GW_IDLEMEM_BUDGET_KIB` | 64 | the all-in per-agent budget the summary checks (reported only) |
 | `YUZU_GW_IDLEMEM_SWEEP` | `0,1000,5000,10000` | the N points (0 is always added) |
 | `YUZU_GW_IDLEMEM_RATE` | 500 | agents per second while the fleet grows |
 | `YUZU_GW_SCALE_HB_MS` | 30000 | heartbeat interval (the agent's) |
