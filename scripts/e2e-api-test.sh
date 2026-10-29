@@ -1171,6 +1171,7 @@ SETTINGS_FRAGMENTS=(
     "/fragments/settings/developer/plugins"
     "/fragments/settings/developer/plugins/observed"
     "/fragments/settings/mcp"
+    "/fragments/settings/engine-principals"
     "/fragments/settings/nvd"
     "/fragments/settings/directory"
     "/fragments/workflows"

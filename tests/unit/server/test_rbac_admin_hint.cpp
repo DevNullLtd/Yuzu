@@ -23,17 +23,21 @@
 
 #include "rbac_admin_predicate.hpp"
 
+#include "audit_store.hpp"
+
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "test_rbac_admin_surface_harness.hpp"
 #include "test_rbac_store_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 
 using namespace yuzu::server;
@@ -68,15 +72,58 @@ const char* name_of(RbacAdminHint h) {
     return "?";
 }
 
+/// The refusal's message and remediation, without the per-request correlation id: a stable,
+/// remediable refusal answers byte-identically in these two fields every time.
+std::string refusal_text(const std::string& body) {
+    const auto j = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
+    if (j.is_discarded() || !j.contains("error"))
+        return body;
+    return j["error"].value("message", "") + " | " + j["error"].value("remediation", "");
+}
+
 RbacAdminHint hint_of(RbacRoleHarness& h) {
     return rbac_admin_hint(h.rest_session(), h.auth_db.get(), h.rbac.get(), RbacAdminSurface::kRest);
 }
 
+/// A REAL AuditStore on the harness's database, counted by querying its table. The harness's own
+/// `audit_log` is fed only by the REST audit_fn, which the hint never receives, so it can never
+/// observe a hint-path write; this is the observation that could (the same rule
+/// test_access_authz.cpp's last case follows).
+class AuditWatch {
+public:
+    explicit AuditWatch(RbacRoleHarness& h)
+        : pool_{{.conninfo = h.auth_db.dsn(), .size = 1}}, store_{pool_} {
+        REQUIRE(store_.is_open());
+    }
+    std::size_t rows() {
+        AuditQuery q;
+        q.limit = 100000;
+        auto r = store_.query(q);
+        REQUIRE(r.has_value());
+        return r->size();
+    }
+
+private:
+    pg::PgPool pool_;
+    AuditStore store_;
+};
+
+/// The break-glass rename P13 uses: the regime check's auth.users JOIN cannot run, while the
+/// predicate (principal_roles) still answers.
+void make_regime_store_unreadable(RbacRoleHarness& h) {
+    auto lease = h.auth_db.pool().acquire();
+    REQUIRE(lease);
+    auto r = pg::exec_params(lease.get(), "ALTER TABLE auth.users RENAME TO users_hint_gone",
+                             std::vector<std::string>{});
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
 /// The hint equals the real POST assign answer, and the hint wrote no audit row.
 void check_assign(RbacRoleHarness& h, RbacAdminHint expected) {
-    const auto audits_before = h.audit_log.size();
+    AuditWatch watch{h};
+    const auto audits_before = watch.rows();
     const auto hint = hint_of(h);
-    CHECK(h.audit_log.size() == audits_before); // the hint path is silent (#5792)
+    CHECK(watch.rows() == audits_before); // the hint path is silent (#5792)
     INFO("hint=" << name_of(hint) << " expected=" << name_of(expected));
     CHECK(hint == expected);
 
@@ -93,9 +140,10 @@ void check_assign(RbacRoleHarness& h, RbacAdminHint expected) {
 /// authority answer and fails the classification loudly.
 void check_unassign(RbacRoleHarness& h, RbacAdminHint expected) {
     REQUIRE(h.rbac->assign_role({"user", "hint-target", "Viewer"}).has_value());
-    const auto audits_before = h.audit_log.size();
+    AuditWatch watch{h};
+    const auto audits_before = watch.rows();
     const auto hint = hint_of(h);
-    CHECK(h.audit_log.size() == audits_before); // the hint path is silent (#5792)
+    CHECK(watch.rows() == audits_before); // the hint path is silent (#5792)
     INFO("hint=" << name_of(hint) << " expected=" << name_of(expected));
     CHECK(hint == expected);
 
@@ -294,13 +342,7 @@ TEST_CASE("rbac_admin_hint == POST assign: regime store unreadable, RBAC on (P13
     h.make_caller_admin(/*rbac_on=*/true);
     // The predicate (principal_roles) still answers kAdmin; the regime check's auth.users JOIN
     // cannot run. A hint that skipped the regime check would say kMay here, the route says 503.
-    {
-        auto lease = h.auth_db.pool().acquire();
-        REQUIRE(lease);
-        auto r = pg::exec_params(lease.get(), "ALTER TABLE auth.users RENAME TO users_hint_gone",
-                                 std::vector<std::string>{});
-        REQUIRE(r.status() == PGRES_COMMAND_OK);
-    }
+    make_regime_store_unreadable(h);
     REQUIRE(is_rbac_administrator(h.rest_session(), h.auth_db.get(), h.rbac.get(),
                                   RbacAdminSurface::kRest) == RbacAdminGate::kAdmin);
     check_assign(h, RbacAdminHint::kUnconfirmed);
@@ -359,6 +401,175 @@ TEST_CASE("rbac_admin_hint == PUT enforcement: engine session (P11)",
     REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
     h.session_principal_kind = "engine";
     check_enforcement(h, RbacAdminHint::kMayNot, /*target=*/true);
+}
+
+// ── More personas on the PUT and DELETE routes (qe-2) ────────────────────────
+
+TEST_CASE("rbac_admin_hint == PUT enforcement: regime store unreadable, RBAC on (P13)",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true);
+    make_regime_store_unreadable(h);
+    REQUIRE(is_rbac_administrator(h.rest_session(), h.auth_db.get(), h.rbac.get(),
+                                  RbacAdminSurface::kRest) == RbacAdminGate::kAdmin);
+    // The route answers 503 (set_enforcement cannot read the source regime); a hint that skipped
+    // the regime check would say kMay.
+    check_enforcement(h, RbacAdminHint::kUnconfirmed, /*target=*/false);
+}
+
+TEST_CASE("rbac_admin_hint == PUT enforcement: the Administrator grant is inert while RBAC is off (P5)",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    make_user(h, h.session_user, auth::Role::user);
+    REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
+    REQUIRE_FALSE(h.rbac->is_rbac_enabled());
+    check_enforcement(h, RbacAdminHint::kMayNot, /*target=*/true);
+}
+
+TEST_CASE("rbac_admin_hint == PUT enforcement: base user holding a non-administrator role, RBAC on (P6)",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.rbac->set_rbac_enabled(true);
+    make_user(h, h.session_user, auth::Role::user);
+    REQUIRE(h.rbac->assign_role({"user", h.session_user, "Viewer"}).has_value());
+    check_enforcement(h, RbacAdminHint::kMayNot, /*target=*/false);
+}
+
+TEST_CASE("rbac_admin_hint == PUT enforcement: MCP-tier token on the REST surface (P9)",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
+    h.rest_session_mcp_tier = "supervised";
+    check_enforcement(h, RbacAdminHint::kMayNot, /*target=*/true);
+}
+
+TEST_CASE("rbac_admin_hint == PUT enforcement: service-scoped token (P10)",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
+    h.session_token_scope_service = "payments";
+    check_enforcement(h, RbacAdminHint::kMayNot, /*target=*/true);
+}
+
+TEST_CASE("rbac_admin_hint == PUT enforcement: plain API-token session of an administrator (P12)",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
+    h.session_auth_source = "api_token";
+    check_enforcement(h, RbacAdminHint::kMay, /*target=*/true);
+}
+
+TEST_CASE("rbac_admin_hint == DELETE unassign: MCP-tier token on the REST surface (P9)",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    h.rest_session_mcp_tier = "supervised";
+    check_unassign(h, RbacAdminHint::kMayNot);
+}
+
+TEST_CASE("rbac_admin_hint == DELETE unassign: service-scoped token (P10)",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    h.session_token_scope_service = "payments";
+    check_unassign(h, RbacAdminHint::kMayNot);
+}
+
+TEST_CASE("rbac_admin_hint == DELETE unassign: engine session (P11)",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    h.session_principal_kind = "engine";
+    check_unassign(h, RbacAdminHint::kMayNot);
+}
+
+TEST_CASE("rbac_admin_hint == DELETE unassign: regime store unreadable, RBAC on (P13)",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true);
+    make_regime_store_unreadable(h);
+    check_unassign(h, RbacAdminHint::kUnconfirmed);
+}
+
+TEST_CASE("rbac_admin_hint == the routes: an administrator whose account was deactivated after sign-in, "
+          "RBAC off",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    // The predicate and the regime check read the same `role = 'admin' AND is_active` population,
+    // so a persona the predicate admits and the regime check refuses under RBAC off cannot be
+    // built from stored state; this is the nearest one, and it pins that the hint re-reads the
+    // live row (the session still says admin) on every route.
+    for (const char* route : {"assign", "unassign", "enforcement"}) {
+        INFO(route);
+        RbacRoleHarness h;
+        make_user(h, h.session_user, auth::Role::admin);
+        {
+            auto lease = h.auth_db.pool().acquire();
+            REQUIRE(lease);
+            auto r = pg::exec_params(lease.get(), "UPDATE auth.users SET is_active = FALSE WHERE username = $1",
+                                     std::vector<std::string>{h.session_user});
+            REQUIRE(r.status() == PGRES_COMMAND_OK);
+        }
+        if (std::string_view{route} == "assign")
+            check_assign(h, RbacAdminHint::kMayNot);
+        else if (std::string_view{route} == "unassign")
+            check_unassign(h, RbacAdminHint::kMayNot);
+        else
+            check_enforcement(h, RbacAdminHint::kMayNot, /*target=*/true);
+    }
+}
+
+// ── CHARACTERISATION: a live switch the destination guard always refuses (sec-3 / hp-1) ────────
+//
+// The hint models AUTHORITY only (the predicate, then the regime check). The enforcement route
+// can still answer 409 from the DESTINATION guard (the caller would not remain an administrator
+// under the new regime). Two personas draw a live switch that is refused every time. This is the
+// documented decision (rbac.md "Why is a control disabled or missing?"): the hint is not changed,
+// the refusal is shown with its remediation text, and nothing changes state. These tests pin the
+// residual so that a later fix flips them knowingly instead of silently.
+
+TEST_CASE("rbac_admin_hint CHARACTERISATION: RBAC off, a local administrator with NO Administrator "
+          "grant is drawn the switch, and enabling is refused 409 every time",
+          "[pg][rbac_admin_predicate][rbac_admin_hint][characterisation]") {
+    RbacRoleHarness h;
+    make_user(h, h.session_user, auth::Role::admin); // RBAC off, no grant
+    REQUIRE_FALSE(h.rbac->is_rbac_enabled());
+    CHECK(hint_of(h) == RbacAdminHint::kMay);
+    std::string first_body;
+    for (int i = 0; i < 5; ++i) {
+        const auto res = h.set_enforcement_rest(true);
+        REQUIRE(res);
+        INFO("attempt " << i << " status=" << res->status << " body=" << res->body);
+        CHECK(res->status == 409);
+        if (i == 0)
+            first_body = refusal_text(res->body);
+        CHECK(refusal_text(res->body) == first_body); // a stable, remediable refusal
+        CHECK_FALSE(h.rbac->is_rbac_enabled()); // nothing changed
+    }
+    CHECK_THAT(first_body, Catch::Matchers::ContainsSubstring("Administrator"));
+}
+
+TEST_CASE("rbac_admin_hint CHARACTERISATION: RBAC on, a base-user Administrator-grant holder is drawn "
+          "the switch, and disabling is refused 409 every time",
+          "[pg][rbac_admin_predicate][rbac_admin_hint][characterisation]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true); // role=user + grant + active row
+    REQUIRE(h.rbac->is_rbac_enabled());
+    CHECK(hint_of(h) == RbacAdminHint::kMay);
+    std::string first_body;
+    for (int i = 0; i < 5; ++i) {
+        const auto res = h.set_enforcement_rest(false);
+        REQUIRE(res);
+        INFO("attempt " << i << " status=" << res->status << " body=" << res->body);
+        CHECK(res->status == 409);
+        if (i == 0)
+            first_body = refusal_text(res->body);
+        CHECK(refusal_text(res->body) == first_body);
+        CHECK(h.rbac->is_rbac_enabled()); // nothing changed
+    }
+    CHECK_FALSE(first_body.empty());
 }
 
 // ── The fold itself ──────────────────────────────────────────────────────────

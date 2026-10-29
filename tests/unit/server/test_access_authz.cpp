@@ -243,6 +243,42 @@ TEST_CASE("access authz: a service-scoped token is denied the fleet-wide enforce
     CHECK(mcp_res->status == 200);
 }
 
+TEST_CASE("access authz: RBAC off, a durable administrator's plain API token is drawn the live "
+          "controls and its MCP-tier token is not (the real session fields reach the hint)",
+          "[pg][access][authz][security]") {
+    Rig r; // RBAC off: the predicate admits root's durable admin row for a session that carries no tier
+    REQUIRE_FALSE(r.rbac.is_rbac_enabled());
+    const auto exp = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
+    const auto plain = r.api_tokens->create_token("plain", "root", exp);
+    const auto mcp = r.api_tokens->create_token("mcp", "root", exp, "", "readonly");
+    REQUIRE(plain.has_value());
+    REQUIRE(mcp.has_value());
+
+    // P12 by design: a plain token's gates never read auth_source, so the switch and the Assign
+    // button are drawn live (every click is re-gated by its route).
+    const auto plain_enf = r.get_bearer(kEnforce, *plain);
+    REQUIRE(plain_enf);
+    CHECK(plain_enf->status == 200);
+    CHECK_THAT(plain_enf->body, ContainsSubstring("data-act=\"enforce\""));
+    CHECK_THAT(plain_enf->body, !ContainsSubstring("Only a durable Administrator can change this."));
+    const auto plain_assign = r.get_bearer(kAssign, *plain);
+    REQUIRE(plain_assign);
+    CHECK(plain_assign->status == 200);
+    CHECK_THAT(plain_assign->body, ContainsSubstring("data-act=\"assign\""));
+
+    // P9: the MCP tier is a structural deny on the REST surface, so a session that dropped
+    // `mcp_tier` on its way to the hint would draw live controls here and fail these bodies.
+    const auto mcp_enf = r.get_bearer(kEnforce, *mcp);
+    REQUIRE(mcp_enf);
+    CHECK(mcp_enf->status == 200);
+    CHECK_THAT(mcp_enf->body, !ContainsSubstring("data-act=\"enforce\""));
+    CHECK_THAT(mcp_enf->body, ContainsSubstring("disabled title=\"Only a durable Administrator can change this.\""));
+    const auto mcp_assign = r.get_bearer(kAssign, *mcp);
+    REQUIRE(mcp_assign);
+    CHECK_THAT(mcp_assign->body, !ContainsSubstring("data-act=\"assign\""));
+    CHECK_THAT(mcp_assign->body, !ContainsSubstring(">Assign role<"));
+}
+
 TEST_CASE("access authz: RBAC on, a user holding only Viewer reads the catalogue but not the grant table",
           "[pg][access][authz]") {
     Rig r;

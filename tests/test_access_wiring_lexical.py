@@ -15,6 +15,12 @@ Access Users (register_access_routes block):
   3. The block never reads the in-memory fallback (`AuthManager`, `auth_mgr_`,
      `auth_manager_`) and never returns a literal empty vector as success.
 
+  8. `.rbac_admin_hint_fn` passes the SESSION, `auth_db_.get()`, `rbac_store_.get()` and
+     `RbacAdminSurface::kRest` to `rbac_admin_hint`, in that order (#6034). The rig re-binds its
+     own copy of the lambda, so no unit test executes the production one: a `nullptr` store, a
+     discarded session or `kMcp` there leaves every other test green while the hint folds to
+     kUnconfirmed (or skips the MCP-tier structural deny) fleet-wide.
+
 Settings enrolment fragments (settings_routes_ wiring):
 
   4. `set_read_admin_fn` binds `auth_routes_->probe_admin(req, res)`: the three auto-loading GET
@@ -68,6 +74,20 @@ def block(src, opener="access::register_access_routes("):
         if depth == 0:
             return t[start:i + 1]
     return None
+
+
+HINT_LAMBDA = (r"\.rbac_admin_hint_fn = \[this\]\(const auth::Session& s\) \{ "
+               r"return yuzu::server::rbac_admin_hint\( s, auth_db_\.get\(\), rbac_store_\.get\(\), "
+               r"yuzu::server::RbacAdminSurface::kRest\); \}")
+
+
+def hint_problems(b):
+    if ".rbac_admin_hint_fn" not in b:
+        return ["access block no longer binds .rbac_admin_hint_fn (the controls lose their server-side hint)"]
+    if not re.search(HINT_LAMBDA, b):
+        return ["access .rbac_admin_hint_fn no longer calls yuzu::server::rbac_admin_hint( s, "
+                "auth_db_.get(), rbac_store_.get(), yuzu::server::RbacAdminSurface::kRest)"]
+    return []
 
 
 def settings_problems(src):
@@ -141,6 +161,7 @@ def problems(src):
         out.append("access block reads the in-memory AuthManager fallback")
     if re.search(r"return (std::vector<auth::UserEntry>\{\}|\{\});", b):
         out.append("access block returns a literal empty list as success")
+    out += hint_problems(b)
     return out + settings_problems(src) + groups_problems(src)
 
 
@@ -156,6 +177,16 @@ MUTATIONS = [
      "AuthDB failure"),
     (r"yuzu::server::access::register_access_routes\(", "yuzu::server::access::register_access_route(",
      "register_access_routes"),
+    # The Access hint lambda passes the session, both stores and kRest, in order (#6034).
+    (r"(rbac_admin_hint\(\s*s, auth_db_\.get\(\), )rbac_store_\.get\(\)", r"\1nullptr", "rbac_admin_hint"),
+    (r"(rbac_admin_hint\(\s*)s(, auth_db_\.get\(\), rbac_store_\.get\(\))",
+     r"\1auth::Session{}\2", "rbac_admin_hint"),
+    (r"(rbac_admin_hint\(\s*s, )auth_db_\.get\(\)", r"\1nullptr", "rbac_admin_hint"),
+    (r"RbacAdminSurface::kRest\);\n(\s*\},\n\s*\}\);)", r"RbacAdminSurface::kMcp);\n\1", "rbac_admin_hint"),
+    # A comment carrying the pinned tokens does not satisfy the pin.
+    (r"(rbac_admin_hint\(\s*s, auth_db_\.get\(\), )rbac_store_\.get\(\),",
+     r"\1nullptr, // rbac_store_.get(),", "rbac_admin_hint"),
+    (r"\.rbac_admin_hint_fn = ", ".rbac_admin_hint_gone = ", "rbac_admin_hint_fn"),
     # Settings enrolment fragments: the quiet probe is bound ...
     (r"(set_read_admin_fn\(\s*\[this\]\(const httplib::Request& req, httplib::Response& res\) \{\s*)"
      r"return auth_routes_->probe_admin\(req, res\);", r"\1return true;", "read_admin_fn"),
