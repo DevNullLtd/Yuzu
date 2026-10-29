@@ -194,8 +194,10 @@ const std::vector<pg::PgMigration>& migrations() {
         {2, "DROP TABLE IF EXISTS sqlite_backfill;"},
         // v3 (Echo rename, upgrade window): a persisted result set's source kind, matcher and
         // source payload (which carries the producing instruction id, so a re-evaluation of a
-        // pre-rename set resolves it) follow the renamed vocabulary. Idempotent. The persisted
-        // echo_query SQL inside the payload is operator text and is left as written.
+        // pre-rename set resolves it) follow the renamed vocabulary. Idempotent. matcher and
+        // source_payload are TEXT, so this is a textual replace() of the `tar_rows_ge` and
+        // `crossplatform.tar.` tokens anywhere in those columns, not a path update: an operator
+        // literal or persisted SQL that contains exactly one of those tokens is rewritten too.
         {3,
          "UPDATE result_sets SET source_kind = 'echo_query' WHERE source_kind = 'tar_query';"
          "UPDATE result_sets SET matcher = replace(matcher, 'tar_rows_ge', 'echo_rows_ge') "

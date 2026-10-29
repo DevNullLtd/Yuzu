@@ -3339,6 +3339,24 @@ bool has_table(const std::vector<std::string>& names, std::string_view n) {
     return std::ranges::find(names, n) != names.end();
 }
 
+// One echo_config value read through raw SQLite (so any WAL beside the file is recovered exactly as a
+// plain open would), "<no row>" when the row or table is absent. Opens read-write: the caller owns a
+// scratch copy, and recovery needs a writable -shm.
+std::string raw_config_value(const fs::path& db_file, const char* key) {
+    SqliteOwner o;
+    REQUIRE(sqlite3_open_v2(db_file.string().c_str(), &o.db, SQLITE_OPEN_READWRITE, nullptr) ==
+            SQLITE_OK);
+    sqlite3_stmt* raw = nullptr;
+    if (sqlite3_prepare_v2(o.db, "SELECT value FROM echo_config WHERE key = ?1", -1, &raw,
+                           nullptr) != SQLITE_OK)
+        return "<no row>";
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> stmt{raw, &sqlite3_finalize};
+    sqlite3_bind_text(stmt.get(), 1, key, -1, SQLITE_STATIC);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW)
+        return "<no row>";
+    return reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+}
+
 // A closed, healthy, pre-rename database at <dir>/tar.db: tar_* tables, schema_version 8, rollback
 // journal (so no WAL is left behind). Built from the real schema, then renamed by raw SQL.
 void make_legacy_tar_db(const fs::path& dir) {
@@ -3441,7 +3459,11 @@ TEST_CASE("adopt_legacy_echo_db: an interrupted adoption resumes", "[echo][store
         CHECK(slurp_file(d.path() / "echo.db") == before);
         CHECK(slurp_file(d.path() / "echo.db-wal") == wal_before);
     }
-    SECTION("a lone stale tar.db-shm beside an adopted echo.db is moved") {
+}
+
+TEST_CASE("adopt_legacy_echo_db: a leftover legacy sidecar without a tar.db is warned about and left",
+          "[echo][store][adopt]") {
+    SECTION("a lone tar.db-shm beside an adopted echo.db") {
         ScratchDir d;
         {
             auto db = EchoDatabase::open(d.path() / "echo.db");
@@ -3450,10 +3472,54 @@ TEST_CASE("adopt_legacy_echo_db: an interrupted adoption resumes", "[echo][store
         std::error_code ec;
         fs::remove(d.path() / "echo.db-shm", ec);
         spit_file(d.path() / "tar.db-shm", "stale");
+        yuzu::test::LogCapture logs;
         REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
-        CHECK_FALSE(fs::exists(d.path() / "tar.db-shm"));
+        logs.stop();
+        CHECK(logs.text().find("tar.db-shm") != std::string::npos);
+        CHECK(logs.text().find("left in place") != std::string::npos);
+        CHECK(fs::exists(d.path() / "tar.db-shm"));
+        CHECK_FALSE(fs::exists(d.path() / "echo.db-shm"));
         auto db = EchoDatabase::open(d.path() / "echo.db");
         CHECK(db.has_value());
+    }
+    SECTION("an orphan tar.db-wal is never replayed over a live echo.db") {
+        ScratchDir d;
+        const auto echo_db = d.path() / "echo.db";
+        {
+            auto db = EchoDatabase::open(echo_db);
+            REQUIRE(db.has_value());
+            REQUIRE(db->set_config("known_row", "current echo history"));
+        }
+        // A cleanly closed WAL database leaves no -wal: the state a stray one would pair up with.
+        REQUIRE_FALSE(fs::exists(d.path() / "echo.db-wal"));
+        {
+            ScratchDir legacy_src;
+            make_legacy_tar_db_with_wal(legacy_src.path());
+            fs::copy_file(legacy_src.path() / "tar.db-wal", d.path() / "tar.db-wal");
+        }
+        const std::string foreign_wal = slurp_file(d.path() / "tar.db-wal");
+
+        // Positive control: under the echo.db name this very WAL is valid and SQLite replays it
+        // over the file, so the assertions below are not vacuous.
+        {
+            ScratchDir probe;
+            fs::copy_file(echo_db, probe.path() / "echo.db");
+            fs::copy_file(d.path() / "tar.db-wal", probe.path() / "echo.db-wal");
+            CHECK(raw_config_value(probe.path() / "echo.db", "known_row") !=
+                  "current echo history");
+        }
+
+        yuzu::test::LogCapture logs;
+        REQUIRE(yuzu::agent::adopt_legacy_echo_db(echo_db).has_value());
+        logs.stop();
+        CHECK(logs.text().find("tar.db-wal") != std::string::npos);
+        CHECK(logs.text().find("left in place") != std::string::npos);
+        CHECK(slurp_file(d.path() / "tar.db-wal") == foreign_wal); // unmoved, unmodified
+        CHECK_FALSE(fs::exists(d.path() / "echo.db-wal"));
+
+        auto db = EchoDatabase::open(echo_db);
+        REQUIRE(db.has_value());
+        CHECK(db->get_config("known_row", "") == "current echo history");
     }
 }
 

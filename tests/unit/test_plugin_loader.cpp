@@ -499,6 +499,38 @@ TEST_CASE("defer_legacy_echo_adoption holds adoption only while the retired plug
     // No retired plugin (any other rejection, or none): adopt as before.
     CHECK_FALSE(yuzu::agent::defer_legacy_echo_adoption(reserved_only, none));
     CHECK_FALSE(yuzu::agent::defer_legacy_echo_adoption({}, none));
+
+    // A stale tar plugin refused BEFORE dlopen (allowlist or signature) never reaches the
+    // retired-name check, so its reason is the earlier one; its file stem still marks it.
+    const std::vector<LoadError> tar_allowlist{{"/p/tar.so", "not in plugin allowlist"}};
+    const std::vector<LoadError> tar_dll_signature{
+        {"/p/tar.dll", std::string{yuzu::agent::kSignatureMissingReason}}};
+    const std::vector<LoadError> other_allowlist{{"/p/other.so", "not in plugin allowlist"}};
+    CHECK(yuzu::agent::defer_legacy_echo_adoption(tar_allowlist, none));
+    CHECK(yuzu::agent::defer_legacy_echo_adoption(tar_dll_signature, none));
+    CHECK_FALSE(yuzu::agent::defer_legacy_echo_adoption(tar_allowlist, echo));
+    CHECK_FALSE(yuzu::agent::defer_legacy_echo_adoption(other_allowlist, none));
+}
+
+TEST_CASE("defer_legacy_echo_adoption sees a stale tar plugin the allowlist refused before dlopen",
+          "[plugin_loader][retired_name]") {
+    // The allowlist miss happens before the file is opened as a library, so plain bytes under the
+    // right filename are enough; no fixture plugin is needed.
+    yuzu::test::TempDir tmp{"yuzu_test_retired_allowlist_"};
+    fs::create_directories(tmp.path);
+    {
+        std::ofstream pf(tmp.path / (std::string{"tar"} + kPluginExt), std::ios::binary);
+        pf << "stale tar plugin bytes";
+    }
+    auto result = yuzu::agent::PluginLoader::scan(
+        tmp.path, {{std::string{"other"} + kPluginExt, std::string(64, '0')}});
+
+    REQUIRE(result.loaded.empty());
+    REQUIRE(result.errors.size() == 1);
+    CHECK(result.errors.front().reason == "not in plugin allowlist");
+    CHECK(fs::path{result.errors.front().path}.stem() == "tar");
+    const std::vector<std::string_view> none;
+    CHECK(yuzu::agent::defer_legacy_echo_adoption(result.errors, none));
 }
 
 // ─── Plugin config-sync (covers agent.cpp post-load sync invariant) ─────────

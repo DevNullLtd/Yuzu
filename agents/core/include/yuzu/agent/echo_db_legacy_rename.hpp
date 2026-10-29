@@ -35,7 +35,10 @@
 // anyway would open it with a foreign WAL and strand the legacy WAL's committed rows. Adoption
 // fails closed there and moves nothing further; tar.db stays, echo.db stays absent, and
 // EchoDatabase::open() refuses until the operator resolves the two files. Without a legacy main
-// file nothing can be mispaired, so a stray legacy sidecar is only warned about and left.
+// file there is nothing to adopt, so a stray legacy sidecar is only warned about and left: renamed
+// onto a live echo.db, a leftover tar.db-wal would be replayed by SQLite over current data (it
+// validates a WAL by its own checksum chain, never against the main file). Every resumable state
+// has tar.db present, because sidecars move before the main file.
 #pragma once
 
 #include <expected>
@@ -69,6 +72,24 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
         return {};
     }
 
+    // No legacy main file: nothing to adopt. A stray legacy sidecar is left where it is, never
+    // moved onto echo.db (see the header comment).
+    if (!legacy_present) {
+        for (const char* suffix : kSidecars) {
+            fs::path stray = legacy;
+            stray += suffix;
+            const bool stray_present = fs::exists(stray, ec);
+            if (ec)
+                return std::unexpected(
+                    std::format("cannot stat {}: {}", stray.string(), ec.message()));
+            if (stray_present)
+                spdlog::warn("Legacy {} left in place: there is no {} to adopt, and a stray "
+                             "sidecar is never moved onto {}",
+                             stray.string(), legacy.string(), echo_db.string());
+        }
+        return {};
+    }
+
     // Sidecars first. A source that does not exist is already moved (or never was): success.
     for (const char* suffix : kSidecars) {
         // path::operator+= appends in the native character type; string() + suffix would narrow
@@ -83,21 +104,16 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
                     std::format("cannot stat {}: {}", from.string(), ec.message()));
             continue;
         }
-        // Never overwrite: an overwritten -wal would lose committed rows. With a legacy main
-        // file to adopt, a collision cannot be resolved here (the main file would be paired with
-        // the wrong WAL), so fail closed and move nothing further; without one, leave the stray
-        // legacy sidecar for the operator.
+        // Never overwrite: an overwritten -wal would lose committed rows. The legacy main file is
+        // still to be adopted, so a collision cannot be resolved here (the main file would be
+        // paired with the wrong WAL): fail closed and move nothing further.
         const bool to_present = fs::exists(to, ec);
         if (ec)
             return std::unexpected(std::format("cannot stat {}: {}", to.string(), ec.message()));
-        if (to_present) {
-            if (legacy_present)
-                return std::unexpected(std::format(
-                    "cannot adopt {}: {} and {} both exist; resolve them by hand", legacy.string(),
-                    from.string(), to.string()));
-            spdlog::warn("Legacy {} left in place: {} already exists", from.string(), to.string());
-            continue;
-        }
+        if (to_present)
+            return std::unexpected(
+                std::format("cannot adopt {}: {} and {} both exist; resolve them by hand",
+                            legacy.string(), from.string(), to.string()));
         fs::rename(from, to, ec);
         if (ec)
             return std::unexpected(std::format("cannot move {} to {}: {}", from.string(),
@@ -105,13 +121,11 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
         spdlog::info("Adopted legacy {} as {}", from.string(), to.string());
     }
 
-    if (legacy_present) {
-        fs::rename(legacy, echo_db, ec);
-        if (ec)
-            return std::unexpected(std::format("cannot move {} to {}: {}", legacy.string(),
-                                               echo_db.string(), ec.message()));
-        spdlog::info("Adopted legacy {} as {}", legacy.string(), echo_db.string());
-    }
+    fs::rename(legacy, echo_db, ec);
+    if (ec)
+        return std::unexpected(std::format("cannot move {} to {}: {}", legacy.string(),
+                                           echo_db.string(), ec.message()));
+    spdlog::info("Adopted legacy {} as {}", legacy.string(), echo_db.string());
     return {};
 }
 

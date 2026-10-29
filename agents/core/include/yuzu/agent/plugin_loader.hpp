@@ -151,14 +151,18 @@ verify_plugin_signature(const std::filesystem::path& plugin_path,
 /// retired-name plugin (`errors`) and no `echo` plugin is among the accepted ones (`loaded_names`).
 /// OTA replaces the agent binary alone, so the renamed plugin may not be installed yet; adopting
 /// now would strand the history under a plugin that is not there (and a roll-back of the binary
-/// would find no tar.db). Pure so the decision is unit-tested; the one caller is the agent boot
-/// step in agent.cpp (pinned by tests/test_echo_adoption_wiring_lexical.py). Removed with the
-/// other legacy-name shims.
+/// would find no tar.db). The name check runs after dlopen, so a stale tar.<ext> refused earlier
+/// (allowlist miss or hash mismatch, signature failure) carries that earlier reason, not
+/// kRetiredNameReason: the file stem identifies it without opening it. Pure so the decision is
+/// unit-tested; the one caller is the agent boot step in agent.cpp (pinned by
+/// tests/test_echo_adoption_wiring_lexical.py). Removed with the other legacy-name shims.
 [[nodiscard]] inline bool
 defer_legacy_echo_adoption(const std::vector<LoadError>& errors,
                            std::span<const std::string_view> loaded_names) {
-    const bool retired_rejected = std::ranges::any_of(
-        errors, [](const LoadError& err) { return err.reason.starts_with(kRetiredNameReason); });
+    const bool retired_rejected = std::ranges::any_of(errors, [](const LoadError& err) {
+        return err.reason.starts_with(kRetiredNameReason) ||
+               is_retired_plugin_name(std::filesystem::path{err.path}.stem().string());
+    });
     return retired_rejected &&
            std::ranges::find(loaded_names, std::string_view{"echo"}) == loaded_names.end();
 }
