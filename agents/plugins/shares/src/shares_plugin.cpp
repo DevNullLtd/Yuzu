@@ -13,10 +13,9 @@
  * READ-ONLY and FACTS ONLY. Linux and macOS report configured shares as written, not live
  * nfsd/smbd state; Windows reports what the Server service publishes now. ACLs, `valid users`
  * and NFS client host lists are never emitted (NFS clients are a count plus an `anonymous`
- * flag). A
- * refused or failed read, or a macOS `sharing` that cannot run or answers unrecognisably, is
- * reported as permission_denied/constrained with a token, and a stopped Windows Server service
- * as unsupported, never as an empty result.
+ * flag). A refused or failed read, or a macOS `sharing` that cannot run or answers
+ * unrecognisably, is reported as permission_denied/constrained with a token, and a stopped
+ * Windows Server service as unsupported, never as an empty result.
  *
  * This TU is portable except for its single dispatch #if, which selects the platform's leg
  * function and exception token (`kLeg`, `kLegExceptionToken`) and ends in an #error. All

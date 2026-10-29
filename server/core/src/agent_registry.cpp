@@ -901,7 +901,9 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "flags, never ACLs or NFS client host lists; not the mapping/session observations tar "
          "mapdrive records; Linux reads the configuration as written (/etc/exports, "
          "/etc/exports.d and /etc/samba/smb.conf), Windows reads the live Server-service shares "
-         "through NetShareEnum (name, path, kind and flags only), macOS is planned; read-only"},
+         "through NetShareEnum (name, path, kind and flags only), macOS reads the share points "
+         "sharing -l -f json records plus /etc/exports (configuration as recorded, not live "
+         "smbd/nfsd state); read-only"},
         {"remote_access_audit.list",
          "SSH inbound-access audit as configured: sshd_config values (Include followed, Match not "
          "evaluated), per-account authorized_keys key fingerprints with option names, and whether "
