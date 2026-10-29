@@ -25,7 +25,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 - With RBAC enabled, an account administrator who does not hold `EnginePrincipal:Read` (for example one holding only a custom role) is now refused on the panel and sees a "You do not have permission to view this panel" note where the list was. Grant `EnginePrincipal:Read` (the built-in `Administrator` and `Viewer` roles hold it) to restore the list.
 - With RBAC enabled, a non-administrator who holds `EnginePrincipal:Read`, such as a `Viewer`, can now `GET` the panel URL and read the list, exactly as they can already read `GET /api/v1/engine-principals`. The `/settings` page itself is still administrator-only, so such a user reaches the panel only by its URL.
 - An administrator's MCP-tier token now reads the panel URL as it already read the REST route (the route admits a token on its creator's authority). Before, the panel refused every MCP-tier token. A plain API token was already admitted and still is.
-- With RBAC disabled nothing changes: only administrator accounts (and their tokens, per the previous point) are admitted.
+- With RBAC disabled only administrator accounts are admitted, as before, plus an administrator's MCP-tier token (the previous point), which the old gate refused.
 
 **Audit.** A refused browser session writes no `auth.permission_required` row on the panel, because it loads on every page view; a refused API token or engine credential still does. An engine session is refused with an `engine_principal.list` denial row, as on the REST route.
 
