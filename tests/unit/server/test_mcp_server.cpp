@@ -33741,6 +33741,94 @@ TEST_CASE("MCP 2f PR2: --mcp-no-streaming still 405s GET (kill switch beats the 
     CHECK(ts.call_raw("GET", "", {{"Accept", "text/event-stream"}})->status == 405);
 }
 
+TEST_CASE("MCP #4754: a service-scoped token is refused on the GET stream channel",
+          "[mcp][transport][2f][stream][4754]") {
+    // Deny-before-lookup is asserted by effect, not by reading the code: an injected
+    // clock proves the refused GET did not slide the session's last_seen, the budget
+    // proves it took no lease, and the attach audit proves it released no ring content.
+    const auto t0 = std::chrono::steady_clock::now();
+    std::chrono::seconds elapsed{0};
+    mcp::McpSessionRegistry reg({.idle_ttl = std::chrono::seconds(30)},
+                                [&] { return t0 + elapsed; });
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 4}};
+    yuzu::MetricsRegistry metrics;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.stream_budget_for_test = &budget;
+    ts.metrics_for_test = &metrics;
+    ts.start();
+    const auto sid = mint_session(ts); // minted by an UNSCOPED credential
+    REQUIRE_FALSE(sid.empty());
+    const auto count_of = [&](const char* reason) {
+        return metrics.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}}).value();
+    };
+    const auto count_audit = [&](const std::string& entry) {
+        return std::count(ts.audit_log.begin(), ts.audit_log.end(), entry);
+    };
+
+    SECTION("403 -32003, no permission field, audited, counted, nothing leased or touched") {
+        elapsed = std::chrono::seconds(20);
+        ts.mock_token_scope_service = "printers";
+        auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "text/event-stream"}});
+        CHECK(res->status == 403);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["code"] == mcp::kPermissionDenied);
+        CHECK(body["error"]["message"] ==
+              "service-scoped tokens may not open the MCP stream channel");
+        CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(body["error"]["data"]["remediation"].is_string());
+        // Clause 5: no permission would, by itself, admit this caller.
+        CHECK_FALSE(body["error"].contains("permission"));
+        CHECK_FALSE(body["error"]["data"].contains("permission"));
+        CHECK(res->body.find("\"permission\"") == std::string::npos);
+
+        // Exact audit effect: one reject row, empty target (nothing was read), exact reason.
+        REQUIRE(count_audit("mcp.session.reject|failure") == 1);
+        const auto it = std::find(ts.audit_log.begin(), ts.audit_log.end(),
+                                  "mcp.session.reject|failure");
+        const auto idx = static_cast<std::size_t>(std::distance(ts.audit_log.begin(), it));
+        CHECK(ts.audit_target_ids[idx].empty());
+        CHECK(ts.audit_target_types[idx] == "McpSession");
+        CHECK(ts.audit_details[idx].rfind("reason=service_scoped cid=req-", 0) == 0);
+        CHECK(count_audit("mcp.stream.attach|success") == 0);
+
+        CHECK(count_of("service_scoped") == 1.0);
+        CHECK(count_of("unknown_session") == 0.0);
+        CHECK(budget.active() == 0); // no StreamBudget lease
+
+        // last_seen did not slide: 40s after mint (>30s idle ttl) but only 20s after the
+        // refused GET, the session is idle-expired. A deny that touched the registry would
+        // have kept it alive.
+        elapsed = std::chrono::seconds(40);
+        CHECK_FALSE(reg.exists(sid, "test-user"));
+    }
+    SECTION("a service-scoped GET with no Mcp-Session-Id answers 403, not 400") {
+        ts.mock_token_scope_service = "printers";
+        auto res = ts.call_raw("GET", "", {{"Accept", "text/event-stream"}});
+        CHECK(res->status == 403);
+        CHECK(nlohmann::json::parse(res->body)["error"]["code"] == mcp::kPermissionDenied);
+        CHECK(count_of("service_scoped") == 1.0);
+        CHECK(count_of("missing_session_header") == 0.0);
+    }
+    SECTION("same case, unscoped credential: attaches, leases, and is not counted") {
+        auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "text/event-stream"}});
+        CHECK(res->status == 200);
+        CHECK(budget.active() == 1);
+        CHECK(count_audit("mcp.stream.attach|success") == 1);
+        CHECK(count_of("service_scoped") == 0.0);
+    }
+    SECTION("DELETE is not service-scope denied (the ruling scopes the deny to GET)") {
+        ts.mock_token_scope_service = "printers";
+        auto res = ts.call_raw("DELETE", "", {{"Mcp-Session-Id", sid}});
+        CHECK(res->status == 200);
+        CHECK(reg.active_count() == 0);
+        CHECK(count_of("service_scoped") == 0.0);
+    }
+}
+
 TEST_CASE("MCP 2f/CH-7(c): --mcp-disable still ANSWERS GET/DELETE (not 404)",
           "[mcp][transport][2f][ch7]") {
     mcp::McpSessionRegistry reg;

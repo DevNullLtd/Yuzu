@@ -6657,6 +6657,33 @@ bool reject_unsupported_protocol_version(const httplib::Request& req, httplib::R
     return true;
 }
 
+// The ONE predicate for "this caller holds a service-scoped API token" on /mcp/v1/
+// (service-scoped confinement clause 4: extend, never fork). A service-scoped token must
+// never reach a fleet-wide surface unfiltered; require_permission's service branch checks
+// the ITServiceOwner role only, never the token's own service-tag scope.
+[[nodiscard]] inline bool is_service_scoped_caller(const auth::Session& session) {
+    return !session.token_scope_service.empty();
+}
+
+// The ONE audit-and-write sink for a service-scoped denial. Callers test
+// is_service_scoped_caller() first and hand over their own envelope body: the POST tool
+// path echoes the JSON-RPC id (its a4_error), the bodyless GET carries a null id.
+// `http_status` empty = leave res.status untouched (the POST tool path answers its
+// JSON-RPC error inside the HTTP status already on the response).
+template <typename AuditFn>
+void write_service_scoped_denial(const AuditFn& audit_fn, const httplib::Request& req,
+                                 httplib::Response& res, const std::string& action,
+                                 const std::string& result, const std::string& target_type,
+                                 const std::string& target_id, const std::string& audit_detail,
+                                 std::optional<int> http_status, const std::string& body) {
+    (void)yuzu::server::detail::try_persist_audit(audit_fn, req, action, result, target_type,
+                                                  target_id, audit_detail);
+    if (http_status.has_value()) {
+        res.status = *http_status;
+    }
+    res.set_content(body, "application/json");
+}
+
 // #3893 fix round (Doomgoose review, blocking findings 1+2): the ONE place
 // that names which MCP tools are dispatch-capable, for the C8 pre-mint dry
 // run and the per-tool main-handler pre-checks alike — issue #3687's own
@@ -7973,7 +8000,11 @@ McpServer::HandlerFn McpServer::build_handler(
             // securable to perm_fn right after this deny — this helper's
             // deny decision itself is securable-agnostic, keyed only on
             // token_scope_service. `session` is already resolved once for
-            // the whole request above — no auth_fn call needed here.
+            // the whole request above — no auth_fn call needed here. The
+            // predicate and the audit-and-write sink are file-scope
+            // (is_service_scoped_caller, write_service_scoped_denial), shared
+            // with build_get_handler; this lambda only supplies the POST
+            // id-echoing envelope.
             // Routed through a4_error (defined just above) rather than a bare
             // error_response, so this denial carries the same correlation_id
             // /retry_after_ms/remediation envelope as every sibling MCP
@@ -7983,11 +8014,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 [&](const std::string& action, const std::string& target_type,
                     const std::string& audit_detail, const std::string& message,
                     const std::string& target_id = "") -> bool {
-                if (session->token_scope_service.empty())
+                if (!is_service_scoped_caller(*session))
                     return false;
-                (void)yuzu::server::detail::try_persist_audit(
-                    audit_fn, req, action, "denied", target_type, target_id, audit_detail);
-                res.set_content(a4_error(kPermissionDenied, message), "application/json");
+                write_service_scoped_denial(audit_fn, req, res, action, "denied", target_type,
+                                            target_id, audit_detail, std::nullopt,
+                                            a4_error(kPermissionDenied, message));
                 return true;
             };
 
@@ -29656,6 +29687,30 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
         auto session = auth_fn(req, res);
         if (!session)
             return; // auth_fn already set 401
+        // A service-scoped token never opens the stream channel (service-scoped
+        // confinement clause 4): the ring can hold another service's execution frames and
+        // this handler has no per-target parameter to scope them against. Decided before
+        // any session lookup, Accept negotiation or StreamBudget lease, so a refused
+        // caller reads and holds nothing. No `permission` field in the body (clause 5:
+        // no permission would, by itself, admit this caller). This precedes the
+        // missing-Mcp-Session-Id check, so a service-scoped GET without a session id
+        // answers 403 rather than the 400 it answered before.
+        if (is_service_scoped_caller(*session)) {
+            const auto cid = yuzu::server::detail::make_correlation_id();
+            if (metrics != nullptr) {
+                metrics->counter("yuzu_mcp_stream_rejects_total", {{"reason", "service_scoped"}})
+                    .increment();
+            }
+            write_service_scoped_denial(
+                audit_fn, req, res, "mcp.session.reject", "failure", "McpSession", std::string{},
+                "reason=service_scoped cid=" + cid, 403,
+                error_response_null_a4(kPermissionDenied,
+                                       "service-scoped tokens may not open the MCP stream channel",
+                                       cid,
+                                       "use a token without scope_service; durable results "
+                                       "remain fetchable by execution_id"));
+            return;
+        }
         // The SSE channel itself (session gate, Accept negotiation, replay, caps,
         // provider) lives in mcp_stream.cpp — this file stays wiring.
         // The actor is captured HERE, while the credential is still valid — the close
