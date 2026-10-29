@@ -780,7 +780,8 @@ inline bool bsd_fspath_valid(std::string_view v) {
 
 /// Whether do_opt accepts an `-fsuuid` value: sixteen pairs of hex digits, one `-` allowed
 /// before each pair. Nothing is tested after the sixteenth pair, so trailing text is accepted;
-/// a short value runs into the terminator, which is no hex digit.
+/// a short value runs into the terminator, which is no hex digit. do_opt's later `HEXTOC < 0`
+/// check cannot fail once the hex-digit test has passed, so it is not modelled separately.
 inline bool bsd_fsuuid_valid(std::string_view v) {
     const auto hex_at = [v](std::size_t k) {
         return k < v.size() && std::isxdigit(static_cast<unsigned char>(v[k])) != 0;
@@ -811,7 +812,8 @@ struct BsdEntry {
 /// together with a host, a malformed network or mask value (a name is never resolved, so an
 /// unresolvable one is still accepted; an all-ones IPv4 value is INADDR_NONE, which get_net
 /// refuses), mismatched families, a -mask without a -network, -maproot (or -root / -r) together
-/// with -mapall (mountd `check_options`), and a bad -sec, -fspath or -fsuuid value (do_opt).
+/// with -mapall (mountd `check_options`), an empty -maproot / -mapall / -root / -r user
+/// (parsecred), and a bad -sec, -fspath or -fsuuid value (do_opt).
 inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
     std::size_t i = 0;
     std::string_view f = bsd_nextfield(entry, i);
@@ -859,7 +861,13 @@ inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
                 } else if (has_arg && (item == "maproot" || item == "mapall" || item == "root" ||
                                        item == "r")) { // mountd do_opt: the credential-taking names
                     // parsecred resets the credential on every call, so the LAST mapping wins.
-                    e.root = is_root_user(arg.substr(0, arg.find(':')));
+                    // An empty user (`-maproot=`, `-mapall=:0`) is getpwnam("") in parsecred,
+                    // which no host can satisfy: do_opt fails and mountd drops the entry. The
+                    // group part after the `:` depends on the host's groups and is not modelled.
+                    const auto user = arg.substr(0, arg.find(':'));
+                    if (user.empty())
+                        return false;
+                    e.root = is_root_user(user);
                     if (item == "mapall")
                         have_mapall = true;
                     else

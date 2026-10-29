@@ -29,6 +29,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::shares;
@@ -1008,6 +1009,22 @@ TEST_CASE("shares bsd exports: no_root_squash follows the last credential Apple 
     CHECK_FALSE(root("/srv -maproot=0,r=daemon"));
 }
 
+TEST_CASE("shares bsd exports: an empty credential user is refused as parsecred refuses it",
+          "[shares]") {
+    // parsecred looks the user up with getpwnam(""), which no host can satisfy, so do_opt fails
+    // and mountd drops the entry; the group after the `:` is host-dependent and not modelled.
+    for (const char* line : {"/srv -maproot=", "/srv -mapall=", "/srv -maproot=:0", "/srv -root=:",
+                             "/srv -r=", "/srv -maproot :0", "/srv -ro,mapall=:nobody"}) {
+        INFO(line);
+        CHECK(rejected(line));
+    }
+    // A named user with an empty group is still an ordinary credential.
+    CHECK(sigs(bsd("/srv -maproot=bin:")) == Sigs{"/srv rw anon clients_0"});
+    CHECK(sigs(bsd("/srv -maproot=0:")) == Sigs{"/srv rw anon no_root_squash,clients_0"});
+    // The line after a rejected one still parses.
+    CHECK(sigs(bsd("/a -maproot=\n/b")) == Sigs{"/b rw anon clients_0"});
+}
+
 TEST_CASE("shares bsd exports: entries are joined as get_export_entry joins them", "[shares]") {
     // A stripped backslash appends the next physical line with NO separator.
     CHECK(sigs(bsd("/a \\\n/b")) == Sigs{"/a/b rw anon clients_0"});
@@ -1095,7 +1112,7 @@ TEST_CASE("shares bsd exports: lines Apple rejects yield no row and no token", "
 }
 
 TEST_CASE(
-    "shares bsd exports: an all-ones IPv4 network or mask is INADDR_NONE, which get_net refuses",
+    "shares bsd exports: an all-ones IPv4 network or mask is INADDR_NONE and get_net refuses it",
     "[shares]") {
     // inet_network packs one byte per part, so four 0xff parts are 0xffffffff in any spelling
     // and get_net fails the entry for both -network and -mask.
@@ -1142,13 +1159,23 @@ TEST_CASE("shares bsd exports: a -sec value is checked as get_sec_flavors checks
         CHECK(rejected(line));
     }
     // Accepted: any non-empty mix of the four flavours, empty components and repeats skipped.
-    for (const char* line :
-         {"/srv -sec=sys", "/srv -sec=sys:sys", "/srv -sec=krb5:krb5i:krb5p",
-          "/srv -sec=sys:krb5:krb5i:krb5p", "/srv -sec=sys::krb5:", "/srv -sec=:sys",
-          "/srv -sec=sys:krb5:sys:krb5i", "/srv -sec=sys,ro", "/srv -ro,sec=krb5p", "/srv -sec sys",
-          "/srv -sec krb5i:sys", "/srv -ro,sec krb5"}) {
+    // The whole signature is compared, so a `ro` that stopped being set would show.
+    const std::pair<const char*, const char*> accepted_sec[] = {
+        {"/srv -sec=sys", "/srv rw anon clients_0"},
+        {"/srv -sec=sys:sys", "/srv rw anon clients_0"},
+        {"/srv -sec=krb5:krb5i:krb5p", "/srv rw anon clients_0"},
+        {"/srv -sec=sys:krb5:krb5i:krb5p", "/srv rw anon clients_0"},
+        {"/srv -sec=sys::krb5:", "/srv rw anon clients_0"},
+        {"/srv -sec=:sys", "/srv rw anon clients_0"},
+        {"/srv -sec=sys:krb5:sys:krb5i", "/srv rw anon clients_0"},
+        {"/srv -sec=sys,ro", "/srv ro anon clients_0"},
+        {"/srv -ro,sec=krb5p", "/srv ro anon clients_0"},
+        {"/srv -sec sys", "/srv rw anon clients_0"},
+        {"/srv -sec krb5i:sys", "/srv rw anon clients_0"},
+        {"/srv -ro,sec krb5", "/srv ro anon clients_0"}};
+    for (const auto& [line, signature] : accepted_sec) {
         INFO(line);
-        CHECK(sigs(bsd(line)).size() == 1);
+        CHECK(sigs(bsd(line)) == Sigs{signature});
     }
     // A valid space-separated value is consumed (it is not a host), an `=` one leaves the next
     // field alone, and no value at all is an unrecognised option that ends the field.
