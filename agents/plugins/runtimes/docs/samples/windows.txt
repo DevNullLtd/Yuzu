@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-28 · interactive user (elevated) · leg-hash a3f4c5ca7477
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-28 · interactive user (elevated) · leg-hash 10a510136fd8
 == action=dotnet
 status|dotnet|unsupported|windows:planned
 [result_status] UNAVAILABLE / PARTIAL / windows:planned

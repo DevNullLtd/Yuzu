@@ -43,6 +43,13 @@
 #include <unistd.h>
 #endif
 
+#if defined(__APPLE__)
+#include <macos_network_mounts.hpp>
+
+#include <cstring>
+#include <sys/mount.h>
+#endif
+
 namespace rt = yuzu::runtimes;
 namespace fs = std::filesystem;
 using namespace runtimes_fixture;
@@ -417,18 +424,23 @@ struct LegRun {
 };
 
 const fs::path* g_leg_root = nullptr;
+const rt::lnx::WalkConfig* g_leg_cfg = nullptr;
 
 int leg_execute(YuzuCommandContext* raw, const char* action, const YuzuParam* /*params*/,
                 std::size_t /*param_count*/) {
     yuzu::CommandContext ctx{raw};
     const auto a = rt::parse_action(action);
     if (!a) return 1;
-    return mac::run_macos_at(ctx, *a, *g_leg_root);
+    return mac::run_macos_at(ctx, *a, *g_leg_root, *g_leg_cfg);
 }
 
-LegRun run_leg(rt::Action action, const fs::path& root) {
+LegRun run_leg(rt::Action action, const fs::path& root, const rt::lnx::WalkConfig& cfg = {}) {
     g_leg_root = &root;
-    yuzu::test::ScopeExit reset{[] { g_leg_root = nullptr; }}; // even if the run throws
+    g_leg_cfg = &cfg;
+    yuzu::test::ScopeExit reset{[] { // even if the run throws
+        g_leg_root = nullptr;
+        g_leg_cfg = nullptr;
+    }};
     YuzuPluginDescriptor descriptor{};
     descriptor.execute = &leg_execute;
     yuzu::agent::LocalDispatcher dispatcher;
@@ -482,6 +494,119 @@ TEST_CASE("python: a refused framework hop is a constrained status row and CONST
     CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(run.provenance == "macos:runtimes:symlink_refused");
 }
+
+TEST_CASE("python: a framework root on, under or containing a network mount is never opened "
+          "(SYNTHETIC)",
+          "[runtimes][python][macos][mounts]") {
+    // The fixture tree holds three readable versions: had the walk opened the Versions directory,
+    // rows would come back. MUTATION: dropping cfg from the python_rows_at call in run_macos_at (or
+    // from open_path) returns the rows and no token.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_pymac_mount_"};
+    std::string err;
+    REQUIRE(materialize_manifest_file(dir.path, err, macos_fixture()));
+    const std::string versions = std::string{"/"} + kVersions;
+    // Exactly the Versions path, an ancestor (/Library), and a descendant (a version's Resources).
+    for (const std::string mount : {versions, std::string{"/Library"}, versions + "/3.13/Resources"}) {
+        INFO("mount: " << mount);
+        rt::lnx::WalkConfig cfg;
+        cfg.network_mounts = {mount};
+        Acc acc;
+        CHECK(mac::python_rows_at(dir.path, acc, cfg).empty());
+        CHECK(acc.reason() == "macos:runtimes:network_fs_skipped");
+    }
+    // Positive control: a mount elsewhere skips nothing.
+    rt::lnx::WalkConfig other;
+    other.network_mounts = {"/Volumes/share", "/Library/Frameworks/Other.framework"};
+    Acc acc;
+    CHECK(mac::python_rows_at(dir.path, acc, other) ==
+          std::vector<std::string>{kRow311, kRow312, kRow313});
+    CHECK_FALSE(acc.any_failure());
+}
+
+TEST_CASE("python: run_macos_at hands the guard to the walk and reports CONSTRAINED/PARTIAL (SYNTHETIC)",
+          "[runtimes][python][macos][mounts]") {
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_pymac_legmount_"};
+    std::string err;
+    REQUIRE(materialize_manifest_file(dir.path, err, macos_fixture()));
+    rt::lnx::WalkConfig cfg;
+    cfg.network_mounts = {std::string{"/"} + kVersions};
+    const auto run = run_leg(rt::Action::python, dir.path, cfg);
+    CHECK(run.rc == 0);
+    CHECK(run.rows ==
+          std::vector<std::string>{"status|python|constrained|macos:runtimes:network_fs_skipped"});
+    CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(run.provenance == "macos:runtimes:network_fs_skipped");
+}
+
+TEST_CASE("python: an unreadable mount table is recorded and the walk still runs (SYNTHETIC)",
+          "[runtimes][python][macos][mounts]") {
+    // The walk runs guarded only by the mounts read, as on Linux: rows are kept, the status row is
+    // constrained. MUTATION: dropping the token (or returning early) turns this red.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_pymac_nomounts_"};
+    std::string err;
+    REQUIRE(materialize_manifest_file(dir.path, err, macos_fixture()));
+    rt::lnx::WalkConfig cfg;
+    cfg.mountinfo_unreadable = true;
+    const auto run = run_leg(rt::Action::python, dir.path, cfg);
+    CHECK(run.rows == std::vector<std::string>{"status|python|constrained|macos:runtimes:mountinfo_unreadable",
+                                               kRow311, kRow312, kRow313});
+    CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(run.provenance == "macos:runtimes:mountinfo_unreadable");
+}
+
+#if defined(__APPLE__)
+
+namespace {
+
+struct StatfsTable {
+    struct statfs row[5]{};
+    void set(int i, const char* fstype, const char* on) {
+        std::strncpy(row[i].f_fstypename, fstype, sizeof row[i].f_fstypename - 1);
+        std::strncpy(row[i].f_mntonname, on, sizeof row[i].f_mntonname - 1);
+    }
+};
+
+} // namespace
+
+TEST_CASE("macos_network_mount_points keeps network types and respells Data-volume mounts (SYNTHETIC)",
+          "[runtimes][python][macos][mounts]") {
+    // MUTATION: keeping apfs, dropping the stripped spelling, or stripping a name that merely
+    // starts with the volume prefix turns a check red.
+    StatfsTable t;
+    t.set(0, "apfs", "/");
+    t.set(1, "nfs", "/Volumes/share");
+    t.set(2, "apfs", "/System/Volumes/Data");
+    t.set(3, "autofs", "/System/Volumes/Data/home");
+    t.set(4, "smbfs", "/System/Volumes/DataX/vol");
+    CHECK(yuzu::shared::macos_network_mount_points(t.row, 5) ==
+          std::vector<std::string>{"/Volumes/share", "/System/Volumes/Data/home", "/home",
+                                   "/System/Volumes/DataX/vol"});
+    CHECK(yuzu::shared::macos_network_mount_points(t.row, 0).empty());
+}
+
+TEST_CASE("python: a Data-volume network mount over /Library skips the framework root (SYNTHETIC)",
+          "[runtimes][python][macos][mounts]") {
+    // The table names the mount `/System/Volumes/Data/Library`; the walk compares the logical
+    // `/Library/...` spelling, which only the stripped entry catches.
+    StatfsTable t;
+    t.set(0, "nfs", "/System/Volumes/Data/Library");
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_pymac_datavol_"};
+    std::string err;
+    REQUIRE(materialize_manifest_file(dir.path, err, macos_fixture()));
+    rt::lnx::WalkConfig cfg;
+    cfg.network_mounts = yuzu::shared::macos_network_mount_points(t.row, 1);
+    Acc acc;
+    CHECK(mac::python_rows_at(dir.path, acc, cfg).empty());
+    CHECK(acc.reason() == "macos:runtimes:network_fs_skipped");
+}
+
+TEST_CASE("python: mac::production_config reads the live mount table", "[runtimes][python][macos][mounts]") {
+    // Smoke only: getmntinfo_r_np(MNT_NOWAIT) always lists the root mount, so the read succeeds.
+    CHECK_FALSE(mac::production_config().mountinfo_unreadable);
+}
+
+#endif // defined(__APPLE__)
 
 TEST_CASE("python: mac::forward_tokens re-spells linux: causes as macos: causes", "[runtimes][python][macos]") {
     Acc from, to;

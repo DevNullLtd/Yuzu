@@ -86,7 +86,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "single-level listing of /Library/Frameworks/Python.framework/Versions; version from each "
-         "version's Resources/Info.plist",
+         "version's Resources/Info.plist; network mounts skipped via getmntinfo_r_np",
          nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,

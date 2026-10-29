@@ -119,11 +119,17 @@ template <class Fn> void for_each_line(const std::string& out, Fn&& fn) {
 }
 
 // Split on '|' into at most `max` tokens; anything past the max-th token is dropped.
-std::vector<std::string_view> split_tokens(std::string_view line, std::size_t max) {
+// `escaped` additionally treats `\|` as field text, not a separator (the wire form
+// yuzu::util::safe_output_field gives a literal pipe; a literal backslash is never emitted, it
+// is replaced by '/'). Tokens stay views of the raw line, so an escaped pipe keeps its `\`.
+std::vector<std::string_view> split_tokens(std::string_view line, std::size_t max,
+                                           bool escaped = false) {
     std::vector<std::string_view> tok;
     std::size_t fp = 0;
     while (tok.size() < max) {
         std::size_t bar = line.find('|', fp);
+        while (escaped && bar != std::string_view::npos && bar > fp && line[bar - 1] == '\\')
+            bar = line.find('|', bar + 1);
         if (bar == std::string_view::npos) {
             tok.push_back(line.substr(fp));
             break;
@@ -167,7 +173,7 @@ AdaptedRows failed(std::string reason) {
 // as `reason` only under constrained; supported and unsupported leave it empty.
 template <class OnRow>
 AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action, OnRow on_row,
-                                ConstrainedPolicy policy) {
+                                ConstrainedPolicy policy, bool escaped = false) {
     AdaptedRows res;
     int status_rows = 0;
     std::optional<yuzu::shared::StatusLevel> level;
@@ -176,7 +182,7 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
     for_each_line(out, [&](std::string_view line) {
         // One more than the widest row (store rows are nine tokens) so an over-wide row
         // fails the `!= N` width checks instead of being truncated to a valid width.
-        const auto tok = split_tokens(line, 10);
+        const auto tok = split_tokens(line, 10, escaped);
         if (yuzu::shared::is_status_line(tok)) {
             if (auto row = yuzu::shared::parse_status_row(tok, action)) {
                 ++status_rows;
@@ -472,6 +478,10 @@ AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPoli
     // The flavour, path and vendor have no installed_software slot and are dropped. A constrained
     // status (an unreadable root, a cap) fails the cycle (the table row's ConstrainedPolicy::fail):
     // a partial roster would delete the stored python rows beyond the failure point.
+    // The producer escapes a literal pipe in the free-text fields (runtimes_parsers.hpp
+    // field_or_dash -> safe_output_field gives `\|`), so the split is escape-aware: width stays
+    // strict (five logical fields) and only the version, which is dotted digits by construction
+    // on every leg, is stored, so no unescape is needed.
     return adapt_pkg_inventory(out, "python",
                                [](const std::vector<std::string_view>& tok,
                                   std::vector<SwEntry>& entries) {
@@ -484,7 +494,7 @@ AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPoli
         e.ecosystem = "python";
         entries.push_back(std::move(e));
         return true;
-    }, policy);
+    }, policy, /*escaped=*/true);
 }
 
 AdaptedRows parse_windows_optional_features_output(const std::string& out) {

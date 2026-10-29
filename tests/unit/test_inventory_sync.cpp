@@ -9,6 +9,7 @@
 #include "sync_scheduler.hpp"
 #include "msi_packages_inventory.hpp"
 #include "pkg_inventory_parsers.hpp"
+#include "runtimes_python_parsers.hpp"
 #include "sync_source_installed_software.hpp"
 #include "windows_optional_features_parsers.hpp"
 
@@ -3061,6 +3062,23 @@ TEST_CASE("collector: runtimes.python contributes sourced rows and an incomplete
         CHECK(python_records(got->first) == 1);
         CHECK(records_of(got->first).size() == 393 + 70 + 1 + 1);
     }
+    SECTION("escaped pipes in the free-text fields do not cost the sourced row") {
+        // Built by the real producer: vendor and install_path go through safe_output_field, so a
+        // literal pipe reaches the collector as `\|` and must not read as a sixth field.
+        yuzu::runtimes::PythonRecord rec;
+        rec.flavour = yuzu::runtimes::PythonFlavour::cpython;
+        rec.version = "3.13.1";
+        rec.install_path = "C:\\Python|313\\";
+        rec.vendor = "org.python|custom";
+        const auto piped = yuzu::runtimes::python_row(rec);
+        REQUIRE(piped.find("\\|") != std::string::npos);
+        fake_mac();
+        g_fake[4].out["python"] = nl({supported_status("python"), piped});
+        const auto got = collect_with(all_plugins());
+        REQUIRE(got.has_value());
+        CHECK(python_records(got->first) == 1);
+        CHECK(records_of(got->first).size() == 393 + 70 + 1 + 1);
+    }
     SECTION("a clean empty read contributes nothing and does not skip the cycle") {
         fake_mac();
         const auto got = collect_with(all_plugins());
@@ -3111,6 +3129,34 @@ TEST_CASE("runtimes python adapter: real-capture rows map to Python / app / pyth
         CHECK(r.entries[i].kind == "app");
         CHECK(r.entries[i].ecosystem == "python");
         CHECK(r.entries[i].publisher.empty());
+    }
+}
+
+TEST_CASE("runtimes python adapter: rows built by the producer round-trip through escaped pipes",
+          "[sync][parse][adapter][runtimes]") {
+    using Status = AdaptedRows::Status;
+    yuzu::runtimes::PythonRecord rec;
+    rec.flavour = yuzu::runtimes::PythonFlavour::cpython;
+    rec.version = "3.13.1";
+    rec.install_path = "C:\\Python|313\\"; // a literal backslash folds to '/', a pipe to `\|`
+    rec.vendor = "org.python|custom";
+    const auto row = yuzu::runtimes::python_row(rec);
+    // Pin the wire form the adapter has to read, so a producer change shows up here.
+    REQUIRE(row == "python|cpython|3.13.1|C:/Python\\|313/|org.python\\|custom");
+    SECTION("one piped vendor and path: one entry, version unchanged") {
+        const auto r = parse_runtimes_python_output(nl({"status|python|supported|-", row}), kFailPolicy);
+        REQUIRE(r.status == Status::ok);
+        REQUIRE(r.entries.size() == 1);
+        CHECK(r.entries[0].version == "3.13.1");
+        CHECK(r.entries[0].ecosystem == "python");
+    }
+    SECTION("more escaped pipes than the split width still read as five logical fields") {
+        rec.vendor = "a|b|c|d|e|f|g|h|i|j|k|l";
+        const auto r = parse_runtimes_python_output(
+            nl({"status|python|supported|-", yuzu::runtimes::python_row(rec)}), kFailPolicy);
+        REQUIRE(r.status == Status::ok);
+        REQUIRE(r.entries.size() == 1);
+        CHECK(r.entries[0].version == "3.13.1");
     }
 }
 

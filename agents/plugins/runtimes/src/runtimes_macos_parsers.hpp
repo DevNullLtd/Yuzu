@@ -16,7 +16,17 @@
  *
  * NOT walked: Homebrew (`/opt/homebrew`, `/usr/local/Cellar`), pyenv, conda, Xcode's Python3.framework
  * under /Library/Developer/CommandLineTools: those are other ecosystems' rows or out of the machine
- * roots. There is no network-mount guard on this leg (the framework root is a local install path).
+ * roots.
+ *
+ * NETWORK MOUNTS ARE NOT WALKED, as on the Linux leg: production passes `production_config()`, whose
+ * `network_mounts` is the getmntinfo_r_np(MNT_NOWAIT) snapshot (agents/shared/macos_network_mounts.hpp,
+ * unprivileged, answered from the kernel's cache). A Versions root that is on, under or contains a
+ * network mount (a mount-on `/Library`, `/Library/Frameworks/...`, or anything beneath the Versions
+ * directory) is skipped before any syscall touches it and records `macos:runtimes:network_fs_skipped`.
+ * When the table cannot be read the walk runs guarded only by that read and records
+ * `macos:runtimes:mountinfo_unreadable` (the token keeps the Linux leg's name). Residuals a plugin
+ * cannot close: a mount that appears after the snapshot, a stacked filesystem over a dead network
+ * mount, and a network type the deny-list does not name.
  *
  * FAILURE NEVER READS AS ABSENT. An absent framework is silent (`supported` + zero rows); a symlink at
  * any hop to the Versions directory is `macos:runtimes:symlink_refused`; an unopenable Versions
@@ -29,6 +39,10 @@
 #include "runtimes_python_parsers.hpp"
 
 #if !defined(_WIN32)
+
+#if defined(__APPLE__)
+#include <macos_network_mounts.hpp> // yuzu::shared::read_macos_network_mounts (agents/shared)
+#endif
 
 #include <array>
 #include <filesystem>
@@ -44,6 +58,9 @@ inline constexpr std::array<std::string_view, 1> kPythonMacRoots{kPythonVersions
 
 /// Info.plist read bound (a real one is ~1 KiB).
 inline constexpr std::size_t kMaxPlistBytes = 256 * 1024;
+
+/// The mount snapshot could not be read (the walk then runs guarded only by what it did read).
+inline constexpr std::string_view kTokMountsUnreadable = "macos:runtimes:mountinfo_unreadable";
 
 /// Re-spells the walk layer's `linux:runtimes:<cause>` tokens as `macos:runtimes:<cause>`.
 inline void forward_tokens(const yuzu::shared::ConstraintAccumulator& from,
@@ -101,14 +118,30 @@ inline void forward_tokens(const yuzu::shared::ConstraintAccumulator& from,
     return rows;
 }
 
-/// The macOS leg body with the root injected: `python` is read, the dotnet/jvm actions stay planned.
-inline int run_macos_at(yuzu::CommandContext& ctx, Action a, const std::filesystem::path& root) {
+#if defined(__APPLE__)
+/// The default walk bounds plus the network mounts from the kernel's mount table, read once at
+/// dispatch start. An unreadable table is `mountinfo_unreadable`, not an empty guard.
+[[nodiscard]] inline lnx::WalkConfig production_config() {
+    lnx::WalkConfig cfg;
+    auto mounts = yuzu::shared::read_macos_network_mounts();
+    cfg.mountinfo_unreadable = !mounts;
+    if (mounts) cfg.network_mounts = std::move(*mounts);
+    return cfg;
+}
+#endif
+
+/// The macOS leg body with the root and walk configuration injected: `python` is read, the
+/// dotnet/jvm actions stay planned. runtimes_macos.cpp passes "/" and `production_config()`; the
+/// default `cfg` (no mounts, table readable) is for the seam tests over a fixture tree.
+inline int run_macos_at(yuzu::CommandContext& ctx, Action a, const std::filesystem::path& root,
+                        const lnx::WalkConfig& cfg = {}) {
     if (a != Action::python) {
         emit_planned(ctx, a, "macos:planned");
         return 0;
     }
     yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = python_rows_at(root, acc);
+    if (cfg.mountinfo_unreadable) acc.add_failure(kTokMountsUnreadable);
+    const auto rows = mac::python_rows_at(root, acc, cfg); // qualified: ADL on WalkConfig also finds lnx::
     emit_read(ctx, a, rows, acc);
     return 0;
 }
