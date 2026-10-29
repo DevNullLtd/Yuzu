@@ -27,7 +27,7 @@ flowchart LR
   ROWS --> RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
 
-- **Windows** asks two sources and reports both, so a disagreement between them is visible. `wmi` is a bounded `Win32_BIOS` query for exactly `Manufacturer`, `SMBIOSBIOSVersion` and `ReleaseDate`. `smbios` reads the raw SMBIOS table with `GetSystemFirmwareTable('RSMB')` and parses its type-0 record: vendor, version, release date, ROM size, and the BIOS and embedded-controller release numbers. The WMI array column `BIOSVersion` is not read, so no `bios_version_list` row exists.
+- **Windows** asks two sources and reports both, so a disagreement between them is visible. `wmi` is a bounded `Win32_BIOS` query for exactly `Manufacturer`, `SMBIOSBIOSVersion` and `ReleaseDate`. `smbios` reads the raw SMBIOS table with `GetSystemFirmwareTable('RSMB')` and hands the bytes to the shared bounds-checked SMBIOS walker (`agents/shared/smbios_parsers.hpp`), which decodes the type-0 record: vendor, version, release date, ROM size, and the BIOS and embedded-controller release numbers. The WMI array column `BIOSVersion` is not read, so no `bios_version_list` row exists.
 - **Linux** reads the four `/sys/class/dmi/id/bios_*` files (vendor, version, date, release), each once with a 4 KiB bound, then asks fwupd on the system D-Bus. It calls `GetDevices`, then `GetUpgrades` for each device flagged updatable, inside one 5 second budget for the whole fwupd read, and reports one `fwupd_device` row per device (at most 256) plus one aggregate `update_pending` row. sd-bus comes from the system package `libsystemd`, never from `vcpkg.json`; a build without it reports `update_pending` as `unreadable` with `fwupd:not_built`.
 - **macOS** reads the IODeviceTree plane through IOKit. An Intel Mac has `/rom` (version, release date, vendor). An Apple Silicon Mac has no `/rom`, so the version is `/chosen` `system-firmware-version` (else `firmware-version`) and the vendor is the tree root `manufacturer`. The plugin also reads `hw.model`, and uses `hw.optional.arm64` to decide whether a missing `/rom` is expected. No `update_pending` row is produced, and Apple Silicon has no release date.
 
@@ -160,7 +160,7 @@ Any status other than `OK` makes the action return 1, which the agent core repor
 ### Where the data goes
 
 - **Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `firmware` is also a gathered definition (`crossplatform.firmware_posture.firmware`, 300s TTL).
-- **Not consumed by** daily-sync, TAR, DEX, or metrics.
+- **Not consumed by** daily-sync, Echo, DEX, or metrics.
 - **Sensitivity.** Rows carry firmware vendor, version, release date, ROM size and, on Linux, fwupd device names and versions (for example a laptop's embedded controller or an NVMe drive firmware). No username, path or process name. Firmware versions identify a specific hardware model and revision, and an out-of-date one tells an attacker which known firmware flaw applies, so treat the rows like other `Security` posture data.
 - **Siblings:** `hardware` (its `bios` action reads the same DMI and WMI fields as an inventory fact without the update-pending verdict) and `bitlocker` (disk encryption posture).
 

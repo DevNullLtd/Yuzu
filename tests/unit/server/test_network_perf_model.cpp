@@ -296,6 +296,57 @@ TEST_CASE("overview render: empty population is honest", "[network][ui]") {
     CHECK(html.find("No network telemetry yet") != std::string::npos);
 }
 
+TEST_CASE("overview render: Quality / Discovered tab strip, panels and script", "[network][ui]") {
+    const auto has = [](const std::string& h, const char* n) { return h.find(n) != std::string::npos; };
+    NetPerfSnapshot snap;
+    snap.devices.push_back(dev("lnx-1", 40.0, 0.4, 3.0e6));
+    NetPerfSnapshot silent;
+    silent.devices.push_back(dev("silent", std::nullopt, std::nullopt, std::nullopt));
+    // Both the populated and the no-telemetry (early-return) paths carry the strip.
+    for (const auto& sn : {snap, silent}) {
+        const auto html = render_network_overview_fragment(net_perf_fleet_now(sn));
+        CHECK(has(html, "id=\"net-tabs\""));
+        CHECK(has(html, "href=\"#\" role=\"tab\" class=\"on\" aria-selected=\"true\""));
+        CHECK(has(html, "href=\"#discovered\" role=\"tab\" aria-selected=\"false\" "
+                        "hx-get=\"/fragments/network/discovered\" hx-target=\"#net-discovered\""));
+        // class="panel" so yuzu.css's panel-scoped dense-table / empty rules apply.
+        CHECK(has(html, "<div id=\"net-discovered\" class=\"panel\" hidden>"));
+        // One in-flight read at a time: a double click is dropped, not queued + audited twice.
+        CHECK(has(html, "hx-sync=\"this:drop\""));
+        CHECK(has(html, "<div id=\"net-quality\">"));
+        CHECK(has(html, "window.netTab=function"));
+        // 403 copy names the permission; listener registered once per page life.
+        CHECK(has(html, "needs the Infrastructure:Read permission"));
+        CHECK(has(html, "service-scoped or group-confined accounts"));
+        // hashchange acts only when the visible tab disagrees with the hash (no double fetch on a click).
+        CHECK(has(html, "if(p.hidden!==d)return;"));
+        CHECK(has(html, "if(!window.__netErr){window.__netErr=1;"));
+        // Deep link boots the Discovered tab.
+        CHECK(has(html, "location.hash==='#discovered'"));
+        // The boot issues the request itself: a synthetic click runs before htmx has
+        // processed the new anchor's hx-get and would fire nothing.
+        CHECK(has(html, "htmx.ajax('GET','/fragments/network/discovered'"));
+        CHECK_FALSE(has(html, "d.click()"));
+        // Transport failure and timeout paint the same failbox; 401 goes to the login page.
+        CHECK(has(html, "htmx:responseError"));
+        CHECK(has(html, "htmx:sendError"));
+        CHECK(has(html, "htmx:timeout"));
+        CHECK(has(html, "if(s===401){location.href='/login';return}"));
+        // Quality clears the hash; Back/Forward re-sync the tab to it.
+        CHECK(has(html, "history.replaceState"));
+        CHECK(has(html, "hashchange"));
+        // Both error branches: 403 permission copy and the generic retry copy.
+        CHECK(has(html, "s===403?"));
+        CHECK(has(html, "Discovered hosts could not be read just now. Try again in a moment."));
+        // CSP-safe: inline handlers only, never hx-on.
+        CHECK_FALSE(has(html, "hx-on"));
+        CHECK(one_dx_style(html));
+    }
+    const auto fleet = render_network_overview_fragment(net_perf_fleet_now(snap));
+    CHECK(fleet.find("<div id=\"net-quality\">") < fleet.find("Fleet now"));
+    CHECK(fleet.find("Fleet now") < fleet.find("<div id=\"net-discovered\""));
+}
+
 TEST_CASE("devices render: worst-first + co-occurrence flags inline", "[network][ui]") {
     NetPerfSnapshot snap;
     snap.devices.push_back(dev("lnx-low", 40.0, std::nullopt, std::nullopt));

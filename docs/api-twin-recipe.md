@@ -55,13 +55,15 @@ a review question into a compile-time impossibility.
 
 ### The exemplar: `discover_routes.{hpp,cpp}`
 
-`server/core/src/discover_routes.hpp` (158 lines) declares five pure builder functions —
+`server/core/src/discover_routes.hpp` declares six pure builder functions —
 `build_permissions_catalog`, `build_instructions_catalog`, `build_routes_catalog`,
-`scope_kinds_catalog`, `build_plugins_catalog` — each taking only the store/registry it needs and
-returning a `DiscoveryDoc { std::string json; std::string etag; }`. The file header states the
-intent explicitly:
+`scope_kinds_catalog`, `plugin_docs_catalog`, `build_plugins_catalog` — each taking only the
+store/registry it needs and returning a `DiscoveryDoc { std::string json; std::string etag; }`.
+`DiscoveryDoc` and the one builder declared outside `discover_routes.hpp`, `build_routes_catalog`,
+are declared in `server/core/src/discover_catalog_types.hpp`, which `discover_routes.hpp`
+re-includes; the other five stay in `discover_routes.hpp`. The file header states the intent explicitly:
 
-> "The five builder functions (`build_*_catalog`) are pure — no I/O beyond reading the
+> "The six builder functions (`build_*_catalog`) are pure — no I/O beyond reading the
 > store/registry pointer passed in — and are declared here specifically so `mcp_server.cpp` can
 > call the SAME functions for the mirrored `discover_*` MCP tools... REST and MCP therefore cannot
 > drift from each other by construction."
@@ -359,7 +361,14 @@ so the record is not a single point of truth: keep the two in step. (A confined 
    different cases; a tripwire, not a proof). A brand-new `mcp_tools_<domain>.cpp` also sets
    `MIN_REGISTRY_FILES` (an exact count) in `scripts/ci/check-api-parity.py` and `kRegistryDomainFiles`
    in `tests/unit/server/test_mcp_dispatch_coverage.cpp`, and a new `mcp_tool*.hpp` sets
-   `kToolHeaderFiles` there, in the same change.
+   `kToolHeaderFiles` there, in the same change. The seam-closure CI gate
+   (`scripts/ci/check-seam-closure.py`, "MCP registry lane") additionally include-closure-checks every
+   `mcp_tools_*.cpp`, the three shared `mcp_tool*.hpp` headers and the seven store-free `*_types.hpp`
+   headers against its store-header patterns, pins the file count (`MCP_REGISTRY_EXPECTED_TU_COUNT`, with
+   `EXPECTED_MCP_REGISTRY_TU_COUNT` and `EXPECTED_MCP_REGISTRY_CPPS` in its self-test — and
+   `MCP_REGISTRY_HEADERS` / `MCP_REGISTRY_TYPES_HEADERS` for a new shared or types header — which also
+   cross-checks the count against `MIN_REGISTRY_FILES` and `kRegistryDomainFiles`), and checks that each
+   `<domain>_tool_records()` accessor declared in `mcp_tool_registry.hpp` has its `mcp_tools_<domain>.cpp`.
 
 What rejects a mistake: building the catalogue (first done in the `ServerImpl` constructor, so it
 applies under `--mcp-disable` too) throws `std::logic_error` naming the record for a null handler, a

@@ -1327,7 +1327,7 @@ TEST_CASE("result poll: the catalogue lookup is case-insensitive and the Forensi
     const CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
     // The derivation is "everything before the last dash of <plugin>-<hex>". It is only sound
     // while no plugin name carries a dash; this is the check that keeps that true.
-    for (const char* p : {"browser_inventory", "tar", "hardware", "app_usage"})
+    for (const char* p : {"browser_inventory", "echo", "hardware", "app_usage"})
         CHECK(registry.knows_plugin(p));
     CHECK_FALSE(registry.knows_plugin("no_such_plugin"));
     CHECK_FALSE(registry.knows_plugin(""));
@@ -1350,8 +1350,8 @@ TEST_CASE("result poll: the plugin comes from the command id; a mismatching capt
     // A real catalogue plugin with a matching caption passes the validation (no reply yet: pending).
     CHECK(status(poll_url("agent-1", "hardware-abc123", "hardware")) == 200);
     // The caption names a different plugin than the command id carries.
-    CHECK(status(poll_url("agent-1", "hardware-abc123", "tar")) == 400);
-    CHECK(status(poll_url("agent-1", "tar-abc123", "hardware")) == 400);
+    CHECK(status(poll_url("agent-1", "hardware-abc123", "echo")) == 400);
+    CHECK(status(poll_url("agent-1", "echo-abc123", "hardware")) == 400);
     // A prefix that is not a catalogue plugin, even with a matching caption.
     CHECK(status(poll_url("agent-1", "no_such_plugin-abc123", "no_such_plugin")) == 400);
     // No dash, an empty prefix, or an extra dash (the prefix would then not be a plugin).

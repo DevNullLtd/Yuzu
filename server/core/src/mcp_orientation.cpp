@@ -27,11 +27,12 @@ std::string_view about_text() {
            "autonomous use-case-engine modules — engine-classed sessions are structurally "
            "barred from calling it, and every mutation is approval-gated.\n\n"
            "Deciding an approval ticket is a human act: approve/reject run from the "
-           "dashboard or REST under an interactive login that passes the MFA step-up "
-           "gate (an un-enrolled local user passes it; requiring an enrolled factor of "
-           "the approver is tracked in #6079). "
+           "dashboard or REST under an interactive login whose account has an enrolled "
+           "MFA factor with a proof no older than the approver window (at most 300 s) "
+           "(#6079); the REST route enforces that, not the MCP tools. "
            "The MCP tools approve_request and reject_request are registered but always "
-           "return approver_assurance_required:* (#6061); an MCP caller can list pending "
+           "refuse on the session class with approver_assurance_required:* (#6061); an "
+           "MCP caller can list pending "
            "approvals and must ask a human to decide them.";
 }
 
@@ -208,11 +209,11 @@ constexpr std::string_view kPreflightDeploy[] = {"list_preflight_runs", "get_dep
 // data model from an Execution (see get_workflow_execution's tool doc).
 constexpr std::string_view kWorkflows[] = {"list_workflows", "get_workflow",
                                            "list_workflow_executions", "get_workflow_execution"};
-// #4027 — TAR (Timeline / Activity Recorder) had zero MCP presence before this
+// #4027 — Echo (Timeline / Activity Recorder) had zero MCP presence before this
 // read-twin batch; its own family rather than folding into an unrelated one.
-constexpr std::string_view kTar[] = {"list_tar_process_tree_devices",
-                                     "list_tar_capture_sources_devices",
-                                     "list_tar_retention_paused"};
+constexpr std::string_view kEcho[] = {"list_echo_process_tree_devices",
+                                     "list_echo_capture_sources_devices",
+                                     "list_echo_retention_paused"};
 // #4031: AD/Entra directory-sync user listing + directory-sync status (last
 // sync time/health, NOT OIDC SSO config — that lives at REST-only
 // GET /api/v1/settings/oidc, deliberately with no MCP twin per #520) — both
@@ -230,7 +231,7 @@ constexpr std::string_view kDirectory[] = {"list_directory_users", "get_director
 constexpr std::string_view kResultSets[] = {"list_result_sets",
                                             "create_result_set",
                                             "create_result_set_from_inventory_query",
-                                            "create_result_set_from_tar_query",
+                                            "create_result_set_from_echo_query",
                                             "create_result_set_from_instruction_result",
                                             "reevaluate_result_set",
                                             "get_result_set",
@@ -255,8 +256,10 @@ constexpr std::string_view kFleetVisualization[] = {"get_fleet_topology", "get_h
 // B4 (#2146 API-parity) — no existing family covers a self-check "can I do X"
 // RBAC read; own family, distinct from Discovery's discover_permissions (the
 // whole catalog + role grid) and from Engine principals' assign/unassign/
-// list_engine_roles (grant AUTHORING, not a self-check).
-constexpr std::string_view kRbacCheck[] = {"check_permission"};
+// list_engine_roles (grant AUTHORING, not a self-check). get_me (twin of
+// GET /api/v1/me) joins it: the same kind of read, a self-description of the
+// CALLING principal that cannot name another one.
+constexpr std::string_view kRbacCheck[] = {"check_permission", "get_me"};
 // A2 (delivery plan §2) — global human role assignment/unassignment. Own
 // family, distinct from RBAC self-check above (a read, not an authoring
 // action) and from Engine principals' assign/unassign_engine_role (a
@@ -327,7 +330,7 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
      kCompliance},
     {"Scope targeting", "validate a scope expression and preview the devices it selects", kScope},
     {"Result sets", "create, inspect, pin, and re-evaluate named scope-walking device sets "
-                    "(from a pre-computed list, an inventory query, a TAR SQL dispatch, or an "
+                    "(from a pre-computed list, an inventory query, an Echo SQL dispatch, or an "
                     "instruction-result dispatch); walk their lineage",
      kResultSets},
     {"Management groups",
@@ -385,10 +388,10 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
      kPreflightDeploy},
     {"Workflows", "multi-step workflow definitions and their per-step execution records",
      kWorkflows},
-    {"TAR process-tree & retention", "operator-scoped device pickers for the TAR process-tree "
+    {"Echo process-tree & retention", "operator-scoped device pickers for the Echo process-tree "
                                      "and capture-sources frames, and the caller's own "
                                      "retention-paused source scan",
-     kTar},
+     kEcho},
     {"Directory & identity", "AD/Entra directory-synced users and directory-sync status",
      kDirectory},
     {"Execution statistics", "fleet-wide, per-agent, and per-definition execution "
@@ -398,7 +401,8 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
                             "connections, and listening sockets, fleet-wide or per-host",
      kFleetVisualization},
     {"RBAC self-check", "check whether the calling principal itself holds a specific RBAC "
-                        "permission",
+                        "permission, and describe the calling session (identity, role, tier, "
+                        "direct RBAC role names)",
      kRbacCheck},
     {"RBAC administration", "grant or revoke one of the 7 fleet-wide-assignable built-in RBAC "
                             "roles to a human user, and switch RBAC enforcement on/off "

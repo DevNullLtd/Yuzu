@@ -98,7 +98,7 @@
 // Producers come in two flavours:
 //   • synchronous  (inventory query, manual curation) — members known at create
 //     time → row lands in status `materialized`.
-//   • asynchronous (TAR SQL, instruction-result) — a command is dispatched and
+//   • asynchronous (Echo SQL, instruction-result) — a command is dispatched and
 //     responses trickle in over seconds–minutes; the row lands `pending` with a
 //     `source_execution_id`, and the server's maintenance thread materialises it
 //     once the execution reaches a terminal state.
@@ -129,7 +129,7 @@ ResultSetStatus result_set_status_from(std::string_view s);
 /// Carried as a plain string in the row so future kinds need no schema change.
 namespace source_kind {
 inline constexpr std::string_view kInventoryQuery = "inventory_query";
-inline constexpr std::string_view kTarQuery = "tar_query";
+inline constexpr std::string_view kEchoQuery = "echo_query";
 inline constexpr std::string_view kInstructionResult = "instruction_result";
 inline constexpr std::string_view kManualCurate = "manual_curate";
 } // namespace source_kind

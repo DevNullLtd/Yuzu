@@ -84,7 +84,7 @@ TEST_CASE("enablement units: the injected predicate is the canonical protective 
     // first production includer's own test must pin that (tracked by #5982).
     CHECK(kProtectivePredicate("__guard__", "push_rules"));
     CHECK(kProtectivePredicate("quarantine", "whitelist"));
-    CHECK_FALSE(kProtectivePredicate("tar", "fleet_snapshot"));
+    CHECK_FALSE(kProtectivePredicate("echo", "fleet_snapshot"));
 }
 
 TEST_CASE("enablement units: every real unit and non-unit name is a legal loader name",
@@ -155,17 +155,17 @@ TEST_CASE("enablement units: the non-unit set is exactly the protective and rese
 TEST_CASE("enablement units: system_reserved rows with D3 work are ordinary units",
           "[enablement][catalogue]") {
     const auto ov = real_overlay();
-    for (const auto* name : {"tar.fleet_snapshot", "asset_tags.sync"}) {
+    for (const auto* name : {"echo.fleet_snapshot", "asset_tags.sync"}) {
         INFO(name);
         const auto* u = ov.find(name);
         REQUIRE(u != nullptr);
         CHECK(u->kind == UnitKind::Action);
     }
-    CHECK(ov.find("tar") != nullptr);
+    CHECK(ov.find("echo") != nullptr);
     CHECK(ov.find("asset_tags") != nullptr);
     CHECK(ov.find("quarantine") == nullptr);
 
-    CHECK(contains(off_names(resolve_all_for(ov, "tar")), "tar.fleet_snapshot"));
+    CHECK(contains(off_names(resolve_all_for(ov, "echo")), "echo.fleet_snapshot"));
     CHECK(contains(off_names(resolve_all_for(ov, "asset_tags")), "asset_tags.sync"));
 }
 
@@ -195,7 +195,7 @@ TEST_CASE("enablement units: structural invariants", "[enablement][catalogue]") 
 TEST_CASE("enablement units: requirement edges", "[enablement][catalogue]") {
     const auto ov = real_overlay();
     const std::vector<std::pair<std::string, std::string>> expected{
-        {"app_usage.summary", "tar"}, {"app_usage.last_used", "tar"}};
+        {"app_usage.summary", "echo"}, {"app_usage.last_used", "echo"}};
     CHECK(ov.requirements == expected);
     CHECK(ov.find("app_usage.foreground") != nullptr);
     for (const auto& [u, req] : ov.requirements) {

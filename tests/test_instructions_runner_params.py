@@ -6,7 +6,7 @@ The server rejects a string parameter that does not match its definition's
 `validation.pattern` (HTTP 400; RE2 PartialMatch, i.e. an unanchored search, which is what
 `re.search` does here). Before the runner honoured the pattern, the Instructions gate failed
 on device.agent_actions.set_log_level, device.discovery.scan_subnet and
-crossplatform.tar.configure. This sweeps EVERY pattern-constrained parameter of every
+crossplatform.echo.configure. This sweeps EVERY pattern-constrained parameter of every
 InstructionDefinition the gate dispatches, so a new pattern the runner cannot satisfy fails
 here instead of in a 15-minute live-stack run, and pins the precedence rules around it.
 

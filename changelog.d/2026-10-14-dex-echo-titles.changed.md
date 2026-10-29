@@ -1,0 +1,1 @@
+- **DEX and Echo page headings match the menu.** The `/dex` and `/echo` pages now head with exactly "DEX" and "Echo", the same words as the navigation and breadcrumb; the long forms ("Digital Employee Experience: ..." and "Echo activity record: ...") move to each page's subtitle.

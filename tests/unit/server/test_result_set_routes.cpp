@@ -1319,10 +1319,10 @@ TEST_CASE("result_set_routes: [pg] producers lists only enabled, read-only, auto
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     InstructionStore is{pool};
     REQUIRE(is.is_open());
-    // os_info.os_version is ReadOnly in the real registry; tar.purge_source is Destructive.
+    // os_info.os_version is ReadOnly in the real registry; echo.purge_source is Destructive.
     REQUIRE(is.create_definition(def_for("Good read", "os_info", "os_version", "auto")));
     REQUIRE(is.create_definition(def_for("Needs approval", "os_info", "os_name", "always")));
-    REQUIRE(is.create_definition(def_for("Destructive", "tar", "purge_source", "auto")));
+    REQUIRE(is.create_definition(def_for("Destructive", "echo", "purge_source", "auto")));
     REQUIRE(is.create_definition(def_for("Disabled", "os_info", "os_version", "auto", false)));
 
     Harness h;
@@ -1614,7 +1614,7 @@ TEST_CASE("result_set_routes: [pg] Re-evaluate is drawn only while the stored so
     auto good = is.create_definition(def_for("Good read", "os_info", "os_version", "auto"));
     auto needs_approval = is.create_definition(def_for("Needs approval", "os_info", "os_name", "always"));
     auto disabled = is.create_definition(def_for("Disabled", "os_info", "os_version", "auto", false));
-    auto destructive = is.create_definition(def_for("Destructive", "tar", "purge_source", "auto"));
+    auto destructive = is.create_definition(def_for("Destructive", "echo", "purge_source", "auto"));
     REQUIRE(good);
     REQUIRE(needs_approval);
     REQUIRE(disabled);

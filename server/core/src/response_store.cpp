@@ -397,6 +397,24 @@ const std::vector<pg::PgMigration>& migrations() {
         {2, R"(
             ALTER TABLE responses ADD COLUMN plugin_result_status INTEGER NOT NULL DEFAULT 0;
         )"},
+        // v3 (Echo rename, upgrade window): stored responses and their facets follow the renamed
+        // definition ids so the per-instruction response views keep pre-rename rows, and the
+        // stored plugin label follows the renamed plugin. Three sequential passes over the
+        // retained history (a default-collation btree cannot serve a prefix LIKE), idempotent.
+        // SET LOCAL lifts the pool's per-lease statement_timeout for this step's transaction only
+        // (precedent: approval_manager.cpp v2): a multi-million-row store runs past the 30 s cap,
+        // which would cancel the statement, roll the version back and leave the store reporting
+        // "persistence disabled" on every boot.
+        {3, R"(
+            SET LOCAL statement_timeout = 0;
+            UPDATE responses SET instruction_id = replace(instruction_id,
+                'crossplatform.tar.', 'crossplatform.echo.')
+                WHERE instruction_id LIKE 'crossplatform.tar.%';
+            UPDATE response_facets SET instruction_id = replace(instruction_id,
+                'crossplatform.tar.', 'crossplatform.echo.')
+                WHERE instruction_id LIKE 'crossplatform.tar.%';
+            UPDATE responses SET plugin = 'echo' WHERE plugin = 'tar';
+        )"},
     };
     return kMigrations;
 }
@@ -1602,7 +1620,7 @@ void ResponseStore::reap_expired() {
             // "Clock-guarded retention" part 6): decline — AuditStore's/
             // GuaranteedStateStore's answer, not ResultSetStore's. A
             // mis-timed pass here would destroy agent command/instruction
-            // results powering the executions drawer + `/tar` dashboard,
+            // results powering the executions drawer + `/echo` dashboard,
             // some of which carry usage-class behavioral PII (device.live.*,
             // per-app panels) — not ResultSetStore's reproducible
             // one-TTL-window scratch result sets.

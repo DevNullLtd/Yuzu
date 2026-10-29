@@ -194,8 +194,8 @@ Two functions, each with exactly one implementation:
 
 Every OPERATOR dispatch surface reaches the second through one of two callers —
 `ServerImpl::dispatch_confined` (the shared closure behind MCP `execute_instruction` /
-`execute_bundle`, the dashboard execute and TAR `purge_source` routes, the per-device DEX live
-query, the three async result-set producers (`POST /api/v1/result-sets/from-tar-query`,
+`execute_bundle`, the dashboard execute and Echo `purge_source` routes, the per-device DEX live
+query, the three async result-set producers (`POST /api/v1/result-sets/from-echo-query`,
 `/from-instruction-result`, `/{id}/re-eval`), and `POST /api/instructions|workflows/{id}/execute`)
 or `command_routes.cpp`'s `/api/command` handler (moved out of server.cpp by #2557). Those two
 callers legitimately differ in how they RESOLVE targets (management-group store, scope engine,
@@ -221,7 +221,7 @@ the failure mode being guarded. A harness that wants genuinely unfiltered dispat
 **returning** `nullopt`; leaving the callback empty is a missing gate, not a synonym for it.
 
 One refinement on top of that floor, by route class. Where the derivation is defense-in-depth behind
-a per-target `scoped_perm_fn` gate (REST bundles, TAR purge, the DEX live query), present-empty is
+a per-target `scoped_perm_fn` gate (REST bundles, Echo purge, the DEX live query), present-empty is
 the whole answer — the primary gate already reports its own absence with a `500`. Where it is the
 **only** per-device authorization — the three async result-set producers, which admit on a bare
 global gate and then dispatch by scope or `__all__` — an unwired derivation answers an **audited
@@ -287,7 +287,7 @@ Three new header-only files under `server/core/src/`, zero `server.cpp` involvem
   {none,rev,irrev}) — later PRs mirror this exact grammar into the proto comment and put it on the
   wire; this header is the one place that gets to change the spelling.
 - **`capability_decls/core_dispatch_capabilities.hpp`** — this package's own fragment: the three
-  dispatches the **server issues to itself** (`tar.fleet_snapshot`, `__guard__.push_rules`,
+  dispatches the **server issues to itself** (`echo.fleet_snapshot`, `__guard__.push_rules`,
   `asset_tags.sync`), each `system_reserved = true`. Every other plugin's rows live in separate
   per-group fragment headers owned by other packages; none of them are aggregated here.
 
@@ -387,27 +387,29 @@ single-target, no exceptions.
 
 **Wave 7 PR7b: application usage is the first live `Forensics` consumer, not `execution_artifacts`.**
 The `app_usage` plugin's dedicated read surface (single-target, `Forensics:Read`) is the first row
-to actually classify anything `Forensics` — application usage history (TAR's `usage_live`/
+to actually classify anything `Forensics` — application usage history (Echo's `usage_live`/
 `usage_daily`/`usage_daily_user` tables, retained on a 31-day rolling window) is designed to be
 reachable only through that surface (see the residual read-path caveat below). It is deliberately
-unreachable through the generic `tar.sql` endpoint (`Infrastructure:Read`,
+unreachable through the generic `echo.sql` endpoint (`Infrastructure:Read`,
 `plugin_action_catalogue_a.hpp`): the three usage tables are excluded from `is_queryable_table()`'s
-allowlist in `tar_schema_registry.cpp`, so the read-only connection's SQLite authorizer denies every
+allowlist in `echo_schema_registry.cpp`, so the read-only connection's SQLite authorizer denies every
 access path to them — direct name, `$Usage_*` placeholder, alias, JOIN, or subquery — with the same
 no-existence-oracle posture `tar_events` already gets (#760 UP-8). #4260 tracked this gap; closed by
 this exclusion. #2744 (the app_usage measurand ADR) is superseded by the machine-scope decision
 above and closes without a code change.
 
-**Residual read path, accepted not closed:** `app_usage` is also a typed daily-sync source
-(`typed_inventory_sources.hpp`) excluded from the generic `InventoryStore` only on the gateway's
-*write* path, with a boot-time purge cleaning up any stray row from a mixed-version deployment
-window (an older gateway writing before an upgraded server's boot purge runs). The generic *read*
-path (`InventoryStore::get`/`query`/`list_tables`) carries no typed-source filter, so a stray row
-from that window — or a failed purge — stays readable via the far lower-privileged
-`Infrastructure:Read`/`Inventory:Read` securable until the next boot purge. This is the same
-architectural gap `device_ci` already carries (per `typed_inventory_sources.hpp`'s own header
-comment) and is not being retrofitted here either; it was accepted at this feature's planning gate
-in favor of purge-on-upgrade over a read-time filter.
+**Residual read path, closed (ADR-0070 D12):** `app_usage` is also a typed daily-sync source
+(`typed_inventory_sources.hpp`). The gateway's generic *write* path skips it, and a boot-time purge
+removes any stray row an older server wrote during a mixed-version window. This was once an
+accepted gap, because the generic *read* path had no typed-source filter, so such a row stayed
+readable via the far lower-privileged `Infrastructure:Read`/`Inventory:Read` securable until the
+next purge. Every generic read (`InventoryStore::list_tables`/`get`/`query`/`count`) now excludes
+each member of `kTypedInventorySources` in SQL, which closes that window for `app_usage`,
+`device_ci` and every other typed source on each server at or after that change. The closure is
+per server, not per fleet: a server older than that change, or rolled back below it, still stores
+and serves such rows, so in a multi-replica deployment reads routed to an older replica expose them
+until every replica is upgraded. The gateway skip, the boot purge and the read filter iterate the
+same one list.
 
 ## Testing
 
