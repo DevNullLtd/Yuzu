@@ -317,6 +317,9 @@ TEST_CASE("overview render: Quality / Discovered tab strip, panels and script", 
         CHECK(has(html, "window.netTab=function"));
         // 403 copy names the permission; listener registered once per page life.
         CHECK(has(html, "needs the Infrastructure:Read permission"));
+        CHECK(has(html, "service-scoped or group-confined accounts"));
+        // hashchange acts only when the visible tab disagrees with the hash (no double fetch on a click).
+        CHECK(has(html, "if(p.hidden!==d)return;"));
         CHECK(has(html, "if(!window.__netErr){window.__netErr=1;"));
         // Deep link boots the Discovered tab.
         CHECK(has(html, "location.hash==='#discovered'"));

@@ -148,7 +148,8 @@ std::string network_overview_shell(const std::string& quality_body) {
          "var s=e.detail.xhr&&e.detail.xhr.status;"
          "if(s===401){location.href='/login';return}"
          "t.innerHTML=s===403?'<div class=\"failbox\" role=\"alert\">Your account cannot read "
-         "discovered hosts: this list needs the Infrastructure:Read permission.</div>'"
+         "discovered hosts. This list needs the Infrastructure:Read permission and is not "
+         "available to service-scoped or group-confined accounts.</div>'"
          ":'<div class=\"failbox\" role=\"alert\">Discovered hosts could not be read just now. "
          "Try again in a moment.</div>';});});"
          // Back/Forward: act only when the visible tab disagrees with the hash. A
