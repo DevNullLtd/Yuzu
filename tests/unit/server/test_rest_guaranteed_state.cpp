@@ -3121,6 +3121,11 @@ TEST_CASE("REST dex/apps: the platform scope selects the population and the cove
     CHECK(none["apps"][0]["subject"] == "chrome.exe");
     CHECK(none["apps"][0]["crashes"] == 2);
     CHECK(none["apps"][0]["distinct_devices"] == 2);
+    // The per-version rows merge across operating systems the same way (one unknown-version bucket).
+    REQUIRE(none["apps"][0]["versions"].size() == 1);
+    CHECK(none["apps"][0]["versions"][0]["version"] == "");
+    CHECK(none["apps"][0]["versions"][0]["crashes"] == 2);
+    CHECK(none["apps"][0]["versions"][0]["distinct_devices"] == 2);
     const auto win = get("/api/v1/dex/apps?window=all&platform=windows");
     CHECK(win["population_basis"] == "windows_online");
     CHECK(win["population"] == 2);

@@ -332,7 +332,9 @@ std::string dex_normalize_apps_scope(std::string_view scope) {
 
 std::vector<std::string> dex_apps_online_ids(const DexFleet& fleet, std::string_view scope) {
     std::vector<std::string> ids;
-    ids.reserve(fleet.connected_agents.size()); // upper bound (exact for `all`); one allocation
+    // Exact for `all`; a scoped read is a fraction of the fleet, so it grows to its own size.
+    if (scope == kDexAppsScopeAll)
+        ids.reserve(fleet.connected_agents.size());
     for (const auto& [id, os] : fleet.connected_agents)
         if (scope == kDexAppsScopeAll || os == scope)
             ids.push_back(id);
