@@ -92,8 +92,10 @@ required.
 > credential revoked or expired between authentication and the tool call, which can occur on a
 > healthy server. With no audit sink there is no row to write, and the four tools that write a
 > `crypto.*.view` row and `set_crypto_dashboard_layout` refuse the call instead of succeeding
-> without one. A row that fails to persist on a working sink is different: those tools still
-> answer, with `audit_persisted:false`. An `export_crypto_cbom` random-number failure answers a
+> without one. A row that fails to persist on a working sink is different: the three
+> library reads and `get_crypto_ca_stats` still answer, with `audit_persisted:false`, and so does
+> `set_crypto_dashboard_layout` when only its closing row fails; if its opening `attempted` row
+> cannot be written, it refuses and does not change the layout. An `export_crypto_cbom` random-number failure answers a
 > retryable internal error and writes no row.
 
 > **Per-principal quota-cap rejections (PR 4.4, ADR-1005 class engine
