@@ -7,7 +7,7 @@
 #include "../command_capability.hpp"
 
 /// @file plugin_action_catalogue_disk_actions.hpp
-/// One fragment of the command capability catalogue: `disk_actions`'s two
+/// One fragment of the command capability catalogue: `disk_actions`'s four
 /// actions (`agents/plugins/disk_actions/src/disk_actions_plugin.cpp`).
 /// Classified by READING the implementation, not the name.
 /// `securable`/`operation` reuse an EXISTING `RbacStore` `types[]`/`ops[]`
@@ -27,6 +27,9 @@
 ///   `volumes` — enumerates volumes and reads their disk extents and mount
 ///               points, to report which physical drive backs which mount
 ///               point. `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` is a query.
+///   `partitions`, `topology` — planned placeholders on every OS: they read
+///               nothing and answer one unsupported status row until their
+///               legs land.
 ///
 /// The mutating half of the original Wave 6 PR6.1-a row — `cleanup_temp`,
 /// `cleanup_recycle`, `trim` — is a SEPARATE change and will need
@@ -42,7 +45,7 @@ namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 2> kPluginActionCatalogueDiskActions{{
+inline constexpr std::array<CommandCapability, 4> kPluginActionCatalogueDiskActions{{
     {
         .plugin = "disk_actions",
         .action = "smart",
@@ -57,6 +60,28 @@ inline constexpr std::array<CommandCapability, 2> kPluginActionCatalogueDiskActi
     {
         .plugin = "disk_actions",
         .action = "volumes",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "disk_actions",
+        .action = "partitions",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "disk_actions",
+        .action = "topology",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
         .securable = "Inventory",
