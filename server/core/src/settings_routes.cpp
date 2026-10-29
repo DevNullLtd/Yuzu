@@ -976,16 +976,25 @@ std::string SettingsRoutes::render_engine_principals_fragment(
             // a revocation occurred. `EnginePrincipalRow` carries no reason
             // column of its own (`revoke()` takes no reason parameter —
             // store schema is frozen for this PR); best-effort recover the
-            // audit trail's own detail string for the ORIGINAL committed
-            // revoke: "credentials_revoked=N[; superseded_by=X]" from the REST
-            // DELETE route, or the operator's typed reason from the MCP tool.
+            // audit trail's own detail string for the EARLIEST RETAINED committed
+            // revoke record: "credentials_revoked=N[; superseded_by=X]" from the
+            // REST DELETE route, or the operator's typed reason from the MCP tool.
             // The row is selected by `committed_revoke_detail`, the Access
-            // tokens panel's own rule: a later FAILED attempt writes the same
-            // action with a store error string as its detail, and a retried
-            // revoke writes a newer success row `credentials_revoked=0`; neither
-            // is the revocation's record. It is the audit trail's text, so it is
-            // shown only to a caller who passes the AuditLog:Read probe (the
-            // handler's quiet one); everyone else gets the cell without it.
+            // tokens panel's own rule (the OLDEST success in the bounded read): a
+            // later FAILED attempt writes the same action with a store error string
+            // as its detail, and a retried revoke writes a newer success row
+            // `credentials_revoked=0`; neither is chosen while an older success
+            // survives. The cell is labelled "earliest retained record" because
+            // the read cannot say it is THE revocation's record, and it is not when
+            // (1) audit retention pruned the revoking row but a later retry survives,
+            // (2) the revoke committed but its success row failed to persist (the
+            // route answers 503), so the reconcile retry's `credentials_revoked=0`
+            // is the first success row, or (3) an MCP revoke given no reason wrote
+            // an empty detail, which reads "(not recorded)". Best-effort evidence;
+            // the facts beside it come from the principal store. It is the audit
+            // trail's text, so it is shown only to a caller who passes the
+            // AuditLog:Read probe (the handler's quiet one); everyone else gets the
+            // cell without it.
             // Three DIFFERENT outcomes, distinguished: "(not recorded)" when the
             // store answered and had no committed revoke, "(unavailable)" when it
             // could not answer at all, "(withheld: ...)" when the caller may not
@@ -993,7 +1002,7 @@ std::string SettingsRoutes::render_engine_principals_fragment(
             // would state a fact the read never established; the revocation facts
             // beside it come from the principal store and are unaffected either way.
             // A full window (more than kRevokeHistoryWindow events) adds the Access
-            // panel's caveat: the text may be a retry, not the original.
+            // panel's caveat: the text may be a retry, not the revoke.
             std::string revocation_cell = "—";
             if (!active) {
                 std::string linkage =
@@ -1040,8 +1049,9 @@ std::string SettingsRoutes::render_engine_principals_fragment(
                 std::string detail_html = html_escape(audit_detail);
                 if (truncated)
                     detail_html += access_tokens::revoke_truncation_hint(have_detail);
-                revocation_cell = linkage + "<br><span class=\"hint\">Detail: " + detail_html +
-                                  "</span>";
+                revocation_cell = linkage +
+                                  "<br><span class=\"hint\">Detail (earliest retained record): " +
+                                  detail_html + "</span>";
                 if (p.revoked_at > 0) {
                     revocation_cell += "<br><span class=\"hint\">" +
                                         fmt_epoch(p.revoked_at) + "</span>";

@@ -341,10 +341,14 @@ private:
     /// permission read could not be confirmed). `may_read_audit` is called LAZILY, at most once
     /// and only when a revoked row exists, so a roster with none issues no probe (a token caller
     /// would otherwise write a denial row for a view with nothing to withhold); an empty one
-    /// means no. It is the ORIGINAL committed revoke (`committed_revoke_detail`, shared with the
-    /// Access tokens panel), never a later failed or retried attempt, and carries that panel's
-    /// truncation caveat when more than its window of revoke events exists. After the first
-    /// failed audit read the remaining revoked rows are not queried and read "(unavailable)".
+    /// means no. The cell is labelled "Detail (earliest retained record)": the oldest committed
+    /// success in the bounded read (`committed_revoke_detail`, shared with the Access tokens
+    /// panel), never a failed attempt or a later retry while an older success survives, but not
+    /// necessarily the revocation's own record (retention can prune it, a failed audit write can
+    /// leave a reconcile retry as the first success, an MCP revoke without a reason is empty).
+    /// It carries that panel's truncation caveat when more than its window of revoke events
+    /// exists. After the first failed audit read the remaining revoked rows are not queried and
+    /// read "(unavailable)".
     /// `roster_count`, when given, is set to the number of principals rendered ONLY when the
     /// roster was actually read: the caller writes the `engine_principal.list` success row
     /// from it, and an absent store or an unreadable roster leaves it empty (no row).
