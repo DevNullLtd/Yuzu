@@ -33813,6 +33813,7 @@ TEST_CASE("MCP #4754: a service-scoped token is refused on the GET stream channe
         // last_seen did not slide: 40s after mint (>30s idle ttl) but only 20s after the
         // refused GET, the session is idle-expired. A deny that touched the registry would
         // have kept it alive.
+        CHECK(reg.exists(sid, test_user_binding())); // positive control: alive at t=20
         elapsed = std::chrono::seconds(40);
         CHECK_FALSE(reg.exists(sid, test_user_binding()));
     }
@@ -33935,6 +33936,7 @@ TEST_CASE("MCP #4754: a session presented by a weaker credential class answers t
         // The registry was not touched: still one live session, and last_seen did not slide
         // (40s after mint, past the 30s ttl; a slide at t=20 would keep it alive).
         CHECK(reg.active_count() == 1);
+        CHECK(reg.exists(sid, mcp_token_binding("supervised"))); // positive control: alive at t=20
         elapsed = std::chrono::seconds(40);
         CHECK_FALSE(reg.exists(sid, mcp_token_binding("supervised")));
     }
@@ -34046,6 +34048,173 @@ TEST_CASE("MCP #4754: POST and DELETE presenting a session from another credenti
         CHECK(ts.call_raw("DELETE", "", {{"Mcp-Session-Id", sid}})->status == 200);
         CHECK(reg.active_count() == 0);
     }
+}
+
+namespace {
+// What a client, the owner and the metrics registry can observe after the four refusals
+// below. Compared field by field between a healthy audit sink and a failing one.
+struct RefusalObservation {
+    int svc_get_status = 0;
+    nlohmann::json svc_get_body;
+    int mismatch_get_status = 0;
+    nlohmann::json mismatch_get_body;
+    int mismatch_post_status = 0;
+    nlohmann::json mismatch_post_body;
+    int mismatch_delete_status = 0;
+    nlohmann::json mismatch_delete_body;
+    double service_scoped_count = -1;
+    double credential_mismatch_count = -1;
+    std::size_t active_sessions = 0;
+    std::int64_t leases_held = -1;
+    int owner_get_status = 0;
+    std::size_t audit_rows_for_refusals = 0;
+};
+
+// Runs the GET service-scoped refusal and the GET/POST/DELETE class-mismatch refusals
+// against a fresh server whose audit sink is healthy, returns false, or throws.
+RefusalObservation observe_refusals(bool audit_returns_false, bool audit_throws) {
+    mcp::McpSessionRegistry reg;
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 4}};
+    yuzu::MetricsRegistry metrics;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.stream_budget_for_test = &budget;
+    ts.metrics_for_test = &metrics;
+    ts.mock_auth_source = "mcp_token";
+    ts.start("supervised");
+    const auto sid = mint_session(ts); // the owner's supervised MCP token
+    REQUIRE_FALSE(sid.empty());
+    // Ring content the refused callers must not be handed.
+    auto stream = reg.stream_for(sid, mcp_token_binding("supervised"));
+    REQUIRE(stream);
+    for (int i = 0; i < 3; ++i) {
+        stream->publish("message", R"({"jsonrpc":"2.0","method":"ring-frame-marker"})");
+    }
+
+    // The failure is armed only now: minting the session is not under test.
+    ts.audit_succeeds_ = !audit_returns_false;
+    ts.audit_throws_ = audit_throws;
+    const auto audit_before = ts.audit_log.size();
+
+    RefusalObservation o;
+    const auto ring_free = [](const std::string& body) {
+        return body.find("ring-frame-marker") == std::string::npos;
+    };
+
+    ts.mock_token_scope_service = "printers";
+    auto svc = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+    ts.mock_token_scope_service.clear();
+    o.svc_get_status = svc->status;
+    o.svc_get_body = body_without_cid(svc->body);
+    REQUIRE(ring_free(svc->body));
+
+    ts.mock_tier = "readonly"; // the weaker credential of the same user
+    auto get = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+    o.mismatch_get_status = get->status;
+    o.mismatch_get_body = body_without_cid(get->body);
+    REQUIRE(ring_free(get->body));
+
+    auto post = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"tools/list","id":7})",
+                            {{"Mcp-Session-Id", sid}});
+    o.mismatch_post_status = post->status;
+    o.mismatch_post_body = body_without_cid(post->body);
+    REQUIRE(ring_free(post->body));
+
+    auto del = ts.call_raw("DELETE", "", {{"Mcp-Session-Id", sid}});
+    o.mismatch_delete_status = del->status;
+    o.mismatch_delete_body = body_without_cid(del->body);
+    o.audit_rows_for_refusals = ts.audit_log.size() - audit_before;
+
+    o.service_scoped_count =
+        metrics.counter("yuzu_mcp_stream_rejects_total", {{"reason", "service_scoped"}}).value();
+    o.credential_mismatch_count =
+        metrics.counter("yuzu_mcp_stream_rejects_total", {{"reason", "credential_mismatch"}})
+            .value();
+    // Nothing leased, and the owner's session is still registered.
+    o.leases_held = static_cast<std::int64_t>(budget.active());
+    o.active_sessions = reg.active_count();
+    // The owner is back and still gets its session. The sink is healthy again: the owner's
+    // attach audit is not what this observation is about.
+    ts.audit_succeeds_ = true;
+    ts.audit_throws_ = false;
+    ts.mock_tier = "supervised";
+    o.owner_get_status =
+        ts.call_raw("GET", "", {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}})
+            ->status;
+    return o;
+}
+} // namespace
+
+TEST_CASE("MCP #4754: an audit sink that fails or throws changes nothing a refused client, "
+          "the owner or the counters can observe",
+          "[mcp][transport][2f][stream][4754]") {
+    const auto healthy = observe_refusals(/*audit_returns_false=*/false, /*audit_throws=*/false);
+
+    // The healthy run is the reference: it must itself be the documented behaviour.
+    CHECK(healthy.svc_get_status == 403);
+    CHECK(healthy.mismatch_get_status == 404);
+    CHECK(healthy.mismatch_post_status == 404);
+    CHECK(healthy.mismatch_delete_status == 404);
+    CHECK(healthy.audit_rows_for_refusals == 4); // one reject row per refusal
+    CHECK(healthy.service_scoped_count == 1.0);
+    // credential_mismatch is counted on GET only (POST and DELETE are audit-only).
+    CHECK(healthy.credential_mismatch_count == 1.0);
+    CHECK(healthy.leases_held == 0); // no refusal took a stream lease
+    CHECK(healthy.active_sessions == 1);
+    CHECK(healthy.owner_get_status == 200);
+
+    const auto check_same = [&](const RefusalObservation& failing) {
+        CHECK(failing.svc_get_status == healthy.svc_get_status);
+        CHECK(failing.svc_get_body == healthy.svc_get_body);
+        CHECK(failing.mismatch_get_status == healthy.mismatch_get_status);
+        CHECK(failing.mismatch_get_body == healthy.mismatch_get_body);
+        CHECK(failing.mismatch_post_status == healthy.mismatch_post_status);
+        CHECK(failing.mismatch_post_body == healthy.mismatch_post_body);
+        CHECK(failing.mismatch_delete_status == healthy.mismatch_delete_status);
+        CHECK(failing.mismatch_delete_body == healthy.mismatch_delete_body);
+        CHECK(failing.service_scoped_count == healthy.service_scoped_count);
+        CHECK(failing.credential_mismatch_count == healthy.credential_mismatch_count);
+        CHECK(failing.leases_held == healthy.leases_held);
+        CHECK(failing.active_sessions == healthy.active_sessions);
+        CHECK(failing.owner_get_status == healthy.owner_get_status);
+        CHECK(failing.audit_rows_for_refusals == healthy.audit_rows_for_refusals);
+    };
+    SECTION("the audit sink reports the row was not persisted") {
+        check_same(observe_refusals(/*audit_returns_false=*/true, /*audit_throws=*/false));
+    }
+    SECTION("the audit sink throws; no exception escapes the handler") {
+        check_same(observe_refusals(/*audit_returns_false=*/false, /*audit_throws=*/true));
+    }
+}
+
+TEST_CASE("MCP #4754: a session minted by a human principal is refused to an engine principal "
+          "of the same name (principal_kind is part of the class)",
+          "[mcp][transport][2f][stream][4754]") {
+    mcp::McpSessionRegistry reg;
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 4}};
+    yuzu::MetricsRegistry metrics;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.stream_budget_for_test = &budget;
+    ts.metrics_for_test = &metrics;
+    ts.mock_auth_source = "mcp_token";
+    ts.start("supervised");
+    const auto sid = mint_session(ts); // principal_kind "human"
+    REQUIRE_FALSE(sid.empty());
+
+    ts.mock_principal_kind = "engine";
+    auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+    CHECK(res->status == 404);
+    CHECK(nlohmann::json::parse(res->body)["error"]["code"] == mcp::kMcpUnknownSession);
+    CHECK(ts.audit_details.back().rfind("reason=credential_mismatch cid=req-", 0) == 0);
+    CHECK(metrics.counter("yuzu_mcp_stream_rejects_total", {{"reason", "credential_mismatch"}})
+              .value() == 1.0);
+    CHECK(budget.active() == 0);
+    CHECK(reg.active_count() == 1); // the human's session is untouched
+
+    ts.mock_principal_kind = "human";
+    CHECK(ts.call_raw("GET", "", {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}})
+              ->status == 200);
 }
 
 TEST_CASE("MCP #4754: session ids and credential classes stay out of logs and audit",

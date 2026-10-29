@@ -16,6 +16,7 @@
 #include "../../../server/core/src/mcp_session.hpp"
 #include "../../../server/core/src/mcp_stream.hpp"
 #include "../../../server/core/src/stream_budget.hpp"
+#include "mcp_test_binding.hpp"
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -36,11 +37,8 @@ namespace detail = yuzu::server::detail;
 
 namespace {
 
-// A binding that carries only the principal (an empty credential class). Tests that
-// exercise the class dimension build an McpSessionBinding explicitly.
-mcp::McpSessionBinding bound(std::string principal) {
-    return mcp::McpSessionBinding{.principal = std::move(principal)};
-}
+// The principal-only fixture (an empty credential class); see mcp_test_binding.hpp.
+using yuzu::test::mcp_session::bound;
 
 /// Captures everything the pump writes, so a test can assert on the wire bytes.
 struct FakeWire {

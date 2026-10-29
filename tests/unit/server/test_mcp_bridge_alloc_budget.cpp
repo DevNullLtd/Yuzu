@@ -29,6 +29,7 @@
 #include "../../../server/core/src/execution_event_bus.hpp"
 #include "../../../server/core/src/mcp_session.hpp"
 #include "../../../server/core/src/mcp_stream_bridge.hpp"
+#include "mcp_test_binding.hpp"
 #include <yuzu/server/auth.hpp>  // CredentialCheck is only forward-declared by mcp_stream.hpp
 
 #include <yuzu/metrics.hpp>
@@ -142,10 +143,8 @@ using yuzu::server::ExecutionEventBus;
 using Bridge = mcp::McpStreamBridge;
 using nlohmann::json;
 
-/// A binding that carries only the principal (an empty credential class).
-mcp::McpSessionBinding bound(std::string principal) {
-    return mcp::McpSessionBinding{.principal = std::move(principal)};
-}
+/// The principal-only fixture (an empty credential class); see mcp_test_binding.hpp.
+using yuzu::test::mcp_session::bound;
 
 /// spdlog formats into heap buffers; nothing in the fault-free measured window
 /// should log at all, but silence it anyway so an unexpected log statement

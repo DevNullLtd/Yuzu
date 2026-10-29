@@ -17,6 +17,7 @@
 #include "../../../server/core/src/execution_tracker.hpp"
 #include "../../../server/core/src/mcp_stream_bridge.hpp"
 #include "../test_helpers.hpp"
+#include "mcp_test_binding.hpp"
 #include "test_execution_tracker_pg_helper.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -123,11 +124,8 @@ namespace {
 using yuzu::server::ExecutionEventBus;
 using Bridge = mcp::McpStreamBridge;
 
-// A binding that carries only the principal (an empty credential class). Tests that
-// exercise the class dimension build an McpSessionBinding explicitly.
-mcp::McpSessionBinding bound(std::string principal) {
-    return mcp::McpSessionBinding{.principal = std::move(principal)};
-}
+// The principal-only fixture (an empty credential class); see mcp_test_binding.hpp.
+using yuzu::test::mcp_session::bound;
 
 /// Poll an eventually-true condition - the projector is asynchronous. Generous
 /// deadline, tight step: never false-RED on a loaded CI box, fast when green.
@@ -195,6 +193,15 @@ struct Fx {
         auto minted = sessions.mint(bound(principal));
         REQUIRE(minted.ok);
         auto stream = sessions.stream_for(minted.session_id, bound(principal));
+        REQUIRE(stream != nullptr);
+        return {minted.session_id, std::move(stream)};
+    }
+    /// A session minted under an explicit binding, so a test can carry a real credential
+    /// class (make_session above mints with an empty one).
+    Session make_session_as(const mcp::McpSessionBinding& binding) {
+        auto minted = sessions.mint(binding);
+        REQUIRE(minted.ok);
+        auto stream = sessions.stream_for(minted.session_id, binding);
         REQUIRE(stream != nullptr);
         return {minted.session_id, std::move(stream)};
     }
@@ -2854,6 +2861,110 @@ TEST_CASE("bridge: a record binds to the session's credential class, not just th
     auto admitted = fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true);
     CHECK(admitted.ok);
     CHECK(fx.bridge->phase_for(s.id, json(1)).has_value());
+}
+
+namespace {
+// A class-bearing binding, as production mints it for an API token. The empty-class
+// fixtures elsewhere in this file cannot tell a record that kept its class from one that
+// silently degraded to the principal alone.
+mcp::McpSessionBinding readonly_api_token(std::string principal = "alice") {
+    return mcp::McpSessionBinding{.principal = std::move(principal),
+                                  .auth_source = "api_token",
+                                  .principal_kind = "human",
+                                  .mcp_tier = "readonly",
+                                  .token_scope_service = {}};
+}
+}  // namespace
+
+TEST_CASE("bridge sweep with a class-bearing mint: a live session's record is kept, a "
+          "terminated session's record is reaped as session_dead (#4754)",
+          "[mcp][bridge][2f][session][4754]") {
+    const auto owner = readonly_api_token();
+
+    SECTION("a different class of the same principal cannot reserve; the owner's class can") {
+        Fx fx;
+        auto s = fx.make_session_as(owner);
+        auto other_tier = owner;
+        other_tier.mcp_tier = "supervised";
+        auto other_source = owner;
+        other_source.auth_source = "mcp_token";
+        for (const auto& other : {other_tier, other_source, bound("alice")}) {
+            auto refused = fx.bridge->reserve(s.id, other, json(1), json("t"), true);
+            CHECK_FALSE(refused.ok);
+            CHECK(std::string(refused.reject_reason) == "unknown_session");
+        }
+        CHECK(fx.bridge->record_count() == 0);
+        CHECK(fx.bridge->reserve(s.id, owner, json(1), json("t"), true).ok);
+        CHECK(fx.bridge->record_count() == 1);
+    }
+    SECTION("ring-only record: retained while the session is live") {
+        Fx fx;
+        auto s = fx.make_session_as(owner);
+        REQUIRE(fx.bridge->reserve(s.id, owner, json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-live"));
+        REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+        REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);
+        fx.bridge->sweep();
+        // A record whose stored binding had lost the class would read as a dead session
+        // here (exists() compares the whole binding) and be reaped while the session lives.
+        CHECK(fx.bridge->record_count() == 1);
+        CHECK(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);
+        CHECK(fx.audit_count("mcp.bridge.session_dead") == 0);
+    }
+    SECTION("ring-only record: reaped as session_dead once the owner terminates the session") {
+        Fx fx;
+        auto s = fx.make_session_as(owner);
+        REQUIRE(fx.bridge->reserve(s.id, owner, json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-dead"));
+        REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+        REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);
+        REQUIRE(fx.sessions.terminate(s.id, owner) ==
+                mcp::McpSessionRegistry::ValidateResult::kValid);
+        fx.bridge->sweep();
+        CHECK(fx.bridge->record_count() == 0);
+        CHECK(fx.audit_count("mcp.bridge.session_dead") == 1);
+    }
+    SECTION("armed-get-only record: retained while live, reaped as session_dead after terminate") {
+        Fx fx;
+        auto s = fx.make_session_as(owner);
+        REQUIRE(fx.bridge->reserve(s.id, owner, json(1), json("t"), false).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-get"));
+        REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kArmedGetOnly);
+        fx.bridge->sweep();
+        CHECK(fx.bridge->record_count() == 1);
+        CHECK(fx.audit_count("mcp.bridge.session_dead") == 0);
+
+        REQUIRE(fx.sessions.terminate(s.id, owner) ==
+                mcp::McpSessionRegistry::ValidateResult::kValid);
+        fx.bridge->sweep();
+        CHECK(fx.bridge->record_count() == 0);
+        CHECK(fx.audit_count("mcp.bridge.session_dead") == 1);
+    }
+    SECTION("streaming record: left streaming while live, parked once the session is gone") {
+        // streaming_park_after is the default (600 s), so only session death can park it.
+        Fx fx;
+        auto s = fx.make_session_as(owner);
+        REQUIRE(fx.bridge->reserve(s.id, owner, json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-stream"));
+        REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kStreaming);
+        fx.bridge->sweep();
+        CHECK(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kStreaming);
+        CHECK(fx.reg.counter("yuzu_mcp_bridge_streaming_backstop_total").value() == 0.0);
+
+        REQUIRE(fx.sessions.terminate(s.id, owner) ==
+                mcp::McpSessionRegistry::ValidateResult::kValid);
+        fx.bridge->sweep();
+        CHECK(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);  // PARKED
+        CHECK(fx.reg.counter("yuzu_mcp_bridge_streaming_backstop_total").value() == 1.0);
+    }
 }
 
 TEST_CASE("bridge progress slot - latest-wins, terminal never dropped",
