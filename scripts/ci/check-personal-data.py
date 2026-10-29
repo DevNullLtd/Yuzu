@@ -427,8 +427,7 @@ def renamed_paths(root: str, mb: str):
     out = subprocess.run(["git", "-C", root, "diff", "-z", "-M", "-l5000", "--name-status",
                           "--diff-filter=R", mb, "HEAD"], check=True,
                          capture_output=True).stdout.decode("utf-8", "surrogateescape").split("\0")
-    # -z name-status renames are three fields: "R<score>", old, new.
-    return {out[i + 1]: out[i + 2] for i in range(0, len(out) - 2, 3) if out[i].startswith("R")}
+    return dict(zip(out[1::3], out[2::3]))  # -z renames: "R<score>", old, new
 
 
 def ratchet(root: str, base: str, counts_now):
