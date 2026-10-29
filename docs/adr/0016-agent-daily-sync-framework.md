@@ -547,14 +547,14 @@ CATASTROPHIC-IF-VIOLATED:
    downstream consumer cannot distinguish from real data.
   exposure (already derivable from the existing `os_info` source).
 
-### 2026-10-29 — `device_ci` blob v2 (H.3: store and ingest)
+### 2026-10-29 — `device_ci` blob v2 (store and ingest)
 
 The server now accepts and stores a versioned `device_ci` blob. This entry is the
-binding wire contract for the agent writer (H.4, `feat/hw-ci-sync-v2`) and records the
-store-side rules. **Server-first rollout:** a v1 server cannot read a v2 blob (it would
+binding wire contract for the agent-side writer change and records the store-side
+rules. **Server-first rollout:** a v1 server cannot read a v2 blob (it would
 store `\x02` + the manufacturer and nack every cycle), so every serving replica upgrades
-before any agent emits v2; H.4 may additionally gate emission on an ack-advertised
-capability. No proto change.
+before any agent emits v2; the agent-side change may additionally gate emission on an
+ack-advertised capability. No proto change.
 
 **Layout.** `blob := 0x02 scalar_record list_record*`; every record is 0x1F-separated
 and 0x1E-terminated. A blob whose first byte is not `0x02` parses exactly as before (v1).
@@ -564,6 +564,7 @@ and 0x1E-terminated. A blob whose first byte is not `0x02` parses exactly as bef
 | `scalar_record` | positions 0-21 = the frozen v1 fields (unchanged order); positions 22-32 appended: `chassis_type`, `chassis_serial`, `chassis_asset_tag`, `chassis_source`, `board_vendor`, `board_product`, `board_serial`, `board_source`, `machine_id_hash`, `machine_id_algorithm`, `machine_id_source`. Missing trailing positions stay blank; extras are ignored. |
 | status record | `status` 1F `<section>` 1F `<level>` 1F `<reason>` — one per registered section, including the three status-only ones (`chassis`, `baseboard`, `machine_id`, whose values are the appended scalars). Last wins. An unregistered section is ignored. |
 | list row | `<kind>` 1F `<c1>` ... `<cn>` — columns per kind below. A short row is padded blank, extra fields are ignored, an unknown kind is ignored. |
+| blob cap | 1 MiB total, fixed (a v1 agent's own 64 KiB cap sits inside it). The agent writer adopts the same value, so a host near every row cap below is never dropped whole. A blob over the cap is dropped and nacked `need_full`; its base fields never land. Every field is clamped to 1,024 bytes. |
 
 Section registry (one declaration, `server/core/src/device_ci_kinds.hpp`, shared by the
 parser and the store; the agent applies the same caps):
@@ -579,7 +580,7 @@ parser and the store; the agent applies the same caps):
 | `partition` | disk, partition, size_bytes, type, mount_points, detail | 512 |
 | `topology` | topo_kind, name, uuid, members, detail | 512 |
 
-**Plugin-action to section mapping (H.4 writer obligation).** The section identifier on
+**Plugin-action to section mapping (agent-side writer obligation).** The section identifier on
 the wire is always the row-kind token, never the plugin action name: `chassis`->`chassis`,
 `baseboard`->`baseboard`, `machine_id`->`machine_id`, `swap`->`swap`, `volumes`->`volume`,
 `partitions`->`partition`, `topology`->`topology`. `partitions`->`partition` is the one
@@ -594,6 +595,13 @@ still reports it.
 section is persisted with level `constrained` and reason `server_cap:<cap>` (appended with
 `;` after a non-empty incoming reason), so a hash-only acknowledgement of an unchanged blob
 never presents a bounded projection as complete.
+
+**The machine ID ships only as a hash.** `machine_id_hash` must be lower-case hex (any
+length — the algorithm is open) or `-` when absent. Any other value, such as a raw
+GUID or `IOPlatformUUID`, is blanked and the `machine_id` section is persisted `constrained`
+with reason `server:machine_id_shape` (appended with `;` after a non-empty incoming reason),
+through the same disclosure path as the row caps. The limit is stated plainly: this rejects
+UUID/GUID shapes but cannot detect a raw hex id such as `/etc/machine-id`.
 
 **Hash, per version.** v1 keeps the positional 22-field join byte-for-byte (the v1
 cross-pin constants are untouched), so an old agent never loops on `need_full`. v2's
@@ -618,5 +626,5 @@ one REPEATABLE READ transaction so a replacement committing mid-read cannot mix 
 
 **Personal data.** `chassis_serial`, `board_serial` and the DIMM `serial` column join the
 serial/UUID/MAC behavioural-PII tier. The sections read has no REST/MCP/UI route yet; the
-later read-surface PR (H.7) must serve it behind the same fail-closed audit as the audited
-`inventory.device.ci` read.
+later REST read-surface change must serve it behind the same fail-closed audit as the
+audited `inventory.device.ci` read.

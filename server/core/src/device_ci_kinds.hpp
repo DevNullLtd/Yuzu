@@ -18,6 +18,8 @@
 
 #include <cstddef>
 #include <iterator>
+#include <optional>
+#include <string_view>
 
 namespace yuzu::server {
 
@@ -57,5 +59,15 @@ inline constexpr DeviceCiSectionDef kDeviceCiSections[] = {
 };
 
 inline constexpr std::size_t kDeviceCiSectionCount = std::size(kDeviceCiSections);
+
+/// The one registry lookup: index of a section / row-kind token in `kDeviceCiSections`, or
+/// nullopt when unregistered. Both the parser (status acceptance, row kinds) and the store
+/// (write and read trust boundary: only registered kinds reach a table) go through it.
+[[nodiscard]] constexpr std::optional<std::size_t> device_ci_section_index(std::string_view name) {
+    for (std::size_t i = 0; i < kDeviceCiSectionCount; ++i)
+        if (name == kDeviceCiSections[i].section)
+            return i;
+    return std::nullopt;
+}
 
 } // namespace yuzu::server

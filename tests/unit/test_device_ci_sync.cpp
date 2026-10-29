@@ -83,8 +83,8 @@ CiRecord dirty() {
 // registered section and one row per list kind, each 0x1F-joined and 0x1E-terminated. The
 // section id is the row-kind token ('partition', never the action name 'partitions').
 // Placeholder serials only; the DIMM serial is '-'. The literals here MUST be
-// byte-identical to the server twin; this is the layout H.4's device_ci_canonical_blob_v2
-// must reproduce.
+// byte-identical to the server twin; this is the layout the agent-side
+// device_ci_canonical_blob_v2 must reproduce.
 constexpr const char* kCrossPinHashV2 = "26037f18de08a8a21facd746eef7ec0a722479ee2009df9b6f14edea35ef0a62";
 
 std::string rec_bytes(const std::vector<std::string>& f) {

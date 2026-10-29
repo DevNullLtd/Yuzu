@@ -40,7 +40,9 @@ namespace yuzu::server {
 /// machine-id scalars), then kind-tagged list records and per-section `status`
 /// records. Every field is scrubbed + clamped like v1; an unregistered status section
 /// or unknown kind is ignored; list rows past a kind's cap are dropped and the section
-/// is marked `constrained` / `server_cap:<n>`. `blob_version` is 2 and `content_hash`
+/// is marked `constrained` / `server_cap:<n>`; a `machine_id_hash` that is not hex (or
+/// "-") is blanked and the `machine_id` section marked `constrained` /
+/// `server:machine_id_shape`. `blob_version` is 2 and `content_hash`
 /// is the sha256 of the received bytes (empty if the digest failed — the store then
 /// nacks). Any other first byte parses exactly as v1 (`blob_version` 1, no sections).
 DeviceCiRecord parse_device_ci_blob(const std::string& blob);

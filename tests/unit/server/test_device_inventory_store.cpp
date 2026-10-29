@@ -2,10 +2,11 @@
 // projection — canonical-hash cross-pin (clean + dirty) with the agent, blob parse
 // round-trip, hash-skip ingest (full/touched/need_full), single-row replace,
 // roster read, delete, server-receipt-time stamping (#1685), broken-pool degrade,
-// oversized-blob nack, and the shared ingest seam end-to-end. v2 blob (H.3): version-byte
-// parse, scalar-section statuses, list rows + caps + truncation disclosure, the per-version
-// hash, the child-table replace transaction, the REPEATABLE READ sections read, the
-// populated-v1 migration upgrade, and the mixed-version (old-agent) guarantee.
+// oversized-blob nack, and the shared ingest seam end-to-end. v2 blob: version-byte
+// parse, scalar-section statuses, list rows + caps + truncation disclosure, the machine-id
+// shape check, the per-version hash, the child-table replace transaction, the REPEATABLE READ
+// sections read, the populated-v1 migration upgrade, and the mixed-version (old-agent)
+// guarantee.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -25,10 +26,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <latch>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using yuzu::server::CiReadError;
@@ -122,7 +125,7 @@ std::string sample_blob() { return build_blob(clean_fields()); }
 // ── v2 fixtures ────────────────────────────────────────────────────────────────
 // kCrossPinHashV2: sha256 of the fixed v2 blob below. The agent twin
 // (tests/unit/test_device_ci_sync.cpp) assembles the SAME bytes from the SAME literal
-// fields — the forward contract H.4's device_ci_canonical_blob_v2 must reproduce.
+// fields — the forward contract the agent-side device_ci_canonical_blob_v2 must reproduce.
 // Placeholder serials only; the DIMM serial is '-'.
 constexpr const char* kCrossPinHashV2 = "26037f18de08a8a21facd746eef7ec0a722479ee2009df9b6f14edea35ef0a62";
 
@@ -235,6 +238,133 @@ long long count_rows(PgPool& pool, const std::string& sql) {
         return -1;
     return std::atoll(PQgetvalue(res.get(), 0, 0));
 }
+
+// One statement on a fresh lease: fault injection / hand-seeding on a per-test clone.
+void exec_stmt(PgPool& pool, const std::string& sql) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+    REQUIRE(res.status() == PGRES_COMMAND_OK);
+}
+
+// The server blob cap (ADR-0016 update "device_ci blob v2"): 1 MiB, fixed.
+constexpr std::size_t kBlobCap = 1024u * 1024;
+
+// Comma-separated registry column list -> names.
+std::vector<std::string> column_names(const char* columns) {
+    std::vector<std::string> out(1);
+    for (const char* p = columns; *p; ++p) {
+        if (*p == ',')
+            out.emplace_back();
+        else
+            out.back().push_back(*p);
+    }
+    return out;
+}
+
+// Every scalar, status and list column carries a value unique to (generation, field), so a
+// blanked, swapped or mis-ordered column cannot round-trip by accident. Two rows per list
+// kind; the swap section's level is cleared in generation A (a blank level must read back
+// blank). Built by hand, bypassing the parser, so the store is what is under test.
+DeviceCiRecord distinct_v2_record(const std::string& g) {
+    DeviceCiRecord r = parse_device_ci_blob(sample_blob());
+    r.blob_version = 2;
+    r.content_hash = "hash-" + g;
+    r.model = "model-" + g; // a v1 column changes too (the ON CONFLICT update path)
+    r.cpu_cores = g == "A" ? "4" : "6";
+    r.chassis_type = "chassis-type-" + g;
+    r.chassis_serial = "chassis-serial-" + g;
+    r.chassis_asset_tag = "chassis-asset-" + g;
+    r.chassis_source = "chassis-source-" + g;
+    r.board_vendor = "board-vendor-" + g;
+    r.board_product = "board-product-" + g;
+    r.board_serial = "board-serial-" + g;
+    r.board_source = "board-source-" + g;
+    r.machine_id_hash = "machine-id-hash-" + g;
+    r.machine_id_algorithm = "machine-id-algo-" + g;
+    r.machine_id_source = "machine-id-source-" + g;
+    for (const auto& d : yuzu::server::kDeviceCiSections) {
+        DeviceCiSection s;
+        s.kind = d.section;
+        s.level = "level-" + g + "-" + d.section;
+        s.reason = "reason-" + g + "-" + d.section;
+        if (d.table != nullptr) {
+            const auto cols = column_names(d.columns);
+            for (int row = 0; row < 2; ++row) {
+                std::vector<std::string> cells;
+                for (const auto& col : cols)
+                    cells.push_back(g + "-" + d.section + "-r" + std::to_string(row) + "-" + col);
+                s.rows.push_back(std::move(cells));
+            }
+        }
+        if (g == "A" && s.kind == "swap")
+            s.level.clear();
+        r.sections.push_back(std::move(s));
+    }
+    return r;
+}
+
+// Every persisted scalar of a record by name (the 22 frozen v1 fields, blob_version and the
+// 11 appended ones).
+std::vector<std::pair<const char*, std::string>> scalar_fields(const DeviceCiRecord& r) {
+    return {{"manufacturer", r.manufacturer},
+            {"model", r.model},
+            {"serial", r.serial},
+            {"system_uuid", r.system_uuid},
+            {"hostname", r.hostname},
+            {"domain", r.domain},
+            {"ou", r.ou},
+            {"bios_vendor", r.bios_vendor},
+            {"bios_version", r.bios_version},
+            {"bios_date", r.bios_date},
+            {"cpu_model", r.cpu_model},
+            {"cpu_cores", r.cpu_cores},
+            {"cpu_threads", r.cpu_threads},
+            {"ram_bytes", r.ram_bytes},
+            {"disks_summary", r.disks_summary},
+            {"primary_mac", r.primary_mac},
+            {"macs_summary", r.macs_summary},
+            {"nic_count", r.nic_count},
+            {"os_name", r.os_name},
+            {"os_version", r.os_version},
+            {"os_build", r.os_build},
+            {"arch", r.arch},
+            {"blob_version", std::to_string(r.blob_version)},
+            {"chassis_type", r.chassis_type},
+            {"chassis_serial", r.chassis_serial},
+            {"chassis_asset_tag", r.chassis_asset_tag},
+            {"chassis_source", r.chassis_source},
+            {"board_vendor", r.board_vendor},
+            {"board_product", r.board_product},
+            {"board_serial", r.board_serial},
+            {"board_source", r.board_source},
+            {"machine_id_hash", r.machine_id_hash},
+            {"machine_id_algorithm", r.machine_id_algorithm},
+            {"machine_id_source", r.machine_id_source}};
+}
+
+void check_scalars_equal(const DeviceCiRecord& got, const DeviceCiRecord& want) {
+    const auto g = scalar_fields(got);
+    const auto w = scalar_fields(want);
+    REQUIRE(g.size() == w.size());
+    for (std::size_t i = 0; i < w.size(); ++i) {
+        INFO("scalar " << w[i].first);
+        CHECK(g[i].second == w[i].second);
+    }
+}
+
+// Full equality, section by section, in order: kind, level, reason and every row cell.
+void check_sections_equal(const std::vector<DeviceCiSection>& got,
+                          const std::vector<DeviceCiSection>& want) {
+    REQUIRE(got.size() == want.size());
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        INFO("section " << want[i].kind);
+        CHECK(got[i].kind == want[i].kind);
+        CHECK(got[i].level == want[i].level);
+        CHECK(got[i].reason == want[i].reason);
+        CHECK(got[i].rows == want[i].rows);
+    }
+}
 } // namespace
 
 TEST_CASE("DeviceInventoryStore canonical_hash matches the cross-pin", "[device_ci][hash]") {
@@ -273,14 +403,19 @@ TEST_CASE("parse_device_ci_blob round-trips fields positionally", "[device_ci][p
         CHECK(p.model == "b");
     }
     SECTION("oversized blob → empty record (defence-in-depth)") {
-        DeviceCiRecord p = parse_device_ci_blob(std::string(70u * 1024, 'x'));
+        DeviceCiRecord p = parse_device_ci_blob(std::string(kBlobCap + 1, 'x'));
         CHECK(p.manufacturer.empty());
+    }
+    SECTION("a blob exactly at the 1 MiB cap still parses") {
+        DeviceCiRecord p = parse_device_ci_blob(std::string(kBlobCap, 'x'));
+        CHECK(p.manufacturer.size() == 1024); // one clamped field, not rejected
     }
 }
 
 TEST_CASE("v1 blobs parse unchanged: version 1, no sections, v1 pins hold (old agent / new server)",
           "[device_ci][parse][v2]") {
-    // R3: a v1 agent's hash must stay byte-identical so it never loops on need_full.
+    // Old agent / new server: a v1 agent's hash must stay byte-identical so it never loops
+    // on need_full.
     DeviceCiRecord r = parse_device_ci_blob(sample_blob());
     CHECK(r.blob_version == 1);
     CHECK(r.sections.empty());
@@ -465,6 +600,131 @@ TEST_CASE("v2 rows past the kind cap are dropped and disclosed as constrained",
     }
 }
 
+TEST_CASE("v2 row caps hold for every list kind (independent literal table)",
+          "[device_ci][parse][v2]") {
+    // Deliberately NOT read from the registry (the kCrossPinHash pattern): if a registry cap
+    // or width drifts, this table disagrees. cap+1 rows in -> exactly cap kept, disclosed.
+    struct Expect {
+        const char* kind;
+        int cap;
+        int width;
+    };
+    constexpr Expect kExpect[] = {{"cpu", 32, 7},      {"dimm", 64, 7},        {"disk", 128, 5},
+                                  {"swap", 16, 3},     {"volume", 256, 6},     {"partition", 512, 6},
+                                  {"topology", 512, 5}};
+    for (const auto& e : kExpect) {
+        INFO("kind " << e.kind);
+        std::vector<std::vector<std::string>> recs = {{"status", e.kind, "ok", ""}};
+        for (int i = 0; i < e.cap + 1; ++i) {
+            std::vector<std::string> row{e.kind};
+            for (int c = 0; c < e.width; ++c)
+                row.push_back("r" + std::to_string(i) + "c" + std::to_string(c));
+            recs.push_back(std::move(row));
+        }
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        const auto* sec = find_section(r, e.kind);
+        REQUIRE(sec != nullptr);
+        CHECK(static_cast<int>(sec->rows.size()) == e.cap);
+        CHECK(sec->level == "constrained");
+        CHECK(sec->reason == "server_cap:" + std::to_string(e.cap));
+        // The kept rows are the FIRST cap rows, full width, in order.
+        CHECK(sec->rows.front().size() == static_cast<std::size_t>(e.width));
+        CHECK(sec->rows.front()[0] == "r0c0");
+        CHECK(sec->rows.back()[0] == "r" + std::to_string(e.cap - 1) + "c0");
+    }
+}
+
+TEST_CASE("v2 blob above the previous 64 KiB bound parses in full (blob cap is 1 MiB)",
+          "[device_ci][parse][v2]") {
+    // A realistic near-cap host: every partition row at its cap with ~40-byte fields lands
+    // well past 64 KiB; the whole blob must still be accepted, rows intact.
+    std::vector<std::vector<std::string>> recs = {{"status", "partition", "ok", ""}};
+    for (int i = 0; i < 512; ++i)
+        recs.push_back({"partition", std::string(40, 'd'), std::to_string(i), std::string(40, 's'),
+                        std::string(40, 't'), std::string(40, 'm'), std::string(40, 'x')});
+    const std::string blob = build_blob_v2(v2_scalars(), recs);
+    REQUIRE(blob.size() > 64u * 1024);
+    REQUIRE(blob.size() <= kBlobCap);
+    DeviceCiRecord r = parse_device_ci_blob(blob);
+    const auto* part = find_section(r, "partition");
+    REQUIRE(part != nullptr);
+    CHECK(part->rows.size() == 512);
+    CHECK(part->level == "ok"); // at the cap exactly: untouched
+    CHECK(r.chassis_serial == "CHS-0001"); // the scalar record survived with it
+}
+
+TEST_CASE("v2 duplicate status records: the last wins, a server disclosure still beats it",
+          "[device_ci][parse][v2]") {
+    SECTION("two conflicting status records around list rows -> the later one") {
+        std::vector<std::vector<std::string>> recs = {
+            {"status", "cpu", "ok", ""},
+            {"cpu", "0", "M", "1", "1", "1", "s", "1"},
+            {"status", "cpu", "constrained", "linux:partial"},
+        };
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        const auto* c = find_section(r, "cpu");
+        REQUIRE(c != nullptr);
+        CHECK(c->level == "constrained");
+        CHECK(c->reason == "linux:partial");
+        CHECK(c->rows.size() == 1);
+    }
+    SECTION("a trailing incoming ok cannot hide a server cap disclosure") {
+        std::vector<std::vector<std::string>> recs;
+        for (int i = 0; i < 33; ++i)
+            recs.push_back({"cpu", std::to_string(i), "M", "1", "1", "1", "s", "1"});
+        recs.push_back({"status", "cpu", "ok", ""}); // arrives AFTER the rows
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        const auto* c = find_section(r, "cpu");
+        REQUIRE(c != nullptr);
+        CHECK(c->rows.size() == 32);
+        CHECK(c->level == "constrained");
+        CHECK(c->reason == "server_cap:32");
+    }
+}
+
+TEST_CASE("v2 machine_id_hash must be hex or '-': anything else is blanked and disclosed",
+          "[device_ci][parse][v2]") {
+    const auto parse_with_hash = [](const std::string& hash,
+                                    std::vector<std::vector<std::string>> recs = {}) {
+        auto f = v2_scalars();
+        f[30] = hash; // machine_id_hash
+        return parse_device_ci_blob(build_blob_v2(f, recs));
+    };
+    const std::string hex64(64, 'a');
+
+    SECTION("lower-case hex, '-' (absent) and empty pass untouched and add no section") {
+        for (const std::string& ok : {hex64, std::string("-"), std::string()}) {
+            DeviceCiRecord r = parse_with_hash(ok);
+            CHECK(r.machine_id_hash == ok);
+            CHECK(find_section(r, "machine_id") == nullptr);
+        }
+    }
+    SECTION("a GUID-shaped raw platform id is blanked and the section is constrained") {
+        DeviceCiRecord r = parse_with_hash("4C4C4544-0042-1234-5678-AABBCCDDEEFF");
+        CHECK(r.machine_id_hash.empty());
+        const auto* m = find_section(r, "machine_id");
+        REQUIRE(m != nullptr);
+        CHECK(m->level == "constrained");
+        CHECK(m->reason == "server:machine_id_shape");
+        CHECK(m->rows.empty());
+    }
+    SECTION("upper-case hex and a non-hex tail are blanked too") {
+        CHECK(parse_with_hash("ABCDEF0123").machine_id_hash.empty());
+        CHECK(parse_with_hash(hex64.substr(0, 63) + "g").machine_id_hash.empty());
+    }
+    SECTION("the disclosure survives, and composes with, the agent's own machine_id status") {
+        DeviceCiRecord ok = parse_with_hash("{GUID}", {{"status", "machine_id", "ok", ""}});
+        const auto* a = find_section(ok, "machine_id");
+        REQUIRE(a != nullptr);
+        CHECK(a->level == "constrained");
+        CHECK(a->reason == "server:machine_id_shape");
+        DeviceCiRecord why = parse_with_hash("{GUID}", {{"status", "machine_id", "ok", "x"}});
+        const auto* b = find_section(why, "machine_id");
+        REQUIRE(b != nullptr);
+        CHECK(b->reason == "x;server:machine_id_shape");
+    }
+}
+
 TEST_CASE("v2 fields get the same scrub + clamp as v1", "[device_ci][parse][v2]") {
     std::vector<std::vector<std::string>> recs = {
         {"status", "cpu", "ok", std::string("bad\xFF") + "reason"},
@@ -492,6 +752,26 @@ TEST_CASE("v2 fields get the same scrub + clamp as v1", "[device_ci][parse][v2]"
         REQUIRE(cc->rows.size() == 1);
         CHECK(cc->rows[0][1].size() == 1024);
         CHECK(cc->rows[0][1].size() % 2 == 0);
+    }
+    SECTION("1023 ASCII + a 2-byte codepoint straddling the cap drops the whole codepoint") {
+        // The 1024-byte cut lands inside 'ü' (0xC3 0xBC at offsets 1023/1024); a byte
+        // truncation would keep the lone lead byte (size 1024), a boundary-safe clamp 1023.
+        const std::string field = std::string(1023, 'a') + "\xC3\xBC";
+        std::vector<std::vector<std::string>> r2 = {{"cpu", "0", field, "1", "1", "1", "s", "1"}};
+        DeviceCiRecord p = parse_device_ci_blob(build_blob_v2(v2_scalars(), r2));
+        const auto* cc = find_section(p, "cpu");
+        REQUIRE(cc != nullptr);
+        REQUIRE(cc->rows.size() == 1);
+        CHECK(cc->rows[0][1] == std::string(1023, 'a'));
+    }
+    SECTION("an embedded NUL is stripped, a tab is kept") {
+        const std::string field("a\0b\tc", 5);
+        std::vector<std::vector<std::string>> r2 = {{"cpu", "0", field, "1", "1", "1", "s", "1"}};
+        DeviceCiRecord p = parse_device_ci_blob(build_blob_v2(v2_scalars(), r2));
+        const auto* cc = find_section(p, "cpu");
+        REQUIRE(cc != nullptr);
+        REQUIRE(cc->rows.size() == 1);
+        CHECK(cc->rows[0][1] == "ab\tc");
     }
 }
 
@@ -685,7 +965,7 @@ TEST_CASE("ingest_device_ci_report end-to-end (all wire shapes)", "[pg][device_c
     SECTION("oversized blob is dropped + nacked, nothing stored") {
         agentpb::InventoryReport rpt;
         (*rpt.mutable_content_hashes())["device_ci"] = "somehash";
-        (*rpt.mutable_plugin_data())["device_ci"] = std::string(70u * 1024, 'x'); // > 64 KiB
+        (*rpt.mutable_plugin_data())["device_ci"] = std::string(kBlobCap + 1, 'x'); // > 1 MiB
         agentpb::InventoryAck ack;
         yuzu::server::ingest_device_ci_report(store, "agent-big", rpt, ack, nullptr);
         REQUIRE(ack.need_full_size() == 1);
@@ -777,6 +1057,108 @@ TEST_CASE("v2 full ingest stores the scalars, every section and the rows", "[pg]
         REQUIRE(none.has_value());
         CHECK(none->empty());
     }
+    SECTION("an empty agent id on an open store is a precondition miss: empty, not degraded") {
+        auto blank = store.get_device_ci_sections("");
+        REQUIRE(blank.has_value());
+        CHECK(blank->empty());
+    }
+}
+
+TEST_CASE("v2 round trip: every scalar and every list column reads back exactly, then updates",
+          "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const DeviceCiRecord a = distinct_v2_record("A");
+    const DeviceCiRecord b = distinct_v2_record("B");
+    // The fixtures really exercise what this case claims to.
+    REQUIRE(a.sections.size() == 10);
+    REQUIRE(find_section(a, "swap")->level.empty());   // a cleared level is part of generation A
+    REQUIRE(!find_section(b, "swap")->level.empty());
+    REQUIRE(find_section(a, "dimm")->rows.size() == 2);
+
+    const auto put = [&](const DeviceCiRecord& r) {
+        return store.apply_device_ci("agent-rt", DeviceInventoryStore::canonical_hash(r),
+                                     std::optional<DeviceCiRecord>{r}, 1);
+    };
+    // Exact read-back: parent scalars (get_device_ci) + status/rows (get_device_ci_sections),
+    // registry order, every cell; and the stored hash is the record's own.
+    const auto verify = [&](const DeviceCiRecord& want) {
+        auto got = store.get_device_ci("agent-rt");
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        CHECK((**got).agent_id == "agent-rt");
+        check_scalars_equal(**got, want);
+        auto secs = store.get_device_ci_sections("agent-rt");
+        REQUIRE(secs.has_value());
+        check_sections_equal(*secs, want.sections);
+        CHECK(store.apply_device_ci("agent-rt", DeviceInventoryStore::canonical_hash(want),
+                                    std::nullopt, 2) == InventoryIngestOutcome::kTouched);
+    };
+
+    REQUIRE(put(a) == InventoryIngestOutcome::kStored);
+    verify(a);
+    auto first = store.get_device_ci("agent-rt");
+    REQUIRE(first.has_value());
+    REQUIRE(first->has_value());
+
+    // Second full payload, every value different: the ON CONFLICT update path replaces the
+    // parent scalars and the whole child set; first_seen survives.
+    REQUIRE(put(b) == InventoryIngestOutcome::kStored);
+    verify(b);
+    auto second = store.get_device_ci("agent-rt");
+    REQUIRE(second.has_value());
+    REQUIRE(second->has_value());
+    CHECK((**second).first_seen == (**first).first_seen);
+    CHECK((**second).last_seen >= (**first).last_seen);
+    // Nothing of generation A lingers in any child table.
+    CHECK(count_rows(pool, count_sql("device_inventory_store.device_ci_dimm WHERE agent_id = "
+                                     "'agent-rt' AND slot LIKE 'A-%'")) == 0);
+}
+
+TEST_CASE("get_device_ci_sections on an open store: broken child read degrades; "
+          "a missing or stray status row reconciles",
+          "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const DeviceCiRecord a = make_v2_record("A", 2, false); // one cpu section, two cpu rows
+    REQUIRE(store.apply_device_ci("agent-sr", DeviceInventoryStore::canonical_hash(a),
+                                  std::optional<DeviceCiRecord>{a}, 1) ==
+            InventoryIngestOutcome::kStored);
+
+    SECTION("a failed child SELECT is a degrade, never an empty success") {
+        exec_stmt(pool,
+                  "ALTER TABLE device_inventory_store.device_ci_cpu RENAME COLUMN idx TO idx_x");
+        auto s = store.get_device_ci_sections("agent-sr");
+        REQUIRE(!s.has_value());
+        CHECK(s.error() == CiReadError::kDegraded);
+    }
+    SECTION("rows whose status row is gone still surface, with a blank level") {
+        exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_section WHERE kind = 'cpu'");
+        auto s = store.get_device_ci_sections("agent-sr");
+        REQUIRE(s.has_value());
+        REQUIRE(s->size() == 1);
+        CHECK((*s)[0].kind == "cpu");
+        CHECK((*s)[0].level.empty());
+        CHECK((*s)[0].reason.empty());
+        CHECK((*s)[0].rows.size() == 2);
+    }
+    SECTION("a stored status for an unregistered kind is never surfaced") {
+        exec_stmt(pool, "INSERT INTO device_inventory_store.device_ci_section "
+                        "(agent_id, kind, level, reason) VALUES ('agent-sr', 'bogus', 'ok', 'x')");
+        auto s = store.get_device_ci_sections("agent-sr");
+        REQUIRE(s.has_value());
+        CHECK(s->size() == 1);
+        CHECK(find_section(*s, "bogus") == nullptr);
+        CHECK(find_section(*s, "cpu") != nullptr);
+    }
 }
 
 TEST_CASE("v2 full replace swaps the whole child set; v1 <-> v2 transitions", "[pg][device_ci][v2]") {
@@ -863,22 +1245,21 @@ TEST_CASE("v2 full replace rolls back whole after a child-insert failure", "[pg]
     REQUIRE(store.is_open());
 
     const DeviceCiRecord a = make_v2_record("A", 3, false);
-    const DeviceCiRecord b = make_v2_record("B", 1, true);
+    DeviceCiRecord b = make_v2_record("B", 1, true);
+    for (auto& sec : b.sections)
+        if (sec.kind == "dimm")
+            sec.rows[0][0] = "POISON"; // the one row the injected constraint refuses
     const std::string ha = DeviceInventoryStore::canonical_hash(a);
     const std::string hb = DeviceInventoryStore::canonical_hash(b);
     REQUIRE(store.apply_device_ci("agent-rb", ha, std::optional<DeviceCiRecord>{a}, 1) ==
             InventoryIngestOutcome::kStored);
 
-    {
-        // Fault injection on this per-test clone: a child table that no longer exists makes
-        // the second replace fail partway through the transaction.
-        auto lease = pool.acquire();
-        REQUIRE(lease);
-        auto drop = yuzu::server::pg::exec_params(
-            lease.get(), "DROP TABLE device_inventory_store.device_ci_dimm",
-            std::vector<std::string>{});
-        REQUIRE(drop.status() == PGRES_COMMAND_OK);
-    }
+    // Fault injection on this per-test clone. A CHECK that rejects only the NEW dimm row lets
+    // every earlier statement of the replace succeed first: the per-kind DELETE loop, the
+    // parent upsert, and the cpu INSERT (registry index 3, before dimm at 4). The failure
+    // therefore lands AFTER a successful child INSERT, which is what the rollback must undo.
+    exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci_dimm "
+                    "ADD CONSTRAINT yuzu_test_reject CHECK (slot <> 'POISON')");
 
     CHECK(store.apply_device_ci("agent-rb", hb, std::optional<DeviceCiRecord>{b}, 2) ==
           InventoryIngestOutcome::kError);
@@ -890,8 +1271,23 @@ TEST_CASE("v2 full replace rolls back whole after a child-insert failure", "[pg]
           InventoryIngestOutcome::kNeedFull);
     CHECK(count_rows(pool, count_sql("device_inventory_store.device_ci_cpu WHERE agent_id = 'agent-rb'")) ==
           3);
+    // ...and they are generation A's rows, not B's half-applied cpu insert.
+    CHECK(count_rows(pool, count_sql("device_inventory_store.device_ci_cpu WHERE agent_id = "
+                                     "'agent-rb' AND model = 'Model-A'")) == 3);
+    CHECK(count_rows(pool, count_sql("device_inventory_store.device_ci_dimm WHERE agent_id = 'agent-rb'")) ==
+          0);
     CHECK(count_rows(pool, count_sql("device_inventory_store.device_ci_section WHERE agent_id = 'agent-rb'")) ==
           1);
+    // The old parent scalars survived too (B's upsert was rolled back with the rest).
+    auto got = store.get_device_ci("agent-rb");
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    CHECK((**got).chassis_serial == "CHS-A");
+    auto secs = store.get_device_ci_sections("agent-rb");
+    REQUIRE(secs.has_value());
+    REQUIRE(secs->size() == 1);
+    CHECK((*secs)[0].reason == "A");
+    CHECK((*secs)[0].rows.size() == 3);
 }
 
 TEST_CASE("competing v2 replacements never expose a mixed generation", "[pg][device_ci][v2]") {
@@ -907,13 +1303,19 @@ TEST_CASE("competing v2 replacements never expose a mixed generation", "[pg][dev
             InventoryIngestOutcome::kStored);
 
     constexpr int kIterations = 50;
+    constexpr int kMaxReads = 10000; // bounds the reader if the writers are slow
     std::atomic<int> writer_failures{0};
     std::atomic<int> torn_reads{0};
     std::atomic<int> degraded_reads{0};
     std::atomic<int> writers_done{0};
     std::atomic<long long> reads{0};
+    // Start handshake (a blocking wait, no sleep or poll): the writers do not begin until the
+    // reader has completed one successful read, so `reads > 0` cannot depend on how the
+    // scheduler orders the three threads.
+    std::latch reader_primed{1};
 
     const auto writer = [&](const DeviceCiRecord& mine, const DeviceCiRecord& other) {
+        reader_primed.wait();
         for (int i = 0; i < kIterations; ++i) {
             const DeviceCiRecord& r = (i % 2 == 0) ? mine : other;
             if (store.apply_device_ci("agent-cc", "x", std::optional<DeviceCiRecord>{r}, 1) !=
@@ -922,27 +1324,36 @@ TEST_CASE("competing v2 replacements never expose a mixed generation", "[pg][dev
         }
         ++writers_done;
     };
-    std::thread w1(writer, std::cref(set_a), std::cref(set_b));
-    std::thread w2(writer, std::cref(set_b), std::cref(set_a));
     // Tripwire for a mixed-generation read (separate READ COMMITTED SELECTs could pair
     // generation X's status with generation Y's rows); not a proof of snapshot isolation.
+    // Started first. A degraded read ends the loop: degraded_reads == 0 is asserted below, so
+    // breaking loses nothing and stops a hot spin against a failing store.
     std::thread reader([&] {
-        while (writers_done.load() < 2) {
+        bool primed = false;
+        for (int n = 0; n < kMaxReads && writers_done.load() < 2; ++n) {
             auto s = store.get_device_ci_sections("agent-cc");
             if (!s.has_value()) {
                 ++degraded_reads;
-                continue;
+                break;
             }
             const auto* cpu = find_section(*s, "cpu");
             if (cpu == nullptr)
                 continue;
             ++reads;
+            if (!primed) {
+                primed = true;
+                reader_primed.count_down();
+            }
             const bool a_ok = cpu->reason == "A" && cpu->rows.size() == 3;
             const bool b_ok = cpu->reason == "B" && cpu->rows.size() == 1;
             if (!a_ok && !b_ok)
                 ++torn_reads;
         }
+        if (!primed)
+            reader_primed.count_down(); // never leave the writers blocked on a failed reader
     });
+    std::thread w1(writer, std::cref(set_a), std::cref(set_b));
+    std::thread w2(writer, std::cref(set_b), std::cref(set_a));
     w1.join();
     w2.join();
     reader.join();
@@ -1057,7 +1468,7 @@ TEST_CASE("ingest seam: a full v2 report stores, the next hash-only report does 
 
     SECTION("an oversized v2 blob is dropped and nacked") {
         std::string big(1, '\x02');
-        big += std::string(70u * 1024, 'x');
+        big += std::string(kBlobCap, 'x'); // version byte + cap bytes = cap + 1
         agentpb::InventoryReport rpt;
         (*rpt.mutable_content_hashes())["device_ci"] = "somehash";
         (*rpt.mutable_plugin_data())["device_ci"] = big;

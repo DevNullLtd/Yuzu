@@ -29,10 +29,15 @@ namespace pb = ::yuzu::agent::v1;
 
 constexpr const char* kSourceDeviceCi = "device_ci";
 
-// Caps — MUST match the agent source (sync_source_device_ci.cpp), comment-
-// coordinated, and sit below the 4 MiB gRPC receive ceiling. The CI blob is a
-// single small record; 64 KiB is a generous abuse bound.
-constexpr std::size_t kMaxBlobBytes = 64u * 1024;
+// Caps. The field cap MUST match the agent source (sync_source_device_ci.cpp),
+// comment-coordinated. The blob cap is the server-side bound and must stay >= the agent's:
+// the server accepts everything an agent can send. A v1 agent's own 64 KiB cap sits inside
+// it; the agent-side v2 writer adopts the same 1 MiB (ADR-0016 update "device_ci blob v2")
+// so a host near every row cap is never dropped whole. 1 MiB is a fixed value, not derived
+// from the registry caps: the clamp-bound worst case (1,620 rows x <=6 fields x 1024 B,
+// ~10 MB) exceeds the 4 MiB gRPC receive ceiling, while a realistic near-cap host is
+// ~160 KB, so 1 MiB leaves ~6x headroom and stays well under gRPC.
+constexpr std::size_t kMaxBlobBytes = 1024u * 1024;
 constexpr std::size_t kMaxFieldLen = 1024;
 // The number of positional fields in the canonical record (see DeviceCiRecord /
 // the agent's CiRecord). Extra fields in a (forward-version) blob are ignored;
@@ -113,6 +118,20 @@ void assign_base_fields(DeviceCiRecord& rec, std::string* f) {
     rec.arch = std::move(f[21]);
 }
 
+// The machine ID ships only as a hash (hex), or "-" when absent; the algorithm is open, so
+// the server enforces the shape but no length. Honest limit: this rejects UUID/GUID shapes
+// (dashes, braces, upper case) so a raw platform identifier is never stored under the hash
+// column, but it cannot detect a raw hex id such as /etc/machine-id (32 hex is also a valid
+// raw id, so a length floor would be theatre).
+bool machine_id_hash_shape_ok(std::string_view h) {
+    if (h.empty() || h == "-")
+        return true;
+    return std::ranges::all_of(
+        h, [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+}
+
+constexpr const char* kMachineIdShapeNote = "server:machine_id_shape";
+
 // v2: 0x02 scalar_record list_record* (see device_ci_kinds.hpp for the layout).
 DeviceCiRecord parse_v2(const std::string& blob) {
     DeviceCiRecord rec;
@@ -161,7 +180,7 @@ DeviceCiRecord parse_v2(const std::string& blob) {
 
     struct Acc {
         bool seen{false};
-        int dropped{0};
+        std::string note; ///< server-side disclosure (cap or shape), appended to the reason
         DeviceCiSection sec;
     };
     std::array<Acc, kDeviceCiSectionCount> acc;
@@ -170,13 +189,16 @@ DeviceCiRecord parse_v2(const std::string& blob) {
     for (const auto& d : kDeviceCiSections)
         max_rec_fields = std::max(max_rec_fields, static_cast<std::size_t>(d.n_fields) + 1);
 
-    const auto find_def = [](const std::string& name, bool list_only) -> int {
-        for (std::size_t i = 0; i < kDeviceCiSectionCount; ++i)
-            if (name == kDeviceCiSections[i].section &&
-                (!list_only || kDeviceCiSections[i].table != nullptr))
-                return static_cast<int>(i);
-        return -1;
-    };
+    // Trust boundary on the one hashed identifier: a machine ID that is not hex (or "-") is
+    // blanked and disclosed on the machine_id section through the same note path the row
+    // caps use, so a raw GUID/IOPlatformUUID is never stored as if it were a hash.
+    if (!machine_id_hash_shape_ok(rec.machine_id_hash)) {
+        rec.machine_id_hash.clear();
+        if (const auto mi = device_ci_section_index("machine_id")) {
+            acc[*mi].seen = true;
+            acc[*mi].note = kMachineIdShapeNote;
+        }
+    }
 
     while (auto r = next_record()) {
         if (r->empty())
@@ -185,23 +207,24 @@ DeviceCiRecord parse_v2(const std::string& blob) {
         if (f[0] == "status") {
             if (f.size() < 2)
                 continue;
-            const int i = find_def(f[1], /*list_only=*/false);
-            if (i < 0)
+            const auto i = device_ci_section_index(f[1]);
+            if (!i)
                 continue; // unregistered section
-            auto& a = acc[static_cast<std::size_t>(i)];
+            auto& a = acc[*i];
             a.seen = true;
             a.sec.level = f.size() > 2 ? std::move(f[2]) : std::string{};
             a.sec.reason = f.size() > 3 ? std::move(f[3]) : std::string{};
             continue;
         }
-        const int i = find_def(f[0], /*list_only=*/true);
-        if (i < 0)
+        const auto i = device_ci_section_index(f[0]);
+        if (!i || kDeviceCiSections[*i].table == nullptr)
             continue; // unknown kind, or a row for a status-only section
-        const auto& def = kDeviceCiSections[i];
-        auto& a = acc[static_cast<std::size_t>(i)];
+        const auto& def = kDeviceCiSections[*i];
+        auto& a = acc[*i];
         a.seen = true;
         if (static_cast<int>(a.sec.rows.size()) >= def.row_cap) {
-            ++a.dropped;
+            if (a.note.empty())
+                a.note = "server_cap:" + std::to_string(def.row_cap);
             continue;
         }
         std::vector<std::string> row(static_cast<std::size_t>(def.n_fields));
@@ -215,12 +238,12 @@ DeviceCiRecord parse_v2(const std::string& blob) {
         if (!a.seen)
             continue;
         a.sec.kind = kDeviceCiSections[i].section;
-        if (a.dropped > 0) {
-            // Disclose the server-side truncation on the persisted section so a hash-only
-            // ack of an unchanged blob never reads a bounded projection as complete.
-            const std::string cap = "server_cap:" + std::to_string(kDeviceCiSections[i].row_cap);
+        if (!a.note.empty()) {
+            // Disclose the server-side truncation / blanking on the persisted section so a
+            // hash-only ack of an unchanged blob never reads a bounded projection as complete.
+            // Applied after every incoming status record, so a trailing `ok` cannot hide it.
             a.sec.level = "constrained";
-            a.sec.reason = a.sec.reason.empty() ? cap : a.sec.reason + ";" + cap;
+            a.sec.reason = a.sec.reason.empty() ? a.note : a.sec.reason + ";" + a.note;
         }
         rec.sections.push_back(std::move(a.sec));
     }

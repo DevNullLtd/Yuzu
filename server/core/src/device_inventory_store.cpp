@@ -6,11 +6,11 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "sha256_hex.hpp"
 
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
-#include <openssl/evp.h>
 #include <spdlog/spdlog.h>
 
 #include <array>
@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
+#include <iterator>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -103,27 +104,16 @@ std::string bigint_param(const std::string& s) {
     return std::to_string(v);
 }
 
-std::string sha256_hex(const std::string& in) {
-    unsigned char md[EVP_MAX_MD_SIZE];
-    unsigned int len = 0;
-    if (EVP_Digest(in.data(), in.size(), md, &len, EVP_sha256(), nullptr) != 1)
-        return {};
-    static const char* kHex = "0123456789abcdef";
-    std::string out;
-    out.reserve(static_cast<std::size_t>(len) * 2);
-    for (unsigned int i = 0; i < len; ++i) {
-        out.push_back(kHex[md[i] >> 4]);
-        out.push_back(kHex[md[i] & 0x0f]);
-    }
-    return out;
-}
-
 // The 11 scalars appended to device_ci at wire positions 22-32 (device_ci_kinds.hpp).
 constexpr const char* kV2ScalarCols[] = {
     "chassis_type",   "chassis_serial", "chassis_asset_tag", "chassis_source",
     "board_vendor",   "board_product",  "board_serial",      "board_source",
     "machine_id_hash", "machine_id_algorithm", "machine_id_source",
 };
+// Ties the migration DDL to the wire: positions 0-21 are the frozen v1 fields, the rest are
+// the appended scalars named here.
+static_assert(std::size(kV2ScalarCols) == kDeviceCiScalarFields - 22,
+              "kV2ScalarCols must name every appended scalar position (22..kDeviceCiScalarFields-1)");
 
 // Split a kDeviceCiSections column list ("a,b,c") into names.
 std::vector<std::string> split_columns(std::string_view columns) {
@@ -131,15 +121,6 @@ std::vector<std::string> split_columns(std::string_view columns) {
     for (const auto part : std::views::split(columns, ','))
         out.emplace_back(part.begin(), part.end());
     return out;
-}
-
-// Registry index of a section/kind token, or kDeviceCiSectionCount when unregistered
-// (the trust-boundary test: only registered kinds reach a table, on write or on read).
-std::size_t section_index(std::string_view kind) {
-    std::size_t i = 0;
-    while (i < kDeviceCiSectionCount && kind != kDeviceCiSections[i].section)
-        ++i;
-    return i;
 }
 
 // Migration v2 (additive, online-safe: constant defaults make the ALTER metadata-only,
@@ -297,7 +278,7 @@ std::string DeviceInventoryStore::canonical_hash(const DeviceCiRecord& rec) {
         first = false;
     }
     canon += '\x1e';
-    return sha256_hex(canon);
+    return sha256_hex(canon).value_or("");
 }
 
 DeviceInventoryStore::DeviceInventoryStore(pg::PgPool& pool) : pool_(pool) {
@@ -460,10 +441,10 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
         // collected for the single device_ci_section INSERT after the loop.
         std::vector<std::string_view> kinds, levels, reasons;
         for (const auto& sec : r.sections) {
-            const std::size_t si = section_index(sec.kind);
-            if (si == kDeviceCiSectionCount)
+            const auto si = device_ci_section_index(sec.kind);
+            if (!si)
                 continue;
-            const auto& def = kDeviceCiSections[si];
+            const auto& def = kDeviceCiSections[*si];
             kinds.emplace_back(sec.kind);
             levels.emplace_back(sec.level);
             reasons.emplace_back(sec.reason);
@@ -638,12 +619,12 @@ DeviceInventoryStore::get_device_ci_sections(std::string_view agent_id) {
         if (sres.status() != PGRES_TUPLES_OK)
             return false;
         for (int i = 0; i < PQntuples(sres.get()); ++i) {
-            const std::size_t si = section_index(PQgetvalue(sres.get(), i, 0));
-            if (si == kDeviceCiSectionCount)
+            const auto si = device_ci_section_index(PQgetvalue(sres.get(), i, 0));
+            if (!si)
                 continue; // unregistered kind: never surfaced
-            sections[si].kind = kDeviceCiSections[si].section;
-            sections[si].level = PQgetvalue(sres.get(), i, 1);
-            sections[si].reason = PQgetvalue(sres.get(), i, 2);
+            sections[*si].kind = kDeviceCiSections[*si].section;
+            sections[*si].level = PQgetvalue(sres.get(), i, 1);
+            sections[*si].reason = PQgetvalue(sres.get(), i, 2);
         }
         // Registry order (deterministic). A kind with rows but no status row still surfaces,
         // with a blank level.
