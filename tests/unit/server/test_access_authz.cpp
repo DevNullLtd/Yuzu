@@ -1,13 +1,19 @@
 /**
  * @file test_access_authz.cpp
  * @brief [pg] persona matrix for the Users and roles fragments, driven through the REAL AuthRoutes
- *        gates (require_auth / probe_admin / require_permission) over a real RbacStore and
- *        AuditStore. test_access_routes.cpp stubs the gates; this file proves the production
- *        wiring admits and refuses the right callers, with RBAC off (the shipped default) and on.
+ *        gates (require_auth / probe_admin / require_permission) over a real RbacStore, AuthDB
+ *        (on the same database, as production) and AuditStore. test_access_routes.cpp stubs the
+ *        gates and the hint; this file proves the production wiring admits and refuses the right
+ *        callers, with RBAC off (the shipped default) and on.
  *
  * Personas (cookie sessions): Administrator and plain user with RBAC off; with RBAC on a user
- * holding Viewer, one holding Reviewer, one holding nothing. For each: which fragments answer,
- * whether the store behind a refused fragment was ever read, and the audit rows written.
+ * holding Viewer, one holding Reviewer, one holding nothing, an account administrator with and
+ * without the Administrator grant, a base user holding the grant, a principal holding the grant
+ * with no auth.users row, a JIT-elevated user, and an unanswerable authority check. For each:
+ * which fragments answer, whether the store behind a refused fragment was ever read, the audit
+ * rows written, and (#6034) whether Assign role and the enforcement switch are drawn live,
+ * disabled with a reason, or not at all. The Rig binds the same `rbac_admin_hint` symbol
+ * server.cpp binds, never a stub; the hint-equals-route equality lives in test_rbac_admin_hint.cpp.
  *
  * Needs YUZU_TEST_POSTGRES_DSN (SKIPs without it); run serially.
  */
@@ -254,7 +260,7 @@ TEST_CASE("access authz: RBAC on, a user holding only Viewer reads the catalogue
     CHECK(r.get(kUsers, c)->status == 403); // the account list is admin-only whatever the grants
     CHECK(r.user_reads == 0);
     CHECK(r.route_audits.empty());
-    // No Assign or enforcement control for anyone who is not an account admin.
+    // No live Assign or enforcement control without a durable Administrator grant.
     CHECK_THAT(r.get(kEnforce, c)->body, !ContainsSubstring("data-act=\"enforce\""));
 }
 
