@@ -15,6 +15,10 @@
  * here for a human cookie only. Difference two (harmless): an engine session with the store
  * absent gets 403 from the fragment, whose engine-session belt runs after the permission gate
  * and before the store note, but 503 from the twin, whose store check precedes its session read.
+ * Difference three (owner ruling, 2026-10-29): the panel refuses an MCP-tier token (403, audited
+ * as `mcp_session_denied`, like the Access tokens panel and the pre-#5882 administrator gate,
+ * #520) where the twin admits an administrator's MCP token on its creator's authority.
+ * `expect_same`'s `mcp_panel_refuses` argument names it at every call site that meets it.
  *
  * Personas, each with RBAC off and on: an account administrator WITHOUT the grant; a
  * non-administrator WITH EnginePrincipal:Read (Viewer); an account administrator holding the
@@ -50,7 +54,13 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <libpq-fe.h>
+
+#include "pg/pg_exec.hpp"
+#include "pg/pg_raii.hpp"
+
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <shared_mutex>
 #include <stdexcept>
@@ -85,6 +95,11 @@ int64_t now_epoch() {
 constexpr const char* kFragment = "/fragments/settings/engine-principals";
 constexpr const char* kTwin = "/api/v1/engine-principals";
 constexpr const char* kSlug = "engine:epanel"; // seeded; its slug is the leak marker in the body
+constexpr const char* kRevokedId = "engine:revoked1";
+// The three rows of a revoked principal's history (Rig::seed_revoked_principal).
+constexpr const char* kRevokeMarker = "credentials_revoked=1; REVOKE-DETAIL-MARKER";
+constexpr const char* kFailedRevokeText = "FAILED-REVOKE-STORE-ERROR connection refused";
+constexpr const char* kLaterRetryText = "LATER-RETRY-credentials_revoked=0";
 
 bool refused(int status) { return status == 401 || status == 403; }
 
@@ -103,7 +118,9 @@ struct Rig {
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider;
     std::unique_ptr<AuthRoutes> ar;
-    std::vector<std::string> fragment_audits; // "action/result/detail" from the panel's own belt
+    std::vector<std::string> fragment_audits; // "action/result/detail" from the panel's own rows
+    std::vector<std::string> twin_audits;     // the same shape, from the REST twin's audit_fn
+    bool drop_audit_writes{false};            // both hooks report a dropped row (set-and-proceed)
     SettingsRoutes settings;
     RestApiV1 api;
     yuzu::server::test::TestRouteSink sink; // LAST: handlers capture `this`
@@ -111,7 +128,8 @@ struct Rig {
     /// `wire_engine_store == false` models a deployment whose engine-principal store is absent.
     explicit Rig(const std::string& dsn, bool wire_engine_store = true)
         : pool{{.conninfo = dsn, .size = 4}}, rbac{pool}, engine_store{pool},
-          audit_pool{{.conninfo = dsn, .size = 2}}, audit_store{audit_pool} {
+          audit_pool{{.conninfo = dsn, .size = 2, .statement_timeout_ms = 500}},
+          audit_store{audit_pool} {
         REQUIRE(pool.valid());
         REQUIRE(rbac.is_open());
         REQUIRE(engine_store.is_open());
@@ -141,16 +159,11 @@ struct Rig {
         };
         auto perm_fn = [this](const httplib::Request& q, httplib::Response& r, const std::string& t,
                               const std::string& o) { return ar->require_permission(q, r, t, o); };
-        auto audit_fn = [this](const httplib::Request& q, const std::string& action,
-                               const std::string& result, const std::string& target_type,
-                               const std::string& target_id, const std::string& detail) -> bool {
-            (void)q;
-            (void)action;
-            (void)result;
-            (void)target_type;
-            (void)target_id;
-            (void)detail;
-            return true;
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string&, const std::string&,
+                               const std::string& detail) -> bool {
+            twin_audits.push_back(action + "/" + result + "/" + detail);
+            return !drop_audit_writes;
         };
         if (wire_engine_store)
             settings.set_engine_principal_store(&engine_store);
@@ -166,7 +179,7 @@ struct Rig {
                                           const std::string& result, const std::string&,
                                           const std::string&, const std::string& detail) -> bool {
             fragment_audits.push_back(action + "/" + result + "/" + detail);
-            return true;
+            return !drop_audit_writes;
         };
         settings.register_routes(sink, auth_fn, admin_fn, perm_fn, settings_audit, cfg, auth_mgr,
                                  auto_approve, api_tokens.get(), &*mgmt_bundle,
@@ -256,9 +269,54 @@ struct Rig {
         return n;
     }
 
+    /// A custom role holding EnginePrincipal:Read, plus AuditLog:Read when `with_audit_read`.
+    void custom_reader_role(const char* role, bool with_audit_read) {
+        REQUIRE(rbac.create_role({role, "reads engine principals", false, 0}).has_value());
+        REQUIRE(rbac.set_permission({role, "EnginePrincipal", "Read", "allow"}).has_value());
+        if (with_audit_read)
+            REQUIRE(rbac.set_permission({role, "AuditLog", "Read", "allow"}).has_value());
+    }
+    void account(const char* user, auth::Role role) {
+        REQUIRE(auth_mgr.upsert_user(user, "correct-horse-battery-staple", role));
+    }
+    /// A revoked principal whose revoke history is: the ORIGINAL committed revoke (carrying
+    /// `kRevokeMarker`), then a FAILED retry whose detail is raw store text, then a LATER
+    /// successful retry (`credentials_revoked=0`). Only the first is the revocation's record.
+    void seed_revoked_principal(const char* id) {
+        REQUIRE(engine_store.create("Revoked Engine", "root", "j", "internal", "admin", id)
+                    .has_value());
+        REQUIRE(engine_store.revoke(id).has_value());
+        const auto row = [&](int64_t age, const char* result, const char* detail) {
+            AuditEvent e;
+            e.timestamp = now_epoch() - age;
+            e.principal = "root";
+            e.action = "engine_principal.revoke";
+            e.target_type = "EnginePrincipal";
+            e.target_id = id;
+            e.result = result;
+            e.detail = detail;
+            REQUIRE(audit_store.log(e));
+        };
+        row(300, "success", kRevokeMarker);
+        row(200, "failure", kFailedRevokeText);
+        row(100, "success", kLaterRetryText);
+    }
+    void clear_audits() {
+        fragment_audits.clear();
+        twin_audits.clear();
+    }
+    std::size_t roster_size() {
+        auto all = engine_store.list_all_checked();
+        REQUIRE(all.has_value());
+        return all->size();
+    }
+
     /// Drive both surfaces with the same credential and assert they agree with `expect_admit`.
-    /// `how`: 'c' cookie, 'b' bearer, 'a' anonymous.
-    void expect_same(char how, const std::string& cred, bool expect_admit) {
+    /// `how`: 'c' cookie, 'b' bearer, 'a' anonymous. `mcp_panel_refuses` names difference three
+    /// (header): the credential is an MCP-tier bearer the twin ADMITS (`expect_admit`) and the
+    /// panel REFUSES with its own 403, so only the twin is held to the admit expectation.
+    void expect_same(char how, const std::string& cred, bool expect_admit,
+                     bool mcp_panel_refuses = false) {
         auto call = [&](const char* path) {
             return how == 'c'   ? cookie_get(path, cred)
                    : how == 'b' ? bearer_get(path, cred)
@@ -269,9 +327,15 @@ struct Rig {
         REQUIRE(frag);
         REQUIRE(twin);
         INFO("fragment=" << frag->status << " twin=" << twin->status << " twin body: " << twin->body);
-        CHECK(refused(frag->status) == !expect_admit);
+        CHECK(refused(frag->status) == (!expect_admit || mcp_panel_refuses));
         CHECK(refused(twin->status) == !expect_admit);
-        if (expect_admit) {
+        if (expect_admit && mcp_panel_refuses) {
+            CHECK(how == 'b'); // only a bearer carries an MCP tier
+            CHECK(frag->status == 403);
+            CHECK(twin->status == 200);
+            CHECK_THAT(twin->body, ContainsSubstring(kSlug));
+            CHECK_THAT(frag->body, !ContainsSubstring(kSlug));
+        } else if (expect_admit) {
             CHECK(frag->status == 200);
             CHECK(twin->status == 200);
             CHECK_THAT(frag->body, ContainsSubstring(kSlug));
@@ -307,12 +371,12 @@ TEST_CASE("engine panel authz, RBAC off: a plain user, even one holding Viewer, 
     r.expect_same('c', c, false);
 }
 
-TEST_CASE("engine panel authz, RBAC off: an administrator's MCP-tier bearer is admitted by both "
-          "(twin parity), a non-administrator's is not",
+TEST_CASE("engine panel authz, RBAC off: an administrator's MCP-tier bearer is admitted by the twin "
+          "and refused by the panel (#520), a non-administrator's is refused by both",
           "[pg][settings][engine_principal][authz][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
     Rig r{db_.dsn()};
-    r.expect_same('b', r.token("root-mcp", "root"), true);
+    r.expect_same('b', r.token("root-mcp", "root"), true, /*mcp_panel_refuses=*/true);
     r.expect_same('b', r.token("alice-mcp", "alice"), false);
 }
 
@@ -344,7 +408,7 @@ TEST_CASE("engine panel authz, both regimes: a JIT-elevated user is admitted by 
 }
 
 TEST_CASE("engine panel authz, both regimes: a service-scoped token is refused by both, even one "
-          "minted by an administrator",
+          "minted by an administrator (its unscoped twin shows the MCP-tier difference)",
           "[pg][settings][engine_principal][authz][security]") {
     for (const bool rbac_enabled : {false, true}) {
         INFO("rbac_on=" << rbac_enabled);
@@ -355,7 +419,7 @@ TEST_CASE("engine panel authz, both regimes: a service-scoped token is refused b
             r.rbac_on();
         // The unscoped twin of the same creator is admitted, so the refusal below is the
         // service scope (kServiceScopeGlobalSafe is empty), not a missing grant or a dead token.
-        r.expect_same('b', r.token("root-unscoped", "root"), true);
+        r.expect_same('b', r.token("root-unscoped", "root"), true, /*mcp_panel_refuses=*/true);
         auto raw = r.api_tokens->create_token("root-scoped", "root", now_epoch() + 3600,
                                               "payments", "readonly");
         REQUIRE(raw.has_value());
@@ -395,13 +459,14 @@ TEST_CASE("engine panel authz, RBAC on: an administrator holding the Administrat
     r.expect_same('c', r.cookie("alice", auth::Role::user), false);
 }
 
-TEST_CASE("engine panel authz, RBAC on: an MCP-tier bearer follows its creator's grant on both",
+TEST_CASE("engine panel authz, RBAC on: an MCP-tier bearer follows its creator's grant on the twin "
+          "and is refused by the panel whatever the grant (#520)",
           "[pg][settings][engine_principal][authz][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
     Rig r{db_.dsn()};
     r.grant("root", "Administrator");
     r.rbac_on();
-    r.expect_same('b', r.token("root-mcp", "root"), true);
+    r.expect_same('b', r.token("root-mcp", "root"), true, /*mcp_panel_refuses=*/true);
     r.expect_same('b', r.token("alice-mcp", "alice"), false);
 }
 
@@ -511,6 +576,265 @@ TEST_CASE("engine panel authz: an engine session that DOES hold EnginePrincipal:
     CHECK_THAT(frag->body, !ContainsSubstring(kSlug));
     REQUIRE(r.fragment_audits.size() == 1);
     CHECK(r.fragment_audits[0] == "engine_principal.list/denied/engine_session_denied");
+}
+
+// ---- revoke detail (sec-1) and the success audit row (sec-2): the CH-3 matrix ---------------
+
+namespace {
+
+/// Holds `LOCK TABLE audit_store.audit_events` from a raw connection until released (or until
+/// the guard dies, so a failed REQUIRE still lets the clone drop).
+class AuditTableLock {
+public:
+    explicit AuditTableLock(const std::string& dsn) : conn_{PQconnectdb(dsn.c_str())} {
+        REQUIRE(PQstatus(conn_.get()) == CONNECTION_OK);
+        REQUIRE(pg::exec_params(conn_.get(), "BEGIN", std::vector<std::string>{}).status() ==
+                PGRES_COMMAND_OK);
+        REQUIRE(pg::exec_params(conn_.get(),
+                                "LOCK TABLE audit_store.audit_events IN ACCESS EXCLUSIVE MODE",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        held_ = true;
+    }
+    ~AuditTableLock() { release(); }
+    AuditTableLock(const AuditTableLock&) = delete;
+    AuditTableLock& operator=(const AuditTableLock&) = delete;
+    void release() {
+        if (!held_)
+            return;
+        held_ = false;
+        (void)pg::exec_params(conn_.get(), "ROLLBACK", std::vector<std::string>{});
+    }
+
+private:
+    pg::PgConn conn_;
+    bool held_{false};
+};
+
+} // namespace
+
+TEST_CASE("engine panel audit: the revoke Detail shows only to a caller who also passes "
+          "AuditLog:Read, and is the ORIGINAL committed revoke, never a failed or later row",
+          "[pg][settings][engine_principal][authz][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
+    Rig r{db_.dsn()};
+    r.seed_revoked_principal(kRevokedId);
+    r.custom_reader_role("EngineReader", /*with_audit_read=*/false);
+    r.custom_reader_role("EngineAuditReader", /*with_audit_read=*/true);
+    r.account("carol", auth::Role::user);
+    r.account("dave", auth::Role::user);
+    r.grant("carol", "EngineReader");
+    r.grant("dave", "EngineAuditReader");
+    r.rbac_on();
+
+    // (b) EnginePrincipal:Read + AuditLog:Read: the committed revoke's detail, nothing else.
+    const auto b = r.cookie_get(kFragment, r.cookie("dave", auth::Role::user));
+    REQUIRE(b);
+    REQUIRE(b->status == 200);
+    CHECK_THAT(b->body, ContainsSubstring(kRevokedId));
+    CHECK_THAT(b->body, ContainsSubstring("REVOKE-DETAIL-MARKER"));
+    CHECK_THAT(b->body, !ContainsSubstring("FAILED-REVOKE-STORE-ERROR"));
+    CHECK_THAT(b->body, !ContainsSubstring("LATER-RETRY"));
+
+    // (a) EnginePrincipal:Read only: the panel is admitted (it is the twin's gate) but the
+    // audit trail's text is not hers to read.
+    const auto before = r.denied_rows("");
+    const auto a = r.cookie_get(kFragment, r.cookie("carol", auth::Role::user));
+    REQUIRE(a);
+    REQUIRE(a->status == 200);
+    CHECK_THAT(a->body, ContainsSubstring(kRevokedId));
+    CHECK_THAT(a->body, !ContainsSubstring("REVOKE-DETAIL-MARKER"));
+    CHECK_THAT(a->body, !ContainsSubstring("FAILED-REVOKE-STORE-ERROR"));
+    CHECK_THAT(a->body, !ContainsSubstring("LATER-RETRY"));
+    // The AuditLog:Read check is the QUIET probe: a cookie session without it leaves no row.
+    CHECK(r.denied_rows("") == before);
+}
+
+TEST_CASE("engine panel audit: with RBAC off the administrator, who holds both reads by the "
+          "topology floor, sees the committed revoke detail",
+          "[pg][settings][engine_principal][authz][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
+    Rig r{db_.dsn()};
+    r.seed_revoked_principal(kRevokedId);
+    const auto resp = r.cookie_get(kFragment, r.cookie("root", auth::Role::admin));
+    REQUIRE(resp);
+    REQUIRE(resp->status == 200);
+    CHECK_THAT(resp->body, ContainsSubstring("REVOKE-DETAIL-MARKER"));
+    CHECK_THAT(resp->body, !ContainsSubstring("FAILED-REVOKE-STORE-ERROR"));
+    CHECK_THAT(resp->body, !ContainsSubstring("LATER-RETRY"));
+}
+
+TEST_CASE("engine panel audit: per caller class the panel leaves the evidence the twin leaves, "
+          "one engine_principal.list row per admitted view",
+          "[pg][settings][engine_principal][authz][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
+    Rig r{db_.dsn()};
+    r.seed_revoked_principal(kRevokedId);
+    REQUIRE(r.engine_store.create("No Grant", "root", "j", "internal", "admin", "engine:nogrant")
+                .has_value());
+    r.custom_reader_role("EngineReader", /*with_audit_read=*/false);
+    r.custom_reader_role("EngineAuditReader", /*with_audit_read=*/true);
+    r.custom_reader_role("EngineLister", /*with_audit_read=*/false);
+    r.account("carol", auth::Role::user);
+    r.account("dave", auth::Role::user);
+    r.account("erin", auth::Role::admin); // an account administrator holding NO grant
+    r.grant("root", "Administrator");
+    r.grant("carol", "EngineReader");
+    r.grant("dave", "EngineAuditReader");
+    REQUIRE(r.rbac.assign_role({"engine", kSlug, "EngineLister"}).has_value());
+    r.rbac_on();
+    const std::string success_row =
+        "engine_principal.list/success/count=" + std::to_string(r.roster_size());
+
+    constexpr int kViews = 50;
+    const auto admitted_cookie = [&](const char* label, const std::string& cred) {
+        INFO("caller " << label);
+        int frag_ok = 0, twin_ok = 0, rows_equal = 0;
+        for (int i = 0; i < kViews; ++i) {
+            r.clear_audits();
+            const auto frag = r.cookie_get(kFragment, cred);
+            const auto twin = r.cookie_get(kTwin, cred);
+            REQUIRE(frag);
+            REQUIRE(twin);
+            frag_ok += (frag->status == 200 && r.fragment_audits ==
+                                                   std::vector<std::string>{success_row});
+            twin_ok += (twin->status == 200 && r.twin_audits ==
+                                                   std::vector<std::string>{success_row});
+            rows_equal += (r.fragment_audits == r.twin_audits);
+        }
+        CHECK(frag_ok == kViews);  // exactly one success row per view, with the twin's detail
+        CHECK(twin_ok == kViews);
+        CHECK(rows_equal == kViews);
+    };
+    // (a) EnginePrincipal:Read only, (b) that plus AuditLog:Read.
+    admitted_cookie("(a) EnginePrincipal:Read only", r.cookie("carol", auth::Role::user));
+    admitted_cookie("(b) EnginePrincipal:Read + AuditLog:Read", r.cookie("dave", auth::Role::user));
+    admitted_cookie("(g) durable Administrator", r.cookie("root", auth::Role::admin));
+
+    {   // (c) an administrator's MCP-tier bearer: the twin admits and audits, the panel refuses
+        // and audits the refusal (difference three).
+        const auto raw = r.token("root-mcp", "root");
+        r.clear_audits();
+        const auto frag = r.bearer_get(kFragment, raw);
+        const auto twin = r.bearer_get(kTwin, raw);
+        REQUIRE(frag);
+        REQUIRE(twin);
+        CHECK(frag->status == 403);
+        CHECK_THAT(frag->body, !ContainsSubstring(kSlug));
+        CHECK(r.fragment_audits ==
+              std::vector<std::string>{"engine_principal.list/denied/mcp_session_denied"});
+        CHECK(twin->status == 200);
+        CHECK(r.twin_audits == std::vector<std::string>{success_row});
+    }
+    {   // (d) an account administrator WITHOUT the grant, cookie session: the panel's quiet probe
+        // leaves NO row (it auto-loads, nobody attempted anything); the twin's loud gate does.
+        // Asserted so that a later change is deliberate.
+        const auto erin = r.cookie("erin", auth::Role::admin);
+        const auto denied_before = r.denied_rows("auth.permission_required");
+        r.clear_audits();
+        const auto frag = r.cookie_get(kFragment, erin);
+        REQUIRE(frag);
+        CHECK(frag->status == 403);
+        CHECK(r.fragment_audits.empty());
+        CHECK(r.denied_rows("auth.permission_required") == denied_before);
+        const auto twin = r.cookie_get(kTwin, erin);
+        REQUIRE(twin);
+        CHECK(twin->status == 403);
+        CHECK(r.twin_audits.empty());
+        CHECK(r.denied_rows("auth.permission_required") == denied_before + 1);
+    }
+    {   // (e) an engine session that HOLDS the read: one denied row on each surface, the same one.
+        const auto raw = r.token("engine-bearer", kSlug, "readonly", "engine");
+        r.clear_audits();
+        const auto frag = r.bearer_get(kFragment, raw);
+        const auto twin = r.bearer_get(kTwin, raw);
+        REQUIRE(frag);
+        REQUIRE(twin);
+        CHECK(frag->status == 403);
+        CHECK(twin->status == 403);
+        CHECK(r.fragment_audits ==
+              std::vector<std::string>{"engine_principal.list/denied/engine_session_denied"});
+        CHECK(r.twin_audits == r.fragment_audits);
+    }
+    {   // (f) an engine session WITHOUT the read: the permission gate refuses, loudly on both
+        // (an engine caller is never given the quiet treatment); no panel row, no twin row.
+        const auto raw = r.token("nogrant-bearer", "engine:nogrant", "readonly", "engine");
+        const auto denied_before = r.denied_rows("auth.permission_required");
+        r.clear_audits();
+        const auto frag = r.bearer_get(kFragment, raw);
+        const auto twin = r.bearer_get(kTwin, raw);
+        REQUIRE(frag);
+        REQUIRE(twin);
+        CHECK(frag->status == 403);
+        CHECK(twin->status == 403);
+        CHECK(r.fragment_audits.empty());
+        CHECK(r.twin_audits.empty());
+        CHECK(r.denied_rows("auth.permission_required") == denied_before + 2);
+    }
+}
+
+TEST_CASE("engine panel audit: the in-page 'store unavailable' note is not a successful read and "
+          "writes no success row",
+          "[pg][settings][engine_principal][authz][audit][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
+    Rig r{db_.dsn(), /*wire_engine_store=*/false};
+    const auto frag = r.cookie_get(kFragment, r.cookie("root", auth::Role::admin));
+    REQUIRE(frag);
+    CHECK(frag->status == 200);
+    CHECK_THAT(frag->body, ContainsSubstring("Engine Principals store unavailable"));
+    CHECK(r.fragment_audits.empty());
+}
+
+TEST_CASE("engine panel audit: a dropped audit row and a locked audit table degrade the panel, "
+          "they do not break it, and never widen what a caller without AuditLog:Read sees",
+          "[pg][settings][engine_principal][authz][audit][chaos]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
+    Rig r{db_.dsn()};
+    r.seed_revoked_principal(kRevokedId);
+    r.custom_reader_role("EngineReader", /*with_audit_read=*/false);
+    r.custom_reader_role("EngineAuditReader", /*with_audit_read=*/true);
+    r.account("carol", auth::Role::user);
+    r.account("dave", auth::Role::user);
+    r.grant("carol", "EngineReader");
+    r.grant("dave", "EngineAuditReader");
+    r.rbac_on();
+    const auto carol = r.cookie("carol", auth::Role::user);
+    const auto dave = r.cookie("dave", auth::Role::user);
+
+    // Set-and-proceed: the success row is dropped, the panel still serves and says so in the
+    // header (the twin's convention).
+    r.drop_audit_writes = true;
+    const auto dropped = r.cookie_get(kFragment, dave);
+    REQUIRE(dropped);
+    CHECK(dropped->status == 200);
+    CHECK(dropped->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_THAT(dropped->body, ContainsSubstring("REVOKE-DETAIL-MARKER"));
+    r.drop_audit_writes = false;
+
+    // The audit table is locked: the revoke-detail lookup cannot answer (its pool statement
+    // timeout is 500 ms in this rig), the panel is still a 200, and the marker is never shown.
+    AuditTableLock lock{db_.dsn()};
+    int served = 0, marker_leaks_a = 0;
+    for (int i = 0; i < 3; ++i) {
+        const auto a = r.cookie_get(kFragment, carol);
+        const auto b = r.cookie_get(kFragment, dave);
+        REQUIRE(a);
+        REQUIRE(b);
+        served += (a->status == 200) + (b->status == 200);
+        marker_leaks_a += a->body.find("REVOKE-DETAIL-MARKER") != std::string::npos;
+        CHECK_THAT(b->body, ContainsSubstring("(unavailable)")); // not recorded would be a lie
+        CHECK_THAT(b->body, !ContainsSubstring("FAILED-REVOKE-STORE-ERROR"));
+        CHECK_THAT(b->body, !ContainsSubstring("LATER-RETRY"));
+    }
+    CHECK(served == 6);
+    CHECK(marker_leaks_a == 0);
+    lock.release();
+
+    // Recovered without a restart.
+    const auto after = r.cookie_get(kFragment, dave);
+    REQUIRE(after);
+    CHECK(after->status == 200);
+    CHECK_THAT(after->body, ContainsSubstring("REVOKE-DETAIL-MARKER"));
 }
 
 // ---- the page itself is unchanged -------------------------------------------------------------
