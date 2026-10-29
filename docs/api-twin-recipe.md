@@ -55,13 +55,15 @@ a review question into a compile-time impossibility.
 
 ### The exemplar: `discover_routes.{hpp,cpp}`
 
-`server/core/src/discover_routes.hpp` (158 lines) declares five pure builder functions —
+`server/core/src/discover_routes.hpp` declares six pure builder functions —
 `build_permissions_catalog`, `build_instructions_catalog`, `build_routes_catalog`,
-`scope_kinds_catalog`, `build_plugins_catalog` — each taking only the store/registry it needs and
-returning a `DiscoveryDoc { std::string json; std::string etag; }`. The file header states the
-intent explicitly:
+`scope_kinds_catalog`, `plugin_docs_catalog`, `build_plugins_catalog` — each taking only the
+store/registry it needs and returning a `DiscoveryDoc { std::string json; std::string etag; }`.
+`DiscoveryDoc` and the one store-free builder, `build_routes_catalog`, are declared in
+`server/core/src/discover_catalog_types.hpp`, which `discover_routes.hpp` re-includes; the other
+five stay in `discover_routes.hpp`. The file header states the intent explicitly:
 
-> "The five builder functions (`build_*_catalog`) are pure — no I/O beyond reading the
+> "The six builder functions (`build_*_catalog`) are pure — no I/O beyond reading the
 > store/registry pointer passed in — and are declared here specifically so `mcp_server.cpp` can
 > call the SAME functions for the mirrored `discover_*` MCP tools... REST and MCP therefore cannot
 > drift from each other by construction."
