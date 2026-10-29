@@ -432,8 +432,10 @@ After a point-in-time restore or a failover to a standby that was behind, a
 replica also clears its cache when the counter is lower than the value it
 cached, so the bump reaches it within about the poll interval. The exception is
 a counter that is exactly equal to the replica's cached value at its next poll:
-that looks unchanged and is not detected, so restart every server replica to be
-sure the revocation reaches all of them.
+that looks unchanged and is not detected. The bump moves the counter by one, so
+if the restored value was one below a replica's cached value, the bump lands
+exactly on it. Restart every server replica to be sure the revocation reaches
+all of them.
 
 `ON_ERROR_STOP` makes `psql` exit non-zero if any statement fails, in which
 case the whole transaction has rolled back and nothing changed. Afterwards,
@@ -776,13 +778,17 @@ psql -q "$YUZU_POSTGRES_DSN" -c \
 The count must be 0. A session the user opens after the reset (a fresh sign-in) shows
 as a new row, so run the check straight after the delete. The delete bumps the session
 write-generation, and each replica polls that counter about once a second
-(`kSessionGenRefreshMs`, 1000 ms) and drops its cached sessions when it changes (a lower value after a restore or failover included), so
-the account is signed out on every replica within about a second. If a replica's poll
-is failing, it trusts its cache for at most 30 seconds from its last successful poll
-(`kSessionGenStaleServeBoundMs`) and then falls back to the store, which no longer
-holds the row. After a restore or a failover to a lagging standby a lower counter is also
-detected at the next poll; only a counter exactly equal to a replica's cached value goes
-undetected, see [Sessions are durable](#sessions-are-durable).
+(`kSessionGenRefreshMs`, 1000 ms) and drops its cached sessions when it
+changes (a lower value after a restore or failover included), so the account is
+signed out on every replica within about a second. If a replica's poll is
+failing, it trusts its cache for at most 30 seconds from its last successful
+poll (`kSessionGenStaleServeBoundMs`) and then falls back to the store, which no
+longer holds the row. After a restore or a failover to a lagging standby a lower
+counter is also detected at the next poll; only a counter exactly equal to a
+replica's cached value goes undetected. The poll must read the primary: a
+reader answered by nodes holding different counters clears the cache on every
+flip, at most once per replica per second; see
+[Sessions are durable](#sessions-are-durable).
 
 **Finding a partial result.** A failed session delete from Settings increments
 `yuzu_auth_session_store_degrade_total{op="invalidate_user"}`, but a single event

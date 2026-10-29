@@ -632,6 +632,9 @@ TEST_CASE("AuthManager+SessionStore: a LOWER durable generation clears the repli
         // an unchanged read must not clear again. A session cached on A survives an
         // out-of-band row delete (no bump), which a replica still holding the old 100
         // would have cleared on this poll (it differs from 41) and failed to re-read.
+        // Creating tok2 bumps the stored counter to 42 without A polling, so A
+        // still caches 41; the raw set puts the counter back to exactly 41, so
+        // the poll below reads a value equal to A's cache (unchanged).
         auto tok2 = a->create_local_session_for_test("rhea2", Role::user, /*mfa=*/false);
         set_write_generation_raw(pool, 41);
         delete_session_rows_raw(pool);

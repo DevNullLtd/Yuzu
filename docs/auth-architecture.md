@@ -73,8 +73,11 @@ of the HA "safe-to-scale" gate. The design:
   invalidate, elevate, revoke-elevation, mfa-verify — but **not**
   `touch_activity`, a sliding idle update). `validate_session` polls the
   generation on a ~1s interval (single-flight); when it changes (a mutation
-  landed, possibly on another replica, or the counter regressed after a restore or a failover) the whole cache is cleared and the next
-  lookup re-reads authoritative state. Operator sessions number in the tens, so a
+  landed, possibly on another replica, or the counter regressed after a restore
+  or a failover) the whole cache is cleared and the next lookup re-reads
+  authoritative state. A counter restored to exactly the cached value is not
+  detected; see `auth-db-recovery.md`, "A restore rolls credentials and sessions
+  back". Operator sessions number in the tens, so a
   global generation whose bump clears the whole cache is cheap. **Two distinct
   staleness bounds:** in NORMAL operation a mutation propagates within the ~1s
   refresh interval. During a refresh OUTAGE (PG brownout, failed

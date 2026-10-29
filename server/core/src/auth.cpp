@@ -678,7 +678,12 @@ void AuthManager::maybe_refresh_session_generation() const {
         // own bump is observed by this same poll like any other), so an
         // unchanged read is the only no-op and there is no clear loop. Two
         // overlapping polls returning out of order can cost one extra clear;
-        // over-clearing only forces durable re-reads, never drops a row.
+        // over-clearing only forces durable re-reads, never drops a durable row
+        // (a session held only in this cache, whose write-through failed, is
+        // lost on a clear, which is fail-closed). The generation read MUST come
+        // from the primary: a reader answered by alternating nodes with
+        // different counters clears the cache on every flip (at most once per
+        // replica per poll interval), an availability cost, never a bypass.
         // KNOWN RESIDUAL: a counter that is EXACTLY equal to the cached value at
         // the poll (restored to it, or regressed and climbed back to it between
         // two polls) is indistinguishable from "no change" and is not detected
@@ -692,7 +697,7 @@ void AuthManager::maybe_refresh_session_generation() const {
     }
     if (changed) {
         // The generation moved (a mutation landed, possibly on another replica,
-        // or the counter regressed) — drop the whole cache so the next lookup
+        // or the counter regressed): drop the whole cache so the next lookup
         // re-reads authoritative state. Cleared under mu_, which is never held
         // together with session_gen_mtx_.
         std::unique_lock lock(mu_);
@@ -1737,7 +1742,8 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
                                                              bool idle_enabled) const {
     // Refresh cross-replica cache coherence BEFORE consulting the cache: a
     // create/invalidate/elevate/mfa mutation on any replica advances the durable
-    // generation, which clears this replica's now-stale cache.
+    // generation (a restore or failover can also lower it); either change clears
+    // this replica's now-stale cache.
     maybe_refresh_session_generation();
 
     const std::string key = hash_token(token);

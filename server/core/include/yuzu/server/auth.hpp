@@ -1712,9 +1712,9 @@ private:
     /// would_strand | grant_read). No-op without a MetricsRegistry.
     void note_lifecycle_store_failure(const char* op) const;
 
-    /// Poll the durable write-generation on an interval; when it has advanced
-    /// (a create/invalidate/elevate/mfa mutation landed, possibly on another
-    /// replica), clear the process-local `sessions_` cache so the next lookup
+    /// Poll the durable write-generation on an interval; when it has changed
+    /// (advanced: a create/invalidate/elevate/mfa mutation landed, possibly on
+    /// another replica; or regressed after a restore or failover; #6079), clear the process-local `sessions_` cache so the next lookup
     /// re-reads authoritative state. Interval-gated + single-flight (mirrors
     /// RbacStore::maybe_refresh_generation); a refresh FAILURE keeps serving the
     /// existing cache (the absolute `expires_at` on every session is the
@@ -1722,7 +1722,7 @@ private:
     ///
     /// Coherence does NOT depend on anchoring a locally-committed write: a
     /// mutation bumps the durable generation, so within one refresh interval
-    /// this same poll observes the advance and clears the cache, re-reading
+    /// this same poll observes the change and clears the cache, re-reading
     /// authoritative state — write-through to the local cache only covers the
     /// sub-interval window until then.
     void maybe_refresh_session_generation() const;
