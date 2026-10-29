@@ -41,8 +41,11 @@
 //
 // Unwired posture, the siblings' (hardware / containment): an unwired provider, a missing audit
 // sink or an unresolvable username answers `answer_unwired` (a non-retryable A4 internal error)
-// and writes the generic failure row, so every call leaves an `mcp.<tool>` row (the registry seam
-// test, test_mcp_server.cpp, requires it). The legacy branches answered a bare
+// and writes the generic failure row, so a call that reaches the handler leaves an `mcp.<tool>`
+// row (the registry seam test, test_mcp_server.cpp, requires that of the default harness). Three
+// cases write none: a refusal by the fleet-read gate (the gate writes its own body), the
+// export_crypto_cbom CSPRNG failure, and a deployment whose audit sink is unwired (nothing to
+// write to; production always wires it). The legacy branches answered a bare
 // `error_response(kInternalError, ...)` with no row; that is a change. The four tools that write
 // a domain audit row (the three confined reads and get_crypto_ca_stats) now also refuse when
 // `audit_fn` is unwired, because `try_persist_audit` would otherwise call an empty sink
