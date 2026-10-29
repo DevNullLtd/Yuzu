@@ -89,8 +89,9 @@ function cssToken(name, fallback) {
 // PR 6: per-OS cube colour palette. Keys match the lowercase substring we
 // expect in `MachineNode.os` from fleet_topology.v1; default covers
 // agents whose os field is empty or unknown. Data colours read from the
-// yuzu.css tokens (--c2, --c3, --c1, --mut) so every scheme applies; opacity is set on the material,
-// not the colour, so colour stays vivid through transparency.
+// yuzu.css tokens (--c2, --c3, --c1, --mut) so every scheme applies; opacity
+// is set on the material, not the colour, so colour stays vivid through
+// transparency.
 const OS_PALETTE = {
   linux:   cssToken('--c2', '#2dd4bf'),
   darwin:  cssToken('--c3', '#f5c542'),
@@ -625,7 +626,7 @@ function buildPortLabel(port) {
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.globalAlpha = 1;
   ctx.font = '500 22px ' + MONO_FONT;
-  ctx.fillStyle = cssToken('--c4', '#ff6b7a');  // matches the listener sphere
+  ctx.fillStyle = cssToken('--c4', '#ff6b7a');  // the sphere itself stays 0xff6b7a on every scheme
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText(':' + port, canvas.width / 2, canvas.height / 2);

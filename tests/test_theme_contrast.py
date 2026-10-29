@@ -4,6 +4,7 @@
 Base = the :root block's hex declarations; each html[data-theme="light*"]
 block is overlaid on it, so a token a light block forgets to redefine is
 judged at its (dark-tuned) :root value and fails. Stdlib only.
+A new light scheme must be added to LIGHT below, or it is not gated.
 """
 import re
 import sys
@@ -21,11 +22,25 @@ CHARTS = ["--mds-color-chart-%d" % i for i in range(1, 13)]
 ACCENTS = [P + "accent-primary-" + s for s in ("normal", "hover", "active")]
 
 
-def block(css, selector):
+TRACKED = re.compile(r"--mds-color-[\w-]+|--c[1-5]|--mut|--faint|--ink2|--bg|--raise")
+ANY_DECL = re.compile(r"(--[\w-]+)\s*:\s*([^;]+);")
+
+
+def block(css, selector, strict=False):
     m = re.search(re.escape(selector) + r"\s*\{(.*?)\n\}", css, re.S)
     if not m:
         raise SystemExit("FAIL: block not found: " + selector)
-    return dict(DECL.findall(re.sub(r"/\*.*?\*/", "", m.group(1), flags=re.S)))
+    body = re.sub(r"/\*.*?\*/", "", m.group(1), flags=re.S)
+    if strict:
+        # A closer not at column 0 runs this match into the next block.
+        if "{" in body:
+            raise SystemExit("FAIL: nested '{' in block (indented closer?): " + selector)
+        # A colour this parser cannot read would silently fall back to :root.
+        for name, val in ANY_DECL.findall(body):
+            if TRACKED.fullmatch(name) and not DECL.fullmatch("%s: %s;" % (name, val.strip())):
+                raise SystemExit("FAIL: unparsed colour declaration in %s: %s: %s"
+                                 % (selector, name, val.strip()))
+    return dict(DECL.findall(body))
 
 
 def resolve(tokens, name):
@@ -51,11 +66,13 @@ def failures(css):
     out = []
     for scheme in LIGHT:
         t = dict(base)
-        t.update(block(css, 'html[data-theme="%s"]' % scheme))
+        t.update(block(css, 'html[data-theme="%s"]' % scheme, strict=True))
         pairs = [(fg, bg) for fg in TEXTS for bg in SURFACES]
         pairs += [(c, bg) for c in CHARTS for bg in SURFACES[:2]]
         pairs += [("--mds-color-text-on-accent", a)
                   for a in ACCENTS]
+        # Fleet-view label plates: alias text and the --c4 port label on the --bg plate.
+        pairs += [("--ink2", "--bg"), ("--c4", "--bg")]
         for fg, bg in pairs:
             r = ratio(resolve(t, fg), resolve(t, bg))
             if r < MIN:
@@ -74,6 +91,23 @@ def main():
     probe2 = css.replace('--mds-color-chart-7: #a04d00;', '', 1)
     assert any("light: --mds-color-chart-7" in f for f in failures(probe2)), \
         "gate did not catch a chart token a light block fails to redefine"
+    # Self-check: a light-block colour in a notation the parser cannot read must fail loudly.
+    for bad_decl in ("rgb(1,2,3)", "#fff", "#0e6fa8cc"):
+        probe3 = css.replace('--mds-color-chart-6: #0e6fa8;', '--mds-color-chart-6: %s;' % bad_decl, 1)
+        try:
+            failures(probe3)
+        except SystemExit as e:
+            assert "unparsed colour declaration" in str(e), e
+        else:
+            raise AssertionError("gate ignored an unparsed light colour: " + bad_decl)
+    # Self-check: an indented closer must not let one block swallow the next.
+    try:
+        block('html[data-theme="x"] {\n --a: #000000;\n  }\nhtml[data-theme="y"] {\n --a: #ffffff;\n}\n',
+              'html[data-theme="x"]', strict=True)
+    except SystemExit as e:
+        assert "nested" in str(e), e
+    else:
+        raise AssertionError("gate accepted an indented block closer")
     bad = failures(css)
     for f in bad:
         print("FAIL " + f)
