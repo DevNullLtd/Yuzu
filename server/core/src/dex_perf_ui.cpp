@@ -121,7 +121,7 @@ std::string render_dex_procperf_panel(const std::vector<DexProcPerfRow>& rows,
                                       const std::string& window) {
     if (rows.empty()) {
         // The SOFT truthful empty state (grill decision 5/A): the read-only
-        // operator-SQL surface deliberately hides tar.db config, so the server
+        // operator-SQL surface deliberately hides echo.db config, so the server
         // cannot distinguish "disabled" from "enabled, no rollup yet". Say both.
         return "<div class=\"gp-note\"><b>No per-app samples in the last 24 hours.</b> "
                "Per-application sampling (<span style=\"font-family:var(--mono)\">"
@@ -248,7 +248,7 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
     if (now.reporting == 0) {
         h += placeholder("No perf telemetry yet",
                          "No device reported a perf heartbeat this cycle. Perf telemetry is "
-                         "collected on Windows and Linux (TAR perf capture source; macOS support "
+                         "collected on Windows and Linux (Echo perf capture source; macOS support "
                          "is planned); devices appear here within a heartbeat of coming online.");
     } else {
         h += "<div class=\"gp-tiles\">";

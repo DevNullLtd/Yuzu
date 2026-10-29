@@ -476,8 +476,8 @@ inline const OfflineHiveFileCheck kOfflineHiveFileUnguarded{};
 ///
 /// PrivilegeScope adjusts the PROCESS token, not a thread token. Once more
 /// than one plugin in the agent uses this ladder -- autoruns, registry,
-/// installed_apps, license_scan and tar all load into one process, and
-/// tar's collectors run on background threads -- two overlapping scopes race:
+/// installed_apps, license_scan and echo all load into one process, and
+/// echo's collectors run on background threads -- two overlapping scopes race:
 ///
 ///   A.ctor(prev=disabled) -> B.ctor(prev=enabled) -> A.dtor(restores
 ///   disabled) -> B's RegLoadKeyW fails
