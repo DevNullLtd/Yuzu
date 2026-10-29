@@ -1115,10 +1115,6 @@ TEST_CASE("shares sharing json: flags name fallback and typing", "[shares]") {
     p = sharing(R"({"k":{"path":"/p","smb_read_only":1,"smb_guest_access":0,"smb_shared":0,"smb_sealed":1}})");
     REQUIRE(p.shares.size() == 1);
     CHECK(share_row(p.shares[0]) == "share|smb|k|/p|ro|false|unavailable,sealed|sharing");
-    // Boolean-typed flags are accepted.
-    p = sharing(R"({"k":{"path":"/p","smb_read_only":true,"smb_guest_access":true,"smb_shared":false}})");
-    REQUIRE(p.shares.size() == 1);
-    CHECK(share_row(p.shares[0]) == "share|smb|k|/p|ro|true|unavailable|sharing");
     // String-typed flags are unknown: ignored.
     p = sharing(R"({"k":{"path":"/p","smb_read_only":"1","smb_guest_access":"1","smb_shared":"0","smb_sealed":"1"}})");
     REQUIRE(p.shares.size() == 1);

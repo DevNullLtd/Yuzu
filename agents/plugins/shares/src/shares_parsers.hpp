@@ -572,12 +572,6 @@ inline bool bsd_net_is_world(std::string_view net, std::string_view mask) {
     return is_v6(mask) && mask.find_first_not_of("0:") == std::string_view::npos;
 }
 
-/// Names that take a value in mountd's `do_opt`, and whether a root-ish credential raises
-/// `no_root_squash`.
-inline bool bsd_root_map_opt(std::string_view n) {
-    return n == "maproot" || n == "mapall" || n == "root" || n == "r";
-}
-
 /// What one accepted entry exports: its distinct paths and the facts they share.
 struct BsdEntry {
     std::vector<std::string> paths;
@@ -634,7 +628,8 @@ inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
                 bool used_next = false;
                 if (item == "ro" || item == "o") {
                     e.ro = true;
-                } else if (has_arg && bsd_root_map_opt(item)) {
+                } else if (has_arg && (item == "maproot" || item == "mapall" || item == "root" ||
+                                       item == "r")) { // mountd do_opt: the credential-taking names
                     const auto user = arg.substr(0, arg.find(':'));
                     if (user == "root" || user == "0")
                         e.root = true;
@@ -1013,13 +1008,11 @@ struct SharingParse {
 
 namespace detail {
 
-/// An integer or boolean member as a number; nullopt when absent or any other type.
+/// An integer member as a number; nullopt when absent or any other type.
 inline std::optional<long long> json_flag(const nlohmann::json& rec, const char* key) {
     const auto it = rec.find(key);
     if (it == rec.end())
         return std::nullopt;
-    if (it->is_boolean())
-        return it->get<bool>() ? 1 : 0;
     if (it->is_number_integer())
         return it->get<long long>();
     return std::nullopt;
