@@ -2,6 +2,21 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: the Users and roles page draws Assign role and the enforcement switch from the server's own administrator check (#6034)
+
+**What changed.** The **Assign role** button on the Role assignments panel and the **Enforce roles** switch on the RBAC enforcement panel used to be drawn from your account role (an administrator account, signed in locally). They are now drawn from the check the `POST` and `DELETE /api/v1/rbac/roles/{name}/assignments` and `PUT /api/v1/rbac/enforcement` routes apply: the durable-Administrator rule followed by the enforcement-regime check, asked again each time the panel loads. The page is still only a hint, every click is checked again by the server, and no route, permission or API field changed.
+
+**Who is affected.**
+- With RBAC enforcement on, an account whose role is `user` but which holds the `Administrator` grant (and an active account row) now sees the controls. Before, it saw none, although the server would have admitted it.
+- With RBAC enforcement on, an account administrator who does not hold the `Administrator` grant no longer sees a live switch (and cannot read the Role assignments panel, which needs `AccessReview:Read`). Before, the page drew the switch and the server then refused the click.
+- A signed-in administrator whose grant has no active account row (an SSO-only principal) is shown no control, because the server would refuse it.
+- When a store cannot answer, the controls are drawn disabled with "Your administrator authority could not be confirmed. Reload to try again." instead of live.
+- With RBAC enforcement off, nothing changes for a local administrator account.
+
+**Not changed.** After you assign or remove a role, the page redraws only the Role assignments panel, so the enforcement switch can lag until the next reload (for example after granting yourself `Administrator`). Reload the page.
+
+**Rollback.** Rolling back restores the account-role hint; no data is migrated.
+
 ## Behaviour change: the Settings Engine Principals panel decides like `GET /api/v1/engine-principals` (#5882)
 
 **What changed.** The Settings **Engine Principals** panel (`GET /fragments/settings/engine-principals`) used to admit exactly the callers the `/settings` page admits (an effective administrator). It now gates on `EnginePrincipal:Read`, the permission the REST route and the `list_engine_principals` MCP tool already use, so the panel and the route agree for every caller. No permission, role or topology-floor entry changed.

@@ -500,12 +500,18 @@ Settings uses, so the two stay equivalent.
   with the number of grants on record (before the 2000-row display cap), exactly as the REST call
   does; if that row cannot be saved the panel is still drawn and the response carries
   `Sec-Audit-Failed`. A grant table that cannot be read is a red message, never an empty table.
-- **Assign and remove a role.** On an administrator account the panel offers **Assign role** (a
+- **Assign and remove a role.** For a caller the server would admit, the panel offers **Assign role** (a
   username and one of the seven fleet-wide roles; ITServiceOwner needs a management group and is not
   offered; the account does not have to exist yet) and **Remove** on a grant. These call
   `POST` and `DELETE /api/v1/rbac/roles/{name}/assignments`, which need a durable Administrator
-  and a fresh MFA check; the page only shows or hides the controls from your account role, and the
-  server's refusal (last administrator, your own Administrator grant, the enforcement-regime
+  and a fresh MFA check. Whether the controls are drawn is decided by the same check those routes
+  apply (the durable-Administrator rule, then the enforcement-regime check), asked again every time
+  the panel loads, not by your account role: with enforcement on, an account whose role is `user`
+  but which holds the Administrator grant is offered the controls, and an account administrator
+  without the grant is not. If that check cannot be answered (a store is unavailable) the **Assign role**
+  button is drawn disabled with "Your administrator authority could not be confirmed. Reload to try
+  again." rather than hidden. The drawn controls are a hint only: every click is checked again by the
+  server, and its refusal (last administrator, your own Administrator grant, the enforcement-regime
   guard) is shown as it came. Only a plain local username can be removed here; a group, SSO or
   engine grant reads "Not removable here". After a server error the panel reloads, because the
   change may have taken effect. The change can take a moment to appear on other servers.
@@ -519,8 +525,10 @@ Settings uses, so the two stay equivalent.
   persist, the page says so and waits for you to choose to continue instead of redirecting at once.
   "Sign out all other sessions" is shown as not available yet.
 - **Turning enforcement on or off.** The **RBAC enforcement** panel shows the current setting to
-  every signed-in user (the cached view that `GET /api/v1/me` reports as `rbac_enabled`, plus an unconfirmed state that `/me` cannot show) and gives an administrator
-  account an **Enforce roles** switch. The switch always shows what the server holds: clicking it
+  every signed-in user (the cached view that `GET /api/v1/me` reports as `rbac_enabled`, plus an unconfirmed state that `/me` cannot show) and gives a durable
+  Administrator (the same check as above) an **Enforce roles** switch. For anyone else the switch is disabled with
+  "Only a durable Administrator can change this."; when the authority check cannot be answered it is disabled
+  with "Your administrator authority could not be confirmed. Reload to try again." The switch always shows what the server holds: clicking it
   asks for confirmation, then (when your second-factor check is stale) for an MFA code, and then the panel is redrawn from the server, so a
   cancelled confirmation or a refusal leaves it where it was. The server's refusals (you would
   not remain an administrator, or the source regime does not recognise you) are shown with their
