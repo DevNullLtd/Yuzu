@@ -47,7 +47,7 @@ namespace yuzu::server {
 
 class NvdDatabase; ///< Forward-declare; vuln overlay only uses match_inventory.
 class AuditStore;  ///< Forward-declare; push audit (CC6.1/CC7.3 evidence).
-struct OfflineEndpoint; ///< Forward-declare (offline_endpoint_store.hpp); see
+struct OfflineEndpoint; ///< Forward-declare (offline_endpoint_types.hpp); see
                         ///< merge_offline_topology() below.
 
 class FleetTopologyStore {

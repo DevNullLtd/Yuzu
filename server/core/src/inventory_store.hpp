@@ -103,7 +103,7 @@ struct InventoryQuery {
 /// `std::optional<InventoryRecord>`: a value == found, `std::nullopt` ==
 /// genuinely no row for this (agent_id, plugin). `std::unexpected(kDegraded)`
 /// == store/pool/query failure — the caller shows a degrade banner/503, never
-/// a 404 (mirrors `DeviceInventoryStore::CiReadError` exactly; out-params are
+/// a 404 (mirrors `CiReadError` (device_inventory_types.hpp) exactly; out-params are
 /// forbidden in new code, docs/cpp-conventions.md, hence `std::expected`
 /// rather than an enum + out-param).
 enum class InventoryReadError { kDegraded };

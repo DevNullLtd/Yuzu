@@ -5114,6 +5114,12 @@ groups:
         # dashboard-invisibility as YuzuInventoryReadDegraded — /readyz stays
         # green under pure pool saturation, so only the store-specific counter
         # moves.
+        # The group LIST joins them: list_groups_checked and
+        # count_members_by_group_checked (the /groups page, which shows a
+        # "could not be read" box) count here, and the legacy list_groups() is
+        # now list_groups_checked().value_or({}), so its other callers
+        # (dashboard, Pre-flight, Settings, MCP, REST, server) count a failed
+        # group-list read here too and still render an empty list.
         # reason = store_not_open | pool_acquire_timeout | query_error.
         expr: |
           sum(rate(yuzu_server_mgmt_group_read_degrade_total[5m])) by (reason) > 0
