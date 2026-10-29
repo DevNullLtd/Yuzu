@@ -3349,11 +3349,16 @@ std::string raw_config_value(const fs::path& db_file, const char* key) {
     sqlite3_stmt* raw = nullptr;
     if (sqlite3_prepare_v2(o.db, "SELECT value FROM echo_config WHERE key = ?1", -1, &raw,
                            nullptr) != SQLITE_OK)
-        return "<no row>";
+        return std::string{sqlite3_errmsg(o.db)}.find("no such table") != std::string::npos
+                   ? "<no row>"
+                   : "<error>";
     std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> stmt{raw, &sqlite3_finalize};
     sqlite3_bind_text(stmt.get(), 1, key, -1, SQLITE_STATIC);
-    if (sqlite3_step(stmt.get()) != SQLITE_ROW)
+    const int step_rc = sqlite3_step(stmt.get());
+    if (step_rc == SQLITE_DONE)
         return "<no row>";
+    if (step_rc != SQLITE_ROW)
+        return "<error>";
     return reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
 }
 
@@ -3505,8 +3510,9 @@ TEST_CASE("adopt_legacy_echo_db: a leftover legacy sidecar without a tar.db is w
             ScratchDir probe;
             fs::copy_file(echo_db, probe.path() / "echo.db");
             fs::copy_file(d.path() / "tar.db-wal", probe.path() / "echo.db-wal");
-            CHECK(raw_config_value(probe.path() / "echo.db", "known_row") !=
-                  "current echo history");
+            const std::string replayed = raw_config_value(probe.path() / "echo.db", "known_row");
+            CHECK(replayed != "<error>");  // an SQL failure must not pass for "replayed over"
+            CHECK(replayed != "current echo history");
         }
 
         yuzu::test::LogCapture logs;

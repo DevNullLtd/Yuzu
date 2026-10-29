@@ -159,9 +159,14 @@ verify_plugin_signature(const std::filesystem::path& plugin_path,
 [[nodiscard]] inline bool
 defer_legacy_echo_adoption(const std::vector<LoadError>& errors,
                            std::span<const std::string_view> loaded_names) {
+    // ASCII-fold the stem: an operator-renamed TAR.dll / Tar.dylib is the same retired file.
+    // (is_retired_plugin_name stays exact-case: it compares a DECLARED name, not a file name.)
     const bool retired_rejected = std::ranges::any_of(errors, [](const LoadError& err) {
-        return err.reason.starts_with(kRetiredNameReason) ||
-               is_retired_plugin_name(std::filesystem::path{err.path}.stem().string());
+        std::string stem = std::filesystem::path{err.path}.stem().string();
+        for (char& c : stem)
+            if (c >= 'A' && c <= 'Z')
+                c = static_cast<char>(c - 'A' + 'a');
+        return err.reason.starts_with(kRetiredNameReason) || is_retired_plugin_name(stem);
     });
     return retired_rejected &&
            std::ranges::find(loaded_names, std::string_view{"echo"}) == loaded_names.end();

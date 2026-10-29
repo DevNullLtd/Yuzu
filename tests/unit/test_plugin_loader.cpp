@@ -510,6 +510,13 @@ TEST_CASE("defer_legacy_echo_adoption holds adoption only while the retired plug
     CHECK(yuzu::agent::defer_legacy_echo_adoption(tar_dll_signature, none));
     CHECK_FALSE(yuzu::agent::defer_legacy_echo_adoption(tar_allowlist, echo));
     CHECK_FALSE(yuzu::agent::defer_legacy_echo_adoption(other_allowlist, none));
+    // A case-renamed stale file (TAR.dll, Tar.dylib) is the same retired plugin.
+    const std::vector<LoadError> upper_stem{{"/p/TAR.dll", "not in plugin allowlist"}};
+    const std::vector<LoadError> mixed_stem{
+        {"/p/Tar.dylib", std::string{yuzu::agent::kSignatureMissingReason}}};
+    CHECK(yuzu::agent::defer_legacy_echo_adoption(upper_stem, none));
+    CHECK(yuzu::agent::defer_legacy_echo_adoption(mixed_stem, none));
+    CHECK_FALSE(yuzu::agent::defer_legacy_echo_adoption(upper_stem, echo));
 }
 
 TEST_CASE("defer_legacy_echo_adoption sees a stale tar plugin the allowlist refused before dlopen",
