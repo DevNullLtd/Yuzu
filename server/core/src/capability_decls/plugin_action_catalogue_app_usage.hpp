@@ -12,7 +12,7 @@
 /// Classified by READING the implementation, per this package's spec.
 ///
 /// All three actions (`summary`, `last_used`, `foreground`) are
-/// ReadOnly/None — the plugin opens tar.db with
+/// ReadOnly/None — the plugin opens echo.db with
 /// `SQLITE_OPEN_READONLY|SQLITE_OPEN_NOMUTEX` plus `PRAGMA query_only=1`
 /// and never mutates anything on any platform; `foreground` never even
 /// opens the database (it is an unconditional CONSTRAINED line).
@@ -22,7 +22,7 @@
 /// `seed_defaults()` `types[]`; validated at wave-1 integration by
 /// test_capability_catalogue's `kSeededSecurableTypes` check, which runs
 /// after P0 lands) — rather than the existing `Inventory` securable
-/// `power_health`/`filesystem_posture` use: this data derives from TAR's
+/// `power_health`/`filesystem_posture` use: this data derives from Echo's
 /// process-event fold and is deliberately kept out of the broad
 /// operational-inventory read population (P0's `Forensics` comment: "Wave 7
 /// forensics class: execution_artifacts, app_usage, later

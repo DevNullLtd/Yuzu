@@ -93,7 +93,7 @@ inline constexpr std::array<CommandCapability, 4> kFixture{{
         .execute_gate = ExecuteGate::None,
     },
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "purge_source",
         .dispatch_class = DispatchClass::Destructive,
         .mutability = Mutability::Irreversible,
@@ -580,7 +580,7 @@ TEST_CASE("/api/command: a throwing audit sink on the destructive-untargeted den
     // covers at the unit level.
     CommandHarness h;
     h.audit_throws = true;
-    auto res = h.sink.Post("/api/command", R"({"plugin":"tar","action":"purge_source"})");
+    auto res = h.sink.Post("/api/command", R"({"plugin":"echo","action":"purge_source"})");
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
@@ -637,12 +637,12 @@ TEST_CASE("/api/command: a Destructive dispatch whose agent_ids all fall outside
     // `mgmt_group_store` is null in this harness -> `vis` stays nullopt ->
     // `DestructiveVisibleAgents{nullopt}` -> fail-closed-empty ->
     // `confine_destructive_targets` returns empty -> the 404 arm this test
-    // pins. `tar.purge_source` (kFixture) is Destructive; `agent_ids` is
+    // pins. `echo.purge_source` (kFixture) is Destructive; `agent_ids` is
     // explicit and non-empty, so this is NOT the sibling
     // `destructive_untargeted` (400) case above.
     CommandHarness h;
     auto res = h.sink.Post("/api/command",
-                           R"({"plugin":"tar","action":"purge_source","agent_ids":["dev-A"]})");
+                           R"({"plugin":"echo","action":"purge_source","agent_ids":["dev-A"]})");
     REQUIRE(res);
     CHECK(res->status == 404);
     auto j = nlohmann::json::parse(res->body);

@@ -361,7 +361,7 @@ separately.
 
 ## Upgrade Notes
 
-### vNEXT — the offline user-hive file check is now the default for autoruns, installed_apps, license_scan, registry and tar (related issue #5291; breaking for fleets with non-standard profile roots)
+### vNEXT — the offline user-hive file check is now the default for autoruns, installed_apps, license_scan, registry and echo (related issue #5291; breaking for fleets with non-standard profile roots)
 
 **What changed.** Agent plugins that mount a logged-out Windows profile's `NTUSER.DAT` offline (to
 read its `HKEY_USERS` hive without a live session) have always run a file-level check against that
@@ -369,7 +369,7 @@ hive — the path must not cross a UNC/non-fixed-drive or a reparse-point ancest
 itself must be a regular file owned by the profile, LocalSystem or Administrators, with no more
 than one hard link (`hive_hardlinked`). Before this
 change only one plugin (`privacy_permissions`) opted into that check; the other five production
-callers (`autoruns`, `installed_apps`, `license_scan`, `registry`, and TAR's mapped-drive-history
+callers (`autoruns`, `installed_apps`, `license_scan`, `registry`, and Echo's mapped-drive-history
 collector) mounted with no check at all. The check is now the default for all of them.
 
 **Who this affects.** A profile hive that fails the check — most commonly an FSLogix, UWP-container
@@ -379,7 +379,7 @@ silently mounted and read: `autoruns list`/`catalog` and `installed_apps list_pe
 specific refusal reason per profile; `license_scan list` reports the aggregate reason
 `hive_file_refused` on its `per_user_hives` probe status (the specific per-profile reason goes to
 the agent log only); `registry` answers its existing hive-file-refused error (unchanged wording,
-no reason suffix); TAR's mapped-drive history retries an affected profile individually, up to 7
+no reason suffix); Echo's mapped-drive history retries an affected profile individually, up to 7
 attempts over 24 h apart, before giving up on that profile. A fleet with many such profiles (e.g. a
 VDI/FSLogix rollout) may see these constraint rows appear for a noticeable fraction of devices
 right after upgrading.
@@ -614,10 +614,10 @@ reason=parent_gone` case: create a fresh result set from the intended parent ins
 re-evaluating the orphaned one. A genuinely parentless original (no `parent_id` was ever supplied
 at creation) still broadcasts on re-eval, unchanged.
 
-### vNEXT — a result-set `parent_id` alias longer than 64 bytes is no longer accepted on `from-tar-query`/`from-instruction-result` (#4734, breaking)
+### vNEXT — a result-set `parent_id` alias longer than 64 bytes is no longer accepted on `from-echo-query`/`from-instruction-result` (#4734, breaking)
 
 **What changed.** `parent_id` accepts either a canonical `rs_...` id or a per-operator alias
-(the set's own `name`, valid up to 256 bytes). `POST /api/v1/result-sets/from-tar-query` and
+(the set's own `name`, valid up to 256 bytes). `POST /api/v1/result-sets/from-echo-query` and
 `/from-instruction-result` now bound `parent_id` to 64 bytes (`kResultSetParentIdMaxLen`) before
 attempting alias resolution, closing a gap where an oversized value was copied unbounded into
 the persisted `scope_input_id` lineage marker. MCP's equivalent producer tools already enforced
@@ -636,7 +636,7 @@ underlying store read was degraded — `ResultSetStore::list_by_owner` returned 
 empty) container rather than surfacing the failure, so a degraded Postgres read answered `200`
 with an empty `result_sets` array indistinguishable from a genuinely-empty owner. It now answers
 `503 RESULT_SET_STORE_UNAVAILABLE` (`Retry-After` present) on a genuine store-level read failure.
-Separately, on REST, the three async result-set producers (`POST /api/v1/result-sets/from-tar-query`,
+Separately, on REST, the three async result-set producers (`POST /api/v1/result-sets/from-echo-query`,
 `/from-instruction-result`, and `/{id}/re-eval`) previously mapped a post-dispatch store fault —
 the pending result-set row failing to persist *after* a real command had already dispatched to
 agents — to `400`. That was a client-error status for a server-side fault; it is now
@@ -1390,7 +1390,7 @@ HAVING COUNT(*) > 1;
 - **`411`** — the body cannot be sized in advance **by framing** (chunked, or no `Content-Length`) and this route's class requires one it can size. Today that is `/mcp/` only; every other class still admits an unmeasurable body up to httplib's 100 MiB backstop, unchanged from before this release.
 - **`415`** — the request carries a `Content-Encoding` header other than `identity`. Refused on **every** class, unconditionally — this one is new in this release and does not depend on the class opting into anything. No shipped Yuzu route accepts a compressed request body, so this should not affect a conforming client; a client or intermediary that compresses request bodies (`gzip`/`br`/`deflate`) must stop doing so against this server. Send an identity-encoded body by **omitting `Content-Encoding` entirely** — do not send `Content-Encoding: identity` explicitly, which reaches httplib's own decompressor lookup, finds nothing to do, and today gets a bare `415` with none of this section's error-shape guarantees (no A4 envelope, no `yuzu_body_cap_rejected_total` increment); see the `415` row in [`docs/user-manual/rest-api.md`](rest-api.md#pre-auth-request-body-caps-2407) for the mechanism.
 
-**Who this affects.** Any integration that was sending a body larger than its route's new class cap and relying on httplib's 100 MiB backstop to accept it. The most likely surface to notice: a very large `POST /api/v1/guaranteed-state/rules`, `/api/workflows`, or `/api/product-packs` body — those three classes are capped at a generous but explicit 16 MiB (a judgment call, not a measured contract, because no aggregate size limit for that content exists yet) rather than the previous 100 MiB backstop. Most other routes had a smaller handler-level check already (response templates, CA import) — for those, the effect really is just an earlier rejection at the same byte count (before the body is buffered rather than after). Also newly affected: any client or intermediary that sends a **compressed** request body — that is now refused outright with `415` on every class (see "What changed" above); no shipped Yuzu client compresses request bodies, so this is expected to affect only a custom integration or a reverse proxy doing transparent compression. One class is **not** the simple "earlier rejection, same effect" case, and clients should not assume "no behavior change" from it: **TAR queries** (`POST /api/dashboard/tar-execute`, `POST /api/v1/result-sets/from-tar-query`) — these two classes' caps as originally shipped bounded the RAW body at the same byte count their handlers check on a DECODED/PARSED value, which is not the same number; that unit mismatch caused some legitimate queries to be rejected here that the handler would have admitted. Both caps carry a margin now (see [`docs/user-manual/rest-api.md`](rest-api.md#pre-auth-request-body-caps-2407) for the sizing), so this class is now also a clean earlier-rejection-only change going forward. **SCIM is no longer a special case either** (fixed as part of this same change, D7): the pre-routing rejection now publishes SCIM's own RFC 7644 §3.12 `application/scim+json` error shape, matching what a strict SCIM client already expected from the handler's own (now-superseded) check.
+**Who this affects.** Any integration that was sending a body larger than its route's new class cap and relying on httplib's 100 MiB backstop to accept it. The most likely surface to notice: a very large `POST /api/v1/guaranteed-state/rules`, `/api/workflows`, or `/api/product-packs` body — those three classes are capped at a generous but explicit 16 MiB (a judgment call, not a measured contract, because no aggregate size limit for that content exists yet) rather than the previous 100 MiB backstop. Most other routes had a smaller handler-level check already (response templates, CA import) — for those, the effect really is just an earlier rejection at the same byte count (before the body is buffered rather than after). Also newly affected: any client or intermediary that sends a **compressed** request body — that is now refused outright with `415` on every class (see "What changed" above); no shipped Yuzu client compresses request bodies, so this is expected to affect only a custom integration or a reverse proxy doing transparent compression. One class is **not** the simple "earlier rejection, same effect" case, and clients should not assume "no behavior change" from it: **Echo queries** (`POST /api/dashboard/echo-execute`, `POST /api/v1/result-sets/from-echo-query`) — these two classes' caps as originally shipped bounded the RAW body at the same byte count their handlers check on a DECODED/PARSED value, which is not the same number; that unit mismatch caused some legitimate queries to be rejected here that the handler would have admitted. Both caps carry a margin now (see [`docs/user-manual/rest-api.md`](rest-api.md#pre-auth-request-body-caps-2407) for the sizing), so this class is now also a clean earlier-rejection-only change going forward. **SCIM is no longer a special case either** (fixed as part of this same change, D7): the pre-routing rejection now publishes SCIM's own RFC 7644 §3.12 `application/scim+json` error shape, matching what a strict SCIM client already expected from the handler's own (now-superseded) check.
 
 **How to raise a cap.** Edit the table in `server/core/src/body_cap_policy.hpp` (with review) and the matching row in `docs/user-manual/rest-api.md`. Do **not** reach for httplib's global `Server::set_payload_max_length` — that knob is shared by every route on the listener, including the ~70 MiB live-query bundle route and the OTA agent-binary upload, so a single global value can't fit every route class at once. Rejections are visible per class via `yuzu_body_cap_rejected_total{path_class,reason}` — see `docs/user-manual/metrics.md`.
 
@@ -2020,7 +2020,7 @@ device filter that matched nothing produces. Each of these is now `400`.
 | `POST /api/command` | `scope` is `"__all__"` | `400 invalid scope` | dispatches to **all connected agents** |
 | `POST /api/v1/result-sets/from-*` | body is not a JSON object | `500` (uncaught type error) | `400` |
 | `POST /api/dashboard/execute` | form field `scope=` supplied but EMPTY | broadcast to all | refused, nothing dispatched |
-| `POST /api/dashboard/tar-execute` | query param `scope=` supplied but EMPTY | broadcast to all | refused, nothing dispatched |
+| `POST /api/dashboard/echo-execute` | query param `scope=` supplied but EMPTY | broadcast to all | refused, nothing dispatched |
 
 The two remediation rows matter for the same reason as the rest: on that route an **absent**
 `agent_ids` means "every non-compliant agent in this policy", so a supplied selector that named
@@ -2029,7 +2029,7 @@ remediation. Omitting `agent_ids` entirely still targets every non-compliant age
 
 The instructions-execute row is the one to read twice: `"scope": "" + empty agent_ids = broadcast`
 was **documented** behaviour in `rest-api.md`, so a client written against the published contract
-is affected. The `from-*` row covers `from-tar-query`, `from-instruction-result`, `re-eval` and
+is affected. The `from-*` row covers `from-echo-query`, `from-instruction-result`, `re-eval` and
 `from-inventory-query`.
 
 **One thing got LOOSER, not tighter.** `POST /api/command` previously rejected
@@ -2059,7 +2059,7 @@ that way look different from before. A saved query selecting historical broadcas
 dialog's "All agents" option sends `__all__` instead of an empty string.
 
 **But automation that POSTs the dashboard forms directly does need attention.** As of the
-Wave-1 foundations change, `/api/dashboard/execute` and `/api/dashboard/tar-execute`
+Wave-1 foundations change, `/api/dashboard/execute` and `/api/dashboard/echo-execute`
 distinguish an OMITTED `scope` from one SUPPLIED as empty (`scope=`): omitted still means the
 whole fleet, but supplied-but-empty is now refused and dispatches to nobody, where it
 previously broadcast. If a script builds the form body unconditionally and leaves `scope`
@@ -2127,10 +2127,10 @@ same caps MCP's `create_result_set_from_instruction_result`/`reevaluate_result_s
 | `POST /api/v1/result-sets/from-instruction-result` | `params` over 32 keys, a key over 256 bytes, or a value over 64 KiB | dispatched | `400` |
 | `POST /api/v1/result-sets/{id}/re-eval` | same, on a set whose stored `instruction_id`/`params` exceed the caps | re-dispatched (params) or reached an unbounded store lookup then 400 (instruction_id) | `400` |
 | `POST /api/v1/result-sets/from-instruction-result` or `{id}/re-eval` | `params` present but not a JSON object (a string, array, or number) | dispatched/re-dispatched with an EMPTY params map, silently discarding it | `400` |
-| `POST /api/v1/result-sets/from-tar-query` | `sql` present but not a JSON string | uncaught exception, bare `500` | `400` |
+| `POST /api/v1/result-sets/from-echo-query` | `sql` present but not a JSON string | uncaught exception, bare `500` | `400` |
 | `POST /api/v1/result-sets/from-instruction-result` or `{id}/re-eval` | `instruction_id` present but not a JSON string | uncaught exception, bare `500` | `400` |
-| `POST /api/v1/result-sets/from-tar-query` or `from-instruction-result` | `name` present but not a JSON string | uncaught exception, bare `500` | `400` |
-| `POST /api/v1/result-sets`, `from-tar-query`, `from-instruction-result`, or `from-inventory-query` | `name` over 256 bytes, or (generic create route only) `source_kind` over 64 bytes | persisted/dispatched unbounded | `400` |
+| `POST /api/v1/result-sets/from-echo-query` or `from-instruction-result` | `name` present but not a JSON string | uncaught exception, bare `500` | `400` |
+| `POST /api/v1/result-sets`, `from-echo-query`, `from-instruction-result`, or `from-inventory-query` | `name` over 256 bytes, or (generic create route only) `source_kind` over 64 bytes | persisted/dispatched unbounded | `400` |
 | `POST /api/v1/result-sets` (the generic/synchronous create route) | `name` or `source_kind` present but not a JSON string | uncaught exception, bare `500` | `400` |
 
 **Who this affects.** Callers sending a field past a numeric/count bound (`instruction_id`,
@@ -2762,21 +2762,21 @@ New CLI flags (all optional):
 ### vNEXT — DEX per-application sampling (`procperf`) is a new telemetry category
 
 This release adds per-application resource sampling (top-N processes by CPU and
-working set, by image name) to the TAR edge warehouse. **Superseded: it is now
+working set, by image name) to the Echo edge warehouse. **Superseded: it is now
 on by default** (`procperf_enabled=true` on every agent, including a one-time
-reset of any stored `false` at the tar.db schema v8 upgrade — see
+reset of any stored `false` at the echo.db schema v8 upgrade — see
 [Upgrading](upgrading.md)); this release originally shipped it off. It is a
 distinct telemetry category, separate from the device-level performance sampling (`perf_enabled`,
 on by default, no per-app identity) that shipped in the prior release **on
 Windows** — on Linux, device-level sampling starts automatically **on upgrade
 to this release** (see the upgrade checklist in the user manual's
-[Upgrading](upgrading.md) page and the TAR manual's upgrade note; opt out per
+[Upgrading](upgrading.md) page and the Echo manual's upgrade note; opt out per
 host with `perf_enabled=false`). To
-disable per-app sampling, set `procperf_enabled=false` via a TAR `configure`
+disable per-app sampling, set `procperf_enabled=false` via an Echo `configure`
 instruction (fleet-wide or per-device). The data is image names only (no
 command lines), 7-day raw / 31-day hourly retention, and is captured in the
 Workstream E data inventory in `docs/enterprise-readiness-soc2-first-customer.md`.
-TAR warehouse tables are now also created on every database open, so upgraded
+Echo warehouse tables are now also created on every database open, so upgraded
 agents need no manual table-creation step. New webhook egress: the `dex.signal`
 event (operator-routed signals) — see the security questionnaire note in the
 assurance package if you answer data-egress questions.
@@ -2787,9 +2787,9 @@ Programmatic clients (CI pipelines, health checks, `curl` scripts) that call `PO
 
 MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` now **enforce** — see the breaking note in `docs/user-manual/upgrading.md`), `--mfa-step-up-window-secs` (default `300`), `--mfa-login-pending-secs` (default `120`), and the break-glass `--mfa-reset <username>` (clears a locked-out user's MFA and exits, writing an `mfa.reset.breakglass` audit row — see `docs/ops-runbooks/auth-db-recovery.md`). Recovery code format changed from `XXXXX-XXXXX` (50 bits) to `XXXX-XXXX-XXXX-XXXX` (80 bits) — codes printed by earlier PR1 commits remain valid until consumed or regenerated. The break-glass procedure for a user who has lost both their authenticator and all recovery codes — and the recovery path for an operator locked out by an enforcement misconfiguration (SSO IdP not asserting `amr`, or a sole admin who could not enroll) — lives at `docs/ops-runbooks/auth-db-recovery.md`.
 
-### vNEXT — service-scoped API tokens can no longer read or mutate the confirmed fleet-wide Guardian/DEX/network/inventory/TAR/Schedule surfaces found as of this release (breaking)
+### vNEXT — service-scoped API tokens can no longer read or mutate the confirmed fleet-wide Guardian/DEX/network/inventory/Echo/Schedule surfaces found as of this release (breaking)
 
-**What changed.** A pre-existing gap let a service-scoped API token read identity-linked, fleet-wide device data — and, for Guardian Baselines, MUTATE what every agent enforces — across every reporting agent, not just its own service's agents. **This note does not claim the underlying class is fully closed** — three tracked issues (#3123 device-discovery, #3124 response/execution data, #3125 inventory data) document further confirmed instances on surfaces this release does not touch, found by an independent adversarial review during this branch's own governance run; see those issues for the current list. The confinement check on these fleet-wide (no single `agent_id`) reads only ever verified the token's role, never its service scope, and several of the affected reads had no per-open audit trail at all. Fixed across REST, the dashboard, and MCP: `GET /api/v1/guaranteed-state/events` (no-`agent_id` shape), `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/perf/devices`, `GET /api/v1/network/devices` and their MCP twins now deny a service-scoped token outright and are access-audited (`dex.signal.view` / `dex.perf.device.view` / `network.device.view` — the latter two had no audit coverage at all before this release); the Guardian dashboard's fleet status, guards list, event timeline, per-Guard drilldown, baselines list, and per-Baseline fragments, plus the `/fragments/dex/perf/devices`, `/fragments/network/devices`, `/fragments/dex/overview`, `/fragments/dex/app`, and `/fragments/dex/catalogue/signal` dashboard fragments now deny a service-scoped token the same way. The same confinement-gap class extends beyond `GuaranteedState:Read`: `GET /fragments/devices/list` (`Infrastructure:Read`), `GET /fragments/inventory/devices` (`Inventory:Read` — GDPR-personal-data serial/system_uuid/primary_mac columns), and both TAR frame device pickers (`GET /fragments/tar/process-tree`, `GET /fragments/tar/capture-sources`) now deny a service-scoped token too. It also reached a MUTATING surface: `POST /fragments/auto/run` (the `/auto` Pre-flight dispatch) resolved its device cohort the same unconfined way before dispatching the configured checks — now denied the same way, before any dispatch occurs. A different shape of the same root cause also reached three more `/auto` Pre-flight routes: `GET /fragments/auto` (the saved-runs rail), `GET /fragments/auto/result` (the run result poll), and `POST /fragments/auto/delete` (run delete) scope by `session->username` alone, and a service-scoped API token shares its creating principal's username (`ApiToken::principal_id`) — so a token scoped to e.g. one IT service could read back, poll, or delete a fleet-wide pre-flight run its own principal created interactively. All three now deny a service-scoped token the same way. The same owner-scoping shape reached the `/auto` Deploy stage too: `GET /fragments/auto/deploy` (the deploy config form) and `POST /fragments/auto/deploy/delete` (deployment delete) now deny a service-scoped token for the same reason; `GET /fragments/auto/deploy/result` (the deployment result poll) now denies too, and — because it also re-invokes the deployment engine's mutating advance step on every call — this additionally narrows how far an already-in-flight deployment can progress for a service-scoped caller. The same owner-scoping shape reached the Schedule API too, and worse: `POST /api/schedules` (create) and `POST /api/schedules/{id}/enable` (re-enable) now deny a service-scoped token outright, even one holding both `Schedule:Write` and `Execution:Execute` — a recurring schedule dispatches fleet-wide through `ScheduleRunner` with no per-fire confinement at all, unattended, and reaching it needs no pre-existing state (unlike every route above). `DELETE /api/schedules/{id}` (delete) denies the same way as the ordinary owner-scoping class. Disabling a schedule (`enable=false`) is deliberately **not** denied by this per-file check — the kill switch is intended to stay reachable even for a service-scoped token. **Caveat added 2026-08-21 (#3290 Phase 2 bucket 1a):** that guarantee does not currently hold in practice — `require_permission(Schedule,Write)` denies a service-scoped token unconditionally at the top of this handler, before `enabled` is even parsed, so a disable is denied the same as an enable. Pre-existing, not introduced by this note's own fixes; tracked as #3378. A separate, worse-than-username-scoping gap in the same feature area: `GET /api/schedules` (REST) and the MCP `list_schedules` tool now also deny a service-scoped token, because `ITServiceOwner` grants full CRUD on `Schedule` and the underlying query had no owner/service filter of any kind, so `Schedule:Read` alone let a service-scoped token enumerate every schedule from every other service. `GET /fragments/schedules` (the dashboard twin) is fixed the same way, and separately gains an RBAC gate it never had — this fragment was previously reachable by **any authenticated session, regardless of role or grant**. Independently, `POST /api/schedules/{id}/enable` had a request-parsing bug that silently reinterpreted the standards-compliant JSON boolean `{"enabled": false}` as `enabled=true` — this is now fixed; see "What to do" below for who needs to check their integration. Two more instances were found and fixed during this branch's own governance review, both in files already touched above: the Guardian dashboard's six MUTATING fragments (guard create, guard enable/disable, baseline create/deploy/delete/update) never got the same deny their read-only siblings got in the same earlier commit — worst of all the fixes in this note, since a service-scoped token could deploy a Baseline (a fleet-wide, `full_sync` operation) outside its own service; and `GET /fragments/inventory/find/results`, `GET /api/v1/inventory/software`, and MCP `query_installed_software` (the software-search family) never got the deny their sibling `/fragments/inventory/devices` got. See `docs/user-manual/audit-log.md` for the full list of new/changed audit verbs and `docs/enterprise-readiness-soc2-first-customer.md` "The machine-health audit exemption" for the narrowed CC7.2 scope.
+**What changed.** A pre-existing gap let a service-scoped API token read identity-linked, fleet-wide device data — and, for Guardian Baselines, MUTATE what every agent enforces — across every reporting agent, not just its own service's agents. **This note does not claim the underlying class is fully closed** — three tracked issues (#3123 device-discovery, #3124 response/execution data, #3125 inventory data) document further confirmed instances on surfaces this release does not touch, found by an independent adversarial review during this branch's own governance run; see those issues for the current list. The confinement check on these fleet-wide (no single `agent_id`) reads only ever verified the token's role, never its service scope, and several of the affected reads had no per-open audit trail at all. Fixed across REST, the dashboard, and MCP: `GET /api/v1/guaranteed-state/events` (no-`agent_id` shape), `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/perf/devices`, `GET /api/v1/network/devices` and their MCP twins now deny a service-scoped token outright and are access-audited (`dex.signal.view` / `dex.perf.device.view` / `network.device.view` — the latter two had no audit coverage at all before this release); the Guardian dashboard's fleet status, guards list, event timeline, per-Guard drilldown, baselines list, and per-Baseline fragments, plus the `/fragments/dex/perf/devices`, `/fragments/network/devices`, `/fragments/dex/overview`, `/fragments/dex/app`, and `/fragments/dex/catalogue/signal` dashboard fragments now deny a service-scoped token the same way. The same confinement-gap class extends beyond `GuaranteedState:Read`: `GET /fragments/devices/list` (`Infrastructure:Read`), `GET /fragments/inventory/devices` (`Inventory:Read` — GDPR-personal-data serial/system_uuid/primary_mac columns), and both Echo frame device pickers (`GET /fragments/echo/process-tree`, `GET /fragments/echo/capture-sources`) now deny a service-scoped token too. It also reached a MUTATING surface: `POST /fragments/auto/run` (the `/auto` Pre-flight dispatch) resolved its device cohort the same unconfined way before dispatching the configured checks — now denied the same way, before any dispatch occurs. A different shape of the same root cause also reached three more `/auto` Pre-flight routes: `GET /fragments/auto` (the saved-runs rail), `GET /fragments/auto/result` (the run result poll), and `POST /fragments/auto/delete` (run delete) scope by `session->username` alone, and a service-scoped API token shares its creating principal's username (`ApiToken::principal_id`) — so a token scoped to e.g. one IT service could read back, poll, or delete a fleet-wide pre-flight run its own principal created interactively. All three now deny a service-scoped token the same way. The same owner-scoping shape reached the `/auto` Deploy stage too: `GET /fragments/auto/deploy` (the deploy config form) and `POST /fragments/auto/deploy/delete` (deployment delete) now deny a service-scoped token for the same reason; `GET /fragments/auto/deploy/result` (the deployment result poll) now denies too, and — because it also re-invokes the deployment engine's mutating advance step on every call — this additionally narrows how far an already-in-flight deployment can progress for a service-scoped caller. The same owner-scoping shape reached the Schedule API too, and worse: `POST /api/schedules` (create) and `POST /api/schedules/{id}/enable` (re-enable) now deny a service-scoped token outright, even one holding both `Schedule:Write` and `Execution:Execute` — a recurring schedule dispatches fleet-wide through `ScheduleRunner` with no per-fire confinement at all, unattended, and reaching it needs no pre-existing state (unlike every route above). `DELETE /api/schedules/{id}` (delete) denies the same way as the ordinary owner-scoping class. Disabling a schedule (`enable=false`) is deliberately **not** denied by this per-file check — the kill switch is intended to stay reachable even for a service-scoped token. **Caveat added 2026-08-21 (#3290 Phase 2 bucket 1a):** that guarantee does not currently hold in practice — `require_permission(Schedule,Write)` denies a service-scoped token unconditionally at the top of this handler, before `enabled` is even parsed, so a disable is denied the same as an enable. Pre-existing, not introduced by this note's own fixes; tracked as #3378. A separate, worse-than-username-scoping gap in the same feature area: `GET /api/schedules` (REST) and the MCP `list_schedules` tool now also deny a service-scoped token, because `ITServiceOwner` grants full CRUD on `Schedule` and the underlying query had no owner/service filter of any kind, so `Schedule:Read` alone let a service-scoped token enumerate every schedule from every other service. `GET /fragments/schedules` (the dashboard twin) is fixed the same way, and separately gains an RBAC gate it never had — this fragment was previously reachable by **any authenticated session, regardless of role or grant**. Independently, `POST /api/schedules/{id}/enable` had a request-parsing bug that silently reinterpreted the standards-compliant JSON boolean `{"enabled": false}` as `enabled=true` — this is now fixed; see "What to do" below for who needs to check their integration. Two more instances were found and fixed during this branch's own governance review, both in files already touched above: the Guardian dashboard's six MUTATING fragments (guard create, guard enable/disable, baseline create/deploy/delete/update) never got the same deny their read-only siblings got in the same earlier commit — worst of all the fixes in this note, since a service-scoped token could deploy a Baseline (a fleet-wide, `full_sync` operation) outside its own service; and `GET /fragments/inventory/find/results`, `GET /api/v1/inventory/software`, and MCP `query_installed_software` (the software-search family) never got the deny their sibling `/fragments/inventory/devices` got. See `docs/user-manual/audit-log.md` for the full list of new/changed audit verbs and `docs/enterprise-readiness-soc2-first-customer.md` "The machine-health audit exemption" for the narrowed CC7.2 scope.
 
 **Who this affects.** Any integration authenticating with a service-scoped API token (a token bound to one service's agents) that currently calls any of the routes/tools/fragments above will start receiving `403` instead of fleet-wide data on this upgrade — this is the intended fix, not a regression. Separately, any integration calling `POST /api/schedules/{id}/enable` with `enabled` as a native JSON boolean will see its `enabled: false` calls actually disable the schedule for the first time — see "What to do" below. Ordinary (non-service-scoped) operator sessions are unaffected by the confinement changes.
 
@@ -2841,21 +2841,21 @@ Option (2) is the recommended long-term posture because it aligns with least-pri
 
 Both paths return `HTTP 404 token not found` on a cross-user revoke attempt — identical to the response for a truly-nonexistent token — to prevent the endpoint from being used as an enumeration oracle.
 
-### v0.12.0 — TAR dashboard page + mixed-version agent caveats
+### v0.12.0 — Echo dashboard page + mixed-version agent caveats
 
-The new `/tar` dashboard page (issue #547) surfaces every device × source pair where a TAR collector has been disabled. The page is reachable from the **TAR** entry in the sidebar's **Posture** group; viewing requires `Infrastructure:Read` and the per-source Re-enable / Scan-fleet actions require `Execution:Execute`.
+The new `/echo` dashboard page (issue #547) surfaces every device × source pair where an Echo collector has been disabled. The page is reachable from the **Echo** entry in the sidebar's **Posture** group; viewing requires `Infrastructure:Read` and the per-source Re-enable / Scan-fleet actions require `Execution:Execute`.
 
-**Mixed-version rollout caveat.** Agents running a build older than v0.12.0 do not emit the new per-source `paused_at` / `live_rows` / `oldest_ts` lines on `tar.status`. The dashboard renders an em-dash (`—`) for those columns when a pre-v0.12.0 agent appears in a scan result. This is not a server bug — it is an honest "we don't know when this collector was disabled because the agent reporting it pre-dates the field." Operators upgrading the server before the agent fleet should expect the em-dash for any pre-existing paused sources until the agent at the affected device is upgraded. See `docs/user-manual/tar.md` for the full TAR dashboard workflow.
+**Mixed-version rollout caveat.** Agents running a build older than v0.12.0 do not emit the new per-source `paused_at` / `live_rows` / `oldest_ts` lines on `echo.status`. The dashboard renders an em-dash (`—`) for those columns when a pre-v0.12.0 agent appears in a scan result. This is not a server bug — it is an honest "we don't know when this collector was disabled because the agent reporting it pre-dates the field." Operators upgrading the server before the agent fleet should expect the em-dash for any pre-existing paused sources until the agent at the affected device is upgraded. See `docs/user-manual/echo.md` for the full Echo dashboard workflow.
 
 **Per-operator scan state caveat.** Scan results are held in the server's memory keyed by operator username, with a 30-second per-operator cooldown to defend against retry-storms. Restarting the server clears all scan state; operators will see "No scan data yet — click Scan fleet" after a restart and a fresh scan returns within seconds. Persistence across restarts and multi-server coordination land in Phase 15.G operational hardening.
 
-**Audit log additions.** Two new audit actions emit on operator activity: `tar.status.scan` (every Scan-fleet click; `result=success`/`denied`/`failure` with detail) and `tar.source.reenable` (every Re-enable click; `result=success`/`denied`/`failure`). SIEM rules can distinguish forged form submissions from genuine connectivity failures via the `detail=scope_violation` vs `detail=agent_not_connected` distinction even though the HTTP response body is identical (`Agent not reachable.` 404) for both cases — the body identity is load-bearing for the no-enumeration-oracle property.
+**Audit log additions.** Two new audit actions emit on operator activity: `echo.status.scan` (every Scan-fleet click; `result=success`/`denied`/`failure` with detail) and `echo.source.reenable` (every Re-enable click; `result=success`/`denied`/`failure`). SIEM rules can distinguish forged form submissions from genuine connectivity failures via the `detail=scope_violation` vs `detail=agent_not_connected` distinction even though the HTTP response body is identical (`Agent not reachable.` 404) for both cases — the body identity is load-bearing for the no-enumeration-oracle property.
 
 ### vNEXT — Fleet visualization (3D) (`/viz/fleet`)
 
 The fleet-visualization feature ladder lands across the `feat/viz-engine` branch. PRs 1–12 are shipped: agent collector + server store + REST/fragment routes + page scaffold + camera controls + cube renderer + Sprite labels + hover tooltip + interior process nodes coloured by category + intra-cube localhost edges + per-cube listening-socket spheres + cross-machine connection edges + push-based topology ingestion + **three-tier stacked layout, talking-socket dots, curved tube wires, loopback-bind filter (PR 12)**. Remaining ladder PRs add the vulnerability overlay and final polish (LOD, edge bundling, a11y, perf).
 
-**Operator-visible state today (PRs 1–12).** Navigating to `/viz/fleet` shows one translucent cube per fleet machine, **organized into three architectural tiers** — frontend cubes on the top Y plane, applications in the middle plane, databases on the bottom plane. Within each tier, machines fall onto a deterministic per-tier grid (FNV-1a hash on `agent_id`). Live agents render at opacity `0.18`; stale agents (no `tar.fleet_snapshot` push within the staleness threshold) drop to `0.08`. Per-OS palette (on the default Slate scheme; the other schemes follow their own chart tokens): Linux `#2dd4bf`, macOS/Darwin `#f5c542`, Windows `#4c9aff`. Hostname `Sprite` labels render below each cube. Inside each cube, one `SphereGeometry` dot per process is laid out deterministically (`hash(pid|ppid)`-mod-bucket inside the cube's interior) and coloured from a six-category palette (on the default Slate scheme; the other schemes follow their own chart tokens): system `#9aa2ae`, browser `#4c9aff`, database `#f5c542`, web `#2dd4bf`, runtime `#a78bfa`, other `#9199a6`. Each cube's TOP face carries a ring of coral-coloured listening-socket spheres (one per `listeners[]` row) with `:port` labels; **loopback-only listeners (`127.x`, `::1`) are now hidden from the surface** — they aren't reachable from other instances. Each cube's BOTTOM face carries a ring of cool-blue **talking-socket** dots (one per unique outbound `(proto, dst_ip, dst_port)`). **Cross-machine connections render as thick curved tubes** (`THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents) that drop from the source's talking dot down/across to the destination's listener sphere. External (off-fleet) destinations render as short grey stub lines with ring markers. Hover order: listener sockets → talking sockets → process dots → edges → cubes. WASD pans, drag rotates, wheel zooms.
+**Operator-visible state today (PRs 1–12).** Navigating to `/viz/fleet` shows one translucent cube per fleet machine, **organized into three architectural tiers** — frontend cubes on the top Y plane, applications in the middle plane, databases on the bottom plane. Within each tier, machines fall onto a deterministic per-tier grid (FNV-1a hash on `agent_id`). Live agents render at opacity `0.18`; stale agents (no `echo.fleet_snapshot` push within the staleness threshold) drop to `0.08`. Per-OS palette (on the default Slate scheme; the other schemes follow their own chart tokens): Linux `#2dd4bf`, macOS/Darwin `#f5c542`, Windows `#4c9aff`. Hostname `Sprite` labels render below each cube. Inside each cube, one `SphereGeometry` dot per process is laid out deterministically (`hash(pid|ppid)`-mod-bucket inside the cube's interior) and coloured from a six-category palette (on the default Slate scheme; the other schemes follow their own chart tokens): system `#9aa2ae`, browser `#4c9aff`, database `#f5c542`, web `#2dd4bf`, runtime `#a78bfa`, other `#9199a6`. Each cube's TOP face carries a ring of coral-coloured listening-socket spheres (one per `listeners[]` row) with `:port` labels; **loopback-only listeners (`127.x`, `::1`) are now hidden from the surface** — they aren't reachable from other instances. Each cube's BOTTOM face carries a ring of cool-blue **talking-socket** dots (one per unique outbound `(proto, dst_ip, dst_port)`). **Cross-machine connections render as thick curved tubes** (`THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents) that drop from the source's talking dot down/across to the destination's listener sphere. External (off-fleet) destinations render as short grey stub lines with ring markers. Hover order: listener sockets → talking sockets → process dots → edges → cubes. WASD pans, drag rotates, wheel zooms.
 
 **Tier classification heuristic.** `classifyTier` reads `listeners[]` port hints (`DB_PORTS = {3306, 5432, 6379, 27017, 1521, 1433, 9042, 9200, 5984, 8086, 11211}` / `WEB_PORTS = {80, 443, 8080, 8443, 8088}`) plus process-category strings (`'database'`, `'web'`). Priority is **db > web > app**: a host with any DB signal lands on the database tier regardless of whether it also serves web traffic. A host with no DB or web signal defaults to the application tier. **Known limitations:** (a) databases on non-standard ports (e.g. Postgres on 5431 for a sharded cluster) fall through to the application tier unless one of the host's processes is classified as `database` by `process_category.hpp`; (b) `WEB_PORTS` is intentionally narrow — it covers reverse proxies / load balancers / API gateways on ports 80/443/8080/8443/8088 but **not** dev-server defaults (3000/4200/5173/8000), because in a classic three-tier deployment a nodejs/django/vite server listening on those ports is application work, not the front edge. There is no operator-accessible override today; both limitations are tracked as a follow-up issue on function-aware tier classification.
 
@@ -2877,7 +2877,7 @@ The fleet-visualization feature ladder lands across the `feat/viz-engine` branch
 
 **Per-host drill-down (`/viz/host/<agent_id>`).** Double-clicking a cube
 opens a new tab with a 2D bipartite IPC graph (processes + sockets,
-Cytoscape `cose` layout) above the existing TAR process tree, with
+Cytoscape `cose` layout) above the existing Echo process tree, with
 cross-pane select-to-highlight and a resizable splitter. The page route
 is auth-gated only; the data fetch (`GET /api/v1/viz/host/<agent_id>/topology`)
 enforces `Response:Read` and honours the `--viz-disable` kill switch.
@@ -2885,13 +2885,13 @@ Audit rows are emitted as `viz.host_topology` (`target_type = HostTopology`).
 The `agent_id` path segment is allow-listed to `[A-Za-z0-9._-]` before
 templating; any other character returns `400`.
 
-**Connection window — `fleet_snapshot_window_seconds` (TAR plugin config).**
-`tar.fleet_snapshot` reports not only the connections ESTABLISHED at the
-exact `/proc` sample instant but also connections TAR observed recently
+**Connection window — `fleet_snapshot_window_seconds` (Echo plugin config).**
+`echo.fleet_snapshot` reports not only the connections ESTABLISHED at the
+exact `/proc` sample instant but also connections Echo observed recently
 in its `tcp_live` warehouse, so short-lived flows still reach the viz.
-The look-back window is operator-tunable via the TAR plugin's KV config
-key `fleet_snapshot_window_seconds` (default `3600`). It is a TAR plugin
-config key, not a server CLI flag — set it through the TAR plugin's
+The look-back window is operator-tunable via the Echo plugin's KV config
+key `fleet_snapshot_window_seconds` (default `3600`). It is an Echo plugin
+config key, not a server CLI flag — set it through the Echo plugin's
 configuration surface. The 60 s sampler still cannot see sub-interval
 connections; that needs kernel eventing (tracked separately).
 
@@ -2899,14 +2899,14 @@ connections; that needs kernel eventing (tracked separately).
 
 `yuzu_register_trigger` / `yuzu_unregister_trigger` were previously no-op
 stubs — no `TriggerEngine` was instantiated on the agent, so interval
-triggers were silently discarded and never fired. As a result the TAR
+triggers were silently discarded and never fired. As a result the Echo
 warehouse `*_live` tables (`tcp_live` and friends) sat permanently empty
 in the field, and any plugin that registered an interval trigger had it
 silently dropped.
 
 **Upgrade caveat.** After upgrading the **agent** daemon, registered
 interval triggers begin firing for the first time. On the first
-`collect_fast` cycle (default 60 s) the TAR `*_live` tables start
+`collect_fast` cycle (default 60 s) the Echo `*_live` tables start
 populating, and operators may see a small increase in per-agent CPU/IO
 proportional to the number of registered triggers. Any plugin that
 registered an interval trigger expecting the old no-op behaviour will now
@@ -5909,7 +5909,7 @@ and `rest_v1` each get their own one-a-minute allowance).
 
 **What the counters do not cover.** `yuzu_server_response_export_truncated_total` counts the two
 export routes only. A cut on the execution visualization route, the dashboard results fragment's
-unfiltered read and the TAR retention-paused scan page is NOT counted: the visualization route logs
+unfiltered read and the Echo retention-paused scan page is NOT counted: the visualization route logs
 a warning naming the cause (not rate-limited), the dashboard fragment and the scan page log
 nothing, and the in-band signal (`result_truncated_by_cap` and `truncation_cause` in the
 visualization payload, the "Partial result" notices on the dashboard, the `result_truncated_by_cap`
@@ -5944,7 +5944,7 @@ routes (`GET /api/v1/responses/{id}`, the legacy `GET /api/responses/{id}`, MCP 
 `GET /api/v1/executions/{id}/responses`) are capped by row count only, at most 1000 rows of up to
 2 MiB of raw bytes per field, and the dashboard
 results fragment's filtered branch (it reads by response id) has no byte bound. The execution
-visualization route, the dashboard results fragment's unfiltered read and the TAR
+visualization route, the dashboard results fragment's unfiltered read and the Echo
 retention-paused scan page's read are bounded by the same 50 MiB cap in SQL and say so when it
 cuts (`result_truncated_by_cap`, or a visible "truncated" notice on the dashboard). The visualization route applies the caller's management-group scope inside that query; the dashboard fragment and the scan page apply it after the fetch, so a confined caller can see a cut notice when every dropped row was outside their scope, and out-of-scope rows can use up the 50 MiB budget that would otherwise reach their own rows.
 Other internal reads also have no byte bound and take their limit from something other than a

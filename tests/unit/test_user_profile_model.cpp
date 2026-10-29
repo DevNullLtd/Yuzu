@@ -6,8 +6,8 @@
  * RegLoadKeyW mounting) are the impure Win32 shell; the SID classification,
  * name derivation, hive-state classification, and wire-row rendering below
  * are header-pure and pinned here on every host (the firewall_parsers.hpp /
- * tar_module_etw.hpp pattern). All SIDs in fixtures are synthetic, matching
- * the convention in test_tar_netconn.cpp.
+ * echo_module_etw.hpp pattern). All SIDs in fixtures are synthetic, matching
+ * the convention in test_echo_netconn.cpp.
  */
 
 #include "user_profile_model.hpp"

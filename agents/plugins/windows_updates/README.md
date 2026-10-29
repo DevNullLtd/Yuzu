@@ -182,7 +182,7 @@ placeholder.
   plugin-specific table.
 - **`pending_reboot` also feeds `/auto` Pre-flight.** `preflight_parse.hpp` parses its trailing
   `reboot_required|<bool>|<reasons>` row as an unconditional summary for the "reboot" readiness check.
-- **Not consumed by** the daily-sync inventory framework (ADR-0016), TAR, DEX, or metrics.
+- **Not consumed by** the daily-sync inventory framework (ADR-0016), Echo, DEX, or metrics.
 - **Sensitivity.** `installed`/`missing` rows can name specific installed software indirectly — a
   Windows KB title/description often embeds a product name (e.g. "...for Microsoft Defender
   Antivirus...") — an installed-software signal by another route; `pending_reboot` and

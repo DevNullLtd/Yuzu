@@ -27,8 +27,8 @@ amends: >-
   2026-09-04 ruling in two ways: a default-on change no longer applies at upgrade (D9), and the
   look-back control, to which that ruling moved the opt-in reasoning, runs by default for
   the sources that ship off today (D3).
-related: ["3005-plugin-config-store", "0015-tar-arp-dns-capture-sources", "0020-tar-netqual-windows-retrospective", "0016-agent-daily-sync-framework", "0021-spark-reflex-architecture"]
-context-refs: ["#5294", "#5355", "#5371", "#5372", "#5373", "#5374", "#5375", "#4867", "#4915", "#4975", "#5057", "docs/yuzu-guardian-design-v1.1.md", "docs/asset-tagging-guide.md", "docs/tar-implementer.md"]
+related: ["3005-plugin-config-store", "0015-echo-arp-dns-capture-sources", "0020-echo-netqual-windows-retrospective", "0016-agent-daily-sync-framework", "0021-spark-reflex-architecture"]
+context-refs: ["#5294", "#5355", "#5371", "#5372", "#5373", "#5374", "#5375", "#4867", "#4915", "#4975", "#5057", "docs/yuzu-guardian-design-v1.1.md", "docs/asset-tagging-guide.md", "docs/echo-implementer.md"]
 ---
 
 # 3006 — Plugin management: what ships, and how it is switched off
@@ -66,7 +66,7 @@ permission and audit trail:
 - **A server-side kill switch** (ADR-3005) keyed by plugin, action and, since #5355, operating
   system. It is checked when a command is dispatched. A missing entry means on. It has no way
   to target a group, a tag or any other subset of endpoints.
-- **Per-agent capture-source flags** for the activity recorder (TAR). Each agent keeps its own
+- **Per-agent capture-source flags** for the activity recorder (Echo). Each agent keeps its own
   flags, and the only way to change them is to send that agent an instruction.
 - **Three agent start-up flags** that switch off, all-or-nothing, the daily inventory sync, the
   DEX signals and the Spark engine. They are set when the agent is deployed.
@@ -717,8 +717,8 @@ point for the roadmap, which decides order and grouping.
 - The three plugins seeded off at server start, the tests and documents that pin that state,
   and the invariants that cite "default-off" as a safeguard.
 - Every document, definition and statement that describes a source as opt-in, off by default or
-  a deploy-time opt-out: the TAR implementer guide and dashboard (including the
-  retention-paused frame, which this ADR retires), the user-manual pages, the TAR definition,
+  a deploy-time opt-out: the Echo implementer guide and dashboard (including the
+  retention-paused frame, which this ADR retires), the user-manual pages, the Echo definition,
   plugin READMEs and their generated documentation, the OS capability matrix, the daily-sync and
   Spark design notes and rulings, and the SOC 2 data inventory.
 - The eight capture sources that ship off, the seven-day look-back default, and the way the

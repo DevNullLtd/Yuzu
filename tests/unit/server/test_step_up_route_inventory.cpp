@@ -85,7 +85,7 @@
 #include "../../../server/core/src/settings_routes.hpp"
 #include "../../../server/core/src/sle_routes.hpp"
 #include "../../../server/core/src/tag_routes.hpp"
-#include "../../../server/core/src/tar_tree_routes.hpp"
+#include "../../../server/core/src/echo_tree_routes.hpp"
 #include "../../../server/core/src/webhook_routes.hpp"
 #include "../../../server/core/src/workflow_routes.hpp"
 
@@ -300,8 +300,8 @@ const std::vector<OwnerRoutes>& register_every_constructible_owner() {
             SleRoutes r;
             r.register_routes(s, {}, {}, {});
         }));
-        v.push_back(register_owner("tar_tree", [](auto& s) {
-            TarTreeRoutes r;
+        v.push_back(register_owner("echo_tree", [](auto& s) {
+            EchoTreeRoutes r;
             r.register_routes(s, {}, {}, {}, {}, {}, {}, {}, {}, {});
         }));
         v.push_back(register_owner("webhook", [](auto& s) {

@@ -366,7 +366,7 @@ function buildCube(machine) {
 const PROCESS_DOT_RADIUS = 0.22;
 const PROCESS_INTERIOR_FRACTION = 0.78;
 // gov R7 CAP-1: soft cap on dots rendered per cube. Agent-side
-// `tar.fleet_snapshot` already truncates at `kFleetSnapshotMaxRows`
+// `echo.fleet_snapshot` already truncates at `kFleetSnapshotMaxRows`
 // (4096); this bound is for graceful degradation when an agent on
 // a heavily-threaded host (e.g. a JVM with thousands of threads)
 // exceeds typical visualization tolerances. Operator sees 1000 dots;
@@ -377,7 +377,7 @@ const PROCESS_PER_CUBE_SOFT_CAP = 1000;
 function placeProcessesInCube(processes, cubeSize) {
   if (!processes || processes.length === 0) return [];
   const N = processes.length;
-  // gov: process count from the server is bounded by tar.fleet_snapshot
+  // gov: process count from the server is bounded by echo.fleet_snapshot
   // truncation (per machine), so N stays in low thousands worst-case.
   const buckets = Math.max(2, Math.ceil(Math.cbrt(Math.max(N * 1.5, 8))));
   const span = cubeSize * PROCESS_INTERIOR_FRACTION;
@@ -1091,7 +1091,7 @@ function mount() {
       // the OrbitControls camera moves or as PR 11 toggles per-cube
       // visibility for LOD culling. Layout coordinates are cube-local.
       //
-      // gov R7 CAP-1: agent-side `tar.fleet_snapshot` caps at
+      // gov R7 CAP-1: agent-side `echo.fleet_snapshot` caps at
       // kFleetSnapshotMaxRows (4096 today). At the documented
       // machines_max ceiling (100k) the worst-case fleet would render
       // 4096 × 100,000 = 409M dots — well past anything WebGL can
@@ -1679,7 +1679,7 @@ function mount() {
 
   // ── PR 6: data fetch ──────────────────────────────────────────────────
   // Asynchronous because the cache-cold path on the server can take up to
-  // 5 s (fleet-wide tar.fleet_snapshot dispatch). Surface failures via
+  // 5 s (fleet-wide echo.fleet_snapshot dispatch). Surface failures via
   // #viz-error rather than letting the scene sit empty.
   function setError(msg) {
     const e = root.querySelector('#viz-error');
