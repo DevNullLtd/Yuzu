@@ -27,11 +27,12 @@ std::string_view about_text() {
            "autonomous use-case-engine modules — engine-classed sessions are structurally "
            "barred from calling it, and every mutation is approval-gated.\n\n"
            "Deciding an approval ticket is a human act: approve/reject run from the "
-           "dashboard or REST under an interactive login that passes the MFA step-up "
-           "gate (an un-enrolled local user passes it; requiring an enrolled factor of "
-           "the approver is tracked in #6079). "
+           "dashboard or REST under an interactive login whose account has an enrolled "
+           "MFA factor with a proof no older than the approver window (at most 300 s) "
+           "(#6079); the REST route enforces that, not the MCP tools. "
            "The MCP tools approve_request and reject_request are registered but always "
-           "return approver_assurance_required:* (#6061); an MCP caller can list pending "
+           "refuse on the session class with approver_assurance_required:* (#6061); an "
+           "MCP caller can list pending "
            "approvals and must ask a human to decide them.";
 }
 

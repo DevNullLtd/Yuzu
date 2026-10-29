@@ -733,6 +733,13 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        clause is met only for approvers whose account has an enrolled factor (or an `amr` proof)
        until #6079 ships. The base route had no step-up at all before this change, so this is
        strictly stricter than what it replaces, not a new gap.
+     - **Superseded by #6079 (2026-10-19).** The pass-through described in the previous bullet is
+       closed: approve and reject now require an enrolled MFA factor with a fresh proof in every
+       `--mfa-enforcement` mode (local: an enrolled TOTP factor and a proof within the approver window
+       that does not predate the enrolment; OIDC: an MFA-method `amr` on a token issued within the
+       window; SAML: refused). The approver window is `min(--mfa-step-up-window-secs, 300)`, and 300
+       when that is `0`, so `0` no longer disables it. The text above is kept as the record of what
+       was accepted on 2026-10-18; see `docs/auth-architecture.md`, "Approver assurance".
      - **Acceptance.** Acceptor: Dave Rae (maintainer). Date: 2026-10-18. Ruling
        source: the maintainer ruling in the #6061 work session (epic #6060) to
        convert the two legacy approve/reject api-parity rows to
@@ -750,6 +757,42 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        later ADR enables non-human approvers as ADR-0033 section 6 describes.
        The same shape of reasoning is recorded for the self-service password
        change in the 2026-10-04 entry above.
+     - **Addendum 2026-10-19 (scope exception recorded by the maintainer, #6079).**
+       The distinct-human requirement is enforced as reviewer username not equal
+       to submitter username, and nothing stronger. One person who holds both a
+       local and an SSO identity, or two SSO identities, is counted as two
+       humans. This is not a four-eyes guarantee across identities. The check
+       predates #6079 and is out of its scope; this entry does not claim that
+       it compares human roots. Operator wording: `docs/user-manual/instructions.md`
+       "Who can approve", Known limitation.
+     - **Acceptance (addendum).** Acceptor: Dave Rae (maintainer). Date:
+       2026-10-19. Ruling source: the maintainer ruling in the #6079 working
+       session. As with the entry above, this is a working-session statement,
+       not a signed decision. The acceptor is also the author of the commits
+       that introduce this addendum, so independent review of this acceptance
+       rests on the pull request review (expected, not enforced by tooling),
+       not on a second approver.
+       Compensating controls an operator can apply today, none enforced by
+       Yuzu: narrowing the identity sources in use (for example
+       `--auth-mode=sso-only`, which still leaves a local break-glass account);
+       a check of each approver and submitter account against the
+       organisation's own HR mapping of accounts to people when the CC6.2
+       access-review export is reviewed (the export names an account, not a
+       person: for a user `display_name` equals `principal_id`, so the
+       mapping must come from the organisation); and periodic sampling of
+       reviewer and submitter pairs, which needs a join, because an
+       `approval.approve` audit row carries the reviewer and the approval id
+       but not the submitter: look the ticket up (`GET /api/v1/approvals/{id}`)
+       and compare its `submitted_by` with the row's principal. The ticket
+       list endpoint returns at most 100 tickets, so use the per-ticket lookup
+       for a sample.
+     - **Revisit 2027-01-18** is a re-confirmation date, not a deadline. It
+       is the same date as the 2026-10-18 entry above, so one re-confirmation
+       covers the pair. The maintainer confirmed it on 2026-10-19 (a
+       working-session statement, not a signed decision). The entry is revisited
+       earlier when the planned follow-up that resolves identities to a human
+       root lands. No issue exists for that follow-up yet (update this line when
+       it is filed). Until a revisit, the entry stands as accepted.
      - Design record: `docs/auth-architecture.md` "Approver assurance
        (maker-checker, #6061)"; operator description:
        `docs/user-manual/instructions.md` "Who can approve".
@@ -982,6 +1025,43 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      The owner gave the confirmation in the authoring session and this entry
      records it; like the entries above it is not a separately signed
      decision.
+
+    - **2026-10-28 - mixed-version admission during a rolling upgrade (scope
+      exception recorded by the maintainer, #6079).** The approver gate
+      (`require_enrolled_fresh_mfa`) runs on each server replica and no
+      minimum-version check exists. While a rolling upgrade is in progress, or
+      after a replica is rolled back, a replica that predates the gate can admit
+      an approve or reject decision the upgraded gate would refuse. Those rows
+      lack the `approver_assurance:enrolled_fresh_mfa` marker. The upgraded
+      build does not relax its own gate; the exception covers only the window in
+      which the control is not yet in force on every replica. Running more than
+      one server replica is unsupported today (the safe-to-scale gate in
+      `docs/ha-delivery-matrix.md`), so the entry covers the rolling-upgrade
+      case and is not a statement that multi-replica operation is supported.
+      Operator wording: `docs/user-manual/upgrading.md` "Mixed-version
+      admission".
+     - **Conditions of this exception.** The upgrade is controlled: the
+       operator records each replica's upgrade timestamp (UTC) in the change
+       ticket (SOC 2 CC8.1) as the roll happens, because the audit row does not
+       name the replica, and keeps the load balancer log for the window. The
+       marker query in `upgrading.md` lists the decisions in the window that
+       carry no marker. Those controls are customer-operated: Yuzu neither
+       enforces nor evidences them.
+     - **Acceptance.** Acceptor: Dave Rae (maintainer). Date: 2026-10-28. Ruling
+       source: the maintainer's answer during the #6079 PR 1 governance working
+       session, given after the governance ledger raised this as finding UP-9.
+       As with the entries above, this is a working-session statement, not a
+       signed decision. The acceptor is also the author of the commits that
+       introduce this entry, so independent review of this acceptance rests on
+       the pull request review (expected, not enforced by tooling), not on a
+       second approver. This entry replaces the earlier statements in
+       `upgrading.md` and `docs/enterprise-readiness-soc2-first-customer.md`
+       that cited an acceptance dated 2026-10-19: no repository record of an
+       acceptance of this exposure existed on that date. The 2026-10-19 addendum
+       above concerns distinct humans only.
+     - **Revisit** when a minimum-version admission check exists, or when
+       multi-replica operation leaves the unsupported state in the safe-to-scale
+       gate, whichever comes first. No calendar date is set.
 
 ## Interim rules (until the named follow-ups ship)
 

@@ -1817,8 +1817,9 @@ static const ToolDef kTools[] = {
      "that cut. Each row carries crashes, hangs and devices affected over the window "
      "(distinct_devices), then the figures over one population, the Windows devices online now: "
      "distinct_devices_online (those of the affected devices that are online now; null when no fleet source is wired), the share of "
-     "that population affected (95 percent Wilson interval), the online devices' events per "
-     "1,000 online devices (exact interval) and the stability score with its decomposition, so a "
+     "that population affected (Wilson interval at the score policy's confidence level, 95 percent "
+     "unless the policy sets model.interval_confidence), the online devices' events per "
+     "1,000 online devices (exact interval at the same level) and the stability score with its decomposition, so a "
      "device that crashed and went offline is in the counts but not in the share, and the score is "
      "withheld as offline_affected while any affected device is offline. "
      "Counts are Windows-scoped (the Apps tab, the Overview top apps and get_dex_app still count "
@@ -2952,11 +2953,20 @@ static const ToolDef kTools[] = {
      "approver_assurance_required:<reason> (reason: non_interactive_session, "
      "engine_principal or non_human_principal) after the Approval:Approve RBAC check. "
      "A human reviewer decides via the dashboard Approvals page or POST "
-     "/api/approvals/{id}/approve from an interactive session that passes the existing "
-     "MFA step-up gate (an un-enrolled local user and, unless --mfa-enforcement=required "
-     "(or admin-only, for an admin role), an OIDC session without an amr proof pass it; "
-     "--mfa-step-up-window-secs=0 disables it; "
-     "SAML sessions are refused, #4935; an enrolled-factor requirement is tracked in #6079).",
+     "/api/approvals/{id}/approve from an interactive session. The REST route (not this "
+     "tool) requires an enrolled MFA factor with a proof no older than the approver "
+     "window (at most 300 s) (#6079); it answers a stale proof with a step-up "
+     "challenge and always refuses an un-enrolled session with "
+     "approver_assurance_required:mfa_not_enrolled. Three further typed reasons are "
+     "conditional, because the generic step-up check can answer first: "
+     "saml_mfa_unsupported (SAML, #4935) surfaces only with the step-up window at 0; "
+     "account_unavailable (deactivated or deleted account) surfaces with the step-up window "
+     "at 0, or when the account is removed between the central step-up check's read and "
+     "the approver rule's read; "
+     "mfa_proof_missing (an OIDC "
+     "login with no MFA amr) surfaces with the step-up window at 0 or when MFA "
+     "enforcement does not cover the caller's role. Otherwise the generic check answers "
+     "first. Those MFA reasons belong to the REST route only.",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to approve"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
@@ -2976,11 +2986,20 @@ static const ToolDef kTools[] = {
      "approver_assurance_required:<reason> (reason: non_interactive_session, "
      "engine_principal or non_human_principal) after the Approval:Approve RBAC check. "
      "A human reviewer decides via the dashboard Approvals page or POST "
-     "/api/approvals/{id}/reject from an interactive session that passes the existing "
-     "MFA step-up gate (an un-enrolled local user and, unless --mfa-enforcement=required "
-     "(or admin-only, for an admin role), an OIDC session without an amr proof pass it; "
-     "--mfa-step-up-window-secs=0 disables it; "
-     "SAML sessions are refused, #4935; an enrolled-factor requirement is tracked in #6079).",
+     "/api/approvals/{id}/reject from an interactive session. The REST route (not this "
+     "tool) requires an enrolled MFA factor with a proof no older than the approver "
+     "window (at most 300 s) (#6079); it answers a stale proof with a step-up "
+     "challenge and always refuses an un-enrolled session with "
+     "approver_assurance_required:mfa_not_enrolled. Three further typed reasons are "
+     "conditional, because the generic step-up check can answer first: "
+     "saml_mfa_unsupported (SAML, #4935) surfaces only with the step-up window at 0; "
+     "account_unavailable (deactivated or deleted account) surfaces with the step-up window "
+     "at 0, or when the account is removed between the central step-up check's read and "
+     "the approver rule's read; "
+     "mfa_proof_missing (an OIDC "
+     "login with no MFA amr) surfaces with the step-up window at 0 or when MFA "
+     "enforcement does not cover the caller's role. Otherwise the generic check answers "
+     "first. Those MFA reasons belong to the REST route only.",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to reject"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
@@ -21218,9 +21237,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 res.set_content(
                     a4_error(kPermissionDenied, approval::approver_refusal_message(refusal),
                              "approving or rejecting requires an interactive human session "
-                             "(passing the MFA step-up gate); MCP, API-token and engine "
-                             "credentials cannot decide an approval. Ask a human reviewer to "
-                             "use the dashboard Approvals page.",
+                             "(local or OIDC login) with an enrolled MFA factor and a fresh proof; "
+                             "MCP, API-token and engine credentials cannot decide an approval. "
+                             "Ask a human reviewer to use the dashboard Approvals page.",
                              /*retry_after_ms=*/-1, /*cid_override=*/{}, audit_ok),
                     "application/json");
                 return;
