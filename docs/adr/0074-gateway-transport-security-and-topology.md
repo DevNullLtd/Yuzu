@@ -120,7 +120,12 @@ Because memory safety is vital, these are requirements, not options:
 
 The difference from nginx is recorded: nginx runs handshakes in worker processes, so a crash costs one worker. Our handshake runs inside the Erlang VM, so a crash costs the gateway. Whether to move handshakes out of the VM later is an open item (see Open questions).
 
-Certificate checking moves into the NIF: `SSL_VERIFY_PEER` with the CA store, the CRL, and the SAN and EKU checks. The current refusal of `ktls` with `verify_peer` goes away.
+**Where the agent-certificate checks run (decided by Nathan on 2026-10-28):**
+- **In C:** OpenSSL checks the chain and the revocation list during the handshake. The NIF sets `SSL_VERIFY_PEER` with fail-if-no-peer-certificate, the CA store (Yuzu root or customer intermediate) and the CRL. A bad chain or a revoked certificate is refused before the handshake completes. Our C stays small: configuring OpenSSL and handing the verified peer certificate to Erlang.
+- **In Erlang:** the gateway checks the SPIFFE identity and the EKU of the verified certificate just after the handshake, before any gRPC request is served. Identity rules will change as SPIFFE and customer intermediates arrive, so they live where they are easy to change and test.
+- **The same split on the fallback path:** OTP `ssl` checks chain and CRL, and the same Erlang identity check runs. The shared accept/refuse suite covers both.
+
+The current refusal of `ktls` with `verify_peer` goes away.
 
 ### D9. Discovery and choosing a gateway
 
