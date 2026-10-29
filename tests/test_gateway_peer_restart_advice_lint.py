@@ -105,7 +105,9 @@ MIN_MATCHES = {
     "docs/operations/troubleshooting.md": 2,
     "docs/pki-architecture.md": 3,
     "docs/security-reviews/gateway-peer-authz-minimal-2026-10-07.md": 3,
-    "changelog.d/5565-gateway-peer-authz.security.md": 1,
+    # (the 0.15.0 promote moved the former changelog.d/5565-gateway-peer-authz.security.md fragment into
+    # CHANGELOG.md; fragments are transient and CHANGELOG.md is not a lint surface: it holds older sections
+    # written before this lint and unrelated gateway-restart bullets)
     "docs/prometheus/yuzu-alerts.yml": 4,
     "deploy/docker/docker-compose.reference-gateway.yml": 0,  # comments carry no restart advice today
     "deploy/systemd/yuzu-server.service": 0,                  # (listed so a future one is checked)

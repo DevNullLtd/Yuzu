@@ -390,9 +390,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
     ],
-    "changelog": [
-      "changelog.d/4895-wmi-firmware-vuln-hardening.fixed.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/wmi.yaml"
     ],

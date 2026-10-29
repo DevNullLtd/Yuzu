@@ -687,9 +687,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
     ],
-    "changelog": [
-      "changelog.d/2026-10-14-pkg_inventory-linux-store-packages.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/pkg_inventory.yaml"
     ],

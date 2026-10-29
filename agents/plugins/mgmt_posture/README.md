@@ -194,5 +194,4 @@ krb5_keytab|absent
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_mgmt_posture.hpp`
 - Tests: `tests/test_mgmt_posture_definition.py` · `tests/unit/test_mgmt_posture_legs.cpp` · `tests/unit/test_mgmt_posture_local_dispatcher.cpp` · `tests/unit/test_mgmt_posture_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-04-mgmt_posture.added.md`
 <!-- END GENERATED -->

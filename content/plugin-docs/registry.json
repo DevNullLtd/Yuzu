@@ -2193,15 +2193,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
     ],
-    "changelog": [
-      "changelog.d/2026-10-22-registry-typed-writes.added.md",
-      "changelog.d/2026-10-22-registry-typed-writes.changed.md",
-      "changelog.d/2026-10-26-registry-recursion-user-apply.added.md",
-      "changelog.d/2026-10-26-registry-recursion-user-apply.changed.md",
-      "changelog.d/6487-registry-kernel-name-fail-closed.security.md",
-      "changelog.d/6490-registry-get-value-bound.changed.md",
-      "changelog.d/6491-registry-output-line-breaks.fixed.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/registry.yaml"
     ],

@@ -2812,20 +2812,7 @@
       "server/core/src/capability_decls/core_dispatch_capabilities.hpp",
       "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
     ],
-    "changelog": [
-      "changelog.d/2026-10-14-dex-tar-titles.changed.md",
-      "changelog.d/2026-10-21-tar-all-sources-default-on.changed.md",
-      "changelog.d/2026-10-21-tar-mapdrive-history-backfill.fixed.md",
-      "changelog.d/2026-10-21-tar-timeline-render.added.md",
-      "changelog.d/2026-10-21-tar-windows-image-db-hardening.security.md",
-      "changelog.d/2026-10-23-tar-timeline-page.added.md",
-      "changelog.d/2026-10-25-tar-regchange-source.added.md",
-      "changelog.d/2026-10-25-tar-retention-tiers-api.added.md",
-      "changelog.d/2026-10-26-tar-regchange-actor-attribution.added.md",
-      "changelog.d/2026-10-26-tar-tiers-data-page.added.md",
-      "changelog.d/20261014-tar-adhoc-sql-moved.changed.md",
-      "changelog.d/20261021-tar-capture-sources-paused-core.fixed.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/tar.yaml",
       "content/definitions/tar_warehouse.yaml"
