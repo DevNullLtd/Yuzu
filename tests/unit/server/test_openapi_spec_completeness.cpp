@@ -41,6 +41,7 @@
 #include "content_etag.hpp"
 #include "crypto_library_model.hpp"
 #include "device_token_store.hpp"
+#include "dex_read_model.hpp" // the scope tokens and the basis/coverage the builder can emit
 #include "license_store.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
@@ -646,6 +647,44 @@ TEST_CASE("openapi_spec_json(): /dex/apps documents the platform scope parameter
           std::string::npos);
     CHECK(op["responses"]["400"].value("description", "").find("invalid platform") !=
           std::string::npos);
+}
+
+TEST_CASE("openapi_spec_json(): DexAppsList covers every population basis and the coverage the "
+          "/dex/apps builder can emit",
+          "[openapi][dex]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["components"]["schemas"].contains("DexAppsList"));
+    const auto& list = spec["components"]["schemas"]["DexAppsList"];
+    const auto& props = list["properties"];
+
+    // Every `<scope>_online` the builder can publish is inside the enum a client validates against.
+    REQUIRE(props.contains("population_basis"));
+    std::vector<std::string> enum_values;
+    for (const auto& v : props["population_basis"]["enum"])
+        enum_values.push_back(v.get<std::string>());
+    for (const char* scope : {yuzu::server::kDexAppsScopeAll, yuzu::server::kDexAppsScopeWindows,
+                              yuzu::server::kDexAppsScopeMacos, yuzu::server::kDexAppsScopeLinux}) {
+        const auto basis = yuzu::server::dex_apps_population_basis(scope);
+        CHECK(std::find(enum_values.begin(), enum_values.end(), basis) != enum_values.end());
+    }
+
+    // crash_source_coverage is always emitted, so it is a declared and required property whose keys
+    // and values cover what the builder can publish.
+    REQUIRE(props.contains("crash_source_coverage"));
+    const auto& required = list["required"];
+    CHECK(std::find(required.begin(), required.end(), json("crash_source_coverage")) !=
+          required.end());
+    const auto& coverage_props = props["crash_source_coverage"]["properties"];
+    for (const auto& [os, value] :
+         yuzu::server::dex_apps_crash_source_coverage(yuzu::server::kDexAppsScopeAll)) {
+        REQUIRE(coverage_props.contains(os));
+        const auto& allowed = coverage_props[os]["enum"];
+        CHECK(std::find(allowed.begin(), allowed.end(), json(value)) != allowed.end());
+    }
+
+    // The component no longer calls the figures Windows-only (the default scope is every platform).
+    CHECK(list.dump().find("Windows only") == std::string::npos);
 }
 
 TEST_CASE("openapi_spec_json(): the execution-statistics reads document their degraded-read 503 "
