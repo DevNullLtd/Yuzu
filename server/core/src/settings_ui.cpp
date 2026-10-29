@@ -663,6 +663,22 @@ const char* const kSettingsPageTemplate =
       }
     });
 
+    /* The Engine Principals panel is gated on EnginePrincipal:Read, which this page's own
+       administrator gate does not imply (an account administrator under RBAC enforcement needs
+       the grant). htmx drops 4xx/5xx bodies, so a refused panel would sit on "Loading..."
+       forever: say why instead. Plain body listener (textContent only), no hx-on: the CSP
+       blocks the new Function() that htmx compiles it with. */
+    document.body.addEventListener('htmx:responseError', function(e) {
+      var d = e.detail || {}, el = d.elt, x = d.xhr;
+      if (!el || !x || el.id !== 'engine-principals-section') return;
+      if (x.status === 403)
+        el.textContent = 'You do not have permission to view this panel. It needs the EnginePrincipal:Read permission.';
+      else if (x.status === 401)
+        el.textContent = 'Your session has expired. Sign in again to view this panel.';
+      else
+        el.textContent = 'This panel could not be loaded (HTTP ' + x.status + '). Reload the page to try again.';
+    });
+
 )HTM"
     // Split here purely to keep each raw-string literal under MSVC's 16 KB
     // C2026 cap (adjacent literals concatenate byte-for-byte; the engine-
