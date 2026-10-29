@@ -676,8 +676,8 @@ TEST_CASE("openapi_spec_json(): DexAppsList covers every population basis and th
     CHECK(std::find(required.begin(), required.end(), json("crash_source_coverage")) !=
           required.end());
     const auto& coverage = props["crash_source_coverage"];
-    CHECK(coverage["type"] == "object");
-    CHECK(coverage["additionalProperties"] == false);
+    CHECK(coverage.value("type", "") == "object");
+    CHECK(coverage.value("additionalProperties", true) == false); // absent must fail, not assert
     REQUIRE(coverage.contains("properties"));
     CHECK(coverage["properties"].size() == 3);
     for (const char* os : {"windows", "macos", "linux"}) {
