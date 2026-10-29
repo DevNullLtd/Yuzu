@@ -2930,10 +2930,12 @@ void SettingsRoutes::register_routes(
     //
     // Gated as its REST twin GET /api/v1/engine-principals (#5882): EnginePrincipal:Read,
     // then the session, then the engine-session belt. The panel applies the same permission
-    // test as the route and is never more permissive; it differs in SIX deliberate ways, listed
-    // once with their rationale in docs/user-manual/upgrading.md (numbered identically in
-    // test_settings_engine_panel_authz.cpp's header, which pins 1 to 3 and 6; the render
-    // cases of 4 and 5 are in test_engine_principal_lifecycle.cpp):
+    // test as the route. Each difference is stricter, a different refusal, or a different
+    // rendering of a store failure; none admits a caller the route refuses. There are SEVEN,
+    // listed once with their rationale in docs/user-manual/upgrading.md (numbered identically
+    // in test_settings_engine_panel_authz.cpp's header, which pins 1 to 3, 6 and 7; the
+    // render cases of 4 and 5 are in test_engine_principal_lifecycle.cpp, their audit halves
+    // in test_settings_engine_panel_authz.cpp):
     //  1. an absent engine-principal store is an in-page note on a 200 (the route answers
     //     503), because htmx would not swap the note otherwise;
     //  2. an engine session with the store absent gets the belt's 403 where the route
@@ -2942,18 +2944,22 @@ void SettingsRoutes::register_routes(
     //     tokens panel and the pre-#5882 administrator gate did (#520): a cookie-session
     //     dashboard panel is not an MCP surface. The route admits an administrator's MCP
     //     token on its creator's authority;
-    //  4. a credential count that cannot be read renders "unavailable" on a 200 and still
-    //     writes the success row; the route answers 503 with a failure row;
+    //  4. a credential count that cannot be read (or no token store wired) renders
+    //     "unavailable" on a 200 and still writes the success row; the route answers 503 with
+    //     a failure row;
     //  5. an unreadable roster renders a note with Retry on a 200 and writes no row; the
     //     route answers 503 with a failure row;
     //  6. the revoke Detail cell shows the audit trail's text, so it needs AuditLog:Read
-    //     as well (the route returns no audit text at all).
+    //     as well (the route returns no audit text at all);
+    //  7. audit rows: the panel auto-loads, so a refused interactive cookie session writes no
+    //     auth.permission_required row (the route writes one), and an API token that lacks
+    //     AuditLog:Read writes one extra denied row on a view that lists a revoked principal
+    //     (the Detail check), although the view is served.
     // The /settings page itself stays administrator-only, so with RBAC on this panel admits
     // a non-administrator holding the grant (a Viewer) and refuses an account administrator
     // without it; the page script says so rather than leave the panel on "Loading..."
-    // (htmx does not swap a 4xx body). The panel auto-loads, so both gates are the quiet
-    // probe: a refused interactive cookie session writes no auth.permission_required row,
-    // a token or engine caller keeps its row. A successful roster read writes one
+    // (htmx does not swap a 4xx body). Both gates are the quiet probe (difference 7); a
+    // token or engine caller keeps its denial row. A successful roster read writes one
     // `engine_principal.list` success row (set-and-proceed, as the route and the Access
     // tokens panel); an absent store or an unreadable roster writes none.
     sink.Get("/fragments/settings/engine-principals",

@@ -30,8 +30,8 @@ Settings enrolment fragments (settings_routes_ wiring):
      and never `probe_admin`: every mutating route keeps its denial row.
   7. `set_read_perm_fn` binds `auth_routes_->probe_permission(req, res, type, op)`: the
      auto-loading Engine Principals fragment gates on EnginePrincipal:Read with the same
-     permission test as its REST twin (#5882), through the quiet probe. Never the loud `require_permission`, never a
-     constant.
+     permission test as its REST twin (#5882), through the quiet probe. Never the loud
+     `require_permission`, never a constant.
 
 Groups page (register_groups_routes block):
 

@@ -116,9 +116,9 @@ public:
 
     /// Quiet permission gate for the auto-loading Engine Principals panel
     /// (`GET /fragments/settings/engine-principals`, #5882). The panel applies the same
-    /// permission test (`EnginePrincipal:Read`) as its REST twin (`GET /api/v1/engine-principals`)
-    /// and is never more permissive than it; the differences are listed once, in
-    /// docs/user-manual/upgrading.md, and numbered the same way in the handler comment in
+    /// permission test (`EnginePrincipal:Read`) as its REST twin (`GET /api/v1/engine-principals`);
+    /// its seven differences, none of which admits a caller the route refuses, are listed once,
+    /// in docs/user-manual/upgrading.md, and numbered the same way in the handler comment in
     /// settings_routes.cpp. It loads on every /settings view, so a caller who lacks the grant
     /// must not write an `auth.permission_required` row per view. server.cpp binds
     /// `AuthRoutes::probe_permission` here: the same decision as `perm_fn` with the 401/403 kept

@@ -59,18 +59,35 @@ the list. The same note appears when the permission check itself could not be
 completed (a degraded RBAC read is answered `403`, not `503`): reload once before
 changing any grant, and if it persists check the role store's health and the
 `YuzuRbacReadDegraded` alert. The Settings page itself still opens for
-effective administrators only. The panel is never more permissive than the REST
-route and differs from it in the ways listed once in
-[upgrading](upgrading.md) (the "Breaking: the Settings Engine Principals panel" section).
+effective administrators only. The panel differs from the REST route in the ways
+listed once in [upgrading](upgrading.md) (the "Breaking: the Settings Engine
+Principals panel" section); none admits a caller the route refuses.
 
-A revoked row's **Detail** cell has three states. It shows the recorded detail of
-the original revoke, or "(not recorded)" when the audit trail holds no committed
-revoke for that principal. It shows "(unavailable)" when the audit store could not
-answer (the remaining revoked rows are then not looked up until you retry). It
-shows "(withheld: needs AuditLog:Read, or it could not be confirmed)" to a caller
-who does not hold `AuditLog:Read`, or when that check could not be completed.
+A revoked row's **Detail (earliest retained record)** cell is the audit trail's text
+for that principal, shown to a caller who also holds `AuditLog:Read`. It is
+best-effort: the oldest committed revoke record the panel's read of the newest 200
+revoke events still holds, which is not the revocation's own record when audit
+retention has pruned it while a later retry survives, when the revoke committed but
+its audit row failed to persist (so the reconcile retry is the first success row),
+or when an MCP revoke was given no reason. Its states:
+
+- The recorded text, as above.
+- "(not recorded)": no committed revoke record is retained. There was no committed
+  revoke, or a committed MCP revoke was given no reason (an empty detail), or the
+  record is older than audit retention (365 days by default).
+- "(unavailable)": not looked up, or the lookup failed. The audit store could not
+  answer, or an earlier credential read in the same load failed (or no token store
+  is wired) and the lookup was skipped; the remaining revoked rows are then not
+  looked up. Retry when the panel shows a Retry control, otherwise reload the page;
+  if it persists, check the `YuzuAuditReadDegraded` alert and the audit store
+  ([Audit log](audit-log.md), Storage).
+- "(withheld: needs AuditLog:Read, or it could not be confirmed)": the caller does
+  not hold `AuditLog:Read`, or that check could not be completed. Grant it (the
+  built-in `Administrator` and `Viewer` roles hold it) or reload.
+
 Past 200 revoke events for one principal the cell adds that the text may be a
-retry's rather than the original.
+retry's rather than the revocation's own record. The full list of what the cell can
+and cannot say is in [upgrading](upgrading.md) ("The Detail cell").
 
 If the list or an engine principal's credentials cannot be read (for example
 while the database connection pool is exhausted), the panel says so: an

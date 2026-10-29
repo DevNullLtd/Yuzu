@@ -317,7 +317,7 @@ admitted; the floor never overrides a live RBAC grant.)
 |---|---|
 | `AccessReview:Read` | The fleet-wide access-review grant export (SOC 2 CC6.2 evidence), `GET /api/v1/access-reviews*`, and the lighter-weight live grant-table listing `GET /api/v1/rbac/roles/assignments` (+ MCP `list_rbac_role_assignments`) — same securable, same sensitivity class, not a management-group-confined view |
 | `UserManagement:Read` | `GET /api/v1/rbac/roles` and the rest of the RBAC role graph |
-| `EnginePrincipal:Read` | The engine-principal inventory and grant graph, `GET /api/v1/engine-principals*` and the `list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP tools, and the two dashboard views over the same list: the Settings **Engine Principals** panel (`GET /fragments/settings/engine-principals`) and the principal panels of the Access **Tokens and principals** page. The Settings panel decides on the same permission test as the REST route: with RBAC on, an account administrator without the grant is refused (the panel says so) and a non-administrator who holds it, such as a `Viewer`, is admitted, although the `/settings` page itself stays administrator-only. It is never more permissive than the route and differs from it in the ways listed once in [upgrading](upgrading.md). |
+| `EnginePrincipal:Read` | The engine-principal inventory and grant graph, `GET /api/v1/engine-principals*` and the `list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP tools, and the two dashboard views over the same list: the Settings **Engine Principals** panel (`GET /fragments/settings/engine-principals`) and the principal panels of the Access **Tokens and principals** page. The Settings panel decides on the same permission test as the REST route: with RBAC on, an account administrator without the grant is refused (the panel says so) and a non-administrator who holds it, such as a `Viewer`, is admitted, although the `/settings` page itself stays administrator-only. It differs from the route in the ways listed once in [upgrading](upgrading.md), none of which admits a caller the route refuses. |
 | `Enrollment:Read` (#4031) | Auto-approve enrollment rules and pending-agent visibility, `GET /api/v1/enrollment/auto-approve-rules` and `GET /api/v1/enrollment/pending-agents` (service-scoped tokens are refused with `403` on both: the `ITServiceOwner` ceiling does not hold this pair) |
 | `OidcConfig:Read` (#4031) | OIDC SSO configuration status, `GET /api/v1/settings/oidc` |
 | `TlsConfig:Read` (#4028) | TLS settings read-twins, `GET /api/v1/settings/tls` and `GET /api/v1/settings/https` |
@@ -325,7 +325,7 @@ admitted; the floor never overrides a live RBAC grant.)
 | `ServerConfig:Read` (#4028) | Server runtime-configuration read-twins — `GET /api/v1/settings/server-config`, `/settings/gateway`, `/settings/mcp` and `/settings/data-retention` |
 | `AnalyticsConfig:Read` (#4028) | Analytics/offload configuration status, `GET /api/v1/settings/analytics` |
 | `Forensics:Read` | Windows forensic-artefact and per-device application-usage reads (Wave 7 PR7.2), per-app privacy-permission grants and per-account SSH access (`remote_access_audit`); also the stored responses of those Forensics-tier plugins on every response read path (REST, MCP, dashboard), which are served only to a caller holding it |
-| `AuditLog:Read` (#5771) | The audit trail itself (SOC 2 CC6.1/CC7.2 evidence): `GET /api/audit`, `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, `GET /api/v1/engine-principals/audit/no-admin`, the `query_audit_log` and `audit_engine_no_admin` MCP tools, and the `yuzu://audit/recent` MCP resource |
+| `AuditLog:Read` (#5771) | The audit trail itself (SOC 2 CC6.1/CC7.2 evidence): `GET /api/audit`, `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, `GET /api/v1/engine-principals/audit/no-admin`, the `query_audit_log` and `audit_engine_no_admin` MCP tools, and the `yuzu://audit/recent` MCP resource; and the two dashboard views that quote the audit trail's text: the revoke Detail of the Settings **Engine Principals** panel and the revocation detail of the Access **Tokens and principals** page |
 
 **Why this exists.** With RBAC **disabled**, the legacy fallback described
 above allows any authenticated non-engine session to perform every `Read` —
@@ -543,9 +543,10 @@ Settings uses, so the two stay equivalent.
   and the Enforce roles switch are drawn from the server's own check, so the cause is one of
   these:
   1. Enforcement is off. The `Administrator` grant is inert while it is off; the account must be
-     an active local administrator account. The RBAC enforcement panel shows which regime
-     applies; `rbac_enabled` in `GET /api/v1/me` is the server's cached view of the switch, can lag a
-     change, and does not report the could-not-confirm state.
+     an active local administrator account (the check reads the RBAC store for the regime and
+     the authentication database for the account). The RBAC enforcement panel shows which
+     regime applies; `rbac_enabled` in `GET /api/v1/me` is the server's cached view of the
+     switch, can lag a change, and does not report the could-not-confirm state.
   2. Enforcement is on and the account does not hold the fleet-wide `Administrator` grant, as
      with an account administrator created after RBAC was enabled. Another Administrator assigns
      it. The affected account often cannot read the Role assignments panel itself (it needs
@@ -557,13 +558,17 @@ Settings uses, so the two stay equivalent.
      controls but still reads "not available to your account" on the Users and Account panels,
      which need the `Administrator` account role.
   4. The controls are disabled with "Your administrator authority could not be confirmed.
-     Reload to try again.": a store behind the check did not answer. With enforcement on that is
-     the RBAC store; with enforcement off the check also reads the account from the
-     authentication database, so an outage of either store produces it. Check the pool
-     alerts first (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`; `/readyz` stays green under
-     pure pool saturation), the `RbacStore` warnings in the server log, and then the
-     `YuzuRbacReadDegraded` alert and `yuzu_server_rbac_read_degrade_total`. A hint stuck in
-     this state may not move that counter, so a flat counter does not mean the store is healthy.
+     Reload to try again.": a store behind the check did not answer. Both stores matter in
+     both regimes: with enforcement on the check reads your grants from the RBAC store, with
+     enforcement off it reads your account from the authentication database, and for an
+     admitted caller it then reads the grants and the active local accounts together (RBAC and
+     authentication tables) in either regime, so an outage of either store produces it. Check
+     the pool alerts first (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`; `/readyz` stays
+     green under pure pool saturation), then the `YuzuRbacReadDegraded` alert and
+     `yuzu_server_rbac_read_degrade_total`. The hint's own reads (the grants, the regime check
+     and the account read) log no warning and may not move that counter, so a flat counter and
+     a quiet log do not mean the stores are healthy; only other reads that coincide with the
+     outage, such as `RbacStore` warnings from unrelated requests, warn.
   5. The switch is live but the server answers `409` with a remediation. The hint decides who
      may attempt the change, not whether it would leave you an administrator: with enforcement
      off, a local administrator with no `Administrator` grant turning enforcement on ("assign

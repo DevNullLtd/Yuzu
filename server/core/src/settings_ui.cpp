@@ -677,8 +677,8 @@ const char* const kSettingsPageTemplate =
         el.textContent = 'Your session has expired. Sign in again to view this panel.';
       else {
         /* Not a reload: a freshly minted or rotated credential secret is shown outside this
-           section and a reload discards it. The Retry control and its
-           wording mirror settings_routes.cpp's kEngineRetryControl (a hand copy, pinned in
+           section and a reload discards it. The Retry control and its wording mirror
+           settings_routes.cpp's kEngineRetryControl (a hand copy, pinned in
            test_settings_page_ui.cpp), built as elements (textContent only) so the note stays
            free of markup parsing. */
         el.textContent = 'This panel could not be loaded (HTTP ' + x.status + '). ';

@@ -3,10 +3,11 @@
  * @brief [pg] Settings > Engine Principals panel (`GET /fragments/settings/engine-principals`)
  *        against its REST twin (`GET /api/v1/engine-principals`), both driven through the REAL
  *        AuthRoutes gates over a real RbacStore, EnginePrincipalStore, ApiTokenStore and
- *        AuditStore (#5882). The panel applies the same permission test as the twin and is never
- *        more permissive: it gates on EnginePrincipal:Read with the quiet probe, the twin with
- *        the loud `require_permission`, and server.cpp binds exactly these functions. The
- *        differences are SIX, numbered here exactly as in the handler comment in
+ *        AuditStore (#5882). The panel applies the same permission test as the twin: it gates on
+ *        EnginePrincipal:Read with the quiet probe, the twin with the loud `require_permission`,
+ *        and server.cpp binds exactly these functions. Each difference is stricter, a different
+ *        refusal, or a different rendering of a store failure; none admits a caller the twin
+ *        refuses. They are SEVEN, numbered here exactly as in the handler comment in
  *        settings_routes.cpp and listed once, with rationale, in docs/user-manual/upgrading.md.
  *
  * Classification rule: a status of 401 or 403 is "refused at the gate"; anything else (200, or
@@ -22,8 +23,12 @@
  * #520) where the twin admits an administrator's MCP token on its creator's authority.
  * `expect_same`'s `mcp_panel_refuses` argument names it at every call site that meets it.
  * Differences four and five (a credential count or the roster that cannot be read) are render
- * cases pinned in test_engine_principal_lifecycle.cpp. Difference six (the revoke Detail needs
- * AuditLog:Read, the twin returns no audit text) is pinned by the "engine panel audit" cases.
+ * cases: the render is pinned in test_engine_principal_lifecycle.cpp and the audit rows
+ * (roster unreadable writes none, credential unreadable still writes the count=N success row)
+ * by the "engine panel audit" cases here. Difference six (the revoke Detail needs
+ * AuditLog:Read, the twin returns no audit text) and difference seven (a refused cookie
+ * session writes no denial row on the panel, a token lacking AuditLog:Read writes one extra on
+ * a view that lists a revoked principal) are pinned by the "engine panel audit" cases.
  *
  * Personas, each with RBAC off and on: an account administrator WITHOUT the grant; a
  * non-administrator WITH EnginePrincipal:Read (Viewer); an account administrator holding the
