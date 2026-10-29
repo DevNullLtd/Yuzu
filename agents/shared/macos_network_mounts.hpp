@@ -4,7 +4,7 @@
 // The table is getmntinfo_r_np(MNT_NOWAIT): the kernel's cache, answered without a call into any
 // server, unprivileged. A mount whose filesystem type is a network one
 // (yuzu::shared::is_network_mount_fstype, network_fstype.hpp) is reported by its mount-on path.
-// The system lists a mount it creates under the Data volume (autofs `/home` appears as
+// The system lists a mount it creates under the Data volume (autofs `/home` can appear as
 // `/System/Volumes/Data/home`), while a walk compares the logical root-relative path, so that
 // spelling is reported with the volume prefix stripped as well; the extra entry only ever widens
 // the guard.
@@ -44,7 +44,7 @@ namespace yuzu::shared {
         if (!is_network_mount_fstype(table[i].f_fstypename)) continue;
         const std::string_view on{table[i].f_mntonname};
         out.emplace_back(on);
-        if (on.size() > kDataVolume.size() && on.substr(0, kDataVolume.size()) == kDataVolume &&
+        if (on.size() > kDataVolume.size() + 1 && on.substr(0, kDataVolume.size()) == kDataVolume &&
             on[kDataVolume.size()] == '/')
             out.emplace_back(on.substr(kDataVolume.size()));
     }

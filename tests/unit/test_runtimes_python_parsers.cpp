@@ -560,7 +560,7 @@ TEST_CASE("python: an unreadable mount table is recorded and the walk still runs
 namespace {
 
 struct StatfsTable {
-    struct statfs row[5]{};
+    struct statfs row[6]{};
     void set(int i, const char* fstype, const char* on) {
         std::strncpy(row[i].f_fstypename, fstype, sizeof row[i].f_fstypename - 1);
         std::strncpy(row[i].f_mntonname, on, sizeof row[i].f_mntonname - 1);
@@ -582,6 +582,10 @@ TEST_CASE("macos_network_mount_points keeps network types and respells Data-volu
     CHECK(yuzu::shared::macos_network_mount_points(t.row, 5) ==
           std::vector<std::string>{"/Volumes/share", "/System/Volumes/Data/home", "/home",
                                    "/System/Volumes/DataX/vol"});
+    // A trailing-slash spelling of the volume root must not respell to "/" (that would skip every root).
+    t.set(5, "nfs", "/System/Volumes/Data/");
+    CHECK(yuzu::shared::macos_network_mount_points(t.row, 6).back() == "/System/Volumes/Data/");
+    CHECK(yuzu::shared::macos_network_mount_points(t.row, 6).size() == 5);
     CHECK(yuzu::shared::macos_network_mount_points(t.row, 0).empty());
 }
 
