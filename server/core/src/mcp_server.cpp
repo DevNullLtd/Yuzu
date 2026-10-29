@@ -6660,10 +6660,12 @@ bool reject_unsupported_protocol_version(const httplib::Request& req, httplib::R
 // The one predicate for the stream-channel deny: "this caller holds a service-scoped API
 // token" (service-scoped confinement clause 4: extend, never fork). Other raw
 // token_scope_service.empty() checks belong to the C8 table and the scoped-gate layer, not
-// to this deny. A service-scoped token must never reach a fleet-wide surface unfiltered;
-// require_permission's service branch is a role ceiling plus a seeded-empty global-safe
-// allow-list; neither says which service the token is scoped to, and this handler has no
-// securable to hand it.
+// to this deny. A service-scoped token must never reach a fleet-wide surface unfiltered.
+// The usual gate does not fit the stream channel: require_permission's service branch is
+// only a role ceiling plus a seeded-empty global-safe allow-list, so it carries no
+// information about WHICH service the token is scoped to, and it needs a (securable,
+// operation) pair, which this handler has no securable to supply. The deny therefore
+// keys on the session's service scope directly.
 [[nodiscard]] bool is_service_scoped_caller(const auth::Session& session) {
     return !session.token_scope_service.empty();
 }

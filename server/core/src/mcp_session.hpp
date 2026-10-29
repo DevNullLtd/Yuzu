@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -34,8 +35,10 @@ class McpStreamState;
 // same principal presenting a different class does not match either
 // (ValidateResult::kCredentialMismatch).
 //
-// Server-derived. The class fields are never sent to a client, logged or audited; a
-// mismatch is reported only as the fixed reason token `credential_mismatch`. There is
+// Server-derived. The class fields are never sent to a client, and the MCP session,
+// stream and bridge code never writes them to a log or audit row (those rows carry the
+// principal as actor); a mismatch is reported only as the fixed reason token
+// `credential_mismatch`. There is
 // no implicit conversion from a string. The type is still an aggregate, so a braced
 // principal-only initialiser compiles with an EMPTY class; only production code, which
 // goes through binding_for(), carries a real one.
@@ -66,8 +69,11 @@ static_assert(!std::is_convertible_v<const char*, McpSessionBinding>,
 // What the session adds is a binding to the principal AND the credential class that
 // minted it (McpSessionBinding): a request that presents the id is served only if its
 // authenticated binding equals the one the session was minted under. That check runs on
-// GET attach and resume, on a POST that presents the id, on the streamed-POST and GET
-// per-tick liveness check, and on DELETE; ring content is released only past it.
+// GET attach and resume, on a POST that presents the id, on DELETE, and on the per-tick
+// liveness check of a streamed POST and a GET stream. That per-tick check compares the
+// binding STORED at attach with the registry's stored binding; the class is not
+// re-derived from the live credential after attach. Ring content is released only past
+// the check.
 //
 // Residuals, stated so nobody reads more into the binding than it gives:
 //  - Two credentials of one user in the same class are interchangeable on a session. The
@@ -78,10 +84,11 @@ static_assert(!std::is_convertible_v<const char*, McpSessionBinding>,
 //    are refused at /mcp/v1/ once the tierless-human refusal (#4309) lands, which is the
 //    planned closure. Until then the session id (128-bit, returned only in the
 //    initialize response header) must be protected like a credential.
-//  - Stream liveness is principal-level; the class is checked at attach. The per-tick
-//    credential revalidation of an open stream is principal-only; the class is compared
-//    at attach (and on every later request that presents the id), not re-derived on
-//    each tick.
+//  - The class is not re-derived from the live credential on an open stream. The per-tick
+//    liveness check compares the attach-time binding the stream captured with the
+//    registry's stored binding, and the per-tick credential revalidation hook is
+//    principal-only. The class of the live credential is compared only when a request
+//    presents the id (attach, resume, POST, DELETE), never on each tick.
 //
 // State is bounded and non-durable: a server restart drops every session, the client
 // gets a 404 on its next call and re-initializes, exactly as the MCP spec prescribes
@@ -234,5 +241,17 @@ session_reject_reason(McpSessionRegistry::ValidateResult result) noexcept {
                ? "credential_mismatch"
                : "unknown_session";
 }
+
+// The tokens are audit/metric vocabulary (yuzu_mcp_stream_rejects_total{reason=...}); lock
+// the mapping so a refactor cannot swap or rename one silently.
+static_assert(std::string_view{session_reject_reason(
+                  McpSessionRegistry::ValidateResult::kCredentialMismatch)} ==
+                  "credential_mismatch",
+              "a credential-class mismatch must report credential_mismatch");
+static_assert(std::string_view{session_reject_reason(
+                  McpSessionRegistry::ValidateResult::kUnknown)} == "unknown_session" &&
+                  std::string_view{session_reject_reason(
+                      McpSessionRegistry::ValidateResult::kValid)} == "unknown_session",
+              "an unknown (or non-rejecting) result must report unknown_session");
 
 }  // namespace yuzu::server::mcp
