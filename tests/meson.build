@@ -585,6 +585,7 @@ agent_test_exe = executable(
     'unit/test_wire_utf8.cpp',          # shared strict-UTF-8 scrubber (agents/shared/wire_utf8.hpp), portable
     'unit/test_row_byte_budget.cpp',    # shared row/byte budget (agents/shared/row_byte_budget.hpp), portable
     'unit/test_wall_clock_step.cpp',    # #4503: shared consecutive-sample wall-vs-monotonic clock-step guard (agents/shared/wall_clock_step.hpp), portable
+    'unit/test_smbios_parsers.cpp',     # H.1: shared bounds-checked SMBIOS walker (agents/shared/smbios_parsers.hpp) + firmware_posture adapter differential, portable
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
     'unit/test_browser_policy_parsers.cpp',         # Wave 10 PR10.2-b: pure policy-row model (every OS) + injected-root Linux JSON walk (POSIX-only bodies)
@@ -596,7 +597,7 @@ agent_test_exe = executable(
     'unit/test_mgmt_posture_legs.cpp',              # mgmt_posture: OS-free posture_linux/posture_macos decision seams over injected fakes; portable
     'unit/test_mgmt_posture_local_dispatcher.cpp',  # mgmt_posture: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_shares_parsers.cpp',                 # shares: pure exports/smb.conf parsers + row formatters over labelled fixtures; portable
-    'unit/test_shares_legs.cpp',                    # shares: OS-free list_linux decision seam over injected fakes; portable
+    'unit/test_shares_legs.cpp',                    # shares: OS-free list_linux/list_windows decision seams over injected fakes; portable
     'unit/test_shares_posix_fs.cpp',                # shares: the real POSIX fs binding under a TempDir (symlink/FIFO/cap/dirfd); body #if !defined(_WIN32)
     'unit/test_shares_local_dispatcher.cpp',        # shares: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_remote_access_audit_config_parsers.cpp',  # remote_access_audit: pure sshd_config/Include/service parsers over REAL CAPTURE + labelled fixtures; portable
@@ -606,6 +607,7 @@ agent_test_exe = executable(
     'unit/test_remote_access_audit_local_dispatcher.cpp',  # remote_access_audit: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_firmware_posture_parsers.cpp',           # Wave 8 PR8.4: pure SMBIOS/DMI/fwupd/IODeviceTree decoders over REAL CAPTURE fixtures
     'unit/test_firmware_posture_local_dispatcher.cpp',  # Wave 8 PR8.4: real firmware_posture plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_hardware_local_dispatcher.cpp',  # H.2 scaffold: real hardware dylib/.so/.dll via LocalDispatcher, unguarded on every OS
     'unit/test_platform_security_parsers.cpp',            # Wave 8 PR8.1-a1: pure decoders/classifiers/status over REAL CAPTURE fixtures
     'unit/test_platform_security_win_parsers.cpp',        # Wave 8 PR8.1-a1: pure registry-state mappers + reg-export parser over the-rig REAL CAPTURE fixtures
     'unit/test_platform_security_local_dispatcher.cpp',   # Wave 8 PR8.1-a1: real platform_security dylib/.so/.dll via LocalDispatcher, unguarded on every OS
@@ -914,6 +916,25 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
     args: ['--allow-running-no-tests', '--durations=yes'],
     suite: 'agent',
     timeout: 60,
+  )
+endif
+
+# ── H.1 SMBIOS walker allocation budget (separate binary, deliberately) ──────
+# test_smbios_alloc_budget.cpp replaces the global operator new/delete (see its header), so it is
+# a separate binary: absent under sanitizers and on Windows.
+if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
+  smbios_alloc_budget_exe = executable(
+    'yuzu_smbios_alloc_budget_tests',
+    files('unit/test_smbios_alloc_budget.cpp'),
+    include_directories: [include_directories('../agents/shared')],
+    dependencies: [catch2_dep],
+  )
+  test(
+    'smbios allocation budget',
+    smbios_alloc_budget_exe,
+    args: ['--allow-running-no-tests', '--durations=yes'],
+    suite: 'agent',
+    timeout: 30,
   )
 endif
 
@@ -1915,6 +1936,7 @@ if build_server
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',
       'unit/server/test_app_usage_store.cpp',       # Wave 7b PR7b.2
+      'unit/server/test_certificate_inventory.cpp',  # slice-2 PR 2a-2a: store, ingest seam, lint
       'unit/server/test_app_usage_ingestion.cpp',   # Wave 7b PR7b.2
       'unit/server/test_app_usage_routes.cpp',      # Wave 7b PR7b.2
       'unit/server/test_device_inventory_store.cpp',
@@ -3579,6 +3601,27 @@ test('shares definition columns',
   timeout: 30,
 )
 
+# hardware's planned-action definition contract (content/definitions/hardware.yaml): the four
+# on-demand definitions (no gather block, row_kind first, the final column schema) and the
+# columns appended to processors and memory (the test holds the expected literals; it does not
+# read the C++).
+test('hardware definition columns',
+  _python3_test,
+  args: [files('test_hardware_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# disk_actions' planned-action definition contract (content/definitions/disk_actions.yaml): the
+# two on-demand definitions (no gather block, row_kind first, the final column schema; the test
+# holds the expected literals; it does not read the C++).
+test('disk_actions definition columns',
+  _python3_test,
+  args: [files('test_disk_actions_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # registry's definition contract (content/definitions/registry.yaml): ids, types, result columns, role gates.
 test('registry definition columns',
   _python3_test,
@@ -3936,6 +3979,16 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
 test('access users production wiring lexical gate',
   _python3_test,
   args: [files('test_access_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# 2a-1b: the typed-source purge thread must start inside run()'s own body, after the
+# startup_failed_ recheck that follows start_web_server() -- not in the ServerImpl constructor
+# and not inside start_web_server(). Source-text only; carries move-mutation self-tests.
+test('typed-source purge wiring lexical gate (2a-1b)',
+  _python3_test,
+  args: [files('test_typed_purge_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

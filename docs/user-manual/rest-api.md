@@ -8413,7 +8413,7 @@ One device's per-executable last-used projection — the per-agent drill. Becaus
 | 503 + `Sec-Audit-Failed` | The per-open audit row could not persist — fail-closed, no data served |
 | 503 | Store unavailable or degraded (A4 envelope with `correlation_id`, `retry_after_ms: 5000`) — **never an empty 200** |
 
-Decommissioning the agent erases this store's rows too — see [Software Licensing (SLE)](#software-licensing-sle)'s `DELETE /api/v1/sle/agents/{agent_id}` (the seven-store cascade).
+Decommissioning the agent erases this store's rows too — see [Software Licensing (SLE)](#software-licensing-sle)'s `DELETE /api/v1/sle/agents/{agent_id}` (the eight-store cascade).
 
 ---
 
@@ -8462,7 +8462,7 @@ A genuinely licence-free (or unknown) device is `200` with `count: 0`; a `503` m
 
 #### `DELETE /api/v1/sle/agents/{agent_id}`
 
-**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **the seven stores in the cascade** (generic inventory, installed-software, device-CI, app-perf, detected-licence, app-usage, and the `endpoint_state` presence row that holds the device's last-known hostname, OS, agent version and architecture), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired whole-device erasure path for those seven stores (GDPR Art. 17); per-agent stores outside the cascade are not erased by it, and row-level / per-subject DSAR erasure is a stated gap (#1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
+**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **the eight stores in the cascade** (generic inventory, installed-software, device-CI, app-perf, detected-licence, app-usage, the `endpoint_state` presence row that holds the device's last-known hostname, OS, agent version and architecture, and the fleet certificate inventory), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired whole-device erasure path for those eight stores (GDPR Art. 17); per-agent stores outside the cascade are not erased by it, and row-level / per-subject DSAR erasure is a stated gap (#1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
 
 **Permission:** a single **per-device-scoped `Decommission:Delete`** securable (ADR-0024 Decision 9, amended Wave 7 PR7.2) — one grant authorizing for the cascade's whole blast radius, replacing the earlier per-store conjunction. A role lacking it is `403`'d, naming `Decommission:Delete` (the seeded Administrator/ITServiceOwner roles hold it by default; a custom role that had assembled the old per-store `Delete` grants must be granted this securable too — the three old grants no longer suffice).
 
@@ -8478,8 +8478,9 @@ Two durable audit events: `sle.agent.decommission|attempt` is written **before**
     "stores": {"inventory": "deleted", "software_inventory": "deleted",
                "app_perf_daily": "deleted", "device_inventory": "skipped",
                "software_licensing": "deleted", "app_usage": "deleted",
-               "offline_endpoint": "deleted"},
-    "deleted": 6,
+               "offline_endpoint": "deleted",
+               "certificate_inventory": "deleted"},
+    "deleted": 7,
     "skipped": 1,
     "failed": 0
   },
@@ -8499,7 +8500,7 @@ Per-store outcomes: `deleted` (the DELETE **committed**), `skipped` (store not c
 | 503 + `Sec-Audit-Failed` | The attempt audit row could not persist — fail-closed, **nothing was erased** |
 | 503 | Scope gate or cascade not configured (A4 envelope) |
 
-A `200` with `decommissioned: true` is confirmed erasure for the stores in the cascade of the replica that answered (a store reported `skipped` was not erased); deleting an unknown `agent_id` is a no-op `200` (nothing to erase). The `deleted` count reaches 7 (it reached 6 before the `offline_endpoint` store joined the cascade) when every store is configured. During a rolling upgrade, a DELETE served by a replica that has not been upgraded runs the old cascade and returns `200` without erasing the presence row: a response whose `stores` map has no `offline_endpoint` key did not erase it, and the `sle.agent.decommission` success audit row that replica writes lists its own stores (no `offline_endpoint`), so it is not evidence that the presence row was erased. Re-issue the DELETE once every replica runs this version.
+A `200` with `decommissioned: true` is confirmed erasure for the stores in the cascade of the replica that answered (a store reported `skipped` was not erased); deleting an unknown `agent_id` is a no-op `200` (nothing to erase). The `deleted` count reaches 8 (7 before the certificate inventory store joined the cascade, 6 before `offline_endpoint`) when every store is configured. During a rolling upgrade, a DELETE served by a replica that has not been upgraded runs the old cascade and returns `200` without erasing the presence row: a response whose `stores` map has no `offline_endpoint` key did not erase it, and the `sle.agent.decommission` success audit row that replica writes lists its own stores (no `offline_endpoint`), so it is not evidence that the presence row was erased. Re-issue the DELETE once every replica runs this version. The same applies to the eighth store: a DELETE served by a replica older than the certificate inventory store returns `200` without a `certificate_inventory` key in `stores`, and did not erase the device's certificate rows (those exist only once a certificate-collecting agent reports, so the window is empty until then). Re-issue it after the rollout.
 
 Erasure does not unenroll the agent: a still-enrolled device re-syncs on its next daily cycle and re-creates its `offline_endpoint` presence row on its next heartbeat. Erasure is therefore point-in-time; an `offline_endpoint=deleted` entry in the success audit row's store breakdown proves the row was deleted at commit, not that it stayed deleted. Stop or uninstall the agent first: revoking its certificate does not cut off an agent connected through a gateway (#5578), which must be disconnected at the gateway layer as well (see Device Management: [Per-agent mTLS auto-provisioning](device-management.md#per-agent-mtls-auto-provisioning-pki)). If you also revoke its certificate, look up the serial with `GET /api/v1/ca/issued` (needs `Security:Read` and an unconfined view; a management-group-confined account is refused), call `POST /api/v1/ca/revoke` (`Security:Delete`), and wait about 15 s for the next revocation sweep to drop a directly connected agent's stream before you issue the DELETE. Revocation cannot be undone through the API: the server refuses to issue a new certificate for that agent id while the revoked certificate is unexpired (audit `ca.cert.reissue_blocked`), so do not revoke a device you intend to re-enrol.
 

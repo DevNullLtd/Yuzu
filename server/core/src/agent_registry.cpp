@@ -897,10 +897,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "Linux from sssd/ipa configuration as written), MDM enrolment on macOS; a refused read is "
          "reported as permission_denied, never as not-joined; read-only, one bounded argv on macOS"},
         {"shares.list",
-         "Shares this host serves over SMB/NFS as configured: name, path, ro/rw, anonymous access "
-         "and a few flags, never ACLs or NFS client host lists; configured exports, not the "
-         "mapping/session observations tar mapdrive records; Linux reads /etc/exports, "
-         "/etc/exports.d and /etc/samba/smb.conf, macOS and Windows are planned; read-only"},
+         "Shares this host serves over SMB/NFS: name, path, ro/rw, anonymous access and a few "
+         "flags, never ACLs or NFS client host lists; not the mapping/session observations tar "
+         "mapdrive records; Linux reads the configuration as written (/etc/exports, "
+         "/etc/exports.d and /etc/samba/smb.conf), Windows reads the live Server-service shares "
+         "through NetShareEnum (name, path, kind and flags only), macOS is planned; read-only"},
         {"remote_access_audit.list",
          "SSH inbound-access audit as configured: sshd_config values (Include followed, Match not "
          "evaluated), per-account authorized_keys key fingerprints with option names, and whether "
@@ -926,6 +927,15 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"hardware.memory", "Installed memory modules (DIMMs) with size and type"},
         {"hardware.disks", "Physical disk drives with size and media type"},
         {"hardware.drivers", "Installed device drivers with version, date, provider, class"},
+        {"hardware.chassis", "Chassis type, serial and asset tag (planned on every OS this release; one unsupported status row)"},
+        {"hardware.baseboard", "Baseboard vendor, product and serial (planned on every OS this release; one unsupported status row)"},
+        {"hardware.swap", "Swap devices and page files with total and used size (planned on every OS this release; one unsupported status row)"},
+        {"hardware.machine_id", "Keyed hash of the OS machine identifier (planned on every OS this release; one unsupported status row)"},
+        // disk_actions
+        {"disk_actions.smart", "Per-physical-drive health: model, transport, media type and, where the OS exposes it, wear indicators"},
+        {"disk_actions.volumes", "Mapping between physical drives and the logical volumes they back, with mount points"},
+        {"disk_actions.partitions", "Partitions of each physical disk with size, type and mount points (planned on every OS this release; one unsupported status row)"},
+        {"disk_actions.topology", "LVM, md, multipath and APFS container layers above the physical disks (planned on every OS this release; one unsupported status row)"},
         // os_info
         {"os_info.os_name", "Full OS product name"},
         {"os_info.os_version", "OS version string"},
