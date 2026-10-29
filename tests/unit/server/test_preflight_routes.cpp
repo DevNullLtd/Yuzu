@@ -801,6 +801,8 @@ TEST_CASE("preflight ui: /auto renders the Deployments tab strip, panels, refusa
     // wedge every later tab click (drop ignores clicks until the stuck XHR settles).
     CHECK(contains(h, "hx-sync=\"this:replace\""));
     CHECK_FALSE(contains(h, "this:drop"));
+    // Returning to the list clears a drilled detail so it cannot outlive the refreshed list.
+    CHECK(contains(h, "if(w==='list'){var x=document.getElementById('auto-detail');if(x)x.innerHTML='';}"));
     // Tab wiring: the two onclick handlers and the pfTab switcher.
     CHECK(contains(h, "window.pfTab=function"));
     CHECK(contains(h, "onclick=\"pfTab('flow');return false\""));

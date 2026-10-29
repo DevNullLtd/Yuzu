@@ -306,7 +306,8 @@ they never create a run or a deployment.
 
 - **Deployments tab** — on the Deployments page (`/auto`), the **Deployments** tab beside
   **Pre-flight and deploy** lists your deployments from the last 14 days, newest first, up to the newest 50 (a notice says
-  when the list is cut). Select a deployment's name to see its device grid below the list; the grid
+  when the list is cut). A target reading **Run no longer kept** means the pre-flight run it
+  came from has aged out of retention; the deployment itself is still listed. Select a deployment's name to see its device grid below the list; the grid
   shows the first 500 devices, with a notice when there are more, and the counts above it stay
   exact. The tab is read-only: it never advances
   a running deployment, so counts for a **Running** deployment are as of the last advance, and a
