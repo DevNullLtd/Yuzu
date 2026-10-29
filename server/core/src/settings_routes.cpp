@@ -988,17 +988,19 @@ std::string SettingsRoutes::render_engine_principals_fragment(
             // the read cannot say it is THE revocation's record, and it is not when
             // (1) audit retention pruned the revoking row but a later retry survives,
             // (2) the revoke committed but its success row failed to persist (the
-            // route answers 503), so the reconcile retry's `credentials_revoked=0`
-            // is the first success row, or (3) an MCP revoke given no reason wrote
-            // an empty detail, which reads "(not recorded)". Best-effort evidence;
-            // the facts beside it come from the principal store. It is the audit
-            // trail's text, so it is shown only to a caller who passes the
-            // AuditLog:Read probe (the handler's quiet one); everyone else gets the
-            // cell without it.
+            // route answers 503), so a later retry of the same revoke, which writes
+            // `credentials_revoked=0`, is the first success row, or (3) an MCP revoke
+            // given no reason wrote an empty detail, which reads "(not recorded)".
+            // Best-effort evidence; the facts beside it come from the principal
+            // store. It is the audit trail's text, so it is shown only to a caller
+            // who passes the AuditLog:Read probe (the handler's quiet one); everyone
+            // else gets the cell without it.
             // Three DIFFERENT outcomes, distinguished: "(not recorded)" when the
-            // store answered and had no committed revoke, "(unavailable)" when it
-            // could not answer at all, "(withheld: ...)" when the caller may not
-            // read the audit trail or that could not be confirmed. Collapsing them
+            // store answered and held no committed revoke text (no committed revoke
+            // at all, or a committed MCP revoke whose detail is empty),
+            // "(unavailable)" when it could not answer at all, "(withheld: ...)"
+            // when the caller may not read the audit trail or that could not be
+            // confirmed. Collapsing them
             // would state a fact the read never established; the revocation facts
             // beside it come from the principal store and are unaffected either way.
             // A full window (more than kRevokeHistoryWindow events) adds the Access
@@ -2930,12 +2932,13 @@ void SettingsRoutes::register_routes(
     //
     // Gated as its REST twin GET /api/v1/engine-principals (#5882): EnginePrincipal:Read,
     // then the session, then the engine-session belt. The panel applies the same permission
-    // test as the route. Each difference is stricter, a different refusal, or a different
-    // rendering of a store failure; none admits a caller the route refuses. There are SEVEN,
-    // listed once with their rationale in docs/user-manual/upgrading.md (numbered identically
-    // in test_settings_engine_panel_authz.cpp's header, which pins 1 to 3, 6 and 7; the
-    // render cases of 4 and 5 are in test_engine_principal_lifecycle.cpp, their audit halves
-    // in test_settings_engine_panel_authz.cpp):
+    // test as the route. Each difference is stricter, a different refusal, a different
+    // rendering of a store failure, or a different audit record; none admits a caller the
+    // route refuses. There are SEVEN, listed once with their rationale in
+    // docs/user-manual/upgrading.md (numbered identically in
+    // test_settings_engine_panel_authz.cpp's header, which pins 1 to 3, 6 and 7; the render
+    // cases of 4 and 5 are in test_engine_principal_lifecycle.cpp, their audit halves in
+    // test_settings_engine_panel_authz.cpp):
     //  1. an absent engine-principal store is an in-page note on a 200 (the route answers
     //     503), because htmx would not swap the note otherwise;
     //  2. an engine session with the store absent gets the belt's 403 where the route
@@ -2944,13 +2947,17 @@ void SettingsRoutes::register_routes(
     //     tokens panel and the pre-#5882 administrator gate did (#520): a cookie-session
     //     dashboard panel is not an MCP surface. The route admits an administrator's MCP
     //     token on its creator's authority;
-    //  4. a credential count that cannot be read (or no token store wired) renders
-    //     "unavailable" on a 200 and still writes the success row; the route answers 503 with
-    //     a failure row;
+    //  4. credential counts, in two cases: (a) a count that cannot be read renders
+    //     "unavailable" on a 200 (no Mint or Rotate) and still writes the success row, where
+    //     the route answers 503 with a failure row; (b) with no token store wired (not a
+    //     production configuration) the panel renders as in (a), with a Retry that cannot
+    //     help, while the route answers 200 with every count 0 and its success row;
     //  5. an unreadable roster renders a note with Retry on a 200 and writes no row; the
     //     route answers 503 with a failure row;
     //  6. the revoke Detail cell shows the audit trail's text, so it needs AuditLog:Read
-    //     as well (the route returns no audit text at all);
+    //     as well (the route returns no audit text at all); a revoked row also shows
+    //     revoked_at and superseded_by, which the list route omits (GET /{id} returns both
+    //     under the same permission);
     //  7. audit rows: the panel auto-loads, so a refused interactive cookie session writes no
     //     auth.permission_required row (the route writes one), and an API token that lacks
     //     AuditLog:Read writes one extra denied row on a view that lists a revoked principal

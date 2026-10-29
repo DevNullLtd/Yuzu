@@ -6,9 +6,10 @@
  *        AuditStore (#5882). The panel applies the same permission test as the twin: it gates on
  *        EnginePrincipal:Read with the quiet probe, the twin with the loud `require_permission`,
  *        and server.cpp binds exactly these functions. Each difference is stricter, a different
- *        refusal, or a different rendering of a store failure; none admits a caller the twin
- *        refuses. They are SEVEN, numbered here exactly as in the handler comment in
- *        settings_routes.cpp and listed once, with rationale, in docs/user-manual/upgrading.md.
+ *        refusal, a different rendering of a store failure, or a different audit record; none
+ *        admits a caller the twin refuses. They are SEVEN, numbered here exactly as in the
+ *        handler comment in settings_routes.cpp and listed once, with rationale, in
+ *        docs/user-manual/upgrading.md.
  *
  * Classification rule: a status of 401 or 403 is "refused at the gate"; anything else (200, or
  * the twin's 503 for a closed store) is "admitted at the gate". Raw statuses are NOT compared

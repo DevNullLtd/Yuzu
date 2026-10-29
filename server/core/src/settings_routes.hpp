@@ -345,7 +345,8 @@ private:
     /// success in the bounded read (`committed_revoke_detail`, shared with the Access tokens
     /// panel), never a failed attempt or a later retry while an older success survives, but not
     /// necessarily the revocation's own record (retention can prune it, a failed audit write can
-    /// leave a reconcile retry as the first success, an MCP revoke without a reason is empty).
+    /// leave a later retry of the same revoke as the first success, an MCP revoke without a reason
+    /// has an empty detail and reads "(not recorded)").
     /// It carries that panel's truncation caveat when more than its window of revoke events
     /// exists. After the first failed audit read the remaining revoked rows are not queried and
     /// read "(unavailable)".

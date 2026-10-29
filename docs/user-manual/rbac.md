@@ -325,7 +325,7 @@ admitted; the floor never overrides a live RBAC grant.)
 | `ServerConfig:Read` (#4028) | Server runtime-configuration read-twins — `GET /api/v1/settings/server-config`, `/settings/gateway`, `/settings/mcp` and `/settings/data-retention` |
 | `AnalyticsConfig:Read` (#4028) | Analytics/offload configuration status, `GET /api/v1/settings/analytics` |
 | `Forensics:Read` | Windows forensic-artefact and per-device application-usage reads (Wave 7 PR7.2), per-app privacy-permission grants and per-account SSH access (`remote_access_audit`); also the stored responses of those Forensics-tier plugins on every response read path (REST, MCP, dashboard), which are served only to a caller holding it |
-| `AuditLog:Read` (#5771) | The audit trail itself (SOC 2 CC6.1/CC7.2 evidence): `GET /api/audit`, `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, `GET /api/v1/engine-principals/audit/no-admin`, the `query_audit_log` and `audit_engine_no_admin` MCP tools, and the `yuzu://audit/recent` MCP resource; and the two dashboard views that quote the audit trail's text: the revoke Detail of the Settings **Engine Principals** panel and the revocation detail of the Access **Tokens and principals** page |
+| `AuditLog:Read` (#5771) | The audit trail itself (SOC 2 CC6.1/CC7.2 evidence): `GET /api/audit`, `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, `GET /api/v1/engine-principals/audit/no-admin`, the `query_audit_log` and `audit_engine_no_admin` MCP tools, and the `yuzu://audit/recent` MCP resource; and the dashboard views that quote the audit trail's text, including the revoke Detail of the Settings **Engine Principals** panel, the revocation detail of the Access **Tokens and principals** page, the Access audit log and sample fragments (`/fragments/access/audit/log`, `/fragments/access/audit/sample`) and the Dashboard activity panel (`/fragments/dashboard/activity`) |
 
 **Why this exists.** With RBAC **disabled**, the legacy fallback described
 above allows any authenticated non-engine session to perform every `Read` —
@@ -560,9 +560,12 @@ Settings uses, so the two stay equivalent.
   4. The controls are disabled with "Your administrator authority could not be confirmed.
      Reload to try again.": a store behind the check did not answer. Both stores matter in
      both regimes: with enforcement on the check reads your grants from the RBAC store, with
-     enforcement off it reads your account from the authentication database, and for an
-     admitted caller it then reads the grants and the active local accounts together (RBAC and
-     authentication tables) in either regime, so an outage of either store produces it. Check
+     enforcement off it reads your account from the authentication database. For an admitted
+     caller a second check then reads the enforcement flag from the RBAC store and, with
+     enforcement on, the `Administrator` grants joined to the active local accounts (RBAC and
+     authentication tables together), or, with enforcement off, the active local administrator
+     accounts only, with no grant read. So an outage of either store produces it in either
+     regime. Check
      the pool alerts first (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`; `/readyz` stays
      green under pure pool saturation), then the `YuzuRbacReadDegraded` alert and
      `yuzu_server_rbac_read_degrade_total`. The hint's own reads (the grants, the regime check
