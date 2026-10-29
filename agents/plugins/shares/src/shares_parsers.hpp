@@ -651,12 +651,16 @@ inline std::optional<bool> parse_v6(std::string_view s) {
 /// or a bare `x` after a dot), every part's 32-bit-wrapped value at most 0xff, and after the
 /// last part the end of the value or a whitespace byte (a CR from a CRLF file is one, so a
 /// trailing network or mask still parses there, unlike an IPv6 one). This is the macOS libc
-/// reading (measured on 26.6.2): `0x0a` is valid, `0x0a000000` is not. Only the family and
-/// validity matter here, the value is never used: an IPv4 network is never the world.
+/// reading (measured on 26.6.2): `0x0a` is valid, `0x0a000000` is not. The parts are packed one
+/// byte each, as inet_network packs them, because get_net refuses the one packed value equal to
+/// INADDR_NONE: four parts that are all 0xff (`255.255.255.255`, `0xff.0xff.0xff.0xff`,
+/// `0377.0377.0377.0377`) are rejected, `255.255.255.254` is not. Past that check only the family
+/// and validity matter here: an IPv4 network is never the world.
 inline bool bsd_v4_literal(std::string_view v) {
     if (v.empty() || std::isdigit(static_cast<unsigned char>(v[0])) == 0)
         return false;
     std::size_t i = 0;
+    std::uint32_t packed = 0;
     for (std::size_t parts = 0;; ++parts) {
         std::uint32_t val = 0;
         std::uint32_t base = 10;
@@ -687,11 +691,13 @@ inline bool bsd_v4_literal(std::string_view v) {
         }
         if (!digit || parts >= 4 || val > 0xff)
             return false;
+        packed = (packed << 8) | val;
         if (i < v.size() && v[i] == '.') {
             ++i;
             continue;
         }
-        return i == v.size() || std::isspace(static_cast<unsigned char>(v[i])) != 0;
+        return (i == v.size() || std::isspace(static_cast<unsigned char>(v[i])) != 0) &&
+               packed != 0xffffffffU; // INADDR_NONE: get_net's error value
     }
 }
 
@@ -745,6 +751,50 @@ inline bool is_root_user(std::string_view user) {
     return static_cast<int>(std::strtoll(std::string(user).c_str(), nullptr, 10)) == 0;
 }
 
+/// Darwin MAXPATHLEN: do_opt copies an `-fspath` value with strlcpy into a buffer this size and
+/// refuses one whose length is this long or longer.
+inline constexpr std::size_t kBsdMaxPathLen = 1024;
+
+/// Whether mountd's `get_sec_flavors` accepts a `-sec` value: colon-separated flavours, an empty
+/// component skipped, a repeat of an accepted flavour skipped, and a component that is not
+/// `sys` / `krb5` / `krb5i` / `krb5p` (exact case) voids the whole list, so `sys:bogus` is as bad
+/// as `bogus`. At least one flavour must be accepted: `-sec=` and `-sec=:` are rejected. Apple's
+/// scan also stops at NX_MAX_SEC_FLAVORS (5), which four distinct flavours can never reach, so
+/// the cap is not modelled.
+inline bool bsd_sec_valid(std::string_view v) {
+    bool any = false;
+    for (const auto flavor : split(v, ':')) {
+        if (flavor.empty())
+            continue;
+        if (flavor != "sys" && flavor != "krb5" && flavor != "krb5i" && flavor != "krb5p")
+            return false;
+        any = true;
+    }
+    return any;
+}
+
+/// Whether do_opt accepts an `-fspath` value: it starts with `/` and is shorter than MAXPATHLEN.
+inline bool bsd_fspath_valid(std::string_view v) {
+    return !v.empty() && v[0] == '/' && v.size() < kBsdMaxPathLen;
+}
+
+/// Whether do_opt accepts an `-fsuuid` value: sixteen pairs of hex digits, one `-` allowed
+/// before each pair. Nothing is tested after the sixteenth pair, so trailing text is accepted;
+/// a short value runs into the terminator, which is no hex digit.
+inline bool bsd_fsuuid_valid(std::string_view v) {
+    const auto hex_at = [v](std::size_t k) {
+        return k < v.size() && std::isxdigit(static_cast<unsigned char>(v[k])) != 0;
+    };
+    std::size_t i = 0;
+    for (int pair = 0; pair < 16; ++pair, i += 2) {
+        if (i < v.size() && v[i] == '-')
+            ++i;
+        if (!hex_at(i) || !hex_at(i + 1))
+            return false;
+    }
+    return true;
+}
+
 /// What one accepted entry exports: its distinct paths and the facts they share.
 struct BsdEntry {
     std::vector<std::string> paths;
@@ -759,8 +809,9 @@ struct BsdEntry {
 /// Parses one joined entry. false => Apple rejects it (no row, no token): an option or host
 /// before any path, a path after an option or host, a repeated -network / -mask, a -network
 /// together with a host, a malformed network or mask value (a name is never resolved, so an
-/// unresolvable one is still accepted), mismatched families, a -mask without a -network, and
-/// -maproot (or -root / -r) together with -mapall (mountd `check_options`).
+/// unresolvable one is still accepted; an all-ones IPv4 value is INADDR_NONE, which get_net
+/// refuses), mismatched families, a -mask without a -network, -maproot (or -root / -r) together
+/// with -mapall (mountd `check_options`), and a bad -sec, -fspath or -fsuuid value (do_opt).
 inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
     std::size_t i = 0;
     std::string_view f = bsd_nextfield(entry, i);
@@ -833,13 +884,21 @@ inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
                     have_net = true;
                     used_next = from_next;
                 } else if (has_arg && item == "sec") {
+                    if (!bsd_sec_valid(arg))
+                        return false;
                     used_next = from_next;
                 } else if (item == "offline") {
                     e.offline = true;
-                } else if (item == "alldirs" || item == "32bitclients" || item == "manglednames" ||
-                           item == "fspath" || item == "fsuuid") {
-                    // accepted and ignored; a next-field value is NOT consumed (mountd leaves it
-                    // to be read as a field of its own)
+                } else if (item == "fspath" || item == "fsuuid") {
+                    // A value is checked, and a bad one rejects the entry; one taken from the
+                    // next field is NOT consumed (mountd leaves it to be read as a field of its
+                    // own, so a valid `-fspath /x` still leaves `/x` a path after an option). No
+                    // value is only a warning.
+                    if (has_arg &&
+                        !(item == "fspath" ? bsd_fspath_valid(arg) : bsd_fsuuid_valid(arg)))
+                        return false;
+                } else if (item == "alldirs" || item == "32bitclients" || item == "manglednames") {
+                    // accepted and ignored; a next-field value is NOT consumed
                 } else {
                     break; // unrecognised (or a value-taking name with no value): the rest of
                            // this option field is dropped, as mountd drops it

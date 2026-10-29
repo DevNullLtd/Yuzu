@@ -929,6 +929,12 @@ std::vector<std::string> sigs(const ExportsParse& p) {
 
 using Sigs = std::vector<std::string>;
 
+/// An entry Apple rejects: no row, and neither a truncation nor an oversize flag either.
+bool rejected(std::string_view line) {
+    const auto p = bsd(line);
+    return p.shares.empty() && !p.truncated && !p.field_oversized;
+}
+
 } // namespace
 
 TEST_CASE("shares bsd exports: the man page shapes", "[shares]") {
@@ -1086,6 +1092,124 @@ TEST_CASE("shares bsd exports: lines Apple rejects yield no row and no token", "
     }
     // The line after a rejected one still parses.
     CHECK(sigs(bsd("/a -ro /b\n/c")) == Sigs{"/c rw anon clients_0"});
+}
+
+TEST_CASE(
+    "shares bsd exports: an all-ones IPv4 network or mask is INADDR_NONE, which get_net refuses",
+    "[shares]") {
+    // inet_network packs one byte per part, so four 0xff parts are 0xffffffff in any spelling
+    // and get_net fails the entry for both -network and -mask.
+    for (const char* line :
+         {"/srv -network 255.255.255.255", "/srv -n=255.255.255.255",
+          "/srv -network 10.0.0.0 -mask 255.255.255.255",
+          "/srv -network 10.0.0.0 -m=255.255.255.255", "/srv -network 0xff.0xff.0xff.0xff",
+          "/srv -network 0377.0377.0377.0377", "/srv -network 10.0.0.0 -mask 0xff.0xff.0xff.0xff",
+          "/srv -network 10.0.0.0 -mask 0377.0377.0377.0377",
+          // mixed bases and cases, a bare hex part after a dot, and a CR from a CRLF file.
+          "/srv -network 255.0XFF.0377.0xFf", "/srv -network 255.255.255.xff",
+          "/srv -network 255.255.255.255\r", "/srv -network 10.0.0.0 -mask 255.255.255.255\r\n"}) {
+        INFO(line);
+        CHECK(rejected(line));
+    }
+    // The near neighbours are ordinary values: one fewer in any part, or fewer than four parts.
+    for (const char* line :
+         {"/srv -network 255.255.255.254", "/srv -network 10.0.0.0 -mask 255.255.255.254",
+          "/srv -network 254.255.255.255", "/srv -network 10.0.0.0 -mask 255.255.255",
+          "/srv -network 255.255", "/srv -network 255", "/srv -network 0xff.0xff.0xff.0xfe",
+          "/srv -network 10.0.0.0 -mask 255.255.255.254\r\n"}) {
+        INFO(line);
+        CHECK(sigs(bsd(line)) == Sigs{"/srv rw named clients_1"});
+    }
+    CHECK_FALSE(detail::bsd_v4_literal("255.255.255.255"));
+    CHECK(detail::bsd_v4_literal("255.255.255.254"));
+    // The line after a rejected one still parses.
+    CHECK(sigs(bsd("/a -network 255.255.255.255\n/b")) == Sigs{"/b rw anon clients_0"});
+}
+
+TEST_CASE("shares bsd exports: a -sec value is checked as get_sec_flavors checks it", "[shares]") {
+    // An empty list, any unknown or differently-cased component (even after a valid one), and
+    // an `=` value that is empty reject the entry, in both value forms.
+    for (const char* line :
+         {"/srv -sec=", "/srv -sec=:", "/srv -sec=::", "/srv -sec=bogus", "/srv -sec=sys:bogus",
+          "/srv -sec=bogus:sys", "/srv -sec=SYS", "/srv -sec=krb5x", "/srv -sec= friends",
+          "/srv -sec bogus", "/srv -sec sys:bogus", "/srv -ro,sec bogus",
+          // a CR from a CRLF file stays in the last field.
+          "/srv -sec=sys\r",
+          // Four distinct flavours never reach Apple's five-slot cap, and a repeat takes no
+          // slot, so an unknown component after them is still examined.
+          "/srv -sec=sys:krb5:krb5i:krb5p:bogus", "/srv -sec=sys:sys:sys:sys:sys:sys:bogus"}) {
+        INFO(line);
+        CHECK(rejected(line));
+    }
+    // Accepted: any non-empty mix of the four flavours, empty components and repeats skipped.
+    for (const char* line :
+         {"/srv -sec=sys", "/srv -sec=sys:sys", "/srv -sec=krb5:krb5i:krb5p",
+          "/srv -sec=sys:krb5:krb5i:krb5p", "/srv -sec=sys::krb5:", "/srv -sec=:sys",
+          "/srv -sec=sys:krb5:sys:krb5i", "/srv -sec=sys,ro", "/srv -ro,sec=krb5p", "/srv -sec sys",
+          "/srv -sec krb5i:sys", "/srv -ro,sec krb5"}) {
+        INFO(line);
+        CHECK(sigs(bsd(line)).size() == 1);
+    }
+    // A valid space-separated value is consumed (it is not a host), an `=` one leaves the next
+    // field alone, and no value at all is an unrecognised option that ends the field.
+    CHECK(sigs(bsd("/srv -sec sys")) == Sigs{"/srv rw anon clients_0"});
+    CHECK(sigs(bsd("/srv -sec sys friends")) == Sigs{"/srv rw named clients_1"});
+    CHECK(sigs(bsd("/srv -sec=sys friends")) == Sigs{"/srv rw named clients_1"});
+    CHECK(sigs(bsd("/srv -sec")) == Sigs{"/srv rw anon clients_0"});
+    CHECK(sigs(bsd("/srv -sec -ro")) == Sigs{"/srv ro anon clients_0"});
+    // The line after a rejected one still parses.
+    CHECK(sigs(bsd("/a -sec=bogus\n/b")) == Sigs{"/b rw anon clients_0"});
+}
+
+TEST_CASE("shares bsd exports: -fspath and -fsuuid values are checked as do_opt checks them",
+          "[shares]") {
+    const std::string uuid = "0123456789abcdef0123456789abcdef";
+    const std::string dashed = "01234567-89ab-cdef-0123-456789abcdef";
+    const std::string path_max = "/" + std::string(detail::kBsdMaxPathLen - 1, 'x');
+    const std::string path_ok = "/" + std::string(detail::kBsdMaxPathLen - 2, 'x');
+    REQUIRE(path_max.size() == detail::kBsdMaxPathLen);
+
+    // fspath: a value that is empty, relative, or MAXPATHLEN or longer rejects the entry, in
+    // both value forms; 1023 bytes is the longest accepted.
+    const std::vector<std::string> bad_fspath = {
+        "/srv -fspath=",       "/srv -fspath=rel",    "/srv -fspath rel",        "/srv -fspath=./x",
+        "/srv -ro,fspath rel", "/srv -fspath=rel,ro", "/srv -fspath=" + path_max};
+    for (const auto& line : bad_fspath) {
+        INFO(line.substr(0, 40));
+        CHECK(rejected(line));
+    }
+    CHECK(sigs(bsd("/srv -fspath=" + path_ok)) == Sigs{"/srv rw anon clients_0"});
+    CHECK(sigs(bsd("/srv -fspath=/x,ro")) == Sigs{"/srv ro anon clients_0"});
+    // No value is only a warning; a valid next-field value is NOT consumed, so it stays a path
+    // after an option and rejects the entry (and an option-led next field is no value at all).
+    CHECK(sigs(bsd("/srv -fspath")) == Sigs{"/srv rw anon clients_0"});
+    CHECK(sigs(bsd("/srv -fspath -ro")) == Sigs{"/srv ro anon clients_0"});
+    CHECK(rejected("/srv -fspath /x"));
+
+    // fsuuid: sixteen hex pairs, one optional dash before each pair, nothing tested after.
+    const std::vector<std::string> bad_fsuuid = {"/srv -fsuuid=",
+                                                 "/srv -fsuuid=zzz",
+                                                 "/srv -fsuuid zzz",
+                                                 "/srv -ro,fsuuid zzz",
+                                                 "/srv -fsuuid=" + uuid.substr(0, 31),
+                                                 "/srv -fsuuid=" + uuid.substr(0, 30),
+                                                 "/srv -fsuuid=" + uuid.substr(0, 31) + "g",
+                                                 "/srv -fsuuid=" + dashed.substr(0, 35),
+                                                 "/srv -fsuuid=0123--456789abcdef0123456789abcdef"};
+    for (const auto& line : bad_fsuuid) {
+        INFO(line);
+        CHECK(rejected(line));
+    }
+    for (const std::string& value : {uuid, dashed, uuid + "zz", dashed + "\r", "-" + uuid}) {
+        INFO(value);
+        CHECK(sigs(bsd("/srv -fsuuid=" + value)) == Sigs{"/srv rw anon clients_0"});
+    }
+    CHECK(sigs(bsd("/srv -fsuuid=" + dashed + ",ro")) == Sigs{"/srv ro anon clients_0"});
+    CHECK(sigs(bsd("/srv -fsuuid")) == Sigs{"/srv rw anon clients_0"});
+    // A valid next-field value is not consumed either: it is read as a host.
+    CHECK(sigs(bsd("/srv -fsuuid " + uuid)) == Sigs{"/srv rw named clients_1"});
+    // The line after a rejected one still parses.
+    CHECK(sigs(bsd("/a -fspath=rel\n/b")) == Sigs{"/b rw anon clients_0"});
 }
 
 TEST_CASE("shares bsd exports: hostile bytes stay inside one escaped row", "[shares]") {
