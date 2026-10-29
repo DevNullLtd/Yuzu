@@ -359,8 +359,8 @@ v0.12.0 is inferred from the agent source, not run) and, for
 persistent missing state, stay rejected until restarted or upgraded (a heartbeat that
 falls in the short gap between the session leaving the pending table and its agent
 process registering can succeed later without re-registration). Upgrade the agents
-first, then the gateway, with a build that includes the #2182 fix once released; until
-then, restart an agent that stays rejected (restarting the agent service re-registers
+first, then the gateway, with 0.15.0 or later (the #2182 fix); until the agents are upgraded,
+restart an agent that stays rejected (restarting the agent service re-registers
 it). Agents that do not connect through the gateway are not affected. Recovery matters
 only when heartbeats are rejected, which happens in four cases: a topology that breaks
 the one-connection assumption, a gateway running without the session index, a
@@ -550,8 +550,8 @@ is not tested.
 
 **Upgrading.** A rejected agent re-registers on its own only in a build that includes
 the #2182 fix, or with `--no-auto-update` on v0.13.0 and v0.14.0-rc6 (see Heartbeat
-admission): upgrade the agents first, then the gateway, with a build that includes the fix
-once released. Until then, restart an agent that stays rejected (restarting the agent service
+admission): upgrade the agents first, then the gateway, with 0.15.0 or later, which includes the fix.
+Until the agents are upgraded, restart an agent that stays rejected (restarting the agent service
 re-registers it). Agents that do not connect through the gateway are not affected. Deploy this
 change with a **gateway restart**. The session index is a
 new in-memory table created when the gateway registry starts, and hot code upgrade
@@ -3447,9 +3447,9 @@ as an unknown session, so the agent stayed stranded without any signal
 arm has no `accepted` check and the only disconnect is the superseded
 `FAILED_PRECONDITION` arm, and from the server's unknown-session handling of a
 `CONNECTED` in `gateway_service_impl.cpp`; neither was run). The disconnect makes
-the strand visible and lets the agent follow its own registration path. Released
-agents that wedge after any disconnect still need the agent service restarted
-until a release containing #5183 ships.
+the strand visible and lets the agent follow its own registration path. Agents older than 0.15.0
+that wedge after any disconnect still need the agent service restarted;
+0.15.0 contains the #5183 fix.
 
 **Replay failures feed the shared circuit breaker.** A failed `ProxyRegister`
 during a verdict-driven drip calls the breaker's failure path like any other

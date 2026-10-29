@@ -17,6 +17,12 @@
 > fingerprint mechanics that make a restored OLD backup with different content
 > REFUSED rather than silently merged are in
 > `docs/adr/2002-high-availability-architecture.md` §8).
+>
+> 0.15.0 supports initial deployment into a fresh database only: restore a backup
+> taken from a 0.15.0 deployment, not one written by an earlier build, and start
+> with no leftover `enrollment-tokens.cfg` or `pending-agents.cfg` in the data or
+> config directory (the server imports them at first boot without checking where
+> they came from).
 
 > Shipped InstructionDefinitions live inside the `yuzu-server` binary
 > (embedded at build time by `server/core/scripts/embed_content.py`)
@@ -37,7 +43,7 @@
 
 ### Pre-Upgrade Backup
 
-Always back up before upgrading:
+Back up a 0.15.0 deployment before changing it (0.15.0 itself has no supported upgrade from an earlier build):
 ```bash
 yuzu-backup.sh --output /backup/yuzu-pre-upgrade-$(date +%Y%m%d)
 ```

@@ -73,7 +73,7 @@
 ## agents at the infra layer.
 ##
 ## Usage:
-##   export YUZU_VERSION=0.12.0
+##   export YUZU_VERSION=0.15.0
 ##   # the server REQUIRES Postgres (fails closed otherwise) — set the two
 ##   # DISTINCT db passwords (superuser + app role):
 ##   export YUZU_POSTGRES_PASSWORD="$(openssl rand -hex 24)"
@@ -85,8 +85,9 @@
 ##   # create an enrollment token via the dashboard / REST, then start agents:
 ##   YUZU_ENROLL_TOKEN=<token> docker compose -f docker-compose.reference-gateway.yml up -d agent
 ##
-## UPGRADING an existing stack: bring up the WHOLE stack, never `up -d server
-## gateway` alone: a running agent container keeps the volume mounts it was
+## RECREATING the containers of this deployment (same volumes; pointing a new
+## YUZU_VERSION at an earlier build's database is not a supported upgrade): bring
+## up the WHOLE stack, never `up -d server gateway` alone: a running agent container keeps the volume mounts it was
 ## created with until compose recreates it.
 ##   YUZU_ENROLL_TOKEN=<token> docker compose -f docker-compose.reference-gateway.yml up -d
 ##   # or only the agent: ... up -d --force-recreate agent

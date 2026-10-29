@@ -15,7 +15,7 @@
 ##      startup and surfaced at /health.
 ##   2. The certs live in the `certs` named volume below so the CA + leaves
 ##      (and therefore the trust your agents have) SURVIVE container
-##      replacement / upgrades. Do not delete that volume.
+##      replacement. Do not delete that volume.
 ##
 ## Bring-your-own-cert (optional): to use your own PKI instead of the built-in
 ## CA, mount your material into /etc/yuzu/certs and add
@@ -35,7 +35,7 @@
 ## with a reverse proxy, and review docs/user-manual/ before exposing it.
 ##
 ## Usage:
-##   export YUZU_VERSION=0.12.0
+##   export YUZU_VERSION=0.15.0
 ##   # Two DISTINCT credentials — store both in your secrets manager. The
 ##   # superuser password stays inside the postgres service; the app role
 ##   # password is what the server's DSN carries. They must differ (the
@@ -51,8 +51,11 @@
 ## Do not point it at a `postgres-data`, `server-data` or `certs` volume written
 ## by an earlier build, and do not run an earlier image against this stack's
 ## database; the server does not detect either. Recreating the containers of
-## THIS deployment is fine (the volumes survive container replacement). See
-## "Deployment contract (hard cutover)" in docs/user-manual/upgrading.md.
+## THIS deployment is fine (the volumes survive container replacement). Restore
+## only a backup taken from THIS deployment on 0.15.0 or later: a dump or a
+## keys/data archive from an earlier build is the same unsupported act, and the
+## server will not detect it. See "Deployment contract (hard cutover)" in
+## docs/user-manual/upgrading.md.
 ##
 ## CAUTION: `docker compose down -v` deletes the `server-data`, `certs`, AND
 ## `postgres-data` volumes — i.e. ALL server state (credentials, agents, audit
@@ -152,7 +155,7 @@ services:
     volumes:
       # All server state (SQLite DBs, yuzu-server.cfg, enrollment tokens, OTA
       # binaries). The default CMD points --config + --data-dir here, so it is
-      # preserved across upgrades.
+      # preserved when the container is recreated.
       - server-data:/var/lib/yuzu
       # The auto-generated CA + leaf certs. MUST persist so the CA (and the
       # trust your agents have in it) survives container replacement.

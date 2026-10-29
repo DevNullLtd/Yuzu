@@ -2,6 +2,8 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+> **Fresh deployment only.** 0.15.0 supports initial deployment into a freshly provisioned database; it provides no upgrade path from an earlier build's database or backups and no return to an earlier build. The server does not enforce this: migrations do not refuse a database written by another build, and a first-boot importer still reads leftover `enrollment-tokens.cfg` and `pending-agents.cfg` files without checking where they came from. Procedures below that describe upgrading, rolling back or restoring an earlier build's data are historical and not supported for 0.15.0 (see "Deployment contract (hard cutover)" in the Forensics section of this page).
+
 ## Behaviour change: a refused or unusable RHEL entitlement directory pauses the licence sync for that host
 
 **What changed.** This is an agent change on Linux. The `license_scan` plugin now reads `/etc/pki/entitlement` in-process instead of running `openssl x509`. `entitlement_certs` is an authoritative surface, so an error on it keeps the last good state and skips that day's `software_licensing` sync for the whole host: its RPM/dpkg, FlexLM and entitlement rows all stay at their last synced values until the cause is cleared. Three causes newly pause the sync. A directory the agent may not list is now `cert_permission_denied` (result status `PERMISSION_DENIED`); before, it read as an empty surface and the daily sync wiped the host's stored entitlement rows while the other rows kept syncing. A `.pem` larger than 64 KiB is now a parse failure for that file; the `openssl` runs parsed any size. A directory or file past the new scan limits also pauses it: more than 4,096 directory entries or 64 certificate files, or more than 16 certificates in one `.pem`; the scan also stops starting new files after 10 seconds, where it was 60. An unreadable, empty or unparseable `.pem` already paused the sync before this release.
@@ -49,7 +51,7 @@ unsupported.
 
 - **Affected:** scripts that write under `HKLM\SYSTEM\CurrentControlSet` (use `HKLM\SYSTEM\ControlSet001`, or the numbered set `Select\Current` names); scripts that create a key directly under a hive root; scripts that rely on a multi-component create leaving its first key behind when a later component fails (2.0.0 tries to remove every key the call created; one it cannot remove, or that now holds a value or key another party put there, stays and is reported as `created=<n>` with `result=failed`); scripts that create keys under a tree whose inherited ACL gives the agent identity no `DELETE` on new keys (the create now answers `access_denied`; see the registry README, caveat 3); scripts that parse `set_value` errors as sentences, read the first output line of a mutating action, or expect `status|ok` to be `delete_key`'s only row; scripts that pass a key path or value name 2.0.0 now refuses (above); scripts that spell a key with different NON-ASCII letter case than it is stored with (refused as `key_is_link`, nothing written: spell the key as stored); and scripts that parse `|` out of read output expecting a literal `|` from registry data; and scripts that create keys below `HKCU\Software\Classes` for a real user. For a real user's hive `HKCU\Software\Classes` is itself a registry link (to the user's `_Classes` hive), so a creating write below it is refused `key_is_link` (1.0.0 followed it); as SYSTEM, the agent's identity, `HKCU` is `HKU\.DEFAULT` and `Software\Classes` is not a link, so such writes succeed; to write a user's classes use `hive=HKU` with `<SID>_Classes`.
 - **Rollout order:** upgrade the server replicas first, so the `registry.write` audit hook is live before any agent emits `audit|` lines, then the agents. Roll a fleet-wide write out in waves: every reply of a mutating action writes one audit row synchronously on the server's shared database pool, so a write that reaches many agents at once should not exceed what `--postgres-pool-size` was sized for (#6295).
-- **Minimum agent version for `registry.write` rows:** agents at v0.14.1 or earlier never stamp the dispatched action on their output frames and mint no `registry.write` rows, silently, while the write succeeds. The minimum agent version is the first release that contains PR #6294 (merge `5f4064fb4`), which is later than 0.14.1; until that release is cut, only agents built from dev at or after `5f4064fb4` qualify. The project version in `meson.build` still reads 0.14.1 after that merge, so it cannot be used to tell.
+- **Minimum agent version for `registry.write` rows:** agents at v0.14.1 or earlier never stamp the dispatched action on their output frames and mint no `registry.write` rows, silently, while the write succeeds. 0.15.0 is the first release that contains PR #6294 (merge `5f4064fb4`); an agent built from any earlier commit does not stamp the action.
 - **Mixed fleets:** an agent still running registry 1.x writes an EMPTY `REG_SZ` over the value for a `data_hex`-only `set_value` and answers `status|ok` (1.x reads only `name`, `value` and `type`; with `type=REG_DWORD` and `data_hex` only it throws and writes nothing), stores `REG_QWORD`, `REG_MULTI_SZ`, `REG_EXPAND_SZ` and `REG_BINARY` values as `REG_SZ` text and reports `status|ok`, and follows a write under `HKLM\SYSTEM\CurrentControlSet` that 2.0.0 refuses. The server does not gate dispatch on a plugin version (`minAgentVersion` is declared and exported, never compared at dispatch), so upgrade the agents before using the new value types or `data_hex`. A NUL inside a parameter sent through `POST /api/command` cuts the value at the NUL on every agent version (the instruction and MCP routes refuse control bytes). This reaches every way a `set_value` is dispatched: review schedules, workflows, policies and bundles that carry one, not only scripts. A reply that is a bare `status|ok` with no leading `audit|` row came from a 1.x agent: read the value back with `get_value`. Until the fleet is upgraded, scope such a write to upgraded devices (`ostype == "windows" AND tag:<key> == "<value>"`, with a tag that marks the upgraded devices) or switch the action off with the `set_value` kill switch: `PUT /api/v1/plugin-config/registry/kill-switch?action=set_value` with the JSON body `{"enabled": false, "reason": "registry 1.x agents still in the fleet"}` (`enabled` is required and must be a boolean; `reason` is optional), which needs `PluginConfig:Write` (or the MCP `set_plugin_kill_switch` tool); `{"enabled": true}` switches it back on ([REST API](rest-api.md#put-apiv1plugin-configpluginkill-switch)).
 - **Existing installs keep the 1.0.0 definitions:** bundled definitions are inserted only when absent, so a server that already holds `windows.registry.set_value`, `delete_value` and `delete_key` keeps their 1.0.0 text, enum and parameters (no `data_hex`, a `type` enum of `REG_SZ` and `REG_DWORD` only, `value` required) after the upgrade, and a server that holds `windows.registry.get_value` keeps its 1.0.0 description (only that text changed in 1.1.0). To get the 1.1.0 text, enum and `data_hex`, export, delete and re-import the three write definitions (`docs/user-manual/instructions.md`, "Replacing a stored parameter schema"); re-importing `get_value` is optional and cosmetic, because its parameter schema is unchanged and only its description text differs. A fresh install already has all four.
 
@@ -225,16 +227,16 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   session could not be stamped: a bearer principal, an absent or mismatched cookie, or a store
   failure). An account with no MFA enrolled is not affected.
 - **What is newly gated, measured against the last release (v0.14.1).** Only the two Settings MFA
-  routes above are gated for the first time by this change. Of the other 34, 25 already called the
-  step-up check from their handlers in v0.14.1. The remaining nine were gated in their handlers
+  routes above are gated for the first time by this change. Of the other 35, 25 already called the
+  step-up check from their handlers in v0.14.1. The remaining ten were gated in their handlers
   earlier in this release cycle, so an upgrade from v0.14.1 gives them a proof requirement too, but
   not through this change. Eight are existing routes that v0.14.1 did not step-up gate: the
   dashboard API-token create and revoke routes (see "Behaviour change: dashboard API-token create
   and revoke apply MFA step-up" below), the Guardian guard Edit and Delete routes, the local
   password change and the administrator password reset, and `POST /api/approvals/{id}/approve` and
-  `POST /api/approvals/{id}/reject` (documented in their own Breaking section below). The ninth,
-  `POST /api/v1/guaranteed-state/policy-generation/raise`, is a new route that did not exist in
-  v0.14.1. For those nine, this change alters the order of checks and the engine-principal denial
+  `POST /api/approvals/{id}/reject` (documented in their own Breaking section below). The ninth and tenth,
+  `POST /api/v1/guaranteed-state/policy-generation/raise` and `PUT /api/v1/config/{key}`, are new routes that did not exist in
+  v0.14.1. For those ten, this change alters the order of checks and the engine-principal denial
   described below, not the proof the caller needs.
 - **Step-up comes before authorization, and after the server-wide same-site check.** A session with
   a stale or missing MFA proof is answered with the `401` step-up envelope before the route's own
@@ -363,8 +365,8 @@ unwired-store refusals still apply and are still recorded. The JIT-elevation rou
 window when it is positive, else 300 s). The new alert `YuzuStepUpWindowDisabled` fires while the
 window is 0 or less. Rolling back to v0.14.1 restores the old order of checks and un-gates the two
 Settings routes and the eight existing routes listed under "What is newly gated" above, because
-v0.14.1 did not gate them in their handlers. It also removes the policy-generation raise route,
-which does not exist in v0.14.1. Nothing is migrated. A rollback also removes the new counter and
+v0.14.1 did not gate them in their handlers. It also removes the policy-generation raise route and `PUT /api/v1/config/{key}`,
+which do not exist in v0.14.1. Nothing is migrated. A rollback also removes the new counter and
 window gauge, so both new alerts go silent.
 
 ## Behaviour change: /health and /api/health per-source budget
@@ -3253,7 +3255,7 @@ agents and the registry restart note below.
 `NOT_FOUND` handling. That logic exists from v0.13.0, but the released v0.13.0 and v0.14.0-rc6 agents
 wedge in their reconnect path with default settings (bug #2182, fixed by PR #5183, which ships in 0.15.0) and recover only with `--no-auto-update` (observed with v0.13.0 and v0.14.0-rc6), or on a
 build that includes the fix. v0.12.0 never recovers by itself (observed; older versions were not tested). Upgrade the
-agents first, then the gateway, using a build that includes the #2182 fix once released; until then,
+agents first, then the gateway, using 0.15.0 or later (the #2182 fix); until the agents are upgraded,
 restart an agent that stays rejected (restarting the agent service re-registers it). Agents that do
 not connect through the gateway are not affected by this requirement.
 
@@ -3305,7 +3307,7 @@ v0.13.0 and v0.14.0-rc6; it is a command-line flag with no environment variable)
 rejected until restarted or upgraded (such agents were still counted online by the server's `/health` `agents.online` in the rig, so check the rejection counters and the agent log, not the online count; a heartbeat that falls in the short gap between the session
 leaving the pending table and its agent process registering can succeed later without
 re-registration). Upgrade the agents first, then the gateway, with a build that includes the #2182
-fix once released; until then, restart an agent that stays rejected (restarting the agent service
+fix (0.15.0 or later); until the agents are upgraded, restart an agent that stays rejected (restarting the agent service
 re-registers it). Agents that do not connect through the gateway are not affected. This matters
 only when heartbeats are rejected, which happens in four cases:
 
@@ -6291,6 +6293,8 @@ generally be broader, now actually populated with real members.
 A preview call no longer extends a referenced result set's TTL as a side effect — it is now a
 genuine read-only dry run, matching its documented `readOnlyHint: true`.
 
+> **Fresh deployment only for 0.15.0.** See the banner at the top of this page: the steps below are not a supported upgrade path from an earlier build's database.
+
 ## Upgrade Order
 
 Always upgrade in this order:
@@ -6300,6 +6304,8 @@ Always upgrade in this order:
 3. **Agents** -- can be upgraded via OTA or manually, in batches
 
 Never upgrade agents before the server -- the server must understand the agent's protocol version.
+
+> **Fresh deployment only for 0.15.0.** See the banner at the top of this page: the steps below are not a supported upgrade path from an earlier build's database.
 
 ## Pre-Upgrade Checklist
 
@@ -6531,6 +6537,8 @@ Before upgrading any component:
   immediately after the agent upgrade. Any operator automation that matched
   previously-mangled non-ASCII strings in those plugins' responses (e.g. a vuln
   finding filtered on `title == "Caf?"`) will need updating.
+
+> **Fresh deployment only for 0.15.0.** See the banner at the top of this page: the steps below are not a supported upgrade path from an earlier build's database.
 
 ## Upgrading the Server
 
@@ -8173,6 +8181,8 @@ Three operator-visible behaviour changes ship in the v0.12.0 A3 ladder. None req
 The `quarantine` plugin's Windows/Linux/macOS `netsh`/`iptables`/`pfctl` invocations were migrated off shell-outs onto a bounded argv runner. Alongside the mechanism change, two reporting bugs were fixed: a Linux chain-flush could previously be miscounted as an applied containment rule (`status|quarantined|rules_applied|1` reported with zero rules actually installed), and macOS whitelist mutations could silently proceed on a failed prerequisite read or report success despite `pfctl -e` failing to enable pf.
 
 **If your automation alerts on `status|failed`/`status|release_uncertain`/`status|update_uncertain` from `quarantine` actions, you may see these fire more often after upgrading** — this is expected. Nothing got more broken; the plugin's failure reporting simply got more honest about cases it previously reported as clean success. No action is required beyond expecting the change.
+
+> **Fresh deployment only for 0.15.0.** See the banner at the top of this page: the steps below are not a supported upgrade path from an earlier build's database.
 
 ## Rollback
 

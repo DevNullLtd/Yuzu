@@ -634,7 +634,7 @@ Eight roles are created automatically and cannot be deleted:
 
 Result sets (scope-walking capability §30, `docs/scope-walking-design.md`) are **ownership-scoped, not RBAC-gated** — the RBAC toggle above has no effect on them, whether it is on or off. This is a deliberate phase-1 design (design §4.1), not an oversight, and it is unaffected by [#5047](https://github.com/Tr3kkR/Yuzu/issues/5047)'s fix below.
 
-The 8 routes/tools in this family authorize purely on `owner_principal == session.username`:
+The 8 routes/tools in this family authorize on `owner_principal == session.username`, with one exception: the members read (`GET /api/v1/result-sets/{id}/members`, `get_result_set_members`) also needs `Infrastructure:Read`, which under RBAC enforcement only `Administrator` and `ITServiceOwner` hold:
 
 | REST | MCP tool | Dashboard fragment |
 |---|---|---|

@@ -856,7 +856,7 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   its new certificate only after it redials (measured with the gateway's gun-based upstream client, see the leaf-rotation note above),
   so check first whether it has already redialled (a server restart forces one), and restart that
   gateway node, one at a time, only if denials continue and its agents can take the disconnect
-  (unless the agents run a build with the #5183 fix, shipped in 0.15.0, released agents stay wedged
+  (unless the agents run a build with the #5183 fix, shipped in 0.15.0, agents older than 0.15.0 stay wedged
   afterwards), as cause class B of the gateway peer-authorization runbook describes. Prefer `POST /ca/import-chain`
   (Subordinate-CA, PR6) when the
   goal is re-keying under a new authority without an enrollment outage. **Not** when the goal is
