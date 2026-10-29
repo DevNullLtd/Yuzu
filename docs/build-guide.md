@@ -55,8 +55,8 @@ pointing at a populated `vcpkg_installed`.
 
 | Set | Ports | Selected by |
 |---|---|---|
-| base (always) | grpc[codegen], protobuf, abseil, spdlog, nlohmann-json, cli11, cpp-httplib, sqlite3, openssl, libxml2 (autoruns plugin) | — |
-| `server` | libpq, xmlsec, zlib (also pulled in by grpc), drogon | default feature |
+| base (always) | grpc[codegen], protobuf, abseil, spdlog, nlohmann-json, cli11, cpp-httplib, sqlite3, openssl, zlib (Windows hand-wired grpc link, `_libzlib` in the root `meson.build`; also server/core), libxml2 (autoruns plugin) | — |
+| `server` | libpq, xmlsec, drogon | default feature |
 | `tests` | catch2 (`x64 \| arm64` only) | default feature |
 | `agent` | none today (placeholder) | explicit `--x-feature=agent` |
 
@@ -69,7 +69,7 @@ meson setup build-linux -Dbuild_server=false ...   # -Dbuild_tests=false (defaul
 vcpkg install --triplet x64-linux --x-manifest-root=. --x-no-default-features --x-feature=tests
 ```
 
-Measured on `x64-linux`: 23 → 16 target-triplet ports (drops catch2, drogon, libpq, xmlsec, jsoncpp, libuuid, trantor; libpq's bison/flex/autoconf build prerequisites are not needed either). `zlib` stays: grpc depends on it, and the Windows hand-wired `_libzlib` in the root `meson.build` relies on that. `brotli` stays too (cpp-httplib's default `brotli` feature).
+Measured on `x64-linux`: 23 → 16 target-triplet ports (drops catch2, drogon, libpq, xmlsec, jsoncpp, libuuid, trantor; libpq's bison/flex/autoconf build prerequisites are not needed either). `zlib` is declared in the base, not in `server`: the agent's Windows link requires it (`required: true`), so it must not depend on a grpc transitive happening to supply it. `brotli` stays (cpp-httplib's default `brotli` feature) (cpp-httplib's default `brotli` feature).
 
 **Cache and shared-tree rule (verified).** An agent-only and a full install of one triplet fill the same path, `vcpkg_installed/<triplet>/`, but vcpkg re-plans on every `install` and reconciles the tree in both directions: a default install onto an agent-only tree adds the server ports, and `--x-no-default-features` onto a full tree removes them (reproduced with a scratch manifest on one `--x-install-root`). A persistent self-hosted tree therefore needs no extra key, and `scripts/ci/vcpkg-triplet-sentinel.sh` deliberately does not take an install profile: it would turn that incremental fix into a full wipe each time two jobs of different shapes share a runner. The hazard is a cache entry that is *restored and not re-planned*, i.e. a GHA `actions/cache` key that saves `vcpkg_installed` (the `canary` job): a job that opts out must put its install profile in that key, or an exact hit skips its own save and leaves the wrong shape in place. The canary is a default (full) install, so its key needs no profile (the `vcpkg.json` hash inside it still changes once on merge, which costs one cold canary run). `-Dbuild_server=false -Dbuild_tests=true` needs `--x-feature=tests` (tests/meson.build requires Catch2). `scripts/setup.sh` always installs the default set, so for an agent-only install run vcpkg yourself as above. vcpkg only *warns* on an unknown `--x-feature=` name (names are case-sensitive) and exits 0, and `--x-feature=agent` alone does not opt out of the defaults, so read the plan. Only `Dockerfile.agent` and `Dockerfile.agent.chisel` opt out today. The one other agent-only leg, the Windows ASan job in `nightly.yml` (`-Dbuild_server=false -Dbuild_tests=true`), still installs the default set; switching it needs `--x-no-default-features --x-feature=tests`.
 
