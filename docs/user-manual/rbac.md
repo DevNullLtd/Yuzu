@@ -306,7 +306,7 @@ Recommended order for a fresh install:
 
 ## The authorization topology floor (#2376)
 
-Eleven reads are treated as **authorization topology or audit evidence**
+Twelve reads are treated as **authorization topology or audit evidence**
 rather than ordinary operational data. Wherever the legacy RBAC-off fallback is the branch in
 effect, they require the `admin` session role — the generic “any Read is
 allowed” rule does not reach them. (With RBAC **enabled** they are ordinary
@@ -326,17 +326,18 @@ admitted; the floor never overrides a live RBAC grant.)
 | `AnalyticsConfig:Read` (#4028) | Analytics/offload configuration status, `GET /api/v1/settings/analytics` |
 | `Forensics:Read` | Windows forensic-artefact and per-device application-usage reads (Wave 7 PR7.2), per-app privacy-permission grants and per-account SSH access (`remote_access_audit`); also the stored responses of those Forensics-tier plugins on every response read path (REST, MCP, dashboard), which are served only to a caller holding it |
 | `AuditLog:Read` (#5771) | The audit trail itself (SOC 2 CC6.1/CC7.2 evidence): `GET /api/audit`, `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, `GET /api/v1/engine-principals/audit/no-admin`, the `query_audit_log` and `audit_engine_no_admin` MCP tools, and the `yuzu://audit/recent` MCP resource |
+| `RevocationSource:Read` (ADR-0070 R1) | The registered CRL sources, `GET /api/v1/crypto/revocation-sources*` and `list_revocation_sources`/`get_revocation_source`: the operator-registered **egress targets** (CRL URLs the server will fetch, with their confirmed address classes and fetch status) map internal network topology. The surface is additionally behind the durable-administrator check in **both** RBAC states, so this floor is the RBAC-off half of a two-part control. |
 
 **Why this exists.** With RBAC **disabled**, the legacy fallback described
 above allows any authenticated non-engine session to perform every `Read` —
-that includes these eleven. On a default install (RBAC ships disabled) that
+that includes these twelve. On a default install (RBAC ships disabled) that
 handed a plain `user` session read access to the authorization topology
 itself: who holds what role, and the complete access-review grant
 population that is supposed to *be* SOC 2 CC6.2 evidence of controlled
 access — and, until #5771, the full audit trail (who did what, to which
 target, with what outcome, plus the free-text detail and, on the legacy
 `GET /api/audit` route, each actor's role and source IP). The floor closes
-that gap by denying these eleven reads to a
+that gap by denying these twelve reads to a
 non-admin whenever the legacy fallback is the branch in effect — never by
 changing behavior under a live RBAC grant.
 
@@ -347,7 +348,7 @@ particular, a non-admin holding the seeded `Reviewer` role (`AccessReview:Read`
 + `AccessReview:Attest`) continues to reach the access-review export exactly
 as before — the floor never overrides that grant.
 
-**If you are relying on a non-admin reaching one of these eleven reads on an
+**If you are relying on a non-admin reaching one of these twelve reads on an
 RBAC-disabled install,** that access is now denied. The supported remedy is
 to enable RBAC and grant the appropriate role rather than to expect a
 non-admin session to reach authorization topology while RBAC is off:
@@ -594,11 +595,11 @@ Eight roles are created automatically and cannot be deleted:
 
 | Role | Permissions | Use case |
 |---|---|---|
-| **Administrator** | All 5 CRUD operations on all 38 securable types, plus Push on GuaranteedState, Attest on AccessReview, and Rotate on ApiToken (P2 #11, SOC 2 CC6.3 — self-service human token rotation) (193 permissions) | Server admins, security team leads |
+| **Administrator** | All 5 CRUD operations on all 39 securable types, plus Push on GuaranteedState, Attest on AccessReview, and Rotate on ApiToken (P2 #11, SOC 2 CC6.3 — self-service human token rotation) (198 permissions) | Server admins, security team leads |
 | **PlatformEngineer** | Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response, Inventory; Read/Write/Delete/Push on GuaranteedState | Authors and managers of YAML instruction definitions, sets, and Guardian rules |
 | **Operator** | Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog, Response, and Inventory; Read and Push on GuaranteedState | Day-to-day instruction execution, schedule management, tagging, and Guardian rule distribution |
 | **ApiTokenManager** | Read, Write, Delete, Rotate on ApiToken (4 permissions) | Create, revoke, rotate, and manage API tokens for programmatic access |
-| **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState, plus Workflow:Read, plus Decommission:Delete (93 permissions). Excludes 20 of the 38 securable types, including UserManagement, Security, ApiToken, AccessReview and EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
+| **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState, plus Workflow:Read, plus Decommission:Delete (93 permissions). Excludes 21 of the 39 securable types, including UserManagement, Security, ApiToken, AccessReview and EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
 | **Viewer** | Read on 24 securable types (24 permissions) — an explicit allow-list in `rbac_store.cpp`'s seed, *not* “everything except” | Helpdesk staff, auditors, read-only dashboards |
 | **Reviewer** | Read and Attest on AccessReview (2 permissions) | Periodic access reviews (SOC 2 CC6.2) — the non-admin role that can attest or flag a grant |
 | **ForensicsAnalyst** | Read on Forensics, Response, Execution and Inventory (4 permissions). No Execute and no write of any kind | Read-only analysts of Forensics-tier response rows. Fleet-wide assignable only; cannot dispatch; not part of any other role |
@@ -644,6 +645,7 @@ Eight roles are created automatically and cannot be deleted:
 | `EnginePrincipal` | Engine-principal inventory and fleet-wide grant-graph reads (list/get engine principals, list their assigned roles) — cut away from `Security` (#2376) so this narrower read is not gated by the same broad permission that also covers CA/quarantine/KEK operational reads. See "The authorization topology floor" below. |
 | `Forensics` | Forensic-artefact reads (Windows execution artefacts — ShimCache/AmCache/Prefetch; per-device application-usage projection; per-app privacy-permission grants; per-account SSH authorized-key fingerprints and sshd settings). Held by default by Administrator and by the read-only `ForensicsAnalyst` role (absent from the Viewer read-list). The stored results of these plugins are served only to a caller who holds `Forensics:Read` in addition to `Response:Read`; to any other reader of the response APIs those rows are absent. With RBAC enforcement off, `Forensics:Read` is administrator-only, so a non-administrator session does not see them either. Only the `plugin` name is stored with a response row, so the filter is per plugin: a plugin that mixed Forensics and ordinary actions would have all of its rows treated as Forensics-tier until the action name is stored too (no such plugin exists today). Every catalogue row on it is single-target (exactly one agent id, no fleet/scope fan-out) and `AdminOrApproval`-gated. Wave 7 PR7.2/PR7.3. |
 | `Decommission` | Device-level agent-erasure gate for `DELETE /api/v1/sle/agents/{id}` (ADR-0024 Decision 9, amended Wave 7 PR7.2). `Decommission:Delete` authorizes for the whole decommission cascade's blast radius (eight per-agent stores: five spanning `Inventory`, `GuaranteedState`, and `SoftwareLicensing`, a sixth `Forensics`-governed store, the `endpoint_state` presence row read on `/hardware` and `/viz/fleet`, and the fleet certificate inventory, whose own read securable arrives with the certificate read surface) in one grant, replacing a hand-maintained per-store conjunction. |
+| `RevocationSource` | Registered CRL sources (ADR-0070 R1): the CAs and the CRL URLs the server may fetch for them (`/api/v1/crypto/revocation-sources*`, six MCP tools). Operations: `Read` (list, get) and `Write` (register, replace, remove, reset the anti-rollback marks; removal is a `Write`, there is no `Delete`). Seeded to **Administrator only**, and **not grantable**: every route and tool ALSO requires a durable Administrator role (the `is_rbac_administrator` check), so a custom role granted `RevocationSource:Read` or `:Write` is still refused, in both RBAC states. The access-review export lists any such grant, which is how it is found. Denied to a service-scoped token. |
 | `SoftwareLicensing` | Discovered software-licence facts synced from endpoints (ADR-0024) |
 | `AccessReview` | Periodic access-review campaigns and attestations (SOC 2 CC6.2). Seeded to Administrator and `Reviewer` only — deliberately NOT `AuditLog`, see "The authorization topology floor" above |
 | `Workflow` | Multi-step workflow definitions and executions |

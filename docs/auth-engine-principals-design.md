@@ -721,7 +721,7 @@ mutations.
   on principal-lifecycle routes, and the engine-principal lifecycle surface
   itself (create/rotate/revoke/transfer-owner) requires a **human admin
   session + MFA step-up** (same posture as the other step-up surfaces,
-  which are now enforced by the central step-up check on 37 routes). One
+  which are now enforced by the central step-up check on 41 routes). One
   defensive addition: those routes deny any engine-classed
   session outright (fail-closed belt to the structural braces), audited as
   `denied` in the route handler. On a route the central check enforces, the

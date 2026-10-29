@@ -936,14 +936,15 @@ TEST_CASE("OIDC egress NAT64: a learned prefix is never forgotten by a later ans
     }
 }
 
-TEST_CASE("OIDC egress NAT64: two concurrent refreshes cannot lose an entry",
+TEST_CASE("OIDC egress NAT64: concurrent refreshes are SINGLE-FLIGHT and cannot lose an entry",
           "[oidc][oidc_egress][oidc_nat64][security]") {
     Nat64CacheReset cache;
     std::mutex mu;
-    std::condition_variable cv;
-    int arrived = 0;
-    // Both ipv4only.arpa lookups are held until BOTH are in flight, so each refresh computes its
-    // answer without knowing the other's; then each writes. A last-writer-wins cache keeps one.
+    int probes = 0;
+    // Two callers hit a stale cache together. Exactly ONE ipv4only.arpa lookup runs (the second
+    // caller waits for it), so a hung resolver plus a burst of sign-ins holds one resolver slot,
+    // not one per caller. (The earlier design let both refresh and relied on a union merge; the
+    // merge still protects sequential refreshes, tested above.)
     ResolverGuard resolver([&](const std::string& host) -> std::vector<std::string> {
         if (host == "p1.test")
             return {metadata_under(1)};
@@ -951,29 +952,38 @@ TEST_CASE("OIDC egress NAT64: two concurrent refreshes cannot lose an entry",
             return {metadata_under(2)};
         if (host != "ipv4only.arpa")
             return {"2001:db8:ffff::1"};
-        std::unique_lock lock(mu);
-        const int me = arrived++;
-        cv.notify_all();
-        cv.wait_for(lock, std::chrono::seconds(10), [&] { return arrived >= 2; });
-        if (me == 0)
-            return {learn_answer(1)};
-        if (me == 1)
-            return {learn_answer(2)};
-        return {};
+        {
+            std::lock_guard lock(mu);
+            ++probes;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(150)); // hold the flight open
+        return {learn_answer(1)};
     });
 
     std::thread a(
-        [] { (void)OidcProvider::fetch_discovery_document("http://idp.test", false, true, 500); });
+        [] { (void)OidcProvider::fetch_discovery_document("http://idp.test", false, true, 2000); });
     std::thread b(
-        [] { (void)OidcProvider::fetch_discovery_document("http://idp.test", false, true, 500); });
+        [] { (void)OidcProvider::fetch_discovery_document("http://idp.test", false, true, 2000); });
     a.join();
     b.join();
     {
         std::lock_guard lock(mu);
-        REQUIRE(arrived == 2); // both really refreshed concurrently
+        CHECK(probes == 1);
     }
     CHECK(refused_by_policy("p1.test"));
+    // A later refresh that learns a second prefix keeps the first (the union, never shrinks).
+    OidcProvider::expire_nat64_discovery_cache_for_test();
+    ResolverGuard second([&](const std::string& host) -> std::vector<std::string> {
+        if (host == "p1.test")
+            return {metadata_under(1)};
+        if (host == "p2.test")
+            return {metadata_under(2)};
+        if (host != "ipv4only.arpa")
+            return {"2001:db8:ffff::1"};
+        return {learn_answer(2)};
+    });
     CHECK(refused_by_policy("p2.test"));
+    CHECK(refused_by_policy("p1.test"));
 }
 
 TEST_CASE("OIDC egress: the strict vet mode refuses a mixed answer the pinning mode pins",
@@ -1087,3 +1097,65 @@ TEST_CASE("OIDC egress: the token POST's pre-check - pinned where the connect is
 }
 
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
+
+// The OIDC probe's WIRING: which host it asks for, how each resolver status becomes a cache state,
+// and that it never claims a clamped budget (an OIDC lookup uses its own configured timeout).
+TEST_CASE("OIDC egress NAT64: the ipv4only.arpa probe wiring - host, status mapping, caching",
+          "[oidc][oidc_egress][oidc_nat64]") {
+    using Stub = OidcProvider::Nat64ProbeStubForTest;
+    struct ProbeGuard {
+        explicit ProbeGuard(OidcProvider::Nat64ProbeLookupForTest f) {
+            OidcProvider::set_nat64_probe_lookup_for_test(std::move(f));
+        }
+        ~ProbeGuard() { OidcProvider::set_nat64_probe_lookup_for_test({}); }
+    };
+    std::atomic<int> probes{0};
+    std::mutex mu;
+    std::vector<std::string> hosts;
+    int status = 1;
+    const auto stub = [&](const std::string& host) {
+        std::lock_guard lk(mu);
+        ++probes;
+        hosts.push_back(host);
+        return Stub{status, {}};
+    };
+    // The target resolves through the system path for a LITERAL, so only the probe is stubbed.
+    // The TARGET resolves through the test resolver to an IPv6 address (permitted with the
+    // private switch on), which is what makes the vet ask for the NAT64 prefixes; the probe itself
+    // is NOT answered by this resolver (the wiring seam takes precedence for ipv4only.arpa).
+    ResolverGuard target_resolver([](const std::string&) -> std::vector<std::string> {
+        return {"2001:db8:ffff::1"};
+    });
+    const auto run_once = [&] {
+        (void)OidcProvider::vet_egress_target_for_test("t.test", true, false, 1500, {}, false);
+    };
+    const auto cached_second_call = [&](int expected_probes_after_two) {
+        run_once();
+        run_once();
+        CHECK(probes.load() == expected_probes_after_two);
+    };
+
+    SECTION("NXDOMAIN (kNotFound) is an ANSWER: cached, so the second check does not probe again") {
+        Nat64CacheReset cache;
+        status = 1;
+        ProbeGuard g(stub);
+        cached_second_call(1);
+        CHECK(hosts.front() == "ipv4only.arpa");
+    }
+    SECTION("a transient failure and a full-budget timeout are FAILURES: cached as failed (negative TTL)") {
+        for (const int st : {2, 3}) {
+            CAPTURE(st);
+            Nat64CacheReset cache;
+            probes = 0;
+            status = st;
+            ProbeGuard g(stub);
+            cached_second_call(1);
+        }
+    }
+    SECTION("a busy pool is INCONCLUSIVE: nothing is remembered, the next check probes again") {
+        Nat64CacheReset cache;
+        status = 4;
+        ProbeGuard g(stub);
+        cached_second_call(2);
+    }
+}

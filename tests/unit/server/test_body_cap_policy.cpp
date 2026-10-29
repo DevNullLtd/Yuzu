@@ -205,6 +205,12 @@ constexpr ExpectedResolution kExpected[] = {
     {"PUT",    "/api/v1/configevil/log_level",                         4u * 1024 * 1024, false, "default"},
     {"GET",    "/api/v1/crypto/ca/stats",                              16u * 1024, false, "crypto"},
     {"PUT",    "/api/v1/cryptoevil",                                   4u * 1024 * 1024, false, "default"},
+    // body_cap_policy.hpp crypto_revocation_sources row - registered CRL sources (R1); longest
+    // match outranks the 16 KiB crypto row for this subtree only. ANY method.
+    {"POST",   "/api/v1/crypto/revocation-sources",                    192u * 1024, false, "crypto_revocation_sources"},
+    {"PUT",    "/api/v1/crypto/revocation-sources/7",                  192u * 1024, false, "crypto_revocation_sources"},
+    {"POST",   "/api/v1/crypto/revocation-sources/7/reset-high-water", 192u * 1024, false, "crypto_revocation_sources"},
+    {"POST",   "/api/v1/crypto/revocation-sourcesevil",                16u * 1024, false, "crypto"},
     // Catch-all default — ordinary JSON/form traffic.
     {"POST",   "/api/v1/some-ordinary-mutation-route",    4u * 1024 * 1024,   false, "default"},
     {"GET",    "/api/v1/devices",                         4u * 1024 * 1024,   false, "default"},
@@ -245,6 +251,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "dex_score_policy",
     "crypto",
     "config",
+    "crypto_revocation_sources",
     "default",
 };
 
@@ -401,8 +408,9 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // dex_score_policy(1: the DEX score policy document) +
     // crypto(1: the /api/v1/crypto subtree, the dashboard layout PUT) +
     // config(1: the /api/v1/config subtree, the runtime-config PUT) +
+    // crypto_revocation_sources(1: ADR-0070 R1 registered CRL sources, 192 KiB) +
     // default(1).
-    CHECK(std::size(kBodyCapTable) == 36);
+    CHECK(std::size(kBodyCapTable) == 37);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──

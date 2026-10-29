@@ -212,6 +212,11 @@
 #include "crypto_api_local.hpp" // /crypto slice 1: make_local_crypto_api (core-only store-backed factory)
 #include "crypto_dashboard_layout_store.hpp" // /crypto widgets: per-operator layout (born-on-PG, ADR-0071)
 #include "crypto_layout_erasure.hpp" // ADR-0071: erase-failure reason set + mapping
+#include "nat64_discovery.hpp" // the shared never-shrink NAT64 cache, published from the health tick
+#include "nat64_probe.hpp"     // the cap-1 discovery resolver pool (its in-flight gauge)
+#include "revocation_source_admin_gate.hpp" // ADR-0070 R1: decide_admin + the service
+#include "revocation_source_routes.hpp"      // ADR-0070 R1: /api/v1/crypto/revocation-sources
+#include "revocation_source_store.hpp"       // ADR-0070 R1: registered CRL sources (born-on-PG)
 #include "crypto_routes.hpp"
 #include "policy_admin_routes.hpp" // ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin)
 #include "guardian_routes.hpp"
@@ -653,6 +658,55 @@ public:
                                                  .burst = 2.0 * cfg_.principal_rate_limit}) {
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
+        metrics_.describe("yuzu_server_revocation_source_degrade_total",
+                          "CRL source registrations refused (or, for nat64_discovery_stale, classified on stale data) "
+                          "for a retryable reason, by reason "
+                          "(own_addresses_unavailable/dns_unavailable/dns_timeout/dns_busy/"
+                          "dns_budget_exhausted/validation_busy/nat64_discovery_unavailable/"
+                          "nat64_discovery_stale/nat64_discovery_overflow)",
+                          "counter");
+        metrics_.describe("yuzu_server_nat64_discovery_lookups_total",
+                          "NAT64 prefix discovery (RFC 7050, ipv4only.arpa) lookups by outcome, from "
+                          "every consumer of the shared cache (OIDC egress and CRL source "
+                          "registration): answered/answered_none/failed/inconclusive",
+                          "counter");
+        for (const char* outcome : {"answered", "answered_none", "failed", "inconclusive"})
+            metrics_.counter("yuzu_server_nat64_discovery_lookups_total", {{"outcome", outcome}});
+        metrics_.describe("yuzu_server_nat64_discovery_overflow_refusals_total",
+                          "IPv6 destinations refused because the shared NAT64 prefix set is in "
+                          "overflow (see yuzu_server_nat64_discovery_overflowed)",
+                          "counter");
+        metrics_.counter("yuzu_server_nat64_discovery_overflow_refusals_total");
+        metrics_.describe("yuzu_server_nat64_discovery_overflowed",
+                          "1 while the shared NAT64 prefix set is in overflow (more than 64 "
+                          "prefixes advertised): IPv6 CRL registrations and OIDC IPv6 fetches are "
+                          "refused until restart or an answer that fits; else 0",
+                          "gauge");
+        metrics_.gauge("yuzu_server_nat64_discovery_overflowed").set(0.0);
+        metrics_.describe("yuzu_server_nat64_discovery_resolver_in_flight",
+                          "NAT64 discovery lookups outstanding in its own capacity-one resolver pool, "
+                          "published every 15 s; 1 for longer than a few seconds means a discovery "
+                          "lookup is stuck (a blocking resolver module): discovery is then "
+                          "inconclusive until the server is restarted",
+                          "gauge");
+        metrics_.gauge("yuzu_server_nat64_discovery_resolver_in_flight").set(0.0);
+        metrics_.describe("yuzu_server_nat64_discovery_prefixes",
+                          "NAT64 prefixes learned and held by the shared never-shrink cache",
+                          "gauge");
+        metrics_.gauge("yuzu_server_nat64_discovery_prefixes").set(0.0);
+        metrics_.describe("yuzu_server_revocation_source_resolver_in_flight",
+                          "Name lookups outstanding in the 16-slot resolver pool CRL source registration "
+                          "resolves hosts in (NAT64 discovery has its own pool: see "
+                          "yuzu_server_nat64_discovery_resolver_in_flight), published every 15 s; a "
+                          "value pinned at 16 means a stuck resolver is refusing every registration",
+                          "gauge");
+        metrics_.gauge("yuzu_server_revocation_source_resolver_in_flight").set(0.0);
+        // Pre-seed every reason so absent() alerting and rate() read 0, not "no series".
+        for (const char* reason :
+             {"own_addresses_unavailable", "dns_unavailable", "dns_timeout", "dns_busy",
+              "dns_budget_exhausted", "validation_busy", "nat64_discovery_unavailable",
+              "nat64_discovery_stale", "nat64_discovery_overflow"})
+            metrics_.counter("yuzu_server_revocation_source_degrade_total", {{"reason", reason}});
         metrics_.describe("yuzu_nvd_total_cves", "Distinct CVEs in the local NVD catalog", "gauge");
         metrics_.describe("yuzu_nvd_backfill_complete",
                           "1 when the newest-first NVD backfill has reached its floor, else 0",
@@ -7851,6 +7905,50 @@ public:
             }
         }
 
+        // RevocationSourceStore - born-on-Postgres registered CRL sources (ADR-0070 R1, schema
+        // revocation_source_store). CONSTRUCTION is fail-CLOSED per ADR-0012 section 1 and the store is
+        // in the /readyz conjunction: unlike a layout, a registered source is operator-authored
+        // security configuration (an egress target and the CA keys a CRL is judged against), so a
+        // node that cannot open it must not serve. It never touches ca_store.
+        if (pg_pool_ && !startup_failed_) {
+            revocation_source_store_ = std::make_unique<RevocationSourceStore>(*pg_pool_);
+            if (!revocation_source_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: revocation-source store migration/open "
+                              "failed (database reachable but the revocation_source_store schema could "
+                              "not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                // The service owns the registration-time address check: the listener addresses
+                // are the server's own, which a registered CRL URL may never name.
+                // NAT64 prefixes the operator declared (--oidc-nat64-prefix) are decoded, so
+                // Pref64 + 169.254.169.254 classifies as metadata, not as "public IPv6".
+                std::vector<oidc::egress::Nat64Prefix> nat64;
+                if (auto prefixes = oidc::egress::parse_nat64_prefix_list(cfg_.oidc_nat64_prefixes)) {
+                    nat64 = std::move(*prefixes);
+                } else {
+                    // Fail loudly: wiring the service with the operator's declared prefixes
+                    // dropped would make the metadata refusal silently weaker than configured.
+                    spdlog::error("Refusing to start: --oidc-nat64-prefix does not parse, so the "
+                                  "CRL source address check cannot apply it");
+                    startup_failed_ = true;
+                }
+                auto egress_env = revocation_source::make_system_egress_env(
+                    {cfg_.listen_address, cfg_.management_address, cfg_.web_address,
+                     cfg_.gateway_upstream_address},
+                    std::move(nat64));
+                egress_env.note_degrade = [this](std::string_view reason) {
+                    metrics_
+                        .counter("yuzu_server_revocation_source_degrade_total",
+                                 {{"reason", std::string(reason)}})
+                        .increment();
+                };
+                revocation_source_service_ =
+                    std::make_unique<revocation_source::RevocationSourceService>(
+                        *revocation_source_store_, std::move(egress_env));
+                spdlog::info("RevocationSourceStore initialized (schema revocation_source_store)");
+            }
+        }
+
         // Typed per-device app-perf daily projection — born-on-Postgres (DEX
         // app-perf-over-time B1). Independent of the software store above (its own
         // schema, its own fail-closed). Wires BOTH server entry points (direct
@@ -9200,6 +9298,43 @@ public:
                 if (stream_budget_) {
                     metrics_.gauge("yuzu_http_held_open_responses")
                         .set(static_cast<double>(stream_budget_->active()));
+                }
+                // NAT64 discovery cache state and the bounded resolver pool, published from this
+                // 15 s tick (never from a request path), so the in-flight gauge cannot sit stale
+                // after a registration ends; the cache counters are monotonic deltas.
+                {
+                    namespace net = ::yuzu::server::net;
+                    auto& c = net::process_nat64_cache();
+                    const auto bump = [&](const char* outcome, std::atomic<std::uint64_t>& v,
+                                          std::uint64_t& last) {
+                        const auto now = v.load(std::memory_order_relaxed);
+                        if (now > last)
+                            metrics_.counter("yuzu_server_nat64_discovery_lookups_total",
+                                             {{"outcome", outcome}})
+                                .increment(static_cast<double>(now - last));
+                        last = now;
+                    };
+                    std::uint64_t& l_ans = nat64_published_[0];
+                    bump("answered", c.stats.answered, l_ans);
+                    bump("answered_none", c.stats.answered_none, nat64_published_[1]);
+                    bump("failed", c.stats.failed, nat64_published_[2]);
+                    bump("inconclusive", c.stats.inconclusive, nat64_published_[3]);
+                    const auto ovf = c.stats.overflow_refusals.load(std::memory_order_relaxed);
+                    if (ovf > nat64_published_[4])
+                        metrics_.counter("yuzu_server_nat64_discovery_overflow_refusals_total")
+                            .increment(static_cast<double>(ovf - nat64_published_[4]));
+                    nat64_published_[4] = ovf;
+                    {
+                        std::lock_guard lk(c.mu);
+                        metrics_.gauge("yuzu_server_nat64_discovery_overflowed")
+                            .set(c.overflowed ? 1.0 : 0.0);
+                        metrics_.gauge("yuzu_server_nat64_discovery_prefixes")
+                            .set(static_cast<double>(c.prefixes.size()));
+                    }
+                    metrics_.gauge("yuzu_server_revocation_source_resolver_in_flight")
+                        .set(static_cast<double>(net::process_resolver_in_flight()));
+                    metrics_.gauge("yuzu_server_nat64_discovery_resolver_in_flight")
+                        .set(static_cast<double>(net::nat64_probe_pool()->in_flight.load()));
                 }
                 if (pg_pool_) {
                     metrics_.gauge("yuzu_pg_pool_in_use")
@@ -11019,6 +11154,11 @@ public:
         // The /crypto layout store: borrowed only by crypto_api_, whose callers (the web worker
         // pool) were joined above. Before the pool (ADR-0012 destruct-before-pool).
         crypto_dashboard_layout_store_.reset();
+        // The revocation-source seam and its store: borrowed only by the REST routes and the MCP
+        // tools, whose callers (the web worker pool) were joined above. Service before store,
+        // before the pool (ADR-0012 destruct-before-pool).
+        revocation_source_service_.reset();
+        revocation_source_store_.reset();
         agent_service_.set_app_perf_daily_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_app_perf_daily_store(nullptr);
@@ -16720,6 +16860,7 @@ private:
                              .analytics_store = analytics_store_.get(),
                              .crypto_dashboard_layout_store =
                                  crypto_dashboard_layout_store_.get(),
+                             .revocation_source_store = revocation_source_store_.get(),
                              .nvd_db = nvd_db_.get(),
                              .nvd_sync = nvd_sync_.get(),
                          });
@@ -19512,6 +19653,28 @@ private:
                                .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
                                .tier_policy_fn = auth_routes_->gateless_tier_policy_fn()});
 
+        // RevocationSourceRoutes - /api/v1/crypto/revocation-sources (ADR-0070 R1). Admin-only in
+        // BOTH RBAC states: perm_fn gates the RevocationSource securable (seeded to Administrator
+        // only, Read floored under RBAC off) and admin_fn is the durable-administrator predicate
+        // (is_rbac_administrator, kRest, plus the regime re-check on a write), so a custom role
+        // holding the securable is still refused. The MCP twins are wired to the SAME service.
+        revocation_source_routes_ = std::make_unique<RevocationSourceRoutes>();
+        revocation_source_routes_->register_routes(
+            *web_server_,
+            RevocationSourceRoutes::Deps{
+                .auth_fn = auth_fn,
+                .audit_fn = audit_fn,
+                .perm_fn = perm_fn,
+                .admin_fn =
+                    [this](const auth::Session& session, bool is_write) {
+                        return revocation_source::decide_admin(session, auth_db_.get(),
+                                                               rbac_store_.get(),
+                                                               RbacAdminSurface::kRest, is_write);
+                    },
+                .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
+                .step_up_fn = step_up_fn,
+                .service = revocation_source_service_.get()});
+
         // HardwareRoutes — /hardware (ServiceNow-style CI list + record).
         // Software lives at /software; /inventory redirects here.
         // `fleet_read_fn` is the SOLE gate on the list + REST twin (admit-then-filter,
@@ -22166,6 +22329,8 @@ private:
             // page or the REST twins. Null (no inventory store) -> the tools answer an
             // internal error, never an empty result.
             mcp_server_->set_crypto_api(crypto_api_);
+            // ADR-0070 R1: the SAME RevocationSourceService the REST routes use.
+            mcp_server_->set_revocation_source_service(revocation_source_service_.get());
             // /crypto widgets: list_crypto_widgets' availability, get_crypto_ca_stats' R2
             // withhold and list_issued_certs' filtered form use the SAME callback as the REST
             // routes and the dashboard.
@@ -23628,6 +23793,14 @@ private:
     std::unique_ptr<CryptoDashboardLayoutStore> crypto_dashboard_layout_store_;
     std::shared_ptr<CryptoApi> crypto_api_;
     std::unique_ptr<CryptoRoutes> crypto_routes_;
+    // Registered CRL sources - born-on-Postgres (ADR-0070 R1). Declared after pg_pool_ so they
+    // destruct before the pool; the service BORROWS the store, so it is declared after it (and
+    // stop() resets them in that order once the web workers are joined).
+    // Last-published values of the shared NAT64 cache's monotonic counters (health tick only).
+    std::uint64_t nat64_published_[5]{};
+    std::unique_ptr<RevocationSourceStore> revocation_source_store_;
+    std::unique_ptr<revocation_source::RevocationSourceService> revocation_source_service_;
+    std::unique_ptr<RevocationSourceRoutes> revocation_source_routes_;
     // Typed per-device app-perf daily projection — born-on-Postgres (DEX
     // app-perf-over-time B1). Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<AppPerfDailyStore> app_perf_daily_store_;

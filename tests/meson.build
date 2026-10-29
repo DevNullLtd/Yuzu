@@ -1556,6 +1556,7 @@ if build_server
       'unit/server/test_rbac_role_assignment.cpp', # A2: POST/DELETE .../rbac/roles/{name}/assignments + MCP twins
       'unit/server/test_rbac_enforcement_toggle.cpp', # A1: PUT /api/v1/rbac/enforcement + MCP twin
       'unit/server/test_guardian_generation_raise.cpp', # POST .../guaranteed-state/policy-generation/raise + MCP twin raise_guardian_policy_generation
+      'unit/server/test_revocation_source_surface.cpp', # ADR-0070 R1: /api/v1/crypto/revocation-sources + MCP twins + service validation
       'unit/server/test_rbac_account_lifecycle_guard.cpp', # #4966: last-Administrator guard for account lifecycle (deactivate_account / set_local_role / would_strand)
       'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
@@ -1930,6 +1931,7 @@ if build_server
       'unit/server/test_crypto_routes.cpp',              # /crypto slice 1: CryptoRoutes over a fake seam + gate
       'unit/server/test_crypto_widget_catalogue.cpp',    # /crypto widgets: pure catalogue, D13 windows, parsers
       'unit/server/test_crypto_dashboard_layout_store.cpp', # /crypto widgets: layout store (born-on-PG)
+      'unit/server/test_revocation_source_store.cpp',   # ADR-0070 R1: registered CRL sources (born-on-PG)
       'unit/server/test_vuln_finding_store.cpp',
       'unit/server/test_vuln_finding_store_adversarial.cpp',
       'unit/server/test_product_normalize.cpp',

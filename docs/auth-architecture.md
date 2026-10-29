@@ -641,13 +641,13 @@ Full design: `docs/auth-mfa-design.md`. Summary:
 - **Step-up on high-risk surfaces** — `cfg.mfa_step_up_window_secs` (300 s
   default) controls how long after a TOTP proof high-risk endpoints
   accept the session as "stepped up." PR 2 introduced the gate on 11
-  sites and the `/login/mfa/stepup` proof route; it now covers 39 mutating
-  routes (user delete and role change, token, session, engine-principal,
+  sites and the `/login/mfa/stepup` proof route; it now covers 44 mutating
+  routes (41 enforced by the chokepoint plus the 3 JIT-elevation routes) (user delete and role change, token, session, engine-principal,
   RBAC-assignment and enforcement-toggle lifecycle, password reset and
   unlock, Guardian rule write / push / policy-generation raise and guard update / delete,
   software-package write, software-deploy start, approval approve and reject
   (`POST /api/approvals/{id}/approve|reject`), MFA recovery-code
-  regeneration and MFA disable, JIT elevation). 37 are enforced by the
+  regeneration and MFA disable, JIT elevation). 41 are enforced by the
   central chokepoint described under "MFA step-up chokepoint" below; the
   three JIT-elevation routes apply their own stricter gate in the handler.
   Other mutating routes and all MCP tools are not MFA-step-up gated in
@@ -685,7 +685,7 @@ by each handler.
 - **One table.** `step_up_policy.hpp`'s `kStepUpPolicy` classifies every
   mutating (`POST`/`PUT`/`PATCH`/`DELETE`) route by its exact `(method,
   registered pattern)`; there are no prefixes or wildcards. The classes are
-  `kRequired` (a fresh proof is needed; today's 37 enforced routes, 34 of
+  `kRequired` (a fresh proof is needed; today's 41 enforced routes, 34 of
   them with the audit labels they always had), `kOwnGate` (the three JIT-elevation routes,
   whose handler applies a stricter gate that the chokepoint leaves alone),
   `kExempt` (a recorded reason: pre-session, self-service, read-shaped,
@@ -693,7 +693,7 @@ by each handler.
   class (`kPendingRuling`) for routes whose classification is still being
   decided, which the chokepoint treats as exempt: 73 REST rows today, a count
   pinned in a `static_assert` (`kPendingRulingMax`) that can only shrink. The
-  table has 235 REST rows: 37 `kRequired`, 3 `kOwnGate`, 122 `kExempt` and 73
+  table has 239 REST rows: 41 `kRequired`, 3 `kOwnGate`, 122 `kExempt` and 73
   `kPendingRuling`.
 - **Where it runs.** In `run_pre_request_stage` (`step_up_wiring.hpp`), the
   body of the pre-request handler `server.cpp` installs: after the route
@@ -740,7 +740,7 @@ by each handler.
   `--mfa-step-up-window-secs 0` (or less) disables the stale-proof requirement on
   `kRequired` rows, but neither the engine denial nor the null-store check
   below. The escape hatch precedes the SAML denial and the store read in
-  `decide_step_up`, so at a window of 0 or less SAML sessions pass all 37
+  `decide_step_up`, so at a window of 0 or less SAML sessions pass all 41
   routes and the authentication store is not read; no stale proof is refused
   (so none is recorded), while engine denials and unwired-store refusals are
   still recorded. The elevation routes use the global window when it is positive
@@ -818,7 +818,7 @@ by each handler.
   calls may be deleted once handlers consume the centrally resolved session or the
   repeated resolves are removed (#6200); the binding stays until then. Until then
   the in-handler calls remain
-  as defence in depth (39 distinct labels: one per `kRequired` row, 37, plus
+  as defence in depth (43 distinct labels: one per `kRequired` row, 41, plus
   the two the elevation path uses).
 - **Audit.** Refusals written by the chokepoint go through
   `AuthRoutes::audit_log`, so the actor is the resolved session. Every row is
@@ -868,19 +868,19 @@ by each handler.
   server's route table is sealed: a later mutating registration through the
   route sink that has no row is not registered, is logged as critical and
   makes the sink throw. Adding a mutating route therefore means adding a row.
-- **Scope.** A fresh MFA proof is required on 37 named high-risk routes (plus
+- **Scope.** A fresh MFA proof is required on 41 named high-risk routes (plus
   the three JIT-elevation routes, whose handlers apply their own gate) for
   MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`;
   un-enrolled accounts and API/MCP tokens pass; engine principals are denied.
-  "High-risk" names these 37 routes; it is not a completeness claim. Other
+  "High-risk" names these 41 routes; it is not a completeness claim. Other
   mutating routes and all MCP tools are not MFA-step-up gated in this release:
   73 REST rows are still `kPendingRuling` (among them CA revoke and
   issue-code-signing, and `PUT /api/config/*`), and MCP is governed by the MCP tier
   and approval ladder (`docs/mcp-server.md`). The MCP tools are classified in
-  a second table, `step_up_mcp_policy.hpp` (65 rows: 19 `kExempt`, 46
+  a second table, `step_up_mcp_policy.hpp` (69 rows: 19 `kExempt`, 50
   `kPendingRuling`, none `kRequired`), which is data only and changes no MCP
   behaviour. The pending rows are a frozen baseline of 44 whose count only goes down,
-  plus a separate list of tools added after it (today two), legal only for a tool
+  plus a separate list of tools added after it (today six), legal only for a tool
   whose REST twin is `kRequired`, which a compile-time check ties to the REST
   table. Every pending tool with a `kRequired` twin is pending because no MCP
   consumer enforces `kRequired` yet. PR 2 promotes pending rows; an MCP `kRequired` row will need a
@@ -2068,16 +2068,16 @@ applies to these two flags).
 ### MFA enforcement with SAML
 
 **MFA step-up is not supported for SAML sessions in this release.** A SAML
-session hitting any step-up-gated route (the 39 listed in the REST API
+session hitting any step-up-gated route (the 44 listed in the REST API
 reference under "Step-up envelope on high-risk endpoints": token, session,
 engine-principal and RBAC lifecycle, Guardian rule and guard writes, software
 deploy, approval approve/reject, user delete/role change, MFA recovery-code regeneration and disable,
 JIT elevation)
 receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"`, regardless of `--mfa-enforcement` mode (the one exception is a disabled window: with
-`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 37 routes enforced by the
+`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 41 routes enforced by the
 central check, but not the three JIT-elevation routes, which own their gate and substitute a
-300 s window, so those still deny SAML). Approval approve/reject are among the 37 central
+300 s window, so those still deny SAML). Approval approve/reject are among the 41 central
 routes, so with the window enabled the central check answers a SAML session first with this
 generic 403, and the handler never runs. They also carry their own, stricter approver gate
 (#6079), which refuses a SAML session in every configuration; the typed
@@ -3380,12 +3380,12 @@ counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
 
 ## Granular RBAC (Phase 3)
 
-- 8 roles (adds `ForensicsAnalyst`, the read-only delegable Forensics tier, #4990), 38 securable types, per-operation permissions, deny-override logic.
+- 8 roles (adds `ForensicsAnalyst`, the read-only delegable Forensics tier, #4990), 39 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO**: Full PKCE flow, OIDC Discovery, JWT validation, group-to-role mapping. Endpoints and `jwks_uri` are never derived from the issuer: `OidcProvider::ensure_discovered` reads them lazily from the issuer's discovery document (an explicit `OidcConfig` field is authoritative for that one field), fails closed with no fallback, and applies one validation, shared with the Settings "Test Connection" button: `issuer` byte-equal to the configured issuer (OIDC Discovery 4.3, the mix-up defense) and every endpoint an absolute URL on the issuer's scheme, at most 2048 bytes, with a well-formed `host[:port]` authority. Test Connection shares only the fetch and validation functions: it never reads or clears the provider's discovery state, so it is a connectivity check and not a guarantee of what a sign-in will hit.
   - All IdP GETs go through one bounded primitive (`http_get_bounded`): 5 s per-operation timeouts and a total bound of 2 x that timeout, 10 s by default, from the start of the request, covering name resolution (on POSIX the resolver is capped at the per-operation timeout where httplib's non-blocking resolver is compiled in: the Linux build; not checked on macOS. On Windows `resolve_host_addresses` runs its own overlapped `GetAddrInfoExW` lookup, canceled at that timeout rounded up to whole seconds, with up to 5 s more for the canceled lookup to complete; a lookup still not complete then is not freed (the OS may still write into it) but handed to a process-wide ledger that destroys it once its event is signaled, holds at most 16 such requests plus lookups in flight, and makes a new lookup fail closed with "the host name did not resolve" while 16 are stuck: `oidc_abandoned_ledger.hpp`), connect and the response; 256 KiB body cap, redirects not followed.
   - A watchdog thread shuts the socket down at that deadline, and again every 50 ms because a pre-connect shutdown does not persist on macOS (measured), so the bound also covers the TLS handshake, which httplib's own `set_max_timeout` does not. On POSIX the watchdog holds a descriptor it reserved before the client existed (an alias of the socket, made by dup2 from httplib's socket-options callback, so exhaustion fails the request closed with `request failed: no file descriptor available` rather than leaving it unwatched). On Windows it takes a private duplicate of the socket (`WSADuplicateSocketW`, so it never touches a socket number httplib may close and Windows may reuse), and a duplicate that cannot be taken fails the request closed with the same text; from the deadline it calls `CancelIoEx` on the duplicate and shuts the connection down every 50 ms, and after 10 such cuts (500 ms) closes the duplicate with `SO_LINGER` zero, an abortive close that resets the connection (the count restarts for each socket httplib hands it). httplib 0.37.1 waits with `WSAPoll` on Windows; the evidence for the cut is the end-to-end Windows drip test. Per-OS test provenance is in `docs/test-coverage.md`.
   - The token-exchange POST has per-operation timeouts only (10/15/15 s on Linux and macOS; Windows uses the WinHTTP defaults) and no total bound. Its response is capped at 256 KiB on every platform (on Windows the size of each chunk is checked against the remaining allowance before it is allocated), and the Windows request sets the WinHTTP redirect policy to never and accepts only HTTP status 200 (`WinHttpQueryHeaders`), so a 3xx answer fails the sign-in instead of being followed to an unchecked host or parsed as a token response.
-  - Every IdP-directed fetch is vetted first (`oidc_egress_policy.hpp`): the host is resolved, every address classified, and the connection pinned to a permitted address; the Windows token POST is only pre-checked, and because WinHTTP may pick any address of its own answer the pre-check is strict there: one refused address in a mixed answer refuses the request outright (the other paths pin the permitted member instead). DNS rebinding between the check and WinHTTP's own lookup is not covered there (it does not follow redirects). Classification also treats the non-global parts of `2001::/23` (Teredo `2001::/32`, benchmarking `2001:2::/48`, ORCHID `2001:10::/28`, the unallocated rest) as non-global, except the sub-ranges the IANA IPv6 special-purpose registry marks globally reachable (`2001:1::1`-`2001:1::3`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28`). NAT64 prefixes learned from `ipv4only.arpa` are only ever added (union across answers, kept for the process lifetime; the TTL controls when to look again, never what is kept), at most 64: an answer that would exceed that is not installed partially, the fetch is refused with a fixed reason. A configured `--oidc-nat64-prefix` is trusted to describe a translator and may therefore permit a destination its own address class would otherwise gate; only the always-refused tier is immutable. Host names are ASCII only (`authority_well_formed` refuses a byte >= 0x80; an internationalized name is given as punycode), so the check and WinHTTP cannot be asked for different names. The process flag `--oidc-allow-private-networks` is the general private-network override (a configured NAT64 prefix has the classification exception above); see `docs/user-manual/authentication.md` "Network and trust".
+  - Every IdP-directed fetch is vetted first (`oidc_egress_policy.hpp`): the host is resolved, every address classified, and the connection pinned to a permitted address; the Windows token POST is only pre-checked, and because WinHTTP may pick any address of its own answer the pre-check is strict there: one refused address in a mixed answer refuses the request outright (the other paths pin the permitted member instead). DNS rebinding between the check and WinHTTP's own lookup is not covered there (it does not follow redirects). Classification also treats the non-global parts of `2001::/23` (Teredo `2001::/32`, benchmarking `2001:2::/48`, ORCHID `2001:10::/28`, the unallocated rest) as non-global, except the sub-ranges the IANA IPv6 special-purpose registry marks globally reachable (`2001:1::1`-`2001:1::3`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28`). NAT64 prefixes learned from `ipv4only.arpa` are only ever added (union across answers, kept for the process lifetime; the TTL controls when to look again, never what is kept), at most 64: an answer that would exceed that is not installed partially, the fetch is refused with a fixed reason. A configured `--oidc-nat64-prefix` is trusted to describe a translator and may therefore permit a destination its own address class would otherwise gate; only the always-refused tier is immutable. Host names are ASCII only (`authority_well_formed` refuses a byte >= 0x80; an internationalized name is given as punycode), so the check and WinHTTP cannot be asked for different names. The process flag `--oidc-allow-private-networks` is the general private-network override (a configured NAT64 prefix has the classification exception above); see `docs/user-manual/authentication.md` "Network and trust". **Shared discovery cache (ADR-0070 R1).** The learned-prefix set is ONE process-wide, never-shrinking cache shared by this OIDC egress check, the CRL-source registration check and the later CRL fetcher: a prefix any of them learns is known to all, and a lookup failure on one is not cached as a failure for another when it was only a squeezed budget. A resolver answer of "no such name" (NXDOMAIN/NODATA) for `ipv4only.arpa` counts as an ANSWER (no DNS64 on this network) in both consumers; a timeout or SERVFAIL counts as a failure. **Residuals:** a resolver that LIES (answers NXDOMAIN, or withholds the AAAA record) suppresses discovery, so declare `--oidc-nat64-prefix` for any network whose NAT64 prefix you know; and one hostile answer carrying more than 64 prefixes freezes the set in overflow (IPv6 destinations are refused, OIDC and CRL registration alike, `yuzu_server_nat64_discovery_overflowed` = 1) until a later answer fits or the server is restarted. If the network is renumbered, restart: the old prefix is kept.
   - Exactly one thread fetches discovery at a time (the in-flight mark is cleared by an RAII guard on every exit) and any other caller that needs it fails fast; a failed attempt is remembered for 30 s and a success for the provider's lifetime. Signing keys are not cached: every verification calls `fetch_jwks_snapshot()` and works from the answer it just obtained, so a key the IdP stops publishing stops verifying at the next login (#1901 UP-19; a failed or non-JWKS answer is `kJwksUnavailable`, with no stale-key fallback; related: #1900, #5983), and a token naming a `kid` the key set lacks is refused rather than checked against another key, while a token with no `kid` is checked against each usable key in turn (at most the first 16, in the order published). An RSA key with a modulus under 2048 bits, or an exponent below 3, even or over 32 bits, is skipped at parse: defence in depth against a weak IdP key, not against a tampered JWKS. Provider swaps: a Settings save is serialized by `oidc_save_mu_` (stored-secret read, provider build, swap, persist), replaces the provider under the exclusive `oidc_mu_`, and retires the old one after the lock drops; `/auth/oidc/start` and `/auth/callback` hold a `Lease` (taken under the shared lock) instead of the lock, and the callback compares the published provider with its leased one right after `handle_callback` (lease still held, so the address cannot be reused) and refuses with audit reason `provider_replaced` before any group, role or session work.
   - Verified end to end against Keycloak 26.4.0 (Linux test host, plain `http` and `https` via a TLS-terminating proxy); Entra ID is supported by the standard but not verified by the project.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
@@ -3565,6 +3565,15 @@ only when a change cannot be expressed as an idempotent additive re-seed
 (`rbac_store.cpp`'s legacy SQLite v4 migration *deletes* rows, which is why
 it needed one — distinct from the PG schema's own migration sequence,
 ADR-0041, currently at v3).
+
+### The revocation-source surface: a registered-egress-target floor class and a further administrator-predicate call site (ADR-0070 R1)
+
+`RevocationSource:Read` is floored (`authz_topology_floor.hpp`) under a class the header's inclusion test now names: **the read discloses operator-registered egress targets** (registered CRL URLs, their confirmed address classes and fetch status map internal network topology). It fits none of the earlier classes, and the header says so rather than stretching one. The floor is only the RBAC-off half: the whole surface (`/api/v1/crypto/revocation-sources*` and the six `*_revocation_source*` MCP tools) is **also** gated on the durable-administrator predicate in **both** RBAC states, through `revocation_source_admin_gate.hpp`'s `decide_admin`, which composes `is_rbac_administrator` (`RbacAdminSurface::kRest` for the REST routes, `kMcp` for the tools) and, for a write, `RbacStore::check_caller_authorized_under_current_regime`. It adds no rule to the predicate (EXTEND it, never fork it). Consequences, each tested:
+
+- **Not grantable.** `RevocationSource` is seeded to `Administrator` only, but a custom role can still be granted `RevocationSource:Read`/`:Write` under RBAC on; such a holder is refused on every route and tool, because the securable is necessary and never sufficient. The access-review export lists any such grant. The reason the grant is refused: the fetch-status fields would otherwise make the fetcher a blind request-forgery and port-scan oracle for whoever holds it.
+- **Service-scoped tokens** are refused by the securable gate (neither pair is in `kServiceScopeGlobalSafe`) and by the predicate; **MCP-tier bearer tokens** are refused on REST by the predicate (`kRest`).
+- **`RevocationSource:Write` is a deliberate entry on `mcp::requires_approval`'s supervised list** (`mcp_policy.hpp`): removal, reset and registration are all a `Write`, never a `Delete`, so without the entry a supervised MCP token held by an administrator would change the registry with no ticket. On REST an MCP-tier token is refused outright (the predicate with `kRest` denies any non-empty `mcp_tier`), so the entry gates MCP only.
+- The four mutations are `kRequired` rows in `step_up_policy.hpp` (and `pending` on the MCP side with a `kRequired` twin).
 
 ## Render-time permission probes (capability hints)
 

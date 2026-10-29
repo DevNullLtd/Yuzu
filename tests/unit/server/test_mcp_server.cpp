@@ -2273,8 +2273,13 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         const bool idempotent = a["idempotentHint"];
         const bool open_world = a["openWorldHint"];
 
-        // Closed managed fleet: never open-world.
-        CHECK(open_world == false);
+        // Closed managed fleet: never open-world, with EXACTLY two exceptions (ADR-0070 R1,
+        // slice 2b-1a): register_revocation_source and update_revocation_source resolve the
+        // administrator-registered CRL host to show its address class, the only outbound reach
+        // any tool has (no tool fetches a CRL; the refresh job does). A third open-world tool is
+        // a new outbound surface and needs its own security review, not an edit here.
+        CHECK(open_world == (name == "register_revocation_source" ||
+                             name == "update_revocation_source"));
         // readOnlyHint is mechanically the Read operation.
         CHECK(read_only == (operation == "Read"));
         // Coherence: a read-only tool is neither destructive, and reads are idempotent.
@@ -3010,8 +3015,9 @@ TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mc
     // + 4 #4028 additions (TlsConfig, PluginSigning, ServerConfig,
     // AnalyticsConfig — Settings read-twins) = 33,
     // + 3 #4031 additions (Directory, Enrollment, OidcConfig) = 36,
-    // + 2 Wave 7 (Forensics, Decommission — PR7.2) = 38.
-    CHECK(rbac_securables_for_test().size() == 38);
+    // + 2 Wave 7 (Forensics, Decommission — PR7.2) = 38,
+    // + 1 ADR-0070 R1 (RevocationSource, slice 2b-1a) = 39.
+    CHECK(rbac_securables_for_test().size() == 39);
 }
 
 TEST_CASE("MCP 2383: three-way dispatch classifier — knownness decides first", "[mcp][2g]") {
@@ -31643,6 +31649,17 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         {"unlock_account", nlohmann::json::parse(R"({"username":"alice"})")},
         // Execution:Execute twin of POST /api/v1/hardware/sync.
         {"sync_hardware_software", nlohmann::json::parse(R"({"scope":"__all__"})")},
+        // ADR-0070 R1 (slice 2b-1a): the four RevocationSource:Write mutations are gated at the
+        // supervised tier by the deliberate requires_approval() entry (removal, reset and
+        // registration are all a Write, never a Delete).
+        {"register_revocation_source",
+         nlohmann::json::parse(
+             R"({"name":"n","ca_certificates":["x"],"crl_urls":[{"url":"http://crl.example.com/a.crl"}]})")},
+        {"update_revocation_source",
+         nlohmann::json::parse(
+             R"({"id":1,"expected_config_version":1,"name":"n","ca_certificates":["x"],"crl_urls":[{"url":"http://crl.example.com/a.crl"}]})")},
+        {"remove_revocation_source", nlohmann::json::parse(R"({"id":1})")},
+        {"reset_revocation_source_high_water", nlohmann::json::parse(R"({"id":1})")},
     };
 
     // Tether: the gated set derived from security rows + requires_approval()

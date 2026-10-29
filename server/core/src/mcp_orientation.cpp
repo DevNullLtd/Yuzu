@@ -313,7 +313,13 @@ constexpr std::string_view kCryptoDashboard[] = {
     "list_crypto_widgets", "get_crypto_dashboard_layout", "set_crypto_dashboard_layout",
     "get_crypto_ca_stats"};
 
-constexpr std::array<ToolFamily, 42> kFamilies{{
+// ADR-0070 R1 (slice 2b-1a): registered CRL sources - a CA plus the CRL URLs the server may fetch.
+// Admin-only in both RBAC states (not grantable). Registration only: nothing is fetched yet.
+constexpr std::string_view kRevocationSources[] = {
+    "list_revocation_sources", "get_revocation_source", "register_revocation_source",
+    "update_revocation_source", "remove_revocation_source", "reset_revocation_source_high_water"};
+
+constexpr std::array<ToolFamily, 43> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions, their full export, and recurring "
@@ -424,6 +430,10 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
     {"Crypto dashboard", "the /crypto widget catalogue, your own widget layout, and counts of "
                          "certificates issued by Yuzu's own CA (fixed windows, with as_of)",
      kCryptoDashboard},
+    {"Revocation sources", "administrator-only registry of CRL sources: the CAs and the CRL URLs "
+                           "the server may fetch for them (registration only; nothing is fetched "
+                           "or judged yet)",
+     kRevocationSources},
 }};
 
 }  // namespace

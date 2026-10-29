@@ -847,6 +847,50 @@ TEST_CASE("AuthRoutes::require_permission - supervised MCP token blocked from ap
     CHECK(res.body.find("approval") != std::string::npos);
 }
 
+// ADR-0070 R1 (slice 2b-1a): RevocationSource:Write joined the supervised-tier requires_approval()
+// list. Registration, replace, removal and the anti-rollback reset are ALL a `Write` (never a
+// `Delete`), so without the entry a supervised MCP token held by an administrator would register an
+// egress target, remove a source or reopen the CRL replay window with no ticket on MCP. On a REST
+// transport require_permission applies the same predicate to an MCP token and answers 403 for the
+// four mutation routes (an MCP-tier token can never complete a REST call here: there is no ticket
+// flow on REST, and the administrator predicate with kRest refuses it too), which this test pins.
+// The Read pair is untouched.
+TEST_CASE("AuthRoutes::require_permission - supervised MCP token gets approval_required for every "
+          "RevocationSource mutation on a REST transport, and reads pass",
+          "[pg][auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-rs-sup", "test_user", now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+
+    const std::vector<std::pair<std::string, std::string>> mutations = {
+        {"POST", "/api/v1/crypto/revocation-sources"},
+        {"PUT", "/api/v1/crypto/revocation-sources/1"},
+        {"DELETE", "/api/v1/crypto/revocation-sources/1"},
+        {"POST", "/api/v1/crypto/revocation-sources/1/reset-high-water"},
+    };
+    for (const auto& [method, path] : mutations) {
+        INFO(method << " " << path);
+        auto req = request_with_header("Authorization", "Bearer " + *raw);
+        req.method = method;
+        req.path = path; // a REST (non-MCP) transport
+        httplib::Response res;
+        // Every one of the four routes gates on the same (securable, operation) pair.
+        CHECK_FALSE(fix.ar->require_permission(req, res, "RevocationSource", "Write"));
+        CHECK(res.status == 403);
+        CHECK(res.body.find("approval") != std::string::npos);
+    }
+    {
+        // The reads are not approval-gated by the policy table.
+        auto req = request_with_header("Authorization", "Bearer " + *raw);
+        req.path = "/api/v1/crypto/revocation-sources";
+        httplib::Response res;
+        CHECK(fix.ar->require_permission(req, res, "RevocationSource", "Read"));
+        CHECK(res.body.find("approval") == std::string::npos);
+    }
+}
+
 // Complement of the above: on the MCP JSON-RPC transport the C8 gate in
 // mcp_server.cpp is the authoritative approval gate for create_api_token
 // (ticket-then-recall, #289), so require_permission must NOT re-deny it here.

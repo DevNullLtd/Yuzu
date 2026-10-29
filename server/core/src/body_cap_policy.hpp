@@ -573,6 +573,17 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // row).
     {kBodyCapAnyMethod, "/api/v1/config", 16u * 1024, false, "config"},
 
+    // /api/v1/crypto/revocation-sources — registered CRL sources (ADR-0070 R1, revocation_source_
+    // routes.cpp): POST / PUT carry {name, ca_certificates (<= 8 PEM, 16 KiB each), crl_urls (<= 8
+    // x 2,048 bytes)}, so 192 KiB (the largest valid body, JSON-escaped, is about 151 KiB) mirrors revocation_source::kBodyMaxBytes exactly (a
+    // static_assert in the routes TU pins the pair). The gates (administrator predicate,
+    // securable) run in the handler after httplib buffered the body, so without its own entry the
+    // path would take the 16 KiB `/api/v1/crypto` row and refuse a legitimate 8-certificate body.
+    // Longest match: it outranks the `/api/v1/crypto` row above for this subtree only. ANY method:
+    // a verb-scoped row would drop the whole prefix to the shorter row (rule 4).
+    {kBodyCapAnyMethod, "/api/v1/crypto/revocation-sources", 192u * 1024, false,
+     "crypto_revocation_sources"},
+
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.
     // Ordinary JSON/form traffic (most REST mutation routes) lands here.

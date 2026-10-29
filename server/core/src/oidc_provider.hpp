@@ -351,6 +351,19 @@ public:
     /// Process-wide: a test must restore it. Same source-scan pin.
     using ResolverForTest = std::function<std::vector<std::string>(const std::string& host)>;
     static void set_resolver_for_test(ResolverForTest resolver);
+    /// Test-only seam for the NAT64 probe's WIRING: replaces the system lookup the `ipv4only.arpa`
+    /// probe hands to the bounded resolver. `status` is a `net::ResolveStatus` value (0 ok,
+    /// 1 not found, 2 temporary, 3 timeout, 4 busy; see bounded_resolver.hpp) and `addresses` the
+    /// numeric answers for kOk. The stub receives the host name the probe asked for. Unlike
+    /// `set_resolver_for_test` (which short-circuits the probe), this runs the real bounded
+    /// resolver and the shared status-to-outcome mapping. An empty function restores the system
+    /// lookup. Process-wide. Same source-scan pin.
+    struct Nat64ProbeStubForTest {
+        int status{1};
+        std::vector<std::string> addresses;
+    };
+    using Nat64ProbeLookupForTest = std::function<Nat64ProbeStubForTest(const std::string& host)>;
+    static void set_nat64_probe_lookup_for_test(Nat64ProbeLookupForTest lookup);
     /// Test-only seam: replaces the 30 s window during which a failed discovery is not retried
     /// (0 = retry on the next call) and clears any window already running. Same source-scan pin.
     void set_discovery_negative_cache_for_test(int ms);

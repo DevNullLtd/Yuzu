@@ -169,6 +169,12 @@ namespace yuzu::server::detail {
 class AgentRegistry;
 } // namespace yuzu::server::detail
 
+// ADR-0070 R1: the revocation-source seam behind the six *_revocation_source* tools
+// (revocation_source_service.hpp). Pointer-only here; the .cpp includes the definition.
+namespace yuzu::server::revocation_source {
+class RevocationSourceService;
+} // namespace yuzu::server::revocation_source
+
 namespace yuzu::server::mcp {
 
 // Progress bridge core (track 2f PR 3a). Forward-declared (pointer-only here,
@@ -856,6 +862,12 @@ public:
         const httplib::Request&, crypto_widgets::WidgetGate, const std::string& securable_type,
         const std::string& operation)>;
     void set_crypto_access_fn(CryptoAccessFn fn) { crypto_access_fn_ = std::move(fn); }
+    /// ADR-0070 R1: the revocation-source seam the six `*_revocation_source*` tools call - the
+    /// SAME instance the REST routes use. Borrowed; null = unwired (the tools answer an internal
+    /// error, never an empty result).
+    void set_revocation_source_service(::yuzu::server::revocation_source::RevocationSourceService* s) {
+        revocation_source_service_ = s;
+    }
 
     /// B4 (#2146 API-parity): mirrors `RestApiV1::LockoutClearFn` (rest_api_v1.hpp)
     /// so the MCP `unlock_account` tool clears an account's lockout counter
@@ -1353,6 +1365,8 @@ private:
     std::shared_ptr<const GuardianApi> guardian_api_;
     // ADR-0031 WS-A4 (tenth family) - see set_crypto_api above.
     std::shared_ptr<const CryptoApi> crypto_api_;
+    // ADR-0070 R1 - see set_revocation_source_service above.
+    ::yuzu::server::revocation_source::RevocationSourceService* revocation_source_service_{nullptr};
     // /crypto widgets - see set_crypto_access_fn above.
     CryptoAccessFn crypto_access_fn_;
 };
