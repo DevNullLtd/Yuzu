@@ -475,7 +475,7 @@ Full parameters, response shapes and error tables are in [rest-api.md](rest-api.
 
 The published ecosystems are the closed list the software catalogue tools use: `""`, `rpm`,
 `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`,
-`optional_feature` and `msi`.
+`optional_feature`, `msi` and `ibm_mq`.
 
 Every tool here is read-only except `set_crypto_dashboard_layout`, which replaces the caller's
 own layout and is annotated destructive for that reason (it overwrites the previous layout; no

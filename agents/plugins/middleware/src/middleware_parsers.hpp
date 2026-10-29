@@ -18,24 +18,27 @@
  *
  * The status row ALWAYS comes first. `supported` with zero data rows means NONE FOUND at the places
  * the leg looks; `constrained` means some read failed or was skipped and the rows that follow may be
- * incomplete -- failure never reads as absent. The status row is written by
- * yuzu::shared::format_status_row.
+ * incomplete -- failure never reads as absent. (A data-shape fault in ONE stanza beside usable ones
+ * is logged, not tokened, so `supported` can omit that one installation; the table is in
+ * middleware_runner.hpp.) The status row is written by yuzu::shared::format_status_row.
  *
  * TWO VOCABULARIES, ONE CHANNEL EACH.
  *   Cause       enumeration-level failures. The only thing that becomes a status token, and only
  *               through make_token(): `<os>:middleware:<source>:<cause>`.
- *   ItemReason  per-item shortfalls (one installation's version unknown, one path refused). They go
- *               to the leg's LOG and degrade that one row's fields; they never constrain the whole
- *               host. make_token has no ItemReason overload, so a per-item reason cannot reach the
- *               accumulator by construction.
+ *   ItemReason  per-item shortfalls (one installation's version unknown, one path refused, one
+ *               stanza dropped beside valid ones). They go to the leg's LOG and degrade that one row
+ *               (or drop that one stanza); they never constrain the whole host. make_token has no
+ *               ItemReason overload, so a per-item reason cannot reach the accumulator by
+ *               construction.
  *
  * BOUNDS. A parser fed more than its byte cap parses NOTHING and reports `truncated` (no partial
  * data from a clipped read); a list past its row cap is cut with `truncated` set, and a cap-sized
  * list is complete. Nothing here throws on garbage, CRLF, truncated or oversized input.
  *
  * Free-text fields (title, name, version, path, edition) are untrusted installer text and go through
- * field_or_dash (sanitize_utf8 then safe_output_field), so a value containing '|' or ending in a
- * backslash can never shift the field count on the server's escape-aware decoder.
+ * field_or_dash (sanitize_utf8 then safe_output_field): a pipe is escaped, a backslash is folded to
+ * '/' and CR/LF to a space, so a value can never shift the field count on the server's escape-aware
+ * decoder.
  */
 #pragma once
 
@@ -66,7 +69,8 @@ inline constexpr std::size_t kMaxRowBytes = 1024 * 1024;
 // -- shared result shape ------------------------------------------------------------------------
 
 /// What a parser saw, so the caller can choose a status token without re-reading the text.
-///  dropped    stanzas unusable (missing a required key); the CALLER counts these, siblings are kept
+///  dropped    stanzas unusable (missing a required key); the CALLER counts these and decides what
+///             they mean (middleware_runner.hpp: siblings are kept and each drop is logged)
 ///  truncated  the row cap or the byte cap cut the result (see BOUNDS)
 ///  malformed  structurally broken input (content but no stanza line at all)
 struct ParseReport {
@@ -255,10 +259,13 @@ enum class Cause {
 }
 
 /// Per-item shortfalls: LOGGED by the leg, never a status token (no make_token overload takes one).
+/// `malformed` is one enumerator stanza that cannot be used (no Name or no FilePath) beside at least
+/// one that can: it degrades nothing else, so the valid siblings are kept (middleware_runner.hpp).
 enum class ItemReason {
     path_refused,
     missing,
     unreadable,
+    malformed,
 };
 
 [[nodiscard]] constexpr std::string_view item_reason_name(ItemReason r) noexcept {
@@ -266,6 +273,7 @@ enum class ItemReason {
     case ItemReason::path_refused: return "path_refused";
     case ItemReason::missing:      return "missing";
     case ItemReason::unreadable:   return "unreadable";
+    case ItemReason::malformed:    return "malformed";
     }
     return "unreadable";
 }

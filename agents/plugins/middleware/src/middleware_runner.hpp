@@ -20,8 +20,33 @@
  *   bool    exhausted() const        the Fs's entries-visited budget ran dry
  *   std::string_view os() const      "linux" | "windows" | "macos", the first token field
  *
- * THE Log CALLABLE. `log(product_id, probe_id, ItemReason, candidate_name)` -- one call per per-item
- * shortfall. It never reaches the status row.
+ * THE Log CALLABLE. `log(product_id, probe_id, ItemReason, item)` -- one call per per-item shortfall;
+ * `item` is the installation's name, or `stanza <n>` (1-based) for a dropped stanza, which may have
+ * no name. It never reaches the status row.
+ *
+ * WHAT CONSTRAINS THE ANSWER, token by token. Only an ACCESS or WALK fault constrains (a status
+ * token, `constrained`, and the collector then withholds the source); a DATA-SHAPE fault in one
+ * stanza beside valid ones is logged and the valid siblings are kept. Failure never reads as
+ * absent: nothing below turns an unreadable read into an empty `supported`.
+ *
+ *   enumerator file absent                              supported, zero rows (none found)
+ *   denied / oversized / symlink / network / refused /
+ *     failed read of the enumerator file                CONSTRAINED  <probe>:permission_denied |
+ *                                                       oversized | symlink_refused |
+ *                                                       network_fs_skipped | unreadable
+ *   stanzas cut at kMaxRows (report.truncated)          CONSTRAINED  <probe>:row_cap; first
+ *                                                       kMaxRows kept
+ *   entries / row / byte budget out (walk or Fs)        CONSTRAINED  walk:row_cap
+ *   mount table unreadable (the caller adds it)         CONSTRAINED  mountinfo:unreadable
+ *   content but no stanza line (report.malformed)       CONSTRAINED  <probe>:malformed; zero
+ *                                                       candidates by construction
+ *   some stanzas dropped (no Name or no FilePath), at
+ *     least one valid                                   supported; one log line per dropped stanza
+ *                                                       (ItemReason::malformed), siblings kept
+ *   every stanza dropped (non-empty file, zero valid)   CONSTRAINED  <probe>:malformed; an
+ *                                                       incomplete answer, never an empty supported
+ *   one candidate's listing missing / refused /
+ *     unreadable / no product tag                       supported; logged; that row's version is "-"
  *
  * ONE BUDGET. `budget` is THE row/byte budget of the leg: the caller builds it (make_row_budget
  * clamps every injected limit to the production ceilings) and nothing in the runner or the Fs
@@ -163,17 +188,24 @@ template <MiddlewareFs Fs, class Log>
     if (report.truncated)
         fail(enumerator.id, Cause::row_cap);
     std::vector<Candidate> candidates;
+    std::size_t ordinal = 0;
     for (const KvStanza& s : stanzas) {
+        ++ordinal;
         const std::string* name = s.get(enumerator.name_key);
         const std::string* path = s.get(enumerator.path_key);
         if (name == nullptr || path == nullptr || name->empty() || path->empty()) {
-            ++report.dropped; // the stanza is dropped, its siblings are kept
+            // A data-shape fault of ONE stanza: logged against its 1-based position (it may have
+            // no name to give), its siblings are kept. The table above says when this is a token.
+            ++report.dropped;
+            const std::string where = "stanza " + std::to_string(ordinal);
+            log(std::string_view{p.id}, std::string_view{enumerator.id}, ItemReason::malformed,
+                std::string_view{where});
             continue;
         }
         candidates.push_back({*name, *path, std::string{}});
     }
-    if (report.dropped > 0)
-        fail(enumerator.id, Cause::malformed);
+    if (!stanzas.empty() && report.dropped == stanzas.size())
+        fail(enumerator.id, Cause::malformed); // every stanza dropped: incomplete, not "none found"
 
     // 2. per candidate: the version from the first dir_name probe that names one.
     for (Candidate& c : candidates) {

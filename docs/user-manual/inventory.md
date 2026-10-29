@@ -42,7 +42,8 @@ cadences.
   `source` names the
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `pkg_inventory.store_packages`,
-  `windows_optional_features.list`, `msi_packages.list_inventory`); `package_id`
+  `windows_optional_features.list`, `msi_packages.list_inventory`,
+  `middleware.ibm_mq`); `package_id`
   is empty for these producers except `msi_packages.list_inventory`, where it is
   the MSI product code. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
@@ -157,13 +158,18 @@ cadences.
   for example `9.4.5`); the fix-pack level is not carried. The install path and edition
   are shown by the `middleware` definition, not carried into installed software. This is a
   metadata-only read with no subprocess: `mqinst.ini` and the
-  swidtag file names, readable by an unprivileged agent. If the answer is `constrained` the
-  collector withholds this source's rows for the cycle, logs a warning, and carries on with
-  every other source, rather than failing the whole report. Because each cycle replaces the
-  agent's stored inventory, the withheld IBM MQ rows are REMOVED from the stored inventory
-  until the source recovers, so they are absent from the Software page; the agent's warn line
-  and the status token are the signal. This is the one exception to the skip-the-cycle rule
-  above. Windows and macOS answer `unsupported` (planned).
+  swidtag file names, readable by an unprivileged account (measured as a throwaway
+  unprivileged uid on one IBM MQ 9.4.5.0 Ubuntu-debs install; not measured as the packaged
+  `yuzu-agent` account or on another version or distribution). If the answer is `constrained`
+  (an access or walk fault such as a refused read or a cap; an unusable `mqinst.ini` stanza
+  beside a usable one is only logged) the collector withholds this source's rows for the
+  cycle, logs a warning, and carries on with every other source, rather than failing the
+  whole report. Because each cycle replaces the agent's stored inventory, the withheld IBM MQ
+  rows are REMOVED from the stored inventory until the source recovers, so they are absent
+  from the Software page. The server sees no signal for this and cannot tell a withheld
+  source from one with no IBM MQ installed; the state is visible only by running the
+  `ibm_mq` action on the device and reading its status row. This is the one exception to the
+  skip-the-cycle rule above. Windows and macOS answer `unsupported` (planned).
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,

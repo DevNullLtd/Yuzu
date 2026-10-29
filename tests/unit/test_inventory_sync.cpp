@@ -7,6 +7,7 @@
 #include "local_dispatcher.hpp"
 #include "sync_canonical.hpp" // sha256_hex
 #include "sync_scheduler.hpp"
+#include "middleware_runner.hpp" // yuzu::middleware::run_leg: the REAL runner feeds the middleware cases
 #include "msi_packages_inventory.hpp"
 #include "pkg_inventory_parsers.hpp"
 #include "sync_source_installed_software.hpp"
@@ -3099,7 +3100,7 @@ TEST_CASE("middleware adapter: a row is accepted only when its title equals the 
     }
 }
 
-TEST_CASE("middleware adapter: an escaped pipe in a free-text field is one field, not two",
+TEST_CASE("middleware adapter: an escaped pipe in a free-text field is one field and not two",
           "[sync][parse][adapter][middleware]") {
     // safe_output_field writes a literal '|' as `\|`; a raw-pipe split would see seven tokens
     // and silently drop the row although the status is supported.
@@ -3111,7 +3112,7 @@ TEST_CASE("middleware adapter: an escaped pipe in a free-text field is one field
               .entries.empty());
 }
 
-TEST_CASE("middleware adapter: status grammar, row shape and the drop_source policy",
+TEST_CASE("middleware adapter: status grammar and row shape and the drop_source policy",
           "[sync][parse][adapter][middleware]") {
     const std::string bad = res("failed", "bad status");
     // bad or missing status fails the cycle (it is not a constrained answer)
@@ -3195,7 +3196,7 @@ TEST_CASE("collector: middleware.ibm_mq publishes its mapped fields; a withheld 
         REQUIRE(got.has_value());
         CHECK(got->first == baseline->first);
     }
-    SECTION("a failing source still skips the cycle, beside a healthy middleware") {
+    SECTION("a failing source still skips the cycle beside a healthy middleware") {
         fake_windows();
         g_fake[4].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
         g_fake[3].out["list_inventory"] = "status|list_inventory|constrained|windows:msi_enum:5\n";
@@ -3203,7 +3204,7 @@ TEST_CASE("collector: middleware.ibm_mq publishes its mapped fields; a withheld 
         CHECK_FALSE(src.collect().has_value());
         CHECK(src.skip_reason() == "msi_packages.list_inventory:windows:msi_enum:5");
     }
-    SECTION("a malformed middleware status is a failure, not a withheld source") {
+    SECTION("a malformed middleware status is a failure and not a withheld source") {
         fake_windows();
         g_fake[4].out["ibm_mq"] = nl({kMqRow}); // no status row
         auto src = make_installed_software_source(with_middleware());
@@ -3253,4 +3254,113 @@ TEST_CASE("collector: populated -> constrained -> recovered middleware cycles",
     REQUIRE(c3.has_value());
     CHECK(c3->second == c1->second);
     CHECK(c3->first == c1->first);
+}
+
+// --- the REAL runner's output through the collector (data faults keep their siblings) ---
+
+namespace {
+namespace mwr = yuzu::middleware;
+
+/// A minimal in-memory Fs for the generic middleware runner: one scripted read of the enumerator
+/// file, every installation directory absent (versions stay `-`: this case is about rows, not
+/// versions).
+struct MwFakeFs {
+    mwr::Read ini;
+    mwr::Read read_abs(std::string_view, std::size_t) { return ini; }
+    mwr::Listing list_under(std::string_view, std::string_view) {
+        return mwr::Listing{{}, false, false, mwr::Read::Outcome::absent};
+    }
+    bool exhausted() const { return false; }
+    std::string_view os() const { return "linux"; }
+};
+
+/// What the real ibm_mq Linux leg writes for `fs`: the composed rows (status row first), one per line.
+std::string run_ibm_mq(MwFakeFs& fs) {
+    const mwr::Product& p = *mwr::find_product("ibm_mq");
+    yuzu::shared::ConstraintAccumulator acc;
+    auto budget = mwr::make_row_budget();
+    const auto data = mwr::run_leg(p, p.linux, fs, acc, budget,
+                                   [](std::string_view, std::string_view, mwr::ItemReason,
+                                      std::string_view) {});
+    std::string out;
+    for (const auto& row : mwr::compose_output(p.id, data, acc))
+        out += row + "\n";
+    return out;
+}
+
+constexpr const char* kBrokenStanza = "Installation:\n   Name=Broken\n";
+constexpr const char* kGoodStanza = "Installation:\n   Name=Installation1\n   FilePath=/opt/mqm\n";
+} // namespace
+
+TEST_CASE("collector: a malformed mqinst.ini stanza beside a valid one still publishes IBM MQ",
+          "[sync][collector][middleware]") {
+    fake_windows();
+    const auto baseline = collect_with(all_plugins());
+    REQUIRE(baseline.has_value());
+    const std::string denied = "linux:middleware:mqinst_ini:permission_denied";
+
+    SECTION("a dropped stanza and a valid sibling: supported, the sibling's row is published") {
+        MwFakeFs fs;
+        fs.ini = {mwr::Read::Outcome::ok, std::string{kBrokenStanza} + kGoodStanza};
+        const std::string out = run_ibm_mq(fs);
+        REQUIRE(out.starts_with("status|ibm_mq|supported|-\n"));
+        // the adapter keeps the answer (not withheld) and maps the one row
+        CHECK(show(bind_mq(out)) == res("ok", "", {entry_of("IBM MQ", "", "IBM", "app", "ibm_mq")}));
+
+        g_fake[4].out["ibm_mq"] = out; // no typed status: the leg declares OK/FULL
+        const auto got = collect_with(with_middleware());
+        REQUIRE(got.has_value());
+        CHECK(count_source(got->first, "middleware.ibm_mq") == 1);
+        CHECK(got->second != baseline->second);
+    }
+    SECTION("every stanza dropped: constrained, malformed, withheld (never an empty supported)") {
+        MwFakeFs fs;
+        fs.ini = {mwr::Read::Outcome::ok, kBrokenStanza};
+        const std::string out = run_ibm_mq(fs);
+        const std::string token = "linux:middleware:mqinst_ini:malformed";
+        REQUIRE(out == "status|ibm_mq|constrained|" + token + "\n");
+        CHECK(show(bind_mq(out)) == res("withheld", token));
+
+        g_fake[4].out["ibm_mq"] = out;
+        g_fake[4].result_status["ibm_mq"] = {YUZU_RESULT_STATUS_CONSTRAINED,
+                                             YUZU_RESULT_COMPLETENESS_PARTIAL, token};
+        const auto got = collect_with(with_middleware());
+        REQUIRE(got.has_value());
+        CHECK(count_source(got->first, "middleware.ibm_mq") == 0);
+        CHECK(got->second == baseline->second);
+    }
+    SECTION("positive control: a permission fault on the same file still withholds the source") {
+        MwFakeFs fs;
+        fs.ini = {mwr::Read::Outcome::denied, {}};
+        const std::string out = run_ibm_mq(fs);
+        REQUIRE(out == "status|ibm_mq|constrained|" + denied + "\n");
+        CHECK(show(bind_mq(out)) == res("withheld", denied));
+
+        g_fake[4].out["ibm_mq"] = out;
+        g_fake[4].result_status["ibm_mq"] = {YUZU_RESULT_STATUS_CONSTRAINED,
+                                             YUZU_RESULT_COMPLETENESS_PARTIAL, denied};
+        const auto got = collect_with(with_middleware());
+        REQUIRE(got.has_value());
+        CHECK(count_source(got->first, "middleware.ibm_mq") == 0);
+        CHECK(got->second == baseline->second);
+    }
+}
+
+TEST_CASE("middleware adapter: the leg's own escaped rows round-trip through the adapter",
+          "[sync][parse][adapter][middleware]") {
+    // mw::format_row (the leg) and the collector's escape-aware split are two implementations of one
+    // grammar. A pipe in the installation name or path must leave the row six fields wide, so the
+    // entry is the one a plain name and path would give. Hand-written escaped literals (the case
+    // above) cannot catch the leg's writer drifting from the collector's reader.
+    const std::string plain = mwr::format_row("ibm_mq", "IBM MQ", "Installation1", "9.4.5", "/opt/mqm", "");
+    const std::string piped = mwr::format_row("ibm_mq", "IBM MQ", "Inst|1", "9.4.5", "/opt/mq|east", "");
+    const std::string tricky = mwr::format_row("ibm_mq", "IBM MQ", "a\\|b", "9.4.5", "C:\\mq\\|x", "");
+    REQUIRE(piped.find("\\|") != std::string::npos); // the pipe really was escaped on the wire
+    const AdaptedRows want = bind_mq(nl({st("ibm_mq", "supported", "-"), plain}));
+    REQUIRE(want.entries.size() == 1);
+    for (const std::string* row : {&piped, &tricky}) {
+        CAPTURE(*row);
+        const AdaptedRows got = bind_mq(nl({st("ibm_mq", "supported", "-"), *row}));
+        CHECK(show(got) == show(want));
+    }
 }

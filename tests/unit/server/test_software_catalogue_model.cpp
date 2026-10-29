@@ -699,7 +699,7 @@ TEST_CASE("strict_args_error: MCP refuses what REST clamps", "[server][software_
     CHECK(strict_args_error(json{{"source", std::string(257, 'a')}}));
     CHECK(strict_args_error(json{{"cursor", std::string(2049, 'a')}}));
     for (const char* eco : {"rpm", "deb", "apk", "pacman", "snap", "flatpak", "windows", "macos",
-                            "macos_pkgutil", "brew", "optional_feature", "msi"})
+                            "macos_pkgutil", "brew", "optional_feature", "msi", "ibm_mq"})
         CHECK_FALSE(strict_args_error(json{{"ecosystem", eco}}));
 }
 

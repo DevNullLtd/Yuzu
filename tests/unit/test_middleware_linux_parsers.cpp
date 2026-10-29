@@ -412,7 +412,7 @@ TEST_CASE("middleware linux: lexically_plain accepts only absolute paths of plai
     CHECK_FALSE(lnx::lexically_plain(std::string_view{"/opt/m\0qm", 9})); // embedded NUL
 }
 
-TEST_CASE("middleware linux: a path touches a network mount when on, under or containing it",
+TEST_CASE("middleware linux: a path touches a network mount when on or under or containing it",
           "[middleware][linux][guards]") {
     const std::vector<std::string> mounts{"/opt/mqm"};
     CHECK(lnx::touches_network_mount("/opt/mqm", mounts));
@@ -471,7 +471,7 @@ TEST_CASE("middleware linux: the leg's row budget is the injected limits clamped
 
 // == ibm_mq ========================================================================================
 
-TEST_CASE("middleware linux: the REAL registered install gives one row, typed OK/FULL",
+TEST_CASE("middleware linux: the REAL registered install gives one row typed OK/FULL",
           "[middleware][linux][ibm_mq]") {
     yuzu::test::TempDir dir{"yuzu_test_middleware_mq_"};
     write_registered_install(dir.path);
@@ -483,7 +483,7 @@ TEST_CASE("middleware linux: the REAL registered install gives one row, typed OK
     CHECK(data_rows(run) == std::vector<std::string>{mq_row("Installation1", "9.4.5", "/opt/mqm")});
     CHECK(run.rc == 0);
 
-    SECTION("without the swidtag the product mqtag still names 9.4.5, the component tags never do") {
+    SECTION("without the swidtag the product mqtag still names 9.4.5 and the component tags never do") {
         fs::remove(dir.path / "opt/mqm/swidtag" / swidtag_of(kTag945));
         const auto tag_only = run_leg(dir.path);
         CHECK(tokens_of(tag_only) == "-");
@@ -508,7 +508,7 @@ TEST_CASE("middleware linux: two installations give two rows in file order (SYNT
                                                      mq_row("Installation2", "9.2.5", "/opt/mqm2")});
 }
 
-TEST_CASE("middleware linux: component tags alone name no product, so the version is - and nothing is tokened",
+TEST_CASE("middleware linux: component tags alone name no product so the version is - and nothing is tokened",
           "[middleware][linux][ibm_mq]") {
     yuzu::test::TempDir dir{"yuzu_test_middleware_mqcomp_"};
     write_text(dir.path / enumerator_rel(), mq_stanza("Inst", "/opt/mqm"));
@@ -572,16 +572,48 @@ TEST_CASE("middleware linux: 257 stanzas give 256 rows and mqinst_ini:row_cap; e
     CHECK(data_rows(run).size() == mw::kMaxRows);
 }
 
-TEST_CASE("middleware linux: a stanza without FilePath is a token and its siblings are kept",
+TEST_CASE("middleware linux: a stanza without FilePath beside valid ones is logged and the siblings are kept",
           "[middleware][linux][ibm_mq]") {
     yuzu::test::TempDir dir{"yuzu_test_middleware_mqdrop_"};
+    // SYNTHETIC: the Broken stanza (second of three) has a Name and no FilePath. A data-shape fault
+    // of one stanza is not an access fault, so the answer stays supported with both valid rows --
+    // the collector withholds a source only when it answers constrained.
     write_text(dir.path / enumerator_rel(),
                mq_stanza("A", "/opt/a") + "Installation:\n   Name=Broken\n" + mq_stanza("C", "/opt/c"));
     touch_names(dir.path / "opt/a/swidtag", {swidtag_of(kTag935)});
-    const auto run = run_leg(dir.path);
-    CHECK(tokens_of(run) == tok("mqinst_ini", "malformed"));
+
+    yuzu::test::LogCapture capture;
+    const auto run = run_leg(dir.path); // check_run: OK/FULL, no token
+    capture.stop();
+    CHECK(tokens_of(run) == "-");
+    CHECK(run.rows.front() == "status|ibm_mq|supported|-");
     CHECK(data_rows(run) == std::vector<std::string>{mq_row("A", "9.3.5", "/opt/a"),
                                                      mq_row("C", "-", "/opt/c")});
+    // exactly one log line for the one dropped stanza, named by its position in the file
+    const std::string log = capture.text();
+    CHECK(log.find("middleware ibm_mq: mqinst_ini: malformed (stanza 2)") != std::string::npos);
+    CHECK(log.find("mqinst_ini: malformed") == log.rfind("mqinst_ini: malformed"));
+}
+
+TEST_CASE("middleware linux: a file in which every stanza is dropped is mqinst_ini:malformed",
+          "[middleware][linux][ibm_mq]") {
+    yuzu::test::TempDir dir{"yuzu_test_middleware_mqalldrop_"};
+    // SYNTHETIC. Zero valid candidates from a non-empty file is an incomplete answer: constrained
+    // with a token (typed CONSTRAINED/PARTIAL by check_run), never an empty supported.
+    write_text(dir.path / enumerator_rel(),
+               "Installation:\n   Name=OnlyName\nInstallation:\n   FilePath=/opt/only\n");
+    const auto run = run_leg(dir.path);
+    CHECK(tokens_of(run) == tok("mqinst_ini", "malformed"));
+    CHECK(data_rows(run).empty());
+    CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
+
+    SECTION("positive control: the same file with one valid stanza added is supported") {
+        write_text(dir.path / enumerator_rel(),
+                   "Installation:\n   Name=OnlyName\n" + mq_stanza("Good", "/opt/good"));
+        const auto ok = run_leg(dir.path);
+        CHECK(tokens_of(ok) == "-");
+        CHECK(data_rows(ok) == std::vector<std::string>{mq_row("Good", "-", "/opt/good")});
+    }
 }
 
 TEST_CASE("middleware linux: per-item swidtag shortfalls degrade the row and never reach the status row",
@@ -626,7 +658,7 @@ TEST_CASE("middleware linux: an unreadable swidtag directory is a per-item short
     CHECK(data_rows(run) == std::vector<std::string>{mq_row("Inst", "-", "/opt/mqm")});
 }
 
-TEST_CASE("middleware linux: the per-directory entry cap is per-item, the entries budget is walk:row_cap",
+TEST_CASE("middleware linux: the per-directory entry cap is per-item and the entries budget is walk:row_cap",
           "[middleware][linux][ibm_mq][caps]") {
     yuzu::test::TempDir dir{"yuzu_test_middleware_mqentries_"};
     write_text(dir.path / enumerator_rel(), mq_stanza("Inst", "/opt/mqm"));
@@ -648,7 +680,7 @@ TEST_CASE("middleware linux: the per-directory entry cap is per-item, the entrie
     CHECK(data_rows(run) == std::vector<std::string>{mq_row("Inst", "9.3.5", "/opt/mqm")});
 }
 
-TEST_CASE("middleware linux: the entries budget is one allowance across installations, not per listing",
+TEST_CASE("middleware linux: the entries budget is one allowance across installations and not per listing",
           "[middleware][linux][ibm_mq][caps]") {
     yuzu::test::TempDir dir{"yuzu_test_middleware_mqentries2_"};
     write_text(dir.path / enumerator_rel(), mq_stanza("A", "/opt/a") + mq_stanza("B", "/opt/b"));
@@ -760,7 +792,7 @@ TEST_CASE("middleware linux: an unreadable mqinst.ini is a permission token",
     CHECK(data_rows(run).empty());
 }
 
-TEST_CASE("middleware linux: a symlink at any hop of the fixed mqinst.ini path is refused, nothing followed",
+TEST_CASE("middleware linux: a symlink at any hop of the fixed mqinst.ini path is refused and nothing followed",
           "[middleware][linux][ibm_mq][symlink]") {
     // The real content stays behind each link (the canary), and the control (no link) shows it reads.
     for (const char* link_at : {"", "etc/opt", "etc/opt/mqm", "etc/opt/mqm/mqinst.ini"}) {
@@ -783,7 +815,7 @@ TEST_CASE("middleware linux: a symlink at any hop of the fixed mqinst.ini path i
     }
 }
 
-TEST_CASE("middleware linux: a FilePath that is not absolute and plain, or is a symlink, is never opened",
+TEST_CASE("middleware linux: a FilePath that is not absolute and plain or is a symlink is never opened",
           "[middleware][linux][ibm_mq][symlink]") {
     const std::string swid = swidtag_of(kTag935);
     // The CANARY is /opt/mqm/swidtag/<9.3.5 swidtag>: any route that reaches it (by normalising a

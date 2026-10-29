@@ -78,8 +78,9 @@ FINDING    IBM's documentation page "Installation configuration file, mqinst.ini
            Description / Identifier / FilePath spellings are therefore confirmed on ONE version
            (9.4.5.0, Ubuntu debs) only; another version or platform may differ, and any divergence
            surfaces as `linux:middleware:mqinst_ini:malformed` (text with content but no
-           `Installation:` line) or as a dropped stanza plus the same token (Name or FilePath
-           missing), never as a silent empty inventory.
+           `Installation:` line, or a file in which every stanza lacks Name or FilePath), never
+           as a silent empty inventory; a stanza lacking one of them beside a valid sibling is
+           logged and dropped, and the sibling is kept.
 inline     Tests that need a SECOND installation use a clearly labelled inline string in
            test_middleware_parsers.cpp: a registered install holds one stanza, so a two-installation
            file is not captured anywhere.

@@ -23,11 +23,17 @@
  *    `status|ibm_mq|supported|-` assertions of every per-item case.
  *  - one listing per subdirectory: dropping the memo fails the list_calls assertions.
  *  - stanzas never merge: reusing yuzu::shared::parse_ini fails the "not merged" case.
+ *  - data faults keep their siblings: restoring `fail(.., Cause::malformed)` on ANY dropped stanza
+ *    fails the "dropped beside a valid sibling" cases; dropping the every-stanza-dropped token
+ *    fails the "every stanza dropped" case (an empty `supported` for a file that held stanzas).
+ *  - plain enumerator path: reverting enumerator_well_formed to a leading-'/' check fails the
+ *    kBadTrailingSlash / kBadDotComponent / kBadEmptyComponent rows.
  */
 #include <catch2/catch_test_macros.hpp>
 
 #include "middleware_parsers.hpp"
 #include "middleware_runner.hpp"
+#include "sync_canonical.hpp" // yuzu::agent::sha256_hex
 
 #include <middleware_products.hpp>
 
@@ -41,6 +47,7 @@
 #include <iterator>
 #include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -337,6 +344,17 @@ constexpr std::array<Probe, 2> kProbesRelative = [] {
     a[0].path = "etc/mqinst.ini";
     return a;
 }();
+/// probes[0] with a path the Linux leg would refuse at run time (lexically_plain), the rest intact.
+constexpr std::array<Probe, 2> probes_with_enumerator_path(const char* path) {
+    std::array<Probe, 2> a{{mw::kIbmMqLinuxProbes[0], mw::kIbmMqLinuxProbes[1]}};
+    a[0].path = path;
+    return a;
+}
+constexpr std::array<Probe, 2> kProbesTrailingSlash = probes_with_enumerator_path("/etc/opt/mqm/");
+constexpr std::array<Probe, 2> kProbesDotComponent = probes_with_enumerator_path("/etc/./mqinst.ini");
+constexpr std::array<Probe, 2> kProbesDotDotComponent = probes_with_enumerator_path("/etc/../mqinst.ini");
+constexpr std::array<Probe, 2> kProbesEmptyComponent = probes_with_enumerator_path("/etc//mqinst.ini");
+constexpr std::array<Probe, 2> kProbesRootOnly = probes_with_enumerator_path("/");
 constexpr std::array<Probe, 2> kProbesDupId = [] {
     std::array<Probe, 2> a{{mw::kIbmMqLinuxProbes[0], mw::kIbmMqLinuxProbes[1]}};
     a[1].id = "mqinst_ini";
@@ -379,6 +397,16 @@ constexpr std::array<Product, 1> kBadEmptySuffix{
 constexpr std::array<Product, 1> kBadNoKey{{mutated([](Product& p) { p.linux.probes = kProbesNoKey; })}};
 constexpr std::array<Product, 1> kBadRelative{
     {mutated([](Product& p) { p.linux.probes = kProbesRelative; })}};
+constexpr std::array<Product, 1> kBadTrailingSlash{
+    {mutated([](Product& p) { p.linux.probes = kProbesTrailingSlash; })}};
+constexpr std::array<Product, 1> kBadDotComponent{
+    {mutated([](Product& p) { p.linux.probes = kProbesDotComponent; })}};
+constexpr std::array<Product, 1> kBadDotDotComponent{
+    {mutated([](Product& p) { p.linux.probes = kProbesDotDotComponent; })}};
+constexpr std::array<Product, 1> kBadEmptyComponent{
+    {mutated([](Product& p) { p.linux.probes = kProbesEmptyComponent; })}};
+constexpr std::array<Product, 1> kBadRootOnly{
+    {mutated([](Product& p) { p.linux.probes = kProbesRootOnly; })}};
 constexpr std::array<Product, 1> kBadDupId{{mutated([](Product& p) { p.linux.probes = kProbesDupId; })}};
 constexpr std::array<Product, 1> kBadProbeId{{mutated([](Product& p) { p.linux.probes = kProbesBadId; })}};
 
@@ -442,7 +470,7 @@ TEST_CASE("middleware products: the same consteval check refuses a broken table"
     SECTION("a support level outside PLANNED / CONSTRAINED / SUPPORTED") {
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadSupportLevel}));
     }
-    SECTION("empty mechanism, title, nullptr vendor, wrong kind") {
+    SECTION("a bad mechanism or title or vendor or kind") {
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadMechanism}));
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadTitle}));
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadVendor}));
@@ -458,6 +486,13 @@ TEST_CASE("middleware products: the same consteval check refuses a broken table"
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadDirFirst}));
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadNoKey}));
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRelative}));
+    }
+    SECTION("probes[0] must be a lexically plain path the Linux leg would not refuse at run time") {
+        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadTrailingSlash}));
+        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadDotComponent}));
+        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadDotDotComponent}));
+        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadEmptyComponent}));
+        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRootOnly}));
     }
     SECTION("probes[1..] must be dir_name probes with a single-component path and a name pattern") {
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadKvSecond}));
@@ -498,7 +533,7 @@ TEST_CASE("middleware parsers: parse_kv_stanzas reads the REAL registered-instal
     CHECK(st[0].get("Primary") == nullptr);   // a fresh install has no Primary key; never required
 }
 
-TEST_CASE("middleware parsers: parse_kv_stanzas reads two installations as two stanzas, never merged",
+TEST_CASE("middleware parsers: parse_kv_stanzas reads two installations as two stanzas and never merges them",
           "[middleware]") {
     mw::ParseReport rep;
     const auto st = mw::parse_kv_stanzas(kTwoInstallationsInline, "Installation:", rep);
@@ -538,7 +573,7 @@ TEST_CASE("middleware parsers: parse_kv_stanzas never merges and reads the first
 
 TEST_CASE("middleware parsers: parse_kv_stanzas stanza and line rules", "[middleware]") {
     mw::ParseReport rep;
-    SECTION("the [Installation] form is not a stanza line: zero stanzas, malformed") {
+    SECTION("the [Installation] form is not a stanza line: zero stanzas and malformed") {
         const auto st = mw::parse_kv_stanzas("[Installation]\nName=a\nFilePath=/x\n", "Installation:", rep);
         CHECK(st.empty());
         CHECK(rep.malformed);
@@ -559,7 +594,7 @@ TEST_CASE("middleware parsers: parse_kv_stanzas stanza and line rules", "[middle
         CHECK(*st[0].get("Name") == "b");
         CHECK_FALSE(rep.malformed);
     }
-    SECTION("comments, blanks, CRLF and padded keys and values") {
+    SECTION("comments and blanks and CRLF and padded keys and values") {
         const auto st = mw::parse_kv_stanzas(
             "# c\r\n; c\r\n\r\nInstallation:\r\n   Name = X Y \r\n   =novalue\r\n", "Installation:", rep);
         REQUIRE(st.size() == 1);
@@ -571,7 +606,7 @@ TEST_CASE("middleware parsers: parse_kv_stanzas stanza and line rules", "[middle
         REQUIRE(st.size() == 2);
         CHECK(st[0].kv.empty());
     }
-    SECTION("empty and comment-only text: nothing, and not malformed") {
+    SECTION("empty and comment-only text: nothing and not malformed") {
         CHECK(mw::parse_kv_stanzas("", "Installation:", rep).empty());
         CHECK(mw::parse_kv_stanzas("# only\n; comments\n\n", "Installation:", rep).empty());
         CHECK_FALSE(rep.malformed);
@@ -654,7 +689,7 @@ TEST_CASE("middleware parsers: only IBM_MQ-<v>.mqtag names the product (R1)", "[
         CHECK(ver(kMqtag, "IBM_MQ-9.1.5.mqtag") == std::string{"9.1.5"});
         CHECK(ver(kMqtag, "IBM_MQ-9.4.5.mqtag") == std::string{"9.4.5"});
     }
-    SECTION("the registered 9.4.5 install: exactly its product tag yields, its component tags do not") {
+    SECTION("the registered 9.4.5 install: exactly its product tag yields and its component tags do not") {
         const auto mqtags = with_suffix(listing_section(kV945), ".mqtag");
         REQUIRE(mqtags == std::vector<std::string>{"IBM_MQ-9.4.5.mqtag", "IBM_MQ_GSKit-9.0.0.mqtag",
                                                    "IBM_MQ_Runtime-9.4.5.mqtag"});
@@ -695,13 +730,48 @@ TEST_CASE("middleware parsers: only IBM_MQ-<v>.mqtag names the product (R1)", "[
     }
 }
 
+TEST_CASE("middleware parsers: of every name in the real listing only the product tags yield a version",
+          "[middleware]") {
+    // listing_section("") is every captured file name of every image (the header lines match an
+    // empty marker). The expected set is built by plain prefix and suffix tests, independently of the
+    // grammar under test, so a probe that accepts a component tag shows up as an extra name.
+    const std::vector<std::string> all = listing_section("");
+    REQUIRE(all.size() >= 50);
+    const std::string product_swid = "ibm.com_IBM_MQ_Advanced_for_Developers_Non-Warranted-";
+    std::set<std::string> expected;
+    std::set<std::string> yielding;
+    std::size_t rejected = 0;
+    for (const std::string& n : all) {
+        CAPTURE(n);
+        const bool swid = n.starts_with(product_swid) && n.ends_with(".swidtag");
+        const bool mqtag = n.starts_with("IBM_MQ-") && n.ends_with(".mqtag");
+        if (swid || mqtag)
+            expected.insert(n);
+        if (ver(kSwid, n) || ver(kMqtag, n))
+            yielding.insert(n);
+        else
+            ++rejected;
+    }
+    CHECK(yielding == expected);
+    // 5 images x 1 developer .swidtag, and the IBM_MQ-<v>.mqtag of the 9.4.5, 9.2.5 and 9.1.5 images
+    CHECK(expected.size() == 8);
+    CHECK(rejected >= 40); // the component tags: GSKit, JRE, Runtime, Messages_*, ...
+
+    SECTION("KNOWN LIMIT (README caveat 4): a component tag in .swidtag form would be taken") {
+        // No capture holds one (components are .mqtag only, and only developer editions were
+        // captured), so the table cannot name a deny-list from evidence. This pins the documented
+        // limit: if the grammar is ever tightened, caveat 4 must change with it.
+        CHECK(ver(kSwid, "ibm.com_IBM_MQ_GSKit-8.0.55.swidtag") == std::string{"8.0.55"});
+    }
+}
+
 TEST_CASE("middleware parsers: version_from_file_name accepts and rejects", "[middleware]") {
     SECTION("product_suffix: '-<v>' and '_<anything>-<v>' (the version follows the LAST '-')") {
         CHECK(ver(kSwid, "ibm.com_IBM_MQ-9.2.5.swidtag") == std::string{"9.2.5"});
         CHECK(ver(kSwid, "ibm.com_IBM_MQ-9.3.5.1.swidtag") == std::string{"9.3.5.1"});
         CHECK(ver(kSwid, "ibm.com_IBM_MQ_Advanced-9.2.5.swidtag") == std::string{"9.2.5"});
     }
-    SECTION("not the product: whole-token prefix, other vendor products, empty or odd versions") {
+    SECTION("not the product: whole-token prefix or other vendor products or empty or odd versions") {
         // the WebSphere spelling is here because no capture names the product that way
         for (const char* n :
              {"ibm.com_IBM_MQSeries-1.0.swidtag", "ibm.com_IBM_Db2-11.5.swidtag",
@@ -727,7 +797,7 @@ TEST_CASE("middleware parsers: version_from_file_name accepts and rejects", "[mi
         CHECK_FALSE(
             mw::version_from_file_name("P_x.t", "P", ".t", mw::NameForm::product_suffix).has_value());
     }
-    SECTION("is_dotted_version is \\d+(\\.\\d+){1,3}") {
+    SECTION("is_dotted_version is two to four dot-separated digit groups") {
         for (const char* v : {"1.2", "10.0.1", "9.3.5.1", "0.0"})
             CHECK(mw::is_dotted_version(v));
         for (const char* v : {"", "1", "1.", ".1", "1..2", "1.2.3.4.5", "1.2a", "v1.2", "1.2 "})
@@ -758,10 +828,11 @@ TEST_CASE("middleware parsers: tokens carry only enumeration causes", "[middlewa
     }
     CHECK(mw::make_token("windows", "walk", mw::Cause::row_cap) == "windows:middleware:walk:row_cap");
 
-    const std::array<std::pair<mw::ItemReason, std::string_view>, 3> reasons{{
+    const std::array<std::pair<mw::ItemReason, std::string_view>, 4> reasons{{
         {mw::ItemReason::path_refused, "path_refused"},
         {mw::ItemReason::missing, "missing"},
         {mw::ItemReason::unreadable, "unreadable"},
+        {mw::ItemReason::malformed, "malformed"},
     }};
     for (const auto& [r, name] : reasons)
         CHECK(mw::item_reason_name(r) == name);
@@ -786,7 +857,7 @@ TEST_CASE("middleware parsers: format_row is six escaped fields", "[middleware]"
     SECTION("every empty field is '-'") {
         CHECK(mw::format_row("ibm_mq", "", "", "", "", "") == "ibm_mq|-|-|-|-|-");
     }
-    SECTION("a pipe is escaped, a backslash folds to '/', newlines fold, and no field shifts") {
+    SECTION("a pipe is escaped and a backslash folds to '/' and newlines fold so no field shifts") {
         const std::string row =
             mw::format_row("ibm_mq", "T|x", "a|b", "9.2", "C:\\mq\\", "line1\nline2");
         const auto f = split_fields(row);
@@ -809,14 +880,14 @@ TEST_CASE("middleware parsers: format_row is six escaped fields", "[middleware]"
 
 TEST_CASE("middleware parsers: compose_output puts the status row first", "[middleware]") {
     yuzu::shared::ConstraintAccumulator acc;
-    SECTION("no failure: supported with '-' tokens, rows follow") {
+    SECTION("no failure: supported with '-' tokens and the rows follow") {
         const auto out = mw::compose_output("ibm_mq", {"ibm_mq|r1", "ibm_mq|r2"}, acc);
         REQUIRE(out.size() == 3);
         CHECK(out[0] == "status|ibm_mq|supported|-");
         CHECK(out[1] == "ibm_mq|r1");
         CHECK(out[2] == "ibm_mq|r2");
     }
-    SECTION("failures: constrained, tokens deduplicated in first-seen order") {
+    SECTION("failures: constrained with tokens deduplicated in first-seen order") {
         acc.add_failure(mw::make_token("linux", "walk", mw::Cause::row_cap));
         acc.add_failure(mw::make_token("linux", "mqinst_ini", mw::Cause::malformed));
         acc.add_failure(mw::make_token("linux", "walk", mw::Cause::row_cap));
@@ -843,7 +914,7 @@ TEST_CASE("middleware runner: make_row_budget clamps to the production ceilings 
 // run_leg over FakeFs: the enumerator
 // =================================================================================================
 
-TEST_CASE("middleware runner: an absent enumerator file is none found, not a failure", "[middleware]") {
+TEST_CASE("middleware runner: an absent enumerator file is none found and not a failure", "[middleware]") {
     FakeFs fs;
     const auto r = run(fs);
     REQUIRE(r.rows.size() == 1);
@@ -881,23 +952,22 @@ TEST_CASE("middleware runner: every enumerator outcome yields exactly its token"
     }
 }
 
-TEST_CASE("middleware runner: malformed enumerator text and dropped stanzas", "[middleware]") {
+TEST_CASE("middleware runner: malformed enumerator text and the row cap", "[middleware]") {
     FakeFs fs;
     fs.put_names("/opt/mqm", {"ibm.com_IBM_MQ-9.2.5.swidtag"});
-    SECTION("content without a stanza line") {
+    SECTION("content without a stanza line is malformed with no candidate") {
         fs.put_file(kIni, "[Installation]\nName=a\nFilePath=/opt/mqm\n");
         const auto r = run(fs);
         REQUIRE(r.rows.size() == 1);
         CHECK(r.status() == "status|ibm_mq|constrained|linux:middleware:mqinst_ini:malformed");
+        CHECK(r.events.empty());
     }
-    SECTION("a stanza lacking a key is dropped once, its siblings are kept") {
-        fs.put_file(kIni,
-                    "Installation:\n Name=A\nInstallation:\n Name=B\n FilePath=/opt/mqm\n"
-                    "Installation:\n FilePath=/x\nInstallation:\n Name=D\n FilePath=\n");
+    SECTION("comment-only text holds no stanza and no content: none found and not a failure") {
+        fs.put_file(kIni, "# nothing registered\n\n; here\n");
         const auto r = run(fs);
-        REQUIRE(r.rows.size() == 2);
-        CHECK(r.status() == "status|ibm_mq|constrained|linux:middleware:mqinst_ini:malformed");
-        CHECK(r.rows[1] == "ibm_mq|IBM MQ|B|9.2.5|/opt/mqm|-");
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.status() == "status|ibm_mq|supported|-");
+        CHECK(r.events.empty());
     }
     SECTION("more than kMaxRows stanzas: the first kMaxRows are kept and row_cap is the token") {
         std::string t;
@@ -908,6 +978,93 @@ TEST_CASE("middleware runner: malformed enumerator text and dropped stanzas", "[
         CHECK(r.data().size() == mw::kMaxRows);
         CHECK(r.status() == "status|ibm_mq|constrained|linux:middleware:mqinst_ini:row_cap");
     }
+}
+
+// A data-shape fault in ONE stanza is not an access fault: the valid siblings are kept and the answer
+// stays `supported` (the collector withholds only a constrained answer). The runner header holds the
+// table these cases pin.
+TEST_CASE("middleware runner: a stanza dropped beside a valid sibling is logged and the sibling kept",
+          "[middleware]") {
+    using IR = mw::ItemReason;
+    FakeFs fs;
+    fs.put_names("/opt/mqm", {"ibm.com_IBM_MQ-9.2.5.swidtag"});
+    const std::string valid_row = "ibm_mq|IBM MQ|B|9.2.5|/opt/mqm|-";
+
+    SECTION("no FilePath: one log line for the dropped stanza and the row of its sibling") {
+        fs.put_file(kIni, "Installation:\n Name=A\nInstallation:\n Name=B\n FilePath=/opt/mqm\n");
+        const auto r = run(fs);
+        REQUIRE(r.rows.size() == 2);
+        CHECK(r.status() == "status|ibm_mq|supported|-");
+        CHECK(r.rows[1] == valid_row);
+        CHECK(r.events == std::vector<LogEvent>{ev("mqinst_ini", IR::malformed, "stanza 1")});
+    }
+    SECTION("no Name and an empty FilePath are dropped too, one log line each in file order") {
+        fs.put_file(kIni,
+                    "Installation:\n Name=A\nInstallation:\n Name=B\n FilePath=/opt/mqm\n"
+                    "Installation:\n FilePath=/x\nInstallation:\n Name=D\n FilePath=\n");
+        const auto r = run(fs);
+        REQUIRE(r.rows.size() == 2);
+        CHECK(r.status() == "status|ibm_mq|supported|-");
+        CHECK(r.rows[1] == valid_row);
+        CHECK(r.events == std::vector<LogEvent>{ev("mqinst_ini", IR::malformed, "stanza 1"),
+                                                ev("mqinst_ini", IR::malformed, "stanza 3"),
+                                                ev("mqinst_ini", IR::malformed, "stanza 4")});
+    }
+    SECTION("a dropped stanza AFTER the valid one changes nothing") {
+        fs.put_file(kIni, "Installation:\n Name=B\n FilePath=/opt/mqm\nInstallation:\n Name=Z\n");
+        const auto r = run(fs);
+        REQUIRE(r.rows.size() == 2);
+        CHECK(r.status() == "status|ibm_mq|supported|-");
+        CHECK(r.rows[1] == valid_row);
+        CHECK(r.events == std::vector<LogEvent>{ev("mqinst_ini", IR::malformed, "stanza 2")});
+    }
+}
+
+TEST_CASE("middleware runner: every stanza dropped is an incomplete answer and never an empty supported",
+          "[middleware]") {
+    using IR = mw::ItemReason;
+    const std::string malformed = "status|ibm_mq|constrained|linux:middleware:mqinst_ini:malformed";
+    FakeFs fs;
+
+    SECTION("a file whose only stanza lacks FilePath") {
+        fs.put_file(kIni, "Installation:\n Name=A\n");
+        const auto r = run(fs);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.status() == malformed);
+        CHECK(r.events == std::vector<LogEvent>{ev("mqinst_ini", IR::malformed, "stanza 1")});
+    }
+    SECTION("several stanzas all lacking a key: one token and one log line each") {
+        fs.put_file(kIni, "Installation:\n Name=A\nInstallation:\n FilePath=/x\nInstallation:\n");
+        const auto r = run(fs);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.status() == malformed);
+        CHECK(r.events.size() == 3);
+    }
+    SECTION("positive control: one valid stanza among the same faults is supported") {
+        fs.put_file(kIni,
+                    "Installation:\n Name=A\nInstallation:\n Name=B\n FilePath=/opt/mqm\n"
+                    "Installation:\n");
+        const auto r = run(fs);
+        CHECK(r.status() == "status|ibm_mq|supported|-");
+        CHECK(r.data().size() == 1);
+    }
+}
+
+TEST_CASE("middleware runner: a walk fault beside a dropped stanza still constrains with its own token only",
+          "[middleware]") {
+    // Positive control of the cases above: leniency covers the DATA fault, never the WALK fault. The
+    // access outcomes of the enumerator file itself are pinned by "every enumerator outcome yields
+    // exactly its token".
+    FakeFs fs;
+    fs.put_file(kIni,
+                "Installation:\n Name=A\nInstallation:\n Name=B\n FilePath=/b\n"
+                "Installation:\n Name=C\n FilePath=/c\n");
+    fs.put_names("/b", {"ibm.com_IBM_MQ-9.2.5.swidtag"});
+    fs.put_names("/c", {"ibm.com_IBM_MQ-9.2.5.swidtag"});
+    const auto r = run(fs, mw::make_row_budget(1));
+    CHECK(r.status() == "status|ibm_mq|constrained|linux:middleware:walk:row_cap");
+    CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|B|9.2.5|/b|-"});
+    CHECK(r.events == std::vector<LogEvent>{ev("mqinst_ini", mw::ItemReason::malformed, "stanza 1")});
 }
 
 // =================================================================================================
@@ -933,7 +1090,7 @@ TEST_CASE("middleware runner: the REAL registered install (mqinst.ini + its swid
                                  "IBM_MQ_Runtime-9.4.5.mqtag"});
         CHECK(run(g).rows[1] == "ibm_mq|IBM MQ|Installation1|9.4.5|/opt/mqm|-");
     }
-    SECTION("component tags alone (Runtime-9.4.5, GSKit-9.0.0) name no product (R1)") {
+    SECTION("component tags alone (Runtime-9.4.5 and GSKit-9.0.0) name no product (R1)") {
         FakeFs g;
         g.put_file(kIni, read_fixture("mqinst.ini"));
         g.put_names("/opt/mqm", {"IBM_MQ_GSKit-9.0.0.mqtag", "IBM_MQ_Runtime-9.4.5.mqtag"});
@@ -944,7 +1101,7 @@ TEST_CASE("middleware runner: the REAL registered install (mqinst.ini + its swid
     }
 }
 
-TEST_CASE("middleware runner: one candidate per stanza, versions from the REAL listing names",
+TEST_CASE("middleware runner: one candidate per stanza with versions from the REAL listing names",
           "[middleware]") {
     FakeFs fs;
     fs.put_file(kIni, kTwoInstallationsInline);         // SYNTHETIC inline: two installations
@@ -960,7 +1117,7 @@ TEST_CASE("middleware runner: one candidate per stanza, versions from the REAL l
     CHECK(fs.list_calls == std::vector<std::string>{"/opt/mqm|swidtag", "/opt/mqm2|swidtag"});
 }
 
-TEST_CASE("middleware runner: the probe fallback order is swidtag, then mqtag", "[middleware]") {
+TEST_CASE("middleware runner: the probe fallback order is swidtag then mqtag", "[middleware]") {
     FakeFs fs;
     fs.put_file(kIni, ini_of({{"I1", "/opt/mqm"}}));
     SECTION("swidtag beats the mqtag") {
@@ -1003,7 +1160,7 @@ TEST_CASE("middleware runner: a directory of component tags only names no produc
     CHECK(r.events == std::vector<LogEvent>{ev("mqtag", mw::ItemReason::missing, "I1")});
 }
 
-TEST_CASE("middleware runner: a flagged listing is never matched, even with a valid name in it (R4)",
+TEST_CASE("middleware runner: a flagged listing is never matched even with a valid name in it (R4)",
           "[middleware]") {
     const std::vector<std::string> valid{"IBM_MQ-9.2.5.mqtag", "ibm.com_IBM_MQ-9.2.5.swidtag"};
     FakeFs fs;
@@ -1037,7 +1194,7 @@ TEST_CASE("middleware runner: a flagged listing is never matched, even with a va
     CHECK(fs.list_calls.size() == 1);
 }
 
-TEST_CASE("middleware runner: absent, empty and unrelated listings are 'missing'", "[middleware]") {
+TEST_CASE("middleware runner: absent and empty and unrelated listings are 'missing'", "[middleware]") {
     FakeFs fs;
     fs.put_file(kIni, ini_of({{"I1", "/opt/mqm"}}));
     SECTION("the swidtag directory does not exist") {
@@ -1121,7 +1278,7 @@ TEST_CASE("middleware runner: the caller-built budget and the Fs budget end in w
         CHECK(r.status() == capped);
         CHECK(r.data().empty());
     }
-    SECTION("an injected limit above the ceiling is clamped, not honoured") {
+    SECTION("an injected limit above the ceiling is clamped and not honoured") {
         auto b = mw::make_row_budget(1'000'000, std::size_t{1} << 30);
         CHECK(b.max_rows == mw::kMaxRows);
         CHECK(run(fs, b).data().size() == 3);
@@ -1150,7 +1307,7 @@ TEST_CASE("middleware runner: a second product's table drives the same runner", 
     };
     FakeFs fs;
 
-    SECTION("the table's own header, keys and sub-directory: the dir_name probe supplies the version") {
+    SECTION("the table's own header and keys and sub-directory: the dir_name probe supplies the version") {
         fs.put_file("/etc/acme.conf", "Instance:\nName=Acme One\nPath=/opt/acme\n");
         fs.put_dir("/opt/acme", "tags", mw::Listing{{"acme-1.2.3.tag", "acme_x-9.9.tag"}, false, false,
                                                     mw::Read::Outcome::ok});
@@ -1183,10 +1340,14 @@ TEST_CASE("middleware fixtures: tree.manifest and provenance say what the tests 
         REQUIRE_FALSE(st.empty());
         CHECK(*st[0].get("FilePath") == paths[0]);
     }
-    SECTION("mqinst.ini is the byte-exact REAL capture and provenance says so, with IBM's caveat") {
+    SECTION("mqinst.ini is the byte-exact REAL capture and provenance says so with IBM's caveat") {
         const std::string ini = read_fixture("mqinst.ini");
         CHECK(ini.rfind("Installation:\n", 0) == 0); // no synthetic label or comment line
         CHECK(ini.find("SYNTHETIC") == std::string::npos);
+        // the fixture IS the capture: size and digest pinned, not just a substring of provenance.txt
+        CHECK(ini.size() == 153);
+        CHECK(yuzu::agent::sha256_hex(ini) ==
+              "1b1c19a3295a5c5fb4c208c116150a99fae38e77e54db006a0252e38ae31ed78");
         const std::string prov = read_fixture("provenance.txt");
         CHECK(prov.find("mqinst.ini is a REAL capture") != std::string::npos);
         CHECK(prov.find("1b1c19a3295a5c5fb4c208c116150a99fae38e77e54db006a0252e38ae31ed78") !=

@@ -325,7 +325,7 @@ TEST_CASE("middleware plugin: a throwing leg is contained and reported as intern
 // discard the output and still answer `-`), and scripts/ci/check-plugin-spawn-lexical.sh accepts
 // `yuzu::agent::run_bounded_subprocess`. So the acquisition boundary is pinned at the source: the
 // same source-tripwire family as the YUZU_AGENT_SRC_DIR tests, a few small files read once.
-TEST_CASE("middleware plugin: no source spawns a process, directly or through the shared runner",
+TEST_CASE("middleware plugin: no source spawns a process directly or through the shared runner",
           "[middleware][contract][subprocess]") {
     // Positive controls: the scan sees each way of starting a process, and ignores prose and
     // quoted text, so the real scan below cannot pass vacuously.
@@ -445,7 +445,7 @@ TEST_CASE("middleware plugin: the status row is always first and well-formed",
     }
 }
 
-TEST_CASE("middleware plugin: an unknown action is refused, not silently ignored",
+TEST_CASE("middleware plugin: an unknown action is refused and not silently ignored",
           "[middleware][actions]") {
     auto plugin = load_middleware_plugin();
     if (!plugin) {

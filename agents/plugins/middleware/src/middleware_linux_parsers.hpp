@@ -18,10 +18,12 @@
  * candidate set); the leaf is read with read_file_no_follow_at. No std::filesystem iteration.
  *
  * REASON CLASSES (middleware_parsers.hpp). ENUMERATION failures (the fixed enumerator file
- * unreadable / oversized / behind a symlink / malformed, a dropped stanza, a cap,
- * `network_fs_skipped`, `mountinfo:unreadable`) are status tokens
+ * unreadable / oversized / behind a symlink, content with no `Installation:` line at all, every
+ * stanza dropped, a cap, `network_fs_skipped`, `mountinfo:unreadable`) are status tokens
  * `linux:middleware:<source>:<cause>`. PER-ITEM shortfalls (anything under ONE installation's
- * FilePath) degrade that row (version `-`), log one line, and never reach the status row.
+ * FilePath, and a stanza dropped beside valid ones) log one line, degrade only that row (version
+ * `-`) or drop only that stanza, and never reach the status row. The full table is in
+ * middleware_runner.hpp.
  *
  * BOUNDS. ONE row/byte budget per action, built once by make_row_budget() from the injected
  * WalkLimits (clamped there to the production ceilings kMaxRows, kMaxRowBytes), and handed to the
@@ -36,7 +38,8 @@
  * (adapted to this Fs): touches_network_mount, finish_dir_open, open_child, scan_mounts,
  * production_config and the kMountinfo* constants. Follow-up OWED, no tracking issue yet: once the
  * in-flight runtimes work (SAM.1) has landed, hoist them into agents/shared so both plugins include
- * one copy. Until then a fix to one copy is a fix to the other.
+ * one copy. Until then a fix to one copy is a fix to the other. This copy alone carries the
+ * t_touch_log test seam (the runtimes copy has none); a hoist must keep it.
  */
 #pragma once
 
@@ -198,10 +201,6 @@ inline Opened finish_dir_open(int fd, int stat_dirfd, const char* name) {
         o.out = outcome_from_errno(err);
         return o;
     }
-    if (t_touch_log != nullptr) {
-        struct stat st{};
-        if (::fstat(fd, &st) == 0) t_touch_log->emplace_back(st.st_dev, st.st_ino);
-    }
     DIR* d = ::fdopendir(fd);
     if (d == nullptr) {
         const int err = errno;
@@ -211,6 +210,10 @@ inline Opened finish_dir_open(int fd, int stat_dirfd, const char* name) {
     }
     o.dir = yuzu::shared::ScopedDir{d};
     o.out = Outcome::ok;
+    if (t_touch_log != nullptr) { // after ownership: emplace_back may throw, and the fd must not leak
+        struct stat st{};
+        if (::fstat(::dirfd(d), &st) == 0) t_touch_log->emplace_back(st.st_dev, st.st_ino);
+    }
     return o;
 }
 

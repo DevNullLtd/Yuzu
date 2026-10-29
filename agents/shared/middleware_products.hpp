@@ -28,6 +28,7 @@
 #include <yuzu/plugin.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string_view>
@@ -149,8 +150,28 @@ namespace detail {
     return true;
 }
 
+/// An absolute path of plain components: no trailing '/', no empty (`//`), `.` or `..` component.
+/// The Linux leg refuses anything else at run time (lexically_plain in
+/// agents/plugins/middleware/src/middleware_linux_parsers.hpp), which would constrain every dispatch,
+/// so the table refuses it at build time.
+[[nodiscard]] constexpr bool is_plain_abs_path(std::string_view s) noexcept {
+    if (s.size() < 2 || s.front() != '/' || s.back() == '/')
+        return false;
+    std::size_t pos = 1;
+    while (pos <= s.size()) {
+        auto slash = s.find('/', pos);
+        if (slash == std::string_view::npos)
+            slash = s.size();
+        const std::string_view part = s.substr(pos, slash - pos);
+        if (part.empty() || part == "." || part == "..")
+            return false;
+        pos = slash + 1;
+    }
+    return true;
+}
+
 [[nodiscard]] constexpr bool enumerator_well_formed(const Probe& p) noexcept {
-    return p.kind == ProbeKind::kv_file && !sv(p.path).empty() && sv(p.path).front() == '/' &&
+    return p.kind == ProbeKind::kv_file && is_plain_abs_path(sv(p.path)) &&
            !sv(p.name_key).empty() && !sv(p.path_key).empty() && !sv(p.stanza).empty();
 }
 
