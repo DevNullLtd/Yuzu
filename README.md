@@ -219,7 +219,7 @@ The stack publishes ports 8443 (dashboard and REST API), 8080 (plain HTTP: redir
 - **RHEL / Rocky / AlmaLinux 9:** the system GCC (11) cannot build C++23 — see
   [`docs/rhel9-build-setup.md`](docs/rhel9-build-setup.md) for the verified
   recipe, or run `bash scripts/setup-rhel9.sh`.
-  The 0.14.0 release packages do not run there either; see the native-package
+  The 0.14.0 release packages do not run there either, and building to an older baseline is not part of 0.15.0; see the native-package
   floor under *Supported Platforms* in [`docs/user-manual/README.md`](docs/user-manual/README.md).
 
 ### Quick Start

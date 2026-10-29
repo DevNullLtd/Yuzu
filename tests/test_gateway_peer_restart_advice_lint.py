@@ -2,7 +2,7 @@
 """Docs lint: advice to restart the gateway after a peer-authorization refusal stays CONDITIONAL.
 
 A gateway restart disconnects every agent the node holds, and on agent builds without the #5183
-fix (in no release yet) released agents then stay wedged. So every place that tells an operator to
+fix (shipped in 0.15.0) released agents then stay wedged. So every place that tells an operator to
 restart a gateway must carry its caveat next to the instruction, not in a different section:
 
   1. the `5183` caveat token (the agent-side reconnect fix the restart depends on, matched with
