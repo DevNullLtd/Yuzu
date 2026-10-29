@@ -124,6 +124,8 @@
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
 #include "app_usage_store.hpp"
+#include "certificate_inventory_ingestion.hpp"
+#include "certificate_inventory_store.hpp"
 #include "app_usage_routes.hpp"
 #include "product_registry_store.hpp"
 #include "sle_routes.hpp"
@@ -2027,8 +2029,11 @@ public:
         // Installed-software inventory observability (ADR-0016; #1664/#1675).
         metrics_.describe("yuzu_inventory_ingest_total",
                           "Inventory-report ingest outcomes by source and outcome "
-                          "(stored/touched/need_full/error/dropped/rejected/rejected_depth)",
+                          "(stored/touched/need_full/error/dropped/rejected/rejected_depth; deferred = "
+                          "a report skipped because another report for the same agent held its "
+                          "lock, certificate_inventory only - not a failure)",
                           "counter");
+        cert_ingest_metric::register_metrics(metrics_); // slice-2 PR 2a-2a
         metrics_.describe("yuzu_inventory_ingest_duration_seconds",
                           "Time to apply one inventory source's report - the pooled-connection + "
                           "transaction hold time per ingest, by source and phase "
@@ -3230,18 +3235,22 @@ public:
         // Fail-closed-path observability (governance hardening round,
         // sre BLOCKING). Every 503 an operator/agentic worker sees from a
         // `is_store_unavailable` guard on the auth/MFA surface increments
-        // this, labelled by the route that hit it — so a PG/KEK outage is
+        // this, labelled by the route that hit it. route="approval" (#6079)
+        // also counts the approval gate's other 503 causes: the approver's
+        // stored MFA secret unreadable, and the session's durable proof
+        // unreadable (or no SessionStore attached). A PG/KEK outage is
         // visible as a metric spike distinct from ordinary 401/403 traffic,
         // and SRE can tell WHICH fail-closed path is degraded. Bounded,
         // pre-seeded closed label set (route) per
         // docs/observability-conventions.md, so absent() alerts stay
         // meaningful.
         metrics_.describe("yuzu_auth_secret_unavailable_total",
-                          "Total requests refused 503 by an is_store_unavailable fail-closed "
-                          "guard on the auth/MFA surface, by route",
+                          "Total requests refused 503 by a fail-closed store-unavailable "
+                          "guard on the auth/MFA surface, by route (route=approval also counts "
+                          "an unreadable durable session proof)",
                           "counter");
-        for (auto route :
-             {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate", "password_change"}) {
+        for (auto route : {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate",
+                           "password_change", "approval"}) {
             metrics_.counter("yuzu_auth_secret_unavailable_total", {{"route", route}});
         }
         // #2396 / #2401: reason-labelled sibling of the counter above. Same
@@ -3331,13 +3340,16 @@ public:
         // handling (stale-cache-or-401) without grepping logs. `op` labels the
         // degrading operation. Wired from AuthManager (validate/create/touch/
         // generation) + the maintenance-thread reap above.
-        metrics_.describe("yuzu_auth_session_store_degrade_total",
-                          "Durable session-store operations that hit a degraded PostgreSQL read/"
-                          "write on the auth hot path (labelled by op: validate / create / touch / "
-                          "generation_refresh / reap / invalidate_user / invalidate / mark_mfa / "
-                          "elevate); a validate degrade fails the request closed, and elevate / "
-                          "revoke (via invalidate_user) degrades fail the privileged op closed",
-                          "counter");
+        metrics_.describe(
+            "yuzu_auth_session_store_degrade_total",
+            "Durable session-store operations that hit a degraded PostgreSQL read/"
+            "write on the auth hot path (labelled by op: validate / create / touch / "
+            "generation_refresh / reap / invalidate_user / invalidate / mark_mfa / "
+            "elevate); a validate degrade fails the request closed, and elevate / "
+            "revoke (via invalidate_user) degrades fail the privileged op closed, except "
+            "that an invalidate_user after an already-committed MFA clear leaves the "
+            "clear in place and ends partial",
+            "counter");
         for (auto op : {"validate", "create", "touch", "generation_refresh", "reap",
                         "invalidate_user", "invalidate", "mark_mfa", "elevate"})
             metrics_.counter("yuzu_auth_session_store_degrade_total", {{"op", op}});
@@ -5274,9 +5286,9 @@ public:
         // born-on-PG stores (ADR-0012 §1): a reachable database whose schema
         // can't migrate/open is a deploy error, not a serve-degraded state.
         // Wired into AuthManager so sessions write-through to Postgres and
-        // survive a replica restart/failover; without it (config-file-only
-        // deployments never reach this block — pg_pool_ is null) AuthManager
-        // keeps its legacy in-memory sessions.
+        // survive a replica restart/failover. A serving process always reaches
+        // this block with a pool (an empty DSN refuses to start, above), so
+        // AuthManager's store-less in-memory path is for unit tests only.
         if (pg_pool_ && !startup_failed_) {
             session_store_ = std::make_unique<SessionStore>(*pg_pool_);
             if (!session_store_->is_open()) {
@@ -7928,6 +7940,27 @@ public:
                     gateway_service_->set_app_usage_store(app_usage_store_.get());
             }
         }
+        // Typed fleet certificate inventory — born-on-Postgres (slice-2 PR 2a-2a, ADR-0070 D12,
+        // ADR-0016 §5, schema `certificate_inventory_store`). Independent of the stores above (its own schema,
+        // its own fail-closed). Wires BOTH server entry points (direct ReportInventory + gateway
+        // ProxyInventory) to the certificate_inventory ingest seam. A store that failed to open
+        // would make ingest acknowledge nothing and (from 2a-2b) every certificate read answer
+        // 503, so the server refuses to start (ADR-0007/0008) and /readyz covers it.
+        if (pg_pool_ && !startup_failed_) {
+            certificate_inventory_store_ = std::make_unique<CertificateInventoryStore>(*pg_pool_);
+            if (!certificate_inventory_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: certificate_inventory store migration/open "
+                              "failed (database reachable but the certificate_inventory_store schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
+            } else {
+                certificate_inventory_store_->set_metrics(&metrics_);
+                agent_service_.set_certificate_inventory_store(certificate_inventory_store_.get());
+                if (gateway_service_)
+                    gateway_service_->set_certificate_inventory_store(
+                        certificate_inventory_store_.get());
+            }
+        }
 
         // ProductRegistryStore — SLE canonical product identities + match links
         // (ADR-0024 Decision 4). Sibling of the licensing store: its own schema, its
@@ -10308,6 +10341,7 @@ public:
             .software_licensing = software_licensing_store_.get(),
             .app_usage = app_usage_store_.get(),
             .offline_endpoint = offline_endpoint_store_.get(),
+            .certificate_inventory = certificate_inventory_store_.get(),
         }};
         return cascade.decommission(agent_id);
     }
@@ -11009,6 +11043,11 @@ public:
         if (gateway_service_)
             gateway_service_->set_app_usage_store(nullptr);
         app_usage_store_.reset();
+        // Fleet certificate inventory (slice-2 PR 2a-2a): same discipline.
+        agent_service_.set_certificate_inventory_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_certificate_inventory_store(nullptr);
+        certificate_inventory_store_.reset();
         // SLE ProductRegistryStore: the /api/v1/sle/* route closures capture `this`
         // and dereference this store only at request time; the gRPC + HTTP drains
         // above have quiesced every handler, so drop it BEFORE the pool (ADR-0012
@@ -16644,6 +16683,7 @@ private:
                              .plugin_config_store = plugin_config_store_.get(),
                              .enablement_store = enablement_store_.get(),
                              .app_usage_store = app_usage_store_.get(),
+                             .certificate_inventory_store = certificate_inventory_store_.get(),
                              .product_registry_store = product_registry_store_.get(),
                              .product_pack_store = product_pack_store_.get(),
                              .scim_store = scim_store_.get(),
@@ -16686,12 +16726,13 @@ private:
         // sec-M5: was duplicated at the SettingsRoutes and RestApiV1
         // register_routes sites; DRY'd up here so a future change updates
         // all surfaces atomically). Hoisted above the Approval routes'
-        // registration (#6061: approve/reject need fresh step-up) because
-        // approval::register_approval_routes, SettingsRoutes::register_routes
-        // and RestApiV1::register_routes (all later in this same function)
+        // registration because SettingsRoutes::register_routes and
+        // RestApiV1::register_routes (both later in this same function)
         // consume it. The closure captures cfg_ + auth_mgr_ + audit_log
         // and dispatches into `require_mfa_step_up`. `std::function` copies
-        // it into each call site.
+        // it into each call site. The Approval routes use it too, to consume the
+        // central check's pass; `approver_mfa_fn` below then refuses what this one lets through
+        // (#6079).
         StepUpFn step_up_fn = [this](const httplib::Request& req, httplib::Response& res,
                                      const auth::Session& session,
                                      const std::string& action_label) -> bool {
@@ -16711,6 +16752,33 @@ private:
                                                   cfg_.mfa_enforcement, &metrics_);
         };
 
+        // #6079: the approve/reject MFA gate, run after `step_up_fn`. That one passes an
+        // un-enrolled account, a bearer and a window of 0, none of which may decide a
+        // four-eyes approval. A server with no AuthDB (not a production shape) answers
+        // kStoreUnavailable, so the routes 503 rather than let anyone through.
+        approval::Deps::ApproverMfaFn approver_mfa_fn =
+            [this](const httplib::Request& req, httplib::Response& res,
+                   const auth::Session& session,
+                   const std::string& action_label) -> ApproverMfaOutcome {
+            auto* const auth_db = auth_mgr_.auth_db_ptr();
+            if (!auth_db)
+                return {ApproverMfaOutcome::Kind::kStoreUnavailable,
+                        MfaFactorState::kStoreUnavailable};
+            // The freshness ceiling is judged on the durable proof and the database clock
+            // (ADR-2002 s4); the gate also keeps this replica's cached monotonic check as a
+            // second, stricter condition (both must be in the window), because that anchor
+            // alone is suspend-blind. Approve/reject admit only cookie sessions
+            // (check_approver_class), so the cookie is the session credential here.
+            const auto durable = auth_mgr_.read_durable_mfa_proof(
+                AuthRoutes::extract_session_cookie(req), session.username);
+            return require_enrolled_fresh_mfa(
+                req, res, session, *auth_db, cfg_.mfa_step_up_window_secs,
+                [this](const httplib::Request& r, const std::string& a, const std::string& rs,
+                       const std::string& tt, const std::string& ti,
+                       const std::string& d) { return audit_log(r, a, rs, tt, ti, d); },
+                action_label, durable, &metrics_);
+        };
+
         // #2542 PR-9: the 4-route Approval API (/api/approvals,
         // /api/approvals/pending/count, /api/approvals/:id/{approve,reject}),
         // extracted onto the same inline_sink seam. Placed here rather than
@@ -16726,6 +16794,7 @@ private:
                              .audit_fn = audit_fn,
                              .emit_event_fn = emit_event_fn,
                              .step_up_fn = step_up_fn,
+                             .approver_mfa_fn = approver_mfa_fn,
                              .csrf_trusted_origins = cfg_.csrf_trusted_origins,
                              .approval_manager = approval_manager_.get(),
                          });
@@ -17163,6 +17232,9 @@ private:
         // use the quiet admin probe, as the Users page does: a non-administrator's page view
         // must not write an auth.admin_required row per panel. Mutating routes keep the loud
         // require_admin bound above. Wired before the listener starts.
+        // mfa.disable audits after ending the actor's own session (#6079), so it needs the
+        // session-bound writer, not the request-resolving one.
+        settings_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
         settings_routes_->set_read_admin_fn(
             [this](const httplib::Request& req, httplib::Response& res) {
                 return auth_routes_->probe_admin(req, res);
@@ -23536,6 +23608,7 @@ private:
     // Per-agent last-used app-usage store (Wave 7 PR7.2, ADR-0016 §5). Declared
     // after pg_pool_ so it destructs before the pool.
     std::unique_ptr<AppUsageStore> app_usage_store_;
+    std::unique_ptr<CertificateInventoryStore> certificate_inventory_store_;
     // SLE canonical product registry (ADR-0024 Decision 4). Declared after pg_pool_
     // so it destructs before the pool; the /api/v1/sle/* routes read it (the UCE
     // module's evaluator writes it, out-of-server).

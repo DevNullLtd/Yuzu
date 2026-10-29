@@ -60,6 +60,7 @@ class AppPerfDailyStore;
 class DeviceInventoryStore;
 class SoftwareLicensingStore;
 class AppUsageStore;
+class CertificateInventoryStore;
 class OfflineEndpointStore;
 
 /// Per-store outcome of one decommission fan-out.
@@ -122,6 +123,7 @@ struct AgentDecommissionStores {
     SoftwareLicensingStore* software_licensing{nullptr}; ///< PG detected licences (SLE)
     AppUsageStore* app_usage{nullptr};                    ///< PG per-agent last-used app usage
     OfflineEndpointStore* offline_endpoint{nullptr}; ///< PG endpoint_state presence row (#5682)
+    CertificateInventoryStore* certificate_inventory{nullptr}; ///< PG certificate_inventory_store (erase only)
 };
 
 /// A single decommission entry point that fans `delete_agent` across a fixed set
