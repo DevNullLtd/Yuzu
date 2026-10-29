@@ -222,7 +222,7 @@ RegistryEvent registry_row(std::string key, std::string action = "changed") {
     ev.actor_image = "actor.exe";
     ev.source = "notify";
     ev.observed_at = 1'761'000'000'000;
-    ev.detail = "note";
+    ev.detail = "attr:corr";
     ev.record_key = std::move(key);
     return ev;
 }
@@ -263,7 +263,7 @@ TEST_CASE("TarDatabase: insert_registry_events_and_cursor round-trips every colu
     CHECK(row[11] == "3");
     CHECK(row[14] == "812");
     CHECK(row[15] == "actor.exe");
-    CHECK(row[18] == "note");
+    CHECK(row[18] == "attr:corr");
     CHECK(row[19] == "k1");
     CHECK(r->rows[1][6].empty()); // the removed row has no value type: an absent value
     CHECK(r->rows[1][14] == "0");
@@ -275,12 +275,17 @@ TEST_CASE("TarDatabase: insert_registry_events_and_cursor round-trips every colu
     CHECK(first_cell(t.db, "SELECT COUNT(*) FROM registry_live") == "2");
     CHECK(*t.db.get_cursor("registry").value() == R"({"v":1,"n":2})");
     CHECK(*t.db.try_get_state("registry:HKLM\\R").value() == R"({"v":1,"keys":{"K":{}}})");
-    // ... even when the replay carries different actor/detail columns: identity is what changed.
+    // ... even when the replay attributes differently: after a restart the in-memory event
+    // buffer is gone, so a replayed change can come back degraded or unattributed. Identity
+    // is what changed, never who -- the stored row keeps its first attribution.
     auto reattributed = registry_row("k1");
     reattributed.actor_pid = 0;
-    reattributed.actor_image = "other.exe";
-    reattributed.detail = "other note";
+    reattributed.actor_image.clear();
+    reattributed.detail = "attr:degraded";
     CHECK(t.db.insert_registry_events_and_cursor({reattributed}, R"({"v":1})", {}));
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM registry_live") == "2");
+    CHECK(first_cell(t.db, "SELECT actor_pid || '/' || detail FROM registry_live WHERE record_key = 'k1'") ==
+          "812/attr:corr");
 }
 
 TEST_CASE("TarDatabase: insert_registry_events_and_cursor refuses collisions and bad keys atomically",
@@ -323,12 +328,20 @@ TEST_CASE("TarDatabase: try_get_state is tri-state", "[tar][store][registry]") {
     sqlite3_close(h);
 }
 
-TEST_CASE("TarDatabase: purge_source(registry) erases the rows, the cursor and every baseline",
+TEST_CASE("TarDatabase: purge_source(registry) erases the rows, the cursor (held values included) and every baseline",
           "[tar][store][purge][registry]") {
     auto t = make_test_db();
+    // The cursor row is a content store too: it holds the rendered old/new values of a change
+    // whose writer is not settled yet. Purging the source must erase it with everything else.
+    const std::string cursor_with_held =
+       R"({"v":1,"tick":4,"held":[{"r":"HKLM\\A","k":"HKLM\\A\\K","v":"Secret","a":"changed",)"
+       R"("t":1,"s":14,"d":"held-rendered-value","dtr":false,"hp":true,"pt":1,"ps":14,)"
+       R"("pd":"held-previous-value","ptr":false,"o":5,"lo":1,"hi":4,"src":"notify"}]})";
     REQUIRE(t.db.insert_registry_events_and_cursor(
-       {registry_row("k1")}, R"({"v":1,"tick":4})",
+       {registry_row("k1")}, cursor_with_held,
        {{"registry:HKLM\\A", "baseline-a"}, {"registry:HKU\\S-1\\B", "baseline-b"}}));
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM tar_cursor WHERE source = 'registry' AND "
+                           "cursor_json LIKE '%held-rendered-value%'") == "1");
     REQUIRE(t.db.set_state("service", "kept")); // unrelated baseline
     REQUIRE(t.db.insert_power_events_and_cursor({PowerEvent{1, 1, "wake", "", "p1"}}, R"({"v":1})"));
 
@@ -336,6 +349,7 @@ TEST_CASE("TarDatabase: purge_source(registry) erases the rows, the cursor and e
     REQUIRE(res.has_value());
     CHECK(first_cell(t.db, "SELECT COUNT(*) FROM registry_live") == "0");
     CHECK_FALSE(t.db.get_cursor("registry").value().has_value());
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM tar_cursor WHERE cursor_json LIKE '%held-%'") == "0");
     CHECK_FALSE(t.db.try_get_state("registry:HKLM\\A").value().has_value());
     CHECK_FALSE(t.db.try_get_state("registry:HKU\\S-1\\B").value().has_value());
     CHECK(*t.db.try_get_state("service").value() == "kept");

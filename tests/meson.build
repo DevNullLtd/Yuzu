@@ -361,6 +361,8 @@ agent_test_exe = executable(
     'unit/test_agent_log_options.cpp', # #4666 PR-2: make_log_handoff_options CLI-flags translator
     'unit/test_installed_apps_inventory.cpp',
     'unit/test_licensing_parsers.cpp',
+    'unit/test_licensing_bplist.cpp',    # bounded bplist00 top-level string lookup over REAL CAPTURE Info.plist fixtures + hostile/wrap/boundary corpus, portable
+    'unit/test_licensing_x509.cpp',      # pure in-process PEM -> notAfter (libcrypto) over generated vectors, portable (OpenSSL on every OS leg)
     'unit/test_licensing_sync.cpp',
     'unit/test_wifi_corewlan.cpp',
     'unit/test_wifi_parsers.cpp',           # PKG-WIFI: pure nmcli/iw/iwlist/iwconfig/airport/
@@ -525,6 +527,11 @@ agent_test_exe = executable(
     'unit/test_license_scan_actions.cpp',    # Wave 4 PR4.3b: real license_scan.dylib/.so driven
                                                 # end to end via LocalDispatcher after the Linux-leg
                                                 # runner migration (POSIX-only, a no-op TU on Windows)
+    'unit/test_license_scan_probe_host_posix.cpp', # ProbeHost::read_file_capped / list_dir errno contract over a real temp tree (POSIX-only, a no-op TU on Windows)
+    '../agents/plugins/license_scan/src/licensing_probes.cpp', # the ProbeHost default bodies under test (compiles on every OS; the plugin carries the same TU)
+    'unit/test_license_scan_surfaces.cpp',   # the per-OS surface shells (run_entitlement_certs_surface / run_mas_receipt_surface) through a recording FakeProbeHost; each OS's cases compile only there, an empty TU on Windows
+    '../agents/plugins/license_scan/src/licensing_linux.cpp', # the shells under test (the plugin carries the same TU); empty off Linux via its #ifdef
+    '../agents/plugins/license_scan/src/licensing_macos.cpp', # likewise, empty off macOS via its #ifdef
     'unit/test_filesystem_posture_parsers.cpp', # Wave 6 PR6.1-b: pure /proc/self/mountinfo, quotactl
                                                 # errno classification, fs_snapshot_list attrlist walk,
                                                 # and the legs.hpp pure row formatters
@@ -578,6 +585,7 @@ agent_test_exe = executable(
     'unit/test_wire_utf8.cpp',          # shared strict-UTF-8 scrubber (agents/shared/wire_utf8.hpp), portable
     'unit/test_row_byte_budget.cpp',    # shared row/byte budget (agents/shared/row_byte_budget.hpp), portable
     'unit/test_wall_clock_step.cpp',    # #4503: shared consecutive-sample wall-vs-monotonic clock-step guard (agents/shared/wall_clock_step.hpp), portable
+    'unit/test_smbios_parsers.cpp',     # H.1: shared bounds-checked SMBIOS walker (agents/shared/smbios_parsers.hpp) + firmware_posture adapter differential, portable
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
     'unit/test_browser_policy_parsers.cpp',         # Wave 10 PR10.2-b: pure policy-row model (every OS) + injected-root Linux JSON walk (POSIX-only bodies)
@@ -907,6 +915,25 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
     args: ['--allow-running-no-tests', '--durations=yes'],
     suite: 'agent',
     timeout: 60,
+  )
+endif
+
+# ── H.1 SMBIOS walker allocation budget (separate binary, deliberately) ──────
+# test_smbios_alloc_budget.cpp replaces the global operator new/delete (see its header), so it is
+# a separate binary: absent under sanitizers and on Windows.
+if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
+  smbios_alloc_budget_exe = executable(
+    'yuzu_smbios_alloc_budget_tests',
+    files('unit/test_smbios_alloc_budget.cpp'),
+    include_directories: [include_directories('../agents/shared')],
+    dependencies: [catch2_dep],
+  )
+  test(
+    'smbios allocation budget',
+    smbios_alloc_budget_exe,
+    args: ['--allow-running-no-tests', '--durations=yes'],
+    suite: 'agent',
+    timeout: 30,
   )
 endif
 
