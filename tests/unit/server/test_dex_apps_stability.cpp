@@ -573,17 +573,20 @@ bool json_near(const nlohmann::json& a, const nlohmann::json& b) {
 
 TEST_CASE("apps model: the default policy reproduces the base build's JSON byte for byte",
           "[dex][apps_model]") {
-    const auto m = dex_apps_model_from_rows("7d", {total_row("a.exe", 12, 3, 7, 10, 3)}, 50, def());
-    CHECK(json_near(nlohmann::json::parse(dex_apps_json(m)), nlohmann::json::parse(kBaseAppsJson)));
+    const auto m = dex_apps_model_from_rows("7d", kDexAppsScopeWindows, {total_row("a.exe", 12, 3, 7, 10, 3)}, 50, def());
+    // The pinned literal predates the additive crash_source_coverage key; every other key must still match.
+    auto got = nlohmann::json::parse(dex_apps_json(m));
+    CHECK(got.erase("crash_source_coverage") == 1);
+    CHECK(json_near(got, nlohmann::json::parse(kBaseAppsJson)));
 }
 
 TEST_CASE("apps model: the policy's interval confidence sets the share and rate intervals",
           "[dex][apps_model]") {
     auto p = dex_default_score_policy();
     p.interval_confidence = 0.90;
-    const auto m = dex_apps_model_from_rows("7d", {total_row("a.exe", 12, 3, 7, 10, 3)}, 50,
+    const auto m = dex_apps_model_from_rows("7d", kDexAppsScopeWindows, {total_row("a.exe", 12, 3, 7, 10, 3)}, 50,
                                             policy_in_force(p));
-    const auto base = dex_apps_model_from_rows("7d", {total_row("a.exe", 12, 3, 7, 10, 3)}, 50, def());
+    const auto base = dex_apps_model_from_rows("7d", kDexAppsScopeWindows, {total_row("a.exe", 12, 3, 7, 10, 3)}, 50, def());
     const auto& f = m.apps[0].figures;
     const auto& b = base.apps[0].figures;
     REQUIRE((f.share_affected && f.rate_per_1000));
@@ -612,7 +615,7 @@ TEST_CASE("apps model: a per-application regression start ratio marks the row an
     p.overrides.push_back(o);
     REQUIRE_FALSE(dex_score_policy_fault(p).has_value());
     const auto m = dex_apps_model_from_rows(
-        "7d", {total_row("a.exe", 12, 3, 7, 10, 3), total_row("b.exe", 2, 0, 1, 2, 0)}, 50,
+        "7d", kDexAppsScopeWindows, {total_row("a.exe", 12, 3, 7, 10, 3), total_row("b.exe", 2, 0, 1, 2, 0)}, 50,
         policy_in_force(p));
     REQUIRE(m.apps.size() == 2);
     const auto& a = m.apps[0].subject == "a.exe" ? m.apps[0] : m.apps[1];
@@ -628,9 +631,9 @@ TEST_CASE("apps model: a global per-device cap normalises the deductions and lea
           "[dex][apps_model]") {
     auto p = dex_default_score_policy();
     p.model.per_device_event_cap = 10;
-    const auto cap10 = dex_apps_model_from_rows("7d", {total_row("a.exe", 12, 3, 7, 10, 3)}, 50,
+    const auto cap10 = dex_apps_model_from_rows("7d", kDexAppsScopeWindows, {total_row("a.exe", 12, 3, 7, 10, 3)}, 50,
                                                 policy_in_force(p));
-    const auto base = dex_apps_model_from_rows("7d", {total_row("a.exe", 12, 3, 7, 10, 3)}, 50, def());
+    const auto base = dex_apps_model_from_rows("7d", kDexAppsScopeWindows, {total_row("a.exe", 12, 3, 7, 10, 3)}, 50, def());
     const auto& f = cap10.apps[0].figures;
     const auto& b = base.apps[0].figures;
     // Raw counts and both intervals do not depend on the cap.
