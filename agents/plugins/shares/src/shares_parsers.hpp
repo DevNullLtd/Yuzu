@@ -25,8 +25,10 @@
 #include <yuzu/string_utils.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <string>
@@ -539,16 +541,175 @@ inline std::string bsd_clean_path(std::string_view f) {
     return s;
 }
 
-/// The family of a `-network` / `-mask` value in mountd's `get_net` order: an IPv6 literal, a
-/// digit-led IPv4 form (inet_network), else a network name (never resolved here). A digit-led
-/// value that is no IPv4 form (`0.0.0.0/0`), an empty value and a non-name (`::/0`) are ones
-/// Apple rejects, the whole line with them.
+/// macOS libc `inet_pton4`: exactly four decimal octets 0-255, nothing stray. A leading zero
+/// is accepted (`01` is 1), as this libc reads it (measured on macOS 26.6.2).
+inline std::optional<std::array<unsigned char, 4>> parse_dotted_quad(std::string_view s) {
+    std::array<unsigned char, 4> out{};
+    std::size_t octets = 0;
+    std::size_t tp = 0;
+    unsigned cur = 0;
+    bool saw_digit = false;
+    for (const char c : s) {
+        if (c >= '0' && c <= '9') {
+            cur = cur * 10 + static_cast<unsigned>(c - '0');
+            if (cur > 255)
+                return std::nullopt;
+            if (!saw_digit) {
+                if (++octets > 4)
+                    return std::nullopt;
+                saw_digit = true;
+            }
+        } else if (c == '.' && saw_digit) {
+            if (octets == 4)
+                return std::nullopt;
+            out[tp++] = static_cast<unsigned char>(cur);
+            cur = 0;
+            saw_digit = false;
+        } else {
+            return std::nullopt;
+        }
+    }
+    if (octets < 4)
+        return std::nullopt;
+    out[tp] = static_cast<unsigned char>(cur);
+    return out;
+}
+
+/// macOS libc `inet_pton(AF_INET6)` as mountd's `get_net` calls it, decoded to its 16 bytes: a
+/// group is hex digits whose value fits 16 bits (leading zeros are free, so `00000::` is
+/// valid), at most one `::` (standing for at least one zero group), a dotted-quad tail only as
+/// the last 32 bits, nothing stray. Pure and portable (no socket header); the Linux `is_v6`
+/// shape check is a different, stricter reading for a different parser. Checked against the
+/// host libc over millions of generated values (macOS 26.6.2).
+inline std::optional<std::array<unsigned char, 16>> parse_v6(std::string_view s) {
+    std::array<unsigned char, 16> out{};
+    std::size_t tp = 0;
+    std::optional<std::size_t> colonp;
+    std::size_t i = 0;
+    if (!s.empty() && s[0] == ':') {
+        if (s.size() < 2 || s[1] != ':')
+            return std::nullopt; // a lone leading colon
+        i = 1;
+    }
+    std::size_t curtok = i;
+    unsigned val = 0;
+    bool saw_xdigit = false;
+    for (; i < s.size(); ++i) {
+        const char c = s[i];
+        if (std::isxdigit(static_cast<unsigned char>(c)) != 0) {
+            const unsigned d = c <= '9' ? static_cast<unsigned>(c - '0')
+                                        : static_cast<unsigned>((c | 0x20) - 'a') + 10;
+            val = (val << 4) | d;
+            if (val > 0xffff)
+                return std::nullopt;
+            saw_xdigit = true;
+        } else if (c == ':') {
+            curtok = i + 1;
+            if (!saw_xdigit) {
+                if (colonp)
+                    return std::nullopt;
+                colonp = tp;
+                continue;
+            }
+            if (i + 1 == s.size() || tp + 2 > out.size())
+                return std::nullopt; // a trailing single colon, or too many groups
+            out[tp++] = static_cast<unsigned char>(val >> 8);
+            out[tp++] = static_cast<unsigned char>(val & 0xff);
+            saw_xdigit = false;
+            val = 0;
+        } else if (c == '.' && tp + 4 <= out.size()) {
+            const auto v4 = parse_dotted_quad(s.substr(curtok));
+            if (!v4)
+                return std::nullopt;
+            std::ranges::copy(*v4, out.begin() + static_cast<std::ptrdiff_t>(tp));
+            tp += 4;
+            saw_xdigit = false;
+            break; // the tail ran to the end of the value
+        } else {
+            return std::nullopt;
+        }
+    }
+    if (saw_xdigit) {
+        if (tp + 2 > out.size())
+            return std::nullopt;
+        out[tp++] = static_cast<unsigned char>(val >> 8);
+        out[tp++] = static_cast<unsigned char>(val & 0xff);
+    }
+    if (colonp) {
+        const std::size_t n = tp - *colonp;
+        if (tp == out.size())
+            return std::nullopt; // `::` must stand for at least one group
+        for (std::size_t k = 1; k <= n; ++k) {
+            out[out.size() - k] = out[*colonp + n - k];
+            out[*colonp + n - k] = 0;
+        }
+        tp = out.size();
+    }
+    if (tp != out.size())
+        return std::nullopt;
+    return out;
+}
+
+/// Whether libc `inet_network` accepts a digit-led value (get_net's `isdigit(*cp)` branch):
+/// 1-4 dot-separated parts, each decimal, octal (`0` prefix, no 8 or 9) or hex (`0x` / `0X`,
+/// or a bare `x` after a dot), every part's 32-bit-wrapped value at most 0xff, and after the
+/// last part the end of the value or a whitespace byte (a CR from a CRLF file is one, so a
+/// trailing network or mask still parses there, unlike an IPv6 one). This is the macOS libc
+/// reading, measured on 26.6.2: `0x0a` is valid, `0x0a000000` is not. Only the family and
+/// validity matter here, the value is never used: an IPv4 network is never the world.
+inline bool bsd_v4_literal(std::string_view v) {
+    if (v.empty() || std::isdigit(static_cast<unsigned char>(v[0])) == 0)
+        return false;
+    std::size_t i = 0;
+    for (std::size_t parts = 0;; ++parts) {
+        std::uint32_t val = 0;
+        std::uint32_t base = 10;
+        bool digit = false;
+        if (i < v.size() && v[i] == '0') {
+            digit = true;
+            base = 8;
+            ++i;
+        }
+        if (i < v.size() && (v[i] == 'x' || v[i] == 'X')) {
+            base = 16;
+            ++i;
+        }
+        for (; i < v.size(); ++i) {
+            const char c = v[i];
+            std::uint32_t d = 0;
+            if (c >= '0' && c <= '9') {
+                if (base == 8 && c >= '8')
+                    return false;
+                d = static_cast<std::uint32_t>(c - '0');
+            } else if (base == 16 && std::isxdigit(static_cast<unsigned char>(c)) != 0) {
+                d = static_cast<std::uint32_t>((c | 0x20) - 'a') + 10;
+            } else {
+                break;
+            }
+            val = val * base + d;
+            digit = true;
+        }
+        if (!digit || parts >= 4 || val > 0xff)
+            return false;
+        if (i < v.size() && v[i] == '.') {
+            ++i;
+            continue;
+        }
+        return i == v.size() || std::isspace(static_cast<unsigned char>(v[i])) != 0;
+    }
+}
+
+/// The family of a `-network` / `-mask` value in mountd's `get_net` order: an IPv6 literal
+/// (`parse_v6`), a digit-led IPv4 form (inet_network), else a network name. A name is
+/// classified by shape only and NEVER resolved (no resolver I/O here), so an unresolvable name
+/// still counts as one client. A digit-led value that is no IPv4 form (`0.0.0.0/0`), an empty
+/// value and a non-name (`::/0`) are ones Apple rejects, the whole line with them.
 enum class BsdNetKind { v4, v6, name, rejected };
 
 inline BsdNetKind bsd_net_kind(std::string_view v) {
-    if (is_v6(v))
+    if (parse_v6(v))
         return BsdNetKind::v6;
-    if (is_v4(v, false))
+    if (bsd_v4_literal(v))
         return BsdNetKind::v4;
     if (v.empty() || std::isdigit(static_cast<unsigned char>(v[0])) != 0)
         return BsdNetKind::rejected;
@@ -560,17 +721,46 @@ inline BsdNetKind bsd_net_kind(std::string_view v) {
 }
 
 /// Whether a `-network` / `-mask` pair admits every client under Apple's matching. An IPv6
-/// network with no mask, or an all-zero one, is the world: mountd zero-fills an absent IPv6
-/// mask and both its masked compare and the kernel's radix lookup (a zero mask is the default
-/// entry) then match every address. An IPv4 network never is: a zero or absent IPv4 mask is
-/// replaced by the classful one, so `0.0.0.0` exports 0.0.0.0/8. A named network or mask never
-/// is. `net` / `mask` are empty when not given.
+/// network with no mask, or a mask whose 16 decoded bytes are all zero (`::`,
+/// `0:0:0:0:0:0:0:0`, `::0.0.0.0`), is the world: mountd zero-fills an absent IPv6 mask and
+/// both its masked compare and the kernel's radix lookup (a zero mask is the default entry)
+/// then match every address. An IPv4 network never is: a zero or absent IPv4 mask is replaced
+/// by the classful one, so `0.0.0.0` exports 0.0.0.0/8. A named network or mask never is.
+/// `net` / `mask` are empty when not given.
 inline bool bsd_net_is_world(std::string_view net, std::string_view mask) {
-    if (net.empty() || bsd_net_kind(net) != BsdNetKind::v6)
+    if (net.empty() || !parse_v6(net))
         return false;
     if (mask.empty())
         return true;
-    return is_v6(mask) && mask.find_first_not_of("0:") == std::string_view::npos;
+    const auto m = parse_v6(mask);
+    return m && std::ranges::all_of(*m, [](unsigned char b) { return b == 0; });
+}
+
+/// Whether the user part of a `-maproot` / `-mapall` credential is root, as mountd's
+/// `parsecred` resolves it: a digit- or `-`-led user is `getpwuid(atoi(user))`, so `0`, `00`,
+/// `0x0` (atoi stops at the `x`) and `-0` are uid 0; any other user is root only when it is
+/// the literal `root`. `atoi` is `(int)strtol`: only the low 32 bits of the value survive and
+/// strtol saturates beyond +-2^63 (LONG_MIN truncates to 0, LONG_MAX to -1). No account
+/// lookup is made, so a non-numeric account that happens to be uid 0 other than `root` is not
+/// seen.
+inline bool is_root_user(std::string_view user) {
+    const auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+    if (user.empty() || (!is_digit(user[0]) && user[0] != '-'))
+        return user == "root";
+    const bool neg = user[0] == '-';
+    unsigned long long mag = 0;
+    bool over = false;
+    for (std::size_t i = neg ? 1 : 0; i < user.size() && is_digit(user[i]); ++i) {
+        const auto d = static_cast<unsigned long long>(user[i] - '0');
+        if (mag > (~0ULL - d) / 10) {
+            over = true;
+            break;
+        }
+        mag = mag * 10 + d;
+    }
+    if (over || mag > (neg ? 1ULL << 63 : 0x7fffffffffffffffULL))
+        return neg; // saturated
+    return (mag & 0xffffffffULL) == 0;
 }
 
 /// What one accepted entry exports: its distinct paths and the facts they share.
@@ -586,7 +776,9 @@ struct BsdEntry {
 
 /// Parses one joined entry. false => Apple rejects it (no row, no token): an option or host
 /// before any path, a path after an option or host, a repeated -network / -mask, a -network
-/// together with a host, a rejected network or mask value, mismatched families.
+/// together with a host, a malformed network or mask value (a name is never resolved, so an
+/// unresolvable one is still accepted), mismatched families, a -mask without a -network, and
+/// -maproot (or -root / -r) together with -mapall (mountd `check_options`).
 inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
     std::size_t i = 0;
     std::string_view f = bsd_nextfield(entry, i);
@@ -595,6 +787,8 @@ inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
     bool got_nondir = false;
     bool have_net = false;
     bool have_mask = false;
+    bool have_maproot = false;
+    bool have_mapall = false;
     std::string net;
     std::string mask;
     BsdNetKind net_kind = BsdNetKind::name;
@@ -631,9 +825,9 @@ inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
                     e.ro = true;
                 } else if (has_arg && (item == "maproot" || item == "mapall" || item == "root" ||
                                        item == "r")) { // mountd do_opt: the credential-taking names
-                    const auto user = arg.substr(0, arg.find(':'));
-                    if (user == "root" || user == "0")
-                        e.root = true;
+                    // parsecred resets the credential on every call, so the LAST mapping wins.
+                    e.root = is_root_user(arg.substr(0, arg.find(':')));
+                    (item == "mapall" ? have_mapall : have_maproot) = true;
                     used_next = from_next;
                 } else if (has_arg && (item == "mask" || item == "m")) {
                     if (have_mask)
@@ -687,6 +881,10 @@ inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
         return false;
     if (have_net && e.hosts > 0)
         return false;
+    if (have_maproot && have_mapall)
+        return false; // check_options: "-mapall and -maproot mutually exclusive"
+    if (have_mask && !have_net)
+        return false; // check_options: "-mask requires -network", hosts or not
     const auto fam = [](BsdNetKind k) { return k == BsdNetKind::v4 || k == BsdNetKind::v6; };
     if (have_net && have_mask && fam(net_kind) && fam(mask_kind) && net_kind != mask_kind)
         return false;
@@ -699,14 +897,16 @@ inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
 
 /// macOS exports(5) as Apple's mountd reads /etc/exports: `<path>... [-opts] [hosts |
 /// -network net [-mask mask]]`. Entries are joined as get_export_entry joins them (trailing
-/// blanks, CR and backslashes stripped, a stripped backslash appends the next physical line
-/// directly; a continuation still open at end of file loses its entry), a field starting
-/// `#` makes the entry a comment, and fields are bounded by nextfield (single or double
-/// quotes, backslash escapes). One share per distinct path; hosts and netgroups are counted,
-/// never emitted. Access is `ro` for `-ro` / `-o`, else `rw`; `-offline` flags the share
-/// `unavailable`; `-maproot` / `-mapall` / `-root` / `-r` naming `root` or `0` raises
-/// `no_root_squash`. Anonymous is Apple's world test (see detail::bsd_net_is_world). A line
-/// Apple rejects yields no row and no token, as the Linux parser skips a malformed line.
+/// spaces, tabs and backslashes stripped, and NOT a CR, which stays in the last field; a
+/// stripped backslash appends the next physical line directly; a continuation still open at
+/// end of file loses its entry), a field starting `#` makes the entry a comment, and fields
+/// are bounded by nextfield (single or double quotes, backslash escapes). One share per
+/// distinct path; hosts and netgroups are counted, never emitted. Access is `ro` for `-ro` /
+/// `-o`, else `rw`; `-offline` flags the share `unavailable`; `no_root_squash` follows the
+/// LAST `-maproot` / `-mapall` / `-root` / `-r` credential and is raised when its user is
+/// root (see detail::is_root_user). Anonymous is Apple's world test (see
+/// detail::bsd_net_is_world). A line Apple rejects yields no row and no token, as the Linux
+/// parser skips a malformed line.
 inline void parse_bsd_exports(std::string_view text, std::string_view source,
                               yuzu::shared::RowByteBudget& budget, ExportsParse& out) {
     std::string entry;
@@ -718,8 +918,10 @@ inline void parse_bsd_exports(std::string_view text, std::string_view source,
         std::string_view raw = text.substr(pos, nl - pos);
         pos = nl + 1;
         bool cont = false;
-        while (!raw.empty() && (raw.back() == ' ' || raw.back() == '\t' || raw.back() == '\r' ||
-                                raw.back() == '\\')) {
+        // get_export_entry's strip set: space, tab, newline (already split on) and backslash.
+        // Not CR: on a CRLF file Apple keeps it in the last field, and a `\` before it is no
+        // continuation.
+        while (!raw.empty() && (raw.back() == ' ' || raw.back() == '\t' || raw.back() == '\\')) {
             cont = cont || raw.back() == '\\';
             raw.remove_suffix(1);
         }

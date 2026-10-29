@@ -26,6 +26,7 @@
 #include "shares_parsers.hpp"
 
 #include <algorithm>
+#include <array>
 #include <string>
 #include <vector>
 
@@ -963,14 +964,53 @@ TEST_CASE("shares bsd exports: comma lists and next-field option values", "[shar
     CHECK(sigs(bsd("/srv -fspath=/x")) == Sigs{"/srv rw anon clients_0"});
 }
 
+TEST_CASE("shares bsd exports: no_root_squash follows the last credential Apple resolves", "[shares]") {
+    const auto root = [](const char* line) {
+        return flags_of(bsd(line).shares.at(0)).find("no_root_squash") != std::string::npos;
+    };
+    // A digit- or '-'-led user is getpwuid(atoi(user)): every spelling atoi reads as 0 is root.
+    for (const char* line :
+         {"/srv -maproot=0", "/srv -maproot=00", "/srv -maproot=00000", "/srv -maproot=0x0",
+          "/srv -maproot=0root", "/srv -maproot=-0", "/srv -maproot=-", "/srv -mapall=00:5",
+          "/srv -r 0000", "/srv -root=root:1:2"})
+        CHECK(root(line));
+    for (const char* line : {"/srv -maproot=1", "/srv -maproot=01", "/srv -maproot=-2:-2", "/srv -maproot=10",
+                             "/srv -maproot=roo", "/srv -maproot=Root", "/srv -maproot=daemon",
+                             "/srv -maproot=1x0"})
+        CHECK_FALSE(root(line));
+    // atoi is (int)strtol: the low 32 bits survive (a wrap to 0 is root) and strtol saturates
+    // beyond +-2^63, LONG_MAX to -1 (not root) and LONG_MIN to 0 (root).
+    CHECK(root("/srv -maproot=4294967296"));
+    CHECK_FALSE(root("/srv -maproot=4294967297"));
+    CHECK(root("/srv -maproot=-4294967296"));
+    CHECK_FALSE(root("/srv -maproot=9223372036854775807"));
+    CHECK_FALSE(root("/srv -maproot=9223372036854775808"));
+    CHECK_FALSE(root("/srv -maproot=99999999999999999999999"));
+    CHECK(root("/srv -maproot=-9223372036854775808"));
+    CHECK(root("/srv -maproot=-99999999999999999999999"));
+    // parsecred resets the credential on every call: the last mapping wins, in both directions.
+    CHECK_FALSE(root("/srv -maproot=0 -maproot=-2:-2"));
+    CHECK_FALSE(root("/srv -maproot=root -r 5"));
+    CHECK(root("/srv -maproot=-2:-2 -maproot=root"));
+    CHECK(root("/srv -maproot=nobody -root=0"));
+    CHECK_FALSE(root("/srv -maproot=0,r=daemon"));
+}
+
 TEST_CASE("shares bsd exports: entries are joined as get_export_entry joins them", "[shares]") {
     // A stripped backslash appends the next physical line with NO separator.
     CHECK(sigs(bsd("/a \\\n/b")) == Sigs{"/a/b rw anon clients_0"});
     CHECK(sigs(bsd("/a \\\n\t/b")) == Sigs{"/a rw anon clients_0", "/b rw anon clients_0"});
     CHECK(sigs(bsd("/a -ro \\\n friends")) == Sigs{"/a ro named clients_1"});
-    // Trailing blanks and CR are stripped.
-    CHECK(sigs(bsd("/srv \t \r\n")) == Sigs{"/srv rw anon clients_0"});
-    CHECK(sigs(bsd("/srv\r\n/b\r\n")) == Sigs{"/srv rw anon clients_0", "/b rw anon clients_0"});
+    // Trailing spaces and tabs are stripped.
+    CHECK(sigs(bsd("/srv \t \n")) == Sigs{"/srv rw anon clients_0"});
+    // A CR is NOT in get_export_entry's strip set (space, tab, newline, backslash): on a CRLF
+    // file Apple keeps it in the last field, so the path is `/srv\r` (the wire folds it to a
+    // space), a `-ro\r` option is unrecognised and the row stays rw, and a backslash before
+    // the CR is no continuation.
+    CHECK(sigs(bsd("/srv\r\n/b\r\n")) == Sigs{"/srv\r rw anon clients_0", "/b\r rw anon clients_0"});
+    CHECK(share_row(bsd("/srv\r\n").shares.at(0)) == "share|nfs|-|/srv |rw|true|clients_0|exports");
+    CHECK(sigs(bsd("/srv -ro\r\n")) == Sigs{"/srv rw anon clients_0"});
+    CHECK(sigs(bsd("/a \\\r\n/b")) == Sigs{"/a rw named clients_1", "/b rw anon clients_0"});
     // A comment is an entry whose FIRST field starts with `#`; its backslash continues it.
     CHECK(sigs(bsd("# /srv\n/b")) == Sigs{"/b rw anon clients_0"});
     CHECK(sigs(bsd("#/srv\n  # /c\n")).empty());
@@ -1013,7 +1053,20 @@ TEST_CASE("shares bsd exports: lines Apple rejects yield no row and no token", "
           "/srv -network 10.0.0.0 friends", "/srv friends -network 10.0.0.0",
           "/srv -network 0.0.0.0/0", "/srv -network ::/0", "/srv -network=",
           "/srv -network 10.0.0.0 -mask ffff::", "/srv -network 2001:db8:: -mask 255.0.0.0",
-          "/srv -mask ffff:: -network 10.0.0.0"}) {
+          "/srv -mask ffff:: -network 10.0.0.0",
+          // check_options: -mask needs a -network (hosts or not), and -maproot (-root, -r) and
+          // -mapall are mutually exclusive in either order.
+          "/srv -mask 255.255.255.0", "/srv -mask 255.0.0.0 friends", "/srv -m ffff::",
+          "/srv -maproot=0 -mapall=-2:-2", "/srv -mapall=nobody -maproot=root",
+          "/srv -root=0 -mapall=nobody", "/srv -mapall root -r root",
+          // inet_pton refuses these dotted tails (short, out of range, too long, not last, no room).
+          "/srv -network ::1.2.3", "/srv -network ::256.0.0.0", "/srv -network ::1.2.3.4.5",
+          "/srv -network 1.2.3.4::", "/srv -network 1:2:3:4:5:6:7:1.2.3.4",
+          // inet_network refuses a part over 0xff (0x0a000000, 0x100, 0400) and an 8 or 9 in octal.
+          "/srv -network 0x0a000000", "/srv -network 0x100", "/srv -network 0400", "/srv -network 09",
+          "/srv -network 0xg", "/srv -network 1.2.3.4.5",
+          // a CR from a CRLF file ends an IPv4 value harmlessly but spoils an IPv6 one.
+          "/srv -network 2001:db8::\r"}) {
         INFO(line);
         const auto p = bsd(line);
         CHECK(p.shares.empty());
@@ -1049,8 +1102,55 @@ TEST_CASE("shares bsd exports: world classification is Apple's", "[shares]") {
     CHECK_FALSE(anon("/srv -network 131.104.48 -mask 255.255.255.0"));
     CHECK_FALSE(anon("/srv -network cis-net"));
     CHECK_FALSE(anon("/srv friends"));
+    // inet_pton's dotted-tail spellings decode like their hex twins: an all-zero mask is the
+    // world however it is written, a v4-mapped network with a real mask is not.
+    CHECK(anon("/srv -network 2001:db8:: -mask ::0.0.0.0"));
+    CHECK(anon("/srv -network ::0.0.0.0"));
+    CHECK(anon("/srv -network 2001:db8:: -mask 0:0:0:0:0:0:0.0.0.0"));
+    CHECK_FALSE(anon("/srv -network ::ffff:10.0.0.0 -mask ::ffff:255.0.0.0"));
+    CHECK_FALSE(anon("/srv -network 2001:db8:: -mask ::0.0.0.1"));
+    CHECK(sigs(bsd("/srv -network ::ffff:10.0.0.0 -mask ::ffff:255.0.0.0")) ==
+          Sigs{"/srv rw named clients_1"});
+    // inet_network's hex and octal spellings are IPv4 networks: one client, never the world.
+    CHECK(sigs(bsd("/srv -network 0x0a")) == Sigs{"/srv rw named clients_1"});
+    CHECK(sigs(bsd("/srv -network 0X10.0x0.0.0 -mask 0xff.0.0.0")) == Sigs{"/srv rw named clients_1"});
+    CHECK(sigs(bsd("/srv -network 010.0377 -mask 0")) == Sigs{"/srv rw named clients_1"});
+    CHECK(sigs(bsd("/srv -network 4.XDe")) == Sigs{"/srv rw named clients_1"});
+    CHECK(sigs(bsd("/srv -network 0x")) == Sigs{"/srv rw named clients_1"});
+    // A trailing CR (a CRLF file) is whitespace to inet_network, so an IPv4 value still parses.
+    CHECK(sigs(bsd("/srv -network 10.0.0.0\r\n")) == Sigs{"/srv rw named clients_1"});
+    CHECK(sigs(bsd("/srv -network 10.0.0.0 -mask 255.0.0.0\r\n")) == Sigs{"/srv rw named clients_1"});
     CHECK(bsd("/srv -network 2001:DB8::").shares[0].flags.back() == "clients_1");
     CHECK(bsd("/srv").shares[0].flags.back() == "clients_0");
+}
+
+TEST_CASE("shares bsd exports: IPv6 literals decode the way inet_pton decodes them", "[shares]") {
+    using Bytes = std::array<unsigned char, 16>;
+    const auto dec = [](std::string_view s) { return detail::parse_v6(s); };
+    CHECK(dec("::") == Bytes{});
+    CHECK(dec("0:0:0:0:0:0:0:0") == Bytes{});
+    CHECK(dec("::0.0.0.0") == Bytes{});
+    CHECK(dec("1::") == Bytes{0, 1});
+    CHECK(dec("::1") == Bytes{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1});
+    CHECK(dec("2001:DB8::") == Bytes{0x20, 0x01, 0x0d, 0xb8});
+    CHECK(dec("1:2:3:4:5:6:7::") == Bytes{0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7});
+    // A dotted-quad tail is the last 32 bits, with or without a `::`.
+    CHECK(dec("::ffff:10.0.0.0") == Bytes{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10});
+    CHECK(dec("::1.2.3.4") == Bytes{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4});
+    CHECK(dec("1:2:3:4:5:6:1.2.3.4") == Bytes{0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 1, 2, 3, 4});
+    CHECK(dec("1::2.3.4.5") == Bytes{0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 4, 5});
+    // This libc (macOS 26.6.2) takes leading zeros in a group (the value must fit 16 bits) and
+    // in an octet.
+    CHECK(dec("00000::") == Bytes{});
+    CHECK(dec("::0002AD") == Bytes{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0xad});
+    CHECK(dec("::01.2.3.4") == Bytes{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4});
+    CHECK(dec("::0.0.0.00") == Bytes{});
+    for (const char* bad :
+         {"", ":", ":1", "1:", ":::", "1:::2", "1::2::3", "12345::", "10000::", "g::", "1.2.3.4",
+          "1:2:3:4:5:6:7", "1:2:3:4:5:6:7:8:9", "1:2:3:4:5:6:7:8::", "1:2:3:4:5:6::1.2.3.4", "::1.2.3",
+          "::1.2.3.4.5", "::256.0.0.0", "::1.2.3.4:", "::1.2.3.4::", "::1.2.3.4 ", "::a.2.3.4", "::1..2.3",
+          "::1.2.3.4/0", "ffff::/0", "1:2:3:4:5:6:7:1.2.3.4", "2001:db8::\r"})
+        CHECK_FALSE(dec(bad).has_value());
 }
 
 TEST_CASE("shares bsd exports: a value-taking option with no value is ignored", "[shares]") {
