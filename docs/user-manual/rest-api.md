@@ -11251,13 +11251,13 @@ These endpoints back the management-group panels of the **Estate → Groups and 
 Render the Management groups panel: the group tree (name, type, member count).
 
 - **Permission:** `ManagementGroup:Read`, the same securable and permission check as `GET /api/v1/management-groups`; unlike that route, a failed read is reported, not rendered as an empty list. The per-group member counts have no field on `GET /api/v1/management-groups`; a machine derives them from each group's member list.
-- **Response (200):** HTML fragment. At most 500 rows are drawn; a note states the true count when more exist, and a group beyond the 500th row cannot be selected from the page. A groups read or a member-count read that does not answer is a red "could not be read" box with a Retry button and **no table**, still with status 200: it is never an empty tree and never a column of zero counts. A group whose parent is not in the list, or that sits in a cycle or beyond the display depth, is drawn as a top-level row rather than dropped.
+- **Response (200):** HTML fragment. At most 500 rows are drawn; a note states the true count when more exist, and a group beyond the 500th row cannot be selected from the page. A groups read or a member-count read that does not answer is a red "could not be read" box with a Retry button and **no table**, still with status 200: it is never an empty tree and never a column of zero counts. A group whose parent is not in the list, or that sits in a cycle or beyond the display depth, is drawn as a top-level row rather than dropped. The group list and the member counts are two separate reads, so a group deleted between them can show a stale count until the next refresh.
 - **Response (401 / 403):** Not signed in / the caller lacks the permission. On a 403 the panel shows the heading "Not available to your account" above the sentence "Your account cannot read management groups."
 - **Headers:** `Cache-Control: no-store`.
 
 **`GET /fragments/groups/detail?id=<group id>`**
 
-Render the selected group: name, type, parent, description, the stored rule of a rule-based group, who created it and when. A rule-based group's (type `dynamic`) rule is shown as stored, with a note that its membership is not kept up to date from the rule. The panel also carries the loader for the members panel.
+Render the selected group: name, type, parent (shown by its id when its name cannot be read), description, the stored rule of a rule-based group, who created it and when. A rule-based group's (type `dynamic`) rule is shown as stored, with a note that its membership is not kept up to date from the rule. The panel also carries the loader for the members panel.
 
 - **Query:** `id` — 1 to 64 of `a-f` and `0-9`. Empty or absent returns the "select a group" placeholder (still permission-checked).
 - **Permission:** `ManagementGroup:Read`, as for the list.

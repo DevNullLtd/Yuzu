@@ -35,7 +35,7 @@ extern const char* const kGroupsTemplate =
   <div class="split">
     <div class="grow">
       <section class="panel" id="grp-list" hx-get="/fragments/groups/list"
-               hx-trigger="load, refreshGroups from:body" hx-swap="innerHTML"
+               hx-trigger="load" hx-swap="innerHTML"
                data-src="/fragments/groups/list"
                data-denied="Your account cannot read management groups."
                data-unavailable="Groups could not be read. This is not an empty list.">

@@ -243,7 +243,7 @@ TEST_CASE("groups page: #grp-list keeps its id and loads the group list; #grp-si
         const auto panel = page.substr(at, end - at);
         CHECK_THAT(panel, ContainsSubstring("<h2>Management groups</h2>"));
         CHECK_THAT(panel, ContainsSubstring("hx-get=\"/fragments/groups/list\""));
-        CHECK_THAT(panel, ContainsSubstring("refreshGroups from:body"));
+        CHECK_THAT(panel, ContainsSubstring("hx-trigger=\"load\""));
         CHECK_THAT(panel, !ContainsSubstring("/settings"));
 
         CHECK(count_of(page, "id=\"grp-side\"") == 1);

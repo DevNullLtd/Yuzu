@@ -194,6 +194,8 @@ no explicit service-scoped denial of its own (it relies on the `Infrastructure:R
 bounded, audited twin is the supported read for agents and integrations; hardening or retiring the
 raw route is tracked by `#5856` (revisit by 2026-11-14).
 
+**Known asymmetry on the management-group members pair.** `GET /fragments/groups/members` is `twinned` to `GET /api/v1/management-groups/{id}` / `get_management_group`, but the twins are not equivalent: the fragment narrows its rows to the caller's scope, while the REST read and the MCP tool return the whole member list under the global `ManagementGroup:Read` permission. No confined principal reaches the unfiltered twins today (a caller whose only grant is management-group-scoped, or a service-scoped token, is refused). The row stays `twinned`; narrowing the twins to match, or untwinning the row, is tracked by `#6722` (revisit by 2026-11-12).
+
 ## Summary
 
 <!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; regenerate with `python3 scripts/ci/check-api-parity.py --render-doc` and splice between these markers -->
