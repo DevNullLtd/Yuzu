@@ -35,7 +35,8 @@ WORKDIR /src
 COPY vcpkg.json vcpkg-configuration.json ./
 # Agent-only: the meson configure below is -Dbuild_server=false -Dbuild_tests=false,
 # so opt out of vcpkg.json's default `server` + `tests` features (libpq, xmlsec,
-# drogon, catch2). Add --x-feature=agent here once that feature has content.
+# drogon, catch2). Add --x-feature=agent here once that feature has content, and
+# --x-feature=tests if -Dbuild_tests=true is ever set below (tests/meson.build needs Catch2).
 RUN /opt/vcpkg/vcpkg install --triplet ${TRIPLET} --x-manifest-root=. --x-no-default-features
 
 COPY . .

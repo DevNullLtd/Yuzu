@@ -24,7 +24,7 @@ vcpkg install --triplet x64-windows --x-manifest-root=. --x-no-default-features
 vcpkg install --triplet x64-windows --x-manifest-root=. --x-no-default-features --x-feature=tests  # + -Dbuild_tests=true
 ```
 
-Neither form touches `triplets/x64-windows.cmake` or the hand-wired grpc/protobuf/abseil branch (#375). `zlib` is still installed as a grpc dependency, which the `_libzlib` find_library in the root `meson.build` needs. `vcpkg_installed/x64-windows` is one tree shared by every Windows job on a runner, so a job that opts out must pass an install profile to `scripts/ci/vcpkg-triplet-sentinel.sh x64-windows <profile>`, or the next default-profile job inherits a tree without libpq/drogon. Details: `docs/build-guide.md` "Dependency features". Not yet exercised on a native Windows runner as of this change.
+Neither form touches `triplets/x64-windows.cmake` or the hand-wired grpc/protobuf/abseil branch (#375). `zlib` is still installed as a grpc dependency, which the `_libzlib` find_library in the root `meson.build` needs. vcpkg reconciles `vcpkg_installed/x64-windows` on every install, so a runner can alternate between the default and the opt-out form without a cache-key change (see `docs/build-guide.md` "Dependency features"). **Not exercised on Windows:** `x64-windows` could not be planned on the authoring host, and no CI leg uses `--x-no-default-features` on a Windows triplet; the default form is exercised by `ci.yml`, `release.yml`, `nightly.yml` and `codeql.yml`.
 
 ## Toolchain paths
 

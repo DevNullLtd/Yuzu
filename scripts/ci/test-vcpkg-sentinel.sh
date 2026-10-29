@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 # test-vcpkg-sentinel.sh — unit tests for vcpkg-triplet-sentinel.sh.
 #
-# Pins the behaviours the sentinel must preserve:
+# Pins the four behaviours the sentinel must preserve:
 #   1. registry-desync recovery (#741): on key drift, BOTH
 #      vcpkg_installed/<triplet>/ and vcpkg_installed/vcpkg/ are wiped.
 #   2. no-op on matching key: neither directory is touched.
 #   3. first-run with no sentinel: exit 0, "no existing tree to wipe".
 #   4. error on missing manifest: exit non-zero.
-#   5. the optional install profile is part of the key: an agent-only and a
-#      full install of the SAME triplet share one tree path, so flipping the
-#      profile must wipe it, and omitting the profile must hash exactly as it
-#      did before profiles existed.
 #
 # Runs locally (./scripts/ci/test-vcpkg-sentinel.sh) and from the
 # canary job in ci.yml. No external test framework — plain bash.
@@ -38,15 +34,14 @@ cleanup() {
 trap cleanup EXIT
 
 # Run the sentinel with $1 as $GITHUB_WORKSPACE and $2 as $VCPKG_COMMIT.
-# Captures stdout+stderr to $3, exit code to $4 (passed by name). Optional $5
-# is the install profile, passed as the sentinel's second argument.
+# Captures stdout+stderr to $3, exit code to $4 (passed by name).
 run_sentinel() {
-  local ws="$1" commit="$2" out_var="$3" rc_var="$4" profile="${5:-}"
+  local ws="$1" commit="$2" out_var="$3" rc_var="$4"
   local tmp_out
   tmp_out="$(mktemp)"
   local rc=0
   GITHUB_WORKSPACE="$ws" VCPKG_COMMIT="$commit" \
-    bash "$SENTINEL" "$TRIPLET" ${profile:+"$profile"} >"$tmp_out" 2>&1 || rc=$?
+    bash "$SENTINEL" "$TRIPLET" >"$tmp_out" 2>&1 || rc=$?
   printf -v "$out_var" '%s' "$(cat "$tmp_out")"
   printf -v "$rc_var" '%s' "$rc"
   rm -f "$tmp_out"
@@ -242,72 +237,6 @@ run_sentinel "$WS5" "any-baseline" OUT5 RC5
 assert_msg "[[ $RC5 -ne 0 ]]" "exit code is non-zero (got $RC5)"
 assert_msg "echo \"\$OUT5\" | grep -q 'no vcpkg.json'" \
   "error message names the missing manifest"
-
-rm -rf "$TMPROOT"
-
-# -----------------------------------------------------------------------
-# Test 6 — the install profile is part of the key
-# -----------------------------------------------------------------------
-# vcpkg.json defaults to the `server` + `tests` features; an agent-only
-# install (--x-no-default-features) of the same triplet fills the SAME
-# vcpkg_installed/<triplet>/ path with fewer ports. The two must not share a
-# key, in either direction, or one shape silently stands in for the other.
-echo "Test 6: install profile flips the key; same profile is a no-op"
-TMPROOT="$(mktemp -d)"
-WS6="$TMPROOT/t6"
-mk_workspace "$WS6"
-
-# Establish the default (no-profile) key and a populated tree.
-OUT6a=""; RC6a=0
-run_sentinel "$WS6" "profile-baseline" OUT6a RC6a
-seed_desync_state "$WS6"
-
-# Same manifest, same baseline, but an agent-only profile: must drift + wipe.
-OUT6b=""; RC6b=0
-run_sentinel "$WS6" "profile-baseline" OUT6b RC6b "agent-only"
-assert_msg "[[ $RC6b -eq 0 ]]" "exit code is 0 (got $RC6b)"
-assert_msg "echo \"\$OUT6b\" | grep -q 'sentinel drift'" \
-  "default -> agent-only is reported as drift"
-assert_msg "[[ ! -d '$WS6/vcpkg_installed/$TRIPLET' ]]" \
-  "default-profile tree wiped when the profile changes"
-assert_msg "[[ ! -d '$WS6/vcpkg_installed/vcpkg' ]]" \
-  "default-profile registry wiped when the profile changes"
-
-# Same profile again: no-op.
-seed_desync_state "$WS6"
-OUT6c=""; RC6c=0
-run_sentinel "$WS6" "profile-baseline" OUT6c RC6c "agent-only"
-assert_msg "echo \"\$OUT6c\" | grep -q 'sentinel unchanged'" \
-  "agent-only -> agent-only is a no-op"
-assert_msg "[[ -d '$WS6/vcpkg_installed/$TRIPLET' ]]" \
-  "agent-only tree preserved on matching profile"
-
-# And back: agent-only -> default must also drift (the other direction).
-OUT6d=""; RC6d=0
-run_sentinel "$WS6" "profile-baseline" OUT6d RC6d
-assert_msg "echo \"\$OUT6d\" | grep -q 'sentinel drift'" \
-  "agent-only -> default is reported as drift"
-assert_msg "[[ ! -d '$WS6/vcpkg_installed/$TRIPLET' ]]" \
-  "agent-only tree wiped when returning to the default profile"
-
-rm -rf "$TMPROOT"
-
-# -----------------------------------------------------------------------
-# Test 7 — omitting the profile hashes exactly the pre-profile inputs
-# -----------------------------------------------------------------------
-# Every existing caller passes no profile. Their key must stay the digest of
-# (manifest [+ configuration + overlay], baseline) and nothing else, so adding
-# the argument cannot by itself invalidate or alias an unrelated cache.
-echo "Test 7: no-profile key equals the pre-profile digest"
-TMPROOT="$(mktemp -d)"
-WS7="$TMPROOT/t7"
-mk_workspace "$WS7"
-expected="$( { (cd "$WS7" && sha256sum vcpkg.json) && printf '%s\n' "legacy-baseline"; } | sha256sum | awk '{print $1}')"
-OUT7=""; RC7=0
-run_sentinel "$WS7" "legacy-baseline" OUT7 RC7
-got7="$(cat "$WS7/vcpkg_installed/.${TRIPLET}-cachekey.sha256")"
-assert_msg "[[ '$got7' == '$expected' ]]" \
-  "no-profile key is byte-identical to the pre-profile formula"
 
 rm -rf "$TMPROOT"
 TMPROOT=""
