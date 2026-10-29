@@ -33,9 +33,9 @@ Detection surfaces v1:
 | Windows | Extensible **`ProbeSpec`** table — MS server products (SQL Server, Exchange, Visual Studio), Autodesk (AdskLicensing), security / backup agents (Veeam, Acronis, AV suites), VMware Workstation, WinRAR, open-source classification rows | probable / heuristic | presence, type, serial-derived hints, `exe_hints` |
 | Windows | **Per-user surfaces** — loaded `HKU\<SID>` hives first, then offline `NTUSER.DAT`; per-profile licence files (e.g. JetBrains `%LOCALAPPDATA%`, Adobe NGL) | probable | per-user records with `user_scope=user` + `user_ref` |
 | Linux | `rpm --qf %{LICENSE}` / dpkg DEP-5 `copyright` header | probable / heuristic | declared SPDX-style licence classification (no lapse detection — stated gap) |
-| Linux | RHEL entitlement certificates (`/etc/pki/entitlement/*.pem`, `notAfter`) | authoritative | subscription expiry |
+| Linux | RHEL entitlement certificates (`/etc/pki/entitlement/*.pem`, `notAfter`, read in-process) | authoritative | subscription expiry. Whether the agent account can read them on RHEL is unmeasured; a refused directory or file reports `PERMISSION_DENIED` and pauses the sync ([details](#when-the-entitlement-directory-is-refused)) |
 | Linux | FlexLM `.lic` files (`INCREMENT` parser, MATLAB / Ansys class) | authoritative (expiry) | feature expiry dates |
-| macOS | `_MASReceipt` presence + `Info.plist` identity; machine-scope vendor plists (Office volume, Parallels) | probable | App Store / retail licensed |
+| macOS | `_MASReceipt` presence + `Info.plist` identity and version (XML and binary `bplist00`); machine-scope vendor plists (Office volume, Parallels) presence-only | probable | App Store / retail licensed |
 
 Adding a vendor later is one `ProbeSpec` row (plus an optional interpreter function) —
 no engine change.
@@ -105,7 +105,10 @@ co-determination question; set the mode per that agreement.
   device's licence rows in a single transaction — the store is always current-state,
   never an append log.
 - **Resilient.** Sync state lives on the agent and survives reconnects and reboots; a
-  failed sync retries on the next cycle.
+  failed sync retries on the next cycle. An error on a primary or authoritative surface
+  (on Linux, the RHEL entitlement certificates) keeps the last good state and skips the
+  cycle instead of wiping stored licences; see
+  [When the entitlement directory is refused](#when-the-entitlement-directory-is-refused).
 
 ## Reading detected licences
 
@@ -223,6 +226,44 @@ the same channel if a host has more. Per-user hives are
 **never a primary surface**, so none of these three conditions skips or wipes the sync
 cycle — the machine-scope detections proceed. See
 [`docs/agent-privilege-model.md`](../agent-privilege-model.md) (the `license_scan` row).
+
+### When the entitlement directory is refused
+
+On a RHEL-family Linux host the agent reads `/etc/pki/entitlement` itself; no `openssl`
+binary is run. Whether the unprivileged agent account may list that directory and read
+its certificates on a real RHEL host has **not been measured**. A host without the
+directory (not RHEL-family, or no subscription) is unchanged: an empty entitlement
+result, not an error.
+
+If the agent is refused the directory, or a certificate in it, the `entitlement_certs`
+surface reports `cert_permission_denied` and the action's result status is
+`PERMISSION_DENIED`. `entitlement_certs` is an authoritative surface, so **any error on
+it keeps the last good state and skips that day's sync for the whole host**: the agent
+logs a warning starting `sync: license_scan primary/authoritative surface reported an error`,
+sends nothing, and every licence row of the host (RPM/dpkg package metadata, FlexLM and
+entitlement certificates) stays at its last synced value until the cause is cleared. The
+surface reports an error for:
+
+- a directory the agent may not list, or a certificate it may not read
+  (`cert_permission_denied`);
+- an unreadable, empty, encrypted or unparseable `.pem`, one larger than 64 KiB, or a
+  directory that fails to open for a reason other than absence or refusal
+  (`cert_parse_failed`, or `cert_parse_partial` when other certificates did parse);
+- more than 4,096 directory entries, 64 certificate files or 16 certificates in one
+  file, or a scan that spent its 10-second budget (`cert_scan_budget_exhausted`).
+
+Before this release an agent read a directory it could not list as an empty surface, so
+the daily sync replaced the host's stored entitlement rows with nothing while the other
+rows kept syncing; only an unreadable, empty or unparseable `.pem` paused the sync. A
+refused directory and a `.pem` over 64 KiB now pause it as well. Rolling the agent back
+to an earlier build restores the silent wipe.
+
+To see why a host is paused, run the `license_scan` plugin's `surfaces` action on the
+device (see the plugin README): its `probe_status|entitlement_certs|error|<token>` line
+names the cause. Remove the cause the token names, for example delete a junk or
+oversized `.pem`; this page does not prescribe a permission change for a refused
+directory, because what the agent account can read on RHEL has not been measured. The
+next cycle then syncs normally.
 
 ## See also
 

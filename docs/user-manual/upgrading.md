@@ -2,6 +2,18 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: a refused or unusable RHEL entitlement directory pauses the licence sync for that host
+
+**What changed.** This is an agent change on Linux. The `license_scan` plugin now reads `/etc/pki/entitlement` in-process instead of running `openssl x509`. `entitlement_certs` is an authoritative surface, so an error on it keeps the last good state and skips that day's `software_licensing` sync for the whole host: its RPM/dpkg, FlexLM and entitlement rows all stay at their last synced values until the cause is cleared. Three causes newly pause the sync. A directory the agent may not list is now `cert_permission_denied` (result status `PERMISSION_DENIED`); before, it read as an empty surface and the daily sync wiped the host's stored entitlement rows while the other rows kept syncing. A `.pem` larger than 64 KiB is now a parse failure for that file; the `openssl` runs parsed any size. A directory or file past the new scan limits also pauses it: more than 4,096 directory entries or 64 certificate files, or more than 16 certificates in one `.pem`; the scan also stops starting new files after 10 seconds, where it was 60. An unreadable, empty or unparseable `.pem` already paused the sync before this release.
+
+**Who is affected.** RHEL-family hosts where the agent account cannot list `/etc/pki/entitlement`, or where a `.pem` in it is oversized or junk. A host whose certificates are all readable, parse and are under 64 KiB each sees no pause. Whether the unprivileged agent can read the directory on a real RHEL host has not been measured, so check a RHEL host after the upgrade rather than assuming either answer.
+
+**First sync after the upgrade.** A Linux host with entitlement certificates sends its full rows once more, because its rows can change: they are now ordered by file name rather than directory order, and a `.pem` with several certificates yields one row per certificate (up to 16 per file) where the `openssl x509` runs read only the first. On macOS a bundle with a binary `Info.plist` now reports its display name and version where it reported the bundle name and an empty version.
+
+**What to do.** Run the `license_scan` plugin's `surfaces` action on a RHEL host and read the `probe_status|entitlement_certs|` line; remove the cause its token names. See [When the entitlement directory is refused](software-licensing.md#when-the-entitlement-directory-is-refused).
+
+**Rollback.** Rolling an agent back to an earlier build restores the silent wipe: a directory it cannot list reads as empty again and the next sync replaces the host's stored entitlement rows with nothing.
+
 ## New: leader-election metrics and alerts (HA WS-11, #4014)
 
 Additive; no behaviour change and no action is needed to keep a deployment working. Every server with a
