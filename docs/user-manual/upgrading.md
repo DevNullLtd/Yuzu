@@ -10,7 +10,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 - With RBAC enforcement on, an account whose role is `user` but which holds the `Administrator` grant (and an active account row) now sees the controls. Before, it saw none, although the server would have admitted it.
 - With RBAC enforcement on, an account administrator who does not hold the `Administrator` grant no longer sees a live switch (and cannot read the Role assignments panel, which needs `AccessReview:Read`). Before, the page drew the switch and the server then refused the click.
 - A signed-in administrator whose grant has no active account row (an SSO-only principal) is shown no control, because the server would refuse it.
-- When a store cannot answer, the controls are drawn disabled with "Your administrator authority could not be confirmed. Reload to try again." instead of live.
+- When a store cannot answer, **Assign role** and the enforcement switch are drawn disabled with "Your administrator authority could not be confirmed. Reload to try again." instead of live, and the per-row **Remove** controls are left out until the check can be answered.
 - With RBAC enforcement off, nothing changes for a local administrator account.
 
 **Not changed.** After you assign or remove a role, the page redraws only the Role assignments panel, so the enforcement switch can lag until the next reload (for example after granting yourself `Administrator`). Reload the page.

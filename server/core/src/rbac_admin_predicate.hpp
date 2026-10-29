@@ -285,25 +285,28 @@ enum class RbacAdminGate {
                                                     const RbacStore* rbac_store,
                                                     RbacAdminSurface surface) {
     switch (is_rbac_administrator(session, auth_db, rbac_store, surface)) {
-    case RbacAdminGate::kAdmin:
+    case RbacAdminGate::kAdmin: {
+        // kAdmin is reachable only with a non-null store (the predicate returns kUnavailable
+        // without one), but the null check stays so this never dereferences on a future edit.
+        if (!rbac_store)
+            return RbacAdminHint::kUnconfirmed;
+        switch (rbac_store->check_caller_authorized_under_current_regime(session.username)) {
+        case RbacRegimeAuthority::kAuthorized:
+            return RbacAdminHint::kMay;
+        case RbacRegimeAuthority::kNotAuthorized:
+            return RbacAdminHint::kMayNot;
+        case RbacRegimeAuthority::kUnavailable:
+            return RbacAdminHint::kUnconfirmed;
+        }
         break;
+    }
     case RbacAdminGate::kDenied:
         return RbacAdminHint::kMayNot;
     case RbacAdminGate::kUnavailable:
         return RbacAdminHint::kUnconfirmed;
     }
-    // kAdmin is reachable only with a non-null store (the predicate returns kUnavailable
-    // without one), but the null check stays so this never dereferences on a future edit.
-    if (!rbac_store)
-        return RbacAdminHint::kUnconfirmed;
-    switch (rbac_store->check_caller_authorized_under_current_regime(session.username)) {
-    case RbacRegimeAuthority::kAuthorized:
-        return RbacAdminHint::kMay;
-    case RbacRegimeAuthority::kNotAuthorized:
-        return RbacAdminHint::kMayNot;
-    case RbacRegimeAuthority::kUnavailable:
-        break;
-    }
+    // An enumerator this fold does not know is "could not confirm", never an admit: the
+    // predicate's answer was not understood, so nothing may be drawn live from it.
     return RbacAdminHint::kUnconfirmed;
 }
 

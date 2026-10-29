@@ -41,7 +41,11 @@ using namespace yuzu::server;
 namespace {
 
 /// What a real route answer says about the caller's authority. Anything outside the three
-/// shapes is not an authority answer, so the test fails loudly rather than guessing.
+/// shapes is not an authority answer, so the test fails loudly rather than guessing. Two
+/// statuses are NOT modelled and would misclassify: the unassign route's 403
+/// `self_admin_unassign_blocked` (a refusal about the request, after the gates passed, which
+/// would read as kMayNot; no persona here removes its own Administrator grant) and a 503 from
+/// a store read after the gates passed (which would read as kUnconfirmed).
 std::optional<RbacAdminHint> classify(int status) {
     if ((status >= 200 && status < 300) || status == 400 || status == 409)
         return RbacAdminHint::kMay; // the gates passed; the refusal (if any) is about the request

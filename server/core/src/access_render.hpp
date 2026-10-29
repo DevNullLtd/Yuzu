@@ -120,9 +120,11 @@ struct AssignmentsView {
     /// Role names the Assign dialog offers (already filtered through `is_rbac_assignable_role`).
     /// Empty with `can_assign` means the catalogue could not be read: the button is drawn disabled.
     std::vector<std::string> assignable;
-    /// `RbacAdminHint::kUnconfirmed`: the authority check could not be answered. The button is
-    /// drawn disabled with `kAdminUnconfirmed` as the reason, never hidden (hiding reads as
-    /// "not allowed", which is not what is known). Meaningful only with `can_assign` false.
+    /// `RbacAdminHint::kUnconfirmed`: the authority check could not be answered. The Assign role
+    /// button is drawn disabled with `kAdminUnconfirmed` as the reason, never hidden (hiding reads
+    /// as "not allowed", which is not what is known). The per-row Remove controls are drawn only
+    /// with `can_assign`, so they are omitted while unconfirmed. Meaningful only with `can_assign`
+    /// false.
     bool admin_unconfirmed = false;
 };
 

@@ -16228,9 +16228,8 @@ private:
                 // Assign button and the enforcement switch from the authority the A2/A1 routes
                 // apply (the durable-Administrator predicate, then the regime check; A1 applies
                 // the regime rule inside set_enforcement), not from the session's base role.
-                // kRest because the controls call the REST
-                // routes. HINT ONLY: every action keeps its own gate. Null stores fold to
-                // kUnconfirmed inside the hint.
+                // kRest because the controls call the REST routes. HINT ONLY: every action
+                // keeps its own gate. Null stores fold to kUnconfirmed inside the hint.
                 .rbac_admin_hint_fn = [this](const auth::Session& s) {
                     return yuzu::server::rbac_admin_hint(
                         s, auth_db_.get(), rbac_store_.get(),
