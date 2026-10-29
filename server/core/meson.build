@@ -642,6 +642,7 @@ yuzu_server_core_lib = static_library(
     'src/dashboard_ui.cpp',
     'src/app_shell.cpp',
     'src/enrolment_render.cpp', # Groups and enrolment page: pure enrolment fragment renderers
+    'src/groups_render.cpp', # Groups and enrolment page: pure group tree / detail / members renderers
     'src/groups_ui.cpp', # Groups and enrolment page: the page template
     'src/groups_routes.cpp', # Groups and enrolment page: /groups + static glue
     'src/integrations_render.cpp', # System Integrations: pure MCP/Gateway panels + MCP form parser

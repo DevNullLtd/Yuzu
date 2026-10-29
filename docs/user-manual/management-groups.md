@@ -467,7 +467,9 @@ Now `emea.lead` can manage all devices in EMEA, and members of the `emea-helpdes
 
 ## Dashboard Management
 
-Management groups are managed through the **Settings** page in the HTMX dashboard. The Settings page displays all groups in a tree view with indentation reflecting the hierarchy. The root "All Devices" group is always displayed first.
+The **Groups and enrolment** page (`/groups`, Estate) shows the management groups read-only: the tree with each group's type and member count, the selected group's details (parent, description, who created it and when, and the stored rule of a rule-based group, that is, one of type `dynamic`), and its member list. A group's members are shown only within the viewer's scope, and the panel says so without stating how many were left out. A panel that cannot be read says so with a Retry button rather than showing an empty tree or "0 members". Membership of a rule-based group is not kept up to date from its rule, so such a group may show no members; the Dynamic membership row under Concepts describes how each kind is filled.
+
+Groups are created and deleted through the **Settings** page in the HTMX dashboard. The Settings page displays all groups in a tree view with indentation reflecting the hierarchy. The root "All Devices" group is always displayed first.
 
 From the Settings page, administrators can:
 
