@@ -84,10 +84,7 @@ _ARCHIVE_LONG_OPTS = (
 PROTECT = [
     # the one sanctioned TAR mention (CONTEXT.md glossary, hand-written)
     r"Echo was named TAR before 2026-10",
-    # evidence-file references: their names are verbatim
-    r"(?:changelog|governance)\.d/[\w./-]+",
-    r"\b20\d{2}-?\d{2}-?\d{2}-[\w.-]*tar[\w.-]*\.(?:added|changed|fixed|security|removed|deprecated)\.md",
-    r"(?:docs/plans/)?feat-tar-15f[\w.-]*",
+    # (evidence-file references are NOT protected any more: the evidence files themselves are renamed)
     # branch names are history
     r"\b(?:feat|fix|chore)/[A-Za-z0-9._-]*(?<![A-Za-z])tar(?![A-Za-z])[A-Za-z0-9._-]*",
     # legacy on-disk SQLite objects inside pre-v3 database files
@@ -283,6 +280,9 @@ MUST_CHANGE = [
     ('spdlog::warn("TAR: failed");', 'spdlog::warn("ECHO: failed");', "cpp"),
     ('displayName: "TAR: SQL Query"', 'displayName: "Echo: SQL Query"', "yaml"),
     ("/fragments/tar/process-tree", "/fragments/echo/process-tree", "md"),
+    ("see changelog.d/2026-10-21-tar-timeline-render.added.md", "see changelog.d/2026-10-21-echo-timeline-render.added.md", "md"),
+    ("governance.d/tar-registry-live-source.KttYnZ.jsonl", "governance.d/echo-registry-live-source.KttYnZ.jsonl", "md"),
+    ("docs/plans/feat-tar-15f-chrome-ir-e2e-2026-07-01.md", "docs/plans/feat-echo-15f-chrome-ir-e2e-2026-07-01.md", "md"),
     ("tar-timeline", "echo-timeline", "md"),
     (".tar-tree-node{margin:0}", ".echo-tree-node{margin:0}", "html"),
     ("/api/v1/result-sets/from-tar-query", "/api/v1/result-sets/from-echo-query", "md"),
@@ -332,8 +332,6 @@ NEVER_CHANGE = [
     "tar_events",
     "tar_events_present",
     "feat/wave7-pr72a-forensics-tar-usage",
-    "docs/plans/feat-tar-15f-chrome-ir-e2e-2026-07-01.md",
-    "changelog.d/2026-10-21-tar-timeline-render.added.md",
     "app|tar|1.35+dfsg-3.1|Janos Lenart <ocsi@debian.org>|-|-|-",
     "Alex Myczko <tar@debian.org>",
     "Echo was named TAR before 2026-10",
