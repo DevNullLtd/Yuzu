@@ -6,8 +6,10 @@
  *         approve nonexistent.
  */
 
+#include <algorithm>
 #include <array>
 #include "approval_manager.hpp"
+#include "approval_model.hpp"
 #include "mcp_approval_error.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -20,7 +22,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 
+#include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <chrono>
 #include <expected>
 #include <filesystem>
@@ -29,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 using namespace yuzu::server;
@@ -360,7 +365,7 @@ TEST_CASE("ApprovalManager: consume_ticket stamps consumed_by with the recalling
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
 
-    auto consumed = mgr.consume_ticket(*id, "operator1", {});
+    auto consumed = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(consumed.has_value());
 
     auto row = mgr.get(*id);
@@ -379,7 +384,7 @@ TEST_CASE("ApprovalManager: consume_ticket without a principal fails closed",
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
     // An unattributable consumption would be a CC7.2 evidence hole.
-    auto consumed = mgr.consume_ticket(*id, "", {});
+    auto consumed = mgr.consume_ticket(*id, "", ApprovalOrigin::kMcp, {});
     CHECK(!consumed.has_value());
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
@@ -401,9 +406,9 @@ TEST_CASE("ApprovalManager: consume_ticket replay is rejected and keeps the orig
     auto id = mgr.submit("mcp.quarantine_device", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
 
-    auto replay = mgr.consume_ticket(*id, "operator1", {});
+    auto replay = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!replay.has_value());
     CHECK(replay.error().kind == ConsumeFailure::kNotConsumable);
     auto row = mgr.get(*id);
@@ -490,7 +495,7 @@ TEST_CASE("ApprovalManager: an undeclared submit still records kUnspecified, and
     CHECK(row->origin == ApprovalOrigin::kUnspecified); // still recorded honestly, not folded
 
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    auto denied = mgr.consume_ticket(*id, "operator1", {});
+    auto denied = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!denied.has_value());
     CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin); // refused, not granted
     CHECK(mgr.get(*id)->consumed_at == 0);
@@ -563,7 +568,7 @@ TEST_CASE("ApprovalManager: a pre-v5 ticket cannot be redeemed at the MCP recall
     }
     REQUIRE(mgr.get(*id)->origin == ApprovalOrigin::kUnrecognised);
 
-    auto denied = mgr.consume_ticket(*id, "operator1", {});
+    auto denied = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!denied.has_value());
     CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin);
     CHECK(mgr.get(*id)->consumed_at == 0); // untouched — still evidence
@@ -585,7 +590,7 @@ TEST_CASE("ApprovalManager: a failing pre-consume recheck denies WITHOUT consumi
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
 
-    auto consumed = mgr.consume_ticket(*id, "operator1", [](const Approval&) {
+    auto consumed = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, [](const Approval&) {
         return std::expected<void, std::string>(
             std::unexpected("rotation t1 already resolved; mint a fresh ticket"));
     });
@@ -616,9 +621,9 @@ TEST_CASE("ApprovalManager: a ticket denied by the recheck is still consumable a
         return {};
     };
 
-    REQUIRE(!mgr.consume_ticket(*id, "operator1", recheck).has_value());
+    REQUIRE(!mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, recheck).has_value());
     drifted = false; // operator resolved the drift — the SAME ticket still works
-    REQUIRE(mgr.consume_ticket(*id, "operator1", recheck).has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, recheck).has_value());
 
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
@@ -638,6 +643,7 @@ TEST_CASE("ApprovalManager: the pre-consume recheck sees the matched ticket's ow
 
     Approval seen;
     auto consumed = mgr.consume_ticket(*id, "operator1",
+                                       ApprovalOrigin::kMcp,
                                        [&seen](const Approval& a) -> std::expected<void, std::string> {
                                            seen = a;
                                            return {};
@@ -659,7 +665,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
 
     // Replay by the SAME submitter, deliberately — a replay by a DIFFERENT
     // principal is refused earlier, by the #2442 submitter-binding check, as
@@ -668,6 +674,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     // foreign-submitter replay would never reach.
     bool ran = false;
     auto replay = mgr.consume_ticket(*id, "operator1",
+                                     ApprovalOrigin::kMcp,
                                      [&ran](const Approval&) -> std::expected<void, std::string> {
                                          ran = true;
                                          return {};
@@ -682,6 +689,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     REQUIRE(pending.has_value());
     ran = false; // reset per sub-case so a regression names WHICH one regressed
     auto on_pending = mgr.consume_ticket(*pending, "operator1",
+                                         ApprovalOrigin::kMcp,
                                          [&ran](const Approval&) -> std::expected<void, std::string> {
                                              ran = true;
                                              return {};
@@ -691,6 +699,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
 
     ran = false;
     auto absent = mgr.consume_ticket("does-not-exist", "operator1",
+                                     ApprovalOrigin::kMcp,
                                      [&ran](const Approval&) -> std::expected<void, std::string> {
                                          ran = true;
                                          return {};
@@ -700,7 +709,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     CHECK(!ran);
 }
 
-TEST_CASE("ApprovalManager: an empty precondition consumes exactly like the two-argument overload",
+TEST_CASE("ApprovalManager: an empty precondition consumes exactly like no precondition at all",
           "[pg][approval_manager][approval]") {
     yuzu::test::ApprovalManagerPg mgr_bundle;
     ApprovalManager& mgr = *mgr_bundle;
@@ -709,7 +718,7 @@ TEST_CASE("ApprovalManager: an empty precondition consumes exactly like the two-
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
-    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
     CHECK(row->consumed_by == "operator1");
@@ -726,6 +735,7 @@ TEST_CASE("ApprovalManager: a missing principal fails closed on the recheck over
 
     bool ran = false;
     auto consumed = mgr.consume_ticket(*id, "",
+                                       ApprovalOrigin::kMcp,
                                        [&ran](const Approval&) -> std::expected<void, std::string> {
                                            ran = true;
                                            return {};
@@ -757,8 +767,9 @@ TEST_CASE("ApprovalManager: the CAS still wins when the row is consumed during t
     // which is a different property than the one under test here.
     auto outer =
         mgr.consume_ticket(*id, "operator1",
+                           ApprovalOrigin::kMcp,
                            [&mgr, &id](const Approval&) -> std::expected<void, std::string> {
-                               (void)mgr.consume_ticket(*id, "operator1", {});
+                               (void)mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
                                return {};
                            });
     REQUIRE(!outer.has_value());
@@ -782,7 +793,7 @@ TEST_CASE("ApprovalManager: a throwing recheck denies without consuming and does
     // not leave a store method as an exception, and must not be reported as a
     // decision the callback never made.
     auto threw = mgr.consume_ticket(
-        *id, "operator1", [](const Approval&) -> std::expected<void, std::string> {
+        *id, "operator1", ApprovalOrigin::kMcp, [](const Approval&) -> std::expected<void, std::string> {
             throw std::runtime_error("rotation lookup failed");
         });
     REQUIRE(!threw.has_value());
@@ -797,6 +808,7 @@ TEST_CASE("ApprovalManager: a throwing recheck denies without consuming and does
     // A non-std throw takes the same path.
     auto odd = mgr.consume_ticket(
         *id, "operator1",
+        ApprovalOrigin::kMcp,
         [](const Approval&) -> std::expected<void, std::string> { throw 42; });
     REQUIRE(!odd.has_value());
     CHECK(odd.error().kind == ConsumeFailure::kStoreError);
@@ -827,6 +839,7 @@ TEST_CASE("ApprovalManager: a store failure during the recheck is not reported a
 
     bool ran = false;
     auto r = mgr.consume_ticket(*id, "operator1",
+                                ApprovalOrigin::kMcp,
                                 [&ran](const Approval&) -> std::expected<void, std::string> {
                                     ran = true;
                                     return {};
@@ -877,7 +890,7 @@ TEST_CASE("ApprovalManager: the recheck may read the store without deadlocking",
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
     auto consumed = mgr.consume_ticket(
-        *id, "operator1", [&mgr](const Approval& a) -> std::expected<void, std::string> {
+        *id, "operator1", ApprovalOrigin::kMcp, [&mgr](const Approval& a) -> std::expected<void, std::string> {
             (void)mgr.get(a.id);
             (void)mgr.pending_count();
             (void)mgr.query({});
@@ -983,7 +996,7 @@ TEST_CASE("ApprovalManager: approved-but-unconsumed tickets expire 7 days after 
     CHECK(row->status == "expired"); // the leaked capability token is dead
 
     // An expired ticket is no longer consumable.
-    auto consumed = mgr.consume_ticket(*id, "operator1", {});
+    auto consumed = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     CHECK(!consumed.has_value());
 }
 
@@ -1003,7 +1016,7 @@ TEST_CASE("ApprovalManager: an approved ticket past its TTL is refused AT CONSUM
     REQUIRE(row_before.has_value());
     REQUIRE(row_before->status == "approved"); // not swept
 
-    auto consumed = mgr.consume_ticket(*id, "operator1", {});
+    auto consumed = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!consumed.has_value());
     CHECK(consumed.error().kind == ConsumeFailure::kExpired);
     CHECK(std::string(consume_denial_reason(consumed.error().kind)) == "expired");
@@ -1020,7 +1033,7 @@ TEST_CASE("ApprovalManager: an approved ticket past its TTL is refused AT CONSUM
     // Once swept it is still refused, still as expired rather than "already used".
     REQUIRE(mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction)
                 .has_value());
-    auto swept = mgr.consume_ticket(*id, "operator1", {});
+    auto swept = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!swept.has_value());
     CHECK(swept.error().kind == ConsumeFailure::kExpired);
 }
@@ -1041,8 +1054,8 @@ TEST_CASE("ApprovalManager: consume expiry boundary -- inside the TTL consumes, 
     backdate(mgr_bundle.pool(), *fresh, "reviewed_at", 6 * 24 * 3600);
     backdate(mgr_bundle.pool(), *edge, "reviewed_at", kApprovalTicketTtlSeconds + 60);
 
-    CHECK(mgr.consume_ticket(*fresh, "operator1", {}).has_value());
-    auto refused = mgr.consume_ticket(*edge, "operator1", {});
+    CHECK(mgr.consume_ticket(*fresh, "operator1", ApprovalOrigin::kMcp, {}).has_value());
+    auto refused = mgr.consume_ticket(*edge, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!refused.has_value());
     CHECK(refused.error().kind == ConsumeFailure::kExpired);
 }
@@ -1087,7 +1100,7 @@ TEST_CASE("ApprovalManager: reviewed_at and consumed_at are written and fall ins
     REQUIRE(row.has_value());
     CHECK(row->reviewed_at >= before);
     CHECK(row->reviewed_at <= after);
-    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
     auto consumed = mgr.get(*id);
     REQUIRE(consumed.has_value());
     CHECK(consumed->consumed_at >= before);
@@ -1114,13 +1127,13 @@ TEST_CASE("ApprovalManager: an approved ticket reviewed in the future is not con
     backdate(mgr_bundle.pool(), *within, "reviewed_at", -100);
     backdate(mgr_bundle.pool(), *beyond, "reviewed_at", -3600);
 
-    auto far_r = mgr.consume_ticket(*far, "operator1", {});
+    auto far_r = mgr.consume_ticket(*far, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!far_r.has_value());
     CHECK(far_r.error().kind == ConsumeFailure::kExpired);
-    auto beyond_r = mgr.consume_ticket(*beyond, "operator1", {});
+    auto beyond_r = mgr.consume_ticket(*beyond, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!beyond_r.has_value());
     CHECK(beyond_r.error().kind == ConsumeFailure::kExpired);
-    CHECK(mgr.consume_ticket(*within, "operator1", {}).has_value());
+    CHECK(mgr.consume_ticket(*within, "operator1", ApprovalOrigin::kMcp, {}).has_value());
 
     // The refusals touched nothing.
     auto row = mgr.get(*far);
@@ -1164,7 +1177,7 @@ TEST_CASE("ApprovalManager: submit() sweep leaves live tickets of every age insi
     REQUIRE(a.has_value());
     CHECK(p->status == "pending");
     CHECK(a->status == "approved");
-    CHECK(mgr.consume_ticket(*approved, "operator1", {}).has_value());
+    CHECK(mgr.consume_ticket(*approved, "operator1", ApprovalOrigin::kMcp, {}).has_value());
 }
 
 namespace {
@@ -1175,11 +1188,11 @@ namespace {
 // ';' (so a ';' inside a SQL literal truncates a statement). The file has none of these; the
 // helper REQUIREs that no char-literal quote or raw string occurs so the day one is added this
 // fails loudly instead of silently mis-scanning.
-std::string approval_manager_code_without_comments() {
+std::string server_code_without_comments(const char* file) {
 #ifndef YUZU_SERVER_SRC_DIR
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
 #endif
-    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "approval_manager.cpp");
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / file);
     REQUIRE(in.is_open());
     const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     REQUIRE(src.find("'\"'") == std::string::npos);  // no '"' char literal
@@ -1221,6 +1234,10 @@ std::string approval_manager_code_without_comments() {
     return out;
 }
 
+std::string approval_manager_code_without_comments() {
+    return server_code_without_comments("approval_manager.cpp");
+}
+
 std::size_t count_occurrences(const std::string& hay, std::string_view needle) {
     std::size_t n = 0;
     for (auto pos = hay.find(needle); pos != std::string::npos; pos = hay.find(needle, pos + 1))
@@ -1239,51 +1256,88 @@ std::string statement_from(const std::string& code, std::string_view anchor) {
 }
 } // namespace
 
-// G8-QE-1 / R3-QE-1 (UP-3/UP-4 closure evidence). The skew defect cannot be simulated
-// in-process (the database clock is not injectable, and the behavioural tests above run both
-// clocks on one host), so this pins the CAUSE at the source: the review/consume stamps and
-// every expiry cutoff -- review, consume CAS, consume's expiry diagnostic, ticket_is_live(),
-// the shared liveness predicate and both submit() sweeps -- are authored in-SQL from
-// kDbNowEpochSql, and the process clock is read at exactly one documented place (submit()'s
-// submitted_at). Reusing submit_stamp_epoch() for reviewed_at, or adding a second clock read
-// of ANY spelling (the file-wide clock-API ban below), fails here.
-TEST_CASE("ApprovalManager: review and consume stamps and every expiry cutoff are authored "
-          "in-SQL from the database clock; the process clock is read at ONE site "
-          "(UP-3/UP-4 source tripwire)",
+namespace {
+// The banned-clock needle lists and the ONE matcher both tripwires below use, shared so the
+// positive control can exercise exactly what the real checks run. The haystacks are
+// lower-cased, so every needle must be lower case or it can never match.
+bool tripwire_matches(const std::string& lowercased_haystack, std::string_view needle) {
+    return lowercased_haystack.find(needle) != std::string::npos;
+}
+const std::vector<std::string_view>& approval_manager_banned_needles() {
+    static const std::vector<std::string_view> v = {
+        "system_clock", "steady_clock", "high_resolution_clock", "utc_clock", "tai_clock",
+        "gps_clock", "file_clock", "clock_gettime", "gettimeofday", "time_t", "std::time(",
+        "time(nullptr)", "time(null)", "time(0)", "time(&", "localtime", "gmtime", ".now(",
+        "now (", "clock(", "clock_timestamp", "current_timestamp", "statement_timestamp",
+        "transaction_timestamp", "localtimestamp"};
+    return v;
+}
+const std::vector<std::string_view>& schedule_path_banned_needles() {
+    static const std::vector<std::string_view> v = {
+        "steady_clock", "high_resolution_clock", "utc_clock", "tai_clock", "gps_clock",
+        "file_clock", "clock_gettime", "gettimeofday", "std::time(", "time(nullptr)",
+        "time(null)", "time(0)", "localtime", "gmtime"};
+    return v;
+}
+} // namespace
+
+// G8-QE-1 / R3-QE-1 (UP-3/UP-4 closure evidence), tightened by #6096. The skew defect cannot
+// be simulated in-process (the database clock is not injectable, and the behavioural tests
+// above run both clocks on one host), so this pins the CAUSE at the source: EVERY stamp and
+// cutoff -- submitted_at, reviewed_at, consumed_at (consume CAS and the schedule-origin
+// retire), the consume expiry diagnostic, ticket_is_live(), the shared liveness predicate and
+// both submit() sweeps -- is authored in-SQL from the database clock (kDbNowEpochSql, except
+// the consume liveness test, which uses kDbWallEpochSql: #6062 sg-6), and approval_manager.cpp
+// reads NO process clock at all. Adding a clock read of ANY spelling fails here.
+TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL from the database "
+          "clock; approval_manager.cpp reads no process clock (UP-3/UP-4/#6096 source tripwire)",
           "[approval_manager][approval]") {
     const std::string code = approval_manager_code_without_comments();
+    // Matching is case-insensitive: SQL is case-blind, so `NOW()` or `Current_Timestamp` must
+    // not slip past a lower-case ban. `code` keeps the original case for the named-statement
+    // lookups below, which anchor on camel-case identifiers.
+    std::string lc = code;
+    for (auto& ch : lc)
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
 
-    // (a) The process clock: ONE system_clock read (inside submit_stamp_epoch's body) and
-    // ONE submit_stamp_epoch call site (submit()'s submitted_at), plus the definition.
-    CHECK(count_occurrences(code, "system_clock::now") == 1);
-    CHECK(count_occurrences(code, "::now(") == 1); // no other clock's now() (R3-QE-1)
-    CHECK(count_occurrences(code, "submit_stamp_epoch(") == 2); // definition + the one call
-    // File-wide ban on every other way to read a clock from C++ code or SQL (R3-QE-1): a new
-    // process-clock cutoff cannot slip in under a spelling the exact-match checks above miss.
-    for (const std::string_view banned :
-         {"steady_clock", "high_resolution_clock", "utc_clock", "tai_clock", "gps_clock",
-          "file_clock", "clock_gettime", "gettimeofday", "time_t", "std::time(", "time(nullptr)",
-          "time(NULL)", "time(0)", "localtime", "gmtime", "clock_timestamp", "current_timestamp",
-          "statement_timestamp", "transaction_timestamp", "localtimestamp"}) {
+    // (a) No process clock. `::now(` catches every chrono clock; the list below catches every
+    // other way to read a clock from C++ code or SQL, so a new cutoff cannot slip in under a
+    // spelling an exact-match check would miss (R3-QE-1).
+    CHECK(count_occurrences(lc, "::now(") == 0);
+    CHECK(count_occurrences(lc, "submit_stamp_epoch") == 0);
+    // The haystack is lower-cased, so every needle must be lower case or it can never match.
+    for (const std::string_view banned : approval_manager_banned_needles()) {
         INFO("banned clock API: " << banned);
-        CHECK(code.find(banned) == std::string::npos);
+        CHECK(std::none_of(banned.begin(), banned.end(),
+                           [](unsigned char ch) { return std::isupper(ch) != 0; }));
+        // The one exemption (#6062 sg-6): the DATABASE's wall clock, spelled once, in
+        // kDbWallEpochSql, for the consume liveness test on a caller-held transaction, where
+        // `now()` is the transaction start. It is the same clock, not a per-replica one.
+        if (banned == "clock_timestamp")
+            continue;
+        CHECK_FALSE(tripwire_matches(lc, banned));
     }
-    // The one database clock: SQL `now()` appears only in kDbNowEpochSql's own definition
-    // (the C++ `system_clock::now()` call is the one "::now()" subtracted here).
-    CHECK(count_occurrences(code, "now()") - count_occurrences(code, "::now()") == 1);
+    CHECK(count_occurrences(lc, "clock_timestamp") == 1);
+    const auto db_wall_def = statement_from(code, "constexpr const char* kDbWallEpochSql");
+    REQUIRE_FALSE(db_wall_def.empty());
+    CHECK(db_wall_def.find("clock_timestamp()") != std::string::npos);
+    // The one database clock: SQL `now()` (any case) appears only in kDbNowEpochSql's own
+    // definition.
+    CHECK(count_occurrences(lc, "now()") == 1);
     const auto db_now_def = statement_from(code, "constexpr const char* kDbNowEpochSql");
     REQUIRE_FALSE(db_now_def.empty());
     CHECK(db_now_def.find("now()") != std::string::npos);
-    const auto submitted_at = statement_from(code, "const std::string submitted_at");
-    REQUIRE_FALSE(submitted_at.empty());
-    CHECK(submitted_at.find("submit_stamp_epoch(") != std::string::npos);
 
     // (b) The database clock: each stamp / cutoff statement names kDbNowEpochSql (directly or
-    // via the shared liveness predicate) and none of them can reach the process clock.
+    // via the shared liveness predicate).
     const auto review = statement_from(code, "const std::string review_sql");
     const auto consume = statement_from(code, "const std::string consume_sql");
+    const auto retire = statement_from(code, "const std::string retire_sql");
+    // The v2 migration's data UPDATE (#6096) is on the same clock and reads no process one.
+    const auto migration_v2 = statement_from(code, "UPDATE approvals SET consumed_at = ");
     const auto why = statement_from(code, "const std::string why_sql"); // consume's diagnostic
     const auto db_now = statement_from(code, "const std::string db_now");
+    const auto insert = statement_from(code, "const std::string insert_sql");
     const auto sweep_pending = statement_from(code, "const std::string sweep_pending_sql");
     const auto sweep_approved = statement_from(code, "const std::string sweep_approved_sql");
     const auto live_now = statement_from(code, "const std::string now =");
@@ -1293,57 +1347,393 @@ TEST_CASE("ApprovalManager: review and consume stamps and every expiry cutoff ar
         "const std::string sql = \"SELECT 1 FROM approval_manager.approvals WHERE id = $1 AND \"";
     CHECK(count_occurrences(code, kIsLiveAnchor) == 1);
     const auto is_live = statement_from(code, kIsLiveAnchor);
-    for (const auto* stmt : {&review, &consume, &why, &db_now, &sweep_pending, &sweep_approved,
-                             &live_now, &live_stmt, &is_live})
+    for (const auto* stmt : {&review, &consume, &retire, &migration_v2, &why, &db_now, &insert, &sweep_pending,
+                             &sweep_approved, &live_now, &live_stmt, &is_live})
         REQUIRE_FALSE(stmt->empty());
 
     CHECK(review.find("kDbNowEpochSql") != std::string::npos);   // reviewed_at
     CHECK(consume.find("kDbNowEpochSql") != std::string::npos);  // consumed_at
-    CHECK(consume.find("ticket_live_sql()") != std::string::npos);
-    CHECK(why.find("ticket_live_sql()") != std::string::npos);   // consume's expiry diagnostic
+    CHECK(retire.find("kDbNowEpochSql") != std::string::npos);   // consumed_at, schedule retire
+    CHECK(migration_v2.find("kDbNowEpochSql") != std::string::npos); // consumed_at, v2 migration
+    // Structural pin (not PG-gated): the v2 data step is bounded by a transaction-local 300 s
+    // statement timeout. migrations() is file-local, so pin the source text just before the
+    // UPDATE. (A behavioural check would need a table large enough to hit the timeout.)
+    {
+        const auto at = code.find("UPDATE approvals SET consumed_at = ");
+        REQUIRE(at != std::string::npos);
+        const auto from = at > 120 ? at - 120 : 0;
+        CHECK(code.substr(from, at - from).find("SET LOCAL statement_timeout = '300s';") !=
+              std::string::npos);
+    }
+    // The consume CAS and its diagnostic read test liveness on the wall clock (#6062 sg-6):
+    // both pass `true` to the shared predicate, so they cannot drift apart or back to `now()`.
+    constexpr std::string_view kLiveCall = "ticket_live_sql(";
+    for (const auto* stmt : {&consume, &why}) {
+        const auto at = stmt->find(kLiveCall);
+        REQUIRE(at != std::string::npos);
+        // The comment stripper leaves blanks where `/*wall_clock=*/` was; the first real
+        // token of the argument list must be `true`, not merely a `true` nearby.
+        const auto arg = stmt->find_first_not_of(" \t\r\n", at + kLiveCall.size());
+        REQUIRE(arg != std::string::npos);
+        CHECK(stmt->compare(arg, 5, "true)") == 0);
+    }
+    // The predicate itself: the parameter really selects the wall clock, the default is the
+    // transaction-start clock, and BOTH bounds are measured on the selected clock. Without
+    // this a swapped ternary, or a bound rewritten to name kDbNowEpochSql directly, would pass
+    // everything above on a machine with no Postgres (the behavioural test is PG-gated and
+    // covers only the lower bound).
+    CHECK(count_occurrences(code, "std::string ticket_live_sql(bool wall_clock = false) {") == 1);
+    CHECK(live_now.find("wall_clock ? kDbWallEpochSql : kDbNowEpochSql") != std::string::npos);
+    CHECK(count_occurrences(code, "kDbWallEpochSql") == 2); // its definition and that one use
+    CHECK(count_occurrences(code, "+ now +") == 2);         // the lower and the upper bound
     CHECK(is_live.find("ticket_live_sql()") != std::string::npos); // ticket_is_live()
     CHECK(db_now.find("kDbNowEpochSql") != std::string::npos);   // the pending-sweep cutoff
     CHECK(sweep_pending.find("db_now") != std::string::npos);
+    // submitted_at (#6096): the INSERT concatenates db_now into the VALUES list rather than
+    // binding a C++-authored value, so there is no `submitted_at` parameter left to stamp.
+    // The INSERT also carries #6062's three bound columns as the LAST parameters ($9..$11), so
+    // "no $9" no longer says this; the position does: db_now sits in the submitted_at slot
+    // (fifth VALUES entry, between submitted_by's $3 and the reviewed_by/at/comment literals).
+    CHECK(insert.find("db_now") != std::string::npos);
+    CHECK(insert.find("$3,\" + db_now + \",'',0,'',$4,") != std::string::npos);
     CHECK(live_now.find("kDbNowEpochSql") != std::string::npos); // the liveness predicate
     CHECK(live_stmt.find("ticket_live_sql()") != std::string::npos);
     CHECK(sweep_approved.find("live_sql") != std::string::npos); // approved sweep cutoff
-    for (const auto* stmt : {&review, &consume, &why, &db_now, &sweep_pending, &sweep_approved,
-                             &live_now, &live_stmt, &is_live}) {
-        CHECK(stmt->find("submit_stamp_epoch") == std::string::npos);
-        CHECK(stmt->find("system_clock") == std::string::npos);
-    }
 }
 
-// G8-QE-7. submitted_at is DELIBERATELY stamped from the process clock (not database time):
-// ScheduleRunner's occurrence anchor (ticket_is_current) compares it with ScheduleEngine's
-// process-clock last_executed_at/created_at, and moving only one side to database time would
-// make that comparison cross-clock (a spent ticket looking newer than its occurrence, one
-// approval firing more than once). The residual -- a schedule re-fire under process/database
-// skew -- is tracked in #6096. If you are changing this, you are changing that trade-off:
-// move ScheduleEngine's stamps in the same change and update this test consciously.
-TEST_CASE("ApprovalManager: submitted_at is deliberately process-clock stamped (#6096 residual)",
-          "[pg][approval_manager][approval]") {
-    const std::string code = approval_manager_code_without_comments();
-    const auto stamp = statement_from(code, "const std::string submitted_at");
-    REQUIRE_FALSE(stamp.empty());
-    CHECK(stamp.find("submit_stamp_epoch(") != std::string::npos);
-    CHECK(stamp.find("kDbNowEpochSql") == std::string::npos);
+// Positive control for both tripwires: a fixture holding EVERY needle must be matched by the
+// same matcher the real checks use, so a needle that can never match (a typo, an upper-case
+// letter against a lower-cased haystack) fails here instead of silently guarding nothing.
+TEST_CASE("Clock tripwires: every banned needle can actually match (positive control, #6096)",
+          "[approval_manager][approval][6096]") {
+    for (const auto* list : {&approval_manager_banned_needles(), &schedule_path_banned_needles()}) {
+        std::string fixture;
+        for (const std::string_view needle : *list) {
+            fixture += needle;
+            fixture += " ";
+        }
+        for (const std::string_view needle : *list) {
+            INFO("needle: " << needle);
+            CHECK(tripwire_matches(fixture, needle));
+            CHECK_FALSE(tripwire_matches(std::string("benign code"), needle));
+        }
+    }
+    // The matcher is case-sensitive over a lower-cased haystack, which is why the real tripwires
+    // lower-case first: an upper-case spelling in the source is only caught after lower-casing.
+    CHECK_FALSE(tripwire_matches("steady_clock", "STEADY_CLOCK"));
+}
 
+// #6096. The approval path's remaining process-clock reads are an allow-listed, documented
+// set, asserted by exact count so a new site fails loudly. ScheduleEngine's stamps
+// (created_at, last_executed_at, next_execution_at and the due-ness comparison) are
+// process-clock due-ness bookkeeping and are INFORMATIONAL for approvals now: no approval
+// decision compares a ticket's database-authored stamp with them. ScheduleRunner reads the
+// process clock only for the timestamp on its audit rows. If you are adding a read to either
+// file, decide consciously that it cannot feed an approval decision, then bump the count.
+TEST_CASE("Schedule path: the process-clock reads are an allow-listed, documented set "
+          "(#6096)",
+          "[approval_manager][approval][schedule]") {
+    const std::string runner = server_code_without_comments("schedule_runner.cpp");
+    const std::string engine = server_code_without_comments("schedule_engine.cpp");
+
+    // Runner: exactly one clock read (now_epoch(), used only by audit()), called once.
+    CHECK(count_occurrences(runner, "::now(") == 1);
+    CHECK(count_occurrences(runner, "system_clock::now") == 1);
+    CHECK(count_occurrences(runner, "now_epoch(") == 2); // definition + audit()'s timestamp
+    // Engine: exactly one clock read (now_epoch()), called at its four due-ness stamp sites
+    // (next-due computation, create's created_at, evaluate_due, advance's last_executed_at).
+    CHECK(count_occurrences(engine, "::now(") == 1);
+    CHECK(count_occurrences(engine, "system_clock::now") == 1);
+    CHECK(count_occurrences(engine, "now_epoch(") == 5); // definition + four stamp sites
+    // Case-insensitive, like the approval_manager.cpp tripwire above.
+    auto lower = [](std::string text) {
+        for (auto& ch : text)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        return text;
+    };
+    const std::string runner_lc = lower(runner);
+    const std::string engine_lc = lower(engine);
+    for (const std::string_view banned : schedule_path_banned_needles())
+        CHECK(std::none_of(banned.begin(), banned.end(),
+                           [](unsigned char ch) { return std::isupper(ch) != 0; }));
+    for (const auto* code : {&runner_lc, &engine_lc})
+        for (const std::string_view banned : schedule_path_banned_needles()) {
+            INFO("banned clock API: " << banned);
+            CHECK_FALSE(tripwire_matches(*code, banned));
+        }
+    // The runner no longer compares a ticket stamp with a schedule stamp at all.
+    CHECK(runner.find("ticket_is_current") == std::string::npos);
+    CHECK(runner.find("submitted_at") == std::string::npos);
+}
+
+// #6096: submitted_at is authored by the DATABASE in submit(), the same clock as every other
+// stamp. The database clock is not injectable, so assert the origin directly: read the
+// database's own clock on a second connection immediately before and after the submit and
+// require the stored stamp inside that window. PLAIN STATEMENT OF THE LIMIT: on one host a
+// process-clock stamp would also fall inside this window, so THIS test cannot fail on the
+// defect; the source tripwire above (zero process-clock reads in approval_manager.cpp, the
+// INSERT binds no submitted_at parameter) is the guard. This test pins only the observable
+// behaviour and that the stamp is within the database's reading of `now()`.
+TEST_CASE("ApprovalManager: submitted_at is authored by the database clock (#6096)",
+          "[pg][approval_manager][approval][6096]") {
     yuzu::test::ApprovalManagerPg mgr_bundle;
     ApprovalManager& mgr = *mgr_bundle;
-    auto epoch = [] {
-        return std::chrono::duration_cast<std::chrono::seconds>(
-                   std::chrono::system_clock::now().time_since_epoch())
-            .count();
+    auto db_epoch = [&] {
+        yuzu::server::pg::PgConn conn{PQconnectdb(mgr_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{
+            PQexec(conn.get(), "SELECT EXTRACT(EPOCH FROM now())::bigint")};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return static_cast<int64_t>(std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10));
     };
-    const int64_t before = epoch();
+    const int64_t before = db_epoch();
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
-    const int64_t after = epoch();
+    const int64_t after = db_epoch();
     REQUIRE(id.has_value());
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
     CHECK(row->submitted_at >= before);
     CHECK(row->submitted_at <= after);
+}
+
+// #6096: the schedule-origin retire settles every unsettled approved/rejected ticket of ONE
+// schedule, by a guarded UPDATE on consumed_at = 0.
+TEST_CASE("ApprovalManager::retire_schedule_tickets: settles a schedule's unsettled "
+          "approved and rejected tickets, once",
+          "[pg][approval_manager][approval][6096]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+    auto mint = [&](const std::string& schedule_id) {
+        auto id = mgr.submit("def-1", "operator1", "scope", schedule_id, ApprovalOrigin::kSchedule,
+                             "procs", "list");
+        REQUIRE(id.has_value());
+        return *id;
+    };
+    auto db_epoch = [&] {
+        yuzu::server::pg::PgConn conn{PQconnectdb(mgr_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(conn.get(), "SELECT EXTRACT(EPOCH FROM now())::bigint")};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return static_cast<int64_t>(std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10));
+    };
+
+    SECTION("approved and rejected are retired, pending and other schedules are not") {
+        const auto approved = mint("sched-a");
+        const auto rejected = mint("sched-a");
+        const auto pending = mint("sched-a");
+        const auto other = mint("sched-b");
+        REQUIRE(mgr.approve(approved, "boss", "ok").has_value());
+        REQUIRE(mgr.reject(rejected, "boss", "no").has_value());
+        REQUIRE(mgr.approve(other, "boss", "ok").has_value());
+
+        const int64_t before = db_epoch();
+        auto n = mgr.retire_schedule_tickets("sched-a", "sched-a:42",
+                                             {approved, rejected, pending, other});
+        const int64_t after = db_epoch();
+        REQUIRE(n.has_value());
+        CHECK(*n == 2);
+
+        for (const auto& id : {approved, rejected}) {
+            auto row = mgr.get(id);
+            REQUIRE(row.has_value());
+            CHECK(row->consumed_at >= before); // database time
+            CHECK(row->consumed_at <= after);
+            CHECK(row->consumed_by == "schedule:sched-a:42"); // never empty
+        }
+        CHECK(mgr.get(approved)->status == "approved"); // status is untouched
+        CHECK(mgr.get(rejected)->status == "rejected");
+        CHECK(mgr.get(pending)->consumed_at == 0);
+        CHECK(mgr.get(pending)->status == "pending");
+        CHECK(mgr.get(other)->consumed_at == 0);
+
+        auto again = mgr.retire_schedule_tickets("sched-a", "sched-a:43",
+                                                 {approved, rejected, pending, other});
+        REQUIRE(again.has_value());
+        CHECK(*again == 0); // a repeat is not an error and rewrites nothing
+        CHECK(mgr.get(approved)->consumed_by == "schedule:sched-a:42");
+    }
+
+    SECTION("nothing to retire is 0, not an error") {
+        auto n = mgr.retire_schedule_tickets("sched-none", "sched-none:1", {"no-such-id"});
+        REQUIRE(n.has_value());
+        CHECK(*n == 0);
+    }
+
+    SECTION("an interactive ticket (empty schedule id) is never matched") {
+        auto id = mgr.submit("def-1", "operator1", "scope", "", ApprovalOrigin::kInstruction);
+        REQUIRE(id.has_value());
+        REQUIRE(mgr.approve(*id, "boss", "ok").has_value());
+        CHECK_FALSE(mgr.retire_schedule_tickets("", "x:1", {*id}).has_value()); // refused outright
+        CHECK(mgr.get(*id)->consumed_at == 0);
+    }
+
+    SECTION("only the observed ids are settled; empty ids touch nothing") {
+        const auto seen = mint("sched-a");
+        const auto later = mint("sched-a"); // approved after the caller's snapshot
+        REQUIRE(mgr.approve(seen, "boss", "ok").has_value());
+        REQUIRE(mgr.approve(later, "boss", "ok").has_value());
+
+        auto none = mgr.retire_schedule_tickets("sched-a", "sched-a:1", {});
+        REQUIRE(none.has_value());
+        CHECK(*none == 0);
+        CHECK(mgr.get(seen)->consumed_at == 0);
+
+        auto n = mgr.retire_schedule_tickets("sched-a", "sched-a:1", {seen});
+        REQUIRE(n.has_value());
+        CHECK(*n == 1);
+        CHECK(mgr.get(seen)->consumed_at != 0);
+        CHECK(mgr.get(later)->consumed_at == 0); // a stale caller cannot settle a successor
+
+        // A stale replica re-running the same retire cannot settle it either.
+        auto stale = mgr.retire_schedule_tickets("sched-a", "sched-a:1", {seen});
+        REQUIRE(stale.has_value());
+        CHECK(*stale == 0);
+        CHECK(mgr.get(later)->consumed_at == 0);
+    }
+
+    SECTION("ids are escaped, not interpreted") {
+        const auto id = mint("sched-a");
+        REQUIRE(mgr.approve(id, "boss", "ok").has_value());
+        auto n = mgr.retire_schedule_tickets("sched-a", "sched-a:1",
+                                             {"a\"b", "c\\d", "e,f", "{g}", id});
+        REQUIRE(n.has_value()); // no SQL error from hostile element text
+        CHECK(*n == 1);
+        CHECK(mgr.get(id)->consumed_at != 0);
+    }
+
+    SECTION("consumed_by is never written empty") {
+        CHECK_FALSE(mgr.retire_schedule_tickets("sched-a", "", {"x"}).has_value());
+        CHECK_FALSE(mgr.retire_schedule_tickets("", "sched-a:1", {"x"}).has_value());
+    }
+
+    SECTION("concurrent callers retire each ticket exactly once between them") {
+        std::vector<std::string> ids;
+        for (int i = 0; i < 5; ++i) {
+            ids.push_back(mint("sched-a"));
+            REQUIRE(mgr.approve(ids.back(), "boss", "ok").has_value());
+        }
+        std::atomic<int> total{0};
+        std::atomic<int> errors{0};
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 4; ++i)
+            threads.emplace_back([&, i] {
+                auto r = mgr.retire_schedule_tickets("sched-a", "sched-a:" + std::to_string(i), ids);
+                if (!r)
+                    ++errors;
+                else
+                    total += *r;
+            });
+        for (auto& t : threads)
+            t.join();
+        CHECK(errors.load() == 0);
+        CHECK(total.load() == 5);
+    }
+
+    SECTION("a store failure is an error, not 0") {
+        pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                                .size = 1,
+                                .connect_timeout_s = 1}};
+        ApprovalManager dead{unreachable};
+        CHECK_FALSE(dead.is_open());
+        CHECK_FALSE(dead.retire_schedule_tickets("x", "x:1", {"a"}).has_value());
+    }
+
+    SECTION("consume_ticket still refuses a schedule-origin ticket") {
+        const auto id = mint("sched-a");
+        REQUIRE(mgr.approve(id, "boss", "ok").has_value());
+        // consume_ticket now takes the surface the CALLER redeems for (#6062). The MCP recall
+        // is the only production caller and declares kMcp; a schedule-origin ticket is not
+        // an MCP ticket. An undeclared surface (kUnspecified) refuses whatever the row says.
+        for (const auto declared : {ApprovalOrigin::kMcp, ApprovalOrigin::kUnspecified}) {
+            auto c = mgr.consume_ticket(id, "operator1", declared, {});
+            REQUIRE_FALSE(c.has_value());
+            CHECK(c.error().kind == ConsumeFailure::kForeignOrigin);
+            CHECK(mgr.get(id)->consumed_at == 0);
+        }
+    }
+}
+
+// #6096: consuming a schedule ticket must not change what the REST/MCP list routes emit.
+TEST_CASE("approval_row_json: the list shape is unchanged by settling a schedule ticket (#6096)",
+          "[pg][approval_manager][approval][6096]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+    auto id = mgr.submit("def-1", "operator1", "scope", "sched-a", ApprovalOrigin::kSchedule,
+                         "procs", "list");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "boss", "ok").has_value());
+    const auto before = approval_row_json(*mgr.get(*id));
+    REQUIRE(mgr.retire_schedule_tickets("sched-a", "sched-a:1", {*id}).has_value());
+    const auto after = approval_row_json(*mgr.get(*id));
+    CHECK(before == after);
+    CHECK(after.size() == 9);
+    CHECK_FALSE(after.contains("consumed_at"));
+    CHECK_FALSE(after.contains("consumed_by"));
+}
+
+// #6096: the v2 migration retires every pre-upgrade unsettled schedule ticket, once, with no
+// clock comparison. Seed a database at v1 (schema-qualified copy of the v1 DDL, the
+// test_access_review_store.cpp technique), then let the real constructor run the runner.
+TEST_CASE("ApprovalManager: the v2 migration retires pre-upgrade schedule tickets only (#6096)",
+          "[pg][approval_manager][approval][6096]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult setup{PQexec(
+            conn.get(),
+            "CREATE TABLE public.schema_meta (store TEXT PRIMARY KEY, version INTEGER NOT NULL, "
+            "  upgraded_at BIGINT NOT NULL);"
+            "CREATE SCHEMA approval_manager;"
+            "CREATE TABLE approval_manager.approvals ("
+            "  id TEXT PRIMARY KEY, definition_id TEXT NOT NULL,"
+            "  status TEXT NOT NULL DEFAULT 'pending', submitted_by TEXT NOT NULL DEFAULT '',"
+            "  submitted_at BIGINT NOT NULL DEFAULT 0, reviewed_by TEXT NOT NULL DEFAULT '',"
+            "  reviewed_at BIGINT NOT NULL DEFAULT 0, review_comment TEXT NOT NULL DEFAULT '',"
+            "  scope_expression TEXT NOT NULL DEFAULT '', consumed_at BIGINT NOT NULL DEFAULT 0,"
+            "  consumed_by TEXT NOT NULL DEFAULT '', schedule_id TEXT NOT NULL DEFAULT '',"
+            "  origin TEXT NOT NULL DEFAULT '', target_plugin TEXT NOT NULL DEFAULT '',"
+            "  target_action TEXT NOT NULL DEFAULT '');"
+            "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+            "  VALUES ('approval_manager', 1, extract(epoch FROM now())::bigint);"
+            // approved + rejected schedule tickets (unsettled), a pending one, an already
+            // settled one, an interactive approved one, and an MCP-origin approved one.
+            "INSERT INTO approval_manager.approvals (id, definition_id, status, schedule_id, "
+            "  consumed_at, consumed_by, origin) VALUES "
+            "('s-approved','d','approved','sched-a',0,'','schedule'),"
+            "('s-rejected','d','rejected','sched-a',0,'','schedule'),"
+            "('s-pending','d','pending','sched-a',0,'','schedule'),"
+            "('s-settled','d','approved','sched-a',123,'someone','schedule'),"
+            "('i-approved','d','approved','',0,'','instruction'),"
+            "('m-approved','d','approved','',0,'','mcp');")};
+        REQUIRE(setup.ok());
+    }
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ApprovalManager mgr{pool};
+    REQUIRE(mgr.is_open());
+
+    for (const char* id : {"s-approved", "s-rejected"}) {
+        auto row = mgr.get(id);
+        REQUIRE(row.has_value());
+        CHECK(row->consumed_at != 0);
+        CHECK(row->consumed_by == "schedule:legacy-6096");
+        CHECK(row->status == (std::string(id) == "s-approved" ? "approved" : "rejected"));
+    }
+    CHECK(mgr.get("s-pending")->consumed_at == 0);
+    CHECK(mgr.get("s-settled")->consumed_at == 123);
+    CHECK(mgr.get("s-settled")->consumed_by == "someone");
+    CHECK(mgr.get("i-approved")->consumed_at == 0);
+    CHECK(mgr.get("m-approved")->consumed_at == 0);
+
+    // Idempotent and once per database: a second construction at v2 does not run it again, and
+    // a ticket settled after the migration is left alone.
+    auto fresh = mgr.submit("d", "op", "", "sched-a", ApprovalOrigin::kSchedule, "p", "a");
+    REQUIRE(fresh.has_value());
+    REQUIRE(mgr.approve(*fresh, "boss", "ok").has_value());
+    ApprovalManager again{pool};
+    REQUIRE(again.is_open());
+    CHECK(again.get(*fresh)->consumed_at == 0);
 }
 
 TEST_CASE("ApprovalManager::ticket_is_live: the shared liveness predicate",
@@ -1369,7 +1759,7 @@ TEST_CASE("ApprovalManager::ticket_is_live: the shared liveness predicate",
     CHECK_FALSE(*mgr.ticket_is_live(*id));
 
     // Agrees with consume_ticket on the same row (the point of sharing it).
-    auto refused = mgr.consume_ticket(*id, "operator1", {});
+    auto refused = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!refused.has_value());
     CHECK(refused.error().kind == ConsumeFailure::kExpired);
 
@@ -1380,7 +1770,7 @@ TEST_CASE("ApprovalManager::ticket_is_live: the shared liveness predicate",
     auto used = mgr.submit("mcp.delete_tag", "operator1", "{ }", "", ApprovalOrigin::kMcp);
     REQUIRE(used.has_value());
     REQUIRE(mgr.approve(*used, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*used, "operator1", {}).has_value());
+    REQUIRE(mgr.consume_ticket(*used, "operator1", ApprovalOrigin::kMcp, {}).has_value());
     CHECK_FALSE(*mgr.ticket_is_live(*used));
 }
 
@@ -1393,14 +1783,14 @@ TEST_CASE("ApprovalManager: an unconsumable, non-expired ticket is still kNotCon
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     // Still pending: not approved, not expired.
-    auto pending = mgr.consume_ticket(*id, "operator1", {});
+    auto pending = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!pending.has_value());
     CHECK(pending.error().kind == ConsumeFailure::kNotConsumable);
     // Replay of a consumed one: also not expired, even when old (consumed rows are history).
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
     backdate(mgr_bundle.pool(), *id, "reviewed_at", k8Days);
-    auto replay = mgr.consume_ticket(*id, "operator1", {});
+    auto replay = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!replay.has_value());
     CHECK(replay.error().kind == ConsumeFailure::kNotConsumable);
 }
@@ -1413,7 +1803,7 @@ TEST_CASE("ApprovalManager: consumed tickets are history, never expired",
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
     backdate(mgr_bundle.pool(), *id, "reviewed_at", k8Days);
 
     REQUIRE(mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction)
@@ -1447,7 +1837,7 @@ TEST_CASE("ApprovalManager: a ticket minted by a declared non-MCP surface cannot
     REQUIRE(mgr.approve(*forged, "admin1", "").has_value());
 
     // The redemption is where it dies. This is the MCP recall's call shape.
-    auto redeemed = mgr.consume_ticket(*forged, "attacker", {});
+    auto redeemed = mgr.consume_ticket(*forged, "attacker", ApprovalOrigin::kMcp, {});
     REQUIRE(!redeemed.has_value());
 
     // And the ticket is UNTOUCHED — a refused forgery must not burn it.
@@ -1462,7 +1852,7 @@ TEST_CASE("ApprovalManager: a ticket minted by a declared non-MCP surface cannot
                             ApprovalOrigin::kSchedule);
     REQUIRE(sched.has_value());
     REQUIRE(mgr.approve(*sched, "admin1", "").has_value());
-    CHECK(!mgr.consume_ticket(*sched, "attacker", {}).has_value());
+    CHECK(!mgr.consume_ticket(*sched, "attacker", ApprovalOrigin::kMcp, {}).has_value());
     CHECK(mgr.get(*sched)->consumed_at == 0);
 }
 
@@ -1476,7 +1866,7 @@ TEST_CASE("ApprovalManager: the redemption refusal is a distinct kind but not a 
     REQUIRE(forged.has_value());
     REQUIRE(mgr.approve(*forged, "admin1", "").has_value());
 
-    auto denied = mgr.consume_ticket(*forged, "attacker", {});
+    auto denied = mgr.consume_ticket(*forged, "attacker", ApprovalOrigin::kMcp, {});
     REQUIRE(!denied.has_value());
     // The KIND separates a forgery attempt from a replay, so the log and any
     // future audit row can tell them apart.
@@ -1488,8 +1878,8 @@ TEST_CASE("ApprovalManager: the redemption refusal is a distinct kind but not a 
     auto spent = mgr.submit("inventory.audit", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(spent.has_value());
     REQUIRE(mgr.approve(*spent, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*spent, "operator1", {}).has_value()); // first use succeeds
-    auto replay = mgr.consume_ticket(*spent, "operator1", {});    // second does not
+    REQUIRE(mgr.consume_ticket(*spent, "operator1", ApprovalOrigin::kMcp, {}).has_value()); // first use succeeds
+    auto replay = mgr.consume_ticket(*spent, "operator1", ApprovalOrigin::kMcp, {});    // second does not
     REQUIRE(!replay.has_value());
     CHECK(replay.error().kind == ConsumeFailure::kNotConsumable);
     CHECK(denied.error().message == replay.error().message);
@@ -1506,7 +1896,7 @@ TEST_CASE("ApprovalManager: an MCP-minted ticket under the reserved prefix still
                                ApprovalOrigin::kMcp);
     REQUIRE(declared.has_value());
     REQUIRE(mgr.approve(*declared, "admin1", "").has_value());
-    CHECK(mgr.consume_ticket(*declared, "operator1", {}).has_value());
+    CHECK(mgr.consume_ticket(*declared, "operator1", ApprovalOrigin::kMcp, {}).has_value());
     CHECK(mgr.get(*declared)->consumed_at != 0);
 
     // The undeclared mint used to be what the frozen MCP gate actually did,
@@ -1531,7 +1921,7 @@ TEST_CASE("ApprovalManager: an ordinary non-MCP ticket is refused at redemption 
     auto rest = mgr.submit("inventory.audit", "operator1", "{}", "", ApprovalOrigin::kInstruction);
     REQUIRE(rest.has_value());
     REQUIRE(mgr.approve(*rest, "admin1", "").has_value());
-    auto denied = mgr.consume_ticket(*rest, "operator1", {});
+    auto denied = mgr.consume_ticket(*rest, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!denied.has_value());
     CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin);
     CHECK(mgr.get(*rest)->consumed_at == 0);
@@ -1555,7 +1945,7 @@ TEST_CASE("ApprovalManager: a ticket recalls for the principal it was submitted 
                          ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    CHECK(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    CHECK(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
     CHECK(mgr.get(*id)->consumed_by == "operator1");
 }
 
@@ -1575,7 +1965,7 @@ TEST_CASE("ApprovalManager: a ticket recalled by a different principal is refuse
     // The scenario this closes: operator2 read operator1's ticket id off
     // GET /api/approvals (Approval:Read, seeded to Viewer) and also holds the
     // target tool's own RBAC permission.
-    auto redeemed = mgr.consume_ticket(*id, "operator2", {});
+    auto redeemed = mgr.consume_ticket(*id, "operator2", ApprovalOrigin::kMcp, {});
     REQUIRE(!redeemed.has_value());
     CHECK(redeemed.error().kind == ConsumeFailure::kForeignSubmitter);
     // Same message as every other "not consumable" outcome — see
@@ -1601,15 +1991,15 @@ TEST_CASE("ApprovalManager: the foreign-submitter refusal is a distinct kind but
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    auto denied = mgr.consume_ticket(*id, "operator2", {});
+    auto denied = mgr.consume_ticket(*id, "operator2", ApprovalOrigin::kMcp, {});
     REQUIRE(!denied.has_value());
     CHECK(denied.error().kind == ConsumeFailure::kForeignSubmitter);
 
     auto spent = mgr.submit("mcp.quarantine_device", "operator3", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(spent.has_value());
     REQUIRE(mgr.approve(*spent, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*spent, "operator3", {}).has_value()); // first use succeeds
-    auto replay = mgr.consume_ticket(*spent, "operator3", {});        // second does not
+    REQUIRE(mgr.consume_ticket(*spent, "operator3", ApprovalOrigin::kMcp, {}).has_value()); // first use succeeds
+    auto replay = mgr.consume_ticket(*spent, "operator3", ApprovalOrigin::kMcp, {});        // second does not
     REQUIRE(!replay.has_value());
     CHECK(replay.error().kind == ConsumeFailure::kNotConsumable);
     CHECK(denied.error().message == replay.error().message);
@@ -1634,7 +2024,7 @@ TEST_CASE("ApprovalManager: a ticket wrong on BOTH origin and submitter reports 
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
-    auto denied = mgr.consume_ticket(*id, "operator2", {});
+    auto denied = mgr.consume_ticket(*id, "operator2", ApprovalOrigin::kMcp, {});
     REQUIRE(!denied.has_value());
     CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin);
     CHECK(denied.error().message == kNotConsumableMessage);
@@ -1673,7 +2063,7 @@ TEST_CASE("ApprovalManager: a store fault AT the binding check masks a foreign-s
                             std::vector<std::string>{})
                 .status() == PGRES_COMMAND_OK);
 
-    auto faulted = mgr.consume_ticket(*id, "operator2", {});
+    auto faulted = mgr.consume_ticket(*id, "operator2", ApprovalOrigin::kMcp, {});
     REQUIRE(!faulted.has_value());
     CHECK(faulted.error().kind == ConsumeFailure::kStoreError);
     CHECK(faulted.error().sqlstate == "55P03");
@@ -1685,7 +2075,7 @@ TEST_CASE("ApprovalManager: a store fault AT the binding check masks a foreign-s
 
     CHECK(mgr.get(*id)->consumed_at == 0); // untouched
 
-    auto cleared = mgr.consume_ticket(*id, "operator2", {});
+    auto cleared = mgr.consume_ticket(*id, "operator2", ApprovalOrigin::kMcp, {});
     REQUIRE(!cleared.has_value());
     CHECK(cleared.error().kind == ConsumeFailure::kForeignSubmitter);
     CHECK(!cleared.error().binding_check_unevaluated);
@@ -1693,7 +2083,7 @@ TEST_CASE("ApprovalManager: a store fault AT the binding check masks a foreign-s
 
     // And the rightful submitter can still redeem it — the fault and the
     // forged recall attempt did not burn the ticket.
-    CHECK(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    CHECK(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
 }
 
 TEST_CASE("ApprovalManager: an empty precondition consumes with no precondition supplied",
@@ -1705,7 +2095,7 @@ TEST_CASE("ApprovalManager: an empty precondition consumes with no precondition 
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
-    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {}).has_value());
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
     CHECK(row->consumed_by == "operator1");
@@ -1722,6 +2112,7 @@ TEST_CASE("ApprovalManager: a missing principal fails closed on the recheck path
 
     bool ran = false;
     auto consumed = mgr.consume_ticket(*id, "",
+                                       ApprovalOrigin::kMcp,
                                        [&ran](const Approval&) -> std::expected<void, std::string> {
                                            ran = true;
                                            return {};
@@ -1764,7 +2155,7 @@ TEST_CASE("ApprovalManager: a store failure is not reported as spent in the mess
         REQUIRE(res.status() == PGRES_COMMAND_OK);
     }
 
-    auto flat = mgr.consume_ticket(*id, "operator1", {});
+    auto flat = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!flat.has_value());
     // The property that matters is the negative: it must NOT read as spent, or
     // an operator is told to discard a live human-approved capability. (The
@@ -1791,7 +2182,7 @@ TEST_CASE("ApprovalManager: an unrecognised origin column value is refused, not 
     CHECK(approval_origin_from_string("mcp") == ApprovalOrigin::kMcp);
     CHECK(approval_origin_from_string("MCP") == ApprovalOrigin::kUnrecognised); // case-sensitive
     CHECK(approval_origin_from_string("nonsense") == ApprovalOrigin::kUnrecognised);
-    CHECK(declares_non_mcp_surface(ApprovalOrigin::kUnrecognised));
+    CHECK_FALSE(origin_redeemable_as(ApprovalOrigin::kUnrecognised, ApprovalOrigin::kMcp));
 
     // End to end: a row written by a newer binary, read back by this one.
     yuzu::test::ApprovalManagerPg mgr_bundle;
@@ -1808,7 +2199,7 @@ TEST_CASE("ApprovalManager: an unrecognised origin column value is refused, not 
         REQUIRE(res.status() == PGRES_COMMAND_OK);
     }
 
-    auto denied = mgr.consume_ticket(*id, "operator1", {});
+    auto denied = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!denied.has_value());
     CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin);
     CHECK(mgr.get(*id)->consumed_at == 0);
@@ -1951,7 +2342,7 @@ TEST_CASE("ApprovalManager: a genuinely transient fault at the origin check is f
                             std::vector<std::string>{})
                 .status() == PGRES_COMMAND_OK);
 
-    auto faulted = mgr.consume_ticket(*forged, "attacker", {});
+    auto faulted = mgr.consume_ticket(*forged, "attacker", ApprovalOrigin::kMcp, {});
     REQUIRE(!faulted.has_value());
     CHECK(faulted.error().kind == ConsumeFailure::kStoreError);
     CHECK(faulted.error().sqlstate == "55P03");
@@ -1970,7 +2361,7 @@ TEST_CASE("ApprovalManager: a genuinely transient fault at the origin check is f
 
     // Once the fault clears, the forgery signal is NOT lost: the same ticket
     // now correctly reports kForeignOrigin, not a repeat of kStoreError.
-    auto cleared = mgr.consume_ticket(*forged, "attacker", {});
+    auto cleared = mgr.consume_ticket(*forged, "attacker", ApprovalOrigin::kMcp, {});
     REQUIRE(!cleared.has_value());
     CHECK(cleared.error().kind == ConsumeFailure::kForeignOrigin);
     CHECK(!cleared.error().binding_check_unevaluated);
@@ -2015,7 +2406,7 @@ TEST_CASE("ApprovalManager: a CAS-step fault after a passing binding check does 
         REQUIRE(trig.status() == PGRES_COMMAND_OK);
     }
 
-    auto faulted = mgr.consume_ticket(*id, "operator1", {});
+    auto faulted = mgr.consume_ticket(*id, "operator1", ApprovalOrigin::kMcp, {});
     REQUIRE(!faulted.has_value());
     CHECK(faulted.error().kind == ConsumeFailure::kStoreError);
     CHECK(!faulted.error().sqlstate.empty());

@@ -3,6 +3,10 @@
 
 #include "hardware_list_model.hpp"
 
+#include "tag_store.hpp" // TagStore::validate_key - the .cpp only; the header stays store-free (#6558)
+
+#include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -248,6 +252,133 @@ std::optional<HardwareListQuery> normalise_hardware_query(HardwareListQuery raw)
     q.limit = std::clamp<std::size_t>(q.limit == 0 ? 50 : q.limit, 1, 200);
     // offset is clamped against the actual result size later, in build_hardware_list_page.
     return q;
+}
+
+namespace {
+
+constexpr std::size_t kHwArgTextMax = 256; // q / tag, matching the MCP input schema maxLength
+
+// A string-typed argument: absent leaves `out` untouched; a non-string, or one over `max_len`
+// bytes, is a refusal.
+bool take_string_arg(const nlohmann::json& args, const char* key, std::size_t max_len,
+                     std::string& out, std::string* why) {
+    const auto it = args.find(key);
+    if (it == args.end())
+        return true;
+    if (!it->is_string() || it->get_ref<const std::string&>().size() > max_len) {
+        if (why)
+            *why = std::string(key) + " must be a string of at most " + std::to_string(max_len) + " bytes";
+        return false;
+    }
+    out = it->get<std::string>();
+    return true;
+}
+
+// An enum-typed argument: absent leaves `out` untouched; anything but exactly one of `allowed`
+// (case-sensitive: the schema enum is lowercase) is a refusal.
+template <std::size_t N>
+bool take_enum_arg(const nlohmann::json& args, const char* key,
+                   const std::array<std::string_view, N>& allowed, std::string& out, std::string* why) {
+    const auto it = args.find(key);
+    if (it == args.end())
+        return true;
+    if (it->is_string()) {
+        const auto& v = it->get_ref<const std::string&>();
+        if (std::find(allowed.begin(), allowed.end(), std::string_view(v)) != allowed.end()) {
+            out = v;
+            return true;
+        }
+    }
+    if (why)
+        *why = std::string(key) + " is not one of the documented values";
+    return false;
+}
+
+// An integer-typed argument bounded to [lo, hi]. JSON integers only: "50", 50.0, true and null
+// are refusals, as is anything outside the bounds (never clamped).
+bool take_int_arg(const nlohmann::json& args, const char* key, std::uint64_t lo, std::uint64_t hi,
+                  std::size_t& out, std::string* why) {
+    const auto it = args.find(key);
+    if (it == args.end())
+        return true;
+    bool ok = it->is_number_integer();
+    std::uint64_t v = 0;
+    if (ok) {
+        if (it->is_number_unsigned()) {
+            v = it->get<std::uint64_t>();
+        } else {
+            const auto signed_v = it->get<std::int64_t>();
+            ok = signed_v >= 0;
+            if (ok)
+                v = static_cast<std::uint64_t>(signed_v);
+        }
+    }
+    if (!ok || v < lo || v > hi) {
+        if (why)
+            *why = std::string(key) + " must be an integer from " + std::to_string(lo) + " to " +
+                   std::to_string(hi);
+        return false;
+    }
+    out = static_cast<std::size_t>(v);
+    return true;
+}
+
+} // namespace
+
+std::optional<HardwareListQuery> hardware_query_from_args(const nlohmann::json& args, std::string* why) {
+    if (!args.is_object()) {
+        if (why)
+            *why = "arguments must be an object";
+        return std::nullopt;
+    }
+    HardwareListQuery q;
+    constexpr std::array<std::string_view, 4> kOs{"all", "windows", "linux", "macos"};
+    constexpr std::array<std::string_view, 3> kStatus{"all", "online", "offline"};
+    constexpr std::array<std::string_view, 12> kSort{"name",  "os",        "status", "last_seen",
+                                                     "manufacturer", "model", "serial", "cpu",
+                                                     "ram",   "os_version", "version", "ip"};
+    constexpr std::array<std::string_view, 2> kDir{"asc", "desc"};
+    std::string dir = "asc";
+    if (!take_string_arg(args, "q", kHwArgTextMax, q.q, why) ||
+        !take_enum_arg(args, "os", kOs, q.os, why) ||
+        !take_enum_arg(args, "status", kStatus, q.status, why) ||
+        !take_enum_arg(args, "sort", kSort, q.sort, why) ||
+        !take_enum_arg(args, "dir", kDir, dir, why) ||
+        !take_string_arg(args, "tag", kHwArgTextMax, q.tag, why) ||
+        !take_int_arg(args, "offset", 0, std::numeric_limits<std::int64_t>::max(), q.offset, why) ||
+        !take_int_arg(args, "limit", 1, 200, q.limit, why))
+        return std::nullopt;
+    q.desc = dir == "desc";
+    return q;
+}
+
+std::pair<std::vector<InventoryDeviceRow>, std::size_t>
+scoped_roster(const InventoryDevicesResult& all, const authz::VisibleSet& scope) {
+    std::vector<InventoryDeviceRow> out;
+    std::size_t dropped = 0;
+    out.reserve(all.rows.size());
+    for (const auto& row : all.rows) {
+        if (!authz::in_scope(scope, row.agent_id)) { ++dropped; continue; }
+        out.push_back(row);
+    }
+    return {std::move(out), dropped};
+}
+
+bool id_is_audit_safe(const std::string& id) {
+    return id.size() <= auth::kMaxAgentIdLength &&
+           std::none_of(id.begin(), id.end(), [](unsigned char c) { return c < 0x20; });
+}
+
+HardwareCiRead classify_hardware_ci_read(const HardwareCiDetail& detail) {
+    const bool truly_absent = !detail.identity &&
+                              (!detail.ci.has_value() ? false : !detail.ci->has_value()) &&
+                              (!detail.software || detail.software->empty()) &&
+                              (!detail.tags || detail.tags->empty());
+    if (truly_absent && detail.identity_degraded)
+        return HardwareCiRead::RosterUnreadable; // a failed roster read is never a 404 (#5531)
+    if (truly_absent)
+        return HardwareCiRead::NotFound;
+    return HardwareCiRead::Found;
 }
 
 std::vector<std::string> hw_search_tokens(std::string_view q) {

@@ -1515,13 +1515,14 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
     auto lease = acquire_with_retry(impl_->pool, kReadTimeout); // #2396 transient-blip ride-out
     if (!lease)
         return std::unexpected(AuthDBError::StoreBusy);
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT id, encode(mfa_totp_secret, 'hex'), (mfa_enrolled_at IS NOT NULL), "
-        "COALESCE((mfa_enrolled_at AT TIME ZONE 'UTC')::text, ''), "
-        "COALESCE((mfa_disabled_at AT TIME ZONE 'UTC')::text, '') "
-        "FROM auth.users WHERE username = $1 AND is_active = TRUE",
-        std::vector<std::string>{username});
+    pg::PgResult res =
+        pg::exec_params(lease.get(),
+                        "SELECT id, encode(mfa_totp_secret, 'hex'), (mfa_enrolled_at IS NOT NULL), "
+                        "COALESCE((mfa_enrolled_at AT TIME ZONE 'UTC')::text, ''), "
+                        "COALESCE((mfa_disabled_at AT TIME ZONE 'UTC')::text, ''), "
+                        "COALESCE((extract(epoch from mfa_enrolled_at)*1000)::bigint, 0) "
+                        "FROM auth.users WHERE username = $1 AND is_active = TRUE",
+                        std::vector<std::string>{username});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(AuthDBError::QueryFailed);
     if (PQntuples(res.get()) == 0)
@@ -1551,18 +1552,24 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
             return std::unexpected(dec.error());
         status.enrolled = true;
         status.enrolled_at = col_str(res.get(), 0, 3);
+        status.enrolled_at_ms = to_i64(col(res.get(), 0, 5));
     }
 
     // Recovery-code count is best-effort display metadata (matches the
     // SQLite-era contract — a failure here does not fail the whole read).
-    auto lease2 = impl_->pool.try_acquire_for(kReadTimeout);
-    if (lease2) {
-        pg::PgResult cres = pg::exec_params(
-            lease2.get(), "SELECT COUNT(*) FROM auth.mfa_recovery_codes WHERE username = $1 AND consumed_at IS NULL",
-            std::vector<std::string>{username});
-        if (cres.status() == PGRES_TUPLES_OK && PQntuples(cres.get()) > 0)
-            status.recovery_codes_remaining = static_cast<int>(to_i64(col(cres.get(), 0, 0)));
-    }
+    //
+    // Reuses the lease already held above. It must NEVER acquire a second one
+    // while this one is live: the pre-routing MFA step-up chokepoint calls
+    // mfa_status on every gated request, so N concurrent requests each holding
+    // one pooled connection while waiting for another exhaust the pool (the
+    // waits surface as StoreBusy, which the gate answers 503 "authentication store is
+    // temporarily unavailable"). One connection,
+    // two sequential statements.
+    pg::PgResult cres = pg::exec_params(
+        lease.get(), "SELECT COUNT(*) FROM auth.mfa_recovery_codes WHERE username = $1 AND consumed_at IS NULL",
+        std::vector<std::string>{username});
+    if (cres.status() == PGRES_TUPLES_OK && PQntuples(cres.get()) > 0)
+        status.recovery_codes_remaining = static_cast<int>(to_i64(col(cres.get(), 0, 0)));
     return status;
 }
 
@@ -2133,27 +2140,44 @@ AuthDB::mfa_regenerate_recovery_codes(const std::string& username) {
 }
 
 std::expected<void, AuthDBError> AuthDB::mfa_disable(const std::string& username) {
+    auto r = mfa_disable_report(username);
+    if (!r)
+        return std::unexpected(r.error());
+    return {};
+}
+
+std::expected<bool, AuthDBError> AuthDB::mfa_disable_report(const std::string& username) {
     if (!is_valid_username(username)) {
         return std::unexpected(AuthDBError::InvalidUsername);
     }
     // UPDATE + DELETE atomically — a kill mid-way must never leave secret=NULL
     // with recovery codes still present (design doc §3 "no half-disabled state").
+    //
+    // The pre-image comes from the SAME row lock as the clear (#6079): a separate status read
+    // before it could miss an enrolment verified in between, and the caller would then skip
+    // ending the sessions made under that factor. An absent or inactive account matches no row
+    // and reports `true` (unknown counts as enrolled, so the caller fails safe).
+    bool was_enrolled = true;
     const bool ok = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         pg::PgResult upd = pg::exec_params(
             conn,
-            "UPDATE auth.users SET mfa_totp_secret = NULL, mfa_enrolled_at = NULL, "
+            "WITH pre AS (SELECT id, (mfa_enrolled_at IS NOT NULL) AS was_enrolled "
+            "FROM auth.users WHERE username = $1 AND is_active = TRUE FOR UPDATE) "
+            "UPDATE auth.users u SET mfa_totp_secret = NULL, mfa_enrolled_at = NULL, "
             "mfa_disabled_at = now(), mfa_last_counter = 0, updated_at = now() "
-            "WHERE username = $1 AND is_active = TRUE",
+            "FROM pre WHERE u.id = pre.id RETURNING pre.was_enrolled",
             std::vector<std::string>{username});
-        if (upd.status() != PGRES_COMMAND_OK)
+        if (upd.status() != PGRES_TUPLES_OK)
             return false;
+        if (PQntuples(upd.get()) == 1)
+            was_enrolled = to_bool(col(upd.get(), 0, 0));
         pg::PgResult del = pg::exec_params(conn, "DELETE FROM auth.mfa_recovery_codes WHERE username = $1",
                                            std::vector<std::string>{username});
         return del.status() == PGRES_COMMAND_OK;
     });
     if (!ok)
         return std::unexpected(AuthDBError::WriteFailed);
-    return {};
+    return was_enrolled;
 }
 
 // ── Enrollment tokens + pending agents (WS-6 slice 6.2, ADR-2002 §8) ─────────

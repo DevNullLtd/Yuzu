@@ -43,12 +43,14 @@ std::string document_with_overrides(int n) {
     return json{{"overrides", std::move(arr)}}.dump();
 }
 
-constexpr std::array<DexPolicyFault, 10> kAllFaults = {
+constexpr std::array<DexPolicyFault, 14> kAllFaults = {
     DexPolicyFault::EdgeOutOfRange,     DexPolicyFault::EdgeNotDisplayExact,
     DexPolicyFault::EdgesNotDescending, DexPolicyFault::EdgeGapBelowMinimum,
     DexPolicyFault::NameInvalid,        DexPolicyFault::WeightInvalid,
     DexPolicyFault::WeightSumAboveMaximum, DexPolicyFault::OverrideKeyInvalid,
-    DexPolicyFault::OverrideKeyDuplicate,  DexPolicyFault::TooManyOverrides};
+    DexPolicyFault::OverrideKeyDuplicate,  DexPolicyFault::TooManyOverrides,
+    DexPolicyFault::EventCapOutOfRange,    DexPolicyFault::RegressionRatioOutOfRange,
+    DexPolicyFault::RegressionRatiosNotAscending, DexPolicyFault::IntervalConfidenceOutOfRange};
 
 } // namespace
 
@@ -317,4 +319,296 @@ TEST_CASE("policy json: every validator fault maps to a field path", "[dex][poli
         CHECK_FALSE(at(f, G).empty());
         CHECK_FALSE(at(f, 7).empty());
     }
+}
+
+// ── The document version (#6085) ─────────────────────────────────────────────
+
+TEST_CASE("policy json: the canonical text carries version 1 and round-trips",
+          "[dex][policy_json]") {
+    const std::string text = dex_score_policy_canonical(dex_default_score_policy());
+    CHECK(json::parse(text)["version"] == 1);
+    const auto back = dex_score_policy_from_json(json::parse(text));
+    REQUIRE(back);
+    CHECK(dex_score_policy_canonical(*back) == text);
+}
+
+TEST_CASE("policy json: an absent version reads as 1", "[dex][policy_json]") {
+    const std::string text = R"({"tiers":{"edges":{"excellent":95}}})";
+    REQUIRE(dex_score_policy_document_version(json::parse(text)).value() == 1);
+    const auto v = dex_policy_in_force_from_stored(text);
+    CHECK(v.source == "custom");
+    CHECK(v.fault.empty());
+}
+
+TEST_CASE("policy json: a newer document falls back whole before its unknown keys are read",
+          "[dex][policy_json]") {
+    const std::string text = R"({"version":3,"future_key":{}})";
+    const auto v = dex_policy_in_force_from_stored(text);
+    CHECK(v.source == "default");
+    CHECK(v.fault.starts_with("unsupported_version at version: 3"));
+    CHECK(v.fault == "unsupported_version at version: 3 above the supported 2");
+    CHECK(v.revision == dex_score_policy_revision(text));
+    CHECK(dex_score_policy_canonical(v.policy) ==
+          dex_score_policy_canonical(dex_default_score_policy()));
+}
+
+// A version at or above 2^63 must not wrap negative and read as "less than 1": it is the
+// newest document of all, and falls back as unsupported_version even with unknown keys.
+TEST_CASE("policy json: a version beyond int64 is unsupported rather than malformed",
+          "[dex][policy_json]") {
+    const std::string text = R"({"version":18446744073709551615,"future_key":{}})";
+    const auto v = dex_policy_in_force_from_stored(text);
+    CHECK(v.source == "default");
+    CHECK(v.fault == "unsupported_version at version: 9223372036854775807 above the supported 2");
+    CHECK(v.revision == dex_score_policy_revision(text));
+}
+
+TEST_CASE("policy json: the writer side refuses a version above the supported one before unknown keys",
+          "[dex][policy_json]") {
+    CHECK(refused_field(R"({"version":3})") == "version");
+    CHECK(refused_message(R"({"version":3})") == "above the supported 2");
+    CHECK(refused_field(R"({"version":18446744073709551615})") == "version");
+    CHECK(refused_message(R"({"version":18446744073709551615})") == "above the supported 2");
+    // The version is checked before the unknown keys, so the operator is told the real cause.
+    CHECK(refused_field(R"({"version":3,"future_key":{}})") == "version");
+    CHECK(refused_message(R"({"version":3,"future_key":{}})") == "above the supported 2");
+    // At or below the supported version an unknown key is still refused at the key.
+    CHECK(refused_field(R"({"version":1,"future_key":{}})") == "future_key");
+    CHECK(refused_field(R"({"version":2,"future_key":{}})") == "future_key");
+}
+
+TEST_CASE("policy json: a version that is not an integer of at least 1 is a parse error",
+          "[dex][policy_json]") {
+    for (const char* bad : {R"("1")", "0", "-1", "1.5", "null", "true"}) {
+        const std::string text = std::string(R"({"version":)") + bad + "}";
+        INFO(text);
+        CHECK(refused_field(text) == "version");
+        const auto v = dex_policy_in_force_from_stored(text);
+        CHECK(v.source == "default");
+        CHECK(v.fault == "unparseable at version: must be an integer of at least 1");
+        CHECK(v.revision == dex_score_policy_revision(text));
+    }
+}
+
+TEST_CASE("policy json: a version-1 document the validator now refuses falls back with its fault",
+          "[dex][policy_json]") {
+    const std::string text =
+        R"({"version":1,"overrides":[{"image":"a.exe"},{"image":"a.exe"}]})";
+    const auto v = dex_policy_in_force_from_stored(text);
+    CHECK(v.source == "default");
+    CHECK(v.fault == "override_key_duplicate at overrides[1].image");
+    CHECK(v.revision == dex_score_policy_revision(text));
+    CHECK(v.policy.overrides.empty());
+}
+
+// -- AP-2.17 model parameters --------------------------------------------------
+
+namespace {
+// The exact texts the base build (before the model parameters) emitted, captured
+// from it and pinned as literals: an existing stored document's revision must not move.
+constexpr const char* kBaseDefaultText =
+    R"({"overrides":[],"tiers":{"edges":{"excellent":90.0,"fair":60.0,"good":75.0},"names":{"excellent":"excellent","fair":"fair","good":"good","poor":"poor"}},"version":1,"weights":{"breadth":60.0,"crashes":20.0,"hangs":8.0,"regression":12.0}})";
+constexpr const char* kBaseCustomText =
+    R"({"overrides":[{"image":"app.exe","tiers":{"edges":{"excellent":92.5},"names":{"poor":"Awful"}},"weights":{"hangs":5.0}},{"image":"other.exe","weights":{"breadth":10.0,"regression":30.0}}],"tiers":{"edges":{"excellent":95.0,"fair":65.0,"good":80.0},"names":{"excellent":"Top","fair":"Meh","good":"Fine","poor":"Bad"}},"version":1,"weights":{"breadth":50.0,"crashes":25.0,"hangs":15.0,"regression":10.0}})";
+constexpr const char* kBaseDefaultRevision = "b2b10f5e7f3feb05";
+constexpr const char* kBaseCustomRevision = "1df445e1d575abcc";
+
+DexScorePolicy parsed(const std::string& text) {
+    const auto r = dex_score_policy_from_json(json::parse(text));
+    REQUIRE(r);
+    return *r;
+}
+
+DexScoreOverride override_for(std::string image) {
+    DexScoreOverride o;
+    o.image = std::move(image);
+    return o;
+}
+} // namespace
+
+TEST_CASE("policy json: a policy with no model parameter dumps the exact version-1 text",
+          "[dex][policy_json]") {
+    const std::string def = dex_score_policy_canonical(dex_default_score_policy());
+    CHECK(def == kBaseDefaultText);
+    CHECK(dex_score_policy_revision(def) == kBaseDefaultRevision);
+    CHECK(json::parse(def).contains("model") == false);
+    CHECK(dex_score_policy_document_version(json::parse(def)).value() == 1);
+
+    // Custom edges, names, weights and overrides with a default model: still version 1.
+    const DexScorePolicy custom = parsed(kBaseCustomText);
+    CHECK_FALSE(dex_score_policy_uses_model_parameters(custom));
+    const std::string text = dex_score_policy_canonical(custom);
+    CHECK(text == kBaseCustomText);
+    CHECK(dex_score_policy_revision(text) == kBaseCustomRevision);
+    CHECK(text.find("model") == std::string::npos);
+}
+
+TEST_CASE("policy json: a model parameter in use makes the document version 2 and round-trips",
+          "[dex][policy_json]") {
+    // A non-default global cap.
+    DexScorePolicy a = dex_default_score_policy();
+    a.model.per_device_event_cap = 6;
+    CHECK(dex_score_policy_uses_model_parameters(a));
+    const json ja = dex_score_policy_to_json(a);
+    CHECK(ja["version"] == 2);
+    REQUIRE(ja.contains("model"));
+    CHECK(ja["model"].size() == 4);
+    CHECK(ja["model"]["per_device_event_cap"] == 6);
+    CHECK(ja["model"]["regression_full_ratio"] == 3.0);
+    CHECK(ja["model"]["regression_start_ratio"] == 1.0);
+    CHECK(ja["model"]["interval_confidence"] == 0.95);
+    const std::string ta = dex_score_policy_canonical(a);
+    const DexScorePolicy back = parsed(ta);
+    CHECK(dex_score_policy_canonical(back) == ta);
+    CHECK(back.model == a.model);
+    CHECK(back.interval_confidence == a.interval_confidence);
+
+    // A non-default confidence level alone.
+    DexScorePolicy c = dex_default_score_policy();
+    c.interval_confidence = 0.9;
+    const std::string tc = dex_score_policy_canonical(c);
+    CHECK(json::parse(tc)["version"] == 2);
+    CHECK(parsed(tc).interval_confidence == 0.9);
+    CHECK(dex_score_policy_canonical(parsed(tc)) == tc);
+
+    // Only one override's regression_start_ratio is off the shipped value.
+    DexScorePolicy b = dex_default_score_policy();
+    DexScoreOverride o = override_for("app.exe");
+    o.regression_start_ratio = 1.5;
+    b.overrides.push_back(o);
+    b.overrides.push_back(override_for("plain.exe"));
+    CHECK(dex_score_policy_uses_model_parameters(b));
+    const json jb = dex_score_policy_to_json(b);
+    CHECK(jb["version"] == 2);
+    CHECK(jb["model"]["per_device_event_cap"] == 5); // the root model lists all four
+    REQUIRE(jb["overrides"][0].contains("model"));
+    CHECK(jb["overrides"][0]["model"].size() == 1);
+    CHECK(jb["overrides"][0]["model"]["regression_start_ratio"] == 1.5);
+    CHECK_FALSE(jb["overrides"][1].contains("model"));
+    const std::string tb = dex_score_policy_canonical(b);
+    const DexScorePolicy bb = parsed(tb);
+    CHECK(dex_score_policy_canonical(bb) == tb);
+    CHECK(bb.overrides[0].regression_start_ratio == std::optional<double>(1.5));
+    CHECK_FALSE(bb.overrides[0].per_device_event_cap.has_value());
+    CHECK_FALSE(bb.overrides[1].regression_start_ratio.has_value());
+
+    // A version-2 body whose every model value is the default re-dumps as version 1.
+    const std::string defaults_v2 =
+        R"({"version":2,"model":{"per_device_event_cap":5,"regression_full_ratio":3.0,)"
+        R"("regression_start_ratio":1.0,"interval_confidence":0.95}})";
+    CHECK(dex_score_policy_canonical(parsed(defaults_v2)) == kBaseDefaultText);
+    CHECK(dex_score_policy_canonical(parsed(R"({"version":2})")) == kBaseDefaultText);
+}
+
+TEST_CASE("policy json: a confidence just off 0.95 is in use and exactly 0.95 is not",
+          "[dex][policy_json]") {
+    DexScorePolicy p = dex_default_score_policy();
+    p.interval_confidence = 0.9500000001;
+    CHECK(dex_score_policy_uses_model_parameters(p));
+    const std::string t = dex_score_policy_canonical(p);
+    CHECK(json::parse(t)["version"] == 2);
+    CHECK(parsed(t).interval_confidence == 0.9500000001);
+    CHECK(dex_score_policy_canonical(parsed(t)) == t);
+
+    p.interval_confidence = 0.95;
+    CHECK_FALSE(dex_score_policy_uses_model_parameters(p));
+    CHECK(dex_score_policy_canonical(p) == kBaseDefaultText);
+}
+
+TEST_CASE("policy json: presence of an override model field and not its value selects version 2",
+          "[dex][policy_json]") {
+    DexScorePolicy p = dex_default_score_policy();
+    DexScoreOverride o = override_for("app.exe");
+    o.per_device_event_cap = 5; // the shipped value
+    p.overrides.push_back(o);
+    CHECK(dex_score_policy_uses_model_parameters(p));
+    const json j = dex_score_policy_to_json(p);
+    CHECK(j["version"] == 2);
+    CHECK(j["overrides"][0]["model"] == json::object({{"per_device_event_cap", 5}}));
+    const std::string t = dex_score_policy_canonical(p);
+    CHECK(dex_score_policy_canonical(parsed(t)) == t);
+    // Under a later global cap of 6 the pinned application keeps 5: the reason presence counts.
+    DexScorePolicy later = parsed(t);
+    later.model.per_device_event_cap = 6;
+    CHECK(resolve_dex_score_policy(later, "app.exe").model.per_device_event_cap == 5);
+    CHECK(resolve_dex_score_policy(later, "other.exe").model.per_device_event_cap == 6);
+    // The same policy without the override is the version-1 text.
+    CHECK(dex_score_policy_canonical(dex_default_score_policy()) == kBaseDefaultText);
+}
+
+TEST_CASE("policy json: model in a version-1 document is refused as is the wrong shape",
+          "[dex][policy_json]") {
+    CHECK(refused_field(R"({"version":1,"model":{}})") == "model");
+    CHECK(refused_message(R"({"version":1,"model":{}})") == "requires version 2");
+    CHECK(refused_field(R"({"model":{"per_device_event_cap":6}})") == "model"); // absent = 1
+    CHECK(refused_field(R"({"version":1,"overrides":[{"image":"a.exe","model":{}}]})") ==
+          "overrides[0].model");
+    CHECK(refused_message(R"({"version":1,"overrides":[{"image":"a.exe","model":{}}]})") ==
+          "requires version 2");
+    // An override has no interval_confidence: it is an unknown key there, not at the root.
+    CHECK(refused_field(
+              R"({"version":2,"overrides":[{"image":"a.exe","model":{"interval_confidence":0.9}}]})") ==
+          "overrides[0].model.interval_confidence");
+    CHECK(refused_message(
+              R"({"version":2,"overrides":[{"image":"a.exe","model":{"interval_confidence":0.9}}]})") ==
+          "unknown key");
+    CHECK(refused_field(R"({"version":2,"model":{"nope":1}})") == "model.nope");
+    CHECK(refused_field(R"({"version":2,"model":[]})") == "model");
+    CHECK(refused_message(R"({"version":2,"model":[]})") == "must be an object");
+    // The cap must be a JSON integer.
+    for (const char* bad : {"5.0", R"("5")", "true", "null"}) {
+        const std::string text = std::string(R"({"version":2,"model":{"per_device_event_cap":)") + bad + "}}";
+        INFO(text);
+        CHECK(refused_field(text) == "model.per_device_event_cap");
+        CHECK(refused_message(text) == "must be an integer");
+    }
+    CHECK(refused_message(R"({"version":2,"overrides":[{"image":"a.exe","model":{"per_device_event_cap":5.5}}]})") ==
+          "must be an integer");
+    CHECK(refused_message(R"({"version":2,"model":{"regression_full_ratio":"3"}})") ==
+          "must be a number");
+    // An unsigned beyond int64 clamps like the version read, and the validator refuses it.
+    const auto big = dex_policy_in_force_from_stored(
+        std::string(R"({"version":2,"model":{"per_device_event_cap":18446744073709551615}})"));
+    CHECK(big.source == "default");
+    CHECK(big.fault == "event_cap_out_of_range at model");
+}
+
+TEST_CASE("policy json: model faults map to a path and are reported through the reader",
+          "[dex][policy_json]") {
+    auto at = [](DexPolicyFault f, std::size_t i) { return dex_policy_fault_field({f, i}); };
+    constexpr auto G = kDexPolicyGlobalIndex;
+    for (const auto f : {DexPolicyFault::EventCapOutOfRange, DexPolicyFault::RegressionRatioOutOfRange,
+                         DexPolicyFault::RegressionRatiosNotAscending,
+                         DexPolicyFault::IntervalConfidenceOutOfRange}) {
+        CHECK(at(f, G) == "model");
+        CHECK(at(f, 3) == "overrides[3].model");
+    }
+    const auto in_force = [](const char* text) {
+        return dex_policy_in_force_from_stored(std::string(text));
+    };
+    CHECK(in_force(R"({"version":2,"model":{"regression_full_ratio":1.0}})").fault ==
+          "regression_ratios_not_ascending at model");
+    CHECK(in_force(R"({"version":2,"model":{"interval_confidence":1.0}})").fault ==
+          "interval_confidence_out_of_range at model");
+    CHECK(in_force(R"({"version":2,"overrides":[{"image":"a.exe"},{"image":"b.exe",)"
+                   R"("model":{"regression_full_ratio":0.5}}]})")
+              .fault == "regression_ratio_out_of_range at overrides[1].model");
+}
+
+TEST_CASE("policy json: a stored version-2 text is served and a version-3 text falls back whole",
+          "[dex][policy_json]") {
+    const std::string v2 = R"({"version":2,"model":{"per_device_event_cap":6}})";
+    const auto in = dex_policy_in_force_from_stored(v2);
+    CHECK(in.source == "custom");
+    CHECK(in.fault.empty());
+    CHECK(in.policy.model.per_device_event_cap == 6);
+    CHECK(in.policy.interval_confidence == kDexStatsConfidence); // an omitted key keeps its default
+    CHECK(in.revision == dex_score_policy_revision(v2));
+
+    const std::string v3 = R"({"version":3,"model":{"per_device_event_cap":6}})";
+    const auto out = dex_policy_in_force_from_stored(v3);
+    CHECK(out.source == "default");
+    CHECK(out.fault == "unsupported_version at version: 3 above the supported 2");
+    CHECK(out.policy.model == kStabilityModel);
+    CHECK(out.revision == dex_score_policy_revision(v3));
 }

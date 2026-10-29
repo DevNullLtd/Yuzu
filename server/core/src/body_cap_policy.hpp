@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <string_view>
 
 /// @file body_cap_policy.hpp
@@ -61,14 +62,14 @@
 /// cap. Chunked request bodies are legal HTTP, and this repo does not
 /// control every client that will ever talk to these routes, so the bit
 /// DEFAULTS OFF and is opted into per class, not per table. It is ON for
-/// three classes: `/mcp/` (that surface's own protocol/client contract already requires
+/// four classes: `/mcp/` (that surface's own protocol/client contract already requires
 /// `Content-Length` on every framed body - see `web_utils.hpp:577`'s
 /// `mcp_body_unmeasurable` rationale - so refusing an unmeasurable MCP body
-/// costs a conforming client nothing), `upload_session`, and `hardware` (the
+/// costs a conforming client nothing), `upload_session`, `hardware` (the
 /// Hardware CI routes carry only a tiny JSON body from the dashboard and API
-/// callers). Every other class below — public REST
-/// (bundles), SCIM, certificate import (REST + dashboard), the plugin trust
-/// bundle, product-pack/workflow authoring, and the OTA upload — keeps it
+/// callers) and `dex_score_policy` (one JSON document, capped by its handler). Every other
+/// class below — public REST (bundles), SCIM, certificate import (REST + dashboard), the
+/// plugin trust bundle, product-pack/workflow authoring, and the OTA upload — keeps it
 /// OFF and falls back to httplib's 100 MiB backstop for a body it cannot
 /// size, until a Content-Length contract is documented and a representative
 /// client population is tested against it. That is a scoping decision for
@@ -168,7 +169,8 @@ struct BodyCapEntry {
     /// Stable short label for a metric dimension. MUST be a fixed string
     /// literal from this table — NEVER derived from the raw, attacker-
     /// controlled request path (unbounded cardinality on a pre-auth metric
-    /// is its own DoS surface).
+    /// is its own DoS surface). Also the label source of
+    /// `yuzu_server_csrf_denied_total` (same_site_write_gate.hpp).
     std::string_view path_class;
 };
 
@@ -546,6 +548,31 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // requires_measurable stays OFF per the file-header default.
     {kBodyCapAnyMethod, "/api/v1/users", 16u * 1024, false, "users"},
 
+    // /api/v1/dex/score-policy: the customer DEX score policy (rest_api_v1.cpp). PUT's body IS
+    // the policy document, capped at kDexScorePolicyMaxBytes (256 KiB) by the handler; 320 KiB
+    // leaves framing headroom over that, so a legitimate document is never refused here and
+    // an unauthenticated flood is held 12x under the 4 MiB catch-all. ANY method: GET and
+    // DELETE are bodyless siblings sharing the class. requires_measurable = true: the
+    // permission gate runs in the handler, after httplib buffers the body (a cookie session's
+    // same-site gate runs earlier, pre-routing), so an unmeasurable (chunked) body must be
+    // refused here (the hardware row's reasoning).
+    {kBodyCapAnyMethod, "/api/v1/dex/score-policy", 320u * 1024, true, "dex_score_policy"},
+    // /api/v1/crypto — the /crypto REST v1 subtree. The only body-bearing route is
+    // PUT /api/v1/crypto/dashboard/layout {"widgets":[ids]}: at most 64 catalogue ids of at most
+    // 64 bytes (crypto_widget_catalogue.hpp kMaxLayoutWidgets / kWidgetIdMaxBytes), about 4.4 KiB
+    // even fully escaped. Mirrors the handler's own kLayoutBodyMaxBytes (16 KiB) exactly - the
+    // ca_revoke two-authority-split precedent. ANY method: every sibling is a bodyless GET and
+    // shares the prefix (rule 4 in the routed-concern row).
+    {kBodyCapAnyMethod, "/api/v1/crypto", 16u * 1024, false, "crypto"},
+
+    // /api/v1/config — the runtime-configuration REST v1 twin. The only body-bearing route is
+    // PUT /api/v1/config/{key} {"value": ...}: one scalar (an integer, a flag, a log level, a
+    // tag key, an OIDC client secret or a short JSON array of routed observation types), well
+    // under 16 KiB. The legacy PUT /api/config/{key} keeps the catch-all (kDefaultIsCorrectFor).
+    // ANY method: the sibling GET is bodyless and shares the prefix (rule 4 in the routed-concern
+    // row).
+    {kBodyCapAnyMethod, "/api/v1/config", 16u * 1024, false, "config"},
+
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.
     // Ordinary JSON/form traffic (most REST mutation routes) lands here.
@@ -584,14 +611,24 @@ struct BodyCapMatch {
 /// to report through (mirrors `dispatch_confined_arms.hpp`'s style).
 [[nodiscard]] constexpr BodyCapMatch resolve_body_cap(std::string_view method,
                                                       std::string_view path) noexcept {
-    const BodyCapEntry* best = nullptr;
-    for (const auto& entry : kBodyCapTable) {
+    // Best match is tracked as an INDEX, not a `const BodyCapEntry*` (#6367).
+    // GCC 15 with -fsanitize=undefined cannot constant-evaluate UBSan's null,
+    // nonnull-attribute or returns-nonnull-attribute checks on a
+    // `const BodyCapEntry*`, so a pointer here makes
+    // `static_assert(resolve_body_cap(...))` (crypto_routes.cpp) a non-constant
+    // expression in every UBSan leg. The CI legs disable only `null,alignment`
+    // (#5492), which leaves the other two failing. Do not revert this to a
+    // pointer.
+    constexpr std::size_t kNone = static_cast<std::size_t>(-1);
+    std::size_t best = kNone;
+    for (std::size_t i = 0; i < std::size(kBodyCapTable); ++i) {
+        const auto& entry = kBodyCapTable[i];
         if (entry.method != kBodyCapAnyMethod && entry.method != method)
             continue;
         if (!body_cap_prefix_matches(path, entry.path_prefix))
             continue;
-        if (best == nullptr || entry.path_prefix.size() > best->path_prefix.size())
-            best = &entry;
+        if (best == kNone || entry.path_prefix.size() > kBodyCapTable[best].path_prefix.size())
+            best = i;
     }
     // Unreachable in practice — the catch-all default (empty prefix,
     // kBodyCapAnyMethod) matches every (method, path), so `best` is always
@@ -602,7 +639,7 @@ struct BodyCapMatch {
     // UNREACHABLE BY CONSTRUCTION, not merely by inspection: the
     // `static_assert` below this function proves `kBodyCapTable` contains an
     // any-method empty-prefix row, which `body_cap_prefix_matches` accepts
-    // for every path, so `best` can never be null and this branch can never
+    // for every path, so `best` can never be `kNone` and this branch can never
     // execute. That is deliberate rather than pre-seeding the label: a
     // sentinel that CANNOT occur is stronger than one that is instrumented
     // when it does, and it removes the `yuzu_body_cap_rejected_total`
@@ -618,16 +655,17 @@ struct BodyCapMatch {
     // appear unannounced the first time this sentinel is ever reached.
     // `server.cpp` owns that seeding loop; this header only owns documenting
     // the gap so it is not silently assumed closed.
-    if (best == nullptr)
+    if (best == kNone)
         return {0, true, "unmatched"};
-    return {best->max_body_bytes, best->requires_measurable, best->path_class};
+    const auto& hit = kBodyCapTable[best];
+    return {hit.max_body_bytes, hit.requires_measurable, hit.path_class};
 }
 
 /// True iff `kBodyCapTable` carries an any-method, empty-prefix catch-all row.
 ///
 /// `body_cap_prefix_matches` accepts an empty prefix for every path, and
 /// `kBodyCapAnyMethod` matches every verb, so such a row makes
-/// `resolve_body_cap`'s null-`best` branch unreachable — the `unmatched`
+/// `resolve_body_cap`'s `kNone`-`best` branch unreachable — the `unmatched`
 /// sentinel becomes impossible rather than merely unlikely.
 [[nodiscard]] constexpr bool body_cap_table_has_catch_all() noexcept {
     for (const auto& e : kBodyCapTable)

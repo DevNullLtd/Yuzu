@@ -1806,6 +1806,110 @@ TEST_CASE("AuthDB MFA enroll -> verify round trip is envelope-encrypted end to e
     CHECK_FALSE(after_disable->enrolled);
 }
 
+// ── mfa_status result contract (unchanged by the single-lease restructure) ──────
+//
+// mfa_status is now on the hot path of the pre-routing MFA step-up chokepoint
+// (every gated request), so its result shape is pinned across every row state.
+
+namespace {
+// Enrol `username` end to end through the real codec.
+void enrol_user(AuthDB& db, const std::string& username) {
+    REQUIRE(db.upsert_user(username, "h", "s", yuzu::server::auth::Role::user).has_value());
+    auto init = db.mfa_init_enrollment(username, "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto raw = yuzu::server::mfa::base32_decode(init->secret_base32);
+    REQUIRE(raw.has_value());
+    auto view = std::string_view(reinterpret_cast<const char*>(raw->data()), raw->size());
+    auto code = yuzu::server::mfa::generate(
+        view, yuzu::server::mfa::current_counter(std::chrono::system_clock::now()));
+    REQUIRE(db.mfa_verify_enrollment(username, code, std::nullopt).has_value());
+}
+} // namespace
+
+TEST_CASE("AuthDB mfa_status: result contract per row state (enrolled / not enrolled / "
+          "mid-enrollment / unknown / invalid)",
+          "[pg][auth_db][mfa]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+
+    // Enrolled: enrolled flag, an enrollment timestamp, and the full recovery set.
+    enrol_user(h.db, "stat_enrolled");
+    auto enrolled = h.db.mfa_status("stat_enrolled");
+    REQUIRE(enrolled.has_value());
+    CHECK(enrolled->enrolled);
+    CHECK_FALSE(enrolled->enrolled_at.empty());
+    CHECK(enrolled->disabled_at.empty());
+    CHECK(enrolled->recovery_codes_remaining == 10);
+
+    // Not enrolled: a plain account with no MFA state at all.
+    REQUIRE(h.db.upsert_user("stat_plain", "h", "s", yuzu::server::auth::Role::user).has_value());
+    auto plain = h.db.mfa_status("stat_plain");
+    REQUIRE(plain.has_value());
+    CHECK_FALSE(plain->enrolled);
+    CHECK(plain->enrolled_at.empty());
+    CHECK(plain->recovery_codes_remaining == 0);
+
+    // Mid-enrollment: a provisional secret is set but mfa_enrolled_at is NULL.
+    // That is NOT enrolled (and must not need the secret to decrypt).
+    REQUIRE(h.db.upsert_user("stat_mid", "h", "s", yuzu::server::auth::Role::user).has_value());
+    REQUIRE(h.db.mfa_init_enrollment("stat_mid", "Yuzu", std::nullopt).has_value());
+    REQUIRE_FALSE(read_secret_hex(h.conn.get(), "stat_mid").empty());
+    auto mid = h.db.mfa_status("stat_mid");
+    REQUIRE(mid.has_value());
+    CHECK_FALSE(mid->enrolled);
+    CHECK(mid->enrolled_at.empty());
+    CHECK(mid->recovery_codes_remaining == 0);
+
+    // Unknown user / invalid username keep their distinct errors.
+    auto unknown = h.db.mfa_status("stat_nobody");
+    REQUIRE_FALSE(unknown.has_value());
+    CHECK(unknown.error() == AuthDBError::UserNotFound);
+    auto invalid = h.db.mfa_status("bad name!");
+    REQUIRE_FALSE(invalid.has_value());
+    CHECK(invalid.error() == AuthDBError::InvalidUsername);
+
+    // Fail-closed is preserved: an enrolled row whose secret cannot decrypt is
+    // SecretUnavailable, never enrolled=false.
+    corrupt_secret(h.conn.get(), "stat_enrolled");
+    auto corrupt = h.db.mfa_status("stat_enrolled");
+    REQUIRE_FALSE(corrupt.has_value());
+    CHECK(corrupt.error() == AuthDBError::SecretUnavailable);
+}
+
+// Regression: mfa_status used to hold its first pool lease while acquiring a
+// SECOND for the recovery-code count. On a saturated pool (every worker inside
+// mfa_status, as under the step-up chokepoint) that starves itself. With a
+// pool of exactly one connection the nested acquire can NEVER succeed, so the
+// count was silently dropped to 0 (the best-effort branch swallowing the
+// failed acquire). One lease must be enough: the count is present.
+TEST_CASE("AuthDB mfa_status: completes on a single-connection pool (no nested lease)",
+          "[pg][auth_db][mfa]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    enrol_user(h.db, "nest_user");
+
+    PgPool tiny{PgPool::Options{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(tiny.valid());
+    // A codec registers a secret column once, so the second AuthDB needs its own
+    // (same provider, so it resolves the KEK the Harness codec minted).
+    SecretCodec tiny_codec(h.provider);
+    AuthDB tiny_db{tiny, tiny_codec, /*cleanup_interval_secs=*/0};
+    REQUIRE(tiny_db.is_open());
+    REQUIRE(tiny_codec.init(h.conn.get()).has_value());
+
+    auto status = tiny_db.mfa_status("nest_user");
+
+    REQUIRE(status.has_value());
+    CHECK(status->enrolled);
+    // The discriminator: the count is best-effort and falls back to 0 if a second lease is
+    // attempted on the one-connection pool and fails. Elapsed time is NOT asserted:
+    // try_acquire_for fast-fails on saturation, so a nested acquire does not reliably stall, and
+    // a wall-clock bound would only add a flake risk on a loaded runner.
+    CHECK(status->recovery_codes_remaining == 10);
+    // The lease was returned.
+    CHECK(tiny.in_use() == 0);
+}
+
 // ── #3762: enrollment double-verify is atomic — one winner, no orphaned codes ──
 //
 // `mfa_verify_enrollment`'s pre-txn `mfa_status().enrolled` check and its enrollment
@@ -2393,6 +2497,167 @@ TEST_CASE("AuthDB MFA fail-closed: mfa_verify_enrollment refuses a corrupted pro
     auto status = h.db.mfa_status("corrupt3");
     REQUIRE(status.has_value());
     CHECK_FALSE(status->enrolled);
+}
+
+// ── MfaStatus::enrolled_at_ms (#6079) ────────────────────────────────────────
+// The approver gate compares a session's MFA-proof instant to the CURRENT enrolment instant,
+// so enrolled_at_ms must be the Postgres-authored instant in epoch milliseconds, and 0 for
+// any row that is not (or is no longer) enrolled.
+
+namespace {
+std::int64_t db_now_ms(PGconn* conn) {
+    PgResult r{PQexec(conn, "SELECT (extract(epoch from now())*1000)::bigint")};
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) == 1);
+    return std::stoll(PQgetvalue(r.get(), 0, 0));
+}
+
+void enroll(AuthDB& db, const std::string& user) {
+    auto init = db.mfa_init_enrollment(user, "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto raw = yuzu::server::mfa::base32_decode(init->secret_base32);
+    REQUIRE(raw.has_value());
+    const auto code = yuzu::server::mfa::generate(
+        std::string_view(reinterpret_cast<const char*>(raw->data()), raw->size()),
+        yuzu::server::mfa::current_counter(std::chrono::system_clock::now()));
+    REQUIRE(db.mfa_verify_enrollment(user, code, std::nullopt).has_value());
+}
+} // namespace
+
+TEST_CASE("AuthDB::mfa_status enrolled_at_ms is 0 for a user who is not enrolled, including one "
+          "with only a provisional secret",
+          "[pg][auth_db][mfa]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("d1", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    auto never = h.db.mfa_status("d1");
+    REQUIRE(never.has_value());
+    CHECK_FALSE(never->enrolled);
+    CHECK(never->enrolled_at_ms == 0);
+
+    REQUIRE(h.db.mfa_init_enrollment("d1", "Yuzu", std::nullopt).has_value());
+    auto provisional = h.db.mfa_status("d1");
+    REQUIRE(provisional.has_value());
+    CHECK_FALSE(provisional->enrolled);
+    CHECK(provisional->enrolled_at_ms == 0);
+}
+
+TEST_CASE("AuthDB::mfa_status enrolled_at_ms is the database instant that completed enrolment",
+          "[pg][auth_db][mfa]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("d2", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    const std::int64_t lo = db_now_ms(h.conn.get());
+    enroll(h.db, "d2");
+    const std::int64_t hi = db_now_ms(h.conn.get());
+
+    auto st = h.db.mfa_status("d2");
+    REQUIRE(st.has_value());
+    REQUIRE(st->enrolled);
+    CHECK(st->enrolled_at_ms >= lo);
+    CHECK(st->enrolled_at_ms <= hi);
+    CHECK(st->enrolled_at_ms > 0);
+}
+
+TEST_CASE("AuthDB::mfa_status enrolled_at_ms returns to 0 after mfa_disable and moves forward on "
+          "re-enrolment",
+          "[pg][auth_db][mfa]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("d3", "h", "s", yuzu::server::auth::Role::user).has_value());
+    enroll(h.db, "d3");
+    auto first = h.db.mfa_status("d3");
+    REQUIRE(first.has_value());
+    REQUIRE(first->enrolled_at_ms > 0);
+
+    REQUIRE(h.db.mfa_disable("d3").has_value());
+    auto off = h.db.mfa_status("d3");
+    REQUIRE(off.has_value());
+    CHECK_FALSE(off->enrolled);
+    CHECK(off->enrolled_at_ms == 0);
+
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(20)); // ms resolution: force a later instant
+    const std::int64_t lo = db_now_ms(h.conn.get());
+    enroll(h.db, "d3");
+    auto again = h.db.mfa_status("d3");
+    REQUIRE(again.has_value());
+    CHECK(again->enrolled_at_ms >= lo);
+    CHECK(again->enrolled_at_ms > first->enrolled_at_ms);
+}
+
+// cs-S2 / au-F2 (#6079): mfa_disable_report's pre-image comes from the SAME row lock as the clear.
+// A concurrent writer holding the row decides what the report says: if a SELECT-then-UPDATE split
+// were ever introduced, the pre-image would be read before the wait and these two cases would
+// report the stale value (and a Settings caller would skip ending sessions made under a factor
+// that was enrolled while it waited).
+TEST_CASE("AuthDB::mfa_disable_report pre-image reflects an enrolment that commits while it "
+          "waits on the row lock",
+          "[pg][auth_db][mfa]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("dr1", "h", "s", yuzu::server::auth::Role::user).has_value());
+    REQUIRE(h.db.mfa_init_enrollment("dr1", "Yuzu", std::nullopt).has_value()); // provisional only
+    REQUIRE_FALSE(h.db.mfa_status("dr1")->enrolled);
+
+    // A second connection holds the row and completes the enrolment inside its transaction.
+    PgConn locker = connect(db.dsn());
+    {
+        PgResult b{PQexec(locker.get(), "BEGIN")};
+        REQUIRE(b.ok());
+    }
+    {
+        PgResult u{PQexec(locker.get(), "UPDATE auth.users SET mfa_enrolled_at = now() "
+                                        "WHERE username = 'dr1'")};
+        REQUIRE(u.ok());
+    }
+    std::optional<std::expected<bool, AuthDBError>> report;
+    {
+        std::jthread disabler([&] { report = h.db.mfa_disable_report("dr1"); });
+        const bool waited = yuzu::test::wait_for_pg_lock_waiter(db.dsn(), "%WITH pre AS%");
+        PgResult c{PQexec(locker.get(), "COMMIT")};
+        CHECK(c.ok());
+        CHECK(waited);
+    } // jthread joins here
+    REQUIRE(report.has_value());
+    REQUIRE(report->has_value());
+    CHECK(**report); // the pre-image saw the enrolment that committed while it waited
+    auto after = h.db.mfa_status("dr1");
+    REQUIRE(after.has_value());
+    CHECK_FALSE(after->enrolled); // and the clear then removed it
+}
+
+TEST_CASE("AuthDB::mfa_disable_report pre-image is false when a concurrent disable commits first",
+          "[pg][auth_db][mfa]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("dr2", "h", "s", yuzu::server::auth::Role::user).has_value());
+    enroll(h.db, "dr2");
+    REQUIRE(h.db.mfa_status("dr2")->enrolled);
+
+    PgConn locker = connect(db.dsn());
+    {
+        PgResult b{PQexec(locker.get(), "BEGIN")};
+        REQUIRE(b.ok());
+    }
+    {
+        PgResult u{PQexec(locker.get(), "UPDATE auth.users SET mfa_totp_secret = NULL, "
+                                        "mfa_enrolled_at = NULL WHERE username = 'dr2'")};
+        REQUIRE(u.ok());
+    }
+    std::optional<std::expected<bool, AuthDBError>> report;
+    {
+        std::jthread disabler([&] { report = h.db.mfa_disable_report("dr2"); });
+        const bool waited = yuzu::test::wait_for_pg_lock_waiter(db.dsn(), "%WITH pre AS%");
+        PgResult c{PQexec(locker.get(), "COMMIT")};
+        CHECK(c.ok());
+        CHECK(waited);
+    } // jthread joins here
+    REQUIRE(report.has_value());
+    REQUIRE(report->has_value());
+    CHECK_FALSE(**report); // nothing left to clear: the other disable already did
 }
 
 #endif // YUZU_TEST_ENABLE_PG

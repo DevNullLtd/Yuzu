@@ -450,12 +450,21 @@ void register_list(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
+        // An engine principal has no legacy or service-scoped authority: its only authority is
+        // an explicit RBAC grant (default-deny). The list-admit resolver below is keyed by
+        // username and admits everyone when RBAC is off, so an engine must clear
+        // `require_permission`'s engine branch first (403 RBAC off or no grant, 503 store
+        // unavailable). `require_permission` fails closed when `perm_fn` is unwired. The MCP
+        // `list_upload_grants` twin runs the same check for every caller.
+        if (session->is_engine() && !require_permission(deps, req, res, "UploadGrant", "Read"))
+            return;
+
         if (!require_store(deps, res))
             return;
 
         // UploadGrant:Read list-admit gate — routed through
         // RbacStore::authorize_list_read at the server.cpp wiring site
-        // (ADR-0017), NOT a bare perm_fn check.
+        // (ADR-0017), NOT a bare perm_fn check for a human caller.
         UploadGrantListAuthorization authz =
             deps.list_read_fn ? deps.list_read_fn(session->username) : UploadGrantListAuthorization{};
         if (authz.decision == UploadGrantListDecision::kDenyAll) {

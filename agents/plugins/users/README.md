@@ -14,18 +14,67 @@
 
 ## How it works
 
-All seven actions are reads (`Mutability::None` on every leg); nothing in this plugin creates, deletes, or modifies an account, session, or group. `logged_on`/`sessions` answer "who is on this box right now" from the OS's live session table (utmp, WTS, or `who`/`w`). `local_users`/`local_admins`/`group_members` enumerate account and group membership from the OS's own directory (passwd/group, Directory Services, or the Windows Net APIs) — `group_members` takes an arbitrary group name as a parameter, `local_admins` is a fixed lookup of the built-in admin group. `primary_user` and `session_history` both mine login history — the Security event log on Windows, `last` on Linux/macOS — the former reducing it to one answer (the most-frequent account), the latter returning it as time-ordered rows. On Linux/macOS every OS-tool invocation goes through a bounded, no-shell argv runner (`run_tool`, ADR-3002 rung 2) with a 10s deadline; a tool that fails to spawn, times out, or is killed reports itself through the ABI4 result-status seam rather than surfacing as a silent empty list.
+All seven actions are reads: nothing in this plugin creates, changes or deletes an account, session or group. `logged_on` and `sessions` answer "who is on this host right now" from the OS session table (Windows Terminal Services sessions, Linux `utmp`, macOS `who` and `w`). `local_users`, `local_admins` and `group_members` list accounts and group membership from the OS's own directory (the Windows NetAPI, `/etc/passwd` and `getgrnam` on Linux, `dscl` on macOS); `group_members` takes a group name, `local_admins` is a fixed lookup of the admin group. `primary_user` and `session_history` mine recent login history: the Security event log on Windows, `last` on Linux and macOS. `primary_user` reduces that window to the one account with the most login records; `session_history` returns the records themselves, newest first, up to `count`. On Linux and macOS every external tool (`w`, `last`, `lastlog`, `who`, `dscl`) runs through a bounded argv runner with no shell and a 10 second deadline, and a tool that cannot be started, times out or is killed is reported through the result status instead of reading as an empty list. Windows runs no subprocess. The plugin is deliberately not an authorisation view: it reports what the OS records, not who is entitled to what.
 
 ```mermaid
 flowchart LR
   OP[Operator / workflow] --> SRV[Server<br/>authz: UserManagement.Read]
   SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[users.execute]
-  EX --> WIN[Windows leg<br/>WTSEnumerateSessionsW · NetUserEnum<br/>NetLocalGroupGetMembers · wevtapi]
-  EX --> MAC[macOS leg<br/>utmp-free: who/w/last/dscl argv]
-  EX --> LIN[Linux leg<br/>utmp · getgrnam/getpwuid · lastlog/last/w argv]
-  WIN & MAC & LIN --> ROWS[pipe rows +<br/>typed result status] --> RS[(ResponseStore<br/>90-day retention)]
-  RS --> API[REST /api/responses<br/>· MCP get_definition/execute_instruction]
+  EX --> WIN[Windows leg<br/>WTS sessions, NetUserEnum<br/>NetLocalGroupGetMembers, Security event log]
+  EX --> MAC[macOS leg<br/>who, w, last, dscl via the argv runner]
+  EX --> LIN[Linux leg<br/>utmp, getgrnam, /etc/passwd<br/>w, last, lastlog via the argv runner]
+  WIN & MAC & LIN --> ROWS[pipe rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
 ```
+
+### What you can decide with it
+
+| Question | Action | Windows | macOS | Linux |
+|---|---|---|---|---|
+| Who is signed in now, and from where? | `logged_on` | Active and disconnected sessions that have a user name; `RDP` when the session name says so | `who` lines; remote when the tty is `ttys*` | `utmp` user-process entries only, so a session that does not register in `utmp` is not seen; remote when the tty is `pts/*` |
+| What state is each session in, and how long idle? | `sessions` | Every session with a user name, with its real state (Active, Connected, Disconnected, Idle, Listen); idle is always `0` | `w -h` lines, state always `Active`, idle as `w` prints it | Same as macOS |
+| Which local accounts exist, are they enabled, when did they last log on? | `local_users` | Local accounts from `NetUserEnum`, enabled flag from the account-disabled bit | `dscl` accounts with uid 500 or above, plus `root`, not starting `_`; enabled means the shell is not `false` or `nologin` | `/etc/passwd` accounts with uid 1000 or above, plus `root`; enabled means the shell is not `nologin` or `false`. Directory-service accounts are not listed |
+| Who holds administrator rights locally? | `local_admins` | Direct members of the group named `Administrators`; a nested group appears as one `group` row and is not expanded | Direct members of the `admin` group | Members listed on the `sudo` and `wheel` groups, plus the uid 0 account |
+| Who is in a given group? | `group_members` | Direct members of the named local group | Members from `dscl` | Listed members, plus accounts in `/etc/passwd` whose primary group it is (`primary_group`) |
+| Who normally uses this device? | `primary_user` | Most frequent account in the latest 200 logon events | Most frequent account in the latest 200 lines of `last` | Same as macOS |
+| Who logged in or out recently? | `session_history` | Logon and logoff events (4624 and 4634) with logon type, source address and UTC time | Lines of `last`, newest first | Same as macOS |
+
+What a clean result does and does not prove. An empty `logged_on` or `sessions` is a legitimate answer (nobody is signed in) and carries no status; only the typed result status tells a degraded read from a clean empty one. A `local_admins` or `group_members` list is the direct, local view only: it does not follow nested groups, directory-service groups or `sudoers` rules, so it is not the set of people who can become administrator. `primary_user` and `session_history` see only the latest window of the login records, so they say nothing about a long-quiet account, and a host with the Security log cleared, or without logon auditing, returns nothing useful on Windows. Nothing here proves an account is in use: `enabled` reflects the account-disabled flag on Windows and the login shell on Linux and macOS, not a password lock or expiry.
+
+### Diagrams
+
+#### Which action answers which question
+
+```mermaid
+flowchart TD
+  Q{"What do you need to know?"}
+  Q -- "who is on the host now" --> L["logged_on: user, host, logon type<br/>sessions: state, client, idle"]
+  Q -- "which accounts exist" --> LU["local_users"]
+  Q -- "who has admin rights" --> LA["local_admins"]
+  Q -- "who is in group X" --> GM["group_members, parameter group"]
+  Q -- "who normally uses it" --> PU["primary_user"]
+  Q -- "who logged in or out lately" --> SH["session_history, parameter count"]
+```
+
+The first two read the live session table, the next three read the account directory, and the last two read recorded history. Only `group_members` and `session_history` take a parameter.
+
+#### How a Security-log read can fail on Windows
+
+```mermaid
+flowchart TD
+  S["Query the Security channel, newest first"] --> R{"Outcome"}
+  R -- "read to the end" --> OK["Rows from the events, status stays undeclared"]
+  R -- "access denied" --> D["PERMISSION_DENIED, users_win_events:access_denied"]
+  R -- "channel not found" --> U1["UNAVAILABLE, users_win_events:channel_not_found"]
+  R -- "no answer in 10 seconds" --> T["CONSTRAINED, users_win_events:evt_next_timeout"]
+  R -- "any other error" --> U2["UNAVAILABLE, users_win_events:evt_query_failed"]
+  D & U1 & T & U2 --> A{"Which action"}
+  A -- "session_history" --> E["One error row naming the cause"]
+  A -- "primary_user" --> F["Fall back to the ProfileList registry"]
+  F -- "readable" --> G["Row with source profile_list and login_count 0, status not set"]
+  F -- "unreadable" --> H["Row saying it cannot query, status from the failure above"]
+```
+
+`session_history` fails loudly: the status and the error row both name the cause. `primary_user` prefers an answer, so when the Security log cannot be read it names a profile from the registry instead, and that answer carries no status; tell it apart by `source` `profile_list` and a login count of `0`. The fallback picks the last profile under `\Users\` in registry order, which says nothing about who actually uses the host.
 
 ## OS capability
 
@@ -50,11 +99,11 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | **None** for the other six actions (WTS/NetAPI calls succeed under the daemon's own account). `session_history` (and `primary_user`'s Security-log path) needs an elevated token to read the Security channel — an unelevated read reports `PERMISSION_DENIED`/`CONSTRAINED`/`UNAVAILABLE` depending on the failure (`users_plugin.cpp:234-253`) and `primary_user` still answers via the ProfileList fallback. | 2026-09-07, bare-metal, SYSTEM | `session_history`/`primary_user` set a typed result status (see Result status below) and emit an `error`-prefixed row naming the cause |
-| macOS | agent daemon, unprivileged | **None.** Every leg is either an IOKit-free `dscl`/`who`/`w`/`last` argv call or the shared `SCDynamicStoreCopyConsoleUser` console-user read — no elevated open. | 2026-09-07, bare-metal, euid 501 (jsmith) | a spawn/timeout is forwarded via `forward_runner_failure` as `UNAVAILABLE`/`CONSTRAINED`; the action falls back to its own "unknown"/error row text |
-| Linux | agent daemon (no row in `docs/agent-privilege-model.md`) | **None** for the native legs (utmp, `getgrnam`, `getpwuid`). `local_users`/`primary_user`/`session_history` also shell out to `lastlog`/`last`, which need to be present on `$PATH` — the 2026-09-06 container capture had neither installed, and both actions degraded to `UNAVAILABLE`/`PARTIAL`. | 2026-09-06, container, euid 0 | a missing/failed tool is forwarded via `forward_runner_failure` as `UNAVAILABLE`/`CONSTRAINED`; native legs (`logged_on`, `local_admins`, `group_members`) are unaffected |
+| Windows | agent service account (LocalSystem today, #1442) | None for the five actions that use WTS and NetAPI calls. `session_history`, and the first path of `primary_user`, read the Security event log, which needs Security-log read access: LocalSystem has it. For the intended virtual account the privilege model lists `Event Log Readers` membership, and says the Security log additionally needs `SeSecurityPrivilege` (`docs/agent-privilege-model.md`; not measured under that account) | Sample captured as `SYSTEM` on bare metal | `session_history` reports `PERMISSION_DENIED` with `users_win_events:access_denied` and an `error` row; `primary_user` falls back to the ProfileList registry (see the diagram above) |
+| macOS | agent daemon (root LaunchDaemon, see `docs/agent-privilege-model.md`) | None: every leg is a plain `dscl`, `who`, `w` or `last` call or the shared console-user read, with no privileged open | Sample captured as a normal interactive user (euid 501), not as the root daemon; all seven actions returned rows | A tool that cannot start, times out or is signalled is forwarded as `UNAVAILABLE` or `CONSTRAINED`; the action then writes its own `unknown` or `error` row text |
+| Linux | agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design; the privilege model has no row for this plugin | None for the native legs (`utmp`, `getgrnam`, `getpwuid`, `/etc/passwd`). `w`, `last` and `lastlog` must be installed; they read the login records the OS keeps (`utmp`, `wtmp`, `lastlog`) | Sample captured as `euid 0` in a minimal container with neither `last` nor `lastlog`; not measured as `yuzu-agent` | A missing or failed tool is forwarded as `UNAVAILABLE` or `CONSTRAINED`; `logged_on`, `local_admins` and `group_members` do not depend on a tool and are unaffected |
 
-Binaries/subprocesses: Linux — `w`, `lastlog`, `last` (probed via `probe_tool_path`, direct argv, no shell). macOS — `who`, `w`, `last`, `dscl`, and `/usr/bin/env` (used only to pin `LC_ALL=C` ahead of `last -y`, still a plain exec, not a shell). Windows — none; every leg is a native Win32/WTS/NetAPI/wevtapi call. No network access on any OS.
+Subprocesses: Linux runs `w`, `lastlog` and `last`, located with `probe_tool_path` and started by direct argv with no shell. macOS runs `who`, `w`, `last`, `dscl` and `/usr/bin/env` (used only to pin `LC_ALL=C` ahead of `last -y`, still a plain exec). Windows runs none. A tool's exit code is not inspected: only a failure to start, a timeout, a cancellation or a signal is a failure, so an unreadable `wtmp` surfaces as an empty `last` result (caveat 5). No network use on any OS.
 
 ## Data contract
 
@@ -69,7 +118,7 @@ Binaries/subprocesses: Linux — `w`, `lastlog`, `last` (probed via `probe_tool_
 
 ### Outputs
 
-Pipe-delimited rows, one per record, discriminated by a literal first field (`user`, `session`, `local_user`, `admin`, `group_member`, `primary_user`, or `session_history`). Unlike some collector plugins, `logged_on`/`sessions`/`group_members` emit **zero rows**, not a placeholder, when there is nothing to report (an empty Windows/Linux `logged_on` and `sessions` capture is exactly this case — see Sample output) — the empty result is legitimate on its own and is not itself a failure signal; only the typed result status (below) tells a genuinely degraded read apart from a clean empty one. A query-level problem (missing/invalid parameter, tool not found, group not found) instead emits a single `<action>|error|<message>` row. `local_users` additionally varies its own field count by OS: Linux and Windows rows carry 4 data fields, macOS rows carry 5 (`console_state` is appended, not padded in with a placeholder) — `users_plugin.cpp:800-806`.
+Rows are pipe-delimited, one per record, and start with a literal discriminator (`user`, `session`, `local_user`, `admin`, `group_member`, `primary_user` or `session_history`). `logged_on`, `sessions` and `group_members` write zero rows, not a placeholder, when there is nothing to report; only the typed result status separates a degraded read from a clean empty one. A query-level problem (missing or invalid parameter, group not found, tool not found) writes a single `<discriminator>|error|<message>` row (for example `group_member|error|Group not found: x` or `admin|error|query failed`; on Linux an unreadable `/etc/passwd` writes `local_user|error|false|Never|<message>`). `local_users` varies its field count by OS: Windows and Linux rows carry four data fields, macOS rows carry five (`console_state` is appended). On Linux, `last_logon` is the account's `lastlog` line verbatim, not the formatted timestamp the table below describes (caveat 4). On Linux and macOS `session_history` writes `last`'s columns into the declared fields in a different order (caveat 1), and `sessions` always reports state `Active` on those two systems.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`device.users.group_members` — `member_name|group_name|member_type`**
@@ -139,26 +188,26 @@ Pipe-delimited rows, one per record, discriminated by a literal first field (`us
 
 ### Result status
 
-`ctx.set_result_status` is called explicitly twice (both on Windows), and indirectly on every POSIX `run_tool()` call via `forward_runner_failure`/`classify_runner_failure` (`agents/core/include/yuzu/agent/runner_status.hpp:44-97`), which latches on the **first** non-`exited` runner outcome per call (`status_forwarded`, e.g. `users_plugin.cpp:340-347`).
+Windows sets the status explicitly when the Security-channel query fails. On Linux and macOS every external tool call is checked, and the first non-normal termination of a call latches the status for the whole action, so a later per-account call cannot overwrite an earlier `UNAVAILABLE`. A tool that exits normally, with any exit code, sets nothing.
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `UNDECLARED` (no call made) | UNKNOWN | — | default; every OS tool/native call `exited` (any exit code) — this is the status on every clean or intentionally-empty read, e.g. every sample's `logged_on`/`sessions` |
-| `OK` | PARTIAL | `subprocess_runner:line_limit` | a POSIX `run_tool()` call hits its `max_lines` cap (`primary_user`'s 200-line bound) before the tool finished — deliberate truncation, not a failure |
-| `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` / `subprocess_runner:cancelled` / `subprocess_runner:signaled` | a POSIX tool exceeds the 10s `kUsersCmdDeadline` or is killed/signalled mid-run |
-| `UNAVAILABLE` | PARTIAL | `subprocess_runner:spawn_error` | `probe_tool_path` found no binary, or the spawn itself failed — the 2026-09-06 Linux container sample (`lastlog`/`last` missing) |
-| `PERMISSION_DENIED` | PARTIAL | `users_win_events:access_denied` | Windows Security-channel query denied (`session_history`, `primary_user`'s event-log path) |
-| `UNAVAILABLE` | PARTIAL | `users_win_events:channel_not_found` | Windows Security channel missing/uninstalled |
-| `CONSTRAINED` | PARTIAL | `users_win_events:evt_next_timeout` | Windows `EvtNext` timed out mid-query |
-| `UNAVAILABLE` | PARTIAL | `users_win_events:evt_query_failed` | any other Windows `EvtQuery`/`EvtNext` error |
+| `UNDECLARED` (no call made) | UNKNOWN | - | default; every OS tool or native call finished normally. This is the status of every clean or intentionally empty read, such as an empty `logged_on` |
+| `OK` | PARTIAL | `subprocess_runner:line_limit` | `primary_user` stopped `last` at its 200-line bound while it was still producing output. This is deliberate truncation, not a failure, and is the normal case on any host with a longer history |
+| `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` / `subprocess_runner:cancelled` / `subprocess_runner:signaled` | a POSIX tool ran past the 10 second deadline, was cancelled, or was killed by a signal |
+| `UNAVAILABLE` | PARTIAL | `subprocess_runner:spawn_error` | no binary was found at the probed paths, or the spawn failed (the Linux container sample, which has no `last` or `lastlog`) |
+| `PERMISSION_DENIED` | PARTIAL | `users_win_events:access_denied` | Windows Security channel query denied; for `primary_user` only when the ProfileList fallback also failed |
+| `UNAVAILABLE` | PARTIAL | `users_win_events:channel_not_found` | Windows Security channel missing or unavailable |
+| `CONSTRAINED` | PARTIAL | `users_win_events:evt_next_timeout` | the Windows event read made no progress for 10 seconds |
+| `UNAVAILABLE` | PARTIAL | `users_win_events:evt_query_failed` | any other Windows event query or read error |
 
 ### Where the data goes
 
-- **Instruction result only.** Rows travel the agent's mTLS gRPC channel as the command response and land in the `ResponseStore` (90-day default retention, `server/core/src/response_store.hpp:153`), queryable at `/api/responses/{id}`.
-- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — nothing in this plugin runs on a schedule; `gather.ttlSeconds` (60–300s per definition) is a repeat-query cache TTL, not a cron trigger.
-- **Sensitivity.** Every action's rows name a specific account: `username`/`member_name` (local or logged-on account names, including admin-group members), `domain`/`domain_or_group` (Windows domain or hostname), and `session_history`'s Windows leg carries the raw Security-log event detail for that account's logons/logoffs. `session_id`/`client` can carry a remote hostname or RDP client name — a device identifier for whatever machine connected in. No column carries installed-software data.
-- **Siblings:** `core.crossplatform.users` (`content/definitions/users_set.yaml`, "User Account Management") is the mutating counterpart in a separate plugin — this plugin never creates, deletes, disables, or reassigns an account.
-- **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.users.session_history")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
+- **Instruction result only.** Rows travel the agent's mTLS gRPC channel as the command response and land in the `ResponseStore` (default 90-day retention), readable at `/api/responses/{id}`.
+- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX or metrics. Nothing in this plugin runs on a schedule; each definition's `gather.ttlSeconds` (60 to 300 seconds) is a repeat-query cache lifetime, not a cron trigger.
+- **Sensitivity.** Every action's rows name specific accounts: `username` and `member_name` (local and logged-on accounts, including administrators), `domain` or `domain_or_group` (a Windows domain or host name), and Windows `session_history` carries the source IP address of each logon. On Linux and macOS `session_history` and `sessions` can carry the remote host or client name a user connected from, and `local_users` carries the account's display name or comment. No column carries installed-software data.
+- **Siblings.** The `core.crossplatform.users` instruction set (`content/definitions/users_set.yaml`, "User Account Management") bundles the `logged_on`, `sessions`, `local_users` and `local_admins` definitions of this same plugin; this plugin has no action that creates, disables or reassigns an account.
+- **MCP / REST.** Discover with `discover_plugins` (summary) then `yuzu://plugin-docs` (this page as data) and `get_definition("device.users.session_history")`; run with `execute_instruction {definition_id, parameters}`; read results at `/api/responses/{id}`.
 
 ## Sample output
 
@@ -295,11 +344,11 @@ session_history|error|last command failed
 
 ## Caveats and known gaps
 
-1. **`session_history`'s Linux/macOS fields do not line up with the declared schema.** The Windows leg (`users_win_events.hpp:329-333`) fills `event_type|logon_type|source|timestamp|detail` correctly, but the Linux/macOS leg (`users_plugin.cpp:1279-1305`, `:1328-1352`) does a raw `ls >> user >> tty >> source` against `last`'s columns and writes `(tty, source-token, derived-console/remote/system, completed/active/crash, free-text-remainder)` into those same five slots. The real timestamp only exists as unparsed free text inside `detail`. Do not consume this action's Linux/macOS output as if it matched the Windows/YAML field semantics.
-2. **`sessions`' idle time is always `0` on Windows.** The code queries `WTSSessionInfo` but never decodes the returned `IdleTime`, explicitly "for simplicity" (`users_plugin.cpp:511-525`). Linux/macOS idle text (via `w`) is real.
-3. **Windows-only exclusion filter.** `primary_user`/`session_history`'s Windows leg drops machine accounts (`...$`) and `SYSTEM` (`users_win_events.hpp:236-237`); the Linux/macOS `last`-based leg instead drops `reboot`/`shutdown`/`wtmp` boilerplate lines. A description that says "excludes machine accounts and SYSTEM" without an OS qualifier is describing the Windows leg only.
-4. **`local_users`' Linux last-logon lookup is gated by `is_safe_identifier`.** A username outside `[A-Za-z0-9._-]` (most commonly an AD/Samba machine account ending `$`) skips the `lastlog -u` call and reports `last_logon=unknown`; the account row is still emitted (`users_plugin.cpp:590-606`).
-5. **A minimal Linux image can be missing `lastlog`/`last` entirely.** The 2026-09-06 container capture had neither on `$PATH`: `local_users` degraded to `unknown` last-logons and `UNAVAILABLE`, and `primary_user`/`session_history` failed outright with the same status — while `logged_on` (utmp), `local_admins`/`group_members` (native `getgrnam`), and `sessions` (`w`, which was present) were unaffected. The same capture's `group_members group=sudo` returned zero rows and no `error` row: `getgrnam` only emits `group_member|error|Group not found: <name>` and returns 1 when the group doesn't exist (`users_plugin.cpp:971-975`); zero rows with rc 0 means the `sudo` group existed but had no explicit members and no `/etc/passwd` account with a matching primary GID (`users_plugin.cpp:976-1008`).
+1. **`session_history` columns on Linux and macOS do not match the declared schema.** The Windows leg fills `event_type|logon_type|source|timestamp|detail` as named, but the Linux and macOS leg splits `last`'s first three tokens and writes the tty, the host token, a derived `console`/`remote`/`system` class, a `completed`/`active`/`crash` word and the rest of the line into those same slots. The real date and duration exist only as free text in `detail`, so do not consume those two OSes' output as if it matched the Windows or YAML meaning. The window is the latest `count` records (1 to 500, default 50 on an out-of-range value) and includes `reboot` lines.
+2. **`primary_user` is a recent-activity heuristic, not a usage measurement.** It counts account names in the latest 200 Windows 4624 events (every logon type, so network and service logons count, and machine accounts and `SYSTEM` are dropped) or the latest 200 lines of `last` (boilerplate lines dropped); a tie goes to the alphabetically first name. When the Windows Security log cannot be read it falls back to the last profile under `\Users\` in registry order with `login_count` `0`, and sets no status.
+3. **The admin and group answers are narrow.** Windows `local_admins` looks up the group literally named `Administrators` and, if that lookup fails (for example on a localised Windows), writes no rows, no error row and no status, which reads like a host with no administrators. `group_members` accepts only the characters `A-Z a-z 0-9 . _ -` and no leading `-` or `.`, so a group with a space in its name, such as `Remote Desktop Users`, is rejected with an `Invalid group name` row on every OS. Linux `group_members` finds primary-group members by scanning `/etc/passwd` only.
+4. **`local_users` is a best-effort account list.** Linux and macOS leave out system accounts (uid below 1000 and 500, and `_` names on macOS), and on Linux `last_logon` is the raw `lastlog` line, `unknown` for a name outside the safe character set, and `Never` when `lastlog` says so. `enabled` on Linux and macOS means a usable login shell, not an unlocked password, and the Windows `last_logon` is this machine's own record shown in the agent's local time.
+5. **A minimal or locked-down host can look empty.** An image without `last` or `lastlog` degrades `local_users`, `primary_user` and `session_history` to `UNAVAILABLE`, while `logged_on` (`utmp`), `local_admins` and `group_members` (`getgrnam`) are unaffected. Because a tool's exit code is ignored, an unreadable `wtmp` gives the same `last command failed` row as a missing tool but with no status, and `group_members` returning zero rows with no `error` row means the group exists with no members.
 
 ## Source and tests
 

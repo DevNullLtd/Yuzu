@@ -27,11 +27,12 @@ std::string_view about_text() {
            "autonomous use-case-engine modules — engine-classed sessions are structurally "
            "barred from calling it, and every mutation is approval-gated.\n\n"
            "Deciding an approval ticket is a human act: approve/reject run from the "
-           "dashboard or REST under an interactive login that passes the MFA step-up "
-           "gate (an un-enrolled local user passes it; requiring an enrolled factor of "
-           "the approver is tracked in #6079). "
+           "dashboard or REST under an interactive login whose account has an enrolled "
+           "MFA factor with a proof no older than the approver window (at most 300 s) "
+           "(#6079); the REST route enforces that, not the MCP tools. "
            "The MCP tools approve_request and reject_request are registered but always "
-           "return approver_assurance_required:* (#6061); an MCP caller can list pending "
+           "refuse on the session class with approver_assurance_required:* (#6061); an "
+           "MCP caller can list pending "
            "approvals and must ask a human to decide them.";
 }
 
@@ -50,8 +51,8 @@ std::string_view operating_model_text() {
 // asserted mechanically by the family-tether test against the live tools/list
 // output, so a new tool with no family assignment (or a family dropped from the
 // blob) is a test FAILURE, not a review miss. The test compares sets, so order is
-// not enforced; served order is legacy kTools[] first, then registry records, and
-// listing names in that order is only a readability convention.
+// not enforced; tools/list is served in tool-name order, and the order of names
+// within a family is only a readability convention.
 
 namespace {
 
@@ -74,7 +75,8 @@ constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_ta
                                            "query_software_licenses", "get_agent_app_usage",
                                            "query_software_catalogue", "get_software_versions",
                                            "get_crypto_libraries", "list_crypto_library_devices",
-                                           "export_crypto_cbom"};
+                                           "export_crypto_cbom", "list_hardware_ci",
+                                           "get_hardware_ci"};
 constexpr std::string_view kCompliance[] = {
     "list_policies",    "get_compliance_summary",       "get_fleet_compliance",
     "get_guardian_schemas", "get_policy", "list_policy_fragments",
@@ -113,7 +115,7 @@ constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devi
                                         "list_discovered_devices"};
 constexpr std::string_view kExecution[] = {"execute_instruction", "execute_bundle",
                                            "get_bundle_result", "sync_hardware_software"};
-constexpr std::string_view kRemediation[] = {"quarantine_device"};
+constexpr std::string_view kRemediation[] = {"quarantine_device", "list_quarantined_devices"};
 // gap-matrix #10 (ADR-1005 A5 parity): issue_code_signing_cert joins the
 // family — same Security securable domain, same "Certificates" mental model.
 // B5 (api-parity #2146): export_ca_root_csr joins too — same PKI/CA domain,
@@ -135,6 +137,10 @@ constexpr std::string_view kPluginConfig[] = {
     "get_plugin_config",    "list_plugin_config",      "set_plugin_config",
     "delete_plugin_config", "set_plugin_secret",       "delete_plugin_secret",
     "get_plugin_kill_switch", "set_plugin_kill_switch"};
+// Server runtime configuration: the effective values and stored overrides, and the one-key write.
+// Separate from plugin config, which is per-plugin keys and secrets; this is the server's own
+// settings (heartbeat timeout, retention windows, log level).
+constexpr std::string_view kRuntimeConfig[] = {"get_runtime_config", "set_runtime_config"};
 // Upload grants are separate from plugin config: they are a short-lived
 // CREDENTIAL surface, not configuration, and the agent-side session endpoints
 // they authorize deliberately have no MCP twin at all.
@@ -250,8 +256,10 @@ constexpr std::string_view kFleetVisualization[] = {"get_fleet_topology", "get_h
 // B4 (#2146 API-parity) — no existing family covers a self-check "can I do X"
 // RBAC read; own family, distinct from Discovery's discover_permissions (the
 // whole catalog + role grid) and from Engine principals' assign/unassign/
-// list_engine_roles (grant AUTHORING, not a self-check).
-constexpr std::string_view kRbacCheck[] = {"check_permission"};
+// list_engine_roles (grant AUTHORING, not a self-check). get_me (twin of
+// GET /api/v1/me) joins it: the same kind of read, a self-description of the
+// CALLING principal that cannot name another one.
+constexpr std::string_view kRbacCheck[] = {"check_permission", "get_me"};
 // A2 (delivery plan §2) — global human role assignment/unassignment. Own
 // family, distinct from RBAC self-check above (a read, not an authoring
 // action) and from Engine principals' assign/unassign_engine_role (a
@@ -298,8 +306,14 @@ constexpr std::string_view kLicense[] = {"get_platform_license", "activate_platf
 constexpr std::string_view kSoftwareDeployments[] = {
     "list_software_deployments", "create_software_deployment",
     "rollback_software_deployment", "cancel_software_deployment"};
+// /crypto dashboard widgets (ADR-0070 D13): the catalogue, the caller's own layout, and the
+// Yuzu-issued certificate counts. The library reads stay in kInventory; the rows behind a
+// Yuzu-issued count are list_issued_certs' filtered form (the CA family).
+constexpr std::string_view kCryptoDashboard[] = {
+    "list_crypto_widgets", "get_crypto_dashboard_layout", "set_crypto_dashboard_layout",
+    "get_crypto_ca_stats"};
 
-constexpr std::array<ToolFamily, 40> kFamilies{{
+constexpr std::array<ToolFamily, 42> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions, their full export, and recurring "
@@ -309,7 +323,8 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
     {"Command responses", "query and aggregate stored command/instruction responses", kResponses},
     {"Executions & audit", "execution status/history and the who-did-what audit log",
      kExecutionsAudit},
-    {"Inventory & software", "collected inventory tables, installed software, and licenses",
+    {"Inventory & software",
+     "collected inventory tables, installed software, hardware CI records, and licenses",
      kInventory},
     {"Policy & compliance", "policies, per-device and fleet compliance, Guardian schemas",
      kCompliance},
@@ -333,7 +348,9 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
      kNetwork},
     {"Live execution", "dispatch plugin actions or bundles to endpoints and collect results",
      kExecution},
-    {"Device remediation", "quarantine a device (destructive, approval-gated)", kRemediation},
+    {"Device remediation",
+     "quarantine a device (destructive, approval-gated) and list active quarantines",
+     kRemediation},
     {"Certificates",
      "list issued agent certificates, revoke one, and issue a code-signing certificate via "
      "CSR custody",
@@ -344,6 +361,9 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
     {"Plugin configuration", "per-plugin config keys, write-only secrets, and the per-action "
                              "kill switch",
      kPluginConfig},
+    {"Runtime configuration", "the server's own settings: effective values, stored overrides, "
+                              "and the one-key write",
+     kRuntimeConfig},
     {"Upload grants", "mint, list and revoke the one-time grants that authorize an agent to "
                       "upload a file northbound",
      kUploadGrants},
@@ -381,9 +401,10 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
                             "connections, and listening sockets, fleet-wide or per-host",
      kFleetVisualization},
     {"RBAC self-check", "check whether the calling principal itself holds a specific RBAC "
-                        "permission",
+                        "permission, and describe the calling session (identity, role, tier, "
+                        "direct RBAC role names)",
      kRbacCheck},
-    {"RBAC administration", "grant or revoke one of the 6 fleet-wide-assignable built-in RBAC "
+    {"RBAC administration", "grant or revoke one of the 7 fleet-wide-assignable built-in RBAC "
                             "roles to a human user, and switch RBAC enforcement on/off "
                             "(Administrator-gated, not a plain permission check)",
      kRbacAdministration},
@@ -400,6 +421,9 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
     {"Software deployments", "software-package fleet deployment lifecycle (list, create, "
                              "rollback, cancel)",
      kSoftwareDeployments},
+    {"Crypto dashboard", "the /crypto widget catalogue, your own widget layout, and counts of "
+                         "certificates issued by Yuzu's own CA (fixed windows, with as_of)",
+     kCryptoDashboard},
 }};
 
 }  // namespace

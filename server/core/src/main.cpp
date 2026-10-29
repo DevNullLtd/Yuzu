@@ -19,6 +19,7 @@
 #include "rbac_store.hpp" // fresh-start Administrator bootstrap (RbacStore::provision_first_admin)
 #include "scim_routes.hpp"
 #include "security_headers.hpp"
+#include "session_store.hpp" // --mfa-reset ends the account's durable sessions (#6079)
 #include "sso_boot_guard.hpp" // sso_only_boot_guard_ok / *_config_complete (CC6.3)
 
 #include <CLI/CLI.hpp>
@@ -371,8 +372,9 @@ int main(int argc, char* argv[]) {
     app.add_option("--csrf-trusted-origin", cfg.csrf_trusted_origins,
                    "External origin the dashboard is served on, for the CSRF same-site check "
                    "(repeatable; a single value may be comma-separated). Set this when a reverse "
-                   "proxy rewrites Host, otherwise every CSRF-gated dashboard action is refused "
-                   "with 403 because the browser's Origin cannot match the proxied Host. Forms: "
+                   "proxy rewrites Host, otherwise every cookie-session write is refused with "
+                   "403 because the browser's Origin cannot match the proxied Host. Environment "
+                   "variable: YUZU_CSRF_TRUSTED_ORIGIN. Forms: "
                    "'https://yuzu.example' (matched on scheme AND host) or a bare 'yuzu.example' "
                    "(host only). Wildcards are NOT supported. No forwarded header is consulted.")
         // Comma-splitting is done ONCE, in normalise_trusted_origins (web_utils.hpp),
@@ -485,7 +487,10 @@ int main(int argc, char* argv[]) {
     app.add_option("--log-max-files", log_max_files, "Max rotated log files (default: 5)")
         ->default_val(5)
         ->envname("YUZU_LOG_MAX_FILES");
-    app.add_option("--rate-limit", rate_limit, "Max API requests/second per IP (default: 100)")
+    app.add_option("--rate-limit", rate_limit,
+                   "Max API requests/second per IP (default: 100). Also the per-source budget "
+                   "for /health and /api/health requests that carry a credential; values "
+                   "below 1 are treated as 1")
         ->default_val(100)
         ->envname("YUZU_RATE_LIMIT");
     app.add_option("--login-rate-limit", login_rate_limit,
@@ -528,8 +533,9 @@ int main(int argc, char* argv[]) {
 
     // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
     app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
-                   "MFA enforcement (default: optional). \"optional\" = self-service "
-                   "enrollment, login never requires it. \"admin-only\" = admins must "
+                   "MFA enforcement (default: optional). \"optional\" = login never requires "
+                   "it; only an administrator can enrol, from Settings (a non-admin needs "
+                   "an enrolment sign-in window). \"admin-only\" = admins must "
                    "enrol before login completes. \"required\" = every role must enrol. "
                    "Under admin-only/required an un-enrolled login is redirected through "
                    "TOTP enrollment (POST /login/mfa/enroll) before a session is minted.")
@@ -538,7 +544,10 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_MFA_ENFORCEMENT");
     app.add_option("--mfa-step-up-window-secs", cfg.mfa_step_up_window_secs,
                    "Seconds after a TOTP proof that high-risk endpoints accept the session as "
-                   "stepped-up (default: 300)")
+                   "stepped-up (default: 300). A value <= 0 disables the stale-proof "
+                   "requirement on the 37 central step-up routes: a stale or absent proof is "
+                   "neither refused nor recorded, SAML sessions pass, and the auth store is not "
+                   "read; engine denials and unwired-store refusals still apply and are recorded")
         ->default_val(300)
         ->envname("YUZU_MFA_STEP_UP_WINDOW_SECS");
     app.add_option("--mfa-login-pending-secs", cfg.mfa_login_pending_secs,
@@ -788,12 +797,20 @@ int main(int argc, char* argv[]) {
     int generate_tokens = 0;
     std::string gen_label;
     int gen_max_uses = 1;
-    int gen_ttl_hours = 0;
+    int gen_ttl_hours = yuzu::server::auth::kDefaultEnrollmentTokenTtlHours;
     app.add_option("--generate-tokens", generate_tokens,
                    "Generate N enrollment tokens and print to stdout (JSON), then exit");
     app.add_option("--token-label", gen_label, "Label prefix for generated tokens");
-    app.add_option("--token-max-uses", gen_max_uses, "Max uses per token (default: 1)");
-    app.add_option("--token-ttl-hours", gen_ttl_hours, "Token TTL in hours (0 = no expiry)");
+    // Non-negative only: a negative --token-ttl-hours used to fall through to "no
+    // expiry" below, the opposite of what a signed number reads as (the REST twin
+    // refuses a negative ttl_hours), and a negative --token-max-uses was refused by the
+    // store rather than by the option parser. 0 is the explicit way to ask for either.
+    app.add_option("--token-max-uses", gen_max_uses,
+                   "Max uses per token (default: 1; 0 = unlimited)")
+        ->check(CLI::NonNegativeNumber);
+    app.add_option("--token-ttl-hours", gen_ttl_hours,
+                   "Token TTL in hours (default 72; 0 = no expiry)")
+        ->check(CLI::NonNegativeNumber);
 
     // Break-glass MFA reset mode (runs and exits, no server startup). Clears a
     // user's MFA enrollment out-of-band so an operator locked out by MFA
@@ -978,16 +995,20 @@ int main(int argc, char* argv[]) {
                    "Used only as a display fallback and logged, never stored or used for identity")
         ->envname("YUZU_SAML_EMAIL_ATTRIBUTE");
 
-    // Data infrastructure options
-    app.add_option("--response-retention-days", cfg.response_retention_days,
+    // Data infrastructure options. Bound to plain ints (CLI11 cannot fill a LiveInt) and copied into
+    // the config right after the parse.
+    int response_retention_days = cfg.response_retention_days;
+    int audit_retention_days = cfg.audit_retention_days;
+    int guardian_event_retention_days = cfg.guardian_event_retention_days;
+    app.add_option("--response-retention-days", response_retention_days,
                    "Response retention period in days (default: 90)")
         ->default_val(90)
         ->envname("YUZU_RESPONSE_RETENTION_DAYS");
-    app.add_option("--audit-retention-days", cfg.audit_retention_days,
+    app.add_option("--audit-retention-days", audit_retention_days,
                    "Audit log retention period in days (default: 365)")
         ->default_val(365)
         ->envname("YUZU_AUDIT_RETENTION_DAYS");
-    app.add_option("--guardian-event-retention-days", cfg.guardian_event_retention_days,
+    app.add_option("--guardian-event-retention-days", guardian_event_retention_days,
                    "Guardian (guaranteed-state) event retention period in days (default: 30)")
         ->default_val(30)
         ->envname("YUZU_GUARDIAN_EVENT_RETENTION_DAYS");
@@ -1032,6 +1053,9 @@ int main(int argc, char* argv[]) {
     app.add_flag("--remove-service", remove_service, "Remove Windows service and exit");
 
     CLI11_PARSE(app, argc, argv);
+    cfg.response_retention_days = response_retention_days;
+    cfg.audit_retention_days = audit_retention_days;
+    cfg.guardian_event_retention_days = guardian_event_retention_days;
 
     // #5906: probe-and-exit, before any server init (no config, secrets, DB, log or
     // cert-dir side effects).
@@ -1101,6 +1125,12 @@ int main(int argc, char* argv[]) {
         spdlog::info("CSRF same-site gate: accepting {} operator-declared external origin(s) "
                      "in addition to the request Host — {}",
                      accepted, joined);
+    } else {
+        spdlog::info("CSRF same-site gate: cookie-session writes require a same-site Origin or "
+                     "Referer matching the request Host; no --csrf-trusted-origin value "
+                     "accepted. Behind a reverse proxy that rewrites Host, declare the public "
+                     "origin with --csrf-trusted-origin or dashboard writes will be refused "
+                     "with 403.");
     }
     // A config whose entries were ALL rejected previously logged nothing — boot
     // output byte-identical to not passing the flag, followed by every proxied
@@ -1121,7 +1151,7 @@ int main(int argc, char* argv[]) {
     // reading the boot log can confirm the deployment's posture (SOC 2
     // CC6.6 evidence). `admin-only` and `required` redirect an un-enrolled
     // login through TOTP enrollment before a session is minted; `optional`
-    // (default) leaves enrollment self-service.
+    // (default) never requires it; only an administrator can enrol from Settings.
     if (cfg.mfa_enforcement != "optional") {
         spdlog::info("MFA enforcement active: mode={} — un-enrolled {} must complete TOTP "
                      "enrollment at login before a session is issued.",
@@ -1197,23 +1227,32 @@ int main(int argc, char* argv[]) {
                      "absolute 8h session lifetime applies.");
     }
     // PR2 governance Gate 2 sec-M6: the step-up gate honours
-    // window_secs <= 0 as an "escape hatch" that lets every request
-    // through without re-prompting. The helper itself doesn't log on
-    // every skip (too noisy), so we surface it once at startup so the
-    // operator sees the disabled state in journald and an auditor
-    // reading the boot log can spot a misconfigured deployment. The JIT
+    // window_secs <= 0 as an "escape hatch" that stops a stale or absent
+    // MFA proof from being refused or re-prompted. It does not admit
+    // everything: the unwired-auth-store 503 (apply_step_up_chokepoint) and
+    // the engine-principal denial (decide_step_up) both run BEFORE the
+    // hatch, so they still apply and are still recorded. The helper itself
+    // doesn't log on every skip (too noisy), so we surface it once at
+    // startup so the operator sees the disabled state in journald and an
+    // auditor reading the boot log can spot a misconfigured deployment. The JIT
     // elevation handlers are the exception: AuthRoutes substitutes a 300 s window
     // for them when this flag is <= 0 (auth_routes.cpp, kElevationStepUpWindow),
-    // so they keep prompting and keep emitting their audit rows.
+    // so they keep prompting and keep emitting their audit rows. The approval
+    // decide routes (#6079) are the other exception: they do not consult the
+    // disabled state at all (see approver_step_up_window in mfa_factor_state.hpp).
     if (cfg.mfa_step_up_window_secs <= 0) {
         spdlog::warn(
-            "--mfa-step-up-window-secs={} disables the MFA step-up gate on every high-risk "
-            "REST + Settings endpoint except the JIT-elevation endpoints (POST /api/v1/elevate "
-            "and the elevation-eligibility routes), which still require an MFA-enrolled "
-            "caller's proof (local TOTP or IdP `amr`) to be no older than 300s. The "
-            "disabled endpoints will NOT re-prompt for MFA proof and emit no SOC 2 CC6.6 "
-            "`mfa.step_up.required` evidence rows. Set to a positive value (default 300) "
-            "to re-enable.",
+            "--mfa-step-up-window-secs={} disables the stale-proof requirement on the 37 central "
+            "step-up routes (REST, dashboard and Settings routes; the three JIT-elevation routes "
+            "keep their own 300 s window). On the 37 routes a stale or absent proof is neither "
+            "refused nor "
+            "recorded (no SOC 2 CC6.6 `mfa.step_up.required` evidence row), they will NOT "
+            "re-prompt for MFA proof, SAML sessions pass, and the auth store is not read. "
+            "Engine-principal denials and unwired-auth-store refusals still apply on those "
+            "routes and are still recorded. Set to a positive value (default 300) to restore "
+            "the requirement. The approval decide routes (POST /api/approvals/{{id}}/approve and "
+            "/reject) are the exception: they also require an ENROLLED caller's proof no older "
+            "than 300s regardless of this setting.",
             cfg.mfa_step_up_window_secs);
     }
 
@@ -1869,11 +1908,12 @@ int main(int argc, char* argv[]) {
             return EXIT_FAILURE;
         }
         // Audit is MANDATORY for break-glass: the whole point of #1226 is to
-        // replace the manual-SQL path that left no evidence (SOC 2 CC6.6). So
-        // open + verify the audit store is WRITABLE *before* mutating MFA — if
-        // it isn't, refuse to proceed rather than silently clear a second factor
-        // with no record (H-1). This also gives the operator an actionable error
-        // instead of a buried warning during a stressful recovery.
+        // replace the manual-SQL path that left no evidence (SOC 2 CC6.6). The
+        // fail-closed gate is the INTENT row written below, before anything is
+        // mutated: if the audit store will not accept it, nothing is cleared. This
+        // open-and-verify step only avoids a pointless attempt and gives the
+        // operator an actionable error instead of a buried warning during a
+        // stressful recovery.
         // ADR-0040: AuditStore is Postgres-backed. Reuse the already-open,
         // validated break-glass PgPool (auth_pg_pool is non-null here — this
         // block is guarded by `if (!auth_db)` above, and auth_db only exists
@@ -1884,38 +1924,112 @@ int main(int argc, char* argv[]) {
             "record in change management).");
         if (!audit)
             return EXIT_FAILURE;
-        if (auto r = auth_db->mfa_disable(mfa_reset_user); !r) {
-            spdlog::error("--mfa-reset: failed to clear MFA for '{}'", mfa_reset_user);
-            return EXIT_FAILURE;
-        }
         // Attribute the break-glass to the KERNEL-AUTHORITATIVE OS identity, not
-        // getenv("USER") — the env var is inherited from the parent and trivially
+        // getenv("USER"): the env var is inherited from the parent and trivially
         // forgeable (USER=root ./yuzu-server --mfa-reset ...), which would let the
         // actor poison the very evidence this audit exists to provide (H-2).
         const std::string os_user = resolve_os_principal();
-        yuzu::server::AuditEvent ev;
-        ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                           std::chrono::system_clock::now().time_since_epoch())
-                           .count();
-        ev.principal = os_user;
-        ev.principal_role = "break-glass";
-        ev.action = "mfa.reset.breakglass";
-        ev.target_type = "User";
-        ev.target_id = mfa_reset_user;
-        ev.result = "success";
-        ev.detail = std::format("MFA enrollment cleared via --mfa-reset CLI (os_identity={})",
-                                os_user);
-        if (!audit->log(ev)) {
-            // The pre-check passed but the write failed (e.g. disk filled mid-op).
-            // MFA is already cleared; fail loudly and non-zero so automation and
-            // the operator know the evidence row is missing and must be recorded.
-            spdlog::error("--mfa-reset: MFA cleared for '{}' but the audit row failed to persist — "
-                          "record this reset manually in your change-management system NOW",
+        // Two rows per reset: an INTENT row ("attempted") written BEFORE the factor
+        // is touched, and an OUTCOME row written after. A kill or host loss between
+        // the clear and the outcome row then still leaves the intent row as evidence
+        // that a clear was requested (#6079 au-F1). Order the two by the audit `id`
+        // identity column; `timestamp` is whole seconds.
+        auto make_event = [&](std::string result, std::string detail) {
+            yuzu::server::AuditEvent ev;
+            ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+            ev.principal = os_user;
+            ev.principal_role = "break-glass";
+            ev.action = "mfa.reset.breakglass";
+            ev.target_type = "User";
+            ev.target_id = mfa_reset_user;
+            ev.result = std::move(result);
+            ev.detail = std::move(detail);
+            return ev;
+        };
+        if (!audit->log(make_event("attempted", std::format("MFA clear requested via --mfa-reset "
+                                                            "CLI (os_identity={})",
+                                                            os_user)))) {
+            spdlog::error("--mfa-reset: the audit store did not accept the intent row for '{}'; "
+                          "MFA was NOT cleared. If you are locked out and cannot restore the "
+                          "audit store, see \"Fallback: direct SQL\" in the Auth Store Recovery "
+                          "Runbook (docs/ops-runbooks/auth-db-recovery.md)",
+                          mfa_reset_user);
+            std::cerr << "error: audit store did not accept the intent row; nothing was changed\n";
+            std::cerr << "if you are locked out and cannot restore the audit store, see "
+                         "\"Fallback: direct SQL\" in the Auth Store Recovery Runbook "
+                         "(docs/ops-runbooks/auth-db-recovery.md)\n";
+            return EXIT_FAILURE;
+        }
+        if (auto r = auth_db->mfa_disable(mfa_reset_user); !r) {
+            // A lost COMMIT acknowledgement reports failure even when the clear
+            // landed, so this path cannot claim nothing changed: record that the
+            // state is unknown and tell the operator to check before re-running.
+            spdlog::error("--mfa-reset: failed to clear MFA for '{}'; the state is unknown (the "
+                          "clear may have committed)",
+                          mfa_reset_user);
+            if (!audit->log(make_event("error", std::format("MFA clear failed; state unknown, "
+                                                            "re-run after checking status "
+                                                            "(os_identity={})",
+                                                            os_user)))) {
+                spdlog::error("--mfa-reset: the outcome audit row for the failed clear of '{}' "
+                              "also failed to persist",
+                              mfa_reset_user);
+            }
+            std::cerr << "error: failed to clear MFA; the state is unknown, check the account's "
+                         "status and re-run\n";
+            return EXIT_FAILURE;
+        }
+        // End the account's durable sessions in the same one-shot (#6079). A session that
+        // survived the reset could hold an MFA proof made under the factor just cleared; the
+        // approver gate refuses a proof older than the CURRENT enrolment, but that comparison
+        // rests on the database clock never stepping backward, and a live session also keeps
+        // a password-only account's access. Ending them leaves no such proof to compare.
+        // The delete bumps the durable generation, so every replica drops its cached copy on
+        // its next refresh. A failure here is loud and non-zero: the factor is already
+        // cleared, so the operator must end the sessions by hand.
+        int sessions_ended = 0;
+        bool sessions_end_failed = false;
+        {
+            yuzu::server::SessionStore sessions(*auth_pg_pool);
+            auto ended = sessions.is_open() ? sessions.invalidate_user(mfa_reset_user)
+                                            : std::unexpected(yuzu::server::SessionStore::Error{
+                                                  "session store did not open"});
+            if (!ended) {
+                spdlog::error("--mfa-reset: MFA cleared for '{}' but ending its sessions failed "
+                              "({}). End them now with DELETE /api/v1/sessions?username=<name> "
+                              "and record the reset.",
+                              mfa_reset_user, ended.error().message);
+                std::cerr << "error: MFA cleared but the account's sessions were not ended\n";
+                sessions_end_failed = true;
+            } else {
+                sessions_ended = *ended;
+            }
+        }
+        // OUTCOME row: "success" when the sessions ended, "partial" when they did not
+        // (the vocabulary the Settings disable route uses for the same state).
+        if (!audit->log(make_event(
+                sessions_end_failed ? "partial" : "success",
+                std::format("MFA enrollment cleared via --mfa-reset CLI (os_identity={}, "
+                            "sessions_ended={})",
+                            os_user,
+                            sessions_end_failed ? "failed" : std::to_string(sessions_ended))))) {
+            // The intent row exists, but the outcome write failed (e.g. disk filled
+            // mid-op). MFA is already cleared; fail loudly and non-zero so automation
+            // and the operator know the outcome row is missing and must be recorded.
+            spdlog::error("--mfa-reset: MFA cleared for '{}' but the outcome audit row failed to "
+                          "persist; record this reset manually in your change-management "
+                          "system NOW",
                           mfa_reset_user);
             std::cerr << "error: MFA cleared but audit row failed to persist; record this reset "
                          "manually\n";
             return EXIT_FAILURE;
         }
+        // The outcome row is written either way; a failed session delete still exits
+        // non-zero so automation and the operator end the sessions by hand.
+        if (sessions_end_failed)
+            return EXIT_FAILURE;
         spdlog::info("Break-glass: MFA cleared for '{}'. The user can now sign in with their "
                      "password alone; under MFA enforcement they will be walked through "
                      "enrollment at next login.",
@@ -2102,7 +2216,13 @@ int main(int argc, char* argv[]) {
         // regardless of which entry point minted it.
         {
             constexpr std::size_t kMaxListed = 20;
-            std::string detail = "by=" + created_by + " max_uses=" + std::to_string(gen_max_uses) +
+            // `by=` and `label=` carry operator text: audit_token() keeps either from
+            // adding a key or a line to the detail (space, `=`, `,` and control bytes
+            // become `_`). The principal column keeps the raw value.
+            std::string detail = "by=" + yuzu::server::audit_token(created_by) +
+                                 " max_uses=" + std::to_string(gen_max_uses) +
+                                 " ttl_s=" + std::to_string(ttl.count()) +
+                                 " label=" + yuzu::server::audit_token(gen_label) +
                                  " count=" + std::to_string(token_ids.size());
             if (!token_ids.empty()) {
                 detail += " ids=";

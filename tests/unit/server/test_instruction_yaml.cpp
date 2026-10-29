@@ -297,6 +297,19 @@ TEST_CASE("instruction_yaml: explicit metadata.id charset/length gate matches Sa
         CHECK(validate_definition_yaml(with_id("mcpx.thing")).empty());
         CHECK(validate_definition_yaml(with_id("a.mcp.thing")).empty());
     }
+    SECTION("the reserved guardian. namespace is rejected here too, with its own token (#6062)") {
+        for (const char* id : {"guardian.deploy.rules", "guardian."}) {
+            auto errors = validate_definition_yaml(with_id(id));
+            INFO(id);
+            REQUIRE(errors.size() == 1);
+            CHECK(errors[0] == std::string(yuzu::server::kReservedGuardianDefinitionIdError));
+        }
+    }
+    SECTION("only the exact guardian. prefix is reserved") {
+        CHECK(validate_definition_yaml(with_id("guardianx.thing")).empty());
+        CHECK(validate_definition_yaml(with_id("Guardian.x")).empty());
+        CHECK(validate_definition_yaml(with_id("my.guardian.x")).empty());
+    }
 }
 
 TEST_CASE("instruction_yaml: byte-level malformations are rejected outright",

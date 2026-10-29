@@ -6,7 +6,7 @@
 # header-only agents/shared/wmi_bounded.hpp — this plugin was its origin
 # (roadmap C-8); it is #include-d, not compiled as a separate source, like
 # every other consumer (win_str.hpp / win_com.hpp pattern).
-license_scan_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
+license_scan_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
 if host_machine.system() == 'windows'
   # wmi_bounded.hpp (header-only): bounded WMI enumerator — COM + WbemLocator.
   # licensing_win.cpp: Reg*W registry probes + hive mounting (advapi32).
@@ -16,6 +16,12 @@ if host_machine.system() == 'windows'
     cxx.find_library('oleaut32'),
     cxx.find_library('advapi32'),
   ]
+elif host_machine.system() == 'linux'
+  # licensing_x509.hpp (header-only, included by licensing_linux.cpp): the
+  # in-process libcrypto PEM -> notAfter read that replaced the
+  # `openssl x509` subprocess on the entitlement_certs surface. Same shape as
+  # agents/plugins/certificates/meson.build's non-Windows openssl dependency.
+  license_scan_deps += dependency('openssl', required: true, include_type: 'system')
 endif
 
 license_scan_plugin_lib = shared_library(

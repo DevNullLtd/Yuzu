@@ -205,8 +205,66 @@ TEST_CASE("operate pages: Approvals copy is exact and claims no second person",
     CHECK(has(js, "'/' + kind"));
     CHECK(has(js, "maxlength: 1000"));
     CHECK(has(js, "list.getAttribute('data-can-decide') === '1'"));
-    CHECK(has(js, "!(pending && !mine && canDecide)"));
+    // An excluded reviewer (#6062) keeps the decision container (the store lets an excluded
+    // root REJECT) and loses only the Approve button; the submitter loses both.
+    CHECK(has(js, "field(detail, 'actions').hidden = !(pending && !mine && canDecide);"));
+    CHECK(has(js, "field(detail, 'excluded').hidden = !(pending && !mine && excluded && canDecide);"));
+    CHECK(has(js, "d.excluded === '1'"));
+    CHECK(has(js, "approveBtn.hidden = excluded || d.unreadable === '1';"));
+    CHECK_FALSE(has(js, "!(pending && !mine && !excluded && canDecide)"));
+    // The dialog copy does not claim the reviewer saw everything when the summary was cut.
+    CHECK(has(js, "d.request && d.shortened === '1' ?"));
+    CHECK(has(js, "The summary above is shortened and is for orientation only; it does not show the "));
+    CHECK(has(js, "The summary above is for orientation. What you approve is the whole request as "));
+    // The Approve POST carries only a comment and matches id + pending status, so no copy may
+    // promise that the request cannot change after the decision (digest-pinned Approve is a
+    // PR3 entry condition in ADR-1009).
+    // The wording that remains is pinned too (both branches end the same way).
+    CHECK(has(js, "the whole request as stored under the digest ' +\n          'shown.' :"));
+    CHECK(has(js, "'stored under the digest shown.' :"));
+    CHECK_FALSE(has(js, "cannot change after your decision"));
+    CHECK_FALSE(has(js, "frozen under the digest"));
+    CHECK_FALSE(has(js, "it is frozen on the request"));
+    // Never claims the summary IS the whole effect.
+    CHECK_FALSE(has(js, "exactly the effect shown"));
+    // An unreadable request hides Approve only (#6062): Reject stays so the row can be cleared.
+    CHECK(has(js, "var approveBtn = $('button[data-act=\"approve\"]', detail);"));
+    // A bound ticket's frozen request fills the detail panel and the decision dialog as
+    // text (#6062): a hidden row revealed by the controller, written with textContent.
+    CHECK(has(body, "data-f=\"request-row\" hidden"));
+    CHECK(has(body, "data-f=\"request\""));
+    CHECK(has(body, "data-f=\"excluded\" hidden"));
+    CHECK(has(body, "You are excluded from approving this request. You can still reject it."));
+    CHECK(has(js, "requestEl.textContent = request;"));
+    CHECK(has(js, "factRow('Requested effect', d.request, true)"));
+    // The dialog shows the whole frozen request, not a 5em scroll box (#6062).
+    CHECK(has(js, "reqRow.lastChild.className = 'req';"));
+    CHECK(has(std::string(yuzu::server::kOperateCss), ".dlg-facts code.req{max-height:50vh;white-space:pre-wrap;text-align:left}"));
     CHECK_FALSE(has(js, "onclick"));
+}
+
+TEST_CASE("operate pages: the Approvals dialog shows an approver refusal's remediation (#6079)",
+          "[ui][operate][pages]") {
+    const auto& js = yuzu::server::kYuzuOperateJs;
+    // The helper is guarded on BOTH the message prefix and a string remediation, and the one
+    // use is the 403 branch of the decide dialog; its error text is a textContent sink.
+    CHECK(count_of(js, "function approverRefusalText(env)") == 1);
+    CHECK(has(js, "e.message.indexOf('approver_assurance_required:') === 0"));
+    CHECK(has(js, "typeof e.remediation === 'string' && e.remediation) return e.remediation;\n     "
+                  " return '';"));
+    CHECK(has(js, "if (r.status === 403) return approverRefusalText(r.data) ||"));
+    // A 503 shows error.message and error.remediation together as one text (MFA state
+    // unreadable, clock fault, audit store down), with the generic text as the fallback;
+    // 400/401/403 keep their own text.
+    CHECK(count_of(js, "function unavailableText(env)") == 1);
+    CHECK(has(js, "return m && r ? m.replace(/[.\\s]+$/, '') + '. ' + r : m || r;"));
+    CHECK(has(js, "if (r.status === 503) return unavailableText(r.data) ||\n"
+                  "                'Could not confirm the decision. Refresh to see the current "
+                  "state.';"));
+    CHECK(has(js, "if (r.status === 401) return 'Your session has expired. Sign in again.';"));
+    // The text reaches the page through textContent only (the toast sink the comment relies on).
+    CHECK(has(js, "t.textContent = msg;"));
+    CHECK(has(js, "'You do not have permission to decide approvals.'"));
 }
 
 TEST_CASE("operate pages: the Executions template carries every hook the controller binds",

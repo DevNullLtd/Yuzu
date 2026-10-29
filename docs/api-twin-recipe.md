@@ -163,11 +163,11 @@ Two headers, split on whether they touch `httplib`:
 
 Every new REST error path goes through `detail::a4_error(res, "...")` or `detail::a4_denial(...)`
 — never a hand-rolled `{"error": "..."}` body. The legacy bare `error_json()` helper is retired
-(#1470; see the comment at `rest_api_v1.cpp:215-218`).
+(#1470; see the comment between `ok_json` and `list_json` in `rest_api_v1.cpp`).
 
 ### Success envelopes
 
-`rest_api_v1.cpp:211` (`ok_json`) and `:220` (`list_json`), both near the top of the file:
+`ok_json` and `list_json` in `rest_api_v1.cpp`, both near the top of the file:
 
 ```cpp
 std::string ok_json(std::string_view data_json) {
@@ -191,18 +191,69 @@ it never reports the page size as a `total` (see `GET /api/v1/deployments`).
 
 ### OpenAPI entry
 
-`openapi_spec()` (`rest_api_v1.cpp:516`) is a hand-maintained raw-string literal (split into
-several `R"json(...)"` segments to stay under MSVC's ~16 KB per-literal cap — see the comment at
-`:1109-1111`), **not** generated from the live route table. `docs/agentic-first-principle.md` §A2
-flags this explicitly: `GET /api/v1/discover/routes` subsets this same document and inherits its
-"can under-report" caveat. Add one `"/<path>": { "get"/"post": {...} }` entry per route, following
-the density of an existing entry in the same tag family — e.g. `/network/fleet`
-(`rest_api_v1.cpp:1107`) for a short read, or `/dex/devices/{id}/app-perf`
-(`rest_api_v1.cpp:1076`) for one that documents its audit/fail-closed posture inline. Match that
-density: summary, tag, a description paragraph naming the required permission and any audit verb,
-full `parameters`, and every realistic `responses` status (200/400/403/503, plus the
-`Sec-Audit-Failed` header block on any audited route — see `/network/devices`'s entry at
-`rest_api_v1.cpp:1113` for the header-documentation shape).
+`openapi_spec()` (in `rest_api_v1.cpp`) is a hand-maintained raw-string literal (split into
+several `R"json(...)"` segments to stay under MSVC's ~16 KB per-literal cap — see the C2026 split
+comment inside the chain), **not** generated from the live route table.
+`docs/agentic-first-principle.md` §A2 flags this explicitly: `GET /api/v1/discover/routes` subsets
+this same document and inherits its "can under-report" caveat. Add one
+`"/<path>": { "get"/"post": {...} }` entry per route, following the density of an existing entry
+in the same tag family — e.g. the `"/network/fleet"` path item for a short read, or the
+`"/dex/devices/{id}/app-perf"` one for one that documents its audit/fail-closed posture inline.
+Match that density: summary, tag, a description paragraph naming the required permission and any
+audit verb, full `parameters`, and every realistic `responses` status (200/400/403/503, plus the
+`Sec-Audit-Failed` header block on any audited route — see the `"/network/devices"` path item for
+the header-documentation shape).
+
+Three more things the entry must carry, because the served document is read by code generators
+and by the `/swagger` page as well as by people:
+
+- **`operationId`.** Every operation has one, unique across the document: the lower-case method,
+  then the path (without the `/api/v1` base) in PascalCase, with each path parameter written as
+  `By` plus its name. `GET /hardware/{id}` is `getHardwareById`, `POST /hardware/{id}/sync` is
+  `postHardwareByIdSync`, `DELETE /upload-grants/{grant_id}` is `deleteUploadGrantsByGrantId`. A
+  new operation follows the same rule. Two tests in `tests/unit/server/test_openapi_spec_completeness.cpp`
+  check uniqueness: `openapi_spec_json(): every operation has a unique and well-formed operationId`
+  (which also checks presence and shape) and `openapi documents: every operation has a unique
+  operationId in both forms`.
+- **Group guides.** Prose for a group lives in the guide of the matching top-level `tags` entry
+  under `x-yuzu-guide`, not inside an operation. `GET /api/v1/openapi.json` leaves the guides out
+  and `?guides=true` includes them; the MCP resource `yuzu://openapi` and the discover tools serve
+  only the form without them.
+- **Unserved routes.** An operation that is documented but not registered on a running server,
+  because the store behind it is not started, carries an `x-yuzu-unavailable` string on the
+  operation saying so. The `/swagger` page labels such operations unavailable, and the route
+  catalog (`GET /api/v1/discover/routes`, MCP `discover_routes`) repeats the string as an
+  `unavailable` field on that row. A route that is registered must not carry it. When a store
+  becomes wired in `server.cpp`, remove its markers in the same change:
+  `tests/test_unavailable_store_wiring.py` fails if they disagree.
+
+**The `ecosystem` tokens.** Three placeholders in the literal are expanded once, on first use, by
+`expand_ecosystem_tokens()`: `"@@ECOSYSTEM_ENUM@@"` (the software routes),
+`"@@ECOSYSTEM_ENUM_OR_EMPTY@@"` (routes where a present-empty value selects rows with no
+ecosystem — the `/crypto` reads) and `@@ECOSYSTEM_LIST@@` (the `ecosystem (a|b|c)` prose). All
+three are generated from `kEcosystemFamilies` (`software_catalog_rules.hpp`), so a new route with
+an `ecosystem` query parameter uses the token, never a hand-typed array. The enum is written
+`"enum": ["@@ECOSYSTEM_ENUM@@"]` (or the `_OR_EMPTY` token): the brackets are the author's, the
+quotes belong to the token. Two gates hold that, and they guarantee different things:
+
+- `tests/unit/server/test_openapi_spec_completeness.cpp` sweeps every `ecosystem` parameter in the
+  served document (referenced parameters and schemas resolved) and fails one whose enum diverges
+  from the table or the table-plus-empty form; the named route pins fix which routes get which
+  form. That guarantees the **values**.
+- `tests/test_software_vocabulary_consistency.py` fails any `ecosystem` enum in the unexpanded
+  literal that is not one of the two tokens. That guarantees the **provenance**, which the served
+  document cannot show: an array copied from the table is value-identical once served. The gate
+  decodes the literal through `check-api-parity.py`'s lexer and checks, in the decoded document,
+  every parameter named `ecosystem` (schema `$ref`s resolved) and every enum-bearing property keyed
+  `ecosystem`, so spelling, key order and JSON escapes cannot matter, and a parameter with no enum
+  fails too.
+
+The template is `expand_ecosystem_tokens(<literal chain>)`. `scripts/ci/check-api-parity.py` lexes
+this source and accepts exactly one wrapper call around the chain: no nested call, second argument
+or non-literal. The initializer must then be followed by `return spec;` and the function's closing
+`}`, so the document is retained once, never copied into a second static. Comments inside
+`openapi_spec()`, between the chunks and before `return spec;`, are `//` line comments; a `/* */`
+comment there fails the lexer with a named error rather than being read past.
 
 ### `docs/user-manual/rest-api.md` entry
 
@@ -254,8 +305,9 @@ what the first four rows above and the dispatch branch carry between them: name,
 output schema, `securable` / `operation`, `ServiceScopeClass`, `ToolEffect` / `idempotent` / `title`, and a
 `void handle_<name>(const ToolCallContext& ctx)` handler. There is no `kWriteToolsRaw[]` row to add:
 write-set membership is derived from `operation != "Read"`. The record drives the generic tier,
-approval, C7 and C8 gates, but the handler repeats its own `tier_allows` / `perm_fn` pair, so the record
-is not a single point of truth: keep the two in step.
+approval, C7 and C8 gates, but a `perm_fn`-gated handler repeats its own `tier_allows` / `perm_fn` pair,
+so the record is not a single point of truth: keep the two in step. (A confined read gated by
+`fleet_read_fn` repeats neither.)
 
 1. **Declare the accessor.** Add `std::span<const ToolRecord> <domain>_tool_records();` to
    `mcp_tool_registry.hpp`.
@@ -269,13 +321,20 @@ is not a single point of truth: keep the two in step.
    file; the parameter must be called `ctx`, because that is the shape `check-mcp-retry-hints.py`
    scans. Knownness, C7, C8, tier and approval have already run by the time it is called, **but the
    #2405 input-schema check runs only inside the approval-gated branch**: for a tool that is not
-   approval-gated the handler receives unvalidated `ctx.args`, which may be any JSON value, so it
-   must check `ctx.args.is_object()` and validate its own arguments (a tool that takes none, like
-   `discover_routes`, has nothing to check). It then makes its own `tier_allows` and `ctx.perm_fn`
-   calls and builds results with `ctx.tool_result`, errors with `ctx.a4_error` and audit rows with
+   approval-gated the handler receives `ctx.args` guaranteed to be a JSON object (the central check
+   refuses anything else, so it does not test `is_object()`) but otherwise unvalidated, so it must
+   validate its own keys, types and ranges (a tool that takes none, like `discover_routes`, has
+   nothing to check). A handler gated by `ctx.perm_fn` then makes its own `tier_allows` and
+   `ctx.perm_fn` calls; a confined read gated by `ctx.deps->fleet_read_fn` calls neither, because
+   that gate is self-sufficient and stacking either is a blocking review defect (`authz_gates.hpp`).
+   Either kind builds results with `ctx.tool_result`, errors with `ctx.a4_error` and audit rows with
    `ctx.audit`. Those are `std::function`s, so pass every argument: `-1` for `retry_after_ms` when
    there is none, and when it is not `-1` write the `/*retry_after_ms=*/` comment next to the value,
-   because the gate matches that token. The handler must complete synchronously and must never
+   because the gate matches that token. `answer_unwired` in `mcp_tool_helpers.hpp` is the shared
+   unwired-provider answer: it hardwires a non-retryable `kInternalError` by design (the retry-hint
+   gate scans a new or changed `mcp_tool*.hpp` too, as a tripwire for a retryable branch added to a
+   helper), so a fault that is transient needs its own `ctx.a4_error` call with a
+   hint, and it writes a domain audit row only when you pass one. The handler must complete synchronously and must never
    capture or store `ctx` (it borrows request-frame objects). A handler that returns without
    responding is turned into an A4 internal error (-32603) plus a `failure` audit row, never an
    empty 200.
@@ -290,6 +349,24 @@ is not a single point of truth: keep the two in step.
 7. **Decide `requires_approval()`.** It lives in `mcp_policy.hpp`, is NOT a `ToolRecord` field and is
    not boot-enforced, so a destructive twin needs it decided here exactly as on the legacy path
    (see "A fifth registration point" below).
+8. **Complete the twin set.** A registry tool also needs a `kExpectedTwins[]` row (the
+   twin-completeness test, `tests/unit/server/test_twin_completeness.cpp`, fails a registry record with
+   no row or no ledger `mcp_twin`), and a domain test file `tests/unit/server/test_mcp_tools_<domain>.cpp`
+   that names the tool, calls `schema_violation(` on a served body and asserts the audit row
+   (string literals do not count as the call and a negative audit assertion such as
+   `audit.empty()` does not count as the row; `check-api-parity.py` check 7 reads it and requires the file to be listed in `tests/meson.build`; the
+   schema pair and the audit pair are each checked inside one `TEST_CASE`, and the two may sit in
+   different cases; a tripwire, not a proof). A brand-new `mcp_tools_<domain>.cpp` also sets
+   `MIN_REGISTRY_FILES` (an exact count) in `scripts/ci/check-api-parity.py` and `kRegistryDomainFiles`
+   in `tests/unit/server/test_mcp_dispatch_coverage.cpp`, and a new `mcp_tool*.hpp` sets
+   `kToolHeaderFiles` there, in the same change. The seam-closure CI gate
+   (`scripts/ci/check-seam-closure.py`, "MCP registry lane") additionally include-closure-checks every
+   `mcp_tools_*.cpp`, the three shared `mcp_tool*.hpp` headers and the seven store-free `*_types.hpp`
+   headers against its store-header patterns, pins the file count (`MCP_REGISTRY_EXPECTED_TU_COUNT`, with
+   `EXPECTED_MCP_REGISTRY_TU_COUNT` and `EXPECTED_MCP_REGISTRY_CPPS` in its self-test — and
+   `MCP_REGISTRY_HEADERS` / `MCP_REGISTRY_TYPES_HEADERS` for a new shared or types header — which also
+   cross-checks the count against `MIN_REGISTRY_FILES` and `kRegistryDomainFiles`), and checks that each
+   `<domain>_tool_records()` accessor declared in `mcp_tool_registry.hpp` has its `mcp_tools_<domain>.cpp`.
 
 What rejects a mistake: building the catalogue (first done in the `ServerImpl` constructor, so it
 applies under `--mcp-disable` too) throws `std::logic_error` naming the record for a null handler, a
@@ -304,11 +381,17 @@ both lexical gates named in §7 (`scripts/ci/check-api-parity.py` reads the `kTo
 cannot scan, and the retry-hints check also fails closed on a missing `handle_<name>` for a new tool
 (it runs over tools new in the compared range).
 
-**Limits, stated plainly.** A handler gets no store, registry or agent access, so only stateless tools
-can use the registry until the context question is settled in the next PR of the seam. Tools are
-compiled in-tree with no runtime or plugin registration, and a fork adding a domain file must edit
-`registered_tool_records()` itself. **Served order:** `tools/list` lists the legacy `kTools[]` tools
-first and then the registry records, so each future migration moves one more tool to the end; clients
+**Limits, stated plainly.** A handler gets no store, registry or agent access. What it can reach is
+`ctx.deps`, a `ToolDeps` (`mcp_tool_deps.hpp`) of provider closures: the `fleet_read_fn` gate, the
+domain-verb `audit_fn`, and the same roster, CI-detail, DEX-score and quarantine-list closures the REST
+`HardwareRoutes` receives (one instance wired into both in `server.cpp`), so a twin reuses the route's
+composition instead of re-deriving it from a store. `ctx.deps` is `nullptr` when unwired and each closure
+may be empty: a handler checks both and answers an internal error, never an empty result. A tool that
+needs a store, `AgentRegistry` or a write-capable callable (other than the audit-row writer `audit_fn`) still belongs on the legacy path, and a lexical
+test fails an `mcp_tools_*.cpp` that includes a `*_store.hpp`, `agent_registry.hpp`, `mcp_server.hpp`,
+`auth_db*` or `pg/` header. Tools are compiled in-tree with no runtime or plugin registration, and a fork adding a domain file must edit
+`registered_tool_records()` itself. **Served order:** `tools/list` lists the merged legacy and registry
+tools in tool-name order (sorted once in `build_catalogue`), so a migration does not move a tool; clients
 key by name, and `tools/list` advertises `listChanged:false`. The legacy path above remains valid, and is
 the only path for every tool not yet moved (the first moved tool is `discover_routes`, in
 `mcp_tools_discovery.cpp`); #2422 is not closed by this seam alone.
@@ -402,9 +485,18 @@ explicitly:
 
 **A twin PR must implement all three postures on its own surface — never pick one and apply it to
 the others.** Concretely: a REST route must check the bool and fail closed; the same data's MCP
-twin must check the bool and add `audit_persisted:false` on failure, never fail the whole call; and
+twin must, by default, check the bool and add `audit_persisted:false` on failure rather than fail the
+whole call (a behavioural-PII twin may fail closed instead: see the footnote beneath this paragraph); and
 if a dashboard fragment already exists for the same data, its `(void)`-discard must not be
 "fixed" to also fail closed.
+
+**Footnote: behavioural-PII MCP twins may fail closed.** The MCP row above is the default, not a
+rule for every tool. A twin whose data is behavioural PII (ADR-0016: serial, system UUID and MAC)
+and whose REST route already fails closed may do the same: it withholds the data when either audit
+row drops and answers a retryable `kInternalError`, with no `audit_persisted` key.
+`get_agent_app_usage` and the hardware CI twins (`list_hardware_ci`, `get_hardware_ci`) take this
+posture. State the choice explicitly in the PR, and do not copy it onto a tool whose data is not
+behavioural PII.
 
 ### The two functions involved
 
@@ -596,8 +688,8 @@ TU can assert against them without duplicating the maps: `tool_security_rows_for
 `tool_annotation_names_for_test()`, `write_tool_names_for_test()`, `tool_names_for_test()`, plus
 wrappers running the real C8 dispatch classifier/validator over synthetic tables.
 
-`tests/unit/server/test_operator_surface_twins.cpp`'s `kExpectedTwins[]` array (line 417) is the
-pattern to extend:
+The `kExpectedTwins[]` array in `tests/unit/server/test_expected_twins.hpp` (shared by
+`test_operator_surface_twins.cpp` and `test_twin_completeness.cpp`) is the pattern to extend:
 
 ```cpp
 constexpr TwinRow kExpectedTwins[] = {
@@ -644,25 +736,40 @@ see §5 for which chokepoints apply.
    down, and add a line to `docs/auth-architecture.md`'s RBAC section (the routed-concern doc for
    this area) — `docs/authz-model.md` (ADR-0033 §2's dispatch-visibility model) is a narrower,
    separate document and not the general permission reference.
-5. **OpenAPI entry.** One `"/<path>"` object per route in `openapi_spec()` (`rest_api_v1.cpp:516`),
-   matching an existing entry's density in the same tag family (§2).
+5. **OpenAPI entry.** One `"/<path>"` object per route in `openapi_spec()` (`rest_api_v1.cpp`),
+   matching an existing entry's density in the same tag family (§2). An `ecosystem` parameter's
+   enum is `["@@ECOSYSTEM_ENUM@@"]` (§2, OpenAPI entry).
 6. **MCP registration.** `kTools[]`, `kToolSecurityRows[]`, `kWriteToolsRaw[]` (if non-Read),
    `kToolAnnotation`, plus the `if (tool_name == "...")` dispatch branch (§3), all boot-enforced; or
    one `ToolRecord` (§3, "The registry route", which also lists the header declaration, the
-   `registered_tool_records()` entry, the orientation family and the ledger block). Two lexical CI
+   `registered_tool_records()` entry, the orientation family, the ledger block and the completeness
+   inputs). Two lexical CI
    gates read the result: `scripts/ci/check-api-parity.py` (the tool name set, from `kTools[]` and
-   every `kToolRecords[]` slice) and `scripts/ci/check-mcp-retry-hints.py` (a new tool's handler
-   block: a store/query-fault branch needs a retry hint or a `// retry-hint-exempt:` comment).
+   every `kToolRecords[]` slice; its check 6, gate parity, also compares the REST route's first gate
+   call with the tool's `"Securable", "Operation"` pair and confinement class for every ledger row that
+   names both twins, so a twin whose gate differs from its REST route fails unless the pair is
+   listed with a reason in `GATE_PARITY_KNOWN_MISMATCHES`; a REST handler that refuses a service-scoped
+   token before its gate reads as `refused`, an MCP handler whose own fleet read confines is read as
+   confining, and every further REST gate call must agree or be matched, one to one, by a gate call the MCP
+   handler makes, and in the other direction a gate call in a derived MCP handler for a pair other than
+   the tool's declared one is a finding too (for rows with a REST object twin; an MCP-only tool or a
+   handler that shares a dispatch branch is not held to it); a route whose gate the script cannot read
+   fails closed unless it is in `GATE_PARITY_NO_GATE_ALLOWED`; both tables are shrink-only) and `scripts/ci/check-mcp-retry-hints.py` (a new tool's handler
+   block, and a new or changed `mcp_tool*.hpp`: a store/query-fault branch needs a retry hint or a
+   `// retry-hint-exempt:` comment).
    For a destructive action-twin, also decide `requires_approval()` (§3's "fifth registration
    point") explicitly — it is **not** boot-enforced, so a missed decision here fails silently, not
    loudly. Run the server locally after wiring the four tables — `validate_tool_security_registration`
-   will refuse to boot on any mismatch, which is the fastest way to find a missed table.
+   will refuse to boot on any mismatch, which is the fastest way to find a missed table. A tool
+   with an `ecosystem` enum writes the token, not an array, and joins the closed lists in
+   `test_mcp_server.cpp` (`docs/mcp-server.md`, "Adding a tool (checklist)").
 7. **Audit verb.** Pick (or reuse, if a REST/fragment twin already has one) a `noun.verb` action
    string per `docs/observability-conventions.md`'s audit envelope shape. Apply the correct posture
    per surface (§4) — fail-closed REST, set-and-proceed fragment, `audit_persisted:false` MCP, with
    the read-vs-mutate distinction from §4's closing note.
-8. **`kExpectedTwins[]` test row.** Add one row per new tool to
-   `tests/unit/server/test_operator_surface_twins.cpp:417` (§6).
+8. **`kExpectedTwins[]` test row.** Add one row per new tool (legacy or registry) to the shared table in
+   `tests/unit/server/test_expected_twins.hpp` (§6); the twin-completeness test fails a registry tool
+   that has no row or no ledger `mcp_twin`.
 9. **Tests.** A `TestRouteSink` fixture for the REST handler (mind the two gotchas, §6) and an MCP
    round-trip test dispatching the new tool through the JSON-RPC surface.
 10. **Docs.** `docs/user-manual/rest-api.md` entry (§2) + `docs/mcp-server.md` entry (following its
@@ -705,9 +812,10 @@ see §5 for which chokepoints apply.
     a row of any status (the preflight checks only `twinned*` rows), and it counts an empty-string claim
     on every row (the preflight treats it as no twin: it skips it on a non-twinned row, errors on
     `twinned` and `twinned-mcp-only`, and accepts it on `twinned-rest-only`). A `retire` or `exception`
-    row that still names a removed tool must therefore null its `mcp_twin`. The test requires at least
-    `kMinLedgerFiles` ledger files (a constant in the test file): when a domain is added to or removed
-    from `DOMAINS`, move that constant with it (a new domain's file may start as `[]`). The test checks
+    row that still names a removed tool must therefore null its `mcp_twin`. The test requires exactly
+    `kLedgerFiles` ledger files (a constant in the test file, repeated in `test_twin_completeness.cpp`):
+    when a domain is added to or removed from `DOMAINS`, move both constants with it (a new domain's
+    file may start as `[]`). The test checks
     that each claimed name is in the compiled catalogue, which `tools/list` and `resources/list` return in
     full; the `--mcp-*` runtime gates act at call time. It is not evidence of handler, behaviour or
     authorization parity, and it does not check that a dispatch branch exists. It is the

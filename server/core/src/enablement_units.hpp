@@ -141,8 +141,8 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 
 // matrix: docs/os-capability-matrix.md generated block (2026-10-06; shares.list,
 // pkg_inventory.store_packages, msi_packages.list_inventory and remote_access_audit.list added
-// 2026-10-17/19), 233 rows.
-inline constexpr std::array<UnitOsRow, 233> kUnitOs{{
+// 2026-10-17/19; registry set_user_value, delete_user_value and apply added in registry 2.1.0), 236 rows.
+inline constexpr std::array<UnitOsRow, 236> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
     {"agent_logging", "get_log", kWin | kLin | kMac},
@@ -294,15 +294,18 @@ inline constexpr std::array<UnitOsRow, 233> kUnitOs{{
     {"quarantine", "whitelist", kWin | kLin | kMac},
     {"rdp_control", "set_state", kWin},
     {"rdp_control", "status", kWin},
-    {"registry", "get_value", kWin},
-    {"registry", "set_value", kWin},
-    {"registry", "delete_value", kWin},
-    {"registry", "delete_key", kWin},
-    {"registry", "key_exists", kWin},
-    {"registry", "enumerate_keys", kWin},
-    {"registry", "enumerate_values", kWin},
-    {"registry", "get_user_value", kWin},
-    {"registry", "list_profiles", kWin},
+    {"registry", "get_value", kWin | kLin | kMac},
+    {"registry", "set_value", kWin | kLin | kMac},
+    {"registry", "delete_value", kWin | kLin | kMac},
+    {"registry", "delete_key", kWin | kLin | kMac},
+    {"registry", "key_exists", kWin | kLin | kMac},
+    {"registry", "enumerate_keys", kWin | kLin | kMac},
+    {"registry", "enumerate_values", kWin | kLin | kMac},
+    {"registry", "get_user_value", kWin | kLin | kMac},
+    {"registry", "list_profiles", kWin | kLin | kMac},
+    {"registry", "set_user_value", kWin | kLin | kMac},
+    {"registry", "delete_user_value", kWin | kLin | kMac},
+    {"registry", "apply", kWin | kLin | kMac},
     {"runtimes", "dotnet", kWin | kLin | kMac},
     {"runtimes", "jvm", kWin | kLin | kMac},
     {"sccm", "client_version", kWin},
@@ -315,7 +318,8 @@ inline constexpr std::array<UnitOsRow, 233> kUnitOs{{
     {"services", "set_start_mode", kWin | kLin | kMac},
     // remote_access_audit: Linux is constrained, macOS supported, Windows `planned` (applicable).
     {"remote_access_audit", "list", kWin | kLin | kMac},
-    // shares: the macOS and Windows legs are `planned`, which is applicable (not unsupported).
+    // shares: Linux and Windows are supported; the macOS leg is `planned`, which is applicable (not
+    // unsupported).
     {"shares", "list", kWin | kLin | kMac},
     {"software_actions", "list_upgradable", kWin | kLin | kMac},
     {"software_actions", "installed_count", kWin | kLin | kMac},

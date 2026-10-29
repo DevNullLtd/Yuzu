@@ -80,6 +80,7 @@ yuzu-agent --cert-store MY --cert-subject "agent-001"
 | 50051 | TCP | Inbound | Agent gRPC | Agent network |
 | 50052 | TCP | Inbound | Management gRPC | Admin network |
 | 50055 | TCP | Inbound | Gateway upstream (mutual TLS plus an SPKI public-key pin of the gateway's key, or an acknowledged-disabled plaintext rig) | Gateway hosts only |
+| 50063 | TCP | Inbound | Gateway management (server to gateway command fan-out; mutual TLS plus a peer pin) | Server hosts only; never publish it |
 | 9568 | TCP | Inbound | Gateway Prometheus | Monitoring network |
 
 **Recommendations:**
@@ -111,8 +112,9 @@ Run each component under its own system user:
 > The gateway is the command fan-out plane — a plaintext, untrusted-network-reachable
 > agent listener lets an on-path attacker inject commands (fleet RCE).
 > **One-way (server-authenticated) TLS now exists for it (PKI PR5c)** — enable it on
-> the agent listener (`transport_opts` with `verify => verify_none`,
-> `fail_if_no_peer_cert => false`; see `gateway/config/sys.config.prod`) and ship the
+> the agent listener (a `tls` map in its `{yuzu_gw, grpc_listeners}` entry with
+> `verify => verify_none`, `fail_if_no_peer_cert => false`; see
+> `gateway/config/sys.config.prod`) and ship the
 > CA to your agents. `docker-compose.reference-gateway.yml` ships it (#1314); the
 > cluster compose boots the image default `sys.config` and the demo and UAT composes use their own UAT/demo `sys.config`; all of those listen in plaintext.
 
@@ -122,17 +124,26 @@ PR5c one-way TLS above (and distribute the CA), **or** at the network layer:
   an L4 virtual IP or a TLS-passthrough proxy that keeps one TCP connection per agent
   end to end), with the gateway agent listener itself running the one-way TLS above.
   A reverse proxy or L7 load balancer that terminates TLS or HTTP/2 in front of
-  `:50051` is no longer a supported way to protect this edge: the gateway binds each
-  agent's heartbeats to the connection that opened its session, and such a proxy can
-  spread one agent's calls over several connections (see
-  [Heartbeat admission](gateway.md#heartbeat-admission)), **or**
+  `:50051` is a supported way to protect this edge only when it keeps each client
+  connection on its own backend connection for as long as the client connection lives
+  (see [Keeping each agent on one backend connection](gateway.md#keeping-each-agent-on-one-backend-connection)):
+  the gateway binds each agent's heartbeats to the connection that opened its session,
+  and a proxy that pools backend connections can spread one agent's calls over several
+  connections (see [Heartbeat admission](gateway.md#heartbeat-admission)), **or**
 - keep `:50051` on a **trusted network** (VPN / private subnet / a mesh policy that does not
   terminate HTTP/2; see [Heartbeat admission](gateway.md#heartbeat-admission)), never
   directly internet-exposed.
 
 The gateway→server **upstream** hop supports mutual TLS (`gateway/config/sys.config.prod`
-`{https,...}`), and the gateway **fails closed** if that channel is configured `https`
-without `verify_peer`. The server's gateway-upstream service additionally requires an
+`{https,...}`). The canonical answer for this hop: mutual TLS with the SPKI pin below is
+enforced **by the server**; the gateway's own check is only that it will talk TLS to a server it
+has verified. A plaintext upstream (`http`) is a lab/UAT posture and needs the server's explicit
+acknowledgement flag (`--insecure-gateway-peer`). The gateway refuses to boot (fails closed) on
+the legacy `{grpcbox, [{client, ...}]}` key, on any `https` endpoint without `verify_peer` and a
+`cacertfile` / `cacerts` of its own, and on a channel that lists both `http` and `https`
+endpoints; a gateway that boots without a client certificate is refused by the server.
+Production is `https`, `verify_peer`, a CA-pinned `cacertfile`, and a client certificate and key.
+The server's gateway-upstream service additionally requires an
 authorized gateway peer: the gateway's client certificate must carry `serverAuth`, be inside
 its validity window and have a public key that matches a configured SPKI pin (automatic on
 the generated default certificates, explicit with `--gateway-peer-pin` /
@@ -149,6 +160,13 @@ Direct agent→server connections (no gateway) use TLS. Full detail + the deploy
 "TLS posture" and `docs/pki-architecture.md` "Gateway TLS".
 
 The agent listener authenticates the gateway to agents, not agents to the gateway.
+Requesting a client certificate on this edge is a configuration change that enforces
+nothing yet, and enforcing one needs a separate design (see
+[Moving the agent edge to mutual TLS](gateway.md#moving-the-agent-edge-to-mutual-tls)).
+The address the gateway reports for an agent is the TCP peer unless the listener is told
+which proxies to trust, and it discards whatever the agent sent (a forged address passes
+through an older gateway that does not: upgrade every gateway; see
+[Client addresses behind a proxy](gateway.md#client-addresses-behind-a-proxy)).
 The gateway admits an agent `Heartbeat` only on the connection that opened the
 session's `Subscribe` stream, and only for a session that gateway node holds
 (a rejected heartbeat is answered `NOT_FOUND`, counted, and not forwarded).
@@ -159,15 +177,48 @@ disclosure of session ids in logs; some log lines still include session ids.
 
 The gateway **management plane** (`:50063`) — the port the server's command
 forwarding dials — is the highest-value gateway surface: whoever it admits can
-run commands on every connected agent. Its secure shape is strict mTLS **plus a
-peer pin** (#1422): the listener's `auth_fun` accepts only a client cert whose
-key matches `{yuzu_gw, mgmt_peer_pins}` (your server's cert) AND carries the
-`serverAuth` EKU — a CA-issued cert alone (any agent's leaf, the gateway's own
-leaf) is rejected with `UNAUTHENTICATED`. The gateway **refuses to boot** when a
+run commands on every connected agent. Its secure shape is strict mTLS **plus peer
+authorization** (#1422, #6016): the listener's `auth_fun` (run by the gateway's gRPC layer before any handler exists) accepts only a client cert that carries the
+`serverAuth` EKU AND is admitted by `{yuzu_gw, mgmt_peer_auth_mode}`: its key matches
+`{yuzu_gw, mgmt_peer_pins}` (your server's cert), or it carries the server identity URI SAN
+`yuzu://<install>/server` that the install CA puts on the server's built-in certificate, or either,
+depending on the mode (unset means `pin`; the identity is an explicit opt-in, and the shipped reference configs set `pin`) — a CA-issued cert alone (any agent's leaf, the gateway's own
+leaf) is rejected with `UNAUTHENTICATED`. A pin needs the server's private key; the identity needs only a
+certificate the install CA signed with that URI, so a deployment that guards the CA key separately from
+the server key should stay in `pin` mode or use `identity` with a pin (which requires both). The identity also trusts the issuing CA's issuance policy: do not enable it where the listener's `cacertfile` is a corporate CA that lets a requester choose a URI SAN with serverAuth (stay in `pin`), and an identity over a `cacertfile` that is not demonstrably exactly one readable certificate (a bundle, or an empty, unreadable or half-written file) refuses to boot unless the mode is `identity` with a pin configured (`identity_over_ca_bundle`). A serial
+deny-list, `mgmt_peer_denied`, refuses a withdrawn certificate in every mode and is read at boot (a change
+takes effect at the next gateway restart, which disconnects the node's agents; a gateway rolled back to a
+pre-#6016 binary does not honour it). The gateway **refuses to boot** when a
 network-reachable mgmt listener lacks this posture; never set
 `{allow_insecure_mgmt, true}` outside an isolated lab rig, and never publish
 `:50063` from a plaintext stack. See `docs/user-manual/gateway.md` "TLS posture"
-for pin configuration and rotation.
+for pin configuration and rotation, and "Authorizing the server by its identity" and
+`docs/adr/2004-gateway-mgmt-server-identity.md` for the identity modes.
+
+**Firewall the management port (known, accepted limitation).** The management listener
+holds at most 256 connections (`limits.max_connections`), and that is a file-descriptor
+bound, not protection. Before the TLS handshake, anyone with layer-4 reach to the port can
+hold a slot for up to the 10 s handshake timeout; after the handshake, any holder of a
+certificate issued by the install CA (every enrolled agent has one) can hold it for as long
+as `PING`s keep the connection busy, because peer authorization (pin and/or identity) runs later, per stream. About
+256 held connections would stop the server making **new** connections to the gateway;
+connections already established are unaffected. The gateway does not fix this; you must
+restrict `:50063` (and any alternative port set by `YUZU_GW_MGMT_PORT`) so that only the
+server replicas can reach it, set the management listener's `listen.ip` to the management
+interface's address so the port is not bound on the agent-facing interface, and where you can,
+multi-home the server so that the interface it uses for gateway management traffic is not
+the one that faces agents or the database. The shipped composes do not publish it, and the
+gateway cannot verify the firewall or the interface separation. To detect a flood, count
+`ss -Htn state established '( sport = :50063 )'` on the gateway host against the number of
+server replicas, and watch `yuzu_server_gateway_forward_total{status="unavailable"}` on the
+server (commands dropped after three attempts; an alert on its `increase` is recommended and
+none ships). To recover, block the source at the firewall; a process restart does not
+clear it. The agent listener has the matching
+residual risk: its 60000-connection ceiling bounds file descriptors, but a peer that
+completes the handshake and keeps sending can hold connections open and fill it, after which
+new connections wait in the kernel backlog (agents already connected are unaffected until
+they reconnect). Limit connections per source address at the L4 balancer or firewall; see
+[Connection ceilings and the unauthenticated ports](gateway.md#grpc-listeners).
 
 ## Secret Management
 
@@ -215,8 +266,8 @@ Configure API and login rate limits:
 yuzu-server --rate-limit 100 --login-rate-limit 10
 ```
 
-- `--rate-limit` — Maximum API requests per second per IP (default: 100)
-- `--login-rate-limit` — Maximum login attempts per second per IP (default: 10)
+- `--rate-limit`: Maximum API requests per second per IP (default: 100). It is also the per-source budget for `/health` and `/api/health` requests that carry a credential header; values below 1 are treated as 1
+- `--login-rate-limit`: Maximum login attempts per second per IP (default: 10)
 
 Clients exceeding the limit receive `429 Too Many Requests` with a `Retry-After: 1` header.
 
@@ -225,9 +276,18 @@ For additional protection, deploy a reverse proxy with rate limiting:
 limit_req_zone $binary_remote_addr zone=yuzu_api:10m rate=50r/s;
 location /api/ {
     limit_req zone=yuzu_api burst=20 nodelay;
+    proxy_set_header Host $http_host;   # repeat in every location that proxies to Yuzu
     proxy_pass http://127.0.0.1:8080;
 }
 ```
+
+Forward the client's `Host` unchanged (`proxy_set_header Host $http_host;`), as above, in every `location` that proxies to Yuzu or at `server` level: nginx otherwise sends `$proxy_host`, and every dashboard write is then refused until the public origin is declared with `--csrf-trusted-origin` (see [CSRF protection](#csrf-protection)). `$host` drops the port, so use `$http_host` unless the public port is 80 or 443.
+
+## CSRF protection
+
+Cookie-session writes require a same-site `Origin` or `Referer`. The server applies one check to every request that is authorised by a session cookie (local, OIDC or SAML) and uses any method other than `GET`, `HEAD` or `OPTIONS`: the request must carry an `Origin` or `Referer` that names the same host as the request's `Host` header or one of the origins declared with `--csrf-trusted-origin` (environment variable `YUZU_CSRF_TRUSTED_ORIGIN`). A request without a usable header, or with one naming another site, is refused `403` `cross-site request refused` after authentication and before step-up evaluation, challenge emission and route-handler effects, and before the body is read. Requests authenticated only by an API, MCP or engine token are exempt, because they do not ride a browser cookie; a request that presents a valid session cookie is treated as a cookie request even if it also carries a token. Evidence: each refusal writes a `csrf.denied` audit row (see [Audit Log](audit-log.md)) and increments `yuzu_server_csrf_denied_total{path_class,reason}` (see [Metrics](metrics.md)). The check fails closed: if it cannot complete, the request is refused and counted with `reason` `gate_error`, and a refusal whose audit row could not be written carries the `Sec-Audit-Failed` response header. The same-host comparison is scheme-aware where the server can know the public scheme. On a server that terminates TLS itself (HTTPS enabled), the `Origin` or `Referer` must be `https://`, and default ports are scheme-aware (`:443` is the default, `:80` is not), so `Host: yuzu.example.com` is matched only by `https://yuzu.example.com` or `https://yuzu.example.com:443`. Behind a TLS-terminating reverse proxy the server listens in plain HTTP and the `Host` header carries no scheme, so the server cannot see the public scheme: declare the public origin WITH its scheme (`--csrf-trusted-origin https://yuzu.example.com`) and a plain-`http://` `Origin` for that host and port is then refused, while a bare-host entry matches either scheme. Stated limits: on a plain-HTTP listener where no `https://` origin is declared for the host, an `http://` `Origin` naming the same host and port as `Host` is still treated as same-site, so a proxied deployment should declare its public `https://` origin; the endpoints that answer before a session exists (sign-in and similar) are outside the check; any origin you declare, including a sibling subdomain, is trusted completely; and the control relies on the browser sending `Origin` or `Referer`, so a proxy that injects or strips either header turns it off or locks every write out. It narrows, and does not eliminate, cross-site request risk, and it complements the other layers rather than replacing them.
+
+Cookie-session requests that dispatch work, persist state or force a refresh of server state (the guarded reads) are held to the same rule, whichever method they use. For those requests the browser's fetch metadata decides, and a `Sec-Fetch-Site` header that is present decides alone: `Origin` and `Referer` are not consulted. A request whose `Sec-Fetch-Site` header is `same-origin`, or `none` (a navigation the user started, such as a typed address or a bookmark), is admitted; any other value (`cross-site`, `same-site` or anything unrecognised) is refused `403` with reason `origin_mismatch`. Only a request without `Sec-Fetch-Site`, such as one from a script, `curl` or an old client, falls back to the `Origin` or `Referer` rule above, with the same trusted origins and the same scheme handling, and is refused with the same three reasons. A repeated `Sec-Fetch-Site` header is treated as a non-matching value and refused with `origin_mismatch`, even when a good `Origin` is also sent; to cure such a refusal send `Sec-Fetch-Site` once with value `same-origin` or `none`, or remove the header and send a same-site `Origin` or `Referer`. Page script cannot set `Sec-Fetch-Site`, and the dashboard's own requests send `same-origin`, so on HTTPS or loopback the dashboard needs no change. Browsers send `Sec-Fetch-*` headers only to potentially trustworthy origins (HTTPS and loopback), and Safari before 16.4 does not send them at all, so on a plain-HTTP listener at a non-loopback address these requests fall back to the `Origin` or `Referer` rule: a same-origin `GET` carries no `Origin`, so the dashboard then depends on the `Referer` the browser sends, which the server's default `Referrer-Policy` (`strict-origin-when-cross-origin`) supplies; a proxy or page policy of `no-referrer` would break those panels on such a deployment. A TLS-terminating proxy is unaffected, because the browser talks to the proxy over HTTPS. Requests authenticated only by a token are exempt, as above. The set of covered requests is an explicit, reviewed list kept as data next to the decision (`kFetchMetadataGuardedPaths` in `same_site_write_policy.hpp`), matched on the exact request path (the path, never a query flag, selects the gate); a best-effort source-text test is meant to fail when a handler that dispatches work or changes state is added without an entry (it is lexical and has stated blind spots), and the live-stack security test exercises one covered request. Refusals use the same `403` body, `csrf.denied` audit row (its `target_id` is `GET <path>` or `HEAD <path>`), counter and alerts as writes. Additional stated limits for these requests: fetch metadata does not tell a browser's own prefetch, prerender or link-preview of an address apart from a user action, so a request the same user's browser issues on its own initiative is admitted; a client that sends neither `Sec-Fetch-Site` nor `Origin`/`Referer` is refused; a request whose path is not on the list is not checked, and cookie-reachable `GET` requests outside the list remain there by decision. The audit `detail` text for a refusal of one of these requests still reads "browser write refused".
 
 ## HTTP Security Response Headers
 
@@ -307,6 +367,8 @@ If you deploy Yuzu behind a reverse proxy (nginx, HAProxy, Caddy, Cloudflare) th
 - Match both policies so the intersection allows what you need.
 
 The same applies to all other security headers — if both layers set them, browsers honor the strictest.
+
+Cookie-session writes require a same-site `Origin` or `Referer`. Forward the client's `Host` unchanged, port included (nginx: `proxy_set_header Host $http_host;` in every `location` that proxies to Yuzu, or at `server` level; `$host` drops the port) or, if the proxy rewrites `Host`, declare the public origin with `--csrf-trusted-origin` (see [CSRF protection](#csrf-protection) and [Server Administration](server-admin.md)). Declare it with its `https://` scheme (for example `https://yuzu.example.com`) even when `Host` is forwarded: the server behind a TLS-terminating proxy cannot see the public scheme, and the scheme-qualified entry is what makes it refuse a plain-`http://` `Origin` for that host. Do not configure the proxy to inject or rewrite `Origin` or `Referer`, which would turn the control off.
 
 ### Verifying headers
 

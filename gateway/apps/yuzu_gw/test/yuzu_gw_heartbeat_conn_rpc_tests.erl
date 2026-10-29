@@ -1,13 +1,14 @@
 %%%-------------------------------------------------------------------
 %%% @doc Transport-level evidence for connection-bound heartbeat admission.
 %%%
-%%% Starts a REAL grpcbox listener serving the REAL yuzu_gw_agent_service,
+%%% Starts a REAL yuzu_grpc_listener serving the REAL yuzu_gw_agent_service,
 %%% with the real registry and agent supervisor behind it, and drives it with
-%%% real grpcbox client channels (one channel = one HTTP/2 connection).
+%%% real gRPC client channels (yuzu_grpc_client_channel with a pool of one: one
+%%% channel = one HTTP/2 connection).
 %%% Only the upstream C++ server client and the heartbeat buffer are mocked.
-%%% No part of the connection key is injected: it comes from the vendored
-%%% grpcbox accessors, for both the bidi Subscribe stream and the unary
-%%% Register / Heartbeat calls. Proves, at gRPC-status level:
+%%% No part of the connection key is injected: it comes from the layer's own
+%%% accessors, for both the bidi Subscribe stream and the unary Register /
+%%% Heartbeat calls. Proves, at gRPC-status level:
 %%%   - a live Subscribe plus a concurrent Heartbeat on the SAME connection
 %%%     is admitted and queued; the same Heartbeat on a different connection
 %%%     is answered NOT_FOUND and is not queued;
@@ -19,20 +20,21 @@
 %%%     restart end or fence the binding as specified;
 %%%   - reannounce and replay reads leave the stored binding byte-identical.
 %%%
-%%% Listener ports are OS-assigned-then-probed with retry (shared CI boxes
-%%% run several jobs; fixed ports collide across jobs).
+%%% Listeners and channels come from yuzu_gw_test_listener (OS-assigned ports;
+%%% shared CI boxes run several jobs).
 %%%
 %%% The whole case list runs over three listener transports, each with its
 %%% own listener and client channels:
 %%%   - plaintext HTTP/2 (the original evidence);
 %%%   - one-way TLS: the shipped agent-listener posture of
-%%%     gateway/config/sys.config.prod (`ssl => true', `verify => verify_none',
+%%%     gateway/config/sys.config.prod (`verify => verify_none',
 %%%     `fail_if_no_peer_cert => false'), clients verify the gateway and
 %%%     present no certificate;
-%%%   - mutual TLS: the same listener with the grpcbox strict defaults, and
+%%%   - mutual TLS: the same listener with the strict defaults (verify_peer,
+%%%     peer certificate required), and
 %%%     both client channels presenting the SAME client certificate, so the
 %%%     only thing that differs between them is the connection.
-%%% Over TLS the connection key is still the pid of the HTTP/2 connection
+%%% Over TLS the connection key is still the pid of the connection
 %%% process, and the cases below observe that rather than assume it. Throwaway
 %%% certificates are minted with the openssl CLI (the helper in
 %%% yuzu_gw_authz_tests) under $TMPDIR. When openssl is unavailable the TLS
@@ -44,7 +46,6 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_heartbeat_conn_rpc_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("grpcbox/include/grpcbox.hrl").
 
 -define(SVC, 'yuzu.agent.v1.AgentService').
 -define(REGISTER_PATH,  <<"/yuzu.agent.v1.AgentService/Register">>).
@@ -177,8 +178,11 @@ replacement_fencing(#{chan_a := A, chan_b := B}) ->
     ?assertMatch({error, {<<"5">>, _}, _}, heartbeat(A, S2)),
     %% The old stream finishes after the replacement: its cleanup must leave
     %% the newer registration alone, in both tables.
+    Mon1 = monitor(process, P1),
     close_stream(Stream1),
-    ok = wait_until(fun() -> not is_process_alive(P1) end, 3000),
+    receive {'DOWN', Mon1, process, P1, _} -> ok
+    after 5000 -> error(old_session_still_alive)
+    end,
     %% The routing table itself, not lookup/1, which falls back to the pg
     %% group and would hide a deleted routing row.
     ?assertEqual({ok, {P2, S2}}, yuzu_gw_registry:lookup_local_session(Id)),
@@ -217,20 +221,20 @@ stream_end_removes_binding(#{chan_a := A}) ->
     ok = await_unbound(S),
     ?assertMatch({error, {<<"5">>, <<"unknown session">>}, _}, heartbeat(A, S)).
 
-connection_close_removes_binding(#{mode := Mode, endpoint := Endpoint}) ->
-    Chan = start_chan(chan_name(Mode, closing), Endpoint),
+connection_close_removes_binding(#{mode := Mode, chan_opts := ChanOpts}) ->
+    Chan = start_chan(chan_name(Mode, closing), ChanOpts),
     {S, _Holder} = register_and_subscribe(Chan, agent_id(<<"conn-close">>)),
     ?assertMatch({ok, _, _}, heartbeat(Chan, S)),
     %% Closing the client channel closes the HTTP/2 connection; the stream
     %% process on the gateway ends with it and the agent process follows.
-    ok = grpcbox_channel:stop(Chan),
+    ok = yuzu_gw_test_listener:stop_channel(Chan),
     ok = await_unbound(S),
     %% A fresh connection that presents the same session id is not admitted.
-    Fresh = start_chan(chan_name(Mode, fresh), Endpoint),
+    Fresh = start_chan(chan_name(Mode, fresh), ChanOpts),
     try
         ?assertMatch({error, {<<"5">>, <<"unknown session">>}, _}, heartbeat(Fresh, S))
     after
-        grpcbox_channel:stop(Fresh)
+        yuzu_gw_test_listener:stop_channel(Fresh)
     end.
 
 replay_leaves_binding(#{chan_a := A, chan_b := B}) ->
@@ -276,29 +280,29 @@ agent_id(Prefix) ->
 register_session(Chan, AgentId) ->
     Req = #{info => #{agent_id => AgentId, hostname => <<"h">>}},
     {ok, #{session_id := S}, _} =
-        grpcbox_client:unary(ctx:new(), ?REGISTER_PATH, Req, register_def(),
-                             #{channel => Chan}),
+        yuzu_gw_test_client:unary(ctx:new(), ?REGISTER_PATH, Req, register_def(),
+                                  #{channel => Chan}),
     S.
 
 %% Open the Subscribe stream from a dedicated process, like a real agent
-%% holds it. A grpcbox client delivers a stream's messages to the process that
-%% opened it, tagged with the HTTP/2 stream id only, and stream ids repeat
-%% across connections: opening the stream in the test process would let its
-%% messages be picked up by a unary call on another channel.
+%% holds it. The test client's stream process is linked to the process that
+%% opened it and cancels the stream when that process exits: opening the stream
+%% from a dedicated holder keeps it open until close_stream/1 asks the holder to
+%% half-close it, and ties its end to the holder, not to the test process.
 subscribe(Chan, SessionId) ->
     Owner = self(),
     Holder = spawn_link(fun() ->
-        Ctx = grpcbox_metadata:append_to_outgoing_ctx(
+        Ctx = yuzu_gw_test_client:with_metadata(
                 ctx:new(), #{<<"x-yuzu-session-id">> => SessionId}),
-        {ok, Stream} = grpcbox_client:stream(Ctx, ?SUBSCRIBE_PATH, subscribe_def(),
-                                             #{channel => Chan}),
+        {ok, Stream} = yuzu_gw_test_client:stream(Ctx, ?SUBSCRIBE_PATH, subscribe_def(),
+                                                  #{channel => Chan}),
         %% Open the stream on the wire; the gateway ignores agent frames that
         %% carry no command id.
-        ok = grpcbox_client:send(Stream, #{command_id => <<"hello">>}),
+        ok = yuzu_gw_test_client:send(Stream, #{command_id => <<"hello">>}),
         Owner ! {subscribed, self()},
         receive
             {close, From} ->
-                catch grpcbox_client:close_send(Stream),
+                catch yuzu_gw_test_client:close_send(Stream),
                 From ! {closed, self()}
         end
     end),
@@ -315,8 +319,8 @@ register_and_subscribe(Chan, AgentId) ->
     {S, Stream}.
 
 heartbeat(Chan, SessionId) ->
-    grpcbox_client:unary(ctx:new(), ?HEARTBEAT_PATH, #{session_id => SessionId},
-                         heartbeat_def(), #{channel => Chan}).
+    yuzu_gw_test_client:unary(ctx:new(), ?HEARTBEAT_PATH, #{session_id => SessionId},
+                              heartbeat_def(), #{channel => Chan}).
 
 %% End the client side of a Subscribe stream (the stream's owner process).
 close_stream(Holder) ->
@@ -348,25 +352,22 @@ wait_until(Pred, Timeout) ->
     end.
 
 register_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) ->
-                     agent_pb:encode_msg(M, 'yuzu.agent.v1.RegisterRequest') end,
-                 unmarshal_fun = fun(B) ->
-                     agent_pb:decode_msg(B, 'yuzu.agent.v1.RegisterResponse') end}.
+    #{marshal => fun(M) ->
+          agent_pb:encode_msg(M, 'yuzu.agent.v1.RegisterRequest') end,
+      unmarshal => fun(B) ->
+          agent_pb:decode_msg(B, 'yuzu.agent.v1.RegisterResponse') end}.
 
 heartbeat_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) ->
-                     agent_pb:encode_msg(M, 'yuzu.agent.v1.HeartbeatRequest') end,
-                 unmarshal_fun = fun(B) ->
-                     agent_pb:decode_msg(B, 'yuzu.agent.v1.HeartbeatResponse') end}.
+    #{marshal => fun(M) ->
+          agent_pb:encode_msg(M, 'yuzu.agent.v1.HeartbeatRequest') end,
+      unmarshal => fun(B) ->
+          agent_pb:decode_msg(B, 'yuzu.agent.v1.HeartbeatResponse') end}.
 
 subscribe_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) ->
-                     agent_pb:encode_msg(M, 'yuzu.agent.v1.CommandResponse') end,
-                 unmarshal_fun = fun(B) ->
-                     agent_pb:decode_msg(B, 'yuzu.agent.v1.CommandRequest') end}.
+    #{marshal => fun(M) ->
+          agent_pb:encode_msg(M, 'yuzu.agent.v1.CommandResponse') end,
+      unmarshal => fun(B) ->
+          agent_pb:decode_msg(B, 'yuzu.agent.v1.CommandRequest') end}.
 
 %%%-------------------------------------------------------------------
 %%% TLS-only cases
@@ -375,8 +376,9 @@ subscribe_def() ->
 %% A raw client handshake against the listener: the server certificate is
 %% verified against the minted CA (verify_peer, so a non-TLS or wrongly signed
 %% listener fails here), the negotiated version is the listener's TLS 1.2, and
-%% HTTP/2 is negotiated for a client that offers it the way the grpcbox client
-%% does (both ALPN and NPN).
+%% HTTP/2 is negotiated for a client that offers it by ALPN, as the gun-based
+%% gateway client does (NPN is offered as well; the assertion is on the
+%% negotiated protocol).
 tls_handshake_observed(#{port := Port, client_ssl := ClientSsl}) ->
     {ok, Sock} = ssl:connect("localhost", Port,
                              ClientSsl ++ [{mode, binary}, {active, false},
@@ -445,7 +447,6 @@ uncerts(Certs) ->
     yuzu_gw_authz_tests:cleanup_certs(Certs).
 
 setup(Mode, Certs) ->
-    {ok, _} = application:ensure_all_started(grpcbox),
     {ok, _} = application:ensure_all_started(telemetry),
     {ok, _} = application:ensure_all_started(ssl),
     ok = yuzu_gw_test_registry:ensure(),
@@ -462,7 +463,7 @@ setup(Mode, Certs) ->
     ok = meck:new(yuzu_gw_upstream, [non_strict, no_link]),
     ok = meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _, _) -> ok end),
     ok = meck:expect(yuzu_gw_upstream, proxy_register,
-                     fun(#{info := #{agent_id := Id}}) ->
+                     fun(#{info := #{agent_id := Id}}, _Opts) ->
                          N = integer_to_binary(erlang:unique_integer([positive])),
                          {ok, #{session_id => <<"rpc-session-", Id/binary, "-", N/binary>>}}
                      end),
@@ -477,42 +478,48 @@ setup(Mode, Certs) ->
     ok = telemetry:attach(?MISMATCH_HANDLER,
                           [yuzu, gw, heartbeat, session_mismatch],
                           fun ?MODULE:handle_mismatch/4, none),
-    {ListenerOpts, ClientSsl} = transport(Mode, Certs),
-    {Port, Server} = start_listener(ListenerOpts, 5),
-    Endpoint = case Mode of
-        plain -> {http, "localhost", Port, []};
-        _     -> {https, "localhost", Port, ClientSsl}
+    {Tls, ClientSsl} = transport(Mode, Certs),
+    Entry0 = #{name => list_to_atom("hb_conn_rpc_" ++ atom_to_list(Mode)),
+               service_protos => [agent_pb],
+               services => #{?SVC => yuzu_gw_agent_service}},
+    {Port, Server} = yuzu_gw_test_listener:start(
+                       case Tls of
+                           none -> Entry0;
+                           _    -> Entry0#{tls => Tls}
+                       end),
+    ChanOpts = case Mode of
+        plain -> #{port => Port};
+        _     -> #{port => Port, scheme => https, ssl => ClientSsl}
     end,
     #{mode => Mode,
       certs => Certs,
       client_ssl => ClientSsl,
       port => Port,
-      endpoint => Endpoint,
+      chan_opts => ChanOpts,
       server => Server,
       agent_sup => AgentSup,
-      chan_a => warmed(start_chan(chan_name(Mode, a), Endpoint)),
-      chan_b => warmed(start_chan(chan_name(Mode, b), Endpoint))}.
+      chan_a => warmed(start_chan(chan_name(Mode, a), ChanOpts)),
+      chan_b => warmed(start_chan(chan_name(Mode, b), ChanOpts))}.
 
 cleanup(#{server := Server, agent_sup := AgentSup} = State) ->
-    [catch grpcbox_channel:stop(maps:get(C, State)) || C <- [chan_a, chan_b]],
-    catch supervisor:terminate_child(grpcbox_services_simple_sup, Server),
+    [yuzu_gw_test_listener:stop_channel(maps:get(C, State)) || C <- [chan_a, chan_b]],
+    yuzu_gw_test_listener:stop(Server),
     catch telemetry:detach(?MISMATCH_HANDLER),
     catch ets:delete(?MISMATCH_TAB),
     catch meck:unload([yuzu_gw_upstream, yuzu_gw_heartbeat_buffer]),
     yuzu_gw_test_registry:stop_agent_sup(AgentSup).
 
-%% {Listener transport_opts, client channel ssl options} for a transport.
-%% The one-way listener options mirror the agent listener in
+%% {Listener tls map (`none' for plaintext), client channel ssl options} for a
+%% transport. The one-way listener options mirror the agent listener in
 %% gateway/config/sys.config.prod; the mutual TLS listener omits the two
-%% relaxing keys so grpcbox applies its strict defaults (verify_peer plus
+%% relaxing keys so the strict defaults apply (verify_peer plus
 %% fail_if_no_peer_cert). Neither listener has an auth_fun.
 transport(plain, _Certs) ->
-    {#{}, []};
+    {none, []};
 transport(Mode, #{dir := Dir, ca := Ca, gw_pem := GwPem, agent_pem := AgentPem}) ->
     GwKey = filename:join(Dir, "gw.key"),
     AgentKey = filename:join(Dir, "agent.key"),
-    Listener = #{ssl => true, certfile => GwPem, keyfile => GwKey,
-                 cacertfile => Ca},
+    Listener = #{certfile => GwPem, keyfile => GwKey, cacertfile => Ca},
     Client = [{cacertfile, Ca}, {verify, verify_peer},
               {versions, ['tlsv1.2']},
               {server_name_indication, "localhost"}],
@@ -529,11 +536,11 @@ warmed(Chan) ->
     ok = warm_chan(Chan),
     Chan.
 
-%% Cold-start guard: the first call on a fresh channel dials the listener, and
-%% under CPU oversubscription grpcbox's internal 5 s call into the subchannel
-%% can time out. Retry a harmless unary call (an unknown session is answered
-%% with a gRPC status, which proves the connection works) until it gets an
-%% answer, so the case bodies only ever see a warm connection.
+%% Cold-start guard: the channel is up when start_chan/2 returns, but the first
+%% call on it can still outlast the call's default 5 s timeout under CPU
+%% oversubscription. Retry a harmless unary call (an unknown session is
+%% answered with a gRPC status, which proves the connection works) until it
+%% gets an answer, so the case bodies only ever see a warm connection.
 warm_chan(Chan) ->
     warm_chan(Chan, 5).
 
@@ -568,27 +575,5 @@ reset_mismatches() ->
     true = ets:delete_all_objects(?MISMATCH_TAB),
     ok.
 
-start_listener(_TransportOpts, 0) ->
-    error(no_free_port);
-start_listener(TransportOpts, Retries) ->
-    Port = probe_free_port(),
-    GrpcOpts = #{service_protos => [agent_pb],
-                 services => #{?SVC => yuzu_gw_agent_service}},
-    case grpcbox:start_server(#{grpc_opts => GrpcOpts,
-                                listen_opts => #{port => Port, ip => {127, 0, 0, 1}},
-                                transport_opts => TransportOpts}) of
-        {ok, Pid}  -> {Port, Pid};
-        {error, _} -> start_listener(TransportOpts, Retries - 1)
-    end.
-
-probe_free_port() ->
-    {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}]),
-    {ok, Port} = inet:port(L),
-    ok = gen_tcp:close(L),
-    Port.
-
-%% sync_start registers the endpoint before start_child returns (see
-%% yuzu_gw_authz_rpc_tests:start_chan/5 for the race it closes).
-start_chan(Name, Endpoint) ->
-    {ok, _} = grpcbox_channel_sup:start_child(Name, [Endpoint], #{sync_start => true}),
-    Name.
+start_chan(Name, ChanOpts) ->
+    yuzu_gw_test_listener:client_channel(Name, ChanOpts).

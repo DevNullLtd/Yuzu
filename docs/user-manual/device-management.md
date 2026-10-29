@@ -20,7 +20,7 @@ The default enrollment mode. When an agent connects without a token, it enters a
 yuzu-agent --server server.example.com:50051
 ```
 
-The agent will attempt registration, receive a "pending" status, and retry periodically until approved.
+The agent will attempt registration, receive a "pending" status, and retry with an increasing delay (2 s, doubling, up to 256 s) until approved.
 
 **Server side (dashboard):** Navigate to **Estate > Groups and enrolment** (panel **Agents waiting for approval**) or **Settings > Pending Agent Approvals**; both show the same queue. The page is named "Groups and enrolment" (UK spelling); the Settings panels keep their existing US-spelling names. Each entry shows the agent's hostname, OS, architecture, version and the time it first asked to join (UTC). Click **Approve**, **Deny**, or **Forget** (`DELETE /api/settings/pending-agents/{id}`, audited as `enrollment.remove`; it removes a waiting request, and the agent is queued again the next time it asks to join). A denied agent stays listed as **Denied** ("denial recorded") with no button. The page offers no way to reverse a denial and the product has no reinstate action today (see below); the **Deny** and **Deny all** confirmations say "This page offers no way to reverse a denial." **Approve all** and **Deny all** act on every waiting agent, including any that arrive after the page loaded, and their confirmation gives the total and the first ten hostnames. At most 200 rows are listed (waiting agents first, then denied). When more than 200 agents are waiting, the panel says "Showing 200 of N" and the two bulk buttons are disabled, because they would also act on the agents not shown; when every waiting agent is listed but denied ones are cut off, it says how many denied agents are not listed.
 
@@ -89,7 +89,7 @@ curl -s -X POST http://localhost:8080/api/settings/enrollment-tokens \
 
 The response is an HTML fragment (the updated tokens table) sent with `Cache-Control: no-store, private`. The raw token value is displayed once in the fragment and cannot be retrieved again.
 
-On the dashboard (**Estate > Groups and enrolment**, panel **Enrolment tokens**, or **Settings > Enrollment Tokens**) the token is shown once above the list, with **Copy to Clipboard** and **Done**. It lives inside the token panel: navigating away, **Done**, revoking a token, generating another or anything else that reloads the panel removes it for good, and the only recovery is to revoke that token and generate a new one. **Copy to Clipboard** needs HTTPS or `localhost`. Where it cannot copy, the Groups and enrolment button says "Copy failed. Select the text." and you copy the token by hand. The Settings panel keeps its older button, which has no failure message: without HTTPS or `localhost` it does nothing, and if the browser refuses the copy it still says "Copied!". Check the clipboard, or select the token by hand, before you leave the panel. The list shows each token's expiry in UTC and its status (**Active**, **Expired**, **Exhausted** or **Revoked**, active first) and lists at most 200 tokens; the form shows "Unlimited uses and no expiry" while both limit fields are empty or zero.
+On the dashboard (**Estate > Groups and enrolment**, panel **Enrolment tokens**, or **Settings > Enrollment Tokens**) the token is shown once above the list, with **Copy to Clipboard** and **Done**. It lives inside the token panel: navigating away, **Done**, revoking a token, generating another or anything else that reloads the panel removes it for good, and the only recovery is to revoke that token and generate a new one. **Copy to Clipboard** needs HTTPS or `localhost`. Where it cannot copy, the Groups and enrolment button says "Copy failed. Select the text." and you copy the token by hand. The Settings panel keeps its older button, which has no failure message: without HTTPS or `localhost` it does nothing, and if the browser refuses the copy it still says "Copied!". Check the clipboard, or select the token by hand, before you leave the panel. The list shows each token's expiry in UTC and its status (**Active**, **Expired**, **Exhausted** or **Revoked**, active first) and lists at most 200 tokens; the form shows "Unlimited uses and no expiry" only while both limit fields hold a literal `0` -- a field left blank takes the bounded default (100 uses, 72 hours), not unlimited.
 
 **Generate tokens in batch (JSON API for scripting):**
 
@@ -113,17 +113,17 @@ Response:
 ```json
 {
   "count": 10,
-  "tokens": ["yuzu_enroll_xxx...", "yuzu_enroll_yyy...", "..."]
+  "tokens": ["<64-hex-token>", "<64-hex-token>", "..."]
 }
 ```
 
-`count`, `max_uses` and `ttl_hours` may each be a JSON integer or a numeric string (`"count": "10"`); an empty string or an omitted key keeps the default (`count` 10, `max_uses` 1, `ttl_hours` 0 = no expiry). A float, boolean, `null`, a number outside the 32-bit range, a negative `ttl_hours` or `max_uses`, a `count` outside 1 to 10000, or a body that is not one JSON object is `400` and mints nothing. Before this check a JSON number was silently ignored, so the example above minted single-use tokens that never expired.
+`count`, `max_uses` and `ttl_hours` may each be a JSON integer or a numeric string (`"count": "10"`); an empty string or an omitted key keeps the default (`count` 10, `max_uses` 1, `ttl_hours` 72 hours). An explicit `0` for `ttl_hours` still means no expiry. A float, boolean, `null`, a number outside the 32-bit range, a negative `ttl_hours` or `max_uses`, a `count` outside 1 to 10000, or a body that is not one JSON object is `400` and mints nothing.
 
 **Agent side:**
 
 ```bash
 yuzu-agent --server server.example.com:50051 \
-           --enrollment-token "yuzu_enroll_xxxxxxxxxxxxxxxxxxxxxxxx"
+           --enrollment-token "<64-hex-token>"
 ```
 
 The agent includes the token in its `RegisterRequest`. If the token is valid and has remaining uses, enrollment succeeds immediately.
@@ -305,7 +305,7 @@ The Hardware CI record's own **Live** lens (`/hardware` → device → **Live** 
 | **Drivers** — installed device drivers: name, version, date, provider, class | `hardware/drivers` | `device.live.hw_drivers` | Windows, Linux |
 | **Battery** — presence, charge state, percent, time-to-empty, cycle count, health | `power_health/battery` | `device.live.battery` | all |
 | **Thermal** — thermal zone status and temperature | `power_health/thermal` | `device.live.thermal` | all |
-| **Disk health (SMART)** — per-disk SMART health, percent used, spare percent | `disk_actions/smart` | `device.live.smart` | Windows, macOS |
+| **Disk health (SMART)** — per-disk model, bus and media type, plus SMART health, percent used and spare percent for NVMe drives on Windows only (health is `unknown` on macOS and for SATA, USB and virtual disks, whose percent used and spare percent are `-`) | `disk_actions/smart` | `device.live.smart` | Windows, macOS |
 | **Volumes** — mounted volumes: mount points, backing device, filesystem, size | `disk_actions/volumes` | `device.live.volumes` | Windows, macOS |
 | **Network adapters** — adapter name, MAC, link speed, status | `network_config/adapters` | `device.live.adapters` | all |
 | **Wi-Fi** — current association: SSID, signal, security, BSSID/channel | `wifi/connected` | `device.live.wifi` | all |
@@ -362,6 +362,7 @@ The full set of agent command-line flags:
 |---|---|---|
 | `--server` | Server address (`host:port`) | `localhost:50051` |
 | `--enrollment-token` | Pre-shared token for Tier 2 enrollment | (none) |
+| `--enrollment-token-file` | File holding the enrollment token (first line); read once at start (under a 5 s deadline) and removed after the first accepted registration or when the server refuses the token. A token read from it takes precedence over `--enrollment-token` / `YUZU_ENROLLMENT_TOKEN`; if the file is absent or unusable, the option or environment value stands. **Accepted only if** the first line is a 64-hex-character token (anything else, including a `yuzu_enroll_...`-shaped string, is ignored with a warning rather than sent, unlike `--enrollment-token`, which sends whatever it is given and lets the server reject it) **and** the opened file is owned by SYSTEM or root, by Administrators (Windows) or by the account the agent runs as, and on Linux and macOS is not group- or other-writable and is readable by the agent (for example mode `0640` root:agent or `0600` agent-owned); a file that fails the owner or mode rule is ignored with a warning. The check reads mode bits only; macOS ACLs are not consulted (the owner rule still applies). On Windows only a path on a local fixed drive is read; a network-share, removable-drive or extended-length (`\\?\`) path is ignored with a warning. The agent removes the file after the first accepted registration: under the shipped systemd unit (`ProtectSystem=strict`, only `/var/lib/yuzu-agent` writable) a file elsewhere is read but cannot be removed, so place it under `/var/lib/yuzu-agent`. When the server refuses the token (unknown, expired, revoked or used up) the agent removes the file, and its next start registers without the file's token (with an `--enrollment-token` / `YUZU_ENROLLMENT_TOKEN` value if one is set, otherwise without a token, into the approval queue); a file that could not be removed is read and presented again on the next start, so keep it where the agent can delete it (see the placement rule above); a refusal that is not about the token, such as an administrator denying the agent, leaves the file in place, and to enrol with a token again you supply a current one; do not bake a token file into a golden image or VDI template (each machine started from it uses one of the token's uses, and a non-persistent image that still carries a token the server has expired, revoked or used up adds a new entry to Pending Agent Approvals on every boot, because each boot is a new agent id; the queue is not capped). The Windows installer writes it to `%ProgramData%\Yuzu\enrollment-token` (Administrators and SYSTEM only) for the service, so a service it registers does not carry the token on its command line. An agent older than this option exits with code 109 when started with it. Env: `YUZU_ENROLLMENT_TOKEN_FILE` | (none) |
 | `--ca-cert` | Path to CA certificate PEM file (verifies the server) | (auto-discover) |
 | `--client-cert` | Path to client certificate PEM file (mTLS) | (auto-discover) |
 | `--client-key` | Path to client private key PEM file (mTLS) | (auto-discover) |
@@ -411,7 +412,7 @@ direct and gateway paths.
 corrupted, the agent transparently re-provisions on its next enrollment: it
 generates a fresh keypair + CSR and the server issues a **new** leaf with a
 **new serial**. The previous serial remains in the server's issued-cert inventory
-(`GET /api/v1/ca/issued`) as an orphaned row that no live agent holds — this is
+(`GET /api/v1/ca/issued`, which a management-group-confined account, or one with no `Inventory:Read` grant, is refused) as an orphaned row that no live agent holds — this is
 harmless, but if you reconcile the inventory you should expect one orphan per
 key-loss event and may revoke it for tidiness. No manual re-enrollment is needed.
 The same happens when the key is unreadable or unparseable at startup, or when
@@ -657,46 +658,52 @@ curl -s -X POST http://localhost:8080/api/v1/discovery/{device_id}/mark-managed 
 
 ## Deployment Jobs
 
-Deploy the Yuzu agent to discovered or known endpoints without manual installation. Deployment jobs target hosts by IP address and support multiple deployment methods.
+> **Not functional; scheduled for removal (#6326).** Deployment jobs are **record-only**. The server stores a row and lets you list, read and cancel it, but nothing executes a job and nothing advances it past `pending`: no agent is installed on any host. The `ssh` and `group_policy` methods are accepted by validation but not implemented, and for `manual` the server only returns a placeholder install command (it points at the literal host `yuzu-server`, not your server). The route is the unversioned `/api/deployment-jobs`; there is no `/api/v1/deployment-jobs`. To get the agent onto a host, install it on that host directly; to install software on devices that are already enrolled, use the [`/auto` Deploy workflow](preflight.md).
 
-### Creating a Deployment Job
+The record-only API below still answers today. It needs `Infrastructure:Read` (list, get) or `Infrastructure:Write` (create, cancel).
+
+### Creating a Deployment Job Record
+
+Each job records exactly one host (`target_host`). `os` is `windows`, `linux` (default) or `darwin`; `method` is `ssh`, `group_policy` or `manual` (default). `target_host` must be a hostname or IP of at most 253 characters using only `[a-zA-Z0-9._-]`, and must not start or end with `-`.
 
 ```bash
-curl -s -X POST http://localhost:8080/api/v1/deployment-jobs \
+curl -s -X POST http://localhost:8080/api/deployment-jobs \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "Deploy to office subnet",
-    "targets": ["192.168.1.10", "192.168.1.11", "192.168.1.12"],
-    "method": "ssh",
-    "os": "linux"
+    "target_host": "192.168.1.10",
+    "os": "linux",
+    "method": "manual"
   }'
 ```
 
-Supported deployment methods: `ssh`, `group_policy`, `manual`.
+The response is `201` with `{"id": "...", "status": "pending"}`, plus a placeholder `install_command` when `method` is `manual`.
 
-### Job Lifecycle
+### Job States
 
-Jobs progress through the following states:
+The store defines the states below, but only `pending` and `cancelled` are ever reached through the product. No caller moves a job to `running`, `completed` or `failed`.
 
-| State | Description |
-|---|---|
-| `pending` | Job created, not yet started |
-| `running` | Deployment in progress |
-| `completed` | All targets successfully deployed |
-| `failed` | One or more targets failed |
-| `cancelled` | Job was cancelled by an administrator |
+| State | Reachable today | Description |
+|---|---|---|
+| `pending` | Yes | Job record created; nothing will start it |
+| `running` | No | Defined, never set |
+| `completed` | No | Defined, never set |
+| `failed` | No | Defined, never set |
+| `cancelled` | Yes | Job was cancelled through the API |
 
-### Monitoring Job Status
+### Reading Job Records
 
 ```bash
-curl -s http://localhost:8080/api/v1/deployment-jobs/{job_id} \
+curl -s http://localhost:8080/api/deployment-jobs \
+  -H "Authorization: Bearer $TOKEN"
+
+curl -s http://localhost:8080/api/deployment-jobs/{job_id} \
   -H "Authorization: Bearer $TOKEN"
 ```
 
 ### Cancelling a Job
 
 ```bash
-curl -s -X POST http://localhost:8080/api/v1/deployment-jobs/{job_id}/cancel \
+curl -s -X DELETE http://localhost:8080/api/deployment-jobs/{job_id} \
   -H "Authorization: Bearer $TOKEN"
 ```

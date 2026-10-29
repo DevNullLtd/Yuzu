@@ -26,6 +26,7 @@
 #define YUZU_LICENSE_SCAN_LICENSING_PARSERS_HPP
 
 #include <sha256.hpp>
+#include <yuzu/plugin.h> // YuzuResultStatus / YuzuResultCompleteness (SurfaceStatus; plain C header)
 #include "licensing_record.hpp" // ProbeOutcome (platform-free; entitlement_certs_outcome() below)
 
 #include <array>
@@ -182,62 +183,6 @@ inline std::string parse_wmi_datetime_to_expiry(std::string_view cim) {
         return {};
     return expiry_wire_from_epoch(
         epoch_from_civil(year, static_cast<unsigned>(month), static_cast<unsigned>(day)));
-}
-
-/// `openssl x509 -noout -enddate` output → the `expires_at` wire value
-/// (UTC-midnight epoch seconds, decimal string). Accepts both the `-dateopt
-/// iso_8601` form ("notAfter=2027-03-04 12:00:00Z") and the default form
-/// ("notAfter=Mar  4 12:00:00 2027 GMT"). Returns "" when unparsable.
-inline std::string parse_openssl_enddate(std::string_view line) {
-    line = parse_detail::trim(line);
-    constexpr std::string_view prefix = "notAfter=";
-    if (line.substr(0, prefix.size()) != prefix)
-        return {};
-    const auto value = parse_detail::trim(line.substr(prefix.size()));
-    // ISO form: YYYY-MM-DD...
-    if (value.size() >= 10 && value[4] == '-' && value[7] == '-') {
-        bool digits = true;
-        for (std::size_t i : {0u, 1u, 2u, 3u, 5u, 6u, 8u, 9u})
-            digits = digits && value[i] >= '0' && value[i] <= '9';
-        if (digits) {
-            const long long y = (value[0] - '0') * 1000 + (value[1] - '0') * 100 +
-                                (value[2] - '0') * 10 + (value[3] - '0');
-            const unsigned mo = static_cast<unsigned>((value[5] - '0') * 10 + (value[6] - '0'));
-            const unsigned d = static_cast<unsigned>((value[8] - '0') * 10 + (value[9] - '0'));
-            return expiry_wire_from_epoch(epoch_from_civil(y, mo, d));
-        }
-    }
-    // Default form: "Mon dd HH:MM:SS yyyy GMT"
-    static constexpr std::array<std::string_view, 12> months = {
-        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"};
-    const auto tokens = parse_detail::split_ws(value);
-    if (tokens.size() < 4)
-        return {};
-    const std::string mon = parse_detail::to_lower(tokens[0]);
-    unsigned month = 0;
-    for (std::size_t i = 0; i < months.size(); ++i) {
-        if (mon == months[i]) {
-            month = static_cast<unsigned>(i + 1);
-            break;
-        }
-    }
-    if (month == 0)
-        return {};
-    int day = 0;
-    for (char c : tokens[1]) {
-        if (c < '0' || c > '9')
-            return {};
-        day = day * 10 + (c - '0');
-    }
-    int year = 0;
-    for (char c : tokens[3]) {
-        if (c < '0' || c > '9')
-            return {};
-        year = year * 10 + (c - '0');
-    }
-    if (year < 1900 || day < 1 || day > 31)
-        return {};
-    return expiry_wire_from_epoch(epoch_from_civil(year, month, static_cast<unsigned>(day)));
 }
 
 // ── SLP LicenseStatus → §3.2 status (ADR-0024 D2; surface table row 1) ─────
@@ -559,24 +504,31 @@ inline std::string plist_string_value(std::string_view xml, std::string_view key
 // ── entitlement_certs outcome decision (pure seam) ─────────────────────────
 
 /// Classifies the outcome of the Linux `entitlement_certs` surface scan from
-/// three plain facts, so the decision is unit-testable without a real
-/// `/etc/pki/entitlement` directory or an `openssl` subprocess. Mirrors
-/// `run_entitlement_certs_surface`'s (licensing_linux.cpp) four-way branch
-/// exactly -- kept here rather than inline so a future refactor of that
-/// impure shell can't silently regress either of the two honest-degrade
-/// invariants it encodes:
-///   - a scan that stopped early (`budget_exhausted`) with certs left
-///     unexamined is NEVER reported clean, whatever was parsed before the
-///     deadline;
+/// four plain facts, so the decision is unit-testable without a real
+/// `/etc/pki/entitlement` directory. Mirrors `run_entitlement_certs_surface`'s
+/// (licensing_linux.cpp) branches exactly -- kept here rather than inline so a
+/// future refactor of that impure shell can't silently regress the
+/// honest-degrade invariants it encodes. Fixed precedence:
+/// permission_denied > budget_exhausted > parse_failed > parse_partial > ok.
+///   - a refusal (`permission_denied`: the agent could not list the directory,
+///     or could not read a certificate) is NEVER an empty or clean surface --
+///     "could not check" is not "nothing there". Whatever certs were parsed
+///     are still carried in `rows`;
+///   - a scan that stopped early (`budget_exhausted`: start gate, truncated
+///     listing, too many files or certs) with certs left unexamined is NEVER
+///     reported clean, whatever was parsed before it;
 ///   - a scan where at least one cert parsed AND at least one failed
 ///     (`any_parse_failure` with `emitted > 0`) is NEVER reported as a clean
 ///     success -- a lapsed or corrupt entitlement cert must not silently
 ///     vanish from this authoritative compliance surface. Kept distinct from
 ///     the total-failure case (`emitted == 0`) so an operator can tell "some
 ///     certs unreadable" from "couldn't read any of them".
-[[nodiscard]] inline ProbeOutcome entitlement_certs_outcome(bool budget_exhausted,
+[[nodiscard]] inline ProbeOutcome entitlement_certs_outcome(bool permission_denied,
+                                                             bool budget_exhausted,
                                                              std::size_t emitted,
                                                              bool any_parse_failure) {
+    if (permission_denied)
+        return ProbeOutcome{"entitlement_certs", false, emitted, "cert_permission_denied"};
     if (budget_exhausted)
         return ProbeOutcome{"entitlement_certs", false, emitted, "cert_scan_budget_exhausted"};
     if (emitted == 0 && any_parse_failure)
@@ -584,6 +536,72 @@ inline std::string plist_string_value(std::string_view xml, std::string_view key
     if (any_parse_failure)
         return ProbeOutcome{"entitlement_certs", false, emitted, "cert_parse_partial"};
     return ProbeOutcome{"entitlement_certs", true, emitted, {}};
+}
+
+/// True when any outcome is a refusal reported by `entitlement_certs_outcome`
+/// (`cert_permission_denied`). The plugin maps it to PERMISSION_DENIED instead
+/// of the generic CONSTRAINED surface error.
+[[nodiscard]] inline bool has_permission_denied_outcome(const std::vector<ProbeOutcome>& outcomes) {
+    for (const auto& o : outcomes) {
+        if (!o.ok && o.error == "cert_permission_denied")
+            return true;
+    }
+    return false;
+}
+
+// ── typed result status of a run (pure seam) ───────────────────────────────
+
+/// The ABI4 typed status a run reports (status, completeness, provenance token).
+struct SurfaceStatus {
+    YuzuResultStatus status;
+    YuzuResultCompleteness completeness;
+    std::string_view provenance;
+};
+
+/// Maps a run's per-surface outcomes to the typed result status, or nullopt when
+/// every surface was ok (nothing to report: the status stays UNDECLARED). Fixed
+/// precedence: a refusal (`cert_permission_denied`) -> PERMISSION_DENIED /
+/// PARTIAL / `license_scan:permission_denied`, distinct from the generic failure
+/// so a consumer of this seam can tell "could not check" from "the check
+/// failed"; any other !ok outcome -> CONSTRAINED / PARTIAL /
+/// `license_scan:surface_error`. PARTIAL on both: rows already collected are
+/// carried on every degraded path. Pure so the precedence is unit-testable
+/// without a plugin context; license_scan_plugin.cpp's propagate_surface_status
+/// is the thin shell that hands the result to ctx.set_result_status.
+[[nodiscard]] inline std::optional<SurfaceStatus>
+surface_result_status(const std::vector<ProbeOutcome>& outcomes) {
+    if (has_permission_denied_outcome(outcomes))
+        return SurfaceStatus{YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                             "license_scan:permission_denied"};
+    for (const auto& o : outcomes) {
+        if (!o.ok)
+            return SurfaceStatus{YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                 "license_scan:surface_error"};
+    }
+    return std::nullopt;
+}
+
+// ── per_user_hives outcome decision (pure seam) ────────────────────────────
+
+/// Classifies the Windows `per_user_hives` surface from four plain facts, same seam shape as
+/// entitlement_certs_outcome above so run_per_user_surfaces' precedence is unit-testable without
+/// a real ProfileList walk. Fixed precedence: privilege_missing > hive_file_refused >
+/// hive_unload_failed > profile_list_truncated > ok. `rows` is carried on every branch -- the
+/// loaded/live-hive records already gathered are never discarded because one profile degraded.
+/// The aggregate reason names only the generic `hive_file_refused`; the per-profile sid + its
+/// specific guard token go to the agent log only (ADR-0024 D3/R15: one ProbeOutcome per surface).
+[[nodiscard]] inline ProbeOutcome per_user_hives_outcome(bool privilege_missing,
+                                                          bool file_refused, bool unload_failed,
+                                                          bool truncated, std::size_t rows) {
+    if (privilege_missing)
+        return ProbeOutcome{"per_user_hives", false, rows, "privilege_missing"};
+    if (file_refused)
+        return ProbeOutcome{"per_user_hives", false, rows, "hive_file_refused"};
+    if (unload_failed)
+        return ProbeOutcome{"per_user_hives", false, rows, "hive_unload_failed"};
+    if (truncated)
+        return ProbeOutcome{"per_user_hives", false, rows, "profile_list_truncated"};
+    return ProbeOutcome{"per_user_hives", true, rows, {}};
 }
 
 } // namespace yuzu::license_scan

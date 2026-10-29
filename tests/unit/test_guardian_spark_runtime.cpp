@@ -10371,7 +10371,7 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
     // that missing regression test.
     {
         GuardianArmAckLedger ledger;
-        ledger.begin_application(1, std::string(64, 'r'), false, 1);
+        ledger.begin_delta_application(1, std::string(64, 'r'), 1, {"r2"});
         ledger.add_pending("r2", res2->receipt);
         CHECK(ledger.drain_locked(*rt, 10) == 1); // resolved (Wedged), but NOT an outstanding wedge yet
         CHECK(ledger.failed_receipt_count_for_test() == 0); // must NOT be inserted while unsettled
@@ -11000,7 +11000,7 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
     // its own reservation attempt until we release it below.
     b->arm_park.park_every = 1;
     constexpr int kFillerCount = 4;
-    const int base_entries = b->arm_entries.load();
+    const auto rules_before_fillers = rt->rule_count();
     std::vector<std::thread> fillers;
     std::vector<std::expected<std::uint64_t, std::string>> filler_results(
         static_cast<std::size_t>(kFillerCount));
@@ -11025,14 +11025,15 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
         }
     } filler_cleanup{&b->arm_park, &fillers};
     REQUIRE(yuzu::test::spin_until(
-        [&] { return b->arm_entries.load() == base_entries + kFillerCount; },
+        [&] {
+            std::lock_guard<std::mutex> lk(b->arm_park.mu);
+            return b->arm_park.parked == kFillerCount;
+        },
         std::chrono::seconds(10)));
-    // TSan finding (2026-09-16): arm_entries is bumped at arm() ENTRY, before
-    // maybe_park() takes arm_park.mu (see arm()/maybe_park() above), so a filler
-    // thread can still be racing toward that lock the instant spin_until above
-    // is satisfied. An unguarded write here can interleave with maybe_park()'s
-    // guarded read of park_every. Take the same lock to make this write visible
-    // with the same mutex maybe_park() reads park_every under.
+    // TSan finding (2026-09-16): park_every is read by maybe_park() under
+    // arm_park.mu, so take the same lock to make this write. (The wait above is on
+    // the gate's parked count, not on arm_entries, which is bumped at arm() ENTRY
+    // before the park - #6681.)
     {
         std::lock_guard<std::mutex> lk(b->arm_park.mu);
         b->arm_park.park_every = 0; // stop parking future arrivals - r2 must reach
@@ -11055,6 +11056,16 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
 
     CHECK(rt->compensation_reservation_refused() >= 1);
     CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Failed);
+
+    // #6681: the four fillers' arms are still parked on detached executor workers. Their
+    // attach_rule() calls have returned, so joining the filler threads (FillerCleanup, at scope
+    // exit) waits for nothing, and the commits land after the test case. Exit segfaults were
+    // seen in that window, with the log showing these commits after main() returned (cause not
+    // backtraced). Release the gate and wait for every one to commit now.
+    b->arm_park.pulse();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return rt->rule_count() >= rules_before_fillers + kFillerCount; },
+        std::chrono::seconds(10)));
 }
 
 // ── rung 9c PR-5c (#4221 up-2): immediate refusal of a genuinely new claimant onto
@@ -11303,6 +11314,27 @@ TEST_CASE("Governance Gate 8 finding (rung 9c PR-5d /governance run): an ordinar
     CHECK(rt->armed_key_count() == 1);
 }
 
+// #6681: `FakeBackend::disarms` is bumped when disarm() RETURNS, but the runtime retires the
+// retained wedge from its FIFO in a completion continuation that runs after that, so for a
+// moment the key can still hold the wedge and the runtime correctly refuses a new claimant
+// ("spark key wedged"). That refusal of a brand-new rule id mutates no rule state, so a test
+// that asserts the runtime is healthy afterwards retries until the result stops being exactly
+// that refusal; a key that never un-wedges still fails at the deadline. Only that exact string
+// is tolerated: any other error, including "arm timed out", ends the retry.
+template <class Attempt>
+auto attach_past_wedge_refusal(Attempt&& attempt) {
+    decltype(attempt()) res{};
+    const bool settled = yuzu::test::spin_until(
+        [&] {
+            res = attempt();
+            return res.has_value() || res.error() != "spark key wedged";
+        },
+        std::chrono::seconds(10));
+    CAPTURE(res.has_value() ? std::string{} : res.error());
+    REQUIRE(settled);
+    return res;
+}
+
 TEST_CASE("#4508: re-observation supersedes a different wedged key before withdrawal",
           "[spark][runtime][liveness]") {
     auto r = std::make_shared<FakeReader>();
@@ -11366,8 +11398,10 @@ TEST_CASE("#4508: re-observation supersedes a different wedged key before withdr
     // The runtime stays healthy afterward - a fresh attach on either key arms
     // normally, proving neither key's index/subscription state was left corrupt
     // by the orphaned-then-disarmed claim.
-    const auto res_fresh = rt->attach_rule("r-fresh", file_spec("/b"), file_exists_rule("r-fresh"),
-                                           true);
+    const auto res_fresh = attach_past_wedge_refusal([&] {
+        return rt->attach_rule("r-fresh", file_spec("/b"), file_exists_rule("r-fresh"), true);
+    });
+    CAPTURE(res_fresh.has_value() ? std::string{} : res_fresh.error());
     REQUIRE(res_fresh.has_value());
     CHECK(rt->rule_count() == 1);
     CHECK(rt->armed_key_count() == 1);
@@ -11439,8 +11473,10 @@ TEST_CASE("#4508: a later timeout yields to the re-observed candidate",
     // The runtime stays healthy afterward - a fresh attach on either key arms
     // normally, proving neither key's index/subscription state was left corrupt by
     // the orphaned-then-disarmed claim.
-    const auto res_fresh = rt->attach_rule("r-fresh", file_spec("/a"), file_exists_rule("r-fresh"),
-                                           true);
+    const auto res_fresh = attach_past_wedge_refusal([&] {
+        return rt->attach_rule("r-fresh", file_spec("/a"), file_exists_rule("r-fresh"), true);
+    });
+    CAPTURE(res_fresh.has_value() ? std::string{} : res_fresh.error());
     REQUIRE(res_fresh.has_value());
     CHECK(rt->rule_count() == 1);
     CHECK(rt->armed_key_count() == 1);
@@ -11531,8 +11567,10 @@ TEST_CASE("This rung 9c PR-5d /governance run's own Gate 4 unhappy-path pass (fi
     // The runtime stays healthy afterward - a fresh attach on either key arms
     // normally, proving neither key's index/subscription state was left corrupt by
     // the orphaned-then-disarmed claim.
-    const auto res_fresh = rt->attach_rule("r-fresh", file_spec("/a"), file_exists_rule("r-fresh"),
-                                           true);
+    const auto res_fresh = attach_past_wedge_refusal([&] {
+        return rt->attach_rule("r-fresh", file_spec("/a"), file_exists_rule("r-fresh"), true);
+    });
+    CAPTURE(res_fresh.has_value() ? std::string{} : res_fresh.error());
     REQUIRE(res_fresh.has_value());
     CHECK(rt->rule_count() == 1);
     CHECK(rt->armed_key_count() == 1);
@@ -14458,7 +14496,7 @@ TEST_CASE("#5403: single-rule serialized retries behind a hung Disarm keep the k
 // teardown pops the claim the next retry is a Reapply that arms the rule.
 //
 // Level: a real GuardianSparkRuntime plus a real GuardianArmAckLedger, driven by the test thread
-// in the order GuardianEngine::apply_rules does (begin_application, detach_all, attach_rule,
+// in the order GuardianEngine::apply_rules does (begin_full_application, detach_all, attach_rule,
 // add_pending) and journal_maintenance_tick does (drain_locked, can_advance). The engine fixture
 // cannot park the arm's completion between detach_all and the re-attach (both run inside one
 // apply_rules under mtx_ with no seam between them). What is modelled rather than exercised: the
@@ -14510,7 +14548,7 @@ struct PostK4472Rig {
     /// FREE key may use this: there the fresh arm can complete before attach_rule resumes, so
     /// Armed is as legal as Accepted.
     RT::ArmOutcome reapply_attach_outcome() {
-        ledger.begin_application(1, digest, /*full_sync=*/true, 1);
+        ledger.begin_full_application(1, digest, 1);
         rt->detach_all();
         return attach_r1_outcome();
     }
@@ -14530,7 +14568,7 @@ struct PostK4472Rig {
     /// retry is Suppressed because that wedge is outstanding.
     void establish_wedge() {
         b->hang_next_arm.store(true);
-        ledger.begin_application(1, digest, /*full_sync=*/true, 1);
+        ledger.begin_full_application(1, digest, 1);
         wedge_receipt = attach_r1();
         REQUIRE(b->wait_entered_hang(std::chrono::seconds(10)));
         // A live, un-abandoned ARM head aged past the 30 s pending-Disarm threshold (but not past
@@ -14553,7 +14591,7 @@ struct PostK4472Rig {
     /// it is not adopted) and its compensating disarm parks inside the backend; the re-attach then
     /// re-observes the same claim.
     RT::ArmReceipt reapply_with_compensation_outstanding() {
-        ledger.begin_application(1, digest, /*full_sync=*/true, 1);
+        ledger.begin_full_application(1, digest, 1);
         rt->detach_all();
         b->hang_next_disarm.store(true);
         b->release_hang(); // the hung arm returns its subscription now
@@ -14798,7 +14836,7 @@ TEST_CASE("#4472: a wedge retained in failed_receipts on an earlier drain become
     f.b->release_hang();
     REQUIRE(f.b->wait_entered_disarm_hang(std::chrono::seconds(10)));
 
-    // Drain N+1 WITHOUT begin_application.
+    // Drain N+1 WITHOUT begin_*_application.
     REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 0);
     CHECK(f.rt->receipt_recovery_status(f.wedge_receipt) ==
           PostK4472Rig::RT::RecoveryStatus::CompensationPending);

@@ -48,7 +48,7 @@ Routes that serve per-person behavioural / compliance PII (the `dex.device.view`
 
 This is intentional cross-surface behaviour: during an audit-store blip a browsing operator sees data while a wired REST integration receives `503`. Alert on `Sec-Audit-Failed: true` (or `audit_persisted: false`) from any surface as a SOC 2 CC7.2 evidence-gap signal. (Mutating routes such as token/session revoke use the related `audit_emitted` body field — see those endpoints.)
 
-A separate, narrower shape applies to ordinary mutation routes that audit a change **after** it already durably committed (not the behavioural-PII read routes above): `POST /api/v1/software-packages`, `POST /api/v1/software-deployments`, and its `.../start`, `.../rollback`, `.../cancel` actions. These **always set-and-proceed** — the mutation cannot be un-committed, so the response stays `2xx` and only `Sec-Audit-Failed: true` signals a dropped audit row, with no `audit_emitted`/`audit_persisted` body field. The Integrations writes share the shape for their OUTCOME row: `POST`/`DELETE /api/webhooks`, `POST`/`DELETE /api/v1/offload-targets`, `POST /api/directory/sync` and `PUT /api/directory/group-mappings` write a `result=attempted` row first (a failure there is a `503` and nothing changes), and if the later outcome row cannot be stored they keep their `2xx` and set `Sec-Audit-Failed: true`, which means the change WAS made and only the `attempted` row stands — do not retry the create. Treat the header the same way as the behavioural-PII surfaces: a CC7.2 evidence-gap signal, not an error.
+A separate, narrower shape applies to ordinary mutation routes that audit a change **after** it already durably committed (not the behavioural-PII read routes above): `POST /api/v1/software-packages`, `POST /api/v1/software-deployments`, and its `.../start`, `.../rollback`, `.../cancel` actions. These **always set-and-proceed** — the mutation cannot be un-committed, so the response stays `2xx` and only `Sec-Audit-Failed: true` signals a dropped audit row, with no `audit_emitted`/`audit_persisted` body field. The Integrations writes share the shape for their OUTCOME row: `POST`/`DELETE /api/webhooks`, `POST`/`DELETE /api/v1/offload-targets`, `POST /api/directory/sync` and `PUT /api/directory/group-mappings` write a `result=attempted` row first (a failure there is a `503` and nothing changes), and if the later outcome row cannot be stored they keep their `2xx` and set `Sec-Audit-Failed: true`, which means the change WAS made and only the `attempted` row stands — do not retry the create. `PUT` and `DELETE /api/v1/dex/score-policy` share the shape too: a `200` that carries the header means the outcome row is missing and only the `attempted` row stands: for a `PUT`, or a `DELETE` that removed a policy, the change was applied and a retry with the old `If-Match` answers `409`, while a `DELETE` of a policy that was never written changed nothing and may be repeated. Treat the header the same way as the behavioural-PII surfaces: a CC7.2 evidence-gap signal, not an error.
 
 ---
 
@@ -151,6 +151,8 @@ Unauthenticated browser requests are redirected to `/home` (the sign-in landing 
 API tokens are created via `POST /api/v1/tokens` and can be scoped to the creating user's permissions. The raw token value is returned exactly once at creation time.
 
 State-changing examples (POST, PUT, DELETE) that authenticate with a session cookie send a same-site `Origin` header (the scheme, host and port of the server you are calling); API-token requests do not need it.
+
+**Cookie-session writes.** Every request other than `GET`, `HEAD` or `OPTIONS` that is authorised by the `yuzu_session` cookie must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`). Otherwise it is refused `403` `cross-site request refused` (the standard error envelope, with a `remediation` and no `permission` field) and audited as `csrf.denied`. One check, applied centrally, decides this after authentication and before step-up evaluation, challenge emission and route-handler effects, and before the request body is read. A request that presents a valid session cookie is treated as a cookie-session request even if it also carries a token; a request authenticated only by an API, MCP or engine token is not subject to this check, except on the routes that keep a copy of their own that is not token-exempt. Browsers send these headers on every write (the dashboard needs no change); a script that reuses a login cookie sends `-H "Origin: https://yuzu.example.com"` or uses an API token. Behind a reverse proxy, declare the public origin with its scheme (`--csrf-trusted-origin https://yuzu.example.com`; required if the proxy rewrites `Host`, and a plain-`http://` origin for that host is then refused) and do not configure the proxy to inject or rewrite `Origin` or `Referer`. A server that terminates TLS itself requires an `https://` `Origin` or `Referer`. The audit row's `result` is `denied`, its `target_id` is the sanitised request method and path (the request path is truncated at 200 bytes) and its `detail` is fixed text plus `reason=<token>`; each refusal increments `yuzu_server_csrf_denied_total{path_class,reason}` (see [Metrics](metrics.md)). Cross-site checks described per route elsewhere in this reference are defence in depth: for a cookie-session caller the central check answers first and writes the `csrf.denied` row, so the per-route `target_id` values documented below are written only by a copy that is actually reached, which in practice means a token caller of a route whose copy is not token-exempt. Cookie-session requests that dispatch work, persist state or force a refresh of server state (the guarded reads) are held to the same rule whichever method they use, and the exact path, never a query flag, selects the gate. For them a `Sec-Fetch-Site` header that is present decides alone: exactly one header with value `same-origin` or `none` is admitted, any other value or a repeated header is refused with `origin_mismatch`, and `Origin` and `Referer` are not consulted. Only a request without `Sec-Fetch-Site` falls back to the `Origin` or `Referer` rule. So a script that reuses a login cookie for such a request either sends no `Sec-Fetch-Site` and a same-site `Origin` or `Referer`, or sends `Sec-Fetch-Site` once with value `same-origin` or `none`; or it uses an API token. Token callers are not gated. The audit row's detail text for such a refusal is the fixed write wording (see [CSRF protection](security-hardening.md#csrf-protection)).
 
 **Reserved headers — do not send.** Five header names are reserved for future
 server-verifiable delegation and are **rejected on every endpoint** (sole
@@ -283,7 +285,7 @@ Routes that parse strictly (the response routes are listed in
 | Dashboard fragments | `GET /fragments/results`: `page`, `per_page`; the three software inventory fragments (`/fragments/inventory/software`, `/software/devices`, `/software/versions`): a malformed `limit` answers `200` with an `inv-caveat` note, not a JSON `400` (htmx drops `4xx` bodies), and the store is not read; a well-formed `limit` is validated and then ignored, because these fragments use a fixed page size; the DEX perf devices fragment and the network quality devices fragment: `limit`; the hardware list fragment and `GET /api/v1/hardware`: `offset`, `limit` (a negative value is refused too, it used to be clamped to `0`); the hardware sync poll: `await_since` (a malformed freshness bound used to read as "no bound", so a stale snapshot could be served as fresh); `GET /fragments/tar/process-tree/detail`: `node` (`stoul` read `-1` as the largest node id and `5x` as `5`) |
 | Delivery and list routes | `GET /api/notifications`: `limit`, `offset` (a negative value is `400` too, where the store answered an empty `200`); `GET /api/webhooks/{id}/deliveries` and `GET /api/v1/offload-targets/{id}/deliveries`: `limit`; `GET /api/v1/ca/issued`: `limit`, `offset`; `GET /api/v1/preflight/runs`: `limit`; the pre-flight run form: `min_gib` and `window` (a malformed value is `400`; a negative `min_gib` is `400` too) and the version thresholds `app_min`, `app_max` and `os_min` (empty, or a dotted-decimal version with an optional `-beta` / `+build` suffix; anything else is `400`, see [Pre-flight readiness checks](preflight.md)); `GET /api/v1/result-sets` and `GET /api/v1/result-sets/{id}/members`: `limit` (trailing characters are `400`, not their numeric prefix; an integer outside the route's page range still uses the default page size); `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/perf/devices` and `GET /api/v1/network/devices`: `limit`; `GET /api/v1/guaranteed-state/events`: `limit` and `offset` (a negative value is `400` too; both are parsed before the `dex.device.view` audit row is written, so a `400` leaves no access row) |
 | Event streams | `GET /api/v1/events`: `since` (a non-negative integer; a malformed value is `400`, answered before the stream budget is touched). A malformed `Last-Event-ID` **header** on `GET /api/v1/events` or the workflow execution stream is served **live only**: nothing buffered is replayed (never the whole ring buffer) and it is not a `400`, because the header is browser-supplied inference and a `400` would fail a reconnect. The cursor is parsed strictly, so `-1` and `5abc` are never accepted as a position (`5abc` used to replay from position 5; `-1` wrapped past every event and also replayed nothing, so that input's outcome is unchanged); valid ids replay exactly as before. A rejected `?since` leaves no success audit row, because it is parsed before the audit write |
-| Settings forms | `POST /api/settings/dex-alerts/blast` (`min_devices`, `window_seconds`, `cooldown_seconds`): a malformed value is `400` and nothing is saved (it used to persist the clamped minimum); `POST /api/settings/enrollment-tokens` and `/batch` (`max_uses`, `ttl_hours`, `count`): `0x5` used to read as `0`, and `max_uses` `0` means unlimited, so a mistyped limit minted an unlimited token (only an **empty** field, or a value that parses to a literal `0` such as `0`, `-0` or `00`, means unlimited or no expiry now; on `/batch` an empty `max_uses` defaults to `1`, not unlimited; a **negative** `ttl_hours` is refused with `400` because it would compute `0`, a token that never expires); the API-token create form `ttl_hours` (the same `0x5` read as a token that never expires; it is refused with the form's usual `200` feedback span, `Invalid TTL value.`, a negative value too, and nothing is minted); the OTA package `rollout_pct` on upload and on the rollout route (an out-of-range integer on upload is clamped to 0..100 as before): a malformed value used to become `100`, a full-fleet rollout. **Behaviour change on the rollout change route only:** an empty `rollout_pct` and a value above `100` are also `400` there (an empty value used to mean `100` and a larger one was clamped to `100`), while a negative value still clamps to `0` (the least exposure); the upload route is unchanged. Each enrollment and OTA `400` also sets an error toast (`HX-Trigger`), because the dashboard drops `4xx` bodies |
+| Settings forms | `POST /api/settings/dex-alerts/blast` (`min_devices`, `window_seconds`, `cooldown_seconds`): a malformed value is `400` and nothing is saved (it used to persist the clamped minimum); `POST /api/settings/enrollment-tokens` and `/batch` (`max_uses`, `ttl_hours`, `count`): `0x5` used to read as `0`, and `max_uses` `0` means unlimited, so a mistyped limit minted an unlimited token (only a value that parses to a literal `0` such as `0`, `-0` or `00` means unlimited or no expiry; an **empty** field takes the default of 100 uses and 72 hours, and on `/batch` an empty `max_uses` defaults to `1` and an empty `ttl_hours` to 72 hours; a **negative** `ttl_hours` is refused with `400` because it would compute `0`, a token that never expires); the API-token create form `ttl_hours` (the same `0x5` read as a token that never expires; it is refused with the form's usual `200` feedback span, `Invalid TTL value.`, a negative value too, and nothing is minted); the OTA package `rollout_pct` on upload and on the rollout route (an out-of-range integer on upload is clamped to 0..100 as before): a malformed value used to become `100`, a full-fleet rollout. **Behaviour change on the rollout change route only:** an empty `rollout_pct` and a value above `100` are also `400` there (an empty value used to mean `100` and a larger one was clamped to `100`), while a negative value still clamps to `0` (the least exposure); the upload route is unchanged. Each enrollment and OTA `400` also sets an error toast (`HX-Trigger`), because the dashboard drops `4xx` bodies |
 | JSON request bodies (security-gating numbers) | `POST /api/v1/tokens` `expires_at` (a negative value or one above 9223372036854775807 minted a token that never expires, `5.5` or `1e3` an already-expired one, and a wrong type threw a bare `500`; now `400`, and `0` or omitted still means never expires); `POST /api/v1/tokens/{id}/rotate` and `POST /api/v1/engine-principals/{id}/credentials/rotate` `overlap_secs` (a truncated or non-object body used to rotate with the 7-day default; now `400`, and an empty body still takes the default); `POST /api/v1/guaranteed-state/rules` `version` (`5.5` was stored as `5` and a wrong type threw; now `400`); `POST /api/v1/upload-grants` `ttl_secs` (a wrong type, `0` or a negative value was ignored and the grant got the 900 s maximum; now `400`); `POST /api/settings/enrollment-tokens/batch` `count`, `max_uses`, `ttl_hours` (a JSON number was silently ignored, so the documented example minted single-use tokens that never expire; now a JSON integer **and** a numeric string are both read, an empty string keeps the default, and a float, boolean, `null`, overflow or a truncated or non-object body is `400` and mints nothing). The `ip_subnet` auto-approve rule value is validated when it is added (`POST /api/settings/auto-approve`, `400` for anything but an IPv4 address or `a.b.c.d/0` to `/32`) |
 
 On the query-parameter routes in the table above, a parameter that is **present but empty** (`?limit=`) is malformed, not absent (`GET /api/v1/audit` `limit` included). Two exceptions. The software list and catalogue routes (`GET /api/v1/inventory/software` and `/software/catalogue`, and the three software fragments) share one parser in which an EMPTY `limit=` means the default; a non-empty malformed or overflowing `limit` is still refused (`400` on the REST routes, a `200` `inv-caveat` note on the fragments). And the auth-sample export: a present but empty `from` or `to` on `GET /api/v1/audit/auth-sample` is accepted as unbounded on that side. The admin forms are different: an EMPTY form field means that field's default.
@@ -302,23 +304,23 @@ does not fit a signed 64-bit integer (the auto-approve rule index answers `200` 
 
 ## Pre-Auth Request Body Caps (#2407)
 
-Every request is checked against a per-route body-size cap **before authentication runs and before the body is read** — a single pre-routing chokepoint (`server.cpp`) resolves the caller's `(method, path)` against the policy table in `body_cap_policy.hpp` and rejects an oversized or unmeasurable body without buffering it. **The four health-probe paths (`/livez`, `/readyz`, `/health`, `/api/health`) are NOT exempt from this gate** — the cap is a single lambda, `enforce_pre_auth_body_cap` in `server.cpp`'s pre-routing handler, invoked from exactly two sites: once INSIDE the probe branch, before its early return, and once after the on-behalf-of guard and the rate limiter for every other route. One definition, two call sites — so the probes cannot drift out of coverage without deleting a call. The plain-HTTP redirect listener (#5906) also serves these four paths, but it admits no body at all: a probe declaring `Content-Length` or `Transfer-Encoding` is redirected before any read (`is_plaintext_probe_request`, `health_routes.hpp`), so no second cap table exists. `tests/unit/server/test_body_cap_policy.cpp`'s "POST /health … is rejected (D3)" case exercises that DECISION on a real socket, but against a test server that reproduces the gate rather than invoking the production one, so it does not pin the wiring: deleting either call site in `server.cpp` would leave the suite green. Treat the wiring as verified by review, not by test, until that gap is closed. Before this fix the probes' early-return sat above the cap entirely, making them the server's last unauthenticated 100 MiB buffer — closing that was the point. The probes remain exempt from the on-behalf-of guard and the rate limiter that run further below (a header-stamping proxy or orchestrator must not be able to crash-loop the server by tripping either on its own liveness check) — that exemption is unchanged; only the body cap now also reaches them. Three status codes:
+Every request is checked against a per-route body-size cap **before authentication runs and before the body is read**. A single pre-routing chokepoint (`server.cpp`) resolves the caller's `(method, path)` against the policy table in `body_cap_policy.hpp` and rejects an oversized or unmeasurable body without buffering it. **The four health-probe paths (`/livez`, `/readyz`, `/health`, `/api/health`) are NOT exempt from this gate**. The cap is a single lambda, `enforce_pre_auth_body_cap` in `server.cpp`'s pre-routing handler, invoked from exactly two sites: once INSIDE the probe branch, before its early return, and once after the on-behalf-of guard and the rate limiter for every other route. One definition, two call sites; the probes cannot drift out of coverage without deleting a call. The plain-HTTP redirect listener (#5906) also serves these four paths, but it admits no body at all: a probe declaring `Content-Length` or `Transfer-Encoding` is redirected before any read (`is_plaintext_probe_request`, `health_routes.hpp`), so no second cap table exists. `tests/unit/server/test_body_cap_policy.cpp`'s "POST /health … is rejected (D3)" case exercises that DECISION on a real socket, but against a test server that reproduces the gate rather than invoking the production one, so it does not pin the wiring itself. The probe-branch call is pinned separately by the source-text wiring case in `tests/unit/server/test_health_routes.cpp`, which fails if that call is deleted or moved out of the probe branch. The non-probe call site (after the on-behalf-of guard and the rate limiter) is not pinned: deleting it would leave the suite green, so treat that call as verified by review, not by test, until that gap is closed. Before this fix the probes' early-return sat above the cap entirely, making them the server's last unauthenticated 100 MiB buffer; closing that was the point. The probes remain exempt from the on-behalf-of guard that runs further below (a header-stamping proxy or orchestrator must not be able to crash-loop the server by tripping it on its own liveness check). That exemption is unchanged; only the body cap now also reaches them. `/livez` and `/readyz` are also exempt from the rate limiter. `/health` and `/api/health` requests that carry a credential header are rate limited per source address in a bucket of their own, checked before the body cap; requests with no credential header are not charged (see the `/health` section below). Three status codes:
 
 | Status | Meaning |
 |---|---|
 | `413` | The body's **declared `Content-Length`** exceeds the resolved cap for this route's class. |
-| `411` | The body cannot be **measured** in advance **by framing** — chunked `Transfer-Encoding`, or a POST/PUT/PATCH with no `Content-Length` at all — and this route's class refuses that. **Three classes refuse an unmeasurable body today: `/mcp/`, `upload_session` (`PUT /api/v1/uploads/{id}/chunk` and its sibling agent-facing upload routes) and `hardware`** — every other class below falls through and is admitted up to httplib's own 100 MiB backstop, because chunked request bodies are legal HTTP and this repo does not control every client population talking to public REST/SCIM/upload routes. This is a deliberate per-class opt-in (`requires_measurable`), not a blanket rule. `upload_session` opts in for the same reason `/mcp/` does: its session gate lives in the route HANDLER, after httplib would otherwise buffer the body, so the pre-routing bound is what actually stops an unauthenticated caller forcing a ~100 MiB buffer per connection — the agent uploader always sends an identity-encoded body with a `Content-Length` (the protocol's `Content-Range` header requires knowing it), so this costs a conforming client nothing. A non-`identity` `Content-Encoding` is judged separately — see `415` below, not this row. |
+| `411` | The body cannot be **measured** in advance **by framing** — chunked `Transfer-Encoding`, or a POST/PUT/PATCH with no `Content-Length` at all — and this route's class refuses that. **Four classes refuse an unmeasurable body today: `/mcp/`, `upload_session` (`PUT /api/v1/uploads/{id}/chunk` and its sibling agent-facing upload routes), `hardware` and `dex_score_policy`** — every other class below falls through and is admitted up to httplib's own 100 MiB backstop, because chunked request bodies are legal HTTP and this repo does not control every client population talking to public REST/SCIM/upload routes. This is a deliberate per-class opt-in (`requires_measurable`), not a blanket rule. `upload_session` opts in for the same reason `/mcp/` does: its session gate lives in the route HANDLER, after httplib would otherwise buffer the body, so the pre-routing bound is what actually stops an unauthenticated caller forcing a ~100 MiB buffer per connection — the agent uploader always sends an identity-encoded body with a `Content-Length` (the protocol's `Content-Range` header requires knowing it), so this costs a conforming client nothing. A non-`identity` `Content-Encoding` is judged separately — see `415` below, not this row. |
 | `415` | The request carries a `Content-Encoding` header set to anything other than `identity` (case-insensitive). Refused **unconditionally, on every route class, regardless of `requires_measurable`** — unlike the framing rule above, this does not depend on a per-class opt-in. Why: this build compiles `CPPHTTPLIB_BROTLI_SUPPORT`, httplib decompresses transparently and enforces only its 100 MiB global limit against the **decompressed** size, so `Content-Length` on a compressed body measures the wrong thing and a sub-cap compressed body can expand to ~100 MiB before anything downstream sees it. No Yuzu route accepts a compressed request body today, so this costs a conforming client nothing — send the body identity-encoded by **omitting `Content-Encoding` entirely**. Do **not** send `Content-Encoding: identity` explicitly: `has_non_identity_content_encoding` correctly admits it past this gate (it isn't a compressed encoding), but httplib's own body reader then calls `create_decompressor("identity")` — which matches none of gzip/deflate/br/zstd, returns null, and httplib answers a bare `415` itself (`httplib.h`'s `prepare_content_receiver`), before this gate, any route handler, or the A4/SCIM envelope code ever runs. That response carries none of the structure this section promises — no A4 envelope, no `correlation_id`, no `yuzu_body_cap_rejected_total` increment. Until that gap is closed at the code level, the only conforming way to send an identity-encoded body is to omit the header. |
 
 All three responses use the standard [A4 error envelope](#json-envelope) with a `remediation` hint (no `permission` field — the request is rejected before any principal is resolved) — **except the `scim` class**, which publishes SCIM's own RFC 7644 §3.12 error shape (`schemas`/`status`/`detail`) on `application/scim+json` instead of the generic envelope (`scim::error()`, `scim_json.hpp:192`; wired into all three status codes above in `server.cpp`'s pre-routing handler). This gate is separate from, and runs *before*, any route-local body check a handler may also carry (e.g. the SCIM/response-template 64 KiB checks below) — those still exist for defense-in-depth if a future edit widens this table's entry, but on the current table this pre-routing gate rejects first. **This is not purely a timing change for every affected class.** For most (response templates, CA import), an earlier rejection at the same byte count is the entire effect. SCIM is **no longer** an exception to that either (fixed as part of this change, D7): the pre-routing rejection's SCIM shape matches the wording of the handler's own (now-superseded, and unreachable — the pre-routing cap and the handler check the identical 64 KiB threshold, so the pre-routing gate always wins first) `413` check exactly, and extends the same shape to the `411`/`415` cases the handler-level check never covered.
 
 ### Post-Read Backstop (#2407)
 
-The pre-routing gate above is what stops an oversized body from being buffered at all — but it can only act on a **declared** size. Its structural limit, recorded in `body_cap_policy.hpp`'s KNOWN LIMITATION paragraph: on the 26 of 29 classes (distinct `path_class` labels) below that don't set `requires_measurable`, a genuine chunked (or otherwise undeclared) body is not size-checked by the pre-routing gate at all — it is admitted, up to httplib's own 100 MiB backstop, without that table's cap being consulted.
+The pre-routing gate above is what stops an oversized body from being buffered at all — but it can only act on a **declared** size. Its structural limit, recorded in `body_cap_policy.hpp`'s KNOWN LIMITATION paragraph: on the 28 of 32 classes (distinct `path_class` labels, the catch-all `default` included) below that don't set `requires_measurable`, a genuine chunked (or otherwise undeclared) body is not size-checked by the pre-routing gate at all — it is admitted, up to httplib's own 100 MiB backstop, without that table's cap being consulted.
 
 A second stage, wired at httplib's `Server::set_pre_request_handler` in `server.cpp`, closes that gap from the other side. It runs inside httplib's `dispatch_request` — **after** `read_content` has consumed the body off the socket into `req.body`, and after the route has matched, but **before the route's own handler runs**. At that point the body's actual size is known, so this stage resolves the SAME `kBodyCapTable`/`resolve_body_cap` the pre-routing gate uses (no forked table) and, if the now-fully-read body is over the class's cap, refuses with the same `413` A4/SCIM envelope shape and the same 1-in-100 per-reason log throttle as the pre-routing gate (tagged `[#2407 post-read]` in the journal rather than `[#2407]`). The rejection reason is a new value, `over_cap_post_read`, on `yuzu_body_cap_rejected_total{path_class,reason}` — pre-seeded at 0 for every class, unconditionally, unlike `unmeasurable`; see `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for the full description.
 
-**What an operator observes.** A chunked (or otherwise undeclared) body that exceeds its route class's cap is now refused — where it previously reached the route handler uncapped, bounded only by httplib's 100 MiB backstop. That is the change: the 21-of-23-class gap the pre-routing gate leaves open is now closed for a body that turns out, once read, to be over cap.
+**What an operator observes.** A chunked (or otherwise undeclared) body that exceeds its route class's cap is now refused — where it previously reached the route handler uncapped, bounded only by httplib's 100 MiB backstop. That is the change: the 28-of-32-class gap the pre-routing gate leaves open is now closed for a body that turns out, once read, to be over cap.
 
 **The two stages are mutually exclusive per request, not stacked.** httplib's `routing()` returns as soon as the pre-routing handler answers Handled, so it never calls `dispatch_request` for a request that gate already refused — a **measurable** over-cap body (a declared `Content-Length` above the cap) is still rejected by the pre-routing gate, before anything is buffered, exactly as before this stage existed. Do not describe this as "the cap now runs twice" — in practice `over_cap_post_read` fires almost exclusively for the chunked/unmeasurable case the pre-routing gate deliberately admits.
 
@@ -335,9 +337,9 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 
 | Method | Path prefix | Cap | `path_class` | Notes |
 |---|---|---|---|---|
-| any | `/mcp/` | 4 MiB | `mcp` | One of three classes with `requires_measurable=true` — see the 411 row above. |
+| any | `/mcp/` | 4 MiB | `mcp` | One of four classes with `requires_measurable=true` — see the 411 row above. |
 | POST | `/api/v1/bundles` | 70 MiB | `bundles` | Sized to the live-query bundle route's own computed 64 MiB parameter-byte floor plus JSON overhead headroom. |
-| any | `/api/v1/uploads` | 8 MiB | `upload_session` | The other `requires_measurable=true` class. Exact mirror of the PR1.6a chunked-receive protocol's own `kDefaultChunkMaxBytes` (`upload_grant_parsers.hpp`), bound to it by a `static_assert` in `file_retrieval_routes.cpp` so the two cannot drift. Any method — the session-open POST, chunk PUT, status GET, commit POST, and cancel DELETE all share this class; only the chunk PUT carries a large body, but scoping to PUT alone would silently drop the sibling verbs to the 4 MiB catch-all. |
+| any | `/api/v1/uploads` | 8 MiB | `upload_session` | The second `requires_measurable=true` class. Exact mirror of the PR1.6a chunked-receive protocol's own `kDefaultChunkMaxBytes` (`upload_grant_parsers.hpp`), bound to it by a `static_assert` in `file_retrieval_routes.cpp` so the two cannot drift. Any method — the session-open POST, chunk PUT, status GET, commit POST, and cancel DELETE all share this class; only the chunk PUT carries a large body, but scoping to PUT alone would silently drop the sibling verbs to the 4 MiB catch-all. |
 | any | `/api/v1/plugin-config` | 256 KiB | `plugin_config` | † The store's own grammar caps a config value at 8 KiB and a secret plaintext at 64 KiB (`plugin_config_parsers.hpp`); 256 KiB covers the larger of the two plus JSON framing/escaping headroom, while keeping an unauthenticated flood against this surface two orders of magnitude under the 4 MiB catch-all. Any method — PUT config/secret writes, DELETE carries no body, GET/list are bodyless. |
 | POST | `/api/settings/updates/upload` | 100 MiB | `ota_upload` | Kept at httplib's own backstop deliberately, not squeezed — OTA agent binaries are legitimately multi-ten-MB. |
 | POST | `/api/export/json-to-csv` | 100 MiB | `json_to_csv_export` | Unbounded by design — converts a full exported dataset to CSV, and its size follows directly from the caller's own prior query. Kept at httplib's backstop, same treatment as `ota_upload`, rather than squeezed or given an arbitrary MiB judgment-call number. |
@@ -348,9 +350,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | POST | `/api/v1/secrets/kek/` | 64 KiB | `kek_ops` | Covers both `/rotate` and `/rewrap` — both take zero body fields and share the handler's own `kMaxKekBody`. |
 | POST | `/api/settings/ca/import-chain` | 512 KiB | `ca_import_chain_dashboard` | † 2× the REST JSON twin's cap — reasoned headroom for form-encoding overhead, not a measured worst case. |
 | POST | `/api/settings/plugin-signing/upload` | 512 KiB | `plugin_trust_bundle` | † 2× the handler's 256 KiB parsed-content check — same reasoned multipart-framing headroom, not measured. |
-| POST | `/scim/v2/` | 64 KiB | `scim` | Matches the handler's own `kMaxBodyBytes`; moves an existing after-buffer check to before it — but the rejection's error SHAPE changes, see the SCIM caveat above. |
-| PUT | `/scim/v2/` | 64 KiB | `scim` | Same. |
-| PATCH | `/scim/v2/` | 64 KiB | `scim` | Same. |
+| any | `/scim/v2/` | 64 KiB | `scim` | Matches the handler's own `kMaxBodyBytes`; moves an existing after-buffer check to before it, but the rejection's error SHAPE changes, see the SCIM caveat above. Any method, as in `kBodyCapTable`: one row, not one per verb. |
 | POST | `/saml/acs` | 1 MiB | `saml_acs` | A legitimate signed `SAMLResponse` is well under 64 KiB; headroom against amplification, not judgment. |
 | POST | `/api/v1/definitions/` | 64 KiB | `response_templates` | Widest literal prefix the segment-boundary matcher can key on for the regex-captured `{id}`/`{template_id}` routes underneath; a future mutation route added elsewhere under this prefix inherits it unless it gets its own, more specific entry. |
 | PUT | `/api/v1/definitions/` | 64 KiB | `response_templates` | Same. |
@@ -369,12 +369,15 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | any | `/api/v1/rbac/enforcement` | 1 KiB | `rbac_enforcement` | A1 enforcement enable/disable toggle. Body is `{"enabled": true}`, under 64 bytes even pretty-printed; 1 KiB is 16× headroom. A segment-boundary-distinct prefix from `rbac_role_assignment` above, so it needs its own row or it would fall to the 4 MiB catch-all. |
 | any | `/api/v1/guaranteed-state/policy-generation` | 1 KiB | `guardian_policy_generation` | The Guardian policy-generation raise (`POST .../raise`). Body is `{"target_generation": <integer>, "acknowledge_rule_set_replaced": true}`, under 128 bytes even pretty-printed; 1 KiB is 8× headroom. The row is any-method, so the read-only `GET .../policy-generation` resolves to the same class; it carries no body. A segment-boundary-distinct prefix from `guardian_rule_authoring` (`/api/v1/guaranteed-state/rules`), so it needs its own row or it would fall to the 4 MiB catch-all. |
 | any | `/api/v1/users` | 16 KiB | `users` | The local-account user subtree: `POST .../me/password` and `POST .../{name}/password` (#5342) plus the bodyless `.../unlock` and the small `.../elevation-eligibility`. The largest legitimate body is two passwords at the 1024-byte policy maximum; worst-case JSON escaping puts that near 12.3 KiB, so 16 KiB admits every policy-conformant request. Any method, because the bodyless siblings share the prefix. |
+| any | `/api/v1/dex/score-policy` | 320 KiB | `dex_score_policy` | The fourth `requires_measurable=true` class. `PUT`'s body IS the score policy document, which the handler caps at 256 KiB (`kDexScorePolicyMaxBytes`); 320 KiB leaves framing headroom, so a legitimate document is never refused here. `GET` and `DELETE` are bodyless siblings sharing the class. The permission gate runs in the handler, after the body is buffered (a cookie session's same-site gate runs earlier, pre-routing), so an unmeasurable (chunked) body is refused up front with `411`. |
+| any | `/api/v1/crypto` | 16 KiB | `crypto` | The `/crypto` REST v1 subtree. The only body-bearing route is `PUT /api/v1/crypto/dashboard/layout` (at most 64 catalogue ids, about 4.4 KiB even fully escaped); 16 KiB mirrors the handler's own `kLayoutBodyMaxBytes` exactly. Any method, because every sibling is a bodyless GET and shares the prefix. |
+| any | `/api/v1/config` | 16 KiB | `config` | The runtime-configuration REST v1 subtree. The only body-bearing route is `PUT /api/v1/config/{key}` (`{"value": ...}`, one scalar: an integer, a flag, a log level, a tag key, an OIDC client secret or a string holding a short JSON array); 16 KiB is far above any legal value. Any method, because the sibling `GET /api/v1/config` is bodyless and shares the prefix. The legacy `PUT /api/config/{key}` stays on the catch-all. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `tar_dashboard_sql`/`tar_result_set_sql` history above is a shipped example).
-‡ = a generous, explicit, judgment-call bound because no aggregate size contract exists for that class yet, reasoned against that class's OWN realistic scale rather than copy-pasted from a sibling — **not** a fixed multiple below httplib's 100 MiB backstop: it ranges from ~12.5× for the 8 MiB `nvd_match` entry (just over one order of magnitude) down to 6.25× for the six 16 MiB entries (under one order of magnitude) — none of the ‡ entries reach two orders of magnitude. Do not read either footnote as license to invent a number for a different route — see the header block of `body_cap_policy.hpp`.
+‡ = a generous, explicit, judgment-call bound because no aggregate size contract exists for that class yet, reasoned against that class's OWN realistic scale rather than copy-pasted from a sibling — **not** a fixed multiple below httplib's 100 MiB backstop: it ranges from ~12.5× for the 8 MiB `nvd_match` entry (just over one order of magnitude) down to 6.25× for the five 16 MiB entries (under one order of magnitude) — none of the ‡ entries reach two orders of magnitude. Do not read either footnote as license to invent a number for a different route — see the header block of `body_cap_policy.hpp`.
 
-Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **33 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, the policy-generation raise `guardian_policy_generation`, and #5342 `users`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **29 classes** overall. Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
+Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **36 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, the policy-generation raise `guardian_policy_generation`, #5342 `users`, and then `crypto`, `config` and `dex_score_policy`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **32 classes** overall (the catch-all `default` included). Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
 
 **Raising a cap.** Edit the table in `body_cap_policy.hpp` (with review) and update this table to match — never reach for `Server::set_payload_max_length`, which is global across every route on the listener (see "Why not one global cap?" above). See also `docs/user-manual/server-admin.md`'s upgrade note for this change and `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for observing rejections.
 
@@ -390,9 +393,12 @@ All endpoints are under the `/api/v1/` prefix.
 
 #### `GET /api/v1/me`
 
-Returns the authenticated user's identity, role and what the server will honour for this session.
+Returns the authenticated caller's identity, legacy role and session context (not an authority summary: see `role` below).
+The MCP twin is `get_me`.
 
-**Permission:** Authenticated session (no specific RBAC permission required).
+**Permission:** Authenticated session (no specific RBAC permission required). The route is
+session-only self-description and writes no audit row. A service-scoped token may call it and
+describe itself; the MCP twin `get_me` refuses service-scoped tokens (a documented asymmetry, tracked in #6432).
 
 **Response:**
 
@@ -402,29 +408,48 @@ Returns the authenticated user's identity, role and what the server will honour 
     "username": "alice",
     "display_name": "Alice",
     "role": "user",
+    "principal_kind": "human",
+    "auth_source": "local",
+    "mcp_tier": "",
+    "scope_service": "",
     "rbac_enabled": false,
     "rbac_role": "Viewer",
-    "effective_role": "admin",
-    "elevated": true,
-    "elevated_until": "2026-10-13T22:31:54Z",
-    "can_access_settings": true
+    "rbac_roles": [],
+    "rbac_roles_resolved": true,
+    "effective_role": "user",
+    "elevated": false,
+    "can_access_settings": false
   },
   "meta": { "api_version": "v1" }
 }
 ```
 
+While a just-in-time elevation is active, `effective_role` is `admin`, `elevated` is `true`,
+`elevated_until` (ISO-8601 UTC) is added and `can_access_settings` is `true` for a local session.
+
 | Field | Meaning |
 |---|---|
-| `role` | The persisted legacy role (`admin` or `user`). Never the elevated view. |
-| `effective_role` | The role the server enforces now: `admin` while a just-in-time elevation is active, otherwise `role`. |
-| `elevated` | `true` while a just-in-time elevation is active. Always `false` for API, MCP and service-scoped tokens. |
+| `username` | The stable authorization principal (for an SSO session an opaque `oidc:<iss>#<sub>` id). |
+| `display_name` | A readable label; falls back to `username`. |
+| `role` | The persisted legacy role (`admin` or `user`). Never the elevated view. This and `effective_role` are the legacy session view, not a summary of authority: with RBAC on, authority is decided per permission (use `POST /api/v1/rbac/check`), and an engine principal's real authority is its `rbac_roles`. |
+| `principal_kind` | `human` or `engine`, and nothing else. This is the classification the server applies: `engine` when the session records that kind or was authenticated by an engine token, `human` otherwise. An engine principal is looked up under RBAC principal type `engine`. |
+| `auth_source` | Always present. How the session authenticated: `local`, `oidc`, `saml`, `api_token`, `mcp_token` or `engine_token`. |
+| `mcp_tier` | The MCP authorization tier of an MCP token; an empty string for any other session. |
+| `scope_service` | The service tag of a service-scoped token; an empty string when the session is not service-scoped. |
+| `rbac_enabled` | The server's cached view of the RBAC switch. It can lag a change made on another replica, and it does not report the degraded state in which enforcement fails closed (tracked in #6033). |
+| `rbac_role` | Deprecated display field: the first DIRECT role assignment in role-name order. Omitted for an engine principal while RBAC is off, for an engine principal with no grant while RBAC is on, and when the role-store read failed. For a human with no direct role it shows the legacy label `Administrator` or `Viewer`, including while RBAC is on; that label is not a grant and not authority. Read `rbac_roles` instead. |
+| `rbac_roles` | The principal's DIRECT role assignments only; roles held through a group grant are not listed. It is not access-review evidence: the access-review export (`AccessReview:Read`) is. With RBAC off it is `[]`. Omitted when the role-store read failed. |
+| `rbac_roles_resolved` | `false` only when the role-store read failed; it is `true` otherwise, including with RBAC off (no read is made then, so `true` is not proof that enforcement is off). When `false` the route still answers `200` and omits `rbac_role` and `rbac_roles`; treat an absent list as unknown, not as "no roles". |
+| `effective_role` | The effective legacy session role: `admin` while a just-in-time elevation is active, otherwise `role`. Like `role`, it is not a summary of authority. |
+| `elevated` | `true` while a just-in-time elevation is active. Always `false` for API and MCP token sessions. |
 | `elevated_until` | End of the elevation window, ISO-8601 UTC. Present only when `elevated` is `true`. |
-| `can_access_settings` | `true` when `GET /settings` would render for this session. MCP-tier and service-scoped tokens are always `false`. A display hint only: every route is still gated server-side. |
+| `can_access_settings` | `true` when `GET /settings` would render for this session. Always `false` for an MCP-tier or service-scoped token, because the admin gate refuses either before it tests the role; for an MCP token `effective_role` therefore equals `role`. A display hint only: every route is still gated server-side. |
 
-The response is sent with `Cache-Control: no-store, private`. During a rolling
-upgrade an older replica omits the four new fields; clients should treat a
-missing `can_access_settings` as `false`. `GET /api/me` returns the same keys
-without the `data` envelope.
+Keys appear in the order shown; do not depend on it. The response is sent with
+`Cache-Control: no-store, private`. During a rolling upgrade an older replica omits the newer
+keys (`principal_kind`, `auth_source`, `mcp_tier`, `scope_service`, `rbac_roles`, `rbac_roles_resolved` and the
+session fields); clients should treat a missing `can_access_settings` as `false`.
+[`GET /api/me`](#get-apime) returns the same keys without the `data` envelope.
 
 ---
 
@@ -514,7 +539,7 @@ The Hardware CI list and single-device CI record: the two read routes of the Ope
 
 The Hardware list: the device roster (identity fields as for `/devices`) plus device-CI columns, a per-page DEX score, claimed IPs and tags.
 
-**Permission:** `Inventory:Read`, via `require_fleet_read` (admit-then-filter).
+**Permission:** `Inventory:Read`, via `require_fleet_read` (admit-then-filter). MCP twin: `list_hardware_ci` (strict argument typing and a lowercase-only `os`/`status`/`sort`/`dir`; see `docs/user-manual/mcp.md`).
 
 **Query parameters:** `q`, `os`, `status`, `sort`, `dir`, `tag`, `offset`, `limit`. An unrecognised `sort`, `os` or `status` token, or an invalid `tag` key, is a `400`; any `dir` other than `desc` sorts ascending.
 
@@ -535,7 +560,7 @@ The Hardware list: the device roster (identity fields as for `/devices`) plus de
 
 One device's CI record: identity, device-CI blob, installed software and tags, each read independently so a degraded read is distinguishable from an absent one.
 
-**Permission:** `Inventory:Read`, via `require_fleet_read`. An id outside the caller's fleet-read scope returns the same `404` as a nonexistent id.
+**Permission:** `Inventory:Read`, via `require_fleet_read`. An id outside the caller's fleet-read scope returns the same `404` as a nonexistent id. MCP twin: `get_hardware_ci` (see `docs/user-manual/mcp.md`).
 
 **Response:** `{ "data": { "agent_id", "hostname", "os", "online", "last_seen", "identity_state", "ci", "ci_state", "software", "tags", ... }, "meta" }`. `identity_state` is `found`, `degraded` (the device roster could not be read) or `absent`; `ci_state` is `found`, `absent` or `degraded`. `agent_id`, `hostname`, `os` and `last_seen` are `null` (and `online` is `false`) unless `identity_state` is `found`.
 
@@ -1010,6 +1035,12 @@ none is. Such a value is not indexed in newly stored responses, so when the arra
 `agent_count` can be 0 or an undercount. The array names keys only, never the values. `agent_count`
 and every status code are unchanged, including the `503` when the response store is degraded.
 
+**Forensics-tier rows (#4990).** Rows written by a Forensics-tier plugin are counted only for a caller who also
+holds `Forensics:Read` (see "Forensics-tier rows" under Command/Instruction Responses). For any other caller they are
+absent from the count with no marker, so a low or zero `agent_count` does not prove that no matching data exists. If
+the caller's Forensics authority cannot be determined the route answers a retryable `503` with `retry_after_ms`
+instead of a partial count. The route writes no audit row of its own.
+
 ---
 
 ### API Tokens
@@ -1072,7 +1103,7 @@ The `expires_at` above is a placeholder epoch: with `mcp_tier` set it must be in
 | `expires_at` | integer | No | Unix epoch seconds, in the future. `0` or omitted = never expires. **Required** for MCP tokens (max 90 days). Must be one JSON integer: a string, float, boolean, `null`, a negative or past value, or one above 9223372036854775807 is `400` and mints nothing. |
 | `mcp_tier` | string | No | MCP authorization tier: `"readonly"`, `"operator"`, or `"supervised"`. Omit for standard API tokens. When set, `expires_at` is mandatory. |
 
-`mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at` within the 90-day cap. Setting `scope_service` requires RBAC to be enabled and either a global `ManagementGroup:Write` grant or `ITServiceOwner` on the `"Service: <scope_service>"` management group — see [Service-Scoped Tokens](authentication.md#service-scoped-tokens).
+`mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at`; the 90-day cap applies to tiered (`mcp_tier` set) tokens only, so a service-scoped token without a tier may expire later than that. Setting `scope_service` requires RBAC to be enabled and either a global `ManagementGroup:Write` grant or `ITServiceOwner` on the `"Service: <scope_service>"` management group — see [Service-Scoped Tokens](authentication.md#service-scoped-tokens).
 
 **Validation errors (`400`):**
 
@@ -1109,9 +1140,9 @@ Revoke an API token. The token becomes immediately unusable.
 
 **Permission:** `ApiToken:Delete`
 
-**Ownership constraint:** A caller with `ApiToken:Delete` may only revoke tokens they created. The global `admin` role is the sole bypass and may revoke any token. Attempting to revoke another user's token returns `404 token not found` — identical to the response for a token that does not exist — so the endpoint cannot be used as an enumeration oracle by a non-owner with `ApiToken:Delete`. Denied attempts are recorded in the audit log with `action=api_token.revoke`, `result=denied`, and `detail=owner=<real owner>` so forensics can distinguish a probe from a legitimate self-revoke.
+**Ownership constraint:** A caller with `ApiToken:Delete` may only revoke tokens they created. The global `admin` role, or a session with an active just-in-time admin elevation, is the only bypass and may revoke any token. Attempting to revoke another user's token returns `404 token not found` — identical to the response for a token that does not exist — so the endpoint cannot be used as an enumeration oracle by a non-owner with `ApiToken:Delete`. Denied attempts are recorded in the audit log with `action=api_token.revoke`, `result=denied`, and `detail=owner=<real owner>` so forensics can distinguish a probe from a legitimate self-revoke.
 
-The same ownership constraint applies to the HTMX dashboard path `DELETE /api/settings/api-tokens/{token_id}`.
+The same ownership constraint applies to the HTMX dashboard path `DELETE /api/settings/api-tokens/{token_id}`. The same bypass applies there: the global `admin` role or a just-in-time-elevated session may revoke any token.
 
 **Response:**
 
@@ -1233,17 +1264,17 @@ Explicit maker-checker confirmation that a rotation's successor secret has been 
 
 ### Engine Principals
 
-Engine principals are the durable identities behind autonomous use-case-engine modules (ADR-1005 item 2b) — a distinct principal class from human users and human-created API tokens, with a named responsible human owner, a grant justification captured at creation, and a required `internal`/`external` classification. Design reference: `docs/auth-engine-principals-design.md`. Every credential minted against an engine principal is hard-locked to MCP tier `readonly` and can never be granted the admin/wildcard role ("no admin, ever" — independently provable via the auditor route below).
+Engine principals are the durable identities behind autonomous use-case-engine modules (ADR-1005 item 2b) — a distinct principal class from human users and human-created API tokens, with a named responsible human owner, a grant justification captured at creation, and a required `internal`/`external` classification. Design reference: `docs/auth-engine-principals-design.md`. Every credential minted against an engine principal is hard-locked to MCP tier `readonly` and can never be granted the `admin`/`Administrator` role or any built-in role (assignment refuses them). A custom role that covers every permission is **not** refused at assignment (maintainer ruling 2026-10-23, #2485); it is detected afterwards by the pull-only auditor route below.
 
-**Every *mutating* route is admin + MFA-step-up gated.** The read routes (`GET`/list, `GET /{id}`, and `GET /audit/no-admin`) are admin + RBAC gated (`EnginePrincipal:Read` for the two engine-principal reads, `AuditLog:Read` for `/audit/no-admin`) but do **not** require a fresh MFA step-up. Beyond that, every route — reads included — structurally denies a caller whose *own* session is engine-classed (`principal_kind="engine"` or `auth_source="engine_token"`): an engine principal can never enumerate, read, or mutate any entry on this surface, not even itself. A denied engine-classed caller gets `403`; the corresponding audit verb is recorded with `result=denied`.
+**Every *mutating* route is admin + MFA-step-up gated.** The read routes (`GET`/list, `GET /{id}`, and `GET /audit/no-admin`) are admin + RBAC gated (`EnginePrincipal:Read` for the two engine-principal reads, `AuditLog:Read` for `/audit/no-admin`) but do **not** require a fresh MFA step-up. Beyond that, every route, reads included, structurally denies a caller whose *own* session is engine-classed (`principal_kind="engine"` or `auth_source="engine_token"`), with one exception: `GET /api/v1/engine-principals/{id}/roles` carries no engine-session check and relies on its `EnginePrincipal:Read` gate alone. The two role mutations (`POST` and `DELETE`) are step-up-gated like every other mutating route here, so they refuse an engine-classed session at the central check. An engine-classed session can therefore not list, read or mutate engine principals through the other routes, not even its own. A denied engine-classed caller gets `403`. On the read routes the handler issues it and the corresponding audit verb is recorded with `result=denied`. On the mutating routes the `403` is issued by the central step-up check, before the handler runs and before any role grant is consulted, so the handler's own audit verb is never written; the only audit row is the step-up refusal `mfa.step_up.required` (`result=error`) whose `detail` carries `reason=engine_principal_denied` and `stage=pre_authz`.
 
 **Storage failure:** if the engine-principal store failed to open at startup (no PostgreSQL configured, or a migration failure), every route on this surface returns `503 service unavailable`.
 
 **Audit-persist failure (fail closed on mutations):** these routes emit a privileged-action audit row, and a mutation that cannot record it must never look like a clean success. If the audit-store write itself fails, every **mutating** route (create, revoke, transfer-owner, `credentials`/`credentials/rotate`/`credentials/confirm`, and the role assign/unassign routes documented later) **fails closed** — it returns `503` with a `Sec-Audit-Failed: true` header instead of its normal `2xx` (ADR-1005 "mutations fail closed on audit failure"). The mutation may already have taken effect (the audit is emitted after the store write), so treat such a `503` as *unconfirmed* and reconcile via a read. This is a stricter posture than the software-package/deployment mutations elsewhere in this API, which set-and-proceed (stay `2xx` with `Sec-Audit-Failed`) on the same audit-drop: engine-principal management is a privileged-identity surface, so ADR-1005 holds it to fail-closed rather than proceed-and-signal.
 
-The credential **mint** and **rotate** routes additionally **withhold the one-time secret** on this path — nothing is placed in the `503` body. Recovery differs by route: a **mint** whose audit dropped leaves a credential that exists but is unusable (no one holds its secret) — `GET` the principal to see it, then **rotate** it (mints an audited successor you can then confirm) to obtain a usable secret; a **rotate** whose reveal-audit dropped can be **rotated again within the overlap window** to re-serve the *same* successor secret (an audited re-serve, not a new credential). Note the compounding case under a *sustained* audit outage: repeated mint/rotate failures can leave two unconfirmed credentials, at which point the store's ≤2-active guard blocks further rotation — recover by revoking one unconfirmed credential and re-minting once the audit store is healthy.
+The credential **mint** and **rotate** routes additionally **withhold the one-time secret** on this path — nothing is placed in the `503` body. Recovery differs by route: a **mint** whose audit dropped leaves a credential that exists but is unusable (no one holds its secret) — `GET` the principal to see it, then **rotate** it (mints an audited successor you can then confirm) to obtain a usable secret; a **rotate** whose reveal-audit dropped can be **rotated again within the grace window** (about two minutes, by the same operator, against the same server replica; after a restart, on another replica or once the window ends the retry is `409`) to re-serve the *same* successor secret (an audited re-serve, not a new credential). If the window has passed, find the stuck successor with `GET /api/v1/engine-principals/{id}` (in `active_credentials`, the credential whose `overlap_expires_at` is `0` while another credential of the same `rotation_group` has a non-zero value; that read fails closed with `503`, so a `200` list is authoritative) and revoke it with `DELETE /api/v1/tokens/{token_id}` (REST only; it needs `ApiToken:Delete`, a fresh MFA step-up and an effective administrator, since the credential's owner is the engine principal and any other caller gets `404`), then rotate again from the remaining sole credential. Do **not** revoke only the predecessor, which leaves a credential nobody holds, and do **not** revoke the principal itself: that is terminal. Note the compounding case under a *sustained* audit outage: repeated mint/rotate failures can leave two unconfirmed credentials, at which point the store's ≤2-active guard blocks further rotation — recover once the audit store is healthy by revoking the stuck successor as described above and rotating again from the remaining credential (a second mint is refused while any active credential exists).
 
-The **read** routes (`GET`/list, `GET /{id}`, `GET /audit/no-admin`, `GET /{id}/roles`) and the engine-session denial above instead set the same `Sec-Audit-Failed: true` header but still serve their response — matching the MCP twins' `audit_persisted:false` body field. Reads proceed (rather than fail closed like the behavioural-PII device/network reads) because they commit no state and disclose only authorization **topology metadata** — principal ids, owners, role grants — not per-person behavioural PII; the fail-closed-on-read posture exists specifically to keep individual-identifying data off an unaudited response, which does not apply here. Alert on `Sec-Audit-Failed: true` from this surface as a SOC 2 CC7.2 evidence-gap signal (the same alert that covers the behavioural-PII routes fires on it), while noting the serve behaviour differs: these reads still return data, those withhold it.
+The **read** routes (`GET`/list, `GET /{id}`, `GET /audit/no-admin`, `GET /{id}/roles`) and the engine-session denial above instead set the same `Sec-Audit-Failed: true` header but still serve their response (except the `503` failure paths of the list and `GET /{id}` routes below, which serve nothing) — matching the MCP twins' `audit_persisted:false` body field. Reads proceed (rather than fail closed like the behavioural-PII device/network reads) because they commit no state and disclose only authorization **topology metadata** — principal ids, owners, role grants — not per-person behavioural PII; the fail-closed-on-read posture exists specifically to keep individual-identifying data off an unaudited response, which does not apply here. Alert on `Sec-Audit-Failed: true` from this surface as a SOC 2 CC7.2 evidence-gap signal (the same alert that covers the behavioural-PII routes fires on it), while noting the serve behaviour differs: these reads still return data, those withhold it.
 
 **`{id}` convention:** on every route below (`GET /{id}`, `DELETE /{id}`, the `credentials`/`credentials/rotate`/`credentials/confirm`/`transfer-owner` sub-resources), `{id}` is the **full** `principal_id`, i.e. `engine:<slug>` (e.g. `GET /api/v1/engine-principals/engine:vuln-uce`) — none of these routes prepend the `engine:` prefix themselves. This is the opposite convention from the `.../{id}/roles` role-assignment sub-resource documented later in this file, where `{id}` is the **bare slug** and the server reconstructs the full id internally — don't assume the two sections share one convention.
 
@@ -1324,7 +1355,7 @@ List every engine principal (all lifecycle states), with each principal's active
 }
 ```
 
-**Errors:** `503` — engine-principal store not open (see Storage failure above). A transient read failure on an open store returns an empty list rather than an error — this route does not otherwise fail.
+**Errors:** `503` — engine-principal store not open (see Storage failure above). `503` with `Retry-After: 2`, `retry_after_ms: 2000` and an `engine_principal.list` audit row with `result=failure` — the engine-principal list or the token store's credential counts could not be read (the two stores share one connection pool, so pool exhaustion shows here), so no list is served: an empty list or a count of `0` is never shown when the read did not answer.
 
 ---
 
@@ -1334,7 +1365,7 @@ Get one engine principal's full identity row plus its active credentials (token 
 
 **Permission:** `EnginePrincipal:Read`
 
-**Errors:** `404` — engine principal not found. `503` — engine-principal store unavailable (not open, or the read itself failed).
+**Errors:** `404` — engine principal not found. `503` — engine-principal store unavailable (not open, or the read itself failed). `503` with `Retry-After: 2`, `retry_after_ms: 2000` and an `engine_principal.get` audit row with `result=failure` — the token store could not be read, so no `active_credentials` list is served (an empty list would read as "no credential").
 
 ---
 
@@ -1390,7 +1421,7 @@ The body is optional only when it is empty or whitespace-only (the credential th
 
 `token` is the raw secret (shown once); `token_id` and `expires_at` let a pure-REST caller correlate the credential it just minted without a follow-up `GET`.
 
-**Errors:** `404` — engine principal not found. `409` — engine principal is not active (revoked), **or** the principal already has an active credential (mint is single-shot; use `credentials/rotate` instead). `400` — `ttl_days` wrong type or out of range, or a non-empty body that is not a JSON object. `503` — CSPRNG failure or any other store failure (a CSPRNG failure also sets `Retry-After: 5` and increments `yuzu_secure_random_failure_total{reason="prng_failure",site="engine_principal"}`). `503` + `Sec-Audit-Failed: true` — the mint audit row could not persist: the credential was created but its **one-time secret is withheld** (never in the body), so the credential exists but is unusable — see *Audit-persist failure* above for recovery.
+**Errors:** `404` — engine principal not found. `409` — engine principal is not active (revoked), **or** the principal already has an active credential (mint is single-shot; use `credentials/rotate` instead). `400` — `ttl_days` wrong type or out of range, or a non-empty body that is not a JSON object. `503` — CSPRNG failure or any other store failure (a CSPRNG failure also sets `Retry-After: 5` and increments `yuzu_secure_random_failure_total{reason="prng_failure",site="engine_principal"}`). `503` with `Retry-After: 2` when the check that the principal has no active credential could not read the token store; nothing is minted, and the audit row is `engine_principal.credential.mint` with `result=failure`. Retry once the store answers. `503` with the secret withheld and the audit row `engine_principal.credential.mint` with `result=partial` when the credential was created but the read that locates it for the response could not answer: the credential exists but no one holds its secret, so do **not** retry the mint (that is `409`); rotate it. The same `503`, withheld secret and `result=partial` row apply when the read **answers but finds no active credential** (the new credential was revoked out of band between the insert and the read-back; the detail says so): list the principal's credentials and rotate only if one is listed. `503` + `Sec-Audit-Failed: true` — the mint audit row could not persist: the credential was created but its **one-time secret is withheld** (never in the body), so the credential exists but is unusable — see *Audit-persist failure* above for recovery.
 
 ---
 
@@ -1406,11 +1437,11 @@ Overlap-pair rotation (design doc §7): mints a successor credential while the e
 { "overlap_secs": 604800 }
 ```
 
-`overlap_secs` defaults to 7 days (`604800`). The overlap window has a **24-hour floor** and a 10-year ceiling — a value below the floor (or above the ceiling) is rejected outright (`400`), never silently truncated up to the floor. `overlap_secs` must be a JSON integer when present, and a non-blank body must be a JSON object: a string, float, boolean or `null` value, or a truncated or non-object body, is `400` and rotates nothing (an empty or whitespace-only body keeps the default).
+`overlap_secs` defaults to 7 days (`604800`). The overlap window has a **24-hour floor** and a 10-year ceiling — a value below the floor (or above the ceiling) is rejected outright (`400`), never silently truncated up to the floor. The window must also end before the predecessor expires and before the successor does, and the successor expires 90 days after the rotation, so in practice the window is shorter than 90 days; a longer one is `400` as well. `overlap_secs` must be a JSON integer when present, and a non-blank body must be a JSON object: a string, float, boolean or `null` value, or a truncated or non-object body, is `400` and rotates nothing (an empty or whitespace-only body keeps the default).
 
 **Grace-window re-serve:** a same-caller retry within a ~120-second grace window after the original mint re-serves the **same** successor secret (rather than erroring or minting a second successor). Each successful return — the original reveal or a grace-window re-serve — is independently recorded under its own `engine_principal.credential.reveal` audit row, since every time the raw secret leaves the server is independently on the audit chain, whether or not the bytes are new. Once the grace window lapses, a further rotate call while a rotation is already in flight errors — the caller must fall back to `credentials/confirm` (below) or the principal-level revoke-and-replace runbook, never an indefinite retry loop.
 
-**Response:** same no-store headers as the mint route; the `data` object adds `overlap_expires_at` (the epoch at which the predecessor is auto-revoked) alongside `token`, `token_id`, and `expires_at`.
+**Response:** same no-store headers as the mint route; the `data` object carries `token`, `token_id`, `expires_at` and `overlap_expires_at`. `expires_at` is 90 days from the rotation; it is not inherited from the predecessor. `overlap_expires_at` is the successor row's own stamp and is always `0`, because only the predecessor is stamped; read the predecessor's stamp on its entry in `active_credentials` of `GET /api/v1/engine-principals/{id}`.
 
 **No `404` path:** unlike `credentials` (mint) and `transfer-owner`, this route never looks up `{id}` via a `get()` call before acting — it drives the rotation state machine straight off the principal's active credential rows. An unknown or revoked `{id}` therefore does **not** 404.
 
@@ -1427,8 +1458,10 @@ Overlap-pair rotation (design doc §7): mints a successor credential while the e
 | Grace window elapsed with no confirm | `409` — `grace window elapsed; confirm or revoke` |
 | No active credential found for this principal to rotate | `503` — **not** `400`/`404`. Deliberately conflated with a transient read failure: the internal read that finds "no active credential" cannot be told apart from a silently-failed read, so a genuine "nothing to rotate" is classified as retryable (503) rather than a definitive client error — treating it as 400 could otherwise mislead a caller into minting a redundant second credential during what was actually a transient outage. |
 | A non-engine-kind active credential is present for this principal (defensive check) | `503` |
+| The rotation itself succeeded (a successor now exists) but the follow-up read that locates it for the response could not answer | `503` with `Retry-After: 2`. The one-time secret is withheld, and the audit row is `engine_principal.credential.rotate` with `result=partial` (a successor exists, so it is never `failure`) and no `engine_principal.credential.reveal` row. The same operator's retry within the ~120-second grace window, against the same server replica, re-serves the same successor secret; after the window, after a restart or on another replica the retry is `409` and the pair is resolved by revoking the **successor** (not the predecessor) as described under *Audit-persist failure* above, then rotating from the sole credential |
 | Advisory-lock acquire failure, CSPRNG failure, the engine-referent check itself being unreachable, or a mint/stamp write that did not persist | `503` — retryable store failure |
-| The reveal audit row could not persist | `503` + `Sec-Audit-Failed: true` — the successor was minted but its **one-time secret is withheld**; rotate again within the overlap window to re-serve the *same* audited successor secret (see *Audit-persist failure* above) |
+| The reveal audit row could not persist | `503` + `Sec-Audit-Failed: true` — the successor was minted but its **one-time secret is withheld**; rotate again within the grace window (about two minutes, same operator, same replica) to re-serve the *same* audited successor secret; after it the retry is `409` (see *Audit-persist failure* above) |
+| The rotation succeeded and the follow-up read answered, but no active credential links back to a predecessor (the successor was revoked or confirmed out of band in between) | `503` with the secret withheld and audit `engine_principal.credential.rotate` with `result=partial`, and **no** `Retry-After` or `retry_after_ms` (no pending pair remains, so a retry would perform a new rotation rather than re-serve). The message reads "A successor may exist; inspect the principal's credentials (`GET /api/v1/engine-principals/{id}`), then rotate again if needed" |
 | MFA step-up not satisfied | `401` |
 | Missing `Security:Write`, or the caller's own session is engine-classed (structural deny belt) | `403` |
 
@@ -1518,7 +1551,7 @@ Reassign the named responsible owner of an active engine principal. Admin-forced
 
 #### `GET /api/v1/engine-principals/audit/no-admin`
 
-Auditor-runnable, independent proof that "no admin, ever" and "no all-permissions toggle" hold for every engine principal — not merely a claim about the write-path guard. Resolves each engine principal's actual role assignments and effective permissions against the live RBAC reference tables and reports any violation: a literal `admin`/`Administrator` role grant, any role flagged `is_system`, or a granted securable × operation set whose size reaches the full cross-product (functionally admin-equivalent even under a custom, non-system role name).
+Auditor-runnable check of the "no admin" rule for every engine principal. Reads every grant held by an `engine:` id from the grant table, with each role's permissions, against the live RBAC reference tables and reports each detected grant: a literal `admin`/`Administrator` role (`admin_role`), any role flagged `is_system` (`system_role`), or a `wildcard_grant` (a role, or with an empty `role` the union of a principal's roles, that allows every securable × operation pair of the grid as it is at run time). Assignment refuses the admin names and built-in roles but not a custom full-grid role (maintainer ruling 2026-10-23, #2485); this route is the detective control for that case. It is point-in-time and pull-only: nothing schedules it or alerts on a result, and role permissions can change after assignment.
 
 **Permission:** `AuditLog:Read` — deliberately **not** `Security`, since this is a read-only evidentiary query, not part of the write-path bar it verifies; a read-only auditor role can run it without holding engine-principal write access. With RBAC disabled the route is admin-only like every other audit read (#5771).
 
@@ -1531,9 +1564,9 @@ Auditor-runnable, independent proof that "no admin, ever" and "no all-permission
 }
 ```
 
-An empty `violations` array with `ok:true` is the positive evidence. A non-empty `violations` array (each entry carrying `principal_id`, `role`, and `reason` — `admin_role` / `system_role` / `wildcard_grant`) indicates the write-path guard was bypassed (data corruption, direct DB write, or a code regression) and should be treated as a security incident.
+`ok:true` means no role held by an engine principal, and no engine principal's union of roles, allows every pair of the current grid at the moment of the run. A role that grants every pair but one is not reported, and `deny` rows are ignored. Each entry of a non-empty `violations` array carries `principal_id`, `role` (the role name; empty for a union-only wildcard) and `reason` (`admin_role` / `system_role` / `wildcard_grant`; the MCP twin's `include_revoked=false` can also return `orphan_grant`, see below). Grants are read by principal id whatever their principal type, so a `user`-typed grant on an `engine:` id is reported too. A row with reason `admin_role` or `system_role` means the assignment check was bypassed (data corruption, direct DB write, or a code regression) and should be treated as a security incident. A `wildcard_grant` is a custom role that covers the whole grid, which assignment does not refuse: review whether that grant is intended. The success audit row `engine_principal.audit.no_admin` carries `violations=N scope=all` and up to ten `principal_id:reason` pairs; those rows are the evidence the control operated. A dropped success-row write is signalled only by `Sec-Audit-Failed` on this route (the MCP twin gives no signal). The Tokens page also calls this route incidentally, in the browser, when a viewer who holds `AuditLog:Read` loads the principals panel; that is not a schedule and not a control, so a period with no rows is not evidence that the check ran or that it passed. The grants, roles and role permissions are three separate reads, not one snapshot.
 
-**Error (503):** `rbac reference data unavailable — cannot verify` — the RBAC reference tables (`securable_types`/`operations`) could not be resolved, so the wildcard-grant bound cannot be computed. This is a fail-**closed** result: treat it as "unable to verify," never as "clean."
+**Errors (503):** `rbac resolution unavailable - cannot verify` when the grants, roles or role permissions could not be read, and `rbac reference data unavailable — cannot verify` when the RBAC reference tables (`securable_types`/`operations`) came back empty. Both carry `Retry-After: 2` and `retry_after_ms: 2000` (the MCP twin uses the same 2000 ms hint). Both are fail-**closed**: there is no partial `violations` list, the audit row is `engine_principal.audit.no_admin` with `result=failure` and no `success` row is written. Treat them as "unable to verify," never as "clean."
 
 ---
 
@@ -1624,7 +1657,7 @@ curl -s -X DELETE \
 
 Self-revoke "Sign out everywhere". Wipes every cookie session belonging to the authenticated caller AND revokes every API token they own. This is intended as the lost-device recovery flow: every credential bearing the caller's identity is killed in one call.
 
-**Permission:** Any interactive authenticated session (cookie). MCP-tier tokens and service-scoped automation tokens are explicitly rejected with 403 — those credential classes have no other write privilege and accepting them here would create a novel DoS surface against the human owner. Use the dashboard or a fresh password-authenticated session.
+**Permission:** Any authenticated caller: a cookie session or a plain API token (one with no `mcp_tier` and no service scope) is accepted. MCP-tier tokens and service-scoped automation tokens are explicitly rejected with 403 — those credential classes have no other write privilege and accepting them here would create a novel DoS surface against the human owner. Use the dashboard, a fresh password-authenticated session or a plain API token.
 
 **Example:**
 
@@ -1659,7 +1692,7 @@ The caller authenticated with an MCP-tier token (`X-Yuzu-Token` carrying a non-e
 {
   "error": {
     "code": 403,
-    "message": "self-revoke requires an interactive session, not an API token"
+    "message": "self-revoke requires an interactive session, not an MCP-tier or service-scoped token"
   },
   "meta": { "api_version": "v1" }
 }
@@ -1705,7 +1738,7 @@ curl -s -X POST \
 
 `audit_emitted` and the `Sec-Audit-Failed: true` header have the same semantics as the session-revoke routes above — `false` means the unlock completed but the audit row was lost, degrading the CC6.3 evidence chain for that request.
 
-**Errors:** `400` — username empty or malformed (e.g. contains a reserved `:`); `401` — MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403` — caller lacks `UserManagement:Write`, or a SAML session (step-up is not available for SAML sessions); `500` — the AuthDB (Postgres) write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503` — the lockout subsystem is not wired (no `AuthDB`).
+**Errors:** `400`: username empty or malformed (e.g. contains a reserved `:`); `401`: MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403`: caller lacks `UserManagement:Write`, or a SAML session (step-up is not available for SAML sessions, unless `--mfa-step-up-window-secs` is `0` or less, which lets SAML sessions through on the 37 step-up-gated routes); `500`: the AuthDB (Postgres) write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503`: the lockout subsystem is not wired (no `AuthDB`).
 
 **Audit:** a successful unlock emits `auth.lockout.cleared` with `result=ok`, `target_type=User`, `target_id=<username>`, `detail=admin_unlock`. A failed write emits the same verb with `result=error`. Note that a lockout cleared automatically (no operator action) emits `auth.lockout.cleared` with `result=ok` and `detail=reset_on_successful_login` when the user next logs in successfully; the threshold crossing itself emits `auth.lockout.applied`. These two verbs are the durable CC6.3 evidence; blocked-while-locked attempts are tracked only via the `yuzu_auth_lockout_blocked_total` metric (no per-attempt audit row **or** analytics event) to avoid amplification under a sustained brute-force.
 
@@ -1717,13 +1750,14 @@ Change the caller's own **local-account** password (#5342). The caller proves th
 
 **Who can call it:** an interactive dashboard session whose account is local (`auth_source=local`). There is no extra permission check — every local user may change their own password. Under `--auth-mode=sso-only` only the configured break-glass account, and only while it is armed, may use it (see the `403 sso_only_local_disabled` row below). Non-admin users have no dashboard page for it yet: the button is on the admin-only User Management page, so a non-admin signs in and uses **Access → Users and roles → Your account → Change password**, or calls the route directly.
 
-**Order of checks.** Each step runs only if every earlier one passed:
+**Order of checks.** Each step runs only if every earlier one passed. For a cookie session the server-wide same-site check (see step 3) answers first, before any step-up evaluation. The central MFA step-up check (step 4) then runs, before the handler's own steps 2 and 3, and the handler repeats it from the same per-request verdict (a token caller skips the same-site check). An over-cap request body whose size is declared in `Content-Length` is refused `413` before any of these, because the pre-routing body cap runs first. This route is in a body class that does not require a measurable body, so a chunked over-cap body from a cookie session with no same-site `Origin`/`Referer` is answered by the same-site `403` before the post-read `413` (which runs after the body is read, just before the step-up check):
 
 1. Authentication (`401` without a session).
 2. Session class: an API, MCP or engine token, or a service-scoped token, is `403 token_session`; an OIDC or SAML session is `409 not_local` (change it at the identity provider).
-3. Same-site request: `Origin`/`Referer` must be the dashboard's own origin (or a `--csrf-trusted-origin` entry), and a request carrying **neither** header is refused — `403 csrf`. `Content-Type` must be `application/json` — `415` (not audited).
+3. Same-site request (this route's own copy): `Origin`/`Referer` must be the dashboard's own origin (or a `--csrf-trusted-origin` entry), and a request carrying **neither** header is refused with `403 csrf`. `Content-Type` must be `application/json`, else `415` (not audited). A cookie-session caller never reaches the `csrf` refusal: the server-wide check (see Authentication) answers first, with message `cross-site request refused` and no `csrf` code, and this copy is defence in depth.
 4. MFA step-up, when the account is enrolled and its proof is stale — `401` step-up envelope (`meta.mfa_step_up_required`, `meta.challenge_url`).
 5. Body and length policy — `400`, **not audited** (nothing security-relevant was attempted, and a policy rejection never records the length). The body is never echoed, because it may hold a password.
+
 6. The current password, through the same lockout-accounted check as `POST /login`: a wrong password is `403 wrong_current` and counts toward [account lockout](server-admin.md#server-cli-flags); a locked account gets the **same** `403` and message (`account_locked` in the audit row only — no lock-state oracle). A password that could not be verified — the auth store could not be read, or the stored password changed while it was being checked — is a retryable `503 verify_transient` and never counts. If the lockout counter cannot be recorded the answer is `503 store_unavailable` (fail closed: an uncounted guess is never answered as an ordinary wrong password). A correct current password clears a non-zero failure counter (`auth.lockout.cleared`, `detail=reset_on_password_change`).
 7. **One transaction.** Under the account's row lock, the server re-checks that the stored password is still exactly the one step 6 verified and that the account is still an active local account, then — together, or not at all — writes the new password, deletes every session of the account (**including the caller's own**, durably and on every replica), wipes a provisional (not yet enrolled) TOTP secret, and writes the `user.password_change` audit row. A refusal here changes **nothing** (your session stays valid): `409 conflict` (the password changed concurrently, e.g. an admin reset), `409 not_local` (the account became SCIM-managed in between), `404 not_found` (it was deactivated). If the audit row cannot be written the change is not made: `503 audit_unavailable` with `Sec-Audit-Failed: true`. Any other store failure is `503 store_unavailable`. A `503` body says what is true: nothing was changed unless the server lost contact with the database at commit; a successful sign-in with the new password confirms the change, which is audited either way.
 
@@ -1764,7 +1798,7 @@ No replacement session is issued: the caller is signed out and signs in again wi
 |---|---|---|
 | `400` | *(not audited)* | Malformed body, or new password outside 12–1024 bytes |
 | `401` | — | No session, or MFA step-up required |
-| `403` | `token_session` / `csrf` | Steps 2–3 |
+| `403` | `token_session` / `csrf` | Steps 2 and 3 (`csrf` is this route's own copy; a cookie-session caller gets `cross-site request refused` from the server-wide check instead) |
 | `403` | `wrong_current` | The current password is wrong. Counts toward lockout exactly like a failed `/login` |
 | `403` | `account_locked` | The account is locked. **Same message as a wrong password** ("current password is incorrect") |
 | `403` | `sso_only_local_disabled` | `--auth-mode=sso-only` and this is not an armed break-glass account. No password was evaluated and nothing counts toward lockout |
@@ -1793,9 +1827,9 @@ Reset another user's **local-account** password (#5342) without knowing the curr
 - **RBAC off:** the caller's own account, re-read from the auth store, must hold the `admin` role.
 - **RBAC on:** the caller must hold an `Administrator` grant as a **user** principal.
 
-A JIT elevation, an IdP-group-derived session role (an OIDC session whose admin role comes only from `--oidc-admin-group`), a group-held `Administrator` grant, or a custom role holding `UserManagement:Write` is refused `403 durable_admin_required`. If the stores cannot confirm the caller's authority the answer is `503 admin_gate_unavailable` (retryable; never downgraded to a `403`). The caller must use an interactive dashboard session; API, MCP, engine and service-scoped tokens are refused `403 token_session`. A SAML session that passes the administrator check is then refused `403` by the shared MFA step-up gate, which has no SAML MFA attestation in this release.
+A JIT elevation, an IdP-group-derived session role (an OIDC session whose admin role comes only from `--oidc-admin-group`), a group-held `Administrator` grant, or a custom role holding `UserManagement:Write` is refused `403 durable_admin_required`. If the stores cannot confirm the caller's authority the answer is `503 admin_gate_unavailable` (retryable; never downgraded to a `403`). The caller must use an interactive dashboard session; API, MCP, engine and service-scoped tokens are refused `403 token_session`. A SAML session is refused `403` by the central MFA step-up check before the administrator check is reached, because there is no SAML MFA attestation in this release.
 
-**Order of checks:** authentication → username format (`400`, not audited) → session class (`403 token_session`) → same-site `Origin`/`Referer` (`403 csrf`) and `Content-Type: application/json` (`415`, not audited) → the durable-Administrator check (`403 durable_admin_required` / `503 admin_gate_unavailable`) → **not yourself** (`403 self_target`) → **not the break-glass account** (`403 break_glass_target`) → MFA step-up (when the caller is enrolled) → body and 12–1024-byte policy (`400`, not audited) → **one transaction** (below).
+**Order of checks:** authentication → for a cookie session, the server-wide same-site check, then the central MFA step-up check (the handler's own step-up below repeats it from the same verdict) → username format (`400`, not audited) → session class (`403 token_session`) → same-site `Origin`/`Referer` (`403 csrf`; this route's own copy, defence in depth, since the server-wide check answers a cookie-session caller first with `cross-site request refused`) and `Content-Type: application/json` (`415`, not audited) → the durable-Administrator check (`403 durable_admin_required` / `503 admin_gate_unavailable`) → **not yourself** (`403 self_target`) → **not the break-glass account** (`403 break_glass_target`) → MFA step-up (when the caller is enrolled) → body and the 12 to 1024 byte policy (`400`, not audited) → **one transaction** (below).
 
 - **Not yourself:** targeting your own username is `403 self_target` — use `POST /api/v1/users/me/password`, which requires your current password, so a stolen admin cookie cannot re-key its own account.
 - **Not the break-glass account:** the account named by `--break-glass-user` is `403 break_glass_target`. It is re-keyed only out of band on the server host, or by signing in as it while armed and using `POST /api/v1/users/me/password`, so an identity-provider compromise cannot invalidate the escape hatch.
@@ -1841,9 +1875,9 @@ curl -s -X POST \
 | Status | Audit detail | Meaning |
 |---|---|---|
 | `400` | *(not audited)* | Malformed username or body, or new password outside 12–1024 bytes |
-| `401` | — | No session, or MFA step-up required |
+| `401` | — | No session (including a request whose principal changed after the step-up check passed), or MFA step-up required |
 | `403` | `durable_admin_required` | The caller is not a durable Administrator (see above) |
-| `403` | `token_session` / `csrf` / `self_target` / `break_glass_target` | See above |
+| `403` | `token_session` / `csrf` / `self_target` / `break_glass_target` | See above (`csrf` is this route's own copy; a cookie-session caller gets `cross-site request refused` from the server-wide check instead) |
 | `403` | — | A SAML session at the step-up gate |
 | `404` | `not_found` | No active account by that name (nothing changed) |
 | `409` | `not_local` | SSO/SCIM account (nothing changed) |
@@ -1894,7 +1928,7 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 
 **Response (200):** `{"status":"ok"}`.
 
-**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated, or MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403` — not admin, self-grant, a grant (`eligible=true`) from a session that is administrator only through an elevation, or a SAML session (step-up is not available for SAML sessions); `404` — user not found (for an SSO principal: the operator has never logged in); `503` — AuthDB unavailable (`--postgres-dsn` unset/unreachable).
+**Errors:** `400`: invalid username/principal or non-boolean body; `401`: not authenticated, or MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403`: not admin, self-grant, a grant (`eligible=true`) from a session that is administrator only through an elevation, or a SAML session (step-up is not available for SAML sessions; this holds even when `--mfa-step-up-window-secs` is `0` or less, because the elevation routes own their gate and substitute a 300 s window); `404`: user not found (for an SSO principal: the operator has never logged in); `503`: AuthDB unavailable (`--postgres-dsn` unset/unreachable).
 
 **Audit:** `user.elevation_eligibility.set`, `result` in `{ok, denied, error}`, `detail=eligible=<bool>` (plus `elevations_cleared=<N>` when a revoke dropped active windows; `self_grant_blocked` or `elevated_session_eligibility_grant_blocked` on a 403).
 
@@ -1936,7 +1970,7 @@ outside the caller's management-group scope is omitted from the list
 entirely, not merely hidden from write access, and an out-of-scope record
 costs neither a per-record permission check nor an audit row.
 
-**Permission:** `Security:Read`, resolved once through the fleet-read list gate
+**Permission:** `Security:Read`, resolved once through the fleet-read list gate. MCP twin: `list_quarantined_devices` (capped at 500 records per call; this route returns the complete list; see `docs/user-manual/mcp.md`).
 
 > **Fail-closed on a degraded read (ADR-0047).** A store/pool/query failure
 > returns `503` (`"quarantine list unavailable — try again"`), never a
@@ -2323,6 +2357,35 @@ Query params `limit` (1–1000, default 200) and `offset` (default 0). The full
 certificate PEM and enrollment reference are intentionally omitted. `503` if
 the CA store is unavailable.
 
+The inventory is fleet-wide data about every enrolled agent (subject, SAN), so it is
+held to the same rules as the filtered list below. A caller whose view of the fleet is
+confined (management-group confinement), or who holds no `Inventory:Read` grant, is refused
+`403` with no `permission` named, and the refusal is written as a `denied`
+`crypto.ca.certificates.view` row (target `inventory`, detail
+`cid=<cid> ws=crypto_widget_windows_v1 withheld=confined` or `withheld=refused`). A served page is
+written as a `success` row (target `inventory`, detail `cid=<cid> inventory rows=<n> limit=<n>
+offset=<n> has_more=<bool> standing=available`), set-and-proceed: if the row cannot be
+written the page is still served, with `Sec-Audit-Failed: true` and `audit_persisted: false` in
+the body. The confinement check reporting itself unavailable is `503` + `retry_after_ms: 5000`
+(`access check unavailable`, also written as a `failure` row), a store that cannot be read is `503`
++ `retry_after_ms: 5000` (`CA store unavailable`, also a `failure` row), and a server built
+without the check is `503` with no `retry_after_ms` (`certificate list unavailable`).
+
+**Who is served.** The list is served only to a caller whose `Inventory:Read` is granted without
+a management-group restriction (a global grant). A caller whose `Inventory:Read` is granted only
+for management groups is confined and is refused (`403`, a `denied` row ending
+`withheld=confined`). A caller holding `Security:Read` and **no** `Inventory:Read` grant at all is
+refused too (`403`, `withheld=refused`): holding no grant is not an affirmative admission to a
+fleet-wide list. Granting a global `Inventory:Read` removes the restriction, and removing a
+caller's last scoped `Inventory:Read` grant never widens what it can see. With RBAC enforcement
+off nothing changes: every `Security:Read` session is served, as before.
+
+**A read failure inside the access check is a retryable `503`, never the list.** If a store
+behind the check (permissions, management groups) cannot be read, the route answers
+`503 access check unavailable` with `retry_after_ms: 5000` and writes a `failure` row. The same
+holds for the filtered list below and the `/crypto` drill (a banner with Retry). The audit row can
+be missing during the same outage (correlate with `yuzu_server_audit_emit_failed_total`).
+
 `meta.has_more` is `true` when more rows exist beyond the current page; when it is,
 `meta.next_offset` carries the `offset` to pass for the next page. Iterate until
 `has_more` is `false` (do **not** infer end-of-list from `count < limit`).
@@ -2362,6 +2425,80 @@ returns the same five fields at the top level of its result.
 ```
 
 The MCP `list_issued_certs` tool mirrors this contract (same `has_more` / `next_offset`).
+
+**Filtered: the certificates behind one `/crypto` count (ADR-0070 R2, R8).** When any of `kind`,
+`days`, `week`, `bucket`, `as_of` or `cursor` is present, the route lists exactly the certificates behind
+one Yuzu-issued count of [`GET /api/v1/crypto/ca/stats`](#get-apiv1cryptocastats), with the same
+predicate. **Permission:** `Security:Read`, and a caller whose view of the fleet is confined, or who holds
+no `Inventory:Read` grant, is refused `403` with no `permission` field (`Yuzu-issued certificate figures are not available to
+this account: ...`), whatever the parameters. The input is strict, and each malformed parameter is
+a `400` whose message names it:
+
+| Parameter | Type | Description |
+|---|---|---|
+| `kind` | string | **Required** in this form: `active`, `expiring`, `expired`, `revoked`, `issued`, `issued_week` or `revoked_week` |
+| `days` | integer | Required for `expiring` (3, 7, 14, 21, 30, 60), `expired` and `revoked` (7, 30, 60, 90) and `issued` (7); refused on other kinds |
+| `week` | string | ISO week `YYYY-Www` (for example `2026-W43`); required for `issued_week` and `revoked_week`, refused on other kinds. A week that does not exist (`2026-W00`, `2027-W53`) is refused |
+| `bucket` | string | `superseded`, `unpublished` or `other`; optional, `revoked` and `revoked_week` only. Omitted lists every reason |
+| `as_of` | integer | Epoch seconds to measure the first page against (for example a `/crypto/ca/stats` count's `as_of`). Accepted from 7 days before the **database** clock up to 5 minutes after it, checked in the read's own transaction; omitted = the database clock now. A continuation page carries its `as_of` in `cursor`; an `as_of` sent beside a cursor must equal it. See [Pinned `as_of`](crypto.md#pinned-as_of-and-keyset-paging) |
+| `limit` | integer | 1 to 500, default 100 (refused outside the range, not clamped) |
+| `cursor` | string | The previous page's `next_cursor` (opaque, at most 512 bytes). Bound to `kind`, `days`, `week` and `bucket`: a cursor that is malformed, edited or issued for another filter is a `400` naming `cursor` |
+
+A parameter repeated with differing values is a `400`. **`offset` is refused in this form** (`400`
+naming it): the filtered list pages by keyset cursor only. `limit` or `offset` alone does not
+select this form (the unfiltered list above keeps its `offset` paging).
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/ca/issued?kind=revoked&days=30&bucket=superseded"
+```
+
+```json
+{
+  "items": [
+    {
+      "serial_hex": "3A4B5C6D...",
+      "subject": "agent-prod-01",
+      "san": "URI:yuzu://<ca-fp>/agent/agent-prod-01",
+      "purpose": "agent",
+      "status": "revoked",
+      "not_after": 1821657600,
+      "issued_at": 1790121600,
+      "revoked_at": 1791590400,
+      "revocation_reason": "superseded",
+      "issued_by": "agent:agent-prod-01",
+      "issuer_key_id": "ab12..."
+    }
+  ],
+  "count": 1,
+  "filter": {
+    "kind": "revoked", "days": 30, "week": null, "week_start": null, "bucket": "superseded",
+    "rule_id": "yuzu_ca_revoked_superseded",
+    "criterion": "Revoked after as_of - 30 days and on or before as_of, reason recorded as superseded (replaced by a same-key successor)",
+    "rule_set_version": "crypto_widget_windows_v1",
+    "as_of": 1792396800, "as_of_iso": "2026-10-19T08:00:00Z", "total": 1,
+    "scope_note": "Counts certificates Yuzu's own CA issued only (agent, server, gateway, HTTPS and code-signing); certificates on your devices are not covered."
+  },
+  "next_cursor": null,
+  "meta": { "api_version": "v1", "limit": 100, "has_more": false }
+}
+```
+
+`filter.total` counts every match at `filter.as_of`; when `meta.has_more` is `true`,
+`next_cursor` is set: request the next page with `cursor=<next_cursor>` (and the same `kind`,
+`days`, `week`, `bucket`). The cursor carries the position of the last certificate served and
+the walk's `as_of`, so every page is measured against the same time and starts strictly after
+that certificate: a certificate revoked between pages never makes the walk skip another (an
+offset would). `next_cursor` is `null` on the last page. Order: expiring soonest first, expired and revoked most recent first, the
+rest newest-issued first. Every filtered call is audited `crypto.ca.certificates.view`, as
+is every unfiltered call (set-and-proceed: `audit_persisted: false` in the body and `Sec-Audit-Failed: true` when the row
+is lost; a confined refusal is a `denied` row, and an unavailable access check a `failure` row).
+Errors: `400` (each malformed parameter, named), `401`, `403` (no `Security:Read`, a confined
+caller, or no `Inventory:Read` grant), `503` + `retry_after_ms: 5000` (`Yuzu CA read degraded`, `crypto read capacity in use;
+retry`, or `access check unavailable`; never an empty list), and `503` **without**
+`retry_after_ms` (`filtered certificate list unavailable`: the server was built without the
+`/crypto` seam, a wiring fault that lasts until a restart). MCP twin: `list_issued_certs` with the
+same arguments.
 
 #### `POST /api/v1/ca/revoke`
 
@@ -2732,9 +2869,12 @@ assignment is rejected pending the Phase-5 `authorize_list_read` extension
 (design §4.3).
 
 **Structural constraint (design §4.2, "no admin, ever"):** an engine principal
-can never hold the `admin`/`Administrator` role, any other built-in system
-role, or a wildcard role. `POST .../roles` **rejects** such a request outright
-(`400`) — it is never silently narrowed to something safer.
+cannot hold the `admin`/`Administrator` role or any other built-in system
+role. `POST .../roles` **rejects** such a request outright (`400`) — it is never
+silently narrowed to something safer. A custom role that grants every securable
+and operation is **not** refused at assignment;
+`GET /api/v1/engine-principals/audit/no-admin` reports it afterwards as
+`wildcard_grant`.
 
 #### `GET /api/v1/engine-principals/{id}/roles`
 
@@ -2747,7 +2887,7 @@ List the fleet-wide roles currently assigned to an engine principal.
 ```json
 {
   "data": [
-    { "principal_id": "engine:vuln-viewer", "role_name": "Viewer" }
+    { "principal_id": "engine:vuln-viewer", "role": "Viewer" }
   ],
   "meta": { "api_version": "v1" }
 }
@@ -2790,7 +2930,7 @@ a principal).
 **Errors:** `400` — invalid JSON, missing `role`, unknown role name, or the
 role is admin/built-in/otherwise rejected by `validate_assignment` (design
 §4.2 — always a `4xx`, never a `500`); `401`/`403` — not authenticated, missing
-`Security:Write`, or MFA step-up required/failed; `404` — no active (live,
+`Security:Write`, an engine session, or MFA step-up required/failed; `404` — no active (live,
 non-revoked) engine principal exists at `{id}`; `503` — the RBAC or
 engine-principal store is unavailable. A rejected assignment is audited
 `engine_principal.role.assigned` with `result=denied`; success with
@@ -2815,9 +2955,11 @@ Unassign a fleet-wide role from an engine principal.
 }
 ```
 
-**Errors:** `400` — the role was not assigned to this principal (store-returned
-error); `401`/`403` — not authenticated, missing `Security:Write`, or MFA
-step-up required/failed; `503` — the RBAC store is unavailable. Audited
+**Errors:** the call is idempotent: a role that was not held also answers `200`
+(`removed=false` appears only in the audit detail). `401` or `403`: not
+authenticated, missing `Security:Write`, an engine session, or MFA step-up
+required or failed. `503`: the RBAC store is unavailable or the query failed.
+Audited
 `engine_principal.role.unassigned` on success. `503` + `Sec-Audit-Failed: true`
 — the unassign audit row could not persist (see *Audit-persist failure* above):
 the grant may already be removed, so reconcile via `GET /{id}/roles`.
@@ -3015,9 +3157,9 @@ Self-audited as `rbac.assignments.list`.
 
 #### `POST /api/v1/rbac/roles/{name}/assignments`
 
-Grant one of the 6 fleet-wide-assignable built-in RBAC roles (`Administrator`,
-`PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`) to a
-human user, fleet-wide. See "Fleet-Wide Role Assignment (Built-in Roles)" in
+Grant one of the 7 fleet-wide-assignable built-in RBAC roles (`Administrator`,
+`PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`,
+`ForensicsAnalyst`) to a human user, fleet-wide. See "Fleet-Wide Role Assignment (Built-in Roles)" in
 `docs/user-manual/rbac.md` for the full narrative (key constraints, examples,
 and why this is a separate surface from `POST /api/v1/rbac/check`'s
 `perm_fn`-gated siblings above).
@@ -3032,7 +3174,7 @@ are all structurally denied before any store read — an MCP-tiered credential
 must use the `assign_rbac_role` MCP tool instead, which carries its own
 supervised-tier + approval-ticket gate ([#520](https://github.com/Tr3kkR/Yuzu/issues/520)).
 
-**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied` (`target_id` `rbac_role_assignment`). API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The check runs after the administrator gate, the current-regime re-check and MFA step-up and before the body is read.
+**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The server-wide same-site check (see Authentication) answers first; this route also keeps its own copy, which is defence in depth.
 
 **Request body:**
 
@@ -3074,7 +3216,7 @@ is never misreported as "no active account."
 array or scalar), missing `principal_id`, a `principal_type`/`principal_id`
 field present with the wrong JSON type (degrades to "missing"/"invalid",
 never an uncaught exception), `principal_type` other than `"user"`, a
-malformed `principal_id`, `{name}` is not one of the 6 assignable roles
+malformed `principal_id`, `{name}` is not one of the 7 assignable roles
 (`ITServiceOwner` and a genuinely unknown/custom role name return the
 identical client-facing message — no role-catalog oracle; the specific
 reason is audited server-side only; use `POST
@@ -3090,7 +3232,9 @@ Administrator role, does not hold authority under the regime that is durably
 true right now, is a service-scoped/engine session, presented an
 MCP-tier bearer token of any tier (use the `assign_rbac_role` MCP tool
 instead), or made a cross-site cookie-session call (`cross-site request
-refused`); `503` — the RBAC or `AuthDB` store is unavailable (including when
+refused`); `409` — a role that is not a built-in role holds the name of the
+built-in role (a name collision; nothing is assigned, and the upgrade guide,
+"Role name collision", has the remedy); `503` — the RBAC or `AuthDB` store is unavailable (including when
 the admin gate itself cannot confirm durable authority — now logged and
 audited as a `denied` row, not silently invisible), a genuine store/query
 fault while writing the grant (as opposed to a client-validation rejection,
@@ -3124,7 +3268,7 @@ unassigning a role the principal did not hold still returns success.
 **Permission:** Same dedicated `is_rbac_administrator` check as the `POST`
 above (including the MCP-tier-token structural denial), plus MFA step-up.
 
-**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied` (`target_id` `rbac_role_assignment`). API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The check runs after the administrator gate, the current-regime re-check and MFA step-up and before the body is read.
+**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The server-wide same-site check (see Authentication) answers first; this route also keeps its own copy, which is defence in depth.
 
 **Response:**
 
@@ -3175,7 +3319,7 @@ accepted deviation `docs/user-manual/rbac.md`'s SSO/break-glass callout
 notes for the equivalent case. A service-scoped API token and an engine
 session are both structurally denied before any store read.
 
-**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied` (`target_id` `rbac_enforcement`). API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The check runs after the administrator gate and MFA step-up and before the body is read.
+**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The server-wide same-site check (see Authentication) answers first; this route also keeps its own copy, which is defence in depth.
 
 **Request body:**
 
@@ -3225,12 +3369,10 @@ administrator after the switch (enabling: no fleet-wide `Administrator`
 grant; disabling: local account role is not `admin`) — the response's
 `remediation` field names the exact follow-up call; `503` — the RBAC or
 `AuthDB` store is unavailable, or (on an otherwise-successful toggle) its
-audit row could not persist — treat the change as unconfirmed and reconcile
-via `GET /api/v1/me`. Audited `rbac.enforcement_changed` — see
+audit row could not persist: treat the change as unconfirmed and check it with the access-review export's `rbac_enforcement` label (`GET /api/v1/access-reviews/export`, `AccessReview:Read`). `GET /api/v1/me` (`rbac_enabled`) is only the cached view; it can lag on another replica and does not report the unconfirmed (degraded) state (#6033). Audited `rbac.enforcement_changed` — see
 `docs/user-manual/audit-log.md`.
 
-There is no `GET` twin: read the current state via `GET /api/v1/me`
-(`rbac_enabled`) or this route's own response.
+There is no `GET` twin: this route's own response echoes the authoritative post-write value, and the access-review export's `rbac_enforcement` label (`enabled`, `disabled` or `degraded`; `GET /api/v1/access-reviews/export`, which also writes an `access_review.exported` audit row) is the strongest available read. It is still the serving replica's view (see the degrade-versus-outage note in `docs/user-manual/rbac.md`). `GET /api/v1/me` (`rbac_enabled`) is the cached view only: it can lag on another replica and does not report the degraded state (#6033).
 
 MCP twin: `set_rbac_enforcement` — see `docs/user-manual/mcp.md`.
 
@@ -3918,7 +4060,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `scope.evaluation_aborted` | Emitted when a scoped dispatch is aborted fail-closed before any device is targeted. `result=failure`. Reasons: `db_degraded` (a `from_result_set:<id>` alias/owner/membership read against the result-set store could not answer — ADR-0036 — **or** a `props.<key>`/`tag:<key>` bulk preload against the custom-properties/tag store could not answer — ADR-0045; all abort the same way and share this reason value), `owner_check_failed` (a referenced set is absent, expired, or not owned — paired with per-ref `instruction.scope_resolution_failed` rows; as of #4981 PR-1 this ALSO fires, with its own paired per-ref row, when the set was deleted in the window between the pre-dispatch owner-check gate and the registry's own later membership read — a TOCTOU case the pre-#4981 code could not detect at all, see ADR-0036's 2026-09-26 Update), `principal_unresolved` (a tracked/MCP dispatch could not recover the dispatching operator), `presence_degraded` (#4981 PR-1 — the cross-replica presence read backing fleet-wide scope evaluation could not answer), `unresolvable` (a `from_result_set:`/`props.<key>` atom referenced a store that was never wired at this call site — unreachable on the real production dispatch ladder, both stores are always wired there, but a defensively-labelled case rather than a misleading `db_degraded`). `target_type` on the audit row is `result_set` for `owner_check_failed` (the only reason actually about a specific result set) and `scope` for every other reason. Fires on all three scoped dispatch paths, plus the no-principal tracked-closure guard (principal_unresolved only). |
 | `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
 | `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`. `result=dispatched` (reached the agent) or `result=no_agents` (reached zero agents → `dispatch_failed` on collate). A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). Emitted on **both** the REST and MCP surfaces (the per-step verb is transport-agnostic; the MCP tool-call envelope additionally audits as `mcp.execute_bundle`). |
-| `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). |
+| `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). A collation that serves a Forensics-tier step's output also writes `response.forensics.read` with `surface=bundle` (see `response.forensics.read` in the [Audit log](audit-log.md) guide). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
 | `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `error`}. Success detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058, or #4981 PR-1's scope-evaluation abort) DOES audit, `result=error`, detail = the specific underlying-cause string (not a fixed literal — see the route's own 503 documentation) — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
 | `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>` (`agents` = delivered count, see the route doc); denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents, a target is already claimed for remediation, or a target has reached its fix-retry cap for this policy); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
@@ -4269,7 +4411,7 @@ session cookie, so a cookie-authenticated request must carry an `Origin` (or
 read and a `csrf.denied` row is written (`target_type=Endpoint`, `target_id` is
 the route as written above). A request that authenticates with an API token is
 not riding a cookie and is not gated. Behind a proxy that rewrites `Host`, add
-the dashboard origin to `--csrf-trusted-origins`.
+the dashboard origin to `--csrf-trusted-origin`.
 
 MCP twins (JSON only — the REST `?format=csv` export path has no MCP
 equivalent): `export_access_review`, `open_access_review`,
@@ -4908,7 +5050,7 @@ the store's unfiltered fleet-wide aggregate. MCP twin: `get_policy_agent_statuse
 this API's general behavioural-PII posture (see [`Sec-Audit-Failed` and the
 behavioural-PII audit posture](#sec-audit-failed-and-the-behavioural-pii-audit-posture)
 above). Unlike the five sibling routes above it, this route's `check_result`
-field carries the raw, unrestricted output of whatever instruction the
+field carries the output of whatever instruction the
 bound fragment's `check_instruction` names — free-form and
 operator-authored at fragment-creation time, not a fixed machine-scope
 shape — so it cannot make the same "not behavioural PII" claim
@@ -4916,6 +5058,14 @@ shape — so it cannot make the same "not behavioural PII" claim
 (`get_policy_agent_statuses`) is unaffected: it follows MCP's own
 convention of surfacing the same gap via an `audit_persisted:false` body
 field rather than a header/status code.
+
+**Forensics-tier checks.** The one case where `check_result` is not the check's output: when
+the check instruction runs a Forensics-tier plugin (`app_usage`, `browser_inventory`,
+`execution_artifacts`, `privacy_permissions`, `remote_access_audit`), the agent's `status` is
+`unknown` and `check_result` is empty, because the evaluator does not read or store that plugin's
+output. `unknown` there says nothing about the device. Check output of such a policy is never
+stored. See "Forensics-tier rows" in the
+Command/Instruction Responses section.
 
 ---
 
@@ -4931,6 +5081,10 @@ this API does **not** re-initialise the running OIDC provider.
 Returns current configuration values and any active runtime overrides.
 
 **Permission:** `Infrastructure:Read`
+
+**Scoped to the caller.** The response shows only the overrides the caller could write with `PUT /api/config/{key}`: for every key the caller would be refused (see **Administrator-only keys** and the `oidc_*` rule under `PUT /api/config/:key`), the stored override is left out, and so is the effective `audit_retention_days`. An administrator account's response is the original body, key for key, apart from `config.log_level` reading `warn` where it used to read `warning`, so the Settings pages read it unchanged. An MCP-tier token, a non-administrator role holding `Infrastructure:Read`, or (for the `oidc_*` keys) an elevated-only session does not receive the administrator-only overrides, including `oidc_admin_group`. Unlike `GET /api/v1/config`, this route does not list what it withheld, so a missing key reads as "not set"; use the v1 route to see `withheld_keys`. Before this change the route returned every override to every `Infrastructure:Read` holder.
+
+> **Replaying this response.** Read with a caller that is not an administrator account, the response omits the administrator-only overrides (see **Scoped to the caller**), so replaying it writes only the keys that caller may write and silently loses the rest; read and write with an administrator account instead. A write of an administrator-only key by a caller that is not an administrator account stops with `403`; see [Replaying `GET /api/config`](#put-apiconfigkey).
 
 > **Secret values are never returned.** For an override whose key holds a credential
 > (today: `oidc_client_secret`) the `value` field is **omitted entirely** and replaced
@@ -4981,22 +5135,34 @@ keys with a stored override, so a key can appear in `config` without appearing i
 
 Update a single runtime configuration value. The key must be one of the allowed runtime-configurable keys.
 
-**Permission:** `Infrastructure:Write`. Writing an `oidc_*` key also needs the caller's own administrator role (the local account role, or the role mapped from the identity provider) from an interactive session: any session whose own role is not `admin` (an administrator only through a temporary elevation, or a non-administrator holding `Infrastructure:Write`) and any MCP-tier token gets `403` and the audit row `config.update / denied`, detail `elevated_session_oidc_setting_blocked` (elevation) or `admin_role_required_oidc_setting_blocked`. Every other key stays writable under `Infrastructure:Write`.
+**Permission:** `Infrastructure:Write`, plus a caller rule for two groups of keys. A caller the rule refuses gets `403` (A4 error envelope, with a `remediation` field and no `permission` field) and the audit row `config.update / denied`, with nothing stored and no preceding `attempted` row. The refusal happens before the runtime-config store is opened and before the request body is parsed, so a refused caller gets `403` even when the store is unavailable or the body is malformed.
+
+- **`oidc_*` keys:** the caller's OWN role must be `admin` (the local account role, or the role mapped from the identity provider), and the caller must not be an MCP-tier token (an elevation does not count). The handler also refuses a service-scoped token, as defence in depth, because the permission gate already does. A session that is an administrator only through a temporary elevation, a non-administrator holding `Infrastructure:Write` and an MCP-tier token are all refused. The `403` message is "changing sign-in provider settings needs your own administrator role"; `detail` is `elevated_session_oidc_setting_blocked` (elevation) or `admin_role_required_oidc_setting_blocked` (any other non-administrator). An MCP-tier or service-scoped token is refused whatever its creator's role, with the message "an administrator account is required; MCP-tier and service-scoped tokens cannot change sign-in provider settings" and `detail` `token_session_oidc_setting_blocked`.
+- **Administrator-only keys:** `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`, `dex_cohort_export_key` and `audit_retention_days`. The first six apply the same caller rule as their Settings routes, which are administrator-only. `audit_retention_days` has no Settings route (this route is its only writer); it is administrator-only by design because it is the stored audit-retention setting (reported by `GET /api/config`, evidence-bearing, and the lever that will govern enforcement once #483 lands), not because a `PUT` changes the retention applied today: the value is stored only and is not enforced (see [When a change takes effect](#when-a-change-takes-effect); the enforced window is `--audit-retention-days` or `YUZU_AUDIT_RETENTION_DAYS` plus a restart). It is administrator-class while `response_retention_days` and `guardian_event_retention_days` stay on `Infrastructure:Write` because it is audit evidence and the other two are operational data; all three are equally stored only today, and the choice should be revisited if any retention store gains a setter. The Settings pages do not expose it: write it with an administrator API token that is not MCP-tier (exempt from the same-site check), or from an administrator session (a cookie session is a browser write and needs a same-site `Origin` or `Referer`). The rule is the same for all seven: a session with an MCP-tier token or a service-scoped token, or whose EFFECTIVE role is not `admin`, is refused (an active temporary elevation counts as `admin`, exactly as on the Settings routes; this differs from `oidc_*`). The role is the account's legacy role or a live temporary elevation, never an RBAC grant: an RBAC Administrator grant alone does not count, so with RBAC on a user whose only administrator authority is that grant gets `admin_role_required_setting_blocked`; an engine principal is refused too. `detail` is `token_session_admin_setting_blocked` (MCP-tier or service-scoped token) or `admin_role_required_setting_blocked` (effective role not `admin`). The `403` message is "an administrator account is required; MCP-tier and service-scoped tokens cannot change this setting" for a token, and "changing this setting needs your own administrator role" for a non-administrator role. The `remediation` field is "change this setting with an administrator API token that is not MCP-tier, or as an administrator from the Settings page where one exists". A plain administrator API token that is not MCP-tier is admitted. Only the caller rule is shared with the Settings routes: the Settings routes also validate and clamp DEX values and tag keys and apply them live, which this generic route does not (see [When a change takes effect](#when-a-change-takes-effect)).
+
+Every other key stays writable under `Infrastructure:Write` alone, including `response_retention_days`, `guardian_event_retention_days`, `log_level`, `heartbeat_timeout` and `auto_approve_enabled`, and that includes a supervised-tier MCP-tier token whose creator is an administrator. That is deliberate for now, pending a maintainer ruling.
+
+In production the permission gate runs first. A service-scoped token, and a `readonly` or `operator` tier MCP token, are refused by that gate with the audit row `auth.permission_required` and never reach this rule, so they do not produce a `config.update / denied` row. The callers that do reach it are a supervised-tier MCP token (even one minted by an administrator) and, with RBAC on, a non-administrator role that holds `Infrastructure:Write`.
+
+**Replaying `GET /api/config`.** A caller that is not an administrator account does not receive the administrator-only overrides (`GET /api/config` leaves them out; `GET /api/v1/config` lists them in `withheld_keys`, which a replay client must treat as indeterminate, not unset). Writing one of those keys with such a caller stops with `403` at the first one it reaches, so keys written before that point stay applied and the rest are not (a half-applied configuration). `overrides` is a name-sorted object, so which keys come first depends on the order the client replays them in. A config-as-code client should read and replay with an administrator API token that is not MCP-tier, or write the seven keys separately (the Settings pages for the six that have one, `PUT /api/config/audit_retention_days` with an administrator account for the seventh). Keys listed in `read_only_keys` (today `dex_score_policy`) appear in `overrides` but are refused by both generic write routes with the route-owned `400` for every caller, an administrator included: skip them when replaying, and write the policy through `PUT /api/v1/dex/score-policy`.
 
 **Audit:** audit-first (ADR-0033 section 9, no audit row, no mutation). An `attempted` `config.update` row is written before anything changes; if it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and the key is neither stored nor applied. A `success` row follows a change, or a `failure` row a store refusal. If only that outcome row is lost the change stays applied and the `200` carries `Sec-Audit-Failed: true` (see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture)). Each accepted call therefore leaves two rows.
 
+**Twins.** `GET /api/v1/config` and `PUT /api/v1/config/{param}` (below) and the MCP tools `get_runtime_config` and `set_runtime_config` read and write the same store. The decisions are one implementation (`config_write.hpp`): the write class (`RuntimeConfigStore::write_class`), the caller rule (`authz::admin_gate_verdict`), the integer-key checks, the live apply, the caller-scoped view and the redacted audit detail. Each surface keeps its own gate call, audit call and envelope, so a further surface that writes these keys must call the shared core, or it reopens the gap this section closes. They differ in more than the envelope: the v1 `PUT` is MFA step-up gated for a cookie session and this legacy route is not; the v1 `PUT` and the MCP tool report an `effect` field and this route does not; the v1 `GET` and the MCP `get_runtime_config` also list `withheld_keys`; and the MCP tool takes string values only, with a 64-character key and a 256-byte value limit.
+
 **Dangling `attempted` row.** An `attempted` `config.update` row with no `success` or `failure` row after it means the outcome is unknown (the server stopped between the two, or the outcome row was lost); read `GET /api/config` to see what is in force. A `failure` row for a database error records `store error; outcome unknown`, because the write may have committed before the acknowledgement was lost.
 
-**Cross-site writes.** A session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API, MCP and engine token callers are exempt.
+**Cross-site writes.** A session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API, MCP and engine token callers are exempt. This is the server-wide rule (see Authentication); this route also keeps its own check, which is defence in depth.
 
-**Allowed keys** (the full set; source of truth is `kAllowedKeys` in
-`server/core/src/runtime_config_store.cpp`):
+**Allowed keys** (the full set; source of truth is the `kKeySpecs` table in
+`server/core/src/runtime_config_store.cpp`, which pairs every key with its write class, that is, who
+may write it through this route; see **Permission** above):
 
 | Key | Type | Takes effect | Description |
 |---|---|---|---|
-| `heartbeat_timeout` | integer | immediately | Seconds before an agent is considered offline. Minimum 30 (the default agent heartbeat interval); a lower value is refused `400`. 30 is a floor, not a recommendation: keep it well above the agents' own `--heartbeat`. A value stored below 30 before the floor existed is raised to 30 at server start (logged), while `GET /api/config` keeps listing the stored override until you replace it |
+| `heartbeat_timeout` | integer | immediately | Seconds before an agent is considered offline. Minimum 30 (the default agent heartbeat interval) and maximum 86400 (one day); a value outside that is refused `400` on every surface, because a longer window leaves a dead agent reading online. 30 is a floor, not a recommendation: keep it well above the agents' own `--heartbeat`. A value stored outside 30 to 86400 before the bounds existed is moved to the nearest bound at server start (logged), while `GET /api/config` keeps listing the stored override until you replace it |
 | `response_retention_days` | integer | **stored only, not enforced - see note** | Days to retain command response data |
-| `audit_retention_days` | integer | **stored only, not enforced - see note** | Days to retain audit log entries |
+| `audit_retention_days` | integer | **stored only, not enforced - see note** | Days to retain audit log entries. Administrator-only (see **Permission**); no Settings page writes it |
 | `guardian_event_retention_days` | integer | **stored only, not enforced - see note** | Days to retain guaranteed-state events |
 | `log_level` | string | immediately | Server log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
 | `auto_approve_enabled` | boolean | **never - see note** | Accepted and stored, but no consumer reads it back |
@@ -5012,19 +5178,20 @@ Update a single runtime configuration value. The key must be one of the allowed 
 | `dex_blast_window_seconds` | integer | **persisted only - see note** | Blast-radius window |
 | `dex_blast_cooldown_seconds` | integer | **persisted only - see note** | Blast-radius cooldown |
 | `dex_cohort_export_key` | string | **persisted only - see note** | Cohort export tag key; `""` disables export |
-| `dex_score_policy` | string (JSON document) | **typically within 5 seconds** | The customer score policy (tier edges and names, deduction weights, per-application overrides). **Read-only here:** a `PUT` to this route is refused, see below. The policy route ships in a later change; until then the key cannot be written through the product and every response reports `source: "default"` |
+| `dex_score_policy` | string (JSON document) | **typically within 5 seconds** | The customer score policy (tier edges and names, deduction weights, scoring model parameters, per-application overrides). **Read-only here:** a `PUT` to this route is refused, see below. Write it with [`PUT /api/v1/dex/score-policy`](#get--put--delete-apiv1dexscore-policy) |
 
 `GET /api/config` also returns `read_only_keys`: the allowed keys that this route lists but does not
 write. It currently holds `dex_score_policy`. `PUT /api/config/dex_score_policy` is refused with a `400` (A4 envelope, no audit row) naming
 `PUT /api/v1/dex/score-policy`: the policy is one document that is validated whole by its own route,
-and a generic single-value write could leave it half-edited. That route ships in a later change;
-until then the key cannot be written through the product, and every response reports `source:
-"default"`.
+and a generic single-value write could leave it half-edited. Write the policy through
+[`PUT /api/v1/dex/score-policy`](#get--put--delete-apiv1dexscore-policy) (and remove it with
+`DELETE`).
 
 ##### When a change takes effect
 
 Persisting a value and applying it are separate steps, and this endpoint only does the first for
-most keys:
+most keys. `PUT /api/v1/config/{key}` and the MCP tool `set_runtime_config` report the outcome as
+`effect` (`immediate`, `deferred`, `stored_only`) in their answer; the groups below are those three:
 
 - **immediately** - only two keys. `heartbeat_timeout` is assigned into the live server config and
   re-read on every stale-session sweep; `log_level` is applied by `RuntimeConfigStore::set()` itself
@@ -5053,8 +5220,9 @@ most keys:
 - **typically within 5 seconds** - `dex_score_policy`. Every server instance reads the stored
   document through a short-lived cache and refreshes it at most every 5 seconds while it serves
   requests, so a change is typically in use on each instance within 5 seconds with no restart; the
-  policy in use is up to 60 seconds old when the store is unreadable. It is read-only through this
-  API (see above).
+  policy in use is up to 60 seconds old when the store is unreadable. It is written through its own
+  route, `PUT /api/v1/dex/score-policy` (the instance that served the write uses the new policy at
+  once); it is read-only through this API (see above).
 - **never** - `auto_approve_enabled` is accepted by the allow-list and written to the store, but no
   code reads it back from there. `GET /api/config` reports `auto_approve_enabled` **derived from
   whether any auto-approve rule exists**, not from the stored value, so a `PUT` of this key can
@@ -5113,21 +5281,20 @@ another OIDC field, restart first so the process is not holding the old value.
 > **Two different error sources, two different shapes.** The shared authorization gate in front of
 > this route **does** emit the A4 envelope: a `401`, a `403` permission denial, or a `503`
 > authorization-store failure carries `correlation_id` (echoed on `X-Correlation-Id`) like any other
-> gated route. Most bodies **the handler itself** emits do not (the three A4 refusals named at the end of this note are the exception) — `/api/config` is a legacy
+> gated route. Most bodies **the handler itself** emits do not (the A4 refusals named at the end of this note are the exception) — `/api/config` is a legacy
 > non-`/api/v1` route, and its own errors are either a bare `error` string or a nested
 > `{"error":{"code","message"},"meta":{"api_version"}}` object with no `correlation_id` and no
 > `retry_after_ms`. Besides those shown below, the handler emits nested bodies for `400` "missing
 > 'value' in request body", `400` "invalid JSON body", `400` "request body nests too deeply"
-> (over 32 levels, `kMcpMaxJsonDepth`), a `403` "changing sign-in provider settings needs your own
-> administrator role" (an `oidc_*` key written by a session whose own role is not `admin`), and a `503` "runtime config store unavailable"
+> (over 32 levels, `kMcpMaxJsonDepth`), and a `503` "runtime config store unavailable"
 > when the runtime-config store is unavailable (`GET` and `PUT` now share the identical message; an
 > earlier `GET`-side wording of "runtime configuration store unavailable" was a drift, not a
 > deliberate distinction, and has been unified). Note `503` and `403` are emitted by **both** sources, so status
 > alone does not tell you which shape you have: test for `error.correlation_id` rather than assuming
-> it, on every status. Three refusals use the A4 envelope (`correlation_id` present): `403`
-> `cross-site request refused`, `503` `audit log unavailable; the change was not made`
+> it, on every status. These refusals use the A4 envelope (`correlation_id` present): `403`
+> `cross-site request refused`, the `403` for a refused administrator-class write (see **Permission**; it carries a `remediation` and no `permission` field), `503` `audit log unavailable; the change was not made`
 > (`retry_after_ms: 5000`, a `remediation` hint, header `Sec-Audit-Failed: true`) and the `400` for
-> `dex_score_policy` (written only through its own route, which ships in a later change; no audit
+> `dex_score_policy` (written only through its own route, `PUT /api/v1/dex/score-policy`; no audit
 > row). An unknown key is a bare `400` and writes no audit row.
 
 **Error (503) - runtime config store unavailable.** A genuine DB/crypto write failure, distinguished
@@ -5174,10 +5341,24 @@ client secret contains `<redacted>`, rotate it at the IdP to a value that does n
 { "error": "value is the redaction placeholder, not a credential; send the real secret, or omit the key to leave it unchanged" }
 ```
 
-**Audit:** a write emits `config.update` / `RuntimeConfig` with `target_id` = the key: `attempted` (empty `detail`) before the change, then `success` (`detail` is `value=<new value>`, redacted for a secret key) or `failure` (`detail` is the store's refusal text, or `store error; outcome unknown` for a database error). A refused `oidc_*` write (the caller's own role is not `admin`) emits `config.update` / `denied` (detail `elevated_session_oidc_setting_blocked` or `admin_role_required_oidc_setting_blocked`), stores nothing and is not preceded by an `attempted` row.
+**Audit:** a write emits `config.update` / `RuntimeConfig` with `target_id` = the key: `attempted` (empty `detail`) before the change, then `success` (`detail` is `value=<new value>`, redacted for a secret key) or `failure` (`detail` is the store's refusal text, or `store error; outcome unknown` for a database error). A write refused by the caller rule (see **Permission**) emits `config.update` / `denied` on `RuntimeConfig` with `target_id` = the key, and `detail` of `elevated_session_oidc_setting_blocked`, `admin_role_required_oidc_setting_blocked` or `token_session_oidc_setting_blocked` for an `oidc_*` key, `token_session_admin_setting_blocked` or `admin_role_required_setting_blocked` for the other administrator-only keys. It stores nothing and is not preceded by an `attempted` row. The Settings routes audit the equivalent denial as `auth.admin_required`, so a SIEM rule keyed on `auth.admin_required` does not see a refusal on this route.
 See [Audit log](audit-log.md) for the `detail` contract, which differs for secret-valued keys.
 
 ---
+
+#### `GET /api/v1/config`
+
+The v1 twin of `GET /api/config`: the effective values, the stored overrides, `allowed_keys` and `read_only_keys`, in the A4 envelope (`{"data": {...}, "meta": {"api_version": "v1"}}`, `Cache-Control: no-store`). The `data` object is the legacy response body, key for key, plus `withheld_keys`, and a secret key reports `is_set` and never its value. **Scoped to the caller:** the stored override of every key the caller could not write with `PUT /api/v1/config/{key}` is left out, and so is the effective `audit_retention_days`, so an MCP-tier token or a non-administrator does not read the `oidc_*`, DEX alert or plugin-signing overrides (a service-scoped token is refused at the permission gate). A stored row whose key has no write class (stale or renamed) is shown only to an effective administrator (an elevated session counts). `withheld_keys` lists the allowed keys withheld from this caller (sorted; empty for an account whose own role is `admin`; an elevated-only session is still withheld the `oidc_*` keys), so a missing key means "not shown to you", not "not set"; a client replaying configuration must treat a withheld key as indeterminate. The legacy `GET /api/config` is scoped the same way but does not declare `withheld_keys`. The values shown are what is stored: the three retention values, `audit_retention_days` included, are not the enforced windows, which come from the command-line flags and are shown as `enforced` by `GET /api/v1/settings/data-retention`. `dex_score_policy` (route-owned) is listed to every reader. **Permission:** `Infrastructure:Read`. Not audited. A store that is closed or cannot be read answers `503` (A4 error with `retry_after_ms`), never an empty list. MCP: `get_runtime_config`.
+
+#### `PUT /api/v1/config/{param}`
+
+The v1 twin of `PUT /api/config/:key`; the path parameter (`{param}` in the route pattern, `{key}` elsewhere in this manual) is the key. Body `{"value": ...}`, at most 16 KiB (`413` above that). Same permission (`Infrastructure:Write`), same caller rule for the seven administrator-only keys and the `oidc_*` keys, same same-site check for a cookie session, same audit-first rows (`config.update`: `denied`, or `attempted` then `success` or `failure`), same value checks. What changes is the answer:
+
+- **Success:** `200 {"data": {"key": "...", "value": "...", "applied": true, "effect": "..."}, "meta": {"api_version": "v1"}}`. `applied` means the value was accepted and stored, not that it is in use: `effect` says how soon it matters. `immediate` is used by the running server now (`heartbeat_timeout`, `log_level`); `deferred` waits for the next DEX -> Alerts save or a restart (the `dex_*` keys) or for a restart (`oidc_admin_group` and `oidc_redirect_uri`); `stored_only` means nothing consumes it (the retention windows, `auto_approve_enabled`, `plugin_signing_required`, which records intent and hardens nothing, and the other `oidc_*` keys). `immediate` is for the server that took the write: other replicas and agents behind a gateway keep the boot-time `heartbeat_timeout`, see [When a change takes effect](#when-a-change-takes-effect). A secret key's `value` is omitted. If only the outcome audit row is lost the change stays applied, `data` carries `"audit_persisted": false` and the response carries `Sec-Audit-Failed: true`.
+- **Errors:** every refusal is an A4 error envelope: `400` for a missing or invalid `value` (a JSON `null`, array or object is refused: send a string or a number or boolean), an unknown key, or a key with its own route (`dex_score_policy`); `401` when a fresh MFA proof is needed (the step-up envelope below); `403` for a refused caller (with `remediation`, no `permission` field), a cross-site cookie write, or a SAML session or engine principal (step-up); `503` when the store is unavailable or the `attempted` row cannot be stored (with `retry_after_ms`).
+- **Step-up:** one of the [step-up routes](#step-up-envelope-on-high-risk-endpoints): an MFA-enrolled local or OIDC cookie session needs a fresh proof per `--mfa-enforcement`; un-enrolled accounts and API-token and MCP-token callers pass. It is checked by the central step-up check before the route runs, ahead of the permission and caller-rule checks, so an enrolled cookie session without a fresh proof gets the step-up `401` even if it also lacks `Infrastructure:Write`. The legacy `PUT /api/config/:key` is unchanged and is not step-up gated.
+
+MCP: `set_runtime_config`, with the arguments `{"key": "...", "value": "..."}` (strings; `key` 1 to 64 characters from `a-z` and `_`, `value` at most 256 bytes). The readonly and operator tiers cannot call it. A supervised-tier token reaches only the five keys that are not administrator-only (`heartbeat_timeout`, `response_retention_days`, `guardian_event_retention_days`, `auto_approve_enabled`, `log_level`); the rest answer a permission error and the `config.update / denied` audit row, and `dex_score_policy` answers invalid params. An untiered administrator API token is admitted for every key, as on REST. It is not approval-gated at the supervised tier: the write is audit-first, and an MCP-tier token cannot reach the administrator-only keys, including every sign-in setting. The retention values are stored but not enforced, even after a restart (see [When a change takes effect](#when-a-change-takes-effect)).
 
 ### Settings
 
@@ -5411,14 +5592,44 @@ REST-only — see the #520 note above.
 
 Response, audit and Guardian-event data retention windows, in days.
 
-**Permission:** `ServerConfig:Read`. **Audit:** none — lowest sensitivity of the eight (a few
-integers).
+**Permission:** `ServerConfig:Read`. **Audit:** none — lowest sensitivity of the eight (integers
+and fixed registry strings).
 
 The top-level fields are the configured/stored values. `enforced` holds the window each store is
 actually applying, in days (`0` or less means rows never expire); a value is `null` when the store
 is absent or not open, which is "unknown", not zero. The two differ after a runtime
 `PUT /api/config/<key>`, which is stored but not applied (see
 [When a change takes effect](#when-a-change-takes-effect)).
+
+`tar` publishes the TAR warehouse retention tiers: `tick_seconds` (the agent's prune
+tick, 900) and `tiers`, one row per source and tier (`live`, `hourly`, `daily`, `monthly`,
+`boot`). Each row has `limit_kind` (`rows` or `seconds`), `limit`, `bucket_seconds` (the
+roll-up bucket: 0 for `live`/`boot`, 3600, 86400, or 2678400 for a month, the 31-day worst
+case) and `guaranteed_depth_seconds`. Roll-up rows age from the start of their bucket, so
+a time-based tier is guaranteed for `limit - bucket_seconds` (a 365-day monthly tier is
+guaranteed for 334 days). It is `null` for `rows` tiers, whose time depth depends on how
+fast a device writes. `guaranteed_depth_seconds` is a floor on how long a record is kept, not
+where it sits: a record is still in its finer tier until the coarser roll-up closes. It is a
+floor on rows that exist, not on coverage: after an agent is offline longer than a tier's
+roll-up catch-up window (2 h hourly, 2 d daily, about 62 d monthly) the missed span is a gap in
+that tier, not a deeper tier. The
+`usage`/`live` row is a backstop, not an operative bound: the usage fold bounds its own open
+set (20,000 runs) before this limit can apply.
+
+These are the registry **defaults** an agent of this server's release applies (agents on other
+releases may differ), not per-device readings: TAR prunes on the agent, so the server has no
+live value. Every source's tiers are declared on every OS; where a source does not run on the
+agent's OS (see the OS compatibility matrix in the TAR manual) its tier applies to an empty
+table. A paused or errored source is never pruned (per-device paused sources: [`GET /api/v1/tar/retention-paused`](#get-apiv1tarretention-paused)); while the agent is running, rows may
+outlive their limit by up to `tick_seconds` (an offline agent or a disabled plugin prunes
+nothing), longer when the retention clock guard declines a prune, shorter by any plausible
+forward skew of the endpoint clock, which the guard does not decline (the depth is measured on
+the agent's own clock), and longer still while a backlog drains through the per-pass delete cap
+(5,000 rows per table per tick). `tar` is `null` only if the server's embedded table cannot be read. A server older than this release omits `tar`; treat absent like `null`.
+
+The order of `tiers` is unspecified; match rows by (`source`, `tier`). Clients must tolerate
+unknown `tier` and `limit_kind` values: a new tier is an additive change. A per-device or
+server-enforced reading, if one ever ships, lands under a new key, never by redefining `tiers`.
 
 ```json
 {
@@ -5430,6 +5641,15 @@ is absent or not open, which is "unknown", not zero. The two differ after a runt
       "response_retention_days": 90,
       "audit_retention_days": 365,
       "guardian_event_retention_days": 30
+    },
+    "tar": {
+      "tick_seconds": 900,
+      "tiers": [
+        { "source": "process", "tier": "live", "limit_kind": "rows", "limit": 100000,
+          "bucket_seconds": 0, "guaranteed_depth_seconds": null },
+        { "source": "process", "tier": "daily", "limit_kind": "seconds", "limit": 2678400,
+          "bucket_seconds": 86400, "guaranteed_depth_seconds": 2592000 }
+      ]
     }
   },
   "meta": { "api_version": "v1" }
@@ -5720,7 +5940,7 @@ validation failures (invalid key, unrecognized type, an invalid/oversized valida
 
 ### Webhooks
 
-Webhooks deliver real-time HTTP POST notifications to external systems when events occur in Yuzu (e.g., agent registration, command completion, policy compliance changes).
+Webhooks deliver real-time HTTP POST notifications to external systems when events occur in Yuzu (e.g., agent registration, a command response arriving, a DEX signal).
 
 #### `GET /api/webhooks`
 
@@ -5734,7 +5954,7 @@ List all configured webhooks.
     {
       "id": 1,
       "url": "https://example.com/hooks/yuzu",
-      "event_types": ["agent.registered", "command.completed"],
+      "event_types": ["agent.registered", "execution.completed"],
       "has_secret": true,
       "enabled": true,
       "created_at": 1710849600
@@ -5754,7 +5974,7 @@ Create a new webhook subscription.
 ```json
 {
   "url": "https://example.com/hooks/yuzu",
-  "event_types": ["agent.registered", "command.completed", "policy.violation"],
+  "event_types": ["agent.registered", "execution.completed", "dex.signal"],
   "secret": "optional-hmac-secret"
 }
 ```
@@ -5770,10 +5990,11 @@ Create a new webhook subscription.
 | Event type | Fired when | Notable payload fields |
 |---|---|---|
 | `agent.registered` | An agent enrolls or re-enrolls | `agent_id`, `hostname`, `os`, `arch`, `agent_version` |
-| `command.completed` / `execution.completed` | An instruction finishes across its targets | command/execution identifiers |
-| `policy.violation` | A policy evaluation finds a non-compliant device | policy + device identifiers |
+| `execution.completed` | Once per agent response to a command, not once per instruction: each target agent that answers produces its own event | `command_id`, `agent_id`, `status`, `exit_code` (and `error` when the response carries one) |
 | `dex.blast_radius` | N distinct devices report the same DEX signal `(obs_type, subject)` within the window — thresholds are operator-tunable on the DEX → Alerts tab (defaults 5 devices / 15 min; see [DEX fleet incident alerts](dex.md#fleet-incident-alerts-blast-radius)) | `obs_type`, `subject`, `device_count`, `window_seconds` |
 | `dex.signal` | A device reports a DEX signal type the operator routed to alerts (DEX → Alerts tab; once per device per hour — see [Routing signals to alerts](dex.md#routing-signals-to-alerts)) | `obs_type`, `subject`, `agent_id` |
+
+These four (`agent.registered`, `execution.completed`, `dex.blast_radius`, `dex.signal`) are the only event types the server fires; no other event is ever sent.
 
 `agent.registered` fires on *every* gRPC reconnect, not only first enrollment — a server restart, a network blip, or a gateway bounce that strands and reconnects a fleet produces one delivery per reconnecting agent, not one per genuinely new device. A target wired to a low-tolerance channel (e.g. a Slack alert intended for "new device joined the fleet") should filter or debounce on the receiving end if reconnect noise matters; the dashboard's own "Agent Enrolled" notification does not have this problem (it fires once, on first enrollment only).
 
@@ -5880,7 +6101,7 @@ Create a new offload target. Returns 201 + `{id, status}` on success, 400 when v
 | `auth_type` | string | No (`none`) | One of `none`, `bearer`, `basic`, `hmac`. |
 | `auth_credential` | string | No | Bearer token (Bearer), `user:pass` (Basic), shared secret (Hmac). Never returned by any endpoint. |
 | `event_types` | string | No (`*`) | Comma-separated list of event types or `*` for all. Same semantics as webhooks. |
-| `batch_size` | int | No (1) | Accumulate up to N events into a single POST body. `1` = no batching. Must be `1`..`10000` (read as a 64-bit value, so an oversized number is rejected rather than wrapped; a float such as `5.5`, a string, a boolean or `null` is `400` `invalid_field_type`, where a float used to be truncated); the per-target buffer flushes only at this size and has no other cap, so the store refuses a larger value (the same range MCP `create_offload_target` enforces). |
+| `batch_size` | int | No (1) | Accumulate up to N events into a single POST body. `1` = no batching. Must be `1`..`10000` (read as a 64-bit value, so an oversized number is rejected rather than wrapped; a float such as `5.5`, a string, a boolean or `null` is `400` `invalid_field_type`, where a float used to be truncated); the per-target buffer flushes only when it reaches this size and at graceful server shutdown (there is no timer flush, so a partly filled buffer waits for more events and is dropped on a crash or when the target is deleted) and has no other cap, so the store refuses a larger value (the same range MCP `create_offload_target` enforces). |
 | `enabled` | bool | No (true) | When false, no events are dispatched until re-enabled. |
 
 **Auth headers (set per `auth_type`):**
@@ -6631,6 +6852,59 @@ row cap and the export byte cap. `GET
 (`response_query_row_json`, `docs/api-twin-recipe.md` Rule 1); `GET /api/v1/responses/{id}/aggregate`
 and MCP `aggregate_responses` share another (`response_aggregate_row_json`).
 
+**Forensics-tier rows (#4990).** Rows written by Forensics-tier plugins (`app_usage`,
+`browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`; the set is
+derived from the capability catalogue) are served only to callers who hold `Forensics:Read` in
+addition to `Response:Read`. This applies to every route that reads stored responses: the legacy
+`GET /api/responses/{id}[/aggregate|/export]`, the v1 twins above, `GET
+/api/v1/executions/{id}/responses`, `GET /api/v1/executions/{id}/visualization`, `GET
+/api/v1/bundles/{id}` (a Forensics step stays `pending` with an empty output for a caller without a
+global grant, so that bundle never reports `complete=true` to that caller), and the `GET
+/api/v1/management-groups/agent-count-preview` count. To any other caller those rows are absent,
+not marked: there is no extra field or flag, and the row cap, the truncation flags, the aggregate
+counts and the agent counts are all computed over the rows the caller may read, so **an empty or
+short result does not imply that no data exists**. The one error is the unresolved case: if the
+server cannot determine whether the caller may read Forensics rows (the authorization store is
+unavailable; this applies to sessions, API tokens, MCP tokens and engine principals (an engine principal once its cached RBAC view is older than 5 seconds: an explicit grant is then admitted and a missing one is `403`; the authorization model reference has the condition), while a service-scoped token is
+default-denied with a definitive `403`), the route answers a retryable A4 `503` (`retry_after_ms` 5000, no
+`permission` field) instead of a result with those rows silently missing; that shape is the Forensics check's own, and
+when a whole-store outage fails the route's earlier `Response:Read` gate first, that gate's own answer is returned
+in its own shape (it can name a `permission`). `yuzu_server_rbac_read_degrade_total`
+(alert `YuzuRbacReadDegraded`) is the correlated signal. `Forensics:Read` is a global grant only: there is
+no management-group scoped read tier on these stored-response routes, and a hand-authored scoped grant reads
+nothing from them (the per-device application-usage read is a separate data set and keeps its own scoped gate). Service-scoped tokens,
+MCP-tier tokens and engine principals need the global grant like everyone else. With RBAC enforcement off, `Forensics:Read` is
+administrator-only, so a non-administrator session does not receive these rows. The built-in
+`ForensicsAnalyst` role is the delegable read-only holder (see `rbac.md`). A served read that
+includes at least one such row also writes a `response.forensics.read` audit row
+(`detail=forensics_rows=<n> plugins=<names> surface=<s>`, `surface` being `rest` for the v1 routes
+and `legacy` for the unversioned ones), fail-closed like the neighboring `response.read` row
+(`503` + `Sec-Audit-Failed: true`, no data); aggregate, facet-option and count reads write none. For an export the
+`forensics_rows` count is taken before the byte cap trims the file, so it can exceed the rows the file holds. When the
+`response.forensics.read` row cannot persist and the route answers `503`, the attempt has already left its
+neighboring success row (`response.read` or `execution.detail.fetch`, written first), and a retry leaves a second one. A caller using
+an API token, an MCP token or an engine principal that does not hold a global `Forensics:Read`
+also leaves one `auth.permission_required` denied audit row per read attempt (an interactive
+browser sign-in does not), so expect denial rows from automation that polls stored responses.
+The filter is per plugin, because only the `plugin` name is stored with a row, and it is a rule
+about these plugins' rows, not about a kind of data: other plugins can return comparable
+information under their own securables, and their stored rows stay under `Response:Read`. The same filter is applied to the
+server's own consumers of these rows: policy check output (such a policy scores `unknown`), result
+set membership (a set sourced from such a command materializes empty) and the live output stream,
+which publishes no row of a Forensics-tier plugin on `GET /events`, `GET /sse/executions/{id}` or
+`GET /api/v1/events`. (Such a frame publishes nothing to the live output stream, not a row and not a notice, and
+nothing is published there when the plugin set is unwired or the frame carries no output. The timing and
+command-status events, which carry no plugin output, still go out, and a dashboard dispatch still resets the Console to
+"Waiting for results..."; the Console's results table therefore stays on that placeholder for such an action,
+so open the execution results instead.) The per-agent `error_detail` of a Forensics-tier command (execution routes,
+`include=agents`) is a short machine token (`scope:cause[:detail]`) or the fixed value
+`forensics_error`; status and exit code are unchanged. The failure notification, the analytics
+event and the webhook and offload payload carry the same reduced text. A response is labelled with the
+plugin the server recorded when it dispatched the command, not with the command id the agent echoes; a
+response with no server record is labelled `~unverified`, which is part of the Forensics set, so it is
+withheld from a caller without `Forensics:Read` like any other Forensics row (see "Provenance" in
+`docs/authz-model.md`).
+
 **Numeric query parameters are parsed strictly (#4644), on these routes AND the legacy
 `GET /api/responses/{id}[/aggregate|/export]` routes.** `status`, `since`, `until`, `limit` (and the
 legacy catch-all route's `offset`) must each be one complete base-10 integer, or the route answers
@@ -6793,7 +7067,12 @@ the query route above. The v1 twin of `GET /api/responses/{id}/aggregate` above,
 `min`/`max` (default `count`); `op_column` (only meaningful for `sum`/`avg`/`min`/`max`) is one of
 `timestamp`/`status`/`id`, defaulting to `id` when omitted. An invalid `group_by`/`op_column` is a
 `400`, validated against `ResponseStore`'s own allow-list before the aggregate query runs — never
-mapped to a `503` (a client typo must not read as store degradation).
+mapped to a `503` (a client typo must not read as store degradation). A `503` (with `retry_after_ms`)
+means the response store is degraded or not initialized, the `response.read` audit row could not persist,
+or the caller's Forensics authority could not be determined (retryable). Rows of Forensics-tier plugins
+are absent from every group and total for a caller without `Forensics:Read`, with no marker, so a small or
+zero total does not prove that no data exists; an aggregate writes no `response.forensics.read` row (see
+"Forensics-tier rows" above).
 
 **Response:**
 
@@ -6861,6 +7140,24 @@ Returns the OpenAPI/Swagger specification for the v1 API as JSON.
 **Permission:** `Infrastructure:Read` (#2057 — was unauthenticated; now matches the MCP `yuzu://openapi` resource twin's gate, `mcp_server.cpp`).
 
 **Response:** OpenAPI 3.x JSON document describing all v1 endpoints, schemas, and authentication methods.
+
+**Query parameter:** `guides` (default off). By default the document leaves out the per-group guides, the `x-yuzu-guide` text on the top-level `tags`, which are written for people reading the `/swagger` page. The parameter turns them on only when its value is exactly `true` or `1`, in lower case; any other value, such as `TRUE` or `yes`, returns the default form. If the parameter is repeated, only the first value is read. The two forms are not the same text with a filter applied: `?guides=true` returns the document exactly as it is written in the server, while the default form is parsed and written out again without the guides, so key order and whitespace can differ although the content is the same apart from the guides. The MCP resource `yuzu://openapi` and the discover tools always serve the default form, so an agentic worker does not read the guide text.
+
+**Caching.** Each form carries its own strong `ETag` (a hash of the bytes served) and `Cache-Control: no-cache, private`, so a client stores the document but asks the server before each reuse, and a shared cache never stores a document that only an authorised caller may read. Send the `ETag` back in `If-None-Match` and a document that has not changed answers `304` with no body, which spares the server re-sending and compressing a large document. The comparison is exact: `If-None-Match` must equal the `ETag` of the form requested, byte for byte. A weak validator (`W/"..."`), a list of validators, `*`, or the `ETag` of the other form is answered with the full document and a `200`, so a proxy that weakens or merges validators costs the saving, not correctness. The permission check runs first, so a caller with no session gets `401`, and a caller without `Infrastructure:Read` gets the `403`, whatever it sends in `If-None-Match`. Building the response is not free: the server compresses the document with brotli for a client that accepts it, once per request that is not answered `304`, and does not cache the compressed bytes (see [Upgrading](upgrading.md)).
+
+**Extensions and identifiers in the document.** Every operation has an `operationId`, unique across the document. It is the lower-case method followed by the path in PascalCase, with each path parameter written as `By` and the parameter name, and the `/api/v1` base left out: `GET /hardware/{id}` is `getHardwareById`, `POST /hardware/{id}/sync` is `postHardwareByIdSync`, and `DELETE /upload-grants/{grant_id}` is `deleteUploadGrantsByGrantId`. An operation that the running server does not serve, because the store behind it is not started, carries an `x-yuzu-unavailable` string explaining that it is documented but not registered; 14 operations carry it today. Group guides live under `x-yuzu-guide` on the top-level `tags`, as described above.
+
+#### `GET /swagger` (dashboard)
+
+A browsable reference for the same document, in the dashboard. It lists every operation grouped by tag, with a search box and filters for method, group and whether the operation declares a typed response schema. Each operation expands to show its description, a `curl` request (with `-g` so the braces of a path parameter are not globbed, and for POST, PUT and PATCH a JSON content type and a placeholder `-d '{}'` body), its parameters, its request body and its responses, with response schemas laid out property by property. A link such as `/swagger#GET%20%2Fhardware` opens one operation directly.
+
+Each group opens with a one-sentence summary and a **Guide** button. The guide says what the group is for, how its data gets there where there is a flow, what it holds, which permissions and audit records apply, and what a caller should watch for, followed by the data model as expandable field tables. Selecting a group in the filter opens its guide, and `/swagger#g-Hardware` links straight to one.
+
+The page loads `/api/v1/openapi.json?guides=true` with your own session, so it shows exactly what that route returns. It takes the same `Infrastructure:Read` gate; an operator without it gets a `403`. An unauthenticated visitor is redirected by the server's pre-routing session check to the sign-in landing page, `/home` (`/swagger` is not a screen the landing page can return to, so the redirect carries no `next` key). It has no sidebar entry, and a successful load writes no audit row. The Developer page links to it for administrators only, but the page is not admin-only: anyone with `Infrastructure:Read` can open `/swagger` by its address, because it shows nothing the same holder cannot already read from `/api/v1/openapi.json`.
+
+**When the page cannot load.** The permission check runs before the page is sent, so an operator without `Infrastructure:Read` never sees the page shell: the browser tab shows the raw `403` JSON error body from the server. Once the page is open, a failed fetch of the document replaces the loading text with a message that names the HTTP status, plus the correlation id when the server sent one (from the error body, or from the `X-Correlation-Id` header when the body is not JSON), and a **Retry** button that fetches again. A `401` adds a note that the session may have ended, and a `403` adds a note naming the `Infrastructure:Read` permission. The fetch is abandoned after 30 seconds and the page then reports that the description took too long to load, again with **Retry**.
+
+Operations the running server does not serve, because the store behind them is not wired in (the License Management, Device Tokens and Software Deployment groups today), are marked **unavailable** and say so at the top of their detail view. Operations whose success response has only a prose description are marked **untyped**.
 
 ---
 
@@ -6972,7 +7269,7 @@ How a client should read `input_schema`:
 
 #### `GET /api/v1/discover/routes`
 
-REST route catalog — a subset of the SAME OpenAPI document `GET /api/v1/openapi.json` serves (they read the identical compiled-in spec, so they cannot disagree), reshaped to `{method, path, summary, tags, description}` rows.
+REST route catalog — a subset of the SAME OpenAPI document `GET /api/v1/openapi.json` serves (they read the identical compiled-in spec, so they cannot disagree), reshaped to `{method, path, summary, tags, description}` rows. An operation that is documented but not registered on a running server (see the `x-yuzu-unavailable` extension under `GET /api/v1/openapi.json`) also carries an `unavailable` string with the same text; the field is absent on every other row. Do not call a row that has it.
 
 **Permission:** `Infrastructure:Read`
 
@@ -7113,8 +7410,8 @@ Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` con
 
 Settings > Developer and API (`GET /settings/developer`, administrators only; others are redirected to the dashboard) is a front for the discovery routes above, plus a load generator control. It adds no REST route and no MCP tool: its four read panels are `GET /fragments/settings/developer/api`, `.../routes`, `.../permissions` and `.../plugins` (plus `.../plugins/observed`, loaded on request), which call the same builders in process. Every fragment is administrators only, like the page, and then takes the same `Infrastructure:Read` gate as the REST twins. The role grid in the permissions panel needs `UserManagement:Read` and is otherwise replaced by a note; that check is a draw-time decision and writes no denial row for a dashboard session (a token caller keeps its denial row).
 
-- **API:** the OpenAPI document link and a live count of documented operations. The count is path x method pairs in the hand-maintained OpenAPI document, not the number of registered routes.
-- **Routes:** the `/discover/routes` catalogue with a path/summary filter, capped at 300 rows. A route's free-text `description` is not shown.
+- **API:** the OpenAPI document link, an **Open API reference** button that opens the `/swagger` page in a new tab, and a live count of documented operations. The count is path x method pairs in the hand-maintained OpenAPI document, not the number of registered routes, so it includes the operations marked unavailable.
+- **Routes:** the `/discover/routes` catalogue with a path/summary filter, capped at 300 rows. A route's free-text `description` is not shown. An operation the document lists but this build does not serve (the `unavailable` field of the catalogue) keeps its row and carries an **unavailable** marker with the reason, so it is not mistaken for a callable route.
 - **Permissions:** each `Securable:Operation` pair with the roles that allow it. The role grid needs `UserManagement:Read`, as on `/discover/permissions`; without it the page says so instead of listing nothing.
 - **Plugins:** the build-embedded manifests with per-OS support. The list of plugins connected devices currently report is a separate, on-request list: no connected device is not the same as no plugins.
 
@@ -7125,6 +7422,8 @@ The process data fetch control is not part of this page.
 ### Inventory
 
 Inventory data is structured per-plugin telemetry collected from agents and stored server-side. The generic store (`InventoryStore`, ADR-0037) is Postgres-backed with an AUTHORITATIVE read posture — a store/pool/query degrade returns **503**, never a silent empty result.
+
+The generic store never returns the typed daily-sync sources (`installed_software`, `app_perf`, `device_ci`, `software_licensing`, `app_usage` and the reserved `certificate_inventory`; ADR-0070 D12). They are absent from the table list and from query results, and a `GET` of one for an agent is **404**, as for any source the agent has not reported. Each has its own typed route and gate, for example the software inventory and app-usage routes; `certificate_inventory` is reserved, and its route arrives with its store.
 
 #### `GET /api/v1/inventory/tables`
 
@@ -7274,6 +7573,7 @@ re-eval, unchanged.
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` with `"kind":"tar_rows_ge"` whose `n` is present but not a JSON integer from `1` to `2147483647` (a wrong type or a wrapped value used to throw in the maintenance tick, which re-threw every 2 seconds and starved the result-set GC; an `n` or `kind` already stored that is malformed, or an `n` below 1, now matches no device). A `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too, and so is a column matcher (no `kind`) whose `column`, `op` or `value` is present but not a string or whose `value_set` is present but not an array (`{"column":5,"op":"eq"}` used to qualify every responder; a stored one now matches no device, while a MISSING key keeps the accept-all default so a typo cannot silently empty the set); it used to be dropped, which meant every responder qualified (omit `matcher` for that default). Nothing is dispatched (#4644) |
+| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` that carries `declared_columns`, `plugin` or `row_discriminator`. These three keys are server-authored: when the matcher's `column` is a column the instruction definition declares in its `result_schema`, the server stores them (`declared_columns` = field names in output order, `plugin` = the definition's plugin) so a column matcher works on any plugin's pipe-row output, not only TAR or JSON. The header row and short status rows (`status\|not_found`, `not_available\|<reason>`) are skipped. A column the definition does not declare stores nothing extra |
 | 400 | `sql`/`instruction_id`/`name` present but not a JSON string (a clean 400 rather than an uncaught exception, #4406); `name` over 256 bytes on `from-tar-query` or `from-instruction-result` |
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
 | 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
@@ -7643,7 +7943,7 @@ A parameter repeated with differing values, an unknown `family`, a value that is
 | 400 | Parameter repeated with differing values, malformed parameter, unknown `family`, invalid UTF-8, over-long value |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | `crypto library read degraded` (the inventory read failed or ran past its 5 s bound) or `crypto read capacity in use; retry` (the server bounds concurrent reads per process): `retry_after_ms: 5000` either way; **never an empty 200**. An absent inventory store or an unwired gate (server misconfiguration) is a `503` without `retry_after_ms` |
+| 503 | `crypto library read degraded` (the inventory read failed or ran past its 5 s bound) or `crypto read capacity in use; retry` (the server bounds concurrent reads per process): `retry_after_ms: 5000` either way; **never an empty 200**. An absent inventory store or an unwired gate (server misconfiguration) is a `503` without `retry_after_ms`. A server whose Postgres pool is smaller than 2 connections refuses these reads with a `503` and **no** `retry_after_ms` (`crypto library reads (and the CBOM export) refused: the server's Postgres pool is smaller than 2 connections; restart the server with --postgres-pool-size 2 or more`): a retry fails the same way until that restart. |
 
 #### `GET /api/v1/crypto/libraries/devices`
 
@@ -7693,7 +7993,7 @@ The devices (and matching package rows) behind one family, optionally one versio
 | 400 | `family` missing or unknown, parameter repeated with differing values, malformed parameter, invalid `limit`, over-long or non-UTF-8 value, or a refused cursor (including one from another `table_version`, or a cursor issued on live names when the catalogue is now in use) |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms` |
+| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms`. A server whose Postgres pool is smaller than 2 connections refuses these reads with a `503` and **no** `retry_after_ms` (`crypto library reads (and the CBOM export) refused: the server's Postgres pool is smaller than 2 connections; restart the server with --postgres-pool-size 2 or more`): a retry fails the same way until that restart. |
 
 #### `GET /api/v1/crypto/cbom`
 
@@ -7748,7 +8048,138 @@ A CycloneDX **1.7** inventory of the cryptographic *library* packages installed 
 | 400 | Repeated parameter with differing values, unknown `family`, invalid UTF-8 or over-long value |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty BOM**. An absent store, an unwired gate or a failure minting the serial number is a `503` too; the serial is minted before the inventory read, so that last failure takes no read slot and writes no audit row |
+| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty BOM**. An absent store, an unwired gate or a failure minting the serial number is a `503` too; the serial is minted before the inventory read, so that last failure takes no read slot and writes no audit row. A server whose Postgres pool is smaller than 2 connections refuses these reads with a `503` and **no** `retry_after_ms` (`crypto library reads (and the CBOM export) refused: the server's Postgres pool is smaller than 2 connections; restart the server with --postgres-pool-size 2 or more`): a retry fails the same way until that restart. |
+
+#### Dashboard widgets (ADR-0070 D13)
+
+The `/crypto` page is a per-operator widget dashboard (see [crypto.md](crypto.md#the-dashboard)). These routes serve the widget catalogue, the caller's own layout and the Yuzu-issued certificate counts; MCP twins `list_crypto_widgets`, `get_crypto_dashboard_layout`, `set_crypto_dashboard_layout` and `get_crypto_ca_stats`. The certificates behind a count are served by the filtered [`GET /api/v1/ca/issued`](#get-apiv1caissued) (MCP `list_issued_certs`). Every route answers `Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token`. The Yuzu-issued figures read **Yuzu's own internal CA** only, never certificates found on fleet devices (ADR-0070 D6). Facts only: the only built-in checks are the D13 named windows, each returned with its criterion and computed at read time against `as_of`, the database clock (ADR-0070 R4, R5), over the closed window set `crypto_widget_windows_v1` (active; expiring 3/7/14/21/30/60 days; expired 7/30/60/90; revoked 7/30/60/90 in three reason buckets; issued 7; 52 ISO weeks, the current partial week included); nothing grades a certificate.
+
+##### `GET /api/v1/crypto/widgets`
+
+The widget catalogue. Authentication only; not audited. `data`: `window_set`, `default_layout` (ids), `max_layout_widgets` (64), `scope_note` and `widgets[]` with `id`, `title`, `kind` (`number`, `bar`, `line`, `table`), `group`, `gate` (`fleet_read`: library widgets, answered over the caller's scope; `fleet_wide_only`: Yuzu-issued counts, withheld from a confined caller), `securable`, `operation` (`Inventory`/`Read` for every widget), `criterion` (what the widget counts, in words), `drill`, `available` and `availability` (`available`, `not_available`, `confined` or `access_check_unavailable`) and, for Yuzu-issued widgets, `ca_kind`, `days`, `drill_securable`/`drill_operation` (`Security`/`Read`) and `drill_available`. `available` and `drill_available` decide what to draw only: they come from the same non-auditing check the data routes would apply, and grant nothing. Errors: `401`, `503` (server misconfiguration).
+
+##### `GET /api/v1/crypto/dashboard/layout`
+
+The caller's OWN layout, keyed by the session user name (never another operator's). Authentication only; not audited. A service-scoped API token is refused `403` (`service-scoped tokens may not read or change a dashboard layout`, no `permission` field; audited `crypto.dashboard.layout.access_denied`), and an MCP-tier token is held to its tier's `Infrastructure:Read`. `data`: `widgets` (catalogue ids this server knows, in display order), `is_default` (`true` when the widgets are the default and no other-version ids are kept), `version` (the stored version, `0` when nothing is stored), `preserved_unknown` (stored ids this server version does not know: kept on every save, not listed) and `max_layout_widgets`.
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" https://yuzu.example.com/api/v1/crypto/dashboard/layout
+```
+
+```json
+{
+  "data": {
+    "widgets": ["lib.devices_reporting", "ca.active", "ca.expiring_30d"],
+    "is_default": false,
+    "version": 7,
+    "preserved_unknown": 0,
+    "max_layout_widgets": 64
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+Errors: `401`, `403`, `422` (the stored layout is damaged: not retryable, the `X-Crypto-Layout-Version` header carries its version; a `PUT` with `expected_version` set to that version replaces it), `503` + `retry_after_ms: 5000` (`dashboard layout read degraded`; never the default served in its place), and `503` without `retry_after_ms` when the layout store did not open at server start (`dashboard layouts unavailable: the layout store did not open at server start; saved layouts return after a restart with the store fixed`).
+
+##### `PUT /api/v1/crypto/dashboard/layout`
+
+Replace the caller's own layout. Body: `widgets` (at most 64 catalogue ids, no repeats; an empty list is valid) and optional `expected_version` (an integer, `0` or more); no other key. With `expected_version` the save is refused `409` unless the stored version is still that value (`0` = only if nothing is stored). Omit it only for a first save: without it the save succeeds only when nothing is stored, and over a stored layout (a damaged one included) it is the same `409` with `X-Crypto-Layout-Version` carrying the stored version. Ids stored by another server version are kept after yours (see `preserved_unknown`). Same caller rules as the GET (service-scoped token `403`, audited as a `crypto.dashboard.layout.update` `denied` row; MCP-tier token held to `Infrastructure:Write`). A cookie-authenticated browser write must name this site (`Origin`/`Referer`), else `403` and a `csrf.denied` row. Audited `crypto.dashboard.layout.update`: an `attempted` row first (if it cannot be written the layout is not changed: `503`, `Sec-Audit-Failed: true`), then `success` or `failure`.
+
+```bash
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"widgets":["lib.devices_reporting","ca.active","ca.expiring_30d"],"expected_version":7}' \
+  https://yuzu.example.com/api/v1/crypto/dashboard/layout
+```
+
+```json
+{
+  "data": {
+    "widgets": ["lib.devices_reporting", "ca.active", "ca.expiring_30d"],
+    "is_default": false,
+    "version": 8,
+    "preserved_unknown": 0,
+    "max_layout_widgets": 64
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`data` carries `audit_persisted: false` (and the response `Sec-Audit-Failed: true`) when the outcome row could not be written. The body cap is 16 KiB, enforced before the body is read; an over-cap body is refused with the pre-auth cap's `413` envelope:
+
+```json
+{
+  "error": {
+    "code": 413,
+    "message": "request body exceeds this route's size cap",
+    "correlation_id": "req-18f2a1c3d-2a",
+    "retry_after_ms": null,
+    "remediation": "reduce the request body size; see docs/user-manual/rest-api.md for the per-route limit"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+| Status | Condition |
+|---|---|
+| 400 | Malformed body, unknown or repeated id, too many ids, a bad `expected_version`, or another key (the message names the position, never the value) |
+| 401 | Unauthenticated |
+| 403 | Service-scoped token, MCP tier below `Infrastructure:Write`, or a cross-site cookie write |
+| 409 | `expected_version` is stale, or omitted while a layout is stored (`the layout changed since it was loaded (another tab or client saved first); reload it and save again`). `X-Crypto-Layout-Version` carries the stored version (`0` when another save landed during this one). Not retryable as sent: read the layout again, then save |
+| 413 | Body over 16 KiB |
+| 503 | `retry_after_ms: 5000`: `dashboard layout save failed` (store degraded), or `save outcome unknown — reload to check` (the connection dropped after the save was sent; the `failure` audit row says `outcome=unknown`; read the layout to see what was stored). Without `retry_after_ms`: the layout store did not open at server start, or the audit `attempted` row could not be written |
+
+##### `GET /api/v1/crypto/ca/stats`
+
+Every Yuzu-issued count against one `as_of`. **Permission:** `Inventory:Read`, and only for an unconfined view of the fleet (ADR-0070 R2): a management-group-confined caller (or one whose service-scoped token confines it) is refused `403` with `Yuzu-issued certificate figures are not available to this account: its view of the fleet is confined, and these are fleet-wide figures.` and no `permission` field (no grant would admit it), audited as a `crypto.ca.stats.view` `denied` row. Every call reads at request time (never cached), bounded by the `/crypto` read admission limit (see [crypto.md](crypto.md#yuzu-issued-certificates)). Audited `crypto.ca.stats.view` on every call (set-and-proceed: `audit_persisted: false` + `Sec-Audit-Failed: true` when the row is lost).
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" https://yuzu.example.com/api/v1/crypto/ca/stats
+```
+
+Response (trimmed: one entry of each array shown):
+
+```json
+{
+  "data": {
+    "scope": "yuzu_issued",
+    "scope_note": "Counts certificates Yuzu's own CA issued only (agent, server, gateway, HTTPS and code-signing); certificates on your devices are not covered.",
+    "window_edge_note": "as_of is the database clock; issued and revoked times are recorded from the issuing server's clock, so a window edge is accurate only to the servers' clock synchronisation.",
+    "rule_set_version": "crypto_widget_windows_v1",
+    "as_of": 1792396800,
+    "as_of_iso": "2026-10-19T08:00:00Z",
+    "active": {"rule_id": "yuzu_ca_active", "criterion": "Status active, issued on or before as_of, notAfter on or after as_of (valid through notAfter, inclusive)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 412},
+    "expiring_within_days": [
+      {"rule_id": "yuzu_ca_expiring", "criterion": "Status active, notAfter from as_of through as_of + 30 days (valid through notAfter, inclusive)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 9, "threshold": 30}
+    ],
+    "expired_within_days": [
+      {"rule_id": "yuzu_ca_expired", "criterion": "Status active, notAfter from as_of - 7 days up to, not including, as_of", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 0, "threshold": 7}
+    ],
+    "revoked_within_days": [
+      {"rule_id": "yuzu_ca_revoked_superseded", "criterion": "Revoked after as_of - 30 days and on or before as_of, reason recorded as superseded (replaced by a same-key successor)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 31, "threshold": 30, "bucket": "superseded"}
+    ],
+    "issued_within_days": {"rule_id": "yuzu_ca_issued", "criterion": "Issued after as_of - 7 days and on or before as_of, excluding unpublished (recorded, never delivered)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 14, "threshold": 7},
+    "week_basis": "last 52 ISO weeks (UTC, Monday start); the current week is partial",
+    "weeks": [
+      {"week": "2026-W43", "week_start": 1792368000, "partial": true,
+       "issued": {"rule_id": "yuzu_ca_issued_week", "criterion": "Issued in ISO week 2026-W43 (Monday 00:00 UTC start) up to as_of, excluding unpublished (recorded, never delivered)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 3, "week": "2026-W43"},
+       "revoked": [
+         {"rule_id": "yuzu_ca_revoked_week_superseded", "criterion": "Revoked in ISO week 2026-W43 (Monday 00:00 UTC start) up to as_of, reason recorded as superseded (replaced by a same-key successor)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 2, "week": "2026-W43", "bucket": "superseded"}
+       ]}
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+- Every count object carries `rule_id`, `criterion`, `rule_set_version`, `as_of` and `count`, plus `threshold` (windowed counts: the window length in days, the ADR-0070 D10 condition-1 field), `week` (per-week counts) and `bucket` (revoked counts). These are counts of certificates, never labels.
+- `expiring_within_days` has one entry per window (3, 7, 14, 21, 30, 60), `expired_within_days` one per window (7, 30, 60, 90). `revoked_within_days` has three entries per window, one per bucket: `superseded`, `unpublished`, `other` (any other recorded reason, including an operator-typed reason stored as `operator-supplied: <text>`). They are never summed.
+- Expiring and expired cover status `active` only; a revoked certificate counts only in the revoked windows (R11). Issued excludes `unpublished` certificates (never delivered).
+- `weeks` has 52 entries, oldest first, zero-filled, ending with the week containing `as_of`, which has `partial: true`. `week_start` is that ISO week's Monday 00:00 UTC.
+- Recompute any count with `Security:Read` from the [filtered `GET /api/v1/ca/issued`](#get-apiv1caissued) with the count's `kind`, `days`/`week`, `bucket` and `as_of`.
+
+Errors: `401`, `403` (no `Inventory:Read`, written by the gate, or a confined caller, above), `503` + `retry_after_ms: 5000` (`Yuzu CA read degraded` or `crypto read capacity in use; retry`; never zeros), and `503` with **no** `retry_after_ms` when the server's Postgres pool is smaller than 4 connections (`Yuzu-issued certificate reads refused: ... restart the server with --postgres-pool-size 4 or more`; a retry fails the same way until that restart). The filtered `GET /api/v1/ca/issued` answers the same refusal the same way.
+
+The `/fragments/crypto/dashboard`, `/fragments/crypto/widget/{id}` and `/fragments/crypto/ca/certificates` fragments render the same data for the page (always HTTP 200, a note on refusal and a banner on degrade) and write the same audit verbs; for a service-scoped token, or an MCP token whose tier refuses the layout read, `/fragments/crypto/dashboard` draws the default layout read-only and never reads the minting operator's saved layout (the layout routes refuse the same tokens); the dashboard fragment writes one row per source per draw (see [crypto.md](crypto.md#audit)). `/fragments/crypto/ca/certificates` is the page's twin of the filtered `GET /api/v1/ca/issued` and needs `Security:Read`.
 
 ---
 
@@ -7947,7 +8378,7 @@ Pin (exempt from TTL expiry) or unpin a result set.
 
 ### Forensics
 
-The **per-agent app-usage** discovery surface (Wave 7 PR7.2, ADR-0016 §5). Data is derived on the agent from TAR's `usage_daily` fold via the read-only `app_usage` plugin and synced daily into `AppUsageStore`, projecting each executable's retained-window first/last-seen plus a trailing-30-day run-count/total-seconds window. `Forensics` is **Administrator-only by design** — deliberately absent from the seeded Viewer read-list.
+The **per-agent app-usage** discovery surface (Wave 7 PR7.2, ADR-0016 §5). Data is derived on the agent from TAR's `usage_daily` fold via the read-only `app_usage` plugin and synced daily into `AppUsageStore`, projecting each executable's retained-window first/last-seen plus a trailing-30-day run-count/total-seconds window. `Forensics` is **held by default only by Administrator and the read-only `ForensicsAnalyst` role** — deliberately absent from the seeded Viewer read-list.
 
 #### `GET /api/v1/forensics/agents/{agent_id}/app-usage`
 
@@ -7982,7 +8413,7 @@ One device's per-executable last-used projection — the per-agent drill. Becaus
 | 503 + `Sec-Audit-Failed` | The per-open audit row could not persist — fail-closed, no data served |
 | 503 | Store unavailable or degraded (A4 envelope with `correlation_id`, `retry_after_ms: 5000`) — **never an empty 200** |
 
-Decommissioning the agent erases this store's rows too — see [Software Licensing (SLE)](#software-licensing-sle)'s `DELETE /api/v1/sle/agents/{agent_id}` (the seven-store cascade).
+Decommissioning the agent erases this store's rows too — see [Software Licensing (SLE)](#software-licensing-sle)'s `DELETE /api/v1/sle/agents/{agent_id}` (the eight-store cascade).
 
 ---
 
@@ -8031,7 +8462,7 @@ A genuinely licence-free (or unknown) device is `200` with `count: 0`; a `503` m
 
 #### `DELETE /api/v1/sle/agents/{agent_id}`
 
-**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **the seven stores in the cascade** (generic inventory, installed-software, device-CI, app-perf, detected-licence, app-usage, and the `endpoint_state` presence row that holds the device's last-known hostname, OS, agent version and architecture), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired whole-device erasure path for those seven stores (GDPR Art. 17); per-agent stores outside the cascade are not erased by it, and row-level / per-subject DSAR erasure is a stated gap (#1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
+**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **the eight stores in the cascade** (generic inventory, installed-software, device-CI, app-perf, detected-licence, app-usage, the `endpoint_state` presence row that holds the device's last-known hostname, OS, agent version and architecture, and the fleet certificate inventory), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired whole-device erasure path for those eight stores (GDPR Art. 17); per-agent stores outside the cascade are not erased by it, and row-level / per-subject DSAR erasure is a stated gap (#1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
 
 **Permission:** a single **per-device-scoped `Decommission:Delete`** securable (ADR-0024 Decision 9, amended Wave 7 PR7.2) — one grant authorizing for the cascade's whole blast radius, replacing the earlier per-store conjunction. A role lacking it is `403`'d, naming `Decommission:Delete` (the seeded Administrator/ITServiceOwner roles hold it by default; a custom role that had assembled the old per-store `Delete` grants must be granted this securable too — the three old grants no longer suffice).
 
@@ -8047,8 +8478,9 @@ Two durable audit events: `sle.agent.decommission|attempt` is written **before**
     "stores": {"inventory": "deleted", "software_inventory": "deleted",
                "app_perf_daily": "deleted", "device_inventory": "skipped",
                "software_licensing": "deleted", "app_usage": "deleted",
-               "offline_endpoint": "deleted"},
-    "deleted": 6,
+               "offline_endpoint": "deleted",
+               "certificate_inventory": "deleted"},
+    "deleted": 7,
     "skipped": 1,
     "failed": 0
   },
@@ -8068,9 +8500,9 @@ Per-store outcomes: `deleted` (the DELETE **committed**), `skipped` (store not c
 | 503 + `Sec-Audit-Failed` | The attempt audit row could not persist — fail-closed, **nothing was erased** |
 | 503 | Scope gate or cascade not configured (A4 envelope) |
 
-A `200` with `decommissioned: true` is confirmed erasure for the stores in the cascade of the replica that answered (a store reported `skipped` was not erased); deleting an unknown `agent_id` is a no-op `200` (nothing to erase). The `deleted` count reaches 7 (it reached 6 before the `offline_endpoint` store joined the cascade) when every store is configured. During a rolling upgrade, a DELETE served by a replica that has not been upgraded runs the old cascade and returns `200` without erasing the presence row: a response whose `stores` map has no `offline_endpoint` key did not erase it, and the `sle.agent.decommission` success audit row that replica writes lists its own stores (no `offline_endpoint`), so it is not evidence that the presence row was erased. Re-issue the DELETE once every replica runs this version.
+A `200` with `decommissioned: true` is confirmed erasure for the stores in the cascade of the replica that answered (a store reported `skipped` was not erased); deleting an unknown `agent_id` is a no-op `200` (nothing to erase). The `deleted` count reaches 8 (7 before the certificate inventory store joined the cascade, 6 before `offline_endpoint`) when every store is configured. During a rolling upgrade, a DELETE served by a replica that has not been upgraded runs the old cascade and returns `200` without erasing the presence row: a response whose `stores` map has no `offline_endpoint` key did not erase it, and the `sle.agent.decommission` success audit row that replica writes lists its own stores (no `offline_endpoint`), so it is not evidence that the presence row was erased. Re-issue the DELETE once every replica runs this version. The same applies to the eighth store: a DELETE served by a replica older than the certificate inventory store returns `200` without a `certificate_inventory` key in `stores`, and did not erase the device's certificate rows (those exist only once a certificate-collecting agent reports, so the window is empty until then). Re-issue it after the rollout.
 
-Erasure does not unenroll the agent: a still-enrolled device re-syncs on its next daily cycle and re-creates its `offline_endpoint` presence row on its next heartbeat. Erasure is therefore point-in-time; an `offline_endpoint=deleted` entry in the success audit row's store breakdown proves the row was deleted at commit, not that it stayed deleted. Stop or uninstall the agent first: revoking its certificate does not cut off an agent connected through a gateway (#5578), which must be disconnected at the gateway layer as well (see Device Management: [Per-agent mTLS auto-provisioning](device-management.md#per-agent-mtls-auto-provisioning-pki)). If you also revoke its certificate, look up the serial with `GET /api/v1/ca/issued` (needs `Security:Read`), call `POST /api/v1/ca/revoke` (`Security:Delete`), and wait about 15 s for the next revocation sweep to drop a directly connected agent's stream before you issue the DELETE. Revocation cannot be undone through the API: the server refuses to issue a new certificate for that agent id while the revoked certificate is unexpired (audit `ca.cert.reissue_blocked`), so do not revoke a device you intend to re-enrol.
+Erasure does not unenroll the agent: a still-enrolled device re-syncs on its next daily cycle and re-creates its `offline_endpoint` presence row on its next heartbeat. Erasure is therefore point-in-time; an `offline_endpoint=deleted` entry in the success audit row's store breakdown proves the row was deleted at commit, not that it stayed deleted. Stop or uninstall the agent first: revoking its certificate does not cut off an agent connected through a gateway (#5578), which must be disconnected at the gateway layer as well (see Device Management: [Per-agent mTLS auto-provisioning](device-management.md#per-agent-mtls-auto-provisioning-pki)). If you also revoke its certificate, look up the serial with `GET /api/v1/ca/issued` (needs `Security:Read` and an unconfined view; a management-group-confined account is refused), call `POST /api/v1/ca/revoke` (`Security:Delete`), and wait about 15 s for the next revocation sweep to drop a directly connected agent's stream before you issue the DELETE. Revocation cannot be undone through the API: the server refuses to issue a new certificate for that agent id while the revoked certificate is unexpired (audit `ca.cert.reissue_blocked`), so do not revoke a device you intend to re-enrol.
 
 To confirm the erasure, wait at least one heartbeat interval (30 s) with the agent stopped and then read `/hardware`; a still-running agent re-creates the row on its next heartbeat, in which case re-issue the DELETE (it is idempotent). `/hardware` reads the table directly (no cache), but it lists only rows seen in the last 30 days (for a device last seen more than 30 days ago `/hardware` cannot confirm erasure, because the row is hidden both before and after the DELETE, so the response's `offline_endpoint: "deleted"` entry is the only confirmation) and needs fleet-scoped `Inventory:Read`; a management-group-confined operator cannot tell "erased" from "out of scope", so confirm with a fleet-scoped reader. Each replica also keeps a liveness cache of about 3 s (used for scope evaluation and dispatch targeting, not by `/hardware`) that the decommission does not invalidate on any replica, including the one that served the DELETE, so the device may still count as present in scope evaluation for up to about 3 s. The `endpoint_state` row holds a hostname, which can identify a person on a personally-assigned device, so treat its erasure as personal-data erasure.
 
@@ -8331,7 +8763,7 @@ Steps are returned in **request order** (not arrival order), so duplicate or sam
 | `404` | Bundle not found, **or** the caller did not dispatch it and is not an admin. The two are deliberately indistinguishable (no enumeration oracle); the real reason is recorded in the audit log. |
 | `503` | The bundle manifest WAS found and owned, but the response store could not be read (transient Postgres degrade) — distinct from a 404, and retryable: `retry_after_ms:5000` in the A4 body. Poll again after the hint rather than treating this as terminal. |
 
-**Audit:** `bundle.collate` (`target_type=Execution`, `target_id=<id>`), `result=success` (carrying `complete=0|1`), `result=denied` (not found / not owned), or `result=failure` (response store degraded, the 503 case above).
+**Audit:** `bundle.collate` (`target_type=Execution`, `target_id=<id>`), `result=success` (carrying `complete=0|1`), `result=denied` (not found / not owned), or `result=failure` (response store degraded, the 503 case above). When the collation serves the output of a Forensics-tier step (a step of a plugin on the `Forensics` securable that has responded), it also writes `response.forensics.read` (`target_type=Execution`, `target_id=<id>`, detail `forensics_rows=<n> plugins=<names> surface=bundle`); it fails closed like the other REST reads: if that row cannot persist the response is `503` with `Sec-Audit-Failed: true` and no result is returned, and a later poll writes the row again. A bundle with no served Forensics-tier step writes no such row.
 
 **Notes:**
 
@@ -8341,6 +8773,7 @@ Steps are returned in **request order** (not arrival order), so duplicate or sam
 **Error handling and retry (for integrators):**
 
 - **Poll cadence:** poll `GET /api/v1/bundles/{id}` with a short backoff (e.g. 1s, 2s, 4s) until `complete` is `true`, then read `succeeded`/`steps`.
+- **A bundle with a Forensics-tier step may never complete for a caller who cannot read it.** For a caller without a global `Forensics:Read` that step stays `pending` with an empty output and carries no marker, so the bundle stays `complete=false` for that caller (an approval ticket to dispatch the step does not imply the right to read its output). The REST result carries no `retry_after_ms`; the MCP `get_bundle_result` twin does keep advertising one while the bundle is incomplete. Because each collate refreshes the manifest window (next bullet), a poller that never stops keeps the manifest alive, so bound the polling with a deadline of your own.
 - **Manifest TTL ≈ 10 minutes, sliding.** Each successful collate refreshes the window, so a bundle you are actively polling never expires; only an abandoned bundle (no poll for the full window) is swept.
 - **A 404 on a poll that previously returned 200** means the manifest expired (you stopped polling past the TTL) **or** the server restarted (in-memory state lost). The correct recovery is to **re-dispatch the bundle** — the already-executed step responses are harmless (idempotent reads). Do not treat the 404 as a hard failure.
 
@@ -9080,6 +9513,8 @@ To suppress process-level visibility for specific agents (privacy-sensitive host
 
 These overlays are in addition to the standard browser console entry. Previous releases (PR 5 and earlier) left the scene blank on every error condition.
 
+The `413` overlay text names a `--viz-machines-max` flag and a management group, but neither is a remedy: no such flag exists, and `machines_max` is a query parameter on the REST route (default `5000`, ceiling `100000`, see below) that the page does not send. The topology call is gated by a global `Response:Read` check and is not narrowed by management group, so scoping the request that way does not shrink the snapshot. To read a fleet above the default cap, call the REST route directly with a larger `machines_max`.
+
 #### `GET /api/v1/viz/fleet/topology`
 
 Returns the full topology as JSON.
@@ -9280,6 +9715,8 @@ Get an aggregated view of fleet execution statistics.
   "meta": { "api_version": "v1" }
 }
 ```
+
+A failed read of the execution store answers `503` with `retry_after_ms: 2000`, never a zeroed summary (see [Execution Statistics](#execution-statistics)).
 
 ---
 
@@ -9501,15 +9938,18 @@ and `Pragma: no-cache`.
 
 List upload grants. **Permission:** `UploadGrant:Read`, routed through
 `RbacStore::authorize_list_read` (admit-then-filter — never a bare global
-permission check). A service-scoped API token is refused `403` before any grant is
+permission check for a human caller). A service-scoped API token is refused `403` before any grant is
 read (`service-scoped tokens may not list upload grants`, no `permission` field, audit
 `upload_grant.list.access_denied`), whoever minted it; list with a non-service token.
+An engine principal is admitted only when RBAC is enabled and it holds an explicit `UploadGrant:Read` grant: with RBAC off, or
+with RBAC on and no grant, it gets `403` (`503` when the RBAC store is unavailable), the same answer as
+the MCP `list_upload_grants` tool. The engine denial is audited as `auth.permission_required`.
 
 #### `DELETE /api/v1/upload-grants/{grant_id}`
 
 Revoke a grant before it is redeemed. **Permission:** `UploadGrant:Delete`.
 Returns `204` on success, `404` if the grant does not exist or is no longer
-revocable (already redeemed, expired, or already revoked).
+revocable (already redeemed or already revoked). An expired grant that was never redeemed is still revocable, so it can be revoked to clear it.
 
 The agent then redeems the grant and streams the file over the agent-facing
 upload session routes (`/api/v1/uploads*`), documented under [Uploads](#uploads).
@@ -9744,13 +10184,13 @@ Per-device all-guards view (#4037, api-parity #2146 Batch A) — every guard's s
 Queue a push of the active rule set to scoped agents. Returns `202 Accepted` — agent delivery is asynchronous. The fan-out is live: the server resolves `scope` to the in-scope agents and delivers each a per-agent filtered rule set (only rules whose `os_target` and `scope_expr` match that agent).
 
 - **Permission:** `GuaranteedState:Push`
-- **Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied` (`target_id` `guaranteed_state_push`), not as `guaranteed_state.push`. API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The check runs after the permission check and MFA step-up and before the body is read.
+- **Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The server-wide same-site check (see Authentication) answers first; this route also keeps its own copy, which is defence in depth.
 - **Request body:**
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `scope` | string | No | Scope DSL selector. Empty = all agents. |
-| `full_sync` | boolean | No | If `true`, agents replace their rule set; otherwise they merge. |
+| `full_sync` | boolean | No | If `true`, agents replace their rule set; otherwise (the default, so a request that omits it) they merge. A merge push does not retry a rule it omits that is still unresolved on the agent (the agent holds its policy generation instead); only a full push, or a push that names the rule, does. See [Guaranteed State](guaranteed-state.md). |
 
 - **Response:** `202` with `data.queued = true`, `data.rules` (server-side rule count), `data.agents` (number of agents the push was dispatched to), `data.scope`.
 - **4xx:** `400` if the JSON body is present but not an object, or if `scope` fails to parse as a Scope DSL expression; `403` `cross-site request refused` for a cross-site or header-less cookie-session call (see above); `403` if a service-scoped API token calls this route — the single most severe instance of this confinement-gap class on this branch, since a `full_sync` push mutates what every OTHER service's agents enforce, not merely reads it. An invalid `scope` is refused with `400` before the fan-out reads the policy generation, the rule list or the deployed set, so it wins over a degraded-store `503` and does not disturb the heartbeat reconcile; a `group:` scope is not parsed here when a management-group store is wired (it names a group, and its members are looked up later).
@@ -9785,8 +10225,8 @@ Read the Guardian policy generation the server holds. It is the value `POST /api
 
 Raise the server's Guardian policy generation to a chosen value. This is the supported recovery for the state in which agents hold a generation above the server's and refuse every full push (see "Restoring the policy generation" in [Guaranteed State](guaranteed-state.md)). The generation is one counter shared by the whole fleet; the call sets it to the target when the target is higher than the stored value and changes nothing otherwise. It never pushes to an agent: the heartbeat reconcile converges every agent that is behind the new value, to the rule set the server holds at that moment, which replaces the rules the agent holds. That is why the request must acknowledge it.
 
-- **Permission:** a durable Administrator, the same dedicated `is_rbac_administrator` check as `PUT /api/v1/rbac/enforcement`, not `GuaranteedState:Push` and not an ordinary permission check. With RBAC enforcement off, the caller's own local account must hold the `admin` role; with it on, the caller must hold a user-principal `Administrator` grant. A JIT elevation or a group-held grant does not satisfy it. After that check the route re-checks the caller's authority under the current RBAC regime, as the RBAC grant routes do (a caller admitted under a stale cached view is refused). MFA step-up applies when the account is enrolled and its proof is stale (`401` with the step-up envelope); a SAML session gets `403` at the step-up gate, an SSO (OIDC) session is judged on the identity provider's MFA assertion and the `--mfa-enforcement` mode instead of a local enrolment, an `api_token` or `mcp_token` bearer session is exempt from step-up (`mfa_step_up.cpp`), the same accepted deviation as the RBAC enforcement toggle, and `--mfa-step-up-window-secs 0` disables the gate. Limit: with `--mfa-enforcement optional` (the default) an administrator who has not enrolled in MFA is not stepped up, and neither is an SSO (OIDC) administrator whose identity provider sent no MFA claim, and any administrator API-token session is exempt, so on this route such administrators are not MFA-gated. **Order of checks:** authentication, session class, durable-Administrator check, current-regime re-check, MFA step-up, same-site `Origin`/`Referer` (cookie sessions), Guardian store availability, body validation, the rule and deployed-Baseline counts and the empty-rule-set check, then the attempted audit row and the raise.
-- **Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers are exempt, so the curl example in "Restoring the policy generation" in [Guaranteed State](guaranteed-state.md), which uses a token, needs no `Origin`. A cookie-session variant of that call sends `-H "Cookie: yuzu_session=$COOKIE" -H "Origin: https://yuzu.example.com"` instead of the `Authorization` header. The check runs after the administrator gate and step-up and before the body is read.
+- **Permission:** a durable Administrator, the same dedicated `is_rbac_administrator` check as `PUT /api/v1/rbac/enforcement`, not `GuaranteedState:Push` and not an ordinary permission check. With RBAC enforcement off, the caller's own local account must hold the `admin` role; with it on, the caller must hold a user-principal `Administrator` grant. A JIT elevation or a group-held grant does not satisfy it. After that check the route re-checks the caller's authority under the current RBAC regime, as the RBAC grant routes do (a caller admitted under a stale cached view is refused). MFA step-up applies when the account is enrolled and its proof is stale (`401` with the step-up envelope); a SAML session gets `403` at the step-up gate, an SSO (OIDC) session is judged on the identity provider's MFA assertion and the `--mfa-enforcement` mode instead of a local enrolment, an `api_token` or `mcp_token` bearer session is exempt from step-up (`mfa_step_up.cpp`), the same accepted deviation as the RBAC enforcement toggle, and `--mfa-step-up-window-secs 0` disables the gate. Limit: with `--mfa-enforcement optional` (the default) an administrator who has not enrolled in MFA is not stepped up, and neither is an SSO (OIDC) administrator whose identity provider sent no MFA claim, and any administrator API-token session is exempt, so on this route such administrators are not MFA-gated. **Order of checks:** authentication, session class, durable-Administrator check, current-regime re-check, MFA step-up, this route's own copy (defence in depth) of the same-site `Origin`/`Referer` check (cookie sessions; the server-wide check has already answered first), Guardian store availability, body validation, the rule and deployed-Baseline counts and the empty-rule-set check, then the attempted audit row and the raise.
+- **Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers are exempt, so the curl example in "Restoring the policy generation" in [Guaranteed State](guaranteed-state.md), which uses a token, needs no `Origin`. A cookie-session variant of that call sends `-H "Cookie: yuzu_session=$COOKIE" -H "Origin: https://yuzu.example.com"` instead of the `Authorization` header. The server-wide same-site check (see Authentication) answers first; this route also keeps its own copy, which is defence in depth.
 - **Request body:**
 
 | Field | Type | Required | Description |
@@ -9812,9 +10252,9 @@ Raise the server's Guardian policy generation to a chosen value. This is the sup
 ```
 
 `previous_generation` and `generation` are the stored value immediately before and after the call. `rules` is the number of rules in the rule store, read just before the raise; it is not the number of guards agents will receive, because agents converge only to enabled rules that are members of deployed Baselines. `deployed_baselines` is the number of deployed Baselines, read at the same point (a `deployed_baselines` of `0` means a `full_sync` converges agents to zero guards, which is why the call needs `acknowledge_empty_rule_set` in that case). `ceiling` is the largest accepted target. The call is atomic and idempotent: a target at or below the current value returns `raised: false` and changes nothing, so a retry is safe.
-- **4xx:** `400` for a body that is not valid JSON or not a JSON object, a `target_generation` that is missing, not an integer or outside `1` to `9007199254740991`, an `acknowledge_rule_set_replaced` that is not `true`, or an empty rule set (no rules, or no deployed Baseline) without `acknowledge_empty_rule_set: true`; `401` when MFA step-up is not satisfied (see above); `403` for a caller who is not a durable Administrator (including one the current-regime re-check refuses), a service-scoped API token, an engine session, a bearer token that carries an MCP tier (denied before the administrator check, because REST has no approval ticket flow to legitimise a tiered token), a SAML session at the step-up gate, or a cross-site cookie-session call (`cross-site request refused`).
+- **4xx:** `400` for a body that is not valid JSON or not a JSON object, a `target_generation` that is missing, not an integer or outside `1` to `9007199254740991`, an `acknowledge_rule_set_replaced` that is not `true`, or an empty rule set (no rules, or no deployed Baseline) without `acknowledge_empty_rule_set: true`; `401` when MFA step-up is not satisfied (see above); `403` for a caller who is not a durable Administrator (including one the current-regime re-check refuses), a service-scoped API token, an engine session (refused by the central step-up check), a bearer token that carries an MCP tier (denied before the administrator check, because REST has no approval ticket flow to legitimise a tiered token), a SAML session at the step-up gate, or a cross-site cookie-session call (`cross-site request refused`).
 - **5xx:** `503` (A4 envelope, `retry_after_ms: 5000`) when the RBAC store is not open or the administrator or current-regime check cannot be answered, when a Guardian store is not open, when the rule count or the deployed-Baseline count cannot be read (nothing is changed; audited `denied`), or when the store fails during the raise (audited `failure`). That last case is UNCONFIRMED: a lost commit acknowledgement can hide a change that did commit, so the response says the outcome is unconfirmed. Repeating the request is the verification and is safe because it is idempotent: a repeat of a raise that took effect returns `200` with `raised: false`, so success on a repeat looks like a no-op. `503` with `Sec-Audit-Failed: true` and the message "audit log unavailable; the change was not made" when the `attempted` audit row cannot be written: the counter is not touched. If the raise itself succeeded but its outcome row could not be persisted, the response is also `503` with `Sec-Audit-Failed: true`, saying the audit record was not persisted, and the counter may already have moved; repeat the request, which is idempotent, to obtain a reply that carries the outcome.
-- **Audit:** `guaranteed_state.policy_generation.raise`, `target_type=GuaranteedState`, `target_id=policy_generation` on every row of this verb, including the denials of a service-scoped token, an engine session and an MCP-tier token. An `attempted` row (`detail` `target=<N>; rules=<X>; deployed_baselines=<Y>`) is written first and is the gate: no `attempted` row, no change. The outcome row follows (`success`, `denied` or `failure`), with `detail` `target=<N>; previous=<P>; resulting=<R>; raised=<true|false>; rules=<X>; deployed_baselines=<Y>` on success. A request refused with `400` (including the empty-rule-set refusal, whose `detail` is `empty rule set not acknowledged; rules=<X>; deployed_baselines=<Y>; target=<N>`) or at a gate leaves a single `denied` row and no `attempted` row. These cases write no row of this verb: a missing session, a step-up refusal (recorded under `mfa.step_up.required`), a cross-site cookie call (recorded as `csrf.denied`), a missing RBAC store (`503`), and a missing Guardian state store or Baseline store (`503`, counted in the metric below only). On the MCP twin, an argument rejected by the input schema (`-32602`) and a call whose stores were never wired also write none; the empty-rule-set refusal (also `-32602`) is the exception and writes one `denied` row. See [Audit Log](audit-log.md).
+- **Audit:** `guaranteed_state.policy_generation.raise`, `target_type=GuaranteedState`, `target_id=policy_generation` on every row of this verb, including the denials of a service-scoped token and an MCP-tier token. An `attempted` row (`detail` `target=<N>; rules=<X>; deployed_baselines=<Y>`) is written first and is the gate: no `attempted` row, no change. The outcome row follows (`success`, `denied` or `failure`), with `detail` `target=<N>; previous=<P>; resulting=<R>; raised=<true|false>; rules=<X>; deployed_baselines=<Y>` on success. A request refused with `400` (including the empty-rule-set refusal, whose `detail` is `empty rule set not acknowledged; rules=<X>; deployed_baselines=<Y>; target=<N>`) or at a gate leaves a single `denied` row and no `attempted` row. These cases write no row of this verb: a missing session, a step-up refusal (recorded under `mfa.step_up.required`), which includes an engine session (`reason=engine_principal_denied`, with the route label as `target_id`), a cross-site cookie call (recorded as `csrf.denied`), a missing RBAC store (`503`), and a missing Guardian state store or Baseline store (`503`, counted in the metric below only). On the MCP twin, an argument rejected by the input schema (`-32602`) and a call whose stores were never wired also write none; the empty-rule-set refusal (also `-32602`) is the exception and writes one `denied` row. See [Audit Log](audit-log.md).
 - **Metrics:** `yuzu_server_guardian_policy_generation_raise_total{transport="rest",result}` with `result` one of `applied`, `unchanged`, `refused` (a rejected body or target, or an empty rule set sent without `acknowledge_empty_rule_set`, `400`), `failed` (a store fault, an unreadable count or an unwritable `attempted` row, `503`). On MCP, `refused` is counted for the empty-rule-set refusal as well as on REST; a bad argument type is rejected by the MCP input-schema check before the handler runs and is not counted. A caller turned away by a gate is not counted. See [Metrics](metrics.md).
 - **MCP twin:** `raise_guardian_policy_generation`, same arguments (including the optional `acknowledge_empty_rule_set`) and the same result fields; supervised tier with an approval ticket and the same administrator check (there is no MFA on MCP; the protection is the approval ticket plus the administrator check). The read-only counterpart is `GET /api/v1/guaranteed-state/policy-generation` (MCP `get_guardian_policy_generation`).
 
@@ -10025,7 +10465,7 @@ The one device list behind every Performance drill: worst devices by a metric (d
 
 ### Application performance over time
 
-Per-application CPU / working-set **by version, over the retained window**, across the fleet or one management group — reading the retained Postgres aggregate (B1 per-device daily / B2 fleet rollup), not the live federated device drill. Per-app sampling is opt-in (`procperf_enabled`, off by default); a device contributes only after its first completed UTC midnight. The aggregate surfaces gate `GuaranteedState:Read` and are **not** audited (cohort posture); the per-device drill is behavioural PII and is audited fail-closed (see below). The same shared transform backs these endpoints, the `get_dex_app_perf` / `get_dex_group_app_perf` MCP tools, and the dashboard so the numbers cannot disagree.
+Per-application CPU / working-set **by version, over the retained window**, across the fleet or one management group — reading the retained Postgres aggregate (B1 per-device daily / B2 fleet rollup), not the live federated device drill. Per-app sampling (`procperf_enabled`) is on by default; a device contributes only after its first completed UTC midnight. The aggregate surfaces gate `GuaranteedState:Read` and are **not** audited (cohort posture); the per-device drill is behavioural PII and is audited fail-closed (see below). The same shared transform backs these endpoints, the `get_dex_app_perf` / `get_dex_group_app_perf` MCP tools, and the dashboard so the numbers cannot disagree.
 
 > **Percentile + suppression semantics (all three trend endpoints).** Each `points[]` entry's `cpu_p50`/`cpu_p95`/`ws_p50`/`ws_p95` is either `null` (absent — empty population, **not** zero) or `{value, lower_bound}`. `lower_bound: true` means the percentile fell in the open top histogram bucket, so `value` is a **floor** — render it as "≥ value", never an exact quantile. `hist_stale: true` means the row was stamped under a superseded histogram scheme, so percentiles are withheld (the exact mean/max still stand). **Cohort floor:** `kDexCohortFloor` is **one** device (maintainer ruling, 2026-10-14; previously 10): a `(version, day)` point is published with its stats whenever at least one device contributed, so only a point no device contributed to is suppressed (stats withheld, `device_count` only). A single-device point is therefore published — as a fleet-wide aggregate by application and version with no `agent_id`, behind `GuaranteedState:Read`; the per-device drill remains the audited path. This applies to **both** the fleet and the group endpoints.
 
@@ -10047,7 +10487,7 @@ The fleet trend for one application — one point per `(version, UTC day)` over 
   - **Breadth** — `affected_devices` is the number of fleet-wide devices that reported a crash or hang for the version in the window, and `crashes` and `hangs` are the fleet-wide event counts; all three are always present (a type with no events is `0`). Breadth counts every reporting device, sampled or not.
   - **Exposure** — `exposure_devices` is the number of devices with retained resource-significant samples for that exact image and version in the window. It is a selected subset (the daily top-N consumers), **not a census**, hence `exposure_basis: "resource_significant"`. `null` means unknown (no sample rows), never zero. When it is known, `exposed_crashes` and `exposed_hangs` count the crash and hang events on **exposed devices only** (each `null` only when exposure is unknown), and, when it is positive, `failure_rate` is `{estimate, lower, upper, reliable}` — those exposed events per exposed device over the window, with an exact (Garwood) 95 percent interval, at full double precision (it is up to the view to scale to per 1,000). A zero `exposure_devices` gives a `null` rate (never a divide by zero, never a healthy zero). The rate is per exposed device over the window, **not per day of use**: a version with fewer days in the window (`day_count`, `latest_day`) has had less time to fail, so read the rate beside `day_count`: it counts days in the 180-day trend window, so only a value below `failure_window_days` + 1 means shorter in-window tenure. `reliable` is `false` below 20 events, an evidence-quality marker and not a floor: print the interval beside it.
   - `previous_version` is the next-older known version in the list (`null` for the oldest known version in the list (see `versions_truncated`) and for `""`). `failure_rate_ratio` is `{estimate, lower, upper, unbounded, reliable}` — this version's rate over the previous version's, with an exact conditional (Clopper-Pearson) 95 percent interval — present only when **both** versions have a known, positive exposure; `null` otherwise, and `null` when neither version saw an exposed event. When the previous version saw no exposed events, `estimate` and `upper` are `null` with `unbounded: true` (a finite `lower` still holds). A request for one exact `version` yields a one-row `versions[]` with no previous version.
-  - `failure_window_days` is the effective window for both the events and the exposure: 30, clamped to one day less than the observation retention (`--guardian-event-retention-days`) when that is 1 to 30 days, so no counted day has had its events reaped (at the default retention of 30 days it reports 29). That holds at a steady retention: raising `guardian_event_retention_days` and restarting widens the window at once but does not restore events already reaped under the old value, so for up to `failure_window_days` days after such a restart the counts and the rate can read low against a full exposure window (an accepted residual); lowering it is safe. The window is that many whole UTC days plus the current day so far, cut at one UTC midnight for both; an observation stamped after the end of the current UTC day is excluded. `stat_failures` counts statistics that returned nothing on valid input (expected `0`); documented refusals — both arms zero-event, an arm above one billion events — are not counted. If either underlying read degrades the whole request is a `503`, never a `200` with an empty `versions[]`.
+  - `failure_window_days` is the effective window for both the events and the exposure: 30, clamped to one day less than the observation retention (`--guardian-event-retention-days`) when that is 1 to 30 days, so no counted day has had its events reaped (at the default retention of 30 days it reports 29). That holds at a steady retention: raising `--guardian-event-retention-days` (or `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`) and restarting widens the window at once but does not restore events already reaped under the old value, so for up to `failure_window_days` days after such a restart the counts and the rate can read low against a full exposure window (an accepted residual); lowering it is safe. The window is that many whole UTC days plus the current day so far, cut at one UTC midnight for both; an observation stamped after the end of the current UTC day is excluded. `stat_failures` counts statistics that returned nothing on valid input (expected `0`); documented refusals — both arms zero-event, an arm above one billion events — are not counted. If either underlying read degrades the whole request is a `503`, never a `200` with an empty `versions[]`.
 
 #### `GET /api/v1/dex/perf/app/devices`
 
@@ -10146,12 +10586,90 @@ App-centric stability list — every application with a Windows crash/hang signa
 
 - **Permission:** `GuaranteedState:Read`.
 - **Query parameters:** `window` — one of `24h`/`7d`/`30d`/`all` (default `7d`); an off-enum value is rejected with `400`.
-- **Response:** `data` object `{window, population, population_basis, apps_total, apps_truncated, policy, apps[]}`. `apps[]` holds the 100 applications affecting the most Windows devices (then crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then name in byte order, not database collation); `apps_total` counts every application with a Windows crash or hang signal in the window and `apps_truncated` is `true` when the cut dropped any. Each `{subject, profile, crashes, hangs, distinct_devices, distinct_devices_online, last_seen, share_affected, rate_per_1000, score, versions[], version_count, versions_truncated}`. `versions[]` (up to 20, ordered by devices affected descending, then version; `""` is the unknown-version bucket) carries the same figures plus `version`; `versions_truncated` is `true` when that cut dropped any. A full response is about 1.2 MB at 100 applications with 20 versions each; MCP clients should request it only when the per-version rows are needed. `crashes`, `hangs` and `distinct_devices` are window-wide. `share_affected`, `rate_per_1000` and `score` are over one population, the Windows devices online now: `distinct_devices_online` is how many of the affected devices are online now (`null` when no fleet source is wired, because membership is then unknown), `share_affected` is that count over the population (95 percent Wilson interval), `rate_per_1000` is those devices' events per 1,000 online devices (exact interval), and the score's inputs are the same online devices' figures. A device that crashed and then went offline is therefore in the counts and in `distinct_devices`, not in the share or rate, and the **score is withheld as `offline_affected`** when it would otherwise be published and `distinct_devices` exceeds `distinct_devices_online`, because a score built from the online devices alone would read healthy for an application that takes its devices offline. Read `distinct_devices_online` against `distinct_devices` before trusting a low share: figures over "online now" vary with the time of day (laptops overnight, weekends) for the same window. Expect this often: on a fleet with laptops or off-hours devices most applications with several affected devices will show a withheld score at any given moment, so use the share and rate, read against `distinct_devices_online` / `distinct_devices`, until an offline-aware score is decided (#5894). The online devices' events are not published separately; the rate is derived from them. `share_affected` carries `reliable: false` under 20 online affected devices and `rate_per_1000` under 20 online events. `score` is the transparent stability score `{score, band, withheld, deductions[]}`; the version-regression deduction is always `assessed: false` here.
-- **Score policy:** `policy` names the score policy every figure in the response was scored under: `{source, revision, fault, tiers}`. `source` is `default` (nothing stored, or a stored policy was refused) or `custom`; `revision` identifies the stored policy document (`default` when none is stored); `tiers` holds `excellent`, `good`, `fair` and `poor`, each `{edge, name}`, where `edge` is the lowest score in that tier and `name` its display name (a label for people: key on `score.band`, whose tokens never change). Poor's edge is the fixed `0`, not a stored value. Each application's `profile` is `override` when a per-application override shaped its tiers or weights and `default` otherwise; its versions inherit it and carry no `profile` of their own, and `tiers` shows the global policy. A change to the stored policy typically reaches every server instance within 5 seconds: each instance refreshes it from the store at most every 5 seconds while it serves requests, through one store read at a time, and the policy in use is up to 60 seconds old when the store is unreadable. A request arriving mid-refresh is scored under the last good policy while that is under 60 seconds old, so it never waits on that read (with no usable policy, it answers the `503` below at once). An invalid stored policy is never half-applied: the shipped defaults score and `fault` says why (`source` is `default`). If the stored policy cannot be read, the last good one is used for up to 60 seconds, after which the read fails as below. The response `tiers` is a read-model projection (`tiers.<tier>.{edge,name}`), not the shape of the stored document (`tiers.edges`, `tiers.names`); weights and per-application override values are not echoed. The policy is read-only on this surface; its own route (`PUT /api/v1/dex/score-policy`) is coming and is not yet available, so every response currently reports `source: "default"`. The cohort floor and the statistics are not part of the policy.
-- **Score policy faults:** when a stored policy document is refused, `policy.fault` holds one of `unparseable at <path>: <message>` (the document is not the expected shape, for example `unparseable at tiers.edges.great: unknown key`), `unparseable at document: not valid JSON`, `oversized at document: more than 262144 bytes`, or `<token> at <path>` where `<token>` is one of `edge_out_of_range`, `edge_not_display_exact`, `edges_not_descending`, `edge_gap_below_minimum`, `name_invalid`, `weight_invalid`, `weight_sum_above_maximum`, `override_key_invalid`, `override_key_duplicate` or `too_many_overrides` (`<path>` names the offending part, for example `overrides[3].weights`, and an unknown key is shown with control characters replaced and capped at 256 bytes). These tokens are stable. Today a refused document can occur only after a direct database write to the `dex_score_policy` row, because nothing in the product writes it yet. The shipped defaults score in the meantime; remove the row (key `dex_score_policy` in the `runtime_config_store.runtime_config` table, a direct database change, since no route removes it) rather than editing it in place. A `503` whose message ends `(score_policy_unavailable)` means the runtime-config store could not be read for more than 60 seconds or, with no usable policy cached, that the first read failed or is still in flight (a restart during the outage, or a concurrent first read), in which case the `503` answers at once: check PostgreSQL health and `yuzu_server_runtime_config_read_degrade_total{reason}`. The token `score_policy_unavailable` is stable.
+- **Response:** `data` object `{window, population, population_basis, apps_total, apps_truncated, policy, apps[]}`. `apps[]` holds the 100 applications affecting the most Windows devices (then crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then name in byte order, not database collation); `apps_total` counts every application with a Windows crash or hang signal in the window and `apps_truncated` is `true` when the cut dropped any. Each `{subject, profile, crashes, hangs, distinct_devices, distinct_devices_online, last_seen, share_affected, rate_per_1000, score, versions[], version_count, versions_truncated}`. `versions[]` (up to 20, ordered by devices affected descending, then version; `""` is the unknown-version bucket) carries the same figures plus `version`; `versions_truncated` is `true` when that cut dropped any. A full response is about 1.2 MB at 100 applications with 20 versions each; MCP clients should request it only when the per-version rows are needed. `crashes`, `hangs` and `distinct_devices` are window-wide. `share_affected`, `rate_per_1000` and `score` are over one population, the Windows devices online now: `distinct_devices_online` is how many of the affected devices are online now (`null` when no fleet source is wired, because membership is then unknown), `share_affected` is that count over the population (Wilson interval at the score policy's confidence level: 95 percent unless the policy sets `model.interval_confidence`), `rate_per_1000` is those devices' events per 1,000 online devices (exact interval at the same level), and the score's inputs are the same online devices' figures. A device that crashed and then went offline is therefore in the counts and in `distinct_devices`, not in the share or rate, and the **score is withheld as `offline_affected`** when it would otherwise be published and `distinct_devices` exceeds `distinct_devices_online`, because a score built from the online devices alone would read healthy for an application that takes its devices offline. Read `distinct_devices_online` against `distinct_devices` before trusting a low share: figures over "online now" vary with the time of day (laptops overnight, weekends) for the same window. Expect this often: on a fleet with laptops or off-hours devices most applications with several affected devices will show a withheld score at any given moment, so use the share and rate, read against `distinct_devices_online` / `distinct_devices`, until an offline-aware score is decided (#5894). The online devices' events are not published separately; the rate is derived from them. `share_affected` carries `reliable: false` under 20 online affected devices and `rate_per_1000` under 20 online events. `score` is the transparent stability score `{score, band, withheld, deductions[]}`; the version-regression deduction is always `assessed: false` here.
+- **Score policy:** `policy` names the score policy every figure in the response was scored under: `{source, revision, fault, tiers}`. `source` is `default` (nothing stored, or a stored policy was refused) or `custom`; `revision` identifies the stored policy document (`default` when none is stored); `tiers` holds `excellent`, `good`, `fair` and `poor`, each `{edge, name}`, where `edge` is the lowest score in that tier and `name` its display name (a label for people: key on `score.band`, whose tokens never change). Poor's edge is the fixed `0`, not a stored value. Each application's `profile` is `override` when a per-application override shaped its tiers, weights or model parameters and `default` otherwise; its versions inherit it and carry no `profile` of their own, and `tiers` shows the global policy. A change to the stored policy typically reaches every server instance within 5 seconds: each instance refreshes it from the store at most every 5 seconds while it serves requests, through one store read at a time, and the policy in use is up to 60 seconds old when the store is unreadable. A request arriving mid-refresh is scored under the last good policy while that is under 60 seconds old, so it never waits on that read (with no usable policy, it answers the `503` below at once). An invalid stored policy is never half-applied: the shipped defaults score and `fault` says why (`source` is `default`). If the stored policy cannot be read, the last good one is used for up to 60 seconds, after which the read fails as below. The response `tiers` is a read-model projection (`tiers.<tier>.{edge,name}`), not the shape of the stored document (`tiers.edges`, `tiers.names`); weights and per-application override values are not echoed. The policy is read-only on this surface; write it with [`PUT /api/v1/dex/score-policy`](#get--put--delete-apiv1dexscore-policy), which also shows the stored shape and its revision. Until a policy is written every response reports `source: "default"`. The cohort floor and the statistical methods are fixed; the scoring model parameters (event cap, regression ratios, interval confidence level) are part of the policy.
+- **Score policy faults:** when a stored policy document is refused, `policy.fault` holds one of `unparseable at <path>: <message>` (the document is not the expected shape, for example `unparseable at tiers.edges.great: unknown key`), `unparseable at document: not valid JSON`, `oversized at document: more than 262144 bytes`, `unsupported_version at version: N above the supported <V>` (`N` is the document's `version`, newer than the `<V>` this build supports: the shipped defaults score and none of the document is applied), or `<token> at <path>` where `<token>` is one of `edge_out_of_range`, `edge_not_display_exact`, `edges_not_descending`, `edge_gap_below_minimum`, `name_invalid`, `weight_invalid`, `weight_sum_above_maximum`, `override_key_invalid`, `override_key_duplicate`, `too_many_overrides`, `event_cap_out_of_range`, `regression_ratio_out_of_range`, `regression_ratios_not_ascending` or `interval_confidence_out_of_range` (`<path>` names the offending part, for example `overrides[3].weights`, and an unknown key is shown with control characters replaced and capped at 256 bytes). These tokens are stable. The product's own write route validates a document with the same checks before it stores it, so a refused document can occur only after a direct database write to the `dex_score_policy` row, or when a newer release wrote a document this build does not support. For `unsupported_version`, leave the row alone: a newer release wrote it, so finish the rolling upgrade (or upgrade this instance) and the document is applied; removing it would destroy a valid policy. For every other fault the shipped defaults score in the meantime; remove it with `DELETE /api/v1/dex/score-policy` (send the revision shown in `policy.revision` as `If-Match`) rather than editing the row in place. A `503` whose message ends `(score_policy_unavailable)` means the runtime-config store could not be read for more than 60 seconds or, with no usable policy cached, that the first read failed or is still in flight (a restart during the outage, or a concurrent first read), in which case the `503` answers at once: check PostgreSQL health and `yuzu_server_runtime_config_read_degrade_total{reason}`. The token `score_policy_unavailable` is stable.
 - **Population and scope:** counts are Windows-scoped and `population` is the number of Windows devices online now (`population_basis: "windows_online"`; `null` = no fleet source wired (unknown); `0` = no Windows device online now). With an unknown or zero population there is no share and no rate, and the score is withheld as `no_population`. The share is a proportion over that one population: its numerator is drawn from the same online devices the population counts, so the affected set can never exceed it. No device floor applies: figures are published at any device count.
 - **Failure:** a failed store read, a stored score policy that cannot be read within its 60-second staleness bound (the message ends `(score_policy_unavailable)`) or a read over its concurrency budget returns `503` with `retry_after_ms: 2000`, never an empty list. The builder also refuses a policy that fails validation (the message ends `(score_policy_invalid)`); that is defence in depth, because a stored policy that fails validation is replaced by the shipped defaults before it reaches the builder. The read holds a database connection for several seconds on a large window, so at most four run at once per server; a fifth answers `503` immediately (counted on `yuzu_server_guardian_read_degrade_total{reason="concurrency_budget"}`) and the caller retries.
 - No per-agent identity (a distinct-device **count** per app, never an `agent_id`) — not audited.
+
+#### `GET / PUT / DELETE /api/v1/dex/score-policy`
+
+The customer DEX score policy: tier edges and names, deduction weights, scoring model parameters and per-application overrides, stored as one JSON document that every server instance reads. `GET` returns the policy in force, `PUT` replaces it and `DELETE` removes it (the shipped defaults apply again). This is the only route that writes the document: `PUT /api/config/dex_score_policy` is refused. There is no Settings page for the policy yet: use this API. The MCP twins are tracked in #6087; there is no MCP tool for this route yet.
+
+- **Permission:** `GET` needs `GuaranteedState:Read` (with RBAC off, any authenticated session). `PUT` and `DELETE` need `Infrastructure:Write`, the broad infrastructure grant (the seeded roles that hold it are Administrator and ITServiceOwner; with RBAC off, only administrators). A cookie session must also be same-site: a cross-site or header-less browser write is refused `403` `cross-site request refused` by the server-wide check (see Authentication, "Cookie-session writes") and audited as `csrf.denied` with `target_id` `PUT /api/v1/dex/score-policy` or `DELETE /api/v1/dex/score-policy`. The server-wide check answers first; this route keeps its own copy as defence in depth. API, MCP and engine token callers are exempt from the same-site rule.
+- **`GET` response:** `data` object `{document, revision, source, fault?}`, with the header `ETag: "<revision>"`. `document` is the stored shape (`version`, `tiers.edges.{excellent,good,fair}`, `tiers.names.{excellent,good,fair,poor}`, `weights.{breadth,crashes,hangs,regression}`, `model.{per_device_event_cap,regression_full_ratio,regression_start_ratio,interval_confidence}`, `overrides[]`), not the `tiers.<tier>.{edge,name}` projection that the Apps `policy` block carries. `revision` is `default` when nothing is stored and otherwise 16 lower-case hex digits that identify the stored text. `source` is `default` or `custom`; `fault` is present when the stored text is refused and the shipped defaults are in force. `GET` reads the store directly, is not audited, and answers `503` (`retry_after_ms: 2000`) when the store is unavailable.
+- **`If-Match` (required on `PUT` and `DELETE`):** the revision the change is based on, quoted or bare: `default` when no policy was ever written, otherwise the `revision` from `GET`. An absent header is `428`. `*`, a weak validator (`W/`), a list (a repeated `If-Match` header is a list) or any other value is `400`. A revision that is not the stored one is `409` and the message names the revision now stored: `GET` it, review the current policy and retry. A write that loses a race with another writer between the check and the commit is also `409`, with a message that says the policy changed and names no revision. If the response to a write is lost, `GET` the policy before repeating it: a replay with the old `If-Match` answers `409` once the write has applied, and the stored `revision` equals the `data.revision` that `dry_run=true` returns for the same document.
+- **`PUT` body:** the whole policy document in the stored shape, at most 256 KiB, validated exactly as the reader validates a stored text (same fields, same range checks, same refusal wording). Unknown keys are refused. **`PUT` refuses the Apps `policy.tiers` projection** (`tiers.excellent`, `source`, `revision`, `fault`): the `400` names the field and says to send `tiers.edges`, `tiers.names`, `weights` and `overrides`. The stored text is the canonical form of the document, so `GET` after `PUT` may differ in whitespace and key order from what was sent, but never in meaning. This server reads versions 1 and 2. A document carrying `model` must say `"version": 2`: a `model` in a version 1 document is refused (`requires version 2`). A document carrying a `version` above 2 is refused with the remediation to send a version 2 document or leave the stored one alone; during a rolling upgrade an older instance can still overwrite a newer document, so do not change the policy during a roll (see [Upgrading](upgrading.md)).
+- **Rules:** any key left out of the global policy takes its shipped default (`version` defaults to `1`). A refusal names the field and one of these tokens. Each edge is a number with `0 < edge < 100` and at most one decimal place (`edge_out_of_range`, `edge_not_display_exact`); the edges strictly descend with a gap of at least 1.0 point (`edges_not_descending`, `edge_gap_below_minimum`); the `poor` tier always starts at 0. A tier name is 1 to 24 printable ASCII characters without `<`, `>`, `&` or `"` (`name_invalid`). Weights are finite, non-negative numbers whose sum is at most 100 (`weight_invalid`, `weight_sum_above_maximum`); all zero is valid and scores every application 100. At most 200 overrides (`too_many_overrides`); each has an `image` (1 to 260 printable ASCII characters, folded to lower case, unique after folding: `override_key_invalid`, `override_key_duplicate`) and optional partial `tiers` and `weights` that inherit whatever they leave out and are validated as merged onto the global policy. `model` holds `per_device_event_cap` (an integer, 1 to 1000; default 5), `regression_start_ratio` and `regression_full_ratio` (finite numbers, 1 to 1000, with `full` above `start`; defaults 1.0 and 3.0; `event_cap_out_of_range`, `regression_ratio_out_of_range`, `regression_ratios_not_ascending`) and `interval_confidence` (0.5 to 0.999, global only; default 0.95; `interval_confidence_out_of_range`). An override's `model` may set the cap and the two ratios only, and its ratios are validated as merged onto the global policy. A document that uses no model parameter is stored as the version 1 text. An unparseable value is `unparseable at <path>: <message>` and a newer `version` is `unsupported_version`.
+- **`dry_run`:** `PUT ...?dry_run=true` validates the document and checks `If-Match` against the stored revision, then answers what a real write would produce without storing anything; it writes one `dex.score_policy.validate` audit row. `dry_run` accepts only `true` or `false`; any other value, or a repeated `dry_run` parameter that differs in its raw bytes, is `400`. `DELETE` does not support `dry_run`: any value is `400`.
+- **Response (`PUT`, `DELETE`, dry run):** `200` everywhere a request is applied, with `data` `{document, revision, source, previous_revision, dry_run?}`. `previous_revision` is the revision the store held when `If-Match` was checked. `DELETE` of a policy that was never written is `200` with `revision: "default"` (idempotent; the audit trail shows `attempted` then `no_change`). The `ETag` header is the new revision, except on a dry run, where it is the CURRENT stored revision (nothing changed; it is what the real `PUT` must send) while `data.revision` is the revision the write would produce and `data.dry_run` is `true`. A `200` that also carries `Sec-Audit-Failed: true` means the outcome audit row is missing (only the `attempted` row stands). For a `PUT`, or a `DELETE` that removed a policy, the change was applied and a retry with the old `If-Match` answers `409`; a `DELETE` of a policy that was never written changed nothing and may be repeated. `GET` the policy to confirm the state, treat the `attempted` row as the sole evidence of the request, and check the health of the audit store (`yuzu_server_audit_emit_failed_total` and its PostgreSQL connection).
+- **Statuses:** `400` (malformed `If-Match`, bad `dry_run`, body not valid JSON, too deeply nested, over 256 KiB, an unknown key or a value the validator refuses), `401`, `403`, `409` (stale `If-Match`, or the policy changed during the write), `411` (a chunked body or one with no `Content-Length`) and `413` (a declared body over 320 KiB), which the pre-auth body cap answers before authentication (see [Pre-Auth Request Body Caps](#pre-auth-request-body-caps-2407); a body between 256 and 320 KiB reaches the handler and is a `400`), `428` (no `If-Match`), `503`. Every `503` carries `retry_after_ms`: `2000` when another policy write in this process is still running or the store is unavailable, `5000` when the audit store refused the row so nothing was changed (header `Sec-Audit-Failed: true`; the route fails closed on audit).
+- **Outcome unknown (`503`):** after a store error that came back once the write was sent (a connection lost after the commit), the server re-reads the store. If the document you sent is stored, the answer is `200`. Otherwise the answer is `503` with `retry_after_ms: 2000`: the server cannot say whether the write applied, and the message names the revision now stored (or says it could not be re-read). `GET` the policy and compare its revision before sending the change again: if it is the `If-Match` revision you sent, the write did not apply and can be sent again; any other revision means the write applied or another writer changed the policy, so review it first. To tell those two apart, send a `dry_run=true` of your document with the revision `GET` returned as its `If-Match` and compare its `data.revision` with that revision: equal means the stored policy is your document (a dry run sent with the OLD `If-Match` answers `409` once anything has changed and gives nothing to compare). After a `DELETE`, the revision `default` means the policy is gone. A retry with the old `If-Match` after the write applied answers `409`, so it is safe. The answer never says the policy was left as it was, because another instance may have written in between.
+- **Audit:** `dex.score_policy.update` (`PUT`), `dex.score_policy.reset` (`DELETE`) and `dex.score_policy.validate` (dry run), `target_type=RuntimeConfig`, `target_id=dex_score_policy`. Every refusal of the request leaves a `denied` row (including a bad `If-Match` or `dry_run`), except an unreadable store (`503`, no row) and a missing permission (the standing `auth.permission_required` row); a real write leaves an `attempted` row BEFORE the store is touched, then `success` or `failure`. If an outcome row cannot be stored after the change was made, the `200` is kept and `Sec-Audit-Failed: true` marks the gap. Details are in the [audit log](audit-log.md). `GET` is not audited.
+- **Convergence:** the instance that served the write uses the new policy at once. Every other instance picks it up typically within 5 seconds (see "When a change takes effect" above). When the outcome was resolved by the re-read after a store error, the serving instance can keep the previous policy for up to 5 seconds as well.
+- **Known limit:** the write holds a process-wide writer lock while it commits. The database call is bounded by the connection pool's statement timeout (30 seconds by default), which a frozen database backend cannot enforce, and which is not applied at all when the database DSN carries its own `options=`. A stalled commit therefore holds the initiating request and the writer lock for the stall; every other policy writer answers `503` with `retry_after_ms: 2000` and readers are unaffected. This is documented rather than bounded. To diagnose a persistent `503` that says another score policy write is still running, find who holds the lock: `pg_stat_activity` shows what each session waits on but not who holds the lock, so use `pg_blocking_pids` (query below) for a session blocking `runtime_config_store.runtime_config`. The way out is to wait out the 30-second statement timeout (it never fires when the DSN carries its own `options=`), or to end the blocking session with `SELECT pg_terminate_backend(<blocking_pid>)`; it is typically an `idle in transaction` psql session. The server log line `runtime_config compare_and_set dex_score_policy: SQLSTATE <code>` (or `compare_and_remove`) appears only once the stalled statement fails, so a write that is still stalled has logged nothing yet. Expect `57014` (statement timeout), `55P03` (lock not available) or a connection-class code (`08xxx`, `57P01`); `SQLSTATE none` means the failure came with no server error code, which is a connection-level failure.
+
+```sql
+SELECT waiting.pid AS waiting_pid, blocker.pid AS blocking_pid, blocker.state,
+       blocker.xact_start, left(blocker.query, 80) AS blocking_query
+FROM pg_stat_activity AS waiting
+CROSS JOIN LATERAL unnest(pg_blocking_pids(waiting.pid)) AS b(pid)
+JOIN pg_stat_activity AS blocker ON blocker.pid = b.pid
+WHERE waiting.query ILIKE '%runtime_config%';
+```
+
+**Example: raise the excellent edge to 95.** A fresh server has no stored policy, so `GET` answers the shipped defaults with `revision` `default`:
+
+```bash
+curl -si -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/dex/score-policy"
+```
+
+```json
+{
+  "data": {
+    "document": {
+      "version": 1,
+      "tiers": {
+        "edges": { "excellent": 90.0, "good": 75.0, "fair": 60.0 },
+        "names": { "excellent": "excellent", "good": "good", "fair": "fair", "poor": "poor" }
+      },
+      "weights": { "breadth": 60.0, "crashes": 20.0, "hangs": 8.0, "regression": 12.0 },
+      "overrides": []
+    },
+    "revision": "default",
+    "source": "default"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+The response header is `ETag: "default"`. Send that revision as `If-Match` on the `PUT`; a partial document is fine because the rest takes its defaults. Add `?dry_run=true` first to check the change without storing it:
+
+```bash
+curl -si -X PUT -H "Authorization: Bearer $TOKEN" -H 'If-Match: "default"' \
+  -H "Content-Type: application/json" \
+  --data '{"tiers":{"edges":{"excellent":95}}}' \
+  "https://yuzu.example.com/api/v1/dex/score-policy"
+```
+
+The answer is `200` with `ETag: "2f9a498b26e94798"`, and `data` carries the full stored document, `"revision": "2f9a498b26e94798"`, `"source": "custom"` and `"previous_revision": "default"`. Sending the same `PUT` again with the old `If-Match` is refused, because the stored revision has moved on:
+
+```json
+{
+  "error": {
+    "code": 409,
+    "message": "the stored policy's revision is 2f9a498b26e94798, which is not the If-Match revision",
+    "correlation_id": "req-18f2a1c3d-2a",
+    "retry_after_ms": null,
+    "remediation": "GET /api/v1/dex/score-policy and send the revision it returns (and review the current policy first)"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+To go back to the shipped defaults, `DELETE` with the current revision: `curl -si -X DELETE -H "Authorization: Bearer $TOKEN" -H 'If-Match: "2f9a498b26e94798"' "https://yuzu.example.com/api/v1/dex/score-policy"`.
 
 #### `GET /api/v1/dex/catalogue`
 
@@ -10497,14 +11015,16 @@ These endpoints drive the **Settings → Security and sign-in → Two-factor sig
 - **Permission:** Admin only.
 - **Request body (form-encoded):** `code=<6-digit TOTP from authenticator>`.
 - **Effect on success:** Sets `mfa_enrolled_at = CURRENT_TIMESTAMP`, advances `mfa_last_counter` to the matched counter (replay defence), generates 10 single-use recovery codes (PBKDF2-SHA256 hashed in `mfa_recovery_codes`).
+- **Step-up proof:** a successful confirmation also records a fresh MFA proof for the calling session, so an administrator who has just enrolled can use the two Settings MFA routes below (recovery-code regeneration and disable) at once, inside the step-up window and from that session only. The proof is recorded only when the call carries the local cookie session of the same user; otherwise the session is not stamped (a bearer principal, an absent or mismatched cookie, or a store failure) and the enrolment still succeeds. The audit detail `step_up_proof=stamped` or `step_up_proof=not_stamped` says which.
 - **Response (200, success):** HTML fragment with the 10 recovery codes as a one-time reveal (`XXXX-XXXX-XXXX-XXXX`, 80 bits each). Same `Cache-Control: no-store` headers as `init`.
 - **Response (200, failure):** Re-renders the verify form with an instruction to wait for the next 30 s code. Provisional row survives so the operator's authenticator app keeps working; the secret is NOT re-revealed.
 - **Password changed during enrolment (#5342):** a confirm whose write waits behind the account's password change or reset enrols nothing and issues no recovery codes (`credential_changed`; the fragment says "Your password changed during enrolment — sign in again", with no retry form); a confirm arriving after the change finds no provisional secret and is answered as a rejected code while the session is revoked.
-- **Audit:** `mfa.enroll.verified` + `mfa.recovery_codes.generated` on success; `mfa.enroll.failed` on rejection (detail `code rejected`, or `credential_changed` for the password-changed case); `mfa.enroll.race` when a concurrent verify already enrolled the account (benign race, distinct from a rejected code — CC7.2).
+- **Audit:** `mfa.enroll.verified` (detail `step_up_proof=stamped`, or `step_up_proof=not_stamped` when the session could not be stamped) + `mfa.recovery_codes.generated` on success; `mfa.enroll.failed` on rejection (detail `code rejected`, or `credential_changed` for the password-changed case); `mfa.enroll.race` when a concurrent verify already enrolled the account (benign race, distinct from a rejected code, CC7.2).
 
 **`POST /api/settings/mfa/recovery-codes`** — Regenerate the 10 recovery codes.
 
 - **Permission:** Admin only. Requires existing enrollment.
+- **Step-up:** one of the 37 routes in the [step-up list](#step-up-envelope-on-high-risk-endpoints), checked before the permission check: an MFA-enrolled session whose proof is older than `mfa_step_up_window_secs` receives `401` `mfa_step_up_required`. The Settings MFA panel cannot yet prompt for the code: the button shows a toast and the operator signs in again (a just-enrolled administrator is covered inside the window, for the confirming session only, by the proof recorded at enrolment confirmation). An account with no MFA enrolled is not affected.
 - **Effect:** Atomic DELETE + 10×INSERT inside a Postgres transaction, serialized on the caller's `auth.users` row (`SELECT … FOR UPDATE`) so two concurrent regenerations cannot interleave (#3779). All prior codes (consumed and unconsumed) are invalidated. If the account has been deactivated, the codes are **not** reissued and the request fails.
 - **Response (200):** HTML fragment with the fresh 10 codes as a one-time reveal. Same `Cache-Control: no-store` headers.
 - **Audit:** `mfa.recovery_codes.generated` / `ok` (detail = `10 codes issued (rotation)`).
@@ -10512,9 +11032,11 @@ These endpoints drive the **Settings → Security and sign-in → Two-factor sig
 **`POST /api/settings/mfa/disable`** — Clear MFA state for the logged-in admin.
 
 - **Permission:** Admin only.
-- **Effect:** Atomic UPDATE users (clears `mfa_totp_secret`, `mfa_enrolled_at`; stamps `mfa_disabled_at`) + DELETE `mfa_recovery_codes` inside a `BEGIN IMMEDIATE / COMMIT` transaction. **Self-target guard (PR 3):** while `--mfa-enforcement` protects the caller's role (`required` → all roles; `admin-only` → admins), the disable is refused — the operator cannot strip the MFA that policy requires of them.
-- **Response (200):** HTML fragment showing the "Not enrolled" state, or, when the self-target guard fires, the unchanged "Enabled" fragment with an inline "MFA is required by policy" message.
-- **Audit:** `mfa.disabled` / `ok` (or `error` on DB failure, or `error` + detail `blocked: mfa_enforcement=<mode>` when the self-target guard refuses the disable).
+- **Step-up:** one of the 37 routes in the [step-up list](#step-up-envelope-on-high-risk-endpoints), checked before the permission check: an MFA-enrolled session whose proof is older than `mfa_step_up_window_secs` receives `401` `mfa_step_up_required`. The Settings MFA panel cannot yet prompt for the code: the button shows a toast and the operator signs in again (a just-enrolled administrator is covered inside the window, for the confirming session only, by the proof recorded at enrolment confirmation). An account with no MFA enrolled is not affected.
+- **Effect:** Atomic UPDATE users (clears `mfa_totp_secret`, `mfa_enrolled_at`; stamps `mfa_disabled_at`) + DELETE `mfa_recovery_codes` inside one Postgres transaction, serialised on the caller's `auth.users` row (`SELECT ... FOR UPDATE`). **Self-target guard (PR 3):** while `--mfa-enforcement` protects the caller's role (`required` → all roles; `admin-only` → admins), the disable is refused - the operator cannot strip the MFA that policy requires of them. After a successful disable every session of the account is ended, the caller's included, because any of them may hold an MFA proof made under the factor just cleared. API tokens are not ended.
+- **Response (503):** the `mfa.disabled` intent row (see Audit) could not be written, so nothing was cleared and no session was ended; the response carries `Sec-Audit-Failed: true` and `Retry-After: 5`, and the message "Audit store unavailable; MFA was not changed." is shown as a toast on both Settings pages (the response carries an `HX-Trigger` `showToast` header; an error toast has a close button) and, on Security and sign-in, also inline in the Two-factor sign-in panel (that page swaps `text/html` error bodies for requests made from inside its panels). Nothing was changed: retry once the audit store has recovered, or tell the operator that the audit store needs attention.
+- **Response (200):** on success an empty body with the `yuzu_session` cookie cleared and `HX-Redirect: /home` (the same exit as logout; the user signs in again). When the self-target guard fires, the unchanged "Enabled" fragment with an inline "MFA is required by policy" message. When the factor was cleared but the sessions could not be ended, the fragment carries the inline message "MFA was disabled, but the account's sessions could not be ended. Ask an administrator to end them." There is no retry control on that page: after the clear the fragment shows the not-enrolled view, and the Disable form exists only in the enrolled view. An administrator ends the sessions with `DELETE /api/v1/sessions?username=<name>` or `yuzu-server --mfa-reset <name>` (see `docs/ops-runbooks/auth-db-recovery.md` "Emergency MFA disable"). This route has no REST v1 or MCP twin yet (ledgered exception #6325, `scripts/ci/api-parity/auth-mfa.json`): the partial and unknown-state outcomes are HTTP 200 `text/html` with no machine-readable marker, so an automated caller must read the audit row to tell them from success. When the clear itself fails, the sessions are still ended, because the clear may have committed with its acknowledgement lost: if that delete succeeds the response is the same sign-out exit (with no hint that the clear failed; the audit row is the record), otherwise the fragment carries "Could not confirm MFA was disabled, and the account's sessions could not be ended. Its state is unknown: ask an administrator to check it and end the sessions." **Cancel setup** on an enrolment that was never verified clears no usable factor, so it ends no session and does not redirect: the not-enrolled fragment is returned.
+- **Audit:** a disable leaves two `mfa.disabled` rows, ordered by the audit `id`. They are attributed to the acting session (principal, principal role and session are the caller's, even though that session has just been deleted); `target_id` is the account. The first, `attempted` with detail `MFA clear requested via Settings`, is written before the factor is touched and fails closed (the `503` above). The outcome row follows: `ok` with detail `sessions_ended=<n>` when a verified factor was cleared and the sessions were ended; `ok` with detail `no verified factor to clear` when an unfinished enrolment was cancelled (no session ended); `partial` with detail `sessions_ended=failed` when the factor was cleared but the durable session delete failed; `error` with detail `disable failed (sessions_ended=<n>)` or `disable failed (sessions_ended=failed)` when the clear itself failed (sessions are still ended); `error` with detail `blocked: mfa_enforcement=<mode>` when the self-target guard refuses the disable (the only row for that request, with no `attempted` row). `<n>` counts the durable session rows deleted, expired rows not yet reaped included. The outcome row is written after the changes and cannot undo them: if it cannot be written the request still completes and the server logs an error, leaving the `attempted` row as the only record. An `attempted` row with no outcome row marks a clear whose result is unknown. `yuzu-server --mfa-reset` follows the same two-phase rule.
 
 > **Note — admin force-disable for other users:** the PR 1 endpoints are self-service only. An admin cannot disable another user's MFA via the dashboard or REST in this release; that feature is planned. For emergency lockout recovery use the break-glass procedure in `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable.
 
@@ -10556,7 +11078,7 @@ Create a new local account.
 | `role` | string | (ignored) | Field is parsed but discarded; new users always land as `user`. Documented for backwards-compatibility — scripts that pass `role=admin` will not error, but the field has no effect. |
 
 - **Response (200):** Re-rendered user table fragment with the new account visible. `HX-Trigger: {"showToast":{"message":"User created","level":"success"}}`. Audit event recorded as `user.create / success`.
-- **Response (403) cross-site / (503) audit:** a session-cookie caller without an `Origin` or `Referer` naming this site is refused with `403` (audit `csrf.denied`, target `/api/settings/users`); API-token callers are exempt. If the `attempted` audit row cannot be written the server answers `503` with `Sec-Audit-Failed: true` and creates nothing (safe to retry).
+- **Response (403) cross-site / (503) audit:** a session-cookie caller without an `Origin` or `Referer` naming this site is refused with `403` (audit `csrf.denied`); API-token callers are exempt. If the `attempted` audit row cannot be written the server answers `503` with `Sec-Audit-Failed: true` and creates nothing (safe to retry).
 - **Response (400):** Returned when `username` is invalid, `password` is empty, or the password is shorter than 12 bytes or longer than 1024 bytes. Audit `user.create / denied / weak_password` (too short), `too_long` (over 1024 bytes, #5342), or `invalid_username`.
 - **Response (409):** Returned when `username` already exists. Body is the A4 error `Username already exists` (with the duplicate-username toast header). Audit `user.create / denied / duplicate_username`. Also returned (A4 error body "The account could not be created. The name may still belong to a removed account, or the user store did not answer.") when a password that meets the policy is refused by the store, which is what re-creating a removed username does: removed accounts keep their name. Audit `user.create / denied / create_refused`.
 - **Response (401):** Defensive — admin gate passed but session not re-resolvable.
@@ -10578,7 +11100,7 @@ The `role` field must be exactly `admin` or `user`.
 
 - **Response (200) success:** Role changed. Body is the re-rendered user table fragment. `HX-Trigger: {"showToast":{"message":"Role updated","level":"success"}}`. Audit `user.role_change / success` with `detail=old_role=user,new_role=admin` (or vice versa). **All active sessions for the target user are invalidated atomically** — the user must re-authenticate.
 - **Response (200) no-op:** Same role requested as already assigned. Body is the re-rendered fragment with `HX-Trigger: {"showToast":{"message":"Role unchanged","level":"info"}}`. Audit `user.role_change / no_op` with `detail=same_role={admin\|user}`.
-- **Response (403) cross-site / (415) / (503) audit:** a session-cookie caller without a same-site `Origin` or `Referer` is refused with `403` (audit `csrf.denied`, target `/api/settings/users/{username}/role`); API-token callers are exempt. A body that is not `application/json` is refused with `415` (audit `user.role_change / denied / content_type_not_json`). If the `attempted` audit row cannot be written the server answers `503` with `Sec-Audit-Failed: true` and changes nothing (distinct from the store-failure `503` below; safe to retry).
+- **Response (403) cross-site / (415) / (503) audit:** a session-cookie caller without a same-site `Origin` or `Referer` is refused with `403` (audit `csrf.denied`); API-token callers are exempt. A body that is not `application/json` is refused with `415` (audit `user.role_change / denied / content_type_not_json`). If the `attempted` audit row cannot be written the server answers `503` with `Sec-Audit-Failed: true` and changes nothing (distinct from the store-failure `503` below; safe to retry).
 - **Response (400) invalid request:**
   - `invalid_username` — `:username` fails the allowlist (alphanumeric + `.` `_` `-`, 1-64 chars).
   - `invalid_json` — body is not valid JSON.
@@ -10682,7 +11204,7 @@ Render the Users panel: one row per active account (name, source, account role).
 Render the Roles panel: one row per role in the catalogue (name, description, whether it is built in).
 
 - **Permission:** `UserManagement:Read`, the same securable and the same checked store read as `GET /api/v1/rbac/roles`.
-- **Response (200):** HTML fragment. A role store that does not answer is a red "could not be read" box with a Retry button and no table, still with status 200. An empty catalogue (which the store never produces: it seeds seven roles) is drawn as the same red box, never as "no roles".
+- **Response (200):** HTML fragment. A role store that does not answer is a red "could not be read" box with a Retry button and no table, still with status 200. An empty catalogue (which the store never produces: it seeds eight roles) is drawn as the same red box, never as "no roles".
 - **Response (403):** The caller lacks the permission; the panel shows a "not available to your account" note.
 - **Headers:** `Cache-Control: no-store`. No success audit row (the REST twin writes none).
 
@@ -10853,7 +11375,7 @@ write a `command.dispatch` audit row with `result=denied` and `detail=reason=<re
 must be a JSON object; anything else is `400`.
 
 **Destructive-class capabilities require explicit, non-empty `agent_ids` — broadcast and `scope`
-fan-out are refused (#3685).** The command catalogue currently classifies 19 `plugin.action` pairs
+fan-out are refused (#3685).** The command catalogue currently classifies 21 `plugin.action` pairs
 `Destructive` (e.g. `tar.purge_source`, `filesystem.delete_lines`, `registry.delete_key`); dispatching
 any of them with `agent_ids` omitted or empty, or with `scope` present at all — including
 `"__all__"` — is refused **before** the command reaches an agent. This is a narrower carve-out
@@ -11026,7 +11548,7 @@ uniqueness against existing definitions.
 **Response (400):** Validation error (missing required field, invalid
 `approval_mode`, malformed JSON, a request/`parameter_schema`/`visualization_spec`/
 `response_templates_spec` body nesting deeper than 32 levels (`kMcpMaxJsonDepth`),
-or an `id` under the reserved `mcp.` prefix). Body is `{"error": "<reason>"}`.
+or an `id` under the reserved `mcp.` or `guardian.` prefix). Body is `{"error": "<reason>"}`.
 
 The `mcp.` definition-id prefix is **reserved** (#2442): it names MCP approval
 tickets, and a definition authored under that prefix could line up with an MCP
@@ -11200,7 +11722,7 @@ Execute an instruction definition by dispatching it to agents. Requires `Executi
 
 **Response (202 -- Approval Required):**
 
-Returned when the definition's `approval_mode` is `role-gated` or `always` and the caller does not have direct-execute permission. The execution is queued for approval.
+Returned when the definition's `approval_mode` is `role-gated` or `always` and the caller does not have direct-execute permission. The execution is held as a pending approval ticket and nothing runs yet. Approving an instruction-origin ticket records the decision but does not yet dispatch the instruction (#6064; see [Upgrading](upgrading.md)).
 
 ```json
 {
@@ -11442,13 +11964,25 @@ Fetch a single approval by id. This is the **A4 `status_url` target**: when an o
 
 `status` is one of `pending` | `approved` | `rejected` | `expired`. The response always carries an `X-Correlation-Id` header.
 
+**Bound tickets (#6062).** A ticket minted with a frozen request (today only the reserved Guardian rule-deploy surface; nothing in this release mints one yet) additionally carries three fields, so an agentic worker sees exactly what the dashboard's Approvals page shows a reviewer. An ordinary ticket (every MCP, interactive-instruction and scheduled-fire ticket) carries none of them and its body is unchanged:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `request` | object or `null` | The frozen request the reviewer approves, as a JSON object (the stored document parsed). `null` when there is no readable request: `request_unreadable` is `true` when one is stored but cannot be shown, and absent when none is stored at all (an inconsistent row holding only a digest). |
+| `request_digest` | string | Lowercase hex SHA-256 of the **exact stored bytes** of the request. The object above is a parsed view and a re-serialisation (sorted keys, no whitespace) need not reproduce those bytes, so use the digest to identify the request, not to recompute it. |
+| `excluded_roots` | array of string | Principals barred from approving this ticket, in addition to its submitter, who is always barred. Matched byte-for-byte against the reviewer's name. |
+| `request_unreadable` | boolean | Present (`true`) only when `request` is `null` because the stored request could not be read or exceeds its bounds. Such a ticket cannot be approved (the approve call returns `400`), but it can be rejected. |
+| `excluded_roots_unreadable` | boolean | Present (`true`) only when the stored excluded-roots list could not be read. Such a ticket cannot be approved. |
+
+These fields are readable under the same bare `Approval:Read` gate as the rest of the row and are not confined by management group: a frozen request can name devices in its `targets`, and every holder of `Approval:Read` can already read the ticket's `scope_expression`. The permission gate and the A4 error envelope are unchanged.
+
 **An aged `approved` ticket (#6098):** `status` is only rewritten to `expired` by the next accepted approval submission, so an approved ticket whose `reviewed_at` is more than 7 days old keeps showing `approved` until then, although consuming it and `ScheduleRunner` already refuse it. Read `reviewed_at` as well as `status` before treating an approved ticket as usable.
 
 **Errors:** `404` (no approval matches the id — A4 envelope), `503` (approval store not initialised — A4 envelope with `retry_after_ms: 5000`).
 
 #### `GET /api/v1/approvals`
 
-REST v1 twin of the legacy unversioned `GET /api/approvals` below and the widened MCP `list_pending_approvals` tool. This route, the single-fetch `GET /api/v1/approvals/{id}` route, and MCP `list_pending_approvals` share one JSON-row builder (`approval_row_json`) so those three cannot drift from each other; the legacy route below is a separate, unmigrated implementation that emits the same field set today by convention, not by construction. **Permission:** bare `Approval:Read` — approval requests carry no per-agent axis for the ADR-0017 admit-then-filter `fleet_read_fn` chokepoint to confine against (same rationale as `GET /api/v1/schedules` above), so this list is fleet-wide for anyone holding the permission; a reviewer approving or rejecting a ticket needs to see the ticket's full `scope_expression` to make that decision, so confinement-filtering this list would break the maker-checker function itself. Accepts `status` and `submitted_by` query parameters, same as the legacy route. **Omitting `status` returns ALL statuses** — unlike MCP `list_pending_approvals`, which defaults to `pending`-only when its own `status` argument is omitted; a caller wiring both a REST dashboard and an MCP agent against the same queue with no filter gets two different result sets. A supplied `status` outside `pending`/`approved`/`rejected`/`expired` is rejected with `400` (governance fix — previously silently produced an empty result, indistinguishable from a genuinely empty match). The underlying query is hard-capped at 100 rows (no caller-visible limit/cursor); `pagination.result_truncated_by_cap` is added when more than 100 approvals match, so `pagination.total` is never presented as the true match count.
+REST v1 twin of the legacy unversioned `GET /api/approvals` below and the widened MCP `list_pending_approvals` tool. This route, the single-fetch `GET /api/v1/approvals/{id}` route, and MCP `list_pending_approvals` share one JSON-row builder (`approval_row_json`) so those three cannot drift from each other; the legacy route below builds its rows with the same function, so a bound ticket's `request`, `request_digest` and `excluded_roots` (see the single-fetch route above) appear on all of them. **Permission:** bare `Approval:Read` — approval requests carry no per-agent axis for the ADR-0017 admit-then-filter `fleet_read_fn` chokepoint to confine against (same rationale as `GET /api/v1/schedules` above), so this list is fleet-wide for anyone holding the permission; a reviewer approving or rejecting a ticket needs to see the ticket's full `scope_expression` to make that decision, so confinement-filtering this list would break the maker-checker function itself. Accepts `status` and `submitted_by` query parameters, same as the legacy route. **Omitting `status` returns ALL statuses** — unlike MCP `list_pending_approvals`, which defaults to `pending`-only when its own `status` argument is omitted; a caller wiring both a REST dashboard and an MCP agent against the same queue with no filter gets two different result sets. A supplied `status` outside `pending`/`approved`/`rejected`/`expired` is rejected with `400` (governance fix — previously silently produced an empty result, indistinguishable from a genuinely empty match). The underlying query is hard-capped at 100 rows (no caller-visible limit/cursor); `pagination.result_truncated_by_cap` is added when more than 100 approvals match, so `pagination.total` is never presented as the true match count.
 
 **Response (200):**
 
@@ -11519,7 +12053,7 @@ HTML fragment behind the Instructions Approvals tab and the Approvals page (`/ap
 
 Approve a pending instruction execution. `comment` is capped at 4,000 bytes; a longer comment is refused with 400 `{"error":"comment too long (max 4000 bytes)"}` and no decision is recorded.
 
-**Who may call it.** Requires `Approval:Approve` and an interactive cookie session (local or OIDC) with a fresh MFA step-up: a stale proof returns `401` with `meta.mfa_step_up_required: true` and `meta.challenge_url`, exactly as on the other step-up endpoints (`docs/user-manual/authentication.md`, "Step-up on high-risk surfaces"). An API-token or MCP-token session is refused with `403` and an A4 error envelope, and an engine principal is never admitted; a SAML session is refused with `403` while step-up is on, because MFA step-up is not available to it (#4935). `--mfa-step-up-window-secs=0` disables the step-up requirement, leaving only the interactive-session rule (and then a SAML session is admitted). The step-up gate can only ask for a factor the account has, so it passes without a second factor in three cases: a local account with no enrolled MFA factor (the gate itself passes it in every `--mfa-enforcement` mode; `required`, and `admin-only` for admins, make login force enrolment, so in practice this is any account under `optional` and a non-admin under `admin-only`); an OIDC session whose identity provider asserted no `amr` proof, unless `--mfa-enforcement=required` (under `admin-only` it still passes for a non-admin role); and any session when `--mfa-step-up-window-secs=0`. `--mfa-enforcement=required` closes the OIDC case only if the identity provider asserts an MFA-method `amr` for approvers: an OIDC session without one gets `401` and loops through re-sign-in at every step-up endpoint, not only approval, so verify `amr` before enabling it (the way back is restarting in `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards), not just any non-`required` mode, because an `amr`-less OIDC admin is still gated under `admin-only`; see [MFA on SSO sessions](authentication.md#mfa-on-sso-sessions-pr-3) and the [recovery runbook](../ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). It also makes every local user enrol at login. Requiring an enrolled factor of the approver in every mode is tracked in #6079. A cookie-session `POST` must also carry a same-site `Origin` (or `Referer`); see the `403 cross-site request refused` row below. The reviewer cannot be the submitter (`400`, audited as denied). Fail-closed behaviour: if the caller's session cannot be resolved the route returns `503` and the request stays pending; the approval attempt is audited before the decision is applied, and if that audit row cannot be written the route returns `503` and changes nothing (#5823). An approved ticket not consumed within 7 days of its review is refused at consume. Full rules: `docs/user-manual/instructions.md`, "Who can approve".
+**Who may call it.** Requires `Approval:Approve` and an interactive cookie session (local or OIDC) whose own identity has an **enrolled MFA factor with a fresh proof** (#6079). A stale proof returns `401` with `meta.mfa_step_up_required: true` and `meta.challenge_url`, as on the other step-up endpoints (`docs/user-manual/authentication.md`, "Step-up on high-risk surfaces"). An API-token or MCP-token session is refused with `403` and an A4 envelope, and an engine principal is never admitted. The approver rule is stricter than the generic step-up gate and does not depend on `--mfa-enforcement` or `--jit-oidc-amr-elevation`: a local account with no enrolled factor is refused `403` `approver_assurance_required:mfa_not_enrolled`; an OIDC session whose sign-in carried no MFA `amr` (or no usable `iat`) is refused `403` `mfa_proof_missing` (with step-up on, typed only when `--mfa-enforcement` does not protect the role; otherwise the central check answers first with the `401` step-up), whereas one whose MFA `amr` is present but whose ID token was issued longer ago than the window gets the `401` step-up with `challenge_url=/auth/oidc/start`; a live session whose account row is deleted, deactivated or has an invalid username is refused `account_unavailable` (typed only with `--mfa-step-up-window-secs` at `0`, or when the account is removed between the central check's read and the approver rule's: with the window above `0` the central check normally answers such an account first with `401` `MFA step-up required`); a SAML session is refused `saml_mfa_unsupported` (#4935; with step-up on, the central check's generic `403` answers it first, so the typed refusal appears only with the window at `0`). The approver rule runs after the central step-up check, so a proof older than the configured window, a SAML session and an engine principal are answered there while the window is above `0`. The window is `min(--mfa-step-up-window-secs, 300)` seconds, and 300 when that setting is `0` or negative, so `--mfa-step-up-window-secs=0` no longer disables the check (before #6079 it did, and admitted a SAML session). The ceiling is measured on the database clock against the proof timestamp stored with the session and read afresh for each decision, so a paused virtual machine or a resumed host cannot extend it. A local proof made before the account's current MFA enrolment is treated as stale (`401`). For an OIDC session "fresh" means the provider issued an ID token with an MFA `amr` within the window; the MFA itself may predate the token, because the provider can reuse its own session, and no second factor is presented again at approval time; real re-authentication is a planned follow-up. Under `--mfa-enforcement=optional` or `admin-only` a non-admin cannot enrol itself, so an administrator must enrol each non-admin approver first (`docs/ops-runbooks/auth-db-recovery.md`, "Enrolling a non-admin approver"). A cookie-session `POST` must also carry a same-site `Origin` (or `Referer`); see the `403 cross-site request refused` row below. The reviewer cannot be the submitter (`400`, audited as denied). Fail-closed behaviour: if the caller's session cannot be resolved the route returns `503` and the request stays pending; the approval attempt is audited before the decision is applied, and if that audit row cannot be written the route returns `503` and changes nothing (#5823). The `attempted` and `success` audit rows carry `detail=approver_assurance:enrolled_fresh_mfa`, which marks a decision made under this control (a row without it predates it). An approved ticket not consumed within 7 days of its review is refused at consume. Full rules: `docs/user-manual/instructions.md`, "Who can approve".
 
 On success the response is `200` with `{"status":"approved"}` (`{"status":"rejected"}` for reject):
 
@@ -11529,21 +12063,34 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/approvals/REQ-001/appro
   -d '{"comment": "Reviewed, safe to proceed."}'
 ```
 
-**Errors** (checked in this order; `POST /api/approvals/{id}/reject` is identical):
+**Errors** (checked in this order; `POST /api/approvals/{id}/reject` is identical). The first row is the server-wide same-site check, which a cookie session meets before anything else (a token caller skips it). The next five rows are the central MFA step-up check, which runs before the route handler (with `--mfa-step-up-window-secs=0` only the first two of those can fire); the handler's own checks follow it, and the handler's step-up call only consumes the central pass:
 
 | Status | Body | Cause |
 |---|---|---|
-| `403` | the standard permission-denied response | The caller lacks `Approval:Approve`. |
-| `503` | A4 envelope, `retry_after_ms: 5000` | The caller's session could not be resolved after the permission gate passed. The request stays pending and nothing is recorded. |
-| `403` | A4 envelope, message `cross-site request refused` | A cookie-session `POST` whose `Origin`/`Referer` names another site, or carries neither header (a `--csrf-trusted-origin` entry is accepted). Audited as `csrf.denied`; the ticket is unchanged and no step-up is spent. Token callers are not subject to this check and are refused by the next row instead. |
-| `403` | A4 envelope, message `approver_assurance_required:<reason>` | Class refusal. `<reason>` is `non_interactive_session` (API-token, MCP-token or any other non-cookie session), `engine_principal` or `non_human_principal`. Audited as `approval.approve` / `approval.reject` with `result=denied` and `detail=approver_assurance:<reason>` (best effort). |
-| `503` | `{"error":{"code":503,"message":"service unavailable"}}` | The approval store is not available. |
-| `503` | A4 envelope | MFA step-up is not wired (fail closed); the decision was not recorded. |
-| `403` | step-up envelope, message `MFA step-up is not available for SAML sessions in this release` | A SAML session while step-up is on (#4935). A deployment whose approvers all sign in through SAML has no working approver path until #4935 is decided (tracked in #6098). |
-| `503` | A4 envelope, message `authentication store is temporarily unavailable` | The step-up gate could not read the account's MFA status; it fails closed (a local account's status read can also answer a `401` whose remediation reads `auth_db unavailable`). |
-| `401` | step-up envelope, `meta.mfa_step_up_required: true`, `meta.challenge_url` | The session's MFA proof is older than `--mfa-step-up-window-secs`. Complete the step-up and retry. |
+| `403` | A4 envelope, message `cross-site request refused` | Server-wide same-site check, after authentication and before the step-up check: a cookie-session `POST` whose `Origin`/`Referer` names another site, or carries neither header (a `--csrf-trusted-origin` entry is accepted). Audited as `csrf.denied` (central gate); no step-up is evaluated, no `attempted` row is written, and the ticket is unchanged. |
+| `503` | A4 envelope, message `authentication store is temporarily unavailable` | Central check: no authentication store is wired (a defensive boot-wiring state). It answers every caller class, an engine principal included, before the engine refusal below, and is audited as `mfa.step_up.required` with `reason=auth_store_unwired`. |
+| `403` | step-up envelope, message `engine principals cannot perform this operation` | Central check: an engine principal. Audited as `mfa.step_up.required` with `reason=engine_principal_denied` in the detail and the route label as `target_id`; the handler never runs, so no `approval.approve` / `approval.reject` row is written. |
+| `403` | step-up envelope, message `MFA step-up is not available for SAML sessions in this release` | Central check: a SAML session while step-up is on (#4935). A deployment whose approvers all sign in through SAML has no working approver path until #4935 is decided (tracked in #6098). |
+| `503` | A4 envelope, message `authentication store is temporarily unavailable` | Central check: the step-up gate could not read the account's MFA status; it fails closed (a local account's status read can also answer a `401` whose remediation reads `auth_db unavailable`). |
+| `401` | step-up envelope, `meta.mfa_step_up_required: true`, `meta.challenge_url` | Central check: the session's MFA proof is older than `--mfa-step-up-window-secs`. Complete the step-up and retry. A cross-site cookie `POST` never reaches this check; the first row answers it. |
+| `403` | the standard permission-denied response | In the handler: the caller lacks `Approval:Approve`. |
+| `503` | A4 envelope, `retry_after_ms: 5000` | In the handler: the caller's session could not be resolved after the permission gate passed. The request stays pending and nothing is recorded. |
+| `403` | A4 envelope, message `cross-site request refused` | In the handler: this route's own copy of the same-site check, defence in depth. A cookie-session caller is answered by the first row and does not reach it; it can fire only where the server-wide check does not run. Audited as `csrf.denied`; the ticket is unchanged. Token callers are not subject to this check and are refused by the next row instead. |
+| `403` | A4 envelope, message `approver_assurance_required:<reason>` | In the handler: class refusal. `<reason>` is `non_interactive_session` (API-token, MCP-token or any other non-cookie session) or `non_human_principal`; `engine_principal` is produced only on the MCP surface, because over REST an engine principal is refused by the central check above. Audited as `approval.approve` / `approval.reject` with `result=denied` and `detail=approver_assurance:<reason>`; the refusal does not depend on that row: if it cannot be written the `403` stands and the response carries `Sec-Audit-Failed: true`. API-token and MCP-token sessions pass the central step-up check and are refused here. |
+| `503` | `{"error":{"code":503,"message":"service unavailable"}}` | In the handler: the approval store is not available. |
+| `503` | A4 envelope, message `MFA verification is not available; the decision was not recorded`, remediation `contact an administrator` | In the handler: Defensive fail-closed branch: the server wires the step-up closure and the approver MFA check at startup, so this appears only if the route was constructed without either (a wiring fault, not a request problem). Nothing is recorded or audited. |
+| `403` | A4 envelope, message `approver_assurance_required:mfa_not_enrolled` | In the handler (the approver rule, after the central check has passed): The local account has no enrolled MFA factor. The A4 remediation differs for an administrator (enrol under Settings) and a non-admin (sign out and sign in again, because sign-in offers enrolment when the deployment's `--mfa-enforcement` requires it for the role; otherwise ask an administrator to enrol the account, and the text points that administrator at "Enrolling a non-admin approver" in the Auth Store Recovery Runbook). Audited `denied`, `detail=approver_assurance:mfa_not_enrolled`; no step-up is offered, because a code cannot help. |
+| `403` | A4 envelope, message `approver_assurance_required:mfa_proof_missing` | In the handler (approver rule): An OIDC session whose sign-in left no MFA proof: the identity provider asserted no MFA-method `amr`, or the token had no usable `iat`. With the window above `0` this is typed only when `--mfa-enforcement` does not protect the role (`optional`, or `admin-only` for a non-administrator); under `required`, or `admin-only` for an administrator, the central check answers first with the `401` step-up. Sign in again through the provider with MFA. If the identity provider re-authenticates you silently without asserting an MFA `amr`, the retry returns `403` `mfa_proof_missing` again; complete provider-side MFA (for example by signing out of the provider first) and then retry. Real re-authentication at approval time is a planned follow-up. A proof that exists but is older than the window is not this row; it is the `401` step-up row below. A proof that is dated after the database clock is the clock-skew `503` row below while the database clock is still behind that instant; once the database clock has passed that instant (after at most as long as the skew is large, even while the skew persists), a session whose cached proof was dropped answers this `403` until its cache re-derives (a session create, MFA mark, elevation or delete by any user clears it; an activity touch does not; so does a server restart; a new sign-in also works once the clocks agree). The remediation names both causes (the identity provider sent no MFA `amr`, or the clocks of the identity provider, the Yuzu server and its database disagree) and always ends with `If it repeats, ask your administrator to check clock synchronisation between the identity provider, the Yuzu server and its database.` Audited `denied`, `detail=approver_assurance:mfa_proof_missing`. |
+| `403` | A4 envelope, message `approver_assurance_required:account_unavailable` | In the handler (approver rule): A live session whose `auth.users` row is deleted, deactivated or has an invalid username. Typed only with `--mfa-step-up-window-secs` at `0`, or when the account disappears between the central check's read and this one: with the window above `0` the central check answers first with a `401` `MFA step-up required` whose remediation reads `auth_db unavailable: retry shortly or contact an administrator`. Sign in again or contact an administrator. Audited `denied`, `detail=approver_assurance:account_unavailable`. |
+| `403` | A4 envelope, message `approver_assurance_required:saml_mfa_unsupported` | In the handler (approver rule): A SAML session (#4935) when step-up is switched off (`--mfa-step-up-window-secs=0`): with step-up on, the central check's `403` above answers first, and this refusal holds in every configuration. A deployment whose approvers all sign in through SAML has no working approver path until #4935 is decided (tracked in #6098). Audited `denied`, `detail=approver_assurance:saml_mfa_unsupported`. |
+| `401` | step-up envelope, `meta.mfa_step_up_required: true`, `meta.challenge_url` (`/login/mfa/stepup` for a local session, `/auth/oidc/start` for OIDC) | In the handler (approver rule): The session's MFA proof is older than the approver window (at most 300 seconds, so this also fires inside a longer configured window, or with the window at `0`; a proof older than the configured window is answered by the central `401` row above), or (local) predates the account's current enrolment. Complete the step-up and retry. If the identity provider re-authenticates you silently without asserting an MFA `amr`, the retry returns `403` `mfa_proof_missing`; complete provider-side MFA (for example by signing out of the provider first) and then retry. Real re-authentication at approval time is a planned follow-up. Two audit rows are written: `mfa.step_up.required` (the gate's own row; detail `reason=proof_predates_enrolment` when the proof predates enrolment) and `approval.approve` / `approval.reject` `result=denied` with `detail=approver_assurance:mfa_proof_stale` (the ticket-specific row). The two have different failure postures: if the ticket-specific row cannot be written, the response carries `Sec-Audit-Failed: true`; the gate's own `mfa.step_up.required` row is best effort, so a failed write is logged on the server and never surfaced in the response. |
+| `503` | A4 envelope, `retry_after_ms: 5000` | In the handler (approver rule): The MFA store could not be read (including a missing or unreadable TOTP secret), or the session's stored proof could not be read, so the check fails closed and the ticket is untouched. Increments `yuzu_auth_secret_unavailable_total{route="approval"}`; audited as an `error` result with `detail=approver_assurance:mfa_store_unavailable`. |
+| `503` | A4 envelope, message `the approver's identity-provider MFA proof is dated after the database clock`, `retry_after_ms` null (the key is present with a null value) | In the handler (approver rule): an OIDC approver whose stored MFA proof is dated after the database clock, which means the replica that took the sign-in ran ahead of the database clock (the sign-in clamps the ID token's `iat` to that replica's own clock, so an identity provider running ahead cannot cause this alone). Reached only when the central check does not answer first: default optional enforcement, `admin-only` for a non-administrator approver, or the step-up window at `0`; under `required` (or `admin-only` for an administrator) with the window above `0` the approver instead sees a repeating `401` step-up challenge and no `approval.*` row. Retrying does not help until an administrator corrects clock synchronisation between the Yuzu server hosts and the database host; the A4 remediation says so (it names the identity provider too). Not counted in `yuzu_auth_secret_unavailable_total{route="approval"}` (that counter stays a store-fault signal); find it by the audit detail `approver_assurance:mfa_proof_clock_skew` (`result=error`) and by the server error log line. See `docs/ops-runbooks/auth-db-recovery.md`, "OIDC approvers refused with a clock-skew 503". |
+| `400` | A4 envelope, message `approval not found` | In the handler: The path id is empty, longer than 128 characters or outside letters, digits, `_` and `-`, so the store is not asked. One `denied` row (`detail` `invalid_approval_id`, `target_id` `invalid-id`) and no `attempted` row; the refusal stands even if that row cannot be written, in which case the response carries `Sec-Audit-Failed: true`. This check runs after the permission, CSRF, class and MFA checks above and before the `attempted` row. An id that is literally `invalid-id` passes the shape check and is looked up like any other, so a row with `target_id` `invalid-id` is told apart by its `detail`. |
 | `503` | A4 envelope, header `Sec-Audit-Failed: true`, `retry_after_ms: 5000` | The `attempted` audit row could not be written, so the decision was not applied and the ticket stays pending (#5823). |
 | `400` | `{"error":"<reason>"}` | The store refused the decision, for example the reviewer is the submitter, or the ticket is no longer pending. Audited as `denied`. |
+
+**Retrying after a lost response.** The decision is applied once. A retry of a request whose response was lost is answered `400` `approval already reviewed (status: <status>)` while the caller's proof is still inside the approver window, and the audit trail shows an `attempted` row followed by a `denied` row for it. Outside the window, or when the account's state changed (for example the factor was cleared), the retry is refused before the store is asked: `401` for a stale proof or `403` `approver_assurance_required:<reason>`, each leaving a `denied` row and no `attempted` row. Read the ticket's status (`GET /api/v1/approvals/{id}`) before deciding that the first request failed.
 
 Example class refusal:
 
@@ -11553,7 +12100,7 @@ Example class refusal:
     "code": 403,
     "message": "approver_assurance_required:non_interactive_session",
     "correlation_id": "req-...",
-    "remediation": "approving or rejecting requires an interactive human session (local or OIDC login) that passes the MFA step-up gate; API-token, MCP and engine credentials cannot decide an approval. Use the dashboard Approvals page."
+    "remediation": "approving or rejecting requires an interactive human session (local or OIDC login) with an enrolled MFA factor and a fresh proof; API-token, MCP and engine credentials cannot decide an approval. Use the dashboard Approvals page."
   },
   "meta": { "api_version": "v1" }
 }
@@ -11850,10 +12397,13 @@ exist. `POST /query` returns `400` on a malformed request body.
 
 #### `GET /api/me`
 
-Returns current user info (legacy version; prefer `/api/v1/me`). The flat body carries
-`username`, `display_name`, `role`, `rbac_enabled`, `rbac_role`, `effective_role`, `elevated`,
-`elevated_until` (only while elevated) and `can_access_settings`, with the same meaning as the
-`data` object of [`GET /api/v1/me`](#get-apiv1me). Sent with `Cache-Control: no-store, private`.
+Returns current user info (legacy version; prefer `/api/v1/me`). The body is the `data` object of
+[`GET /api/v1/me`](#get-apiv1me) with no envelope: the same keys with the same meaning, including
+`principal_kind`, `auth_source`, `mcp_tier`, `scope_service`, `rbac_roles` and `rbac_roles_resolved`,
+and the same engine-principal and role-store-fault behaviour (an engine principal gets no invented
+`rbac_role`; a role-store fault answers `200` with `rbac_roles_resolved: false` and no role keys).
+Keys are emitted in insertion order, not alphabetically, so a JSON consumer must not depend on key
+order. Sent with `Cache-Control: no-store, private`.
 
 #### `GET /api/analytics/status`
 
@@ -11962,7 +12512,7 @@ backport-aware matching (M1b/OVAL) lands.
 
 #### `GET /events`
 
-Server-Sent Events stream for real-time dashboard updates. Events include agent connections/disconnections, command responses, and system notifications.
+Server-Sent Events stream for real-time dashboard updates. Events include agent connections/disconnections, command responses, and system notifications. Live output events never carry a row written by a Forensics-tier plugin (see "Forensics-tier rows" under Command/Instruction Responses); a Forensics-tier frame publishes nothing to the live output stream (no row, no notice; the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder; open the execution results instead.
 
 **Example (curl):**
 
@@ -11989,6 +12539,8 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 - **`{id}`:** the execution id returned by `POST /api/instructions/:id/execute` or visible in the executions list (regex: `[A-Za-z0-9_-]{1,128}`).
 - **Content-Type:** `text/event-stream`
 - **Headers:** `Cache-Control: no-cache`, `X-Accel-Buffering: no` (so reverse proxies don't buffer the stream into chunks).
+
+**Forensics-tier output is not published (#4990).** The live output events never carry a row written by a Forensics-tier plugin (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`), whoever is subscribed, and the failure text in the execution events of such a command is a short machine token or the fixed value `forensics_error`. Read the rows through the response routes, which require `Forensics:Read`. Such a frame publishes nothing to the live output stream, not even a notice (the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder for such an action; open the execution results instead.
 
 **Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check — a management-group-confined operator is admitted and then sees only their in-scope agents' events. The caller who **dispatched** the execution is always admitted to the stream (visibility only — avoids a false 404 on a just-dispatched execution with zero responses yet), but that ownership never bypasses the per-event redaction below. RBAC-off → unrestricted (legacy-open). **This gate is evaluated once, at subscribe time** — it is not re-checked for the life of the connection. If your scope is narrowed, or your session is revoked, mid-stream, an already-open subscription is not automatically disconnected (tracked: #3788); a full server restart is the only thing that currently drops every live stream.
 
@@ -12079,6 +12631,8 @@ The browser-oriented `/sse/executions/{id}` route is preserved for the dashboard
 
 **Permission:** `Execution:Read`.
 **Auth:** Bearer token, `X-Yuzu-Token` header, or session cookie. Same auth surface as every other `/api/v1/*` endpoint.
+
+**Forensics-tier output is not published (#4990).** The live output events never carry a row written by a Forensics-tier plugin (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`), whoever is subscribed, and the failure text in the execution events of such a command is a short machine token or the fixed value `forensics_error`. Read the rows through the response routes, which require `Forensics:Read`. Such a frame publishes nothing to the live output stream, not even a notice (the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder for such an action; open the execution results instead.
 
 **Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check — a management-group-confined operator is admitted and then sees only their in-scope agents' events. The execution's dispatcher is always admitted to the stream (visibility only — avoids a false 404 on a just-dispatched execution with zero responses yet), never a bypass of the per-event redaction below. RBAC-off → unrestricted (legacy-open). This route shares one event projector (`execution_event_scope.hpp`) with the dashboard's `/sse/executions/{id}` sibling — see that section for the drop/sanitize table (`agent-transition` filtered by `agent_id`, `execution-progress` dropped, `execution-completed` sanitized to `status` only), and for the same subscribe-time-only gate staleness caveat (tracked: #3788) — this route shares that gap.
 
@@ -12287,7 +12841,7 @@ Dispatch a single-device `tar.configure` with `<source>_enabled=true`. Per-sourc
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `device_id` | string | Yes | The agent ID. Must be in the operator's visible-agent set; otherwise rejected with 404 (same body as not-connected). |
-| `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Other values rejected with 400 to prevent forged form submissions. The retention-paused list covers the always-on four; opt-in sources (`arp`, `dns`, `procperf`, `netqual`, `module`) are enabled/disabled via the **Capture sources** frame (below), not this route. |
+| `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Other values rejected with 400 to prevent forged form submissions. The retention-paused list covers the four listed sources; the other sources (`arp`, `dns`, `procperf`, `netqual`, `module`) are enabled/disabled via the **Capture sources** frame (below), not this route. |
 
 **Response:**
 - 200 OK with empty body and an `HX-Trigger` toast on success.
@@ -12304,7 +12858,7 @@ Dispatch a single-device `tar.purge_source` that **permanently drops every wareh
 
 **Confirmation:** the dashboard requires the operator to type the device hostname before this POST fires (a native `prompt()`, CSP-safe). The confirmation is **client-side** — scripted callers that POST directly are still gated by the permission, the per-device visibility check, and the agent-side paused-guard.
 
-**Paused-guard (authoritative, agent-side):** the agent refuses the purge (`source_not_paused`) unless the source currently reports disabled. This closes the scan→purge TOCTOU (a source re-enabled between the operator's scan and the purge is not dropped). The server does **not** enforce a `SOURCE_NOT_PAUSED` check — the retention-paused list is an ephemeral live scan with no persisted paused-state.
+**Paused-guard (authoritative, agent-side):** the agent refuses the purge (`source_not_paused`) unless the source currently reports disabled, and refuses (`config_unreadable`) when the enable flag cannot be read so it cannot confirm that; nothing is purged in either case. This closes the scan→purge TOCTOU (a source re-enabled between the operator's scan and the purge is not dropped). The server does **not** enforce a `SOURCE_NOT_PAUSED` check — the retention-paused list is an ephemeral live scan with no persisted paused-state.
 
 **Request body (form-encoded):**
 
@@ -12339,7 +12893,7 @@ The **agentic-first (A1) structured surface** for the same destructive purge —
 | `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Others → 400. |
 
 **Responses:**
-- **202 Accepted** — `{"data":{"command_id","device_id","source","agents_reached"},"meta":{"api_version":"v1"}}`. Async: the agent computes `rows_deleted` (and the agent-side `source_not_paused` refusal if the source was re-enabled) into the command's **response record** — poll it by `command_id`; it is not in the 202 body. `X-Correlation-Id` header on every response.
+- **202 Accepted** — `{"data":{"command_id","device_id","source","agents_reached"},"meta":{"api_version":"v1"}}`. Async: the agent computes `rows_deleted` (and the agent-side `source_not_paused` refusal if the source was re-enabled, or `config_unreadable` if the enable flag could not be read) into the command's **response record** — poll it by `command_id`; it is not in the 202 body. `X-Correlation-Id` header on every response.
 - **400** — invalid JSON / missing `device_id`/`source` / source not in the allowlist (A4 error envelope).
 - **403 / 404** — permission denied or device out of scope (scoped gate; A4 envelope).
 - **404** — dispatch reached zero agents (device offline).
@@ -12831,7 +13385,7 @@ Same strict-shape gate as `POST /login/mfa`: exactly 6 ASCII digits is interpret
 | Status | Condition | Body |
 |---|---|---|
 | `200` | Code accepted; session's `mfa_verified_at` refreshed to now | `{"status":"ok"}` |
-| `400` | Missing `code`, or principal is an API/MCP token, or an **OIDC** session (OIDC re-proves via SSO, not local step-up — the body points to `/auth/oidc/start`) | `{"error":{"code":400,"message":"missing code"}}` / `step-up is for session-cookie callers only` / `OIDC sessions re-prove MFA by re-authenticating with the identity provider …` |
+| `400` | Missing `code`, or principal is an API/MCP token, or an **OIDC** session (OIDC re-proves via SSO, not local step-up; the body points to `/auth/oidc/start`), or a **SAML** session (SAML sessions carry no MFA attestation and cannot step up in this release; the refusal is audited as `mfa.step_up.failed`) | `{"error":{"code":400,"message":"missing code"}}` / `step-up is for session-cookie callers only` / `OIDC sessions re-prove MFA by re-authenticating with the identity provider …` / `SAML sessions cannot satisfy step-up in this release; re-authenticating does not help` |
 | `401` | No session cookie, or rejected code | `{"error":{"code":401,"message":"MFA step-up failed"}}` |
 | `503` | `auth_db` unavailable (transient) | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
 
@@ -12854,7 +13408,16 @@ curl -s -X POST https://yuzu.example.com/login/mfa/stepup \
 
 #### Step-up envelope on high-risk endpoints
 
-The following endpoints return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs` (the JIT-elevation routes near the end of this list use a 300s window instead when that flag is `0` or less):
+A fresh MFA proof is required on 37 named high-risk routes (listed below) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`; un-enrolled accounts and API-token and MCP-token callers pass, and engine principals are denied. The three JIT-elevation routes, whose handlers apply their own stricter check, are separate. Other mutating routes and all MCP tools are not MFA-step-up gated in this release. The 37 are checked by one central step-up check that runs after the session is resolved and after the server-wide same-site check (a cross-site or header-less cookie write is answered `403` `cross-site request refused` before it), and **before** the route's own authorization, own same-site copy and body checks. These routes return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs` (the JIT-elevation routes at the end of this list use a 300s window instead when that flag is `0` or less; a positive value is used as it is).
+
+Other outcomes of that check:
+
+- `403` for a SAML session (no SAML MFA attestation in this release; the remediation says SAML sessions cannot satisfy step-up, re-authenticating does not help, and to use an existing untiered, unscoped API token where the route accepts one, or ask an administrator). The escape hatch precedes this denial, so with `--mfa-step-up-window-secs` at `0` or less SAML sessions pass all 37 routes. Also `403` for an engine principal on every one of the 37 routes, regardless of its grants (audited as `mfa.step_up.required` with `result=error` and `reason=engine_principal_denied`; the body carries `meta.mfa_step_up_required: false` and no `challenge_url`). Once its credential resolves, an engine principal is refused before any role grant is consulted and without any MFA store read, even when `--mfa-step-up-window-secs` is `0`; it can never satisfy a TOTP challenge. During a database outage the pre-routing authentication cannot resolve the credential (an engine token reads the store on every request; a cookie session is served from the validation cache for about 30 seconds of a stall and is in the same position only once that cache lapses), so the request is answered as an unauthenticated one: `401` `unauthorized` (a JSON body on `/api/`, `/events` and `/mcp/` paths; other paths, such as `/fragments/`, get a redirect or `HX-Redirect`) without the step-up envelope, the engine quota or a step-up audit row. The checks that precede the denial are the pre-routing gates (on-behalf rejection, the rate limit, the `401` for no session and the engine quota `429`) and the unwired-store `503` below, which answers every caller class. On these 37 routes this replaces the per-route handler denial (a `result=denied` audit row with detail `engine_session_denied` and the body text `engine principals cannot access this endpoint`), which is no longer produced there; update SIEM rules keyed on it.
+- `503` when the server has no wired authentication store (for any caller, including a token caller and a disabled window), or when the store cannot be read or the stored second factor cannot be decrypted (for a local session; API-token and MCP-token callers pass before any store read, and an OIDC session is judged on its identity-provider assertion). A `503` still carries `meta.mfa_step_up_required: true`, with no `challenge_url`; a client must treat a `503` as "retry shortly" and prompt for a code only on a `401`. Any other failure to read the enrollment state of a local session is a `401` whose remediation names the store.
+- A refusal carries an `X-Correlation-Id` response header equal to the body's `error.correlation_id`, and the audit row of a refusal made by the central check carries `cid=<id>` (the same value) and `stage=pre_authz` in the `mfa.step_up.required` row's `detail`, so the response is joinable to its row. The detail of a stale or absent proof is `user=<name> age_secs=<n> window_secs=<n> cid=<id> stage=pre_authz` (`age_secs=-1` when the session has no proof); every other refusal is `user=<name> reason=<token> cid=<id> stage=pre_authz`. The gate the three JIT-elevation handlers apply in their own handler writes the same fields without `cid=` or `stage=`, so only the central check's rows join by correlation id. The row is best effort, and the central check writes none for a request with no session (counted on the metric only; pre-routing answers anonymous requests first). An over-cap request body is refused `413` before the step-up check runs.
+- **Dashboard controls.** The `/fragments/...` and `/api/settings/...` routes below answer in the same envelope. When the request carries `HX-Request` (an htmx control, on these routes or on an `/api/v1/` route such as `DELETE /api/v1/sessions`) the response also carries an `HX-Trigger` error toast whose text is the envelope's `message`; a `fetch` request has no such header and gets no toast. The Guardian page's Edit and Delete controls use `fetch` through the shared dialog, which prompts for a code on a `401` envelope and shows the `message` of a `403` or `503` inside the dialog. See [Authentication](authentication.md) for the prompts each dashboard control raises.
+
+The server refuses to start (exit status `1`) if a mutating route is registered that the step-up table does not classify; this can only happen on a fork or a custom build.
 
 - `POST /api/v1/tokens` (mint API token)
 - `DELETE /api/v1/tokens/{id}` (revoke API token)
@@ -12871,8 +13434,13 @@ The following endpoints return `401` with an MFA step-up envelope when the calli
 - `DELETE /api/v1/guaranteed-state/rules/{id}` (delete Guardian rule)
 - `POST /api/v1/guaranteed-state/push` (fan out Guardian rules)
 - `POST /api/v1/guaranteed-state/policy-generation/raise` (raise the Guardian policy generation)
+- `PUT /api/v1/config/{key}` (write a runtime-configuration override; its legacy twin `PUT /api/config/{key}` is not step-up gated)
 - `POST /api/settings/api-tokens` (mint an API token from the dashboard)
 - `DELETE /api/settings/api-tokens/{id}` (revoke an API token from the dashboard)
+- `POST /api/settings/mfa/recovery-codes` (regenerate your MFA recovery codes from the dashboard)
+- `POST /api/settings/mfa/disable` (disable your MFA enrollment from the dashboard)
+- `POST /fragments/guardian/guard/{id}/update` (update a guard from the Guardian dashboard)
+- `POST /fragments/guardian/guard/{id}/delete` (delete a guard from the Guardian dashboard)
 - `DELETE /api/settings/users/{username}` (delete user)
 - `POST /api/settings/users/{username}/role` (change user role)
 - `POST /api/v1/engine-principals/{id}/roles` (assign a fleet-wide role to an engine principal)
@@ -12880,16 +13448,17 @@ The following endpoints return `401` with an MFA step-up envelope when the calli
 - `POST /api/v1/engine-principals` (create an engine principal)
 - `DELETE /api/v1/engine-principals/{id}` (revoke an engine principal)
 - `POST /api/v1/engine-principals/{id}/credentials` (mint the first credential)
-- `POST /api/v1/engine-principals/{id}/credentials/rotate` (rotate a credential)
+- `POST /api/v1/engine-principals/{id}/credentials/rotate` (rotate a credential; runs on every call, including a grace-window re-serve)
 - `POST /api/v1/engine-principals/{id}/credentials/confirm` (confirm a rotation cutover)
 - `POST /api/v1/engine-principals/{id}/transfer-owner` (reassign the responsible owner)
-- `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject` (decide an approval request; cookie sessions only, API-token and MCP-token sessions get `403 approver_assurance_required:<reason>` instead of passing through, #6061)
+- `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject` (decide an approval request; cookie sessions only, API-token and MCP-token sessions get `403 approver_assurance_required:<reason>` instead of passing through, #6061; the caller also needs an enrolled MFA factor with a fresh proof, within `min(--mfa-step-up-window-secs, 300)` seconds, #6079, a stricter rule than this gate)
 - `POST /api/v1/rbac/roles/{name}/assignments` (assign a fleet-wide RBAC role to a human user)
 - `DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}` (unassign a fleet-wide RBAC role from a human user)
+- `PUT /api/v1/rbac/enforcement` (switch RBAC enforcement on or off)
 - `POST /api/v1/users/{username}/elevation-eligibility` and `POST /api/v1/users/elevation-eligibility?username=` (grant or revoke JIT-elevation eligibility)
 - `POST /api/v1/elevate` (activate a JIT admin elevation)
 
-For **OIDC** sessions the envelope's `challenge_url` is `/auth/oidc/start` (and the remediation points at re-SSO) instead of `/login/mfa/stepup` — an external identity has no local TOTP secret to step up against. An OIDC session whose IdP did not attest MFA at all (no `amr`) passes the gate under `--mfa-enforcement=optional`, but is **gated** (re-SSO) under `required` (or `admin-only` for an admin) — symmetric with a local user being forced to enrol.
+For **OIDC** sessions the envelope's `challenge_url` is `/auth/oidc/start` (and the remediation points at re-SSO) instead of `/login/mfa/stepup` — an external identity has no local TOTP secret to step up against. An OIDC session whose IdP did not attest MFA at all (no `amr`) passes the gate under `--mfa-enforcement=optional`, but is **gated** (re-SSO) under `required` (or `admin-only` for an admin) — symmetric with a local user being forced to enrol. Approve and reject are the exception: they refuse an OIDC session with no MFA `amr` (`403 approver_assurance_required:mfa_proof_missing`) and a local account with no enrolled factor (`mfa_not_enrolled`) in every mode, and use a proof window of `min(--mfa-step-up-window-secs, 300)` (300 when that is `0`), so they are not switched off by `--mfa-step-up-window-secs=0`.
 
 Envelope shape:
 
@@ -12909,7 +13478,7 @@ Envelope shape:
 }
 ```
 
-`meta.mfa_step_up_required` is the boolean discriminator that distinguishes this 401 from an "unauthenticated" 401; `meta.challenge_url` tells the client where to re-prove — `/login/mfa/stepup` for local sessions, `/auth/oidc/start` for OIDC sessions. API token / MCP token principals **never see this 401** — the gate skips them entirely (the bearer credential was issued as part of an authenticated session and is itself the step-up).
+`meta.mfa_step_up_required` is the boolean discriminator that distinguishes this 401 from an "unauthenticated" 401 (the `503` store-unavailable envelope carries it as `true` too, with no `challenge_url`, so prompt only on a `401`); `meta.challenge_url` tells the client where to re-prove: `/login/mfa/stepup` for local sessions, `/auth/oidc/start` for OIDC sessions. API token / MCP token principals **never see this 401**: they pass the proof check (the bearer credential was issued as part of an authenticated session and is itself the step-up). Engine principals are refused with `403` on the routes above, as described there.
 
 ### JIT Admin Elevation
 
@@ -12942,7 +13511,7 @@ curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
 
 #### `POST /api/v1/elevate/revoke`
 
-Step an active elevation down early (reduces privilege; no MFA step-up required). Body: none. Always `200 {"status":"ok"}`; whether a window was actually active is recorded as `was_elevated=<bool>` in the `role.elevation.revoked` audit detail, not the response body.
+Step an active elevation down early (reduces privilege; no MFA step-up required). Body: none. Answers `200 {"status":"ok"}` once the elevation is cleared, whether or not a window was active; that is recorded as `was_elevated=<bool>` in the `role.elevation.revoked` audit detail, not the response body. If the server cannot durably clear the elevation it answers `503` (retry) and writes the same action with `result=error`, because the elevation may still be live.
 
 #### `POST /logout`
 
@@ -13340,13 +13909,13 @@ The header bell polls `GET /api/notifications?limit=10` with the session cookie 
 
 #### `GET /health` (alias: `GET /api/health`)
 
-> **Note:** `/api/health` is an identical alias of `/health`, provided for monitoring integrations that prefix every REST call with `/api/`. Both paths are unauthenticated, exempt from rate limiting, and return the same JSON body. The canonical path is `/health`; use `/api/health` only when your tooling enforces the `/api/` prefix unconditionally. (Restored in v0.12.0 — see issue #620.)
+> **Note:** `/api/health` is an identical alias of `/health`, provided for monitoring integrations that prefix every REST call with `/api/`. Both paths are unauthenticated and return the same JSON body. On the main listener, a request that carries a `Cookie`, `Authorization` or `X-Yuzu-Token` header is counted against a per-source budget. The source is the connection's peer address (behind a proxy or load balancer, all callers share it). The budget is the `--rate-limit` value (default 100 requests/second, `YUZU_RATE_LIMIT`; values below 1 are treated as 1, so the limit cannot be turned off), `/health` and `/api/health` share one bucket per source, and the bucket is separate from the REST budget. A request over the budget gets `429` with `Retry-After: 1` and the standard error envelope (including `correlation_id` and `retry_after_ms`). A request is charged by the presence of one of those headers, whether or not the credential is valid; a credentialed monitor behind a shared address shares the budget with every credentialed request from that address, so load balancer and orchestrator checks should use `/livez` or `/readyz`. A request that carries none of those headers is not counted, is never refused by this limit, and always gets the unauthenticated body. `/livez` and `/readyz` are not rate limited. The canonical path is `/health`; use `/api/health` only when your tooling enforces the `/api/` prefix unconditionally. (Restored in v0.12.0, see issue #620.)
 >
 > **Note:** When HTTPS is on, `/health` and `/api/health` are also answered on the plain-HTTP redirect port, in cleartext, where they always return the unauthenticated shape (no session is ever resolved there). That port answers `503 {"status":"not ready","reason":"https_listener_not_serving"}` to all four probe paths while the HTTPS listener is not bound or has exited.
 >
 > **Note:** `/health` and `/api/health` are intentionally NOT draining-aware (they continue returning 200 during graceful shutdown). For load-balancer health checks that should drain in-flight traffic before stopping, use `/readyz` instead — it returns 503 once the server begins draining.
 >
-> **Body shape varies by auth.** Unauthenticated callers (the standard monitoring case) get the cheap probe response: `status`, `uptime_seconds`, `agents.online`, `stores.*`, `enablement_regressed`, `version`, `tls.*` (default-certificates flag, install CA fingerprint and expiry). Authenticated callers additionally get `agents.pending`, `executions.*`, and `system.*` — those fields require SQLite scans and are gated behind a session so an unauthenticated probe flood cannot become a DoS amplification primitive.
+> **Body shape varies by auth.** Unauthenticated callers (the standard monitoring case) get the cheap probe response: `status`, `uptime_seconds`, `agents.online`, `stores.*`, `enablement_regressed`, `version`, `tls.*` (default-certificates flag, install CA fingerprint and expiry). Authenticated callers additionally get `agents.pending`, `executions.*`, and `system.*`. Those fields need extra store reads, so they are returned only to a caller with a session.
 
 Structured JSON health check endpoint. This endpoint is **unauthenticated** and intended for load balancers, monitoring systems, and orchestration tools.
 

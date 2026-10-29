@@ -435,7 +435,7 @@ today this is a documented limitation rather than something the setup script can
 ## Out of scope
 
 - **The Erlang gateway.** With no rebar3 on `PATH` the configure step prints `Erlang gateway:
-  skipped` and the C++ build proceeds normally; the `gateway eunit` / `gateway ct` meson tests simply
+  skipped` and the C++ build proceeds normally; the `gateway eunit shard A` / `gateway eunit shard B` / `gateway ct` meson tests simply
   never register. With rebar3 but no Erlang/OTP **28.4 or later 28.x** (EPEL's OTP 26 does not
   qualify), configure prints `WARNING: Erlang gateway: SKIPPED.` with every install it inspected.
   Neither `meson setup` nor `scripts/ensure-erlang.sh` downloads an OTP; they only find one.

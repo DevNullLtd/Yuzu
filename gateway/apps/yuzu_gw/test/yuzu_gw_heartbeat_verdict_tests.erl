@@ -6,11 +6,11 @@
 %%% The buffer's whole contract is: from either success shape of the
 %%% BatchHeartbeat result, take the listed ids, drop the ones that cannot be
 %%% session ids (counted as verdict_dropped reason malformed), sort and cap
-%%% them, and hand the list to yuzu_gw_upstream:replay_sessions/1 with one
+%%% them, and hand the list to yuzu_gw_upstream:replay_sessions/2 with one
 %%% cast. Error results never feed the verdict path. What the upstream then
 %%% does with the ids is covered in yuzu_gw_registration_replay_tests.
 %%%
-%%% Mocks: grpcbox_client, telemetry, yuzu_gw_upstream (replay_sessions/1 is
+%%% Mocks: yuzu_grpc_client, telemetry, yuzu_gw_upstream (replay_sessions/1,2 are
 %%% recorded). All mocks append to an ETS log from the calling process, so a
 %%% flush_sync/0 reply (or the sys:get_state/1 barrier after a `flush`
 %%% message) proves everything the flush did is already in the log.
@@ -73,11 +73,11 @@ verdict_test_() ->
      ]}.
 
 setup() ->
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     catch meck:unload(telemetry),
     catch meck:unload(yuzu_gw_upstream),
     persistent_term:put(?LOGK, ets:new(verdict_test_log, [public, ordered_set])),
-    meck:new(grpcbox_client, [non_strict, no_link]),
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
     set_result({ok, #{acknowledged_count => 0}, #{}}),
     meck:new(telemetry, [passthrough, no_link]),
     meck:expect(telemetry, execute, fun(Event, Meas, Meta) ->
@@ -92,6 +92,11 @@ setup() ->
     end,
     meck:new(yuzu_gw_upstream, [passthrough, no_link]),
     meck:expect(yuzu_gw_upstream, replay_sessions, fun(Ids) ->
+        rec({cast, Ids}),
+        ok
+    end),
+    %% The buffer hands the verdict over with its batch facts (#5695).
+    meck:expect(yuzu_gw_upstream, replay_sessions, fun(Ids, _Verdict) ->
         rec({cast, Ids}),
         ok
     end),
@@ -112,7 +117,7 @@ cleanup(_SetupPid) ->
         undefined -> ok;
         Standin   -> exit(Standin, kill)
     end,
-    catch meck:unload([grpcbox_client, telemetry, yuzu_gw_upstream]),
+    catch meck:unload([yuzu_grpc_client, telemetry, yuzu_gw_upstream]),
     persistent_term:erase(?LOGK),
     ok.
 
@@ -223,7 +228,7 @@ verdict_with_upstream_not_running_returns_ok() ->
     ?assertEqual(Pid, whereis(yuzu_gw_heartbeat_buffer)),
     ?assertEqual(1, dropped(malformed)).
 
-%% grpcbox returns {ok, <<>>, Trailers} for an OK with trailers and no DATA
+%% yuzu_grpc_client returns {ok, <<>>, Trailers} for an OK with trailers and no DATA
 %% frame, which reaches the second success arm. Before the guard this raised
 %% badmap inside the buffer and lost every heartbeat it held. The buffered
 %% heartbeat is still counted as flushed (flush returns ok, buffer emptied).
@@ -441,7 +446,7 @@ trunc_warnings(Lines) ->
 
 %% Make the next BatchHeartbeat rpc return Result.
 set_result(Result) ->
-    meck:expect(grpcbox_client, unary, fun(_Ctx, _Path, _Req, _Def, _Opts) -> Result end).
+    meck:expect(yuzu_grpc_client, unary, fun(_Meta, _Path, _Req, _Def, _Opts) -> Result end).
 
 %% Queue one heartbeat and flush it through flush_sync/0. The cast and the
 %% call come from this process, so the flush sees the heartbeat.

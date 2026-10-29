@@ -2,11 +2,13 @@
 /// HTTP-level coverage for the page-shell/static-asset route module (#2542)
 /// — driven in-process through TestRouteSink (no httplib acceptor, #438),
 /// mirroring test_plugin_config_routes.cpp's Harness shape. None of these
-/// 35 routes touches Postgres (no store), so every case here runs without
+/// 36 routes touches Postgres (no store), so every case here runs without
 /// YUZU_TEST_POSTGRES_DSN.
 
 #include "page_routes.hpp"
+#include "tar_timeline_page_ui.hpp"
 #include "test_route_sink.hpp"
+#include "web_utils.hpp"
 
 #include "agent_registry.hpp"
 #include "event_bus.hpp"
@@ -42,6 +44,7 @@ struct Harness {
 
     std::atomic<bool> viz_disabled{false};
     const yuzu::server::detail::AgentRegistry* registry{nullptr};
+    bool tar_timeline_ui{kTarTimelineUi};
 
     yuzu::server::test::TestRouteSink sink;
 
@@ -74,6 +77,7 @@ struct Harness {
         };
         deps.viz_disabled = &viz_disabled;
         deps.registry = registry;
+        deps.tar_timeline_ui = tar_timeline_ui;
         page::register_page_routes(sink, deps);
     }
 };
@@ -540,7 +544,7 @@ TEST_CASE("page_routes: /viz/host/:id rejects a malformed agent id with 400",
 // Routes that are not a kStaticAssets row: "/", the pages, /viz/*, the help API, the fragments.
 // A new static asset is one kStaticAssets row and leaves this alone, so two PRs that each add
 // an asset no longer collide on a hand-kept total. Add or remove any other route and this moves.
-constexpr std::size_t kNonAssetRoutes = 16;
+constexpr std::size_t kNonAssetRoutes = 17;
 
 TEST_CASE("page_routes: route count is assets + pages, with /viz/fleet reachable independently "
           "of /viz/host/:id (the documented registration order — /viz/fleet before the "
@@ -564,4 +568,90 @@ TEST_CASE("page_routes: route count is assets + pages, with /viz/fleet reachable
     REQUIRE(host);
     CHECK(host->status == 200);
     CHECK(host->body.find("somehost1") != std::string::npos);
+}
+
+// ── TAR timeline page (hidden behind kTarTimelineUi) ───────────────────────
+
+namespace yuzu::server {
+extern const std::string kYuzuTarTimelineJs;
+}
+
+TEST_CASE("page_routes: the TAR timeline page ships hidden; its routes do not exist by default",
+          "[server][routes][page_routes][tar][timeline]") {
+    CHECK_FALSE(kTarTimelineUi);
+    Harness h;
+    h.wire();
+    // Unregistered, not disabled: nothing matches, so there is no 404 page to tell them apart.
+    CHECK(h.sink.Get("/tar/timeline?id=x") == nullptr);
+    CHECK(h.sink.Get("/tar/timeline") == nullptr);
+    CHECK(h.sink.Get("/static/yuzu-tar-timeline.js") == nullptr);
+    CHECK(h.sink.route_count() == kStaticAssets.size() + kNonAssetRoutes);
+}
+
+TEST_CASE("page_routes: with the flag on the timeline page and its script are registered",
+          "[server][routes][page_routes][tar][timeline]") {
+    Harness h;
+    h.tar_timeline_ui = true;
+    h.wire();
+    CHECK(h.sink.route_count() == kStaticAssets.size() + kNonAssetRoutes + 2);
+    // /tar is unaffected.
+    auto tar = h.sink.Get("/tar");
+    REQUIRE(tar);
+    CHECK(tar->status == 200);
+}
+
+TEST_CASE("page_routes: the timeline page needs a session and an id",
+          "[server][routes][page_routes][tar][timeline]") {
+    Harness h;
+    h.tar_timeline_ui = true;
+    h.session_present = false;
+    h.wire();
+    auto anon = h.sink.Get("/tar/timeline?id=x");
+    REQUIRE(anon);
+    CHECK(anon->status == 302);
+    // /tar/timeline is not in the nav: the redirect names its family screen, so the landing page
+    // says "Sign in to open TAR".
+    CHECK(anon->get_header_value("Location") == "/home?next=tar");
+
+    Harness a;
+    a.tar_timeline_ui = true;
+    a.wire();
+    for (const char* path : {"/tar/timeline", "/tar/timeline?id="}) {
+        INFO(path);
+        auto r = a.sink.Get(path);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(r->body == "missing id");
+        CHECK(r->get_header_value("Cache-Control").find("no-cache") != std::string::npos);
+    }
+}
+
+TEST_CASE("page_routes: the timeline page renders the id only in its encoded form, uncached",
+          "[server][routes][page_routes][tar][timeline]") {
+    Harness h;
+    h.tar_timeline_ui = true;
+    h.wire();
+    // The sink parses the query itself; "%22" and friends reach the handler already decoded.
+    auto r = h.sink.Get("/tar/timeline?id=a%22b%3Cc%3E&at=1792486800");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value("Cache-Control").find("no-cache") != std::string::npos);
+    CHECK(r->get_header_value("Content-Type").starts_with("text/html"));
+    const std::string enc = url_query_value("a\"b<c>");
+    CHECK(r->body.find("run?id=" + enc + "&at=1792486800") != std::string::npos);
+    CHECK(r->body.find("a\"b") == std::string::npos);
+    CHECK(r->body.find("<c>") == std::string::npos);
+}
+
+TEST_CASE("page_routes: the timeline script is served as javascript and never cached",
+          "[server][routes][page_routes][tar][timeline]") {
+    Harness h;
+    h.tar_timeline_ui = true;
+    h.wire();
+    auto r = h.sink.Get("/static/yuzu-tar-timeline.js");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value("Content-Type") == "application/javascript; charset=utf-8");
+    CHECK(r->get_header_value("Cache-Control").find("no-cache") != std::string::npos);
+    CHECK(r->body == yuzu::server::kYuzuTarTimelineJs);
 }

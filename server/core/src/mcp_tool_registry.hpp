@@ -38,25 +38,35 @@
 //     NOT catch it), that a handler repeats the record's
 //     tier_allows/perm_fn pair correctly (the record drives the generic gates;
 //     the handler states its own pair and must keep it in sync), or that the
-//     handler validates its own arguments: the #2405 input-schema check runs
-//     only for approval-gated tools, so a non-gated handler receives
-//     UNVALIDATED ctx.args (any JSON value) and must check it itself.
+//     handler validates its own arguments: the central check below proves only
+//     that `ctx.args` is a JSON object, and the #2405 input-schema check runs
+//     only for approval-gated tools, so a non-gated handler must still check the
+//     keys, types and bounds of its own arguments.
 //
 // What the dispatch chain still does BEFORE a handler runs, unchanged:
 // knownness, the C7 read-only guard, service-scope default-deny, tier,
-// approval and, for approval-gated tools only, the #2405 input-schema check. A
-// handler therefore only runs for a tool that has cleared the generic gates,
-// and then performs its OWN perm_fn check (RBAC runs after the tier gate, never
-// before it).
+// approval and, for approval-gated tools only, the #2405 input-schema check;
+// then, for every registry tool, the central is_object() check on `arguments`
+// (a non-object is refused with an A4 -32602 and a denial row, so a handler
+// never sees a scalar, array or null). A handler therefore only runs for a tool
+// that has cleared the generic gates, and then performs its OWN permission
+// check (RBAC runs after the tier gate, never before it). EXCEPTION: a CONFINED
+// READ gated by ctx.deps->fleet_read_fn must NOT call tier_allows or
+// ctx.perm_fn at all; fleet_read_fn is its sole gate (it already covers the tier
+// ladder and RBAC), and stacking either on the same (securable, operation) is
+// the BLOCKING defect authz_gates.hpp documents.
 //
-// The context carries the nine things every legacy branch reads and nothing
-// else: no store pointers. A handler that needs one is a sign the tool belongs
-// on the legacy path (or the context shape is wrong), not a reason to widen
-// this struct. The context BORROWS request-frame objects (see ToolCallContext):
-// a handler completes synchronously and never stores or captures it. The
-// empty-response backstop in the dispatch chain likewise assumes a handler answers
-// with res.set_content; a handler that streams or uses a content provider needs
-// that guard reworked first (a PR2 context decision).
+// The context carries the nine things every legacy branch reads, plus one
+// pointer to a ToolDeps (mcp_tool_deps.hpp): a bundle of provider closures, the
+// same instances the REST routes receive, and NO store pointers. A handler
+// that needs a store, the agent registry or a write-capable callable is a sign
+// the tool belongs on the legacy path (or the provider set is wrong), not a
+// reason to widen this struct; a lexical test keeps mcp_tools_*.cpp from
+// including a store header (direct includes only). The context BORROWS request-frame objects (see
+// ToolCallContext): a handler completes synchronously and never stores or
+// captures it. The empty-response backstop in the dispatch chain likewise
+// assumes a handler answers with res.set_content; a handler that streams or uses
+// a content provider needs that guard reworked first (a context decision).
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -127,6 +137,7 @@ inline constexpr const char* kObjectOutputSchema =
     R"({"type":"object","additionalProperties":true})";
 
 struct ToolCallContext;
+struct ToolDeps; // mcp_tool_deps.hpp; a handler's TU includes that header to call through it
 
 // A registry tool's entry point. A plain function pointer, so a ToolRecord
 // stays a literal type usable in a constexpr array.
@@ -176,6 +187,12 @@ struct ToolCallContext {
     const AuditFn& audit;
     const A4ErrorFn& a4_error;
     ToolResultFn tool_result;
+    // Provider closures: the data readers and the domain audit sink the REST twins also
+    // receive (see mcp_tool_deps.hpp). LAST on purpose: an
+    // aggregate initialiser that stops at tool_result leaves it nullptr, so the
+    // test contexts built from nine values still compile. nullptr means "not
+    // wired" and a handler that needs it must answer an internal error.
+    const ToolDeps* deps = nullptr;
 };
 
 /// One registry-resident tool. A literal type, so a domain file can hold its
@@ -260,8 +277,12 @@ constexpr bool records_well_formed(std::span<const ToolRecord> records) {
 }
 
 // One accessor per domain file, each over that file's constexpr kToolRecords[].
+// The pairing is by NAME: `<domain>_tool_records()` is defined in `mcp_tools_<domain>.cpp`
+// (scripts/ci/check-seam-closure.py checks it in both directions).
 // mcp_server.cpp's registered_tool_records() lists them in a fixed order; a new
 // accessor must be added there too (an unlisted file serves nothing).
 std::span<const ToolRecord> discovery_tool_records();
+std::span<const ToolRecord> hardware_tool_records();
+std::span<const ToolRecord> containment_tool_records();
 
 } // namespace yuzu::server::mcp

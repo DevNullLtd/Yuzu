@@ -60,6 +60,8 @@
 #include <string_view>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #ifndef YUZU_SERVER_SRC_DIR
 #error                                                                                             \
     "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build (meson.project_source_root() / 'server' / 'core' / 'src') - see the server_test_exe cpp_args block."
@@ -297,6 +299,15 @@ std::vector<std::string> declared_record_names(const std::string& code, const st
     return names;
 }
 
+// Exact counts of the registry source files a healthy scan reads. Equality, not a floor: a
+// domain file that drops out of the glob (renamed away from the prefix) would otherwise leave
+// its records and includes unchecked while the scan still passes on the remaining files. Bump
+// kRegistryDomainFiles together with MIN_REGISTRY_FILES in scripts/ci/check-api-parity.py (and the
+// seam-closure lane pins in scripts/ci/check-seam-closure.py) when a mcp_tools_<domain>.cpp is
+// added; bump kToolHeaderFiles when an mcp_tool*.hpp is added.
+constexpr std::size_t kRegistryDomainFiles = 3;
+constexpr std::size_t kToolHeaderFiles = 3;
+
 } // namespace
 
 TEST_CASE("MCP dispatch coverage: the stripper and the scan behave as documented",
@@ -413,7 +424,12 @@ TEST_CASE("MCP dispatch coverage: every mcp_tools_*.cpp record is registered and
                 problems.push_back(fname + ": no `" + def + "` definition");
         }
     }
-    CHECK(files >= 1);
+    INFO("mcp_tools_*.cpp files scanned: " << files << " (expected " << kRegistryDomainFiles
+                                           << "); bump kRegistryDomainFiles with the new file, together with "
+                                              "MIN_REGISTRY_FILES in scripts/ci/check-api-parity.py and the "
+                                              "seam-closure lane pins (MCP_REGISTRY_EXPECTED_TU_COUNT in "
+                                              "scripts/ci/check-seam-closure.py)");
+    CHECK(files == kRegistryDomainFiles);
 
     // Set equality in both directions, and no name declared twice across files.
     std::set<std::string> declared_set(declared.begin(), declared.end());
@@ -429,6 +445,136 @@ TEST_CASE("MCP dispatch coverage: every mcp_tools_*.cpp record is registered and
             problems.push_back("registered but declared in no mcp_tools_*.cpp file: " + n);
     INFO(join(problems));
     CHECK(problems.empty());
+}
+
+// A registry handler reaches its dependencies only through ToolCallContext::deps
+// (mcp_tool_deps.hpp): provider closures, no store pointers. The file-level half
+// of that rule is lexical: an mcp_tools_*.cpp includes none of the headers that would
+// let it name a store, the agent registry, the server class or the auth database.
+// (A header reached transitively through an allowed include is NOT caught; this
+// polices the direct include list, which is where a reach for a store starts.)
+bool is_forbidden_tool_include(std::string_view header) {
+    if (header.find("pg/") != std::string_view::npos)
+        return true;
+    const std::size_t slash = header.rfind('/');
+    const std::string_view base = slash == std::string_view::npos ? header : header.substr(slash + 1);
+    return base.ends_with("_store.hpp") || base == "agent_registry.hpp" || base == "mcp_server.hpp" ||
+           base.starts_with("auth_db");
+}
+
+TEST_CASE("MCP dispatch coverage: the include denylist for mcp_tools_*.cpp behaves as documented",
+          "[mcp][dispatch_coverage]") {
+    for (const char* bad : {"quarantine_store.hpp", "api_token_store.hpp", "agent_registry.hpp",
+                            "mcp_server.hpp", "auth_db.hpp", "auth_db_sql_helpers.hpp",
+                            "pg/pg_pool.hpp", "pg/secret_codec.hpp", "yuzu/server/foo_store.hpp"})
+        CHECK(is_forbidden_tool_include(bad));
+    for (const char* ok : {"mcp_tool_registry.hpp", "mcp_tool_deps.hpp", "mcp_policy.hpp",
+                           "mcp_jsonrpc.hpp", "discover_routes.hpp", "hardware_list_model.hpp",
+                           "quarantine_visible.hpp", "storefront.hpp", "mcp_server_testonly.hpp"})
+        CHECK_FALSE(is_forbidden_tool_include(ok));
+}
+
+namespace {
+
+// The direct #include names in `source` that the denylist forbids. Comments and raw strings
+// are stripped first, so a commented-out include is not an offence.
+std::vector<std::string> forbidden_includes_in(const std::string& source) {
+    std::vector<std::string> offences;
+    const std::string code = strip_comments_and_raw_strings(source);
+    std::istringstream lines(code);
+    std::string line;
+    while (std::getline(lines, line)) {
+        const std::size_t hash = line.find_first_not_of(" \t");
+        if (hash == std::string::npos || line[hash] != '#')
+            continue;
+        const std::size_t inc = line.find("include", hash + 1);
+        if (inc == std::string::npos)
+            continue;
+        const std::size_t open = line.find_first_of("<\"", inc + 7);
+        if (open == std::string::npos)
+            continue;
+        const std::size_t close = line.find(line[open] == '<' ? '>' : '"', open + 1);
+        if (close == std::string::npos)
+            continue;
+        const std::string header = line.substr(open + 1, close - open - 1);
+        if (is_forbidden_tool_include(header))
+            offences.push_back(header);
+    }
+    return offences;
+}
+
+// The files the include denylist polices: every registry domain file (mcp_tools_*.cpp) and
+// every registry seam / shared-helper header (mcp_tool*.hpp: mcp_tool_registry.hpp,
+// mcp_tool_deps.hpp, mcp_tool_helpers.hpp). The headers matter because a shared helper
+// header may be included by any domain file, so a store header reached through one of them
+// would reach every domain file that includes it, and the .cpp scan alone would never see it. Each header is
+// held to the same denylist as the .cpp files: mcp_tool_deps.hpp deliberately names
+// domain MODEL headers (hardware_list_model.hpp, inventory_types.hpp,
+// quarantine_visible.hpp) for the provider closure types, but none of them is a store,
+// agent-registry, server or auth header, so it passes unchanged and the denylist is not
+// weakened for it. This test polices DIRECT includes only; the TRANSITIVE closure (a store
+// reached through one of those model headers) is held store-free by scripts/ci/
+// check-seam-closure.py's MCP registry lane (#6558), which globs these same files.
+struct ToolScanFiles {
+    std::vector<fs::path> cpp;
+    std::vector<fs::path> hpp;
+};
+
+ToolScanFiles tool_scan_files() {
+    ToolScanFiles out;
+    for (const auto& entry : fs::directory_iterator(fs::path(YUZU_SERVER_SRC_DIR))) {
+        const std::string fname = entry.path().filename().string();
+        if (fname.rfind("mcp_tools_", 0) == 0 && entry.path().extension() == ".cpp")
+            out.cpp.push_back(entry.path());
+        else if (fname.rfind("mcp_tool", 0) == 0 && entry.path().extension() == ".hpp")
+            out.hpp.push_back(entry.path());
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("MCP dispatch coverage: mcp_tools_*.cpp and mcp_tool*.hpp include no store, registry, "
+          "server or auth header",
+          "[mcp][dispatch_coverage]") {
+    std::vector<std::string> offences;
+    const ToolScanFiles files = tool_scan_files();
+    for (const auto* group : {&files.cpp, &files.hpp})
+        for (const auto& path : *group)
+            for (const auto& header : forbidden_includes_in(read_source(path)))
+                offences.push_back(path.filename().string() + ": #include \"" + header + "\"");
+    INFO("mcp_tools_*.cpp files: " << files.cpp.size() << " (expected " << kRegistryDomainFiles
+                                   << "), mcp_tool*.hpp files: " << files.hpp.size()
+                                   << " (expected " << kToolHeaderFiles
+                                   << "); bump kRegistryDomainFiles (together with MIN_REGISTRY_FILES in "
+                                      "scripts/ci/check-api-parity.py) for a new mcp_tools_<domain>.cpp, "
+                                      "or kToolHeaderFiles for a new mcp_tool*.hpp");
+    CHECK(files.cpp.size() == kRegistryDomainFiles);
+    CHECK(files.hpp.size() == kToolHeaderFiles);
+    INFO(join(offences));
+    CHECK(offences.empty());
+}
+
+TEST_CASE("MCP dispatch coverage: the include scan reaches the registry headers and the shared helper",
+          "[mcp][dispatch_coverage]") {
+    const ToolScanFiles files = tool_scan_files();
+    std::set<std::string> headers;
+    for (const auto& path : files.hpp)
+        headers.insert(path.filename().string());
+    // A header that drops out of the scan (renamed away from the mcp_tool prefix, or the
+    // glob narrowed) would silently exempt it from the denylist.
+    CHECK(headers.contains("mcp_tool_helpers.hpp"));
+    CHECK(headers.contains("mcp_tool_registry.hpp"));
+    CHECK(headers.contains("mcp_tool_deps.hpp"));
+
+    // The scan itself is not vacuous: a store header in a header-shaped source is an
+    // offence, a commented-out one is not, and an allowed one is not.
+    const std::string bad =
+        "#pragma once\n#include \"mcp_tool_registry.hpp\"\n#include \"quarantine_store.hpp\"\n"
+        "#include <pg/pg_pool.hpp>\n// #include \"auth_db.hpp\"\n";
+    CHECK(forbidden_includes_in(bad) ==
+          std::vector<std::string>{"quarantine_store.hpp", "pg/pg_pool.hpp"});
+    CHECK(forbidden_includes_in("#include \"rest_audit.hpp\"\n#include <nlohmann/json.hpp>\n").empty());
 }
 
 TEST_CASE("MCP dispatch coverage: the ctor feeds the validator from the merged catalogue, and the "
@@ -491,4 +637,85 @@ TEST_CASE("MCP dispatch coverage: the ctor feeds the validator from the merged c
     CHECK(call_at < first_branch);
     CHECK(code.find(guarded, call_at + 1) == std::string::npos);
     CHECK(code.find(squash("registry_handler(ctx)")) == std::string::npos);
+
+    // (4) The central non-object `arguments` refusal sits inside the registry branch:
+    // after the lookup (so only a registry tool is checked, and after every generic
+    // gate) and before the guarded call (so no handler ever sees a scalar, array or
+    // null `arguments`). One copy: a per-handler check is the drift this replaces.
+    const std::string args_check = squash("if (!args.is_object()) {");
+    const std::size_t check_at = code.find(args_check, lookup);
+    REQUIRE(check_at != std::string::npos);
+    CHECK(check_at > lookup);
+    CHECK(check_at < call_at);
+    CHECK(code.find(squash("arguments must be a JSON object"), lookup) < call_at);
+    CHECK(code.find(squash("kInvalidParams, \"arguments must be a JSON object\""), lookup) < call_at);
+    // ...and it is the only such refusal between the lookup and the guarded call.
+    CHECK(code.find(args_check, check_at + 1) > call_at);
+}
+
+// A5 item 2/3/4 (docs/agentic-first-principle.md): the machine-checkable half of the agentic
+// context contract, applied to EVERY registry tool, so a tool added to a new domain file is held
+// to it with no edit here. The prose half (when to use, chaining, what an empty result means)
+// cannot be checked by a program; it is the consistency-auditor's Gate 4 checklist in the same
+// doc. This test is the floor under that review, not a replacement for it.
+TEST_CASE("MCP registry tools: every record carries the A5 machine-checkable context",
+          "[mcp][a5][dispatch_coverage]") {
+    using nlohmann::json;
+    const auto records = yuzu::server::mcp::registry_records_for_test();
+    REQUIRE(!records.empty());
+    // A floor on the description, not a target: a tool that states its purpose, its bounds and
+    // what its result means does not fit in less.
+    constexpr std::size_t kMinDescription = 300;
+    // Pre-existing registry tools below the floor, owned by the A5 backfill (track 2g) rather
+    // than by whichever PR first added this test. An exemption must still be short: once the
+    // description is brought up to the floor the entry fails below and must be deleted, so the
+    // list can only shrink.
+    // Now empty: discover_routes left it when its description gained the sentence telling an
+    // agent to skip a route that carries `unavailable`, which took it past the floor.
+    const std::set<std::string> kShortDescriptionBackfill{};
+    CHECK(kShortDescriptionBackfill.size() <= 1); // a new short description is fixed, not listed
+    for (const auto& name : kShortDescriptionBackfill) {
+        INFO("backfill entry " << name);
+        CHECK(std::any_of(records.begin(), records.end(),
+                          [&](const auto& r) { return name == r.name; })); // stale entry
+    }
+    for (const auto& r : records) {
+        INFO("tool " << r.name);
+        const std::string desc = r.description;
+        if (kShortDescriptionBackfill.contains(r.name))
+            CHECK(desc.size() < kMinDescription);
+        else
+            CHECK(desc.size() >= kMinDescription);
+        if (r.effect == yuzu::server::mcp::ToolEffect::ReadOnly) {
+            std::string lower = desc;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            CHECK(lower.find("read-only") != std::string::npos);
+        }
+
+        const json in = json::parse(r.input_schema_json);
+        REQUIRE(in.is_object());
+        if (in.contains("properties")) {
+            for (const auto& [prop, schema] : in["properties"].items()) {
+                INFO("property " << prop);
+                CHECK(schema.contains("description"));
+                if (schema.contains("description"))
+                    CHECK(!schema["description"].get<std::string>().empty());
+                // Top-level properties only; a union type, oneOf or $ref has no plain "type"
+                // string and is checked for its description alone.
+                const bool is_string = schema.contains("type") && schema["type"] == "string";
+                if (is_string && !schema.contains("enum"))
+                    CHECK(schema.contains("maxLength"));
+                if (schema.contains("type") && schema["type"] == "integer")
+                    CHECK(schema.contains("minimum"));
+            }
+        }
+
+        // A typed output schema: the generic additionalProperties placeholder does not count.
+        const json out = json::parse(r.output_schema_json);
+        REQUIRE(out.is_object());
+        CHECK(out.contains("properties"));
+        if (out.contains("properties"))
+            CHECK(!out["properties"].empty());
+    }
 }

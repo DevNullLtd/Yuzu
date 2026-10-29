@@ -128,3 +128,26 @@ groups:
         annotations:
           summary: "High agent disconnect rate on gateway"
           description: "{{ $value }}/s agent disconnections on gateway node {{ $labels.node }}."
+
+      # MFA step-up check answered 503: the auth store could not be read, the
+      # stored second factor could not be decrypted, there is no usable auth store, or the
+      # check itself threw or could not fingerprint the session. The gated routes
+      # stay closed. The >= 3 debounce keeps one stray 503 from paging.
+      - alert: YuzuStepUpGateUnavailable
+        expr: sum by (job, instance, surface) (increase(yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}[10m])) >= 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MFA step-up check answering 503 on {{ $labels.instance }} ({{ $labels.surface }} surface)"
+          description: "The MFA step-up check refused at least three requests in ten minutes with 503 because it could not establish the caller's MFA state (auth store unreadable, stored second factor undecryptable, no usable auth store, or an unexpected exception inside the check). Step-up routes stay closed until the cause is fixed. Check PostgreSQL and the KEK."
+
+      # --mfa-step-up-window-secs <= 0 disables the stale-proof requirement (recovery lever).
+      - alert: YuzuStepUpWindowDisabled
+        expr: yuzu_auth_mfa_step_up_window_seconds <= 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MFA step-up stale-proof requirement is disabled (--mfa-step-up-window-secs <= 0)"
+          description: "The server was started with --mfa-step-up-window-secs 0 (or less), so the stale-proof requirement is disabled on every step-up route except the JIT-elevation routes: no stale proof is refused (so none is recorded), and SAML sessions and the authentication-store read are skipped too, while engine denials and unwired-store refusals still apply and are recorded. This is a recovery lever, not a steady state: restore the window (default 300) and restart once the reason it was set is resolved."

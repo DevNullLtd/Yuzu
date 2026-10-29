@@ -197,9 +197,10 @@ DexStabilityFigures apps_figures(const DexAppStabilityRow& r, std::optional<int6
     // population's own ids; if a caller breaks that, the share is withheld
     // and the score reads `inconsistent`. A refusal, not a failure.
     if (population && *population > 0 && affected >= 0 && affected <= *population) {
-        f.share_affected = dex_proportion(affected, *population);
+        f.share_affected = dex_proportion(affected, *population, eff.interval_confidence);
         if (events >= 0)
-            f.rate_per_1000 = dex_rate(events, static_cast<double>(*population) / 1000.0);
+            f.rate_per_1000 =
+                dex_rate(events, static_cast<double>(*population) / 1000.0, eff.interval_confidence);
     }
     StabilityInputs in;
     in.reporting_devices = population.value_or(0);
@@ -319,12 +320,32 @@ DexAppsModel dex_apps_model_from_rows(const std::string& window,
     return m;
 }
 
+std::string dex_normalize_apps_scope(std::string_view scope) {
+    for (const char* s : {kDexAppsScopeAll, kDexAppsScopeWindows, kDexAppsScopeMacos, kDexAppsScopeLinux})
+        if (scope == s)
+            return std::string{scope};
+    return {};
+}
+
+std::vector<std::string> dex_apps_online_ids(const DexFleet& fleet, std::string_view scope) {
+    std::vector<std::string> ids;
+    for (const auto& [id, os] : fleet.connected_agents)
+        if (scope == kDexAppsScopeAll || os == scope)
+            ids.push_back(id);
+    return ids;
+}
+
+std::string dex_apps_population_basis(std::string_view scope) {
+    return std::string{scope} + "_online";
+}
+
 DexAppsModel build_dex_apps_model(GuaranteedStateStore* store, const std::string& window,
-                                  const std::string& since,
-                                  const std::optional<std::vector<std::string>>& online_windows,
+                                  const std::string& since, const std::string& platform_scope,
+                                  const std::optional<std::vector<std::string>>& online_ids,
                                   const DexPolicyInForce& policy) {
     DexAppsModel m;
     m.window = window;
+    m.platform_scope = platform_scope;
     // A score under an invalid policy is never published: the resolver requires
     // a policy that passed dex_score_policy_fault. The provider already serves
     // the shipped defaults for a refused stored document, so this is the
@@ -339,21 +360,29 @@ DexAppsModel build_dex_apps_model(GuaranteedStateStore* store, const std::string
         m.degraded = true;
         return m;
     }
-    // Windows-scoped, and the share numerators drawn from the same online ids
-    // whose count is the population.
+    // Scoped to the platform ("" = every platform), and the share numerators
+    // drawn from the same online ids whose count is the population.
     static const std::vector<std::string> kNoIds;
-    const auto rows = store->dex_app_stability_checked(since, "windows", kDexAppsLimit, kDexAppsVersionCap,
-                                                       kStabilityPerDeviceEventCap,
-                                                       online_windows ? *online_windows : kNoIds);
+    // The cap the store applies per subject: the global one, and an override's own for
+    // the applications it names (o.image is already the ASCII-lowercased key).
+    std::vector<std::pair<std::string, int64_t>> subject_caps;
+    for (const auto& o : policy.policy.overrides)
+        if (o.per_device_event_cap)
+            subject_caps.emplace_back(o.image, *o.per_device_event_cap);
+    const auto rows = store->dex_app_stability_checked(
+        since, platform_scope == kDexAppsScopeAll ? std::string{} : platform_scope, kDexAppsLimit,
+        kDexAppsVersionCap, policy.policy.model.per_device_event_cap, online_ids ? *online_ids : kNoIds,
+        subject_caps);
     if (!rows) {
         m.degraded = true;
         return m;
     }
-    return dex_apps_model_from_rows(
+    auto out = dex_apps_model_from_rows(
         window, *rows,
-        online_windows ? std::optional<int64_t>{static_cast<int64_t>(online_windows->size())}
-                       : std::nullopt,
+        online_ids ? std::optional<int64_t>{static_cast<int64_t>(online_ids->size())} : std::nullopt,
         policy);
+    out.platform_scope = platform_scope;
+    return out;
 }
 
 std::string dex_apps_json(const DexAppsModel& model) {
@@ -379,7 +408,7 @@ std::string dex_apps_json(const DexAppsModel& model) {
     out["apps_total"] = model.apps_total;
     out["apps_truncated"] = model.apps_truncated;
     out["population"] = model.population ? json(*model.population) : json(nullptr);
-    out["population_basis"] = kDexAppsPopulationBasis;
+    out["population_basis"] = dex_apps_population_basis(model.platform_scope);
     out["policy"] = policy_json(model.policy);
     return out.dump();
 }

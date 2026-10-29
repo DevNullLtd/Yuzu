@@ -993,10 +993,88 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     prune follows the clock-guarded-retention concern. The design doc also states how a
     pruned store's rows are re-sent despite the daily sync skipping unchanged content.
     Until pruned, kept rows are shown as last observed at their `observed_at`.
+  - **R15 — location grain inside a `constrained` store (owner, 2026-10-23; amends the
+    bounded-retention rule above).** A store whose reads keep succeeding only partly reports
+    `constrained`, so its kept locations would never reach the store-grain condition and would
+    grow without bound. A location inside such a store counts as not observed once it has been
+    missing from every report the server received from that device over the stated bound
+    (server receipt times on both sides), and the same pass prunes it. An offline device sends
+    no reports, so nothing of it is pruned: age alone still never prunes. Ruled by the owner
+    (liamsomerville) on 2026-10-23 and recorded as decision 6 in the Decisions section of
+    `docs/crypto-slice2-certificate-design.md`, whose governance ledger is under `governance.d/`.
+  - **R16 — one location-grain prune rule (owner, 2026-10-26; supersedes R15's predicate and the
+    store-grain condition of the bounded-retention rule above).** Governance on the prune PR
+    showed that the store-grain condition, compared against the server's current time, prunes an
+    offline device's rows once a store read `unreadable` before the device went offline, and
+    never prunes a store whose first read was `constrained`. R16 replaces that condition, and
+    R15's predicate, with one rule: a location is pruned only when its store's latest status is
+    `unreadable`, `not_observed` or `constrained`, it has been missing from every report the
+    server received from that device over the bound (the device's last receipt time minus the
+    location's last receipt time), and the device's last receipt time is not in the future. An
+    offline device is never pruned, and a location seen within the bound never is. Accepted
+    residual: a forward step of the database clock in force when the device next reports
+    shortens the bound by that step. R16 is a different rule, not a narrowing of the one it
+    replaces: it keeps some locations the store-grain condition would prune, and prunes some it
+    would keep. What stands from the bounded-retention rule: age alone never prunes, and the
+    prune follows the clock-guarded-retention concern. Ruled by the owner (liamsomerville) on
+    2026-10-26: the rule is accepted as written, with points (i)-(iv) accepted as residuals;
+    recorded as decision 7 in the Decisions section of
+    `docs/crypto-slice2-certificate-design.md`. Points raised by the prune PR's governance: (i)
+    a device that returns after more than the bound offline can lose its kept locations after
+    one report; (ii) a location in a `constrained` store that went unreported for longer than
+    the bound is pruned on the next report that reads the store `unreadable`; (iii) the
+    forward-clock residual above; (iv) the rule covers machine-scope stores only (per-user
+    stores are not collected in slice 2).
+  - **R17 — the agents-before-servers window for `certificate_inventory` (owner, 2026-10-26; L7
+    residual accepted 2026-10-27; amends the "Lifecycle" sentence below that the mixed-version
+    window "is **not** acceptable for this source").** D12 says stray certificate rows must
+    never be readable and the mixed-version window is not acceptable for this source; that
+    stands, with one exception: the owner-accepted L7 balancer residual named below (every
+    backend at 2a-1 or later; never roll a backend back below 2a-1 while certificate-collecting
+    agents report). A server older than the typed-source read filter (or rolled back below it)
+    that receives the agent's blob through a gateway would store it in the generic store,
+    readable under `Inventory:Read` and `Infrastructure:Read`. The owner (liamsomerville) ruled
+    on 2026-10-26 that the window is to be closed in code, not by deploy order (bar the L7
+    residual below): the agent sends `certificate_inventory` only when the server's
+    `RegisterResponse` advertises `certificate_inventory_v1` (new field `repeated string
+    server_capabilities = 9`), and the server advertises it only while its certificate store
+    opened. Absent means never sent, so the gate fails closed and is stateless. The server
+    capability is planned for a separate slice-2 PR, 2a-2a-cap, and the agent gate for 2a-2e. Neither is on `dev`
+    (on 2026-10-28 `RegisterResponse` ends at field 8). 2a-1 (PR #6563) has merged, so R17's
+    closure depends on 2a-2a-cap merging, and on 2a-2e for the agent side. Not adopted: (a) accepting the
+    window and closing it by deploy order (servers first, never roll back, a merge-order test
+    and an `upgrading.md` note), because it relies on operators following an order nothing
+    enforces and amends D12; (b) a reserved `__sync__` enable action persisted on the agent,
+    because it adds a server-to-agent action and persistent agent state that a capability
+    advertised on every registration makes unnecessary. Recorded as decision 8 in the Decisions
+    section of `docs/crypto-slice2-certificate-design.md`. As planned for 2a-2a-cap, the gateway also enforces the capability per upstream connection
+    (record from `ProxyRegister`, strip for a connection without `certificate_inventory_v1`,
+    fail closed for an unknown one, rate-limited re-probe for admitted sessions only). Accepted
+    residual (owner, 2026-10-27): behind an L7 balancer that spreads one connection's requests
+    across backends, every backend must run the 2a-1 typed-source reservation release (PR #6563)
+    or later before certificate-collecting agents are enabled, and no backend may be rolled back
+    below it while those agents report (the no-rollback condition: a rolled-back backend stores
+    the blob in the generic store, readable under `Inventory:Read` and `Infrastructure:Read`,
+    which under RBAC off (the default) any authenticated session holds, until that backend is
+    upgraded); SOC 2 risk register, review-by 2027-01-31. The SOC 2 risk entry is owed by 2a-2a-cap.
+    Update 2026-10-28 (owner ruling): the capability and gateway enforcement moved from 2a-2a to a
+    separate PR that merges before 2a-2e, because `dev` replaced the gateway's grpcbox client; the
+    requirement is unchanged.
 - A capped or timed-out capture is reported `constrained`, and the report is never an
   empty success.
 - An empty blob is never sent for a failed or constrained capture (the ADR-0016
   `app_usage` rule).
+  - **R18 — a stalled certificate walk skips the daily-sync blob (owner, kept 2026-10-27, stated
+    as an exception 2026-10-28; amends the two bullets above).** The two bullets above say a
+    capped or timed-out capture is reported `constrained` and an empty blob is never sent; that
+    stands, with one exception. When the agent's certificate walk is still blocked after the
+    sync thread's 75-second wait (reason `walk_stalled`), or its worker cannot start
+    (`walk_unavailable`), the daily-sync source sends nothing for that cycle, not even a
+    status-only blob. The server keeps the last good state, so `observed_at` ages visibly and
+    the prune, the design's decommission sweep and the counts never act on a partial walk. A
+    walk that returns, even one cut short by its 60-second action deadline, is still reported,
+    with each unfinished store `constrained`, so the two bullets hold on that path. Recorded as
+    decision 11 in the Decisions section of `docs/crypto-slice2-certificate-design.md`.
 - A field an older agent did not send reads as unknown, never as empty, and the blob is
   versioned.
 
@@ -1049,7 +1127,8 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
   - membership of the boot-time purge, checked by a test against the typed set.
 
   App-usage accepts a mixed-version window in which stray rows stay readable. That window
-  is **not** acceptable for this source.
+  is **not** acceptable for this source. R17 (under "Honest capture" above) amends this
+  sentence with one owner-accepted exception, the L7 balancer residual.
 - It is covered by `/readyz`.
 - Any new background job is classified in `background_jobs.hpp`, and any prune follows
   the clock-guarded-retention routed concern.
@@ -1448,9 +1527,152 @@ carries once that PR merges. Before the merge, the PR is the proposal.
   certificates), and D13's ruling also amends D6 so they may use a `CaStore` count
   method. The rulings are recorded here as rulings, not requests. They are also
   recorded in PR #6125's description, and are ratified by the approving review.
-- The approval grants those five rulings as written. Approvers are asked to state each
-  ruling in the review, so that the record shows each one, but the statements are a
+- R15 to R18 are the owner's later amendments of D12, made after this ADR was accepted and
+  recorded as decisions 6 to 8 and 11 of the slice-2 design: R15 (2026-10-23; location grain
+  inside a `constrained` store; amends the bounded-retention rule), R16 (2026-10-26; one
+  location-grain prune rule; supersedes R15's predicate and D12's store-grain condition), R17
+  (2026-10-26, its L7 residual accepted 2026-10-27; the agents-before-servers window; amends D12's
+  "not acceptable" sentence under "Lifecycle") and R18 (kept 2026-10-27, stated as an exception
+  2026-10-28; a stalled certificate walk skips the daily-sync blob; amends D12's "Honest capture"
+  bullets). They are ratified when the approving review of the PR that adds them, from someone
+  other than the author, approves it. Until then they are the owner's rulings awaiting that
+  review.
+- The approval of this ADR's PR grants the five decisions above and R1–R14 as written; the
+  approval of the PR that adds R15 to R18 grants those four as written. Approvers are asked to
+  state each ruling in the review, so that the record shows each one, but the statements are a
   request, not a separate acceptance gate. On merge, the "ruling requested" notes in those
   decisions record rulings granted by that approval.
 - A reviewer who disagrees with any one of them blocks on it specifically, so that it can
   be split out rather than accepted silently.
+
+## Update (2026-10-23) - `GET /api/v1/ca/issued` and the panel inventory are confined; the actual gate
+
+This Update does not change R2's text above. It records what the code now does where R2 is
+silent, and one correction to a statement in this ADR's narrative.
+
+### What changed
+
+- **Both forms of `GET /api/v1/ca/issued` (and MCP `list_issued_certs`), and the issued-certificate
+  list in the Settings certificate panel, are confined.** R2 said the CA routes "gate on
+  `Security:Read`" and the narrative above (the sentence beginning "`/api/v1/ca/issued` is not
+  confined today (pre-existing)") recorded the unfiltered list as an unconfined gap. The unfiltered list
+  returns the same per-agent rows (subject, SAN, issuing identity) the filtered list does, and
+  `list_issued` has no scope parameter to narrow them by, so it is held to the same standing: a
+  confined caller is withheld (403, no permission named; MCP permission denied), never served a
+  narrowed list. The panel withholds only the inventory (CA details, downloads and the import form
+  stay), and a revoke or import answers a non-empty body. Both forms are audited
+  `crypto.ca.certificates.view` (`denied`, `failure`, `success`).
+
+### The actual gate
+
+The gate is `Security:Read` **plus** a standing probe on `Inventory:Read` (the same non-auditing
+availability callback the `/crypto` widgets use, kFleetWideOnly class). It resolves to:
+
+| Standing | Answer |
+|---|---|
+| kConfined (a present exec-visibility set from a management-group-scoped `Inventory:Read` grant) | withheld: 403 / permission denied; audited `denied` |
+| kDegraded (the check answered 503: a store behind it could not be read) | 503, `retry_after_ms` 5000; audited `failure` |
+| kAvailable (admitted, with no exec-visibility set: a global grant, or RBAC enforcement off) | served; success row ends `standing=available` |
+| kRefused (the check admitted nobody and did not answer 503) | **served**; success row ends `standing=refused` |
+
+The table is the behaviour of the REST and MCP lists. The Settings panel answers kConfined and
+kDegraded with a note in place of the inventory (kDegraded: "Certificate inventory unavailable
+(access check failed)") and a normal page, not a 403 or 503, and writes no audit row (#6384).
+
+R2 says a confined caller is one with "a present exec-visibility set" and is silent on a failed
+read. kRefused covers two causes the answer cannot tell apart:
+
+1. **No `Inventory:Read` grant at all.** Served on purpose: `Security:Read` already admitted the
+   caller, and R2 reads confinement as a property of a scoped grant ("unconfined `Inventory:Read`
+   holders"). Consequence to state plainly: removing a group-scoped `Inventory:Read` grant, or
+   adding a deny, does **not** confine a caller; granting a global `Inventory:Read` removes the
+   confinement. Whether a `Security:Read` holder without `Inventory:Read` should see this list at
+   all is a policy question this Update does not settle (#6383).
+2. **A read failure partway through the access check** (the permission-groups or visible-set read
+   errors, and `authorize_list_read` returns DenyAll). This is served too, i.e. the check **fails
+   open**. That is an **exception to ADR-0017 INV-1** ("any error is deny") **and INV-5** (a partial
+   failure 503s the whole read). It was previously unrecorded, and R2 does not say it; code
+   comments cite R2 only for the confinement withholding. It also affects the filtered list and the `/crypto` drill
+   (`ca_drill_gate`) and `authz_gates.cpp`'s documented 2c weakening. It is strictly narrower than
+   the behaviour before the unfiltered list was confined (every confined caller was served), is
+   pinned by tests that name it ("KNOWN RESIDUAL"), and is tracked by #6382 (a tri-state
+   `read_failed` result from `authorize_list_read` so the answer becomes 503). The no-grant arm and
+   the failed-read arm are indistinguishable at the probe today, so that fix changes the
+   failed-read arm only; the no-grant arm stays served until #6383 decides it.
+   When the tri-state fix lands, supersede this paragraph by a further dated Update (do not delete
+   it, so the history of the exception stays on record) and update the code comments.
+
+Detective control until then: on `GET /api/v1/ca/issued` and `list_issued_certs`, every success
+row carries `standing=available|refused`; review the `refused` rows, knowing that `refused` cannot
+separate a by-design no-grant caller from a read failure, that the audit row can be missing during
+the same outage, and that no alert fires on this path. The `/crypto` drill's success rows carry no
+standing token, so a drill page served on a failed read is not marked. The drill and the Settings
+panel write no `denied` row for a confined caller (a separate gap, tracked with the drill's
+missing `failure` row on a degraded gate: #6384).
+
+### Record
+
+`docs/user-manual/crypto.md` said of the unfiltered list that it "still returns every Yuzu-issued
+certificate to any `Security:Read` holder, a confined one included (owner decision; the same
+rows, without the dashboard's windows)". That sentence entered with commit 95486afc2, whose
+message lists two owner decisions (layout saves; keyset drill paging) and not this one, and no ADR
+records it. On 2026-10-23 the maintainer, Dave Rae, authorised reversing that statement: the unfiltered list is confined, as recorded in "What changed". He also ruled that a caller the standing check refuses without a 503 (kRefused) is served and the behaviour disclosed, with the failed-read exception tracked in #6382 and the no-grant question in #6383, and he approved this Update. He reports that the author of this ADR approved it offline before it was committed; that approval is not recorded elsewhere in the repository.
+
+## Update (2026-10-24): the issued-certificate list is served only to an affirmatively unconfined caller
+
+**Status of the 2026-10-23 Update.** It stays on record as history. Its "kRefused is served" row and
+its "A read failure partway through the access check" exception are **superseded by this Update**;
+the maintainer's 2026-10-23 ruling to keep serving was reviewed by an independent adjudicator on
+2026-10-24 and was not upheld (see "Why", below). Its "Detective control until then" paragraph and its statement about the Settings panel are superseded too: success rows now carry only `standing=available`, `refused` is a withheld standing with its own `denied` row, and the panel withholds the list for a refused caller. Nothing in the 2026-10-23 Update is deleted.
+
+**What changed.** The standing decides what `GET /api/v1/ca/issued` (both forms), MCP `list_issued_certs`,
+the `/crypto` drill and the Settings certificate panel's inventory do. The standing is the same on all
+four; the answer shape and the audit row differ by surface.
+
+| Standing | Served? | REST route and MCP tool | `/crypto` drill and Settings panel |
+|---|---|---|---|
+| kAvailable (a global `Inventory:Read`, an elevated session, an engine principal holding the grant, or RBAC enforcement off) | yes | list served; success row ends `standing=available` | list rendered; the drill's success row carries no standing token, the panel is not audited |
+| kConfined (`Inventory:Read` granted only through management groups) | no | 403 / permission denied; `denied` row ending `withheld=confined` | HTTP 200 fragment with a note in place of the list; no CA-view row |
+| kRefused (no `Inventory:Read` grant at all) | **no** | 403 / permission denied; `denied` row ending `withheld=refused` | HTTP 200 fragment with a different note; no CA-view row |
+| kDegraded (the access check could not complete, **including a read failure inside it**) | no | 503, `retry_after_ms` 5000; `failure` row | HTTP 200 fragment with an unavailable note and Retry; no CA-view row (the drill writes none when its check is unavailable) |
+
+The missing rows on the drill and the panel are an existing gap, tracked as #6384; this Update does not
+change it. The `failure` row is written for the resolver and engine branches this Update adds. A failed
+service-ceiling or service-tag read at the fleet gate still audits `denied`.
+
+1. **A read failure inside the access check is a 503, never the list.** `ListReadAuthorization` gains
+   `bool read_failed`, set when the global-grant read, the permission-group resolution or the
+   visible-set expansion fails, or the management-group store is not wired (not for an empty
+   `allow_groups`). When the global-grant read fails nothing further is read. An engine principal's
+   grant read is checked the same way. The fleet-read gate (`authz_gates.cpp`) and the list-read
+   gate (`auth_routes.cpp`) answer 503 on it instead of a 403, so `crypto_access_for` already maps
+   it to kDegraded. ADR-0017 INV-1 (any error is deny) and INV-5 (a partial failure never includes)
+   hold again for these reads; the exception recorded on 2026-10-23 is closed. Every fleet-gated
+   and list-gated read now answers 503 rather than 403 on a mid-query failure; both still deny.
+   The front `Security:Read` gate and the other plain `require_permission` sites still answer 403
+   on a failed first read (ADR-0041 deny-on-degrade); that is unchanged and is tracked as #6437.
+2. **No grant is not an affirmative admission.** A `Security:Read` holder with no `Inventory:Read`
+   grant is refused the list. R2's reading that confinement is a property of a scoped grant remains
+   true, but the converse does not follow: removing a caller's last scoped grant must not widen what
+   it can see. #6383 is decided by this Update.
+3. **Corrections to the 2026-10-23 text.** (a) The slice withholds a confined caller's whole
+   inventory; it does not filter it per device (`list_issued` has no scope parameter). (b) "Adding a
+   deny" does not by itself widen the list: a global deny does not erase a group allow. The widening
+   was the loss of the last scoped allow. (c) The two "KNOWN RESIDUAL" tests injected kRefused; they
+   did not reproduce an authorization query failure. They are replaced by REST tests that run the real
+   access check against a broken management-group store and against grant removal. The MCP
+   refused-standing test still injects `kRefused`; it covers the consumer, and the failed-read and
+   engine paths are covered by the real-stack and engine-gate tests.
+
+**Why.** The governance rules do not let an author defer a CRITICAL or HIGH finding, and an
+adjudication is not a waiver. The adjudicator (a second model, read-only, 2026-10-24) derived the
+failed-read disclosure as CRITICAL (impact I1, exposure E2: an authenticated `Security:Read` holder
+with only group-scoped inventory access receives out-of-scope device-certificate metadata: serial,
+subject which is the agent id, SAN, status, dates, issuer) and the no-grant widening as HIGH.
+
+**Consequence for operators.** Breaking for a custom role that holds `Security:Read` and no
+`Inventory:Read`; the seeded Administrator and Viewer roles, the only seeded roles that hold
+`Security:Read`, also hold a global `Inventory:Read`, per `seed_defaults()`. See
+`docs/user-manual/upgrading.md`.
+
+**Approval.** The maintainer, Dave Rae, approved applying this Update on 2026-10-24. The ADR author's confirmation is not recorded in the repository.

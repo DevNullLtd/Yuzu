@@ -7,6 +7,10 @@
  * Covers the #1567 chain the pure-part tests cannot: corrupt tar.db at boot ->
  * quarantine -> db_health status line -> reconcile into the heartbeat KV keys
  * (idempotent replay) -> the #1846 status keys. Unguarded on every OS.
+ *
+ * Also pins the default-on contract at the plugin seam the unit-test exe cannot
+ * reach (tar_plugin.cpp is not linked there): no `<src>_enabled` seed at init, the
+ * destructive purge refusing an unreadable enable flag, and `snapshot` reporting partial.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -23,6 +27,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <optional>
 #include <sstream>
@@ -80,12 +85,55 @@ std::optional<std::string> row_with_prefix(const std::vector<std::string>& rows,
     return std::nullopt;
 }
 
+// Registered capture sources: one `<src>_last_status` health line each. The registry source
+// is the 17th (Windows-only, but its health lines are emitted on every OS). Not derived from
+// capture_sources(): that table lives in a TU this executable does not link.
+constexpr std::size_t kTarSourceCount = 17;
+
 size_t count_containing(const std::vector<std::string>& rows, const std::string& needle) {
     size_t n = 0;
     for (const auto& r : rows)
         if (r.find(needle) != std::string::npos)
             ++n;
     return n;
+}
+
+// Count the `<src>_enabled` rows init left in tar_config (raw read, no plugin code).
+int enabled_rows_in(const fs::path& db_path) {
+    yuzu::test::SqliteHandleOwner<sqlite3> owner;
+    REQUIRE(sqlite3_open_v2(db_path.string().c_str(), &owner.db, SQLITE_OPEN_READONLY, nullptr) ==
+            SQLITE_OK);
+    // sqlite3_exec with a callback: no statement handle to finalize on a failing REQUIRE.
+    int n = -1;
+    REQUIRE(sqlite3_exec(
+                owner.db,
+                "SELECT count(*) FROM tar_config WHERE key LIKE '%\\_enabled' ESCAPE '\\'",
+                [](void* out, int, char** vals, char**) {
+                    *static_cast<int*>(out) = std::atoi(vals[0]);
+                    return 0;
+                },
+                &n, nullptr) == SQLITE_OK);
+    return n;
+}
+
+// Make ONLY the read of `tar_config.value` for `key` fail (at step), from a second
+// connection to the plugin's open tar.db; every other key still reads. `value`
+// becomes a VIRTUAL generated column whose expression overflows for that one key; the
+// expression is row-dependent, so a stored value is written first (init stores none).
+// (Same technique as make_config_key_unreadable in test_tar_aggregator.cpp.)
+void make_config_key_unreadable(const fs::path& db_path, const std::string& key) {
+    yuzu::test::SqliteHandleOwner<sqlite3> owner;
+    REQUIRE(sqlite3_open(db_path.string().c_str(), &owner.db) == SQLITE_OK);
+    sqlite3_busy_timeout(owner.db, 5000);
+    const auto sql =
+        std::format("INSERT INTO tar_config (key, value) VALUES ('{0}', 'true') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value; "
+                    "ALTER TABLE tar_config RENAME COLUMN value TO value_raw; "
+                    "ALTER TABLE tar_config ADD COLUMN value TEXT GENERATED ALWAYS AS "
+                    "(CASE WHEN key = '{0}' THEN abs(-9223372036854775808 + 0 * length(key)) "
+                    "ELSE value_raw END) VIRTUAL;",
+                    key);
+    REQUIRE(sqlite3_exec(owner.db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
 }
 
 } // namespace
@@ -137,9 +185,9 @@ TEST_CASE("tar plugin: corrupt boot quarantines, publishes the fleet signal, sta
             const auto epoch = health->substr(std::string{"db_health|quarantined|"}.size());
             CHECK(row_with_prefix(rows, "config|perf_capture_method|").has_value());
             CHECK(row_with_prefix(rows, "config|procperf_procs_seen|").has_value());
-            CHECK(count_containing(rows, "_last_status|") == 16);
-            CHECK(count_containing(rows, "_last_status_at|") == 16);
-            CHECK(count_containing(rows, "_consecutive_failures|") == 16);
+            CHECK(count_containing(rows, "_last_status|") == kTarSourceCount);
+            CHECK(count_containing(rows, "_last_status_at|") == kTarSourceCount);
+            CHECK(count_containing(rows, "_consecutive_failures|") == kTarSourceCount);
 
             CHECK(kv->get("tar", "heartbeat.db_corruption_total") == std::optional<std::string>{"1"});
             const auto last = kv->get("tar", "heartbeat.db_quarantine_last");
@@ -327,4 +375,100 @@ TEST_CASE("tar plugin: corrupt boot quarantines, publishes the fleet signal, sta
         CHECK_FALSE(kv->get("tar", "heartbeat.db_corruption_total").has_value());
         desc->shutdown(ctx.get());
     }
+}
+
+TEST_CASE("tar plugin: every source is enabled by default with no stored flag; an unreadable flag "
+          "refuses a purge and makes a snapshot partial",
+          "[tar][local_dispatcher][default-on]") {
+    const auto plugin_path = find_tar_plugin();
+    if (plugin_path.empty()) {
+        if (std::getenv("MESON_BUILD_ROOT") != nullptr)
+            FAIL("tar plugin library not found under meson test");
+        WARN("tar plugin library not found -- skipping (run from the build root or via meson test)");
+        return;
+    }
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    REQUIRE(handle.has_value());
+    const auto* desc = handle->descriptor();
+    REQUIRE(desc != nullptr);
+    REQUIRE(desc->init != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_tar_local_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    auto kv = yuzu::agent::KvStore::open(dir_guard.path / "kv_store.db");
+    REQUIRE(kv.has_value());
+    yuzu::agent::StandalonePluginContext ctx("tar", {{"agent.data_dir", dir_guard.path.string()}},
+                                             &*kv);
+    REQUIRE(desc->init(ctx.get()) == 0);
+    const auto db_path = dir_guard.path / "tar.db";
+    yuzu::agent::LocalDispatcher d;
+
+    SECTION("a fresh init seeds no flag; formerly opt-in sources read enabled and run") {
+        // init used to write `<src>_enabled=false` for four of these; the registry
+        // default now supplies "true", so a fresh data dir stores nothing.
+        CHECK(enabled_rows_in(db_path) == 0);
+
+        // `registry` is Windows-only, but status lists every registered source's flag on
+        // every OS (unsupported ones record nothing), so it is asserted here everywhere.
+        const auto rows = rows_of(d.run(desc, "status").captured);
+        for (const char* src :
+             {"module", "software", "netconn", "mapdrive", "netqual", "procperf", "registry"}) {
+            INFO("source=" << src);
+            CHECK(row_with_prefix(rows, std::format("config|{}_enabled|true", src)).has_value());
+        }
+        CHECK(count_containing(rows, "source_disabled") == 0);
+
+        // The registry source's eleven health keys are always present, at their "not
+        // running" defaults before any tick has written them.
+        for (const char* kv : {"registry_capture_method|none", "registry_watch_roots|0",
+                               "registry_watch_roots_unarmed|0", "registry_roots_unreadable|0",
+                               "registry_roots_capped|0", "registry_etw_events|0",
+                               "registry_etw_dropped|0", "registry_etw_lost|0",
+                               "registry_attr_attributed|0", "registry_attr_ambiguous|0",
+                               "registry_attr_none|0"}) {
+            INFO("key=" << kv);
+            const auto expected = std::format("config|{}", kv);
+            CHECK(row_with_prefix(rows, expected) == std::optional<std::string>{expected});
+        }
+
+        // The per-app leg of collect_perf is gated on source_enabled("procperf"):
+        // with no stored flag it must run (baseline / unsupported_platform /
+        // counters_unavailable by OS), never report source_disabled.
+        const auto perf = rows_of(d.run(desc, "collect_perf").captured);
+        const auto leg = row_with_prefix(perf, "tar|collect_procperf|");
+        REQUIRE(leg.has_value());
+        CHECK_FALSE(leg->ends_with("|source_disabled"));
+    }
+
+    SECTION("purge_source refuses when the enable flag cannot be read") {
+        make_config_key_unreadable(db_path, "module_enabled");
+
+        const YuzuParam module_params[] = {{"source", "module"}};
+        const auto refused = d.run(desc, "purge_source", module_params);
+        CHECK(refused.rc == 1);
+        CHECK(refused.captured.find("error|config_unreadable") != std::string::npos);
+
+        // Control: a source whose flag still reads is refused for the OTHER reason
+        // (enabled by default), so the first refusal is the unreadable-flag guard.
+        const YuzuParam process_params[] = {{"source", "process"}};
+        const auto control = d.run(desc, "purge_source", process_params);
+        CHECK(control.rc == 1);
+        CHECK(control.captured.find("error|source_not_paused") != std::string::npos);
+    }
+
+    SECTION("snapshot reports partial, not complete, when an enable flag cannot be read") {
+        // An unreadable flag skips its source through skip_token() and never raises
+        // IncompleteCaptureError, so only the flag read in do_snapshot can name it.
+        make_config_key_unreadable(db_path, "module_enabled");
+
+        const auto snap = d.run(desc, "snapshot");
+        CHECK(snap.rc != 0);
+        const auto line = row_with_prefix(rows_of(snap.captured), "tar|snapshot|");
+        REQUIRE(line.has_value());
+        CHECK(line->starts_with("tar|snapshot|partial|"));
+        CHECK(line->find("module") != std::string::npos);
+    }
+
+    desc->shutdown(ctx.get());
 }
