@@ -16226,8 +16226,9 @@ private:
                     },
                 // The ONE call site of `rbac_admin_hint` (routed A2/A1 row): the page draws the
                 // Assign button and the enforcement switch from the authority the A2/A1 routes
-                // apply (the durable-Administrator predicate, then the regime check), not from
-                // the session's base account role. kRest because the controls call the REST
+                // apply (the durable-Administrator predicate, then the regime check; A1 applies
+                // the regime rule inside set_enforcement), not from the session's base role.
+                // kRest because the controls call the REST
                 // routes. HINT ONLY: every action keeps its own gate. Null stores fold to
                 // kUnconfirmed inside the hint.
                 .rbac_admin_hint_fn = [this](const auth::Session& s) {

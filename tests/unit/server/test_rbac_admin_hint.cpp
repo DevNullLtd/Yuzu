@@ -4,8 +4,12 @@
  * enforcement switch (#6034).
  *
  * Two layers:
- *   1. The ROUTE-LEVEL equality matrix, the structural proof that the hint cannot drift from the
- *      gate. Per persona, the hint is computed from the same stores the routes read, then the
+ *   1. The ROUTE-LEVEL equality matrix, the empirical control that the hint equals the gate for
+ *      every persona it models. The assign routes call the same two functions in the same
+ *      order; the enforcement route applies the regime rule inside set_enforcement on a real
+ *      transition, so its equality rests on this matrix. A change to the gate sequence of
+ *      any of the three routes needs a matching row here. Per persona, the hint is computed
+ *      from the same stores the routes read, then the
  *      REAL `POST /api/v1/rbac/roles/{name}/assignments` (and, for the personas that can
  *      reach a real transition, `PUT /api/v1/rbac/enforcement`) is called and its answer
  *      classified: 2xx / 400 / 409 = authority admitted (kMay), 403 = kMayNot, 503 = kUnconfirmed.

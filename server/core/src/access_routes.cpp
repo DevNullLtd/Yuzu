@@ -241,7 +241,8 @@ void register_access_routes(HttpRouteSink& sink, Deps deps) {
     // session, so this is a session-only gate too. The switch is a hint (the server decides on
     // every PUT). The displayed state is read ONLY through the store's display accessors; whether
     // the switch is live comes from `rbac_admin_hint_fn`, the composition of the administrator
-    // predicate and the regime check the routes apply, wired in server.cpp.
+    // predicate and the regime check (the enforcement route applies the regime rule inside
+    // `set_enforcement`), wired in server.cpp.
     sink.Get("/fragments/access/enforcement",
              [deps](const httplib::Request& req, httplib::Response& res) {
                  // The fleet-wide RBAC state, including the "Unconfirmed" bit /api/v1/me does

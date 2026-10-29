@@ -53,11 +53,15 @@
 /// the predicate, as A1 does.
 ///
 /// SCOPE EXTENSION (#6034, the Users and roles page hint): `rbac_admin_hint` (below) is the
-/// ONE advisory composition of the two authority functions the A2/A1 routes call, in the same
-/// order: this predicate with `RbacAdminSurface::kRest`, then
-/// `RbacStore::check_caller_authorized_under_current_regime`. It exists so `/access/users`
-/// draws the Assign button and the enforcement switch from the authority the server will apply
-/// rather than from the session's base account role. HINT ONLY, never a gate: it adds no
+/// ONE advisory composition of this predicate with `RbacAdminSurface::kRest`, then
+/// `RbacStore::check_caller_authorized_under_current_regime`. The A2 assign and unassign routes
+/// call those same two functions in that order; the A1 enforcement route (`PUT
+/// /api/v1/rbac/enforcement`) calls the predicate and applies the regime rule INSIDE
+/// `set_enforcement`, on a real transition only, so its equality with the hint rests on the
+/// per-persona matrix in `test_rbac_admin_hint.cpp`, not on a shared call. A change to the gate
+/// sequence of any of the three routes needs a matching row in that matrix. It exists so
+/// `/access/users` draws the Assign button and the enforcement switch from the authority the
+/// server will apply rather than from the session's base account role. HINT ONLY, never a gate: it adds no
 /// admission logic of its own, writes no audit row and no response, and every action it hints
 /// at keeps its own unchanged gate. Its one production call site is the Access wiring lambda in
 /// `server.cpp` (`rbac_admin_hint_fn`), which passes `kRest` because the controls call the REST
@@ -265,15 +269,18 @@ enum class RbacAdminGate {
 ///     `kDenied` -> `kMayNot` (the regime check is then not consulted, as in the routes);
 ///   - on `kAdmin`, `rbac_store->check_caller_authorized_under_current_regime(username)`:
 ///     `kAuthorized` -> `kMay`, `kNotAuthorized` -> `kMayNot`, `kUnavailable` -> `kUnconfirmed`.
-/// The regime check is part of the fold because the routes apply it right after the predicate:
-/// it refuses a caller the predicate admitted when the grant has no active `auth.users` row (an
+/// The regime check is part of the fold because the routes apply it after the predicate (the
+/// assign routes as a separate call, the enforcement route inside `set_enforcement`): it
+/// refuses a caller the predicate admitted when the grant has no active `auth.users` row (an
 /// SSO-only principal) or the local cache lags the durable regime. A predicate-only hint would
 /// draw a control the route then refuses.
 ///
 /// HINT ONLY (see the scope paragraph above): the surface has NO default argument, exactly like
-/// the predicate, and there is deliberately no branch here beyond the fold, so the hint cannot
-/// drift from the gate. Neither function it calls writes an audit row or a response; this one
-/// does not either. A null or closed `rbac_store` is `kUnconfirmed`, never `kMayNot`.
+/// the predicate, and there is deliberately no branch here beyond the fold, so the hint has no
+/// logic of its own that could drift. That does not bind the routes: a change to any of the
+/// three routes' gate sequence needs a matching row in `test_rbac_admin_hint.cpp`. Neither
+/// function it calls writes an audit row or a response; this one does not either. A null or
+/// closed `rbac_store` is `kUnconfirmed`, never `kMayNot`.
 [[nodiscard]] inline RbacAdminHint rbac_admin_hint(const auth::Session& session, AuthDB* auth_db,
                                                     const RbacStore* rbac_store,
                                                     RbacAdminSurface surface) {
