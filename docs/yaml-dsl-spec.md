@@ -222,7 +222,7 @@ Each column object:
 server-side representation: `executeRoles`' labels (`endpoint-admin`,
 `security-admin`, ...) are a content-authoring convention that matches no
 seeded RBAC role (`Administrator`/`PlatformEngineer`/`Operator`/
-`ApiTokenManager`/`ITServiceOwner`/`Viewer`/`Reviewer`), and `embed_content.py`
+`ApiTokenManager`/`ITServiceOwner`/`Viewer`/`Reviewer`/`ForensicsAnalyst`), and `embed_content.py`
 drops the entire `permissions` block at build time -- it never reaches the
 running server. Actual execute-time enforcement is `spec.approval.mode` (see
 above); actual author-time enforcement is the `InstructionDefinition:Write`

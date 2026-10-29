@@ -139,18 +139,30 @@ groups:
             Disconnections" in docs/operations/troubleshooting.md). While it is down, agents through this
             gateway are stranded and command forwarding is dead.
 
-      # #1422 mgmt-plane peer pin, every rejection reason EXCEPT pin_mismatch
-      # (that one has its own rule below, because a routine server-leaf
-      # rotation produces a few of it). None of these reasons is produced by a
-      # rotation: missing_server_auth_eku, bad_peer_cert = a CA-cert holder
-      # that is not the server reached the command plane (or the server
-      # presents a leaf without the serverAuth EKU); no_pins_resolved,
+      # #1422 mgmt-plane peer authorization, every rejection reason EXCEPT
+      # pin_mismatch (that one has its own rule below, because a routine
+      # server-leaf rotation in pin mode produces a few of it). None of these
+      # reasons is produced by a rotation: missing_server_auth_eku, bad_peer_cert
+      # = a CA-cert holder that is not the server reached the command plane (or
+      # the server presents a leaf without the serverAuth EKU); no_pins_resolved,
       # no_pins_configured, bad_pin_config = the gateway's pin configuration
       # admits nobody (a pin file unreadable since the gateway started; once a
       # pin has been read it stays pinned, see YuzuGatewayMgmtPinUnresolved);
-      # internal_error = a defect. Each one needs a person, so no `for:`. The
-      # name is the pre-split rule's, so existing silences and routes keep
-      # applying to the non-rotation reasons.
+      # the #6016 server identity adds no_uri_san (the peer's certificate
+      # carries no identity URI), identity_mismatch (it carries URIs but not
+      # this install's /server), identity_unresolved (the gateway could not
+      # resolve the identity it must match) and revoked (the peer presented a
+      # certificate whose serial is in mgmt_peer_denied); in the identity
+      # modes a server key renewal that keeps the identity produces NONE of
+      # them, which is the point. In identity_or_pin with pins configured, a
+      # peer that fails BOTH paths is reported with the PIN's reason
+      # (pin_mismatch / no_pins_resolved), so no_uri_san and identity_mismatch
+      # reach this rule only when no pin is configured or the mode is identity
+      # (identity mode reports the identity's reason); identity_unresolved (a
+      # gateway configuration defect) and revoked are reported as themselves in
+      # every mode. internal_error = a defect. Each one needs a
+      # person, so no `for:`. The name is the pre-split rule's, so existing
+      # silences and routes keep applying to the non-rotation reasons.
       - alert: YuzuGatewayMgmtAuthRejected
         expr: |
           increase(yuzu_gw_mgmt_auth_rejected_total{reason!="pin_mismatch"}[1h]) > 0
@@ -172,9 +184,32 @@ groups:
             names, which is picked up within mgmt_pin_refresh_ms; a correction
             to mgmt_peer_pins in sys.config applies only at the next gateway
             restart, which disconnects every agent on the node, and agents
-            without the #5183 fix stay wedged after it); internal_error is a
-            gateway defect (collect the gateway log and report it). Rotation
-            never produces these reasons.
+            without the #5183 fix stay wedged after it); no_uri_san means the
+            peer's certificate has no server identity URI (in identity mode
+            the server's built-in certificate has not been re-issued with it:
+            check yuzu_server_identity_uri_present on the server, and keep
+            mgmt_peer_auth_mode at pin or identity_or_pin until it reads 1);
+            identity_mismatch means the certificate names another install or
+            another role (a certificate of a different CA, or an agent-style
+            URI): treat as a security incident unless the server was just
+            re-keyed under another CA; identity_unresolved means this gateway
+            could not work out the install identity (its management listener's
+            cacertfile is a bundle or unreadable): set mgmt_peer_identity (over
+            a bundle the gateway then also needs mode identity and a pin);
+            revoked means the peer presented a certificate whose serial is in
+            mgmt_peer_denied: the server is still using a withdrawn
+            certificate, re-key it, or a holder of that certificate is
+            connecting. mgmt_peer_auth_mode, mgmt_peer_identity and
+            mgmt_peer_denied are read at boot: a change to them applies only
+            if the gateway is restarted, which disconnects every agent on the
+            node, and agents without the #5183 fix stay wedged after it;
+            internal_error is a gateway defect (collect the gateway log and
+            report it). Rotation never produces these reasons, except identity_unresolved in
+            identity_or_pin with an unresolved identity. With pins
+            configured in identity_or_pin, no_uri_san and identity_mismatch
+            are reported as pin_mismatch instead and raise
+            YuzuGatewayMgmtPinMismatch, not this alert; identity_unresolved
+            and revoked are always reported as themselves.
 
       # pin_mismatch: the peer's key is not the pinned key. A routine rotation
       # produces a few: the server presents its new leaf up to one
@@ -227,7 +262,12 @@ groups:
             updated, add the new key's {spki_sha256, Hex} to mgmt_peer_pins,
             which applies at the next gateway restart (that disconnects every
             agent on the node, and agents without the #5183 fix stay wedged
-            after it). If the server's certificate did not change, a holder of another
+            after it). If this gateway is in mgmt_peer_auth_mode
+            identity_or_pin, the peer ALSO failed the identity check, since a
+            pin reason is only reported when both paths fail: look at
+            yuzu_server_identity_uri_present on the server (0 means the
+            built-in certificate lacks the identity URI) before changing a pin.
+            If the server's certificate did not change, a holder of another
             certificate with the serverAuth usage (for example the gateway's
             own key) is presenting it to the command plane: treat it as a
             security incident. A routine rotation does not fire this: its
@@ -246,8 +286,8 @@ groups:
       # server's next rotation, which would otherwise be refused. Last known
       # good means deleting, emptying or corrupting the file does NOT revoke
       # the pinned key; it never admits a key that was not pinned, and an entry
-      # that never resolved still admits nothing (fail closed; revocation by
-      # identity is #6016). `for: 2m` keeps a single
+      # that never resolved still admits nothing (fail closed; withdrawing a
+      # certificate without a file is mgmt_peer_denied, #6016). `for: 2m` keeps a single
       # half-written file seen on one refresh tick from paging; it delays the
       # counter half by two minutes and does not require a sustained episode
       # of it (increase()[1h] stays true for an hour after one increment).
@@ -2870,6 +2910,45 @@ groups:
             access is granted in the meantime. Check Postgres availability.
           runbook_url: "https://docs.yuzu.io/runbooks/ca-revocation-sweep-failing"
 
+      # #6016: the built-in server certificate carries the server identity URI
+      # the gateway management plane will admit by. 0 = the in-place upgrade
+      # was skipped or failed (the server log says why and retries on every
+      # boot); the gauge is absent, not 0, when built-in certificates are not
+      # in use, so an installation with its own certificates never fires.
+      # A gateway in identity mode would refuse this server (no_uri_san), so
+      # this is the gate before moving mgmt_peer_auth_mode to `identity`; in
+      # pin or identity_or_pin mode (with a pin) nothing breaks, hence a warning
+      # that waits out a rolling restart.
+      - alert: YuzuServerIdentityUriAbsent
+        expr: |
+          yuzu_server_identity_uri_present == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The built-in server certificate carries no server identity URI ({{ $labels.instance }})"
+          description: >-
+            yuzu_server_identity_uri_present is 0: default-server.pem lacks the
+            URI SAN yuzu://<install>/server that the gateway's management
+            plane admits the server by, because the in-place re-issue was
+            skipped or failed. The server log says why on every boot: the
+            server key was withdrawn (revoked for a reason other than
+            superseded; re-key the set, which also changes the key every
+            gateway mgmt_peer_pins entry refers to), the cert directory is
+            read-only, the CA key is not in it, or the CA inventory is
+            unreachable. A gateway in mgmt_peer_auth_mode pin or
+            identity_or_pin still admits this server by its pin (when it has
+            one), so nothing is failing; a gateway in identity mode refuses
+            it (no_uri_san). Do not move a gateway to identity mode until this
+            reads 1 on every server replica. The gauge is set once, at server
+            boot, so it stays 0 until the server is restarted after the cause
+            is fixed. It describes the file default-server.pem: a server given
+            its own --cert/--key presents that certificate to the gateway,
+            even while default certificates stay active for another
+            listener, which this gauge does not see. See docs/pki-architecture.md and
+            docs/user-manual/upgrading.md.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/gateway.md#authorizing-the-server-by-its-identity"
+
       - alert: YuzuCaReissueBlocked
         expr: |
           increase(yuzu_server_ca_reissue_blocked_total[1h]) > 0
@@ -2958,6 +3037,45 @@ groups:
             Response reads returned a degrade rather than a result for 10m —
             consumers render a degrade banner / 503 rather than a false-empty.
             Usually PostgreSQL pool saturation; correlate with pool metrics.
+
+      # #4990: stored-response reads withhold Forensics-tier rows from a caller without
+      # Forensics:Read. When the caller's authority itself cannot be determined (the
+      # authorization read answered unavailable, or a dependency was never wired) the read is
+      # refused with a retryable 503 or shows a notice (sessions, API tokens, MCP tokens and engine
+      # principals; a service-scoped token is default-denied instead, and a whole-store outage
+      # that fails the surface's earlier admission gate first is answered by that gate and does
+      # not move this counter); it is not served
+      # as a 200 with the Forensics rows silently missing. Only a global Forensics:Read admits
+      # rows (there is no scoped read tier). A definitive
+      # refusal is correct behavior and is not counted, so the series is flat on a healthy
+      # server whatever the callers' roles. The series is pre-seeded to 0 for every reason at
+      # boot, so the first event is a rate. `for: 10m` over a 5m rate window (the shape of
+      # YuzuResponseReadDegrade): one refusal keeps the expression true for under 5 minutes, so
+      # it never fires, and neither does a burst shorter than about 5 minutes; a failure that
+      # keeps recurring (an event every few minutes) fires after about 10 minutes. BOUNDARY, by
+      # design: with the 5m rate window, a refusal that recurs only every 5 minutes or longer
+      # leaves the rate false between events, never holds for 10 consecutive minutes, and does not
+      # fire (measured with promtool: an event every 285 seconds still fires at minute 12, every
+      # 300 seconds does not).
+      - alert: YuzuForensicsTierUnresolved
+        expr: |
+          sum by (instance, reason) (rate(yuzu_server_forensics_tier_withheld_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Forensics-tier reads are being refused because caller authority cannot be determined on {{ $labels.instance }} (reason={{ $labels.reason }})"
+          description: >-
+            Reads of stored responses could not determine whether the caller may see
+            Forensics-tier rows (reason={{ $labels.reason }}) repeatedly over at least 10
+            minutes on {{ $labels.instance }}. Those reads are refused with a retryable error (a 503 on the
+            REST and legacy routes, a JSON-RPC internal error carrying retry_after_ms on MCP)
+            or show a notice (dashboard); no Forensics row is served and no partial result is
+            returned. rbac_unavailable: the authorization store answered
+            unavailable. unwired: a dependency of the resolver was never wired, which a running
+            server should not show. Usually PostgreSQL pool saturation or a store outage:
+            correlate with yuzu_server_rbac_read_degrade_total, the pool metrics and the
+            server log line "Forensics-tier visibility could not be resolved".
 
       - alert: YuzuResponseReapBacklog
         expr: |
@@ -4026,9 +4144,16 @@ groups:
             dex.signal.view, dex.perf.device.view, network.device.view, inventory.devices,
             inventory.device.ci, plus
             response.read on the v1 query, aggregate and export routes and on the
-            legacy get, aggregate and export routes) is returning 503 and withholding PII or response
+            legacy get, aggregate and export routes, plus response.forensics.read (written
+            only when the rows served include a Forensics-tier plugin's) on the v1
+            execution-scoped response, response get, export and visualization routes, on
+            bundle collation (GET /api/v1/bundles/{id}) and on the legacy get and export
+            routes) is returning 503 and withholding PII or response
             data, so a ServiceNow / CMDB poll blackouts fleet-wide. Set-and-proceed reads, including
-            crypto.libraries.*, keep serving data and do not 503: their REST routes and dashboard
+            crypto.libraries.* and response.forensics.read on the dashboard results fragment, the
+            executions drawer, the hardware result poll, the MCP query_responses tool and
+            the MCP get_bundle_result tool, keep
+            serving data and do not 503: their REST routes and dashboard
             fragments set the Sec-Audit-Failed header, their MCP tools set audit_persisted:false
             (the hardware CI tools list_hardware_ci and get_hardware_ci, which audit as
             inventory.devices and inventory.device.ci, fail closed instead: they withhold the
@@ -5953,8 +6078,13 @@ groups:
           description: >-
             A durable session-store operation ({{ $labels.op }}) hit a degraded
             PostgreSQL read/write for 10m. A `validate` degrade fails requests
-            closed (401); `create`/`elevate`/`mark_mfa`/`invalidate`/
-            `invalidate_user` degrades fail the privileged op closed; a sustained
+            closed (401; the approve and reject routes answer 503 when they cannot read
+            the session's stored MFA proof); `create`/`elevate`/`mark_mfa`/`invalidate`/
+            `invalidate_user` degrades fail the privileged op closed, except an
+            `invalidate_user` after an MFA clear that already committed (Settings MFA
+            disable), which leaves the clear in place and ends `partial`; a single
+            event does not hold this alert's 10m condition, so look for
+            `mfa.disabled` rows with result `partial` in the audit log; a sustained
             `generation_refresh` degrade drops the validate cache past the
             stale-serve bound. Usually PostgreSQL pool saturation / failover —
             correlate with the pool metrics.
@@ -6307,13 +6437,26 @@ groups:
     # in-process cmd_execution_ids_ map). Mirrors yuzu-auth-sessions'
     # YuzuSessionReapClockAnomaly shape: a reap pass declines when its
     # DB-primary now() read is implausibly ahead of, or behind, the
-    # persisted anchor. Lower stakes than the session case (this table is a
-    # regenerable observability aid, not compliance evidence — see
-    # docs/executions-history-ladder.md), so a single reap-clock-anomaly
-    # alert is the whole ask here; the write/store-degrade counters are
-    # deferred (no comparable existing shape to adapt, best-effort
-    # observability rather than an integrity signal). Zero-seeded at boot,
-    # so increase() > 0 is meaningful.
+    # persisted anchor. A decline here un-expires nothing (rows only age past
+    # the window), so a single reap-clock-anomaly alert is the whole ask for
+    # the reap; see docs/executions-history-ladder.md. Since #4990 the table
+    # is also the server's dispatch record, the source of a stored response's
+    # plugin label: a missing record means the response is stored
+    # `~unverified` (Forensics-tier, withheld from callers without
+    # Forensics:Read). The write/store-degrade counters and the
+    # yuzu_server_response_provenance_total outcomes `unrecorded` and
+    # `lookup_degraded` are therefore signals of responses being stored
+    # unverified. Rules exist for: failed record writes
+    # (YuzuDispatchRecordWriteFailing), the `lookup_degraded` outcome
+    # (YuzuResponseProvenanceLookupDegraded) and a saturated reap
+    # (YuzuExecCorrelationReapSaturated). DELIBERATELY no rule on `unrecorded`
+    # (it is non-zero on a healthy fleet: an id the server never issued, a
+    # record reaped after 24 hours, an empty id; a failed write that causes it is
+    # already covered by the write rule), on read_degrade_total (a first-attempt
+    # failure that the retry recovers also counts there and unverifies nothing;
+    # the double failure that does is the `lookup_degraded` outcome), or on
+    # store_degrade_total (a failed hourly reap pass: no response is affected).
+    # Zero-seeded at boot, so increase() > 0 is meaningful.
     rules:
       - alert: YuzuExecCorrelationReapClockAnomaly
         expr: |
@@ -6335,6 +6478,135 @@ groups:
             the DATABASE primary's NTP / clock health; correlate with
             yuzu_exec_correlation_store_degrade_total /
             yuzu_exec_correlation_write_degrade_total.
+
+      # #4990: every dispatch writes one command_execution record, and a response is
+      # labelled from it. A dispatch whose record write fails (pool lease not acquired
+      # within 2 s, lock or statement timeout, query error, tracker not open) still goes
+      # out, but every response to it is stored `~unverified`: Forensics-tier, so it is
+      # withheld from callers without Forensics:Read (an HTTP 200 with no marker) and
+      # hidden from fixed-plugin polls such as DEX, TAR and hardware. One failed write
+      # unverifies one command, which a blip can cause, so only a failure that keeps
+      # recurring pages. Shape of YuzuForensicsTierUnresolved: `for: 10m` over a 5m rate
+      # window; one failure keeps the expression true for under 5 minutes and a burst
+      # shorter than about 5 minutes never reaches 10. BOUNDARY, by design: dispatch is
+      # operator or automation driven, so a store outage with fewer than one dispatch
+      # every ~5 minutes leaves the rate false between failures and does not fire,
+      # although each of those commands is still unverified (the promtool case pins an
+      # event every 6 minutes as quiet). The counter is the complete evidence. The pool
+      # rules (YuzuPgPoolSaturated, YuzuPgAcquireWaitHigh) do not cover a statement-level
+      # failure (lock timeout, query error) with a healthy pool. COUNTING NOTE: in the one
+      # loop that writes a record per target (the operator Guardian rule push), the first
+      # failed write skips the rest, and each skipped write is counted too. An outage push to
+      # N agents therefore adds N to the counter from ONE real write attempt, so the size of
+      # a jump measures affected commands, not store attempts. The expression only tests
+      # for a non-zero rate, so it is unchanged by this.
+      - alert: YuzuDispatchRecordWriteFailing
+        expr: |
+          sum by (instance) (rate(yuzu_exec_correlation_write_degrade_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dispatch records are failing to write on {{ $labels.instance }}, so responses are being stored unverified"
+          description: >-
+            Writing the per-dispatch command_execution record has failed repeatedly over at
+            least 10 minutes on {{ $labels.instance }}. Dispatch itself is unaffected, but
+            every response to a command whose record was not written is stored
+            `~unverified`, which is Forensics-tier: legitimate responses of any plugin are
+            withheld from callers without Forensics:Read (a normal 200 with the rows
+            missing) and hidden from fixed-plugin polls such as DEX, TAR and hardware, and
+            the executions drawer misses those commands' agent events. First check
+            PostgreSQL health and the yuzu_pg_* pool and lock metrics (the write fails on a
+            pool lease timeout, a lock or statement timeout or a query error), then
+            yuzu_exec_correlation_write_degrade_total and the server log line "pool
+            exhausted for command_id" (at most one per minute per cause). The responses
+            already stored unverified are not repaired when the store recovers; re-run the
+            affected commands.
+
+      # #4990: the READ side of the same record. A response frame whose record lookup
+      # fails twice (one retry) is stored `~unverified` with the same consequences. Only
+      # outcome="lookup_degraded" is a fault signal. Do NOT widen this to `unrecorded`:
+      # that outcome also counts an id the server never issued (a forged or echoed id), a
+      # record reaped after its 24 hour window and an empty id, none of which is a store
+      # fault, so it is non-zero on a healthy fleet. Do not use
+      # yuzu_exec_correlation_read_degrade_total either: it also counts a first-attempt
+      # failure that the retry recovers, which unverifies nothing. Keepalive frames are
+      # never counted in the provenance family, which is intended. Same shape and
+      # boundary as the write rule above (`for: 10m` over a 5m rate window), but the
+      # trigger is response traffic, which is usually denser than dispatch traffic, so the
+      # sparse-failure boundary is rarely the limiting case here.
+      - alert: YuzuResponseProvenanceLookupDegraded
+        expr: |
+          sum by (instance) (rate(yuzu_server_response_provenance_total{outcome="lookup_degraded"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dispatch-record lookups are failing on {{ $labels.instance }}, so responses are being stored unverified"
+          description: >-
+            Looking up the dispatch record of an incoming command response has failed twice
+            for responses repeatedly over at least 10 minutes on {{ $labels.instance }}.
+            Each such response is stored `~unverified`, which is Forensics-tier:
+            legitimate responses of any plugin are withheld from callers without
+            Forensics:Read (a normal 200 with the rows missing) and hidden from fixed-plugin
+            polls such as DEX, TAR and hardware. First check PostgreSQL health and the
+            yuzu_pg_* pool and lock metrics, then
+            yuzu_server_response_provenance_total{outcome="lookup_degraded"} and
+            yuzu_exec_correlation_read_degrade_total{reason} (pool_exhausted or
+            query_failed), and the server log line "response provenance unresolved" (at most
+            one per minute per outcome). Responses already stored unverified are not
+            repaired when the store recovers; re-run the affected commands. A rise in
+            outcome="unrecorded" alone is not this alert (see the group comment).
+
+      # #4990: the dispatch-record reap deletes at most 50,000 rows per pass
+      # (kCmdExecutionReapCap) and runs about hourly, so it can reclaim about 1.2 million
+      # rows a day. A pass that finds more than that deletes exactly the cap, so the counter
+      # moves by the cap every hour while a backlog exists, and the table grows by the
+      # difference between inflow and reclaim. Expression: the counter moved by at least
+      # 200,000 (four caps) over 6 hours. The window holds 5 or 6 hourly passes depending on
+      # its phase, so the expression is true in EVERY phase only when each pass deletes
+      # about 39,500 rows or more (79 percent of the cap, which includes full saturation);
+      # between about 33,400 and 39,400 it is true in some phases only, so it flaps, which
+      # restarts the 24h pending and keeps the rule quiet. Four caps rather than five is so
+      # that a slightly slower pass cadence, which leaves 4 passes in some windows, still
+      # holds a saturated reap true. `increase` is used instead of an average over
+      # productive passes because it stays correct across a server restart (a reset), which
+      # an average built on `changes()` does not. The threshold is the cap times 4 and must
+      # be revisited if kCmdExecutionReapCap changes. `for: 24h` is sized to one day of the
+      # ceiling, recorded reasoning rather than a copied number: a one-off burst is drained
+      # at the cap, so it saturates exactly as long as it takes to drain, and the cap is
+      # designed to absorb two fleet-wide per-agent events a day (about one million rows,
+      # 20 saturated passes) without paging. The expression is true from the fourth
+      # saturated pass until about three passes after the last one, so a drain of up to 24
+      # saturated passes (1.2 million rows) stays quiet and a longer backlog pages, as does
+      # any sustained saturation after about 28 hours. BOUNDARIES: a replica restart that
+      # skips passes keeps the rule quiet while fewer than 4 passes are in the window; the
+      # rule is per replica (each replica's own reap pass), so a pass that finds nothing
+      # left on a second replica does not mask the first; and passes more than 1.5 times
+      # slower than the nominal hour would leave 4 passes or fewer in most windows and the
+      # rule unreliable. See execution_tracker.cpp kCmdExecutionReapCap.
+      - alert: YuzuExecCorrelationReapSaturated
+        expr: |
+          increase(yuzu_exec_correlation_reap_total[6h]) >= 200000
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dispatch-record reap on {{ $labels.instance }} has been running at its per-pass cap for a day"
+          description: >-
+            The hourly sweep of the command_execution dispatch-record table has deleted
+            at or near its 50,000 rows per pass cap on {{ $labels.instance }} (at least
+            200,000 rows over the last 6 hours) continuously for 24 hours, so records are
+            being created faster than the sweep can reclaim them and the table is growing
+            (about 210 bytes a row before the execution_id index, a little more with it).
+            This is a capacity signal, not a response failure: nothing is unverified by it. A burst of per-agent dispatches
+            is drained at the cap and resolves on its own after the backlog clears. If it
+            persists, the sustained dispatch rate is about 11 records a second or more (the
+            rule fires from about 79 percent of the cap; the cap itself is about 14 a
+            second): find the source (a fleet-wide per-agent push, an API client or a runner dispatching
+            in a loop). The cap is a compile-time constant today, so a persistent excess
+            needs an engineering escalation, not a configuration change. Correlate with
+            yuzu_exec_correlation_reap_total and yuzu_exec_correlation_store_degrade_total.
 
   - name: yuzu-enablement
     # ADR-3006 — the durable plugin-enablement store (EnablementStore). Every closed-label

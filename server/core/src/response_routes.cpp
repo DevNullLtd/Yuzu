@@ -2,6 +2,7 @@
 
 #include "authz_model.hpp"
 #include "data_export.hpp"
+#include "forensics_read_audit.hpp"
 #include "http_route_sink.hpp"
 #include "response_export_metrics.hpp"
 #include "response_query_params.hpp"
@@ -18,6 +19,16 @@ namespace yuzu::server::response {
 
 namespace {
 
+/// The 503 every fail-closed audit step answers (A4 envelope, retry_after_ms 5000).
+void refuse_unaudited(httplib::Response& res) {
+    res.status = 503;
+    res.set_content(detail::a4_error(res,
+                                     "audit subsystem unavailable; refusing to serve "
+                                     "response data without durable evidence",
+                                     {.retry_after_ms = 5000, .remediation = "retry the request"}),
+                    "application/json");
+}
+
 /// Fail-closed access-audit step shared by the three legacy read routes (get, aggregate,
 /// export; #4644 Gate 7). Emits one `response.read` row and, when it does not durably persist
 /// (a false return, or a throwing pipeline, both already handled by `emit_behavioral_audit`;
@@ -33,12 +44,21 @@ namespace {
     if (detail::emit_behavioral_audit(deps.audit_fn, req, res, "response.read", result,
                                       "Execution", instruction_id, detail_text))
         return true;
-    res.status = 503;
-    res.set_content(detail::a4_error(res,
-                                     "audit subsystem unavailable; refusing to serve "
-                                     "response data without durable evidence",
-                                     {.retry_after_ms = 5000, .remediation = "retry the request"}),
-                    "application/json");
+    refuse_unaudited(res);
+    return false;
+}
+
+/// #4990: the same fail-closed step for the `response.forensics.read` row, written only when the
+/// rows about to be served include a Forensics-tier plugin's (`forensics_read_audit.hpp`). Nothing
+/// to audit is a pass. Called after the `response.read` row and before any body is built.
+[[nodiscard]] bool audit_forensics_or_refuse(const Deps& deps, const httplib::Request& req,
+                                             httplib::Response& res,
+                                             const ForensicsServed& served,
+                                             const std::string& instruction_id) {
+    if (emit_forensics_read_audit(deps.audit_fn, req, res, served, instruction_id,
+                                  ForensicsSurface::kLegacy))
+        return true;
+    refuse_unaudited(res);
     return false;
 }
 
@@ -62,6 +82,14 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
                 "application/json");
             return;
         }
+
+        // #4990: the existing gate ran first; this derives the tier filter (writes no response).
+        const auto tier_resolved = tier_filter_for(req, deps.forensics_visibility_fn, deps.forensics_plugins);
+        if (!tier_resolved) { // Unknown: never a partial 200 (#4990)
+            respond_forensics_tier_unknown(res);
+            return;
+        }
+        const ResponseTierFilter& tier = *tier_resolved;
 
         auto group_by = req.get_param_value("group_by");
         if (group_by.empty())
@@ -132,7 +160,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         AggregateScope agg_scope; // nullopt = no restriction
         std::size_t agg_dropped = 0;
         if (gate.scope) {
-            auto distinct = deps.store->distinct_agent_ids(instruction_id);
+            auto distinct = deps.store->distinct_agent_ids(instruction_id, tier);
             if (!distinct) {
                 res.status = 503;
                 res.set_content(
@@ -162,7 +190,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
                                       " surface=aggregate"))
             return;
 
-        auto results_opt = deps.store->aggregate(instruction_id, aq, filter, agg_scope);
+        auto results_opt = deps.store->aggregate(instruction_id, tier, aq, filter, agg_scope);
         if (!results_opt) {
             res.status = 503;
             res.set_content(
@@ -213,6 +241,14 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
+        // #4990: the existing gate ran first; this derives the tier filter (writes no response).
+        const auto tier_resolved = tier_filter_for(req, deps.forensics_visibility_fn, deps.forensics_plugins);
+        if (!tier_resolved) { // Unknown: never a partial 200 (#4990)
+            respond_forensics_tier_unknown(res);
+            return;
+        }
+        const ResponseTierFilter& tier = *tier_resolved;
+
         ResponseQuery q;
         if (req.has_param("agent_id"))
             q.agent_id = req.get_param_value("agent_id");
@@ -240,7 +276,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         AggregateScope scope_arg; // nullopt = unrestricted
         std::size_t export_dropped = 0;
         if (gate.scope) {
-            auto distinct = deps.store->distinct_agent_ids(instruction_id);
+            auto distinct = deps.store->distinct_agent_ids(instruction_id, tier);
             if (!distinct) {
                 res.status = 503;
                 res.set_content(
@@ -264,7 +300,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         // output/error_detail (see ResponseStore::query_bounded). Same predicates and
         // scope push-down as query().
         const std::size_t byte_cap = export_body_byte_cap().load();
-        auto bounded_opt = deps.store->query_bounded(instruction_id, q, scope_arg, byte_cap);
+        auto bounded_opt = deps.store->query_bounded(instruction_id, tier, q, scope_arg, byte_cap);
         if (!bounded_opt) {
             res.status = 503;
             res.set_content(
@@ -291,6 +327,10 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         if (!audit_read_or_refuse(deps, req, res, "success", instruction_id,
                                   "legacy response export cid=" +
                                       detail::ensure_correlation_id(res)))
+            return;
+        if (!audit_forensics_or_refuse(deps, req, res,
+                                       summarize_forensics_served(results, deps.forensics_plugins),
+                                       instruction_id))
             return;
 
         auto format = req.get_param_value("format");
@@ -374,6 +414,14 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
+        // #4990: the existing gate ran first; this derives the tier filter (writes no response).
+        const auto tier_resolved = tier_filter_for(req, deps.forensics_visibility_fn, deps.forensics_plugins);
+        if (!tier_resolved) { // Unknown: never a partial 200 (#4990)
+            respond_forensics_tier_unknown(res);
+            return;
+        }
+        const ResponseTierFilter& tier = *tier_resolved;
+
         ResponseQuery q;
         if (req.has_param("agent_id"))
             q.agent_id = req.get_param_value("agent_id");
@@ -404,7 +452,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         AggregateScope scope_arg; // nullopt = unrestricted
         std::size_t get_dropped = 0;
         if (gate.scope) {
-            auto distinct = deps.store->distinct_agent_ids(instruction_id);
+            auto distinct = deps.store->distinct_agent_ids(instruction_id, tier);
             if (!distinct) {
                 res.status = 503;
                 res.set_content(
@@ -423,7 +471,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
             scope_arg = std::move(in_scope); // engaged-empty means no rows
         }
 
-        auto results_opt = deps.store->query(instruction_id, q, scope_arg);
+        auto results_opt = deps.store->query(instruction_id, tier, q, scope_arg);
         if (!results_opt) {
             res.status = 503;
             res.set_content(
@@ -445,6 +493,10 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         if (!audit_read_or_refuse(deps, req, res, "success", instruction_id,
                                   "legacy response query cid=" +
                                       detail::ensure_correlation_id(res)))
+            return;
+        if (!audit_forensics_or_refuse(deps, req, res,
+                                       summarize_forensics_served(results, deps.forensics_plugins),
+                                       instruction_id))
             return;
 
         nlohmann::json arr = nlohmann::json::array();

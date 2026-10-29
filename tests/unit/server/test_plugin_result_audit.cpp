@@ -41,6 +41,7 @@
 #include "../../../agents/plugins/registry/src/registry_plan.hpp"
 #include "test_auth_db_pg_helper.hpp"
 #include "test_principal_lock_gate.hpp"
+#include "test_provenance_fake.hpp" // #4990: harness record source when no tracker is wired
 #include "test_tracker_scope.hpp"
 #include "web_utils.hpp"
 #include "../test_helpers.hpp"
@@ -582,8 +583,7 @@ TEST_CASE("registry audit: only the six mutating actions of the registry plugin 
         for (const char* spelling : {"Registry", "REGISTRY", "rEgIsTrY"}) {
             const auto id = rid(9, spelling);
             INFO(id);
-            CHECK(registry_audit_events_for_frame("agent-1", id, extract_plugin(id), "set_value",
-                                                  output, 5)
+            CHECK(registry_audit_events_for_frame("agent-1", id, spelling, "set_value", output, 5)
                       .events.size() == 1);
         }
         CHECK(events("registr", "set_value").empty());
@@ -818,6 +818,9 @@ struct IngestHarness {
         audit = std::make_shared<AuditStore>(pool);
         REQUIRE(audit->is_open());
         svc.set_registry_audit_store(audit);
+        // #4990: the frame's plugin comes from a dispatch record; this harness answers with the
+        // id's prefix (a TrackerScope clears it and reads real records).
+        yuzu::test::use_prefix_provenance(svc);
     }
     static apb::CommandResponse frame(const std::string& command_id,
                                       apb::CommandResponse::Status status,
@@ -908,6 +911,36 @@ TEST_CASE("registry audit live ingest: a refused write is a failure row and read
     CHECK(h.rows().size() == 1);
 }
 
+TEST_CASE("registry audit live ingest: the plugin that gates the rows is the recorded one (#4990)",
+          "[pg][server][registry_audit][provenance]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
+    IngestHarness h(db.dsn());
+    const std::string line = line_with_result("ok");
+
+    // An unrecorded `registry-<hex>` id: the server never dispatched it, so the frame is
+    // unverified and owes no registry.write row (the id's own prefix is not trusted).
+    h.svc.override_command_record_lookup({});
+    h.svc.process_gateway_response(
+        "agent-1", IngestHarness::frame(rid(0xf1), apb::CommandResponse::RUNNING, "set_value", line));
+    CHECK(h.rows().empty());
+
+    // The same id once the server's record names the registry plugin owes its row.
+    h.svc.override_command_record_lookup([](const std::string&, std::string*) {
+        return std::optional<yuzu::server::CommandRecord>{{"registry", ""}};
+    });
+    h.svc.process_gateway_response(
+        "agent-1", IngestHarness::frame(rid(0xf1), apb::CommandResponse::RUNNING, "set_value", line));
+    CHECK(h.rows().size() == 1);
+
+    // A record that names ANOTHER plugin for a registry-looking id owes none.
+    h.svc.override_command_record_lookup([](const std::string&, std::string*) {
+        return std::optional<yuzu::server::CommandRecord>{{"filesystem", ""}};
+    });
+    h.svc.process_gateway_response(
+        "agent-1", IngestHarness::frame(rid(0xf2), apb::CommandResponse::RUNNING, "set_value", line));
+    CHECK(h.rows().size() == 1);
+}
+
 TEST_CASE("registry audit live ingest: a terminal frame that does carry output still owes its rows",
           "[pg][server][registry_audit]") {
     YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
@@ -954,6 +987,7 @@ TEST_CASE("registry audit live ingest: no audit store means no audit work and no
                          auto_approve,
                          metrics,
                          /*gateway_mode=*/false};
+    yuzu::test::use_prefix_provenance(svc); // #4990: see IngestHarness
 
     yuzu::test::LogCapture cap;
     svc.process_gateway_response("agent-1",
@@ -1466,7 +1500,7 @@ TEST_CASE("registry audit live ingest: the row is written before the execution a
     ExecutionEventBus exec_bus;
     yuzu::test::TrackerScope ts{h.svc, h.pool, &exec_bus};
     const auto id = ts.make_exec();
-    h.svc.record_execution_id(rid(0xe1), id);
+    h.svc.record_command_dispatch(rid(0xe1), "registry", id);
 
     // The tracker publishes `agent-transition` synchronously from inside the ingest, so the
     // listener sees exactly what a live operator watching the execution would.
@@ -1532,6 +1566,7 @@ struct LiveHarness {
         audit = std::make_shared<AuditStore>(pool);
         REQUIRE(audit->is_open());
         svc.set_registry_audit_store(audit);
+        yuzu::test::use_prefix_provenance(svc); // #4990: see IngestHarness
         if (configure)
             configure(svc);
         grpc::ServerBuilder builder;

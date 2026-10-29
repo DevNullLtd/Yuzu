@@ -6,6 +6,7 @@
 #include "scope_attribute_guard.hpp" // E-1: unknown-attribute refusal for expression sends
 #include "mcp_input_bounds.hpp"    // kExecInstrScopeMaxLen
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500), kReasonDestructiveUntargeted
+#include "forensics_read_audit.hpp" // #4990: response.forensics.read
 #include "rest_audit.hpp" // detail::try_persist_audit (E-1: audit-before-dispatch)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, make_correlation_id (#4027 REST twin)
 #include "tar_tree_routes.hpp" // TarRetentionPausedScan/TarPausedSourceRow/tar_retention_paused_json (#4027)
@@ -16,6 +17,7 @@
 #include <ctime>
 #include <format>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -110,6 +112,20 @@ static int col_index_for_name(const std::vector<std::string>& cols, const std::s
 // A facet value over kMaxFacetValueBytes is not indexed in newly stored responses (rows an older
 // server stored may still match), so such a filter may match nothing; the results page says so
 // rather than let an empty table read as "no agent has this value".
+/// #4990: the results fragment when the caller's Forensics-tier decision could not be made (an
+/// unavailable authorization read). A visible banner in the table body and the summary slot, the
+/// same treatment as a store degrade: never the empty or "no results match your filters" state,
+/// which would read as a genuine zero-match answer.
+static std::string render_forensics_unknown_results() {
+    return "<tbody id=\"results-tbody\"><tr><td colspan=\"99\" "
+           "class=\"empty-state result-degrade-banner\" data-forensics-tier-unknown=\"true\">"
+           "<b>Results unavailable.</b> The permission check for this view could not be "
+           "completed. This is <b>not</b> \"no results\"; retry shortly.</td></tr></tbody>"
+           "<div id=\"result-summary\" hx-swap-oob=\"true\">"
+           "<span class=\"result-degrade-banner\">permission check incomplete; count "
+           "unavailable</span></div>";
+}
+
 static bool any_filter_value_too_long(const std::vector<FacetFilter>& filters) {
     return std::any_of(filters.begin(), filters.end(),
                        [](const FacetFilter& f) { return facet_filter_value_over_bound(f.value); });
@@ -412,10 +428,26 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                     }
                 }
 
-                auto html = render_results(command_id, plugin, sort_col, sort_dir,
+                // #4990: derived after the Response:Read gate (never writes a response); the
+                // filter narrows the rows, facets and counts below to what the caller may read.
+                const auto tier_resolved =
+                    tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                if (!tier_resolved) {
+                    // Unknown: a visible notice, never the empty or "no results" state (#4990).
+                    res.set_content(render_forensics_unknown_results(), "text/html; charset=utf-8");
+                    return;
+                }
+                const ResponseTierFilter& tier = *tier_resolved;
+                ForensicsServed served;
+                auto html = render_results(command_id, tier, plugin, sort_col, sort_dir,
                                            page, per_page, filters, text_query,
                                            definition_id, template_id,
-                                           visible_columns, gate.scope);
+                                           visible_columns, gate.scope, &served);
+                // #4990: a page that shows Forensics-tier rows leaves its own separately countable
+                // row. Set-and-proceed like the neighboring dashboard fragments: a persist failure
+                // shows as `Sec-Audit-Failed` and never blanks the operator's view.
+                (void)emit_forensics_read_audit(persist_audit_fn_, req, res, served, command_id,
+                                                ForensicsSurface::kDashboard);
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
@@ -455,7 +487,23 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                     if (std::regex_match(raw, kTplIdRegex)) template_id = raw;
                 }
 
-                auto html = render_filter_bar(command_id, plugin, definition_id, template_id,
+                // #4990: derived after the Response:Read gate; facet options come from the
+                // rows the caller may read, so a filtered value is not offered.
+                const auto tier_resolved =
+                    tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                if (!tier_resolved) {
+                    res.set_header("Cache-Control", "no-store, private");
+                    res.set_header("Vary", "Cookie");
+                    res.set_content(
+                        "<div id=\"filter-bar\" class=\"filter-bar result-degrade-banner\">"
+                        "<b>Filters unavailable.</b> The permission check for this view could "
+                        "not be completed. This is <b>not</b> \"no filters\"; retry "
+                        "shortly.</div>",
+                        "text/html; charset=utf-8");
+                    return;
+                }
+                const ResponseTierFilter& tier = *tier_resolved;
+                auto html = render_filter_bar(command_id, tier, plugin, definition_id, template_id,
                                               session->username, auth::is_elevated(*session));
                 // The body is now principal-specific (confined per caller's
                 // visible scope) rather than fleet-common, so an unpartitioned
@@ -564,9 +612,16 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // degrade must not render as "0 agents", not that the
                 // no-store/no-filter cases need a NEW distinction from it.
                 std::optional<int64_t> agent_count;
-                if (response_store_ && !filters.empty())
-                    agent_count = response_store_->facet_agent_count(command_id, filters,
-                                                                      agent_scope);
+                if (response_store_ && !filters.empty()) {
+                    // #4990: after the ManagementGroup:Write gate; the tier filter alone closes
+                    // the Forensics half (no Response:Read gate is added to this route).
+                    // Unknown leaves `agent_count` empty: the form then says the count is
+                    // unavailable, never a number computed over a partial row set.
+                    if (const auto tier =
+                            tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_))
+                        agent_count = response_store_->facet_agent_count(command_id, *tier, filters,
+                                                                          agent_scope);
+                }
                 else if (filters.empty())
                     agent_count = 0; // genuine: no filter → no scoped count
 
@@ -642,10 +697,41 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // match" — that's a wrong-result-presented-as-correct claim on
                  // a write-adjacent action (it would tell the operator their
                  // filters are bad when the store just couldn't be read).
-                 auto agent_ids_opt = response_store_->facet_agent_ids(command_id, filters);
+                 // #4990: after the ManagementGroup:Write gate and the same-site gate; the tier
+                 // filter alone closes the Forensics half, so the membership this materializes
+                 // never reflects rows the caller may not read.
+                 const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                 if (!tier) {
+                     // Unknown: this action materializes membership, so it refuses outright rather
+                     // than proceeding on a filter computed from a partial answer (#4990).
+                     // The form is hx-swap="none", so neither a body nor HX-Retarget is ever
+                     // shown; the operator sees the refusal through the page's toast channel
+                     // (an HX-Trigger showToast event, rendered with textContent). The message is
+                     // a constant: no caller or plugin data. Answered 200 (htmx drops a 4xx/5xx
+                     // body); the body carries the same text for every caller, htmx simply
+                     // does not display it. The planned REST and MCP twins (#2146) must NOT copy
+                     // this 200: they answer the shared retryable A4 503
+                     // (`respond_forensics_tier_unknown`, with `retry_after_ms`), as the
+                     // read-side twin does.
+                     res.set_header(
+                         "HX-Trigger",
+                         R"({"showToast":{"message":"The permission check for this action could )"
+                         R"(not be completed. Nothing was created. Retry shortly.","level":"error"}})");
+                     res.set_content(
+                         "<span class=\"feedback-error\">"
+                         "The permission check for this action could not be completed. "
+                         "Nothing was created. Retry shortly.</span>",
+                         "text/html; charset=utf-8");
+                     return;
+                 }
+                 auto agent_ids_opt = response_store_->facet_agent_ids(command_id, *tier, filters);
                  if (!agent_ids_opt.has_value()) {
                      res.status = 503;
-                     res.set_header("HX-Retarget", "#group-form-slot");
+                     // Same toast channel as the refusal above (the form never swaps a body).
+                     res.set_header(
+                         "HX-Trigger",
+                         R"({"showToast":{"message":"Agent count unavailable. The response store )"
+                         R"(could not be read. Nothing was created. Retry shortly.","level":"error"}})");
                      res.set_content(
                          "<span class=\"feedback-error\">"
                          "Agent count unavailable — the response store could not be read. "
@@ -766,11 +852,32 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                               " agents from " + command_id + ")");
 
                  // Response: no body, side-effects via HX-Trigger headers
+                 // The header is built with the JSON library, never by concatenation: the
+                 // operator-supplied name may hold a quote, a backslash, a control character,
+                 // a CR/LF (httplib drops a header value carrying one) or non-ASCII bytes,
+                 // any of which would otherwise leave the group created but the operator
+                 // with no confirmation and no list refresh. `ensure_ascii` keeps the header
+                 // 7-bit, `replace` turns invalid UTF-8 into U+FFFD instead of throwing, and
+                 // the ordered type keeps the key order of the hand-built header.
+                 // The toast renders its message with textContent, so no HTML escaping.
+                 // The name has no length bound in this handler or in the store, and every
+                 // non-ASCII byte becomes a six-byte \uXXXX escape, so the echoed name is cut
+                 // at 80 bytes (a cut inside a UTF-8 sequence becomes U+FFFD) to keep the
+                 // header far under any proxy header limit; the group list shows the full name.
+                 constexpr std::size_t kToastNameBytes = 80;
+                 const std::string toast_name =
+                     group_name.size() > kToastNameBytes
+                         ? group_name.substr(0, kToastNameBytes) + "..."
+                         : group_name;
+                 const nlohmann::ordered_json trigger = {
+                     {"showToast",
+                      {{"message", "Group '" + toast_name + "' created with " +
+                                       std::to_string(agent_ids.size()) + " agents"},
+                       {"level", "success"}}},
+                     {"agentChanged", true}};
                  res.set_header("HX-Trigger",
-                     R"({"showToast":{"message":"Group ')" +
-                     html_escape(group_name) + "' created with " +
-                     std::to_string(agent_ids.size()) +
-                     R"( agents","level":"success"},"agentChanged":true})");
+                                trigger.dump(-1, ' ', true,
+                                             nlohmann::ordered_json::error_handler_t::replace));
                  res.set_content("", "text/html; charset=utf-8");
              });
 
@@ -2328,7 +2435,7 @@ std::vector<std::string> DashboardRoutes::resolve_render_columns(
 // ---------------------------------------------------------------------------
 
 std::string DashboardRoutes::render_results(
-    const std::string& command_id, const std::string& plugin,
+    const std::string& command_id, const ResponseTierFilter& tier, const std::string& plugin,
     const std::string& sort_col, const std::string& sort_dir,
     int page, int per_page,
     const std::vector<FacetFilter>& filters,
@@ -2336,7 +2443,8 @@ std::string DashboardRoutes::render_results(
     const std::string& definition_id,
     const std::string& template_id,
     const std::vector<std::string>& visible_columns,
-    const authz::VisibleSet& scope) {
+    const authz::VisibleSet& scope,
+    ForensicsServed* served) {
 
     if (!response_store_) {
         return "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\">"
@@ -2395,7 +2503,7 @@ std::string DashboardRoutes::render_results(
         // dropped row happened to be out of this caller's scope (conservative, never silent).
         ResponseQuery q;
         q.limit = 10000; // upper bound
-        auto bounded_opt = response_store_->query_bounded(command_id, q, std::nullopt,
+        auto bounded_opt = response_store_->query_bounded(command_id, tier, q, std::nullopt,
                                                           export_body_byte_cap().load());
         store_degraded = !bounded_opt.has_value();
         if (bounded_opt) {
@@ -2405,10 +2513,10 @@ std::string DashboardRoutes::render_results(
         total_agent_count = static_cast<int64_t>(responses.size());
     } else {
         // Use faceted index to get matching response IDs, then load them
-        auto resp_ids_opt = response_store_->facet_response_ids(command_id, filters, 10000, 0);
+        auto resp_ids_opt = response_store_->facet_response_ids(command_id, tier, filters, 10000, 0);
         store_degraded = !resp_ids_opt.has_value();
         auto resp_ids = resp_ids_opt.value_or(std::vector<int64_t>{});
-        auto responses_opt = response_store_->query_by_ids(resp_ids);
+        auto responses_opt = response_store_->query_by_ids(resp_ids, tier);
         store_degraded = store_degraded || !responses_opt.has_value();
         responses = responses_opt.value_or(std::vector<StoredResponse>{});
         // facet_agent_count is degrade-distinguishable too — a degraded count
@@ -2419,7 +2527,7 @@ std::string DashboardRoutes::render_results(
         // same reasoning) — superseded by the #1712 in-handler recompute
         // plan (per the PR-4 re-enumeration); no behaviour change at this
         // site.
-        auto count_opt = response_store_->facet_agent_count(command_id, filters);
+        auto count_opt = response_store_->facet_agent_count(command_id, tier, filters);
         store_degraded = store_degraded || !count_opt.has_value();
         total_agent_count = count_opt.value_or(0);
     }
@@ -2447,6 +2555,7 @@ std::string DashboardRoutes::render_results(
     struct ResultLine {
         std::string agent_name;
         std::vector<std::string> fields; // excludes Agent column
+        std::size_t response_idx{0};     // index into `responses` (#4990: the row behind the line)
     };
     std::vector<ResultLine> all_lines;
     all_lines.reserve(responses.size() * 4);
@@ -2458,7 +2567,8 @@ std::string DashboardRoutes::render_results(
     for (const auto& f : filters)
         filter_stored_values.push_back(facet_filter_stored_form(f.value));
 
-    for (const auto& resp : responses) {
+    for (std::size_t resp_idx = 0; resp_idx < responses.size(); ++resp_idx) {
+        const auto& resp = responses[resp_idx];
         auto agent_name = registry_ ? registry_->display_name(resp.agent_id)
                                      : resp.agent_id;
         auto lines = split_output_lines(resp.output);
@@ -2488,6 +2598,7 @@ std::string DashboardRoutes::render_results(
             ResultLine rl;
             rl.agent_name = agent_name;
             rl.fields = std::move(fields);
+            rl.response_idx = resp_idx;
             all_lines.push_back(std::move(rl));
         }
     }
@@ -2518,6 +2629,15 @@ std::string DashboardRoutes::render_results(
     if (page > total_pages) page = static_cast<int>(total_pages);
     int64_t start = static_cast<int64_t>(page - 1) * per_page;
     int64_t end = std::min(start + per_page, total_lines);
+
+    // #4990: the stored rows behind the lines this page shows (a degraded read serves none).
+    if (served && !store_degraded) {
+        std::set<std::size_t> shown;
+        for (int64_t i = start; i < end; ++i)
+            shown.insert(all_lines[i].response_idx);
+        for (const auto idx : shown)
+            served->note(responses[idx].plugin, forensics_plugins_);
+    }
 
     // Phase 5: render HTML
 
@@ -2777,6 +2897,7 @@ std::string DashboardRoutes::render_results(
 // ---------------------------------------------------------------------------
 
 std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
+                                                const ResponseTierFilter& tier,
                                                 const std::string& plugin,
                                                 const std::string& definition_id,
                                                 const std::string& template_id,
@@ -2863,7 +2984,7 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
         std::vector<FacetValue> facet_vals;
         bool facet_degraded = false;
         if (response_store_) {
-            auto facet_opt = response_store_->facet_values(command_id, col_idx, agent_scope);
+            auto facet_opt = response_store_->facet_values(command_id, tier, col_idx, agent_scope);
             facet_degraded = !facet_opt.has_value();
             facet_vals = std::move(facet_opt).value_or(std::vector<FacetValue>{});
         }
@@ -3137,7 +3258,9 @@ DashboardRoutes::gather_tar_retention_paused(const std::string& username,
     // and every surface (HTML banner, REST/MCP JSON) reports the result as partial.
     ResponseQuery q;
     q.limit = 10000;
-    auto bounded_opt = response_store_->query_bounded(scan.scan_id, q, std::nullopt,
+    // #4990: the scan is a TAR dispatch the server issued itself (fixed plugin, not Forensics).
+    const auto tier = ResponseTierFilter::for_fixed_plugin_poll(forensics_plugins_);
+    auto bounded_opt = response_store_->query_bounded(scan.scan_id, tier, q, std::nullopt,
                                                       export_body_byte_cap().load());
     scan.store_degraded = !bounded_opt.has_value();
     std::vector<StoredResponse> responses;
