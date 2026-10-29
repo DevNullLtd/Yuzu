@@ -675,4 +675,14 @@ TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the
         CHECK_FALSE(ar.require_fleet_read(sreq, sres, "GuaranteedState", "Read").has_value());
         CHECK(sres.status == 403);
     }
+    SECTION("make_audit_event") {
+        // The audit class starts from the credential presentation (a cookie reads "human") and
+        // is re-stamped "engine" from the resolved session's is_engine(). The split session
+        // carries a human stored kind, so only the predicate, not the stored kind, yields it.
+        auto req = request_for(human_token);
+        CHECK(ar.make_audit_event(req, "test.action", "success").principal_class == "human");
+
+        auto sreq = request_for(split_token);
+        CHECK(ar.make_audit_event(sreq, "test.action", "success").principal_class == "engine");
+    }
 }
