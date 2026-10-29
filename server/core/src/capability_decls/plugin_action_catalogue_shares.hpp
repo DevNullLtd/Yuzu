@@ -13,10 +13,12 @@
 /// `RbacStore` `types[]`/`ops[]` entry; none is minted here.
 ///
 /// `list` is ReadOnly/None. The Linux leg reads /etc/exports, /etc/exports.d/*.exports and
-/// /etc/samba/smb.conf with bounded no-follow reads plus one lstat; the macOS and Windows
-/// legs are PLANNED placeholders that read nothing. No leg touches the network, takes an
-/// operator-supplied argument, emits an ACL or an NFS client host list, or changes host
-/// state: the action reports which shares the host is configured to serve as a FACT. Share
+/// /etc/samba/smb.conf with bounded no-follow reads plus one lstat; the Windows leg calls
+/// NetShareEnum (level 2, level 1 when refused) against the local Server service in bounded
+/// pages; the macOS leg is a PLANNED placeholder that reads nothing. No leg touches the
+/// network beyond that local RPC, takes an operator-supplied argument, emits an ACL or an
+/// NFS client host list, or changes host state: the action reports which shares the host
+/// serves (Linux: is configured to serve) as a FACT. Share
 /// names and paths can embed account names; that is disclosed in the README and definition.
 ///
 /// Grouped under `Infrastructure` (the network_config.routes precedent): what this host

@@ -897,10 +897,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "Linux from sssd/ipa configuration as written), MDM enrolment on macOS; a refused read is "
          "reported as permission_denied, never as not-joined; read-only, one bounded argv on macOS"},
         {"shares.list",
-         "Shares this host serves over SMB/NFS as configured: name, path, ro/rw, anonymous access "
-         "and a few flags, never ACLs or NFS client host lists; configured exports, not the "
-         "mapping/session observations tar mapdrive records; Linux reads /etc/exports, "
-         "/etc/exports.d and /etc/samba/smb.conf, macOS and Windows are planned; read-only"},
+         "Shares this host serves over SMB/NFS: name, path, ro/rw, anonymous access and a few "
+         "flags, never ACLs or NFS client host lists; not the mapping/session observations tar "
+         "mapdrive records; Linux reads the configuration as written (/etc/exports, "
+         "/etc/exports.d and /etc/samba/smb.conf), Windows reads the live Server-service shares "
+         "through NetShareEnum (name, path, kind and flags only), macOS is planned; read-only"},
         {"remote_access_audit.list",
          "SSH inbound-access audit as configured: sshd_config values (Include followed, Match not "
          "evaluated), per-account authorized_keys key fingerprints with option names, and whether "
