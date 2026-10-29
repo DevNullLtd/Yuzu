@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace yuzu::shares;
@@ -932,7 +933,8 @@ using Sigs = std::vector<std::string>;
 
 TEST_CASE("shares bsd exports: the man page shapes", "[shares]") {
     CHECK(sigs(bsd("/usr /usr/local -maproot=0:10 friends")) ==
-          Sigs{"/usr rw named no_root_squash,clients_1", "/usr/local rw named no_root_squash,clients_1"});
+          Sigs{"/usr rw named no_root_squash,clients_1",
+               "/usr/local rw named no_root_squash,clients_1"});
     CHECK(sigs(bsd("/usr -maproot=daemon grumpy.cis.uoguelph.ca 131.104.48.16")) ==
           Sigs{"/usr rw named clients_2"});
     CHECK(sigs(bsd("/usr -ro -mapall=nobody")) == Sigs{"/usr ro anon clients_0"});
@@ -941,20 +943,23 @@ TEST_CASE("shares bsd exports: the man page shapes", "[shares]") {
     CHECK(sigs(bsd("/u1 -alldirs -network 2001:DB8:: -mask ffff:ffff::")) ==
           Sigs{"/u1 rw named clients_1"});
     CHECK(sigs(bsd("/u2 -maproot=root friends")) == Sigs{"/u2 rw named no_root_squash,clients_1"});
-    CHECK(sigs(bsd("/u2 -alldirs -network cis-net -mask cis-mask")) == Sigs{"/u2 rw named clients_1"});
+    CHECK(sigs(bsd("/u2 -alldirs -network cis-net -mask cis-mask")) ==
+          Sigs{"/u2 rw named clients_1"});
+    CHECK(sigs(bsd("/srv -network cis-net -mask 255.0.0.0")) == Sigs{"/srv rw named clients_1"});
 }
 
 TEST_CASE("shares bsd exports: comma lists and next-field option values", "[shares]") {
     CHECK(sigs(bsd("/srv -ro,maproot=root")) == Sigs{"/srv ro anon no_root_squash,clients_0"});
-    for (const char* line : {"/srv -maproot root", "/srv -mapall root", "/srv -r root", "/srv -root=0"})
+    for (const char* line :
+         {"/srv -maproot root", "/srv -mapall root", "/srv -r root", "/srv -root=0"})
         CHECK(sigs(bsd(line)) == Sigs{"/srv rw anon no_root_squash,clients_0"});
     CHECK(sigs(bsd("/srv -network 10.1.0.0 -mask 255.255.0.0")) == Sigs{"/srv rw named clients_1"});
     CHECK(sigs(bsd("/srv -n=10.1.0.0 -m=255.255.0.0")) == Sigs{"/srv rw named clients_1"});
     // `friends` is offered to the last item (alldirs) as a value but alldirs takes none, so it
     // stays a host.
     CHECK(sigs(bsd("/srv -ro,alldirs friends")) == Sigs{"/srv ro named clients_1"});
-    for (const char* line : {"/srv -maproot=nobody", "/srv -mapall=nobody:group", "/srv -maproot=bin:",
-                             "/srv -maproot nobody"})
+    for (const char* line : {"/srv -maproot=nobody", "/srv -mapall=nobody:group",
+                             "/srv -maproot=bin:", "/srv -maproot nobody"})
         CHECK(sigs(bsd(line)) == Sigs{"/srv rw anon clients_0"});
     // An unrecognised name ends that option field only.
     CHECK(sigs(bsd("/srv -bogus,ro")) == Sigs{"/srv rw anon clients_0"});
@@ -964,7 +969,8 @@ TEST_CASE("shares bsd exports: comma lists and next-field option values", "[shar
     CHECK(sigs(bsd("/srv -fspath=/x")) == Sigs{"/srv rw anon clients_0"});
 }
 
-TEST_CASE("shares bsd exports: no_root_squash follows the last credential Apple resolves", "[shares]") {
+TEST_CASE("shares bsd exports: no_root_squash follows the last credential Apple resolves",
+          "[shares]") {
     const auto root = [](const char* line) {
         return flags_of(bsd(line).shares.at(0)).find("no_root_squash") != std::string::npos;
     };
@@ -974,9 +980,9 @@ TEST_CASE("shares bsd exports: no_root_squash follows the last credential Apple 
           "/srv -maproot=0root", "/srv -maproot=-0", "/srv -maproot=-", "/srv -mapall=00:5",
           "/srv -r 0000", "/srv -root=root:1:2"})
         CHECK(root(line));
-    for (const char* line : {"/srv -maproot=1", "/srv -maproot=01", "/srv -maproot=-2:-2", "/srv -maproot=10",
-                             "/srv -maproot=roo", "/srv -maproot=Root", "/srv -maproot=daemon",
-                             "/srv -maproot=1x0"})
+    for (const char* line :
+         {"/srv -maproot=1", "/srv -maproot=01", "/srv -maproot=-2:-2", "/srv -maproot=10",
+          "/srv -maproot=roo", "/srv -maproot=Root", "/srv -maproot=daemon", "/srv -maproot=1x0"})
         CHECK_FALSE(root(line));
     // atoi is (int)strtol: the low 32 bits survive (a wrap to 0 is root) and strtol saturates
     // beyond +-2^63, LONG_MAX to -1 (not root) and LONG_MIN to 0 (root).
@@ -1007,7 +1013,8 @@ TEST_CASE("shares bsd exports: entries are joined as get_export_entry joins them
     // file Apple keeps it in the last field, so the path is `/srv\r` (the wire folds it to a
     // space), a `-ro\r` option is unrecognised and the row stays rw, and a backslash before
     // the CR is no continuation.
-    CHECK(sigs(bsd("/srv\r\n/b\r\n")) == Sigs{"/srv\r rw anon clients_0", "/b\r rw anon clients_0"});
+    CHECK(sigs(bsd("/srv\r\n/b\r\n")) ==
+          Sigs{"/srv\r rw anon clients_0", "/b\r rw anon clients_0"});
     CHECK(share_row(bsd("/srv\r\n").shares.at(0)) == "share|nfs|-|/srv |rw|true|clients_0|exports");
     CHECK(sigs(bsd("/srv -ro\r\n")) == Sigs{"/srv rw anon clients_0"});
     CHECK(sigs(bsd("/a \\\r\n/b")) == Sigs{"/a rw named clients_1", "/b rw anon clients_0"});
@@ -1031,7 +1038,8 @@ TEST_CASE("shares bsd exports: offline quoting escapes and trailing slashes", "[
     CHECK(sigs(bsd("/a\\ b friends")) == Sigs{"/a b rw named clients_1"});
     CHECK(sigs(bsd("\"/a\\\"b\"")) == Sigs{"/a\"b rw anon clients_0"});
     // An unterminated quote runs to end of line: one path, as Apple reads it.
-    CHECK(sigs(bsd("\"/srv/x -ro\n/b")) == Sigs{"/srv/x -ro rw anon clients_0", "/b rw anon clients_0"});
+    CHECK(sigs(bsd("\"/srv/x -ro\n/b")) ==
+          Sigs{"/srv/x -ro rw anon clients_0", "/b rw anon clients_0"});
     CHECK(sigs(bsd("/srv/\n///\n/")) == Sigs{"/srv rw anon clients_0", "/ rw anon clients_0",
                                              "/ rw anon clients_0"});
     // Options written after the host list are honoured.
@@ -1053,18 +1061,21 @@ TEST_CASE("shares bsd exports: lines Apple rejects yield no row and no token", "
           "/srv -network 10.0.0.0 friends", "/srv friends -network 10.0.0.0",
           "/srv -network 0.0.0.0/0", "/srv -network ::/0", "/srv -network=",
           "/srv -network 10.0.0.0 -mask ffff::", "/srv -network 2001:db8:: -mask 255.0.0.0",
+          // a name counts as IPv4 (get_net tries getnetbyname first), so a v6 partner mismatches.
+          "/srv -network cis-net -mask ffff::", "/srv -network 2001:db8:: -mask cis-mask",
           "/srv -mask ffff:: -network 10.0.0.0",
           // check_options: -mask needs a -network (hosts or not), and -maproot (-root, -r) and
           // -mapall are mutually exclusive in either order.
-          "/srv -mask 255.255.255.0", "/srv -mask 255.0.0.0 friends", "/srv -m ffff::",
-          "/srv -maproot=0 -mapall=-2:-2", "/srv -mapall=nobody -maproot=root",
+          "/srv -mask 255.255.255.0", "/srv -mask 255.0.0.0 friends",
+          "/srv -m ffff::", "/srv -maproot=0 -mapall=-2:-2", "/srv -mapall=nobody -maproot=root",
           "/srv -root=0 -mapall=nobody", "/srv -mapall root -r root",
-          // inet_pton refuses these dotted tails (short, out of range, too long, not last, no room).
+          // inet_pton refuses these dotted tails (short, out of range, too long, not last, no
+          // room).
           "/srv -network ::1.2.3", "/srv -network ::256.0.0.0", "/srv -network ::1.2.3.4.5",
           "/srv -network 1.2.3.4::", "/srv -network 1:2:3:4:5:6:7:1.2.3.4",
           // inet_network refuses a part over 0xff (0x0a000000, 0x100, 0400) and an 8 or 9 in octal.
-          "/srv -network 0x0a000000", "/srv -network 0x100", "/srv -network 0400", "/srv -network 09",
-          "/srv -network 0xg", "/srv -network 1.2.3.4.5",
+          "/srv -network 0x0a000000", "/srv -network 0x100", "/srv -network 0400",
+          "/srv -network 09", "/srv -network 0xg", "/srv -network 1.2.3.4.5",
           // a CR from a CRLF file ends an IPv4 value harmlessly but spoils an IPv6 one.
           "/srv -network 2001:db8::\r"}) {
         INFO(line);
@@ -1113,40 +1124,48 @@ TEST_CASE("shares bsd exports: world classification is Apple's", "[shares]") {
           Sigs{"/srv rw named clients_1"});
     // inet_network's hex and octal spellings are IPv4 networks: one client, never the world.
     CHECK(sigs(bsd("/srv -network 0x0a")) == Sigs{"/srv rw named clients_1"});
-    CHECK(sigs(bsd("/srv -network 0X10.0x0.0.0 -mask 0xff.0.0.0")) == Sigs{"/srv rw named clients_1"});
+    CHECK(sigs(bsd("/srv -network 0X10.0x0.0.0 -mask 0xff.0.0.0")) ==
+          Sigs{"/srv rw named clients_1"});
     CHECK(sigs(bsd("/srv -network 010.0377 -mask 0")) == Sigs{"/srv rw named clients_1"});
     CHECK(sigs(bsd("/srv -network 4.XDe")) == Sigs{"/srv rw named clients_1"});
     CHECK(sigs(bsd("/srv -network 0x")) == Sigs{"/srv rw named clients_1"});
     // A trailing CR (a CRLF file) is whitespace to inet_network, so an IPv4 value still parses.
     CHECK(sigs(bsd("/srv -network 10.0.0.0\r\n")) == Sigs{"/srv rw named clients_1"});
-    CHECK(sigs(bsd("/srv -network 10.0.0.0 -mask 255.0.0.0\r\n")) == Sigs{"/srv rw named clients_1"});
+    CHECK(sigs(bsd("/srv -network 10.0.0.0 -mask 255.0.0.0\r\n")) ==
+          Sigs{"/srv rw named clients_1"});
     CHECK(bsd("/srv -network 2001:DB8::").shares[0].flags.back() == "clients_1");
     CHECK(bsd("/srv").shares[0].flags.back() == "clients_0");
 }
 
 TEST_CASE("shares bsd exports: IPv6 literals validate the way inet_pton does", "[shares]") {
     // parse_v6 answers validity and "every group zero" only: no caller reads a decoded byte.
-    const auto zero = [](std::string_view s) { return detail::parse_v6(s) == std::optional<bool>{true}; };
-    const auto nonzero = [](std::string_view s) { return detail::parse_v6(s) == std::optional<bool>{false}; };
+    const auto zero = [](std::string_view s) {
+        return detail::parse_v6(s) == std::optional<bool>{true};
+    };
+    const auto nonzero = [](std::string_view s) {
+        return detail::parse_v6(s) == std::optional<bool>{false};
+    };
     for (const char* z : {"::", "0:0:0:0:0:0:0:0", "::0.0.0.0", "::0:0", "0:0:0:0:0:0:0.0.0.0"})
         CHECK(zero(z));
-    for (const char* nz : {"1::", "::1", "2001:DB8::", "1:2:3:4:5:6:7::", "0:0:0:0:0:0:0:1"})
+    for (const char* nz : {"1::", "::1", "2001:DB8::", "1:2:3:4:5:6:7::", "0:0:0:0:0:0:0:1",
+                            "0:0:1:0:0:0:0:0"})
         CHECK(nonzero(nz));
     // A dotted-quad tail is the last 32 bits, with or without a `::`, and counts toward zero.
-    for (const char* nz : {"::ffff:10.0.0.0", "::1.2.3.4", "1:2:3:4:5:6:1.2.3.4", "1::2.3.4.5", "::0.0.0.1",
-                           "0:0:0:0:0:0:0.0.0.1", "::1.0.0.0"})
+    for (const char* nz : {"::ffff:10.0.0.0", "::1.2.3.4", "1:2:3:4:5:6:1.2.3.4", "1::2.3.4.5",
+                           "::0.0.0.1", "0:0:0:0:0:0:0.0.0.1", "::1.0.0.0", "::0.1.0.0"})
         CHECK(nonzero(nz));
-    // This libc (macOS 26.6.2) takes leading zeros in a group (the value must fit 16 bits) and
-    // in an octet.
+    // The macOS libc (measured on 26.6.2) takes leading zeros in a group (the value must fit 16
+    // bits) and in an octet.
     for (const char* z : {"00000::", "::0.0.0.00", "::000.0.0.0"})
         CHECK(zero(z));
     for (const char* nz : {"::0002AD", "::01.2.3.4"})
         CHECK(nonzero(nz));
     for (const char* bad :
          {"", ":", ":1", "1:", ":::", "1:::2", "1::2::3", "12345::", "10000::", "g::", "1.2.3.4",
-          "1:2:3:4:5:6:7", "1:2:3:4:5:6:7:8:9", "1:2:3:4:5:6:7:8::", "1:2:3:4:5:6::1.2.3.4", "::1.2.3",
-          "::1.2.3.4.5", "::256.0.0.0", "::1.2.3.4:", "::1.2.3.4::", "::1.2.3.4 ", "::a.2.3.4", "::1..2.3",
-          "::1.2.3.4/0", "ffff::/0", "1:2:3:4:5:6:7:1.2.3.4", "2001:db8::\r"})
+          "1:2:3:4:5:6:7", "1:2:3:4:5:6:7:8:9", "1:2:3:4:5:6:7:8::", "1:2:3:4:5:6::1.2.3.4",
+          "::1.2.3", "::1.2.3.4.5", "::256.0.0.0", "::1.2.3.4:", "::1.2.3.4::", "::1.2.3.4 ",
+          "::a.2.3.4", "::1..2.3", "::1.2.3.4/0", "ffff::/0", "1:2:3:4:5:6:7:1.2.3.4",
+          "2001:db8::\r"})
         CHECK_FALSE(detail::parse_v6(bad).has_value());
 }
 
@@ -1200,7 +1219,8 @@ TEST_CASE("shares sharing json: the redacted braga capture", "[shares]") {
     CHECK(p.recognised);
     CHECK(p.malformed_records == 0);
     REQUIRE(p.shares.size() == 1);
-    CHECK(share_row(p.shares[0]) == "share|smb|J Smith’s Public Folder|/Users/jsmith/Public|rw|true|-|sharing");
+    CHECK(share_row(p.shares[0]) ==
+          "share|smb|J Smith’s Public Folder|/Users/jsmith/Public|rw|true|-|sharing");
 }
 
 TEST_CASE("shares sharing json: flags name fallback and typing", "[shares]") {
@@ -1209,11 +1229,15 @@ TEST_CASE("shares sharing json: flags name fallback and typing", "[shares]") {
     REQUIRE(p.shares.size() == 1);
     CHECK(share_row(p.shares[0]) == "share|smb|Key|/p|-|-|-|sharing");
     // ro, guest off, sharing off, sealed.
-    p = sharing(R"({"k":{"path":"/p","smb_read_only":1,"smb_guest_access":0,"smb_shared":0,"smb_sealed":1}})");
+    p = sharing(
+        R"({"k":{"path":"/p","smb_read_only":1,"smb_guest_access":0,)"
+        R"("smb_shared":0,"smb_sealed":1}})");
     REQUIRE(p.shares.size() == 1);
     CHECK(share_row(p.shares[0]) == "share|smb|k|/p|ro|false|unavailable,sealed|sharing");
     // String-typed flags are unknown: ignored.
-    p = sharing(R"({"k":{"path":"/p","smb_read_only":"1","smb_guest_access":"1","smb_shared":"0","smb_sealed":"1"}})");
+    p = sharing(
+        R"({"k":{"path":"/p","smb_read_only":"1","smb_guest_access":"1",)"
+        R"("smb_shared":"0","smb_sealed":"1"}})");
     REQUIRE(p.shares.size() == 1);
     CHECK(share_row(p.shares[0]) == "share|smb|k|/p|-|-|-|sharing");
 }
@@ -1232,7 +1256,8 @@ TEST_CASE("shares sharing json: ACL permission and remark members are never read
 }
 
 TEST_CASE("shares sharing json: what is recognised and what is not", "[shares]") {
-    for (const char* t : {"{}", "  {}\n", "No share point records.", "\n  No share point records.\n\n"}) {
+    for (const char* t :
+         {"{}", "  {}\n", "No share point records.", "\n  No share point records.\n\n"}) {
         INFO(t);
         const auto p = sharing(t);
         CHECK(p.recognised);
@@ -1265,10 +1290,13 @@ TEST_CASE("shares sharing json: a hostile name yields one well-formed row", "[sh
     CHECK(row.find('\0') == std::string::npos);
     CHECK(yuzu::shared::count_invalid_wire_bytes(row) == 0);
 
-    // Invalid UTF-8 never reaches a row: the JSON parser refuses the text, a named failure upstream.
-    CHECK_FALSE(sharing(std::string(R"({"k":{"path":"/p","smb_name":"a)") + "\xff" + R"("}})").recognised);
+    // Invalid UTF-8 never reaches a row: the JSON parser refuses the text, a named failure
+    // upstream.
+    CHECK_FALSE(
+        sharing(std::string(R"({"k":{"path":"/p","smb_name":"a)") + "\xff" + R"("}})").recognised);
 
-    const auto big = sharing(R"({"k":{"path":"/p","smb_name":")" + std::string(5000, 'n') + R"("}})");
+    const auto big =
+        sharing(R"({"k":{"path":"/p","smb_name":")" + std::string(5000, 'n') + R"("}})");
     REQUIRE(big.shares.size() == 1);
     CHECK(big.shares[0].name.size() == kMaxFieldBytes);
     CHECK(big.field_oversized);

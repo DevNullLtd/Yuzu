@@ -726,7 +726,8 @@ using yuzu::agent::SubprocessResult;
 using yuzu::agent::TerminationReason;
 
 constexpr const char* kOneShare =
-    R"({"Pub":{"path":"\/Users\/jsmith\/Public","smb_guest_access":1,"smb_name":"Pub","smb_read_only":0,"smb_sealed":0,"smb_shared":1}})";
+    R"({"Pub":{"path":"\/Users\/jsmith\/Public","smb_guest_access":1,"smb_name":"Pub",)"
+    R"("smb_read_only":0,"smb_sealed":0,"smb_shared":1}})";
 
 SubprocessResult ran(std::string output, int exit_code = 0) {
     SubprocessResult r;
@@ -843,9 +844,11 @@ TEST_CASE("shares macos: truncation exit codes and unrecognised output", "[share
         f.result = ran("  No share point records.\n", code);
         const auto l = f.run();
         CHECK(l.status == StatusState::supported);
-        CHECK(l.rows == std::vector<std::string>{"source|exports|absent|-", "source|sharing|read|0"});
+        CHECK(l.rows ==
+              std::vector<std::string>{"source|exports|absent|-", "source|sharing|read|0"});
     }
-    for (const char* text : {"", "  \n", "[]", "not json", "{\"truncated\":", "No share point records. x"}) {
+    for (const char* text :
+         {"", "  \n", "[]", "not json", "{\"truncated\":", "No share point records. x"}) {
         INFO(text);
         FakeMac f;
         f.result = ran(text);
@@ -943,7 +946,8 @@ TEST_CASE("shares macos: an oversized field is cut and reported", "[shares]") {
     CHECK(count_prefix(l, "share|smb|") == 1);
 }
 
-TEST_CASE("shares macos: rows are the two source rows then the shares each pipe-clean", "[shares]") {
+TEST_CASE("shares macos: rows are the two source rows then the shares each pipe-clean",
+          "[shares]") {
     FakeMac f;
     f.exports = ok("/srv -ro friends\n");
     f.result = ran(R"({"k":{"path":"/p|q","smb_name":"a|b"}})");

@@ -542,7 +542,7 @@ inline std::string bsd_clean_path(std::string_view f) {
 }
 
 /// macOS libc `inet_pton4`: exactly four decimal octets 0-255, nothing stray. A leading zero
-/// is accepted (`01` is 1), as this libc reads it (measured on macOS 26.6.2). nullopt when the
+/// is accepted (`01` is 1), as the macOS libc reads it (measured on 26.6.2). nullopt when the
 /// value is invalid, else whether every octet is zero (the decoded bytes are never needed).
 inline std::optional<bool> parse_dotted_quad(std::string_view s) {
     std::size_t octets = 0;
@@ -580,8 +580,7 @@ inline std::optional<bool> parse_dotted_quad(std::string_view s) {
 /// nothing stray. nullopt when the value is invalid, else whether every group is zero: a caller
 /// needs the validity and the all-zero test, never the decoded address. Pure and portable (no
 /// socket header); the Linux `is_v6` shape check is a different, stricter reading for a
-/// different parser. Checked against the host libc over millions of generated values (macOS
-/// 26.6.2).
+/// different parser.
 inline std::optional<bool> parse_v6(std::string_view s) {
     constexpr std::size_t kBytes = 16;
     std::size_t tp = 0; // bytes decoded so far
@@ -593,7 +592,7 @@ inline std::optional<bool> parse_v6(std::string_view s) {
             return std::nullopt; // a lone leading colon
         i = 1;
     }
-    std::size_t curtok = i;
+    std::size_t curtok = i; // start of the current group
     unsigned val = 0;
     bool saw_xdigit = false;
     for (; i < s.size(); ++i) {
@@ -652,7 +651,7 @@ inline std::optional<bool> parse_v6(std::string_view s) {
 /// or a bare `x` after a dot), every part's 32-bit-wrapped value at most 0xff, and after the
 /// last part the end of the value or a whitespace byte (a CR from a CRLF file is one, so a
 /// trailing network or mask still parses there, unlike an IPv6 one). This is the macOS libc
-/// reading, measured on 26.6.2: `0x0a` is valid, `0x0a000000` is not. Only the family and
+/// reading (measured on 26.6.2): `0x0a` is valid, `0x0a000000` is not. Only the family and
 /// validity matter here, the value is never used: an IPv4 network is never the world.
 inline bool bsd_v4_literal(std::string_view v) {
     if (v.empty() || std::isdigit(static_cast<unsigned char>(v[0])) == 0)
@@ -738,7 +737,8 @@ inline bool bsd_net_is_world(std::string_view net, std::string_view mask) {
 /// the literal `root`. `atoi` is `(int)strtol`: only the low 32 bits of the value survive and
 /// strtol saturates beyond +-2^63 (LONG_MIN truncates to 0, LONG_MAX to -1). `strtoll` is that
 /// 64-bit strtol on every platform (`long` is 32-bit on LLP64 Windows). No account lookup is
-/// made, so a non-numeric account that happens to be uid 0 other than `root` is not seen.
+/// made: a lone user (numeric or named) is never looked up, so one with no account still yields
+/// a row though mountd drops the entry, and a non-root-named account that is uid 0 is not seen.
 inline bool is_root_user(std::string_view user) {
     if (user.empty() || ((user[0] < '0' || user[0] > '9') && user[0] != '-'))
         return user == "root";
@@ -809,7 +809,10 @@ inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
                                        item == "r")) { // mountd do_opt: the credential-taking names
                     // parsecred resets the credential on every call, so the LAST mapping wins.
                     e.root = is_root_user(arg.substr(0, arg.find(':')));
-                    (item == "mapall" ? have_mapall : have_maproot) = true;
+                    if (item == "mapall")
+                        have_mapall = true;
+                    else
+                        have_maproot = true;
                     used_next = from_next;
                 } else if (has_arg && (item == "mask" || item == "m")) {
                     if (have_mask)
@@ -867,8 +870,9 @@ inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
         return false; // check_options: "-mapall and -maproot mutually exclusive"
     if (have_mask && !have_net)
         return false; // check_options: "-mask requires -network", hosts or not
-    const auto fam = [](BsdNetKind k) { return k == BsdNetKind::v4 || k == BsdNetKind::v6; };
-    if (have_net && have_mask && fam(net_kind) && fam(mask_kind) && net_kind != mask_kind)
+    // get_net tries getnetbyname first and a resolved name is always AF_INET (an unresolved one
+    // fails every later branch), so a name counts as IPv4 here and a v6 partner is a mismatch.
+    if (have_net && have_mask && (net_kind == BsdNetKind::v6) != (mask_kind == BsdNetKind::v6))
         return false;
     e.clients = e.hosts + (have_net ? 1 : 0);
     e.world = (e.hosts == 0 && !have_net) || bsd_net_is_world(net, mask);

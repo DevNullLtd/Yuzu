@@ -27,7 +27,8 @@ int run_macos(yuzu::CommandContext& ctx) {
     fs.exports_path = "/etc/exports";
     fs.read = &read_no_follow;
     fs.run = [](const std::vector<std::string>& argv, const yuzu::agent::SubprocessOptions& opts) {
-        // sink: shares/run_macos#1 -- /usr/sbin/sharing -l -f json (rung 2 argv; no public API exposes share-point records and the dslocal sharepoints node is not a permitted read)
+        // sink: shares/run_macos#1 -- /usr/sbin/sharing -l -f json (rung 2 argv; no public API
+        // exposes share-point records and the dslocal sharepoints node is not a permitted read)
         return yuzu::agent::run_bounded_subprocess(argv, opts);
     };
     report_list(ctx, list_macos(fs));

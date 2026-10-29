@@ -168,7 +168,8 @@ bool share_row_is_wellformed(const std::string& row) {
         return std::ranges::any_of(set, [&](const char* s) { return v == s; });
     };
     return f[0] == "share" && in(f[1], {"nfs", "smb"}) && in(f[4], {"ro", "rw", "mixed", "-"}) &&
-           in(f[5], {"true", "false", "-"}) && in(f[7], {"exports", "exports_d", "smb_conf", "netshareenum", "sharing"});
+           in(f[5], {"true", "false", "-"}) &&
+           in(f[7], {"exports", "exports_d", "smb_conf", "netshareenum", "sharing"});
 }
 
 } // namespace
