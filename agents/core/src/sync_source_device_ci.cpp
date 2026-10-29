@@ -18,8 +18,9 @@ namespace yuzu::agent {
 
 namespace {
 
-// Caps — MUST match the server seam (device_ci_ingestion.cpp) so the server's
-// parse never truncates/drops differently from what this source hashed.
+// Caps. The field cap MUST match the server seam (device_ci_ingestion.cpp) so the server's
+// parse never truncates differently from what this source hashed. The blob cap must stay
+// <= the server's (server >= agent): the server accepts everything this source can send.
 constexpr std::size_t kMaxFieldLen = 1024;
 // The device-CI canonical blob is a single small record (~22 short fields); 64 KiB
 // is far above any real machine and well below the gRPC 4 MiB receive ceiling.

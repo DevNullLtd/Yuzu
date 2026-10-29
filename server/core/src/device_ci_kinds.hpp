@@ -37,7 +37,7 @@ struct DeviceCiSectionDef {
     const char* table;   ///< unqualified child table, or nullptr (status-only)
     const char* columns; ///< comma-separated TEXT columns, in wire order
     int n_fields;        ///< number of columns / wire fields per row
-    int row_cap;         ///< server-side row cap (agent applies the same cap)
+    int row_cap;         ///< server-side row cap (the agent-side v2 writer MUST apply the same cap)
 };
 
 inline constexpr DeviceCiSectionDef kDeviceCiSections[] = {

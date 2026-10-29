@@ -567,7 +567,7 @@ and 0x1E-terminated. A blob whose first byte is not `0x02` parses exactly as bef
 | blob cap | 1 MiB total, fixed (a v1 agent's own 64 KiB cap sits inside it). The agent writer adopts the same value, so a host near every row cap below is never dropped whole. A blob over the cap is dropped and nacked `need_full`; its base fields never land. Every field is clamped to 1,024 bytes. |
 
 Section registry (one declaration, `server/core/src/device_ci_kinds.hpp`, shared by the
-parser and the store; the agent applies the same caps):
+parser and the store; the agent-side v2 writer MUST apply the same caps):
 
 | Section / row kind | Columns | Row cap |
 |---|---|---|
@@ -623,6 +623,12 @@ per-agent advisory lock (key prefixed `device_ci:` so it never collides with the
 store's per-agent lock); any failure rolls back with the previous set intact and nacks
 `need_full`. A v1 full replaces the child set with the empty set. The sections read runs in
 one REPEATABLE READ transaction so a replacement committing mid-read cannot mix generations.
+
+**Rollback.** Do not run an older server after migration 2. An older server keeps working
+on the migrated database (the new columns default blank and the child tables cascade), but its
+v1 full neither rewrites the v2 columns nor deletes the child rows. If you must, expect stale
+chassis, board and machine-id values and stale child rows to be served as current until each
+agent's next full report on the upgraded server.
 
 **Personal data.** `chassis_serial`, `board_serial` and the DIMM `serial` column join the
 serial/UUID/MAC behavioural-PII tier. The sections read has no REST/MCP/UI route yet; the

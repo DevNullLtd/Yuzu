@@ -34,8 +34,8 @@ constexpr const char* kSourceDeviceCi = "device_ci";
 // the server accepts everything an agent can send. A v1 agent's own 64 KiB cap sits inside
 // it; the agent-side v2 writer adopts the same 1 MiB (ADR-0016 update "device_ci blob v2")
 // so a host near every row cap is never dropped whole. 1 MiB is a fixed value, not derived
-// from the registry caps: the clamp-bound worst case (1,620 rows x <=6 fields x 1024 B,
-// ~10 MB) exceeds the 4 MiB gRPC receive ceiling, while a realistic near-cap host is
+// from the registry caps: the clamp-bound worst case (1,520 rows x <=7 fields x 1024 B,
+// ~10.9 MB) exceeds the 4 MiB gRPC receive ceiling, while a realistic near-cap host is
 // ~160 KB, so 1 MiB leaves ~6x headroom and stays well under gRPC.
 constexpr std::size_t kMaxBlobBytes = 1024u * 1024;
 constexpr std::size_t kMaxFieldLen = 1024;

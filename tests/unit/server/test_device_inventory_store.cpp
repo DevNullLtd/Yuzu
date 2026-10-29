@@ -412,7 +412,7 @@ TEST_CASE("parse_device_ci_blob round-trips fields positionally", "[device_ci][p
     }
 }
 
-TEST_CASE("v1 blobs parse unchanged: version 1, no sections, v1 pins hold (old agent / new server)",
+TEST_CASE("v1 blobs parse unchanged: version 1 with no sections; v1 pins hold (old agent / new server)",
           "[device_ci][parse][v2]") {
     // Old agent / new server: a v1 agent's hash must stay byte-identical so it never loops
     // on need_full.
@@ -511,7 +511,7 @@ TEST_CASE("v2 scalar-section statuses round-trip independently of any list kind"
     CHECK(find_section(r, "nosuchsection") == nullptr);
 }
 
-TEST_CASE("v2 list rows attach by kind; short rows pad, long rows truncate, unknown kinds drop",
+TEST_CASE("v2 list rows attach by kind; short rows pad; long rows truncate; unknown kinds drop",
           "[device_ci][parse][v2]") {
     DeviceCiRecord r = parse_device_ci_blob(fixture_blob_v2());
     REQUIRE(r.sections.size() == 10);
@@ -653,7 +653,7 @@ TEST_CASE("v2 blob above the previous 64 KiB bound parses in full (blob cap is 1
     CHECK(r.chassis_serial == "CHS-0001"); // the scalar record survived with it
 }
 
-TEST_CASE("v2 duplicate status records: the last wins, a server disclosure still beats it",
+TEST_CASE("v2 duplicate status records: the last wins; a server disclosure still beats it",
           "[device_ci][parse][v2]") {
     SECTION("two conflicting status records around list rows -> the later one") {
         std::vector<std::vector<std::string>> recs = {
@@ -986,7 +986,7 @@ TEST_CASE("ingest_device_ci_report end-to-end (all wire shapes)", "[pg][device_c
 
 // ── v2 store (PG) ─────────────────────────────────────────────────────────────
 
-TEST_CASE("v2 full ingest stores the scalars, every section and the rows", "[pg][device_ci][v2]") {
+TEST_CASE("v2 full ingest stores the scalars and the rows of every section", "[pg][device_ci][v2]") {
     YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -1064,7 +1064,7 @@ TEST_CASE("v2 full ingest stores the scalars, every section and the rows", "[pg]
     }
 }
 
-TEST_CASE("v2 round trip: every scalar and every list column reads back exactly, then updates",
+TEST_CASE("v2 round trip: every scalar and every list column reads back exactly; then updates",
           "[pg][device_ci][v2]") {
     YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 3}};
@@ -1303,9 +1303,13 @@ TEST_CASE("competing v2 replacements never expose a mixed generation", "[pg][dev
             InventoryIngestOutcome::kStored);
 
     constexpr int kIterations = 50;
-    constexpr int kMaxReads = 10000; // bounds the reader if the writers are slow
+    constexpr int kMaxReads = 1000; // bounds the reader if the writers are slow
     std::atomic<int> writer_failures{0};
     std::atomic<int> torn_reads{0};
+    // Positive controls: a reader that only ever saw one generation proves nothing about
+    // torn_reads == 0, so both generations must have been observed while the writers ran.
+    std::atomic<int> a_seen{0};
+    std::atomic<int> b_seen{0};
     std::atomic<int> degraded_reads{0};
     std::atomic<int> writers_done{0};
     std::atomic<long long> reads{0};
@@ -1328,7 +1332,7 @@ TEST_CASE("competing v2 replacements never expose a mixed generation", "[pg][dev
     // generation X's status with generation Y's rows); not a proof of snapshot isolation.
     // Started first. A degraded read ends the loop: degraded_reads == 0 is asserted below, so
     // breaking loses nothing and stops a hot spin against a failing store.
-    std::thread reader([&] {
+    const auto read_loop = [&] {
         bool primed = false;
         for (int n = 0; n < kMaxReads && writers_done.load() < 2; ++n) {
             auto s = store.get_device_ci_sections("agent-cc");
@@ -1346,14 +1350,36 @@ TEST_CASE("competing v2 replacements never expose a mixed generation", "[pg][dev
             }
             const bool a_ok = cpu->reason == "A" && cpu->rows.size() == 3;
             const bool b_ok = cpu->reason == "B" && cpu->rows.size() == 1;
+            if (a_ok)
+                ++a_seen;
+            if (b_ok)
+                ++b_seen;
             if (!a_ok && !b_ok)
                 ++torn_reads;
         }
         if (!primed)
             reader_primed.count_down(); // never leave the writers blocked on a failed reader
-    });
-    std::thread w1(writer, std::cref(set_a), std::cref(set_b));
-    std::thread w2(writer, std::cref(set_b), std::cref(set_a));
+    };
+    // The threads are default-constructed so the guard below exists before any of them runs: a
+    // throw while starting a later thread (std::system_error) would otherwise destroy a
+    // joinable one (std::terminate, taking the whole shard down). The wait is bounded on every
+    // path: a writer that never starts leaves writers_done < 2, so the reader stops at
+    // kMaxReads, and the reader releases reader_primed if it never primed. No CHECK or REQUIRE
+    // sits between the first start and the joins.
+    std::thread reader;
+    std::thread w1;
+    std::thread w2;
+    struct JoinOnExit {
+        std::thread* ts[3];
+        ~JoinOnExit() {
+            for (std::thread* t : ts)
+                if (t->joinable())
+                    t->join();
+        }
+    } join_all{{&reader, &w1, &w2}};
+    reader = std::thread(read_loop);
+    w1 = std::thread(writer, std::cref(set_a), std::cref(set_b));
+    w2 = std::thread(writer, std::cref(set_b), std::cref(set_a));
     w1.join();
     w2.join();
     reader.join();
@@ -1362,6 +1388,8 @@ TEST_CASE("competing v2 replacements never expose a mixed generation", "[pg][dev
     CHECK(degraded_reads.load() == 0);
     CHECK(torn_reads.load() == 0);
     CHECK(reads.load() > 0);
+    CHECK(a_seen.load() > 0);
+    CHECK(b_seen.load() > 0);
 
     // Final state is one consistent pair.
     auto fin = store.get_device_ci_sections("agent-cc");
@@ -1438,7 +1466,7 @@ TEST_CASE("populated v1 device_ci upgrades to v2 in place", "[pg][device_ci][mig
           InventoryIngestOutcome::kTouched);
 }
 
-TEST_CASE("ingest seam: a full v2 report stores, the next hash-only report does not nack",
+TEST_CASE("ingest seam: a full v2 report stores; the next hash-only report does not nack",
           "[pg][device_ci][ingest][v2]") {
     YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

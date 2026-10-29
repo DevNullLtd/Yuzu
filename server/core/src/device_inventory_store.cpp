@@ -8,11 +8,13 @@
 #include "pg/pg_raii.hpp"
 #include "sha256_hex.hpp"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <charconv>
@@ -359,7 +361,17 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
     const std::string agent_id_s{agent_id};
     const std::string ts_s = std::to_string(ts);
 
+    // Which statement failed and Postgres's primary error line, for the warn below.
+    const char* fail_stage = "";
+    std::string fail_err;
     const bool ok = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
+        // First line only: later lines (DETAIL) can echo row values.
+        const auto fail = [&](const char* stage) {
+            fail_stage = stage;
+            fail_err = PQerrorMessage(c);
+            fail_err.resize(std::min(fail_err.find('\n'), fail_err.size()));
+            return false;
+        };
         // Serialise concurrent full replaces for THIS agent (two fulls under READ COMMITTED
         // would interleave their child DELETE+INSERT and leave a mixed set under a hash that
         // matches neither). Transaction-scoped and blocking on purpose — same rationale as
@@ -369,7 +381,7 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
             c, "SELECT pg_advisory_xact_lock(hashtextextended('device_ci:' || $1::text, 0))",
             std::vector<std::string>{agent_id_s});
         if (lk.status() != PGRES_TUPLES_OK)
-            return false;
+            return fail("lock");
 
         // Parent upsert. first_seen is preserved on conflict; last_seen is the server
         // receipt time. blob_version + the 11 appended scalars are replaced wholesale, so a
@@ -417,7 +429,7 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
                 r.board_serial, r.board_source, r.machine_id_hash, r.machine_id_algorithm,
                 r.machine_id_source});
         if (up.status() != PGRES_TUPLES_OK)
-            return false;
+            return fail("upsert");
 
         // Child replace: the full payload IS the new set, so a v1 full (no sections) or a
         // shrunk v2 leaves no stale rows. Driven by the registry so a kind costs no code.
@@ -428,13 +440,13 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
                 std::string("DELETE FROM device_inventory_store.") + d.table + " WHERE agent_id = $1";
             pg::PgResult dr = pg::exec_params(c, del.c_str(), std::vector<std::string>{agent_id_s});
             if (dr.status() != PGRES_COMMAND_OK)
-                return false;
+                return fail("child_delete");
         }
         pg::PgResult ds = pg::exec_params(
             c, "DELETE FROM device_inventory_store.device_ci_section WHERE agent_id = $1",
             std::vector<std::string>{agent_id_s});
         if (ds.status() != PGRES_COMMAND_OK)
-            return false;
+            return fail("section_delete");
 
         // Only registered kinds persist (a hand-built record cannot smuggle a stray kind).
         // One pass: each kept section's row INSERT runs inline while its status columns are
@@ -486,7 +498,7 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
                 params.push_back(pg::to_text_array(a));
             pg::PgResult ins = pg::exec_params(c, sql.c_str(), params);
             if (ins.status() != PGRES_COMMAND_OK)
-                return false;
+                return fail("row_insert");
         }
         if (!kinds.empty()) {
             pg::PgResult si = pg::exec_params(
@@ -497,14 +509,17 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
                 std::vector<std::string>{agent_id_s, pg::to_text_array(kinds),
                                          pg::to_text_array(levels), pg::to_text_array(reasons)});
             if (si.status() != PGRES_COMMAND_OK)
-                return false;
+                return fail("section_insert");
         }
         return true;
     });
     if (!ok) {
         // Rolled back (or never began): the previous set survives intact; the caller nacks
-        // need_full and the agent resends. Never a half-replaced set.
-        spdlog::warn("DeviceInventoryStore: full ingest failed for agent={} ({})", agent_id,
+        // need_full and the agent resends. Never a half-replaced set. An empty stage means
+        // no statement ran (no connection in time, or BEGIN failed): the pool error says why.
+        spdlog::warn("DeviceInventoryStore: full ingest failed for agent={} stage={} err='{}' "
+                     "pool='{}'",
+                     agent_id, *fail_stage != '\0' ? fail_stage : "acquire_or_begin", ::yuzu::log_key_token(fail_err),
                      pool_.last_error());
         return InventoryIngestOutcome::kError;
     }
@@ -601,13 +616,25 @@ DeviceInventoryStore::get_device_ci_sections(std::string_view agent_id) {
     // ONE snapshot: a concurrent full replace committing between them can never mix
     // generations (a plain with_txn_for is READ COMMITTED — each statement re-snapshots).
     // `sections` is indexed by registry position; a non-empty `kind` marks a section seen
-    // (a status row, or rows without one). with_txn_for runs the lambda exactly once, so the
+    // (a status row, or rows without one). with_txn_on runs the lambda exactly once, so the
     // registry-order result is assembled inside it.
+    //
+    // The lease is acquired here (bounded, nothing in between) rather than inside
+    // with_txn_for so "no connection in time" and "the transaction failed" are told apart:
+    // with_txn_for answers both with one false. A read has no compensating step, so the
+    // lost-COMMIT ambiguity documented on with_txn_on does not apply.
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, s).should_log)
+            spdlog::warn("DeviceInventoryStore: sections get skipped for agent={}, no connection "
+                         "in time ({})",
+                         agent_id, pool_.last_error());
+        return std::unexpected(CiReadError::kDegraded);
+    }
     std::array<DeviceCiSection, kDeviceCiSectionCount> sections;
     std::vector<DeviceCiSection> out;
-    bool began = false;
-    const bool ok = pool_.with_txn_for(kQueryAcquireTimeout, [&](PGconn* c) -> bool {
-        began = true;
+    const bool ok = pool_.with_txn_on(std::move(lease), [&](PGconn* c) -> bool {
         pg::PgResult iso{PQexec(c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")};
         if (iso.status() != PGRES_COMMAND_OK)
             return false;
@@ -659,12 +686,8 @@ DeviceInventoryStore::get_device_ci_sections(std::string_view agent_id) {
     });
     if (!ok) {
         // Never an empty success on a failed read: a degrade the caller can surface.
-        static DegradeSampler s_timeout;
-        static DegradeSampler s_query;
-        const bool timeout = !began;
-        if (note_read_degrade(metrics_, timeout ? kReasonPoolTimeout : kReasonQueryError,
-                              timeout ? s_timeout : s_query)
-                .should_log)
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
             spdlog::warn("DeviceInventoryStore: sections get failed for agent={} ({})", agent_id,
                          pool_.last_error());
         return std::unexpected(CiReadError::kDegraded);

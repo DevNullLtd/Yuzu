@@ -1121,7 +1121,8 @@ sync, defeating the hash-skip protocol.
   `machine_id` section means the reported machine ID was not a hash and was discarded.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the
   device serial and system UUID. Agents keep working unchanged; upgrade the server
-  before the agents. No page or API reads the per-device rows yet.
+  before the agents. No page or API reads the per-device rows yet: these values are stored
+  now and become visible when the device-CI read surface ships.
 
 The operator-facing read surface — the **Hardware** list's CI columns and the CI
 record's **Overview** lens — is live; see the **`/hardware`** bullet above for its
