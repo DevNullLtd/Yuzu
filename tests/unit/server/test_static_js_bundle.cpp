@@ -362,11 +362,11 @@ TEST_CASE("static_js_bundle: kYuzuVizJs declares per-OS palette for linux/darwin
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("darwin:"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("windows:"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("pickOsColor"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("linux:   '#2dd4bf'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("darwin:  '#f5c542'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("macos:   '#f5c542'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("windows: '#4c9aff'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("default: '#9aa2ae'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("linux:   cssToken('--c2'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("darwin:  cssToken('--c3'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("macos:   cssToken('--c3'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("windows: cssToken('--c1'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("default: cssToken('--mut'"));
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs pins the listener coral, talking-socket blue and local edge",
@@ -374,9 +374,25 @@ TEST_CASE("static_js_bundle: kYuzuVizJs pins the listener coral, talking-socket 
     // Reverting the listener sphere to yellow (or the :port label away from the coral chart
     // token) must fail loud: the invariants doc and the legend both name these colours.
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("color: 0xff6b7a"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("ctx.fillStyle = '#ff6b7a'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("ctx.fillStyle = cssToken('--c4'"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("TALKING_SOCKET_COLOR = 0x7ab6ff"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("color: 0xe9ecf0"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs label plates and text read the colour-scheme tokens",
+          "[static-js][viz]") {
+    // A dark rgba plate under --ink2 text (dark on the light schemes) is unreadable: plate and
+    // text must both follow the scheme. Removing the token reads, or re-adding the literal plate
+    // colour, fails here.
+    const std::string_view js = yuzu::server::kYuzuVizJs;
+    CHECK_THAT(std::string(js), !ContainsSubstring("rgba(20,23,28"));
+    CHECK_THAT(std::string(js), ContainsSubstring("ctx.fillStyle = cssToken('--ink2'"));
+    CHECK_THAT(std::string(js), ContainsSubstring("ctx.fillStyle = cssToken('--bg', '#14171c');\n  ctx.globalAlpha = 0.6;"));
+    CHECK_THAT(std::string(js), ContainsSubstring("ctx.fillStyle = cssToken('--bg', '#14171c');\n  ctx.globalAlpha = 0.7;"));
+    std::size_t resets = 0;
+    for (std::size_t at = 0; (at = js.find("ctx.globalAlpha = 1;", at)) != std::string_view::npos; ++at)
+        ++resets;
+    CHECK(resets == 2);
 }
 
 TEST_CASE("static_js_bundle: the Fleet page keeps its error banner and the Host page its Refresh button",
@@ -714,12 +730,12 @@ TEST_CASE("static_js_bundle: kYuzuVizJs declares CATEGORY_PALETTE for the six ca
     // or recolours a category fails this test loud.
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("CATEGORY_PALETTE"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("pickCategoryColor"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("system:   '#9aa2ae'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("browser:  '#4c9aff'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("database: '#f5c542'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("web:      '#2dd4bf'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("runtime:  '#a78bfa'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("other:    '#9199a6'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("system:   cssToken('--mut'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("browser:  cssToken('--c1'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("database: cssToken('--c3'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("web:      cssToken('--c2'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("runtime:  cssToken('--c5'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("other:    cssToken('--faint'"));
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs lays processes out on hash(pid|ppid)-mod-bucket grid",

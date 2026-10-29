@@ -286,7 +286,7 @@
    redefines the minimal token set: UA colour scheme, surfaces and outlines,
    text, action, highlight, focus, status colours and the two shadows. Chart
    colours stay as they are on the dark schemes; the light ones darken
-   chart-1..5 (blue, teal, amber, red, violet) because Home's family headings,
+   chart-1..12 (blue, teal, amber, red, violet, then the extended series) because Home's family headings,
    tile icons and the Trends line use them as text and strokes, which needs 4.5:1
    on every light surface. Every text pair on the light schemes is held to
    4.5:1 (primary-button hover included); highlight and focus to 3:1. */
@@ -382,6 +382,13 @@ html[data-theme="light"] {
   --mds-color-chart-3: #86610a;  /* amber  */
   --mds-color-chart-4: #c8293a;  /* red    */
   --mds-color-chart-5: #6b44d6;  /* violet */
+  --mds-color-chart-6: #0e6fa8;  /* sky    */
+  --mds-color-chart-7: #a04d00;  /* orange */
+  --mds-color-chart-8: #1a7a3e;  /* green  */
+  --mds-color-chart-9: #2a5db0;  /* light blue */
+  --mds-color-chart-10: #0f6b78; /* cyan   */
+  --mds-color-chart-11: #5b3fb8; /* light violet */
+  --mds-color-chart-12: #b0294a; /* rose   */
   --mds-elevation-2: 0 4px 14px rgba(16,24,40,.10);
   --mds-elevation-3: 0 12px 32px rgba(16,24,40,.18);
 }
@@ -417,6 +424,13 @@ html[data-theme="light-baby"] {
   --mds-color-chart-3: #86610a;  /* amber  */
   --mds-color-chart-4: #c8293a;  /* red    */
   --mds-color-chart-5: #6b44d6;  /* violet */
+  --mds-color-chart-6: #0e6fa8;  /* sky    */
+  --mds-color-chart-7: #a04d00;  /* orange */
+  --mds-color-chart-8: #1a7a3e;  /* green  */
+  --mds-color-chart-9: #2a5db0;  /* light blue */
+  --mds-color-chart-10: #0f6b78; /* cyan   */
+  --mds-color-chart-11: #5b3fb8; /* light violet */
+  --mds-color-chart-12: #b0294a; /* rose   */
   --mds-elevation-2: 0 4px 14px rgba(190,60,100,.12);
   --mds-elevation-3: 0 12px 32px rgba(120,40,70,.2);
 }
@@ -452,6 +466,13 @@ html[data-theme="light-hot"] {
   --mds-color-chart-3: #86610a;  /* amber  */
   --mds-color-chart-4: #c8293a;  /* red    */
   --mds-color-chart-5: #6b44d6;  /* violet */
+  --mds-color-chart-6: #0e6fa8;  /* sky    */
+  --mds-color-chart-7: #a04d00;  /* orange */
+  --mds-color-chart-8: #1a7a3e;  /* green  */
+  --mds-color-chart-9: #2a5db0;  /* light blue */
+  --mds-color-chart-10: #0f6b78; /* cyan   */
+  --mds-color-chart-11: #5b3fb8; /* light violet */
+  --mds-color-chart-12: #b0294a; /* rose   */
   --mds-elevation-2: 0 4px 14px rgba(212,0,111,.12);
   --mds-elevation-3: 0 12px 32px rgba(120,0,60,.2);
 }

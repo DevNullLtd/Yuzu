@@ -3250,6 +3250,14 @@ test('ensure-erlang strict-mode callers',
   timeout: 180,
 )
 
+# Light colour schemes (yuzu.css): WCAG 4.5:1 for text, chart series and on-accent pairs.
+test('theme contrast gate',
+  _python3_test,
+  args: [files('test_theme_contrast.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # docs/ build inputs of Meson targets are re-included in /.dockerignore (the image
 # builds `COPY . .` with docs/ otherwise excluded).
 test('docker context re-includes embedded docs inputs',
