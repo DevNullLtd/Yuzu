@@ -34,7 +34,8 @@
 # at the cost of an older OTP patch than the 28.5.0.2 used here. That trade is
 # tracked separately; published gateway images are amd64-only either way.
 #
-# Lift this with that re-pin or with the move to OTP 29.1 or newer (#6740). The marker line
+# Lift this with that re-pin (#6740) or with the move to OTP 29.1 or newer.
+# The marker line
 # is read by scripts/ci/check-gateway-base-index.py, which fails when the
 # listed platforms are not all annotated, in the pinned index, as built on the
 # runtime stage's Alpine release; add a platform to the marker and to the guard
@@ -51,7 +52,8 @@ ARG TARGETARCH
 RUN case "${TARGETARCH:-amd64}" in amd64) ;; *) \
       echo "FATAL: Dockerfile.gateway supports linux/amd64 only (TARGETARCH=${TARGETARCH})." \
            "Upstream builds this architecture of the pinned erlang:28-alpine on a newer Alpine than the" \
-           "runtime stage, which the abi-guard (#2150) refuses until the gateway is on OTP 29.1 (#1743)." \
+           "runtime stage; the abi-guard (#2150) requires the same Alpine release in both, and the runtime" \
+           "cannot move to the newer one before OTP 29.1 (#1743), unless the builder is re-pinned (#6740)." \
            "Build with --platform linux/amd64 (on an arm64 host that is emulation, which has crashed in" \
            "the Erlang deps stage under OrbStack; prefer an amd64 host or CI)." \
            "See #6711 and docs/operations/troubleshooting.md." \
