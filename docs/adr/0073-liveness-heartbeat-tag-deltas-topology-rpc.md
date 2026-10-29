@@ -1,0 +1,1431 @@
+# ADR-0073: A liveness-only heartbeat over an opaque gateway relay: status tags as deltas, topology on its own RPC, registration replay by ids
+
+- **Status:** Proposed
+- **Date:** 2026-10-29. First drafted 2026-10-26; revised 2026-10-29 for ADR-0074 and the merged PR #5695.
+- **Authors:** Nathan Dornbrook (platform block `0xxx`; see `docs/adr/README.md`)
+- **Deciders:** Nathan Dornbrook. Owner rulings of 2026-10-26:
+  - adopt the architect's heartbeat/topology split;
+  - no backward compatibility;
+  - jitter everything;
+  - fold the status-tag shrink into this ADR;
+  - the gateway is an opaque relay. As reworded on 2026-10-28 for both this ADR and ADR-0074: the
+    gateway keeps **no per-agent state beyond the connection**. Fleet-level state that any gateway
+    could rebuild (ADR-0074's cached CRL, drain flag, gateway list and cluster membership) is allowed;
+  - fold in S1: registration replay by ids only;
+  - no proto subtraction: "proto subtractions are breaking, so we should just not use the field, not
+    remove it from the protobufs" (recorded in #6555 and enforced by `proto/buf.yaml`).
+
+  The reviewers this ADR routes to are listed under *Routed concerns*.
+- **Amends:** `docs/fleet-viz-invariants.md` "Push-ingestion invariants — PR 10". That section is the
+  only design record for the current topology vehicle, which arrived in `ba7e34a8d` (2026-05-12,
+  merged in PR #1032) with no ADR.
+- **Related:**
+  - ADR-0074 (`0074-gateway-transport-security-and-topology.md`, PR #6703): its D14 sets the gateway
+    budget this ADR is measured against, its D5 decides which messages are signed, and its Conflicts
+    items 4 and 5 are resolved by this revision.
+  - ADR-0016 (`0016-agent-daily-sync-framework.md`): its "cost tracks change" principle, not its
+    transport.
+  - ADR-0021 Decision 5: built-in schedules become Reflexes.
+  - ADR-0069: the owned gRPC gateway over Cowboy and gun (PR #5695, merged).
+  - ADR-2002: the stuck heartbeat-batch incident, WS-0 command dedup, and WS-4 route adoption.
+  - ADR-0034: held-open connection scaling.
+  - ADR-0066: gRPC stays the transport.
+- **Depends on:** ADR-0074 (PR #6703) being ratified, for the budget (D14) and the signing scope (D5).
+  Every code reference below is cited at `origin/dev` `dfdffa4c0`, which includes PR #5695.
+
+## Decision
+
+1. **The heartbeat becomes a liveness message.** It carries `session_id`, `sent_at`, a
+   `StatusTags` delta serialized into an **opaque `bytes` field** the gateway never decodes (D2),
+   and a ~70-byte `TopologyDigest` (D5).
+   - `fleet_snapshot_json` (field 4) is **no longer used**.
+   - The flat `status_tags` map (field 3) is **no longer used** either. It is replaced, not extended.
+   - Both stay in the proto, marked `[deprecated = true]` with a comment naming ADR-0073 (D15). The
+     agent stops populating them and every receiver ignores them. Nothing parses the old fields and
+     nothing falls back to them.
+2. **Status tags are split by how they change** (D1).
+   - **Six interval tags** (`yuzu.perf_*`, `yuzu.net_*`) are measured over each heartbeat interval.
+     They are sent **whole on every beat** with replace semantics, exactly as today.
+   - Every other tag is **state**. Register sends the full state set, and each heartbeat sends only
+     the state tags that changed since the last acknowledged beat, plus explicit removals and a
+     digest of the agent's full state set.
+3. **The server detects divergence on every heartbeat.** It recomputes the state-set digest over its
+   merged view after applying the delta, using one shared, pure function (D3). If the digests
+   differ, or the server has no base, it asks for the full set.
+4. **The topology body moves to a new unary RPC, `AgentService.ReportTopology`**, proxied by the
+   gateway as `GatewayUpstream.ProxyTopology`. It is sent when the topology digest changes, when a
+   jittered 15-minute floor expires, at agent start, or on server request (D5-D7).
+5. **The server derives topology liveness from the heartbeat's digest**, not from body arrival. The
+   90 s stale rule and the 300 s IP-claim reclaim keep their meaning, keyed on server receipt of a
+   *confirming heartbeat* (D6).
+6. **One resync mechanism serves both: a system-only reserved Subscribe command, `__resync__`**
+   (actions `tags` and `topology`). It is rate-limited at the server, and the gateway relays it like
+   any other command (D8).
+7. **The gateway is an opaque relay for everything this ADR introduces** (D4):
+   - no per-agent state beyond the connection;
+   - no parsing, validation or composition of tag deltas or digests;
+   - heartbeat-buffer coalescing is keep-newest over whole heartbeats;
+   - it retains **less** than before: with D14 it no longer keeps the RegisterRequest at all.
+
+   The existing gateway tag checks move to the server, so the gateway does *less* than today.
+8. **Everything periodic is jittered and nothing is clock-aligned** (D9).
+9. **The fleet-wide pull paths go away** (D10):
+   - the server's legacy `tar.fleet_snapshot` dispatch fetcher;
+   - the gateway heartbeat buffer's snapshot handling.
+10. **The topology pump stays an agent-core thread**, made tunable and disableable now. Converting
+    it to an ADR-0021 Reflex is deferred (D11).
+11. **Server-pull when `/viz` is viewed is not adopted** (D12).
+12. **The gateway no longer keeps the RegisterRequest** (D14). Today it holds it three times. On an
+    upstream reconnect or a server "unknown session" verdict, it sends **ids only**: a new
+    `GatewayUpstream.ProxyReattach{agent_id, session_id, observed_peer}`.
+    - The server rebuilds the session from a new durable, born-on-Postgres
+      `AgentRegistrationStore`, written at every successful registration.
+    - If that record is missing or unreadable, the gateway closes the agent's stream and the agent
+      registers again on its own.
+    - Enrollment tokens no longer sit in gateway memory.
+13. **The agent's reconnect backoff gets full jitter** (D9). Today it is a pure power of two, which
+    phase-aligns the fleet after a mass disconnect.
+14. **No proto subtraction; deprecate and ignore** (owner ruling 2026-10-26). A field, RPC or message
+    this ADR retires stays in the `.proto`: fields are marked `[deprecated = true]`, RPCs and messages
+    `option deprecated = true;`, each with a comment naming ADR-0073. Senders stop populating them
+    and receivers ignore them; a retired RPC answers `UNIMPLEMENTED`. Additions are unaffected.
+
+This ruling governs the proto schema only. It does not restore support for old agents: the
+no-back-compat stance on behaviour stands, and an old agent's deprecated fields are ignored, not
+honoured.
+
+**Upgrade consequence, stated plainly: server, gateways and agents must be upgraded together.** This
+is a wire break in both directions. An agent older than this release sends a heartbeat whose fields
+3 and 4 the new server ignores. **It contributes no status tags at all**, so for that agent the
+following stop:
+- every fleet gauge;
+- DEX performance and network quality;
+- Spark and Guardian health;
+- Guardian generation reconcile;
+- dedup and OTA telemetry;
+- topology.
+
+It still counts as connected and still receives commands.
+
+An upgraded agent behind an old server or gateway has its tags and topology ignored the same way.
+Command dispatch, responses, inventory and liveness are unaffected in either direction.
+
+## Context
+
+### What the heartbeat carries today
+
+`HeartbeatRequest` (`proto/yuzu/agent/v1/agent.proto:138-161`) carries `session_id`, `sent_at`, a
+flat `status_tags` map, and `fleet_snapshot_json`. Both thread timings are fixed with no jitter:
+- the heartbeat sleeps `cfg_.heartbeat_interval` (default 30 s, `agents/core/include/yuzu/agent/agent.hpp:19`)
+  in its loop in `agents/core/src/agent.cpp` (about l.2514-2522);
+- the snapshot pump sleeps a fixed 30 s (`agent.cpp`, `snapshot_pump_thread_`, about l.1645-1685).
+
+**Topology body.** `fleet_snapshot_json` carries TAR's `fleet_snapshot.v1` document: every process
+(user and redacted cmdline), the live connections merged with the last hour's closed `tcp_live` rows,
+and the local IPs. Its embedded `ts` and per-connection `last_seen_seconds_ago` change every run. The
+pump bumps its sequence on every run and never compares content. So the 50-800 KB body rides nearly
+every beat. The proto comment's "5-20 KB, about once per two heartbeats" is wrong on both counts.
+
+Its sole consumer is `FleetTopologyStore`, which feeds:
+- the `/viz` fleet and host views;
+- MCP `get_fleet_topology` and `get_host_topology`;
+- the Hardware list's claimed-IPs column.
+
+**Status tags.** About 97 `yuzu.*` tags are rebuilt and sent whole every beat (`agent.cpp`, from
+`req.mutable_status_tags()` at about l.2547 to about l.3080):
+
+| Family | Keys (approx.) | Producer | Server consumers |
+|---|---|---|---|
+| Identity | `yuzu.os`, `.arch`, `.agent_version`, `.healthy` (constant `"1"`), `.plugins_loaded`, `.plugins_failed` | agent core | `AgentHealthStore::recompute_metrics`: `yuzu_fleet_agents_by_{os,arch,version}`, `yuzu_fleet_plugin_init_failed` |
+| Activity counters | `yuzu.uptime_s`, `.commands_executed` | agent core | `commands_executed` feeds the fleet rollup. `uptime_s` has no server consumer found on `origin/dev`; only gateway tests read it. |
+| Dedup (HA WS-0) | `yuzu.dedup_degraded`, `_replays`, `_claim_errors`, `_record_terminal_misses`, `_record_errors`, `_release_errors` (6) | agent core | fleet gauges, `docs/command-dedup.md` |
+| OTA | `yuzu.ota_signature_refused`, `yuzu.ota_signature_mode` | agent core | fleet gauge (#416/#3807) |
+| Guardian | about 65 `yuzu.guardian_*` (generation, backend, arm counts, journal counters and gauges, `*_age_seconds` / `*_stale_seconds` gauges) | `GuardianEngine` emitters, groups A-D2 | `server/core/src/guardian_*_fleet_tags.hpp` gauges. **`yuzu.guardian_generation` drives per-heartbeat re-push of lagging agents** (`server/core/src/heartbeat_ingestion.cpp`, about l.104-150). |
+| Spark | `yuzu.spark_running`, `_disabled`, `_mechs`, `_armed_faulted`, `_watch_faults`, `_queued_dropped`, `_consumer_errors`, plus per-mechanism keys | `SparkEngine` | `server/core/src/spark_fleet_tags.hpp` gauges. **Absence is a posture** (shutting down emits nothing). |
+| DEX observer | `yuzu.dex_observer_armed`, `yuzu.dex_observed` | DEX signal observer | fleet gauges via `recompute_metrics` |
+| Plugin facts | `yuzu.plugin.<p>.<k>` (bounded `heartbeat.*` KV facts) | plugins via KV | **`yuzu.plugin.tar.db_corruption_total` + `db_quarantine_last` drive the tar-corruption audit sink on every heartbeat** (`AgentHealthStore::upsert`, #1567) |
+| Daily-sync skips | `yuzu.sync.<source>.skip_streak`, `.last_skip` | `emit_sync_skip_tags` | fleet gauge, inventory runbook |
+| Perf (interval) | `yuzu.perf_cpu_pct`, `_commit_pct`, `_disk_lat_ms` | agent core, per-interval deltas | `yuzu_fleet_perf_*`, `/dex` performance (`server/core/src/dex_perf_rules.hpp`) |
+| Network quality (interval) | `yuzu.net_rtt_p50_ms`, `_retrans_pct`, `_throughput_bps`, pinned to `kNetTag*` by `static_assert` (`server/core/src/network_perf_rules.hpp`) | agent core, interval deltas over `steady_clock` baselines | `yuzu_fleet_net_*` (absent-not-zero), `/network` read model (`docs/user-manual/network.md`) |
+
+The server stores them with `AgentHealthStore::upsert` (`server/core/src/agent_registry.hpp`), which
+**clears and replaces** the agent's map on every beat. Fleet gauges are rebuilt from that map on a
+timer, pruning agents not seen in 90 s.
+
+Most of these values do not change from beat to beat:
+- identity is static;
+- counters move only on events;
+- Guardian and Spark health is flat in steady state.
+
+Only the six interval tags change by nature.
+
+### Freshness is store-defined, not an SLO
+
+| Rule | Constant | Keyed on |
+|---|---|---|
+| Topology render cache | 60 s (`FleetTopologyStore` constructor default) | server time |
+| Topology stale flag (stuck-pump detector) | `kPushedStaleAfter{90}` (`fleet_topology_store.hpp`) | body `server_received_at` |
+| IP-claim reclaim (anti-spoof liveness) | `kIpClaimReclaimAfter{300}` (`fleet_topology_store.hpp`) | body `server_received_at` |
+| Health map pruning | 90 s (`server.cpp`, the `recompute_metrics(metrics_, std::chrono::seconds{90})` call) | last heartbeat |
+
+Both topology liveness rules are keyed on body arrival. A scheme that sends the body less often
+without a server change therefore breaks both:
+- every quiet host goes stale at 90 s;
+- its IPs become claimable by another agent at 300 s.
+
+### What it costs the gateway (budget: ADR-0074 D14)
+
+The budget is ADR-0074 D14: one gateway on 8 cores and 16 GB holds **100,000 idle agents** with
+mutual TLS, inside 8 GB of memory; and a CI regression check of **64 KiB per idle agent, all-in
+including the kernel's per-connection memory**. (D14 replaces the 8 KiB-per-connection goal that an
+earlier draft of this ADR cited.) The measurements below show why the heartbeat's payload is a large
+part of the gap to that check.
+
+**Idle-memory harness, 2026-10-26.** N = 10,000 simulated agents on the PR #5695 code (OTP 28.4.2),
+150 KB body every 30 s.
+- With TLS: 826 KiB/conn BEAM (a second run gave 707).
+- Plaintext: 431 KiB/conn.
+- Forced GC brings TLS down to 194 KiB/conn.
+- A real 836-process Mac produced a 150,178 B body.
+
+**No-snapshot sensitivity, 2026-10-26.** Same harness, macOS, N = 5,000, body 0 bytes; two runs agree
+within about 2 %.
+- TLS: about 411 KiB/conn BEAM. The binary term **collapses from 475 to 38 KiB**, but process heaps
+  stay about **310 KiB**. Forced GC gives 173 KiB.
+- Plaintext: about 311 KiB/conn, of which about 231 KiB is heap. Forced GC gives 142 KiB.
+- The heaps are grown by **decoding the 97-tag heartbeat and Register**, and they persist until GC.
+  Forced GC takes the connection process from 89 to 15 KiB and the stream process from 87 to 4 KiB.
+- **The post-GC floor (about 140-175 KiB) is the same with or without the snapshot.**
+
+**100 real Windows agents, 2026-10-26**, on the PR #5695 stack at `fa10fa135`. Marginal cost per
+TLS connection: 213-219 KiB BEAM and 417-468 KiB OS anon. Forced GC takes per-agent process memory
+from 189 to 60 KB.
+
+**1,000 agents, 2026-10-25:** 544 MiB anon, about 557 KiB/conn naive.
+
+ADR-0074 D14 records the same order of magnitude on merged `dev` at 5,000 agents (about 320 to 470 KB
+per agent).
+
+**Collection and buffering.**
+- The gateway's connection process collects only after 1 MiB of request bytes
+  (`gateway/apps/yuzu_gw/src/yuzu_grpc_stream_h.erl:79`, `COLLECT_AFTER_BYTES`).
+- **Live state after GC, 2026-10-26** (term-level ledger, harness, macOS, TLS, snapshot 0 B, marginal
+  from N = 1,000 to 3,000, two forced GCs per process): **131.8 KiB live per agent**. About two thirds
+  of it is the decoded RegisterRequest, **kept three times**, with a 69-plugin registration:
+  - the `yuzu_gw_agents` registry row (`yuzu_gw_registry.erl`): 30,112 B, of which the Register is
+    26,696 and its PluginInfo list 25,696;
+  - the `yuzu_gw_owner_sessions` row (`yuzu_gw_agent_sup.erl`): 27,104 B, the same Register again;
+  - the `yuzu_gw_agent` owner process's `agent_info` (`yuzu_gw_agent.erl`): 26,392 B, of which only
+    `hostname` is ever read.
+
+  Those copies serve only:
+  - the rare registration replay (`yuzu_gw_registry:entries_for_sessions/1` and
+    `all_register_reqs/0`, sent by `yuzu_gw_upstream:replay_send/4`);
+  - an owner restart (`yuzu_gw_agent_sup:restore_args/1`);
+  - the management plane's `GetAgent`, `ListAgents` and `QueryInventory`
+    (`yuzu_gw_mgmt_service.erl`).
+
+  The server calls none of the management reads; it uses only `SendCommand` (`server.cpp`, the
+  gateway `SendCommand` forwarder, and `gateway_mgmt_stub_pool.hpp`). Both registration rows also keep
+  the agent's **enrollment token** for the whole session.
+
+  The 100-agent Windows rig's agents loaded 6 plugins, which is why this did not show there.
+  Production agents with most plugins look like the harness.
+- ADR-2002 (the "stuck heartbeat batch" observation, about l.1445) records the operational version of
+  the same cost: a 24.8 MB retained heartbeat batch wedged recovery until a gateway restart.
+
+**Reading.** The retained Register is *live* state, about 87 KB per agent, removable only by
+changing what replay sends (D14). The two wire payloads are a garbage-retention problem, not live
+state:
+- the snapshot inflates off-heap binary references;
+- re-decoding a mostly unchanged 97-tag map every 30 s inflates process heaps.
+
+Removing the snapshot alone is necessary but not sufficient: it leaves about 310 KiB/conn of tag
+garbage. This ADR removes the wire cause of both terms. It does **not** move the post-GC floor
+(process count, ssl processes, ETS, allocator slack). That belongs to ADR-0074's gateway-only memory
+measures and its kTLS work, which these changes make measurable.
+
+### Precedent
+
+**No ADR chose either vehicle.** The topology field's recorded rationale is a commit message
+(`ba7e34a8d`: "Cache-miss latency 800ms → 2ms"). The flat tag map grew one family at a time.
+
+The accepted ADRs point the other way:
+- ADR-0016's Context objects to resending unchanged data every cycle ("be kind to the network at
+  fleet scale").
+- ADR-0021 Decision 5 says "TAR snapshot pumps etc." become visible, tunable, disableable
+  Reflexes.
+
+Commercial endpoint platforms follow the same pattern:
+- liveness is the session plus a small, randomised keepalive or state check-in;
+- telemetry is pulled, batched, or sent as events;
+- bulk content goes on a separate channel.
+
+Frequent check-ins are fine when they are small.
+
+**The stampede rule.** The owner's standing transport rule is that idle connections must be
+near-free, and no periodic mechanism may fire across connections on a uniform clock. The repo
+already applies it elsewhere, in `CommandRequest.stagger_seconds` and daily-sync's enrollment-herd
+guard. Today's fixed 30 s timers phase-align the fleet after any mass reconnect.
+
+## Decision detail
+
+### D1. Tag classes
+
+Every tag key belongs to exactly one class. The classification is one table in
+`common/include/yuzu/status_tag_classes.hpp`, keyed by exact key or by declared prefix. It is pure
+data, so it is allowed under the #2549 firewall.
+
+| Class | Keys | Wire rule | Server rule | Why |
+|---|---|---|---|---|
+| **Interval** | `yuzu.perf_cpu_pct`, `yuzu.perf_commit_pct`, `yuzu.perf_disk_lat_ms`, `yuzu.net_rtt_p50_ms`, `yuzu.net_retrans_pct`, `yuzu.net_throughput_bps` | every heartbeat, all present values | **replace** the agent's interval map on each heartbeat; a key absent this beat is absent on the server | Each value is a measurement **over this beat's interval**, from `hb_prev_*` baselines. Absent means "not measured this interval", and the gauges are absent-not-zero (`docs/user-manual/network.md`). Carrying an old rate forward under a delta would publish a stale rate as current, which is a false reading in `yuzu_fleet_net_*` and `/network`. The `kNetTag*` pins and their `static_assert` are unchanged. |
+| **State** | every other `yuzu.*` key, including the dynamic `yuzu.plugin.<p>.*`, `yuzu.sync.<src>.*` and per-mechanism `yuzu.spark_*` keys | full set at Register; afterwards upserts and removals since the last acknowledged beat, plus the digest | **merge** into the agent's state map, then verify the digest (D3) | Values are static or change on events. Re-sending them every 30 s is the garbage the harness measured. |
+
+**Unknown keys** (an agent emitting a key the table does not list) are classified **state** by
+default. A unit test fails if any key the agent core can emit is not explicitly listed. The default
+exists only so an unlisted plugin fact degrades to "sent on change" rather than being dropped.
+
+**Retired and changed keys** (no back-compat):
+- **`yuzu.uptime_s` is retired.** It changes every beat by construction, which makes it the worst
+  possible state tag, and no server code reads it.
+- **`yuzu.started_at`** (agent epoch seconds at process start, a static state tag) replaces it. The
+  server derives uptime at read time.
+- **`yuzu.healthy`** stays as a static state tag. Its value is always `"1"`, so it costs nothing
+  under deltas. Retiring it is left to its consumers.
+
+**Age-valued Guardian gauges** (`yuzu.guardian_*_age_seconds`, `*_stale_seconds`,
+`*_headroom_blocked_seconds`) stay in the state class. They are emitted only while their condition
+holds, so they cost bytes only during an incident, when the information is wanted. Re-expressing them
+as "since" timestamps would remove even that. That is not decided here, because it changes their
+emitters' contract (`guardian_*_fleet_tags.hpp`).
+
+### D2. Wire shape
+
+```proto
+// agent.proto
+message StatusTags {
+  map<string, string> interval = 1;   // complete interval set for this beat (replace)
+  map<string, string> upsert   = 2;   // state keys added or changed since the base
+  repeated string     removed  = 3;   // state keys deleted since the base
+  string state_digest          = 4;   // "v1:" + 32 lowercase hex over the agent's FULL state set after this change
+  bool   full                  = 5;   // true: `upsert` IS the complete state set; server replaces, `removed` must be empty
+}
+
+message RegisterRequest {
+  // fields 1-7 unchanged
+  bytes status_tags_pb = 8;           // serialized StatusTags, full = true, interval empty; base for the first heartbeat
+}
+
+message HeartbeatRequest {
+  string session_id = 1;
+  yuzu.common.v1.Timestamp sent_at = 2;
+  map<string, string> status_tags = 3 [deprecated = true];  // ADR-0073: not populated; ignored by every receiver
+  bytes fleet_snapshot_json = 4 [deprecated = true];        // ADR-0073: not populated; ignored by every receiver
+  TopologyDigest topology = 5;        // D5; the gateway passes it through untouched
+  bytes status_tags_pb = 6;           // serialized StatusTags; OPAQUE to the gateway (D4)
+}
+// HeartbeatResponse and BatchHeartbeatResponse are unchanged.
+```
+
+**Why the tags are `bytes`, not a typed sub-message.** The gateway decodes `HeartbeatRequest` to
+admit it (it needs `session_id`) and re-encodes it into a batch. A typed `StatusTags` would be
+decoded into Erlang terms on every beat, which is the heap growth the harness measured. It would
+also tie gateway gpb regeneration to every tag-schema change. As `bytes`, the payload stays one
+sub-binary of the received frame. The gateway cannot interpret it, so opacity is enforced by the
+type, not by review discipline.
+
+The cost is one extra decode on the server and agent, which is negligible. Producers (agent) and
+consumers (server) use the generated `StatusTags` type.
+
+`buf breaking` runs with `WIRE_JSON` plus the explicit no-delete rules in `proto/buf.yaml` (the
+`proto-compat` job in `.github/workflows/ci.yml`). It accepts this shape with no exemption, because
+nothing is subtracted: fields 3 and 4 stay, deprecated, and everything else is an addition.
+
+**Deletions are explicit.** A state key the agent no longer emits goes in `removed` once, and the
+server erases it. This preserves every "absence is meaningful" posture:
+- Spark's ABSENT posture on shutdown;
+- a cleared `yuzu.plugins_failed`;
+- a sync source with no skips.
+
+A key cannot appear in both `upsert` and `removed`; the server treats that as divergence.
+
+**Base and acknowledgement.**
+- The agent's base is the state set as of its last **acknowledged** heartbeat, or the Register's
+  full set right after (re)registration.
+- "Acknowledged" means the RPC returned OK. That comes from the gateway (which answers locally) or
+  from the server.
+- A failed or timed-out heartbeat does not advance the base, so its changes repeat in the next
+  delta.
+- A heartbeat the gateway acknowledged but later lost (keep-newest coalescing, buffer drop, oversize
+  drop) is caught by the digest (D3), not by the agent.
+
+### D3. Divergence detection
+
+The **state digest** is SHA-256 over the full state set, truncated to the first 16 bytes and
+rendered as `"v1:"` plus 32 lowercase hex characters. Each `(key, value)` pair is encoded as two
+u32-little-endian length-prefixed byte strings, and pairs are sorted by key bytes. Interval tags are
+excluded, since they are complete on every beat. An empty set has a defined digest.
+
+**One implementation.** The digest function lives in `common/include/yuzu/status_tag_digest.hpp`,
+used by the agent and by the server alike. It is pure computation with no I/O, store or wire types,
+which the #2549 firewall permits. OpenSSL is already a dependency of both binaries. Unlike ADR-0016's
+blob hash, the canonical form therefore exists once, and the two sides cannot drift.
+
+**On each heartbeat** the server (`HeartbeatIngestion`, `server/core/src/heartbeat_ingestion.{hpp,cpp}`,
+shared by direct `Heartbeat` and gateway `BatchHeartbeat`):
+
+1. Replaces the agent's interval map with `tags.interval`.
+2. Decodes `status_tags_pb` and checks it against the tag caps: at most 512 keys, 64 KiB per key or
+   value, 256 KiB in total, valid UTF-8. These caps are enforced at the gateway today
+   (`yuzu_gw_heartbeat_buffer.erl`: `MAX_STATUS_TAGS`, `MAX_TAG_ITEM_BYTES`, `MAX_TAG_BYTES_TOTAL`
+   at l.117-130, and `screen/1` with the UTF-8 repair at about l.460-583). A payload that fails them
+   is discarded and counted `rejected`, and the agent is treated as `diverged`. A per-agent resync
+   backoff (D8) stops a persistently oversize agent from looping.
+3. Then branches:
+   - If `full`: replace the state map with `upsert`. **Synced.**
+   - Else if the server holds no state map for the agent (server restart, HA replica change, a
+     Register that never reached this replica): apply nothing, **issue `__resync__.tags`** (D8), and
+     count `no_base`.
+   - Else: apply `removed`, then `upsert`, to a copy. Recompute the digest. If it equals
+     `state_digest`, commit and the agent is **synced**. Otherwise keep the pre-delta map (the last
+     verified state), **issue `__resync__.tags`** (D8), and count `diverged`.
+
+A diverged or unbased agent keeps its last verified state, if any, until the full set arrives. Its
+interval tags are always current. The full set arrives on the agent's next heartbeat after
+`__resync__.tags` reaches it (D8): within one heartbeat interval of the command.
+
+**Per-heartbeat side effects read the merged view, never the wire:**
+- Guardian generation reconcile (`yuzu.guardian_generation`);
+- the tar-corruption audit sink (`yuzu.plugin.tar.db_corruption_*`).
+
+Both depend on firing on **every** heartbeat, not only on change. The reconcile re-pushes a still
+lagging agent; the corruption sink retries a candidate the gate skipped. So they run after step 2,
+over the agent's current merged state.
+
+Deprecating `HeartbeatRequest.status_tags` makes any surviving direct read a deprecation warning,
+not a compile error. The enforcement for this invariant is a lexical test that no non-generated
+source reads or writes heartbeat fields 3 or 4.
+
+### D4. The gateway is an opaque relay
+
+**Owner ruling, 2026-10-26, reworded 2026-10-28: no per-agent state beyond the connection.** The
+gateway relays what this ADR introduces without interpreting it. Fleet-level state that any gateway
+could rebuild, such as ADR-0074's cached CRL, drain flag, gateway list and cluster membership, is
+outside this rule; this ADR adds none of it.
+
+- **No parsing.**
+  - `status_tags_pb` is `bytes` (D2), never decoded.
+  - `TopologyDigest` is passed through as a field of the heartbeat it already decodes, never read.
+  - `ReportTopology` is forwarded as received (D7).
+- **No new per-agent state.** Resync is a server-to-agent command on the existing command path
+  (D8). The gateway holds no resync bits and no per-agent tag or digest state. There are no new
+  `BatchHeartbeatResponse` fields.
+- **Coalescing is keep-newest, over whole heartbeats.**
+  - **Today:** the buffer keeps one entry per session, and a newer heartbeat replaces the older
+    one's fields except the snapshot, which keeps the newest non-empty one
+    (`yuzu_gw_heartbeat_buffer.erl`, header l.13-24 and `coalesce/2` at about l.588).
+  - **Under this ADR:** a newer heartbeat **replaces the older one whole**. That is simpler than
+    today and needs no understanding of deltas.
+  - **Rejected alternative: forward-all** (keep every heartbeat per session). It would make buffer
+    memory grow per session with outage length, which is exactly ADR-2002's stuck-batch failure.
+  - **The cost of keep-newest:**
+    - any state change carried only in a dropped older heartbeat is missing at the server;
+    - the next delta then fails the digest check (D3), and the server re-requests the full set with
+      `__resync__.tags`.
+    - Coalescing happens only when a session sends two beats before a flush. In steady state that is
+      rare, because flushes run far more often than every 30 s.
+    - It is routine during an **upstream outage**. After an outage, every agent whose state tags
+      changed during it diverges once. The server then resyncs them at the configured rate (2000/s
+      per replica, about 4 KB each). For 100k agents that is at most about 50 s of resync traffic
+      after recovery.
+  - The digest makes keep-newest correct, not merely tolerable. A later delta that happens to
+    restore the server's view to the agent's state passes the digest and needs no resync, because
+    the check compares final states.
+- **Every other lossy path is unchanged in behaviour and becomes self-healing.** All of these lose a
+  delta, and the server then diverges and resyncs:
+  - the buffer-full drop;
+  - the oversize drop, now judged on the **whole encoded heartbeat's** byte size only;
+  - the non-transient rejection.
+- **What the gateway stops doing.** It no longer decodes, counts, size-checks or UTF-8-repairs
+  individual tags (`yuzu_gw_heartbeat_buffer.erl`, about l.460-583); that moves to the server (D3,
+  step 2). The `heartbeat_invalid` and tag-strip paths are removed. The gateway does **less** per
+  heartbeat than today.
+
+**Pre-existing gateway state.**
+- **Removed by this ADR:** the retained RegisterRequest, in all three copies (D14).
+- **Kept, because it is the connection:**
+  - the per-session `yuzu_gw_agent` process and its routing record (ids, connection, stream home,
+    owner key, `connected_at`, observed peer);
+  - the session-index ETS rows;
+  - local heartbeat answering (`yuzu_gw_agent_service:heartbeat/2`, about l.448-466).
+- **Removed with the Register:** the plugin-name list (D14).
+
+A fresh Register is decoded **transiently** to forward it as `ProxyRegister`, and nothing from it
+is kept, so its `status_tags_pb` (field 8) never enters gateway state.
+
+### D5. Topology digest and pump
+
+**`TopologyDigest`** (heartbeat field 5):
+
+```proto
+message TopologyDigest {
+  string digest = 1;                          // "v1:" + 32 lowercase hex; empty until the first good run
+  yuzu.common.v1.Timestamp last_pump_at = 2;  // agent clock, last successful run; compared for CHANGE only
+  TopologyPumpOutcome last_outcome = 3;       // OK | TRUNCATED | FAILED | DISABLED
+}
+```
+
+The owner's ruling described "one tiny digest tag". It is a typed field instead, for three reasons:
+- a per-run-changing tag would turn into a state-tag delta on every pump;
+- tags count against the tag caps;
+- a typed field is visible in the contract.
+
+**The topology digest is computed by TAR**, inside its `fleet_snapshot` builder
+(`agents/plugins/tar/src/tar_fleet_snapshot.{hpp,cpp}`), and emitted as a top-level `content_digest`
+member (a `schema_minor` bump). Definition `v1`: SHA-256, first 16 bytes, `"v1:"` plus 32 hex
+characters, over a u32/i64 little-endian, length-prefixed encoding of:
+
+1. `schema`, `schema_minor`, `hostname`.
+2. `local_ips`, sorted and de-duplicated.
+3. `processes[]` as tuples `(pid, ppid, name, cmdline, user)`, sorted, duplicates kept.
+4. `connections[]` as tuples `(proto, local_addr, local_port, remote_addr, remote_port, remote_host,
+   state, pid, process_name)`, sorted, duplicates kept.
+5. The truncation flags and the source-paused flags.
+
+**Excluded as volatile:** `ts`, and every row's `last_seen_seconds_ago`.
+
+The builder holds one static list classifying every emitted key as digested or volatile. A test
+fails if a built document contains an unclassified key. **The server treats this digest as opaque.**
+It stores the value that arrived with the body, rejects a report whose `digest` disagrees with the
+body's `content_digest`, and never recomputes it. That keeps one implementation (TAR) and keeps JSON
+canonicalisation out of the server.
+
+**Pump.** The pump stays a Run()-lifetime thread (`snapshot_pump_thread_` in `agent.cpp`). Each run:
+1. execute `tar.fleet_snapshot` via `LocalDispatcher`;
+2. keep the body, digest, `last_pump_at` and outcome;
+3. sleep a jittered 60 s.
+
+Truncated runs (over 2 MiB) keep the previous body and record `TRUNCATED`.
+
+### D6. Server topology liveness from the digest
+
+Each topology slot gains these fields, all on the server's wall clock:
+- `digest`;
+- `body_received_at`;
+- `confirmed_at`: the last heartbeat whose digest equalled the slot's;
+- `pump_marker` and `pump_advanced_at`: when `last_pump_at` last **changed**. The comparison is
+  inequality, never ordering, so an agent clock step cannot keep a slot fresh or age it;
+- `mismatch_since`.
+
+| Heartbeat says | Server does |
+|---|---|
+| digest equals slot | `confirmed_at = now`; refresh the slot's IP claims; advance `pump_advanced_at` if the marker changed; clear `mismatch_since` |
+| digest differs | set `mismatch_since` if unset. The agent's change report is expected; past `kReportGrace` (120 s), issue `__resync__.topology` (D8) |
+| non-empty digest, no slot | issue `__resync__.topology` (D8) |
+| no field, or `DISABLED` | no request; an existing slot ages out through the stale and evict rules |
+
+Rendered as `stale_reason`:
+
+| `stale_reason` | Condition | Notes |
+|---|---|---|
+| `agent_silent` | `now - confirmed_at > 90 s` | Same 90 s as `kPushedStaleAfter`: two jittered heartbeats (at most 36 s each) plus gateway flush slack. |
+| `pump_stuck` | `now - pump_advanced_at > 240 s`, or `last_outcome ∈ {TRUNCATED, FAILED}` for that long | 240 s ≥ 3 × 72 s (60 s pump, +20 % jitter) plus one heartbeat. |
+| `body_pending` | `mismatch_since` older than `kReportGrace` | new |
+| `disconnected` | slot retained after disconnect | below |
+| `not_reported` | roster agent with no slot | today's placeholder |
+
+- **IP-claim reclaim** stays at 300 s, keyed on `confirmed_at`. A quiet host keeps its claim with a
+  ~70-byte field; a silent host loses it at 300 s, as today.
+- **Retain on disconnect** replaces evict-on-disconnect (`FleetTopologyStore::evict_pushed`). On
+  stream close, IP claims are released **immediately** (UP-5 unchanged), but the body and digest are
+  kept for 300 s, rendered `disconnected`. On the first confirming heartbeat after a reconnect, the
+  stored `local_ips` are re-claimed:
+  - if they are free, the slot is live again with no body sent;
+  - if any IP is held by another live agent, the slot is dropped and topology is requested, so the
+    fresh body goes through first-claim-wins.
+
+  A gateway restart thus costs zero bodies for agents back within five minutes. Eviction is lazy (in
+  `confirm` and `build_snapshot`), so no background loop is added.
+- **Connection ages.** The stored body's ages are rebased at render time:
+  `last_seen_seconds_ago + (now - body_received_at)`. A closed row older than 3600 s is dropped.
+
+### D7. `ReportTopology` and its gateway proxy
+
+```proto
+// AgentService
+rpc ReportTopology(TopologyReport) returns (TopologyAck);
+message TopologyReport {
+  string session_id = 1;
+  yuzu.common.v1.Timestamp sent_at = 2;
+  string digest = 3;                // must equal the body's content_digest
+  bytes fleet_snapshot_json = 4;    // fleet_snapshot.v1, <= 2 MiB
+  TopologyReportReason reason = 5;  // CHANGED | REFRESH | STARTUP | RESYNC
+}
+message TopologyAck {
+  bool accepted = 1;
+  TopologyRejectReason reject_reason = 2; // PARSE | DIGEST_MISMATCH | IP_CONFLICT | OVERSIZE | UNKNOWN_SESSION
+}
+// GatewayUpstream
+rpc ProxyTopology(yuzu.agent.v1.TopologyReport) returns (yuzu.agent.v1.TopologyAck);
+```
+
+**Server.**
+- Both paths call the one shared parser, `FleetTopologyStore::parse_fleet_snapshot_json`. After D10
+  there are exactly two callers.
+- The trust boundary is unchanged: `agent_id` and `os` come from the session.
+- The 2 MiB and 4096-row caps are checked before parsing.
+- The `topology.push.first` and `topology.push.rejected` audit rows are unchanged.
+
+**Gateway:**
+- a `report_topology/2` handler in `yuzu_gw_agent_service.erl`, admitted like `report_inventory/2`
+  (`yuzu_gw_heartbeat_admission:admit_inventory/2`) but with its **own** permit pool;
+- a 2 MiB per-RPC message cap;
+- forwarding via `ProxyTopology` to the session's owning replica;
+- **no buffering**: an unforwardable report fails `UNAVAILABLE` and the agent retries.
+
+**Peer authorization.** `ProxyTopology` is a new gateway-upstream RPC. It gets an explicit
+`GatewayPeerGuardedService` override (`server/core/src/gateway_peer_guard.hpp`) that calls
+`gateway_peer::decide` first, an `rpc` label, and a test row. When ADR-0074 D1 moves gateway and
+server from pins to CA trust plus identity plus revocation, this RPC follows the same admission as
+every other upstream RPC; it adds no path of its own.
+
+**Collect after large requests.** `yuzu_grpc_stream_h` collects the connection process after any
+single request of 64 KiB or more, not only after 1 MiB cumulative. The body still crosses the agent's
+long-lived connection process and its TLS receiver, because the unary shares the agent's HTTP/2
+connection. So this ADR saves by **rate**, not location, and the collection stops the rare body from
+lingering.
+
+**Agent send rules.** A per-connection topology sender mirrors the daily-sync thread (its own stub,
+joined on disconnect). It sends when:
+- **CHANGED:** the latest digest differs from the last accepted one; delay uniform 0-10 s.
+- **REFRESH:** the floor expires; drawn uniformly from 12-18 min, restarted on every accepted
+  report.
+- **STARTUP:** first report of the process; delay uniform 0-60 s.
+- **RESYNC:** on `__resync__.topology` (D8); delay uniform `[0, window_s]` from the command.
+
+It does not send on reconnect; the heartbeat digest lets the server decide. Failures back off
+exponentially with full jitter (base 15 s, cap 15 min). `UNIMPLEMENTED` is logged once per
+connection, counted, and retried only at the floor; it is never a fallback. `IP_CONFLICT` waits a
+full floor.
+
+**Why a 15-minute floor.** Liveness no longer depends on body arrival (D6). The floor's only job is to
+bound a defect that keeps the digest constant while rendered content changes: a misclassified field,
+or a lost ack. A visible mismatch is already caught within one heartbeat plus `kReportGrace`.
+Fifteen minutes:
+- keeps that blind window well inside TAR's one-hour connection history;
+- is three times the IP-claim window;
+- is a minutes-scale refresh, consistent with how commercial endpoint platforms refresh host details.
+
+At 10k agents with 150 KB bodies, the floor costs about 1.7 MB/s fleet-wide, against about 50 MB/s
+today.
+
+### D8. Resync: a reserved Subscribe command, `__resync__`
+
+The server needs a way to tell one agent "send me your full tag set" or "send me your topology"
+without per-agent gateway state. Four options were weighed:
+
+**(a) Piggyback the verdict on a synchronous response.**
+- `HeartbeatResponse` is answered locally by the gateway, so it cannot carry the verdict without
+  per-agent gateway state.
+- `TopologyAck` (the proxied `ReportTopology` response) is synchronous end-to-end, but it reaches
+  only agents that are *sending a body*. A quiet agent, or one with `--no-topology`, never asks, and
+  tag divergence is independent of topology.
+- A new small jittered "check" unary (agent sends its digests, server answers with the verdict)
+  works without gateway state. But it adds a proxied round trip per agent per check interval, so
+  convergence latency equals that interval. To converge within a minute it costs about 1,700
+  unaries/s at 100k agents, steady, forever, to serve a condition that is rare outside restarts.
+- **Rejected.**
+
+**(b) A reserved Subscribe command.** Server to agent, on the stream every agent already holds open,
+relayed by the gateway like any command (no new gateway state).
+- The cost, re-weighed honestly:
+  - one row per command in the agent's `CommandDedupStore` ring. The ring is a bounded, clock-free
+    rowid ring over terminal rows, so the cost is transient;
+  - one capability-catalogue entry with an `ExecuteGate` (compile-time, once);
+  - one id-prefix skip in `notify_exec_tracker`;
+  - a small `CommandResponse` relayed back up.
+- It is paid **only when divergence occurs**: after a server restart, replica change, upstream
+  outage or real loss. It is zero in steady state.
+- Latency is one stream hop.
+- **Adopted.**
+
+**(c) Agent-driven self-healing:** a jittered periodic full set, with no server signal.
+- Bandwidth is trivial: about 4 KB per agent per period.
+- But the period *is* the worst-case divergence and post-restart latency. At 15 min, state-derived
+  fleet gauges, Guardian generation reconcile and the corruption sink would run on missing data for
+  up to 15 min after every server restart.
+- At 1 min, the full set rides every second beat, and the gateway decodes about half today's tag
+  volume, which forfeits much of the saving.
+- **Rejected as the mechanism.** It is also not added as a backstop: the digest checks every beat,
+  so (b) is triggered whenever a backstop could have helped.
+
+**(d) Lean on reconnection.** A full set already goes with every Register, so the server could
+force a reconnect. That tears down the connection, costing the gateway a TLS handshake and per-agent
+process churn, to fix a 4 KB discrepancy. **Rejected.**
+
+**Mechanism.**
+- **Reserved name `__resync__`**, actions `tags` and `topology` (parameter `window_s`, default 60).
+  It is handled in the agent's Subscribe command loop alongside `__sync__` (`agent.cpp`, the
+  reserved-name dispatch at about l.3447-3497). The decision logic is a pure, unit-tested function,
+  like `agents/core/src/sync_now_decision.hpp`.
+- **Dedup.** The command is **dedup-claimed**; only `__guard__` bypasses the claim (ADR-2002 WS-0).
+  `record_command_terminal` runs **before** the stream write.
+- **Agent response.**
+  - `tags`: the next heartbeat carries `full = true`. There is no extra RPC, because the heartbeat
+    is already jittered.
+  - `topology`: the topology sender sends `RESYNC` after a uniform delay in `[0, window_s]` (D7).
+- **Server.**
+  - Command ids are minted `resync-*`, and `notify_exec_tracker` skips them like `polchk-` and
+    `preflight-` (`server/core/src/agent_service_impl.cpp`): no tracker row, no SSE, not in the
+    executions drawer.
+  - The pairs `(__resync__, tags)` and `(__resync__, topology)` are declared in the capability
+    catalogue as ReadOnly, `ExecuteGate::None`, system-only.
+  - Operator dispatch surfaces (REST `/api/command`, MCP `execute_instruction`, workflows, dashboard)
+    refuse them by the reserved-name rule, extended there if absent.
+  - They are sent through the server's system send path to the agent's own stream. That is not a
+    new `DispatchCaller` construction site and is not a fleet dispatch.
+  - Issuance is per replica, from heartbeat ingestion, and is not leader-gated: the replica that
+    lacks the state is the one that must ask.
+  - Under ADR-0074 D5 every command is server-signed and every result agent-signed; `__resync__` is
+    a command like any other and takes no exemption.
+- **Rate limits** (per replica). A request over the rate is deferred to a later heartbeat and
+  counted; nothing is dropped permanently, because divergence persists until fixed.
+  - `tags`: `--tag-resync-rate`, default 2000/s, at most one per agent per 60 s. A full set is about
+    4 KB, so 100k agents resync in about 50 s.
+  - `topology`: `--topology-resync-rate`, default 200/s, at most one per agent per 5 min. 100k agents
+    repopulate in about 8 min at about 30 MB/s of body ingest.
+- **Loss.** A command that cannot be sent (no stream) is not retried by itself. The agent's next
+  diverged heartbeat re-triggers it after the per-agent interval. An agent whose stream is down
+  reconnects, and its Register carries the full set anyway.
+
+**Direct-connected agents use the same command.** There is one mechanism, not a response flag on one
+path and a command on the other.
+
+### D9. Jitter: no clock-aligned periodic work
+
+| Timer | Value |
+|---|---|
+| Heartbeat | 30 s, each sleep uniform ×[0.8, 1.2]; first beat after connect uniform [0, 30 s]. The cadence is unchanged so the interval tags keep their meaning. Rates divide by measured `steady_clock` elapsed (`agents/core/src/net_quality_sampler.cpp`), so jitter does not bias them. |
+| Topology pump | 60 s, each sleep uniform ×[0.8, 1.2]; first run uniform 5-65 s. Flags: `--topology-interval` (30-900 s) and `--no-topology` (no pump; `DISABLED` on the wire). |
+| Change report | uniform 0-10 s after change |
+| Refresh floor | uniform 12-18 min |
+| Startup report | uniform 0-60 s |
+| Resync report | uniform `[0, window_s]` from `__resync__.topology`, default 60 s |
+| Server `kReportGrace` | 120 s |
+| Agent reconnect backoff | full jitter: uniform [0, min(2^n, 300) s]. Today it is exactly `min(2^n, 300)` (`agent.cpp`, `kMaxReconnectDelaySecs` and the backoff at about l.1689-1724), so every agent dropped by one gateway restart retries on the same schedule. |
+
+Every timer is re-drawn per cycle. None is derived from wall-clock boundaries. Server-originated
+work is rate-limited at the source (D8). Reviewers reject any new heartbeat or topology timer that
+lacks jitter. ADR-0074 D11's two-phase jittered drain follows the same rule.
+
+### D10. What is removed (no backward compatibility)
+
+The owner ruled 2026-10-26: no live customers; aggressive changes for the better.
+
+- **Proto:**
+  - `HeartbeatRequest` fields 3 and 4 stay but are marked `[deprecated = true]`, with a comment
+    naming ADR-0073, in `proto/yuzu/agent/v1/agent.proto` and both gateway copies
+    (`gateway/priv/proto/agent.proto`, `gateway/priv/proto/yuzu/agent/v1/agent.proto`). The agent
+    stops populating them and the server and gateway ignore them (D15: no proto subtraction);
+  - `agent_pb.erl`, `gateway_pb.erl` and `management_pb.erl` (`gateway/apps/yuzu_gw/src/`) are
+    regenerated;
+  - no dual parsing and no agent fallback.
+- **Agent:**
+  - the flat tag build becomes a state map plus an interval map, diffed against the base;
+  - the topology attach block (`agent.cpp`, about l.3083-3101) and `last_attached_seq` go;
+  - `yuzu.uptime_s` goes.
+- **Server:**
+  - `AgentHealthStore::upsert(Map)` becomes `apply(agent_id, StatusTags) -> ApplyOutcome`, with
+    separate interval and state maps;
+  - the field-4 branch of `HeartbeatIngestion::ingest` (`heartbeat_ingestion.cpp`, about l.176-200)
+    goes;
+  - the **legacy dispatch fetcher** (`server.cpp`, the `tar.fleet_snapshot` fan-out at about
+    l.5528-5700) goes, with the store's `Fetcher` seam and
+    `yuzu_viz_topology_fetch_duration_seconds`. Cold start becomes roster placeholders filled by
+    resync, not a fleet-wide pull down the Subscribe streams.
+- **Gateway heartbeat buffer** (`yuzu_gw_heartbeat_buffer.erl`): these go:
+  - newest-snapshot coalescing (header l.13-24, `coalesce/2` at about l.588), snapshot-first
+    eviction and send-without-snapshot;
+  - per-tag counting, size checks and UTF-8 repair (about l.460-583; moved to the server, D3);
+  - the `snapshot_oversize`, `snapshot_evicted` and `heartbeat_invalid` drop reasons (`drop_reason()`
+    at l.169-170).
+
+  Keep-newest coalescing, chunking, the byte cap and the session cap stay, applied to opaque
+  heartbeats.
+
+An old agent still populates fields 3 and 4. The new gateway and server decode them as the
+deprecated fields they remain and ignore them. They still cost bytes until the agent is upgraded,
+which is why this is one coordinated release.
+
+### D11. The pump and ADR-0021
+
+Converting the pump to an embedded-content Reflex is **out of scope**. The Reflex deployment runtime
+is not live (`prefer_spark_` is false in production), and coupling a transport-cost fix to it would
+stall the fix.
+
+This ADR delivers the tunable and disableable parts now (`--topology-interval`, `--no-topology`,
+`DISABLED`). It structures the pump as schedule, then action, then digest compare, then report, which
+is the Spark-to-Reaction shape. The later conversion replaces only the schedule.
+
+### D12. Server-pull when `/viz` is viewed: deferred
+
+On-change push keeps a changed host's body within about 82 s (72 s pump plus 10 s send delay), and an
+unchanged host's body is current by definition. Pull-on-view would add little.
+
+It would also make a `Response:Read` page view dispatch work to agents, a read causing execution that
+the dispatch-authorization model would have to admit and audit. A future single-host "refresh now"
+would be an explicit operator action with its own gate and audit verb. It would issue
+`__resync__.topology` for one agent, not run as a side effect of a read. Fleet-view pull is rejected
+outright for the same burst reason the dispatch fetcher is removed.
+
+### D13. Observability
+
+Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
+`docs/observability-conventions.md`.
+
+**Agent:**
+- `yuzu_agent_heartbeat_bytes` (histogram);
+- `yuzu_agent_heartbeat_tag_upserts` (histogram per beat);
+- `yuzu_agent_heartbeat_full_tags_total{reason}`, with `register|resync`;
+- `yuzu_agent_commands_executed_total{plugin="__resync__"}` (the existing family);
+- `yuzu_agent_topology_pump_total{outcome}`, with `ok|unchanged|truncated|failed`;
+- `yuzu_agent_topology_reports_total{reason,result}`;
+- `yuzu_agent_topology_report_bytes` (histogram).
+
+**Server:**
+- `yuzu_server_heartbeat_tags_total{via,outcome}`, with `synced|full|diverged|no_base|rejected`;
+- `yuzu_server_tag_resync_total{outcome}`, with `sent|deferred|send_failed`;
+- `yuzu_viz_topology_pushed_total{via,reason}` (gains `reason`);
+- `yuzu_viz_topology_push_parse_errors_total{via}` (unchanged);
+- `yuzu_viz_topology_digest_total{via,outcome}`, with `match|mismatch|no_slot|absent`;
+- `yuzu_viz_topology_resync_total{outcome}`, with `sent|deferred|send_failed`;
+- gauge `yuzu_viz_topology_slots{state}`.
+
+**Gateway:**
+- `yuzu_gw_topology_proxied_total{result}`;
+- `yuzu_gw_heartbeat_coalesced_total` (unchanged; it counts keep-newest replacements, which now
+  predict server-side `diverged` verdicts);
+- `rpc="ProxyTopology"` on the peer-guard metrics;
+- `snapshot_oversize`, `snapshot_evicted` and `heartbeat_invalid` are retired from
+  `yuzu_gw_heartbeat_buffer_dropped_total{reason}`, and their documentation is removed.
+
+**Alerts** (`docs/prometheus/yuzu-alerts.yml`, ticket severity, never paging):
+- `YuzuHeartbeatTagDivergenceSustained`: the `diverged` share stays above 1 % of heartbeats for
+  30 min **while the gateway's coalescing rate is near zero**. Outside an outage, that indicates a
+  canonical-form or agent delta defect rather than a fleet event.
+- `YuzuVizTopologyResyncBacklog`: `deferred` stays above 0 for 30 min.
+
+**Fleet-gauge semantics.** `yuzu_fleet_*` are rebuilt from the merged views. While an agent is
+`no_base` (after a server restart, until its full set lands), its state-derived gauges are absent,
+not zero, and its interval-derived gauges are present. The documented consequence: after a server
+restart, state-derived fleet gauges converge over about one minute (rate-limited full resync) instead
+of one heartbeat.
+
+### D14. Registration replay by ids: the gateway keeps no RegisterRequest
+
+**Why.** This is the no-per-agent-state ruling applied to the largest piece of per-agent state the
+gateway holds. The gateway is a relay. A registration's facts belong to the server, which already
+decides enrollment, owns the route directory (ADR-2002 WS-4) and holds the durable endpoint store.
+Keeping the request so the gateway can replay it later makes the gateway a second, weaker copy of
+server state. That copy is about 87 KB per agent, and it holds a credential.
+
+**What the gateway keeps per agent.** Each item is part of the connection and is justified by a
+reader, not by habit:
+
+| Fact | Why the gateway needs it |
+|---|---|
+| `agent_id` | the routing key for command fan-out and the registry; sent on reattach |
+| `session_id` | heartbeat admission and binding (`yuzu_gw_heartbeat_admission`); sent on reattach for the route-directory CAS |
+| connection, stream and owner references | delivering commands down the agent's own Subscribe stream |
+| `stream_home_id`, owner key | already sent in the CONNECTED notification that follows a reattach (`yuzu_gw_upstream.erl`, `handle_cast({notify_stream_status, ...})` at about l.1442-1478), unchanged |
+| observed peer address | a transport fact only the gateway sees. It fills `RegisterRequest.gateway_observed_peer` today and is sent on reattach so the server's session keeps it. |
+| `connected_at` | management-plane liveness answers |
+
+It keeps **no** hostname, platform, version, plugin list, plugin names, scopable tags, status tags,
+enrollment token, CSR, certificate or attestation.
+
+**Replay becomes reattach.**
+
+```proto
+// GatewayUpstream
+rpc ProxyReattach(ReattachRequest) returns (ReattachResponse);
+message ReattachRequest {
+  string agent_id = 1;
+  string session_id = 2;          // also sent as x-yuzu-session-id, as replay does today
+  string observed_peer = 3;
+}
+message ReattachResponse {
+  bool accepted = 1;
+  string session_id = 2;          // the adopted session
+  ReattachRefusal refusal = 3;    // NO_RECORD | NOT_ENROLLED | SUPERSEDED | MALFORMED_SESSION | DEGRADED
+}
+```
+
+- **Triggers and pacing are unchanged.** `yuzu_gw_upstream`'s replay (described in its module
+  header, "Registration replay: what the server says it does not know") keeps everything it has
+  today:
+  - targeted replay of `unknown_session_ids`;
+  - full replay only on evidence the server lost state;
+  - start jitter (`registration_replay_start_jitter_ms`);
+  - the replay permit pool and concurrency cap (`upstream_replay_concurrency`);
+  - the 60 s full-replay cooldown (`FULL_REPLAY_COOLDOWN_MS`);
+  - re-announcing CONNECTED after an adopt (`yuzu_gw_agent:reannounce/2`).
+
+  Only the payload changes, from a stored request to two ids and a peer address. That removes the
+  `local_error` encode-failure branch of `replay_send/4`.
+- **Server** (`GatewayUpstreamServiceImpl::ProxyReattach`, `server/core/src/gateway_service_impl.cpp`):
+  1. gateway peer authorization (`GatewayPeerGuardedService` override; D7's rule for a new upstream
+     RPC);
+  2. `registration_lock_for(agent_id)`;
+  3. enrollment status read (the existing fast-path read). If the agent is not enrolled, or is
+     denied or revoked, answer `NOT_ENROLLED`. Reattach can never enrol;
+  4. **the same adopt decision ProxyRegister uses** (`renew_leases` / `reclaim_tombstoned_session`
+     CAS, `server/core/src/gateway_route_store.hpp` and its FORWARD NOTE), extracted into one shared
+     function and called from both RPCs. Never a second copy. Whatever ADR-0074 decides about
+     cluster affinity (its Conflict 1) therefore applies to both RPCs at once;
+  5. read the agent's `AgentRegistrationStore` record and its interned plugin set. A missing record
+     answers `NO_RECORD`; a degraded read answers `DEGRADED`, retryable and fail-closed. **Never
+     install a session from partial facts:** an empty plugin list would make dispatch report
+     `plugin_not_found`, and empty scopable tags would silently change scope results;
+  6. install the `AgentSession` from the record, the adopted session id and `observed_peer`.
+
+  The CONNECTED re-announce then sets `gateway_node`, wire capabilities and `stream_home_id`, as
+  today. Status tags and topology are **not** in the record. The next heartbeat is `no_base`, and
+  `__resync__.tags`, then `__resync__.topology`, converge them (D3, D8).
+- **Fallback is re-registration by the agent, not `__resync__`.** On `NO_RECORD` or `NOT_ENROLLED`,
+  the gateway does what it already does for a replay answered `accepted = false`
+  (`yuzu_gw_upstream:replay_send/4`, about l.1964-1976): it disconnects the agent's stream. The agent
+  reconnects with its jittered backoff (D9) and sends a fresh Register, which runs the full
+  enrollment path and writes a new record.
+
+  `__resync__` cannot serve here. It is a Subscribe command, so the server must already hold an
+  installed session to route it, and installing a session without the registration facts is exactly
+  what step 5 refuses.
+- **Authority is unchanged, and stated so it stays that way.** Today's replay presents the stored
+  request, but for an enrolled agent the server takes the fast path and ignores the token. Replay
+  authority already rests on three things:
+  - the gateway's peer authorization;
+  - the agent's durable enrolled status;
+  - the route-directory CAS proving the session's row.
+
+  Reattach rests on exactly those three, so removing the token removes exposure, not a check. When
+  ADR-0074 D5 lands, the agent's per-session signature is a fourth, and it applies to a reattached
+  session as it does to a fresh one: reattach installs a session, and does not exempt it from the
+  session-start proof.
+
+**What the server persists: `AgentRegistrationStore`.**
+- **Placement.** Born on Postgres, schema `agent_registration_store` (ADR-0006/0008 naming,
+  ADR-0012 store contract, `docs/postgres-store-playbook.md`). Construction fails closed per
+  ADR-0007/0012.
+- **Table `registrations`:**
+  - columns: `agent_id TEXT PRIMARY KEY`, `hostname`, `os`, `arch`, `agent_version`, `cluster_id`,
+    `scopable_tags JSONB`, `plugin_set_hash TEXT NOT NULL`, `registered_at BIGINT NOT NULL`;
+  - `registered_at` is authored by Postgres `now()` in SQL, never the replica's clock (the ADR-2002
+    #3715 DB-clock rule);
+  - no secret is stored: no enrollment token, CSR, certificate or attestation.
+- **Table `plugin_sets`:**
+  - columns: `plugin_set_hash TEXT PRIMARY KEY`, `plugins JSONB NOT NULL`;
+  - the PluginInfo list is interned by a SHA-256 over its canonical encoding;
+  - PluginInfo is compiled into the agent, so a fleet has one row per (version, OS, build), not one
+    per agent. Replicas cache rows by hash in memory; the table is immutable per hash.
+- **Writes.** One upsert of the agent's row, plus an insert-if-absent of its plugin set, in one
+  transaction, after every successful fresh registration (direct `Register` and `ProxyRegister`).
+  - It runs after the session is installed and is not on the enrollment decision.
+  - A failed write is logged and counted (`yuzu_server_agent_registration_store_failed_total{op}`)
+    and the registration proceeds. The cost of a lost write is bounded: the agent's next reattach
+    answers `NO_RECORD`, and the agent re-registers.
+  - Reads on reattach fail closed (step 5).
+- **Lifecycle.**
+  - Rows are deleted by the agent decommission/deregistration cascade
+    (`server/core/src/agent_decommission.hpp`), which gains this store as a member.
+  - `plugin_sets` rows are never deleted. They are bounded by the number of distinct agent builds,
+    so no retention pass, and no clock-guarded-retention apparatus, applies.
+- **HA.** The record is fleet-wide, so a reattach succeeds on **any** replica. Today a replay needs
+  the stored request, so it can only come from the gateway that holds it. `OfflineEndpointStore`
+  presence, `gateway_route_store` and `AgentRegistry` presence are unchanged. The registry's
+  per-replica `AgentSession` is rebuilt from the record exactly as from a Register.
+- **Not merged into `OfflineEndpointStore`** (`server/core/src/offline_endpoint_store.hpp`), though
+  both hold hostname, os, arch and version. That store is written on every heartbeat for presence.
+  This one is written once per registration for replay. Separate owners keep the per-heartbeat write
+  narrow. A later change may make the presence store read identity from this one.
+
+**Storm behaviour after a server restart at 100k agents.**
+1. **The gateway replays sessions as ids.** Pacing is the existing replay start jitter and permit
+   concurrency. The server adds a per-replica token bucket, `--reattach-rate`, default 2000/s.
+   Over-rate calls answer `RESOURCE_EXHAUSTED` with a retry hint, and the gateway's replay worker
+   waits and asks again, as it already does for `too_many_streams`. Each reattach costs one lock,
+   one enrollment-status read, one route CAS and one primary-key read, with the plugin set usually
+   cached. That is lighter than today's ProxyRegister replay, which carries a 9 KB, 69-plugin
+   request. 100k agents reattach in about 50 s.
+2. **Tags follow.** `__resync__.tags` runs at 2000/s per replica, about 4 KB each: about 50 s,
+   overlapping step 1.
+3. **Topology follows.** `__resync__.topology` runs at 200/s per replica, about 8 min.
+4. **Agents do not reconnect** in steady state. Reattach is invisible to them. Only `NO_RECORD`
+   agents reconnect, under jittered backoff.
+
+   After this release every agent has registered at least once (no back-compat: agents are
+   upgraded with the server, and the upgraded agent's first connection registers fresh), so
+   `NO_RECORD` is the exception: lost writes, and agents that never re-registered since a
+   decommission cascade.
+
+This is a server restart, not a gateway restart: agents keep their connections, so ADR-0074 D14's
+60-second full-reconnect target is not consumed by it.
+
+**Gateway owner restart.** `yuzu_gw_agent_sup:restore_args/1` (about l.315) restores from the ids
+row, not a stored request, and re-registers through reattach, like any replay.
+
+**Management plane: `ListAgents`, `GetAgent` and `QueryInventory` are retired** (owner ruling
+2026-10-26).
+- **Why.** They are the only readers of the gateway's hostname and plugin data
+  (`yuzu_gw_mgmt_service.erl`: `list_agents/2`, `get_agent/2`, `query_inventory/2`). The server
+  calls only `SendCommand` (`gateway_mgmt_stub_pool.hpp`); a search of `server/core/src` at
+  `dfdffa4c0` finds no call to the other three.
+- **What stays.** `SendCommand` and `WatchEvents` stay live. The three retired RPCs and their
+  request and response messages also stay in `proto/yuzu/server/v1/management.proto` (and the
+  gateway's copy), marked `option deprecated = true;` with a comment naming ADR-0073 (D15: no proto
+  subtraction). The gateway answers them `UNIMPLEMENTED`. The gateway gpb module is regenerated.
+- **Where agent views come from.** The server's REST and MCP surfaces are the only agent views.
+  No back-compat.
+- **Status.** The retirement is gateway-only and may land ahead of the rest of this ADR (slice 0b).
+  It needs no server change, because the server never called these RPCs. It is not on `dev` at the
+  time of writing.
+
+### D15. No proto subtraction (owner ruling 2026-10-26)
+
+"Proto subtractions are breaking, so we should just not use the field, not remove it from the
+protobufs." Nothing this ADR retires is deleted or `reserved`:
+- `HeartbeatRequest.status_tags` (3) and `fleet_snapshot_json` (4): `[deprecated = true]`, not
+  populated, ignored;
+- management `ListAgents`, `GetAgent`, `QueryInventory`: `option deprecated = true;`, the gateway
+  answers `UNIMPLEMENTED`; their request and response messages: `option deprecated = true;`, unused.
+
+Each carries a comment naming ADR-0073. New fields, messages and RPCs are added as usual. The ruling
+is about the schema only; behaviour toward old agents is still no back-compat (D10). `proto/buf.yaml`
+enforces it with the `*_NO_DELETE` breaking rules.
+
+### D16. Relationship to ADR-0074
+
+ADR-0074 is the transport-security and topology decision for the same gateway. This ADR changes what
+crosses the agent connection; ADR-0074 changes how the connection is authenticated and where it
+lands. The two are kept consistent as follows.
+
+- **Budget.** ADR-0074 D14 is the budget this ADR is measured against: 100,000 idle agents per
+  8-core, 16 GB gateway, and the 64 KiB-per-agent CI regression check including the kernel. This ADR
+  removes the per-agent payload terms (the snapshot binary, the tag-decode heap, the retained
+  Register). It does not by itself meet the check; the remaining live state (TLS, the Cowboy
+  connection, the relay, the inet port and buffer, the index rows) is addressed by ADR-0074's memory
+  measures and kTLS (its D8).
+- **State.** Both ADRs use the same rule: no per-agent state beyond the connection. Fleet-level state
+  any gateway could rebuild is allowed (ADR-0074's Conflict 5, decided 2026-10-28).
+- **Signing.** Under ADR-0074 D5 the server signs every command and the agent signs every result;
+  liveness heartbeats stay unsigned. So the tag delta and the topology digest, which ride the
+  heartbeat, carry no integrity beyond the agent's session. A compromised gateway could therefore
+  alter or drop them. The consequence is bounded: dropping or altering a delta makes the server's
+  digest check fail and triggers a signed `__resync__.tags`, and a forged digest can only keep a
+  topology slot looking fresh (`confirmed_at`) or force a body request. Whether `ReportTopology` is
+  signed as a result is left to ADR-0074 D5's final scope.
+- **Gateway choice.** ADR-0074 lets agents move freely between gateways. Reattach adds no gateway
+  affinity: a reattach succeeds on any server replica (D14, *HA*), and its adopt decision is the one
+  ProxyRegister uses.
+
+## Considered options
+
+1. **Keep the body and the full tag map on the heartbeat** (status quo). Rejected. Liveness carries
+   bulk, and the gateway retains both terms as garbage: about 475 KiB binary plus about 310 KiB heap
+   per TLS connection in the harness, far above ADR-0074 D14's 64 KiB check.
+2. **Agent-only topology hash-skip** (attach the body only on content change, no server change).
+   Rejected. Both topology liveness rules are keyed on body arrival, so every quiet host goes stale
+   at 90 s and its IP claim lapses at 300 s, a quiet anti-spoof regression.
+3. **ADR-0016 daily sync for topology.** Rejected. ADR-0016 deliberately excludes volatile data (IP
+   addresses included) from hashed sources, and its cadence is daily. Its principle is adopted; its
+   transport is not.
+4. **Server-pull as the topology main path.** Rejected. At 10k agents × 150 KB, one refresh is a
+   1.5 GB burst through the Subscribe streams. Pull-on-view as an addition is deferred (D12).
+5. **Topology digest as a status tag** (the ruling's wording). Not chosen; D5 gives the reasons.
+6. **Back-compat** (keep parsing fields 3 and 4, fall back on `UNIMPLEMENTED`). Rejected by owner
+   ruling. It would also keep every path this ADR deletes.
+7. **Tag deltas without a digest** (sequence numbers and acks only). Rejected. The gateway
+   acknowledges heartbeats before the server sees them, and it coalesces and can drop them. A
+   sequence scheme would need the server's ack to travel back through the gateway on every beat,
+   which is per-agent gateway state or a new round trip. A state digest detects every loss and
+   coalescing effect at the receiver with an opaque gateway.
+8. **Server-opaque tag digest** (trust the agent's digest, as topology does). Rejected for tags. The
+   server's merged view *is* the product here, and only a server-side recomputation proves it equals
+   the agent's set. The shared `common/include` function removes the two-implementation hazard that
+   made opacity attractive for topology.
+9. **Every tag on change, including perf and net.** Rejected. Interval values are per-interval
+   measurements whose absence is meaningful. Merging would publish stale rates as current.
+10. **Longer heartbeat** (60-120 s). Deferred. With deltas, the beat is small, and the interval tags'
+    30 s semantics (`/network`, `/dex` performance) would change with it. That is its own decision.
+11. **Resync flags in `HeartbeatResponse`, delivered through per-session gateway bits.** This was
+    the previous draft. Rejected by owner ruling (no per-agent gateway state). The alternatives
+    weighed for the replacement are in D8: (a) a synchronous-response piggyback or a check unary,
+    (c) a periodic agent full set, (d) a forced reconnect.
+12. **Topology delta encoding** (send only changed rows). Deferred until D13's
+    `yuzu_agent_topology_pump_total{outcome}` shows busy hosts dominate bytes.
+13. **Topology body over the Subscribe stream.** Rejected. It puts bulk on the longest-lived flow; a
+    unary gets its own admission, cap and failure semantics.
+14. **Delta-aware gateway coalescing** (compose older and newer deltas in the buffer). Rejected by
+    owner ruling (no parsing in the gateway). Keep-newest plus server-side digest repair costs one
+    resync per changed agent after an outage, and nothing in steady state.
+15. **Typed `StatusTags` in the heartbeat.** Rejected for `bytes` (D2), so the gateway never decodes
+    tags.
+16. **Keep the Register once at the gateway** (a registry row read by replay; about −29 KiB).
+    Rejected. It still keeps per-agent registration state and the enrollment token, and only removes
+    a duplicate.
+17. **Keep the encoded Register as one refcounted binary** (about 9 KB, decoded on replay).
+    Rejected for the same reasons. Smaller, but still per-agent state and a credential.
+18. **Persist the verbatim RegisterRequest at the server.** Rejected. It would put the enrollment
+    token, CSR and attestation at rest as a plain column (ADR-0010 forbids secrets as plain
+    columns), and it is opaque to the queries the record will serve. The store keeps the derived
+    facts only.
+19. **Reattach by asking the agent to re-register** (always, not only as a fallback), through
+    `__resync__` or a forced disconnect.
+    - `__resync__` cannot reach an agent whose session is not yet installed (D14).
+    - A forced disconnect of 100k agents after every server restart costs 100k TLS handshakes and
+      full enrollment paths, where a primary-key read suffices. It would also spend ADR-0074 D14's
+      reconnect budget on every server restart.
+    - Kept only as the `NO_RECORD` fallback.
+
+## Consequences
+
+### Upgrade (breaking)
+
+`docs/user-manual/upgrading.md` gains: "⚠️ Breaking: the heartbeat carries status-tag changes and a
+topology digest; fleet topology moved to its own RPC — upgrade server, gateways and agents together".
+It should say:
+- the order: server, then gateways, then agents, in one maintenance window;
+- un-upgraded agents keep connecting and executing commands, but contribute **no** status tags and no
+  topology until upgraded (absent from fleet gauges, DEX performance, `/network`, Spark and Guardian
+  health, and `/viz`);
+- after a server restart, state-derived gauges converge over about a minute and topology over several
+  minutes;
+- the new flags: `--topology-interval`, `--no-topology`, `--tag-resync-rate`,
+  `--topology-resync-rate`, `--reattach-rate`;
+- `yuzu.uptime_s` is replaced by `yuzu.started_at`;
+- the gateway management RPCs `ListAgents`, `GetAgent` and `QueryInventory` stay in the proto,
+  deprecated, but the gateway answers them `UNIMPLEMENTED`; use the server's REST or MCP agent views;
+- a gateway from before this release cannot reattach to the new server (no `ProxyReattach`), and
+  the new gateway cannot replay to an old server.
+
+The *Version Compatibility* table's row states minimum agent and gateway versions equal to this
+release. Changelog: one fragment, `changelog.d/<PR#>-liveness-heartbeat.changed.md`, with the bold
+lead "**Breaking: liveness-only heartbeat**". It names the deprecated, no-longer-populated fields,
+the new RPCs, the tag-delta semantics and the upgrade-together requirement. `CHANGELOG.md` is not
+edited.
+
+### Gateway memory
+
+Idle connections stop receiving:
+- a 50-800 KB body every 30 s;
+- a ~97-tag map every 30 s.
+
+A quiet host sends six interval tags, a digest and about 70 bytes of topology digest each beat, one
+body per 12-18 min, and changes.
+
+Expectation, to be measured rather than claimed:
+- the binary term falls as in the no-snapshot runs (TLS 475 to about 38 KiB);
+- the tag-decode heap term (about 310 KiB TLS) shrinks in proportion to bytes decoded per beat;
+- the per-session buffer entry shrinks (it holds an opaque binary, not a decoded tag map);
+- **live state falls by the retained Register (D14).** In the ledger that is about 87 KB per agent
+  of 131.8 KiB (the two registration rows, `agent_info`, and the plugin-name lists). The plugin-count
+  dependence goes with it.
+
+**No per-agent gateway state is added, and about two thirds of today's per-agent live state is
+removed.** The gateway decodes fewer fields per heartbeat than today.
+
+**This alone does not meet ADR-0074 D14's 64 KiB check.** With the Register gone, the ledger's
+remaining live state is about 45 KiB of BEAM terms:
+- OTP ssl, about 19 KiB;
+- the Cowboy connection, about 9 KiB;
+- the relay, the inet port and buffer, and the index rows.
+
+The check is all-in, so the kernel's per-connection memory and allocator slack count on top of that.
+Closing the rest is ADR-0074's work: its memory measures and kTLS at the agent edge (its D8). This
+ADR is a precondition for that work, because without it the payload terms dominate any measurement.
+
+**Bandwidth.** At 10k agents and 150 KB bodies, topology falls from about 50 MB/s to about 1.7 MB/s
+plus churn. Tags fall from about 4 KB to a few hundred bytes per beat.
+
+### Server stores
+
+**`AgentHealthStore`** (`server/core/src/agent_registry.{hpp,cpp}`):
+- `apply()` with interval and state maps and per-agent sync state;
+- `perf_snapshot` and `net_snapshot` read the interval map;
+- `recompute_metrics` reads both;
+- the per-heartbeat hooks (corruption sink, Guardian reconcile) run on the merged view after
+  `apply` (D3);
+- the 90 s prune is unchanged.
+
+**`FleetTopologyStore`** (`server/core/src/fleet_topology_store.{hpp,cpp}`):
+- the D6 slot fields;
+- `push_snapshot(raw, digest, reason)`;
+- `confirm()`;
+- `mark_disconnected` replaces `evict_pushed`;
+- `stale_reason`;
+- age rebasing;
+- the `Fetcher` seam is removed;
+- the `kPushedMapHardCap` LRU orders by `body_received_at`.
+
+Both stores stay in-memory and per-replica. HA gets cleaner, not worse: a replica that lacks a base
+or a body asks for it, rate-limited. A shared store is neither needed nor decided here.
+
+### Consumers
+
+- **DEX performance and `/network`:** unchanged semantics. They read interval tags, which are still
+  sent and replaced every beat. `network.md`'s interval-delta and absent-not-zero statements stay
+  true.
+- **After a gateway upstream outage:** agents whose state tags changed during the outage diverge
+  once (keep-newest coalescing) and are resynced at the configured rate (D4).
+- **Guardian:**
+  - generation reconcile still fires every heartbeat, from the merged view;
+  - its `yuzu.guardian_*` fleet gauges are unchanged once synced;
+  - a diverged agent shows its last verified values for up to about one minute.
+- **Spark:** the ABSENT posture travels as explicit removals.
+- **Fleet gauges:** unchanged values in steady state. After a server restart they are briefly absent
+  for `no_base` agents (D13).
+- **Viz:**
+  - a non-stale host's topology is at most one pump interval plus 10 s behind, plus the 60 s render
+    cache;
+  - `stale` carries a reason;
+  - MCP `fresh=true` bypasses only the render cache and never dispatches.
+- **MCP tools:** `get_fleet_topology` and `get_host_topology` gain `stale_reason` in their typed
+  output schema (A5), with updated descriptions. REST `/api/v1/viz/fleet/topology` matches.
+
+### Security
+
+- **Enrollment tokens leave gateway memory.** Today each connected agent's token is held twice in
+  ETS for the whole session, only for replay.
+- **Reattach is a new gateway-upstream RPC.** It gets a peer-guard override, an `rpc` label and a
+  test row.
+- **Its authority is unchanged and cannot enrol** (D14). The same enrolled-status read and the same
+  shared adopt CAS gate it.
+- **`AgentRegistrationStore` holds no secret** (ADR-0010).
+- **Heartbeat content is unsigned** under ADR-0074 D5; D16 states what a compromised gateway can and
+  cannot do with that.
+- **Quarantine containment is unchanged:**
+  - a reattach installs a session exactly as a replay-adopt does, so the heartbeat-driven
+    reconnect reconciler (#3425) applies;
+  - no quarantine-store read is added to the reattach path, matching the rule for `Register`.
+
+### Privacy
+
+The process user and redacted cmdline cross the gateway on change and roughly every 15 min, instead
+of every ~30 s. The content is unchanged.
+
+### Tests
+
+**Shared function:**
+- the `status_tag_digest` canonical form, including empty-set and ordering cases;
+- the class table's completeness: every key the agent core can emit is listed.
+
+**Agent:**
+- delta computation, including removals, base-only-on-ack, and full-on-Register and full-on-resync;
+- the `__resync__` decision function, dedup claim, and terminal recorded before the write;
+- the topology send rules, with an injected RNG for jitter bounds, never timing.
+
+**Server:**
+- `ProxyReattach`: adopt via the shared decision (one function, called by both RPCs); every refusal;
+  fail-closed on a degraded record read; never installs from partial facts; the rate limit;
+- `AgentRegistrationStore` under the ADR-0012 test conventions (`YUZU_REQUIRE_PG_DB`): upsert, plugin
+  interning, the decommission cascade, DB-authored timestamps;
+- the `apply` outcomes (synced, full, diverged, no_base, rejected), and the moved tag caps;
+- keep-newest loss producing `diverged` and then `__resync__.tags`;
+- the `resync-*` exec-tracker skip;
+- the catalogue pair's system-only refusal at operator surfaces;
+- hooks firing on unchanged-tag heartbeats (generation reconcile, corruption sink);
+- interval replace semantics (a missing net tag disappears);
+- the D6 confirm, mismatch, grace, `stale_reason`, retain-on-disconnect, re-claim and conflict
+  cases;
+- resync rate limits.
+
+**Gateway eunit:**
+- a heartbeat's `status_tags_pb` and `topology` pass through byte-identical;
+- keep-newest replaces the whole entry;
+- no gateway code path reads either field (a lexical test, like the existing peer-guard
+  registration gate);
+- no RegisterRequest is retained (registry row, owner-sessions row, owner state). A size test on the
+  per-agent rows is part of the harness;
+- replay sends `ProxyReattach` with exactly the three fields;
+- `NO_RECORD` and `NOT_ENROLLED` close the agent's stream;
+- owner restart restores from ids;
+- the management service serves only `SendCommand` and `WatchEvents` (the three deprecated RPCs
+  answer UNIMPLEMENTED);
+- `ProxyTopology` admission, permit pool, cap, no buffering and peer-guard row;
+- collect-after-64 KiB;
+- the gateway tests that assert `yuzu.uptime_s` are updated.
+
+**Elsewhere:**
+- `buf breaking` passes with no exemption (nothing is subtracted; fields 3 and 4 and the three
+  management RPCs remain, deprecated);
+- a lexical test that no non-generated source reads or writes heartbeat fields 3 or 4 (D3);
+- a UAT rig check that a quiet agent stays synced and non-stale for 30 min with one or two bodies
+  sent;
+- the idle-memory harness rerun with ADR-0074 D14's method (OS anonymous memory plus kernel, after
+  settling, TLS on) at 5,000 and 10,000 agents, as the recorded before/after.
+
+### Routed concerns and agents this touches
+
+- **Network quality** (`docs/user-manual/network.md`): `security-guardian` and `docs-writer`. The
+  `yuzu.net_*` heartbeat block's wire envelope changes, and its interval semantics and `kNetTag*`
+  pins must be shown unchanged.
+- **Guardian / Guaranteed State and DEX** (the `__observation__` / `kDexCohortFloor` row):
+  `security-guardian` and `docs-writer`, for the `yuzu.guardian_*` and `yuzu.dex_*` / `yuzu.perf_*`
+  carriage and the reconcile hook.
+- **Spark detection layer:** `security-guardian` and `cpp-safety`, for the Spark fleet-tag emit
+  site and its ABSENT posture.
+- **Fleet visualization** (`docs/fleet-viz-invariants.md`): `security-guardian` and `docs-writer`.
+  The push-ingestion invariants are rewritten. The trust boundary, shared parser, IP-spoof and audit
+  invariants are preserved.
+- **Gateway-upstream peer authorization:** `security-guardian`, `cpp-safety`, `architect` and
+  `docs-writer`, for the `ProxyTopology` and `ProxyReattach` overrides.
+- **`common/include/` firewall (#2549):** `architect` and `security-guardian`, for the two new pure
+  headers (no I/O; no CLAUDE.md annotation change needed).
+- **Durable agent command idempotency** (`docs/command-dedup.md`): `cpp-safety` and `architect`, for
+  the new `__resync__` reserved dispatch (dedup-claimed, terminal before write).
+- **Executions-history ladder:** the `resync-` skip in `notify_exec_tracker`.
+- **Dispatch-caller approval provenance / ExecuteGate:** `security-guardian` and `cpp-safety`, for
+  the two system-only catalogue pairs and confirmation that no new `DispatchCaller` site exists.
+- **Prometheus metrics and alert rules** (`docs/observability-conventions.md`): `sre` and
+  `architect`.
+- **TAR** (`tar_fleet_snapshot`, schema minor): `architect`, `plugin-developer`.
+- **Erlang gateway:** `gateway-erlang`, for the gpb regen, keep-newest opacity, moving the tag
+  checks out, replay-as-reattach, the owner-restart path, and the management-RPC retirement.
+- **Server storage substrate (Postgres):** `architect` and `sre`, for the born-on-PG
+  `AgentRegistrationStore` (ADR-0012 contract, playbook, a migration-ladder row) and the
+  decommission cascade.
+- **Authentication and enrollment:** `security-guardian`. The `ProxyReattach` enrollment gate must
+  stay equivalent to the ProxyRegister fast path, and the token leaves gateway memory.
+- **HA WS-4 route adoption** (ADR-2002, `gateway_route_store.hpp` FORWARD NOTE): `security-guardian`
+  and `cpp-safety`. The adopt decision is extracted into one function shared by ProxyRegister and
+  ProxyReattach.
+- **PKI / gateway management plane** (the rows naming `yuzu_gw_mgmt_service.erl`):
+  `security-guardian` and `gateway-erlang`, for retiring three RPCs on the `:50063` management
+  surface (deprecated, answering `UNIMPLEMENTED`). Its peer check and `SendCommand`/`WatchEvents` are
+  unchanged.
+- **Device quarantine / containment:** `security-guardian`, to confirm the reattach path adds no
+  synchronous quarantine read and keeps the reconnect reconciler semantics.
+- **All C++:** `cpp-expert` and `cpp-safety`.
+- **Proto and cross-module shape:** `architect`.
+
+### Docs to update in the implementing PRs
+
+- `docs/fleet-viz-invariants.md`: push-ingestion section and the Metrics fetch-histogram bullet.
+- `docs/user-manual/network.md`: the carriage note; the semantics are unchanged.
+- `docs/user-manual/gateway.md`: the heartbeat batching text (about l.199-227); registration replay
+  becomes reattach; the live management RPCs are `SendCommand` and `WatchEvents`, the other three
+  deprecated and `UNIMPLEMENTED`.
+- `docs/user-manual/metrics.md`.
+- `docs/observability-conventions.md`: the heartbeat-buffer drop reasons (about l.109), plus the new
+  families.
+- `docs/user-manual/rest-api.md` and `docs/user-manual/mcp.md`: `stale_reason` and freshness.
+- `docs/command-dedup.md`: the dedup tags are carried as state; `__resync__` is a second
+  dedup-claimed reserved name alongside `__sync__`.
+- `docs/user-manual/upgrading.md`.
+- `docs/architecture.md`, `docs/capability-map.md` and `docs/erlang-gateway-blueprint.md`: mark
+  `ListAgents`, `GetAgent` and `QueryInventory` deprecated and `UNIMPLEMENTED` on the gateway
+  management surface (slice 0b's own PR).
+- `docs/postgres-migration-ladder.md`: the `AgentRegistrationStore` row.
+- `docs/auth-architecture.md`: the gateway no longer holds enrollment tokens; reattach authority.
+- The agent CLI reference.
+- The ADR-2002 incident paragraph: a pointer to this ADR.
+
+The same changes fix known truth-drift:
+- the proto comment's "5-20 KB" and "once per two heartbeats" (`agent.proto:155-159`);
+- `fleet_topology_store.hpp:194` ("invalidates the cache");
+- `fleet-viz-invariants.md`'s "whose `ts`" and "5-20 KB struct";
+- the `server.cpp` "60 s cache" comment on `claimed_ips()` (about l.19169).
+
+## Implementation slices
+
+Small PRs, in order. Slices 0-2b are wire-compatible and can land early. Slices 3-10 are the breaking
+release and merge to `dev` inside one release window. ADR-0074 gates its own waves at 5,000 agents
+(its Conflict 7); the measurements in slices 1 and 10 use the same counts.
+
+0. **Gateway: collect after any request of 64 KiB or more** (`yuzu_grpc_stream_h.erl`). Interim and
+   independent; measurable on the harness at once.
+0b. **Gateway: retire management `ListAgents`, `GetAgent` and `QueryInventory`** (D14, D15). It
+    includes the proto deprecation (`option deprecated = true;`, the gateway answering
+    `UNIMPLEMENTED`; nothing deleted), the gpb regen, the eunit updates, and the docs
+    (`architecture.md`, `capability-map.md`, `erlang-gateway-blueprint.md`, `user-manual/gateway.md`).
+    It is independent of every other slice.
+1. **Agent jitter and measurement.**
+   - Jittered heartbeat and pump sleeps (D9).
+   - `yuzu_agent_heartbeat_bytes`, plus a would-be-delta histogram computed locally. That measures the
+     tag saving before the wire changes.
+   - An audit that no server heartbeat-age threshold sits under 1.2 × 30 s plus margin.
+2. **Shared pure headers and TAR digest.**
+   - `common/include/yuzu/status_tag_classes.hpp` and `status_tag_digest.hpp`, with completeness
+     and canonical-form tests.
+   - TAR `content_digest` (`schema_minor` bump) and its classification list.
+   - The pump records digest, `last_pump_at` and outcome.
+2b. **`AgentRegistrationStore`, written on every successful registration** (direct and gateway).
+    It is additive and wire-compatible, so it can land early. Records accumulate before anything
+    reads them.
+3. **Proto and gpb.**
+   - `StatusTags` (carried as `bytes`), `TopologyDigest`, `ReportTopology`, `ProxyTopology` and
+     `ProxyReattach`.
+   - Mark heartbeat fields 3 and 4 `[deprecated = true]` (not removed, D15), and add Register
+     field 8.
+   - Regenerate the gateway gpb modules.
+   - The minimal compiling removal of every field-3/4 reader and writer.
+
+   The tree is coherent but tags and topology are inert until slices 4-9 land.
+4. **Server tags.** `AgentHealthStore::apply`, the D3 ingestion order (including the tag caps moved
+   from the gateway), hooks on the merged view, server tag metrics, and the divergence alert.
+5. **Agent tags.** State and interval maps, the base and delta, full on Register,
+   `yuzu.started_at`, `yuzu.uptime_s` removed, agent tag metrics.
+6. **`__resync__`, both ends.**
+   - Agent: reserved dispatch, decision function, dedup claim.
+   - Server: minting, per-replica rate limits and per-agent intervals, the exec-tracker skip, the
+     catalogue pairs, and the operator-surface refusal.
+
+   Covers both `tags` and `topology`; the `topology` action is inert until slice 8.
+7. **Gateway opacity.** Keep-newest whole-heartbeat coalescing; the per-tag checks and
+   `heartbeat_invalid` removed; pass-through and lexical eunit.
+7b. **Reattach, both ends.**
+    - Server: `ProxyReattach` with the shared adopt function, its rate limit, and the peer-guard
+      override.
+    - Gateway: replay sends ids; all three Register copies and the plugin-name lists removed; owner
+      restart from ids; `NO_RECORD` closes the stream.
+    - Agent: reconnect backoff with full jitter.
+8. **Server topology.** `ReportTopology`, digest confirm, the D6 slot changes, `stale_reason`,
+   retain-on-disconnect, age rebasing, the topology resync trigger, the fetcher removed, server
+   topology metrics.
+9. **Gateway topology and agent sender.**
+   - Gateway: `report_topology/2` with its permit pool and cap, `ProxyTopology`, the peer-guard
+     override.
+   - Agent: the per-connection sender (D7), pump default 60 s, `--topology-interval` and
+     `--no-topology`.
+10. **Surfaces and docs.**
+    - MCP and REST `stale_reason` and descriptions.
+    - Both alert rules.
+    - Every doc listed above, the upgrading.md section and the changelog fragment.
+    - The harness and rig rerun recorded as the measured outcome, using ADR-0074 D14's method.
+
+## Open points for the owner
+
+1. **Typed `TopologyDigest` field instead of a status tag** (D5). Recommended. Under tag deltas, a tag
+   would also churn the state digest on every pump.
+2. **Retain-on-disconnect for 300 s** replaces evict-on-disconnect (D6). It amends a fleet-viz
+   invariant (UP-5). IP claims are still released immediately; a `disconnected` cube lingers up to
+   five minutes.
+3. **Removing the legacy dispatch fetcher** (D10). Cold start becomes placeholders that fill over
+   minutes.
+4. **`StatusTags` carried as `bytes`** (D2). Opacity by type. The cost is a nested-serialization
+   idiom unusual in this proto set.
+5. **The gateway's per-tag checks move to the server** (D3, D4). The gateway protects the server
+   only from an oversize heartbeat.
+6. **Keep-newest coalescing** (D4). An upstream outage costs one tag resync per agent whose state
+   changed during it.
+7. **A new `AgentRegistrationStore` rather than widening `OfflineEndpointStore`** (D14). They have
+   different write cadences and owners, at the cost of some overlapping columns.
+8. **Registration-store write failures are set-and-proceed** (D14). The agent still registers; the
+   cost is a later re-registration on reattach.
+9. **`observed_peer` stays at the gateway and is sent on reattach.** It is the one registration-time
+   fact the server cannot rebuild.
+10. **`yuzu.uptime_s` retired for `yuzu.started_at`** (D1).
+11. **Pump default 60 s**: changed-host topology lags up to about 82 s instead of about 40 s.
+12. **Unsigned heartbeat content** (D16). Accept that a compromised gateway can alter tag deltas and
+    topology digests, bounded by the digest check and signed resync, as ADR-0074 D5 accepts for
+    liveness.
