@@ -276,7 +276,7 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   dynamic-DLL LOAD assertion** (Linux builds+links only); it is skipped when the Wee Tam pool is
   unhealthy, so branch protection must treat a skipped Windows context as NOT-pass, and a CI presence
   tripwire should guard the canary from silently ceasing to run (#4296). **WS-B2 follow-ups surfaced by this round:** feature-gate
-  Drogon to a server vcpkg feature (agent/ASan/cross legs currently build it unused; #4295), a
+  Drogon to a server vcpkg feature (PARTIAL for #4295: `vcpkg.json`'s default-on `server` feature now owns drogon, libpq and xmlsec, and the two agent Dockerfiles opt out; every other leg, including the agent-only nightly Windows ASan job, still installs the default set and so still BUILDS Drogon until it adopts `--x-no-default-features`; see `docs/build-guide.md` "Dependency features"), a
   STL-marshalling canary + a `dumpbin`/`ldd` import-provenance assertion, the Drogon+gRPC coexistence
   link test, and adding Drogon/trantor/jsoncpp to `NOTICE`'s third-party attribution list once a shipped
   binary links them. (Drogon's transitive tree already appears in the release SBOM today — `release.yml`'s Syft
