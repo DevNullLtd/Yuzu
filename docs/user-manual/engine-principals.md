@@ -50,6 +50,13 @@ Every mutating operation on this surface requires:
 Dashboard: Settings → **Engine Principals** → fill in Slug, Display Name,
 Owner, Classification, Justification → Create.
 
+The panel needs `EnginePrincipal:Read`, the same permission as
+`GET /api/v1/engine-principals`. With RBAC disabled that means an administrator
+account; with RBAC enabled it means the grant (the built-in `Administrator`
+and `Viewer` roles hold it), so an account administrator who has been given a
+role without it sees "You do not have permission to view this panel" instead of
+the list. The Settings page itself still opens for administrator accounts only.
+
 If the list or an engine principal's credentials cannot be read (for example
 while the database connection pool is exhausted), the panel says so: an
 "unavailable" notice replaces the table, or the Active Creds cell shows

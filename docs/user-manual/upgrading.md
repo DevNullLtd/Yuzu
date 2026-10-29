@@ -2,6 +2,20 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: the Settings Engine Principals panel decides like `GET /api/v1/engine-principals` (#5882)
+
+**What changed.** The Settings **Engine Principals** panel (`GET /fragments/settings/engine-principals`) used to admit exactly the callers the `/settings` page admits (an effective administrator). It now gates on `EnginePrincipal:Read`, the permission the REST route and the `list_engine_principals` MCP tool already use, so the panel and the route agree for every caller. No permission, role or topology-floor entry changed.
+
+**Who is affected.**
+- With RBAC enabled, an account administrator who does not hold `EnginePrincipal:Read` (for example one holding only a custom role) is now refused on the panel and sees a "You do not have permission to view this panel" note where the list was. Grant `EnginePrincipal:Read` (the built-in `Administrator` and `Viewer` roles hold it) to restore the list.
+- With RBAC enabled, a non-administrator who holds `EnginePrincipal:Read`, such as a `Viewer`, can now `GET` the panel URL and read the list, exactly as they can already read `GET /api/v1/engine-principals`. The `/settings` page itself is still administrator-only, so such a user reaches the panel only by its URL.
+- An administrator's MCP-tier token now reads the panel URL as it already read the REST route (the route admits a token on its creator's authority). Before, the panel refused every MCP-tier token. A plain API token was already admitted and still is.
+- With RBAC disabled nothing changes: only administrator accounts (and their tokens, per the previous point) are admitted.
+
+**Audit.** A refused browser session writes no `auth.permission_required` row on the panel, because it loads on every page view; a refused API token or engine credential still does. An engine session is refused with an `engine_principal.list` denial row, as on the REST route.
+
+**Rollback.** Rolling back restores the administrator-only panel gate; no data is migrated.
+
 ## Behaviour change: a refused or unusable RHEL entitlement directory pauses the licence sync for that host
 
 **What changed.** This is an agent change on Linux. The `license_scan` plugin now reads `/etc/pki/entitlement` in-process instead of running `openssl x509`. `entitlement_certs` is an authoritative surface, so an error on it keeps the last good state and skips that day's `software_licensing` sync for the whole host: its RPM/dpkg, FlexLM and entitlement rows all stay at their last synced values until the cause is cleared. Three causes newly pause the sync. A directory the agent may not list is now `cert_permission_denied` (result status `PERMISSION_DENIED`); before, it read as an empty surface and the daily sync wiped the host's stored entitlement rows while the other rows kept syncing. A `.pem` larger than 64 KiB is now a parse failure for that file; the `openssl` runs parsed any size. A directory or file past the new scan limits also pauses it: more than 4,096 directory entries or 64 certificate files, or more than 16 certificates in one `.pem`; the scan also stops starting new files after 10 seconds, where it was 60. An unreadable, empty or unparseable `.pem` already paused the sync before this release.
