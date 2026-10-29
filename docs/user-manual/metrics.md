@@ -288,6 +288,13 @@ The `/crypto` Yuzu-issued certificate reads (`GET /api/v1/crypto/ca/stats`, MCP 
 
 The same counter, its other sources and the per-degrade log sampling are described in [Inventory](inventory.md). Two alerts read it: `YuzuInventoryReadDegraded` (any source, per `reason`, for 5 minutes) and **`YuzuCryptoCaReadDegraded`** (`sum(rate(yuzu_inventory_read_degrade_total{source="ca_issued"}[5m])) > 0` for 15 minutes, warning): the Yuzu-issued widgets have answered `503` for long enough to need a person. Split it by `reason`: `admission_full` means too many concurrent `/crypto` reads (a poll storm) or a pool of 3 connections or fewer, so raise the pool or find the caller; `pool_acquire_timeout` and `query_error` are database faults, so check the `yuzu_pg_*` pool metrics and the server's `CaStore` warnings (they carry the database error; sampled: the first of an episode, then every 100th). A `query_error` whose warning reads `canceling statement due to statement timeout` on every read is not a transient fault: the counts statement has outgrown its 5 s bound (it is sized for about a million live certificates, ADR-0053 "Update (2026-10-20)"), and retrying does not help; `store_not_open` means the CA store did not open at boot. See [Crypto: Failure behavior](crypto.md#failure-behavior), which is also the alert's `runbook_url`.
 
+## Inventory purge metrics (typed-source hygiene)
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_inventory_typed_purge_rows_total` | counter | Stray typed-source rows removed from the generic inventory store by the once-per-boot background purge. Present at 0 on every boot; non-zero only after an upgrade or rollback that left such rows. |
+| `yuzu_inventory_typed_purge_failures_total` | counter | Background typed-source purge passes that gave up: a batch kept failing (closed store, pool timeout, SQL error, 20 s statement timeout) through its retries, which halve the batch size down to 100 rows, or typed rows stayed locked by another session across the retries (the locked path retries with backoff but does not halve). A restart re-runs the pass. No alert ships for it: stray rows are already unreadable (the read filter is the control), the pass is hygiene, and it runs once per boot, so a rate or sustained-value rule has nothing to measure; check it after an upgrade if the warning `Typed-source purge failed` appears. See [Inventory](inventory.md). |
+
 ## Executions event-outbox metrics (HA WS-2a)
 
 The durable `event_outbox` (ADR-2002 §5) shadows the execution-history SSE events and,

@@ -2314,6 +2314,17 @@ public:
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error",
                                   "invalid_key", "stale"})
             metrics_.counter("yuzu_inventory_ingest_dropped_total", {{"reason", reason}});
+        metrics_.describe("yuzu_inventory_typed_purge_rows_total",
+                          "Stray typed-source rows removed from the generic InventoryStore by the "
+                          "once-per-boot background purge",
+                          "counter");
+        metrics_.describe("yuzu_inventory_typed_purge_failures_total",
+                          "Background typed-source purge passes that gave up after a failed batch or "
+                          "rows that stayed locked by another session (retried with backoff "
+                          "first); stray rows stay unreadable regardless",
+                          "counter");
+        metrics_.counter("yuzu_inventory_typed_purge_rows_total");
+        metrics_.counter("yuzu_inventory_typed_purge_failures_total");
         metrics_.describe("yuzu_inventory_query_truncated_total",
                           "Generic InventoryStore query() calls whose result hit the effective "
                           "row limit or aggregate byte cap - more rows may exist past what was "
@@ -7769,21 +7780,15 @@ public:
                 // Defence-in-depth purge (adjudication P1): a typed source's rows
                 // never belong in the generic store — is_typed_inventory_source is
                 // the PRIMARY control (the gateway ProxyInventory generic-blob loop
-                // skips these sources outright); this sweep is hygiene for a
-                // newer-agent/older-server window where a typed blob landed here
-                // before the exclusion took effect (or before a source was
-                // promoted to typed at all). Never fails closed on a purge miss —
-                // the exclusion and the read filter, not the purge, are what a caller
-                // must rely on.
-                // Iterates kTypedInventorySources, the one list the gateway skip and
-                // the read filter also use; never a second hand-written list here.
-                for (const std::string_view s : kTypedInventorySources) {
-                    if (!inventory_store_->delete_source(s))
-                        spdlog::warn("[PG] Boot purge: InventoryStore::delete_source(\"{}\") "
-                                     "reported failure (non-fatal — hygiene sweep, not a startup "
-                                     "gate)",
-                                     s);
-                }
+                // skips these sources outright) and the read filter makes any stray
+                // row unreadable (ADR-0070 D12); the purge is hygiene that reclaims
+                // the space. It runs in the BACKGROUND, bounded and batched, and is
+                // never awaited before serving, so boot no longer blocks on an
+                // unbounded DELETE per source. The thread is started in run()'s own
+                // body after the startup_failed_ recheck, NOT here: ~16 store
+                // constructions follow and a throw would destroy a joinable
+                // std::thread (std::terminate) -- see the start site and
+                // tests/test_typed_purge_wiring_lexical.py.
             }
         }
 
@@ -8997,6 +9002,59 @@ public:
                          "stopping the already-started agent/management gRPC listeners.");
             stop();
             return;
+        }
+
+        // Typed-source purge (inventory_store.purge_typed_sources, 2a-1b): one-shot
+        // background hygiene pass over the generic InventoryStore. Started here, in run()'s
+        // OWN body after the startup_failed_ recheck that follows start_web_server(), so a
+        // server that refused to start (constructor failure, SCIM / cipher-pin / step-up
+        // aborts inside start_web_server()) never runs it and a constructor throw never
+        // leaves a joinable std::thread (std::terminate). Never awaited, not part of
+        // readiness. Not std::jthread: stop_requested_ is declared after the thread member,
+        // so an implicit join at member destruction would outlive it.
+        // The start holds lifecycle_mu_, the mutex stop() holds for its whole teardown:
+        // signal handlers are installed before run(), so a watcher-thread stop() can finish
+        // (join is a no-op, inventory_store_ reset, teardown_complete_ set) before this
+        // line; launching then would leave a thread that is never joined and reads a reset
+        // pointer. Under the lock either stop() has not begun (it will join this thread) or
+        // it has finished (skip). stop() never needs this thread to take lifecycle_mu_, so
+        // the join cannot deadlock.
+        // A delete of rows that must not exist, with no clock cutoff: clock-guarded-retention
+        // parts 1-4, 6 and 7 are n/a (recorded in docs/clock-guarded-retention.md); the
+        // per-batch bound is part 5 (the per-pass total is not bounded).
+        {
+            std::lock_guard<std::mutex> life(lifecycle_mu_);
+            if (teardown_complete_ || stop_requested_.load(std::memory_order_acquire)) {
+                // stop() already ran (or began) -- a SIGTERM during boot. Every thread
+                // started below has its join only in stop(), which will not run again
+                // (~ServerImpl's call returns early), so starting any of them would leave a
+                // joinable std::thread to be destroyed (std::terminate). Do not serve.
+                spdlog::info("run(): shutdown requested during startup; not starting "
+                             "background threads");
+                return;
+            }
+            if (inventory_store_ && inventory_store_->is_open()) {
+                typed_purge_thread_ = std::thread([this]() {
+                    YUZU_ASSERT_BACKGROUND_JOB("inventory_store.purge_typed_sources"); // WS-10 ReplicaSafe
+                    const auto r = inventory_store_->drain_typed_sources(
+                        InventoryStore::TypedPurgeOptions{},
+                        [this] { return stop_requested_.load(std::memory_order_acquire); });
+                    using St = InventoryStore::TypedPurgeStatus;
+                    if (r.status == St::kFailed)
+                        spdlog::warn("[PG] Typed-source purge failed after removing {} row(s): {} "
+                                     "(non-fatal hygiene sweep; stray rows stay unreadable)",
+                                     r.rows, r.cause);
+                    else if (r.status == St::kStopped)
+                        spdlog::info("[PG] Typed-source purge stopped by shutdown after {} row(s)",
+                                     r.rows);
+                    else if (r.rows > 0)
+                        spdlog::info("[PG] Typed-source purge finished: {} stray row(s) removed "
+                                     "from the generic inventory store",
+                                     r.rows);
+                    else
+                        spdlog::debug("[PG] Typed-source purge finished: no stray rows");
+                });
+            }
         }
 
         // Start certificate hot-reload watcher
@@ -10594,6 +10652,12 @@ public:
         // execution_tracker_, response_store_ — must stop before teardown)
         if (result_set_maint_thread_.joinable()) {
             result_set_maint_thread_.join();
+        }
+
+        // Join the one-shot typed-source purge (borrows inventory_store_; checks
+        // stop_requested_ between batches, so this returns promptly)
+        if (typed_purge_thread_.joinable()) {
+            typed_purge_thread_.join();
         }
 
         // Join the insecure-TLS reminder thread (issue #79)
@@ -23603,6 +23667,7 @@ private:
     std::thread preflight_runner_thread_; // joined before stores in stop()
     std::thread schedule_tick_thread_;    // drives ScheduleRunner (#1191); joined before stores
     std::thread result_set_maint_thread_;
+    std::thread typed_purge_thread_; // one-shot boot pass over inventory_store_; joined before stores
 
     // WS-3 (ADR-2002 §3/§6/§10): the fenced leader elector + its election loop.
     // The elector owns a dedicated coordination connection (NOT pg_pool_), so it

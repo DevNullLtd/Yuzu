@@ -677,7 +677,7 @@ bounded at 1 MiB per device, so a large fleet is storage- and WAL-heavy (see
 
 **Deploy order, and what is per server.** The filter protects reads served by a server at this release or later, and nothing else. Every server older than this release, or rolled back below it, keeps storing typed-source blobs that arrive through a gateway attached to it, and keeps serving them under `Infrastructure:Read` or `Inventory:Read`. In a multi-replica deployment that means the exposure is not closed until every replica runs this release: during a rolling upgrade, reads routed to an older replica still return those rows, and rows an older replica writes after an upgraded replica's boot purge stay in the table (unreadable through upgraded replicas) until a purge runs again. Upgrade servers before agents, finish the rolling upgrade promptly, and never roll a server back below this release once agents send `certificate_inventory` (none does yet).
 
-**No action on upgrade.** There is no schema change, and the boot purge still removes any stray typed rows.
+**No action on upgrade.** There is no schema change. The server still removes any stray typed rows at every boot, but it now does so in the background in bounded batches, so startup no longer waits on the purge and a large backlog cannot delay serving. Stray rows were already unreadable from the generic store, so nothing depends on the purge finishing. Completion or failure is logged, and removed rows and failures are counted in `yuzu_inventory_typed_purge_rows_total` and `yuzu_inventory_typed_purge_failures_total`. If a pass fails, a restart re-runs it.
 
 ## Behaviour change: the DEX score policy document carries a version (#6085, #6086)
 

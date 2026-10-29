@@ -942,6 +942,16 @@ ingest is failing. Four further series sharpen the picture:
   `YuzuGenericInventoryPersistenceDropped` warns only after a non-`stale` reason's rate
   remains non-zero for 15 minutes, avoiding alerts for a single self-healing report or
   expected clock-step stale suppression.
+- `yuzu_inventory_typed_purge_rows_total` (counter) — stray typed-source rows removed from the
+  generic store by the background boot purge. Present at 0 on every boot; it rises only after
+  an upgrade or rollback that left such rows. The pass runs once per boot and then stops, so a
+  flat counter after the first minutes is normal.
+- `yuzu_inventory_typed_purge_failures_total` (counter) — background purge passes that gave up after a failed
+  batch (closed store, pool timeout, SQL error, 20 s statement timeout) through its retries with backoff
+  at smaller batch sizes, or because typed rows stayed locked by another session across the retries
+  (that path retries without halving). The pass is not retried until the next boot; **a restart re-runs it**, which is the remediation once the database is healthy;
+  stray rows stay unreadable meanwhile. Any non-zero value after a boot is worth a look at the
+  Postgres pool, not a page. Readiness does not depend on the pass.
 - `yuzu_inventory_query_truncated_total` (counter) — generic-store reads that hit their
   row cap or 8 MiB aggregate payload cap. A non-zero rate on the result-set
   producer path pairs with 503s from

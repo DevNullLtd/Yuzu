@@ -3961,6 +3961,16 @@ test('access users production wiring lexical gate',
   timeout: 30,
 )
 
+# 2a-1b: the typed-source purge thread must start inside run()'s own body, after the
+# startup_failed_ recheck that follows start_web_server() -- not in the ServerImpl constructor
+# and not inside start_web_server(). Source-text only; carries move-mutation self-tests.
+test('typed-source purge wiring lexical gate (2a-1b)',
+  _python3_test,
+  args: [files('test_typed_purge_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Audit and reviews page: pins the production wiring in server.cpp (the loud perm_fn gate, the
 # audit store read that returns nullopt for a closed store). Source-text only, so Python.
 # Suite 'docs' for the same reason as the Users page gate above.
