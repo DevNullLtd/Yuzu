@@ -130,10 +130,12 @@ session row edited by hand into another pairing is affected: the migration delet
 `WARNING` in the Postgres server log (`session_store v2 (#2343): deleted N inconsistent session
 row(s)`), and that principal signs in again.
 
-**What to do.** Nothing. Do not start the upgrade while `pg_dump` or another long transaction is
-running: the migration needs a brief exclusive lock on `sessions`, and a boot refused with
-`canceling statement due to lock timeout` is safe to retry once the transaction ends. An older
-binary can still run against the upgraded database.
+**What to do.** No action is needed, with one precondition. Do not start the upgrade while
+`pg_dump` or another long transaction is running: the migration takes a brief exclusive lock on
+`sessions`, and a boot refused with `canceling statement due to lock timeout` (or a deadlock
+abort) rolls the whole migration back and is safe to retry once the transaction ends. The server
+applies a 10 second lock timeout unless your connection string sets its own. An older binary can
+still run against the upgraded database.
 
 ## Behaviour change: engine principals are default-deny when RBAC is off
 

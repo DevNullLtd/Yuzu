@@ -345,8 +345,8 @@ struct Config {
 
     // Per-principal quota cap (PR 4.4, ADR-1005 class engine principals).
     // Gates only engine-classed sessions (stored principal_kind "engine" or
-    // an engine_token source) at the pre-routing chokepoint; human/agent/anonymous traffic is unaffected. See
-    // principal_quota.hpp. `burst` is derived as 2x rate at construction.
+    // an engine_token source) at the pre-routing chokepoint; human/agent/
+    // anonymous traffic is unaffected. See principal_quota.hpp. `burst` is derived as 2x rate at construction.
     int principal_max_concurrency{16};    // per-engine-principal in-flight cap
     double principal_rate_limit{20.0};    // per-engine-principal requests/second
 

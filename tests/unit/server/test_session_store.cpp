@@ -21,6 +21,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <string>
 #include <vector>

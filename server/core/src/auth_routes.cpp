@@ -1674,8 +1674,9 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
         // principal_class_of(req) above can only distinguish by credential
         // presentation (bearer token → "agent"), which mislabels an engine
         // principal's bearer-token requests. Re-stamp from the resolved
-        // session's engine classification (Session::is_engine()) so engine-principal actions are
-        // audited truthfully as "engine" (design §6 / adr-1005-execution-plan
+        // session's engine classification (Session::is_engine()) so
+        // engine-principal actions are audited truthfully as "engine"
+        // (design §6 / adr-1005-execution-plan
         // Decision 9 — the AuditStore column reports it now; the HTTP metric
         // is deferred to 4.5).
         if (session->is_engine()) {

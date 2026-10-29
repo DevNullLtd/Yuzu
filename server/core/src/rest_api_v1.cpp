@@ -293,9 +293,9 @@ std::string list_json(std::string_view data_json, int64_t total, int64_t start =
 // future RBAC misconfiguration somehow granted it Security:Write. Keyed on
 // `Session::is_engine()` (the stored `principal_kind` or an `engine_token`
 // authentication source, design doc §6), so a future second engine
-// authentication path cannot silently bypass a string-keyed deny. Returns true (and has already written the 403 A4 body) when the
-// caller must stop; false when the session is human and the route may
-// proceed.
+// authentication path cannot silently bypass a string-keyed deny. Returns
+// true (and has already written the 403 A4 body) when the caller must stop;
+// false when the session is human and the route may proceed.
 static bool deny_engine_session(const auth::Session& s, const httplib::Request& req,
                                 httplib::Response& res, const RestApiV1::AuditFn& audit,
                                 const char* action, const char* target,

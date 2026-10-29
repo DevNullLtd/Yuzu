@@ -577,8 +577,9 @@ TEST_CASE("AuthManager legacy path: an empty token never matches a session",
 // front of the gates is the durable row, restored by a fresh (cold-cache) AuthManager. The v2
 // CHECK forbids the row, so the test drops it first, exactly as a hand edit of an older
 // database would. With RBAC off (the default), an engine-classed session is refused 403 by the
-// engine branch of every gate, while an ordinary human admin is admitted by the legacy path,
-// so reverting any one site to the raw stored-kind compare turns its assertion red.
+// engine branch of every gate, while an ordinary human admin is admitted by the legacy path
+// (or, for require_fleet_read, reaches the 503 arm of an unwired store), so reverting any one
+// site to the raw stored-kind compare turns its assertion red.
 TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the engine branch",
           "[auth_session_store][pg][engine_principal]") {
     YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
@@ -662,8 +663,8 @@ TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the
     SECTION("require_fleet_read") {
         auto req = request_for(human_token);
         httplib::Response res;
-        // No TagStore is wired here, so a human session falls through to the tag-store arm
-        // and is answered 503; the engine branch answers first with 403. The two statuses
+        // No management-group store is wired here, so a human session stops at that
+        // check and is answered 503; the engine branch answers first with 403. The two statuses
         // differ, so the 403 below is the engine branch and not the human arm.
         auto control = ar.require_fleet_read(req, res, "GuaranteedState", "Read");
         CHECK_FALSE(control.has_value());

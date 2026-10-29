@@ -170,13 +170,19 @@ const std::vector<pg::PgMigration>& migrations() {
         // DELETE first so a retry clears any row an older binary wrote between attempts
         // before the ALTER validates (same shape as AuditStore v2). The DROP ... IF EXISTS
         // makes the ADD idempotent against a constraint of the same name applied by hand
-        // (otherwise 42710 would refuse boot on every restart). The write_generation bump is
+        // (otherwise 42710 would refuse boot on every restart). The LOCK TABLE comes first so
+        // the migration holds the strongest lock before it deletes anything: without it the
+        // DELETE (row locks) followed by the ALTER (lock upgrade) deadlocks with a live
+        // session writer waiting on a row the DELETE removed (reproduced on postgres:18), and
+        // a row committed between the DELETE and the ALTER would fail the ADD's validation
+        // and refuse boot. The write_generation bump is
         // LAST so the session_meta row lock is taken after the sessions locks (see
         // session_store_sql_helpers.hpp "take it LAST"; bump first would invite a lock-order
         // deadlock with a live session writer): a peer replica's validate cache then drops
         // the deleted rows on its next generation poll instead of serving them until some
         // unrelated login bumps it. v2 has not shipped, so it is edited in place.
-        {2, "DO $$ DECLARE n bigint; BEGIN"
+        {2, "LOCK TABLE sessions IN ACCESS EXCLUSIVE MODE;"
+            "DO $$ DECLARE n bigint; BEGIN"
             " DELETE FROM sessions WHERE NOT ("
             "(principal_kind = 'human' AND auth_source <> 'engine_token')"
             " OR (principal_kind = 'engine' AND auth_source = 'engine_token'));"
