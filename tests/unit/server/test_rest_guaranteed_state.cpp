@@ -3082,13 +3082,17 @@ TEST_CASE("REST dex/apps: an off-enum window is a 400, never a silent default",
 TEST_CASE("REST dex/apps: an unknown platform is a 400 with no retry hint",
           "[pg][rest][dex][apps]") {
     RestGsHarness h;
-    auto res = h.sink.Get("/api/v1/dex/apps?platform=darwin");
-    REQUIRE(res);
-    CHECK(res->status == 400);
-    auto j = nlohmann::json::parse(res->body);
-    CHECK(j["error"]["message"] == "invalid platform (expected all|windows|macos|linux)");
-    CHECK(j["error"]["retry_after_ms"].is_null());
-    CHECK(res->get_header_value("Retry-After").empty());
+    // The token match is exact: an unshipped spelling, empty and any non-lowercase form all refuse.
+    for (const char* bad : {"darwin", "", "Windows", "ALL"}) {
+        CAPTURE(bad);
+        auto res = h.sink.Get(std::string{"/api/v1/dex/apps?platform="} + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["error"]["message"] == "invalid platform (expected all|windows|macos|linux)");
+        CHECK(j["error"]["retry_after_ms"].is_null());
+        CHECK(res->get_header_value("Retry-After").empty());
+    }
 }
 
 TEST_CASE("REST dex/apps: the platform scope selects the population and the coverage",
@@ -3097,7 +3101,9 @@ TEST_CASE("REST dex/apps: the platform scope selects the population and the cove
     h.dex_fleet_override_.connected_agents = {{"w1", "windows"}, {"w2", "windows"}, {"l1", "linux"},
                                               {"m1", "macos"}};
     h.dex_fleet_override_.total_online = 4;
+    // The same subject on two operating systems: one merged row under `all`, one row per scope otherwise.
     h.seed_obs("b1", "w1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("b2", "l1", "process.crashed", "chrome.exe", "linux", "2026-06-10T10:00:00Z");
     const auto get = [&](const char* q) {
         auto res = h.sink.Get(q);
         REQUIRE(res);
@@ -3107,13 +3113,23 @@ TEST_CASE("REST dex/apps: the platform scope selects the population and the cove
     const auto none = get("/api/v1/dex/apps?window=all");
     CHECK(none["population_basis"] == "all_online");
     CHECK(none["population"] == 4);
+    REQUIRE(none["apps"].size() == 1);
+    CHECK(none["apps"][0]["subject"] == "chrome.exe");
+    CHECK(none["apps"][0]["crashes"] == 2);
+    CHECK(none["apps"][0]["distinct_devices"] == 2);
     const auto win = get("/api/v1/dex/apps?window=all&platform=windows");
     CHECK(win["population_basis"] == "windows_online");
     CHECK(win["population"] == 2);
+    REQUIRE(win["apps"].size() == 1);
+    CHECK(win["apps"][0]["crashes"] == 1);
+    CHECK(win["apps"][0]["distinct_devices"] == 1);
     CHECK(win["crash_source_coverage"] == nlohmann::json{{"windows", "complete"}});
     const auto lin = get("/api/v1/dex/apps?window=all&platform=linux");
     CHECK(lin["population_basis"] == "linux_online");
     CHECK(lin["population"] == 1);
+    REQUIRE(lin["apps"].size() == 1);
+    CHECK(lin["apps"][0]["crashes"] == 1);
+    CHECK(lin["apps"][0]["distinct_devices"] == 1);
     CHECK(lin["crash_source_coverage"] == nlohmann::json{{"linux", "partial"}});
 }
 

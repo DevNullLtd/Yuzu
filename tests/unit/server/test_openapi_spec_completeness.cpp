@@ -618,6 +618,7 @@ TEST_CASE("openapi_spec_json(): /dex/apps documents the platform scope parameter
     REQUIRE(spec["paths"].contains("/dex/apps"));
     const auto& op = spec["paths"]["/dex/apps"]["get"];
 
+    REQUIRE(op.contains("parameters")); // const operator[] on a missing key asserts
     const json* platform = nullptr;
     for (const auto& p : op["parameters"])
         if (p.value("name", "") == "platform")

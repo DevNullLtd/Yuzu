@@ -35,6 +35,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -177,6 +178,10 @@ std::string dex_apps_population_basis(std::string_view scope);
 /// "partial" (an empty list there is not proof of stability). `all` carries all three
 /// keys, a single scope its one key; the vector order is this helper's, and the JSON
 /// object is keyed by platform with no ordering promise.
+/// A fixed table of the shipped design, NOT live collector health: it mirrors the crash
+/// sources in docs/user-manual/dex-signal-catalog.md (Windows WER/event log; Linux
+/// `process.crashed` needs systemd-coredump as the active handler; macOS fidelity notes)
+/// and does not change when a collector is disabled or absent on a host.
 std::vector<std::pair<std::string, std::string>> dex_apps_crash_source_coverage(std::string_view scope);
 
 /// The score policy an Apps read scored under, and where it came from.

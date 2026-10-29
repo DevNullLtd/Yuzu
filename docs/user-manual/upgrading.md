@@ -8,6 +8,10 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 - **Affected:** any REST caller of `/api/v1/dex/apps` that sends no `platform`: its applications, counts, population (`population_basis` is now `all_online`) and scores now cover every platform.
 - **To keep today's figures:** add `platform=windows`. The Windows result is otherwise unchanged apart from one additive field, `crash_source_coverage`.
+- **Find affected callers:** search integrations and gateway access logs for `/api/v1/dex/apps` requests without `platform=`, and for parsers of `population_basis == "windows_online"` (the Windows scope still reports `windows_online`).
+- **Figures step at upgrade:** on a mixed fleet the population grows and the shares, rates and scores shift as soon as the server is upgraded.
+- **`all` is not a sum:** it is one row per application across operating systems and includes agents whose operating system is not recognised, so it is not the sum of the per-platform results.
+- **No setting restores the old default:** the caller passes `platform=windows`.
 - **Not changed:** the MCP tool `list_dex_apps` stays Windows-scoped; it also returns the additive `crash_source_coverage` field.
 
 ## New: leader-election metrics and alerts (HA WS-11, #4014)
