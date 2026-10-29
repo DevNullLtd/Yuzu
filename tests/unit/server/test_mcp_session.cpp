@@ -635,14 +635,15 @@ TEST_CASE("MCP session: one class holding the per-principal cap blocks the owner
     CHECK(restarted.mint(strong).ok);
 }
 
-// #4754 CH-8: DOCUMENTS the accepted residual, and is expected to FLIP when #4309 lands.
-// JIT admin elevation is per-request state, not part of the credential class, so an
-// elevated and a non-elevated session of one user bind to the SAME class today. #4309
-// refuses tierless (cookie) sessions at /mcp/v1/, the only sessions that can be elevated;
-// once it lands this equality no longer describes a reachable state and this test should
-// be rewritten or removed with it.
+// #4754 CH-8: PINS the accepted residual that JIT admin elevation is NOT part of the
+// binding class. Elevation is per-request state, so an elevated and a non-elevated session
+// of one user bind to the SAME class. The closure for the residual is #4309, which refuses
+// tierless (cookie) sessions at the /mcp/v1/ handler; that does not change binding_for(),
+// so this test will NOT flip when #4309 lands. It fails only if someone adds elevation to
+// the class, which is a decision to be made deliberately (and then this test, the
+// registry's residual comment and the user docs change with it).
 TEST_CASE("MCP session: an elevated and a non-elevated session of one user bind equal "
-          "(documents the accepted #4754 residual; flips with #4309)",
+          "(pins that elevation is not part of the binding class; accepted #4754 residual)",
           "[mcp][session][4754]") {
     yuzu::server::auth::Session plain;
     plain.username = "alice";

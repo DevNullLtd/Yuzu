@@ -216,6 +216,19 @@ struct Fx {
         }
         return n;
     }
+
+    /// The actor of every captured row for `action`, in capture order. Lets a test pin
+    /// WHO a client-caused row is attributed to, not only that a row exists.
+    std::vector<std::string> audit_actors(const std::string& action) {
+        std::lock_guard<std::mutex> lk(audit_mu);
+        std::vector<std::string> out;
+        for (const auto& row : audits) {
+            if (row.action == action) {
+                out.push_back(row.actor);
+            }
+        }
+        return out;
+    }
 };
 
 /// Snapshot the session ring by attaching at a cursor and copying the replayed
@@ -922,6 +935,11 @@ TEST_CASE("bridge admission - client-gone finals never lock a session out of str
         CHECK(fifth.ok);
         CHECK(displaced_count() == 1.0);
         CHECK(fx.audit_count("mcp.bridge.pin_displaced_for_admission") == 1);
+        // Attributed to the admitting caller, not the empty "system" actor and not a
+        // moved-from binding (reserve takes the binding by value and moves it into the
+        // record before this row is written).
+        CHECK(fx.audit_actors("mcp.bridge.pin_displaced_for_admission") ==
+              std::vector<std::string>{"alice"});
         // The OLDEST parked record yields - its resume window is the one most
         // likely already gone - and the result stays fetchable by execution_id.
         CHECK(s.stream->pinned_count() == 3);
@@ -1065,6 +1083,8 @@ TEST_CASE("bridge admission - ORPHAN pins are reclaimed too (governance UP-1)",
     CHECK(displaced_total() == 1.0);
     CHECK(s.stream->pinned_count() == 3);
     CHECK(fx.audit_count("mcp.bridge.pin_displaced_for_admission") == 1);
+    CHECK(fx.audit_actors("mcp.bridge.pin_displaced_for_admission") ==
+          std::vector<std::string>{"alice"});
 }
 
 TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final is never lost",
