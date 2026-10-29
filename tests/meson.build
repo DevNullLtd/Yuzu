@@ -1766,6 +1766,7 @@ if build_server
       'unit/server/test_plugin_page_model.cpp', # System > Plugins and updates: pure panel goldens
       'unit/server/test_settings_plugins_page.cpp', # System > Plugins and updates: page pins and fragment gates
       'unit/server/test_settings_plugins_authz.cpp', # System > Plugins and updates: [pg] the fragments through the REAL probe gates (denial rows: token yes, cookie no)
+      'unit/server/test_settings_engine_panel_authz.cpp', # #5882: [pg] Settings Engine Principals panel vs its REST twin through the REAL gates (RBAC off/on personas)
       'unit/server/test_ca_panel_render.cpp', # System > Certificates and secrets: pure CA panel goldens
       'unit/server/test_kek_panel_render.cpp', # System > Certificates and secrets: pure KEK status panel goldens
       'unit/server/test_settings_pki_page.cpp', # System > Certificates and secrets: page pins, page gate, KEK fragment

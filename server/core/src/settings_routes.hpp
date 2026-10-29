@@ -114,6 +114,17 @@ public:
     /// to `admin_fn`, so an unwired probe can only be louder, never weaker.
     void set_read_admin_fn(AdminFn fn) { read_admin_fn_ = std::move(fn); }
 
+    /// Quiet permission gate for the auto-loading Engine Principals panel
+    /// (`GET /fragments/settings/engine-principals`, #5882). The panel gates on
+    /// `EnginePrincipal:Read` exactly as its REST twin does (`GET /api/v1/engine-principals`),
+    /// and loads on every /settings view, so a caller who lacks the grant must not write an
+    /// `auth.permission_required` row per view. server.cpp binds `AuthRoutes::probe_permission`
+    /// here: the same decision as `perm_fn` with the 401/403 kept on the response and the denial
+    /// row withheld for an interactive cookie session only (a token or engine caller keeps it).
+    /// Left unset (tests, other callers) the panel falls back to `perm_fn`, so an unwired probe
+    /// can only be louder, never weaker. No other route reads it.
+    void set_read_perm_fn(PermFn fn) { read_perm_fn_ = std::move(fn); }
+
     /// Audit writer for a session the handler already resolved (#6079): `mfa.disable` ends the
     /// actor's own session before it writes its row, so the request-resolving `AuditFn` would
     /// stamp an empty principal. Same `std::function` type as `AuthRoutes::AuditAsSessionFn`;
@@ -356,6 +367,11 @@ private:
         return read_admin_fn_ ? read_admin_fn_(req, res) : admin_fn_(req, res);
     }
     PermFn perm_fn_;
+    PermFn read_perm_fn_; // see set_read_perm_fn(); empty -> perm_fn_
+    bool read_perm(const httplib::Request& req, httplib::Response& res, const std::string& type,
+                   const std::string& op) const {
+        return read_perm_fn_ ? read_perm_fn_(req, res, type, op) : perm_fn_(req, res, type, op);
+    }
     AuditFn audit_fn_;
     AuditAsSessionFn audit_as_session_fn_;
     AuditReadFn audit_read_fn_; // #4028 — fail-closed REST audit hook, see AuditReadFn doc comment
