@@ -365,6 +365,30 @@ class T(unittest.TestCase):
         rc, out = self.r.run("--ratchet", "--base", "basebr")
         self.assertEqual(rc, 1, out)
         self.assertIn("baseline grew", out)
+    def _ratchet_rename_repo(self, base_count, now_count):
+        def lines(n):
+            return "".join(f"{U}{REAL_USER}{i}/x\n" for i in range(n))
+        git = ["git", "-C", self.r.root, "-c", "user.name=t", "-c", "user.email=t@example.com"]
+        self.r.write("a.md", lines(base_count))
+        self.r.run("--update-baseline")
+        subprocess.run(git + ["add", "-A", "-f"], check=True)
+        subprocess.run(git + ["commit", "-q", "-m", "base"], check=True)
+        subprocess.run(git + ["branch", "-f", "basebr"], check=True)
+        subprocess.run(git + ["mv", "a.md", "b.md"], check=True)
+        self.r.write("b.md", lines(now_count))
+        self.r.run("--update-baseline")
+        subprocess.run(git + ["add", "-A", "-f"], check=True)
+        subprocess.run(git + ["commit", "-q", "-m", "head"], check=True)
+    def test_ratchet_follows_a_rename(self):
+        # The baselined file moves; its allowance moves with it, so it is not a new entry.
+        self._ratchet_rename_repo(2, 2)
+        rc, out = self.r.run("--ratchet", "--base", "basebr")
+        self.assertEqual(rc, 0, out)
+    def test_ratchet_rename_with_growth_still_fails(self):
+        self._ratchet_rename_repo(2, 3)
+        rc, out = self.r.run("--ratchet", "--base", "basebr")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("baseline grew", out)
     def test_ratchet_shrink_and_equal_pass(self):
         self._ratchet_repo(2, 1)
         rc, out = self.r.run("--ratchet", "--base", "basebr")
