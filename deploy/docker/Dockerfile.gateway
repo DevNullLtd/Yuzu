@@ -12,7 +12,7 @@
 # Quick rebuild (code-only):
 #   docker build -t yuzu-gateway -f deploy/docker/Dockerfile.gateway .
 #
-# Pre-bake the deps image:
+# Pre-bake the deps image (linux/amd64 only, see "Supported platforms" below):
 #   docker build --target deps -t yuzu-gateway-deps -f deploy/docker/Dockerfile.gateway .
 #   docker build -t yuzu-gateway -f deploy/docker/Dockerfile.gateway .
 
@@ -29,8 +29,10 @@
 #
 # Lift this only together with the move to OTP 29.1 or newer. The marker line
 # is read by scripts/ci/check-gateway-base-index.py, which fails when the
-# listed platforms are not all on the runtime stage's Alpine release in the
-# pinned index; add a platform to the marker and to the guard below together.
+# listed platforms are not all annotated, in the pinned index, as built on the
+# runtime stage's Alpine release; add a platform to the marker and to the guard
+# below together. The guard treats an unset TARGETARCH (a builder that does not
+# set it) as amd64; the abi-guard below still stops such an arm64 build.
 # yuzu:gateway-platforms linux/amd64
 
 # ── Stage 1: deps — fetch and compile Erlang dependencies (cached) ────────
@@ -41,10 +43,11 @@ FROM erlang:28-alpine@sha256:a2679e9248862e8cfc1c106f602dac416092450b6727f0a6373
 ARG TARGETARCH
 RUN case "${TARGETARCH:-amd64}" in amd64) ;; *) \
       echo "FATAL: Dockerfile.gateway supports linux/amd64 only (TARGETARCH=${TARGETARCH})." \
-           "The pinned erlang:28-alpine index puts this architecture on Alpine 3.24 (musl 1.2.6)" \
-           "while the runtime stage is Alpine 3.23 (musl 1.2.5), and musl 1.2.6 with OTP < 29.1 aborts" \
-           "beam.smp at boot on AMX CPUs (#1743). See #6711 and docs/operations/troubleshooting.md." \
-           "For a glibc build use deploy/docker/Dockerfile.gateway.chisel."; \
+           "Upstream builds this architecture of the pinned erlang:28-alpine on a newer Alpine than the" \
+           "runtime stage, and the newer musl with OTP < 29.1 aborts beam.smp at boot on AMX CPUs (#1743)." \
+           "Build with --platform linux/amd64. See #6711 and docs/operations/troubleshooting.md." \
+           "A single-node demo can use deploy/docker/Dockerfile.gateway.chisel (demo variant: no" \
+           "gateway-entrypoint.sh, so it cannot form a cluster; do not use it for a clustered gateway)."; \
       exit 1;; esac
 
 RUN apk add --no-cache git

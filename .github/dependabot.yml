@@ -68,7 +68,7 @@ updates:
     #     A digest refresh of the erlang index is also checked by
     #     scripts/ci/check-gateway-base-index.py (docker-healthcheck-invariants.yml):
     #     the platforms Dockerfile.gateway supports (linux/amd64 only, #6711) must
-    #     stay on the runtime stage's Alpine release.
+    #     be annotated in the index as built on the runtime stage's Alpine release.
     ignore:
       - dependency-name: "erlang"
         update-types: ["version-update:semver-major"]

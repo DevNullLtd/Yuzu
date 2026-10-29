@@ -79,6 +79,15 @@ Health probes (`/livez`, `/readyz`, `/health`, `/api/health`) are exempt from th
 | `outside_validity` on every call although the certificate was renewed | The guard re-checks the certificate on every call, but the gateway keeps its long-lived connection and presents the certificate it had when it dialled; status 16 does not make it redial. Renew **before** `notAfter`, then check whether the gateway already redialled (cause class B in the row above: restart that node, one at a time, only if denials continue after about 2 minutes and its agents can take the disconnect, because unless the agents run a build with the #5183 fix, in no release yet, released agents stay wedged afterwards). A renewal over the same key needs no pin change and no server restart; a new key needs its pin first |
 | Process limit | Erlang default process limit is 262144 — sufficient for most fleets |
 
+### Gateway image build fails at the platform check
+
+`deploy/docker/Dockerfile.gateway` builds for `linux/amd64` only (#6711). The first
+step of its `deps` stage refuses any other architecture:
+
+| Message | Fix |
+|---------|-----|
+| `Dockerfile.gateway supports linux/amd64 only (TARGETARCH=...)` | Build with `--platform linux/amd64` (for the UAT scripts and compose files that pass no platform: `DOCKER_DEFAULT_PLATFORM=linux/amd64`, or `platform: linux/amd64` on the compose service; `scripts/start-viz-uat.sh` takes `VIZ_UAT_PLATFORM=linux/amd64`). On an arm64 host that runs under emulation, which has not been validated for the gateway build. The reason: the pinned `erlang:28-alpine` index builds arm64 on a newer Alpine than the runtime stage, and musl 1.2.6 with OTP older than 29.1 aborts at boot on AMX CPUs (#1743). For a single-node arm64 demo, `deploy/docker/Dockerfile.gateway.chisel` builds natively; it is the demo variant, runs no `gateway-entrypoint.sh`, and so cannot form a cluster (see "Gateway Disconnections" above), so do not use it for a clustered gateway. |
+
 ### Gateway image build fails at abi-guard
 
 When you build `deploy/docker/Dockerfile.gateway` yourself, a step in the
@@ -89,7 +98,6 @@ fails the build when the two stages cannot safely run the same release:
 |---------|-----|
 | `runtime Alpine/musl (...) differs from the builder's (...)` | The `erlang:28-alpine` builder and the runtime `alpine:` image are on different Alpine releases. Point the runtime `FROM` at the builder's Alpine release (`docker run --rm <erlang image> cat /etc/alpine-release`). |
 | `musl ... with OTP ...: beam.smp aborts at boot on AMX CPUs` | The runtime is on musl 1.2.6 or newer (Alpine 3.24+) with an OTP older than 29.1. Keep both stages on Alpine 3.23, or move the builder to OTP 29.1 or newer. |
-| `Dockerfile.gateway supports linux/amd64 only (TARGETARCH=...)` | The gateway image is built for `linux/amd64` only (#6711): the pinned `erlang:28-alpine` index puts arm64 on Alpine 3.24 (musl 1.2.6) while the runtime stage is Alpine 3.23, and musl 1.2.6 with OTP older than 29.1 aborts at boot on AMX CPUs. Build with `--platform linux/amd64`; on an arm64 host that means emulation, which can fail in the Erlang deps stage, so for a native glibc build use `deploy/docker/Dockerfile.gateway.chisel`. |
 | `... is not a plain dotted version` | A version could not be read, for example an OTP release candidate or a patched OTP (`28.5.0.2**`). Build from a released OTP. |
 | `could not compare versions (apk printed ...)` | `apk version -t` gave no usable answer for versions that looked valid. Report it with the `abi-guard:` line; do not bypass the step. |
 
