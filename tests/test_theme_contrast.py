@@ -69,6 +69,11 @@ def main():
     probe = css.replace('--mds-color-chart-1: #1d5fc2;', '--mds-color-chart-1: #4c9aff;', 1)
     assert any("light: --mds-color-chart-1" in f for f in failures(probe)), \
         "gate did not catch a dark chart token on a light scheme"
+    # Self-check: a token a light block forgets to redefine is judged at its :root value.
+    # The first --mds-color-chart-7 override is html[data-theme="light"]'s (:root's is #ff9f43).
+    probe2 = css.replace('--mds-color-chart-7: #a04d00;', '', 1)
+    assert any("light: --mds-color-chart-7" in f for f in failures(probe2)), \
+        "gate did not catch a chart token a light block fails to redefine"
     bad = failures(css)
     for f in bad:
         print("FAIL " + f)

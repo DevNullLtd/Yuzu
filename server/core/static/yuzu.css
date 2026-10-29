@@ -286,9 +286,10 @@
    redefines the minimal token set: UA colour scheme, surfaces and outlines,
    text, action, highlight, focus, status colours and the two shadows. Chart
    colours stay as they are on the dark schemes; the light ones darken
-   chart-1..12 (blue, teal, amber, red, violet, then the extended series) because Home's family headings,
-   tile icons and the Trends line use them as text and strokes, which needs 4.5:1
-   on every light surface. Every text pair on the light schemes is held to
+   chart-1..12 (blue, teal, amber, red, violet, then chart-6..12: sky, orange,
+   green, light blue, cyan, light violet, rose) because Home's family headings,
+   tile icons and the Trends line use them as text and strokes, which needs
+   4.5:1 on every light surface. Every text pair on the light schemes is held to
    4.5:1 (primary-button hover included); highlight and focus to 3:1. */
 html[data-theme="navy"] {
   color-scheme: dark;
