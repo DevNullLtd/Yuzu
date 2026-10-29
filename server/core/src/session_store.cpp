@@ -32,6 +32,12 @@ using pg::PgResult;
 namespace {
 
 constexpr const char* kStoreName = "session_store"; // schema = snake_case(SessionStore)
+// The ONE statement of the stored-principal invariant (#2343): a human session (any source
+// except engine_token) or an engine session (engine_token). The v2 migration interpolates it
+// into both the DELETE (negated) and the CHECK, so the two cannot drift apart.
+constexpr const char* kPrincipalPairingOk =
+    "((principal_kind = 'human' AND auth_source <> 'engine_token')"
+    " OR (principal_kind = 'engine' AND auth_source = 'engine_token'))";
 constexpr std::chrono::milliseconds kWriteTimeout{2000};
 constexpr std::chrono::milliseconds kReadTimeout{2000};
 
@@ -180,28 +186,35 @@ const std::vector<pg::PgMigration>& migrations() {
         // setting says: while the request queues behind a long transaction (pg_dump), every
         // new sessions query on a running peer queues behind it, so a short cap keeps that
         // stall short, and the whole migration rolls back and retries on the next boot.
-        // The write_generation bump is LAST so the session_meta row lock is taken after the sessions locks (see
-        // session_store_sql_helpers.hpp "take it LAST"; bump first would invite a lock-order
-        // deadlock with a live session writer): a peer replica's validate cache then drops
-        // the deleted rows on its next generation poll instead of serving them until some
-        // unrelated login bumps it. v2 has not shipped, so it is edited in place.
-        {2, "SET LOCAL lock_timeout = '3s';"
-            "LOCK TABLE sessions IN ACCESS EXCLUSIVE MODE;"
-            "DO $$ DECLARE n bigint; BEGIN"
-            " DELETE FROM sessions WHERE NOT ("
-            "(principal_kind = 'human' AND auth_source <> 'engine_token')"
-            " OR (principal_kind = 'engine' AND auth_source = 'engine_token'));"
-            " GET DIAGNOSTICS n = ROW_COUNT;"
-            " IF n > 0 THEN RAISE WARNING 'session_store v2 (#2343): deleted % inconsistent"
-            " session row(s); each affected principal must sign in again', n; END IF;"
-            " END $$;"
-            "ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_principal_kind_consistent;"
-            "ALTER TABLE sessions ADD CONSTRAINT sessions_principal_kind_consistent CHECK ("
-            "(principal_kind = 'human' AND auth_source <> 'engine_token')"
-            " OR (principal_kind = 'engine' AND auth_source = 'engine_token'));"
-            "INSERT INTO session_store.session_meta (key, value) VALUES ('write_generation', '1')"
-            " ON CONFLICT (key) DO UPDATE SET value ="
-            " (session_store.session_meta.value::bigint + 1)::text;"},
+        // The write_generation bump runs only when rows were deleted, inside the DO block's
+        // IF, so a clean upgrade does not make every replica drop its validate cache for
+        // nothing. Its position is safe because the ACCESS EXCLUSIVE lock is already held: a
+        // session writer takes sessions locks before it bumps session_meta (see
+        // session_store_sql_helpers.hpp "take it LAST"), so none can be holding the
+        // session_meta row while this waits on sessions. A peer replica's validate cache then
+        // drops the deleted rows on its next generation poll instead of serving them until
+        // some unrelated login bumps it. v2 has not shipped, so it is edited in place.
+        {2, std::string("SET LOCAL lock_timeout = '3s';"
+                        "LOCK TABLE sessions IN ACCESS EXCLUSIVE MODE;"
+                        "DO $$ DECLARE n bigint; BEGIN"
+                        " DELETE FROM sessions WHERE NOT ") +
+                kPrincipalPairingOk +
+                std::string(";"
+                            " GET DIAGNOSTICS n = ROW_COUNT;"
+                            " IF n > 0 THEN"
+                            " RAISE WARNING 'session_store v2 (#2343): deleted % inconsistent"
+                            " session row(s); each affected principal must sign in again', n;"
+                            " INSERT INTO session_store.session_meta (key, value)"
+                            " VALUES ('write_generation', '1')"
+                            " ON CONFLICT (key) DO UPDATE SET value ="
+                            " (session_store.session_meta.value::bigint + 1)::text;"
+                            " END IF;"
+                            " END $$;"
+                            "ALTER TABLE sessions DROP CONSTRAINT IF EXISTS"
+                            " sessions_principal_kind_consistent;"
+                            "ALTER TABLE sessions ADD CONSTRAINT"
+                            " sessions_principal_kind_consistent CHECK (") +
+                kPrincipalPairingOk + std::string(");")},
     };
     return kMigrations;
 }

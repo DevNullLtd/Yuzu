@@ -140,14 +140,19 @@ site that reads a session now classifies an engine with the same `Session::is_en
 local, OIDC or SAML sign-in, and API, MCP and engine token sessions are never stored. Only a
 session row edited by hand into another pairing is affected: the migration deletes it, logs a
 `WARNING` in the Postgres server log (`session_store v2 (#2343): deleted N inconsistent session
-row(s)`), and that principal signs in again.
+row(s)`; the same line reaches the server process's standard error), and that principal signs in
+again. The migration also bumps the session write generation in that case, so other replicas drop
+their cached copy of the deleted rows within about a second. A clean upgrade deletes nothing and
+bumps nothing.
 
 **What to do.** No action is needed, with one precondition. Do not start the upgrade while
 `pg_dump` or another long transaction is running: the migration takes a brief exclusive lock on
-`sessions` and waits at most 3 seconds for it. If it cannot get the lock the migration rolls back
+`sessions` and waits at most 3 seconds to acquire it; once held, the migration itself runs in
+milliseconds on a normal table. If it cannot get the lock the migration rolls back
 completely and the server refuses to start, logging `canceling statement due to lock timeout` on
 the preceding `PgMigrationRunner` line; start it again once the transaction ends. While it waits,
-sign-ins and session checks on replicas that are still running pause for up to those 3 seconds.
+sign-ins and session checks on replicas that are still running pause for up to those 3 seconds,
+plus the milliseconds the migration then holds the lock.
 An older binary can still run against the upgraded database.
 
 ## Behaviour change: engine principals are default-deny when RBAC is off

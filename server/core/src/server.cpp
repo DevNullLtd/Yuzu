@@ -23727,8 +23727,9 @@ private:
     RateLimiter api_rate_limiter_;
     RateLimiter login_rate_limiter_;
 
-    // Per-principal quota cap (PR 4.4) — gates principal_kind=="engine"
-    // sessions only, at the pre-routing chokepoint. See principal_quota.hpp.
+    // Per-principal quota cap (PR 4.4) — gates engine-classed sessions only
+    // (stored principal_kind "engine" or an engine_token source), at the
+    // pre-routing chokepoint. See principal_quota.hpp.
     PrincipalQuota principal_quota_;
 };
 

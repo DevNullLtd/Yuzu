@@ -498,3 +498,37 @@ TEST_CASE("SessionStore v2: upgrading a v1 database removes the inconsistent row
     // A peer replica's validate cache drops the deleted rows on its next generation poll.
     CHECK(write_generation(pool) > gen_before);
 }
+
+TEST_CASE("SessionStore v2: a clean upgrade deletes nothing and leaves the write generation alone",
+          "[session_store][pg]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    {
+        SessionStore fresh{pool};
+        REQUIRE(fresh.is_open());
+        REQUIRE(fresh.create(make_params("keep-human", "alice")).has_value());
+    }
+    {
+        auto lease = pool.acquire();
+        REQUIRE(pg::exec_params(lease.get(),
+                                "ALTER TABLE session_store.sessions DROP CONSTRAINT "
+                                "sessions_principal_kind_consistent",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "UPDATE public.schema_meta SET version = 1 "
+                                "WHERE store = 'session_store'",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    const std::int64_t gen_before = write_generation(pool);
+
+    SessionStore upgraded{pool}; // runs v2 over a table with only consistent rows
+    REQUIRE(upgraded.is_open());
+    auto got = upgraded.find("keep-human");
+    REQUIRE(got.has_value());
+    CHECK(got->has_value());
+    CHECK(write_generation(pool) == gen_before); // no rows deleted, so peers keep their caches
+    CHECK(insert_raw_session(pool, "again", "engine_token", "human") == kCheckViolation);
+}
