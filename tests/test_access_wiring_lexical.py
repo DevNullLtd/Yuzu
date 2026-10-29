@@ -22,6 +22,10 @@ Settings enrolment fragments (settings_routes_ wiring):
      view writes no auth.admin_required row per panel (the Users page fix, ef7adec0c).
   5. `settings_routes_->register_routes(...)` still binds the LOUD `require_admin` as `admin_fn`
      and never `probe_admin`: every mutating route keeps its denial row.
+  7. `set_read_perm_fn` binds `auth_routes_->probe_permission(req, res, type, op)`: the
+     auto-loading Engine Principals fragment gates on EnginePrincipal:Read exactly as its REST
+     twin does (#5882), through the quiet probe. Never the loud `require_permission`, never a
+     constant.
 
 Groups page (register_groups_routes block):
 
@@ -76,6 +80,15 @@ def settings_problems(src):
         out.append("settings read_admin_fn no longer returns auth_routes_->probe_admin(req, res)")
     elif re.search(r"return (true|false)|require_admin", rd):
         out.append("settings read_admin_fn returns a constant or the loud gate")
+    rp = block(src, "settings_routes_->set_read_perm_fn(")
+    if rp is None:
+        out.append("server.cpp no longer calls settings_routes_->set_read_perm_fn( "
+                   "(the Engine Principals fragment falls back to the loud perm_fn_)")
+    elif "return auth_routes_->probe_permission(req, res, type, op);" not in rp:
+        out.append("settings read_perm_fn no longer returns "
+                   "auth_routes_->probe_permission(req, res, type, op)")
+    elif re.search(r"return (true|false)|require_permission|require_admin", rp):
+        out.append("settings read_perm_fn returns a constant or a loud gate")
     reg = block(src, "settings_routes_->register_routes(")
     if reg is None:
         out.append("server.cpp no longer calls settings_routes_->register_routes(")
@@ -148,6 +161,17 @@ MUTATIONS = [
      r"return auth_routes_->probe_admin\(req, res\);", r"\1return true;", "read_admin_fn"),
     (r"settings_routes_->set_read_admin_fn\(", "settings_routes_->set_read_admin_fn_gone(",
      "set_read_admin_fn"),
+    # The Engine Principals fragment's quiet permission probe is bound ...
+    (r"(set_read_perm_fn\(\s*\[this\]\(const httplib::Request& req, httplib::Response& res, "
+     r"const std::string& type,\s*const std::string& op\) \{\s*)"
+     r"return auth_routes_->probe_permission\(req, res, type, op\);", r"\1return true;",
+     "read_perm_fn"),
+    (r"(set_read_perm_fn\(\s*\[this\]\(const httplib::Request& req, httplib::Response& res, "
+     r"const std::string& type,\s*const std::string& op\) \{\s*)"
+     r"return auth_routes_->probe_permission\(req, res, type, op\);",
+     r"\1return auth_routes_->require_permission(req, res, type, op);", "read_perm_fn"),
+    (r"settings_routes_->set_read_perm_fn\(", "settings_routes_->set_read_perm_fn_gone(",
+     "set_read_perm_fn"),
     # ... and the mutating routes keep the loud gate.
     (r"(\[this\]\(const httplib::Request& req, httplib::Response& res\) \{\s*)"
      r"return require_admin\(req, res\);(\s*\},\s*\[this\]\(const httplib::Request& req, "
