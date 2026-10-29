@@ -379,3 +379,89 @@ TEST_CASE("SessionStore: touch_activity is monotonic — a now() stamp never reg
     REQUIRE(store.touch_activity("h").has_value());
     CHECK((*store.find("h"))->row.last_activity_ms == future); // NOT regressed
 }
+
+// ── #2343: the v2 migration and the principal_kind CHECK ─────────────────────────────────────
+
+namespace {
+// A raw row insert that bypasses SessionStore::create (which only ever writes the values its
+// callers pass), modelling a hand-edited or foreign-written durable row.
+bool insert_raw_session(PgPool& pool, const std::string& hash, const std::string& auth_source,
+                        const std::string& kind) {
+    auto lease = pool.acquire();
+    auto r = pg::exec_params(
+        lease.get(),
+        "INSERT INTO session_store.sessions (token_hash, username, role, auth_source, "
+        "principal_kind, created_at_ms, expires_at_ms, last_activity_ms) "
+        "VALUES ($1, 'raw-user', 'admin', $2, $3, 1, 9999999999999, 1)",
+        std::vector<std::string>{hash, auth_source, kind});
+    return r.status() == PGRES_COMMAND_OK;
+}
+} // namespace
+
+TEST_CASE("SessionStore v2: the CHECK rejects an unknown kind and an engine_token source "
+          "recorded as human, and admits every legitimate pairing",
+          "[session_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    // The split state the constraint exists to make unrepresentable.
+    CHECK_FALSE(insert_raw_session(pool, "split", "engine_token", "human"));
+    // Kinds outside {human, engine}, including a case variant a string compare would miss.
+    CHECK_FALSE(insert_raw_session(pool, "empty", "local", ""));
+    CHECK_FALSE(insert_raw_session(pool, "case", "local", "Engine"));
+    CHECK_FALSE(insert_raw_session(pool, "unknown", "oidc", "service"));
+    // What the server really writes, plus the consistent engine pairing.
+    CHECK(insert_raw_session(pool, "ok-local", "local", "human"));
+    CHECK(insert_raw_session(pool, "ok-saml", "saml", "human"));
+    CHECK(insert_raw_session(pool, "ok-engine", "engine_token", "engine"));
+    CHECK(insert_raw_session(pool, "ok-engine-local", "local", "engine"));
+}
+
+TEST_CASE("SessionStore v2: upgrading a v1 database removes the inconsistent rows, keeps the rest, "
+          "and leaves the constraint in force",
+          "[session_store][pg]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    {
+        SessionStore fresh{pool};
+        REQUIRE(fresh.is_open());
+        REQUIRE(fresh.create(make_params("keep-human", "alice")).has_value());
+    }
+    // Rewind to a v1 database: no constraint, schema_meta at 1, then plant the rows only a hand
+    // edit could produce.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(pg::exec_params(lease.get(),
+                                "ALTER TABLE session_store.sessions DROP CONSTRAINT "
+                                "sessions_principal_kind_consistent",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "UPDATE public.schema_meta SET version = 1 "
+                                "WHERE store = 'session_store'",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    REQUIRE(insert_raw_session(pool, "bad-split", "engine_token", "human"));
+    REQUIRE(insert_raw_session(pool, "bad-kind", "local", "Engine"));
+    REQUIRE(insert_raw_session(pool, "keep-engine", "engine_token", "engine"));
+
+    SessionStore upgraded{pool}; // runs v2
+    REQUIRE(upgraded.is_open());
+
+    auto present = [&](const char* hash) {
+        auto got = upgraded.find(hash);
+        REQUIRE(got.has_value());
+        return got->has_value();
+    };
+    CHECK_FALSE(present("bad-split"));
+    CHECK_FALSE(present("bad-kind"));
+    CHECK(present("keep-human"));
+    CHECK(present("keep-engine"));
+    // The constraint is back, so the same hand edit is refused now.
+    CHECK_FALSE(insert_raw_session(pool, "again", "engine_token", "human"));
+}

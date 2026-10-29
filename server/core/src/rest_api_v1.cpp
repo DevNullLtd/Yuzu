@@ -301,7 +301,7 @@ static bool deny_engine_session(const auth::Session& s, const httplib::Request& 
                                 httplib::Response& res, const RestApiV1::AuditFn& audit,
                                 const char* action, const char* target,
                                 const char* target_id = "") {
-    if (s.principal_kind == "engine" || s.auth_source == "engine_token") {
+    if (s.is_engine()) {
         // #2466/#2406: surface a dropped denial-audit via Sec-Audit-Failed (the
         // 403 stands — a denial commits no mutation, so it does not fail closed;
         // the header carries the audit-persist gap, matching the route successes).

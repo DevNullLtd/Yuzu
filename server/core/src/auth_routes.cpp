@@ -831,7 +831,7 @@ bool AuthRoutes::require_permission_impl(const httplib::Request& req, httplib::R
     // pre-RBAC legacy fallback below would otherwise hand an engine credential
     // fleet-wide Read the moment RBAC is off (the default). Resolve engine
     // sessions here, RBAC-only, or deny.
-    if (session->principal_kind == "engine") {
+    if (session->is_engine()) {
         if (!rbac_store_ || !rbac_store_->is_open()) {
             // Cannot evaluate authority — fail closed, 503.
             audit_log(req, "auth.permission_required", "denied", "", "",
@@ -1204,7 +1204,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // pre-RBAC legacy fallback below would otherwise hand an engine credential
     // fleet-wide Read the moment RBAC is off (the default). Resolve engine
     // sessions here, RBAC-only, or deny.
-    if (session->principal_kind == "engine") {
+    if (session->is_engine()) {
         if (!rbac_store_ || !rbac_store_->is_open()) {
             // Cannot evaluate authority — fail closed, 503.
             audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
@@ -1522,7 +1522,7 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
     // default-deny). authorize_list_read's own legacy-open branch would
     // otherwise hand an engine credential fleet-wide read the moment RBAC is
     // disabled; resolve engine sessions here, RBAC-only, or deny.
-    if (session->principal_kind == "engine") {
+    if (session->is_engine()) {
         if (!rbac_store_ || !rbac_store_->is_open()) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "engine principal denied: RBAC store unavailable");
@@ -1678,7 +1678,7 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
         // audited truthfully as "engine" (design §6 / adr-1005-execution-plan
         // Decision 9 — the AuditStore column reports it now; the HTTP metric
         // is deferred to 4.5).
-        if (session->principal_kind == "engine") {
+        if (session->is_engine()) {
             event.principal_class = "engine";
         }
     }
@@ -1793,7 +1793,7 @@ bool AuthRoutes::audit_log_for_session(const httplib::Request& req, const auth::
     // and, via `make_audit_event_for_principal`, the session correlator and source fields.
     return audit_log_for_principal(req, action, result, session.username, principal_role,
                                    target_type, target_id, detail,
-                                   session.principal_kind == "engine" ? "engine" : std::string{});
+                                   session.is_engine() ? "engine" : std::string{});
 }
 
 AuthRoutes::AuditAsSessionFn AuthRoutes::audit_as_session_fn() {

@@ -193,7 +193,7 @@ enum class SsoOnlyLocalGate : std::uint8_t {
 /// reaches a panel URL is anomalous and keeps the auditing behaviour, so a revoked or
 /// low-tier machine credential probing the Dashboard still leaves its row (PR #5859 review).
 [[nodiscard]] inline bool denial_row_may_be_withheld(const auth::Session& s) noexcept {
-    if (s.principal_kind == "engine")
+    if (s.is_engine())
         return false;
     return s.auth_source == "local" || s.auth_source == "oidc" || s.auth_source == "saml";
 }

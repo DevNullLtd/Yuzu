@@ -259,7 +259,7 @@ const std::string kRetryPrincipals = "data-tk=\"reload\" data-target=\"principal
 bool sees_all_owners(const auth::Session& s) {
     const bool cookie = s.auth_source != "api_token" && s.auth_source != "mcp_token" &&
                         s.auth_source != "engine_token";
-    return cookie && s.mcp_tier.empty() && s.token_scope_service.empty() && s.principal_kind != "engine" &&
+    return cookie && s.mcp_tier.empty() && s.token_scope_service.empty() && !s.is_engine() &&
            auth::effective_role(s) == auth::Role::admin;
 }
 

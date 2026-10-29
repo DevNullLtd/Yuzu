@@ -156,6 +156,22 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE INDEX sessions_username_idx ON sessions (username);"
          "CREATE INDEX sessions_expires_idx ON sessions (expires_at_ms);"
          "CREATE TABLE session_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"},
+        // v2 (#2343): keep the stored principal class inside {human, engine} and consistent
+        // with the authentication source. Token sessions (api/mcp/engine tokens) are never
+        // persisted, and every persist_new_session caller hard-codes a local, oidc or saml
+        // auth_source with the default 'human' kind, so no binary writes a row this
+        // constraint rejects; only a hand-edited row can. Such a row is untrusted by
+        // definition and a session is ephemeral, so the DELETE costs that principal one
+        // sign-in. Both statements stay ONE migration (the runner commits each migration as
+        // one transaction), DELETE first, so a retry clears any row an older binary wrote
+        // between attempts before the ALTER validates (same shape as AuditStore v2). Without
+        // the constraint, code that reads the stored kind alone and code that reads
+        // Session::is_engine() could classify one session differently.
+        {2, "DELETE FROM sessions WHERE principal_kind NOT IN ('human', 'engine')"
+            " OR (auth_source = 'engine_token' AND principal_kind <> 'engine');"
+            "ALTER TABLE sessions ADD CONSTRAINT sessions_principal_kind_consistent CHECK ("
+            "principal_kind IN ('human', 'engine')"
+            " AND (auth_source <> 'engine_token' OR principal_kind = 'engine'));"},
     };
     return kMigrations;
 }
