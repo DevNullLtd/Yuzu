@@ -75,7 +75,6 @@ namespace yuzu::server::mcp {
 namespace sse_bus = ::yuzu::server::detail;
 
 class McpSessionRegistry;
-struct McpSessionBinding;
 
 /// Replay-ring capacity per session. Matches `sse_bus::kPerConnectionQueueCapDefault`
 /// so a full-ring replay fits the sink queue exactly and cannot trip the sink's

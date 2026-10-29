@@ -6657,11 +6657,14 @@ bool reject_unsupported_protocol_version(const httplib::Request& req, httplib::R
     return true;
 }
 
-// The ONE predicate for "this caller holds a service-scoped API token" on /mcp/v1/
-// (service-scoped confinement clause 4: extend, never fork). A service-scoped token must
-// never reach a fleet-wide surface unfiltered; require_permission's service branch checks
-// the ITServiceOwner role only, never the token's own service-tag scope.
-[[nodiscard]] inline bool is_service_scoped_caller(const auth::Session& session) {
+// The one predicate for the stream-channel deny: "this caller holds a service-scoped API
+// token" (service-scoped confinement clause 4: extend, never fork). Other raw
+// token_scope_service.empty() checks belong to the C8 table and the scoped-gate layer, not
+// to this deny. A service-scoped token must never reach a fleet-wide surface unfiltered;
+// require_permission's service branch is a role ceiling plus a seeded-empty global-safe
+// allow-list; neither says which service the token is scoped to, and this handler has no
+// securable to hand it.
+[[nodiscard]] bool is_service_scoped_caller(const auth::Session& session) {
     return !session.token_scope_service.empty();
 }
 
@@ -6909,6 +6912,9 @@ McpServer::HandlerFn McpServer::build_handler(
         auto session = auth_fn(req, res);
         if (!session)
             return; // auth_fn already set 401
+        // Derived once per request: the presented-session check, the initialize mint, the
+        // bridge reserve and the streamed-POST liveness check all use this one value.
+        auto binding = binding_for(*session);
 
         // Parse JSON-RPC envelope
         auto parsed = parse_request(req.body);
@@ -6929,8 +6935,7 @@ McpServer::HandlerFn McpServer::build_handler(
         if (streaming_on) {
             const auto sid = req.get_header_value("Mcp-Session-Id");
             if (!sid.empty() && rpc.method != "initialize") {
-                const auto presented =
-                    mcp_sessions->validate_and_touch(sid, binding_for(*session));
+                const auto presented = mcp_sessions->validate_and_touch(sid, binding);
                 if (presented != McpSessionRegistry::ValidateResult::kValid) {
                     const auto cid = yuzu::server::detail::make_correlation_id();
                     // #2917: the session id is an attacker-controlled HEADER until
@@ -6942,11 +6947,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // through raw.
                     session_audit("mcp.session.reject", "failure",
                                   yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8)),
-                                  std::string("reason=") +
-                                      (presented ==
-                                               McpSessionRegistry::ValidateResult::kCredentialMismatch
-                                           ? "credential_mismatch"
-                                           : "unknown_session") +
+                                  std::string("reason=") + session_reject_reason(presented) +
                                       " cid=" + cid);
                     res.status = 404;
                     // Echo the request id — this is a post-parse error with a known
@@ -7062,7 +7063,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // A client-supplied Mcp-Session-Id is never adopted here (no
             // fixation, 15(a)/CH-8).
             if (streaming_on) {
-                auto mint = mcp_sessions->mint(binding_for(*session));
+                auto mint = mcp_sessions->mint(binding);
                 if (!mint.ok) {
                     const auto cid = yuzu::server::detail::make_correlation_id();
                     session_audit("mcp.session.reject", "failure", "",
@@ -20062,7 +20063,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             }
                             stream_lease.emplace(std::move(acquired.lease));
                         }
-                        auto rr = bridge->reserve(bridge_sid, binding_for(*session), id,
+                        auto rr = bridge->reserve(bridge_sid, binding, id,
                                                   std::move(bridge_token),
                                                   /*streamed_intent=*/streamed_mode);
                         if (rr.ok) {
@@ -20772,7 +20773,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                 // Also the TTL slide: a live streamed POST keeps its
                                 // session alive exactly as a GET tick does.
                                 auto session_alive = [mcp_sessions, bridge_sid,
-                                                      binding = binding_for(*session)] {
+                                                      binding = std::move(binding)] {
                                     return mcp_sessions->validate_and_touch(bridge_sid, binding) ==
                                            McpSessionRegistry::ValidateResult::kValid;
                                 };
@@ -29805,8 +29806,8 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
         // mcp_stream.cpp already does this; DELETE takes the same untrusted input into
         // the same verbs and was passing it through raw.
         const auto audit_sid = yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8));
-        McpSessionRegistry::ValidateResult refusal = McpSessionRegistry::ValidateResult::kUnknown;
-        if (sessions->terminate(sid, binding_for(*session), &refusal)) {
+        const auto terminated = sessions->terminate(sid, binding_for(*session));
+        if (terminated == McpSessionRegistry::ValidateResult::kValid) {
             session_audit("mcp.session.close", "success", audit_sid, "");
             res.status = 200;
         } else {
@@ -29815,16 +29816,13 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
             // for the last, and the owner's session is left standing.
             const auto cid = yuzu::server::detail::make_correlation_id();
             session_audit("mcp.session.reject", "failure", audit_sid,
-                          std::string("reason=") +
-                              (refusal == McpSessionRegistry::ValidateResult::kCredentialMismatch
-                                   ? "credential_mismatch"
-                                   : "unknown_session") +
+                          std::string("reason=") + session_reject_reason(terminated) +
                               " cid=" + cid);
             res.status = 404;
             res.set_content(
                 error_response_null_a4(kMcpUnknownSession, "Unknown or expired session", cid,
-                                       "the session does not exist or is already terminated; no "
-                                       "action needed"),
+                                       "the session is unknown, expired or terminated; call "
+                                       "initialize to start a new session"),
                 "application/json");
         }
     };

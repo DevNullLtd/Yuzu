@@ -1716,10 +1716,8 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
         // otherwise different) credential of the owner is probing the session (#4754).
         // The registry left the owner's session untouched.
         deny(404, kMcpUnknownSession, "Unknown or expired session",
-             validated == McpSessionRegistry::ValidateResult::kCredentialMismatch
-                 ? "credential_mismatch"
-                 : "unknown_session",
-             "re-initialize to mint a new session", std::nullopt, sid);
+             session_reject_reason(validated), "re-initialize to mint a new session",
+             std::nullopt, sid);
         return;
     }
     if (!transport::accept_wants_sse(req.get_header_value("Accept"))) {

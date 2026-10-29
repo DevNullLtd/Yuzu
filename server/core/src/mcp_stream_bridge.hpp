@@ -516,7 +516,7 @@ public:
     /// #2740 they are no longer permanent: an at-cap admission RECLAIMS one
     /// rather than refusing (see `select_displaceable_pin_locked`). A transient
     /// over-count still rejects fail-closed (A5/C3).
-    ReserveResult reserve(const std::string& session_id, const McpSessionBinding& binding,
+    ReserveResult reserve(const std::string& session_id, McpSessionBinding binding,
                           const nlohmann::json& jsonrpc_id,
                           std::optional<nlohmann::json> progress_token, bool streamed_intent);
 

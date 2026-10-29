@@ -117,12 +117,12 @@ TEST_CASE("MCP session: terminate is principal-bound; reuse 404s", "[mcp][sessio
     auto a = reg.mint(bound("alice"));
     REQUIRE(a.ok);
 
-    CHECK_FALSE(reg.terminate(a.session_id, bound("bob"))); // foreign principal cannot delete
+    CHECK(reg.terminate(a.session_id, bound("bob")) == Validate::kUnknown); // foreign cannot delete
     CHECK(reg.validate_and_touch(a.session_id, bound("alice")) == Validate::kValid); // still alive
 
-    CHECK(reg.terminate(a.session_id, bound("alice"))); // owner deletes
+    CHECK(reg.terminate(a.session_id, bound("alice")) == Validate::kValid); // owner deletes
     CHECK(reg.validate_and_touch(a.session_id, bound("alice")) == Validate::kUnknown); // gone
-    CHECK_FALSE(reg.terminate(a.session_id, bound("alice"))); // double-delete is a no-op
+    CHECK(reg.terminate(a.session_id, bound("alice")) == Validate::kUnknown); // double-delete no-op
     CHECK(reg.active_count() == 0);
 }
 
@@ -153,7 +153,7 @@ TEST_CASE("MCP session: concurrent access is race-free (TSan regression net)", "
                     mine.push_back(m.session_id);
                 }
                 if (!mine.empty() && (i % 3 == 0)) {
-                    reg.terminate(mine.back(), bound(principal));
+                    (void)reg.terminate(mine.back(), bound(principal));
                     mine.pop_back();
                 }
                 // foreign / unknown probes must never crash or leak across threads
@@ -207,7 +207,7 @@ TEST_CASE("MCP session: shutdown closes every live session and refuses new mints
     CHECK(rejected.reject_reason == "shutdown");
     CHECK(reg.validate_and_touch(a.session_id, bound("alice")) == Validate::kUnknown);
     CHECK(reg.stream_for(a.session_id, bound("alice")) == nullptr);
-    CHECK_FALSE(reg.terminate(a.session_id, bound("alice")));
+    CHECK(reg.terminate(a.session_id, bound("alice")) == Validate::kUnknown);
     CHECK_FALSE(reg.exists(a.session_id, bound("alice")));
     reg.gc(); // no-op on an already-empty map; must not crash or resurrect anything
     CHECK(reg.active_count() == 0);
@@ -291,7 +291,7 @@ TEST_CASE("MCP session: shutdown races mint/validate/terminate cleanly (TSan reg
                 }
                 (void)reg.validate_and_touch(std::string(32, 'e'), bound("intruder"));
                 if (!mine.empty() && (i % 3 == 0)) {
-                    reg.terminate(mine.back(), bound(principal));
+                    (void)reg.terminate(mine.back(), bound(principal));
                     mine.pop_back();
                 }
                 if (i % 7 == 0) {
@@ -347,9 +347,7 @@ TEST_CASE("MCP session: a weaker credential class of the same principal is refus
     // Every registry entry point refuses the weaker class...
     CHECK(reg.validate_and_touch(a.session_id, weaker) == Validate::kCredentialMismatch);
     CHECK(reg.stream_for(a.session_id, weaker) == nullptr);
-    Validate why = Validate::kValid;
-    CHECK_FALSE(reg.terminate(a.session_id, weaker, &why));
-    CHECK(why == Validate::kCredentialMismatch);
+    CHECK(reg.terminate(a.session_id, weaker) == Validate::kCredentialMismatch);
     CHECK_FALSE(reg.exists(a.session_id, weaker));
     // ...and none of them terminated the owner's session.
     CHECK(reg.active_count() == 1);
@@ -377,7 +375,7 @@ TEST_CASE("MCP session: the same class on a second credential instance is accept
     CHECK(reg.validate_and_touch(a.session_id, successor) == Validate::kValid);
     CHECK(reg.stream_for(a.session_id, successor) != nullptr);
     CHECK(reg.exists(a.session_id, successor));
-    CHECK(reg.terminate(a.session_id, successor));
+    CHECK(reg.terminate(a.session_id, successor) == Validate::kValid);
     CHECK(reg.active_count() == 0);
 }
 
@@ -393,9 +391,7 @@ TEST_CASE("MCP session: a foreign principal is still kUnknown, never kCredential
     CHECK(reg.validate_and_touch(a.session_id, readonly_token("bob")) == Validate::kUnknown);
     CHECK(reg.validate_and_touch(std::string(32, 'a'), readonly_token("alice")) ==
           Validate::kUnknown);
-    Validate why = Validate::kValid;
-    CHECK_FALSE(reg.terminate(a.session_id, readonly_token("bob"), &why));
-    CHECK(why == Validate::kUnknown);
+    CHECK(reg.terminate(a.session_id, readonly_token("bob")) == Validate::kUnknown);
     CHECK(reg.stream_for(a.session_id, supervised_token("bob")) == nullptr);
     CHECK(reg.validate_and_touch(a.session_id, supervised_token("alice")) == Validate::kValid);
 }

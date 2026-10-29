@@ -252,24 +252,19 @@ std::shared_ptr<McpStreamState> McpSessionRegistry::stream_for(const std::string
     return it->second.stream;
 }
 
-bool McpSessionRegistry::terminate(const std::string& id, const McpSessionBinding& binding,
-                                   ValidateResult* refusal) {
+McpSessionRegistry::ValidateResult McpSessionRegistry::terminate(const std::string& id,
+                                                                 const McpSessionBinding& binding) {
     std::shared_ptr<McpStreamState> stream;
     std::size_t active = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = sessions_.find(id);
         if (it == sessions_.end() || it->second.binding.principal != binding.principal) {
-            if (refusal != nullptr) {
-                *refusal = ValidateResult::kUnknown;
-            }
-            return false;
+            return ValidateResult::kUnknown;
         }
         if (it->second.binding != binding) {
-            if (refusal != nullptr) {
-                *refusal = ValidateResult::kCredentialMismatch;
-            }
-            return false;  // a weaker/other-class credential never ends the owner's session
+            // Another class never ends the owner's session.
+            return ValidateResult::kCredentialMismatch;
         }
         stream = std::move(it->second.stream);
         sessions_.erase(it);
@@ -282,7 +277,7 @@ bool McpSessionRegistry::terminate(const std::string& id, const McpSessionBindin
     if (stream) {
         stream->close(McpStreamClose::kSessionTerminated);
     }
-    return true;
+    return ValidateResult::kValid;
 }
 
 std::size_t McpSessionRegistry::active_count() const {

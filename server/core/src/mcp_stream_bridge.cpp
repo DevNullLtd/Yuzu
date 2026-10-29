@@ -398,7 +398,7 @@ ExecutionEventBus::Listener McpStreamBridge::make_listener(std::shared_ptr<Bridg
 // ── reserve / subscribe / arm / cancel / abandon / park ────────────────────
 
 McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& session_id,
-                                                        const McpSessionBinding& binding,
+                                                        McpSessionBinding binding,
                                                         const nlohmann::json& jsonrpc_id,
                                                         std::optional<nlohmann::json> progress_token,
                                                         bool streamed_intent) {
@@ -435,7 +435,7 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     // to discard on a reject and must not serialize against the map).
     auto rec = std::make_shared<BridgeRecord>();
     rec->session_id = session_id;
-    rec->binding = binding;
+    rec->binding = std::move(binding);
     rec->jsonrpc_id = jsonrpc_id;
     rec->key = make_key(session_id, jsonrpc_id);
     rec->streamed_intent = streamed_intent;
@@ -680,7 +680,8 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
                         displaced->orphan
                             ? "orphan pin released to admit a new streamed call on this session"
                             : "pin released to admit a new streamed call on this session",
-                        displaced_detail, AuditResult::kSuccess, binding.principal);
+                        displaced_detail, AuditResult::kSuccess,
+                        rec->binding.principal);
         // Evidence floor, matching this file's teardown convention: the counter
         // and the audit row both route through swallowing guards, so a log line is
         // the one trace that survives an obs/audit sink failure. The release

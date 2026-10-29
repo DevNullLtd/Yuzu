@@ -1182,7 +1182,8 @@ TEST_CASE("McpSessionRegistry: terminate closes the session's live stream",
     auto attached = stream->attach_and_replay(0, nullptr, "alice");
     REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
 
-    REQUIRE(reg.terminate(minted.session_id, bound("alice")));
+    REQUIRE(reg.terminate(minted.session_id, bound("alice")) ==
+            mcp::McpSessionRegistry::ValidateResult::kValid);
     // The provider is woken and given a reason — a DELETE must not present as a
     // bare connection drop.
     CHECK(attached.sink->sse->closed.load());
@@ -1430,7 +1431,7 @@ TEST_CASE("McpSessionRegistry: concurrent mint / stream_for / terminate is race-
                 if (auto s = reg.stream_for(m.session_id, bound(principal))) {
                     s->publish("message", "x");
                 }
-                reg.terminate(m.session_id, bound(principal));
+                (void)reg.terminate(m.session_id, bound(principal));
             }
         });
     }
