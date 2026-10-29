@@ -35,6 +35,7 @@
 /// so the LLM-native flow does not require an out-of-band fetch"). REST and
 /// MCP therefore cannot drift from each other by construction.
 
+#include "discover_catalog_types.hpp" // DiscoveryDoc, build_routes_catalog (store-free)
 #include "instruction_store.hpp"
 #include "rbac_store.hpp"
 #include "scope_engine.hpp"
@@ -58,16 +59,6 @@ class HttpRouteSink; // http_route_sink.hpp — avoid pulling httplib-sink machi
 namespace detail {
 class AgentRegistry; // agent_registry.hpp — forward-declared, pointer-only here.
 } // namespace detail
-
-/// A built discovery response plus its content-derived ETag. Mirrors
-/// guardian::SchemaCatalog (guardian_schema_registry.hpp) — same shape, same
-/// FNV-1a content-hash idiom (build_discovery_doc in discover_routes.cpp) —
-/// but not reused directly since that type lives in the `guardian` namespace
-/// for a different catalog.
-struct DiscoveryDoc {
-    std::string json; ///< serialised JSON body
-    std::string etag; ///< strong ETag, e.g. "\"<hex>\"" — changes iff `json` changes
-};
 
 // ── Shared builders (REST + MCP both call these) ──────────────────────────
 
@@ -111,15 +102,6 @@ inline constexpr std::size_t kDiscoveryCanonicalBudgetBytes = 4 * 1024 * 1024;
 DiscoveryDoc build_instructions_catalog(
     InstructionStore& instruction_store,
     std::size_t canonical_budget_bytes = kDiscoveryCanonicalBudgetBytes);
-
-/// `/discover/routes`. Subsets the OpenAPI document
-/// (`yuzu::server::openapi_spec_json()`, openapi_spec_access.hpp) to
-/// {method, path, summary, tags, description} per operation. Carries
-/// `"source":"openapi"` plus a caveat string: the OpenAPI document is
-/// hand-maintained, not generated from the live route table, and can
-/// under-report. `openapi_json` is the raw OpenAPI document body (caller
-/// supplies it so this function has no direct dependency on rest_api_v1.*).
-DiscoveryDoc build_routes_catalog(const std::string& openapi_json);
 
 /// `/discover/scope-kinds`. Fully static — ground kinds (`__all__`,
 /// `group:<name>`), attribute kinds (`yuzu::server::detail::scope_kind_catalog()`,

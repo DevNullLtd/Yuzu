@@ -5472,8 +5472,9 @@ void SettingsRoutes::register_routes(
 
         // Owner-scoped revocation (fixes the sibling IDOR to #222 on
         // the HTMX dashboard path). A caller with ApiToken:Delete
-        // may only revoke their own tokens; the global admin role
-        // is the only bypass. We return a generic "not found"
+        // may only revoke their own tokens; the only bypass is an
+        // effective admin (the global admin role, or a session holding
+        // a JIT admin elevation). We return a generic "not found"
         // fragment in both the missing-id and the not-owner cases
         // so the dashboard does not become an enumeration oracle.
         auto existing = api_token_store_->get_token(token_id);
@@ -7064,18 +7065,104 @@ void SettingsRoutes::register_routes(
                           "text/html; charset=utf-8");
                       return;
                   }
-                  auto r = db->mfa_disable(session->username);
-                  if (!r) {
-                      audit_fn_(req, "mfa.disabled", "error", "User", session->username,
-                                "disable failed");
-                      res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
-                                                          "Could not disable MFA"),
-                                      "text/html; charset=utf-8");
+                  // Two rows per disable: an INTENT row ("attempted") written BEFORE the factor is
+                  // touched, and an OUTCOME row after. The outcome row is written AFTER the actor's
+                  // own session is deleted, so both are attributed to the session already
+                  // resolved, not re-resolved from the cookie. Order them by the audit `id`.
+                  // Returns whether the row persisted; the unwired fallback (tests, other callers)
+                  // is a void writer and reports true, so only the production binding can refuse.
+                  const auto audit = [&](const char* result, const std::string& detail) -> bool {
+                      if (audit_as_session_fn_)
+                          return audit_as_session_fn_(
+                              req, *session, auth::role_to_string(auth::effective_role(*session)),
+                              "mfa.disabled", result, "User", session->username, detail);
+                      audit_fn_(req, "mfa.disabled", result, "User", session->username, detail);
+                      return true;
+                  };
+                  // Fail closed on the intent row: an MFA clear that cannot be recorded does not
+                  // happen. Nothing has been cleared and no session has been ended.
+                  if (!audit("attempted", "MFA clear requested via Settings")) {
+                      spdlog::error("mfa.disabled: the audit store did not accept the intent row "
+                                    "for '{}'; MFA was NOT changed",
+                                    log_safe(session->username));
+                      res.status = 503;
+                      res.set_header("Retry-After", "5");
+                      res.set_header("Sec-Audit-Failed", "true");
+                      // /settings swaps no 5xx body (only /settings/security swaps this
+                      // fragment), so the toast is what tells the operator on the main page.
+                      res.set_header("HX-Trigger",
+                                     R"({"showToast":{"message":"Audit store unavailable; MFA )"
+                                     R"(was not changed.","level":"error"}})");
+                      res.set_content(
+                          render_mfa_fragment(*session, {}, {}, {}, {},
+                                              "Audit store unavailable; MFA was not changed."),
+                          "text/html; charset=utf-8");
                       return;
                   }
-                  audit_fn_(req, "mfa.disabled", "ok", "User", session->username, "");
-                  res.set_content(render_mfa_fragment(*session),
-                                  "text/html; charset=utf-8");
+                  // The clear has no undo, so a lost OUTCOME row cannot stop it; it is logged.
+                  const auto audit_outcome = [&](const char* result, const std::string& detail) {
+                      if (!audit(result, detail))
+                          spdlog::error("mfa.disabled: MFA cleared for '{}' but the outcome audit "
+                                        "row failed to persist",
+                                        log_safe(session->username));
+                  };
+                  // Same exit as logout: drop the cookie and send the browser to the landing page.
+                  const auto sign_out = [&] {
+                      res.set_header("Set-Cookie",
+                                     "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+                      res.set_header("HX-Redirect", "/home");
+                      res.set_content("", "text/plain");
+                  };
+                  // The pre-image comes from the clear's own row lock, so it cannot miss an
+                  // enrolment verified in between. A failed clear leaves it unknown, which counts
+                  // as enrolled: the fail-safe is to end sessions.
+                  auto r = db->mfa_disable_report(session->username);
+                  if (!r) {
+                      // The clear may have committed with its acknowledgement lost, so the
+                      // sessions end anyway (#6079).
+                      const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
+                      audit_outcome("error", "disable failed (sessions_ended=" +
+                                                 (ended.db_persisted ? std::to_string(ended.count)
+                                                                     : std::string("failed")) +
+                                                 ")");
+                      if (ended.db_persisted) {
+                          sign_out();
+                          return;
+                      }
+                      // Neither the clear nor the delete is confirmed: say the state is unknown.
+                      res.set_content(
+                          render_mfa_fragment(
+                              *session, {}, {}, {}, {},
+                              "Could not confirm MFA was disabled, and the account's sessions "
+                              "could not be ended. Its state is unknown: ask an administrator "
+                              "to check it and end the sessions."),
+                          "text/html; charset=utf-8");
+                      return;
+                  }
+                  const bool had_factor = *r;
+                  // Cancelling an enrolment that never completed clears no usable factor, so no
+                  // proof can predate one: nothing to end.
+                  if (!had_factor) {
+                      audit_outcome("ok", "no verified factor to clear");
+                      res.set_content(render_mfa_fragment(*session), "text/html; charset=utf-8");
+                      return;
+                  }
+                  // End EVERY session of the account, the caller's included (#6079): any of them
+                  // may hold an MFA proof made under the factor just cleared. The user signs in
+                  // again; a kept session would be a surviving proof we could not tell apart.
+                  const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
+                  if (!ended.db_persisted) {
+                      audit_outcome("partial", "sessions_ended=failed");
+                      res.set_content(
+                          render_mfa_fragment(
+                              *session, {}, {}, {}, {},
+                              "MFA was disabled, but the account's sessions could not be ended. "
+                              "Ask an administrator to end them."),
+                          "text/html; charset=utf-8");
+                      return;
+                  }
+                  audit_outcome("ok", std::format("sessions_ended={}", ended.count));
+                  sign_out();
               });
 }
 

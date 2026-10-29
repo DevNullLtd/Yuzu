@@ -11,7 +11,7 @@
 //     through the `add_store` seam with recording/throwing/failing fakes (no
 //     database needed);
 //   * a real-store fan-out ([pg][decommission][software_licensing]) — populate
-//     all seven stores (all born-on-PG), decommission one agent, and assert its
+//     all eight stores (all born-on-PG), decommission one agent, and assert its
 //     rows are gone from EVERY store while a bystander survives, including the
 //     software_licensing, app_usage and offline_endpoint (#5682) stores.
 
@@ -26,6 +26,7 @@
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
 #include "app_usage_store.hpp"
+#include "certificate_inventory_store.hpp"
 #include "offline_endpoint_store.hpp"
 
 #include "pg/pg_exec.hpp"
@@ -247,12 +248,12 @@ TEST_CASE("AgentDecommission null-store constructor registers every store as Ski
     // The all-null construction (a deployment that configured no per-agent
     // stores) fans to nothing but still audits one line per store.
     AgentDecommission cascade{AgentDecommissionStores{}};
-    CHECK(cascade.target_count() == 7); // inventory + 5 typed projections + presence
+    CHECK(cascade.target_count() == 8); // inventory + 5 typed projections + presence + certs
 
     const auto result = cascade.decommission("agent-x");
     CHECK(result.deleted == 0);
     CHECK(result.failed == 0);
-    CHECK(result.skipped == 7);
+    CHECK(result.skipped == 8);
     // The Decision-11 store is present in the audit even when unconfigured.
     const auto* sl = find_store(result, "software_licensing");
     REQUIRE(sl != nullptr);
@@ -278,7 +279,8 @@ yuzu::test::PgTestTemplate decommission_tpl{"decommission", [](const std::string
     yuzu::server::SoftwareLicensingStore software_licensing{pool};
     yuzu::server::AppUsageStore app_usage{pool};
     yuzu::server::OfflineEndpointStore offline_endpoint{pool};
-    if (!inventory.is_open() || !software_inventory.is_open() || !app_perf_daily.is_open() ||
+    yuzu::server::CertificateInventoryStore certificate_inventory{pool};
+    if (!certificate_inventory.is_open() || !inventory.is_open() || !software_inventory.is_open() || !app_perf_daily.is_open() ||
         !device_inventory.is_open() || !software_licensing.is_open() || !app_usage.is_open() ||
         !offline_endpoint.is_open())
         throw std::runtime_error("decommission template: a store failed to migrate");
@@ -296,7 +298,7 @@ TEST_CASE("InventoryStore::delete_agent guards an empty id and reports commit st
     REQUIRE(pool.valid());
     yuzu::server::InventoryStore inv{pool};
     REQUIRE(inv.is_open());
-    inv.upsert("agent-x", "installed_software", R"({"seed":"1"})", 1000);
+    inv.upsert("agent-x", "hardware_info", R"({"seed":"1"})", 1000);
 
     // Empty id: guarded — never a `WHERE agent_id = ''` — reports false (no
     // commit), and the real row is untouched.
@@ -332,7 +334,7 @@ std::int64_t today_utc_midnight() {
     return (now / 86400) * 86400;
 }
 
-// Populate one agent across all seven stores. `tag` distinguishes the target
+// Populate one agent across all eight stores. `tag` distinguishes the target
 // agent from the bystander so the assertions can prove agent-scoping.
 void seed_agent(const std::string& agent_id, yuzu::server::InventoryStore& inv,
                 yuzu::server::SoftwareInventoryStore& soft,
@@ -347,8 +349,8 @@ void seed_agent(const std::string& agent_id, yuzu::server::InventoryStore& inv,
     using yuzu::server::InventoryIngestOutcome;
     using yuzu::server::SoftwareEntry;
 
-    // Generic SQLite inventory.
-    inv.upsert(agent_id, "installed_software", R"({"seed":"1"})", 1000);
+    // Generic inventory (a non-typed source; typed ones are filtered from its reads).
+    inv.upsert(agent_id, "hardware_info", R"({"seed":"1"})", 1000);
 
     // Typed installed-software projection.
     std::vector<SoftwareEntry> sw = {{"Chrome", "119", "Google", "2026-01-01"}};
@@ -436,6 +438,8 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     yuzu::server::SoftwareLicensingStore software_licensing{pool};
     yuzu::server::AppUsageStore app_usage{pool};
     yuzu::server::OfflineEndpointStore offline_endpoint{pool};
+    yuzu::server::CertificateInventoryStore certificate_inventory{pool};
+    REQUIRE(certificate_inventory.is_open());
     REQUIRE(software_inventory.is_open());
     REQUIRE(app_perf_daily.is_open());
     REQUIRE(device_inventory.is_open());
@@ -457,12 +461,13 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
         .software_licensing = &software_licensing,
         .app_usage = &app_usage,
         .offline_endpoint = &offline_endpoint,
+        .certificate_inventory = &certificate_inventory,
     }};
 
     const auto result = cascade.decommission("agent-del");
 
-    // One decommission call fanned to all seven stores, all Deleted.
-    CHECK(result.deleted == 7);
+    // One decommission call fanned to all eight stores, all Deleted.
+    CHECK(result.deleted == 8);
     CHECK(result.skipped == 0);
     CHECK(result.failed == 0);
     CHECK(result.ok());
@@ -475,6 +480,9 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     const auto* oe = find_store(result, "offline_endpoint");
     REQUIRE(oe != nullptr);
     CHECK(oe->outcome == DecommissionOutcome::Deleted); // the presence store IS included
+    const auto* ci = find_store(result, "certificate_inventory");
+    REQUIRE(ci != nullptr);
+    CHECK(ci->outcome == DecommissionOutcome::Deleted); // the certificate store IS included
 
     // agent-del is gone from EVERY store.
     auto inv_del = inventory.get_agent_inventory("agent-del");
@@ -565,7 +573,7 @@ TEST_CASE("AgentDecommission over real stores skips an unconfigured store, still
 
     const auto result = cascade.decommission("agent-del");
     CHECK(result.deleted == 1);
-    CHECK(result.skipped == 6);
+    CHECK(result.skipped == 7);
     CHECK(result.failed == 0);
     CHECK(result.ok());
 
@@ -742,10 +750,10 @@ TEST_CASE("decommission cascade: store list is pinned to the DELETE route's docu
     // is the cascade's registered-store count without needing a live store.
     AgentDecommission cascade{AgentDecommissionStores{}};
 
-    constexpr std::size_t kCascadeStoreCount = 7; // inventory, software_inventory,
+    constexpr std::size_t kCascadeStoreCount = 8; // inventory, software_inventory,
                                                   // app_perf_daily, device_inventory,
                                                   // software_licensing, app_usage,
-                                                  // offline_endpoint
+                                                  // offline_endpoint, certificate_inventory
     CHECK(cascade.target_count() == kCascadeStoreCount);
 
     const auto result = cascade.decommission("agent-x");

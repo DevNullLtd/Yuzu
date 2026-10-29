@@ -19,9 +19,10 @@
 ## The per-profile `extensions` action follows as its own PR; Firefox and
 ## Safari are out of scope for this plugin's initial legs and follow separately.
 ##
-## Gated behind the Forensics securable, Administrator-only. Same enforced
-## boundary as execution_artifacts and app_usage (Forensics:Read +
-## AdminOrApproval, Forensics seeded to Administrator only); see this
+## Gated behind the Forensics securable: dispatch is Administrator or approval-gated.
+## Same enforced boundary as execution_artifacts and app_usage (Forensics:Read +
+## AdminOrApproval; Forensics:Read is seeded to Administrator and to the
+## read-only ForensicsAnalyst role, which cannot dispatch); see this
 ## plugin's README (agents/plugins/browser_inventory/README.md); the
 ## docs/user-manual page is a separate follow-up. Every read is
 ## SINGLE-TARGET (exactly one agent id) -- fleet/scope dispatch is refused

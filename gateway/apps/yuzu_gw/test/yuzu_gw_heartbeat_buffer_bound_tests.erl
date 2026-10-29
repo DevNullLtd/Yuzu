@@ -9,9 +9,9 @@
 %%% heartbeat can carry a 200 to 800 KB fleet snapshot) exceeded the server's
 %%% receive limit and every later flush failed forever.
 %%%
-%%% Mocks: grpcbox_client (every request is encoded with the Def the buffer
+%%% Mocks: yuzu_grpc_client (every request is encoded with the Def the buffer
 %%% passes, so sizes are the real wire sizes), telemetry and
-%%% yuzu_gw_upstream:replay_sessions/1 (both recorded). The log is an ETS
+%%% yuzu_gw_upstream:replay_sessions/1,2 (both recorded). The log is an ETS
 %%% table written from the calling process, so a flush_sync/0 reply (or the
 %%% sys:get_state/1 barrier after a cast) proves everything the buffer did is
 %%% already in it.
@@ -21,7 +21,7 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_heartbeat_buffer_bound_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("grpcbox/include/grpcbox.hrl").
+-include("../src/yuzu_grpc_client.hrl").
 
 -export([log/2]).  %% logger handler callback, see capture_logs/1
 
@@ -128,11 +128,11 @@ bound_test_() ->
      ]}.
 
 setup() ->
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     catch meck:unload(telemetry),
     catch meck:unload(yuzu_gw_upstream),
     persistent_term:put(?LOGK, ets:new(bound_test_log, [public, ordered_set])),
-    meck:new(grpcbox_client, [non_strict, no_link]),
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
     set_unary(fun(_N) -> {ok, #{acknowledged_count => 0}, #{}} end),
     meck:new(telemetry, [passthrough, no_link]),
     meck:expect(telemetry, execute, fun(Event, Meas, Meta) ->
@@ -146,6 +146,10 @@ setup() ->
         rec({cast, Ids}),
         ok
     end),
+    meck:expect(yuzu_gw_upstream, replay_sessions, fun(Ids, _Verdict) ->
+        rec({cast, Ids}),
+        ok
+    end),
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 60000),
     application:set_env(yuzu_gw, max_heartbeat_buffer, 100),
     application:unset_env(yuzu_gw, max_heartbeat_buffer_bytes),
@@ -155,7 +159,7 @@ setup() ->
 cleanup(_) ->
     stop_buffer(),
     stop_upstream(),
-    catch meck:unload([grpcbox_client, telemetry, yuzu_gw_upstream]),
+    catch meck:unload([yuzu_grpc_client, telemetry, yuzu_gw_upstream]),
     persistent_term:erase(?LOGK),
     application:unset_env(yuzu_gw, max_heartbeat_buffer_bytes),
     application:set_env(yuzu_gw, max_heartbeat_buffer, 100),
@@ -780,7 +784,7 @@ refused_single_chunk_is_dropped() ->
          reset_requests(),
          ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
          ?assertEqual([], requests())
-     end || Status <- [?GRPC_STATUS_RESOURCE_EXHAUSTED, ?GRPC_STATUS_INVALID_ARGUMENT]],
+     end || Status <- [?GRPC_STATUS_BIN_RESOURCE_EXHAUSTED, ?GRPC_STATUS_BIN_INVALID_ARGUMENT]],
     ok.
 
 %% The server's grpc-message is untrusted text: the BatchHeartbeat warning shows
@@ -788,10 +792,10 @@ refused_single_chunk_is_dropped() ->
 %% text yuzu_gw_upstream logs), whatever a hostile or buggy server sends.
 status_message_is_sanitised_in_the_log() ->
     Message = <<"m1\r\nm2\e[31m", 0, 127, 16#85, 16#9B, (binary:copy(<<"z">>, 1024))/binary>>,
-    meck:expect(grpcbox_client, unary,
+    meck:expect(yuzu_grpc_client, unary,
                 fun(_Ctx, _Path, Req, _Def, _Opts) ->
                     rec({request, Req, 0}),
-                    {error, {?GRPC_STATUS_INVALID_ARGUMENT, Message}, #{}}
+                    {error, {?GRPC_STATUS_BIN_INVALID_ARGUMENT, Message}, #{}}
                 end),
     queue(hb(<<"one">>, #{})),
     {_, Lines} = capture_logs(fun() -> yuzu_gw_heartbeat_buffer:flush_sync() end),
@@ -812,7 +816,7 @@ refused_chunk_is_split_and_poison_dropped() ->
     [queue(hb(Id, #{snap => snap(?MIB)})) || Id <- Ids],
     refuse_if(fun(Req) -> lists:any(fun(H) -> maps:get(session_id, H) =:= <<"p">> end,
                                     hbs(Req))
-              end, ?GRPC_STATUS_RESOURCE_EXHAUSTED),
+              end, ?GRPC_STATUS_BIN_RESOURCE_EXHAUSTED),
     ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
     ?assertEqual([[<<"p">>, <<"q1">>], [<<"p">>], [<<"q1">>], [<<"q2">>]],
                  [[maps:get(session_id, H) || H <- hbs(R)] || R <- requests()]),
@@ -827,7 +831,7 @@ refused_chunk_is_split_and_poison_dropped() ->
 refusal_of_multi_requests_delivers_singles() ->
     Ids = [sid(I) || I <- lists:seq(1, 8)],
     [queue(hb(Id, #{tags => tags()})) || Id <- Ids],
-    refuse_if(fun(Req) -> length(hbs(Req)) > 1 end, ?GRPC_STATUS_INVALID_ARGUMENT),
+    refuse_if(fun(Req) -> length(hbs(Req)) > 1 end, ?GRPC_STATUS_BIN_INVALID_ARGUMENT),
     ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
     Accepted = [maps:get(session_id, H) || R <- requests(), length(hbs(R)) =:= 1, H <- hbs(R)],
     ?assertEqual(Ids, Accepted),
@@ -839,7 +843,7 @@ refusal_of_multi_requests_delivers_singles() ->
 
 refusing_server_is_bounded_per_flush() ->
     [queue(hb(sid(I), #{})) || I <- lists:seq(1, 100)],
-    refuse_if(fun(_Req) -> true end, ?GRPC_STATUS_INVALID_ARGUMENT),
+    refuse_if(fun(_Req) -> true end, ?GRPC_STATUS_BIN_INVALID_ARGUMENT),
     ?assertEqual({error, rpc_limit}, yuzu_gw_heartbeat_buffer:flush_sync()),
     ?assertEqual(64, length(requests())),
     %% What the 64 RPCs got to is dropped; the rest stays for the next cycle.
@@ -850,10 +854,10 @@ refusing_server_is_bounded_per_flush() ->
 
 transient_failures_retain_and_stop() ->
     Failures = [
-        {error, {?GRPC_STATUS_UNAVAILABLE, <<"down">>}, #{}},
-        {error, {?GRPC_STATUS_DEADLINE_EXCEEDED, <<"slow">>}, #{}},
-        {error, {?GRPC_STATUS_INTERNAL, <<"oops">>}, #{}},
-        {error, {?GRPC_STATUS_NOT_FOUND, <<"?">>}, #{}},
+        {error, {?GRPC_STATUS_BIN_UNAVAILABLE, <<"down">>}, #{}},
+        {error, {?GRPC_STATUS_BIN_DEADLINE_EXCEEDED, <<"slow">>}, #{}},
+        {error, {?GRPC_STATUS_BIN_INTERNAL, <<"oops">>}, #{}},
+        {error, {?GRPC_STATUS_BIN_NOT_FOUND, <<"?">>}, #{}},
         {error, econnrefused},
         {error, timeout},
         {error, {stream_down, normal}},
@@ -872,8 +876,8 @@ transient_failures_retain_and_stop() ->
      end || F <- Failures],
     ok.
 
-%% grpcbox_client does not catch an exit of the HTTP/2 connection (an upstream
-%% that accepts and closes made h2_connection:new_stream exit noproc), and the
+%% yuzu_grpc_client does not catch an exit of the HTTP/2 connection (an upstream
+%% that accepts and closes made the connection process exit), and the
 %% marshal fun runs inside the call. The reason (it can hold the request) is
 %% not logged: only the class.
 exception_out_of_rpc_is_a_failed_flush() ->
@@ -886,7 +890,7 @@ exception_out_of_rpc_is_a_failed_flush() ->
         {throw, fun() -> throw({Marker, thrown}) end}
     ],
     [begin
-         meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) -> Raise() end),
+         meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) -> Raise() end),
          {Result, Lines} = capture_logs(fun() -> yuzu_gw_heartbeat_buffer:flush_sync() end),
          ?assertEqual({error, {exception, Class}}, Result),
          ?assertEqual(Pid, whereis(yuzu_gw_heartbeat_buffer)),
@@ -1030,7 +1034,7 @@ terminate_report_is_small_and_redacted() ->
     Pid = whereis(yuzu_gw_heartbeat_buffer),
     queue(hb(<<"SESSION-MARKER">>, #{snap => binary:copy(<<"SNAPSHOT-MARKER">>, 200000),
                                      tags => #{<<"TAGKEY-MARKER">> => <<"TAGVALUE-MARKER">>}})),
-    set_unary(fun(_N) -> {error, {?GRPC_STATUS_UNAVAILABLE, <<"down">>}, #{}} end),
+    set_unary(fun(_N) -> {error, {?GRPC_STATUS_BIN_UNAVAILABLE, <<"down">>}, #{}} end),
     _ = sys:replace_state(Pid, fun(St) -> setelement(5, St, not_an_interval) end),
     Ref = monitor(process, Pid),
     {_, Lines} = capture_logs(fun() ->
@@ -1058,8 +1062,8 @@ terminate_report_is_small_and_redacted() ->
 %% Every request is logged, and answered with Status when Pred(Req) holds and
 %% accepted otherwise. The request is encoded with the real marshal fun first.
 refuse_if(Pred, Status) ->
-    meck:expect(grpcbox_client, unary, fun(_Ctx, _Path, Req, Def, _Opts) ->
-        Size = iolist_size((Def#grpcbox_def.marshal_fun)(Req)),
+    meck:expect(yuzu_grpc_client, unary, fun(_Ctx, _Path, Req, Def, _Opts) ->
+        Size = iolist_size((maps:get(marshal, Def))(Req)),
         rec({request, Req, Size}),
         case Pred(Req) of
             true  -> {error, {Status, <<"refused">>}, #{}};
@@ -1072,12 +1076,12 @@ refuse_if(Pred, Status) ->
 %% rest. The request is logged either way.
 refuse_over_limit() ->
     Counter = counters:new(1, []),
-    meck:expect(grpcbox_client, unary, fun(_Ctx, _Path, Req, Def, _Opts) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_Ctx, _Path, Req, Def, _Opts) ->
         counters:add(Counter, 1, 1),
-        Size = iolist_size((Def#grpcbox_def.marshal_fun)(Req)),
+        Size = iolist_size((maps:get(marshal, Def))(Req)),
         rec({request, Req, Size}),
         case Size > ?SERVER_LIMIT of
-            true  -> {error, {?GRPC_STATUS_RESOURCE_EXHAUSTED, <<"too big">>}, #{}};
+            true  -> {error, {?GRPC_STATUS_BIN_RESOURCE_EXHAUSTED, <<"too big">>}, #{}};
             false -> {ok, #{acknowledged_count => length(maps:get(heartbeats, Req))}, #{}}
         end
     end).
@@ -1192,10 +1196,10 @@ check_bookkeeping() ->
 %% measured with the Def the buffer passed (the real marshal fun).
 set_unary(Fun) ->
     Counter = counters:new(1, []),
-    meck:expect(grpcbox_client, unary, fun(_Ctx, _Path, Req, Def, _Opts) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_Ctx, _Path, Req, Def, _Opts) ->
         counters:add(Counter, 1, 1),
         N = counters:get(Counter, 1),
-        Size = iolist_size((Def#grpcbox_def.marshal_fun)(Req)),
+        Size = iolist_size((maps:get(marshal, Def))(Req)),
         rec({request, Req, Size}),
         Fun(N)
     end).

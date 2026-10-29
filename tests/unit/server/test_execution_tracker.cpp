@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <expected>
 #include <latch>
 #include <memory>
 #include <optional>
@@ -40,6 +41,23 @@ static Execution make_execution(const std::string& definition_id = "def-001",
     exec.dispatched_by = dispatched_by;
     exec.status = "running";
     return exec;
+}
+
+
+// #4990: the dispatch record is (command_id -> plugin, execution_id). These two helpers keep the
+// pre-existing execution-id cases readable: they record under a fixed ordinary plugin and read the
+// execution id back; "no record" and "recorded with no execution id" are both reported as the
+// empty/absent execution id here, and the provenance cases below read the whole record.
+static bool record_cmd(ExecutionTracker& t, const std::string& command_id,
+                       const std::string& execution_id) {
+    return t.record_command_dispatch(command_id, "echo", execution_id);
+}
+static std::optional<std::string> lookup_exec(const ExecutionTracker& t,
+                                              const std::string& command_id) {
+    auto rec = t.lookup_command_record(command_id);
+    if (!rec)
+        return std::nullopt;
+    return rec->execution_id;
 }
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -1411,24 +1429,25 @@ TEST_CASE("ExecutionTracker: record/lookup command_execution round-trips",
           "[pg][execution_tracker]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
 
-    CHECK_FALSE(tracker_bundle->lookup_execution_id("cmd-unknown").has_value());
+    CHECK_FALSE(lookup_exec(*tracker_bundle, "cmd-unknown").has_value());
 
-    REQUIRE(tracker_bundle->record_command_execution("cmd-1", "exec-1"));
-    auto looked_up = tracker_bundle->lookup_execution_id("cmd-1");
+    REQUIRE(record_cmd(*tracker_bundle, "cmd-1", "exec-1"));
+    auto looked_up = lookup_exec(*tracker_bundle, "cmd-1");
     REQUIRE(looked_up.has_value());
     CHECK(*looked_up == "exec-1");
 
     // Last-write-wins on a repeated command_id (mirrors the former map's
     // operator[]= semantics).
-    REQUIRE(tracker_bundle->record_command_execution("cmd-1", "exec-2"));
-    looked_up = tracker_bundle->lookup_execution_id("cmd-1");
+    REQUIRE(record_cmd(*tracker_bundle, "cmd-1", "exec-2"));
+    looked_up = lookup_exec(*tracker_bundle, "cmd-1");
     REQUIRE(looked_up.has_value());
     CHECK(*looked_up == "exec-2");
 
-    // Empty execution_id deletes the mapping (the former map's explicit-
-    // clear branch).
-    REQUIRE(tracker_bundle->record_command_execution("cmd-1", ""));
-    CHECK_FALSE(tracker_bundle->lookup_execution_id("cmd-1").has_value());
+    // An empty execution_id never erases the recorded one (a re-drive that does not carry it).
+    REQUIRE(record_cmd(*tracker_bundle, "cmd-1", ""));
+    looked_up = lookup_exec(*tracker_bundle, "cmd-1");
+    REQUIRE(looked_up.has_value());
+    CHECK(*looked_up == "exec-2");
 }
 
 TEST_CASE("ExecutionTracker: lookup is non-destructive across a multi-agent "
@@ -1438,13 +1457,173 @@ TEST_CASE("ExecutionTracker: lookup is non-destructive across a multi-agent "
     // response against the SAME command_id. A lookup must never consume the
     // mapping, or agents 2..N would find nothing to stamp.
     yuzu::test::ExecutionTrackerPg tracker_bundle;
-    REQUIRE(tracker_bundle->record_command_execution("cmd-fanout", "exec-fanout"));
+    REQUIRE(record_cmd(*tracker_bundle, "cmd-fanout", "exec-fanout"));
 
     for (int i = 0; i < 5; ++i) {
-        auto looked_up = tracker_bundle->lookup_execution_id("cmd-fanout");
+        auto looked_up = lookup_exec(*tracker_bundle, "cmd-fanout");
         REQUIRE(looked_up.has_value());
         CHECK(*looked_up == "exec-fanout");
     }
+}
+
+TEST_CASE("ExecutionTracker: the dispatch record carries the plugin; the plugin is immutable "
+          "once recorded and an empty execution id keeps the stored one (#4990)",
+          "[pg][execution_tracker][forensics_tier]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    SECTION("round trip: plugin and execution id") {
+        REQUIRE(tracker.record_command_dispatch("tar-0001", "tar", "exec-1"));
+        const auto rec = tracker.lookup_command_record("tar-0001");
+        REQUIRE(rec.has_value());
+        CHECK(rec->plugin == "tar");
+        CHECK(rec->execution_id == "exec-1");
+    }
+    SECTION("an untracked dispatch records the plugin with an empty execution id") {
+        REQUIRE(tracker.record_command_dispatch("hardware-0002", "hardware", ""));
+        const auto rec = tracker.lookup_command_record("hardware-0002");
+        REQUIRE(rec.has_value());
+        CHECK(rec->plugin == "hardware");
+        CHECK(rec->execution_id.empty());
+    }
+    SECTION("the first writer's plugin wins: a later write cannot relabel a recorded command") {
+        REQUIRE(tracker.record_command_dispatch("cmd-1", "echo", "exec-1"));
+        REQUIRE(tracker.record_command_dispatch("cmd-1", "shell_exec", "exec-2"));
+        const auto rec = tracker.lookup_command_record("cmd-1");
+        REQUIRE(rec.has_value());
+        CHECK(rec->plugin == "echo");
+        CHECK(rec->execution_id == "exec-2"); // a non-empty execution id still replaces
+    }
+    SECTION("an empty execution id on a repeat keeps the stored one, and refreshes the clock") {
+        REQUIRE(tracker.record_command_dispatch("cmd-2", "echo", "exec-1"));
+        {
+            auto lease = tracker_bundle.pool().acquire();
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(),
+                                    "UPDATE execution_tracker.command_execution "
+                                    "SET created_at = created_at - 90000 WHERE command_id = 'cmd-2'",
+                                    std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
+        REQUIRE(tracker.record_command_dispatch("cmd-2", "echo", ""));
+        const auto rec = tracker.lookup_command_record("cmd-2");
+        REQUIRE(rec.has_value());
+        CHECK(rec->execution_id == "exec-1");
+        // The re-drive refreshed created_at, so the 24h sweep does not take it from under a
+        // live dispatch.
+        auto first = tracker.reap_command_execution_mappings();
+        REQUIRE(first.has_value());
+        CHECK(first->deleted == 0);
+    }
+    SECTION("a record without a plugin, or without a command id, is refused") {
+        CHECK_FALSE(tracker.record_command_dispatch("cmd-3", "", "exec-1"));
+        CHECK_FALSE(tracker.record_command_dispatch("", "echo", "exec-1"));
+        CHECK_FALSE(tracker.lookup_command_record("cmd-3").has_value());
+    }
+    SECTION("an unknown command id is a genuine miss, not a degrade") {
+        std::string degrade;
+        CHECK_FALSE(tracker.lookup_command_record("cmd-unknown", &degrade).has_value());
+        CHECK(degrade.empty());
+    }
+}
+
+TEST_CASE("ExecutionTracker: the 24h sweep takes at most 50000 expired dispatch records per pass "
+          "(#4990 retention re-decision)",
+          "[pg][execution_tracker][forensics_tier]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        // 50,010 records aged past the window: more than one pass may take.
+        auto ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO execution_tracker.command_execution "
+            "(command_id, plugin, execution_id, created_at) "
+            "SELECT 'aged-' || g, 'echo', '', extract(epoch FROM now())::bigint - 100000 "
+            "FROM generate_series(1, 50010) g",
+            std::vector<std::string>{});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    }
+    auto first = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(first.has_value());
+    CHECK(first->deleted == 50000);
+    auto second = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(second.has_value());
+    CHECK(second->deleted == 10);
+}
+
+TEST_CASE("ExecutionTracker: the 24h sweep does not delete a record a live dispatch refreshes while "
+          "the sweep is running (#4990)",
+          "[pg][execution_tracker][forensics_tier]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    pg::PgPool& pool = tracker_bundle.pool();
+
+    REQUIRE(tracker.record_command_dispatch("old-a", "echo", ""));
+    REQUIRE(tracker.record_command_dispatch("old-b", "echo", ""));
+    REQUIRE(tracker.record_command_dispatch("refreshed", "echo", ""));
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "UPDATE execution_tracker.command_execution "
+                                "SET created_at = created_at - 90000",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+
+    // A concurrent writer refreshes one record (the re-drive of `record_command_dispatch`) and
+    // holds its transaction open, so the sweep's DELETE reaches the row version it already chose
+    // and has to wait for the lock. When the writer commits, the sweep must re-test the age on the
+    // refreshed version and leave the row alone.
+    auto writer = pool.acquire();
+    REQUIRE(writer);
+    REQUIRE(pg::exec_params(writer.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(writer.get(),
+                            "UPDATE execution_tracker.command_execution "
+                            "SET created_at = extract(epoch FROM now())::bigint "
+                            "WHERE command_id = 'refreshed'",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    std::optional<std::expected<CommandExecutionReapOutcome, std::string>> reaped;
+    std::thread sweeper([&] { reaped = tracker.reap_command_execution_mappings(); });
+    // A failed REQUIRE below throws while the sweeper is joinable (and blocked on the writer's
+    // row lock): destroying a joinable std::thread calls std::terminate and would abort the whole
+    // test binary. Release the lock and join on every exit path instead.
+    yuzu::test::ScopeExit sweeper_cleanup{[&] {
+        if (sweeper.joinable()) {
+            (void)pg::exec_params(writer.get(), "ROLLBACK", std::vector<std::string>{});
+            sweeper.join();
+        }
+    }};
+
+    // Wait (bounded) until the sweep is blocked on the writer's row lock.
+    bool blocked = false;
+    for (int i = 0; i < 200 && !blocked; ++i) {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto r = pg::exec_params(lease.get(),
+                                 "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                                 "AND datname = current_database()",
+                                 std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        blocked = std::string(PQgetvalue(r.get(), 0, 0)) != "0";
+        if (!blocked)
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    REQUIRE(blocked);
+    REQUIRE(pg::exec_params(writer.get(), "COMMIT", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    sweeper.join();
+
+    REQUIRE(reaped.has_value());
+    REQUIRE(reaped->has_value());
+    CHECK((*reaped)->deleted == 2); // old-a and old-b only
+    CHECK_FALSE(lookup_exec(tracker, "old-a").has_value());
+    CHECK_FALSE(lookup_exec(tracker, "old-b").has_value());
+    CHECK(tracker.lookup_command_record("refreshed").has_value());
 }
 
 TEST_CASE("ExecutionTracker: a command_execution mapping written on one "
@@ -1453,7 +1632,7 @@ TEST_CASE("ExecutionTracker: a command_execution mapping written on one "
           "[pg][execution_tracker]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle; // "replica A" — dispatches
 
-    REQUIRE(tracker_bundle->record_command_execution("cmd-cross-replica", "exec-cross-replica"));
+    REQUIRE(record_cmd(*tracker_bundle, "cmd-cross-replica", "exec-cross-replica"));
 
     // "replica B" — a second pool AND a second ExecutionTracker instance
     // against the SAME database, sharing no process memory with A. The
@@ -1463,7 +1642,7 @@ TEST_CASE("ExecutionTracker: a command_execution mapping written on one "
     ExecutionTracker tracker_b{pool_b};
     REQUIRE(tracker_b.is_open());
 
-    auto looked_up = tracker_b.lookup_execution_id("cmd-cross-replica");
+    auto looked_up = lookup_exec(tracker_b, "cmd-cross-replica");
     REQUIRE(looked_up.has_value());
     CHECK(*looked_up == "exec-cross-replica");
 }
@@ -1477,8 +1656,8 @@ TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades "
     ExecutionTracker closed(unreachable);
     REQUIRE(!closed.is_open());
 
-    CHECK_FALSE(closed.record_command_execution("cmd-1", "exec-1")); // no-op, not a crash
-    CHECK_FALSE(closed.lookup_execution_id("cmd-1").has_value());
+    CHECK_FALSE(record_cmd(closed, "cmd-1", "exec-1")); // no-op, not a crash
+    CHECK_FALSE(lookup_exec(closed, "cmd-1").has_value());
     auto reaped = closed.reap_command_execution_mappings();
     REQUIRE_FALSE(reaped.has_value());
     CHECK(reaped.error() == "execution tracker not open");
@@ -1489,8 +1668,8 @@ TEST_CASE("ExecutionTracker: reap_command_execution_mappings deletes only "
           "[pg][execution_tracker]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
 
-    REQUIRE(tracker_bundle->record_command_execution("cmd-fresh", "exec-fresh"));
-    REQUIRE(tracker_bundle->lookup_execution_id("cmd-fresh").has_value());
+    REQUIRE(record_cmd(*tracker_bundle, "cmd-fresh", "exec-fresh"));
+    REQUIRE(lookup_exec(*tracker_bundle, "cmd-fresh").has_value());
 
     // First pass: no anchor yet, nothing aged out (the fresh row's
     // created_at is "now", far inside the 24h retention window) — proceeds
@@ -1499,7 +1678,7 @@ TEST_CASE("ExecutionTracker: reap_command_execution_mappings deletes only "
     REQUIRE(first.has_value());
     CHECK(first->deleted == 0);
     CHECK_FALSE(first->clock_anomaly);
-    CHECK(tracker_bundle->lookup_execution_id("cmd-fresh").has_value());
+    CHECK(lookup_exec(*tracker_bundle, "cmd-fresh").has_value());
 
     // Directly age the row past the retention window by rewriting
     // created_at through a second connection on the same pool (the public
@@ -1521,7 +1700,7 @@ TEST_CASE("ExecutionTracker: reap_command_execution_mappings deletes only "
     REQUIRE(second.has_value());
     CHECK(second->deleted == 1);
     CHECK_FALSE(second->clock_anomaly);
-    CHECK_FALSE(tracker_bundle->lookup_execution_id("cmd-fresh").has_value());
+    CHECK_FALSE(lookup_exec(*tracker_bundle, "cmd-fresh").has_value());
 }
 
 TEST_CASE("ExecutionTracker: reap declines on an implausibly-forward "
@@ -1741,8 +1920,8 @@ TEST_CASE("ExecutionTracker: the four non-tracked correlation-id VALUES "
          {"polchk-abc123", "bundle-def456", "preflight-run1-check2", "deployment-xyz-stage"}) {
         CAPTURE(execution_id);
         const std::string command_id = "plugin-cmd-" + execution_id;
-        REQUIRE(tracker_bundle->record_command_execution(command_id, execution_id));
-        auto looked_up = tracker_bundle->lookup_execution_id(command_id);
+        REQUIRE(record_cmd(*tracker_bundle, command_id, execution_id));
+        auto looked_up = lookup_exec(*tracker_bundle, command_id);
         REQUIRE(looked_up.has_value());
         CHECK(*looked_up == execution_id);
     }
@@ -2127,7 +2306,7 @@ TEST_CASE("ExecutionTracker: release_concurrency_claim_by_command / "
     // These *_by_command methods are the fallback notify_exec_tracker falls
     // back to whenever it can't resolve execution_id via the PG-backed
     // command_id -> execution_id correlation table (HA WS-1(1b),
-    // ExecutionTracker::lookup_execution_id) -- genuinely, today: a
+    // ExecutionTracker::lookup_command_record) -- genuinely, today: a
     // workflow-step dispatch (execution_id is always empty for those,
     // CONSIST-2/sec-M2), a correlation-table write/read degrade, or the
     // correlation table's own 24h-window entry aging out from under a

@@ -675,6 +675,7 @@ yuzu_server_core_lib = static_library(
     'src/ota_signature_sidecar.cpp',
     'src/update_registry.cpp',
     'src/response_store.cpp',
+    'src/forensics_visibility.cpp', # #4990: ForensicsVisibilityFn + the production resolver
     'src/response_routes.cpp',
     'src/response_query_model.cpp', # #2146 A2-R2: shared REST v1 + MCP builder for the
                                      # instruction/command-ID-keyed response query/aggregate/export surface
@@ -720,6 +721,7 @@ yuzu_server_core_lib = static_library(
     'src/schedule_model.cpp', # ADR-0031 WS-A4: seventh per-family seam, pure JSON row builder
     'src/schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam
     'src/help_ui.cpp',
+    'src/swagger_page_ui.cpp',
     'src/home_ui.cpp',     # Home (/home): the sign-in landing page, rendered per request
     'src/home_render.cpp', # Dashboard panels: pure value structs + renderers
     'src/home_routes.cpp', # Dashboard: GET /fragments/dashboard/summary over injected seams
@@ -927,6 +929,8 @@ yuzu_server_core_lib = static_library(
     'src/software_licensing_store.cpp',
     'src/software_licensing_ingestion.cpp',
     'src/app_usage_store.cpp',           # Wave 7b PR7b.2
+    'src/certificate_inventory_store.cpp',      # slice-2 PR 2a-2a
+    'src/certificate_inventory_ingestion.cpp',  # slice-2 PR 2a-2a
     'src/app_usage_ingestion.cpp',       # Wave 7b PR7b.2
     'src/app_usage_routes.cpp',          # Wave 7b PR7b.2
     'src/app_usage_read_model.cpp',      # Wave 7b PR7b.2 (Rule 1 shared builder)

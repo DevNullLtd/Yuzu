@@ -14,22 +14,52 @@
 
 ## How it works
 
-`list_networks` scans for visible access points, one row per AP (SSID, signal, security, channel, BSSID/type). Windows walks every WLAN interface via `WlanEnumInterfaces` + `WlanGetAvailableNetworkList` (wifi_plugin.cpp:666-715). Linux first reads NetworkManager's cached `AccessPoints` over D-Bus — a read only, not a scan trigger; it requires a device to report a finished `LastScan` before trusting the cache — then falls to `nmcli device wifi list` (which does scan), then a per-interface `iwlist <iface> scan` bounded by a 45s aggregate ladder budget across the whole action (wifi_plugin.cpp:87-105, 716-869). macOS runs the legacy `airport -s` (removed in macOS 14+) and then `system_profiler SPAirPortDataType`, both via the bounded argv runner and both needing a Location Services grant a background daemon typically lacks (wifi_plugin.cpp:870-937).
+Both actions are read-only: the plugin never joins, leaves or reconfigures a network. `list_networks` returns one row per visible access point; `connected` returns the network the radio is currently associated with. Each OS answers from its own Wi-Fi stack, and the Linux and macOS legs fall back down a ladder of tools when the preferred source does not answer.
 
-`connected` reports the single currently-associated network. Windows walks every connected-state interface via `WlanQueryInterface`; Linux checks NetworkManager's `ActiveAccessPoint` over D-Bus, then nmcli's `ACTIVE` row, then an `iwconfig` ESSID/Signal text blob; macOS reads CoreWLAN directly — native, no shell-out (wifi_corewlan.mm:69-118).
+- **Windows.** The WLAN API (`wlanapi`) is called in process. `list_networks` walks every wireless interface and reads the list of networks Windows already holds for it (`WlanGetAvailableNetworkList`); the plugin never asks Windows to scan. `connected` queries each interface that is in the connected state (`WlanQueryInterface`) and emits one row per connected interface.
+- **Linux.** The first rung reads NetworkManager over the system D-Bus (not the session bus): its device list, then each Wi-Fi device's `LastScan` and cached `AccessPoints`. That read never triggers a scan, so it is trusted only if some device reports a finished scan. The D-Bus rung exists only in builds with libsystemd; other builds start at nmcli. Otherwise the plugin runs `nmcli device wifi list` (the plugin passes no rescan option; whether nmcli rescans a stale cache is nmcli's own behaviour), then `iw dev` plus `iwlist <interface> scan` per interface for `list_networks`, or `iwconfig` for `connected`. Every subprocess is a direct argv, never a shell.
+- **macOS.** `connected` reads CoreWLAN in process. `list_networks` runs the legacy `airport -s` (removed in macOS 14) and then `system_profiler SPAirPortDataType`, which needs a Location Services grant a background daemon normally does not have.
 
-Every subprocess leg is gated on `wifi_tool_answered()`: a tool only counts as having answered the question if it exited zero, so a spawn failure or nonzero exit is never reported as a fabricated "Not connected" or an empty scan (wifi_parsers.hpp:695-721). No leg anywhere invokes a shell or interpreter — every subprocess call is direct argv (wifi_plugin.cpp:16-24, wifi_parsers.hpp:630-637). It deliberately does not distinguish WEP from Open on the Linux D-Bus leg (the AP's PRIVACY bit is never read, wifi_parsers.hpp:592-595), and it does not itself trigger a NetworkManager scan on the D-Bus rung — it consumes whatever cache already exists.
+A tool counts as having answered only if it exited with status zero. A spawn failure or a non-zero exit is therefore reported as an unavailable or constrained result, never as "Not connected" or an empty airspace. The plugin does not tell WEP from Open on the Linux D-Bus leg.
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Infrastructure.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[wifi.execute]
-  EX --> WIN[Windows leg<br/>WlanGetAvailableNetworkList / WlanQueryInterface]
-  EX --> MAC[macOS leg<br/>airport / system_profiler (list_networks)<br/>CoreWLAN (connected)]
-  EX --> LIN[Linux leg<br/>NetworkManager D-Bus → nmcli → iw/iwlist/iwconfig]
-  WIN & MAC & LIN --> ROWS[rows + typed result status]
-  ROWS --> RS[(ResponseStore)] --> API[REST /api/responses · MCP]
+  OP["Operator or workflow"] --> SRV["Server<br/>authz: Infrastructure.Read"]
+  SRV -- "gRPC mTLS" --> HOST["Agent plugin host"] --> EX["wifi.execute"]
+  EX --> WIN["Windows leg<br/>WlanGetAvailableNetworkList, WlanQueryInterface"]
+  EX --> MAC["macOS leg<br/>airport, system_profiler for list_networks<br/>CoreWLAN for connected"]
+  EX --> LIN["Linux leg<br/>NetworkManager D-Bus, then nmcli, then iw, iwlist, iwconfig"]
+  WIN & MAC & LIN --> ROWS["rows and typed result status"]
+  ROWS --> RS[("ResponseStore")] --> API["REST /api/responses and MCP"]
 ```
+
+### What you can decide with it
+
+| Question | Action | Windows | macOS | Linux |
+|---|---|---|---|---|
+| Is this device on the corporate network name? | `connected` | SSID, signal percent, authentication type, BSSID and adapter description, one row per connected adapter | Association, signal in dBm, channel and security are reliable; SSID and BSSID are usually the `<ssid-withheld>` marker on macOS 14 and later | SSID, signal percent, security, BSSID and the interface name, when NetworkManager (or nmcli or iwconfig) can see the radio |
+| Is any open or unexpected network visible? | `list_networks` | The networks Windows has cached for each adapter (no BSSID or channel), with an `Open` authentication label for unsecured ones | Normally one `wifi\|info` row saying the scan is unavailable on macOS 14 and later | SSID, signal percent, security, channel and BSSID for each AP NetworkManager or nmcli reports |
+| Does this device have a Wi-Fi radio at all? | either | `list_networks` writes a `No wireless interfaces found` error row; `connected` cannot tell you | Neither action says so; `connected` reports "Not connected" for a host with no Wi-Fi interface | `list_networks` writes an info row naming the missing interface or tools |
+
+How to read a negative: `Not connected` on Windows and macOS also appears when the host has no wireless adapter, so it does not prove a radio exists. `connected|unknown|...` means nothing answered, which is different from not connected. A `wifi|info|...no networks visible` row means a source answered and found none; a `wifi|error|...` row means the scan did not happen. This is a per-device snapshot, not a site survey: signal units differ by OS (percent on Windows and Linux, dBm on macOS) and are not comparable across a mixed fleet.
+
+### Diagrams
+
+```mermaid
+flowchart TD
+  A["list_networks on Linux"] --> B{"NetworkManager reachable, has a Wi-Fi device, finished scan?"}
+  B -- "yes" --> C["Rows from cached AccessPoints, or an info row if none"]
+  B -- "no" --> D["Record wifi:nm_dbus_fallthrough"] --> E{"nmcli exited 0?"}
+  E -- "yes" --> F["Rows from nmcli, or an info row if none"]
+  E -- "no" --> G{"iw dev lists interfaces?"}
+  G -- "yes" --> H["iwlist scan per interface, 45 s budget between scans"]
+  H --> I{"Did any scan exit 0?"}
+  I -- "yes" --> J["scan_output rows, or an info row"]
+  I -- "no" --> K["Error row, UNAVAILABLE wifi:iwlist_scan_failed"]
+  G -- "no" --> L["Error row, or info row if iw ran and found none"]
+```
+
+The ladder stops at the first rung that answers. A fallthrough from D-Bus is recorded as provenance but is not a failure, because the next rung answers in full. The 45 second budget is checked between `iwlist` runs, so it bounds the slowest rung, not the whole action. `connected` descends the same way: D-Bus, then the active row of `nmcli device wifi list`, then an `iwconfig` ESSID blob, then a `connected|unknown` row when none of them answered.
 
 ## OS capability
 
@@ -51,11 +81,11 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | None — `WlanGetAvailableNetworkList`/`WlanQueryInterface` need no elevation (docs/agent-privilege-model.md row 96) | 2026-09-07 on bare-metal as SYSTEM (windows.txt capture stamp) | A WLAN API failure (not privilege-specific) reports `UNAVAILABLE`/`PARTIAL` with a named provenance rather than a false "Not connected" (wifi_plugin.cpp:956-971, 1023-1027) |
-| macOS | agent LaunchDaemon, root by default (no `UserName` key — docs/agent-privilege-model.md "macOS is the current exception"); this plugin itself needs no elevation | None for `connected` (CoreWLAN reads are unprivileged); `list_networks`' `system_profiler` fallback needs a Location Services grant a background daemon cannot obtain (docs/agent-privilege-model.md row 96) | 2026-09-07 on bare-metal at **euid 501 (jsmith)** — unprivileged, not the production root LaunchDaemon identity (macos.txt capture stamp) | `list_networks`: `CONSTRAINED`/`PARTIAL`/`wifi:macos_scan_requires_location_services`, sentinel `wifi\|info\|...` (wifi_plugin.cpp:931-936). `connected`: SSID/BSSID silently become `<ssid-withheld>` on an otherwise-live connection, never a false "Not connected" (wifi_corewlan.hpp:14-22) |
-| Linux | agent unprivileged account (`yuzu`, docs/agent-privilege-model.md "TL;DR") | None for the D-Bus read or the `nmcli` argv fallback; the tertiary `iwlist <iface> scan` needs root for an active scan, which the agent does not hold and does not request (docs/agent-privilege-model.md row 96) | 2026-09-06 in a container as **euid 0 (root)** (linux.txt capture stamp) | Under the least-privilege agent, `iwlist` returns nothing and the plugin reports the scan as failed (`wifi\|error\|Wi-Fi scan failed on every discovered interface...`, `UNAVAILABLE`/`PARTIAL`/`wifi:iwlist_scan_failed`, wifi_plugin.cpp:833-839) rather than an empty airspace |
+| Windows | agent service account (LocalSystem today, #1442) | None: the WLAN API calls need no elevation (`docs/agent-privilege-model.md`, `wifi.*` row) | 2026-09-07, bare-metal, as `SYSTEM` | A WLAN API failure is not privilege-specific. `connected` reports `UNAVAILABLE`/`PARTIAL` with a named `wifi:wlan_*` token; `list_networks` writes a `wifi\|error\|Cannot open WLAN handle` row (and sets no status). A single interface whose list call fails is skipped silently (caveat 1). |
+| macOS | agent LaunchDaemon, root by default (no `UserName` key; `docs/agent-privilege-model.md` "macOS is the current exception"); the plugin itself needs no elevation | None for `connected` (CoreWLAN reads are unprivileged). The `system_profiler` fallback of `list_networks` needs a Location Services grant a background daemon cannot obtain. | 2026-09-07, bare-metal, as an unprivileged interactive user, not the production root LaunchDaemon identity | `list_networks`: `CONSTRAINED`/`PARTIAL` with `wifi:macos_scan_requires_location_services` and a `wifi\|info\|...` sentinel row. `connected`: SSID and BSSID become `<ssid-withheld>`/`-` on an otherwise live connection, never a false "Not connected". |
+| Linux | agent unprivileged account (`yuzu-agent` on the packaged unit; `docs/agent-privilege-model.md` TL;DR) | None for the NetworkManager read or the `nmcli` fallback. The last rung, `iwlist <interface> scan`, is expected to need root for an active scan (inferred from the tool, not shown by the plugin code), which the agent neither holds nor requests. | 2026-09-06, container, as root (`euid 0`), with no wireless tools installed | Under the least-privilege agent `iwlist` is expected to fail or return nothing (not measured); if no scan exits zero, `list_networks` reports `UNAVAILABLE`/`PARTIAL` with `wifi:iwlist_scan_failed` and a `wifi\|error\|Wi-Fi scan failed on every discovered interface` row rather than an empty airspace. |
 
-Binaries/subprocesses/network: Linux spawns `nmcli`, `iw`, `iwlist`, `iwconfig` via the bounded argv runner (20s per call, 45s aggregate ladder budget, wifi_plugin.cpp:84-97) and opens a D-Bus session-bus connection to NetworkManager (IPC, not a subprocess). macOS spawns `airport` (legacy, absent on macOS 14+) and `system_profiler` via the same bounded runner. Windows spawns nothing — it links `wlanapi.dll` directly (meson.build:8). No leg on any OS makes a network call of its own; the D-Bus and WLAN API calls are all local IPC to the host's own network stack.
+Binaries and network: Linux opens a connection to the system D-Bus for NetworkManager (local IPC, not a subprocess) and spawns `nmcli`, `iw`, `iwlist` and `iwconfig` through the bounded argv runner (20 second deadline per call, 5 second budget for the D-Bus calls). macOS spawns `airport` (absent on macOS 14 and later) and `system_profiler` the same way. Windows spawns nothing and links `wlanapi` directly. No leg makes a network call of its own.
 
 ## Data contract
 
@@ -67,7 +97,7 @@ Neither action takes parameters.
 
 ### Outputs
 
-Pipe-delimited rows. `list_networks` emits zero or more `wifi|...` rows per scan, or a single `wifi|info|...` / `wifi|error|...` / `wifi|scan_output|...` sentinel row when the scan could not enumerate real access points; `connected` emits exactly one `connected|...` row. Every free-text field (SSID, security, BSSID, raw scan blobs) is escaped through `safe_output_field` at the single emission site in `wifi_plugin.cpp`, because `wifi` is not a key|value plugin server-side and an unescaped `|`/`\n` in an attacker-controlled SSID would shift columns or fabricate a row (wifi_plugin.cpp:75-79, wifi_corewlan.hpp:58-65). The fourth and fifth columns of `list_networks` are OVERLOADED across platforms (see the table below), and its `wifi|scan_output|<blob>` fallback — the raw `iwlist` text after ESSID/Quality/Encryption filtering — does not populate the declared columns at all; it is one opaque field (wifi_plugin.cpp:824-828).
+Rows are pipe-delimited. `list_networks` emits zero or more `wifi|...` rows, or a single `wifi|info|...`, `wifi|error|...` or `wifi|scan_output|...` row when the scan could not enumerate real access points; `connected` emits one `connected|...` row (Windows emits one per connected adapter). The fourth and fifth `list_networks` columns mean different things per OS (see the table below), and the `wifi|scan_output|<blob>` fallback, the raw `iwlist` text after ESSID, Quality and Encryption filtering, fills none of the declared columns and is one opaque field. Every free-text field (SSID, security, BSSID, raw scan text) is escaped through `safe_output_field` at the emission site, because `wifi` is not a key-value plugin on the server and an unescaped `|` or newline in an attacker-controlled SSID would shift columns or fabricate a row.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`device.wifi.connected` — `ssid|signal|security|bssid|interface_or_channel`**
@@ -95,29 +125,27 @@ Pipe-delimited rows. `list_networks` emits zero or more `wifi|...` rows per scan
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `OK` | FULL | `wifi:nm_dbus_fallthrough` | Linux, both actions: NetworkManager D-Bus failed/unreachable and the action fell through to nmcli — provenance, not a failure, because the next rung answers fully (wifi_plugin.cpp:754-755, 1055-1056) |
-| `CONSTRAINED` | PARTIAL | `wifi:action_budget_exhausted` | Linux `list_networks`: the 45s aggregate ladder budget ran out mid `iwlist` scan with interfaces still unscanned (wifi_plugin.cpp:806-808) |
-| `CONSTRAINED` | PARTIAL | `wifi:macos_scan_requires_location_services` | macOS `list_networks`: neither `airport` nor `system_profiler` produced rows (wifi_plugin.cpp:931-933) |
-| `UNAVAILABLE` | PARTIAL | `wifi:iwlist_scan_failed` | Linux `list_networks`: interfaces were discovered but no `iwlist scan` answered (wifi_plugin.cpp:835-837) |
-| `UNAVAILABLE` | PARTIAL | `wifi:no_wireless_tools` | Linux `list_networks`: neither nmcli nor `iw` answered and no runner-level failure was already forwarded (wifi_plugin.cpp:857-859) |
-| `UNAVAILABLE` | PARTIAL | `wifi:wlan_open_handle_failed` / `wifi:wlan_enum_interfaces_failed` / `wifi:wlan_query_interface_failed` | Windows `connected`: the WLAN API call itself failed (wifi_plugin.cpp:956-957, 967-968, 1023-1025) |
-| `UNAVAILABLE` | PARTIAL | `wifi:nmcli_and_iwconfig_failed` | Linux `connected`: neither nmcli nor iwconfig answered and no runner-level failure was already forwarded (wifi_plugin.cpp:1111-1113) |
-| `UNAVAILABLE` | PARTIAL | `subprocess_runner:spawn_error` | The child process could not be spawned at all — this is what the linux.txt sample shows for both actions (wifi_plugin.cpp:768-769, 822-823, 854-855, 1074-1075, 1090-1091, 1109-1110) |
-| `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` | The runner's own deadline elapsed and the child was killed still running, forwarded via the same `forward_runner_failure` call sites |
-| `CONSTRAINED` | PARTIAL | `subprocess_runner:cancelled` | The run was cancelled before it finished, forwarded via the same call sites |
-| `CONSTRAINED` | PARTIAL | `subprocess_runner:signaled` | The child was killed by a signal rather than exiting cleanly, forwarded via the same call sites |
-| `OK` | PARTIAL | `subprocess_runner:line_limit` | A deliberate bounded stop: the runner capped output at its line limit and killed a still-producing child — not a failure, but incomplete |
-
-macOS `connected` and Windows `list_networks` never call `set_result_status` on any path (wifi_plugin.cpp:666-715, 1117-1134); Windows `connected`'s "not found, no error" branch (wifi_plugin.cpp:1028-1030) is the same. All three record `UNDECLARED`/`UNKNOWN` with empty provenance, exactly as the macos.txt and windows.txt samples show.
+| `UNDECLARED` (default) | UNKNOWN | (empty) | Windows `list_networks` (every path, including the error rows), Windows `connected` when no interface is connected, macOS `connected`, and every Linux or macOS result that completed without a degrade. The plugin sets no status on these paths. |
+| `OK` | FULL | `wifi:nm_dbus_fallthrough` | Linux, both actions: the NetworkManager D-Bus rung did not answer and the action fell through to nmcli. This is provenance, not a failure, because the next rung answers in full. |
+| `CONSTRAINED` | PARTIAL | `wifi:action_budget_exhausted` | Linux `list_networks`: the 45 second budget ran out between `iwlist` scans with interfaces still unscanned |
+| `CONSTRAINED` | PARTIAL | `wifi:macos_scan_requires_location_services` | macOS `list_networks`: neither `airport` nor `system_profiler` produced rows |
+| `UNAVAILABLE` | PARTIAL | `wifi:iwlist_scan_failed` | Linux `list_networks`: interfaces were discovered but no `iwlist scan` exited zero |
+| `UNAVAILABLE` | PARTIAL | `wifi:no_wireless_tools` | Linux `list_networks`: neither nmcli nor `iw` answered and no runner-level failure was already forwarded |
+| `UNAVAILABLE` | PARTIAL | `wifi:wlan_open_handle_failed` / `wifi:wlan_enum_interfaces_failed` / `wifi:wlan_query_interface_failed` | Windows `connected`: the WLAN API call itself failed |
+| `UNAVAILABLE` | PARTIAL | `wifi:nmcli_and_iwconfig_failed` | Linux `connected`: neither nmcli nor iwconfig answered and no runner-level failure was already forwarded |
+| `UNAVAILABLE` | PARTIAL | `subprocess_runner:spawn_error` | A tool could not be spawned at all; this is what `docs/samples/linux.txt` shows for both actions |
+| `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` | The 20 second runner deadline elapsed and the child was killed |
+| `CONSTRAINED` | PARTIAL | `subprocess_runner:cancelled` | The run was cancelled before it finished |
+| `CONSTRAINED` | PARTIAL | `subprocess_runner:signaled` | The child was killed by a signal rather than exiting cleanly |
+| `OK` | PARTIAL | `subprocess_runner:line_limit` | Defined by the shared runner for a capped line count. This plugin sets no line limit, so it does not occur here. |
 
 ### Where the data goes
 
-- **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore at the DSL default 90-day retention (`spec.response.retentionDays` is unset in `wifi.yaml`, docs/yaml-dsl-spec.md:190-194), queryable at `/api/responses/{id}`.
-- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule — `gather.ttlSeconds: 30` bounds the agent's response deadline, not a recurring interval (docs/yaml-dsl-spec.md:184-188) — the plugin executes only when an operator or workflow dispatches one of its two definitions.
-- **Sensitivity.** `bssid`/`bssid_or_connected` rows carry access-point MAC addresses (device identifiers, not the managed host's own) on Linux/macOS `list_networks` and on `connected` across all three OSes; `ssid` free text can itself identify a person or a specific device (e.g. a personal hotspot named after its owner, or the `<hex:...>` fallback for a non-UTF-8 SSID). No column carries the host's own hostname, IP address, or a logged-in username.
-- **Siblings:** none of this plugin's own definitions feed TAR. TAR ships its own, independent `netconn` capture source (`agents/plugins/tar/src/tar_netconn.hpp`, Windows-only, on by default) that records Wi-Fi connect/fail/disconnect transitions from the OS event log with a stricter allow-list than this plugin — it never extracts SSID, BSSID, or profile names (tar_schema_registry.cpp:822-825).
-- **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.wifi.connected")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
-
+- **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore at the DSL default 90-day retention (`spec.response.retentionDays` is unset in `wifi.yaml`), queryable at `/api/responses/{id}`.
+- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule: `gather.ttlSeconds: 30` bounds the agent's response deadline, not a recurring interval, and the plugin executes only when an operator or workflow dispatches one of its two definitions.
+- **Sensitivity.** `bssid`/`bssid_or_connected` rows carry access-point MAC addresses (device identifiers, not the managed host's own) on Linux and macOS `list_networks` and on `connected` across all three OSes; `ssid` free text can itself identify a person or a specific device (for example a personal hotspot named after its owner, or the `<hex:...>` form of a non-UTF-8 SSID). No column carries the host's own hostname, IP address, or a logged-in username.
+- **Siblings:** none of this plugin's definitions feed TAR. TAR ships its own independent `netconn` capture source (`agents/plugins/tar/src/tar_netconn.hpp`, Windows-only, on by default) that records Wi-Fi connect, fail and disconnect transitions from the OS event log with a stricter allow-list than this plugin; it never extracts SSID, BSSID or profile names.
+- **MCP / REST.** Discover: `discover_plugins` (summary), then `yuzu://plugin-docs` (this page as data), then `discover_instructions` / `get_definition("device.wifi.connected")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
@@ -159,11 +187,11 @@ connected|unknown|Wi-Fi connection state could not be determined (NetworkManager
 
 ## Caveats and known gaps
 
-1. **Windows `list_networks` can emit zero rows with no sentinel.** A failed WLAN handle or zero enumerated interfaces IS reported (`wifi|error|Cannot open WLAN handle|...`, `wifi|error|No wireless interfaces found|...`, wifi_plugin.cpp:670-673, 677-682). The silent gap is one level deeper: once at least one interface exists, `WlanGetAvailableNetworkList` returning `ERROR_SUCCESS` with zero networks (wifi_plugin.cpp:689-691) leaves the per-network loop with nothing to iterate (wifi_plugin.cpp:693,710) — no sentinel is written, unlike the Linux/macOS legs, which always emit an explicit `wifi|info|...`/`wifi|error|...` line for an empty result. This is what the windows.txt capture shows: the-rig's SYSTEM capture had a wireless interface (the WLAN API needs no interactive session) but no visible networks.
-2. **The Linux D-Bus rung has never met a real access point.** Every AP-property signature is spec/introspection-verified, not runtime-verified: the verification host was a container with no wireless device (wifi_plugin.cpp:159-166, 1184-1202). Promoting either leg to `SUPPORTED` needs one real-radio run that returns an AP through D-Bus and a second that forces the nmcli fallback (wifi_plugin.cpp:1199-1202).
-3. **WEP is indistinguishable from Open on the Linux D-Bus leg.** `nm_security_flags_to_string` reads only `WpaFlags`/`RsnFlags`, never the AP's PRIVACY bit, so a WEP-only AP reports `Open` the same as a genuinely unsecured one (wifi_parsers.hpp:592-595).
-4. **The nmcli `connected` fallback was dead on every host before this migration.** The previous `nmcli device show` argv requested `WIFI.SSID`/`WIFI.SIGNAL`-family fields that command rejects outright (`invalid field 'WIFI.SSID'`, exit 2); `device wifi list`'s `ACTIVE` row replaces it (wifi_parsers.hpp:140-155).
-5. **Neither non-Windows sample exercises the least-privilege path.** The Linux capture ran as root (euid 0) in a container with no `nmcli`/`iw` installed at all, so both actions hit the "no wireless tools" branch rather than the documented root-only-`iwlist` degrade; the macOS capture ran unprivileged (euid 501), not as the production root LaunchDaemon (docs/agent-privilege-model.md "macOS is the current exception").
+1. **Windows `list_networks` can return nothing without saying why.** A failed WLAN handle and a host with no wireless interface are reported as `wifi|error|...` rows, but once an interface exists, a failed `WlanGetAvailableNetworkList` call is skipped silently, and a successful call that returns zero networks writes no row. The Windows capture shows exactly this: an adapter was present and no networks were listed, with no status and no sentinel.
+2. **Windows reports a narrower, cached view.** The plugin never asks Windows to scan, so `list_networks` is whatever the WLAN service already knows, with no BSSID or channel. Its security label comes from the authentication algorithm alone (Open, WEP-Shared, WPA-Enterprise, WPA-PSK, WPA-None, WPA2-Enterprise, WPA2-PSK), so WPA3 and Enhanced Open networks read `Unknown` and a WEP network using open authentication reads `Open`.
+3. **The Linux D-Bus rung has never met a real access point.** The signatures were checked against introspection and a running NetworkManager in a container with no radio, so both Linux legs are declared constrained, and no sample on any OS shows a real access-point row. Promoting a leg needs one real-radio run that returns an AP through D-Bus and one that forces the nmcli fallback.
+4. **WEP reads as Open on the Linux D-Bus leg.** The plugin reads only the WPA and RSN flag words, never the access point's privacy bit, so a WEP-only network reports `Open` the same as a genuinely unsecured one.
+5. **On macOS 14 and later `list_networks` is normally the sentinel.** Without Location Services the scan returns the `wifi|info` row with `wifi:macos_scan_requires_location_services`, and the 2026-09-07 sample shows it. Neither non-Windows sample used the production identity (the macOS capture ran unprivileged and the Linux capture ran as root with no wireless tools), so the least-privilege `iwlist` degrade is neither captured nor shown by the code (the plugin only reports what the tool's exit status says).
 
 ## Source and tests
 

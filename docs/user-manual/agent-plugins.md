@@ -41,7 +41,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `installed_apps` | ✅ ✅ ✅ | Inventories installed applications and queries by name | [README](../../agents/plugins/installed_apps/README.md) |
 | `interaction` | ✅ ✅ ✅ | Desktop user interaction — notifications, message boxes, input dialogs, surveys, DND | [README](../../agents/plugins/interaction/README.md) |
 | `ioc` | ✅ ✅ ✅ | Indicator of Compromise checking — match IOCs against local endpoint state | [README](../../agents/plugins/ioc/README.md) |
-| `license_scan` | ✅ 🟡 🟡 | Detects software licences across OS, vendor and per-user surfaces | [README](../../agents/plugins/license_scan/README.md) |
+| `license_scan` | ✅ ✅ 🟡 | Detects software licences across OS, vendor and per-user surfaces | [README](../../agents/plugins/license_scan/README.md) |
 | `local_security_policy` | 🟡 🟡 🟡 | Reports local password, lockout and audit policy posture and sudoers content | [README](../../agents/plugins/local_security_policy/README.md) |
 | `mgmt_posture` | 🟡 ✅ 🟡 | Management-plane posture: which plane controls the device (facts only) | [README](../../agents/plugins/mgmt_posture/README.md) |
 | `msi_packages` | ✅ ✅ ⛔ | Enumerates installed packages and product codes (Windows MSI / macOS pkgutil) | [README](../../agents/plugins/msi_packages/README.md) |
@@ -67,7 +67,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `sccm` | ✅ ⛔ ⛔ | Reports SCCM/ConfigMgr client status, version, and site assignment | [README](../../agents/plugins/sccm/README.md) |
 | `script_exec` | ✅ ✅ ✅ | Executes commands and scripts with streaming output (admin-only) | [README](../../agents/plugins/script_exec/README.md) |
 | `services` | ✅ ✅ ✅ | System services — enumerate, query, and configure service startup types | [README](../../agents/plugins/services/README.md) |
-| `shares` | 🟡 🟡 ✅ | Shares this host serves over SMB/NFS: names, paths and a few flags, never ACLs | [README](../../agents/plugins/shares/README.md) |
+| `shares` | ✅ 🟡 ✅ | Shares this host serves over SMB/NFS: names, paths and a few flags, never ACLs | [README](../../agents/plugins/shares/README.md) |
 | `software_actions` | ✅ ✅ ✅ | Lists upgradable packages and counts installed software | [README](../../agents/plugins/software_actions/README.md) |
 | `status` | ✅ ✅ ✅ | Reports agent version, system info, health, modules, connection, switch, and config | [README](../../agents/plugins/status/README.md) |
 | `storage` | ✅ ✅ ✅ | Persistent key-value storage — set, get, delete, list, clear | [README](../../agents/plugins/storage/README.md) |

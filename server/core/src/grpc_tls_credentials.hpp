@@ -55,7 +55,7 @@ build_server_tls_credentials(const std::filesystem::path& cert_path,
 // policy): verify_peer authenticates to the CA, NOT to a specific identity.
 //
 // #1422: the gateway side no longer stops at the CA check. Its mgmt
-// listener's grpcbox auth_fun (yuzu_gw_authz:check_mgmt_peer/1) pins the
+// listener's auth_fun (yuzu_gw_authz:check_mgmt_peer/1) pins the
 // peer to THIS server's key — SPKI SHA-256 of the presented leaf against
 // {yuzu_gw, mgmt_peer_pins} (default: the default-server.pem in the shared
 // cert volume), plus a serverAuth-EKU requirement agent leaves can never

@@ -897,10 +897,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "Linux from sssd/ipa configuration as written), MDM enrolment on macOS; a refused read is "
          "reported as permission_denied, never as not-joined; read-only, one bounded argv on macOS"},
         {"shares.list",
-         "Shares this host serves over SMB/NFS as configured: name, path, ro/rw, anonymous access "
-         "and a few flags, never ACLs or NFS client host lists; configured exports, not the "
-         "mapping/session observations tar mapdrive records; Linux reads /etc/exports, "
-         "/etc/exports.d and /etc/samba/smb.conf, macOS and Windows are planned; read-only"},
+         "Shares this host serves over SMB/NFS: name, path, ro/rw, anonymous access and a few "
+         "flags, never ACLs or NFS client host lists; not the mapping/session observations tar "
+         "mapdrive records; Linux reads the configuration as written (/etc/exports, "
+         "/etc/exports.d and /etc/samba/smb.conf), Windows reads the live Server-service shares "
+         "through NetShareEnum (name, path, kind and flags only), macOS is planned; read-only"},
         {"remote_access_audit.list",
          "SSH inbound-access audit as configured: sshd_config values (Include followed, Match not "
          "evaluated), per-account authorized_keys key fingerprints with option names, and whether "
@@ -2240,7 +2241,8 @@ AgentRegistry::evaluate_scope_for_agent(const std::string& agent_id,
 
 const std::vector<ScopeKindInfo>& scope_kind_catalog() {
     static const std::vector<ScopeKindInfo> catalog = {
-        {"from_result_set:<id>", "from_result_set:<id>", "from_result_set:rs_01H8X3ZQK7YB2",
+        {"from_result_set:<id>", "from_result_set:<id>",
+         "from_result_set:rs_019a3c5e7b20123456789abcdef",
          "Owner-checked membership of a previously-saved result set (composable "
          "scope, docs/scope-walking-design.md). A set the caller does not own, "
          "or that no longer exists, aborts the whole dispatch (#4981 PR-1) — it "

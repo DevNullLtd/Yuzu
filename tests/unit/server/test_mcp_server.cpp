@@ -14,6 +14,9 @@
 #include "mcp_jsonrpc.hpp"
 #include "secure_random.hpp" // test_hooks: force the next CSPRNG failure
 #include "mcp_orientation.hpp" // 2g PR 1: shared orientation source + tool_families()
+#include "test_json_schema_subset.hpp" // yuzu::test::schema_violation (get_me output-schema conformance)
+#include "test_principal_lock_gate.hpp" // yuzu::test::GrantReadFault (get_me real-store fault)
+#include "dashboard_api_routes.hpp"     // get_me parity against legacy GET /api/me
 #include "mcp_policy.hpp"
 #include "../test_log_capture.hpp"
 #include "execution_event_bus.hpp" // 2f PR 3a: progress-bridge integration tests
@@ -57,6 +60,7 @@
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "rest_api_v1.hpp"      // M.9 PR-2b: cross-transport cursor walk (REST + MCP)
+#include "test_forensics_tier_fixture.hpp" // #4990: the Forensics tier fixture
 #include "test_route_sink.hpp"  // M.9 PR-2b: in-process sink for that REST half
 #include "test_principal_lock_gate.hpp" // SqlFault: a REAL table moved aside in the throwaway DB
 #include "scope_engine.hpp"
@@ -119,6 +123,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <shared_mutex>
 #include <span>
@@ -134,6 +139,12 @@
 
 using namespace yuzu::server::mcp;
 using namespace yuzu::server;
+
+// #4990: reads in this file are test oracles, not an operator surface, so they take no tier
+// restriction (the tier itself is pinned in test_response_store.cpp / test_response_tier_filter.cpp).
+namespace {
+const auto kAllRows = yuzu::server::ResponseTierFilter::unrestricted_internal_consumer();
+} // namespace
 
 namespace {
 // AuditStore migrated to Postgres (ADR-0006) — "MCP AuditStore: query with
@@ -725,13 +736,13 @@ TEST_CASE("MCP ResponseStore: query with filters", "[pg][mcp][response]") {
 
     // Query all for instruction
     ResponseQuery rq;
-    auto results = store.query("instr-1", rq);
+    auto results = store.query("instr-1", kAllRows, rq);
     REQUIRE(results.has_value());
     CHECK(results->size() == 2);
 
     // Query filtered by agent
     rq.agent_id = "agent-1";
-    results = store.query("instr-1", rq);
+    results = store.query("instr-1", kAllRows, rq);
     REQUIRE(results.has_value());
     CHECK(results->size() == 1);
     CHECK((*results)[0].agent_id == "agent-1");
@@ -1040,6 +1051,12 @@ struct McpTestServer {
     /// the new execution_id exact-correlation collect path. Default nullptr
     /// keeps existing tests on the "Response store unavailable" path.
     yuzu::server::ResponseStore* response_store_for_test{nullptr};
+
+    /// #4990: the caller's Forensics visibility for the response tools (admin by default, so a
+    /// test that is not about the tier keeps its meaning; the tier cases flip it before calling).
+    /// `forensics_unwired_for_test` leaves the resolver AND plugin set unwired (fail closed).
+    yuzu::server::test::ForensicsCaller forensics_for_test;
+    bool forensics_unwired_for_test{false};
 
     /// Optionally wire a real AuditStore so query_audit_log can be exercised
     /// end-to-end through the actual MCP dispatch path. Default nullptr keeps
@@ -1593,6 +1610,12 @@ private:
         // shape for every pre-existing test that never touches it.
         mcp.set_fleet_read_fn(fleet_read_fn_for_test);
 
+        // #4990: the Forensics tier for the response tools, wired like the fleet gate above.
+        if (!forensics_unwired_for_test) {
+            mcp.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
+            mcp.set_forensics_visibility_fn(forensics_for_test.fn());
+        }
+
         // The registry tools' ToolDeps rides a setter beside it. The fleet gate is the
         // same permissive fake, so a deps-backed tool reaches its provider closures.
         {
@@ -1961,9 +1984,13 @@ TEST_CASE("MCP 2g: orientation says approvals are decided in the dashboard/REST,
     for (const std::string* text : {&blob, &about}) {
         CHECK(text->find("approver_assurance_required:*") != std::string::npos);
         CHECK(text->find("human act") != std::string::npos);
-        // G8-AR-3: "step-up" is the existing gate with its pass-throughs, not a guarantee
-        // that the approver holds an enrolled factor; the handshake must say so (#6079).
+        // #6079: the REST route requires an enrolled factor with a proof inside the approver
+        // window (at most 300 s); the handshake must say so, and must not revive the old
+        // "un-enrolled passes" claim.
         CHECK(text->find("#6079") != std::string::npos);
+        CHECK(text->find("enrolled MFA factor with a proof no older than the approver window "
+                         "(at most 300 s)") != std::string::npos);
+        CHECK(text->find("an un-enrolled local user passes it") == std::string::npos);
     }
     // The old claim that an MCP caller can decide a ticket must not return.
     CHECK(blob.find("approve/reject maker-checker tickets") == std::string::npos);
@@ -1972,12 +1999,11 @@ TEST_CASE("MCP 2g: orientation says approvals are decided in the dashboard/REST,
     CHECK(blob.find("reject_request") != std::string::npos);
 }
 
-// R3-CA-2: the approve_request/reject_request descriptions state the OIDC no-amr pass-through
-// the way mfa_step_up.cpp implements it (`mfa_enforcement_protects(mode, role)`): it ends under
-// --mfa-enforcement=required AND under admin-only for an admin role. The machine-readable
-// refusal token stays exact.
-TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the OIDC pass-through "
-          "precisely (R3-CA-2)",
+// R3-CA-2 / #6079: the approve_request/reject_request descriptions state that the REST route
+// (not the tool) requires an enrolled factor with a proof <= 300 s, and that the MFA reasons
+// belong to the REST route only. The machine-readable refusal token stays exact.
+TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the REST enrolled-factor "
+          "requirement (R3-CA-2, #6079)",
           "[mcp][2g][approval]") {
     McpTestServer ts;
     ts.start();
@@ -1993,8 +2019,30 @@ TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the OIDC pa
         const auto desc = t["description"].get<std::string>();
         INFO(name);
         CHECK(desc.find("approver_assurance_required:<reason>") != std::string::npos);
-        CHECK(desc.find("--mfa-enforcement=required") != std::string::npos);
-        CHECK(desc.find("admin-only, for an admin role") != std::string::npos);
+        CHECK(desc.find("enrolled MFA factor with a proof no older than the approver window "
+                        "(at most 300 s) (#6079)") != std::string::npos);
+        CHECK(desc.find("--mfa-step-up-window-secs") == std::string::npos);
+        CHECK(desc.find("account_unavailable") != std::string::npos);
+        CHECK(desc.find("MFA reasons belong to the REST route only") != std::string::npos);
+        // The typed MFA refusals other than mfa_not_enrolled are conditional (C-1): the
+        // description must not call them unconditional.
+        CHECK(desc.find("always refuses an un-enrolled session with "
+                        "approver_assurance_required:mfa_not_enrolled") != std::string::npos);
+        // One clause per reason (S-2): the lumped sentence put all three under one condition.
+        CHECK(desc.find("conditional, because the generic step-up check can answer first") !=
+              std::string::npos);
+        CHECK(desc.find("saml_mfa_unsupported (SAML, #4935) surfaces only with the step-up "
+                        "window at 0") != std::string::npos);
+        CHECK(desc.find("account_unavailable (deactivated or deleted account) surfaces with "
+                        "the step-up window at 0, or when the account is removed between the "
+                        "central step-up check's read and the approver rule's read") !=
+              std::string::npos);
+        CHECK(desc.find("mfa_proof_missing (an OIDC login with no MFA amr) surfaces with the "
+                        "step-up window at 0 or when MFA enforcement does not cover the "
+                        "caller's role") != std::string::npos);
+        CHECK(desc.find("enforcement not protecting the route") == std::string::npos);
+        CHECK(desc.find("--mfa-enforcement=required") == std::string::npos);
+        CHECK(desc.find("is tracked in #6079") == std::string::npos);
     }
     CHECK(seen == 2);
 }
@@ -8391,6 +8439,331 @@ TEST_CASE("MCP check_permission: an oversized securable_type/operation is reject
               .value() == 1.0);
 }
 
+// ── get_me (twin of GET /api/v1/me) ─────────────────────────────────────────
+// Legacy kTools[] tool, mirroring check_permission: generic tier gate only, no
+// perm_fn, default `denied` service-scope class, generic mcp.get_me audit. One shared
+// builder (me_response.hpp) with REST /api/v1/me and legacy /api/me.
+
+namespace {
+
+nlohmann::json get_me_output_schema(McpTestServer& ts) {
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7000})");
+    nlohmann::json schema;
+    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"])
+        if (t["name"] == "get_me")
+            schema = t["outputSchema"];
+    // A missing schema must fail here, never let schema_violation pass vacuously.
+    REQUIRE(schema.is_object());
+    return schema;
+}
+
+nlohmann::json call_get_me(McpTestServer& ts, const std::string& arguments = "{}") {
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7001,"params":{"name":"get_me","arguments":)" +
+        arguments + "}}");
+    return nlohmann::json::parse(res->body);
+}
+
+} // namespace
+
+TEST_CASE("MCP get_me: describes the caller and conforms to the served output schema",
+          "[mcp][get_me]") {
+    McpTestServer ts;
+    ts.mock_username = "test-user";
+    ts.mock_role = yuzu::server::auth::Role::admin;
+    ts.start("readonly");
+    const auto schema = get_me_output_schema(ts);
+    REQUIRE(schema.is_object());
+    // Every key the builder can emit is declared; the required set is exactly the
+    // always-emitted keys, compared by NAME (a count alone passes a swapped key).
+    std::set<std::string> required;
+    for (const auto& k : schema["required"])
+        required.insert(k.get<std::string>());
+    CHECK(required == std::set<std::string>{"username", "display_name", "role", "principal_kind",
+                                            "auth_source", "mcp_tier", "scope_service",
+                                            "rbac_enabled", "rbac_roles_resolved",
+                                            "effective_role", "elevated", "can_access_settings"});
+    CHECK(schema["additionalProperties"] == false);
+    for (const auto& k : required)
+        CHECK(schema["properties"].contains(k));
+
+    const auto body = call_get_me(ts);
+    REQUIRE(body.contains("result"));
+    const auto& sc = body["result"]["structuredContent"];
+    CHECK(yuzu::test::schema_violation(schema, sc) == "");
+    CHECK(sc["username"] == "test-user");
+    CHECK(sc["role"] == "admin");
+    CHECK(sc["principal_kind"] == "human");
+    CHECK(sc["mcp_tier"] == "readonly");
+    CHECK(sc["scope_service"] == "");
+    CHECK(sc["rbac_enabled"] == false); // no store wired
+    CHECK(sc["rbac_roles_resolved"] == true);
+    // An MCP-tier session is never admitted to settings, whatever its role.
+    CHECK(sc["can_access_settings"] == false);
+    CHECK(sc["effective_role"] == "admin");
+    CHECK_FALSE(sc.contains("audit_persisted"));
+    // content[0].text carries the same object.
+    CHECK(nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>()) == sc);
+}
+
+TEST_CASE("MCP get_me: emits the generic audit row and takes no perm_fn gate",
+          "[mcp][get_me]") {
+    McpTestServer ts;
+    // Deny EVERY permission: the REST twin calls auth_fn only, so this tool must not be
+    // refused by a perm_fn call.
+    ts.perm_override_for_test = [](const std::string&, const std::string&) { return false; };
+    ts.start("readonly");
+    const auto body = call_get_me(ts);
+    REQUIRE(body.contains("result"));
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.get_me|success");
+}
+
+TEST_CASE("MCP get_me: a dropped audit row is reported as audit_persisted:false",
+          "[mcp][get_me]") {
+    McpTestServer ts;
+    ts.audit_succeeds_ = false;
+    ts.start("readonly");
+    const auto schema = get_me_output_schema(ts);
+    const auto body = call_get_me(ts);
+    REQUIRE(body.contains("result"));
+    const auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["audit_persisted"] == false);
+    CHECK(yuzu::test::schema_violation(schema, sc) == "");
+    CHECK(sc["username"] == "test-user"); // the data is still returned (set-and-proceed)
+}
+
+TEST_CASE("MCP get_me: identity isolation, no argument can name another principal",
+          "[mcp][get_me]") {
+    McpTestServer ts;
+    ts.mock_username = "carol";
+    ts.start("operator");
+    const auto body = call_get_me(
+        ts, R"({"username":"someone-else","principal_id":"engine:other","agent_id":"x"})");
+    REQUIRE(body.contains("result"));
+    CHECK(body["result"]["structuredContent"]["username"] == "carol");
+}
+
+TEST_CASE("MCP get_me: available at every MCP tier, refused for an unknown tier",
+          "[mcp][get_me]") {
+    for (const char* tier : {"readonly", "operator", "supervised", ""}) {
+        INFO("tier = " << tier);
+        McpTestServer ts;
+        ts.start(tier);
+        const auto body = call_get_me(ts);
+        CHECK(body.contains("result"));
+        CHECK_FALSE(body.contains("error"));
+    }
+    McpTestServer bad;
+    bad.start("not-a-real-tier"); // tier_allows denies an unknown tier
+    auto res = bad.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7002,"params":{"name":"get_me","arguments":{}}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    CHECK_FALSE(body.contains("result"));
+    // The generic gate audits the refusal; the handler never ran, so no success row.
+    REQUIRE_FALSE(bad.audit_log.empty());
+    CHECK(bad.audit_log.back() == "mcp.get_me|denied");
+    CHECK(std::count(bad.audit_log.begin(), bad.audit_log.end(), "mcp.get_me|success") == 0);
+}
+
+TEST_CASE("MCP get_me: a service-scoped token is refused (default denied class) and audited",
+          "[mcp][get_me]") {
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+    const auto body = call_get_me(ts);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK_FALSE(body.contains("result"));
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.get_me|denied");
+}
+
+TEST_CASE("MCP get_me: invalid UTF-8 in the session is replaced and the call succeeds with "
+          "one success audit row",
+          "[mcp][get_me]") {
+    McpTestServer ts;
+    ts.mock_username = std::string("ab\xC3\x28");
+    ts.start("readonly");
+    const auto schema = get_me_output_schema(ts);
+    const auto body = call_get_me(ts);
+    REQUIRE(body.contains("result"));
+    REQUIRE_FALSE(body.contains("error"));
+    const auto& sc = body["result"]["structuredContent"];
+    // U+FFFD is EF BF BD; the stray lead byte is replaced, the following "(" is kept.
+    CHECK(sc["username"].get<std::string>() == "ab\xEF\xBF\xBD(");
+    CHECK(sc["display_name"].get<std::string>() == "ab\xEF\xBF\xBD(");
+    CHECK(yuzu::test::schema_violation(schema, sc) == "");
+    CHECK_FALSE(sc.contains("audit_persisted"));
+    // Exactly one success row, and it is the last audit entry.
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.get_me|success");
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(), "mcp.get_me|success") == 1);
+}
+
+TEST_CASE("MCP get_me: invalid UTF-8 with a dropped audit row still returns audit_persisted:false",
+          "[mcp][get_me]") {
+    McpTestServer ts;
+    ts.mock_username = std::string("\xFF\xFE");
+    ts.audit_succeeds_ = false;
+    ts.start("readonly");
+    const auto body = call_get_me(ts);
+    REQUIRE(body.contains("result"));
+    const auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["username"].get<std::string>() == "\xEF\xBF\xBD\xEF\xBF\xBD");
+    CHECK(sc["audit_persisted"] == false);
+}
+
+TEST_CASE("MCP get_me: an engine principal with RBAC off carries no fabricated rbac_role",
+          "[mcp][get_me]") {
+    McpTestServer ts;
+    ts.mock_username = "engine:indexer";
+    ts.mock_principal_kind = "engine";
+    ts.mock_auth_source = "engine_token";
+    ts.mock_role = yuzu::server::auth::Role::user;
+    ts.start("readonly");
+    const auto schema = get_me_output_schema(ts);
+    const auto body = call_get_me(ts);
+    REQUIRE(body.contains("result"));
+    const auto& sc = body["result"]["structuredContent"];
+    CHECK(yuzu::test::schema_violation(schema, sc) == "");
+    CHECK(sc["principal_kind"] == "engine");
+    CHECK(sc["auth_source"] == "engine_token");
+    CHECK_FALSE(sc.contains("rbac_role"));
+    CHECK(sc["rbac_roles"].empty());
+    CHECK(sc["rbac_roles_resolved"] == true);
+}
+
+TEST_CASE("MCP get_me: RBAC on reads the caller's direct roles under the session-kind namespace",
+          "[mcp][pg][rbac][get_me]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool};
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    // Insertion order (Viewer first) deliberately differs from role_name order, so the
+    // rbac_role assertion below proves the store's ORDER BY, not insertion order.
+    REQUIRE(rbac.assign_role({"user", "test-user", "Viewer"}).has_value());
+    REQUIRE(rbac.assign_role({"user", "test-user", "PlatformEngineer"}).has_value());
+    REQUIRE(rbac.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(rbac.assign_role({"engine", "engine:indexer", "EngineReader"}).has_value());
+
+    SECTION("human: direct roles, rbac_role is the role_name-first") {
+        McpTestServer ts;
+        ts.rbac_store_for_test = &rbac;
+        ts.start("readonly");
+        const auto schema = get_me_output_schema(ts);
+        const auto body = call_get_me(ts);
+        REQUIRE(body.contains("result"));
+        const auto& sc = body["result"]["structuredContent"];
+        CHECK(yuzu::test::schema_violation(schema, sc) == "");
+        CHECK(sc["rbac_enabled"] == true);
+        CHECK(sc["rbac_role"] == "PlatformEngineer");
+        CHECK(sc["rbac_roles"] == nlohmann::json::array({"PlatformEngineer", "Viewer"}));
+        CHECK(sc["rbac_roles_resolved"] == true);
+    }
+    SECTION("engine: reads the engine grant keyed by engine:<slug>") {
+        McpTestServer ts;
+        ts.rbac_store_for_test = &rbac;
+        ts.mock_username = "engine:indexer";
+        ts.mock_principal_kind = "engine";
+        ts.mock_auth_source = "engine_token";
+        ts.start("readonly");
+        const auto body = call_get_me(ts);
+        REQUIRE(body.contains("result"));
+        const auto& sc = body["result"]["structuredContent"];
+        CHECK(sc["rbac_role"] == "EngineReader");
+        CHECK(sc["rbac_roles"] == nlohmann::json::array({"EngineReader"}));
+    }
+    SECTION("engine with no grant: no rbac_role, never Viewer") {
+        McpTestServer ts;
+        ts.rbac_store_for_test = &rbac;
+        ts.mock_username = "engine:ungranted";
+        ts.mock_principal_kind = "engine";
+        ts.mock_auth_source = "engine_token";
+        ts.start("readonly");
+        const auto body = call_get_me(ts);
+        REQUIRE(body.contains("result"));
+        const auto& sc = body["result"]["structuredContent"];
+        CHECK_FALSE(sc.contains("rbac_role"));
+        CHECK(sc["rbac_roles"].empty());
+        CHECK(sc["rbac_roles_resolved"] == true);
+    }
+    SECTION("real store fault: principal_roles unreadable is a 200 with rbac_roles_resolved:false") {
+        // GrantReadFault moves rbac_store.principal_roles aside, so the REAL
+        // RbacStore::get_principal_roles_checked fails while is_rbac_enabled() (rbac_meta)
+        // still answers true. Nothing is faked through the injected reader.
+        McpTestServer ts;
+        ts.rbac_store_for_test = &rbac;
+        ts.start("readonly");
+        const auto schema = get_me_output_schema(ts);
+        yuzu::test::GrantReadFault fault(rbac_pool);
+        fault.arm();
+        const auto body = call_get_me(ts);
+        fault.repair();
+        REQUIRE(body.contains("result"));
+        REQUIRE_FALSE(body.contains("error"));
+        const auto& sc = body["result"]["structuredContent"];
+        CHECK(sc["rbac_enabled"] == true);
+        CHECK(sc["rbac_roles_resolved"] == false);
+        CHECK_FALSE(sc.contains("rbac_role"));
+        CHECK_FALSE(sc.contains("rbac_roles"));
+        CHECK(yuzu::test::schema_violation(schema, sc) == "");
+        CHECK(ts.audit_log.back() == "mcp.get_me|success");
+        // Repaired: the same call resolves again.
+        const auto again = call_get_me(ts);
+        REQUIRE(again.contains("result"));
+        CHECK(again["result"]["structuredContent"]["rbac_roles_resolved"] == true);
+    }
+    SECTION("parity: MCP get_me, REST /api/v1/me data and legacy /api/me are field-equal") {
+        McpTestServer ts;
+        ts.rbac_store_for_test = &rbac;
+        ts.start("readonly");
+        auto mcp_sc = call_get_me(ts)["result"]["structuredContent"];
+        REQUIRE(mcp_sc.contains("rbac_roles"));
+        mcp_sc.erase("audit_persisted"); // MCP-only, present only when the audit row dropped
+
+        yuzu::server::auth::Session session;
+        session.username = "test-user";
+        session.role = yuzu::server::auth::Role::admin;
+        session.mcp_tier = "readonly";
+        const auto auth_fn = [&session](const httplib::Request&, httplib::Response&)
+            -> std::optional<yuzu::server::auth::Session> { return session; };
+        const auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                const std::string&) { return true; };
+
+        yuzu::server::test::TestRouteSink v1_sink;
+        yuzu::server::RestApiV1 api;
+        const auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                                 const std::string&, const std::string&, const std::string&) {
+            return true;
+        };
+        api.register_routes(v1_sink, auth_fn, perm_fn, audit_fn, &rbac, nullptr, nullptr, nullptr,
+                            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        auto v1 = v1_sink.Get("/api/v1/me");
+        REQUIRE(v1);
+        REQUIRE(v1->status == 200);
+        CHECK(nlohmann::json::parse(v1->body)["data"] == mcp_sc);
+
+        yuzu::server::test::TestRouteSink legacy_sink;
+        yuzu::server::dashboard_api::Deps deps;
+        deps.auth_fn = auth_fn;
+        deps.perm_fn = perm_fn;
+        deps.visible_agents_json_fn = [](const std::string&) { return nlohmann::json::array(); };
+        deps.rbac_store = &rbac;
+        yuzu::server::dashboard_api::register_dashboard_api_routes(legacy_sink, deps);
+        auto legacy = legacy_sink.Get("/api/me");
+        REQUIRE(legacy);
+        REQUIRE(legacy->status == 200);
+        CHECK(nlohmann::json::parse(legacy->body) == mcp_sc);
+    }
+}
+
 // ── #4353 follow-up, empty-tier discriminating test ─────────────────────────
 //
 // The 5 management-group/result-set mutators below (ManagementGroup:Write /
@@ -13002,6 +13375,10 @@ TEST_CASE("MCP 2g PR4: yuzu://openapi matches openapi_spec_json()",
     REQUIRE(contents.size() == 1);
     CHECK(contents[0]["uri"] == "yuzu://openapi");
     CHECK(contents[0]["mimeType"] == "application/json");
+    // The bytes themselves, not only the parsed value: the resource and REST's default
+    // `GET /api/v1/openapi.json` are documented as byte-identical, and a re-serialisation
+    // (key order, whitespace) would pass the parsed comparison below.
+    CHECK(contents[0]["text"].get<std::string>() == yuzu::server::openapi_spec_json());
     auto got = nlohmann::json::parse(contents[0]["text"].get<std::string>());
     CHECK(got == expected);
 }
@@ -15332,7 +15709,9 @@ TEST_CASE("MCP list_workflow_executions: advertised read-only with a bounded inp
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":951})");
     REQUIRE(res);
     nlohmann::json tool;
-    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"])
+    // Named local, not a range-for over a temporary's operator[]: it dangles before P2718R0 (#5924).
+    auto listed = nlohmann::json::parse(res->body);
+    for (const auto& t : listed["result"]["tools"])
         if (t["name"] == "list_workflow_executions")
             tool = t;
     REQUIRE_FALSE(tool.is_null());
@@ -15582,7 +15961,9 @@ TEST_CASE("MCP Agentic demo: classify schema drops phantom mode and never steers
     auto list = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":306})");
     REQUIRE(list);
     bool checked = false;
-    for (const auto& t : nlohmann::json::parse(list->body)["result"]["tools"]) {
+    // Named local, not a range-for over a temporary's operator[]: it dangles before P2718R0 (#5924).
+    auto listed = nlohmann::json::parse(list->body);
+    for (const auto& t : listed["result"]["tools"]) {
         if (t["name"] == "classify_operational_question") {
             checked = true;
             CHECK_FALSE(t["inputSchema"]["properties"].contains("mode"));
@@ -16673,6 +17054,119 @@ TEST_CASE("MCP #3685: supervised-tier execute_instruction fails closed at the C8
           std::string::npos);
     CHECK(appr.pending_count() == 0); // no ticket minted
     CHECK_FALSE(dispatched);
+}
+
+// ── #4990: ForensicsAnalyst alone cannot dispatch a Forensics-class plugin, ticket or not ─────────
+//
+// Forensics:Read is also the RBAC pair `classify_and_authorize_dispatch` asks of a Forensics-class
+// plugin, so the dispatch chokepoint alone would admit a ForensicsAnalyst holder to the approval
+// check. What stops them is the tool's own `Execution:Execute` gate, which the role does not carry.
+// This drives the real McpServer handler at the supervised tier (approval tickets in play), with the
+// real catalogue and the real chokepoint over a real RbacStore, and pins the observed outcome.
+TEST_CASE("MCP execute_instruction: a caller holding only ForensicsAnalyst is refused at the "
+          "Execution:Execute gate, with or without an approval ticket",
+          "[mcp][pg][integration][execute][security][forensics_analyst]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    REQUIRE(rbac.assign_role({"user", "test-user", "ForensicsAnalyst"}).has_value());
+    // Control: the same chokepoint admits a holder of Execution:Execute that is not an admin.
+    REQUIRE(rbac.assign_role({"user", "ops-user", "Operator"}).has_value());
+    REQUIRE(rbac.assign_role({"user", "ops-user", "ForensicsAnalyst"}).has_value());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    static const yuzu::server::CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    const auto has_permission = [&](std::string_view principal, std::string_view securable,
+                                    yuzu::server::authz::Operation op) {
+        return rbac.check_permission(std::string(principal), std::string(securable),
+                                     std::string(yuzu::server::authz::to_string(op)));
+    };
+
+    struct Outcome {
+        int mint_code{0};
+        int recall_status{0};
+        std::string recall_body;
+        bool dispatched{false};
+        int64_t consumed_at{0};
+    };
+    const auto run = [&](const std::string& user) {
+        Outcome out;
+        McpTestServer ts;
+        ts.mock_username = user;
+        ts.mock_role = auth::Role::user; // not an effective admin
+        ts.perm_override_for_test = [&](const std::string& securable, const std::string& op) {
+            return rbac.check_permission(user, securable, op);
+        };
+        ts.classify_fn_for_test = [](std::string_view p, std::string_view a) {
+            return registry.classify(p, a);
+        };
+        ts.authorize_dispatch_fn_for_test = [&](const yuzu::server::DispatchCaller& c,
+                                                std::string_view p, std::string_view a) {
+            return yuzu::server::detail::classify_and_authorize_dispatch(registry, c, p, a,
+                                                                          has_permission);
+        };
+        ts.caller_fn_for_test = [](const auth::Session& sess) {
+            return yuzu::server::DispatchCaller{.principal = sess.username,
+                                                .principal_role = "user",
+                                                .exec_visible = std::nullopt,
+                                                .principal_is_admin = false};
+        };
+        ts.approval_manager_for_test = &appr;
+        ts.start_with_dispatch(
+            [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                const std::string&, const std::unordered_map<std::string, std::string>&,
+                const std::string&,
+                const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+                out.dispatched = true;
+                return {.sent = 1, .command_id = "cmd-forensics"};
+            },
+            "supervised");
+        const std::string args =
+            R"("arguments":{"plugin":"browser_inventory","action":"profiles","agent_ids":["dev-1"])";
+        auto mint = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":)"
+                            R"("execute_instruction",)" +
+                            args + "}}}");
+        REQUIRE(mint);
+        const auto mint_body = nlohmann::json::parse(mint->body);
+        REQUIRE(mint_body.contains("error"));
+        out.mint_code = mint_body["error"]["code"].get<int>();
+        const auto approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+        REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+        auto recall = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":)"
+                              R"("execute_instruction",)" +
+                              args + R"(,"approval_id":")" + approval_id + R"("}}})");
+        REQUIRE(recall);
+        out.recall_status = recall->status;
+        out.recall_body = recall->body;
+        const auto ticket = appr.get(approval_id);
+        REQUIRE(ticket.has_value());
+        out.consumed_at = ticket->consumed_at;
+        return out;
+    };
+
+    // Control: Operator + ForensicsAnalyst holds Execution:Execute and Forensics:Read, so a recall
+    // with the approved ticket reaches the dispatch.
+    const auto ops = run("ops-user");
+    INFO("ops recall body: " << ops.recall_body);
+    CHECK(ops.mint_code == yuzu::server::mcp::kApprovalRequired);
+    CHECK(ops.recall_status == 200);
+    CHECK(ops.dispatched);
+
+    // ForensicsAnalyst alone: the first call still mints a ticket (the approval gate runs before the
+    // tool's own RBAC check, for every approval-gated tool), but the recall is refused 403 at the
+    // tool's Execution:Execute gate and nothing is dispatched. The ticket is spent by that recall.
+    const auto ana = run("test-user");
+    INFO("analyst recall body: " << ana.recall_body);
+    CHECK(ana.mint_code == yuzu::server::mcp::kApprovalRequired);
+    CHECK(ana.recall_status == 403);
+    // The body is this fixture's mock permission gate's 403 shape (production answers through
+    // AuthRoutes::require_permission); the evidence is the status, no dispatch and the spent ticket.
+    CHECK(ana.recall_body == R"({"error":"forbidden"})");
+    CHECK_FALSE(ana.dispatched);
+    CHECK(ana.consumed_at != 0);
 }
 
 // ── 25. Missing plugin ───────────────────────────────────────────────────
@@ -19729,7 +20223,9 @@ TEST_CASE("MCP query_audit_log: the published schema carries its bounds and desc
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     REQUIRE(res);
     nlohmann::json tool;
-    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"])
+    // Named local, not a range-for over a temporary's operator[]: it dangles before P2718R0 (#5924).
+    auto listed = nlohmann::json::parse(res->body);
+    for (const auto& t : listed["result"]["tools"])
         if (t["name"] == "query_audit_log")
             tool = t;
     REQUIRE_FALSE(tool.is_null());
@@ -24147,6 +24643,205 @@ TEST_CASE("MCP get_bundle_result collates the responses in request order", "[pg]
     CHECK(bundle_structured(get) == p);
 }
 
+TEST_CASE("MCP get_bundle_result: a Forensics step's output follows the caller's Forensics tier "
+          "(#4990)",
+          "[pg][mcp][bundle][forensics_tier]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start_with_dispatch(fake_bundle_dispatch());
+
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":84,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-1","steps":[{"plugin":"browser_inventory","action":"profiles"},{"plugin":"os_info","action":"uptime"}]}}})");
+    auto exec_id = bundle_payload(disp)["bundle_id"].get<std::string>();
+    auto inject = [&](const std::string& cmd, const std::string& out, const std::string& plugin) {
+        yuzu::server::StoredResponse r;
+        r.execution_id = exec_id;
+        r.instruction_id = cmd;
+        r.agent_id = "agent-1";
+        r.plugin = plugin;
+        r.status = 1;
+        r.output = out;
+        r.timestamp = 100;
+        store.store(r);
+    };
+    inject("cmd-browser_inventory-profiles", "marker-4990-mcp-bundle",
+           yuzu::server::test::kForensicsPlugin);
+    inject("cmd-os_info-uptime", "up 3d", "os_info");
+    const std::string get_call =
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":85,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        exec_id + R"("}}})";
+
+    ts.forensics_for_test.viewer();
+    auto hidden = bundle_payload(ts.call(get_call));
+    CHECK(hidden["steps"][0]["output"] == "");
+    CHECK(hidden["steps"][1]["output"] == "up 3d");
+    CHECK(hidden["received"] == 1);
+
+    ts.forensics_for_test.admin();
+    auto shown = bundle_payload(ts.call(get_call));
+    CHECK(shown["steps"][0]["output"] == "marker-4990-mcp-bundle");
+    CHECK(shown["steps"][1]["output"] == "up 3d");
+}
+
+TEST_CASE("MCP get_bundle_result: an Unknown Forensics decision is a retryable error, not a hidden step "
+          "(#4990)",
+          "[pg][mcp][bundle][forensics_tier]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start_with_dispatch(fake_bundle_dispatch());
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":84,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
+    auto exec_id = bundle_payload(disp)["bundle_id"].get<std::string>();
+
+    ts.forensics_for_test.unknown();
+    const std::string get_call =
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":86,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        exec_id + R"("}}})";
+    auto res = ts.call(get_call);
+    REQUIRE(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK_FALSE(body.contains("result"));
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+}
+
+TEST_CASE("MCP get_bundle_result: serving a Forensics step writes exactly one "
+          "response.forensics.read row with surface=bundle, and a persist failure shows as "
+          "audit_persisted:false (#4990)",
+          "[pg][mcp][bundle][forensics_tier][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start_with_dispatch(fake_bundle_dispatch());
+
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":87,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-1","steps":[{"plugin":"browser_inventory","action":"profiles"},{"plugin":"os_info","action":"uptime"}]}}})");
+    auto exec_id = bundle_payload(disp)["bundle_id"].get<std::string>();
+    auto inject = [&](const std::string& cmd, const std::string& out, const std::string& plugin) {
+        yuzu::server::StoredResponse r;
+        r.execution_id = exec_id;
+        r.instruction_id = cmd;
+        r.agent_id = "agent-1";
+        r.plugin = plugin;
+        r.status = 1;
+        r.output = out;
+        r.timestamp = 100;
+        store.store(r);
+    };
+    inject("cmd-browser_inventory-profiles", "marker-4990-mcp-audit",
+           yuzu::server::test::kForensicsPlugin);
+    inject("cmd-os_info-uptime", "up 3d", "os_info");
+    const std::string get_call =
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":88,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        exec_id + R"("}}})";
+
+    using Row = std::array<std::string, 4>;
+    auto verb_rows = [&] {
+        std::vector<Row> out;
+        for (std::size_t i = 0; i < ts.audit_log.size(); ++i)
+            if (ts.audit_log[i].rfind("response.forensics.read|", 0) == 0)
+                out.push_back({ts.audit_log[i].substr(std::string("response.forensics.read|").size()),
+                               ts.audit_target_types[i], ts.audit_target_ids[i],
+                               ts.audit_details[i]});
+        return out;
+    };
+    auto reset_log = [&] {
+        ts.audit_log.clear();
+        ts.audit_details.clear();
+        ts.audit_target_ids.clear();
+        ts.audit_target_types.clear();
+    };
+
+    SECTION("a non-holder gets no Forensics output and no audit row") {
+        ts.forensics_for_test.viewer();
+        reset_log();
+        auto p = bundle_payload(ts.call(get_call));
+        CHECK(p["steps"][0]["output"] == "");
+        CHECK(p["steps"][1]["output"] == "up 3d");
+        CHECK_FALSE(p.contains("audit_persisted"));
+        CHECK(verb_rows().empty());
+    }
+    SECTION("a holder gets the output and exactly one audit row") {
+        ts.forensics_for_test.admin();
+        reset_log();
+        auto p = bundle_payload(ts.call(get_call));
+        CHECK(p["steps"][0]["output"] == "marker-4990-mcp-audit");
+        CHECK_FALSE(p.contains("audit_persisted"));
+        const auto rows = verb_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == Row{"success", "Execution", exec_id,
+                             "forensics_rows=1 plugins=browser_inventory surface=bundle"});
+    }
+    SECTION("a failed verb row still serves the output and reports audit_persisted:false") {
+        ts.forensics_for_test.admin();
+        reset_log();
+        ts.audit_succeeds_for_action_ = [](const std::string& action) {
+            return action != "response.forensics.read";
+        };
+        auto res = ts.call(get_call);
+        auto p = bundle_payload(res);
+        CHECK(p["steps"][0]["output"] == "marker-4990-mcp-audit");
+        REQUIRE(p.contains("audit_persisted"));
+        CHECK(p["audit_persisted"] == false);
+        CHECK(bundle_structured(res)["audit_persisted"] == false);
+        CHECK(verb_rows().size() == 1);
+        ts.audit_succeeds_for_action_ = nullptr;
+    }
+}
+
+TEST_CASE("MCP get_bundle_result: a bundle with no Forensics step writes no response.forensics.read "
+          "row (#4990)",
+          "[pg][mcp][bundle][forensics_tier][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start_with_dispatch(fake_bundle_dispatch());
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":89,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
+    auto exec_id = bundle_payload(disp)["bundle_id"].get<std::string>();
+    yuzu::server::StoredResponse r;
+    r.execution_id = exec_id;
+    r.instruction_id = "cmd-os_info-uptime";
+    r.agent_id = "agent-1";
+    r.plugin = "os_info";
+    r.status = 1;
+    r.output = "up 3d";
+    r.timestamp = 100;
+    store.store(r);
+
+    ts.forensics_for_test.admin();
+    ts.audit_log.clear();
+    auto p = bundle_payload(ts.call(
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":90,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        exec_id + R"("}}})"));
+    CHECK(p["steps"][0]["output"] == "up 3d");
+    CHECK_FALSE(p.contains("audit_persisted"));
+    for (const auto& a : ts.audit_log)
+        CHECK(a.rfind("response.forensics.read|", 0) != 0);
+}
+
 TEST_CASE("MCP get_bundle_result: #3344 retry_after_ms present only while complete=false",
           "[pg][mcp][bundle]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -26482,8 +27177,13 @@ struct PreviewRestTwin {
     yuzu::MetricsRegistry metrics;
     yuzu::server::RestApiV1 api;
     yuzu::server::test::TestRouteSink sink;
+    // #4990: the caller's Forensics visibility (admin by default; a twin comparison is about the
+    // two surfaces agreeing, so both sides see the same caller).
+    yuzu::server::test::ForensicsCaller forensics;
 
     explicit PreviewRestTwin(yuzu::server::ResponseStore* store) {
+        api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
+        api.set_forensics_visibility_fn(forensics.fn());
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<yuzu::server::auth::Session> {
             yuzu::server::auth::Session session;
@@ -27318,6 +28018,65 @@ TEST_CASE("MCP assign_management_group_role: role_name outside {Operator,Viewer}
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["message"] == "only Operator and Viewer roles can be delegated");
     CHECK(store.get_group_roles(*created).empty());
+}
+
+// Companion of the REST allow-list case in test_rest_mgmt_group_roles_floor.cpp. The group-scope
+// allow-list is the only thing keeping a management-group-scoped Forensics:Read grant from being
+// authored through these surfaces. The Forensics response-read resolver has no scoped branch
+// (#4990), so this pin guards the older per-device scoped Forensics gate (app_usage_routes.cpp and
+// the MCP get_agent_app_usage tool), a different consumer outside that finding: widening the list
+// would make that gate reachable by a role it was not reviewed for. The role names come from the
+// real seeded role list and the answer from the real handler.
+TEST_CASE("MCP assign_management_group_role: the group-scope allow-list is exactly "
+          "{Operator, Viewer}; widening it makes the per-device scoped Forensics:Read gate reachable "
+          "(re-review that gate, #4990)",
+          "[mcp][pg][management_group][forensics_analyst]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Role Allowlist";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+
+    std::set<std::string> names;
+    for (const auto& r : rbac.list_roles())
+        names.insert(r.name);
+    REQUIRE(names.contains("ForensicsAnalyst"));
+    REQUIRE(names.contains("Administrator"));
+    names.insert({"NoSuchRole", "operator", "VIEWER"});
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.rbac_store_for_test = &rbac;
+    ts.start();
+    std::set<std::string> accepted;
+    int n = 0;
+    for (const auto& role : names) {
+        INFO(role);
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":14,)"
+            R"("params":{"name":"assign_management_group_role",)"
+            R"("arguments":{"group_id":")" +
+            *created + R"(","principal_id":"p)" + std::to_string(n++) + R"(","role_name":")" + role +
+            R"("}}})");
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        if (!body.contains("error")) {
+            accepted.insert(role);
+            continue;
+        }
+        // Everything else is refused for the role, with the allow-list's own message.
+        CHECK(body["error"]["message"] == "only Operator and Viewer roles can be delegated");
+    }
+    CHECK(accepted == std::set<std::string>{"Operator", "Viewer"});
+    CHECK(store.get_group_roles(*created).size() == 2);
 }
 
 TEST_CASE("MCP assign_management_group_role: RBAC denial (ManagementGroup:Write, no "
@@ -28401,6 +29160,361 @@ TEST_CASE("MCP aggregate_responses: unrestricted fleet gate preserves legacy-ope
     for (const auto& a : ts.audit_log)
         CHECK(a != "mcp.aggregate_responses|denied");
     CHECK_FALSE(result.contains("audit_persisted"));
+}
+
+// ── #4990: the Forensics tier on the response tools ─────────────────────────────────────────────
+//
+// Real PG-backed store, exact rendered rows, and a non-Forensics control row in every case: a stub
+// that only recorded the filter it was handed would stay green with the SQL clause deleted.
+namespace {
+using yuzu::server::test::kForensicsPlugin;
+using yuzu::server::test::kOrdinaryPlugin;
+using TierOutputs = std::set<std::string>;
+
+void store_tier_row(yuzu::server::ResponseStore& store, const std::string& exec_id,
+                    const std::string& instr_id, const std::string& agent,
+                    const std::string& plugin, const std::string& output, int64_t ts) {
+    auto r = mk_resp(exec_id, instr_id, agent, 0, output, ts);
+    r.plugin = plugin;
+    store.store(r);
+}
+
+// agent-A and agent-B each answered with a Forensics row; agent-A and agent-C with an ordinary one.
+void seed_mcp_tier(yuzu::server::ResponseStore& store, const std::string& exec_id,
+                   const std::string& instr_id) {
+    store_tier_row(store, exec_id, instr_id, "agent-A", kForensicsPlugin, "forensics-A", 600);
+    store_tier_row(store, exec_id, instr_id, "agent-B", kForensicsPlugin, "forensics-B", 601);
+    store_tier_row(store, exec_id, instr_id, "agent-A", kOrdinaryPlugin, "ordinary-A", 602);
+    store_tier_row(store, exec_id, instr_id, "agent-C", kOrdinaryPlugin, "ordinary-C", 603);
+}
+
+nlohmann::json query_responses_result(McpTestServer& ts, const std::string& args) {
+    auto body = mcp_tool_call(ts, "query_responses", args);
+    REQUIRE(body.contains("result"));
+    return body["result"];
+}
+
+TierOutputs response_outputs(const nlohmann::json& result) {
+    const auto rows = nlohmann::json::parse(result["content"][0]["text"].get<std::string>());
+    TierOutputs out;
+    for (const auto& r : rows)
+        out.insert(r["output"].get<std::string>());
+    return out;
+}
+} // namespace
+
+TEST_CASE("MCP query_responses: Forensics rows follow the caller's Forensics visibility, on both "
+          "id paths",
+          "[pg][mcp][integration][response][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_mcp_tier(store, "exec-tier", "instr-tier");
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    for (const char* args : {R"({"execution_id":"exec-tier"})", R"({"instruction_id":"instr-tier"})"}) {
+        INFO(args);
+        ts.forensics_for_test.viewer();
+        CHECK(response_outputs(query_responses_result(ts, args)) ==
+              TierOutputs{"ordinary-A", "ordinary-C"});
+        ts.forensics_for_test.admin();
+        CHECK(response_outputs(query_responses_result(ts, args)) ==
+              TierOutputs{"forensics-A", "forensics-B", "ordinary-A", "ordinary-C"});
+        ts.forensics_for_test.unsupported_subset({"agent-B"}); // unsupported: fails closed
+        CHECK(response_outputs(query_responses_result(ts, args)) ==
+              TierOutputs{"ordinary-A", "ordinary-C"});
+    }
+}
+
+TEST_CASE("MCP query_responses: a filtered row looks absent and the cap flag follows the permitted set",
+          "[pg][mcp][integration][response][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    // Three Forensics rows and one ordinary row; limit=2 caps the full set but not the ordinary one.
+    store_tier_row(store, "exec-cap", "instr-cap", "agent-A", kForensicsPlugin, "forensics-1", 600);
+    store_tier_row(store, "exec-cap", "instr-cap", "agent-B", kForensicsPlugin, "forensics-2", 601);
+    store_tier_row(store, "exec-cap", "instr-cap", "agent-C", kForensicsPlugin, "forensics-3", 602);
+    store_tier_row(store, "exec-cap", "instr-cap", "agent-A", kOrdinaryPlugin, "ordinary-1", 603);
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    ts.forensics_for_test.viewer();
+    {
+        const auto result = query_responses_result(ts, R"({"execution_id":"exec-cap","limit":2})");
+        CHECK(response_outputs(result) == TierOutputs{"ordinary-1"});
+        CHECK_FALSE(result.contains("result_truncated_by_cap"));
+        CHECK_FALSE(result.contains("audit_persisted"));
+    }
+    ts.forensics_for_test.admin();
+    {
+        const auto result = query_responses_result(ts, R"({"execution_id":"exec-cap","limit":2})");
+        CHECK(response_outputs(result).size() == 2);
+        CHECK(result.contains("result_truncated_by_cap"));
+    }
+}
+
+TEST_CASE("MCP response tools: an Unknown Forensics decision is a retryable error, never a partial result",
+          "[pg][mcp][integration][response][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_mcp_tier(store, "exec-unk", "instr-unk");
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+    ts.forensics_for_test.unknown();
+
+    const auto expect_retryable_refusal = [&](const nlohmann::json& body) {
+        REQUIRE(body.contains("error"));
+        CHECK_FALSE(body.contains("result"));
+        CHECK(body["error"]["code"] == -32603);
+        // A5: the hint is honest and bounded; a retry is the remedy, not a permission grant.
+        CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+        CHECK(body["error"]["message"].get<std::string>().find("could not be resolved") !=
+              std::string::npos);
+        const auto text = body.dump();
+        CHECK(text.find("ordinary-") == std::string::npos);
+        CHECK(text.find("forensics-") == std::string::npos);
+    };
+
+    SECTION("query_responses on both id paths") {
+        expect_retryable_refusal(mcp_tool_call(ts, "query_responses", R"({"execution_id":"exec-unk"})"));
+        expect_retryable_refusal(
+            mcp_tool_call(ts, "query_responses", R"({"instruction_id":"instr-unk"})"));
+    }
+    SECTION("aggregate_responses") {
+        expect_retryable_refusal(mcp_tool_call(
+            ts, "aggregate_responses",
+            R"({"instruction_id":"instr-unk","group_by":"status","aggregate":"count"})"));
+    }
+    // A refusal is a failure row, never a success read row: nothing was served.
+    for (const auto& a : ts.audit_log)
+        CHECK(a.find("|success") == std::string::npos);
+
+    // Control: once the decision is Denied the same call serves the ordinary rows.
+    ts.forensics_for_test.viewer();
+    CHECK(response_outputs(query_responses_result(ts, R"({"execution_id":"exec-unk"})")) ==
+          TierOutputs{"ordinary-A", "ordinary-C"});
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: an Unknown Forensics decision is a retryable "
+          "error, not a count over a partial row set",
+          "[pg][mcp][integration][response][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_mcp_tier(store, "exec-unk-prev", "instr-unk-prev");
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start();
+    ts.forensics_for_test.unknown();
+    const auto body = mcp_tool_call(
+        ts, "preview_management_group_agent_count",
+        R"({"command_id":"instr-unk-prev","plugin":"procfetch","filters":{"pid":"1234"}})");
+    REQUIRE(body.contains("error"));
+    CHECK_FALSE(body.contains("result"));
+    CHECK(body["error"]["code"] == -32603);
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+    // The Unknown refusal, not the store-degrade branch that follows it.
+    CHECK(body["error"]["message"].get<std::string>().find("could not be resolved") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP query_responses: an unwired Forensics resolver or plugin set fails closed",
+          "[pg][mcp][integration][response][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_mcp_tier(store, "exec-unw", "instr-unw");
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.forensics_unwired_for_test = true;
+    ts.start("operator");
+    // No plugin set: the Forensics rows cannot be told apart from the rest, so none is served.
+    CHECK(response_outputs(query_responses_result(ts, R"({"execution_id":"exec-unw"})")).empty());
+}
+
+TEST_CASE("MCP query_responses: response.forensics.read is written only when Forensics rows are "
+          "served, and a persist failure shows as audit_persisted:false",
+          "[pg][mcp][integration][response][audit][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_mcp_tier(store, "exec-faud", "instr-faud");
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    // The recorded verb rows as (result, target_type, target_id, detail).
+    auto verb_rows = [&] {
+        std::vector<std::array<std::string, 4>> out;
+        for (std::size_t i = 0; i < ts.audit_log.size(); ++i)
+            if (ts.audit_log[i].rfind("response.forensics.read|", 0) == 0)
+                out.push_back({ts.audit_log[i].substr(std::string("response.forensics.read|").size()),
+                               ts.audit_target_types[i], ts.audit_target_ids[i],
+                               ts.audit_details[i]});
+        return out;
+    };
+    using Row = std::array<std::string, 4>;
+
+    for (const char* args : {R"({"execution_id":"exec-faud"})", R"({"instruction_id":"instr-faud"})"}) {
+        INFO(args);
+        const std::string key = std::string(args).find("execution_id") != std::string::npos
+                                    ? "exec-faud"
+                                    : "instr-faud";
+
+        ts.forensics_for_test.viewer();
+        ts.audit_log.clear();
+        ts.audit_details.clear();
+        ts.audit_target_ids.clear();
+        ts.audit_target_types.clear();
+        CHECK_FALSE(query_responses_result(ts, args).contains("audit_persisted"));
+        CHECK(verb_rows().empty());
+
+        ts.forensics_for_test.admin();
+        ts.audit_log.clear();
+        ts.audit_details.clear();
+        ts.audit_target_ids.clear();
+        ts.audit_target_types.clear();
+        {
+            const auto result = query_responses_result(ts, args);
+            CHECK_FALSE(result.contains("audit_persisted"));
+            const auto rows = verb_rows();
+            REQUIRE(rows.size() == 1);
+            CHECK(rows[0] == Row{"success", "Execution", key,
+                                 "forensics_rows=2 plugins=browser_inventory surface=mcp"});
+        }
+
+        ts.forensics_for_test.unsupported_subset({"agent-B"});
+        ts.audit_log.clear();
+        ts.audit_details.clear();
+        ts.audit_target_ids.clear();
+        ts.audit_target_types.clear();
+        (void)query_responses_result(ts, args);
+        CHECK(verb_rows().empty()); // unsupported subset: no Forensics row served, no verb row
+
+        // The verb row alone does not persist: the data is still served, the gap is surfaced.
+        ts.forensics_for_test.admin();
+        ts.audit_log.clear();
+        ts.audit_details.clear();
+        ts.audit_target_ids.clear();
+        ts.audit_target_types.clear();
+        ts.audit_succeeds_for_action_ = [](const std::string& action) {
+            return action != "response.forensics.read";
+        };
+        {
+            const auto result = query_responses_result(ts, args);
+            REQUIRE(result.contains("audit_persisted"));
+            CHECK(result["audit_persisted"] == false);
+            CHECK(result["structuredContent"]["audit_persisted"] == false);
+            CHECK(response_outputs(result).size() == 4);
+            CHECK(verb_rows().size() == 1);
+        }
+        ts.audit_succeeds_for_action_ = nullptr;
+    }
+
+    SECTION("a caller served only ordinary rows writes no verb row") {
+        store_tier_row(store, "exec-ord", "instr-ord", "agent-A", kOrdinaryPlugin, "ordinary-only", 700);
+        ts.forensics_for_test.admin();
+        ts.audit_log.clear();
+        ts.audit_details.clear();
+        ts.audit_target_ids.clear();
+        ts.audit_target_types.clear();
+        CHECK(response_outputs(query_responses_result(ts, R"({"execution_id":"exec-ord"})")) ==
+              TierOutputs{"ordinary-only"});
+        CHECK(verb_rows().empty());
+    }
+}
+
+TEST_CASE("MCP aggregate_responses: totals are computed from the permitted rows only",
+          "[pg][mcp][integration][response][aggregate][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_mcp_tier(store, "exec-agg", "instr-agg");
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    auto counts = [&] {
+        auto body = mcp_tool_call(
+            ts, "aggregate_responses",
+            R"({"instruction_id":"instr-agg","group_by":"agent_id","aggregate":"count"})");
+        const auto groups = nlohmann::json::parse(
+            body["result"]["content"][0]["text"].get<std::string>());
+        std::map<std::string, std::int64_t> m;
+        for (const auto& g : groups)
+            m[g["group_value"].get<std::string>()] = g["count"].get<std::int64_t>();
+        return m;
+    };
+    using M = std::map<std::string, std::int64_t>;
+
+    ts.forensics_for_test.viewer();
+    CHECK(counts() == M{{"agent-A", 1}, {"agent-C", 1}});
+    ts.forensics_for_test.admin();
+    CHECK(counts() == M{{"agent-A", 2}, {"agent-B", 1}, {"agent-C", 1}});
+    ts.forensics_for_test.unsupported_subset({"agent-B"}); // unsupported: fails closed
+    CHECK(counts() == M{{"agent-A", 1}, {"agent-C", 1}});
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: only readable rows make an agent count",
+          "[pg][mcp][integration][response][devices][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    const std::string command_id = "cmd-mcp-preview-tier";
+    auto put = [&](const std::string& agent, const std::string& plugin) {
+        yuzu::server::StoredResponse r;
+        r.instruction_id = command_id;
+        r.agent_id = agent;
+        r.received_at_ms = 1000;
+        r.status = 0;
+        r.output = "same-value";
+        r.plugin = plugin;
+        store.store(r);
+    };
+    put("agent-a", kForensicsPlugin);
+    put("agent-b", kForensicsPlugin);
+    put("agent-c", kOrdinaryPlugin);
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start();
+
+    auto count = [&] {
+        const nlohmann::json args = {{"command_id", command_id},
+                                     {"plugin", "registry"},
+                                     {"filters", {{"output", "same-value"}}}};
+        auto body = mcp_tool_call(ts, "preview_management_group_agent_count", args.dump());
+        INFO(body.dump());
+        return preview_structured(body)["agent_count"].get<std::int64_t>();
+    };
+
+    ts.forensics_for_test.viewer();
+    CHECK(count() == 1); // agent-c only
+    ts.forensics_for_test.admin();
+    CHECK(count() == 3);
+    ts.forensics_for_test.unsupported_subset({"agent-a"}); // unsupported: fails closed
+    CHECK(count() == 1); // agent-c only
 }
 
 TEST_CASE("MCP aggregate_responses: aggregate wrong JSON type is rejected -- not silently "
@@ -31015,6 +32129,10 @@ void check_mcp_approval_refused(McpTestServer& ts, const std::string& tool, int 
     CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
     CHECK(body["error"]["message"] == "approver_assurance_required:" + reason);
     CHECK(body["error"]["data"].contains("remediation"));
+    // The class-refusal text names the requirement the code enforces, not a gate it does not.
+    const auto remediation = body["error"]["data"]["remediation"].get<std::string>();
+    CHECK(remediation.find("enrolled MFA factor and a fresh proof") != std::string::npos);
+    CHECK(remediation.find("passing the MFA step-up gate") == std::string::npos);
     CHECK(!body.contains("result"));
     // The refused attempt is audited as a denial, with the stable reason in the detail.
     CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp." + tool + "|denied") !=

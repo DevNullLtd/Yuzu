@@ -65,7 +65,8 @@ ModuleSignVerdict SigningCache::get(const std::string& full_path, std::int64_t m
 // common tar_etw_util would mean a blind refactor of the shipped process
 // collector on a host that cannot compile MSVC. Consolidation is a tracked
 // follow-up for a Windows-capable session (different TUs → internal linkage, no
-// ODR conflict in the meantime).
+// ODR conflict in the meantime). The one exception is the pid → process-name
+// helper, shared with the registry source via tar_win_process_name.hpp.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -97,6 +98,7 @@ ModuleSignVerdict SigningCache::get(const std::string& full_path, std::int64_t m
 #include <vector>
 
 #include "tar_local_image_path.hpp" // refuse network-path images (see image_path_is_local)
+#include "tar_win_process_name.hpp"  // process_basename_for_pid (shared with the registry source)
 
 #pragma comment(lib, "tdh.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -187,38 +189,6 @@ std::string prop_image_path(EVENT_RECORD* rec, const wchar_t* name) {
         return {};
     }
     return wide_to_utf8(std::wstring(buf.data()));
-}
-
-// RAII for a Win32 HANDLE.
-struct HandleGuard {
-    HANDLE h{nullptr};
-    explicit HandleGuard(HANDLE handle) noexcept : h(handle) {}
-    ~HandleGuard() {
-        if (h != nullptr && h != INVALID_HANDLE_VALUE) {
-            CloseHandle(h);
-        }
-    }
-    HandleGuard(const HandleGuard&) = delete;
-    HandleGuard& operator=(const HandleGuard&) = delete;
-};
-
-// Best-effort owning-process basename for a (usually still-alive) pid. Cached by
-// the caller so QueryFullProcessImageName runs ~once per pid. "" for
-// protected/exited processes (mirrors the process collector's capture_sid).
-std::string process_basename_for_pid(std::uint32_t pid) {
-    HandleGuard proc{OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)};
-    if (proc.h == nullptr) {
-        return {};
-    }
-    wchar_t buf[MAX_PATH];
-    DWORD len = MAX_PATH;
-    if (!QueryFullProcessImageNameW(proc.h, 0, buf, &len) || len == 0) {
-        return {};
-    }
-    std::wstring path(buf, len);
-    auto pos = path.find_last_of(L"\\/");
-    std::wstring base = (pos == std::wstring::npos) ? path : path.substr(pos + 1);
-    return wide_to_utf8(base);
 }
 
 // ── No-reparse image open (NtCreateFile) ─────────────────────────────────────

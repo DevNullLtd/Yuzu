@@ -247,9 +247,18 @@ instances).
 (fresh-start, no SQLite backfill); its `agents_responded`/`agents_success`/`agents_failure` counters
 are recomputed in-transaction from `agent_exec_status` via correlated `COUNT(*)` inside
 `UPDATE ... RETURNING`, never app-side read-modify-write. `cmd_execution_ids_` moved to
-`ExecutionTracker`'s PG-backed `command_execution` table (`record_command_execution`/
-`lookup_execution_id`), closing the cross-replica hazard this prerequisite names — see
+`ExecutionTracker`'s PG-backed `command_execution` table (`record_command_dispatch`/
+`lookup_command_record`), closing the cross-replica hazard this prerequisite names — see
 `docs/executions-history-ladder.md`.
+
+**Update (2026-10-24, #4990).** The table's entry points were renamed from `record_command_execution`/
+`lookup_execution_id` (and `AgentServiceImpl::record_execution_id`/`resolve_execution_id`) to
+`record_command_dispatch`/`lookup_command_record` (and `record_command_dispatch`/
+`resolve_response_provenance`), because the table now holds one row per DISPATCH carrying the
+dispatched `plugin` as well as the (possibly empty) execution id: a stored response's plugin label is
+the server's own record, and a response with no record is labelled `~unverified`. The per-pass reap cap
+was re-decided to 50,000 for the new inflow. The decision recorded above (a PG-backed correlation
+shared across replicas) is unchanged.
 
 ### 6. Background workers — fenced leader + transactional outbox (Q6)
 A single **core** instance holds the **fenced** leader lock and runs the singleton loops. The correctness
@@ -1224,8 +1233,10 @@ lost `Subscribe` stream and got `NOT_FOUND` on the new gateway, and v0.14.0-rc6 
 branch agent re-registered in 11 to 12 s with no rejections). Rollback is redeploying the
 previous gateway (the only new state is the in-memory index; derived from the change, not run).
 - **Connection key.** The key is the pid of the HTTP/2 connection process that carries the call, read
-  through a typed accessor added to the vendored grpcbox as its third `YUZU PATCH` site
-  (`grpcbox_stream:connection_pid/1`, `connection_pid_from_ctx/1`; `YUZU_PATCH.md`), wrapped by
+  through a typed accessor (as first shipped, added to a vendored grpcbox as its third `YUZU PATCH` site:
+  `grpcbox_stream:connection_pid/1`, `connection_pid_from_ctx/1`; `YUZU_PATCH.md`; that copy is deleted,
+  superseded by the gateway's own listener layer, which exposes `yuzu_grpc:conn_pid/1` and
+  `yuzu_grpc_stream:conn_pid/1`), wrapped by
   `yuzu_gw_conn` (the only module the handlers call for keys). Every stream of one connection reports
   the same key. A call without a key (`undefined`) never matches, not even a session registered without
   one.
@@ -1372,7 +1383,7 @@ one core replica a server-only restart now recovers through the replay described
   the production server today (`set_device_token_store` has no production caller), so that revoke is
   dormant until one is. Two cases replay a known session: (i) a verdict computed before a replay landed
   arrives after it (the guard stamp is taken when the replay is sent, and a stale verdict can arrive up to the 5 s flush
-  deadline, the vendored grpcbox client default, plus the replay RPC time later, so do not set
+  deadline, the upstream client's default per-call timeout (5000 ms; it was the vendored grpcbox client's default, and `yuzu_grpc_client`'s since 2026-10-11), plus the replay RPC time later, so do not set
   `registration_replay_session_guard_ms` below 5000 plus the expected replay RPC time; the default 10000 is
   safe, INFERRED); (ii) a double replay: a
   verdict replay runs first (no prior session, nothing revoked) and a later full breaker-recovery replay
@@ -1391,9 +1402,15 @@ one core replica a server-only restart now recovers through the replay described
 - **Multi-replica statement (read from the code; no multi-replica run exists, so this is inferred).**
   The verdict/replay reconcile is correct and bounded on one core replica. On several replicas it
   converges in one round only if a gateway's `BatchHeartbeat`, replay `ProxyRegister` and reannounce
-  `NotifyStreamStatus` reach the SAME replica during the reconcile. The shipped gateway does this per
-  connection (one grpcbox channel, one endpoint, one HTTP/2 connection) through an L4 VIP. A
-  multi-endpoint node list (grpcbox round-robins per RPC) or an L7 per-RPC balancer breaks it: the
+  `NotifyStreamStatus` reach the SAME replica during the reconcile. The shipped gateway did this per
+  connection (one grpcbox channel, one endpoint, one HTTP/2 connection) through an L4 VIP. Since
+  2026-10-11 the upstream client is `yuzu_grpc_client` over gun, whose channel opens `pool_size`
+  connections per endpoint and sends each call on the next live one, round-robin. The default
+  `pool_size` is 1, so this property is unchanged from grpcbox; **with `pool_size` above 1,
+  through an L4 VIP the connections can land on different replicas and it no longer holds** (read
+  from the code; no multi-replica run exists).
+  A multi-endpoint node list (the channel round-robins per call; grpcbox did per RPC) or an L7
+  per-RPC balancer breaks it: the
   lacking replica keeps listing the session, an arbitrary replica receives each replay, a replica that
   already holds the session re-installs it (placement wiped until its own reannounce lands on it), and
   the lacking replica learns the session only when a replay happens to land there. Convergence is then
@@ -1573,7 +1590,7 @@ one core replica a server-only restart now recovers through the replay described
   time inside the single `yuzu_gw_upstream` process, and without `TCP_NODELAY` on the gateway-to-server socket each
   call took about 41 to 43 ms, so one stock gateway registered about 24 agents per second and a burst of more than
   about 700 agents could not finish inside the agents' 30 s `Register` deadline (1000 agents: 703 registered). The
-  gateway now sets `TCP_NODELAY` on that one upstream channel by default (`upstream_tcp_nodelay`, `sys.config` only);
+  gateway now sets `TCP_NODELAY` on that one upstream channel by default (`upstream_tcp_nodelay`, `sys.config` only; since 2026-10-11 applied to each connection's socket by the gun-based client instead of by restarting the grpcbox channel);
   running the proxy RPC outside the process, shedding requests whose caller is gone and a shorter upstream deadline
   are planned follow-ups with no issue numbers yet. Rig pass 6 (`c518edd93`, simulated agents, loopback) registered 1000, 2000 and 5000 agents in 1.89 s, 4.16 s and 12.08 s with the shipped setting. Detail:
   `docs/user-manual/gateway.md`, "Registration rate per gateway".
@@ -1628,7 +1645,8 @@ earlier text of this section is left as written; the points below say what it no
 - **Residuals** are the ones listed under Known limits in `docs/user-manual/gateway.md`, among them: a probe
   success proves only the notification path, not registration; the synchronous RPCs still run inside the one
   upstream process, so casts queue in its mailbox while one runs; retry or breaker feedback for an ordinary
-  notification worker that fails is a follow-up.
+  notification worker that fails was a follow-up (since done in #5695: a failed send is held again and
+  retried, and counts against the breaker while it is closed).
 The measured evidence (rig runs against the previous build and with TLS, the governance run and the
 adversarial review) is `docs/security-reviews/gateway-notify-pending-store-2026-10-05.md`.
 
@@ -2141,9 +2159,13 @@ WARN, or the `route_meta` value after a restart), because a tombstoned group of 
 most k-1 refusals (N is a safe upper bound); count the refusal WARN lines rather than the counter if any
 replica restarted since the migrating start (the counter resets on restart); any `op="announce_connected"` refusal is NOT the artifact;
 and (b) they all occur within that start's window: one or two agent heartbeat cycles (30 s by default,
-`--heartbeat` changes it), plus up to 300 s of breaker backoff (cap `circuit_breaker_max_reset_timeout_ms`
-in `gateway/config/sys.config`), plus the replay drip (about 20 ms per agent on that gateway): allow
-roughly 6 minutes plus 20 ms per agent at the defaults. Refusals past that window, or more than N, are
+`--heartbeat` changes it), plus the gateway circuit breaker's backoff if it opened (up to 30 s on a
+gateway that includes #5695, cap `circuit_breaker_max_reset_timeout_ms` in `gateway/config/sys.config`;
+up to 300 s on an older gateway), plus the replay (on a #5695 gateway a random start delay of up to 1 s,
+`registration_replay_start_jitter_ms`, then up to 24 registrations in flight at once,
+`upstream_replay_concurrency`; on an older gateway a drip of about 20 ms per agent): allow roughly 2
+minutes at the defaults when every gateway includes #5695 (plus the replay itself: the gateway's agent count times the server's `ProxyRegister` time, divided by 24; about 10 s for 5,000 agents at 50 ms a call), or roughly 6 minutes plus 20 ms per agent if any gateway is older. Refusals past that window, or
+more than N, are
 NOT the artifact (escalating errs on the safe side): treat them as a forged or colliding id and
 escalate. Refusals inside the bound and the window are still NOT proof of benignness (a forged presenter
 acting at the same time could hide inside them, and a forger that wins the reclaim of a tombstoned id
@@ -2176,6 +2198,46 @@ unpublished). The dedup tombstones are not undone.
 *Still open.* The tombstoned-victim window above is unchanged (a tombstone holds NULL, so no index can see
 it); it is tracked in #6339. This change does not touch #5685 and does NOT lift the safe-to-scale gate: it is the first
 cross-REPLICA serialisation of a session adopt, not a second-replica safety proof.
+
+### 7g. Gateway-to-server upstream topology — several servers is the standard (2026-10-11)
+
+**Stated production topology (maintainer, 2026-10-11).** Dozens to hundreds of gateways; always at least
+two servers; very likely globally only two PostgreSQL databases in a streaming-replication pair. A gateway
+therefore dials SEVERAL upstream servers as the normal case, not a lab configuration. This section records
+what that changes. It is a **design direction**: apart from the breaker classification below, none of it is
+implemented, and no multi-server run exists.
+
+**What it supersedes.** Section 7c's "Multi-replica statement" rests on the shipped gateway using ONE
+upstream channel and connection, so that a gateway's calls are connection-sticky to one core replica. That
+premise no longer holds as a default. Likewise the gateway guidance to "keep one connection per gateway"
+and the boot warning for a channel with more than one connection (`docs/user-manual/gateway.md`,
+`yuzu_gw_app:warn_multi_connection/1`) describe the case this topology makes ordinary.
+
+**Consequences, each tracked as its own issue:**
+
+1. **Explicit backpressure (#5647).** A database failover degrades BOTH servers at once, so every gateway
+   sees errors from every server together. A circuit breaker is the wrong response (it drops every agent a
+   gateway holds); the server should say "retry in N ms" with the gRPC pushback trailer
+   (`grpc-retry-pushback-ms`) and the gateway should treat that as a pause, not a failure.
+2. **Per-endpoint breaker and failover (#5648).** There is one breaker per gateway today, whatever the
+   channel lists. One dead server out of two must not stop the gateway using the other.
+3. **The reconcile decision (#5649).** Either the verdict/replay/re-announce reconcile (7c) is made sticky
+   to one upstream endpoint on the gateway side, or it is made safe on any replica on the server side
+   (adoption that does not wipe placement; see #5244). Until that is decided and run on two replicas, 7c's
+   convergence claim holds for one replica only.
+4. **Herd sizing (#5650).** The breaker's open interval is deterministic (10 s doubling to 30 s by default since #5695; 300 s before) and the
+   reconnect jitter is narrow; with hundreds of gateways, probes and reconnects must be spread.
+5. **Defaults and guidance (#5651).** Reference configs, the boot warning, the wizard and the Settings page
+   must treat a two-server channel as the standard.
+
+**Shipped separately from the upstream-client change.** The breaker counts only server faults: a gRPC answer that blames the request
+(`INVALID_ARGUMENT`, `NOT_FOUND`, `ALREADY_EXISTS`, `PERMISSION_DENIED`, `FAILED_PRECONDITION`,
+`OUT_OF_RANGE`, `UNAUTHENTICATED`) is the server answering correctly and no longer counts towards opening it.
+`RESOURCE_EXHAUSTED` stays counted until item 1 lands.
+
+**SRE implications.** Alerts keyed on the single breaker (`YuzuGatewayUpstreamCircuitOpened`) become
+per-endpoint signals once item 2 lands; a fleet-wide simultaneous breaker open is the signature of a shared
+cause (the database pair), not of one bad server, and the runbook should say so.
 
 ### 8. PKI / CA high availability (Q8)
 Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced *(the
