@@ -193,7 +193,7 @@ The memory measures in this ADR's companion change apply to both TLS paths: a ga
 4. **ADR-0073's budget text.** It cites the 8 KiB goal, and must cite D14 instead before it goes to PR. Its gateway citations also predate the merge of PR #5695 and must be re-cited.
 5. **"The gateway adds no state."** ADR-0073's second revision rules out new gateway state. This ADR adds fleet-level gateway state: a cached CRL, a drain flag, a cached gateway list, and cluster membership. Proposed rewording for both ADRs: no per-agent state beyond the connection.
 6. **Erlang clusters and the server's `cluster_id`.** The server already routes by a `cluster_id` per gateway session (ADR-2002 WS-4 4.3). Clustered gateways (D10) must map onto one `cluster_id`, or the server sees them as different clusters, which is the #4669 conflict case.
-7. **The design target.** ADR-0069 records 100,000 agents per gateway. Dave has been steering to a solid 5,000 per gateway now, nothing that blocks 50,000 and beyond, and 500,000 as the long-term horizon. Nathan and Dave must agree which number gates which wave.
+7. **The design target.** ADR-0069 records 100,000 agents per gateway. Dave has been steering to a solid 5,000 per gateway now, nothing that blocks 50,000 and beyond, and 500,000 as the long-term horizon. **Decided by Nathan on 2026-10-28** (Dave to see): waves 1 to 5 must pass at 5,000 agents on both rigs, with nothing that blocks 50,000; wave 6 tests failover under a 5,000-agent load; wave 7 is the 100,000-agent per-box budget (D14); 500,000 stays the long-term horizon, outside this programme.
 
 ## Review of 2026-10-28 (BigColin session, for Dave Rae)
 
@@ -205,7 +205,7 @@ Three proposals change the plan. All three were accepted by Nathan on 2026-10-28
 3. **Accepted by Nathan on 2026-10-28; now in wave 0.** The common memory baseline first (D14): OS anonymous memory plus kernel per-connection memory, after settling, TLS on, realistic heartbeats, at 5,000 and 10,000 agents, on merged `dev` and the kTLS branch, run on both BigColin's rig and ours.
 
 
-Each wave ends with the owner's guidance before the next starts. Pull requests target `dev` and merge by the repository's usual rules.
+Each wave ends with the owner's guidance before the next starts. Waves 1 to 6 are gated at 5,000 agents on both rigs (conflict 7); wave 7 at 100,000. Pull requests target `dev` and merge by the repository's usual rules.
 
 | Wave | Content | Done when |
 |---|---|---|
