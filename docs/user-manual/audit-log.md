@@ -84,17 +84,19 @@ required.
 > A rejected argument (an unknown key, a wrongly typed value, a bad cursor) writes
 > `result=denied`, `detail` `invalid arguments: <reason>`; the `<reason>` is fixed text and
 > never echoes the caller's input. A tool that cannot run answers an internal error and
-> writes `result=failure` where an audit sink exists. A `failure` row whose `detail` ends
-> `provider unwired`, or is `audit sink unwired; layout not changed`, is a deployment fault
-> and cannot occur on a correctly started server. A `caller identity unresolved` row is
-> different: the credential was revoked or expired between authentication and the tool call,
-> and it can occur on a healthy server. The four tools that write a `crypto.*.view` row
+> writes `result=failure` when an audit sink exists to receive it. A `failure` row whose
+> `detail` ends `provider unwired` is a deployment fault and cannot occur on a correctly
+> started server. A `caller identity unresolved` row (on `set_crypto_dashboard_layout`,
+> `caller identity unresolved; layout not changed`) means the caller's identity could not be
+> re-resolved for the call: usually a credential revoked or expired between authentication and
+> the tool call, which can occur on a healthy server, though an unwired identity lookup
+> produces the same row. When the audit sink itself is not wired no row can be written, so the
+> refusal appears only in the error response: the four tools that write a `crypto.*.view` row
 > (`get_crypto_libraries`, `list_crypto_library_devices`, `export_crypto_cbom`,
-> `get_crypto_ca_stats`) refuse the call, with `detail` `crypto provider unwired`, when the
-> audit sink is not wired, instead of succeeding without a row; `set_crypto_dashboard_layout`
-> refuses the same way (`audit sink unwired; layout not changed`), so a layout is never changed
-> without its row. Treat a burst of `denied` rows from one principal as a misbehaving client,
-> not as a gap in access control.
+> `get_crypto_ca_stats`) answer `crypto provider unwired`, and `set_crypto_dashboard_layout`
+> answers `audit sink unwired; layout not changed`, so a call never succeeds, and a layout is
+> never changed, without its row. A burst of `invalid arguments` `denied` rows from one
+> principal is a misbehaving client, not a gap in access control.
 
 > **Per-principal quota-cap rejections (PR 4.4, ADR-1005 class engine
 > principals) are deliberately NOT audited.** When an **engine principal**
