@@ -46,6 +46,7 @@
 
 #include <array>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -120,10 +121,13 @@ inline void forward_tokens(const yuzu::shared::ConstraintAccumulator& from,
 
 #if defined(__APPLE__)
 /// The default walk bounds plus the network mounts from the kernel's mount table, read once at
-/// dispatch start. An unreadable table is `mountinfo_unreadable`, not an empty guard.
-[[nodiscard]] inline lnx::WalkConfig production_config() {
+/// dispatch start. An unreadable table is `mountinfo_unreadable`, not an empty guard. The reader
+/// is a parameter (the live getmntinfo_r_np snapshot by default) so a test can feed a failed one.
+[[nodiscard]] inline lnx::WalkConfig production_config(
+    std::optional<std::vector<std::string>> (*read_mounts)() =
+        &yuzu::shared::read_macos_network_mounts) {
     lnx::WalkConfig cfg;
-    auto mounts = yuzu::shared::read_macos_network_mounts();
+    auto mounts = read_mounts();
     cfg.mountinfo_unreadable = !mounts;
     if (mounts) cfg.network_mounts = std::move(*mounts);
     return cfg;

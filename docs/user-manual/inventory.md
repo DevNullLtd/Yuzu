@@ -30,10 +30,13 @@ cadences.
   skips that day's report and keeps the last good state — nothing is deleted. A
   `constrained` `managers` answer that still names at least one present manager
   is accepted: the constraint concerns manager facts the presence row never
-  carried. A skipped cycle is retried sooner on a phase-aligned backoff:
-  waits that double from 1 h after each consecutive skip (1 h, 2 h, 4 h, 8 h, …),
-  each retry capped so it never lands after the next daily slot — up to four
-  extra attempts — then one attempt per daily slot until a collection succeeds.
+  carried. A `constrained` `runtimes` `python` answer is the other exception: it
+  withholds only the Python rows and the cycle continues, so the stored Python rows
+  are removed until a later read succeeds (see Troubleshooting). A skipped cycle
+  is retried sooner on a phase-aligned backoff: waits that double from 1 h after
+  each consecutive skip (1 h, 2 h, 4 h, 8 h, …), each retry capped so it never
+  lands after the next daily slot — up to four extra attempts — then one attempt
+  per daily slot until a collection succeeds.
   While it is skipping, the agent publishes the heartbeat tags
   `yuzu.sync.installed_software.skip_streak` (consecutive skips since the last
   success, uncapped) and `yuzu.sync.installed_software.last_skip` (the reason
@@ -161,10 +164,11 @@ cadences.
   publishers are not listed) and reports the full `x.y.z`. macOS reads the
   python.org framework under `/Library/Frameworks/Python.framework/Versions` and
   reports the full `x.y.z` from each version's `Info.plist`. Linux lists
-  `python3.<minor>` files in `/usr/bin` and `/usr/local/bin` (`/var/usrlocal/bin` on
-  rpm-ostree hosts such as Fedora CoreOS and RHEL Edge, where `/usr/local` links to
-  `../var/usrlocal`) and reports **major.minor only** (for example `3.11`): the patch
-  level is not stored anywhere without running the interpreter, so it is not guessed.
+  `python3.<minor>` files in `/usr/bin`, `/usr/local/bin` and `/var/usrlocal/bin` (the
+  last exists only on rpm-ostree hosts such as Fedora CoreOS and RHEL Edge, where
+  `/usr/local` links to `../var/usrlocal`) and reports **major.minor only** (for
+  example `3.11`): the patch level is not stored anywhere without running the
+  interpreter, so it is not guessed.
   Homebrew, pyenv, conda, virtual environments and Xcode's Python are not walked. A
   read that cannot be completed (an unreadable or network-mounted root, a cap, an
   access-denied registry key) withholds only the `python` rows from that day's report
@@ -850,8 +854,9 @@ The `runtimes` `python` read was constrained, so the agent withheld only the Pyt
 rather than send a partial list. The report replaces the device's stored software rows,
 so its stored `python` rows are removed until a read succeeds again; no other source is
 affected and the cycle is not skipped. The tokens name the cause:
-`linux:runtimes:network_fs_skipped` (`/usr/bin`, `/usr/local/bin` or `/usr/local` is on a
-network mount, so it is never opened), `linux:runtimes:permission_denied`,
+`linux:runtimes:network_fs_skipped` (`/usr/bin`, `/usr/local/bin`, `/var/usrlocal/bin` or
+a directory above one of them, such as `/usr/local`, is on a network mount, so it is
+never opened), `linux:runtimes:permission_denied`,
 `linux:runtimes:symlink_refused` (a symlink at a root that is not a same-action alias;
 the rpm-ostree `/usr/local -> ../var/usrlocal` link is covered and is not a cause),
 `linux:runtimes:mountinfo_unreadable` and `macos:runtimes:mountinfo_unreadable` (the

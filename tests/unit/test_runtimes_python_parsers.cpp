@@ -610,6 +610,22 @@ TEST_CASE("python: mac::production_config reads the live mount table", "[runtime
     CHECK_FALSE(mac::production_config().mountinfo_unreadable);
 }
 
+TEST_CASE("python: mac::production_config maps the mount reader's answer onto the walk guard",
+          "[runtimes][python][macos][mounts]") {
+    // A failed read is `mountinfo_unreadable` with no mounts (the walk then runs guarded only by
+    // that read); a successful one carries its list through and leaves the flag clear.
+    const auto cfg_failed =
+        mac::production_config([]() -> std::optional<std::vector<std::string>> { return std::nullopt; });
+    CHECK(cfg_failed.mountinfo_unreadable);
+    CHECK(cfg_failed.network_mounts.empty());
+
+    const auto cfg_ok = mac::production_config([]() -> std::optional<std::vector<std::string>> {
+        return std::vector<std::string>{"/Volumes/x"};
+    });
+    CHECK_FALSE(cfg_ok.mountinfo_unreadable);
+    CHECK(cfg_ok.network_mounts == std::vector<std::string>{"/Volumes/x"});
+}
+
 #endif // defined(__APPLE__)
 
 TEST_CASE("python: mac::forward_tokens re-spells linux: causes as macos: causes", "[runtimes][python][macos]") {

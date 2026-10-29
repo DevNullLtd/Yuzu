@@ -490,9 +490,7 @@ AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPoli
     // becomes one {name Python, kind app, ecosystem python} entry whose version is the row's
     // (`-` = unknown -> empty; on Linux it is major.minor, the patch level is not available there).
     // The flavour, path and vendor have no installed_software slot and are dropped. A constrained
-    // status (an unreadable root, a cap) withholds the python rows only (the table row's
-    // ConstrainedPolicy::drop_source): a partial roster is never published, the other sources'
-    // rows and the cycle continue, and the stored python rows are removed until it recovers.
+    // status withholds these rows only: see the table row's ConstrainedPolicy::drop_source.
     // The producer escapes a literal pipe in the free-text fields (runtimes_parsers.hpp
     // field_or_dash -> safe_output_field gives `\|`), so the split is escape-aware: width stays
     // strict (five logical fields) and only the version, which is dotted digits by construction

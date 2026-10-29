@@ -3095,6 +3095,11 @@ TEST_CASE("collector: runtimes.python contributes sourced rows, a constrained Py
         fake_mac();
         g_fake[4].out["python"] =
             nl({st("python", "constrained", "linux:runtimes:permission_denied"), python_row});
+        // The real leg also types the answer CONSTRAINED + PARTIAL (runtimes_legs.hpp emit_read):
+        // the withheld verdict must win over the PARTIAL skip, which would cost the whole cycle.
+        g_fake[4].result_status["python"] = {YUZU_RESULT_STATUS_CONSTRAINED,
+                                             YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                             "linux:runtimes:permission_denied"};
         auto src = make_installed_software_source(all_plugins());
         REQUIRE(src.skip_reason);
         const auto got = src.collect();
