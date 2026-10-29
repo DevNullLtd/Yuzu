@@ -86,9 +86,18 @@ device/app facts flagged inline. Each row links to the device drill-down.
 Hosts found by network discovery scans (including hosts with no agent) are
 readable through `GET /api/v1/network/discovered-devices`, the MCP tool
 `list_discovered_devices` and the `/fragments/network/discovered` fragment.
-Permission required: **`Infrastructure:Read`**. Each read is audited as
+Permission required: **`Infrastructure:Read`**. Each successful read is audited as
 `network.discovered.view`, and a service-scoped API token is refused.
 
+- On the **Network quality** page the same read is the **Discovered** tab, next to
+  **Quality**. Opening it (or `/network#discovered`) loads the fragment; each
+  successful load writes one `network.discovered.view` audit row. The tab sits inside the
+  overview, which needs `GuaranteedState:Read`, so an account holding only
+  `Infrastructure:Read` cannot reach it from the page and uses the REST list
+  instead (or the MCP tool `list_discovered_devices`). An account with the
+  overview but without the read (no `Infrastructure:Read`, a service-scoped token,
+  or a group-confined operator) sees a message naming the cause rather than an
+  empty tab.
 - When RBAC is enforced, an operator confined to a management group is refused
   (`403`): this read is gated by a flat `Infrastructure:Read` check, as the
   device list is (that one needs `GuaranteedState:Read`), and does not yet narrow
