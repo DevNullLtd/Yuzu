@@ -506,6 +506,9 @@ implementation is.
 | mgmt_posture | posture | linux | constrained | 1 | /etc/sssd/sssd.conf + /etc/sssd/conf.d/*.conf active domains, /etc/ipa/default.conf and /etc/krb5.keytab presence (bounded file reads) | configuration as written, not the live join state; sssd.conf is root 0600, so an unprivileged agent reports permission_denied (plane unknown), never not-joined; a privileged agent reads it in full |
 | mgmt_posture | posture | macos | supported | 2 | subprocess_runner:/usr/bin/profiles status -type enrollment | MDM enrolment only; AD binding is device_identity.domain; Jamf not read |
 | mgmt_posture | posture | windows | planned | 1 | NetGetJoinInformation + HKLM\\SOFTWARE\\Microsoft\\Enrollments and CloudDomainJoin\\JoinInfo registry reads | not read yet: one unsupported status row, windows:planned |
+| middleware | ibm_mq | linux | supported | 1 | /etc/opt/mqm/mqinst.ini Installation: stanzas; version from the swidtag file name under each installation's FilePath; no dspmqver | - |
+| middleware | ibm_mq | macos | planned | 1 | installer-metadata read, not yet wired on macOS (every product) | planned; the action answers a single unsupported status row on this OS |
+| middleware | ibm_mq | windows | planned | 1 | HKLM\\SOFTWARE\\IBM\\WebSphere MQ\\Installation\\<name> FilePath/VRMF in both registry views | planned; the action answers a single unsupported status row on this OS |
 | msi_packages | list | linux | unsupported | - | - | - |
 | msi_packages | list | macos | supported | 2 | pkgutil via bounded argv runner | - |
 | msi_packages | list | windows | supported | 1 | msi_api | - |

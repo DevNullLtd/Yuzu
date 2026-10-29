@@ -1,6 +1,15 @@
 # middleware
 
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
+| | |
+|---|---|
+| **What it does** | Installed middleware inventory from installer metadata (table-driven; IBM MQ) |
+| **Version** | 1.0.0 |
+| **Kind** | Collector · read-only · gathered (crossplatform.middleware.ibm_mq) |
+| **Platforms** | Windows 🟡 planned · macOS 🟡 planned · Linux ✅ |
+| **Actions** | `ibm_mq` (definition `crossplatform.middleware.ibm_mq`) |
+| **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
+| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -29,6 +38,14 @@ What a result proves. A row proves the installation is registered in `mqinst.ini
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
+| Action | Windows | macOS | Linux |
+|---|---|---|---|
+| `ibm_mq` | 🟡 planned · rung 1 · HKLM\\SOFTWARE\\IBM\\WebSphere MQ\\Installation\\<name> FilePath/VRMF in both registry views | 🟡 planned · rung 1 · installer-metadata read, not yet wired on macOS (every product) | ✅ supported · rung 1 · /etc/opt/mqm/mqinst.ini Installation: stanzas; version from the swidtag file name under each installation's FilePath; no dspmqver |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`ibm_mq` / Windows** — planned; the action answers a single unsupported status row on this OS
+- **`ibm_mq` / macOS** — planned; the action answers a single unsupported status row on this OS
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -46,6 +63,7 @@ No external binaries, no subprocesses, no shell-out, no network use: the plugin 
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
+The action takes no parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -53,6 +71,16 @@ No external binaries, no subprocesses, no shell-out, no network use: the plugin 
 Every row is pipe-delimited. The first row is always `status|<action>|<level>|<reason>` (`level` is `supported`, `constrained` or `unsupported`; `reason` is comma-joined tokens, or `-`). Installation rows follow as `<action>|<title>|<name>|<version>|<install_path>|<edition>`, one per registered installation; the first field is `row_kind` (`status`, or the action name) and is the first column below, and on a status row the next columns carry the action name, the level and the tokens. `supported` with zero rows means none was found at the places read (caveat 1); `constrained` means a read failed or was skipped and the rows may be incomplete, so failure never reads as absent. A field the host did not supply is `-` (the version of an installation whose swidtag directory names no product tag, caveat 4; the edition of every IBM MQ row, which the installer metadata does not carry). Free-text fields go through the shared escaper, so a value containing a pipe or ending in a backslash cannot shift the field count on the server's escape-aware decoder. `middleware` is not in the server's `kKeyValuePlugins` set (`server/core/src/result_parsing.hpp`), so its rows are not decoded as two-cell key and value rows.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
+**`crossplatform.middleware.ibm_mq` — `row_kind|title|name|version|install_path|edition`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | `status` `ibm_mq` | Linux | `ibm_mq` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), ibm_mq (one per installation found). |
+| `title` | string | - | Linux | `IBM MQ` | Product display name, fixed per action (IBM MQ). Status rows: the action name. |
+| `name` | string | - | Linux | `Installation1` | Installation name: the mqinst.ini Name value, for example Installation1. Status rows: the level (supported, constrained or unsupported). |
+| `version` | string | - | Linux | `9.4.5` | Installation version taken from the product tag file name (ibm.com_IBM_MQ*-<v>.swidtag, else IBM_MQ-<v>.mqtag; component tags such as GSKit or Runtime never name the product), or "-" when it cannot be read. VRM (version.release.modification): the fix-pack level is not carried, so a fix pack 9.3.5.1 reports 9.3.5. Status rows: the comma-joined failure tokens, or -. |
+| `install_path` | string | - | Linux | `/opt/mqm` | Absolute path of the installation (the mqinst.ini FilePath value). |
+| `edition` | string | - | Linux | `-` | Always "-" for ibm_mq: the installer metadata the agent reads carries no edition field. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -76,6 +104,14 @@ Every read sets a typed result status; a degraded read is `CONSTRAINED`, never a
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · container · 2026-10-29 · euid 2001 · leg-hash ca94f832e087
+
+```
+== action=ibm_mq
+status|ibm_mq|supported|-
+ibm_mq|IBM MQ|Installation1|9.4.5|/opt/mqm|-
+[result_status] OK / FULL
+```
 <!-- END GENERATED -->
 
 ## Caveats and known gaps
@@ -89,4 +125,10 @@ Every read sets a typed result status; a degraded read is `CONSTRAINED`, never a
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
+- Plugin: `agents/plugins/middleware/src/middleware_legs.hpp` · `agents/plugins/middleware/src/middleware_linux.cpp` · `agents/plugins/middleware/src/middleware_linux_parsers.hpp` · `agents/plugins/middleware/src/middleware_macos.cpp` · `agents/plugins/middleware/src/middleware_parsers.hpp` · `agents/plugins/middleware/src/middleware_plugin.cpp` · `agents/plugins/middleware/src/middleware_runner.hpp` · `agents/plugins/middleware/src/middleware_win.cpp`
+- Definitions: `content/definitions/middleware.yaml`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_middleware.hpp`
+- Tests: `tests/test_middleware_definition.py` · `tests/unit/test_middleware_linux_parsers.cpp` · `tests/unit/test_middleware_local_dispatcher.cpp` · `tests/unit/test_middleware_parsers.cpp`
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
+- Changelog: `changelog.d/2026-10-29-middleware-ibm-mq.added.md`
 <!-- END GENERATED -->

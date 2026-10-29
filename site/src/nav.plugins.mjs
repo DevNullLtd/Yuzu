@@ -34,6 +34,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/license_scan/README', slug: 'plugins/license_scan', title: 'license_scan' },
   { file: 'agents/plugins/local_security_policy/README', slug: 'plugins/local_security_policy', title: 'local_security_policy' },
   { file: 'agents/plugins/mgmt_posture/README', slug: 'plugins/mgmt_posture', title: 'mgmt_posture' },
+  { file: 'agents/plugins/middleware/README', slug: 'plugins/middleware', title: 'middleware' },
   { file: 'agents/plugins/msi_packages/README', slug: 'plugins/msi_packages', title: 'msi_packages' },
   { file: 'agents/plugins/netprobe/README', slug: 'plugins/netprobe', title: 'netprobe' },
   { file: 'agents/plugins/netstat/README', slug: 'plugins/netstat', title: 'netstat' },
