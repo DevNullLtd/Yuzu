@@ -141,8 +141,9 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 
 // matrix: docs/os-capability-matrix.md generated block (2026-10-06; shares.list,
 // pkg_inventory.store_packages, msi_packages.list_inventory and remote_access_audit.list added
-// 2026-10-17/19; registry set_user_value, delete_user_value and apply added in registry 2.1.0), 236 rows.
-inline constexpr std::array<UnitOsRow, 236> kUnitOs{{
+// 2026-10-17/19; registry set_user_value, delete_user_value and apply added in registry 2.1.0;
+// hardware chassis/baseboard/swap/machine_id and disk_actions partitions/topology added as planned), 242 rows.
+inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
     {"agent_logging", "get_log", kWin | kLin | kMac},
@@ -184,6 +185,9 @@ inline constexpr std::array<UnitOsRow, 236> kUnitOs{{
     {"discovery", "scan_subnet", kWin | kLin | kMac},
     {"disk_actions", "smart", kWin | kMac},
     {"disk_actions", "volumes", kWin | kMac},
+    // partitions/topology: planned on every leg (applicable); the leg PRs may move some to unsupported.
+    {"disk_actions", "partitions", kWin | kLin | kMac},
+    {"disk_actions", "topology", kWin | kLin | kMac},
     {"disk_space", "free", kWin | kLin | kMac},
     {"event_logs", "errors", kWin | kLin | kMac},
     {"event_logs", "query", kWin | kLin | kMac},
@@ -222,6 +226,11 @@ inline constexpr std::array<UnitOsRow, 236> kUnitOs{{
     {"hardware", "disks", kWin | kLin | kMac},
     {"hardware", "drivers", kWin | kLin},
     {"hardware", "system", kWin | kLin | kMac},
+    // chassis/baseboard/swap/machine_id: planned on every leg (applicable).
+    {"hardware", "chassis", kWin | kLin | kMac},
+    {"hardware", "baseboard", kWin | kLin | kMac},
+    {"hardware", "swap", kWin | kLin | kMac},
+    {"hardware", "machine_id", kWin | kLin | kMac},
     {"http_client", "download", kWin | kLin | kMac},
     {"http_client", "get", kWin | kLin | kMac},
     {"http_client", "head", kWin | kLin | kMac},

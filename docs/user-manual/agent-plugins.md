@@ -29,7 +29,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `device_identity` | ✅ ✅ ✅ | Reports device hostname, domain membership, and AD organizational unit | [README](../../agents/plugins/device_identity/README.md) |
 | `diagnostics` | ✅ ✅ ✅ | Agent diagnostics — log level, certificates, connection info | [README](../../agents/plugins/diagnostics/README.md) |
 | `discovery` | ✅ ✅ 🟡 | Network device discovery — ARP scan and ping sweep | [README](../../agents/plugins/discovery/README.md) |
-| `disk_actions` | ✅ 🟡 ⛔ | Reports physical drive health and the mapping between drives and the logical volumes they back | [README](../../agents/plugins/disk_actions/README.md) |
+| `disk_actions` | ✅ 🟡 🟡 | Reports physical drive health and the mapping between drives and the logical volumes they back | [README](../../agents/plugins/disk_actions/README.md) |
 | `disk_space` | ✅ ✅ ✅ | Reports free / total disk space for a single volume | [README](../../agents/plugins/disk_space/README.md) |
 | `echo` | ✅ ✅ ✅ | Echo activity record -- continuous system state change tracking | [README](../../agents/plugins/echo/README.md) |
 | `event_logs` | ✅ ✅ ✅ | Queries system event logs for errors and filtered events | [README](../../agents/plugins/event_logs/README.md) |
@@ -39,7 +39,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `filesystem_posture` | 🟡 ✅ 🟡 | Reports mounted filesystems, per-mount quota-subsystem state, and snapshot-capable volumes | [README](../../agents/plugins/filesystem_posture/README.md) |
 | `firewall` | ✅ ✅ ✅ | Firewall status and rule listing | [README](../../agents/plugins/firewall/README.md) |
 | `firmware_posture` | ✅ 🟡 🟡 | Reports firmware/BIOS vendor, version, release date and update-pending posture | [README](../../agents/plugins/firmware_posture/README.md) |
-| `hardware` | ✅ ✅ ✅ | Reports hardware inventory: manufacturer, model, BIOS, CPU, memory, disks, drivers | [README](../../agents/plugins/hardware/README.md) |
+| `hardware` | ✅ ✅ ✅ | Reports hardware inventory: manufacturer, model, BIOS, CPU, memory, disks, drivers, chassis, baseboard, swap, machine id | [README](../../agents/plugins/hardware/README.md) |
 | `http_client` | ✅ ✅ ✅ | HTTP client — download files, GET/HEAD requests with hash verification (no shell-out) | [README](../../agents/plugins/http_client/README.md) |
 | `installed_apps` | ✅ ✅ ✅ | Inventories installed applications and queries by name | [README](../../agents/plugins/installed_apps/README.md) |
 | `interaction` | ✅ ✅ ✅ | Desktop user interaction — notifications, message boxes, input dialogs, surveys, DND | [README](../../agents/plugins/interaction/README.md) |
