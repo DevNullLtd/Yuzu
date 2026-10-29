@@ -669,6 +669,10 @@ public:
         std::string enrolled_at;
         std::string disabled_at;
         int recovery_codes_remaining{0};
+        /// `mfa_enrolled_at` as milliseconds since the Unix epoch, authored from
+        /// the Postgres `now()` that stamped the enrolment (the same clock domain
+        /// as `session_store.sessions.mfa_verified_ms`). 0 == not enrolled.
+        std::int64_t enrolled_at_ms{0};
     };
 
     struct MfaEnrollmentInit {
@@ -774,6 +778,11 @@ public:
     /// mfa_disabled_at, and deletes all recovery codes. Idempotent on
     /// not-enrolled rows.
     std::expected<void, AuthDBError> mfa_disable(const std::string& username);
+
+    /// `mfa_disable`, reporting whether the account had a verified factor at the moment of the
+    /// clear (the pre-image of the same row lock, #6079). `true` also when no active row matched,
+    /// so a caller deciding whether to end the account's sessions fails safe.
+    [[nodiscard]] std::expected<bool, AuthDBError> mfa_disable_report(const std::string& username);
 
     // ── Enrollment tokens + pending agents (WS-6 slice 6.2, ADR-2002 §8) ─────
     //

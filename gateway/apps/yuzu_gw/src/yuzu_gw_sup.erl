@@ -14,6 +14,8 @@
 %%%   7. yuzu_gw_health            — HTTP health/readiness endpoint
 %%%   8. yuzu_gw_memory_shedder    — node-wide memory load shedder (suspends the
 %%%      agent listener(s) under memory pressure, never the management listener)
+%%%      yuzu_gw_mem_reclaim       — gives OS memory back after the agent count
+%%%      drops (GC of the large long-lived processes, then malloc_trim on glibc)
 %%%   9. yuzu_gw_agent_sup         — simple_one_for_one for agent processes
 %%%  10. yuzu_gw_mgmt_pins         — the management-pin watcher (#5696): resolves the
 %%%      {cert_file, Path} pins in init, so the first management stream finds them,
@@ -146,6 +148,15 @@ init([]) ->
         %% not strand the listener.
         #{id       => yuzu_gw_memory_shedder,
           start    => {yuzu_gw_memory_shedder, start_link, []},
+          restart  => permanent,
+          shutdown => 5000,
+          type     => worker},
+
+        %% Gives OS memory back after a storm or a drain (module doc). It reads
+        %% the registry table, which yuzu_gw_registry (above) owns; it never
+        %% raises, so it cannot spend the restart intensity of the tree.
+        #{id       => yuzu_gw_mem_reclaim,
+          start    => {yuzu_gw_mem_reclaim, start_link, []},
           restart  => permanent,
           shutdown => 5000,
           type     => worker},

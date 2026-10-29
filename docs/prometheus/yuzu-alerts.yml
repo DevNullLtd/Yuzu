@@ -139,18 +139,30 @@ groups:
             Disconnections" in docs/operations/troubleshooting.md). While it is down, agents through this
             gateway are stranded and command forwarding is dead.
 
-      # #1422 mgmt-plane peer pin, every rejection reason EXCEPT pin_mismatch
-      # (that one has its own rule below, because a routine server-leaf
-      # rotation produces a few of it). None of these reasons is produced by a
-      # rotation: missing_server_auth_eku, bad_peer_cert = a CA-cert holder
-      # that is not the server reached the command plane (or the server
-      # presents a leaf without the serverAuth EKU); no_pins_resolved,
+      # #1422 mgmt-plane peer authorization, every rejection reason EXCEPT
+      # pin_mismatch (that one has its own rule below, because a routine
+      # server-leaf rotation in pin mode produces a few of it). None of these
+      # reasons is produced by a rotation: missing_server_auth_eku, bad_peer_cert
+      # = a CA-cert holder that is not the server reached the command plane (or
+      # the server presents a leaf without the serverAuth EKU); no_pins_resolved,
       # no_pins_configured, bad_pin_config = the gateway's pin configuration
       # admits nobody (a pin file unreadable since the gateway started; once a
       # pin has been read it stays pinned, see YuzuGatewayMgmtPinUnresolved);
-      # internal_error = a defect. Each one needs a person, so no `for:`. The
-      # name is the pre-split rule's, so existing silences and routes keep
-      # applying to the non-rotation reasons.
+      # the #6016 server identity adds no_uri_san (the peer's certificate
+      # carries no identity URI), identity_mismatch (it carries URIs but not
+      # this install's /server), identity_unresolved (the gateway could not
+      # resolve the identity it must match) and revoked (the peer presented a
+      # certificate whose serial is in mgmt_peer_denied); in the identity
+      # modes a server key renewal that keeps the identity produces NONE of
+      # them, which is the point. In identity_or_pin with pins configured, a
+      # peer that fails BOTH paths is reported with the PIN's reason
+      # (pin_mismatch / no_pins_resolved), so no_uri_san and identity_mismatch
+      # reach this rule only when no pin is configured or the mode is identity
+      # (identity mode reports the identity's reason); identity_unresolved (a
+      # gateway configuration defect) and revoked are reported as themselves in
+      # every mode. internal_error = a defect. Each one needs a
+      # person, so no `for:`. The name is the pre-split rule's, so existing
+      # silences and routes keep applying to the non-rotation reasons.
       - alert: YuzuGatewayMgmtAuthRejected
         expr: |
           increase(yuzu_gw_mgmt_auth_rejected_total{reason!="pin_mismatch"}[1h]) > 0
@@ -172,9 +184,32 @@ groups:
             names, which is picked up within mgmt_pin_refresh_ms; a correction
             to mgmt_peer_pins in sys.config applies only at the next gateway
             restart, which disconnects every agent on the node, and agents
-            without the #5183 fix stay wedged after it); internal_error is a
-            gateway defect (collect the gateway log and report it). Rotation
-            never produces these reasons.
+            without the #5183 fix stay wedged after it); no_uri_san means the
+            peer's certificate has no server identity URI (in identity mode
+            the server's built-in certificate has not been re-issued with it:
+            check yuzu_server_identity_uri_present on the server, and keep
+            mgmt_peer_auth_mode at pin or identity_or_pin until it reads 1);
+            identity_mismatch means the certificate names another install or
+            another role (a certificate of a different CA, or an agent-style
+            URI): treat as a security incident unless the server was just
+            re-keyed under another CA; identity_unresolved means this gateway
+            could not work out the install identity (its management listener's
+            cacertfile is a bundle or unreadable): set mgmt_peer_identity (over
+            a bundle the gateway then also needs mode identity and a pin);
+            revoked means the peer presented a certificate whose serial is in
+            mgmt_peer_denied: the server is still using a withdrawn
+            certificate, re-key it, or a holder of that certificate is
+            connecting. mgmt_peer_auth_mode, mgmt_peer_identity and
+            mgmt_peer_denied are read at boot: a change to them applies only
+            if the gateway is restarted, which disconnects every agent on the
+            node, and agents without the #5183 fix stay wedged after it;
+            internal_error is a gateway defect (collect the gateway log and
+            report it). Rotation never produces these reasons, except identity_unresolved in
+            identity_or_pin with an unresolved identity. With pins
+            configured in identity_or_pin, no_uri_san and identity_mismatch
+            are reported as pin_mismatch instead and raise
+            YuzuGatewayMgmtPinMismatch, not this alert; identity_unresolved
+            and revoked are always reported as themselves.
 
       # pin_mismatch: the peer's key is not the pinned key. A routine rotation
       # produces a few: the server presents its new leaf up to one
@@ -227,7 +262,12 @@ groups:
             updated, add the new key's {spki_sha256, Hex} to mgmt_peer_pins,
             which applies at the next gateway restart (that disconnects every
             agent on the node, and agents without the #5183 fix stay wedged
-            after it). If the server's certificate did not change, a holder of another
+            after it). If this gateway is in mgmt_peer_auth_mode
+            identity_or_pin, the peer ALSO failed the identity check, since a
+            pin reason is only reported when both paths fail: look at
+            yuzu_server_identity_uri_present on the server (0 means the
+            built-in certificate lacks the identity URI) before changing a pin.
+            If the server's certificate did not change, a holder of another
             certificate with the serverAuth usage (for example the gateway's
             own key) is presenting it to the command plane: treat it as a
             security incident. A routine rotation does not fire this: its
@@ -246,8 +286,8 @@ groups:
       # server's next rotation, which would otherwise be refused. Last known
       # good means deleting, emptying or corrupting the file does NOT revoke
       # the pinned key; it never admits a key that was not pinned, and an entry
-      # that never resolved still admits nothing (fail closed; revocation by
-      # identity is #6016). `for: 2m` keeps a single
+      # that never resolved still admits nothing (fail closed; withdrawing a
+      # certificate without a file is mgmt_peer_denied, #6016). `for: 2m` keeps a single
       # half-written file seen on one refresh tick from paging; it delays the
       # counter half by two minutes and does not require a sustained episode
       # of it (increase()[1h] stays true for an hour after one increment).
@@ -2870,6 +2910,45 @@ groups:
             access is granted in the meantime. Check Postgres availability.
           runbook_url: "https://docs.yuzu.io/runbooks/ca-revocation-sweep-failing"
 
+      # #6016: the built-in server certificate carries the server identity URI
+      # the gateway management plane will admit by. 0 = the in-place upgrade
+      # was skipped or failed (the server log says why and retries on every
+      # boot); the gauge is absent, not 0, when built-in certificates are not
+      # in use, so an installation with its own certificates never fires.
+      # A gateway in identity mode would refuse this server (no_uri_san), so
+      # this is the gate before moving mgmt_peer_auth_mode to `identity`; in
+      # pin or identity_or_pin mode (with a pin) nothing breaks, hence a warning
+      # that waits out a rolling restart.
+      - alert: YuzuServerIdentityUriAbsent
+        expr: |
+          yuzu_server_identity_uri_present == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The built-in server certificate carries no server identity URI ({{ $labels.instance }})"
+          description: >-
+            yuzu_server_identity_uri_present is 0: default-server.pem lacks the
+            URI SAN yuzu://<install>/server that the gateway's management
+            plane admits the server by, because the in-place re-issue was
+            skipped or failed. The server log says why on every boot: the
+            server key was withdrawn (revoked for a reason other than
+            superseded; re-key the set, which also changes the key every
+            gateway mgmt_peer_pins entry refers to), the cert directory is
+            read-only, the CA key is not in it, or the CA inventory is
+            unreachable. A gateway in mgmt_peer_auth_mode pin or
+            identity_or_pin still admits this server by its pin (when it has
+            one), so nothing is failing; a gateway in identity mode refuses
+            it (no_uri_san). Do not move a gateway to identity mode until this
+            reads 1 on every server replica. The gauge is set once, at server
+            boot, so it stays 0 until the server is restarted after the cause
+            is fixed. It describes the file default-server.pem: a server given
+            its own --cert/--key presents that certificate to the gateway,
+            even while default certificates stay active for another
+            listener, which this gauge does not see. See docs/pki-architecture.md and
+            docs/user-manual/upgrading.md.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/gateway.md#authorizing-the-server-by-its-identity"
+
       - alert: YuzuCaReissueBlocked
         expr: |
           increase(yuzu_server_ca_reissue_blocked_total[1h]) > 0
@@ -4804,7 +4883,10 @@ groups:
           summary: "Installed-software ingest dropping over-cap blobs"
           description: >-
             yuzu_inventory_ingest_total{outcome="dropped"} is non-zero: one or more
-            agents are sending an installed-software blob over the 3 MiB cap, which
+            agents are sending an installed-software blob over the 3 MiB cap (the label
+            source says which; source="certificate_inventory" also counts an unknown
+            major version or an unparseable header, which are NOT resent - see
+            YuzuCertInventoryReportsRejected for those), which
             is dropped + nacked and will NOT self-heal (the agent resends the same
             payload). Likely an agent/server cap-constant drift after a version skew,
             or a non-conforming agent — check the agent version and the warn-level
@@ -4831,6 +4913,30 @@ groups:
             advances to its weekly full-floor). The framework wires ~1 source, so this
             signals a malformed/abusive/corrupted agent — check the agent version and the
             warn-level "carries too many sources" server logs for the agent_id.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuCertInventoryReportsRejected
+        # certificate_inventory: result="rejected" is a whole report refused (over 3 MiB, unknown
+        # major version, bad header, over 64 stores / 10,000 certificates, >64 sources). It is
+        # acknowledged WITHOUT a resend and writes nothing, so the device's stored inventory
+        # freezes and nothing else shows it. Sustained = a device (or a fleet after an agent
+        # upgrade ahead of the server) is stuck.
+        # increase over a day with NO hold: a single device refused once a day is enough, and a
+        # rate()-with-for would never fire for it. budget_exceeded freezes a device the same way.
+        expr: |
+          sum by (result, reason) (increase(yuzu_server_cert_inventory_ingest_total{result="rejected"}[1d])) > 0
+          or
+          sum by (result, reason) (increase(yuzu_server_cert_inventory_ingest_total{result="error",reason="budget_exceeded"}[1d])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Certificate inventory reports being rejected"
+          description: >-
+            yuzu_server_cert_inventory_ingest_total{result="rejected"} (or
+            error/budget_exceeded) increased in the last day. The affected devices'
+            certificate inventory is frozen (acknowledged, not stored, not resent). By reason label: unknown_version = an agent newer than the
+            server (upgrade the server first); bad_header / over_cap / blob_too_large = a
+            malformed or oversize report - find the agent in the warn log line
+            "certificate_inventory: blob from agent=... refused".
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryGenericBlobRejectedDepth
         # json-dump-depth-guard fix: outcome=rejected_depth is a SEPARATE outcome
@@ -6005,8 +6111,13 @@ groups:
           description: >-
             A durable session-store operation ({{ $labels.op }}) hit a degraded
             PostgreSQL read/write for 10m. A `validate` degrade fails requests
-            closed (401); `create`/`elevate`/`mark_mfa`/`invalidate`/
-            `invalidate_user` degrades fail the privileged op closed; a sustained
+            closed (401; the approve and reject routes answer 503 when they cannot read
+            the session's stored MFA proof); `create`/`elevate`/`mark_mfa`/`invalidate`/
+            `invalidate_user` degrades fail the privileged op closed, except an
+            `invalidate_user` after an MFA clear that already committed (Settings MFA
+            disable), which leaves the clear in place and ends `partial`; a single
+            event does not hold this alert's 10m condition, so look for
+            `mfa.disabled` rows with result `partial` in the audit log; a sustained
             `generation_refresh` degrade drops the validate cache past the
             stale-serve bound. Usually PostgreSQL pool saturation / failover —
             correlate with the pool metrics.
