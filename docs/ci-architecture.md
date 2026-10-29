@@ -705,8 +705,9 @@ annotated as built on the runtime stage's Alpine release. That is the early chec
 Dependabot digest refresh; the build's abi-guard stays the build-time enforcement.
 Exit 1 is a mismatch, 2 an unreadable registry or a body that is not the pinned digest (the
 log says whether a re-run can help), 3 an input the script does not understand. A skipped
-plain job satisfies a required check, so it needs no stub. To disable the networked check, put `if: false` on the job (and take it out of branch protection
-first if it was ever made required). Keep the script, `tests/test_gateway_base_index.py` and
+plain job satisfies a required check, so it needs no stub. To disable the networked
+check, put `if: false` on the job (and take it out of branch protection first if it was
+ever made required). Keep the script, `tests/test_gateway_base_index.py` and
 the `docs-lint.yml` "Gateway base index lint" step: that test also holds the executed
 arch-guard contract for `Dockerfile.gateway`.
 

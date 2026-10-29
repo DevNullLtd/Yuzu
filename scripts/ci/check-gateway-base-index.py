@@ -76,8 +76,11 @@ class InputDefect(Exception):
 class RegistryError(Exception):
     """The registry could not be read, or served a body that is not the pinned one (exit 2).
 
-    `transient` is True for faults a re-run may clear (outage, rate limit, truncated body) and
-    False for ones it will not (a 4xx for the pinned digest, a body that is not the pinned one).
+    `transient` is True for faults a re-run may clear (outage, rate limit, network error), False
+    for ones it will not (a 4xx for the pinned digest, an oversized response), and None when a
+    re-run is worth trying once but a repeat means the pin or the registry content changed (a
+    body that is not the pinned one, which a truncated response also produces; a token or
+    manifest body that is not what was asked for).
     """
 
     def __init__(self, message, transient=True):
@@ -157,7 +160,8 @@ def parse_dockerfile(text):
 def _retry_after(headers):
     """Seconds to wait per a Retry-After header: 1..30, or None when absent/unusable."""
     value = headers.get("Retry-After") if headers else None
-    if value and value.isascii() and value.isdigit():
+    # Bounded length: int() of a very long digit string raises on Python 3.11+.
+    if value and len(value) <= 9 and value.isascii() and value.isdigit():
         return max(1, min(int(value), 30))
     return None
 
@@ -199,17 +203,17 @@ def fetch_index(repo, digest):
         if not isinstance(token, str) or not token:
             raise ValueError("token is not a non-empty string")
     except (ValueError, KeyError, TypeError, RecursionError) as exc:
-        raise RegistryError(f"token response not understood: {exc!r}", transient=False)
+        raise RegistryError(f"token response not understood: {exc!r}", transient=None)
     body = _get(f"https://registry-1.docker.io/v2/{repo}/manifests/{digest}",
                 {"Authorization": f"Bearer {token}", "Accept": ", ".join(INDEX_TYPES)})
     got = "sha256:" + hashlib.sha256(body).hexdigest()
     if got != digest:
         raise RegistryError(f"the registry served a body hashing to {got}, not the pinned {digest}",
-                            transient=False)
+                            transient=None)
     try:
         return json.loads(body)
     except ValueError as exc:
-        raise RegistryError(f"the pinned index is not JSON: {exc}", transient=False)
+        raise RegistryError(f"the pinned index is not JSON: {exc}", transient=None)
 
 
 def main(argv=None):
@@ -232,9 +236,14 @@ def main(argv=None):
         print(f"FATAL: {exc}", file=sys.stderr)
         return 3
     except RegistryError as exc:
-        advice = ("this looks transient: re-run the job" if exc.transient else
-                  "re-running will not help: check the pinned digest in Dockerfile.gateway "
-                  "(deleted, or not the index it claims to be)")
+        if exc.transient:
+            advice = "this looks transient: re-run the job"
+        elif exc.transient is None:
+            advice = ("re-run once (a truncated response looks like this); if it repeats, check the pinned "
+                      "digest in Dockerfile.gateway")
+        else:
+            advice = ("re-running will not help: check the pinned digest in Dockerfile.gateway "
+                      "(deleted, or not the index it claims to be)")
         print(f"FATAL: could not read the pinned index; {advice}: {exc}", file=sys.stderr)
         return 2
     except (OSError, ValueError, RecursionError) as exc:

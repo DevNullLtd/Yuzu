@@ -115,6 +115,12 @@ class CheckTests(unittest.TestCase):
         with self.assertRaisesRegex(mod.InputDefect, "image index"):
             mod.check(single, ["linux/amd64"], "3.23")
 
+    def test_non_string_annotation_is_a_verdict_not_a_crash(self):
+        idx = {"manifests": [{"platform": {"os": "linux", "architecture": "amd64"},
+                              "annotations": {mod.BASE_NAME_KEY: 7}}]}
+        failures, _ = mod.check(idx, ["linux/amd64"], "3.23")
+        self.assertEqual(len(failures), 1)
+
     def test_mis_shaped_entries_are_input_defects_not_tracebacks(self):
         bad = (
             {"manifests": None},
@@ -245,6 +251,12 @@ class MainTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("re-running will not help", err)
 
+    def test_an_unclear_registry_failure_says_to_rerun_once(self):
+        rc, err = self.run_registry_failure(mod.RegistryError("hash mismatch", transient=None))
+        self.assertEqual(rc, 2)
+        self.assertIn("re-run once", err)
+        self.assertNotIn("will not help", err)
+
     def test_missing_index_file_is_3(self):
         df = self.dir / "Dockerfile"
         df.write_text(self.GOOD, encoding="utf-8")
@@ -316,7 +328,8 @@ class FetchTests(unittest.TestCase):
         self.assertFalse(cm.exception.transient)
 
     def test_retry_after_is_honoured_clamped_and_never_crashes(self):
-        cases = {"7": 7, "0": 1, "999999": 30, "abc": None, "-5": None, "1.5": None, "\u00b2": None, "": None}
+        cases = {"7": 7, "0": 1, "999999": 30, "abc": None, "-5": None, "1.5": None, "\u00b2": None, "": None,
+                 "9" * 5000: None}
         for value, want in cases.items():
             with self.subTest(value=value):
                 self.assertEqual(mod._retry_after({"Retry-After": value}), want)
@@ -362,6 +375,71 @@ class FetchTests(unittest.TestCase):
         with self.assertRaisesRegex(mod.RegistryError, "larger than"):
             mod._get("https://example.invalid/x", {})
 
+    def test_a_truncated_200_body_is_unclear_not_hopeless(self):
+        body = json.dumps(AGREE).encode()
+        digest = "sha256:" + hashlib.sha256(body).hexdigest()
+        mod._get = lambda url, headers, attempts=4: b'{"token": "t"}' if "auth.docker.io" in url else body[:10]
+        with self.assertRaises(mod.RegistryError) as cm:
+            mod.fetch_index("erlang", digest)
+        self.assertIsNone(cm.exception.transient)
+
+    def test_other_5xx_including_500_is_retried(self):
+        calls = []
+
+        def five(req, timeout=0):
+            calls.append(1)
+            raise mod.urllib.error.HTTPError(req.full_url, 500, "boom", {}, None)
+
+        self.patch_urlopen(five)
+        with self.assertRaises(mod.RegistryError) as cm:
+            mod._get("https://example.invalid/x", {})
+        self.assertTrue(cm.exception.transient)
+        self.assertEqual(len(calls), len(mod.RETRY_DELAYS) + 1)
+
+    def test_socket_level_errors_are_retried(self):
+        for exc in (ConnectionResetError("reset"), TimeoutError("slow")):
+            calls = []
+
+            def flaky(req, timeout=0, e=exc, c=calls):
+                c.append(1)
+                raise e
+
+            with self.subTest(exc=type(exc).__name__):
+                self.patch_urlopen(flaky)
+                with self.assertRaises(mod.RegistryError) as cm:
+                    mod._get("https://example.invalid/x", {})
+                self.assertTrue(cm.exception.transient)
+                self.assertEqual(len(calls), len(mod.RETRY_DELAYS) + 1)
+
+    def test_a_token_body_without_a_token_key_is_a_registry_error(self):
+        mod._get = lambda url, headers, attempts=4: b"{}"
+        with self.assertRaises(mod.RegistryError) as cm:
+            mod.fetch_index("erlang", "sha256:" + "0" * 64)
+        self.assertIsNone(cm.exception.transient)
+
+    def test_digest_mismatch_and_oversize_have_the_right_transient_class(self):
+        body = json.dumps(AGREE).encode()
+        mod._get = lambda url, headers, attempts=4: b'{"token": "t"}' if "auth.docker.io" in url else body
+        with self.assertRaises(mod.RegistryError) as cm:
+            mod.fetch_index("erlang", "sha256:" + "0" * 64)
+        self.assertIsNone(cm.exception.transient)
+
+        class Big:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, n=-1):
+                return b"x" * n
+
+        mod._get = self._get
+        self.patch_urlopen(lambda req, timeout=0: Big())
+        with self.assertRaises(mod.RegistryError) as cm:
+            mod._get("https://example.invalid/x", {})
+        self.assertFalse(cm.exception.transient)
+
     def test_a_non_string_token_is_refused_before_the_manifest_request(self):
         for body in (b'{"token": null}', b'{"token": ["a"]}', b'{"token": ""}', b'{"token": 7}'):
             with self.subTest(body=body):
@@ -374,7 +452,7 @@ class FetchTests(unittest.TestCase):
                 mod._get = fake
                 with self.assertRaises(mod.RegistryError) as cm:
                     mod.fetch_index("erlang", "sha256:" + "0" * 64)
-                self.assertFalse(cm.exception.transient)
+                self.assertIsNone(cm.exception.transient)
                 self.assertEqual(len(calls), 1, "the manifest was requested with a bad token")
 
     def test_a_matching_but_non_json_body_is_a_registry_error(self):
