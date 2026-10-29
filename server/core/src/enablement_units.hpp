@@ -318,7 +318,8 @@ inline constexpr std::array<UnitOsRow, 236> kUnitOs{{
     {"services", "set_start_mode", kWin | kLin | kMac},
     // remote_access_audit: Linux is constrained, macOS supported, Windows `planned` (applicable).
     {"remote_access_audit", "list", kWin | kLin | kMac},
-    // shares: the macOS and Windows legs are `planned`, which is applicable (not unsupported).
+    // shares: Linux and Windows are supported; the macOS leg is `planned`, which is applicable (not
+    // unsupported).
     {"shares", "list", kWin | kLin | kMac},
     {"software_actions", "list_upgradable", kWin | kLin | kMac},
     {"software_actions", "installed_count", kWin | kLin | kMac},

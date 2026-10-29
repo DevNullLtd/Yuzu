@@ -124,6 +124,8 @@ The gateway source lives in `gateway/apps/yuzu_gw/src/`:
 | `yuzu_grpc`, `yuzu_grpc_stream`, `yuzu_grpc_route`, `yuzu_grpc_runner`, `yuzu_grpc_frame` | The rest of the gRPC layer: context accessors (`peer/1`, `origin/1`, `peer_cert/1`), the stream API handlers use (`send/2`), route table built from the proto modules, handler runner (unary, server-streaming, bidi), and gRPC message framing |
 | `yuzu_gw_telemetry` | Telemetry event definitions and handlers |
 | `yuzu_gw_gauge` | Periodic gauge emission for Prometheus |
+| `yuzu_gw_mem_reclaim` | Gives OS memory back after the agent count drops (see "Giving memory back after a drop") |
+| `yuzu_gw_mem_trim` | Optional loader of the `malloc_trim` NIF, built on glibc Linux only |
 | `yuzu_gw_proto` | Protobuf encode/decode wrappers |
 
 ---
@@ -1402,6 +1404,56 @@ few points between the two marks so it does not flap. The kill and receive-timeo
 counters above (`yuzu_gw_grpc_connection_killed_total`,
 `yuzu_gw_grpc_recv_timeout_total`) tell you whether the pressure is a flood of
 half-finished requests rather than genuine fleet growth.
+
+**Giving memory back after a drop.** After a reconnect storm or a drain, the
+gateway's memory does not fall back with its agent count by itself: most of what it
+still holds is garbage in the long-lived processes whose heaps grew during the storm
+(the connection supervisors, the acceptors, the registries), which are rarely
+collected once they are quiet again. `yuzu_gw_mem_reclaim` reads the agent count
+every `interval_ms` and, when it has fallen by a quarter of its peak and by at least
+1,000 agents, garbage-collects every process holding more than `gc_min_bytes`, so the
+VM can hand that memory back to the OS. It repeats the pass `followup_ms` later,
+because the count falls before the closing connections' processes and buffers have
+gone. On glibc Linux it then also calls `malloc_trim(0)`, which returns the free pages
+of the C allocator (OpenSSL's, for one), after each pass and every `trim_interval_ms`.
+
+*Which builds trim.* The `malloc_trim` call is a small NIF compiled only when the
+gateway is built on glibc Linux: the chiselled image (`Dockerfile.gateway.chisel`) and
+a release built on a glibc Linux host (the `.deb` and `.rpm`) have it; the default
+Alpine image (musl has no `malloc_trim`), macOS and Windows do not, and there every
+pass is garbage collection only. The first pass on such a build logs one notice,
+`gateway memory reclaim: malloc_trim unavailable (...); garbage collection only`.
+
+*What a pass logs and costs.* Each pass logs one notice line, `gateway memory reclaim:
+#{agents => ..., gc_processes => ..., trim => ..., rss_anon_kb_before => ...,
+rss_anon_kb_after => ..., ms => ...}` (the RSS figures come from `/proc/self/status`
+and are `undefined` off Linux). There is no metric for it. Measured on a transport and
+HTTP/2 probe, not the full gateway (10,000 TLS connections and a 30,000-handshake
+storm, all closed; 2026-10-29): two minutes after the close, the memory held above the
+pre-test level fell from 343 MiB (musl) and 251 MiB (glibc) to about 150 MiB on both
+with these passes, and to 121 MiB on glibc with `malloc_trim` too (that run also had
+two other allocator settings this release does not ship). A pass walks every process
+on the node; over 300,000 processes it took 350-450 ms on a laptop (2026-10-29). It
+runs in its own process, never on an agent's call path, and `malloc_trim` runs on a
+dirty scheduler.
+
+Configure it under `{yuzu_gw, [{mem_reclaim, #{...}}]}` (read once at start; no
+`YUZU_GW_*` environment variable maps to it; not present in any shipped `sys.config`).
+A value of the wrong type or out of range, or an unknown key, is logged as a warning
+(`gateway memory reclaim: ignoring ...`) and the default is used; it never stops the
+gateway starting.
+
+| Key | Meaning | Default |
+|---|---|---|
+| `enabled` | `false` turns it off (no pass, no trim). | `true` |
+| `interval_ms` | How often the agent count is read (a positive integer). | `10000` |
+| `drop_fraction` | The fall below the peak that triggers a pass, as a fraction of the peak (above 0, at most 1). | `0.25` |
+| `min_drop` | The fall must also be at least this many agents. | `1000` |
+| `min_gap_ms` | The shortest time between two passes the count triggers (the follow-up pass is not held back by it). | `60000` |
+| `gc_min_bytes` | Only processes holding more than this many bytes are collected. A hibernated agent connection holds a few KB and is skipped. | `32768` |
+| `followup_ms` | The second pass runs this long after the first; `0` runs no second pass. | `30000` |
+| `trim` | `false` stops every `malloc_trim` call (after passes and periodic); the passes still collect. | `true` |
+| `trim_interval_ms` | `malloc_trim(0)` on its own this often, whatever the count does; `0` never. | `300000` |
 
 A leftover `{grpcbox, [{servers, ...}]}` block **refuses boot**: nothing reads it, so
 it would configure no listener while the file reads as if it did. The same goes for a
