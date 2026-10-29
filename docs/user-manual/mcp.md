@@ -44,7 +44,10 @@ Key characteristics:
   present-but-unsupported `MCP-Protocol-Version` header is rejected with `400`.
 - **Authentication**: Same as all Yuzu API endpoints -- session cookie, Bearer
   token, or `X-Yuzu-Token` header. Auth is per-request on every method; an
-  `Mcp-Session-Id` is transport affinity only, never a credential.
+  `Mcp-Session-Id` is transport affinity only, never a credential, and it
+  only works for the principal and credential class that created it (see
+  [Streamable HTTP sessions](#streamable-http-sessions)). A service-scoped token
+  cannot open the `GET /mcp/v1/` stream channel (`403`).
 - **Authorization**: Two layers -- MCP tier (checked first) then RBAC
   (checked second). A token must pass both.
 - **Audit**: Every tool invocation is recorded in the audit log with an
@@ -173,13 +176,26 @@ on `/mcp/v1/`. Sessions are **optional** — a client that never sends
 change: a notification POST now answers `202` instead of `204`).
 
 - **`initialize`** returns an `Mcp-Session-Id` response header (a ≥128-bit
-  server-generated value, bound to the authenticated principal). A client-supplied
+  server-generated value, bound to the authenticated principal and to the
+  credential class that created it). A client-supplied
   `Mcp-Session-Id` on `initialize` is ignored — the server always mints a fresh
   one (no session fixation).
 - **Presenting the header** on a later request validates it: unknown, expired,
   `DELETE`d, or another principal's id all return `-32007` / HTTP `404` (no
-  cross-principal oracle) — re-run `initialize`. Sessions are in-memory, so a
-  server restart drops them (re-initialize).
+  cross-principal oracle) — re-run `initialize`. The same `404` answers an id
+  presented by a different **credential class** of the same user: the class is
+  the authentication source (cookie or token), the principal kind, the MCP tier
+  and the service scope. For example, a `readonly` token cannot use a session
+  created by a `supervised` token, and a cookie session or tierless token
+  cannot use a session created by a token with a tier. This applies on a `GET`
+  attach or resume, a `POST` that reuses the session, and a `DELETE`. The
+  refusal does not end the original session, and the client simply re-runs
+  `initialize` with the credential it is using. Rotating an API token or
+  signing in again keeps the same class, so an existing session survives both.
+  Two credentials of the same class belonging to one user remain
+  interchangeable, because they carry the same authority. Sessions are
+  in-memory per server replica, so a server restart drops them
+  (re-initialize).
 - **`DELETE /mcp/v1/`** with the `Mcp-Session-Id` header ends a session (`200`; a
   second `DELETE` of the same id → `404`).
 - **`Origin`** is validated on every method when streaming is on (`-32008` / `403` if a
@@ -189,9 +205,15 @@ change: a notification POST now answers `202` instead of `204`).
   **`MCP-Protocol-Version`** is
   negotiated (`-32009` / `400` for an unsupported value); the per-principal/global
   session cap returns `-32010` / `429` on `initialize` when full.
-- **`GET /mcp/v1/`** is the session's server→client **SSE channel**. It requires the
-  session's `Mcp-Session-Id` (`400` if absent; `404` if unknown, expired, or another
-  principal's) and `Accept: text/event-stream` (`-32011` / `406` otherwise — wildcards
+- **`GET /mcp/v1/`** is the session's server→client **SSE channel**. A
+  **service-scoped** API token is refused with `403` (`-32003`) before anything else
+  is checked, so such a caller gets this `403` even when it sends no
+  `Mcp-Session-Id` (other callers get the `400` below). Use a token without
+  `scope_service` to open the channel; a service-scoped caller's streamed `POST`
+  still delivers its frames inline, and durable results stay fetchable by
+  `execution_id`. Otherwise it requires the
+  session's `Mcp-Session-Id` (`400` if absent; `404` if unknown, expired, another
+  principal's, or created by a different credential class) and `Accept: text/event-stream` (`-32011` / `406` otherwise — wildcards
   like `*/*` do not opt in). The stream sends a heartbeat on any ~3 s tick that delivers
   nothing else — a stream busy delivering real frames emits no heartbeat filler, so do
   not key liveness detection on heartbeat cadence: any delivered frame proves liveness.
@@ -255,12 +277,15 @@ change: a notification POST now answers `202` instead of `204`).
   cap rather than releasing it at routing hand-off. See
   `docs/user-manual/engine-principals.md` "Per-principal quota cap".
 - The session id is **transport affinity only** — never an auth credential;
-  per-request token auth runs on every method regardless.
+  per-request token auth runs on every method regardless. It is also bound to
+  the principal and credential class that created it, as described above.
 
 The `--mcp-no-streaming` kill switch disables all of the above (no minting;
 `GET`/`DELETE` → `405`; plain POST only), useful behind a buffering reverse proxy.
 Session open/close and every denial are audited (`mcp.session.open` /
-`mcp.session.close` / `mcp.session.reject`), and each stream attach/close is audited
+`mcp.session.close` / `mcp.session.reject`; a rejected session shows `reason=service_scoped`
+or `reason=credential_mismatch` in the `detail`, see `docs/user-manual/audit-log.md`), and
+each stream attach/close is audited
 too (`mcp.stream.attach` / `mcp.stream.close`, the latter carrying the close reason).
 
 ---
