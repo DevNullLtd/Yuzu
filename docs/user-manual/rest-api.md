@@ -13057,8 +13057,10 @@ below).
 not a heartbeat frame is emitted, so revoking it ends a *live* stream, not just future
 ones. A service-scoped API token is refused outright (`403`, below). The session is
 bound to the principal and credential class that created it (authentication source,
-principal kind, MCP tier, service scope; not elevation state), and stream liveness is
-principal-level while the class is checked at attach.
+principal kind, MCP tier, service scope; not elevation state). Stream liveness is
+principal-level: the class is checked when the stream attaches and is not re-derived
+from the live credential afterwards (the per-tick credential recheck compares the
+principal only, and the per-tick session check compares the class captured at attach).
 
 **Required headers:** `Mcp-Session-Id` (from `initialize`), `Accept: text/event-stream`.
 **Optional:** `Last-Event-ID` to resume.
