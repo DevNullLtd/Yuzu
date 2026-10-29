@@ -25,10 +25,10 @@
 #include <yuzu/string_utils.hpp>
 
 #include <algorithm>
-#include <array>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <string>
@@ -542,13 +542,13 @@ inline std::string bsd_clean_path(std::string_view f) {
 }
 
 /// macOS libc `inet_pton4`: exactly four decimal octets 0-255, nothing stray. A leading zero
-/// is accepted (`01` is 1), as this libc reads it (measured on macOS 26.6.2).
-inline std::optional<std::array<unsigned char, 4>> parse_dotted_quad(std::string_view s) {
-    std::array<unsigned char, 4> out{};
+/// is accepted (`01` is 1), as this libc reads it (measured on macOS 26.6.2). nullopt when the
+/// value is invalid, else whether every octet is zero (the decoded bytes are never needed).
+inline std::optional<bool> parse_dotted_quad(std::string_view s) {
     std::size_t octets = 0;
-    std::size_t tp = 0;
     unsigned cur = 0;
     bool saw_digit = false;
+    bool zero = true;
     for (const char c : s) {
         if (c >= '0' && c <= '9') {
             cur = cur * 10 + static_cast<unsigned>(c - '0');
@@ -562,7 +562,7 @@ inline std::optional<std::array<unsigned char, 4>> parse_dotted_quad(std::string
         } else if (c == '.' && saw_digit) {
             if (octets == 4)
                 return std::nullopt;
-            out[tp++] = static_cast<unsigned char>(cur);
+            zero = zero && cur == 0;
             cur = 0;
             saw_digit = false;
         } else {
@@ -571,20 +571,22 @@ inline std::optional<std::array<unsigned char, 4>> parse_dotted_quad(std::string
     }
     if (octets < 4)
         return std::nullopt;
-    out[tp] = static_cast<unsigned char>(cur);
-    return out;
+    return zero && cur == 0;
 }
 
-/// macOS libc `inet_pton(AF_INET6)` as mountd's `get_net` calls it, decoded to its 16 bytes: a
-/// group is hex digits whose value fits 16 bits (leading zeros are free, so `00000::` is
-/// valid), at most one `::` (standing for at least one zero group), a dotted-quad tail only as
-/// the last 32 bits, nothing stray. Pure and portable (no socket header); the Linux `is_v6`
-/// shape check is a different, stricter reading for a different parser. Checked against the
-/// host libc over millions of generated values (macOS 26.6.2).
-inline std::optional<std::array<unsigned char, 16>> parse_v6(std::string_view s) {
-    std::array<unsigned char, 16> out{};
-    std::size_t tp = 0;
-    std::optional<std::size_t> colonp;
+/// macOS libc `inet_pton(AF_INET6)` as mountd's `get_net` calls it: a group is hex digits whose
+/// value fits 16 bits (leading zeros are free, so `00000::` is valid), at most one `::`
+/// (standing for at least one zero group), a dotted-quad tail only as the last 32 bits,
+/// nothing stray. nullopt when the value is invalid, else whether every group is zero: a caller
+/// needs the validity and the all-zero test, never the decoded address. Pure and portable (no
+/// socket header); the Linux `is_v6` shape check is a different, stricter reading for a
+/// different parser. Checked against the host libc over millions of generated values (macOS
+/// 26.6.2).
+inline std::optional<bool> parse_v6(std::string_view s) {
+    constexpr std::size_t kBytes = 16;
+    std::size_t tp = 0; // bytes decoded so far
+    bool dc = false;    // a `::` was seen
+    bool zero = true;
     std::size_t i = 0;
     if (!s.empty() && s[0] == ':') {
         if (s.size() < 2 || s[1] != ':')
@@ -606,23 +608,23 @@ inline std::optional<std::array<unsigned char, 16>> parse_v6(std::string_view s)
         } else if (c == ':') {
             curtok = i + 1;
             if (!saw_xdigit) {
-                if (colonp)
+                if (dc)
                     return std::nullopt;
-                colonp = tp;
+                dc = true;
                 continue;
             }
-            if (i + 1 == s.size() || tp + 2 > out.size())
+            if (i + 1 == s.size() || tp + 2 > kBytes)
                 return std::nullopt; // a trailing single colon, or too many groups
-            out[tp++] = static_cast<unsigned char>(val >> 8);
-            out[tp++] = static_cast<unsigned char>(val & 0xff);
+            tp += 2;
+            zero = zero && val == 0;
             saw_xdigit = false;
             val = 0;
-        } else if (c == '.' && tp + 4 <= out.size()) {
-            const auto v4 = parse_dotted_quad(s.substr(curtok));
-            if (!v4)
+        } else if (c == '.' && tp + 4 <= kBytes) {
+            const auto v4_zero = parse_dotted_quad(s.substr(curtok));
+            if (!v4_zero)
                 return std::nullopt;
-            std::ranges::copy(*v4, out.begin() + static_cast<std::ptrdiff_t>(tp));
             tp += 4;
+            zero = zero && *v4_zero;
             saw_xdigit = false;
             break; // the tail ran to the end of the value
         } else {
@@ -630,24 +632,19 @@ inline std::optional<std::array<unsigned char, 16>> parse_v6(std::string_view s)
         }
     }
     if (saw_xdigit) {
-        if (tp + 2 > out.size())
+        if (tp + 2 > kBytes)
             return std::nullopt;
-        out[tp++] = static_cast<unsigned char>(val >> 8);
-        out[tp++] = static_cast<unsigned char>(val & 0xff);
+        tp += 2;
+        zero = zero && val == 0;
     }
-    if (colonp) {
-        const std::size_t n = tp - *colonp;
-        if (tp == out.size())
+    if (dc) {
+        if (tp == kBytes)
             return std::nullopt; // `::` must stand for at least one group
-        for (std::size_t k = 1; k <= n; ++k) {
-            out[out.size() - k] = out[*colonp + n - k];
-            out[*colonp + n - k] = 0;
-        }
-        tp = out.size();
+        tp = kBytes;
     }
-    if (tp != out.size())
+    if (tp != kBytes)
         return std::nullopt;
-    return out;
+    return zero;
 }
 
 /// Whether libc `inet_network` accepts a digit-led value (get_net's `isdigit(*cp)` branch):
@@ -707,7 +704,7 @@ inline bool bsd_v4_literal(std::string_view v) {
 enum class BsdNetKind { v4, v6, name, rejected };
 
 inline BsdNetKind bsd_net_kind(std::string_view v) {
-    if (parse_v6(v))
+    if (parse_v6(v).has_value())
         return BsdNetKind::v6;
     if (bsd_v4_literal(v))
         return BsdNetKind::v4;
@@ -721,46 +718,31 @@ inline BsdNetKind bsd_net_kind(std::string_view v) {
 }
 
 /// Whether a `-network` / `-mask` pair admits every client under Apple's matching. An IPv6
-/// network with no mask, or a mask whose 16 decoded bytes are all zero (`::`,
-/// `0:0:0:0:0:0:0:0`, `::0.0.0.0`), is the world: mountd zero-fills an absent IPv6 mask and
-/// both its masked compare and the kernel's radix lookup (a zero mask is the default entry)
-/// then match every address. An IPv4 network never is: a zero or absent IPv4 mask is replaced
-/// by the classful one, so `0.0.0.0` exports 0.0.0.0/8. A named network or mask never is.
-/// `net` / `mask` are empty when not given.
+/// network with no mask, or a mask whose groups are all zero (`::`, `0:0:0:0:0:0:0:0`,
+/// `::0.0.0.0`), is the world: mountd zero-fills an absent IPv6 mask and both its masked
+/// compare and the kernel's radix lookup (a zero mask is the default entry) then match every
+/// address. An IPv4 network never is: a zero or absent IPv4 mask is replaced by the classful
+/// one, so `0.0.0.0` exports 0.0.0.0/8. A named network or mask never is. `net` / `mask` are
+/// empty when not given.
 inline bool bsd_net_is_world(std::string_view net, std::string_view mask) {
-    if (net.empty() || !parse_v6(net))
+    if (net.empty() || !parse_v6(net).has_value())
         return false;
     if (mask.empty())
         return true;
-    const auto m = parse_v6(mask);
-    return m && std::ranges::all_of(*m, [](unsigned char b) { return b == 0; });
+    return parse_v6(mask).value_or(false); // an invalid mask is not an all-zero one
 }
 
 /// Whether the user part of a `-maproot` / `-mapall` credential is root, as mountd's
 /// `parsecred` resolves it: a digit- or `-`-led user is `getpwuid(atoi(user))`, so `0`, `00`,
 /// `0x0` (atoi stops at the `x`) and `-0` are uid 0; any other user is root only when it is
 /// the literal `root`. `atoi` is `(int)strtol`: only the low 32 bits of the value survive and
-/// strtol saturates beyond +-2^63 (LONG_MIN truncates to 0, LONG_MAX to -1). No account
-/// lookup is made, so a non-numeric account that happens to be uid 0 other than `root` is not
-/// seen.
+/// strtol saturates beyond +-2^63 (LONG_MIN truncates to 0, LONG_MAX to -1). `strtoll` is that
+/// 64-bit strtol on every platform (`long` is 32-bit on LLP64 Windows). No account lookup is
+/// made, so a non-numeric account that happens to be uid 0 other than `root` is not seen.
 inline bool is_root_user(std::string_view user) {
-    const auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
-    if (user.empty() || (!is_digit(user[0]) && user[0] != '-'))
+    if (user.empty() || ((user[0] < '0' || user[0] > '9') && user[0] != '-'))
         return user == "root";
-    const bool neg = user[0] == '-';
-    unsigned long long mag = 0;
-    bool over = false;
-    for (std::size_t i = neg ? 1 : 0; i < user.size() && is_digit(user[i]); ++i) {
-        const auto d = static_cast<unsigned long long>(user[i] - '0');
-        if (mag > (~0ULL - d) / 10) {
-            over = true;
-            break;
-        }
-        mag = mag * 10 + d;
-    }
-    if (over || mag > (neg ? 1ULL << 63 : 0x7fffffffffffffffULL))
-        return neg; // saturated
-    return (mag & 0xffffffffULL) == 0;
+    return static_cast<int>(std::strtoll(std::string(user).c_str(), nullptr, 10)) == 0;
 }
 
 /// What one accepted entry exports: its distinct paths and the facts they share.

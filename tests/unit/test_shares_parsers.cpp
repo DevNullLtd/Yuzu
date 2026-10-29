@@ -26,7 +26,7 @@
 #include "shares_parsers.hpp"
 
 #include <algorithm>
-#include <array>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -1124,33 +1124,30 @@ TEST_CASE("shares bsd exports: world classification is Apple's", "[shares]") {
     CHECK(bsd("/srv").shares[0].flags.back() == "clients_0");
 }
 
-TEST_CASE("shares bsd exports: IPv6 literals decode the way inet_pton decodes them", "[shares]") {
-    using Bytes = std::array<unsigned char, 16>;
-    const auto dec = [](std::string_view s) { return detail::parse_v6(s); };
-    CHECK(dec("::") == Bytes{});
-    CHECK(dec("0:0:0:0:0:0:0:0") == Bytes{});
-    CHECK(dec("::0.0.0.0") == Bytes{});
-    CHECK(dec("1::") == Bytes{0, 1});
-    CHECK(dec("::1") == Bytes{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1});
-    CHECK(dec("2001:DB8::") == Bytes{0x20, 0x01, 0x0d, 0xb8});
-    CHECK(dec("1:2:3:4:5:6:7::") == Bytes{0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7});
-    // A dotted-quad tail is the last 32 bits, with or without a `::`.
-    CHECK(dec("::ffff:10.0.0.0") == Bytes{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10});
-    CHECK(dec("::1.2.3.4") == Bytes{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4});
-    CHECK(dec("1:2:3:4:5:6:1.2.3.4") == Bytes{0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 1, 2, 3, 4});
-    CHECK(dec("1::2.3.4.5") == Bytes{0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 4, 5});
+TEST_CASE("shares bsd exports: IPv6 literals validate the way inet_pton does", "[shares]") {
+    // parse_v6 answers validity and "every group zero" only: no caller reads a decoded byte.
+    const auto zero = [](std::string_view s) { return detail::parse_v6(s) == std::optional<bool>{true}; };
+    const auto nonzero = [](std::string_view s) { return detail::parse_v6(s) == std::optional<bool>{false}; };
+    for (const char* z : {"::", "0:0:0:0:0:0:0:0", "::0.0.0.0", "::0:0", "0:0:0:0:0:0:0.0.0.0"})
+        CHECK(zero(z));
+    for (const char* nz : {"1::", "::1", "2001:DB8::", "1:2:3:4:5:6:7::", "0:0:0:0:0:0:0:1"})
+        CHECK(nonzero(nz));
+    // A dotted-quad tail is the last 32 bits, with or without a `::`, and counts toward zero.
+    for (const char* nz : {"::ffff:10.0.0.0", "::1.2.3.4", "1:2:3:4:5:6:1.2.3.4", "1::2.3.4.5", "::0.0.0.1",
+                           "0:0:0:0:0:0:0.0.0.1", "::1.0.0.0"})
+        CHECK(nonzero(nz));
     // This libc (macOS 26.6.2) takes leading zeros in a group (the value must fit 16 bits) and
     // in an octet.
-    CHECK(dec("00000::") == Bytes{});
-    CHECK(dec("::0002AD") == Bytes{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0xad});
-    CHECK(dec("::01.2.3.4") == Bytes{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4});
-    CHECK(dec("::0.0.0.00") == Bytes{});
+    for (const char* z : {"00000::", "::0.0.0.00", "::000.0.0.0"})
+        CHECK(zero(z));
+    for (const char* nz : {"::0002AD", "::01.2.3.4"})
+        CHECK(nonzero(nz));
     for (const char* bad :
          {"", ":", ":1", "1:", ":::", "1:::2", "1::2::3", "12345::", "10000::", "g::", "1.2.3.4",
           "1:2:3:4:5:6:7", "1:2:3:4:5:6:7:8:9", "1:2:3:4:5:6:7:8::", "1:2:3:4:5:6::1.2.3.4", "::1.2.3",
           "::1.2.3.4.5", "::256.0.0.0", "::1.2.3.4:", "::1.2.3.4::", "::1.2.3.4 ", "::a.2.3.4", "::1..2.3",
           "::1.2.3.4/0", "ffff::/0", "1:2:3:4:5:6:7:1.2.3.4", "2001:db8::\r"})
-        CHECK_FALSE(dec(bad).has_value());
+        CHECK_FALSE(detail::parse_v6(bad).has_value());
 }
 
 TEST_CASE("shares bsd exports: a value-taking option with no value is ignored", "[shares]") {
