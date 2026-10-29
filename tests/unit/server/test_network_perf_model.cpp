@@ -309,7 +309,10 @@ TEST_CASE("overview render: Quality / Discovered tab strip, panels and script", 
         CHECK(has(html, "href=\"#\" role=\"tab\" class=\"on\" aria-selected=\"true\""));
         CHECK(has(html, "href=\"#discovered\" role=\"tab\" aria-selected=\"false\" "
                         "hx-get=\"/fragments/network/discovered\" hx-target=\"#net-discovered\""));
-        CHECK(has(html, "<div id=\"net-discovered\" hidden>"));
+        // class="panel" so yuzu.css's panel-scoped dense-table / empty rules apply.
+        CHECK(has(html, "<div id=\"net-discovered\" class=\"panel\" hidden>"));
+        // One in-flight read at a time: a double click is dropped, not queued + audited twice.
+        CHECK(has(html, "hx-sync=\"this:drop\""));
         CHECK(has(html, "<div id=\"net-quality\">"));
         CHECK(has(html, "window.netTab=function"));
         // 403 copy names the permission; listener registered once per page life.
@@ -321,6 +324,14 @@ TEST_CASE("overview render: Quality / Discovered tab strip, panels and script", 
         // processed the new anchor's hx-get and would fire nothing.
         CHECK(has(html, "htmx.ajax('GET','/fragments/network/discovered'"));
         CHECK_FALSE(has(html, "d.click()"));
+        // Transport failure and timeout paint the same failbox; 401 goes to the login page.
+        CHECK(has(html, "htmx:responseError"));
+        CHECK(has(html, "htmx:sendError"));
+        CHECK(has(html, "htmx:timeout"));
+        CHECK(has(html, "if(s===401){location.href='/login';return}"));
+        // Quality clears the hash; Back/Forward re-sync the tab to it.
+        CHECK(has(html, "history.replaceState"));
+        CHECK(has(html, "hashchange"));
         // Both error branches: 403 permission copy and the generic retry copy.
         CHECK(has(html, "s===403?"));
         CHECK(has(html, "Discovered hosts could not be read just now. Try again in a moment."));

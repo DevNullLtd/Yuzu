@@ -91,7 +91,7 @@ Permission required: **`Infrastructure:Read`**. Each read is audited as
 
 - On the **Network quality** page the same read is the **Discovered** tab, next to
   **Quality**. Opening it (or `/network#discovered`) loads the fragment; each
-  activation is one `network.discovered.view` audit row. The tab sits inside the
+  successful load writes one `network.discovered.view` audit row. The tab sits inside the
   overview, which needs `GuaranteedState:Read`, so an account holding only
   `Infrastructure:Read` cannot reach it from the page and uses the REST list
   instead. An account with the overview but not `Infrastructure:Read` sees a

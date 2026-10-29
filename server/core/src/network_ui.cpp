@@ -125,9 +125,11 @@ std::string network_overview_shell(const std::string& quality_body) {
          "onclick=\"netTab('quality');return false\">Quality</a>"
          "<a href=\"#discovered\" role=\"tab\" aria-selected=\"false\" "
          "hx-get=\"/fragments/network/discovered\" hx-target=\"#net-discovered\" "
-         "hx-swap=\"innerHTML\" onclick=\"netTab('discovered')\">Discovered</a></div>";
+         "hx-swap=\"innerHTML\" hx-sync=\"this:drop\" onclick=\"netTab('discovered')\">"
+         "Discovered</a></div>";
     h += "<div id=\"net-quality\">" + quality_body + "</div>";
-    h += "<div id=\"net-discovered\" hidden><div class=\"gp-placeholder\">"
+    // class="panel": yuzu.css scopes the dense-table / empty-note rules under .panel.
+    h += "<div id=\"net-discovered\" class=\"panel\" hidden><div class=\"gp-placeholder\">"
          "Loading discovered hosts&hellip;</div></div>";
     h += "<script>"
          "window.netTab=function(t){var q=t==='quality';"
@@ -135,15 +137,28 @@ std::string network_overview_shell(const std::string& quality_body) {
          "document.getElementById('net-discovered').hidden=q;"
          "var a=document.querySelectorAll('#net-tabs a');"
          "for(var i=0;i<a.length;i++){var on=(i===0)===q;"
-         "a[i].className=on?'on':'';a[i].setAttribute('aria-selected',on?'true':'false');}};"
+         "a[i].className=on?'on':'';a[i].setAttribute('aria-selected',on?'true':'false');}"
+         // Quality leaves the hash behind otherwise, so a re-render would re-open
+         // Discovered. Discovered sets '#discovered' natively via its href.
+         "if(q&&location.hash)history.replaceState(null,'',location.pathname+location.search);};"
          "if(!window.__netErr){window.__netErr=1;"
-         "document.body.addEventListener('htmx:responseError',function(e){"
+         "['htmx:responseError','htmx:sendError','htmx:timeout'].forEach(function(n){"
+         "document.body.addEventListener(n,function netFail(e){"
          "var t=e.detail.target;if(!t||t.id!=='net-discovered')return;"
          "var s=e.detail.xhr&&e.detail.xhr.status;"
+         "if(s===401){location.href='/login';return}"
          "t.innerHTML=s===403?'<div class=\"failbox\" role=\"alert\">Your account cannot read "
          "discovered hosts: this list needs the Infrastructure:Read permission.</div>'"
          ":'<div class=\"failbox\" role=\"alert\">Discovered hosts could not be read just now. "
-         "Try again in a moment.</div>';});}"
+         "Try again in a moment.</div>';});});"
+         // Back/Forward: act only when the visible tab disagrees with the hash. A
+         // Discovered click already ran onclick + hx-get, so its hashchange no-ops.
+         "window.addEventListener('hashchange',function(){"
+         "var p=document.getElementById('net-discovered');if(!p)return;"
+         "var d=location.hash==='#discovered';if(p.hidden!==d)return;"
+         "netTab(d?'discovered':'quality');"
+         "if(d)htmx.ajax('GET','/fragments/network/discovered',"
+         "{target:'#net-discovered',swap:'innerHTML'});});}"
          "if(location.hash==='#discovered'){netTab('discovered');"
          "htmx.ajax('GET','/fragments/network/discovered',"
          "{target:'#net-discovered',swap:'innerHTML'});}"
