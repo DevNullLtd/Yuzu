@@ -103,7 +103,6 @@ std::string cell(const std::optional<double>& v, Unit u) {
     return v ? fmt_val(*v, u) : std::string("<span class=\"gp-mute\">&mdash;</span>");
 }
 
-
 // Wraps the quality body with the back link, DEX sub-nav, the Quality / Discovered
 // tab strip, both panels and the tab script. The Discovered anchor always carries an
 // href so it is focusable and Enter-activatable; htmx leaves a fragment href alone,
