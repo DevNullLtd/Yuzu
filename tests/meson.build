@@ -585,6 +585,7 @@ agent_test_exe = executable(
     'unit/test_wire_utf8.cpp',          # shared strict-UTF-8 scrubber (agents/shared/wire_utf8.hpp), portable
     'unit/test_row_byte_budget.cpp',    # shared row/byte budget (agents/shared/row_byte_budget.hpp), portable
     'unit/test_wall_clock_step.cpp',    # #4503: shared consecutive-sample wall-vs-monotonic clock-step guard (agents/shared/wall_clock_step.hpp), portable
+    'unit/test_smbios_parsers.cpp',     # H.1: shared bounds-checked SMBIOS walker (agents/shared/smbios_parsers.hpp) + firmware_posture adapter differential, portable
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
     'unit/test_browser_policy_parsers.cpp',         # Wave 10 PR10.2-b: pure policy-row model (every OS) + injected-root Linux JSON walk (POSIX-only bodies)
@@ -914,6 +915,25 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
     args: ['--allow-running-no-tests', '--durations=yes'],
     suite: 'agent',
     timeout: 60,
+  )
+endif
+
+# ── H.1 SMBIOS walker allocation budget (separate binary, deliberately) ──────
+# test_smbios_alloc_budget.cpp replaces the global operator new/delete (see its header), so it is
+# a separate binary: absent under sanitizers and on Windows.
+if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
+  smbios_alloc_budget_exe = executable(
+    'yuzu_smbios_alloc_budget_tests',
+    files('unit/test_smbios_alloc_budget.cpp'),
+    include_directories: [include_directories('../agents/shared')],
+    dependencies: [catch2_dep],
+  )
+  test(
+    'smbios allocation budget',
+    smbios_alloc_budget_exe,
+    args: ['--allow-running-no-tests', '--durations=yes'],
+    suite: 'agent',
+    timeout: 30,
   )
 endif
 
