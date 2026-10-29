@@ -51,17 +51,26 @@ Dashboard: Settings → **Engine Principals** → fill in Slug, Display Name,
 Owner, Classification, Justification → Create.
 
 The panel needs `EnginePrincipal:Read`, the same permission as
-`GET /api/v1/engine-principals`. With RBAC disabled that means an administrator
-account; with RBAC enabled it means the grant (the built-in `Administrator`
+`GET /api/v1/engine-principals`. With RBAC disabled that means an effective
+administrator; with RBAC enabled it means the grant (the built-in `Administrator`
 and `Viewer` roles hold it), so an account administrator who has been given a
 role without it sees "You do not have permission to view this panel" instead of
 the list. The same note appears when the permission check itself could not be
 completed (a degraded RBAC read is answered `403`, not `503`): reload once before
 changing any grant, and if it persists check the role store's health and the
 `YuzuRbacReadDegraded` alert. The Settings page itself still opens for
-administrator accounts only. An MCP-tier token is refused by the panel whatever
-its creator holds, and the revoked row's **Detail** is shown only to a caller who
-also holds `AuditLog:Read`.
+effective administrators only. The panel is never more permissive than the REST
+route and differs from it in the ways listed once in
+[upgrading](upgrading.md) (the "Breaking: the Settings Engine Principals panel" section).
+
+A revoked row's **Detail** cell has three states. It shows the recorded detail of
+the original revoke, or "(not recorded)" when the audit trail holds no committed
+revoke for that principal. It shows "(unavailable)" when the audit store could not
+answer (the remaining revoked rows are then not looked up until you retry). It
+shows "(withheld: needs AuditLog:Read, or it could not be confirmed)" to a caller
+who does not hold `AuditLog:Read`, or when that check could not be completed.
+Past 200 revoke events for one principal the cell adds that the text may be a
+retry's rather than the original.
 
 If the list or an engine principal's credentials cannot be read (for example
 while the database connection pool is exhausted), the panel says so: an

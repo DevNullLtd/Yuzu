@@ -29,8 +29,8 @@ Settings enrolment fragments (settings_routes_ wiring):
   5. `settings_routes_->register_routes(...)` still binds the LOUD `require_admin` as `admin_fn`
      and never `probe_admin`: every mutating route keeps its denial row.
   7. `set_read_perm_fn` binds `auth_routes_->probe_permission(req, res, type, op)`: the
-     auto-loading Engine Principals fragment gates on EnginePrincipal:Read exactly as its REST
-     twin does (#5882), through the quiet probe. Never the loud `require_permission`, never a
+     auto-loading Engine Principals fragment gates on EnginePrincipal:Read with the same
+     permission test as its REST twin (#5882), through the quiet probe. Never the loud `require_permission`, never a
      constant.
 
 Groups page (register_groups_routes block):

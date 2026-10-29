@@ -61,12 +61,12 @@
 /// per-persona matrix in `test_rbac_admin_hint.cpp`, not on a shared call. A change to the gate
 /// sequence of any of the three routes needs a matching row in that matrix. It exists so
 /// `/access/users` draws the Assign button and the enforcement switch from the authority the
-/// server will apply rather than from the session's base account role. HINT ONLY, never a gate: it adds no
-/// admission logic of its own, writes no audit row and no response, and every action it hints
-/// at keeps its own unchanged gate. Its one production call site is the Access wiring lambda in
-/// `server.cpp` (`rbac_admin_hint_fn`), which passes `kRest` because the controls call the REST
-/// routes. A new caller needs the same proof the rest of this header asks for: it must not
-/// change the admission input set of either function.
+/// server will apply rather than from the session's base account role. HINT ONLY, never a
+/// gate: it adds no admission logic of its own, writes no audit row and no response, and every
+/// action it hints at keeps its own unchanged gate. Its one production call site is the Access
+/// wiring lambda in `server.cpp` (`rbac_admin_hint_fn`), which passes `kRest` because the
+/// controls call the REST routes. A new caller needs the same proof the rest of this header
+/// asks for: it must not change the admission input set of either function.
 ///
 /// THE RULE: a caller passes iff they hold a DURABLE `Administrator`
 /// authority right now, re-read fresh from the store rather than trusted

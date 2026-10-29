@@ -115,14 +115,18 @@ public:
     void set_read_admin_fn(AdminFn fn) { read_admin_fn_ = std::move(fn); }
 
     /// Quiet permission gate for the auto-loading Engine Principals panel
-    /// (`GET /fragments/settings/engine-principals`, #5882). The panel gates on
-    /// `EnginePrincipal:Read` exactly as its REST twin does (`GET /api/v1/engine-principals`),
-    /// and loads on every /settings view, so a caller who lacks the grant must not write an
-    /// `auth.permission_required` row per view. server.cpp binds `AuthRoutes::probe_permission`
-    /// here: the same decision as `perm_fn` with the 401/403 kept on the response and the denial
-    /// row withheld for an interactive cookie session only (a token or engine caller keeps it).
-    /// Left unset (tests, other callers) the panel falls back to `perm_fn`, so an unwired probe
-    /// can only be louder, never weaker. No other route reads it.
+    /// (`GET /fragments/settings/engine-principals`, #5882). The panel applies the same
+    /// permission test (`EnginePrincipal:Read`) as its REST twin (`GET /api/v1/engine-principals`)
+    /// and is never more permissive than it; the differences are listed once, in
+    /// docs/user-manual/upgrading.md, and numbered the same way in the handler comment in
+    /// settings_routes.cpp. It loads on every /settings view, so a caller who lacks the grant
+    /// must not write an `auth.permission_required` row per view. server.cpp binds
+    /// `AuthRoutes::probe_permission` here: the same decision as `perm_fn` with the 401/403 kept
+    /// on the response and the denial row withheld for an interactive cookie session only (a
+    /// token or engine caller keeps it). The panel also asks it for `AuditLog:Read` (the revoke
+    /// Detail), lazily, only when a revoked row exists. Left unset (tests, other callers) the
+    /// panel falls back to `perm_fn`, so an unwired probe can only be louder, never weaker. No
+    /// other route reads it.
     void set_read_perm_fn(PermFn fn) { read_perm_fn_ = std::move(fn); }
 
     /// Audit writer for a session the handler already resolved (#6079): `mfa.disable` ends the
@@ -346,8 +350,9 @@ private:
     /// from it, and an absent store or an unreadable roster leaves it empty (no row).
     /// The route gates the caller (EnginePrincipal:Read); a null `engine_principal_store_` renders an
     /// inert "not configured" panel.
-    std::string render_engine_principals_fragment(const std::function<bool()>& may_read_audit,
-                                                  std::optional<std::size_t>* roster_count = nullptr);
+    std::string render_engine_principals_fragment(
+        const std::function<bool()>& may_read_audit,
+        std::optional<std::size_t>* roster_count = nullptr);
 
     /// Render the Access Reviews Settings fragment (SOC 2 CC6.2) — a
     /// CONVENIENCE dashboard surface only; the REST endpoints under

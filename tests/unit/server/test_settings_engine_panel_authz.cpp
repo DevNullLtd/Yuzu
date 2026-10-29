@@ -3,22 +3,27 @@
  * @brief [pg] Settings > Engine Principals panel (`GET /fragments/settings/engine-principals`)
  *        against its REST twin (`GET /api/v1/engine-principals`), both driven through the REAL
  *        AuthRoutes gates over a real RbacStore, EnginePrincipalStore, ApiTokenStore and
- *        AuditStore (#5882). The two surfaces must admit and refuse the same callers: the panel
- *        gates on EnginePrincipal:Read with the quiet probe, the twin with the loud
- *        `require_permission`, and server.cpp binds exactly these functions.
+ *        AuditStore (#5882). The panel applies the same permission test as the twin and is never
+ *        more permissive: it gates on EnginePrincipal:Read with the quiet probe, the twin with
+ *        the loud `require_permission`, and server.cpp binds exactly these functions. The
+ *        differences are SIX, numbered here exactly as in the handler comment in
+ *        settings_routes.cpp and listed once, with rationale, in docs/user-manual/upgrading.md.
  *
  * Classification rule: a status of 401 or 403 is "refused at the gate"; anything else (200, or
  * the twin's 503 for a closed store) is "admitted at the gate". Raw statuses are NOT compared
  * for an admitted caller whose store is unavailable: the twin answers 503 before it reads the
  * session, the panel answers its in-page "store unavailable" note with 200 (htmx does not swap
- * a 4xx/5xx, so the degraded note must ride a 200). That is deliberate difference one, pinned
- * here for a human cookie only. Difference two (harmless): an engine session with the store
- * absent gets 403 from the fragment, whose engine-session belt runs after the permission gate
- * and before the store note, but 503 from the twin, whose store check precedes its session read.
- * Difference three (owner ruling, 2026-10-29): the panel refuses an MCP-tier token (403, audited
- * as `mcp_session_denied`, like the Access tokens panel and the pre-#5882 administrator gate,
+ * a 4xx/5xx, so the degraded note must ride a 200). That is difference one, pinned here for a
+ * human cookie only. Difference two: an engine session with the store absent gets 403 from the
+ * fragment, whose engine-session belt runs after the permission gate and before the store
+ * note, but 503 from the twin, whose store check precedes its session read. Difference three
+ * (owner ruling, 2026-10-29): the panel refuses an MCP-tier token (403, audited as
+ * `mcp_session_denied`, like the Access tokens panel and the pre-#5882 administrator gate,
  * #520) where the twin admits an administrator's MCP token on its creator's authority.
  * `expect_same`'s `mcp_panel_refuses` argument names it at every call site that meets it.
+ * Differences four and five (a credential count or the roster that cannot be read) are render
+ * cases pinned in test_engine_principal_lifecycle.cpp. Difference six (the revoke Detail needs
+ * AuditLog:Read, the twin returns no audit text) is pinned by the "engine panel audit" cases.
  *
  * Personas, each with RBAC off and on: an account administrator WITHOUT the grant; a
  * non-administrator WITH EnginePrincipal:Read (Viewer); an account administrator holding the

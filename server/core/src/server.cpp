@@ -17154,8 +17154,8 @@ private:
             [this](const httplib::Request& req, httplib::Response& res) {
                 return auth_routes_->probe_admin(req, res);
             });
-        // The auto-loading Engine Principals panel gates on EnginePrincipal:Read exactly as its
-        // REST twin does (#5882); the quiet probe withholds the denial row for a refused cookie
+        // The auto-loading Engine Principals panel applies the same EnginePrincipal:Read test as
+        // its REST twin (#5882); the quiet probe withholds the denial row for a refused cookie
         // session only. Wired before the listener starts.
         settings_routes_->set_read_perm_fn(
             [this](const httplib::Request& req, httplib::Response& res, const std::string& type,

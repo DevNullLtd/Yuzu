@@ -889,8 +889,8 @@ constexpr const char* kEngineRetryControl =
     "credential secret shown above.</span>";
 } // namespace
 
-std::string SettingsRoutes::render_engine_principals_fragment(const std::function<bool()>& may_read_audit,
-                                                              std::optional<std::size_t>* roster_count) {
+std::string SettingsRoutes::render_engine_principals_fragment(
+    const std::function<bool()>& may_read_audit, std::optional<std::size_t>* roster_count) {
     if (roster_count)
         roster_count->reset();
     if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
@@ -2919,17 +2919,24 @@ void SettingsRoutes::register_routes(
     // pattern.
     //
     // Gated as its REST twin GET /api/v1/engine-principals (#5882): EnginePrincipal:Read,
-    // then the session, then the engine-session belt. The panel admits the same callers
-    // as the route and differs in three DELIBERATE ways (pinned in
-    // test_settings_engine_panel_authz.cpp):
+    // then the session, then the engine-session belt. The panel applies the same permission
+    // test as the route and is never more permissive; it differs in SIX deliberate ways, listed
+    // once with their rationale in docs/user-manual/upgrading.md (numbered identically in
+    // test_settings_engine_panel_authz.cpp's header, which pins 1 to 3 and 6; the render
+    // cases of 4 and 5 are in test_engine_principal_lifecycle.cpp):
     //  1. an absent engine-principal store is an in-page note on a 200 (the route answers
-    //     503), because htmx would not swap the note otherwise; an engine session with the
-    //     store absent gets the belt's 403 where the route answers 503;
-    //  2. an MCP-tier token is REFUSED (403, audited `mcp_session_denied`), as the Access
+    //     503), because htmx would not swap the note otherwise;
+    //  2. an engine session with the store absent gets the belt's 403 where the route
+    //     answers 503;
+    //  3. an MCP-tier token is REFUSED (403, audited `mcp_session_denied`), as the Access
     //     tokens panel and the pre-#5882 administrator gate did (#520): a cookie-session
     //     dashboard panel is not an MCP surface. The route admits an administrator's MCP
     //     token on its creator's authority;
-    //  3. the revoke Detail cell shows the audit trail's text, so it needs AuditLog:Read
+    //  4. a credential count that cannot be read renders "unavailable" on a 200 and still
+    //     writes the success row; the route answers 503 with a failure row;
+    //  5. an unreadable roster renders a note with Retry on a 200 and writes no row; the
+    //     route answers 503 with a failure row;
+    //  6. the revoke Detail cell shows the audit trail's text, so it needs AuditLog:Read
     //     as well (the route returns no audit text at all).
     // The /settings page itself stays administrator-only, so with RBAC on this panel admits
     // a non-administrator holding the grant (a Viewer) and refuses an account administrator

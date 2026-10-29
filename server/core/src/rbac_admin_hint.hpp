@@ -13,9 +13,10 @@ namespace yuzu::server {
 
 /// What the Users and roles page may draw for the RBAC administration controls (Assign role, the
 /// enforcement switch). ADVISORY ONLY: it decides how a control is drawn, never whether an
-/// action is allowed. Every action keeps its own unchanged gate. The page draws only these two
-/// controls from it: kUnconfirmed disables Assign role and the switch with a reason, and
-/// omits the per-row Remove controls (they are drawn only while the hint is kMay).
+/// action is allowed. Every action keeps its own unchanged gate. The page draws three kinds of
+/// control from it: Assign role, the enforcement switch and the per-row Remove controls.
+/// kUnconfirmed disables Assign role and the switch with a reason and omits the Remove controls
+/// (they are drawn only while the hint is kMay).
 enum class RbacAdminHint {
     kMay,         ///< The routes would admit this caller's authority right now.
     kMayNot,      ///< The routes would refuse it (403-class).
