@@ -67,7 +67,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `sccm` | ✅ ⛔ ⛔ | Reports SCCM/ConfigMgr client status, version, and site assignment | [README](../../agents/plugins/sccm/README.md) |
 | `script_exec` | ✅ ✅ ✅ | Executes commands and scripts with streaming output (admin-only) | [README](../../agents/plugins/script_exec/README.md) |
 | `services` | ✅ ✅ ✅ | System services — enumerate, query, and configure service startup types | [README](../../agents/plugins/services/README.md) |
-| `shares` | 🟡 🟡 ✅ | Shares this host serves over SMB/NFS: names, paths and a few flags, never ACLs | [README](../../agents/plugins/shares/README.md) |
+| `shares` | ✅ 🟡 ✅ | Shares this host serves over SMB/NFS: names, paths and a few flags, never ACLs | [README](../../agents/plugins/shares/README.md) |
 | `software_actions` | ✅ ✅ ✅ | Lists upgradable packages and counts installed software | [README](../../agents/plugins/software_actions/README.md) |
 | `status` | ✅ ✅ ✅ | Reports agent version, system info, health, modules, connection, switch, and config | [README](../../agents/plugins/status/README.md) |
 | `storage` | ✅ ✅ ✅ | Persistent key-value storage — set, get, delete, list, clear | [README](../../agents/plugins/storage/README.md) |
