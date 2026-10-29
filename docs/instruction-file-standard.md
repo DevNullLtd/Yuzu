@@ -15,6 +15,15 @@ Six files load into every agent session before any work starts:
 | `.claude/routed-concerns-security-posture.md` | Claude (`@`-imported by CLAUDE.md) | 40,000 | 48,000 |
 | `.claude/routed-concerns-software-estate.md` | Claude (`@`-imported by CLAUDE.md) | 40,000 | 48,000 |
 
+Which routed-concerns file holds what (the four share CLAUDE.md's "Routed concerns" table and its authority):
+`routed-concerns.md` holds the platform, product, data and observability concerns;
+`routed-concerns-access-control.md` the auth, access-control and request-admission concerns;
+`routed-concerns-security-posture.md` the read-only security-posture plugin rows, the mutating registry row
+and the gateway rows (upstream peer authorization, origin trust); `routed-concerns-software-estate.md` the
+Forensics and per-user-software-data concerns. A row is the catastrophic-if-violated invariant plus a doc
+pointer and nothing else: detail goes in the routed doc. This explanation used to be a header comment in
+`routed-concerns.md`, which cost that file 811 characters of its budget on every session.
+
 Every character in them is paid on every session, whether or not the work touches that subject. A
 `docs/` file costs nothing until something reads it.
 

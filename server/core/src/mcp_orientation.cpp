@@ -27,11 +27,12 @@ std::string_view about_text() {
            "autonomous use-case-engine modules — engine-classed sessions are structurally "
            "barred from calling it, and every mutation is approval-gated.\n\n"
            "Deciding an approval ticket is a human act: approve/reject run from the "
-           "dashboard or REST under an interactive login that passes the MFA step-up "
-           "gate (an un-enrolled local user passes it; requiring an enrolled factor of "
-           "the approver is tracked in #6079). "
+           "dashboard or REST under an interactive login whose account has an enrolled "
+           "MFA factor with a proof no older than the approver window (at most 300 s) "
+           "(#6079); the REST route enforces that, not the MCP tools. "
            "The MCP tools approve_request and reject_request are registered but always "
-           "return approver_assurance_required:* (#6061); an MCP caller can list pending "
+           "refuse on the session class with approver_assurance_required:* (#6061); an "
+           "MCP caller can list pending "
            "approvals and must ask a human to decide them.";
 }
 
@@ -255,8 +256,10 @@ constexpr std::string_view kFleetVisualization[] = {"get_fleet_topology", "get_h
 // B4 (#2146 API-parity) — no existing family covers a self-check "can I do X"
 // RBAC read; own family, distinct from Discovery's discover_permissions (the
 // whole catalog + role grid) and from Engine principals' assign/unassign/
-// list_engine_roles (grant AUTHORING, not a self-check).
-constexpr std::string_view kRbacCheck[] = {"check_permission"};
+// list_engine_roles (grant AUTHORING, not a self-check). get_me (twin of
+// GET /api/v1/me) joins it: the same kind of read, a self-description of the
+// CALLING principal that cannot name another one.
+constexpr std::string_view kRbacCheck[] = {"check_permission", "get_me"};
 // A2 (delivery plan §2) — global human role assignment/unassignment. Own
 // family, distinct from RBAC self-check above (a read, not an authoring
 // action) and from Engine principals' assign/unassign_engine_role (a
@@ -398,9 +401,10 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
                             "connections, and listening sockets, fleet-wide or per-host",
      kFleetVisualization},
     {"RBAC self-check", "check whether the calling principal itself holds a specific RBAC "
-                        "permission",
+                        "permission, and describe the calling session (identity, role, tier, "
+                        "direct RBAC role names)",
      kRbacCheck},
-    {"RBAC administration", "grant or revoke one of the 6 fleet-wide-assignable built-in RBAC "
+    {"RBAC administration", "grant or revoke one of the 7 fleet-wide-assignable built-in RBAC "
                             "roles to a human user, and switch RBAC enforcement on/off "
                             "(Administrator-gated, not a plain permission check)",
      kRbacAdministration},

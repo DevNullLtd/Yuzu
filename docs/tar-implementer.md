@@ -133,6 +133,7 @@ function, never in `applies_*` collectors.
 | **Uninstall** (`yuzu-agent --remove-service`, MSI uninstall) | tar.db is **left in place** by design. The data dir is operator-managed; uninstall removes the binary and service registration only. To wipe TAR data, delete `<data_dir>/tar.db` explicitly. |
 | **Reinstall over an existing data dir** | The new binary opens the existing tar.db, runs migration if the schema version differs, and resumes collection. State in `tar_state` may be stale (see §5). On Windows, files left by a different agent account are refused rather than adopted (`docs/user-manual/tar.md` "Data storage"). |
 | **`data_dir` change** (config update) | The new directory has no tar.db — the next collect_fast creates it from scratch. The old tar.db at the previous path is orphaned but not deleted. Operator concern, not TAR's. |
+| **Roll back to an older agent** | The older binary opens the same `tar.db` (the registry source adds no schema version) but does not know the `registry` source, so the `registry_live` table, the `registry` row of `tar_cursor` and every `registry:%` baseline in `tar_state` stay on disk, with the per-key baselines holding every watched value unmasked (and the cursor row, for about one tick, the rendered old and new values of changes still waiting for their writer), and the older binary has no way to erase them. An older agent that does know the `registry` source (the key-watch-only build) reads a cursor that holds changes (`held` or `loss`, written as cursor version 2) as lost: one `gap:cursorlost` row and a re-baseline, and those changes are never rows. Run `tar.purge_source` on the paused `registry` source BEFORE the rollback. |
 | **Corruption detected at open** (#559) | `TarDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `tar.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `tar_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `tar.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — TAR refuses to load rather than trust the corrupt DB. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.tar.*` heartbeat tags; the server exposes `yuzu_fleet_tar_db_corruption_agents` and writes a `tar.db.corruption_quarantined` audit row — see docs/user-manual/tar.md "Fleet visibility". |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent
@@ -349,9 +350,10 @@ header):
    `crossplatform.tar.configure` (the MCP/REST + GUI toggle path) and any canned
    `tar.sql` drill-downs.
 9. **Server GUI** (optional) — the Capture-sources frame
-   (`render_tar_capture_sources`) lists the ten core sources in a static array
+   (`render_tar_capture_sources`) lists the eleven core sources (the original ten plus
+   `registry`, which also adds the sixth `System` category chip) in a static array
    (`kSources` in `tar_process_tree.cpp`, plus the Push allowlist in
-   `tar_tree_routes.cpp`); a new source is toggled through `tar.configure`
+   `tar_tree_routes.cpp` and `kSrc` in `device_routes.cpp`); a new source is toggled through `tar.configure`
    until it is added to both; presentation metadata (category, always-on, `$`-name, badges)
    lives in that render function. Device-level panels (no pid) go in the
    process-tree pane (`render_tar_*_panel` + a `tar_tree_routes` fragment).
@@ -398,6 +400,154 @@ between snapshot and ack cannot destroy an entry that was never committed.
 `EventRing<T>` for a stream whose loss is acceptable and counted; use
 `BoundedPendingQueue` when the events are forensic and the sink is
 transactional. Do not add a fourth.
+
+**The `registry` source (`tar_registry_source.{hpp,cpp}`, pure core in
+`tar_registry_parsers.hpp`) is the third `CursorSource` and the precedent for a
+cursor source whose durable state is a snapshot baseline plus a position
+cursor.** What it adds to the pattern:
+
+- **Two stores, one transaction.** What changed comes from a
+  `RegNotifyChangeKeyValue` subtree watch and a per-root baseline diff; each
+  root's baseline lives in a `tar_state` row (`registry:<root>`) and is written
+  by `insert_registry_events_and_cursor` in the SAME transaction as the rows and
+  the cursor, so a baseline can never advance without the rows that explain it.
+  A baseline read goes through the tri-state `try_get_state`; `get_state`'s
+  empty-on-failure would read a transient SQLite error as "no baseline" and
+  silently re-baseline. The baselines hold rendered (unmasked) values and are
+  readable through `tar.sql` like `registry_live` itself;
+  `purge_source("registry")` erases the table, the cursor row and every
+  `registry:%` baseline in one transaction.
+- **Four read statuses.** Complete, Absent, Unreadable, Capped. Removals are
+  derived only from Complete and Absent reads; an Unreadable read changes
+  nothing and a Capped one only adds and updates, so a partial read can never
+  fabricate a deletion. Unreadable means the root, or any key beneath it other
+  than an access-denied child, could not be read (an open, a query or an
+  enumeration failure there makes the whole root Unreadable). Only an
+  access-denied child is isolated: it is listed in the read's `skipped` set, the
+  rest of the root is read as usual, and the diff keeps what the baseline holds
+  beneath the denied key. That holds for up to `kSkippedCap` (32) children per
+  read; the 33rd makes the read Capped, which derives no deletion in that root.
+  A root going Unreadable, or the denied set gaining a member, writes one
+  `gap:unreadable:<root>` row; the set is kept in the cursor so a steady state,
+  a shrink or a clear writes nothing. A Capped read's list is partial, so it can
+  add to the stored set but never shrinks it, and the stored set is clamped to
+  `kSkippedCap` names so a root that stays Capped cannot grow the cursor row.
+  Keys are opened with `REG_OPTION_OPEN_LINK`, so a watched key that is itself a
+  symbolic link is recorded as the link (its `SymbolicLinkValue`) and its target
+  is never followed: following it would let a user point this agent's SYSTEM
+  token at a key they cannot read, and the price is that writes under a link a
+  user planted over their own `Run` key are invisible. The reader's enumeration
+  is index-driven, so `read_key` compares each key's value count, subkey count
+  and last-write time before and after walking it; a difference means the key
+  was written to mid-walk, and the read is Capped (no removals, root re-read at
+  the next tick), never Complete, because a deletion at an index already passed
+  would otherwise hide a surviving entry and report it removed.
+- **Reconcile.** Every `kReconcileEveryTicks` (12) slow ticks every root is
+  re-read whether or not the watch fired (hourly at the default 300 s
+  `slow_interval`). It finds what the watch missed (a notify lost to a watcher
+  that is not running, an unarmed root) and a child that became denied after the
+  last read: the watch mask is `NAME | LAST_SET`, so a permission change raises
+  nothing.
+- **A root's first read is silent.** A root not yet baselined (first run, a user
+  hive loaded at logon, a user who logged off and back on, a re-enable) has its
+  first read taken as the baseline, with no rows. Writes made to it between the
+  hive loading and that read, up to one slow interval, are folded into the
+  baseline and are not recorded; no per-root gap row is written, since a logon
+  would add one per root per user.
+- **Rows land in the tick that observes the change, or the next one, and the writer is
+  correlated, not verified.** A candidate is held only while `now - window_hi <
+  kEtwSettle100ns` (5 s), and a notify window closes 1 s after the last notify, so a
+  burst that ended more than about 6 s before the tick is written in that same tick;
+  a burst nearer the tick, and every change found without a key-watch notify (the
+  hourly reconcile, or a root with no live watch: its window ends at the end of the
+  read, after `now`), is held to the next one. A change whose marker
+  cannot depend on a later event (`attr:off`, `attr:lost-restart`: both are decided
+  before any event is consulted and only ever become more true within a run) is not
+  held at all and is written in the tick that sees it, so a restart's whole
+  reconcile (every change in it is `attr:lost-restart`) never sits in the cursor
+  row; `attr:degraded` is held like any other, since a later tick can still record
+  a loss over its window. The mechanism, the `attr:*` precedence, loss epochs and
+  exactly what an attribution does and does not establish are written once, in the
+  banner of `tar_registry_parsers.hpp` (the row key: `registry_diff_record_key`),
+  with its residuals: a change that had no value-write event, an event delivered
+  more than the settle interval after its window closed with no counted loss (a
+  starved consumer, suspend/resume), an ambiguity any local process can force, and
+  an `actor_image` read when the event was delivered. Every user-manual sentence
+  must keep saying "a lead to verify, not proof".
+- **`RegistryEtwBuffer` is not `BoundedPendingQueue`.** It releases by sequence
+  identity like `ack_through`, but selectively: after a commit it retires the
+  events older than the minimum root `window_base` (`retention_watermark`) that
+  no held candidate's window covers (`release_event`). The events a held
+  candidate still needs are interleaved with ones it does not, which a prefix
+  release cannot express. `EventRing` (`tar_proc_stream.hpp`) was not reused for the
+  same reason: it evicts by position, and this buffer must release selectively by
+  sequence identity. It is not persisted: a restart, or a disable and
+  re-enable, loses it, and the candidates it would have attributed are written
+  `attr:lost-restart`. A root that is never completely read keeps its
+  `window_base` at 0 and is left out of the watermark while it has no unread
+  notify: every wide-window candidate of such a root has `window_lo` 0, before
+  `events_since`, so it finalises `attr:lost-restart` whatever the buffer holds,
+  and an idle one that stays Capped does not pin the buffer for the fleet. An
+  unread notify changes that. A root the read budget deferred, or one marked
+  again while it was being read, has no candidate yet, so the held-window test
+  protects nothing of it: its next read builds a narrow window from the first
+  unread notify, and until that read the floor stays at
+  `max(window_base, first - slack)` (the pending stamps are passed to
+  `retention_watermark`; the same floor ages the loss epochs). The pin ends when
+  the root is read, which the fair rotation bounds. A root that was complete once
+  keeps its last `window_base` whatever its status afterwards (`retention_watermark`
+  is status-blind on purpose: its next wide-window diff, hourly or on recovery,
+  would otherwise be correlated to a bystander with no loss recorded). An idle root
+  therefore holds the watermark up to an hour back, since the hourly reconcile
+  re-reads every root, and one that stays Unreadable or Capped holds it there for as
+  long as it does. The buffer fills to the cap (65536 events: about 18 host-wide
+  registry writes per second against a root last read an hour ago, about 110 against
+  one last read ten minutes ago) and the eviction shows as recurring `gap:loss`
+  rows and `attr:degraded`, marked and never silent (no volume guard is added).
+  Lifting the pin would need a retained-floor marker in the cursor and a stitch rule
+  that a window starting below it is `attr:degraded`: a design change, not a fix.
+- **The cursor row is a third content store.** Besides the rows and the
+  baselines, `held` carries each waiting candidate's rendered old and new values
+  until the next tick at most (readable through `tar.sql` as `tar_cursor`; erased by
+  `purge_source("registry")`). A candidate held when the source is disabled stays in
+  the row until re-enable (then written `attr:lost-restart` with its original
+  `observed_at`; the disable does not drop it, since it is a change observed before
+  the pause and the re-enable re-baselines silently) or `purge_source` on the paused
+  source. Cursor decode treats `window_base`, `held` and `loss` as optional so a
+  cursor written by the key-watch-only source decodes as present; a malformed one
+  would re-baseline every root. The cursor is written as version 2 whenever it
+  holds `held` or `loss` and as version 1 otherwise; decode accepts both and
+  takes any other version as lost (`gap:cursorlost`, re-baseline). That is what
+  makes a rollback loud: the key-watch-only build reads only version 1, so it
+  takes a cursor holding changes as lost, where a build that ignored the unknown
+  field would re-encode the cursor without them and drop changes whose baseline
+  had already advanced, with no row. Decode also clamps a held candidate's window
+  to a non-negative, ordered one, so a corrupt row cannot overflow the stitch's
+  `now - window_hi`.
+- **The Windows ETW code has no unit seam and no fault-injection test of the
+  callback.** `WinEtw` (the session and consumer handles each behind a RAII
+  owner, one `ProcessTrace` worker, a `noexcept` callback that contains every
+  exception and counts a decode failure) is covered by compile plus the
+  `[registry][windows]` live cases, which need an elevated agent and SKIP with a
+  named reason otherwise. Teardown order is explicit in `WinEtw::stop()`:
+  CloseTrace (it unblocks `ProcessTrace`), join, then stop the session. A
+  session that cannot open is degrade-not-fail (`registry_capture_method` =
+  `notify`, rows `attr:off`; the start-failure warning carries the Win32 error);
+  one that dies after it opened is logged once and not restarted. The session takes the default
+  ETW security descriptor (the sibling sessions set none either), so members of
+  Performance Log Users can attach to the stream (value names, pids and sizes,
+  system-wide) or stop it; a stop is detected (`ProcessTrace` returns) and shows
+  as `attr:off`. The image name is looked up once per pid when its first event is
+  delivered, refused when the process was created after the event (the pid was
+  reused), and cached for five minutes, so it can be stale under pid reuse. The
+  session name is salted with the agent's pid, so a crash leaks the session until
+  the host restarts and only a successor with the same pid stops it (the
+  `ERROR_ALREADY_EXISTS` retry); the sibling `YuzuTarProcEtw` and `YuzuTarModuleEtw`
+  sessions leak the same way and nothing sweeps `YuzuTar*` sessions at start. The
+  operator runbook (`logman query -ets`, `logman stop <name> -ets`) is in the
+  manual's Health bullet.
+- **Windows warehouse columns are NOT NULL.** "Not applicable" is `''`/`0`, and an
+  empty `data_type` distinguishes an absent value from an empty one.
 
 **`NstatClient` (`tar_netqual_nstat.*`) is the second such case and a
 deliberate, documented exception to a literal `ProcStreamCollector` subclass:**

@@ -1058,6 +1058,67 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 },
             },
         },
+        // ── registry (cursor-model seam, tar_cursor.hpp) — registry value and key
+        // changes under a curated persistence/policy watch list (HKLM and each
+        // loaded HKU hive): what changed, with its old and new value. LIVE TIER
+        // ONLY, no rollups (P-008, same rationale as power above). Mechanism: a
+        // RegNotifyChangeKeyValue subtree watch + a per-root baseline diff
+        // (tar_state `registry:<root>`) say WHAT changed; a write-only
+        // Kernel-Registry ETW session says WHO, by correlation on value name, type,
+        // size and time window. actor_pid / actor_image hold the correlated writer
+        // (a lead to verify, not proof) and are 0 / '' when none is named; `detail`
+        // says why (attr:corr | ambiguous | none | degraded | off | lost-restart).
+        // Values are stored UNMASKED: `data`/`prev_data` are readable through
+        // tar.sql. Retention is a row count.
+        // Replay idempotence via the UNIQUE record_key index below.
+        {
+            .name = "registry",
+            .dollar_name = "Registry",
+            .default_enabled = true,
+            .unique_key_column = "record_key",
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported, "regnotify+etw",
+                 "RegNotifyChangeKeyValue subtree watch + baseline diff (what changed, old/new "
+                 "value) and a write-only Kernel-Registry ETW session that names the writing "
+                 "process by correlation; cursor-model (tar_cursor.hpp). Without an elevated "
+                 "agent the session cannot open and rows carry attr:off."},
+                {"linux",   OsSupportStatus::kUnsupported, "",
+                 "The Windows registry does not exist on this platform."},
+                {"macos",   OsSupportStatus::kUnsupported, "",
+                 "The Windows registry does not exist on this platform."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    .retention_default = 500000,
+                    .columns = {
+                        {"ts",                  "INTEGER"},
+                        {"snapshot_id",         "INTEGER"},
+                        {"hive",                "TEXT"},    // HKLM | HKU
+                        {"key_path",            "TEXT"},
+                        {"value_name",          "TEXT"},    // "" for key_removed / capture_gap
+                        {"action",              "TEXT"},    // added, changed, removed,
+                                                            // key_removed, capture_gap
+                        {"data_type",           "TEXT"},
+                        {"data",                "TEXT"},    // UNMASKED; '' when n/a (data_type '' = no value)
+                        {"data_size",           "INTEGER"},
+                        {"data_truncated",      "INTEGER"},
+                        {"prev_data_type",      "TEXT"},
+                        {"prev_data",           "TEXT"},
+                        {"prev_data_size",      "INTEGER"},
+                        {"prev_data_truncated", "INTEGER"},
+                        {"actor_pid",           "INTEGER"}, // 0 = no writer named (see detail)
+                        {"actor_image",         "TEXT"},    // '' when no writer is named
+                        {"source",              "TEXT"},    // notify | reconcile
+                        {"observed_at",         "INTEGER"}, // unix ms the read saw it
+                        {"detail",              "TEXT"},    // attr:* on a change row; the gap text on a gap
+                        {"record_key",          "TEXT"},    // UNIQUE — replay idempotence
+                    },
+                },
+            },
+        },
+
         // ── Usage (Wave 7 PR7.2b) — DERIVED from `process`: a checked_
         // transaction fold (tar_usage.cpp run_usage_fold) pairs started/
         // stopped by (pid, exe_key) into runs; usage_live holds OPEN runs
@@ -1407,7 +1468,13 @@ bool is_queryable_table(std::string_view real_table_name) {
         // entirely unobservable -- no reset path exists, and the only remedy is
         // deleting tar.db, which destroys every OTHER source's history too.
         // Reading it exposes a source name, a position and updated_at; the
-        // cursor payload is the source's own bookkeeping, not captured content.
+        // cursor payload is the source's own bookkeeping, not captured content --
+        // with one exception: the registry cursor row holds, for about one tick, the
+        // rendered old and new values of changes whose writer is not settled yet.
+        // tar_state carries the registry baselines (`registry:<root>`, rendered
+        // values), readable here consistently with registry_live's own unmasked
+        // values; purge_source("registry") erases the table, the cursor row and
+        // every `registry:%` state row in one transaction.
         std::unordered_set<std::string> s{"tar_state", "tar_config", "tar_cursor"};
         for (const auto& [real, ref] : table_ref_map())
             s.insert(real);

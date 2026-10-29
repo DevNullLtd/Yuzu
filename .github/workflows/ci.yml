@@ -1779,6 +1779,8 @@ jobs:
       # Belt-and-suspenders with Start-PinnedRunner.ps1: every Wee Tam job
       # explicitly carries the 16-thread width of its assigned CCD.
       YUZU_BUILD_JOBS: "16"
+      # #6488: per-job registry key scope; see scripts/ci/check-registry-test-leftovers.ps1
+      YUZU_TEST_REGISTRY_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build_type }}
     defaults:
       run:
         # The default `bash` keyword on a self-hosted Windows runner
@@ -2095,6 +2097,48 @@ jobs:
           echo "PGCONNECT_TIMEOUT=30" >> "$GITHUB_ENV"
           echo "PGCONNECT_TIMEOUT=30 appended to GITHUB_ENV for the later steps"
 
+      # #6488: proves both decisions of the leftover check; see scripts/ci/check-registry-test-leftovers.ps1
+      - name: Self-test the registry leftover check
+        shell: pwsh
+        run: |
+          $scope = $env:YUZU_TEST_REGISTRY_SCOPE
+          $script = './scripts/ci/check-registry-test-leftovers.ps1'
+          # one probe under EACH root the script scans, so dropping a root from it turns this step red
+          $probes = [ordered]@{
+            'HKCU:\Software' = "YuzuTest-selftest-$scope-probe-hkcu"
+            'HKLM:\SOFTWARE' = "YuzuTest-selftest-$scope-probe-hklm"
+            'HKLM:\SOFTWARE\Wow6432Node' = "YuzuTest-selftest-$scope-probe-wow"
+          }
+          function Arm($s, $want, $kind, $name) {
+            $out = & pwsh -NoProfile -NonInteractive -File $script -Scope $s 2>&1 | Out-String
+            $rc = $LASTEXITCODE
+            Write-Host ($out -replace '::(error|warning)::', 'child $1: ')
+            if ($rc -ne $want) {
+              throw "registry leftover check self-test, $name arm: expected exit $want, got exit $rc"
+            }
+            foreach ($p in $probes.Values) {
+              if ($out -notmatch ($kind + '.*' + [regex]::Escape($p))) {
+                throw "registry leftover check self-test, $name arm: expected exit $want naming $p, got exit $rc"
+              }
+            }
+          }
+          # no -Force: a probe that already exists fails the step and, not in $made, is never removed by it
+          $made = @()
+          try {
+            foreach ($root in $probes.Keys) { $p = Join-Path $root $probes[$root]; New-Item -Path $p | Out-Null; $made += $p }
+            Arm "selftest-$scope" 1 '::error::leftover registry key ' 'own-scope'
+            Arm $scope 0 '::warning::' 'other-scope'
+            foreach ($root in $probes.Keys) {
+              if (-not (Test-Path -LiteralPath (Join-Path $root $probes[$root]))) {
+                throw "registry leftover check self-test: the check removed its probe under $root"
+              }
+            }
+          } finally {
+            foreach ($p in $made) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p } }
+          }
+          Write-Host 'registry leftover check self-test: both decisions hold'
+          exit 0
+
       # Windows CI test-phase restructuring (#3443, 2026-08-28): mirrors the
       # Linux job's non-pg/pg-shards/pg-smoke split — see docs/ci-architecture.md
       # "PG coverage by platform" for the full rationale and the measured
@@ -2122,6 +2166,12 @@ jobs:
       - name: Test (non-pg suites)
         env:
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
+          # #6488: the registry plugin's real-registry cases (tests/unit/test_registry_write_local_dispatcher.cpp
+          # skip_or_fail, tests/unit/test_registry_win_internals.cpp skip_or_fail) WARN-and-skip when registry.dll is
+          # missing or the process cannot write HKLM, and a skip is green. This job runs as LOCAL SYSTEM (see the
+          # shell comment above), which is elevated, so a skip here is a regression: "1" turns it into a FAIL.
+          YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS: "1"
+          # The fixtures' key-name scope (YUZU_TEST_REGISTRY_SCOPE) is the job-level env above.
         run: |
           if [[ "${{ matrix.build_type }}" == "debug" ]]; then
             bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/debug/bin"
@@ -2161,6 +2211,20 @@ jobs:
           # (meson overwrites it), so a run that selects no tests leaves no stale log.
           # On a red run bash -e stops before it, use the meson-logs artifact (#4884).
           python scripts/ci/test-durations-summary.py --builddir build-windows-${{ matrix.build_type }} --label "Windows non-pg"
+
+      # #6488: the registry plugin's tests create scratch keys under HKLM\SOFTWARE (and Wow6432Node) and HKCU\Software
+      # (HKU\.DEFAULT for LOCAL SYSTEM) and each fixture removes its own; this step is the tripwire that notices one that
+      # did not. Only a key of THIS job's scope (YuzuTest-<scope>-..., see the job-level env) fails the job. Any other
+      # YuzuTest-* key is a ::warning only: an orphan of a cancelled or crashed job (a cancelled job skips this step), a
+      # concurrent job's live key on the shared box, or the nightly windows-asan leg's unscoped keys. It REPORTS and
+      # never deletes: a leftover can be a registry link, and every tree delete follows links (the plugin's own rule),
+      # so removal is left to a human. The scan is scripts/ci/check-registry-test-leftovers.ps1, whose two decisions the
+      # self-test step before the suite proves on every run.
+      - name: Assert this job left no YuzuTest-* registry keys behind
+        if: success() || failure()
+        shell: pwsh
+        run: |
+          ./scripts/ci/check-registry-test-leftovers.ps1 -Scope $env:YUZU_TEST_REGISTRY_SCOPE
 
       # if: matrix.pg_mode == 'full' — see the Resolve step above; PRs are
       # debug-only (exclude: above), so PR coverage is unaffected. k=2 was

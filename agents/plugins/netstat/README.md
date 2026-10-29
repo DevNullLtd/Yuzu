@@ -22,15 +22,15 @@ Neither action takes parameters, sets a typed result status, filters by protocol
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow<br/>dispatches definition] --> SRV[Server<br/>authz: Infrastructure.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host]
-  HOST --> EX[netstat.execute]
-  EX --> WIN[Windows leg<br/>GetExtendedTcpTable/UdpTable<br/>+ QueryFullProcessImageNameW]
-  EX --> MAC[macOS leg<br/>libproc via macos_socket_walk.hpp]
-  EX --> LIN[Linux leg<br/>/proc/net/tcp,udp[6] + /proc/pid/fd]
-  WIN & MAC & LIN --> ROWS[pipe rows,<br/>UNDECLARED result status]
-  ROWS -- CommandResponse --> RS[(ResponseStore<br/>90-day retention)]
-  RS --> API[REST /api/responses · dashboard table]
+  OP["Operator / workflow dispatches definition"] --> SRV["Server - authz: Infrastructure.Read"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"]
+  HOST --> EX["netstat.execute"]
+  EX --> WIN["Windows leg - GetExtendedTcpTable/UdpTable + QueryFullProcessImageNameW"]
+  EX --> MAC["macOS leg - libproc via macos_socket_walk.hpp"]
+  EX --> LIN["Linux leg - /proc/net/tcp,udp[6] + /proc/pid/fd"]
+  WIN & MAC & LIN --> ROWS["pipe rows, UNDECLARED result status"]
+  ROWS -->|"CommandResponse"| RS[("ResponseStore - 90-day retention")]
+  RS --> API["REST /api/responses, dashboard table"]
 ```
 
 ## OS capability

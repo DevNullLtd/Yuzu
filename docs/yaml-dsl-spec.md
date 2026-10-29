@@ -185,10 +185,11 @@ Each column object:
 |---|---|---|---|---|
 | `name` | string | Yes | -- | Column identifier. |
 | `type` | string | Yes | -- | Column type. Values: `bool`, `int32`, `int64`, `string`, `datetime`, `guid`, `clob`. See [Section 11](#11-result-column-type-system). |
-| `description` | string | No | -- | Documentation only: what the column carries. Rendered into the plugin README's Outputs table and the `content/plugin-docs` manifest by `tools/plugin-doc-gen` (`docs/plugin-readme-standard.md` rule 8). Every server consumer of `result.columns` (`result_envelope.cpp`, `response_templates_engine.cpp`) reads only `name` and `type`; the extra keys pass through the embedded `result_schema` untouched. |
+| `description` | string | No | -- | Documentation only: what the column carries. Rendered into the plugin README's Outputs table and the `content/plugin-docs` manifest by `tools/plugin-doc-gen` (`docs/plugin-readme-standard.md` rule 8). Every server consumer of `result.columns` (`result_envelope.cpp`, `response_templates_engine.cpp`) reads only `name` and `type`, and the result-set matcher (`result_set_matcher.cpp`) additionally reads `discriminator`; the other extra keys pass through the embedded `result_schema` untouched. |
 | `values` | list of string | No | -- | Documentation only: the closed vocabulary the column may carry (e.g. `[ok, warning, failing, unknown, unsupported]`). Meaningful only on a `string` column. Not enforced at runtime; `tools/plugin-doc-gen` validates the shape of these four keys (a list where a list is meant, `platforms` drawn from the vocabulary below) and fails its `--check` otherwise. |
 | `example` | string | No | -- | Documentation only: one representative value. |
 | `platforms` | list of string | No | -- | Documentation only: the platforms on which the column carries a real value, from `windows`, `linux`, `darwin`. Omitted means every platform the definition lists. |
+| `discriminator` | boolean | No | `false` | Behavioural, first column only (a `string` column; plugin-doc-gen enforces the position and type, the server reads only a boolean on the first column): this column is the wire row's leading discriminator, and the declared columns are the wire fields in order. A result-set column matcher on the instruction then splits each row on every unescaped pipe and binds positionally, taking only a row of exactly the declared width. Without it a key/value plugin's rows are key + remainder and never match a wider declaration, which is also what a stored definition that predates the key keeps doing. Not rendered into the plugin docs; `tools/plugin-doc-gen` validates it. |
 
 #### `spec.result.aggregation`
 
@@ -221,7 +222,7 @@ Each column object:
 server-side representation: `executeRoles`' labels (`endpoint-admin`,
 `security-admin`, ...) are a content-authoring convention that matches no
 seeded RBAC role (`Administrator`/`PlatformEngineer`/`Operator`/
-`ApiTokenManager`/`ITServiceOwner`/`Viewer`/`Reviewer`), and `embed_content.py`
+`ApiTokenManager`/`ITServiceOwner`/`Viewer`/`Reviewer`/`ForensicsAnalyst`), and `embed_content.py`
 drops the entire `permissions` block at build time -- it never reaches the
 running server. Actual execute-time enforcement is `spec.approval.mode` (see
 above); actual author-time enforcement is the `InstructionDefinition:Write`
@@ -1766,6 +1767,9 @@ This section enumerates the stable builtin primitives that content authors targe
 | `registry.enumerate_values` | `registry` | Y | - | - | Verified |
 | `registry.get_user_value` | `registry` | Y | - | - | Verified |
 | `registry.list_profiles` | `registry` | Y | - | - | Verified |
+| `registry.set_user_value` | `registry` | Y | - | - | Verified |
+| `registry.delete_user_value` | `registry` | Y | - | - | Verified |
+| `registry.apply` | `registry` | Y | - | - | Verified |
 | `wmi.query` | `wmi` | Y | - | - | Verified |
 | `wmi.get_instance` | `wmi` | Y | - | - | Verified |
 | `rdp_control.set_state` | `rdp_control` | Y | - | - | Verified |

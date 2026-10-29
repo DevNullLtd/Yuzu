@@ -148,6 +148,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -171,6 +172,7 @@ class PgPool;
 // Stores checked by /health AND /readyz (also /fragments/health/summary
 // where noted).
 class PgReachabilityProbe; // HA WS-8: /readyz pg_reachable + /metrics gauges
+class LeaderElector;       // HA WS-11: /metrics leader series ONLY (never a /readyz input)
 class ResponseStore;       // + fragment summary
 class AuditStore;          // + fragment summary
 class InstructionStore;
@@ -216,6 +218,7 @@ class SoftwareLicensingStore;
 class PluginConfigStore;
 class EnablementStore;
 class AppUsageStore;
+class CertificateInventoryStore;
 class ProductRegistryStore;
 class ProductPackStore;
 class ScimStore;
@@ -396,6 +399,21 @@ struct Deps {
     /// FAIL-CLOSED (row reports not ready), matching the store-pointer idiom;
     /// never null in production whenever `pg_pool` is set.
     PgReachabilityProbe* pg_reachability_probe{nullptr};
+    /// HA WS-11 (#4014): the fenced leader elector, read ONLY on `/metrics`
+    /// scrape and ONLY through the lock-free `stats()` snapshot -- never
+    /// `is_open()`/`is_leader()`/`heartbeat()`/`try_acquire()`: `is_open()` takes
+    /// the elector's `mu_`, which the election loop holds across blocking libpq
+    /// calls, so a stalled coordination probe would stall every scrape.
+    /// LEADERSHIP IS NOT READINESS (the #4014 decision, extended): this pointer
+    /// is deliberately NOT consulted by `/readyz` or `/health`. Null means "no
+    /// elector on this server": no leader series are published (the series are
+    /// seeded only where an elector is built).
+    const LeaderElector* leader_elector{nullptr};
+    /// The election loop's tally of iterations that threw. A plain atomic owned
+    /// by `ServerImpl` so the loop never touches the MetricsRegistry (a registry
+    /// call inside its catch blocks could throw and std::terminate); pulled here
+    /// at scrape time. Null reads as 0.
+    const std::atomic<std::uint64_t>* leader_loop_errors{nullptr};
     ResponseStore* response_store{nullptr};
     AuditStore* audit_store{nullptr};
     InstructionStore* instruction_store{nullptr};
@@ -441,6 +459,7 @@ struct Deps {
     PluginConfigStore* plugin_config_store{nullptr};
     EnablementStore* enablement_store{nullptr}; // ADR-3006 (also a /healthz row)
     AppUsageStore* app_usage_store{nullptr}; // Wave 7 PR7.2 (gov Gate 3 sre HIGH finding)
+    CertificateInventoryStore* certificate_inventory_store{nullptr}; // slice-2 PR 2a-2a
     ProductRegistryStore* product_registry_store{nullptr};
     ProductPackStore* product_pack_store{nullptr};
     ScimStore* scim_store{nullptr};

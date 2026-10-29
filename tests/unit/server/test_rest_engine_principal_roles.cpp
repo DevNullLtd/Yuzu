@@ -7,7 +7,7 @@
  * by external review as the largest confirmed HIGH finding on PR #2202:
  * `RbacStore::assign_role(principal_type="engine")` had zero production
  * callers, so the RBAC resolver's engine-resolution branch (the third UNION
- * arm in `collect_roles_locked`) was unreachable. These tests prove the
+ * arm in `collect_roles`) was unreachable. These tests prove the
  * route exists, is gated correctly, and — critically — that the loop the
  * reviewer flagged is now closed end-to-end: assigning a role through this
  * REST route makes `RbacStore::check_permission("engine:<slug>", ...)`
@@ -226,7 +226,7 @@ TEST_CASE("REST POST /api/v1/engine-principals/{id}/roles: assign creates a reso
 
     // The end-to-end proof: RbacStore::check_permission on "engine:vuln" now
     // resolves true through the resolution-side UNION arm — production
-    // route -> RbacStore::assign_role -> collect_roles_locked engine arm.
+    // route -> RbacStore::assign_role -> collect_roles engine arm.
     CHECK(h.rbac_store->check_permission("engine:vuln", "Inventory", "Read"));
 
     REQUIRE(h.audit_log.size() == 1);

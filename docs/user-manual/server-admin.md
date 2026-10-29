@@ -99,15 +99,15 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--viz-disable` | off | Disable the fleet visualization feature. When set, the REST endpoints (`GET /api/v1/viz/fleet/topology`, `GET /fragments/viz/fleet/topology`, and the per-host drill-down routes) **and** the page shells (`GET /viz/fleet`, `GET /viz/host/<id>`) all return `503`. Tier-before-permission ordering: the kill switch takes effect even for callers who would otherwise fail RBAC. Two pieces of durable evidence that the switch took effect: the startup log line `[VIZ] viz endpoint disabled by configuration`, and a `server.viz_disabled` audit event (`target_type = FleetTopology`) written to the audit store at boot — so an auditor can confirm the disabled state from the audit trail even on a deployment with no viz traffic. Env: `YUZU_VIZ_DISABLE`. |
 | `--allow-unsigned-packs` | off | **Dangerous.** Accept product packs at install without an Ed25519 signature. Default is to reject unsigned packs with `pack '<name>' is unsigned and signature enforcement is enabled (set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)` (security-by-default since #802 / W7.4). Setting this flag restores the pre-W7.4 behaviour where any operator with pack-upload permission, or a MITM on pack delivery, could install a pack containing arbitrary `InstructionDefinition` or plugin payloads that would execute fleet-wide. Two pieces of durable evidence that the flag is active: a startup log line `[SECURITY] product pack signature enforcement DISABLED by configuration`, and a `server.unsigned_packs_allowed` audit event (`target_type = ProductPack`) written to the audit store at boot. Use only as a temporary migration aid; sign your packs and remove the flag as soon as feasible. Env: `YUZU_ALLOW_UNSIGNED_PACKS`. |
 | `--allow-unsigned-definitions` | off | **Dangerous.** Accept `InstructionDefinition` imports via `POST /api/v1/instructions/import` without an Ed25519 signature. Default is to reject unsigned imports with `instruction-import is unsigned and signature enforcement is enabled (set --allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS=1 to bypass)` (security-by-default since #1073 / W7.4 sibling-gap closure). Closes the equivalent fleet-RCE surface that `--allow-unsigned-packs` covers on the ProductPack side: without enforcement, any operator with `InstructionDefinition:Write` (or a MITM on a content sync) can publish a definition that dispatches a malicious plugin invocation on every targeted agent. Durable evidence: startup log line `[SECURITY] instruction-definition signature enforcement DISABLED by configuration` AND a `server.unsigned_definitions_allowed` audit event (`target_type = InstructionDefinition`). Env: `YUZU_ALLOW_UNSIGNED_DEFINITIONS`. |
-| `--mfa-enforcement` | `optional` | MFA enforcement mode: `optional` (users may enroll voluntarily; login never requires it), `admin-only` (an admin without MFA must enroll before login completes), or `required` (every role must enroll). Under `admin-only`/`required` an un-enrolled login is redirected through TOTP enrollment (`POST /login/mfa/enroll`) before a session is minted; the server logs an `INFO` line naming the active mode at startup. **Breaking:** earlier releases accepted `admin-only`/`required` as no-ops — if you staged the flag, read `docs/user-manual/upgrading.md` before upgrading (live enforcement begins immediately, and SSO users require an IdP that asserts `amr`). See `docs/user-manual/authentication.md` § Multi-Factor Authentication and `docs/auth-mfa-design.md`. Env: `YUZU_MFA_ENFORCEMENT`. |
-| `--mfa-step-up-window-secs` | `300` | Seconds after a successful TOTP proof during which the 37 high-risk REST, Settings and Guardian dashboard routes enforced by the central step-up check (PR2 of the MFA ladder, since extended; see [Authentication](authentication.md)) accept the session as "stepped up" without re-prompting. Set to `0` (or less) to disable the stale-proof requirement on those routes (SAML sessions then pass too, and the authentication store is not read); the JIT-elevation routes keep a 300 s window, and engine denials and a server with no wired authentication store (`503`) still apply and are recorded (emits a startup `WARN`). Disabling the window also drops approval approve/reject to an interactive-session-only requirement, so review every `approval.approve` audit row with `result=success` if you run that way, and check every `attempted` row that has no outcome row, comparing counts per `target_id` (each decision also writes a `result=attempted` row first, and a decision whose outcome row failed to write leaves only that row; see `audit-log.md`). Env: `YUZU_MFA_STEP_UP_WINDOW_SECS`. |
+| `--mfa-enforcement` | `optional` | MFA enforcement mode: `optional` (login never requires it; an administrator can enrol its own account in Settings, but Settings enrolment is administrator-only, so a non-admin cannot enrol itself, see [Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver)), `admin-only` (an admin without MFA must enroll before login completes), or `required` (every role must enroll). Under `admin-only`/`required` an un-enrolled login is redirected through TOTP enrolment (`POST /login/mfa/enroll`) before a session is minted; the server logs an `INFO` line naming the active mode at startup. **Breaking:** earlier releases accepted `admin-only`/`required` as no-ops — if you staged the flag, read `docs/user-manual/upgrading.md` before upgrading (live enforcement begins immediately, and SSO users require an IdP that asserts `amr`). See `docs/user-manual/authentication.md` § Multi-Factor Authentication and `docs/auth-mfa-design.md`. Env: `YUZU_MFA_ENFORCEMENT`. |
+| `--mfa-step-up-window-secs` | `300` | Seconds after a successful TOTP proof during which the 37 high-risk REST, Settings and Guardian dashboard routes enforced by the central step-up check (PR2 of the MFA ladder, since extended; see [Authentication](authentication.md)) accept the session as "stepped up" without re-prompting. Set to `0` (or less) to disable the stale-proof requirement on those routes (SAML sessions then pass too, and the authentication store is not read); the JIT-elevation routes keep a 300 s window, and engine denials and a server with no wired authentication store (`503`) still apply and are recorded (emits a startup `WARN`). Approval approve/reject are among those routes but are not switched off by `0`: they always require an enrolled MFA factor and a proof made within `min(this value, 300)` seconds (300 when this is `0` or less), and are never admitted for a SAML session (#6079; see `authentication.md`, "Approver MFA requirement"). Decisions recorded before that change under `0` carry only the interactive-session assurance; review every `approval.approve` audit row with `result=success` from that period, and check every `attempted` row that has no outcome row, comparing counts per `target_id` (each decision also writes a `result=attempted` row first, and a decision whose outcome row failed to write leaves only that row; see `audit-log.md`). Env: `YUZU_MFA_STEP_UP_WINDOW_SECS`. |
 | `--mfa-login-pending-secs` | `120` | Lifetime of the intermediate `mfa_pending_token` between password success and TOTP submission. The pending state is per-process (lost on restart, not shared across HA replicas without sticky sessions). Env: `YUZU_MFA_LOGIN_PENDING_SECS`. |
-| `--mfa-reset <username>` | *(none)* | **Break-glass.** Clears the named user's MFA enrollment and exits **without starting the server** — the recovery path from MFA-enforcement lockout. Writes an `mfa.reset.breakglass` audit row (principal = the OS account that ran the CLI). Requires the Postgres auth store (`--postgres-dsn` / `YUZU_POSTGRES_DSN`), and the same `--config` the service uses if it is not at the platform default (`/etc/yuzu/yuzu-server.cfg` on Linux and root macOS; `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows) — the container images run with `--config /var/lib/yuzu/yuzu-server.cfg`, and without it the binary falls into interactive first-run setup and exits. No TLS flags needed. See `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
+| `--mfa-reset <username>` | *(none)* | **Break-glass.** Clears the named user's MFA enrolment and exits **without starting the server** - the recovery path from MFA-enforcement lockout. Also deletes the account's durable sessions, so every session of the account ends on every replica (API tokens are untouched); if that fails the command exits non-zero with "MFA cleared but the account's sessions were not ended" and the operator must run `DELETE /api/v1/sessions?username=<name>` by hand. Writes two `mfa.reset.breakglass` audit rows: a `result=attempted` intent row BEFORE it clears anything (if the audit store does not accept it the command exits `1` and nothing is changed), then an outcome row (principal = the OS account that ran the CLI; the outcome detail ends `sessions_ended=<n>)` with `result=success`, or `sessions_ended=failed)` with `result=partial`; `result=error` means the clear itself failed and its state is unknown). Requires the Postgres auth store (`--postgres-dsn` / `YUZU_POSTGRES_DSN`), and the same `--config` the service uses if it is not at the platform default (`/etc/yuzu/yuzu-server.cfg` on Linux and root macOS; `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows) - the container images run with `--config /var/lib/yuzu/yuzu-server.cfg`, and without it the binary falls into interactive first-run setup and exits. No TLS flags needed. See `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | `--generate-tokens <N>` | *(none)* | Mint `N` enrollment tokens directly into the same PostgreSQL `auth.enrollment_tokens` store the running server reads (WS-6 6.2), and exit **without starting the server** — the recovery/scripting equivalent of the dashboard "Generate Token" button. Requires the Postgres auth store (`--postgres-dsn` / `YUZU_POSTGRES_DSN`); refuses with the same style of message as `--mfa-reset` when it is absent or unreachable. Tokens are attributed `created_by = "cli:<OS account that ran the CLI>"` (kernel-authoritative identity, `getpwuid(geteuid())`/`GetUserNameA`, not `getenv("USER")` — the same anti-forgery rule the break-glass audit rows use), so a dashboard operator reviewing the token list can tell a CLI-minted batch apart from one minted through `POST /api/settings/enrollment-tokens`. Companions: `--token-label` (label prefix, default `batch-<n>`), `--token-max-uses` (default `1`; `0` = unlimited), `--token-ttl-hours` (default `72`; `0` = never expires); a negative value of either is refused with a usage error and nothing is minted. The mint is audited as `enrollment.bulk_token_create` (`by`, `max_uses`, `ttl_s`, `label`, `count`, `ids`). Prints `{"count":N,"tokens":[...]}` to stdout (each raw token shown once — capture it now) and exits non-zero if any token fails to persist, naming how many of the batch minted before the failure (those remain valid; revoke via the dashboard). Does **not** run the one-time legacy `.cfg` import (that only ever runs from the server's own boot path, immediately after the auth store is wired — never from a CLI one-shot). |
 | `--auth-lockout-threshold` | `5` | Consecutive failed **local-password** login attempts before an account is temporarily locked (SOC 2 CC6.3). A locked account returns the **same generic 401** as a bad password — no enumeration/lock-state oracle. Counter resets on a successful login, an admin unlock (`POST /api/v1/users/{name}/unlock`), or a successful password change/reset (`POST /api/v1/users/me/password`, `POST /api/v1/users/{name}/password`). A wrong current password on the self-service change route counts as a failed attempt. Scope is local-password only — OIDC/SSO sessions and API tokens are unaffected. Setting `0` **disables** lockout (startup `WARN`) and constitutes a deviation from the CC6.3 hardened baseline — record it as a documented exception on your risk register, do not just flip it. NIST 800-63B §5.2.2 suggests allowing ≥10 attempts where network-layer rate-limiting is also present; raise the threshold accordingly if you front Yuzu with an IP throttle. Env: `YUZU_AUTH_LOCKOUT_THRESHOLD`. |
 | `--auth-lockout-window-secs` | `900` | How long an account stays locked after the threshold is crossed. The lock **auto-expires** after this window — it is never permanent, so it cannot be weaponised to permanently deny a legitimate principal; a waited-out user regains a full attempt budget. Env: `YUZU_AUTH_LOCKOUT_WINDOW_SECS`. |
 | `--jit-max-elevation-secs` | `3600` | **JIT admin elevation** maximum window (SOC 2 CC6.3/CC6.6). Caps the lifetime of a time-boxed admin elevation activated via `POST /api/v1/elevate`; a request asking for longer is clamped. Range 1–86400 (24h). Eligibility is the per-user `users.elevation_eligible` flag (admin-set via `POST /api/v1/users/<name>/elevation-eligibility`), elevation requires a fresh MFA step-up, and for Postgres-backed deployments the grant is **durably persisted** to the cookie session's `SessionStore` row (HA WS-1/1a, ADR-2002 §4), so it **survives a restart** — bounded by this 24h ceiling and the session's own absolute expiry, and auto-reverting on lapse, logout, or explicit revoke (config-file-only deployments keep the old in-memory-per-session behavior a restart drops). API/MCP tokens can never be elevated. Env: `YUZU_JIT_MAX_ELEVATION_SECS`. |
-| `--jit-oidc-amr-elevation` / `--no-jit-oidc-amr-elevation` | `true` (enabled) | Whether an OIDC session whose IdP login attested MFA (the `amr` claim, seeding `Session::mfa_verified_at` at `/auth/callback`) can satisfy `POST /api/v1/elevate`'s mandatory second-factor requirement **without** local TOTP enrollment. An OIDC session never consults a local namesake account's TOTP enrollment — a single-factor (no-`amr`) OIDC session is **always** denied regardless of this flag. Pass `--no-jit-oidc-amr-elevation` to disable JIT elevation for OIDC sessions **entirely** — an OIDC session cannot present a local TOTP step-up (its step-up challenge is re-authenticating via SSO, not a TOTP code), so with the flag off an operator must switch to a local-authenticated session with local TOTP to elevate. A one-time INFO log line is emitted at boot when OIDC is configured and this flag is on. ⚠️ **This flag currently has no observable effect** — since the #1837/#1857 identity re-key, an OIDC session is denied JIT elevation at the eligibility gate (its `oidc:<iss>#<sub>` principal has no local `users` row), before the `amr` branch this flag controls is reached; OIDC elevation is restored by #1852. Env: `YUZU_JIT_OIDC_AMR_ELEVATION`. |
+| `--jit-oidc-amr-elevation` / `--no-jit-oidc-amr-elevation` | `true` (enabled) | Whether an OIDC session whose IdP login attested MFA (the `amr` claim, seeding `Session::mfa_verified_at` at `/auth/callback`) can satisfy `POST /api/v1/elevate`'s mandatory second-factor requirement **without** local TOTP enrollment. An OIDC session never consults a local namesake account's TOTP enrollment — a single-factor (no-`amr`) OIDC session is **always** denied regardless of this flag. Pass `--no-jit-oidc-amr-elevation` to disable JIT elevation for OIDC sessions **entirely** — an OIDC session cannot present a local TOTP step-up (its step-up challenge is re-authenticating via SSO, not a TOTP code), so with the flag off an operator must switch to a local-authenticated session with local TOTP to elevate. A one-time INFO log line is emitted at boot when OIDC is configured and this flag is on. Env: `YUZU_JIT_OIDC_AMR_ELEVATION`. |
 | `--session-inactivity-secs` | `0` | **Idle (inactivity) session timeout** (SOC 2 CC6.3). Seconds of inactivity after which an operator **dashboard cookie session** is invalidated server-side — a **sliding** window that resets on each authenticated request, *under* the absolute 8-hour session lifetime. `0` (default) **disables** it (only the absolute lifetime applies — existing deployments are unaffected); a recommended hardened value is `900` (15 min). Scope is cookie sessions only: **API tokens and MCP tokens are never idle-timed-out** (long-lived automation is unaffected); OIDC users simply re-authenticate via SSO. The active window is logged once at boot for evidence; a value ≥ the absolute 8-hour session lifetime (28800s) is accepted but elicits a startup `WARN` (the idle window can never fire before absolute expiry). Env: `YUZU_SESSION_INACTIVITY_SECS`. |
 | `--auth-mode` | `standard` | Local-password login policy (SOC 2 CC6.3). `standard` = password login enabled. `sso-only` = **local-password login is disabled fleet-wide** — only an SSO provider mints a session — so the server **refuses to start** unless OIDC (`--oidc-issuer` + `--oidc-client-id`) or, on Linux/macOS with HTTPS enabled, a complete SAML SP config is present. A rejected local login returns the **same generic 401** as a bad password (no oracle) and is counted via the metric `yuzu_auth_local_disabled_total` (metric, not a per-attempt audit row — avoids audit-flood under credential spray). A single `--break-glass-user` is exempt while armed. Env: `YUZU_AUTH_MODE`. |
 | `--break-glass-user <username>` | *(none)* | The single local account exempt from `--auth-mode=sso-only`, exempt **only while armed** (see `--break-glass-arm`). Under `sso-only` the server **refuses to start** unless this account exists and has **MFA enrolled** (a break-glass account must carry a second factor). A break-glass login is forced through MFA regardless of `--mfa-enforcement` and writes an `auth.breakglass.login` audit row. Env: `YUZU_BREAK_GLASS_USER`. |
@@ -365,7 +365,8 @@ separately.
 **What changed.** Agent plugins that mount a logged-out Windows profile's `NTUSER.DAT` offline (to
 read its `HKEY_USERS` hive without a live session) have always run a file-level check against that
 hive — the path must not cross a UNC/non-fixed-drive or a reparse-point ancestor, and the file
-itself must be a regular file owned by the profile, LocalSystem or Administrators. Before this
+itself must be a regular file owned by the profile, LocalSystem or Administrators, with no more
+than one hard link (`hive_hardlinked`). Before this
 change only one plugin (`privacy_permissions`) opted into that check; the other five production
 callers (`autoruns`, `installed_apps`, `license_scan`, `registry`, and TAR's mapped-drive-history
 collector) mounted with no check at all. The check is now the default for all of them.
@@ -819,7 +820,7 @@ command not delivered`:
 
 | Reason code prefix | Meaning | What to check |
 |---|---|---|
-| `gateway_unauthenticated` | The gateway's mgmt-plane peer pin (#1422) rejected this server's certificate | The server's mgmt-plane leaf cert and the gateway's `mgmt_peer_pins` configuration agree |
+| `gateway_unauthenticated` | The gateway's mgmt-plane peer authorization (the SPKI pin, #1422, and/or the server identity, #6016) rejected this server's certificate | The server's mgmt-plane leaf cert and the gateway's `mgmt_peer_auth_mode` / `mgmt_peer_pins` configuration agree; the reason is on the gateway's `yuzu_gw_mgmt_auth_rejected_total{reason}` (see [Authorizing the server by its identity](gateway.md#authorizing-the-server-by-its-identity)) |
 | `gateway_unknown_cluster` | No `--gateway-cluster-addr` is configured for the agent's cluster | Server startup flags / the compose/env configuration for that cluster |
 | `gateway_unavailable` | The gateway was unreachable after 3 retry attempts | Gateway process health, network path between server and gateway |
 | `gateway_agent_mismatch` | The gateway answered for a different agent than the one this command targeted | Possible cross-cluster response forgery or a stale cluster resolution — treat as a security-relevant signal, not routine noise |
@@ -938,28 +939,29 @@ leader elected over a dedicated Postgres coordination connection (ADR-2002 §3).
 On a single server the sole replica is always the leader, so behaviour is
 unchanged.
 
-> **This is the *attempt-gate* half only — do NOT run a second server replica on
-> the strength of this change alone.** It ensures only the leader *attempts* the
-> dispatching loops; the correctness guarantee that a paused ex-leader cannot
-> still commit a dispatch (the epoch fence in the claim write) lands in a
-> follow-on slice, and a supported active-active deployment additionally needs
-> gateway-fronted routing, shared agent presence, and PKI HA. Running a second
-> replica against this slice alone can double-dispatch destructive singleton work
-> (quarantine, deployment, policy remediation). Single-server is the only
-> supported topology today.
+> **The elector alone is not a reason to run a second server replica.** It
+> ensures only the leader *attempts* the dispatching loops. The correctness
+> guarantee that a paused ex-leader cannot still commit a leader-driven dispatch
+> is the epoch fence in the claim write (the command outbox, since the follow-on
+> slice 3.3; operator-triggered remediation is arbitrated by its own durable
+> per-target claim instead). A supported active-active deployment additionally
+> needs gateway-fronted routing, shared agent presence, PKI HA and the rest of
+> the safe-to-scale gate (`docs/ha-delivery-matrix.md`); that gate is **not**
+> lifted. Single-server is the only supported topology today.
 
 What you will see, on **every** deployment including single-server, are new
 startup log lines — these are routine, not a fault:
 
 - `leader_elector: coordination connection established (host=… port=… dbname=…; dedicated, never-recycled)`
 - `leader_elector: election loop started (poll=5s)`
-- `leader_elector: acquired leadership 'server_background_leader' at epoch N`
+- `leader_elector: acquired leadership 'server_background_leader' at epoch N (holder_id=srv-…)`
 
 If instead you see `[HA] leader_elector could not open its coordination
 connection; FencedLeaderOnly background loops are PAUSED …`, the server could not
 reach its Postgres coordination connection: it keeps serving and re-tries every
 election cycle (so a transient blip self-heals within seconds), but while the
-message persists the four dispatching loops above do not run. This is fail-closed
+message persists the leader-only background loops (the four above, plus command-outbox
+delivery) do not run. This is fail-closed
 by design — a paused loop never double-dispatches — and a persistent occurrence
 is a Postgres-reachability problem to investigate, not a server bug. (The
 operator-triggered paths are unaffected: a manual policy remediation or evaluation,
@@ -968,6 +970,144 @@ remediation/evaluation is also *completed* on that same replica, so it still rea
 a terminal verdict even while that replica is not the leader. Only the leader-owned
 *scheduling* half — the automatic due-policy dispatch and the periodic CRL freshness
 re-publish — pauses.)
+
+### Leader election: metrics and alerts (HA WS-11)
+
+Running more than one server replica is **not supported today** (the safe-to-scale gate in
+`docs/ha-delivery-matrix.md` is not lifted); the multi-replica wording below is for pilots and
+pre-GA testing. On the supported single-server deployment `YuzuLeaderSplitBrain` cannot fire (one
+series); in practice only `YuzuLeaderNoLeader` and `YuzuLeaderCoordinationStale` fire, and
+`YuzuLeaderFlapping` only on a Postgres connection flap or a restart loop whose acquire is delayed.
+
+Each replica exposes the elector's state as `yuzu_server_leader_*` series on its
+own `/metrics` (reference: [metrics.md](metrics.md) "Leader election metrics"),
+and `docs/prometheus/yuzu-alerts.yml` ships the `yuzu-ha-leader` group. Reload
+your Prometheus rule file to pick it up. **Prometheus must scrape each replica
+individually** (not through the load balancer), and unrelated Yuzu deployments
+sharing one Prometheus need separate `job`s (the shipped scrape configs all use
+`job_name: 'yuzu-server'`, so a second stack must be renamed), because the alerts
+aggregate `sum by (job)`. **`/readyz` does not include leadership**: a replica that
+cannot lead is a ready follower, so these alerts are the only signal that the
+leader-only passes (scheduled dispatch, policy dispatch, quarantine
+reconciliation, the command-outbox delivery loop and the CRL re-publish) are
+paused. The thresholds below (2 m, 5 m, 6 acquisitions per 30 m, 120 s) are
+initial claims with no multi-replica fleet data behind them; tune them from your
+own history.
+
+**Every one of these alerts needs a successful scrape, and no server `up == 0`
+rule ships.** If the primary freezes while its kernel keeps acknowledging packets,
+the `/metrics` handler's own database queries hang too, the scrape fails, every
+`yuzu_server_leader_*` series goes stale at once and every rule below evaluates
+empty. Configure an `up{job="<your server job>"} == 0` alert (the shipped scrape configs
+name the job `yuzu-server`; use yours, with a `for:` of a few scrape intervals) and probe `/readyz`
+from a blackbox exporter or your load balancer as the backstop. A hung scrape becomes
+`up == 0` only after Prometheus's `scrape_timeout`. No server dead-man's-switch rule ships:
+#2956 tracked it and was closed without building it.
+
+Find the replica that is the leader with
+`yuzu_server_leader_is_leader == 1`; the cluster's authoritative record is
+`SELECT * FROM leader_elector.leader_state;` (its `holder_id` matches the
+`(holder_id=srv-…)` text in the `acquired leadership` log line of the process
+that holds it).
+
+- **`YuzuLeaderSplitBrain` (critical).** More than one replica believes it leads
+  for over 2 minutes. **First, compare each replica's coordination
+  host/dbname** in its startup log line (`coordination connection established
+  (host=… dbname=…)`). Against the real elector the usual cause is replicas
+  pointed at **different databases** (a split `--postgres-dsn`, or a Patroni
+  double-primary). In that case each replica holds a valid lock and a valid epoch
+  *in its own database*, so the epoch fence does **not** span them: both
+  replicas run every leader-only pass, and on a forked database the same
+  scheduled occurrence can be sent twice (only the agent's `command_id` dedup,
+  which is effectively-once, absorbs it). Then establish **which database is
+  authoritative**: `patronictl list`, and compare
+  `SELECT system_identifier FROM pg_control_system();` on each side (two different
+  identifiers are two different clusters; hostnames, aliases and a VIP can make
+  "different" hosts the same cluster, and a Patroni demotion followed by `pg_rewind`
+  discards the demoted side's divergent writes, so do not demote on a log-line
+  comparison alone). Then fix the DSN, or fence or demote the wrong primary in
+  Patroni, **before restarting any replica**: a restart just reconnects to
+  whichever primary the DSN resolves to. Only when every replica
+  shares **one** database is the stale replica the one whose
+  `yuzu_server_leader_epoch` differs from `leader_state.current_leader_epoch`;
+  restart it. Within one database fenced claims stay safe (assuming no committed
+  transaction was lost on a promotion, that is, synchronous replication, the
+  shipped quorum default; the fence is not claimed safe across a lossy
+  asynchronous promotion) and what runs twice is the unfenced background passes. **What it does not catch:** a *paused*
+  ex-leader (the case the epoch fence exists for) — its process is frozen, so its
+  series goes stale, not `1`, and a frozen process serves no `/metrics`, so no
+  alert on its own series can evaluate. That case is covered by the fence itself
+  (and `YuzuLeaderNoLeader` fires after 5 minutes if no other replica takes
+  over); `YuzuLeaderCoordinationStale` is the signal for a leader that is alive
+  and serving `/metrics` but whose coordination connection has stopped
+  answering. This alert is verified
+  by Prometheus rule unit cases only; a genuine two-leader state cannot be
+  produced against one database.
+- **`YuzuLeaderNoLeader` (critical).** No replica has believed it leads for over
+  5 minutes, so the leader-only passes are paused on every replica while
+  `/readyz` stays green. **Step 0:** scrape every replica's `/metrics` directly
+  and check `up` for each. If any replica reads `yuzu_server_leader_is_leader 1`
+  this is a scrape problem, not a leader problem (a leader whose own scrape target
+  is down leaves only the followers' zeros, which sums to 0). Otherwise check, in
+  order: the server log for
+  `[HA] leader_elector could not open its coordination connection` and the
+  `yuzu_server_leader_acquire_failures_total{cause}` series (`connect` rising
+  means the dedicated connection cannot be made, or its schema migration failed:
+  reach the primary directly, not through a transaction-mode pooler); then, in
+  Postgres,
+  `SELECT a.pid, a.client_addr, a.state, a.backend_start, a.state_change FROM pg_locks l JOIN pg_stat_activity a USING (pid) WHERE l.locktype = 'advisory' AND l.classid = 1735291205;`
+  Compare `client_addr` with the replicas: a lock held by a backend that **no live
+  replica owns** is a **zombie lock holder** (a half-open connection the server
+  side has not noticed; Postgres notices only via its own keepalives, which can
+  take hours by default). On a **single** replica the zombie is typically that
+  replica's *own previous connection* after a network blip of 15 seconds or more
+  (`backend_start` older than the server process, state idle), and the replica's
+  `acquire_failures_total` stays flat because losing the try-lock to a holder is
+  the normal follower outcome and is not counted. Only that backend should be
+  terminated: `SELECT pg_terminate_backend(<pid>);` (this needs superuser or
+  membership of `pg_signal_backend`), after which a replica acquires within one
+  election cycle. Terminating a *live* leader's backend forces a failover. Fenced claims stay
+  safe; for up to about 8 seconds (one heartbeat interval, plus any pass already in flight) before the old leader notices, its unfenced passes
+  (schedule tick, policy dispatch, quarantine reconcile, CRL re-publish) can
+  overlap the successor's, and any duplicate dispatch is absorbed only by the
+  agent's `command_id` dedup. During a restart of the only replica the series is
+  absent and the alert does not fire. **Silence this alert during planned
+  Postgres maintenance or a switchover that will take more than 5 minutes:**
+  scope the silence to the job, end it at the window plus about 10 minutes, and
+  afterwards confirm a replica reads `yuzu_server_leader_is_leader 1`.
+- **`YuzuLeaderFlapping` (warning).** Six or more acquisitions in 30 minutes across
+  a **multi-replica** deployment: a network or Postgres failover flap, or a
+  handover loop. Compare with `YuzuServerPostgresUnreachable` and
+  `yuzu_server_leader_lost_total{cause="liveness_failed"}`. A rolling upgrade of an
+  N-replica deployment legitimately adds up to N acquisitions; the threshold
+  leaves room for four replicas. **It usually does not detect a single
+  replica in a restart loop**: the counter is synced at scrape time, so a boot whose
+  leadership is acquired before its first scrape reads 1 with no rise, whereas a
+  boot whose acquire is delayed (slow or unreachable Postgres, a lock still held by
+  the previous process) is counted. Do not rely on this rule for that failure; use
+  `YuzuServerRestartLoop` (which has its own documented limits).
+- **`YuzuLeaderCoordinationStale` (critical).** A replica still reads leader but
+  its coordination connection has not answered for over 120 seconds. This is the
+  only series that moves when a network partition lets the peer's kernel keep
+  acknowledging packets and only the dedicated coordination connection wedges:
+  the heartbeat then blocks inside a database call that has **no client-side
+  time bound** against a frozen-but-acknowledging backend (about 100 seconds is
+  merely how long one measured pause lasted), the replica's leadership belief
+  stays `1`, so the count of leaders stays at one and **both `YuzuLeaderSplitBrain`
+  and `YuzuLeaderNoLeader` stay silent** while that replica's leader-only passes
+  keep attempting, and its fenced claims cannot commit (its unfenced passes may still succeed). Fenced claims still cannot double-dispatch
+  (the epoch predicate is evaluated in the claim's write on an ordinary pooled
+  connection). Detection takes about 4–5 minutes (age above 120 s, held for 2
+  minutes, plus a scrape interval); a shorter freeze never alerts. Check
+  connectivity from that replica to the primary. If the primary is reachable,
+  terminate the stuck backend as above (that ends the lock and unblocks the stale
+  replica, which then drops its belief; its unfenced passes can briefly overlap the
+  successor's, with the same `command_id`-dedup caveat); otherwise restart the replica. A restart
+  can take as long as the supervisor's stop timeout, or need a second signal,
+  while the coordination call is wedged; if the old backend still holds the
+  advisory lock afterwards, terminate it (see `YuzuLeaderNoLeader`). **Blind
+  spot:** when the whole primary is frozen the scrape itself fails (see the
+  note above), so this rule cannot evaluate: rely on the `up == 0` backstop.
 
 ### vNEXT — Guardian compliance % and the fleet honesty banner now reflect Linux Service Guards correctly (#4252; NOT breaking)
 
@@ -1066,9 +1206,9 @@ dispatch a fix. (This is the guarantee for when the safe-to-scale gate lifts, AD
 **Scope of the guarantee.** This holds between replicas running the **same
 schema version**. A rolling upgrade across the migration boundary can
 transiently run an old binary that predates the durable claim alongside a new
-one; that mixed-version window is gated today by issue #4014 (which blocks
-running a second production replica) pending a durable cluster-capability
-admission gate. The exposure is one-directional: a row written by an old
+one; that mixed-version window is covered today only by the safe-to-scale gate
+(`docs/ha-delivery-matrix.md`, which is procedural and not lifted), pending a
+durable cluster-capability admission gate (#6528). The exposure is one-directional: a row written by an old
 binary carries claim-generation `0`, a value a new binary never mints.
 Separately, this is effectively-once, not exactly-once (consistent with
 ADR-2002): a replica that pauses for longer than `fixing_stale_seconds`
@@ -1114,7 +1254,8 @@ The gateway's `:50063` command plane requires, on any network-reachable
 listener, strict mTLS **plus** an SPKI peer pin
 (`auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` and
 `{yuzu_gw, mgmt_peer_pins}`) — and the gateway **refuses to boot** without
-them. Two upgrade orderings fail, in opposite directions:
+them (mode `identity`: without a resolvable server identity; mode
+`identity_or_pin`: with neither a pin nor a resolvable identity, #6016). Two upgrade orderings fail, in opposite directions:
 
 - **New gateway image + your old custom mTLS mgmt config** → boot refusal.
   Add the `auth_fun` and `mgmt_peer_pins` entries (copy the shape from
@@ -1129,7 +1270,27 @@ them. Two upgrade orderings fail, in opposite directions:
 
 BYO-cert installs: point `mgmt_peer_pins` at your server certificate — which
 **must carry the `serverAuth` EKU** — or paste its SPKI SHA-256; pin-list
-edits take effect on gateway restart. `{allow_insecure_mgmt, true}` is a
+edits take effect on gateway restart. A pin is not the only way to admit the
+server any more (#6016): with the built-in certificates the gateway can instead
+admit it by the identity URI SAN `yuzu://<install>/server` that the install CA
+puts on the server's certificate (`mgmt_peer_auth_mode` `identity_or_pin` or
+`identity`), which needs no gateway change when the server's key is renewed
+when no pin is configured (a pin kept in `identity` mode must follow the
+renewal). It is an opt-in: the shipped reference configs and an unset mode are
+`pin`, and the identity trusts the issuing CA's issuance policy, so it must not
+be enabled behind a CA that lets a requester choose a URI SAN. Rolling the
+gateway back to a binary from before #6016 ignores these settings: the
+deny-list is no longer honoured, and a configuration with no pins (dropped
+for `identity`, or `identity_or_pin` running on the identity alone) refuses to
+boot (`no_mgmt_peer_pins`); restore the pins, matching the key the server
+presents now,
+first (see the "Rolling back" paragraph of that section). The rollback is a
+gateway restart, so do it only if the node's agents can take the disconnect,
+because agents without the #5183 fix stay wedged after it.
+Bring-your-own certificates, `--no-default-certs` and a server given its own `--cert`/`--key`
+carry no identity and stay on pins. See
+[Authorizing the server by its identity](gateway.md#authorizing-the-server-by-its-identity)
+and `docs/adr/2004-gateway-mgmt-server-identity.md`. `{allow_insecure_mgmt, true}` is a
 lab-rig acknowledgement only; never set it where `:50063` is reachable from
 untrusted networks.
 
@@ -1156,9 +1317,13 @@ Until the fleet is fully upgraded, treat field 6 as free text: match on agent
 version rather than on the field's content, or defer any query that keys on it.
 `SELECT` on the plugin version, not on the value.
 
-A long-standing bug that made the macOS network scan return no results on
-macOS 14 and later is fixed in the same release; macOS hosts that reported an
-empty scan may begin reporting networks, subject to Location Services.
+On macOS 14 and later `list_networks` still normally returns no networks.
+`airport` was removed in that release, and the `system_profiler` fallback the
+plugin now tries needs a Location Services grant that a background daemon does
+not normally have. Without it the plugin reports a single `wifi|info` row
+(`wifi:macos_scan_requires_location_services`) instead of an empty scan, so the
+cause is visible; networks appear only on a host where Location Services has
+been granted.
 
 ### vNEXT — `event_logs` acquires natively; Windows message text and `count` semantics change (breaking)
 
@@ -2664,7 +2829,7 @@ MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` 
 
 ### v0.10.0 — API token revocation is owner-scoped
 
-Starting with v0.10.0, non-admin users can no longer revoke API tokens they do not own. A caller holding the `ApiToken:Delete` permission may revoke only tokens whose `principal_id` matches the session's username; the global `admin` role is the sole bypass. Prior releases allowed any holder of `ApiToken:Delete` to revoke any token, which was an IDOR (tracked in GitHub issue #222).
+Starting with v0.10.0, non-admin users can no longer revoke API tokens they do not own. A caller holding the `ApiToken:Delete` permission may revoke only tokens whose `principal_id` matches the session's username; the global `admin` role, or a session with an active just-in-time admin elevation, is the only bypass. Prior releases allowed any holder of `ApiToken:Delete` to revoke any token, which was an IDOR (tracked in GitHub issue #222).
 
 **If your deployment uses a non-admin service account to rotate tokens for other principals** — for example, a shared `ops` role that recycles service-account tokens on a schedule — those rotations will begin receiving `HTTP 404 token not found` after upgrade. To restore the behavior, either:
 
@@ -3107,9 +3272,11 @@ dashboard fragment) — a separate, additional new rejection path on all three s
 
 **Who this affects.** Any RBAC-**enabled** deployment where a non-admin principal creates a
 result set by supplying `device_ids` directly. Checked against this repository's actual seed
-grants (`RbacStore::seed_defaults`), of the 7 seeded built-in roles only **Administrator** and
+grants (`RbacStore::seed_defaults`), of the 8 seeded built-in roles only **Administrator** and
 **ITServiceOwner** hold `Infrastructure:Read` — **Viewer, Operator, PlatformEngineer,
-ApiTokenManager, and Reviewer do not**. A principal holding one of those five roles who could
+ApiTokenManager, Reviewer, and ForensicsAnalyst do not** (`ForensicsAnalyst` was added later, so
+it is not a role that could have created result sets with `device_ids` before this release). A principal holding one of the five roles that existed at that release
+(Viewer, Operator, PlatformEngineer, ApiTokenManager, Reviewer) who could
 previously create a result set with `device_ids` (the RBAC-enabled default before this release
 carried no permission check on this field at all) will now receive a new `403` on all three
 surfaces. This is a genuine, confirmed regression path, not a hypothetical one. A caller who omits
@@ -3128,8 +3295,8 @@ of `Viewer`, `Operator`, `PlatformEngineer`, `ApiTokenManager`, or `Reviewer` wh
 capability; each will start receiving `403` the moment this release is live, with no advance
 warning from the caller's own side.
 
-**What to do.** Of the 6 fleet-wide-assignable built-in roles, only `Administrator` holds
-`Infrastructure:Read` — `ITServiceOwner` (the 7th, management-group-scoped-only) also holds it. A
+**What to do.** Of the 7 fleet-wide-assignable built-in roles, only `Administrator` holds
+`Infrastructure:Read` — `ITServiceOwner` (the 8th, management-group-scoped-only) also holds it. A
 principal who needs to keep creating result sets with `device_ids` after this release needs one of
 those two roles; per `rbac.md`'s own current state, there is **no REST API or Settings UI yet for
 creating a custom role or editing an existing role's permission set** (tracked as planned, not
@@ -3842,7 +4009,8 @@ short-lived contractor's badge is being rotated).
 
 The audit log records `session.revoke_all` with `target_id=<username>`,
 `target_type=User`, and `detail=count=<N>` where N is the number of
-in-memory cookie sessions wiped. The action is also surfaced on the
+cookie sessions wiped (the durable session store's count, or this server's
+cached count if the durable delete failed). The action is also surfaced on the
 `yuzu_auth_sessions_revoked_total{caller="admin",scope="cookies"}`
 Prometheus counter — a sustained spike there is the operator's
 automated alert for either a real incident response in progress or
@@ -5842,7 +6010,7 @@ On the main listener, a `/health` or `/api/health` request that carries a `Cooki
 - **A sustained overload also reds every replica together, and that is deliberate (#4944).** If the probe's one-row, no-table `SELECT` misses its 2 s deadline twice in a row, the database cannot answer real requests within their deadlines either (nearly every request validates a session and writes an audit row), so the replica is truthfully unable to serve — and, from the client side, a hopelessly slow backend and a frozen one look the same. There is **no server-side hysteresis** by decision: the rule stays two failures to go red, one success to recover, and your load balancer's thresholds are the damping — see "Load balancers and shutdown drain" below for the recommended values. A *brief* stall never evicts: one failed probe is a blip (`scripts/ha/ha-readyz-scenarios.sh`, scenario M holds a 3 s pause green; scenario L shows a CPU-starved database going red and recovering within one probe of the limit being lifted).
 - **Enablement is detail, not a gate.** The `enablement` object reports whether a regression is declared (`regression_pending`), whether this boot found no continuity anchor (`anchor_unwitnessed_at_boot`, which is `true` on every fresh install) and whether an endpoint reported above the store's highest (`report_ahead`). None of them changes the verdict. They are read from a cache refreshed at boot and when this replica declares a regression, so a declaration made by another replica shows here only after this one restarts; see [Enablement continuity anchor](#enablement-continuity-anchor). The `enablement_store` row is an ordinary startup check.
 - **The store rows are startup checks.** Every other row (`response_store`, `session_store`, ...) reports whether that store opened and migrated when the server started. They do not re-check a running store — a runtime problem with one store (a revoked grant, a dropped table) shows up as `503`s on that store's routes and in metrics, not on `/readyz`, because every replica shares the same database and moving traffic elsewhere would not help. For example, DEX Apps lists refuse with `score_policy_unavailable` once the `dex_score_policy` key has been unreadable for over 60 s, or at once when no policy is cached (a restart during the outage, or a concurrent first read) (see `yuzu_server_runtime_config_read_degrade_total{reason}`).
-- **Leadership is not readiness.** A replica that is not the background-work leader is fully ready.
+- **Leadership is not readiness.** A replica that is not the background-work leader is fully ready, and so is one whose leader elector could not open its coordination connection: it still serves every operator-synchronous request. The paused background passes are reported by the `yuzu_server_leader_*` metrics and the `YuzuLeaderNoLeader` alert instead (see [Leader election: metrics and alerts](#leader-election-metrics-and-alerts-ha-ws-11)).
 
 ### Probing a TLS-enabled server
 
@@ -6455,3 +6623,24 @@ The following server administration features are on the roadmap but not yet impl
 | Runtime Configuration API | Phase 7 (7.3) | Change retention TTLs, connection limits, and other server parameters via REST API. **Not all keys apply live** - retention TTLs are stored and reported immediately but not enforced (the enforced window comes from the `--*-retention-days` flag or its environment variable, #483), and OIDC keys apply only via Settings -> OIDC. See [REST API -> When a change takes effect](rest-api.md#when-a-change-takes-effect). |
 | AD/Entra Integration | Phase 7 (7.5) | Sync users and groups from Active Directory (LDAP) or Microsoft Entra ID. Auto-create Yuzu principals from directory membership. |
 | System Health Monitoring | Phase 7 (7.2) | Server-side health dashboard showing memory, CPU, disk, database size, connected agent count, and gRPC stream health. Prometheus metrics for server internals. |
+
+## Fleet certificate inventory storage
+
+The fleet certificate inventory (`certificate_inventory_store` schema, one row per device and
+certificate) is written by the `certificate_inventory` daily-sync source.
+
+- **Schema and privileges.** Created at boot; the database role needs `CREATE` on the database.
+  The server refuses to start if it cannot be created. Rolling the server back leaves the schema
+  (and any rows) in place, unread.
+- **Capacity.** A device reports at most 10,000 distinct certificates and 1 MiB of DER. Facts are
+  stored once per (device, certificate) with its locations; a typical Linux device is a few hundred
+  rows. The optional DER column is the bulk of the storage: allow up to about 1 MiB per device
+  (about 50 GB at 50,000 devices) plus the matching WAL, and size backups and PITR retention
+  accordingly. Unchanged facts are not rewritten on a repeat full report.
+- **Per-agent lock.** Reports for one device are serialised by a Postgres advisory lock. A report
+  that cannot take it is answered `deferred`/`agent_busy` (a full report is asked to resend; a
+  hash-only report retries next cycle) instead of waiting on a pooled connection.
+- **Metrics.** `yuzu_server_cert_inventory_ingest_total{result,reason}` and the generic
+  `yuzu_inventory_ingest_total{source="certificate_inventory"}`; see [Metrics](metrics.md).
+- **Restore.** A restore from backup brings back rows for devices erased since the backup. Re-run
+  the decommission for those devices afterwards.

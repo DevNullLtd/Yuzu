@@ -202,6 +202,168 @@ TEST_CASE("TarDatabase: purge_source(usage) also erases usage_daily_user",
     CHECK(count("usage_live") == 0);
 }
 
+namespace {
+
+RegistryEvent registry_row(std::string key, std::string action = "changed") {
+    RegistryEvent ev;
+    ev.ts = 1'761'000'000;
+    ev.snapshot_id = 3;
+    ev.hive = "HKLM";
+    ev.key_path = "SOFTWARE\\Vendor\\Svc";
+    ev.value_name = "Start";
+    ev.action = std::move(action);
+    ev.data_type = "REG_DWORD";
+    ev.data = "2";
+    ev.data_size = 4;
+    ev.prev_data_type = "REG_DWORD";
+    ev.prev_data = "3";
+    ev.prev_data_size = 4;
+    ev.actor_pid = 812;
+    ev.actor_image = "actor.exe";
+    ev.source = "notify";
+    ev.observed_at = 1'761'000'000'000;
+    ev.detail = "attr:corr";
+    ev.record_key = std::move(key);
+    return ev;
+}
+
+std::string first_cell(TarDatabase& db, const std::string& sql) {
+    auto r = db.execute_query(sql);
+    REQUIRE(r.has_value());
+    REQUIRE_FALSE(r->rows.empty());
+    return r->rows[0][0];
+}
+
+} // namespace
+
+TEST_CASE("TarDatabase: insert_registry_events_and_cursor round-trips every column, replays as a no-op",
+          "[tar][store][registry]") {
+    auto t = make_test_db();
+    auto removed = registry_row("k2", "removed");
+    removed.data_type.clear(); // absent value: '' type and data
+    removed.data.clear();
+    removed.data_size = 0;
+    removed.actor_pid = 0; // unattributed
+    removed.actor_image.clear();
+    removed.detail.clear();
+    REQUIRE(t.db.insert_registry_events_and_cursor({registry_row("k1"), removed}, R"({"v":1})",
+                                                    {{"registry:HKLM\\R", R"({"v":1,"keys":{}})"}}));
+    auto r = t.db.execute_query("SELECT ts, snapshot_id, hive, key_path, value_name, action, data_type, "
+                                "data, data_size, data_truncated, prev_data_type, prev_data, "
+                                "prev_data_size, prev_data_truncated, actor_pid, actor_image, source, "
+                                "observed_at, detail, record_key FROM registry_live ORDER BY id");
+    REQUIRE(r.has_value());
+    REQUIRE(r->rows.size() == 2);
+    const auto& row = r->rows[0];
+    CHECK(row[0] == "1761000000");
+    CHECK(row[2] == "HKLM");
+    CHECK(row[3] == "SOFTWARE\\Vendor\\Svc");
+    CHECK(row[5] == "changed");
+    CHECK(row[7] == "2");
+    CHECK(row[11] == "3");
+    CHECK(row[14] == "812");
+    CHECK(row[15] == "actor.exe");
+    CHECK(row[18] == "attr:corr");
+    CHECK(row[19] == "k1");
+    CHECK(r->rows[1][6].empty()); // the removed row has no value type: an absent value
+    CHECK(r->rows[1][14] == "0");
+    CHECK(r->rows[1][15].empty());
+
+    // A replayed key is a silent no-op and still commits the cursor and baseline.
+    REQUIRE(t.db.insert_registry_events_and_cursor({registry_row("k1")}, R"({"v":1,"n":2})",
+                                                    {{"registry:HKLM\\R", R"({"v":1,"keys":{"K":{}}})"}}));
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM registry_live") == "2");
+    CHECK(*t.db.get_cursor("registry").value() == R"({"v":1,"n":2})");
+    CHECK(*t.db.try_get_state("registry:HKLM\\R").value() == R"({"v":1,"keys":{"K":{}}})");
+    // ... even when the replay attributes differently: after a restart the in-memory event
+    // buffer is gone, so a replayed change can come back degraded or unattributed. Identity
+    // is what changed, never who -- the stored row keeps its first attribution.
+    auto reattributed = registry_row("k1");
+    reattributed.actor_pid = 0;
+    reattributed.actor_image.clear();
+    reattributed.detail = "attr:degraded";
+    CHECK(t.db.insert_registry_events_and_cursor({reattributed}, R"({"v":1})", {}));
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM registry_live") == "2");
+    CHECK(first_cell(t.db, "SELECT actor_pid || '/' || detail FROM registry_live WHERE record_key = 'k1'") ==
+          "812/attr:corr");
+}
+
+TEST_CASE("TarDatabase: insert_registry_events_and_cursor refuses collisions and bad keys atomically",
+          "[tar][store][registry]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.insert_registry_events_and_cursor({registry_row("k1")}, R"({"v":1})",
+                                                    {{"registry:HKLM\\R", "old"}}));
+    // Same key, different change: a collision. The cursor and the baseline roll back with it.
+    auto other = registry_row("k1");
+    other.data = "9";
+    const auto collided = t.db.insert_registry_events_and_cursor({other}, R"({"v":2})",
+                                                                 {{"registry:HKLM\\R", "new"}});
+    REQUIRE_FALSE(collided.has_value());
+    CHECK(collided.error() == TarDatabase::CursorInsertError::KeyCollision);
+    CHECK(*t.db.get_cursor("registry").value() == R"({"v":1})");
+    CHECK(*t.db.try_get_state("registry:HKLM\\R").value() == "old");
+    // Empty and NUL keys are refused before anything is written.
+    for (const std::string& bad : {std::string{}, std::string("a\0b", 3)}) {
+        const auto r = t.db.insert_registry_events_and_cursor({registry_row(bad)}, R"({"v":3})", {});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == TarDatabase::CursorInsertError::KeyCollision);
+    }
+    CHECK(*t.db.get_cursor("registry").value() == R"({"v":1})");
+}
+
+TEST_CASE("TarDatabase: try_get_state is tri-state", "[tar][store][registry]") {
+    auto t = make_test_db();
+    auto missing = t.db.try_get_state("registry:none");
+    REQUIRE(missing.has_value());
+    CHECK_FALSE(missing->has_value()); // succeeded, no row
+    REQUIRE(t.db.set_state("registry:one", "{}"));
+    CHECK(*t.db.try_get_state("registry:one").value() == "{}");
+    // A broken store is an ERROR, not "absent": get_state's empty-on-failure would read as
+    // "no baseline" and silently re-baseline.
+    sqlite3* h = nullptr;
+    REQUIRE(sqlite3_open(t.path.string().c_str(), &h) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(h, "ALTER TABLE tar_state RENAME TO tar_state_away", nullptr, nullptr, nullptr) ==
+            SQLITE_OK);
+    CHECK_FALSE(t.db.try_get_state("registry:one").has_value());
+    sqlite3_close(h);
+}
+
+TEST_CASE("TarDatabase: purge_source(registry) erases the rows, the cursor (held values included) and every baseline",
+          "[tar][store][purge][registry]") {
+    auto t = make_test_db();
+    // The cursor row is a content store too: it holds the rendered old/new values of a change
+    // whose writer is not settled yet. Purging the source must erase it with everything else.
+    const std::string cursor_with_held =
+       R"({"v":1,"tick":4,"held":[{"r":"HKLM\\A","k":"HKLM\\A\\K","v":"Secret","a":"changed",)"
+       R"("t":1,"s":14,"d":"held-rendered-value","dtr":false,"hp":true,"pt":1,"ps":14,)"
+       R"("pd":"held-previous-value","ptr":false,"o":5,"lo":1,"hi":4,"src":"notify"}]})";
+    REQUIRE(t.db.insert_registry_events_and_cursor(
+       {registry_row("k1")}, cursor_with_held,
+       {{"registry:HKLM\\A", "baseline-a"}, {"registry:HKU\\S-1\\B", "baseline-b"}}));
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM tar_cursor WHERE source = 'registry' AND "
+                           "cursor_json LIKE '%held-rendered-value%'") == "1");
+    REQUIRE(t.db.set_state("service", "kept")); // unrelated baseline
+    REQUIRE(t.db.insert_power_events_and_cursor({PowerEvent{1, 1, "wake", "", "p1"}}, R"({"v":1})"));
+
+    const auto res = t.db.purge_source("registry");
+    REQUIRE(res.has_value());
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM registry_live") == "0");
+    CHECK_FALSE(t.db.get_cursor("registry").value().has_value());
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM tar_cursor WHERE cursor_json LIKE '%held-%'") == "0");
+    CHECK_FALSE(t.db.try_get_state("registry:HKLM\\A").value().has_value());
+    CHECK_FALSE(t.db.try_get_state("registry:HKU\\S-1\\B").value().has_value());
+    CHECK(*t.db.try_get_state("service").value() == "kept");
+    CHECK(t.db.get_cursor("power").value().has_value());
+
+    // Purging another source leaves the registry bookkeeping alone.
+    REQUIRE(t.db.insert_registry_events_and_cursor({registry_row("k9")}, R"({"v":1})",
+                                                    {{"registry:HKLM\\A", "b"}}));
+    REQUIRE(t.db.purge_source("power").has_value());
+    CHECK(t.db.get_cursor("registry").value().has_value());
+    CHECK(t.db.try_get_state("registry:HKLM\\A").value().has_value());
+    CHECK(t.db.get_cursor("power").value().has_value()); // purge(power) leaves its own cursor too
+}
+
 TEST_CASE("TarDatabase: purge_source rejects an unknown source", "[tar][store][purge]") {
     auto t = make_test_db();
     auto res = t.db.purge_source("not_a_source");

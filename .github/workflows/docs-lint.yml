@@ -78,6 +78,28 @@ jobs:
       - name: Split interlock tripwire self-test
         run: python3 tests/test_split_interlock_tripwire_selftest.py
 
+      # #4990: stored-response reads and the Forensics tier. The exact set of ResponseStore read
+      # methods (each must take a ResponseTierFilter) and the exact set of
+      # unrestricted_internal_consumer() call sites are frozen in the tripwire; a new read or a new
+      # internal-consumer site fails until it is classified in a reviewed change. The self-test runs
+      # the checks against mutated sources and proves each mutation is caught.
+      - name: Response store read tripwire (#4990)
+        run: python3 -I tests/test_response_store_read_tripwire.py
+
+      - name: Response store read tripwire self-test (#4990)
+        run: python3 -I tests/test_response_store_read_tripwire_selftest.py
+
+      # #4990: server.cpp keeps wiring the Forensics plugin set and the visibility resolver into
+      # every surface that reads stored responses. A route class built without them fails closed
+      # and would silently lose Forensics rows for every caller, so no unit test notices a
+      # dropped line; this lexical gate does. The self-test deletes each required statement in
+      # memory and proves the gate names it.
+      - name: Forensics tier wiring gate (#4990)
+        run: python3 -I tests/test_forensics_tier_wiring_lexical.py
+
+      - name: Forensics tier wiring gate self-test (#4990)
+        run: python3 -I tests/test_forensics_tier_wiring_lexical_selftest.py
+
       # Personal-data guard: no real home paths, SIDs, tailnet IPs, MACs, private
       # keys, consumer e-mail or tracked session artifacts in this PUBLIC repo.
       # Pre-existing hits live in scripts/ci/personal-data-baseline.json (counts
@@ -125,8 +147,8 @@ jobs:
       # item 1): a family's presentation/handler TUs must not reach a store
       # directly. check-seam-closure.py walks each declared family TU's
       # transitive #include closure and fails on any store-layer header found
-      # in it (see the script's module docstring for the "sound proxy, two
-      # acknowledged escapes" scope statement). Pure lexical source-tree
+      # in it (see the script's module docstring for the "sound proxy" scope
+      # statement and its list of what is NOT caught). Pure lexical source-tree
       # analysis, no build deps — belongs beside the other preflight gates in
       # this job, same as the sibling check-api-parity.py gate (ci.yml).
       - name: Seam-closure gate (ADR-0031 WS-A4 item 1)
@@ -138,6 +160,11 @@ jobs:
       # above is evidence the gate actually discriminates, not that it always
       # passes. Mirrors the split interlock self-test's shape immediately above.
       - name: Seam-closure gate self-test
+        # The include-parser fixtures are cross-checked against GNU g++ -MM -MG; docs-lint's
+        # ubuntu-24.04 image has one, so require it rather than silently skipping the oracle
+        # (qa-4 precedent, the link-gate self-test below).
+        env:
+          YUZU_REQUIRE_TOOLCHAIN: "1"
         run: python3 tests/test_seam_closure_selftest.py
 
       # check-seam-closure.py's LINK-level twin, scripts/ci/check_core_
@@ -202,6 +229,14 @@ jobs:
         run: |
           node --version
           YUZU_REQUIRE_NODE=1 python3 tests/test_compose_wizard.py
+
+      # The /swagger page's renderer runs under node against a fake DOM. The meson entry
+      # skips without node, so run it here on the hosted image and fail rather than skip
+      # if node is missing.
+      - name: Swagger page behaviour
+        run: |
+          node --version
+          YUZU_REQUIRE_NODE=1 python3 tests/test_swagger_page_behaviour.py
 
       # Changelog promote --append (#5221): folds post-promotion hotfix
       # fragments into an already-promoted release section. Stdlib only.

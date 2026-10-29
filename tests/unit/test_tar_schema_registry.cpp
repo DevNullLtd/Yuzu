@@ -227,6 +227,27 @@ TEST_CASE("TAR schema: effective network capture method is always polling today"
     CHECK(effective_network_capture_method("not_a_real_method") == "polling");
 }
 
+TEST_CASE("TAR schema: the registry source row (PR11.8)", "[tar][schema][registry]") {
+    const CaptureSourceDef* def = nullptr;
+    for (const auto& src : capture_sources())
+        if (src.name == "registry")
+            def = &src;
+    REQUIRE(def != nullptr);
+    CHECK(def->dollar_name == "Registry");
+    CHECK(def->default_enabled);
+    CHECK(def->unique_key_column == "record_key");
+    REQUIRE(def->os_support.size() == 3);
+    CHECK(os_support_status("registry", "windows") == OsSupportStatus::kSupported);
+    CHECK(supported_capture_method("registry", "windows") == "regnotify+etw");
+    CHECK(os_support_status("registry", "linux") == OsSupportStatus::kUnsupported);
+    CHECK(os_support_status("registry", "macos") == OsSupportStatus::kUnsupported);
+    REQUIRE(def->granularities.size() == 1); // one live tier, no rollups
+    CHECK(def->granularities[0].suffix == "live");
+    CHECK(def->granularities[0].retention_type == RetentionType::kRowCount);
+    CHECK(def->granularities[0].retention_default == 500000);
+    CHECK(is_queryable_table("registry_live"));
+}
+
 // ── Per-source default-enabled (review R1) ──────────────────────────────────
 
 TEST_CASE("TAR schema: every capture source ships default_enabled=true",

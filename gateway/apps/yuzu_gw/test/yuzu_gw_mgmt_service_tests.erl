@@ -258,7 +258,8 @@ wait_dead(Pid, Attempts) ->
 %% through a command_error-derived response, instead of the previous
 %% hardcoded `command_id => <<>>`. Before this fix, a gateway-side "agent
 %% not connected on this cluster" error was invisible to the core server's
-%% execution tracker (resolve_execution_id("") -> nullopt) — see
+%% execution tracker (an empty command id resolved to no execution; the
+%% server now labels it ~unverified) — see
 %% docs/adr/2002-high-availability-architecture.md §7d for the full
 %% end-to-end story. `send_command/2` is exercised directly (not
 %% `stream_responses/3`, which isn't exported) by mocking `yuzu_gw_router`'s

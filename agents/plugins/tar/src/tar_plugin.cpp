@@ -45,6 +45,7 @@
 #include <yuzu/agent/network_interfaces.hpp>
 #include <yuzu/agent/process_enum.hpp>
 #include <yuzu/plugin.hpp>
+#include <yuzu/tar_retention_tick.hpp> // kTarRollupTickSeconds (shared with the data-retention API)
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -671,7 +672,8 @@ public:
 
         // Register rollup trigger (15-minute aggregation cycle)
         auto rollup_config = std::format(
-            R"({{"interval_seconds":900,"plugin":"tar","action":"rollup","parameters":{{}}}})");
+            R"({{"interval_seconds":{},"plugin":"tar","action":"rollup","parameters":{{}}}})",
+            yuzu::kTarRollupTickSeconds);
         ctx.register_trigger("tar.rollup", "interval", rollup_config);
 
         // Gap-free process events: ETW on Windows, Endpoint Security on macOS. On
@@ -3074,6 +3076,23 @@ private:
         ctx.write_output(
             std::format("config|nstat_layout_mismatch|{}",
                         (nstat_client_ && nstat_client_->layout_mismatch()) ? "true" : "false"));
+
+        // registry source (PR11.8) health — emitted UNCONDITIONALLY (key-always-present
+        // contract) from the values the source wrote on its last committed tick. The
+        // defaults read as "not running": capture_method none, every counter 0.
+        {
+            static constexpr std::pair<std::string_view, std::string_view> kRegistryKeys[] = {
+                {"registry_capture_method", "none"},   {"registry_watch_roots", "0"},
+                {"registry_watch_roots_unarmed", "0"}, {"registry_roots_unreadable", "0"},
+                {"registry_roots_capped", "0"},        {"registry_etw_events", "0"},
+                {"registry_etw_dropped", "0"},         {"registry_etw_lost", "0"},
+                {"registry_attr_attributed", "0"},     {"registry_attr_ambiguous", "0"},
+                {"registry_attr_none", "0"},
+            };
+            for (const auto& [key, def] : kRegistryKeys)
+                ctx.write_output(std::format("config|{}|{}", key,
+                                             db_->get_config(std::string(key), std::string(def))));
+        }
 
         // netqual capture method (ADR-0020) — the method actually in effect:
         // "inetdiag" (Linux), "estats" (Windows once the elevation gate latches

@@ -159,9 +159,10 @@ TEST_CASE("access authz: Administrator with RBAC off reads every panel and may a
     }
     const auto assign = r.get(kAssign, c);
     CHECK_THAT(assign->body, ContainsSubstring("data-act=\"assign\""));
-    // The real catalogue, filtered to the closed assignable list: six names, never ITServiceOwner.
+    // The real catalogue, filtered to the closed assignable list: seven names, never ITServiceOwner.
     CHECK_THAT(assign->body,
-               ContainsSubstring("data-roles=\"Administrator,ApiTokenManager,Operator,PlatformEngineer,Reviewer,Viewer\""));
+               ContainsSubstring("data-roles=\"Administrator,ApiTokenManager,ForensicsAnalyst,Operator,"
+                                 "PlatformEngineer,Reviewer,Viewer\""));
     CHECK_THAT(r.get(kEnforce, c)->body, ContainsSubstring("data-act=\"enforce\""));
     CHECK(r.denied_rows() == 0);
     // The grant-table read leaves its own audit row, exactly as its REST twin.

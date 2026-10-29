@@ -294,7 +294,7 @@ jobs:
 
           tar czf "yuzu-linux-x64.tar.gz" "${STAGING}"
 
-      # Linux ELF floor gate, ADR-2003 (Proposed, PR #5631) slice S0:
+      # Linux ELF floor gate, ADR-2003 (Accepted, PR #5631) slice S0:
       # REPORT-ONLY. Measures the versioned-symbol requirements of everything
       # just staged against the committed floor files (agent: glibc 2.28;
       # server: 2.34) and records them. continue-on-error, and the script exits

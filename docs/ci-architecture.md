@@ -292,7 +292,7 @@ where each lives.
 Every Linux native artifact carries the glibc / libstdc++ floor of the host
 that built it by accident (#5143). The gate makes the floor an explicit,
 committed promise and measures every build against it. It is specified by
-ADR-2003 (Proposed, PR #5631; the ADR is not on `dev` yet). **In S0 it is
+ADR-2003 (Accepted, PR #5631). **In S0 it is
 report-only: nothing it finds can fail a build or a release.** S2 turns it on.
 
 - **The script** runs `objdump -T` and `readelf -d` over every ELF under a
@@ -318,7 +318,7 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   `deploy/packaging/linux-floor-server.json` (glibc 2.34, `GLIBCXX_3.4.29`,
   `CXXABI_1.3.13`, `OPENSSL_3.0.0`, `LIBSYSTEMD_240`, `BLKID_1.0`, forbidden
   `EVP_sm4_*`; also the gateway's ERTS and OTP). They state the promise, not a
-  measurement. Changing one is a floor decision (ADR-2003 (Proposed, PR #5631),
+  measurement. Changing one is a floor decision (ADR-2003, accepted in PR #5631:
   "Floor review rule"), not a tuning edit. A typo in a family key would silently
   ungate that family (families absent from `max` are only reported), so the
   loader requires `GLIBC`, the script reports a measured family one edit away
@@ -362,7 +362,7 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   deterministic (sorted, no timestamps or paths): a refresh diffs cleanly. A
   set whose scan was incomplete (a PROBLEM, an unreadable or unscanned ELF)
   carries an `incomplete` list; the committed baseline has none. The
-  floor-review rule in ADR-2003 (Proposed, PR #5631) says when to refresh it.
+  floor-review rule in ADR-2003 (Accepted, PR #5631) says when to refresh it.
 - **Release wiring.** `release.yml`'s `build-linux` job runs the script
   report-only on the staged tarball contents right after "Package archive"
   (agent set, then server set) in a `continue-on-error` step, and uploads the
@@ -839,10 +839,12 @@ the gateway source and rerunning the suite).
 
 The same run covers the **management hop**, server to gateway (`:50063`, the privileged command
 plane; the symptom of #5175 was every `SendCommand` reaching the server as `Socket closed`). The
-gateway's management listener runs in the production posture: strict mutual TLS
+gateway's management listener runs in the production posture except for the mode: strict mutual TLS
 (`verify_peer` + `fail_if_no_peer_cert`), `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1`, and
 `mgmt_peer_pins = [{cert_file, <server default-server.pem>}]` (the shipped form: the gateway pins that
-leaf's SPKI and requires `serverAuth`); the server is pointed at it with `--gateway-command-addr` and
+leaf's SPKI and requires `serverAuth`), plus `mgmt_peer_auth_mode = identity_or_pin`. The rig opts in to
+that mode (#6016); the shipped configs stay on `pin`, so the shipped `pin` configuration (resolved and judged by the real boot-guard functions) is covered by
+the eunit module `yuzu_gw_config_posture_tests`, not exercised on the real stack; the server is pointed at it with `--gateway-command-addr` and
 presents its own default leaf. Three layers check it. (1) The script dispatches `os_info.os_name` to
 the real agent through the server's REST API (admin login, `POST /api/command`, poll
 `/api/responses/{id}`): one round trip, then 300 commands, 16 at a time, whose streams all share the
@@ -850,7 +852,7 @@ server's single management connection; every one must return the agent's SUCCESS
 `yuzu_server_gateway_forward_total` must count all 301 as `ok` and none under any failure status (the
 REST per-IP limit is raised for this server with `--rate-limit 10000`; at the default 100 requests/s the
 limiter answers 429 for most of the burst and the commands never overlap). (2)
-`yuzu_gw_real_mgmt_SUITE` dials the listener itself: the pinned leaf is served; the gateway's own
+`yuzu_gw_real_mgmt_SUITE` dials the listener itself: the pinned leaf is served, and the server identity cases (#6016, in the `identity_or_pin` mode the script configures) are covered too: the real server leaf is admitted by identity, a renewed-key leaf and a same-key re-issue carrying the identity are served, and a leaf carrying another install's identity is refused; the gateway's own
 leaf and an enrolled agent's leaf, both valid certificates of the same CA, get `UNAUTHENTICATED` and
 move `yuzu_gw_mgmt_auth_rejected_total` by `pin_mismatch` and `missing_server_auth_eku`; a peer with
 no certificate gets no call; a command to the real agent returns its SUCCESS with output; 300
@@ -1054,6 +1056,28 @@ invocation selects `--suite platform` instead of `--suite docs` (the
 `docs` suite is Linux-only, "Test suites by leg" below) and its
 `assert-suite-cover.py` guard names `--exclude-suite docs`, so a missed
 label still fails loud.
+
+`Test (non-pg suites)` also carries the registry plugin's real-registry cases (#6488). It sets
+`YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1`, so a case that would skip (no `registry.dll`, or a process that
+cannot write `HKLM`; the job runs as LOCAL SYSTEM, which can) fails instead. The job-level
+`YUZU_TEST_REGISTRY_SCOPE` (`<run id>-<attempt>-<build type>`) puts every scratch key under
+`YuzuTest-<scope>-`, so two test phases sharing a box through the 2-slot gate judge only their own keys. The script
+scans only the direct children named `YuzuTest-*` of `HKLM\SOFTWARE`, its `Wow6432Node` and `HKCU\Software`; the
+local dispatcher's `Software\YuzuTest\RegistryPr17Ld_<salt>` keys (`test_registry_local_dispatcher.cpp:228,248`) are
+outside the scan.
+Before the suite, `Self-test the registry leftover check` plants a probe key under each root the script scans and proves both decisions of
+`scripts/ci/check-registry-test-leftovers.ps1` (the probe's own scope: exit 1 with an `::error` naming it; any
+other scope: exit 0 with a `::warning`); after it, `Assert this job left no YuzuTest-* registry keys behind` runs
+the same script with the job's scope; a root it cannot list fails the step (a missing root is skipped). The
+could-not-list arm has no self-test of its own (accepted residual): a persistent listing failure is caught pre-suite,
+because the self-test's probes go unnamed. It reports and never deletes (a leftover can be a registry link, and a
+tree delete follows links), so a key orphaned by a cancelled job stays as a warning in later jobs until a human
+removes it.
+
+Removing a leftover is the job of whoever owns the runner. For each `YuzuTest-*` key whose run is no longer in
+progress, open the key with `REG_OPTION_OPEN_LINK` and `DELETE` access, then call `NtDeleteKey` on that handle (a key
+with subkeys: delete them first, leaf first, the same way). Never use `Remove-Item -Recurse` or `RegDeleteTreeW`:
+both follow a registry link and can delete its target.
 
 `nightly.yml`'s `windows-asan` job now joins this same `with-test-slot.sh 2`
 gate and carries `--timeout-multiplier 2` (#4018) — previously it ran

@@ -959,15 +959,6 @@ inline bool form_value_supplied(const std::string& body, const std::string& key)
     return false;
 }
 
-/// Extract plugin name from a command_id string (format: "plugin-timestamp").
-inline std::string extract_plugin(const std::string& command_id) {
-    auto dash = command_id.find('-');
-    if (dash != std::string::npos) {
-        return command_id.substr(0, dash);
-    }
-    return command_id;
-}
-
 // ============================================================================
 // Time formatting and now-epoch — used by the executions surface and the TAR
 // dashboard. Both surfaces standardise on UTC; relative time goes in the cell
