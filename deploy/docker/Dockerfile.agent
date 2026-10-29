@@ -33,7 +33,10 @@ ENV VCPKG_ROOT=/opt/vcpkg
 
 WORKDIR /src
 COPY vcpkg.json vcpkg-configuration.json ./
-RUN /opt/vcpkg/vcpkg install --triplet ${TRIPLET} --x-manifest-root=.
+# Agent-only: the meson configure below is -Dbuild_server=false -Dbuild_tests=false,
+# so opt out of vcpkg.json's default `server` + `tests` features (libpq, xmlsec,
+# drogon, catch2). Add --x-feature=agent here once that feature has content.
+RUN /opt/vcpkg/vcpkg install --triplet ${TRIPLET} --x-manifest-root=. --x-no-default-features
 
 COPY . .
 # LTO is intentionally OFF for the agent: linking the executable across the

@@ -62,11 +62,15 @@ COPY vcpkg.json vcpkg-configuration.json ./
 # buildtrees/vcpkg-running.lock, so a shared (default) mount makes the second
 # arch fail with "failed to take lock ... Device or resource busy". `locked`
 # serialises the two vcpkg installs against this mount instead.
+#
+# Agent-only: the meson configure below is -Dbuild_server=false -Dbuild_tests=false,
+# so --x-no-default-features opts out of vcpkg.json's default `server` + `tests`
+# features (libpq, xmlsec, drogon, catch2). Add --x-feature=agent once it has content.
 RUN --mount=type=cache,target=/opt/vcpkg/buildtrees,sharing=locked \
     --mount=type=cache,target=/opt/vcpkg/downloads \
     --mount=type=cache,target=/root/.cache/vcpkg \
     T="${TRIPLET:-$(case "$TARGETARCH" in arm64) echo arm64-linux;; *) echo x64-linux;; esac)}"; \
-    /opt/vcpkg/vcpkg install --triplet "$T" --x-manifest-root=.
+    /opt/vcpkg/vcpkg install --triplet "$T" --x-manifest-root=. --x-no-default-features
 
 ENV CC="ccache gcc-13" \
     CXX="ccache g++-13" \

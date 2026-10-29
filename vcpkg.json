@@ -21,26 +21,42 @@
     "cli11",
     "cpp-httplib",
     "sqlite3",
-    {
-      "name": "libpq",
-      "default-features": false,
-      "features": ["openssl"]
-    },
     "openssl",
-    {
-      "name": "catch2",
-      "platform": "x64 | arm64"
-    },
     {
       "name": "libxml2",
       "default-features": false
-    },
-    "xmlsec",
-    "zlib",
-    {
-      "name": "drogon",
-      "default-features": false
     }
   ],
+  "default-features": ["server", "tests"],
+  "features": {
+    "server": {
+      "description": "Dependencies of server/core only; agent-only builds opt out with --x-no-default-features",
+      "dependencies": [
+        {
+          "name": "libpq",
+          "default-features": false,
+          "features": ["openssl"]
+        },
+        "xmlsec",
+        "zlib",
+        {
+          "name": "drogon",
+          "default-features": false
+        }
+      ]
+    },
+    "agent": {
+      "description": "Agent-only dependencies (none today; placeholder so a future agent-only port has a home)"
+    },
+    "tests": {
+      "description": "Unit-test dependencies (-Dbuild_tests=true)",
+      "dependencies": [
+        {
+          "name": "catch2",
+          "platform": "x64 | arm64"
+        }
+      ]
+    }
+  },
   "overrides": []
 }

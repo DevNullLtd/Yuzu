@@ -8,7 +8,23 @@
 #     | vcpkg-configuration.json
 #     | triplets/<triplet>.cmake     (when an overlay exists; otherwise empty)
 #     | $VCPKG_COMMIT                (vcpkg baseline pinned in CI env)
+#     | profile=<profile>            (only when the optional 2nd arg is given)
 #   )
+#
+# Usage: vcpkg-triplet-sentinel.sh <triplet> [profile]
+#
+# `profile` names the feature selection the caller's `vcpkg install` uses, and
+# a caller that installs anything other than the DEFAULT feature set MUST pass
+# it (e.g. `agent-only` for `--x-no-default-features`). vcpkg.json declares
+# `server` and `tests` as default features, so an agent-only install and a full
+# install of the SAME triplet produce different trees at the SAME path
+# (vcpkg_installed/<triplet>/). Without the profile in the key the two collide:
+# a runner (or a GHA cache entry) holding the other shape would match, and
+# either keep a tree missing the server ports or skip its own save on an
+# exact hit and leave the wrong shape in place for good. The sentinel file name
+# stays triplet-only on purpose (there is ONE tree per triplet), so flipping
+# profile is a key drift that wipes and re-installs. Omitting the argument
+# hashes exactly what it did before, i.e. the default (full) profile.
 #
 # Scope of action on key drift:
 #   - rm -rf vcpkg_installed/<triplet>/         (the per-triplet install root)
@@ -39,13 +55,14 @@ set -uo pipefail
 # error checks instead.
 
 # Self-identify so the next failure isn't a 0-byte log line.
-echo "vcpkg-triplet-sentinel.sh: starting (triplet=${1:-?}, GITHUB_WORKSPACE=${GITHUB_WORKSPACE:-<unset>})"
+echo "vcpkg-triplet-sentinel.sh: starting (triplet=${1:-?}, profile=${2:-<default>}, GITHUB_WORKSPACE=${GITHUB_WORKSPACE:-<unset>})"
 
 if [[ $# -lt 1 ]]; then
-  echo "usage: $0 <triplet>" >&2
+  echo "usage: $0 <triplet> [profile]" >&2
   exit 2
 fi
 TRIPLET="$1"
+PROFILE="${2:-}"
 
 WS="${GITHUB_WORKSPACE:-$(pwd)}"
 # On MSYS2 Windows GITHUB_WORKSPACE arrives as 'C:\actions-runner\...'
@@ -88,7 +105,14 @@ echo "vcpkg-triplet-sentinel.sh: inputs=${inputs[*]}"
 # cache (correct: ports may have changed even if our manifest didn't).
 baseline="${VCPKG_COMMIT:-unset}"
 
-if ! want=$( { sha256sum "${inputs[@]}" && printf '%s\n' "$baseline"; } | sha256sum | awk '{print $1}'); then
+# The optional install profile rides in the same digest line as the baseline so
+# the no-profile (default/full) key is byte-identical to the pre-profile key.
+keyed_tail="$baseline"
+if [[ -n "$PROFILE" ]]; then
+  keyed_tail="${baseline}"$'\n'"profile=${PROFILE}"
+fi
+
+if ! want=$( { sha256sum "${inputs[@]}" && printf '%s\n' "$keyed_tail"; } | sha256sum | awk '{print $1}'); then
   echo "::error::sha256sum pipeline failed" >&2
   exit 2
 fi
@@ -111,6 +135,7 @@ if [[ "$want" != "$have" ]]; then
   echo "vcpkg sentinel drift for triplet=${TRIPLET}"
   echo "  inputs:   ${inputs[*]}"
   echo "  baseline: ${baseline}"
+  echo "  profile:  ${PROFILE:-<default>}"
   echo "  have=${have:-<none>}"
   echo "  want=${want}"
   if [[ -d "$installed_dir" ]]; then

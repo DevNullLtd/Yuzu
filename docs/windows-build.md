@@ -15,6 +15,17 @@ The gateway's Erlang/OTP needs no activation step: Meson resolves the pinned rel
 
 **Python for build scripts:** every Meson target that runs a repo script uses the interpreter running Meson itself (`yuzu_python` in the root `meson.build`), i.e. the native `C:\Python314` of the runner contract. A bare `python3` under MSYS2 bash is MSYS2's `/usr/bin/python3`, which cannot open the `C:/` paths Meson passes and made every script test fail in ~0.04s.
 
+## Agent-only vcpkg install
+
+`vcpkg.json` defaults to the `server` and `tests` features (libpq, xmlsec, zlib, drogon, catch2), so a plain `vcpkg install --triplet x64-windows --x-manifest-root=.` is unchanged. An agent-only Windows build opts out and skips them (`libpq` is a from-source PostgreSQL build, `drogon` pulls trantor and jsoncpp):
+
+```bash
+vcpkg install --triplet x64-windows --x-manifest-root=. --x-no-default-features
+vcpkg install --triplet x64-windows --x-manifest-root=. --x-no-default-features --x-feature=tests  # + -Dbuild_tests=true
+```
+
+Neither form touches `triplets/x64-windows.cmake` or the hand-wired grpc/protobuf/abseil branch (#375). `zlib` is still installed as a grpc dependency, which the `_libzlib` find_library in the root `meson.build` needs. `vcpkg_installed/x64-windows` is one tree shared by every Windows job on a runner, so a job that opts out must pass an install profile to `scripts/ci/vcpkg-triplet-sentinel.sh x64-windows <profile>`, or the next default-profile job inherits a tree without libpq/drogon. Details: `docs/build-guide.md` "Dependency features". Not yet exercised on a native Windows runner as of this change.
+
 ## Toolchain paths
 
 All paths are configured by `setup_msvc_env.sh`. Do **not** use Clang (`C:\Program Files\LLVM\bin`) — must use cl.exe / MSVC.
