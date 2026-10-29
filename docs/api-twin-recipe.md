@@ -59,9 +59,9 @@ a review question into a compile-time impossibility.
 `build_permissions_catalog`, `build_instructions_catalog`, `build_routes_catalog`,
 `scope_kinds_catalog`, `plugin_docs_catalog`, `build_plugins_catalog` — each taking only the
 store/registry it needs and returning a `DiscoveryDoc { std::string json; std::string etag; }`.
-`DiscoveryDoc` and the one store-free builder, `build_routes_catalog`, are declared in
-`server/core/src/discover_catalog_types.hpp`, which `discover_routes.hpp` re-includes; the other
-five stay in `discover_routes.hpp`. The file header states the intent explicitly:
+`DiscoveryDoc` and the one builder declared outside `discover_routes.hpp`, `build_routes_catalog`,
+are declared in `server/core/src/discover_catalog_types.hpp`, which `discover_routes.hpp`
+re-includes; the other five stay in `discover_routes.hpp`. The file header states the intent explicitly:
 
 > "The six builder functions (`build_*_catalog`) are pure — no I/O beyond reading the
 > store/registry pointer passed in — and are declared here specifically so `mcp_server.cpp` can
