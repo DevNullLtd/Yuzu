@@ -784,9 +784,13 @@ TEST_CASE("mcp crypto tools: an unwired provider is an internal error, never an 
             if (tool == "list_crypto_widgets")
                 continue; // reads only the access closure
             INFO(tool);
+            t.clear_audit();
             const json r = t.call(tool, args_for(tool));
             REQUIRE(r.contains("error"));
             CHECK(r["error"]["code"] == mcp::kInternalError);
+            // Every unwired answer leaves the generic failure row (the registry seam contract).
+            CHECK(audit_count(t.generic_rows, "mcp." + tool + "|failure") == 1);
+            CHECK(audit_count(t.generic_rows, "mcp." + tool + "|success") == 0);
         }
         CHECK(audit_count(t.generic_rows, "mcp.get_crypto_libraries|success") == 0);
         CHECK(audit_count(t.domain_rows, "crypto.dashboard.layout.update|attempted|CryptoDashboard|tester") == 0);
@@ -799,9 +803,27 @@ TEST_CASE("mcp crypto tools: an unwired provider is an internal error, never an 
         for (const char* tool : {"get_crypto_libraries", "list_crypto_library_devices", "export_crypto_cbom",
                                  "get_crypto_ca_stats"}) {
             INFO(tool);
+            t.clear_audit();
             const json r = t.call(tool, args_for(tool));
             REQUIRE(r.contains("error"));
             CHECK(r["error"]["code"] == mcp::kInternalError);
+            CHECK(audit_count(t.generic_rows, std::string("mcp.") + tool + "|failure") == 1);
+        }
+        CHECK(t.api->calls() == 0);
+    }
+    SECTION("no audit sink: the four domain-row readers fail closed instead of succeeding row-less") {
+        Twin::Opts o;
+        o.wire_audit = false;
+        Twin t(o);
+        for (const char* tool : {"get_crypto_libraries", "list_crypto_library_devices", "export_crypto_cbom",
+                                 "get_crypto_ca_stats"}) {
+            INFO(tool);
+            t.clear_audit();
+            const json r = t.call(tool, args_for(tool));
+            REQUIRE(r.contains("error"));
+            CHECK(r["error"]["code"] == mcp::kInternalError);
+            CHECK(audit_count(t.generic_rows, std::string("mcp.") + tool + "|failure") == 1);
+            CHECK(audit_count(t.generic_rows, std::string("mcp.") + tool + "|success") == 0);
         }
         CHECK(t.api->calls() == 0);
     }
@@ -813,6 +835,7 @@ TEST_CASE("mcp crypto tools: an unwired provider is an internal error, never an 
         REQUIRE(r.contains("error"));
         CHECK(r["error"]["code"] == mcp::kInternalError);
         CHECK(audit_count(t.generic_rows, "mcp.list_crypto_widgets|success") == 0);
+        CHECK(audit_count(t.generic_rows, "mcp.list_crypto_widgets|failure") == 1);
     }
     SECTION("no username closure: the layout tools fail closed and write nothing") {
         Twin::Opts o;
@@ -820,9 +843,11 @@ TEST_CASE("mcp crypto tools: an unwired provider is an internal error, never an 
         Twin t(o);
         for (const char* tool : {"get_crypto_dashboard_layout", "set_crypto_dashboard_layout"}) {
             INFO(tool);
+            t.clear_audit();
             const json r = t.call(tool, args_for(tool));
             REQUIRE(r.contains("error"));
             CHECK(r["error"]["code"] == mcp::kInternalError);
+            CHECK(audit_count(t.generic_rows, std::string("mcp.") + tool + "|failure") == 1);
         }
         CHECK(t.api->layout_reads.empty());
         CHECK(t.api->layout_writes.empty());

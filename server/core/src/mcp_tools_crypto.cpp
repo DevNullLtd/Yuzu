@@ -39,12 +39,16 @@
 // Inventory:Read gate for the four tools that have one (the three confined reads and
 // get_crypto_ca_stats).
 //
-// Unwired posture, deliberately the LEGACY one and not the siblings' (hardware / containment use
-// `answer_unwired`: an A4 envelope plus a generic failure row): an unwired provider, a missing
-// audit sink or an unresolvable username answers a bare `error_response(kInternalError, ...)` and
-// writes no `mcp.<tool>` row, exactly as the legacy branches did. The layout write is the exception
-// for two refusals, which do leave a generic failure row: an unresolvable username, and a failed
-// "attempted" audit row. Its missing-audit-sink refusal stays bare and writes no row.
+// Unwired posture, the siblings' (hardware / containment): an unwired provider, a missing audit
+// sink or an unresolvable username answers `answer_unwired` (a non-retryable A4 internal error)
+// and writes the generic failure row, so every call leaves an `mcp.<tool>` row (the registry seam
+// test, test_mcp_server.cpp, requires it). The legacy branches answered a bare
+// `error_response(kInternalError, ...)` with no row; that is a change. The four tools that write
+// a domain audit row (the three confined reads and get_crypto_ca_stats) now also refuse when
+// `audit_fn` is unwired, because `try_persist_audit` would otherwise call an empty sink
+// "persisted" and the read would succeed with no `crypto.*.view` row. A caller-input refusal
+// (strict arguments, a bad cursor) likewise leaves an `mcp.<tool>|denied` row, as the hardware
+// tools do; the legacy branches wrote none.
 //
 // Also changed, and not visible in a response when it succeeds: a domain audit row goes through
 // `detail::try_persist_audit`, so a throwing audit sink is caught (the layout write's "attempted"
@@ -61,7 +65,7 @@
 #include "mcp_jsonrpc.hpp"             // kInternalError, kInvalidParams, kPermissionDenied, success_response, error_response
 #include "mcp_retry.hpp"               // kMcpStoreFaultRetryMs, kCryptoPoolTooSmallRemedy
 #include "mcp_tool_deps.hpp"           // ToolDeps
-#include "mcp_tool_helpers.hpp"        // answer (shared by the registry files)
+#include "mcp_tool_helpers.hpp"        // answer, answer_unwired (shared by the registry files)
 #include "rest_audit.hpp"              // detail::try_persist_audit (the shared audit kernel)
 
 #include <yuzu/version.hpp> // kVersionString - the CBOM metadata tool version
@@ -121,9 +125,17 @@ std::string layout_failure_tag(const CryptoReadError& e) {
     return e.cause == CryptoReadCause::kCapacity ? "outcome=busy" : "outcome=degraded";
 }
 
-/// A caller-input refusal: a bare JSON-RPC -32602, never retryable.
-void refuse_params(const ToolCallContext& ctx, const std::string& message) {
+/// A caller-input refusal: a bare JSON-RPC -32602, never retryable. Writes no row: for a refusal
+/// that already left its own failure row (a store-reported invalid input after the read).
+void answer_invalid_params(const ToolCallContext& ctx, const std::string& message) {
     answer(ctx, error_response(ctx.id, kInvalidParams, message)); // retry-hint-exempt: caller-input rejection
+}
+
+/// A caller-input refusal judged before any row exists: the same bare -32602, plus the generic
+/// `mcp.<tool>|denied` row every registry call leaves (hardware / containment precedent).
+void refuse_params(const ToolCallContext& ctx, const std::string& message) {
+    (void)ctx.audit("denied", "invalid arguments: " + message);
+    answer_invalid_params(ctx, message);
 }
 
 /// The generic mcp.<tool> row, written the way the legacy branches' `mcp_audit` lambda wrote it.
@@ -147,10 +159,10 @@ bool domain_row(const ToolCallContext& ctx, const char* verb, const std::string&
 // ── get_crypto_libraries ──────────────────────────────────────────────────────────────────
 void handle_get_crypto_libraries(const ToolCallContext& ctx) {
     namespace cl = crypto_library;
-    if (ctx.deps == nullptr || !ctx.deps->fleet_read_fn) {
-        spdlog::error("get_crypto_libraries: fleet_read_fn unwired — misconfigured call site; "
-                      "failing closed");
-        answer(ctx, error_response(ctx.id, kInternalError, "service unavailable"));
+    if (ctx.deps == nullptr || !ctx.deps->fleet_read_fn || !ctx.deps->audit_fn) {
+        answer_unwired(ctx, "service unavailable", "crypto provider unwired", {},
+                       "get_crypto_libraries: fleet_read_fn or audit_fn unwired - misconfigured call site; "
+                       "failing closed");
         return;
     }
     auto gate = ctx.deps->fleet_read_fn(ctx.req, ctx.res, "Inventory", "Read");
@@ -162,7 +174,7 @@ void handle_get_crypto_libraries(const ToolCallContext& ctx) {
         return;
     }
     if (!ctx.deps->crypto_library_summary_fn) {
-        answer(ctx, error_response(ctx.id, kInternalError, "Crypto library data unavailable"));
+        answer_unwired(ctx, "Crypto library data unavailable", "crypto library provider unwired");
         return;
     }
     const auto parsed =
@@ -213,10 +225,10 @@ void handle_get_crypto_libraries(const ToolCallContext& ctx) {
 // ── list_crypto_library_devices ───────────────────────────────────────────────────────────
 void handle_list_crypto_library_devices(const ToolCallContext& ctx) {
     namespace cl = crypto_library;
-    if (ctx.deps == nullptr || !ctx.deps->fleet_read_fn) {
-        spdlog::error("list_crypto_library_devices: fleet_read_fn unwired — misconfigured call "
-                      "site; failing closed");
-        answer(ctx, error_response(ctx.id, kInternalError, "service unavailable"));
+    if (ctx.deps == nullptr || !ctx.deps->fleet_read_fn || !ctx.deps->audit_fn) {
+        answer_unwired(ctx, "service unavailable", "crypto provider unwired", {},
+                       "list_crypto_library_devices: fleet_read_fn or audit_fn unwired - "
+                       "misconfigured call site; failing closed");
         return;
     }
     auto gate = ctx.deps->fleet_read_fn(ctx.req, ctx.res, "Inventory", "Read");
@@ -227,7 +239,7 @@ void handle_list_crypto_library_devices(const ToolCallContext& ctx) {
         return;
     }
     if (!ctx.deps->crypto_library_devices_fn) {
-        answer(ctx, error_response(ctx.id, kInternalError, "Crypto library data unavailable"));
+        answer_unwired(ctx, "Crypto library data unavailable", "crypto library provider unwired");
         return;
     }
     const auto parsed = cl::parse_devices_params(
@@ -281,10 +293,10 @@ void handle_list_crypto_library_devices(const ToolCallContext& ctx) {
 // get_crypto_libraries) so the retry-hint CI gate inspects it.
 void handle_export_crypto_cbom(const ToolCallContext& ctx) {
     namespace cl = crypto_library;
-    if (ctx.deps == nullptr || !ctx.deps->fleet_read_fn) {
-        spdlog::error("export_crypto_cbom: fleet_read_fn unwired - misconfigured call site; "
-                      "failing closed");
-        answer(ctx, error_response(ctx.id, kInternalError, "service unavailable"));
+    if (ctx.deps == nullptr || !ctx.deps->fleet_read_fn || !ctx.deps->audit_fn) {
+        answer_unwired(ctx, "service unavailable", "crypto provider unwired", {},
+                       "export_crypto_cbom: fleet_read_fn or audit_fn unwired - misconfigured call site; "
+                       "failing closed");
         return;
     }
     auto gate = ctx.deps->fleet_read_fn(ctx.req, ctx.res, "Inventory", "Read");
@@ -298,7 +310,7 @@ void handle_export_crypto_cbom(const ToolCallContext& ctx) {
         return;
     }
     if (!ctx.deps->crypto_library_summary_fn) {
-        answer(ctx, error_response(ctx.id, kInternalError, "Crypto library data unavailable"));
+        answer_unwired(ctx, "Crypto library data unavailable", "crypto library provider unwired");
         return;
     }
     const auto parsed =
@@ -381,9 +393,9 @@ void handle_list_crypto_widgets(const ToolCallContext& ctx) {
         return;
     }
     if (ctx.deps == nullptr || !ctx.deps->crypto_access_fn) {
-        spdlog::error("list_crypto_widgets: crypto_access_fn unwired — misconfigured call site; "
-                      "failing closed");
-        answer(ctx, error_response(ctx.id, kInternalError, "service unavailable"));
+        answer_unwired(ctx, "service unavailable", "crypto access provider unwired", {},
+                       "list_crypto_widgets: crypto_access_fn unwired - misconfigured call site; "
+                       "failing closed");
         return;
     }
     cw::AccessMemo access([&](cw::WidgetGate g, std::string_view s, std::string_view o) {
@@ -402,7 +414,7 @@ void handle_get_crypto_dashboard_layout(const ToolCallContext& ctx) {
         return;
     }
     if (ctx.deps == nullptr || !ctx.deps->crypto_dashboard_layout_fn) {
-        answer(ctx, error_response(ctx.id, kInternalError, "Crypto dashboard layout unavailable"));
+        answer_unwired(ctx, "Crypto dashboard layout unavailable", "crypto layout provider unwired");
         return;
     }
     // The layout is keyed on the caller's session username. The registry path carries no
@@ -412,9 +424,9 @@ void handle_get_crypto_dashboard_layout(const ToolCallContext& ctx) {
     // the answer is a non-retryable "service unavailable".
     const auto user = ctx.deps->username_fn ? ctx.deps->username_fn(ctx.req) : std::nullopt;
     if (!user || user->empty()) { // an empty name is refused here, not by the store after a row
-        spdlog::error("get_crypto_dashboard_layout: the caller's username could not be resolved "
-                      "— failing closed");
-        answer(ctx, error_response(ctx.id, kInternalError, "service unavailable"));
+        answer_unwired(ctx, "service unavailable", "caller identity unresolved", {},
+                       "get_crypto_dashboard_layout: the caller's username could not be resolved "
+                       "- failing closed");
         return;
     }
     // Non-retryable answers (caller input, a corrupt stored layout) go through this helper so
@@ -423,7 +435,7 @@ void handle_get_crypto_dashboard_layout(const ToolCallContext& ctx) {
         if (e.kind == CryptoReadError::Kind::kCorrupt)
             answer(ctx, ctx.a4_error(kInternalError, e.message, "call set_crypto_dashboard_layout with expected_version=" + std::to_string(e.version) + " to replace it", -1, {}, true)); // retry-hint-exempt: stored-state defect, retrying reads it again
         else
-            refuse_params(ctx, e.message);
+            answer_invalid_params(ctx, e.message);
     };
     auto read = ctx.deps->crypto_dashboard_layout_fn(*user);
     if (!read) {
@@ -460,25 +472,24 @@ void handle_set_crypto_dashboard_layout(const ToolCallContext& ctx) {
         return;
     }
     if (ctx.deps == nullptr || !ctx.deps->crypto_set_dashboard_layout_fn) {
-        answer(ctx, error_response(ctx.id, kInternalError, "Crypto dashboard layout unavailable"));
+        answer_unwired(ctx, "Crypto dashboard layout unavailable", "crypto layout provider unwired");
         return;
     }
     // "No audit row, no mutation" needs a sink to write the row to. try_persist_audit would call
     // an empty sink "persisted", so an unwired one is refused here instead (the legacy branch
     // threw on an empty sink, before the write). Production always wires it.
     if (!ctx.deps->audit_fn) {
-        spdlog::error("set_crypto_dashboard_layout: audit_fn unwired - misconfigured call site; "
-                      "failing closed, layout not changed");
-        answer(ctx, error_response(ctx.id, kInternalError, "service unavailable"));
+        answer_unwired(ctx, "service unavailable", "audit sink unwired; layout not changed", {},
+                       "set_crypto_dashboard_layout: audit_fn unwired - misconfigured call site; "
+                       "failing closed, layout not changed");
         return;
     }
     const auto resolved = ctx.deps->username_fn ? ctx.deps->username_fn(ctx.req) : std::nullopt;
     if (!resolved || resolved->empty()) { // refused BEFORE the "attempted" row: it would name no one
-        spdlog::error("set_crypto_dashboard_layout: the caller's username could not be resolved "
-                      "— failing closed, layout not changed");
-        // A refused destructive call leaves a row, not only a log line.
-        mcp_row(ctx, "failure", "caller identity unresolved; layout not changed");
-        answer(ctx, error_response(ctx.id, kInternalError, "service unavailable"));
+        // A refused destructive call leaves a row (answer_unwired writes it), not only a log line.
+        answer_unwired(ctx, "service unavailable", "caller identity unresolved; layout not changed", {},
+                       "set_crypto_dashboard_layout: the caller's username could not be resolved "
+                       "- failing closed, layout not changed");
         return;
     }
     const std::string& user = *resolved;
@@ -504,7 +515,7 @@ void handle_set_crypto_dashboard_layout(const ToolCallContext& ctx) {
         else if (e.kind == CryptoReadError::Kind::kCorrupt)
             answer(ctx, ctx.a4_error(kInternalError, e.message, "save again with expected_version=" + std::to_string(e.version) + " to replace it", -1, {}, true)); // retry-hint-exempt: stored-state defect, the same call fails identically
         else
-            refuse_params(ctx, e.message);
+            answer_invalid_params(ctx, e.message);
     };
     auto wrote = ctx.deps->crypto_set_dashboard_layout_fn(user, lr.widgets, lr.expected_version);
     if (!wrote) {
@@ -541,10 +552,10 @@ void handle_set_crypto_dashboard_layout(const ToolCallContext& ctx) {
 
 void handle_get_crypto_ca_stats(const ToolCallContext& ctx) {
     namespace cw = crypto_widgets;
-    if (ctx.deps == nullptr || !ctx.deps->fleet_read_fn) {
-        spdlog::error("get_crypto_ca_stats: fleet_read_fn unwired — misconfigured call site; "
-                      "failing closed");
-        answer(ctx, error_response(ctx.id, kInternalError, "service unavailable"));
+    if (ctx.deps == nullptr || !ctx.deps->fleet_read_fn || !ctx.deps->audit_fn) {
+        answer_unwired(ctx, "service unavailable", "crypto provider unwired", {},
+                       "get_crypto_ca_stats: fleet_read_fn or audit_fn unwired - misconfigured call site; "
+                       "failing closed");
         return;
     }
     auto gate = ctx.deps->fleet_read_fn(ctx.req, ctx.res, "Inventory", "Read");
@@ -564,8 +575,8 @@ void handle_get_crypto_ca_stats(const ToolCallContext& ctx) {
         return;
     }
     if (!ctx.deps->crypto_ca_stats_fn) {
-        answer(ctx, error_response(ctx.id, kInternalError,
-                                   "Yuzu-issued certificate data unavailable"));
+        answer_unwired(ctx, "Yuzu-issued certificate data unavailable",
+                       "crypto ca stats provider unwired");
         return;
     }
     auto read = ctx.deps->crypto_ca_stats_fn(std::nullopt);
