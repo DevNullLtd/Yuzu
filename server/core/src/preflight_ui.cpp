@@ -157,12 +157,14 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
     // Tabs: the flow (default) and the read-only deployments list. Both anchors carry an
     // href so they stay focusable and Enter-activatable; the Deployments href sets the hash
     // natively (htmx leaves a fragment href alone) so #deployments deep-links.
+    // hx-sync=replace, not drop: the list read is unaudited and capped, and a hung request
+    // must not swallow every later click (drop ignores them until the stuck XHR settles).
     h += "<div class=\"tabs\" id=\"auto-tabs\" role=\"tablist\">"
          "<a href=\"#\" role=\"tab\" class=\"on\" aria-selected=\"true\" "
          "onclick=\"pfTab('flow');return false\">Pre-flight and deploy</a>"
          "<a href=\"#deployments\" role=\"tab\" aria-selected=\"false\" "
          "hx-get=\"/fragments/auto/deployments\" hx-target=\"#auto-list\" hx-swap=\"innerHTML\" "
-         "hx-sync=\"this:drop\" onclick=\"pfTab('list')\">Deployments</a></div>";
+         "hx-sync=\"this:replace\" onclick=\"pfTab('list')\">Deployments</a></div>";
     h += "<div id=\"auto-flow\">";
     h += "<div class=\"af-note\">"
          "Configure the checks (parameters + thresholds), run across a cohort, and get a go/no-go "
@@ -277,7 +279,8 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
     // htmx.ajax directly rather than clicking the anchor.
     h += "<script>window.pfTab=function(w){var f=document.getElementById('auto-flow'),"
          "d=document.getElementById('auto-deployments');if(!f||!d)return;f.hidden=(w!=='flow');"
-         "d.hidden=(w!=='list');document.querySelectorAll('#auto-tabs a').forEach(function(a,i){"
+         "d.hidden=(w!=='list');if(w==='list'){var x=document.getElementById('auto-detail');"
+         "if(x)x.innerHTML='';}document.querySelectorAll('#auto-tabs a').forEach(function(a,i){"
          "var on=(i===(w==='flow'?0:1));a.classList.toggle('on',on);"
          "a.setAttribute('aria-selected',on?'true':'false');});"
          "if(w==='flow'&&location.hash==='#deployments')history.replaceState(null,'',"

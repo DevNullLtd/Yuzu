@@ -797,7 +797,10 @@ TEST_CASE("preflight ui: /auto renders the Deployments tab strip, panels, refusa
     CHECK(contains(h, "<a href=\"#\" role=\"tab\" class=\"on\" aria-selected=\"true\""));
     CHECK(contains(h, "<a href=\"#deployments\" role=\"tab\" aria-selected=\"false\" "
                       "hx-get=\"/fragments/auto/deployments\" hx-target=\"#auto-list\""));
-    CHECK(contains(h, "hx-sync=\"this:drop\""));
+    // replace, not drop: the list read is unaudited and capped, and a hung request must not
+    // wedge every later tab click (drop ignores clicks until the stuck XHR settles).
+    CHECK(contains(h, "hx-sync=\"this:replace\""));
+    CHECK_FALSE(contains(h, "this:drop"));
     // Tab wiring: the two onclick handlers and the pfTab switcher.
     CHECK(contains(h, "window.pfTab=function"));
     CHECK(contains(h, "onclick=\"pfTab('flow');return false\""));
@@ -807,6 +810,8 @@ TEST_CASE("preflight ui: /auto renders the Deployments tab strip, panels, refusa
     const auto verify = h.find("id=\"auto-verify\"");
     const auto panel = h.find("<div id=\"auto-deployments\" hidden>");
     REQUIRE(flow != std::string::npos);
+    REQUIRE(cfg != std::string::npos);
+    REQUIRE(verify != std::string::npos);
     REQUIRE(panel != std::string::npos);
     CHECK(flow < cfg);
     CHECK(verify < panel);

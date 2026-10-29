@@ -305,8 +305,10 @@ they never create a run or a deployment.
   A service-scoped token is denied under `deployment.list.view` / `deployment.detail.view`.
 
 - **Deployments tab** — on the Deployments page (`/auto`), the **Deployments** tab beside
-  **Pre-flight and deploy** lists your deployments from the last 14 days, newest first. Select a
-  deployment's name to see its device grid below the list. The tab is read-only: it never advances
+  **Pre-flight and deploy** lists your deployments from the last 14 days, newest first, up to the newest 50 (a notice says
+  when the list is cut). Select a deployment's name to see its device grid below the list; the grid
+  shows the first 500 devices, with a notice when there are more, and the counts above it stay
+  exact. The tab is read-only: it never advances
   a running deployment, so counts for a **Running** deployment are as of the last advance, and a
   running deployment advances only while its deploy results view (Pre-flight and deploy, then
   Deploy) is open. Reading the list and detail needs `SoftwareDeployment:Read`; without it the tab
