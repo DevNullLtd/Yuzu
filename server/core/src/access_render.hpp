@@ -21,7 +21,7 @@
 /// carries them as `data-denied` / `data-unavailable` attributes and `yuzu-access.js`
 /// builds its client-side boxes from those attributes.
 
-#include "fragment_states.hpp"
+#include "fragment_states.hpp" // access::Unavailable and access::NotFound live there
 #include "rbac_store.hpp"
 
 #include <yuzu/server/auth.hpp>

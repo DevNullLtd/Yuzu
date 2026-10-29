@@ -3,7 +3,7 @@
 #include "groups_render.hpp"
 
 #include "enrolment_render.hpp"
-#include "management_group_store.hpp"
+#include "management_group_store.hpp" // kRootGroupId; this .cpp is not an enrolled TU
 #include "web_utils.hpp"
 
 #include <algorithm>
