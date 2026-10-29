@@ -218,6 +218,7 @@ class SoftwareLicensingStore;
 class PluginConfigStore;
 class EnablementStore;
 class AppUsageStore;
+class CertificateInventoryStore;
 class ProductRegistryStore;
 class ProductPackStore;
 class ScimStore;
@@ -459,6 +460,7 @@ struct Deps {
     PluginConfigStore* plugin_config_store{nullptr};
     EnablementStore* enablement_store{nullptr}; // ADR-3006 (also a /healthz row)
     AppUsageStore* app_usage_store{nullptr}; // Wave 7 PR7.2 (gov Gate 3 sre HIGH finding)
+    CertificateInventoryStore* certificate_inventory_store{nullptr}; // slice-2 PR 2a-2a
     ProductRegistryStore* product_registry_store{nullptr};
     ProductPackStore* product_pack_store{nullptr};
     ScimStore* scim_store{nullptr};

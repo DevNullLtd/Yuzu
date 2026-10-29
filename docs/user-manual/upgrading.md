@@ -25,6 +25,18 @@ start**.
   routes in total), and RBAC now seeds a `RevocationSource` securable (Administrator only; see
   [RBAC](rbac.md)). Nothing is fetched yet: this release registers CRL sources only.
 
+## Behaviour change: a refused or unusable RHEL entitlement directory pauses the licence sync for that host
+
+**What changed.** This is an agent change on Linux. The `license_scan` plugin now reads `/etc/pki/entitlement` in-process instead of running `openssl x509`. `entitlement_certs` is an authoritative surface, so an error on it keeps the last good state and skips that day's `software_licensing` sync for the whole host: its RPM/dpkg, FlexLM and entitlement rows all stay at their last synced values until the cause is cleared. Three causes newly pause the sync. A directory the agent may not list is now `cert_permission_denied` (result status `PERMISSION_DENIED`); before, it read as an empty surface and the daily sync wiped the host's stored entitlement rows while the other rows kept syncing. A `.pem` larger than 64 KiB is now a parse failure for that file; the `openssl` runs parsed any size. A directory or file past the new scan limits also pauses it: more than 4,096 directory entries or 64 certificate files, or more than 16 certificates in one `.pem`; the scan also stops starting new files after 10 seconds, where it was 60. An unreadable, empty or unparseable `.pem` already paused the sync before this release.
+
+**Who is affected.** RHEL-family hosts where the agent account cannot list `/etc/pki/entitlement`, or where a `.pem` in it is oversized or junk. A host whose certificates are all readable, parse and are under 64 KiB each sees no pause. Whether the unprivileged agent can read the directory on a real RHEL host has not been measured, so check a RHEL host after the upgrade rather than assuming either answer.
+
+**First sync after the upgrade.** A Linux host with entitlement certificates sends its full rows once more, because its rows can change: they are now ordered by file name rather than directory order, and a `.pem` with several certificates yields one row per certificate (up to 16 per file) where the `openssl x509` runs read only the first. On macOS a bundle with a binary `Info.plist` now reports its display name and version where it reported the bundle name and an empty version.
+
+**What to do.** Run the `license_scan` plugin's `surfaces` action on a RHEL host and read the `probe_status|entitlement_certs|` line; remove the cause its token names. See [When the entitlement directory is refused](software-licensing.md#when-the-entitlement-directory-is-refused).
+
+**Rollback.** Rolling an agent back to an earlier build restores the silent wipe: a directory it cannot list reads as empty again and the next sync replaces the host's stored entitlement rows with nothing.
+
 ## New: leader-election metrics and alerts (HA WS-11, #4014)
 
 Additive; no behaviour change and no action is needed to keep a deployment working. Every server with a
@@ -647,9 +659,35 @@ spent or expired.
 **How to fix.** Pass an explicit `0` for `max_uses` and/or `ttl_hours` to keep the old
 unlimited/no-expiry behaviour, or size them to the rollout window and the number of machines.
 
+## Behaviour change: a new Postgres schema for the fleet certificate inventory, and an eighth decommission store
+
+The server now creates the Postgres schema `certificate_inventory_store` at boot (seven tables, no
+data until a certificate-collecting agent reports). The server's database role needs `CREATE` on the
+database, as for every other store; if the schema cannot be created the server refuses to start
+(fail-closed, ADR-0007). `/readyz` includes `certificate_inventory_store` once the server is up, so a degraded store after boot shows there.
+
+`DELETE /api/v1/sle/agents/{id}` now fans out across **eight** stores: the response's `stores` map
+gains a `certificate_inventory` key and `deleted` reaches 8 when every store is configured. During a
+rolling upgrade a replica that has not been upgraded runs the old cascade and returns `200` without
+that key; it did not erase certificate rows. Re-issue the DELETE once every replica is upgraded (the
+same advice as for the presence row, #5682). Erasure is not durable yet: a still-running agent
+repopulates its rows on its next report until the decommission tombstone ships in a later change.
+
+No agent sends `certificate_inventory` yet; agents start only once the server advertises that it
+accepts the source, in a separate later change. The server's gateway path (`ProxyInventory`) now
+stores such a blob in this typed store, exactly as the direct `ReportInventory` path does. The
+previous release discarded it there; releases before the typed-source read filter (see "Behaviour change: generic
+inventory reads never return a typed source's rows" below) stored it in the generic store, which that
+filter and the boot purge now exclude. It never reaches the generic inventory store.
+
+**Rolling back** leaves the `certificate_inventory_store` schema in the database; it is harmless to
+the older binary and is not read. Plan capacity before agents start reporting: DER is optional and
+bounded at 1 MiB per device, so a large fleet is storage- and WAL-heavy (see
+[Server administration](server-admin.md#fleet-certificate-inventory-storage)).
+
 ## Behaviour change: generic inventory reads never return a typed source's rows
 
-**What changed.** The generic inventory store's reads (`query_inventory`, `get_agent_inventory`, `list_inventory_tables` and their REST twins, `POST /api/v1/inventory/evaluate`, and the inventory-query result-set source) no longer return rows for the typed daily-sync sources: `installed_software`, `app_perf`, `device_ci`, `software_licensing`, `app_usage`, and the reserved `certificate_inventory`. Those sources have their own stores and gates. Before this change, a typed source's blob that reached the generic store through an older server's gateway path could be read there under `Infrastructure:Read` or `Inventory:Read` until the next boot purge removed it. That window is now closed on every server at this release or later (see the per-server note below). The gateway also drops a `certificate_inventory` blob, a source no agent sends yet, instead of storing it generically.
+**What changed.** The generic inventory store's reads (`query_inventory`, `get_agent_inventory`, `list_inventory_tables` and their REST twins, `POST /api/v1/inventory/evaluate`, and the inventory-query result-set source) no longer return rows for the typed daily-sync sources: `installed_software`, `app_perf`, `device_ci`, `software_licensing`, `app_usage`, and the reserved `certificate_inventory`. Those sources have their own stores and gates. Before this change, a typed source's blob that reached the generic store through an older server's gateway path could be read there under `Infrastructure:Read` or `Inventory:Read` until the next boot purge removed it. That window is now closed on every server at this release or later (see the per-server note below). A `certificate_inventory` blob, a source no agent sends yet, arriving through a gateway is stored only in the certificate inventory's own typed store (see the certificate inventory note above), never generically.
 
 **Who notices.** Only a caller that read one of those six source names from the generic store. Their data was never meant to be there. Use the typed surface instead, which is unchanged:
 
@@ -675,6 +713,16 @@ unlimited/no-expiry behaviour, or size them to the rollout window and the number
 **If a stored document is refused.** A later release that tightens validation can refuse a document an earlier release accepted. The server then serves the shipped defaults with a fault naming the field. Save the policy again through `PUT /api/v1/dex/score-policy` (the response to a `GET` of the policy shows the revision to send as `If-Match`). Nothing is migrated automatically.
 
 **No action on upgrade.** There is no schema change. No policy written by an earlier release exists to migrate (a row placed by a direct database write is read as any other document).
+
+## Behaviour change: the DEX score policy document gains model parameters and version 2
+
+**What changed.** The score policy can now set the per-device event cap, the regression full-weight and start ratios (each globally and per application) and the interval confidence level (globally). The canonical text stays version 1 and byte-identical, with the same revision, until one of them differs from its default (5, 3.0, 1.0, 0.95) or a per-application override sets one, even at the global value, because that pins the application. The writer then stores version 2, with a `model` object. A version 1 document that carries `model` is refused. With the defaults every score, interval and band is exactly what the previous release produced.
+
+**The rule.** A server on the previous release meets a version 2 document as `unsupported_version at version: 2 above the supported 1`. It scores under the shipped defaults with that fault on every Apps response and never applies part of the document. So do not set a model parameter during a rolling upgrade or rollback.
+
+While a version 2 document is stored, new and old replicas return different Apps figures. An older replica's `GET /api/v1/dex/score-policy` shows the shipped defaults, not the stored document, and a `PUT` or `DELETE` from it replaces the whole document. The audit row records the new document and the prior revision, not the replaced text, so keep a copy of the version 2 document (`GET` it from a current replica) before any such write. After a rollback, save the policy again without the model block first; `DELETE` only if resetting tiers and weights too is intended. The `unsupported_version` fault is described in [REST API](rest-api.md#get--put--delete-apiv1dexscore-policy).
+
+**No action on upgrade.** There is no schema change. A stored version 1 document stays valid and is read as before.
 
 ## ⚠️ Breaking: `POST` and `DELETE /api/v1/quarantine` now apply the dispatch approval check (#6065)
 
