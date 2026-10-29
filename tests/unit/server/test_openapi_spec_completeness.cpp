@@ -656,57 +656,57 @@ TEST_CASE("openapi_spec_json(): DexAppsList covers every population basis and th
     REQUIRE_FALSE(spec.is_discarded());
     REQUIRE(spec["components"]["schemas"].contains("DexAppsList"));
     const auto& list = spec["components"]["schemas"]["DexAppsList"];
-    const auto& props = list["properties"];
+    // A lookup by JSON pointer that yields null for a missing node: a regression that deletes part
+    // of the schema fails an assertion here instead of aborting the whole test binary.
+    const auto at = [&list](const std::string& ptr) {
+        return list.value(json::json_pointer(ptr), json());
+    };
+    const auto contains = [](const json& array, const json& v) {
+        return std::find(array.begin(), array.end(), v) != array.end();
+    };
 
-    // Every `<scope>_online` the builder can publish is inside the enum a client validates against.
-    REQUIRE(props.contains("population_basis"));
-    std::vector<std::string> enum_values;
-    for (const auto& v : props["population_basis"]["enum"])
-        enum_values.push_back(v.get<std::string>());
+    // The published population vocabulary is exactly the four values, and every `<scope>_online`
+    // the builder can publish is inside it.
+    const json basis_enum = at("/properties/population_basis/enum");
+    CHECK(basis_enum ==
+          json::array({"all_online", "windows_online", "macos_online", "linux_online"}));
     for (const char* scope : {yuzu::server::kDexAppsScopeAll, yuzu::server::kDexAppsScopeWindows,
-                              yuzu::server::kDexAppsScopeMacos, yuzu::server::kDexAppsScopeLinux}) {
-        const auto basis = yuzu::server::dex_apps_population_basis(scope);
-        CHECK(std::find(enum_values.begin(), enum_values.end(), basis) != enum_values.end());
-    }
+                              yuzu::server::kDexAppsScopeMacos, yuzu::server::kDexAppsScopeLinux})
+        CHECK(contains(basis_enum, json(yuzu::server::dex_apps_population_basis(scope))));
 
     // crash_source_coverage is always emitted, so it is a declared and required property, and its
     // schema is a closed object: the three platform keys, each exactly complete|partial.
-    REQUIRE(props.contains("crash_source_coverage"));
-    const auto& required = list["required"];
-    CHECK(std::find(required.begin(), required.end(), json("crash_source_coverage")) !=
-          required.end());
-    const auto& coverage = props["crash_source_coverage"];
+    CHECK(contains(at("/required"), json("crash_source_coverage")));
+    const std::string cov = "/properties/crash_source_coverage";
+    const json coverage = at(cov);
+    REQUIRE(coverage.is_object());
     CHECK(coverage.value("type", "") == "object");
     CHECK(coverage.value("additionalProperties", true) == false); // absent must fail, not assert
-    REQUIRE(coverage.contains("properties"));
-    CHECK(coverage["properties"].size() == 3);
-    for (const char* os : {"windows", "macos", "linux"}) {
-        REQUIRE(coverage["properties"].contains(os));
-        CHECK(coverage["properties"][os]["enum"] == json::array({"complete", "partial"}));
-    }
+    CHECK(at(cov + "/properties").size() == 3);
+    for (const char* os : {"windows", "macos", "linux"})
+        CHECK(at(cov + "/properties/" + os + "/enum") == json::array({"complete", "partial"}));
     // ... and it covers what the builder can publish under `all`.
     for (const auto& [os, value] :
-         yuzu::server::dex_apps_crash_source_coverage(yuzu::server::kDexAppsScopeAll)) {
-        REQUIRE(coverage["properties"].contains(os));
-        const auto& allowed = coverage["properties"][os]["enum"];
-        CHECK(std::find(allowed.begin(), allowed.end(), json(value)) != allowed.end());
-    }
+         yuzu::server::dex_apps_crash_source_coverage(yuzu::server::kDexAppsScopeAll))
+        CHECK(contains(at(cov + "/properties/" + os + "/enum"), json(value)));
 
     // The figures are no longer called Windows-only: each description the scope changed names the
     // platform scope and none says Windows (the default scope is every platform).
-    const auto scoped = [](const json& node) {
-        const std::string d = node.value("description", "");
-        return d.find("scope") != std::string::npos && d.find("Windows") == std::string::npos;
+    const auto scoped = [&at](const std::string& node) {
+        const json d = at(node + "/description");
+        if (!d.is_string())
+            return false;
+        const auto text = d.get<std::string>();
+        return text.find("scope") != std::string::npos && text.find("Windows") == std::string::npos;
     };
-    CHECK(scoped(list));
-    CHECK(scoped(props["population"]));
-    CHECK(scoped(props["apps_total"]));
-    CHECK(scoped(props["population_basis"]));
-    const auto& app_figures = props["apps"]["items"]["properties"];
-    const auto& version_figures = app_figures["versions"]["items"]["properties"];
+    CHECK(scoped(""));
+    CHECK(scoped("/properties/population"));
+    CHECK(scoped("/properties/apps_total"));
+    CHECK(scoped("/properties/population_basis"));
+    const std::string app = "/properties/apps/items/properties/";
     for (const char* key : {"crashes", "hangs", "distinct_devices"}) {
-        CHECK(scoped(app_figures[key]));
-        CHECK(scoped(version_figures[key]));
+        CHECK(scoped(app + key));
+        CHECK(scoped(app + "versions/items/properties/" + key));
     }
 }
 
