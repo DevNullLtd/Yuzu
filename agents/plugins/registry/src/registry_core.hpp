@@ -1004,7 +1004,7 @@ struct HiveFacts {
         wo = WriteOutcome{};
         // The audit reason and the closing `error|<token>` share the write tokens' space (key_not_found,
         // value_not_found, access_denied ...), so a hive outcome carries a hive_ prefix here: the bare not_found /
-        // mount_failed / file_refused that yuzu::profiles::hive_access_token spells for the autoruns and tar rows would
+        // mount_failed / file_refused that yuzu::profiles::hive_access_token spells for the autoruns and echo rows would
         // read as a key or value fact. The hive-access lines above are the shared sentences, unchanged.
         switch (hf.status) {
         case HiveAccessStatus::not_found: wo.reason = "hive_not_found"; break;

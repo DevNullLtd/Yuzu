@@ -778,7 +778,7 @@ must decide privacy before any slice-3 code is written. It must at least settle 
   - the data-processor obligations an engine takes on when it consumes this data (the
     ADR-0024 re-home note is the precedent).
 - **Collection mechanism.** Login evidence comes from logs: the sshd journal and auth logs,
-  and the Windows OpenSSH event log. That makes a TAR cursor source the likely collector,
+  and the Windows OpenSSH event log. That makes an Echo cursor source the likely collector,
   with its no-silent-replay contract. An `app_usage`-style daily-sync hand-off follows if
   the data is centralised at all. The slice-3 ADR must choose.
 
@@ -1039,16 +1039,15 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     `RegisterResponse` advertises `certificate_inventory_v1` (new field `repeated string
     server_capabilities = 9`), and the server advertises it only while its certificate store
     opened. Absent means never sent, so the gate fails closed and is stateless. The server
-    capability is planned for slice-2 PR 2a-2a and the agent gate for 2a-2e. Neither is on `dev`
-    (on 2026-10-28 `RegisterResponse` ends at field 8), so R17's closure depends on 2a-1 (PR
-    #6563) and 2a-2a merging, and on 2a-2e for the agent side. Not adopted: (a) accepting the
+    capability is planned for a separate slice-2 PR, 2a-2a-cap, and the agent gate for 2a-2e. Neither is on `dev`
+    (on 2026-10-28 `RegisterResponse` ends at field 8). 2a-1 (PR #6563) has merged, so R17's
+    closure depends on 2a-2a-cap merging, and on 2a-2e for the agent side. Not adopted: (a) accepting the
     window and closing it by deploy order (servers first, never roll back, a merge-order test
     and an `upgrading.md` note), because it relies on operators following an order nothing
     enforces and amends D12; (b) a reserved `__sync__` enable action persisted on the agent,
     because it adds a server-to-agent action and persistent agent state that a capability
     advertised on every registration makes unnecessary. Recorded as decision 8 in the Decisions
-    section of `docs/crypto-slice2-certificate-design.md`. As planned for 2a-2a (and implemented
-    on its unmerged branch), the gateway also enforces the capability per upstream connection
+    section of `docs/crypto-slice2-certificate-design.md`. As planned for 2a-2a-cap, the gateway also enforces the capability per upstream connection
     (record from `ProxyRegister`, strip for a connection without `certificate_inventory_v1`,
     fail closed for an unknown one, rate-limited re-probe for admitted sessions only). Accepted
     residual (owner, 2026-10-27): behind an L7 balancer that spreads one connection's requests
@@ -1057,7 +1056,10 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     below it while those agents report (the no-rollback condition: a rolled-back backend stores
     the blob in the generic store, readable under `Inventory:Read` and `Infrastructure:Read`,
     which under RBAC off (the default) any authenticated session holds, until that backend is
-    upgraded); SOC 2 risk register, review-by 2027-01-31. The SOC 2 risk entry is owed by 2a-2a.
+    upgraded); SOC 2 risk register, review-by 2027-01-31. The SOC 2 risk entry is owed by 2a-2a-cap.
+    Update 2026-10-28 (owner ruling): the capability and gateway enforcement moved from 2a-2a to a
+    separate PR that merges before 2a-2e, because `dev` replaced the gateway's grpcbox client; the
+    requirement is unchanged.
 - A capped or timed-out capture is reported `constrained`, and the report is never an
   empty success.
 - An empty blob is never sent for a failed or constrained capture (the ADR-0016

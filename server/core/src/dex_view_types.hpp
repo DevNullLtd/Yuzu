@@ -42,7 +42,7 @@ struct DexAgentResponse {
 };
 
 /// A4: dispatch a plugin command to specific agents (same 5-param shape as
-/// DashboardRoutes' DispatchFn). Used ONLY for the canned `tar.sql` device
+/// DashboardRoutes' DispatchFn). Used ONLY for the canned `echo.sql` device
 /// perf query. May be empty → the perf panel renders "unavailable".
 using DexDispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
     const std::string& plugin, const std::string& action,

@@ -317,7 +317,7 @@ misses short-lived connections — fatal for attack-path evidence and C2 detecti
 into flow summaries `(src, dst, port, proto, first_seen, last_seen, count)` (the
 Cilium/Hubble, Datadog-NPM pattern). Lossless on *existence* of a flow (all reachability
 needs) while keeping volume near today's poll volume. The summary history stays in the
-**agent's local SQLite warehouse** (TAR `tcp_live` precedent), retained, **not flushed** —
+**agent's local SQLite warehouse** (Echo `tcp_live` precedent), retained, **not flushed** —
 each box is a leaf of a distributed SQL warehouse the server queries on demand.
 
 **macOS plays a different graph role anyway.** Laptops are **entry points** (initial

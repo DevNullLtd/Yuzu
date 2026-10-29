@@ -59,7 +59,7 @@ constexpr Expected kTable[] = {
     {"Posture", "Compliance", "/compliance", "Check devices against policy and fix the ones that fail."},
     {"Posture", "Guardian", "/guardian", "Hold settings to the state you set and undo drift."},
     {"Posture", "DEX", "/dex", "See crashes, slow starts and noisy apps as users feel them."},
-    {"Posture", "TAR", "/tar", "A recorded history of what ran and connected on each device."},
+    {"Posture", "Echo", "/echo", "A recorded history of what ran and connected on each device."},
     {"Estate", "Devices", "/devices", "Every device, with tags and properties."},
     {"Estate", "Hardware", "/hardware", "CPU, memory, disks and firmware across the fleet."},
     {"Estate", "Software", "/software", "What is installed, how current it is, and roll out updates."},
@@ -348,7 +348,7 @@ TEST_CASE("landing: the family tokens and the landing block are in yuzu.css, wit
     const auto start = css.find("/* Home landing (delta 2026-10-14)");
     REQUIRE(start != std::string::npos);
     // Bounded at the next appended block so a later block's own rules are not scanned here.
-    const auto end = css.find("/* -- TAR timeline:", start);
+    const auto end = css.find("/* -- Echo timeline:", start);
     const std::string block = css.substr(start, end == std::string::npos ? std::string::npos : end - start);
     CHECK(count_of(block, "/* Home landing (delta 2026-10-14)") == 1);
     CHECK_THAT(block, ContainsSubstring("background: color-mix(in srgb, var(--fam) 10%, var(--surface));"));

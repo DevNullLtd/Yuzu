@@ -2,8 +2,8 @@
 
 /**
  * app_usage_parsers.hpp — pure sqlite seam for the app_usage plugin
- * (summary / last_used over TAR's usage_daily / usage_daily_user /
- * usage_live tables inside tar.db).
+ * (summary / last_used over Echo's usage_daily / usage_daily_user /
+ * usage_live tables inside echo.db).
  *
  * ALL SQL and formatting live here, taking an already-open `sqlite3*` — the
  * shell (app_usage_plugin.cpp) owns opening/closing the connection and
@@ -16,21 +16,21 @@
  * Reads allowed, and ONLY these: usage_daily, usage_daily_user
  * (COUNT(DISTINCT user) only — user names never leave SQLite),
  * `SELECT COUNT(*) FROM usage_live` (open-run count only — no pid/exe
- * column is ever selected from usage_live), and the named tar_config keys
- * below. Never TAR's raw process-event table or any command-line column —
+ * column is ever selected from usage_live), and the named echo_config keys
+ * below. Never Echo's raw process-event table or any command-line column —
  * a grep of the plugin sources for those two forbidden identifiers is a
  * test in its own right (test_app_usage_parsers.cpp).
  *
  * Time cutoffs (`since_day_ts`) are computed by the shell and injected in —
- * this header never reads the system clock, matching tar_usage.hpp's own
+ * this header never reads the system clock, matching echo_usage.hpp's own
  * `now`-injection shape (apply_event/expire_open_runs) so every query is
  * driven off values the fixture tests fully control.
  *
  * RETENTION (adjudication P3, binding): `first_seen`/`last_seen` are
  * MIN/MAX over the `usage_daily` rows that are actually present in the
- * table — i.e. within TAR's retained usage window (31 days default; TAR
+ * table — i.e. within Echo's retained usage window (31 days default; Echo
  * prunes usage_daily on its own retention cadence). Never described as
- * spanning every run this executable has ever had: once TAR's retention
+ * spanning every run this executable has ever had: once Echo's retention
  * prunes a day's rows, this plugin has no way to see past them, so
  * claiming an unbounded history would overstate what the fold can still
  * answer.
@@ -107,19 +107,19 @@ namespace detail {
 
 // ──────────────────────────────────────────────────────── source state ────
 
-/// TAR's #560 tri-state for a source's `<name>_enabled` tar_config key
-/// (tar_aggregator.cpp:375-381, `canonical_source_enabled`): a stored value
+/// Echo's #560 tri-state for a source's `<name>_enabled` echo_config key
+/// (echo_aggregator.cpp:375-381, `canonical_source_enabled`): a stored value
 /// of anything other than "true"/"false" means the source is ERRORED —
-/// TAR itself has stopped collecting for it, not merely disabled — so a
+/// Echo itself has stopped collecting for it, not merely disabled — so a
 /// consumer that only checks `!= "false"` would keep reporting stale rows
 /// as if the source were still live. `Errored` must never be treated as
 /// `Enabled`.
 enum class SourceState { Enabled, Disabled, Errored };
 
-/// `stored` is the raw `tar_config` value for `usage_enabled`
+/// `stored` is the raw `echo_config` value for `usage_enabled`
 /// (`std::nullopt` when the key is absent). A missing key falls to
-/// `source_default_enabled("usage")` = true (tar_schema_registry.cpp:1111),
-/// so `nullopt` maps to `Enabled`, matching TAR's own default. `"true"` ->
+/// `source_default_enabled("usage")` = true (echo_schema_registry.cpp:1111),
+/// so `nullopt` maps to `Enabled`, matching Echo's own default. `"true"` ->
 /// `Enabled`, `"false"` -> `Disabled`; any other stored text (corruption, a
 /// future tri-state value this plugin doesn't know about, hand-editing) ->
 /// `Errored`, mirroring `canonical_source_enabled`'s #560 rule above.
@@ -136,13 +136,13 @@ source_state_from_config(std::optional<std::string_view> stored) {
 
 // ─────────────────────────────────────────────── exe_key normalisation ────
 
-/// Mirrors tar_usage.hpp's `normalise_exe_key()` byte-for-byte — tar_usage
-/// .hpp (agents/plugins/tar/src/tar_usage.hpp, P21/wave 2) is the SOURCE OF
+/// Mirrors echo_usage.hpp's `normalise_exe_key()` byte-for-byte — echo_usage
+/// .hpp (agents/plugins/echo/src/echo_usage.hpp, P21/wave 2) is the SOURCE OF
 /// TRUTH for this rule. Duplicated rather than shared: this plugin cannot
-/// depend on the tar plugin's internal header (P21/P22 have no dependency
+/// depend on the echo plugin's internal header (P21/P22 have no dependency
 /// ordering between them), so the rule is copied here and pinned by
 /// test_app_usage_parsers.cpp's 10-input parity test — any future drift in
-/// tar_usage.hpp's rule must be mirrored here by hand, and that parity test
+/// echo_usage.hpp's rule must be mirrored here by hand, and that parity test
 /// is what catches a missed mirror.
 ///
 /// Rule: lowercase, basename after the last '/' or '\\', trimmed of
@@ -254,9 +254,9 @@ inline constexpr std::string_view kLastUsedSqlOne =
     "SUM(CASE WHEN day_ts >= ? THEN total_seconds ELSE 0 END) "
     "FROM usage_daily WHERE exe_key = ? GROUP BY exe_key";
 
-// tar_config keys this plugin is allowed to read — nothing else.
+// echo_config keys this plugin is allowed to read — nothing else.
 inline constexpr std::string_view kConfigUsageEnabled = "usage_enabled";
-// process_enabled (tar_config) gates TAR's own process fold, not this
+// process_enabled (echo_config) gates Echo's own process fold, not this
 // plugin: its only effect on app_usage is indirect, surfacing as a stale
 // usage_last_fold_ts once the fold stops advancing. Nothing here reads it
 // directly, so no constant for that key is declared in this header.
@@ -303,7 +303,7 @@ private:
 
 /// `since_day_ts` (default 0 — the whole table) drives `days_present`, the
 /// only meta field that is itself window-scoped; every other field is a
-/// tar_config scalar or the current `usage_live` open-run count and is not
+/// echo_config scalar or the current `usage_live` open-run count and is not
 /// affected by the caller's window.
 ///
 /// The two SQL-driven counters here (`open_runs` from usage_live,
@@ -314,7 +314,7 @@ private:
 /// reader), one counter failing must not silently blank out the other: both
 /// are attempted, and `yuzu::shared::ConstraintAccumulator` composes
 /// whichever tokens actually failed into one CC-07 reason rather than
-/// reporting only the first. (The tar_config scalar reads below have no
+/// reporting only the first. (The echo_config scalar reads below have no
 /// failure mode of their own — `get_config`'s lambda falls back to `def` on
 /// any prepare/step failure — so they are not accumulator inputs; a code
 /// path that can only ever produce exactly one token doesn't need the
@@ -354,7 +354,7 @@ private:
         return std::unexpected(QueryError{acc.reason()});
 
     const auto get_config = [&](std::string_view key, std::string_view def) -> std::string {
-        detail::Stmt stmt{db, "SELECT value FROM tar_config WHERE key = ?"};
+        detail::Stmt stmt{db, "SELECT value FROM echo_config WHERE key = ?"};
         if (!stmt)
             return std::string{def};
         sqlite3_bind_text(stmt.get(), 1, key.data(), static_cast<int>(key.size()),
@@ -524,9 +524,9 @@ run_last_used(sqlite3* db, std::optional<std::string_view> exe, int64_t since_30
 // failure (busy/locked/corrupt -- prepare fails, or step returns anything
 // other than SQLITE_ROW/SQLITE_DONE) from the legitimate "no such table"
 // case (step returns SQLITE_DONE, zero rows). The old bool-returning version
-// conflated both into `false`, which the caller read as "older TAR schema" --
+// conflated both into `false`, which the caller read as "older Echo schema" --
 // exactly the same bug class check_usage_source_state's tri-state already
-// guards against for tar_config reads. `std::unexpected` on a genuine
+// guards against for echo_config reads. `std::unexpected` on a genuine
 // failure; `false` inside the expected on legitimate absence.
 [[nodiscard]] inline std::expected<bool, QueryError> usage_daily_table_exists(sqlite3* db) {
     if (!db)
@@ -543,9 +543,9 @@ run_last_used(sqlite3* db, std::optional<std::string_view> exe, int64_t since_30
 }
 
 // Round-3 review finding (HIGH): a fresh per-dispatch sqlite3_open_v2 alone
-// never proves tar.db's integrity -- TarDatabase::open (tar_db.cpp) runs a
+// never proves echo.db's integrity -- EchoDatabase::open (echo_db.cpp) runs a
 // full PRAGMA integrity_check and quarantines/fails closed on a corrupt file
-// at ITS OWN open time, but that guarantee is scoped to TAR's own long-lived
+// at ITS OWN open time, but that guarantee is scoped to Echo's own long-lived
 // connection; this plugin's own connection has none of it. PRAGMA
 // quick_check(1) trades the full cross-index consistency pass for speed
 // (this runs on every dispatch, not once at process start) and stops at the
@@ -568,7 +568,7 @@ run_last_used(sqlite3* db, std::optional<std::string_view> exe, int64_t since_30
 // ─────────────────────────────────────────────────────────── formatting ───
 
 /// See format_usage_row's P5 / no-fixed-buffer note — identical treatment.
-/// `coverage_since`/`gap_last_ts`/`last_fold_ts` are tar_config values TAR
+/// `coverage_since`/`gap_last_ts`/`last_fold_ts` are echo_config values Echo
 /// itself writes, not operator/attacker input this plugin controls, but
 /// they are still opaque text reaching this plugin's pipe-delimited wire
 /// format from outside it, so they get the same `safe_output_field` pass
@@ -588,7 +588,7 @@ run_last_used(sqlite3* db, std::optional<std::string_view> exe, int64_t since_30
 /// `safe_output_field` (P5) before it ever reaches the pipe-delimited wire
 /// format, so a `|`, CR, or LF embedded in a real executable's basename can
 /// never inject a field or row boundary. Built directly into a std::string
-/// (no fixed-size stack buffer) — neither normalise_exe_key nor TAR's own
+/// (no fixed-size stack buffer) — neither normalise_exe_key nor Echo's own
 /// writer caps executable-name length, and pipe-escaping can roughly double a
 /// pipe-heavy name, so a fixed ceiling here would silently truncate a real
 /// row (the daily-sync consumer then drops a truncated row outright).

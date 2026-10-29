@@ -37,7 +37,7 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 | [TLS policy](tls.md) | Pinned TLS 1.2 cipher allow-list and version floor across the gRPC and HTTPS listeners -- what's pinned, what isn't yet, and what CI proves |
 | [REST API Reference](rest-api.md) | Complete REST API v1 endpoint reference with request/response examples |
 | [Gateway](gateway.md) | Erlang/OTP gateway node for multi-site deployments and scale-out |
-| [TAR (Timeline Activity Record)](tar.md) | Continuous system state change tracking -- processes, network, services, users |
+| [Echo](echo.md) | Continuous system state change tracking -- processes, network, services, users |
 | [Upgrading](upgrading.md) | Version upgrades, rollback, and migration |
 | [Release Verification](release-verification.md) | SHA256SUMS, cosign signatures, SLSA provenance, and CycloneDX / SPDX SBOMs |
 | [MCP (AI Integration)](mcp.md) | Model Context Protocol server -- AI-driven fleet querying, tools, tokens, and approval workflows |
@@ -69,8 +69,8 @@ The following features are documented within the files listed above:
 | [Disaster Recovery](../operations/disaster-recovery.md) | Backup strategy, restore procedures, and failover architecture |
 | [Certificate Renewal](../operations/certificate-renewal.md) | TLS certificate lifecycle, rotation, and automated renewal |
 | [Capacity Planning](../operations/capacity-planning.md) | Server sizing, storage growth, network bandwidth, and scaling patterns |
-| [TAR Power Source](tar-power.md) | TAR power capture source: AC-line and sleep/wake history — on by default |
-| [TAR Removable Source](tar-removable.md) | TAR removable-media capture source: attach/detach and executed-from-removable evidence — on by default |
+| [Echo Power Source](echo-power.md) | Echo power capture source: AC-line and sleep/wake history — on by default |
+| [Echo Removable Source](echo-removable.md) | Echo removable-media capture source: attach/detach and executed-from-removable evidence — on by default |
 
 ---
 

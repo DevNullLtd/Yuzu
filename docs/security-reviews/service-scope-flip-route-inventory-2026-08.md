@@ -44,7 +44,7 @@ handler; treat `sweep-heuristic` rows as lower-confidence than
 | 22 | `POST /api/v1/result-sets/{id}/pin` | `rest_api_v1.cpp` | Same fix | handler-read (sweep-found) |
 | 23 | `POST /api/v1/result-sets/{id}/unpin` | `rest_api_v1.cpp` | Same fix | handler-read (sweep-found) |
 | 24 | `DELETE /api/v1/result-sets/{id}` | `rest_api_v1.cpp` | Same fix | handler-read (sweep-found) |
-| 25 | `POST /api/v1/result-sets/from-inventory-query` | `rest_api_v1.cpp` | **Distinct, more severe, NOT service-scope-specific**: had NO authorization check of any kind (CWE-862) — any authenticated session, service-scoped or not, could query up to 5000 fleet-wide inventory records with zero scoping. Its dispatch siblings (`from-tar-query`, `from-instruction-result`, `{id}/re-eval`) were already gated by an earlier fix (e7b47ca3/#2500); this synchronous-read producer was never in scope for that fix and was missed. Gated on `Inventory:Read` (matches `GET /api/v1/inventory/software`'s securable for the same data class) — closes both the CWE-862 gap and the service-scope gap in one call, since `perm_fn` routes through the §3a-flipped `require_permission` | handler-read (sweep-found) |
+| 25 | `POST /api/v1/result-sets/from-inventory-query` | `rest_api_v1.cpp` | **Distinct, more severe, NOT service-scope-specific**: had NO authorization check of any kind (CWE-862) — any authenticated session, service-scoped or not, could query up to 5000 fleet-wide inventory records with zero scoping. Its dispatch siblings (`from-echo-query`, `from-instruction-result`, `{id}/re-eval`) were already gated by an earlier fix (e7b47ca3/#2500); this synchronous-read producer was never in scope for that fix and was missed. Gated on `Inventory:Read` (matches `GET /api/v1/inventory/software`'s securable for the same data class) — closes both the CWE-862 gap and the service-scope gap in one call, since `perm_fn` routes through the §3a-flipped `require_permission` | handler-read (sweep-found) |
 
 Rows 13–25 were not in the plan's original enumeration — found by the
 residual sweep of `rest_api_v1.cpp` (all 74 `auth_fn` call sites) and
@@ -121,7 +121,7 @@ No routes were left in an unresolved/undecided state **within this sweep's
 scope** — `rest_api_v1.cpp`'s 74 `auth_fn` call sites and `mcp_server.cpp`'s
 3 (per the sweep note in the ADR). The nine other `*_routes.cpp` files
 (guardian, dex, deployment, preflight, schedule, device, network, inventory,
-tar_tree) were not re-swept here; they already carry `deny_service_scoped_*`/
+echo_tree) were not re-swept here; they already carry `deny_service_scoped_*`/
 `token_scope_service` handling from prior PRs in this saga (found by
 compliance-officer, Gate 6) and are not re-verified by this document.
 

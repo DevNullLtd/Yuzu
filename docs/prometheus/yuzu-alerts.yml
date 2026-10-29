@@ -2999,7 +2999,7 @@ groups:
             — malformed_identity_field excluded, that's an agent sending a
             malformed identity field, not store unhealth; see
             YuzuResponseMalformedIdentityDrops for that case).
-            The executions ladder still tracks the commands, but drawer/TAR
+            The executions ladder still tracks the commands, but drawer/Echo
             result history is lossy — check PostgreSQL pool saturation / health.
 
       # Companion, informational: a NUL-byte-guard rejection is the security
@@ -4883,7 +4883,10 @@ groups:
           summary: "Installed-software ingest dropping over-cap blobs"
           description: >-
             yuzu_inventory_ingest_total{outcome="dropped"} is non-zero: one or more
-            agents are sending an installed-software blob over the 3 MiB cap, which
+            agents are sending an installed-software blob over the 3 MiB cap (the label
+            source says which; source="certificate_inventory" also counts an unknown
+            major version or an unparseable header, which are NOT resent - see
+            YuzuCertInventoryReportsRejected for those), which
             is dropped + nacked and will NOT self-heal (the agent resends the same
             payload). Likely an agent/server cap-constant drift after a version skew,
             or a non-conforming agent — check the agent version and the warn-level
@@ -4910,6 +4913,30 @@ groups:
             advances to its weekly full-floor). The framework wires ~1 source, so this
             signals a malformed/abusive/corrupted agent — check the agent version and the
             warn-level "carries too many sources" server logs for the agent_id.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuCertInventoryReportsRejected
+        # certificate_inventory: result="rejected" is a whole report refused (over 3 MiB, unknown
+        # major version, bad header, over 64 stores / 10,000 certificates, >64 sources). It is
+        # acknowledged WITHOUT a resend and writes nothing, so the device's stored inventory
+        # freezes and nothing else shows it. Sustained = a device (or a fleet after an agent
+        # upgrade ahead of the server) is stuck.
+        # increase over a day with NO hold: a single device refused once a day is enough, and a
+        # rate()-with-for would never fire for it. budget_exceeded freezes a device the same way.
+        expr: |
+          sum by (result, reason) (increase(yuzu_server_cert_inventory_ingest_total{result="rejected"}[1d])) > 0
+          or
+          sum by (result, reason) (increase(yuzu_server_cert_inventory_ingest_total{result="error",reason="budget_exceeded"}[1d])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Certificate inventory reports being rejected"
+          description: >-
+            yuzu_server_cert_inventory_ingest_total{result="rejected"} (or
+            error/budget_exceeded) increased in the last day. The affected devices'
+            certificate inventory is frozen (acknowledged, not stored, not resent). By reason label: unknown_version = an agent newer than the
+            server (upgrade the server first); bad_header / over_cap / blob_too_large = a
+            malformed or oversize report - find the agent in the warn log line
+            "certificate_inventory: blob from agent=... refused".
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryGenericBlobRejectedDepth
         # json-dump-depth-guard fix: outcome=rejected_depth is a SEPARATE outcome
@@ -5087,6 +5114,12 @@ groups:
         # dashboard-invisibility as YuzuInventoryReadDegraded — /readyz stays
         # green under pure pool saturation, so only the store-specific counter
         # moves.
+        # The group LIST joins them: list_groups_checked and
+        # count_members_by_group_checked (the /groups page, which shows a
+        # "could not be read" box) count here, and the legacy list_groups() is
+        # now list_groups_checked().value_or({}), so its other callers
+        # (dashboard, Pre-flight, Settings, MCP, REST, server) count a failed
+        # group-list read here too and still render an empty list.
         # reason = store_not_open | pool_acquire_timeout | query_error.
         expr: |
           sum(rate(yuzu_server_mgmt_group_read_degrade_total[5m])) by (reason) > 0
@@ -6484,7 +6517,7 @@ groups:
       # within 2 s, lock or statement timeout, query error, tracker not open) still goes
       # out, but every response to it is stored `~unverified`: Forensics-tier, so it is
       # withheld from callers without Forensics:Read (an HTTP 200 with no marker) and
-      # hidden from fixed-plugin polls such as DEX, TAR and hardware. One failed write
+      # hidden from fixed-plugin polls such as DEX, Echo and hardware. One failed write
       # unverifies one command, which a blip can cause, so only a failure that keeps
       # recurring pages. Shape of YuzuForensicsTierUnresolved: `for: 10m` over a 5m rate
       # window; one failure keeps the expression true for under 5 minutes and a burst
@@ -6514,7 +6547,7 @@ groups:
             every response to a command whose record was not written is stored
             `~unverified`, which is Forensics-tier: legitimate responses of any plugin are
             withheld from callers without Forensics:Read (a normal 200 with the rows
-            missing) and hidden from fixed-plugin polls such as DEX, TAR and hardware, and
+            missing) and hidden from fixed-plugin polls such as DEX, Echo and hardware, and
             the executions drawer misses those commands' agent events. First check
             PostgreSQL health and the yuzu_pg_* pool and lock metrics (the write fails on a
             pool lease timeout, a lock or statement timeout or a query error), then
@@ -6549,7 +6582,7 @@ groups:
             Each such response is stored `~unverified`, which is Forensics-tier:
             legitimate responses of any plugin are withheld from callers without
             Forensics:Read (a normal 200 with the rows missing) and hidden from fixed-plugin
-            polls such as DEX, TAR and hardware. First check PostgreSQL health and the
+            polls such as DEX, Echo and hardware. First check PostgreSQL health and the
             yuzu_pg_* pool and lock metrics, then
             yuzu_server_response_provenance_total{outcome="lookup_degraded"} and
             yuzu_exec_correlation_read_degrade_total{reason} (pool_exhausted or

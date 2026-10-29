@@ -194,17 +194,19 @@ no explicit service-scoped denial of its own (it relies on the `Infrastructure:R
 bounded, audited twin is the supported read for agents and integrations; hardening or retiring the
 raw route is tracked by `#5856` (revisit by 2026-11-14).
 
+**Known asymmetry on the management-group members pair.** `GET /fragments/groups/members` is `twinned` to `GET /api/v1/management-groups/{id}` / `get_management_group`, but the twins are not equivalent: the fragment narrows its rows to the caller's scope, while the REST read and the MCP tool return the whole member list under the global `ManagementGroup:Read` permission. No confined principal reaches the unfiltered twins today (a caller whose only grant is management-group-scoped, or a service-scoped token, is refused). The row stays `twinned`; narrowing the twins to match, or untwinning the row, is tracked by `#6722` (revisit by 2026-11-12).
+
 ## Summary
 
 <!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; regenerate with `python3 scripts/ci/check-api-parity.py --render-doc` and splice between these markers -->
 
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
-| devices | 21 | 10 | 11 |
+| devices | 24 | 13 | 11 |
 | inventory | 4 | 4 | 0 |
 | dex | 27 | 18 | 9 |
 | guardian | 18 | 10 | 8 |
-| tar | 12 | 3 | 9 |
+| echo | 12 | 3 | 9 |
 | auto-preflight | 4 | 1 | 3 |
 | auto-deploy | 6 | 3 | 3 |
 | auto-verify | 3 | 1 | 2 |
@@ -224,7 +226,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | enrollment | 21 | 4 | 17 |
 | crypto | 5 | 5 | 0 |
 | other | 82 | 27 | 55 |
-| **Total** | **344** | **132** | **212** |
+| **Total** | **347** | **135** | **212** |
 
 Registered `/api/vN/*` routes: 265. OpenAPI `paths` entries: 264. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 206.
 

@@ -206,7 +206,7 @@ struct Deps {
     /// #4983 — same shape as `RestApiV1::FleetReadFn` / the `fleet_read_fn`
     /// closure server.cpp already threads into several other `Deps`-based
     /// route modules (`dashboard_routes.cpp`'s `set_fleet_read_fn`,
-    /// `TarTreeRoutes::set_fleet_read_fn`). This module's `POST
+    /// `EchoTreeRoutes::set_fleet_read_fn`). This module's `POST
     /// /fragments/result-sets/create` (the dashboard CSV-paste import) had
     /// the identical unchecked-`device_ids` gap `POST /api/v1/result-sets`
     /// (REST) and MCP `create_result_set` were fixed for in the same PR —
