@@ -111,6 +111,8 @@ std::string cell(const std::optional<double>& v, Unit u) {
 // page life via a window flag because this fragment re-renders on every sub-nav visit.
 // The discovered fragment gates on Infrastructure:Read while the overview gates on
 // GuaranteedState:Read, and htmx drops a non-2xx body, so the error handler paints it.
+// The deep-link boot calls htmx.ajax directly: this script runs during the swap, before
+// htmx has processed the new anchor's hx-get, so a synthetic click would fire no request.
 std::string network_overview_shell(const std::string& quality_body) {
     std::string h;
     h += "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
@@ -142,8 +144,9 @@ std::string network_overview_shell(const std::string& quality_body) {
          "discovered hosts: this list needs the Infrastructure:Read permission.</div>'"
          ":'<div class=\"failbox\" role=\"alert\">Discovered hosts could not be read just now. "
          "Try again in a moment.</div>';});}"
-         "if(location.hash==='#discovered'){var d=document.querySelector("
-         "'#net-tabs a[href=\"#discovered\"]');if(d)d.click();}"
+         "if(location.hash==='#discovered'){netTab('discovered');"
+         "htmx.ajax('GET','/fragments/network/discovered',"
+         "{target:'#net-discovered',swap:'innerHTML'});}"
          "</script>";
     return h;
 }

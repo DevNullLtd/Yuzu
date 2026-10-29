@@ -317,6 +317,13 @@ TEST_CASE("overview render: Quality / Discovered tab strip, panels and script", 
         CHECK(has(html, "if(!window.__netErr){window.__netErr=1;"));
         // Deep link boots the Discovered tab.
         CHECK(has(html, "location.hash==='#discovered'"));
+        // The boot issues the request itself: a synthetic click runs before htmx has
+        // processed the new anchor's hx-get and would fire nothing.
+        CHECK(has(html, "htmx.ajax('GET','/fragments/network/discovered'"));
+        CHECK_FALSE(has(html, "d.click()"));
+        // Both error branches: 403 permission copy and the generic retry copy.
+        CHECK(has(html, "s===403?"));
+        CHECK(has(html, "Discovered hosts could not be read just now. Try again in a moment."));
         // CSP-safe: inline handlers only, never hx-on.
         CHECK_FALSE(has(html, "hx-on"));
         CHECK(one_dx_style(html));
