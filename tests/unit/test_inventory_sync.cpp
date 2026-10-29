@@ -14,7 +14,6 @@
 
 #include <inventory_status_row.hpp>
 
-#include <spdlog/sinks/ostream_sink.h>
 #include <spdlog/spdlog.h>
 
 #include <yuzu/plugin.h>
@@ -3038,28 +3037,6 @@ constexpr const char* kMqRow = "ibm_mq|IBM MQ|Installation1|9.4.5.0|/opt/mqm|-";
 
 AdaptedRows bind_mq(const std::string& s) { return parse_middleware_output(s, "ibm_mq", kDropPolicy); }
 
-// Captures every spdlog payload logged while it lives (the collector logs on the calling thread).
-struct LogCapture {
-    std::ostringstream text;
-    std::shared_ptr<spdlog::logger> prev = spdlog::default_logger();
-    LogCapture() {
-        auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(text);
-        auto logger = std::make_shared<spdlog::logger>("capture", sink);
-        logger->set_level(spdlog::level::warn); // independent of any level an earlier test set
-        spdlog::set_default_logger(std::move(logger));
-    }
-    ~LogCapture() { spdlog::set_default_logger(prev); }
-    LogCapture(const LogCapture&) = delete;
-    LogCapture& operator=(const LogCapture&) = delete;
-    [[nodiscard]] std::size_t count(std::string_view needle) const {
-        const std::string t = text.str();
-        std::size_t n = 0;
-        for (auto at = t.find(needle); at != std::string::npos; at = t.find(needle, at + 1))
-            ++n;
-        return n;
-    }
-};
-
 SyncPluginMap with_middleware() {
     SyncPluginMap m = all_plugins();
     m["middleware"] = &kFakeMiddleware;
@@ -3250,7 +3227,10 @@ TEST_CASE("collector: populated -> constrained -> recovered middleware cycles",
     fake_windows();
     const auto baseline = collect_with(all_plugins());
     REQUIRE(baseline.has_value());
-    LogCapture log;
+    // No log assertions: the collector lives in libyuzu_agent_core, whose spdlog registry is a
+    // separate image from this binary's on macOS (test_log_capture.hpp, #3355), so a capture here
+    // would pass or fail by platform. The withheld status and reason are pinned at the adapter
+    // level above (parse_middleware_output); this case pins the published blob.
     const auto populated = [] {
         g_fake[4].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
         g_fake[4].result_status.erase("ibm_mq");
@@ -3261,7 +3241,6 @@ TEST_CASE("collector: populated -> constrained -> recovered middleware cycles",
     REQUIRE(c1.has_value());
     CHECK(count_source(c1->first, "middleware.ibm_mq") == 1);
     CHECK(c1->second != baseline->second);
-    CHECK(log.count("rows withheld this cycle") == 0);
 
     g_fake[4].out["ibm_mq"] = nl({st("ibm_mq", "constrained", "linux:middleware:mqinst_permission_denied")});
     const auto c2 = collect_with(with_middleware());
@@ -3270,12 +3249,10 @@ TEST_CASE("collector: populated -> constrained -> recovered middleware cycles",
     CHECK(c2->second == baseline->second);
     CHECK(c2->first == baseline->first);
     CHECK(count_source(c2->first, "msi_packages.list_inventory") > 0); // the other sources stayed
-    CHECK(log.count("rows withheld this cycle") == 1);
 
     populated();
     const auto c3 = collect_with(with_middleware());
     REQUIRE(c3.has_value());
     CHECK(c3->second == c1->second);
     CHECK(c3->first == c1->first);
-    CHECK(log.count("rows withheld this cycle") == 1); // fired once, in cycle 2 only
 }
