@@ -89,6 +89,7 @@ fails the build when the two stages cannot safely run the same release:
 |---------|-----|
 | `runtime Alpine/musl (...) differs from the builder's (...)` | The `erlang:28-alpine` builder and the runtime `alpine:` image are on different Alpine releases. Point the runtime `FROM` at the builder's Alpine release (`docker run --rm <erlang image> cat /etc/alpine-release`). |
 | `musl ... with OTP ...: beam.smp aborts at boot on AMX CPUs` | The runtime is on musl 1.2.6 or newer (Alpine 3.24+) with an OTP older than 29.1. Keep both stages on Alpine 3.23, or move the builder to OTP 29.1 or newer. |
+| `Dockerfile.gateway supports linux/amd64 only (TARGETARCH=...)` | The gateway image is built for `linux/amd64` only (#6711): the pinned `erlang:28-alpine` index puts arm64 on Alpine 3.24 (musl 1.2.6) while the runtime stage is Alpine 3.23, and musl 1.2.6 with OTP older than 29.1 aborts at boot on AMX CPUs. Build with `--platform linux/amd64`; on an arm64 host that means emulation, which can fail in the Erlang deps stage, so for a native glibc build use `deploy/docker/Dockerfile.gateway.chisel`. |
 | `... is not a plain dotted version` | A version could not be read, for example an OTP release candidate or a patched OTP (`28.5.0.2**`). Build from a released OTP. |
 | `could not compare versions (apk printed ...)` | `apk version -t` gave no usable answer for versions that looked valid. Report it with the `abi-guard:` line; do not bypass the step. |
 

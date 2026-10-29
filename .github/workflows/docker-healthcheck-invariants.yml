@@ -133,6 +133,7 @@ jobs:
             -e '^docker-compose\.uat\.yml$' \
             -e '^scripts/test/docker-compose\.upgrade-test\.yml$' \
             -e '^scripts/ci/verify-healthcheck-invariants\.sh$' \
+            -e '^scripts/ci/check-gateway-base-index\.py$' \
             -e '^\.github/workflows/docker-healthcheck-invariants\.yml$'; then
             echo "Image surface touched -- verifying."
             emit true
@@ -227,6 +228,33 @@ jobs:
         env:
           IMAGE: yuzu-hc-verify/${{ matrix.role }}:${{ github.sha }}
         run: docker image rm -f "$IMAGE" || true
+
+  # ── Gateway builder index vs runtime Alpine (#6711) ──────────────────────────
+  # Dockerfile.gateway pins a multi-arch erlang:28-alpine index whose per-platform
+  # entries are built independently upstream, and the runtime stage is a fixed
+  # alpine:X.Y. This reads the pinned index from the registry and fails when a
+  # platform the Dockerfile claims to support (its `yuzu:gateway-platforms` marker)
+  # is not on the runtime stage's Alpine release, so a Dependabot digest refresh
+  # that moves it is caught in the PR rather than after a full build. It needs no
+  # Docker, only registry reads, so it runs on a hosted runner.
+  #
+  # NOT a matrix job and NOT path-filtered (the #1978 trap above): a skipped plain
+  # job reports "skipped", which satisfies a required check.
+  gateway-base-index:
+    name: "Gateway builder index matches runtime Alpine"
+    needs: changes
+    if: needs.changes.outputs.images_touched == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the pinned erlang index against the runtime stage
+        run: python3 -I scripts/ci/check-gateway-base-index.py
 
   # ── Required-check stubs (#1978 / actions/runner#952) ────────────────────────
   # `verify` is a MATRIX job, and a matrix job skipped at the job level is skipped
