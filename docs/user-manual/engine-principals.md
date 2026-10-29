@@ -33,16 +33,15 @@ return it no agents; enable RBAC and grant it a role to give it access. See
 Every mutating operation on this surface requires:
 
 - An **admin session** with **MFA step-up** (REST) or the **`supervised`**
-  MCP tier plus **maker-checker approval** (an approver who is not the
-  submitter) for the six mutating MCP tools.
+  MCP tier plus **maker-checker approval** (an approver account other than the
+  submitter's) for the six mutating MCP tools.
 - The `owner_username` (and, for a transfer, the `new_owner`) must already
   exist as a real Yuzu user — creation and transfer both fail closed
   (`400`) against an unknown username.
 
-**A structural rule with no exception:** a caller whose *own* session is
-itself engine-classed can never touch this surface at all, on either
-transport — not even to read. REST and all 9 MCP tools carry the same
-denial belt.
+**An engine-classed session is refused on the lifecycle and credential surface.** A caller whose *own* session is engine-classed is refused, even to read, on every engine-principal lifecycle and credential route on REST (create, list, get, revoke, mint, rotate, confirm, transfer and the no-admin audit) and on the engine lifecycle MCP tools; for the MCP tools, see the [MCP tool list](mcp.md#available-tools). `GET /api/v1/engine-principals/{id}/roles` (list) is the one REST exception: it carries no engine-session check and relies on its `EnginePrincipal:Read` gate alone. `POST` and `DELETE` on the roles routes (assign, unassign) are step-up gated like every other mutating route, so they refuse an engine-classed session before the handler runs.
+
+**What an engine principal can never be given.** Assignment refuses the roles named `admin` and `Administrator`, and refuses every built-in (system) role. Assignment does not inspect the permissions of a custom role, so a custom role that grants broad permissions can still be assigned. `GET /api/v1/engine-principals/audit/no-admin` reports an admin grant, a system role, or an effective grant that covers every securable and operation, so run it after assigning a custom role.
 
 ## Walkthrough: create, mint, rotate, confirm, transfer, revoke
 
@@ -225,7 +224,10 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
   was never picked up) via
   `DELETE /api/v1/tokens/{token_id}` (never
   `DELETE /api/v1/engine-principals/{id}` — see step 4's callout below for
-  why).
+  why). That call needs the administrator role (or a JIT-elevated session, which
+  counts for this route): a caller without either gets
+  `404 token not found`, the same answer as for an unknown id, and only the
+  audit log records the denial.
 
 ### 4. Confirm the rotation (optional but recommended)
 
@@ -282,6 +284,19 @@ is an ordinary API token row, so `DELETE /api/v1/tokens/{token_id}` (an
 admin caller may revoke any token, not just one they created — see
 `docs/user-manual/rest-api.md` "`DELETE /api/v1/tokens/{token_id}`") works
 on it, then rotate again once you're down to one active credential.
+
+**Recovering when the successor secret was lost.** If the rotate response was
+lost and the ~120-second re-serve window has passed, the secret cannot be shown
+again and `confirm` cannot be used (it needs the raw secret). The way out is an
+administrator call, and nothing else will do it: sign in as a user who holds the
+`admin` role or has an active JIT elevation (the same MFA step-up as other token revokes applies), read
+`GET /api/v1/engine-principals/{id}`, and pick the entry in `active_credentials`
+with `last_used_at` of `0` and `overlap_expires_at` of `0` (the successor; the
+predecessor carries the non-zero `overlap_expires_at`). Then call
+`DELETE /api/v1/tokens/{token_id}` with that `token_id`. A user who holds neither
+the admin role nor an active elevation gets `404` for a token it does not own. Rotate again afterwards.
+Until then the predecessor keeps working, and the sweep will not retire it
+because the successor was never used.
 
 If you replay a `confirm` **after it already succeeded** — a dropped `200`, a
 double-submit, or a client racing the auto-revoke sweep — you get a *terminal*

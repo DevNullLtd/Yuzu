@@ -204,6 +204,29 @@ audit verb, full `parameters`, and every realistic `responses` status (200/400/4
 `Sec-Audit-Failed` header block on any audited route — see the `"/network/devices"` path item for
 the header-documentation shape).
 
+Three more things the entry must carry, because the served document is read by code generators
+and by the `/swagger` page as well as by people:
+
+- **`operationId`.** Every operation has one, unique across the document: the lower-case method,
+  then the path (without the `/api/v1` base) in PascalCase, with each path parameter written as
+  `By` plus its name. `GET /hardware/{id}` is `getHardwareById`, `POST /hardware/{id}/sync` is
+  `postHardwareByIdSync`, `DELETE /upload-grants/{grant_id}` is `deleteUploadGrantsByGrantId`. A
+  new operation follows the same rule. Two tests in `tests/unit/server/test_openapi_spec_completeness.cpp`
+  check uniqueness: `openapi_spec_json(): every operation has a unique and well-formed operationId`
+  (which also checks presence and shape) and `openapi documents: every operation has a unique
+  operationId in both forms`.
+- **Group guides.** Prose for a group lives in the guide of the matching top-level `tags` entry
+  under `x-yuzu-guide`, not inside an operation. `GET /api/v1/openapi.json` leaves the guides out
+  and `?guides=true` includes them; the MCP resource `yuzu://openapi` and the discover tools serve
+  only the form without them.
+- **Unserved routes.** An operation that is documented but not registered on a running server,
+  because the store behind it is not started, carries an `x-yuzu-unavailable` string on the
+  operation saying so. The `/swagger` page labels such operations unavailable, and the route
+  catalog (`GET /api/v1/discover/routes`, MCP `discover_routes`) repeats the string as an
+  `unavailable` field on that row. A route that is registered must not carry it. When a store
+  becomes wired in `server.cpp`, remove its markers in the same change:
+  `tests/test_unavailable_store_wiring.py` fails if they disagree.
+
 **The `ecosystem` tokens.** Three placeholders in the literal are expanded once, on first use, by
 `expand_ecosystem_tokens()`: `"@@ECOSYSTEM_ENUM@@"` (the software routes),
 `"@@ECOSYSTEM_ENUM_OR_EMPTY@@"` (routes where a present-empty value selects rows with no
@@ -336,7 +359,14 @@ so the record is not a single point of truth: keep the two in step. (A confined 
    different cases; a tripwire, not a proof). A brand-new `mcp_tools_<domain>.cpp` also sets
    `MIN_REGISTRY_FILES` (an exact count) in `scripts/ci/check-api-parity.py` and `kRegistryDomainFiles`
    in `tests/unit/server/test_mcp_dispatch_coverage.cpp`, and a new `mcp_tool*.hpp` sets
-   `kToolHeaderFiles` there, in the same change.
+   `kToolHeaderFiles` there, in the same change. The seam-closure CI gate
+   (`scripts/ci/check-seam-closure.py`, "MCP registry lane") additionally include-closure-checks every
+   `mcp_tools_*.cpp`, the three shared `mcp_tool*.hpp` headers and the seven store-free `*_types.hpp`
+   headers against its store-header patterns, pins the file count (`MCP_REGISTRY_EXPECTED_TU_COUNT`, with
+   `EXPECTED_MCP_REGISTRY_TU_COUNT` and `EXPECTED_MCP_REGISTRY_CPPS` in its self-test — and
+   `MCP_REGISTRY_HEADERS` / `MCP_REGISTRY_TYPES_HEADERS` for a new shared or types header — which also
+   cross-checks the count against `MIN_REGISTRY_FILES` and `kRegistryDomainFiles`), and checks that each
+   `<domain>_tool_records()` accessor declared in `mcp_tool_registry.hpp` has its `mcp_tools_<domain>.cpp`.
 
 What rejects a mistake: building the catalogue (first done in the `ServerImpl` constructor, so it
 applies under `--mcp-disable` too) throws `std::logic_error` naming the record for a null handler, a

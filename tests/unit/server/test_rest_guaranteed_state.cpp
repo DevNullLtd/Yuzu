@@ -35,6 +35,7 @@
 #include "guardian_api_local.hpp" // ADR-0031 WS-A4 (ninth family): wire the real GuardianApi seam
 #include "rest_api_v1.hpp"
 #include "test_dex_perf_api_double.hpp"
+#include "test_forensics_tier_fixture.hpp" // #4990
 #include "test_guardian_api_double.hpp" // ADR-0031 WS-A4 (ninth family): FnGuardianApi
 #include "test_network_api_double.hpp"
 #include "test_route_sink.hpp"
@@ -671,6 +672,9 @@ struct RestGsHarness {
         sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
 
         api.set_csrf_trusted_origins(std::move(csrf_trusted_origins));
+        // #4990: the live-snapshot polls read back with a fixed-plugin tier filter, and an unwired
+        // plugin set refuses every row.
+        api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/&rbac_,
                             /*mgmt_store=*/&mgmt_,

@@ -136,8 +136,8 @@ claims a status. WS-0…WS-10 come from ADR-2002 §Decomposition; WS-11…WS-14 
 delivery/ops workstreams the three-model review surfaced as missing; WS-15 (gateway
 failback/rebalance, roadmap 7.1.1, #5759) was added 2026-10-13 as WS-13's pair.
 
-**WS-3 / WS-11 re-stamped 2026-10-26 (#4014):** ONLY those two rows were re-audited (against `origin/dev`
-`931842654` plus the unmerged #4014 branch, and `gh`; re-stamp at merge); no other row was. The WS-11 leader-observability subset shipped (metrics published at
+**WS-3 / WS-11 re-stamped 2026-10-28 (#4014, PR #6542 merged):** ONLY those two rows were re-audited (against `origin/dev`
+`377cc7700` and `gh`); no other row was. The WS-11 leader-observability subset shipped (metrics published at
 scrape time from a lock-free `LeaderElector::Stats`, the `yuzu-ha-leader` alerts; leadership and the elector
 being open stay out of `/readyz`). Follow-ups: #6526 (remediation-claim lifecycle counters), #6527 (CRL
 freshness gauge), #6528 (durable cluster-capability admission gate), #6535 (epoch fence not monotonic across a lossy async promotion; must close or be explicitly accepted before the gate lifts). The safe-to-scale gate is NOT lifted.
@@ -339,7 +339,8 @@ gateway-fronted fleets.**
 > the server answered authoritatively) and calls `disconnect/1` to force
 > the agent-driven reconnect the FORWARD NOTE requires. Also fixed a latent,
 > pre-existing crash in `do_rpc`'s error-clause pattern (never matched what
-> `grpcbox_client:unary/5` actually returns; unreachable before 4.4 since
+> `grpcbox_client:unary/5` (the upstream client at the time; replaced by
+> `yuzu_grpc_client`, which keeps the same result shapes) actually returned; unreachable before 4.4 since
 > this RPC never previously returned a real non-OK, non-transport grpc
 > status). **Round-2 Fable review found 3 more real bugs before push**: F1
 > (BLOCKING) — the adopt decision let an in-memory `gateway_sessions_` hit

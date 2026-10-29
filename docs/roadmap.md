@@ -164,7 +164,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 12.11 | [#282](https://github.com/Tr3kkR/Yuzu/issues/282) | Application Whitelisting | Open |
 | | 12.12 | [#283](https://github.com/Tr3kkR/Yuzu/issues/283) | Inventory Replication (Delta Sync) | **Done** (NOT_PLANNED, 2026-07-14, delivered differently: ADR-0016's hash-skip conditional sync, `sync_scheduler.hpp`) |
 | | 12.13 | [#284](https://github.com/Tr3kkR/Yuzu/issues/284) | Binary Resource Distribution | Open |
-| **13** | 13.1 | [#285](https://github.com/Tr3kkR/Yuzu/issues/285) | 2FA for Instruction Approval (TOTP) | Open (stale — TOTP/MFA step-up shipped generally, not wired to approval, see body note) |
+| **13** | 13.1 | [#285](https://github.com/Tr3kkR/Yuzu/issues/285) | 2FA for Instruction Approval (TOTP) | Open (stale - TOTP/MFA step-up shipped generally and is wired to approve/reject by #6061 and #6079; close this issue when #6079 merges, see body note) |
 | | 13.2 | [#286](https://github.com/Tr3kkR/Yuzu/issues/286) | Composable Instruction Chains | **Done** (NOT_PLANNED, 2026-07-14, delivered: `workflow_engine.cpp` `foreach_source` step field + step interpolation) |
 | | 13.3 | [#287](https://github.com/Tr3kkR/Yuzu/issues/287) | Process / Sync Logging UI | Open |
 | | 13.4 | [#288](https://github.com/Tr3kkR/Yuzu/issues/288) | Dashboard Branding | Open |
@@ -1080,7 +1080,7 @@ Targets carry typed auth (none / bearer / basic / hmac), a server-side batching 
 
 REST: `GET/POST/DELETE /api/v1/offload-targets`, `GET /api/v1/offload-targets/{id}`, `GET /api/v1/offload-targets/{id}/deliveries`. RBAC: `Infrastructure:Read`/`Write`. Audit events: `offload_target.create` (success | denied), `offload_target.delete`.
 
-**Known follow-up:** the dispatcher does not yet extract `spec.offload.targets` from the originating definition — `fire_event(target_filter)` honours an explicit caller-supplied filter, but the agent-service fan-out passes none. Wiring the per-instruction filter through the command_id -> execution_id correlation (HA WS-1(1b): `ExecutionTracker::lookup_execution_id`, not the retired in-proc `cmd_execution_ids_` map) -> `definition_id` -> `InstructionStore` is tracked separately so the global fan-out path lands clean first.
+**Known follow-up:** the dispatcher does not yet extract `spec.offload.targets` from the originating definition — `fire_event(target_filter)` honours an explicit caller-supplied filter, but the agent-service fan-out passes none. Wiring the per-instruction filter through the command_id -> execution_id correlation (HA WS-1(1b): `ExecutionTracker::lookup_command_record`, not the retired in-proc `cmd_execution_ids_` map) -> `definition_id` -> `InstructionStore` is tracked separately so the global fan-out path lands clean first.
 
 **Files:** `server/core/src/offload_target_store.{hpp,cpp}` (Postgres migration, ADR-0059, fresh-start cutover — no backfill), `server/core/src/offload_routes.{hpp,cpp}`, `server/core/src/server.cpp` (`SecretCodec`-gated construction + AgentService wiring + route registration), `server/core/src/agent_service_impl.{hpp,cpp}` (`set_offload_target_store` + fire_event at 3 call sites), `docs/yaml-dsl-spec.md` § `spec.offload`, `docs/user-manual/rest-api.md` § Offload Targets, `docs/adr/0059-offload-target-store-postgres-migration.md`, `tests/unit/server/test_offload_target_store.cpp`, `tests/unit/server/test_rest_offload_targets.cpp`.
 
@@ -1497,7 +1497,7 @@ Server-side resource registry for versioned binary blobs:
 *Close remaining security gaps and improve operational UX.*
 
 ### Issue 13.1: 2FA for Instruction Approval (TOTP)
-**Capability:** new | **Scope:** Server | **Status:** Open (stale: TOTP + MFA step-up landed generally and now gates instruction approve and reject; the `totp_code` parameter this issue asked for is not wired)
+**Capability:** new | **Scope:** Server | **Status:** Open (stale: TOTP + MFA step-up landed generally and gates instruction approve and reject, and #6061 and #6079 require an interactive session and an enrolled factor with a fresh proof; the `totp_code` parameter this issue asked for is not wired, the code is entered at the step-up prompt)
 
 TOTP (`totp.{hpp,cpp}`) and a general step-up MFA framework (`mfa_step_up.{hpp,cpp}`) shipped as part of the auth-and-authz workstream - the step-up check is enforced centrally on 37 named REST/dashboard routes (the three JIT-elevation routes keep their own handler gate) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`, and MCP tools are not step-up gated. MFA step-up now gates `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject` among those routes. This issue's specific ask, a `totp_code` request parameter on instruction approval, is not wired; the step-up check reads the session's MFA proof instead. Original sketch:
 
@@ -1594,6 +1594,13 @@ Server supports multiple concurrent gateway registrations:
 - Topology view shows all gateways with agent counts and health status
 
 **Files:** `server/core/src/agent_registry.cpp`, `server/core/src/gateway_service_impl.cpp`, `gateway/apps/yuzu_gw/src/yuzu_gw_cluster.erl`
+
+**Upstream side (gateway to several servers), added 2026-10-11.** Production runs dozens to hundreds of
+gateways against always at least two servers and a streaming-replication Postgres pair, so a gateway dialling
+several upstream servers is the standard case. Open work, in priority order: explicit server-to-gateway
+backpressure (#5647), a per-endpoint circuit breaker with failover (#5648), the registration-reconcile
+decision for several replicas (#5649), herd jitter for hundreds of gateways (#5650), and multi-server
+defaults and guidance (#5651). Design record: ADR-2002 §7g.
 
 ### Issue 14.3: Database Sharding (Response Partitioning)
 **Capability:** new | **Scope:** Server | **Status:** **Partial** (#292 closed NOT_PLANNED, 2026-07-14) — not implemented as designed below (no sharding/partitioning code exists); **obsoleted by the Postgres substrate migration**, which addresses the underlying scaling need differently

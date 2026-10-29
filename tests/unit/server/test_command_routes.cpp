@@ -32,6 +32,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "rbac_store.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -44,6 +45,7 @@
 
 #include <array>
 #include <chrono>
+#include <functional>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -146,6 +148,9 @@ struct CommandHarness {
     int auth_fn_calls = 0;
     bool auth_fails = false;
     bool perm_allow = true;
+    /// When set, decides each (securable, operation) the route's permission gate asks, instead of
+    /// `perm_allow` (a real RbacStore-backed decision for the role cases). Unset = old behavior.
+    std::function<bool(const std::string&, const std::string&)> perm_probe;
 
     // -- audit --
     std::vector<AuditCall> audit_calls;
@@ -226,7 +231,14 @@ struct CommandHarness {
             return s;
         };
         deps.perm_fn = [this](const httplib::Request&, httplib::Response& res,
-                              const std::string&, const std::string&) -> bool {
+                              const std::string& securable, const std::string& operation) -> bool {
+            if (perm_probe) {
+                if (!perm_probe(securable, operation)) {
+                    res.status = 403;
+                    return false;
+                }
+                return true;
+            }
             if (!perm_allow) {
                 res.status = 403;
                 return false;
@@ -1049,6 +1061,62 @@ TEST_CASE("/api/command: a Forensics action's single target falling outside the 
     REQUIRE(res);
     CHECK(res->status == 404);
     CHECK(h.send_to_ids_called.empty());
+}
+
+// #4990: the delegable ForensicsAnalyst role reads stored Forensics rows; it carries no
+// Execution:Execute, and this route's first gate asks for exactly that, so a holder of only that role
+// is refused before any classification or dispatch work. (This route takes no approval ticket: an
+// approval-gated pair is a denial here, never a ticket redemption; the MCP twin's ticket case is
+// pinned in test_mcp_server.cpp.) The permission decision is a real RbacStore's.
+namespace {
+yuzu::test::PgTestTemplate command_rbac_tpl{"rbacstore", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::RbacStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("rbac template: store failed to migrate/seed");
+}};
+} // namespace
+
+TEST_CASE("/api/command: a caller holding only ForensicsAnalyst is refused 403 at the "
+          "Execution:Execute gate and nothing is classified or dispatched",
+          "[pg][command_routes][security][forensics_analyst]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, command_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    REQUIRE(rbac.assign_role({"user", "tester", "ForensicsAnalyst"}).has_value());
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    REQUIRE(mg.is_open());
+    grant_visibility(mg, {"dev-A"});
+
+    CommandHarness h{&mg};
+    h.perm_probe = [&](const std::string& securable, const std::string& op) {
+        return rbac.check_permission("tester", securable, op);
+    };
+    // The role does read Forensics rows ...
+    CHECK(rbac.check_permission("tester", "Forensics", "Read"));
+    // ... and is refused at the route's gate for the Forensics plugin and for an ordinary one alike.
+    for (const char* body : {
+             R"({"plugin":"app_usage","action":"last_used","agent_ids":["dev-A"]})",
+             R"({"plugin":"noop","action":"run","agent_ids":["dev-A"]})"}) {
+        INFO(body);
+        auto res = h.sink.Post("/api/command", body);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+    CHECK(h.send_to_ids_called.empty());
+    CHECK(h.send_all_calls == 0);
+    CHECK(h.last_stagger == -1); // the classification step was never reached
+
+    // Control: the same principal holding Operator as well passes the gate and dispatches.
+    REQUIRE(rbac.assign_role({"user", "tester", "Operator"}).has_value());
+    auto res = h.sink.Post(
+        "/api/command", R"({"plugin":"app_usage","action":"last_used","agent_ids":["dev-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.send_to_ids_called == std::vector<std::string>{"dev-A"});
 }
 
 // ─────────────── json-dump-depth-guard fix (#2437-class) ────────────────────

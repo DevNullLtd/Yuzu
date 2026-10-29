@@ -27,7 +27,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `device_identity` | ✅ ✅ ✅ | Reports device hostname, domain membership, and AD organizational unit | [README](../../agents/plugins/device_identity/README.md) |
 | `diagnostics` | ✅ ✅ ✅ | Agent diagnostics — log level, certificates, connection info | [README](../../agents/plugins/diagnostics/README.md) |
 | `discovery` | ✅ ✅ 🟡 | Network device discovery — ARP scan and ping sweep | [README](../../agents/plugins/discovery/README.md) |
-| `disk_actions` | ✅ 🟡 ⛔ | Reports physical drive health and the mapping between drives and the logical volumes they back | [README](../../agents/plugins/disk_actions/README.md) |
+| `disk_actions` | ✅ 🟡 🟡 | Reports physical drive health and the mapping between drives and the logical volumes they back | [README](../../agents/plugins/disk_actions/README.md) |
 | `disk_space` | ✅ ✅ ✅ | Reports free / total disk space for a single volume | [README](../../agents/plugins/disk_space/README.md) |
 | `event_logs` | ✅ ✅ ✅ | Queries system event logs for errors and filtered events | [README](../../agents/plugins/event_logs/README.md) |
 | `example` | ✅ ✅ ✅ | Reference example plugin — responds to 'ping' | [README](../../agents/plugins/example/README.md) |
@@ -36,12 +36,12 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `filesystem_posture` | 🟡 ✅ 🟡 | Reports mounted filesystems, per-mount quota-subsystem state, and snapshot-capable volumes | [README](../../agents/plugins/filesystem_posture/README.md) |
 | `firewall` | ✅ ✅ ✅ | Firewall status and rule listing | [README](../../agents/plugins/firewall/README.md) |
 | `firmware_posture` | ✅ 🟡 🟡 | Reports firmware/BIOS vendor, version, release date and update-pending posture | [README](../../agents/plugins/firmware_posture/README.md) |
-| `hardware` | ✅ ✅ ✅ | Reports hardware inventory: manufacturer, model, BIOS, CPU, memory, disks, drivers | [README](../../agents/plugins/hardware/README.md) |
+| `hardware` | ✅ ✅ ✅ | Reports hardware inventory: manufacturer, model, BIOS, CPU, memory, disks, drivers, chassis, baseboard, swap, machine id | [README](../../agents/plugins/hardware/README.md) |
 | `http_client` | ✅ ✅ ✅ | HTTP client — download files, GET/HEAD requests with hash verification (no shell-out) | [README](../../agents/plugins/http_client/README.md) |
 | `installed_apps` | ✅ ✅ ✅ | Inventories installed applications and queries by name | [README](../../agents/plugins/installed_apps/README.md) |
 | `interaction` | ✅ ✅ ✅ | Desktop user interaction — notifications, message boxes, input dialogs, surveys, DND | [README](../../agents/plugins/interaction/README.md) |
 | `ioc` | ✅ ✅ ✅ | Indicator of Compromise checking — match IOCs against local endpoint state | [README](../../agents/plugins/ioc/README.md) |
-| `license_scan` | ✅ 🟡 🟡 | Detects software licences across OS, vendor and per-user surfaces | [README](../../agents/plugins/license_scan/README.md) |
+| `license_scan` | ✅ ✅ 🟡 | Detects software licences across OS, vendor and per-user surfaces | [README](../../agents/plugins/license_scan/README.md) |
 | `local_security_policy` | 🟡 🟡 🟡 | Reports local password, lockout and audit policy posture and sudoers content | [README](../../agents/plugins/local_security_policy/README.md) |
 | `mgmt_posture` | 🟡 ✅ 🟡 | Management-plane posture: which plane controls the device (facts only) | [README](../../agents/plugins/mgmt_posture/README.md) |
 | `msi_packages` | ✅ ✅ ⛔ | Enumerates installed packages and product codes (Windows MSI / macOS pkgutil) | [README](../../agents/plugins/msi_packages/README.md) |
@@ -67,7 +67,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `sccm` | ✅ ⛔ ⛔ | Reports SCCM/ConfigMgr client status, version, and site assignment | [README](../../agents/plugins/sccm/README.md) |
 | `script_exec` | ✅ ✅ ✅ | Executes commands and scripts with streaming output (admin-only) | [README](../../agents/plugins/script_exec/README.md) |
 | `services` | ✅ ✅ ✅ | System services — enumerate, query, and configure service startup types | [README](../../agents/plugins/services/README.md) |
-| `shares` | 🟡 🟡 ✅ | Shares this host serves over SMB/NFS: names, paths and a few flags, never ACLs | [README](../../agents/plugins/shares/README.md) |
+| `shares` | ✅ 🟡 ✅ | Shares this host serves over SMB/NFS: names, paths and a few flags, never ACLs | [README](../../agents/plugins/shares/README.md) |
 | `software_actions` | ✅ ✅ ✅ | Lists upgradable packages and counts installed software | [README](../../agents/plugins/software_actions/README.md) |
 | `status` | ✅ ✅ ✅ | Reports agent version, system info, health, modules, connection, switch, and config | [README](../../agents/plugins/status/README.md) |
 | `storage` | ✅ ✅ ✅ | Persistent key-value storage — set, get, delete, list, clear | [README](../../agents/plugins/storage/README.md) |

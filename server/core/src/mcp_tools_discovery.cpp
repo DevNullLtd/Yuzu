@@ -6,10 +6,10 @@
 
 #include "mcp_tool_registry.hpp"
 
-#include "discover_routes.hpp"     // build_routes_catalog (shared with REST /discover/routes)
-#include "mcp_jsonrpc.hpp"         // kTierDenied, success_response
-#include "mcp_policy.hpp"          // tier_allows
-#include "openapi_spec_access.hpp" // openapi_spec_json()
+#include "discover_catalog_types.hpp" // build_routes_catalog (shared with REST /discover/routes)
+#include "mcp_jsonrpc.hpp"             // kTierDenied, success_response
+#include "mcp_policy.hpp"              // tier_allows
+#include "openapi_spec_access.hpp"     // openapi_spec_json()
 
 #include <span>
 
@@ -45,12 +45,15 @@ constexpr ToolRecord kToolRecords[] = {
     {"discover_routes",
      "REST route catalog — subset of the same OpenAPI document GET /api/v1/openapi.json "
      "serves. Hand-maintained source, so it can under-report an undocumented route "
-     "(the response carries a caveat field). Read-only catalog.",
+     "(the response carries a caveat field). A route that has an `unavailable` field is "
+     "documented but not registered on this server: skip it, do not call it. Read-only "
+     "catalog.",
      R"({"type":"object","properties":{}})",
      // #2986: build_routes_catalog's per-route projection is fixed
-     // (method/path/summary/tags/description) regardless of which OpenAPI
+     // (method/path/summary/tags/description, plus `unavailable` on an operation the
+     // build documents but does not register) regardless of which OpenAPI
      // operations exist — the route COUNT varies, the shape does not.
-     R"j({"type":"object","properties":{"version":{"type":"integer"},"source":{"type":"string"},"description":{"type":"string"},"caveat":{"type":"string"},"count":{"type":"integer"},"routes":{"type":"array","items":{"type":"object","properties":{"method":{"type":"string"},"path":{"type":"string"},"summary":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"description":{"type":"string"}},"required":["method","path","summary","tags","description"]}}},"required":["version","source","description","caveat","count","routes"]})j",
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"source":{"type":"string"},"description":{"type":"string"},"caveat":{"type":"string"},"count":{"type":"integer"},"routes":{"type":"array","items":{"type":"object","properties":{"method":{"type":"string"},"path":{"type":"string"},"summary":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"description":{"type":"string"},"unavailable":{"type":"string","description":"Present only on a route this build documents but does not register. Skip the route: do not call it. Carries the reason."}},"required":["method","path","summary","tags","description"]}}},"required":["version","source","description","caveat","count","routes"]})j",
      "Infrastructure", "Read", ServiceScopeClass::denied, ToolEffect::ReadOnly, true,
      "Discover REST routes", &handle_discover_routes},
 };

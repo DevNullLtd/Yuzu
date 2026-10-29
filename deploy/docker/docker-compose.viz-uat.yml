@@ -192,6 +192,13 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.gateway
     image: yuzu-gateway-viz-uat:latest
+    # Planned stop: the gateway ends its agent sessions and sends their
+    # DISCONNECTED notices to the server before it exits, within
+    # shutdown_flush_budget_ms (default 20 s), then stops its processes. The
+    # Docker default (10 s before SIGKILL) would cut that short; 40 s covers the
+    # budget with margin. Raise both together (docs/user-manual/gateway.md,
+    # "Planned stop").
+    stop_grace_period: 40s
     container_name: yuzu-viz-gateway
     environment:
       # See server.environment — same proxy-bypass rationale.

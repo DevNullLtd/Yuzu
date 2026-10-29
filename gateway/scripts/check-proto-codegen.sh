@@ -171,7 +171,7 @@ if [ "$drift" -ne 0 ]; then
     echo "  • 'gateway proto codegen drift in <x>_pb.erl' / 'regenerated <x>_pb.erl has" >&2
     echo "    no committed counterpart' — a committed module under apps/yuzu_gw/src is" >&2
     echo "    stale vs (or missing for) priv/proto. Regenerate + commit:" >&2
-    echo "        cd gateway && rebar3 grpc gen   # or the gpb regen used to author them" >&2
+    echo "        cd gateway && escript regen_pb.escript" >&2
     echo "  • 'flat/nested proto drift: priv/proto/<x>.proto vs ...' — the flat copy" >&2
     echo "    and its package-pathed mirror under priv/proto/yuzu/<pkg>/v1/ disagree" >&2
     echo "    on message/field structure. Edit BOTH copies in lockstep so the field" >&2

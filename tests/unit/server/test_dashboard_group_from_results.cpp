@@ -60,12 +60,14 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "response_store.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_mgmt_group_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <libpq-fe.h>
 
@@ -148,6 +150,9 @@ struct GroupFromResultsHarness {
     std::unique_ptr<ResponseStore> rs_;
     yuzu::test::ManagementGroupStorePg mg_bundle;
     ManagementGroupStore& mg = *mg_bundle;
+    // #4990: the caller's Forensics visibility (admin by default so the cases that are not about
+    // the tier keep their meaning). Declared before `routes`: the resolver borrows it.
+    yuzu::server::test::ForensicsCaller forensics;
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
 
@@ -237,6 +242,7 @@ struct GroupFromResultsHarness {
 
         if (!csrf_trusted_origins.empty())
             routes.set_csrf_trusted_origins(std::move(csrf_trusted_origins));
+        yuzu::server::test::wire_forensics(routes, forensics);
 
         routes.register_routes(
             sink, auth_fn, perm_fn, audit_fn, rs_.get(), &mg,
@@ -363,6 +369,121 @@ TEST_CASE("group-from-results: an all-dropped scope falls into the existing "
     CHECK_FALSE(h.mg.find_group_by_name("alldropped-group").has_value());
 }
 
+// ── (2a) #4990: the Forensics tier narrows the membership this materializes ───────────────────────
+
+TEST_CASE("group-from-results: agents matched only through Forensics rows the caller may not read "
+          "are not materialized, and look like no match",
+          "[pg][server][dashboard][group_from_results][security][forensics]") {
+    GroupFromResultsHarness h;
+    // agent-A and agent-B match through a Forensics plugin; agent-C through an ordinary one.
+    for (const char* agent : {"agent-A", "agent-B"}) {
+        StoredResponse r;
+        r.instruction_id = kCommandId;
+        r.agent_id = agent;
+        r.status = 1;
+        r.plugin = yuzu::server::test::kForensicsPlugin;
+        r.output = "high|cat-a|title|detail\n";
+        h.rs().store(r);
+    }
+    {
+        StoredResponse r;
+        r.instruction_id = kCommandId;
+        r.agent_id = "agent-C";
+        r.status = 1;
+        r.plugin = yuzu::server::test::kOrdinaryPlugin;
+        r.output = "high|cat-a|title|detail\n";
+        h.rs().store(r);
+    }
+
+    SECTION("without Forensics:Read the membership is exactly the ordinary match") {
+        h.forensics.viewer();
+        auto res = h.post(GroupFromResultsHarness::form_body("tier-viewer-group"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("tier-viewer-group");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-C"});
+    }
+    SECTION("a global Forensics:Read materializes every match") {
+        h.forensics.admin();
+        auto res = h.post(GroupFromResultsHarness::form_body("tier-admin-group"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("tier-admin-group");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) ==
+              std::set<std::string>{"agent-A", "agent-B", "agent-C"});
+    }
+    SECTION("a per-agent subset is unsupported and fails closed: no Forensics match is materialized") {
+        h.forensics.unsupported_subset({"agent-B"});
+        auto res = h.post(GroupFromResultsHarness::form_body("tier-subset-group"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("tier-subset-group");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-C"});
+    }
+}
+
+TEST_CASE("group-from-results: when every match is a Forensics row the caller may not read, the "
+          "answer is the ordinary 422 and no group exists",
+          "[pg][server][dashboard][group_from_results][security][forensics]") {
+    GroupFromResultsHarness h;
+    StoredResponse r;
+    r.instruction_id = kCommandId;
+    r.agent_id = "agent-A";
+    r.status = 1;
+    r.plugin = yuzu::server::test::kForensicsPlugin;
+    r.output = "high|cat-a|title|detail\n";
+    h.rs().store(r);
+
+    h.forensics.viewer();
+    auto res = h.post(GroupFromResultsHarness::form_body("tier-none-group"));
+    CHECK(res->status == 422);
+    // Byte-identical to the genuine-empty body: nothing distinguishes a filtered match.
+    CHECK(res->body ==
+          "<span class=\"feedback-error\">No agents match the current filters.</span>");
+    CHECK_FALSE(h.mg.find_group_by_name("tier-none-group").has_value());
+    // The filtered row leaves no scope-drop trace either.
+    CHECK(h.audits_for("response.read", "denied") == 0);
+}
+
+TEST_CASE("group-from-results: an Unknown Forensics decision shows a visible notice (200) and creates "
+          "no group",
+          "[pg][server][dashboard][group_from_results][security][forensics]") {
+    GroupFromResultsHarness h;
+    StoredResponse r;
+    r.instruction_id = kCommandId;
+    r.agent_id = "agent-A";
+    r.status = 1;
+    r.plugin = yuzu::server::test::kOrdinaryPlugin;
+    r.output = "high|cat-a|title|detail\n";
+    h.rs().store(r);
+
+    h.forensics.unknown();
+    auto res = h.post(GroupFromResultsHarness::form_body("tier-unknown-group"));
+    // 200, not 503: htmx drops a 4xx/5xx body, and the notice below is the operator's only signal.
+    CHECK(res->status == 200);
+    CHECK(res->body.find("class=\"feedback-error\"") != std::string::npos);
+    CHECK(res->body.find("could not be completed") != std::string::npos);
+    CHECK(res->body.find("Nothing was created") != std::string::npos);
+    // The form is hx-swap="none": the body and HX-Retarget are never displayed. The operator sees
+    // the refusal through the page's toast channel (the HX-Trigger showToast event every other
+    // handler of this page uses), carrying exactly this constant message at the error level.
+    CHECK(res->get_header_value("HX-Trigger") ==
+          R"({"showToast":{"message":"The permission check for this action could not be completed. )"
+          R"(Nothing was created. Retry shortly.","level":"error"}})");
+    CHECK(res->get_header_value("HX-Retarget").empty());
+    // This action materializes membership: an Unknown answer must create nothing, not a group from
+    // the ordinary rows alone.
+    CHECK_FALSE(h.mg.find_group_by_name("tier-unknown-group").has_value());
+
+    // Control: a Denied decision still creates the group from the ordinary row.
+    h.forensics.viewer();
+    auto ok = h.post(GroupFromResultsHarness::form_body("tier-denied-group"));
+    CHECK(ok->status != 503);
+    CHECK(ok->body.find("Nothing was created") == std::string::npos);
+    CHECK(ok->get_header_value("HX-Trigger").find("could not be completed") == std::string::npos);
+    CHECK(h.mg.find_group_by_name("tier-denied-group").has_value());
+}
+
 // -- (2b) #5623: an empty match with a filter over the ingest bound says so --
 
 TEST_CASE("group-from-results: a 422 for an over-bound filter value explains the undercount, "
@@ -442,6 +563,12 @@ TEST_CASE("group-from-results: a degraded response store 503s with the "
     auto res = h.post(GroupFromResultsHarness::form_body("degrade-group"));
     CHECK(res->status == 503);
     CHECK(contains(res->body, "could not be read"));
+    // The form never swaps a body (hx-swap="none"), so the refusal also travels on the toast
+    // channel: exactly this constant message, at the error level.
+    CHECK(res->get_header_value("HX-Trigger") ==
+          R"({"showToast":{"message":"Agent count unavailable. The response store could not be read. )"
+          R"(Nothing was created. Retry shortly.","level":"error"}})");
+    CHECK(res->get_header_value("HX-Retarget").empty());
 
     CHECK(h.audits_for("response.read", "denied") == 0);
     CHECK_FALSE(h.mg.find_group_by_name("degrade-group").has_value());
@@ -626,4 +753,104 @@ TEST_CASE("group-from-results: a configured trusted origin is accepted "
                       {{"Host", kHost}, {"Origin", "https://proxy.example"}});
     CHECK(res->status == 200);
     CHECK(h.mg.find_group_by_name("csrf-trusted-group").has_value());
+}
+
+// ── Success toast: the HX-Trigger header is always valid, single-line, ASCII JSON ───────────
+
+namespace {
+
+/// Percent-encode every byte that is not an unreserved URL character, so a test can put any
+/// byte (quote, backslash, CR/LF, tab, UTF-8) into the urlencoded `group_name` field.
+std::string percent_encode(std::string_view in) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    for (const unsigned char c : in) {
+        const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+        if (unreserved) {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[c >> 4]);
+            out.push_back(kHex[c & 0x0F]);
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("group-from-results: the success toast is valid single-line ASCII JSON whatever the "
+          "group name holds",
+          "[pg][server][dashboard][group_from_results][toast]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+
+    const auto run = [&](const std::string& name) {
+        auto res = h.post(GroupFromResultsHarness::form_body(percent_encode(name)));
+        REQUIRE(res->status == 200);
+        const std::string trigger = res->get_header_value("HX-Trigger");
+        // A header dropped by the transport (CR/LF in the value) leaves the operator with no
+        // confirmation and no list refresh, so its absence is itself the failure.
+        REQUIRE_FALSE(trigger.empty());
+        for (const unsigned char c : trigger) {
+            INFO("byte " << static_cast<int>(c) << " in the HX-Trigger header");
+            REQUIRE((c >= 0x20 && c < 0x7F));
+        }
+        const auto j = nlohmann::json::parse(trigger, nullptr, /*allow_exceptions=*/false);
+        REQUIRE_FALSE(j.is_discarded());
+        REQUIRE(j.is_object());
+        // Event structure is unchanged: the toast plus the list-refresh trigger, nothing else.
+        CHECK(j.size() == 2);
+        REQUIRE(j.contains("showToast"));
+        REQUIRE(j["showToast"].is_object());
+        CHECK(j["showToast"].size() == 2);
+        CHECK(j["showToast"].value("level", "") == "success");
+        REQUIRE(j.contains("agentChanged"));
+        CHECK(j["agentChanged"] == true);
+        // The message round-trips the name byte for byte.
+        CHECK(j["showToast"].value("message", "") == "Group '" + name + "' created with 1 agents");
+    };
+
+    SECTION("an ordinary name is unchanged") {
+        run("plain-group");
+        CHECK(h.mg.find_group_by_name("plain-group").has_value());
+    }
+    SECTION("a double quote") {
+        run("say \"hi\"");
+    }
+    SECTION("a backslash") {
+        run("a\\b");
+    }
+    SECTION("a newline") {
+        run("line1\nline2");
+    }
+    SECTION("a carriage return and line feed") {
+        run("line1\r\nline2");
+    }
+    SECTION("a tab") {
+        run("col1\tcol2");
+    }
+    SECTION("a non-ASCII name") {
+        run("Gr\xC3\xBC" "ppe \xE2\x9C\x93 \xE6\x97\xA5\xE6\x9C\xAC");
+    }
+    SECTION("markup characters travel as text, not HTML entities") {
+        run("R&D <team> 'north'");
+    }
+    SECTION("a long name is cut in the toast so the header stays small, and the group keeps it whole") {
+        // 60 three-byte characters = 180 bytes of name, which would escape to 360 bytes.
+        std::string name;
+        for (int i = 0; i < 60; ++i)
+            name += "\xE6\x97\xA5";
+        auto res = h.post(GroupFromResultsHarness::form_body(percent_encode(name)));
+        REQUIRE(res->status == 200);
+        const std::string trigger = res->get_header_value("HX-Trigger");
+        REQUIRE_FALSE(trigger.empty());
+        CHECK(trigger.size() < 400);
+        const auto j = nlohmann::json::parse(trigger, nullptr, /*allow_exceptions=*/false);
+        REQUIRE_FALSE(j.is_discarded());
+        const std::string msg = j["showToast"].value("message", "");
+        CHECK(msg.find("...' created with 1 agents") != std::string::npos);
+        CHECK(h.mg.find_group_by_name(name).has_value()); // the store keeps the full name
+    }
 }
