@@ -70,6 +70,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_raii.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -123,6 +124,13 @@ constexpr const char* kTruncatedNoSuccess =
     "succeeded)</span>";
 
 bool refused(int status) { return status == 401 || status == 403; }
+
+std::size_t count_occurrences(const std::string& haystack, const std::string& needle) {
+    std::size_t n = 0;
+    for (std::size_t at = 0; (at = haystack.find(needle, at)) != std::string::npos; ++at)
+        ++n;
+    return n;
+}
 
 /// The whole Detail cell markup for `escaped_text` (already HTML-escaped) and an optional
 /// truncation caveat, so a test pins the cell and not a substring of it.
@@ -310,6 +318,16 @@ struct Rig {
             if (r.result == "denied" && (action.empty() || r.action == action))
                 ++n;
         return n;
+    }
+    /// The `detail` of every denied row of `action`, newest first.
+    std::vector<std::string> denied_details(const std::string& action) {
+        auto rows = audit_store.query({});
+        REQUIRE(rows.has_value());
+        std::vector<std::string> out;
+        for (const auto& r : *rows)
+            if (r.result == "denied" && r.action == action)
+                out.push_back(r.detail);
+        return out;
     }
 
     /// `yuzu_server_audit_read_degrade_total{reason="query_error"}` as of now: one per failed
@@ -690,7 +708,8 @@ private:
 } // namespace
 
 TEST_CASE("engine panel audit: the revoke Detail shows only to a caller who also passes "
-          "AuditLog:Read, and is the earliest retained committed revoke, never a failed or later row",
+          "AuditLog:Read, and is the earliest retained committed revoke, never a failed or "
+          "later row",
           "[pg][settings][engine_principal][authz][audit]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
     Rig r{db_.dsn()};
@@ -912,6 +931,9 @@ TEST_CASE("engine panel audit: an unreadable roster writes no success row, an un
               std::vector<std::string>{"engine_principal.list/success/count=" +
                                        std::to_string(r.roster_size())});
         CHECK_THAT(resp->body, ContainsSubstring(detail_cell("(unavailable)")));
+        // A failed credential read, unlike an audit-only failure, draws the Retry control (and
+        // proves the audit-only case's "no Retry" assertion is looking for the right words).
+        CHECK_THAT(resp->body, ContainsSubstring("Retry</button>"));
     }
 }
 
@@ -952,7 +974,8 @@ TEST_CASE("engine panel audit: a dropped audit row and a locked audit table degr
         REQUIRE(b);
         served += (a->status == 200) + (b->status == 200);
         marker_leaks_a += a->body.find("REVOKE-DETAIL-MARKER") != std::string::npos;
-        CHECK_THAT(b->body, ContainsSubstring(detail_cell("(unavailable)"))); // "not recorded" would lie
+        // "(not recorded)" here would state a fact the failed read never established.
+        CHECK_THAT(b->body, ContainsSubstring(detail_cell("(unavailable)")));
         CHECK_THAT(b->body, !ContainsSubstring("FAILED-REVOKE-STORE-ERROR"));
         CHECK_THAT(b->body, !ContainsSubstring("LATER-RETRY"));
     }
@@ -1095,6 +1118,9 @@ TEST_CASE("engine panel audit: once the audit store fails the remaining revoked 
     for (std::size_t at = 0; (at = resp->body.find(cell, at)) != std::string::npos; ++at)
         ++unavailable;
     CHECK(unavailable == static_cast<std::size_t>(kRevoked));
+    // Only the audit lookup failed, so the credential reads are fine and the page draws no Retry
+    // control: the documented recovery is a reload (after copying any secret shown on the page).
+    CHECK_THAT(resp->body, !ContainsSubstring("Retry"));
     CHECK_THAT(resp->body, !ContainsSubstring("Detail (earliest retained record): (not recorded)"));
     CHECK_THAT(resp->body, !ContainsSubstring("REVOKE-DETAIL-MARKER"));
 
@@ -1141,9 +1167,19 @@ TEST_CASE("engine panel audit: the AuditLog:Read probe is issued only when a rev
     const auto some = r.bearer_get(kFragment, raw);
     REQUIRE(some);
     CHECK(some->status == 200);
-    CHECK_THAT(some->body, ContainsSubstring(detail_cell(
-                               "(withheld: needs AuditLog:Read, or it could not be confirmed)")));
+    // Every revoked row reads the withheld text (the probe's answer is memoised, not re-asked
+    // and not read as "admitted" for rows 2..N), and none of the audit text leaks.
+    CHECK(count_occurrences(some->body,
+                            detail_cell("(withheld: needs AuditLog:Read, or it could not be "
+                                        "confirmed)")) == 3);
+    CHECK_THAT(some->body, !ContainsSubstring("REVOKE-DETAIL-MARKER"));
+    CHECK_THAT(some->body, !ContainsSubstring("FAILED-REVOKE-STORE-ERROR"));
+    CHECK_THAT(some->body, !ContainsSubstring("LATER-RETRY"));
     CHECK(r.denied_rows("auth.permission_required") == before + 1);
+    // The served-but-denied row names the permission it lacked (RBAC-on wording,
+    // auth_routes.cpp `require_permission`/`probe_permission`).
+    CHECK(std::ranges::count(r.denied_details("auth.permission_required"),
+                             std::string("RBAC denied AuditLog:Read")) == 1);
 
     // The same caller as a cookie session: the probe is quiet, no row.
     const auto cookie = r.cookie_get(kFragment, r.cookie("carol", auth::Role::user));
@@ -1201,6 +1237,81 @@ TEST_CASE("engine panel audit: the three Detail cell states read as their exact 
     CHECK_THAT(carol->body, ContainsSubstring(detail_cell(
                                 "(withheld: needs AuditLog:Read, or it could not be confirmed)")));
     CHECK_THAT(carol->body, !ContainsSubstring("(not recorded)"));
+}
+
+TEST_CASE("engine panel audit: a committed revoke with an empty detail (an MCP revoke given no "
+          "reason) reads '(not recorded)', and a later retry's text is not shown in its place",
+          "[pg][settings][engine_principal][authz][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
+    Rig r{db_.dsn()};
+    r.custom_reader_role("EngineAuditReader", /*with_audit_read=*/true);
+    r.account("dave", auth::Role::user);
+    r.grant("dave", "EngineAuditReader");
+    r.rbac_on();
+    // The MCP tool's `reason` is optional, so its committed success row can carry no detail. The
+    // oldest success is still that row, whatever a later retry wrote.
+    r.seed_revoked("engine:noreason", {{300, "success", ""}});
+    r.seed_revoked("engine:noreason-retried",
+                   {{300, "success", ""}, {100, "success", kLaterRetryText}});
+
+    const auto resp = r.cookie_get(kFragment, r.cookie("dave", auth::Role::user));
+    REQUIRE(resp);
+    REQUIRE(resp->status == 200);
+    CHECK(count_occurrences(resp->body, detail_cell("(not recorded)")) == 2);
+    CHECK_THAT(resp->body, !ContainsSubstring("LATER-RETRY"));
+    // A short history: no truncation caveat in either wording.
+    CHECK_THAT(resp->body, !ContainsSubstring("more than 200 revoke events"));
+}
+
+namespace {
+/// Makes the credential read of exactly ONE principal (`engine:poison`) fail in the token
+/// store's clone database while every other principal's read answers: the table is renamed
+/// behind a view whose filter raises, at a cost that orders it after the other filters, for a
+/// row of that principal only. (The credential row must exist before this runs.)
+void poison_credential_read_for(const std::string& token_dsn) {
+    exec_ddl(token_dsn,
+             "CREATE FUNCTION public.yuzu_test_poison(p text) RETURNS boolean LANGUAGE plpgsql "
+             "COST 1000000 AS $f$ BEGIN IF p = 'engine:poison' THEN "
+             "RAISE EXCEPTION 'yuzu test poison'; END IF; RETURN TRUE; END $f$");
+    exec_ddl(token_dsn, "ALTER TABLE api_token_store.api_tokens RENAME TO api_tokens_real");
+    exec_ddl(token_dsn, "CREATE VIEW api_token_store.api_tokens AS SELECT * FROM "
+                        "api_token_store.api_tokens_real "
+                        "WHERE public.yuzu_test_poison(principal_id)");
+}
+} // namespace
+
+TEST_CASE("engine panel audit: rows rendered before a credential-read failure keep their real "
+          "Detail, the row that failed and those after it read unavailable",
+          "[pg][settings][engine_principal][authz][audit][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
+    Rig r{db_.dsn()};
+    r.custom_reader_role("EngineAuditReader", /*with_audit_read=*/true);
+    r.account("dave", auth::Role::user);
+    r.grant("dave", "EngineAuditReader");
+    r.rbac_on();
+    r.seed_revoked_principal("engine:okfirst");
+    r.seed_revoked_principal("engine:poison");
+    r.seed_revoked_principal("engine:after");
+    // The roster is ordered by created_at; pin the order so the failing row is the second
+    // revoked row, not whichever the clock ties happened to give.
+    int64_t at = 100;
+    for (const char* id : {kSlug, "engine:okfirst", "engine:poison", "engine:after"})
+        exec_ddl(db_.dsn(), ("UPDATE engine_principal_store.engine_principals SET created_at = " +
+                             std::to_string(at++) + " WHERE principal_id = '" + id + "'")
+                                .c_str());
+    // A live credential for the poisoned principal, so its credential read has a row to trip on.
+    (void)r.token("poison-cred", "engine:poison", "readonly", "engine");
+    poison_credential_read_for(r.api_tokens.dsn());
+
+    const auto resp = r.cookie_get(kFragment, r.cookie("dave", auth::Role::user));
+    REQUIRE(resp);
+    REQUIRE(resp->status == 200);
+    // Rendered before the failure: the real audit text. At and after it: not looked up.
+    CHECK(count_occurrences(resp->body, detail_cell(kRevokeMarker)) == 1);
+    CHECK(count_occurrences(resp->body, detail_cell("(unavailable)")) == 2);
+    CHECK(count_occurrences(resp->body, "<span class=\"muted\">unavailable</span>") == 2);
+    CHECK_THAT(resp->body, ContainsSubstring("Retry</button>"));
+    CHECK_THAT(resp->body, !ContainsSubstring("(not recorded)"));
 }
 
 // ---- the page itself is unchanged -------------------------------------------------------------
