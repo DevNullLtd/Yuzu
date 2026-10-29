@@ -675,8 +675,25 @@ const char* const kSettingsPageTemplate =
         el.textContent = 'You do not have permission to view this panel. It needs the EnginePrincipal:Read permission.';
       else if (x.status === 401)
         el.textContent = 'Your session has expired. Sign in again to view this panel.';
-      else
-        el.textContent = 'This panel could not be loaded (HTTP ' + x.status + '). Reload the page to try again.';
+      else {
+        /* Not a reload: a freshly minted or rotated credential secret is shown outside this
+           section and a reload discards it. The Retry control and its
+           wording are settings_routes.cpp's kEngineRetryControl, built as elements (textContent
+           only) so the note stays free of markup parsing. */
+        el.textContent = 'This panel could not be loaded (HTTP ' + x.status + '). ';
+        var retry = document.createElement('button');
+        retry.type = 'button';
+        retry.className = 'btn btn-secondary';
+        retry.textContent = 'Retry';
+        retry.addEventListener('click', function() {
+          htmx.trigger(document.body, 'refreshEnginePrincipals');
+        });
+        var hint = document.createElement('span');
+        hint.className = 'hint';
+        hint.textContent = ' Retry here instead of reloading the page, which would discard a credential secret shown above.';
+        el.appendChild(retry);
+        el.appendChild(hint);
+      }
     });
 
 )HTM"

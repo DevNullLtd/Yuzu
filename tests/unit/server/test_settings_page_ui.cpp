@@ -142,14 +142,24 @@ TEST_CASE("Settings page tells a caller the Engine Principals panel refused why,
     CHECK(count_of(html, "It needs the EnginePrincipal:Read permission.") == 1);
     CHECK(count_of(html, "Sign in again to view this panel.") == 1);
     CHECK(count_of(html, "(HTTP ' + x.status + ')") == 1);
+    // The 5xx/429 note offers the in-page Retry (kEngineRetryControl's wording) and never tells
+    // the caller to reload: a reload discards a credential secret shown outside the section.
+    CHECK(count_of(html, "Retry here instead of reloading the page, which would discard a "
+                         "credential secret shown above.") == 1);
+    CHECK(count_of(html, "htmx.trigger(document.body, 'refreshEnginePrincipals')") >= 1);
+    CHECK(count_of(html, "Reload the page to try again.") == 0);
     // The note is written as text, never parsed as markup.
     const auto at = html.find("'htmx:responseError'");
     REQUIRE(at != std::string::npos);
-    const auto end = html.find("});", at);
+    const auto end = html.find("\n    });", at); // the listener's own close, not a nested one
     REQUIRE(end != std::string::npos);
     const auto body = html.substr(at, end - at);
     CHECK(count_of(body, "el.textContent = ") == 3);
     CHECK(count_of(body, "innerHTML") == 0);
+    // The listener writes only to the panel's own section, never to the secret-reveal element
+    // that sits outside it (a mint or rotate response is shown there and must survive).
+    CHECK(count_of(body, "engine-principal-reveal") == 0);
+    CHECK(count_of(body, "getElementById") == 0);
     CHECK(count_of(body, "hx-on") == 0);
     CHECK(count_of(body, "new Function") == 0);
     CHECK(count_of(body, "eval(") == 0);

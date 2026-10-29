@@ -329,11 +329,18 @@ private:
     /// A roster that cannot be read renders an "unavailable" notice instead of a
     /// table; a credential count that cannot be read renders "unavailable" and the
     /// row offers neither Mint nor Rotate.
-    /// Revoked rows surface the `superseded_by` linkage AND the revocation
-    /// reason explicitly (design doc §3.1) — never a merged history that
-    /// hides that a revocation occurred. Admin-only; a null
-    /// `engine_principal_store_` renders an inert "not configured" panel.
-    std::string render_engine_principals_fragment();
+    /// Revoked rows surface the `superseded_by` linkage AND the recorded revoke detail
+    /// explicitly (design doc §3.1) — never a merged history that hides that a revocation
+    /// occurred. The detail is the audit trail's text, so it is looked up and shown only when
+    /// `may_read_audit` (the caller passes the quiet AuditLog:Read probe); otherwise the cell
+    /// says it is withheld. It is the ORIGINAL committed revoke (`committed_revoke_detail`,
+    /// shared with the Access tokens panel), never a later failed or retried attempt.
+    /// `roster_count`, when given, is set to the number of principals rendered ONLY when the
+    /// roster was actually read: the caller writes the `engine_principal.list` success row
+    /// from it, and an absent store or an unreadable roster leaves it empty (no row).
+    /// Admin-only; a null `engine_principal_store_` renders an inert "not configured" panel.
+    std::string render_engine_principals_fragment(bool may_read_audit,
+                                                  std::optional<std::size_t>* roster_count = nullptr);
 
     /// Render the Access Reviews Settings fragment (SOC 2 CC6.2) — a
     /// CONVENIENCE dashboard surface only; the REST endpoints under
