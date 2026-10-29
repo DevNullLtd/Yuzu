@@ -408,6 +408,66 @@ TEST_CASE("disk_actions: macOS reports real mount points, not an empty join",
 }
 #endif // __APPLE__
 
+#if defined(_WIN32)
+constexpr const char* kPlannedToken = "windows:planned";
+#elif defined(__APPLE__)
+constexpr const char* kPlannedToken = "macos:planned";
+#else
+constexpr const char* kPlannedToken = "linux:planned";
+#endif
+
+TEST_CASE("disk_actions plugin: partitions and topology are declared PLANNED on every leg",
+          "[disk_actions][descriptors]") {
+    auto plugin = load_disk_actions_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    const auto* d = plugin->descriptor;
+    REQUIRE(d->action_descriptor_count == 4);
+    for (std::size_t i = 0; i < d->action_descriptor_count; ++i) {
+        const auto& a = d->action_descriptors[i];
+        const std::string_view name{a.action};
+        INFO("action: " << name);
+        if (name == "partitions" || name == "topology") {
+            for (const auto* leg : {&a.linux_leg, &a.macos_leg, &a.windows_leg}) {
+                CHECK(leg->support == YUZU_SUPPORT_PLANNED);
+                CHECK(leg->rung == 1);
+            }
+        } else if (name == "smart") {
+            CHECK(a.linux_leg.support == YUZU_SUPPORT_UNSUPPORTED);
+            CHECK(a.macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
+            CHECK(a.windows_leg.support == YUZU_SUPPORT_SUPPORTED);
+        } else {
+            CHECK(name == "volumes");
+            CHECK(a.linux_leg.support == YUZU_SUPPORT_UNSUPPORTED);
+            CHECK(a.macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
+            CHECK(a.windows_leg.support == YUZU_SUPPORT_CONSTRAINED);
+        }
+    }
+}
+
+TEST_CASE("disk_actions plugin: partitions and topology answer one typed planned status row",
+          "[disk_actions][actions]") {
+    auto plugin = load_disk_actions_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    for (const char* name : {"partitions", "topology"}) {
+        INFO("action: " << name);
+        auto result = dispatcher.run(plugin->descriptor, name);
+        CHECK(result.rc == 0);
+        const auto rows = captured_rows(result.captured);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == std::string{"status|"} + name + "|unsupported|" + kPlannedToken);
+        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+        CHECK(result.result_provenance == kPlannedToken);
+    }
+}
+
 TEST_CASE("disk_actions plugin: an unknown action is refused, not silently ignored",
           "[disk_actions][actions]") {
     auto plugin = load_disk_actions_plugin();
