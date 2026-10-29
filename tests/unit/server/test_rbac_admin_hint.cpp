@@ -10,8 +10,9 @@
  *      transition, so its equality rests on this matrix. A change to the gate sequence of
  *      any of the three routes needs a matching row here. Per persona, the hint is computed
  *      from the same stores the routes read, then the
- *      REAL `POST /api/v1/rbac/roles/{name}/assignments` (and, for the personas that can
- *      reach a real transition, `PUT /api/v1/rbac/enforcement`) is called and its answer
+ *      REAL `POST /api/v1/rbac/roles/{name}/assignments` (plus `DELETE .../assignments/{id}`
+ *      for two personas, and, for the personas that can reach a real transition,
+ *      `PUT /api/v1/rbac/enforcement`) is called and its answer
  *      classified: 2xx / 400 / 409 = authority admitted (kMay), 403 = kMayNot, 503 = kUnconfirmed.
  *      The hint must equal that classification, and must not have written an audit row.
  *   2. The fold itself: structural denies need no store, a null or degraded store is
@@ -78,6 +79,25 @@ void check_assign(RbacRoleHarness& h, RbacAdminHint expected) {
     const auto res = h.assign_rest("Viewer", R"({"principal_type":"user","principal_id":"hint-target"})");
     REQUIRE(res);
     INFO("assign status=" << res->status << " body=" << res->body);
+    const auto classified = classify(res->status);
+    REQUIRE(classified.has_value());
+    CHECK(*classified == hint);
+}
+
+/// The hint equals the real DELETE unassign answer. The target holds the grant first, so a
+/// request that clears both gates succeeds (2xx) instead of answering 404, which is not an
+/// authority answer and fails the classification loudly.
+void check_unassign(RbacRoleHarness& h, RbacAdminHint expected) {
+    REQUIRE(h.rbac->assign_role({"user", "hint-target", "Viewer"}).has_value());
+    const auto audits_before = h.audit_log.size();
+    const auto hint = hint_of(h);
+    CHECK(h.audit_log.size() == audits_before); // the hint path is silent (#5792)
+    INFO("hint=" << name_of(hint) << " expected=" << name_of(expected));
+    CHECK(hint == expected);
+
+    const auto res = h.unassign_rest("Viewer", "hint-target");
+    REQUIRE(res);
+    INFO("unassign status=" << res->status << " body=" << res->body);
     const auto classified = classify(res->status);
     REQUIRE(classified.has_value());
     CHECK(*classified == hint);
@@ -208,6 +228,28 @@ TEST_CASE("rbac_admin_hint == POST assign: a principal with no auth.users row at
           "[pg][rbac_admin_predicate][rbac_admin_hint]") {
     RbacRoleHarness h;
     check_assign(h, RbacAdminHint::kMayNot);
+}
+
+// DELETE unassign calls the same two authority functions in the same order as POST assign
+// (rest_api_v1.cpp), but through its own handler, so its sequence is pinned on its own.
+TEST_CASE("rbac_admin_hint == DELETE unassign: base user WITH the Administrator grant, RBAC on (P4)",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true);
+    check_unassign(h, RbacAdminHint::kMay);
+}
+
+TEST_CASE("rbac_admin_hint == DELETE unassign: SSO principal with the grant but NO auth.users row (P7)",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.session_user = "oidc:https://idp.example#sub-1";
+    h.session_auth_source = "oidc";
+    h.rbac->set_rbac_enabled(true);
+    REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
+    // Past the predicate, refused by the regime check: the second gate of the DELETE handler.
+    REQUIRE(is_rbac_administrator(h.rest_session(), h.auth_db.get(), h.rbac.get(),
+                                  RbacAdminSurface::kRest) == RbacAdminGate::kAdmin);
+    check_unassign(h, RbacAdminHint::kMayNot);
 }
 
 TEST_CASE("rbac_admin_hint == POST assign: MCP-tier token on the REST surface (P9)",

@@ -11,13 +11,15 @@
  * the twin's 503 for a closed store) is "admitted at the gate". Raw statuses are NOT compared
  * for an admitted caller whose store is unavailable: the twin answers 503 before it reads the
  * session, the panel answers its in-page "store unavailable" note with 200 (htmx does not swap
- * a 4xx/5xx, so the degraded note must ride a 200). That is the one deliberate difference, and
- * it is pinned here for a human cookie only.
+ * a 4xx/5xx, so the degraded note must ride a 200). That is deliberate difference one, pinned
+ * here for a human cookie only. Difference two (harmless): an engine session with the store
+ * absent gets 403 from the fragment, whose engine-session belt runs after the permission gate
+ * and before the store note, but 503 from the twin, whose store check precedes its session read.
  *
  * Personas, each with RBAC off and on: an account administrator WITHOUT the grant; a
  * non-administrator WITH EnginePrincipal:Read (Viewer); an account administrator holding the
  * Administrator grant; a plain user; an administrator's MCP-tier bearer; an engine session; an
- * unauthenticated caller.
+ * unauthenticated caller; a JIT-elevated user; a service-scoped token.
  *
  * Audit: a refused interactive cookie session leaves no auth.permission_required row on the
  * panel (it auto-loads) but does on the twin; a refused token keeps its row on both.
@@ -321,6 +323,44 @@ TEST_CASE("engine panel authz, RBAC off: an engine session and an unauthenticate
     Rig r{db_.dsn()};
     r.expect_same('b', r.token("engine-bearer", kSlug, "readonly", "engine"), false);
     r.expect_same('a', "", false);
+}
+
+TEST_CASE("engine panel authz, both regimes: a JIT-elevated user is admitted by both (the "
+          "elevation short-circuit), and a user who is not elevated is not",
+          "[pg][settings][engine_principal][authz][security]") {
+    for (const bool rbac_enabled : {false, true}) {
+        INFO("rbac_on=" << rbac_enabled);
+        YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
+        Rig r{db_.dsn()};
+        if (rbac_enabled)
+            r.rbac_on();
+        const auto elevated = r.cookie("alice", auth::Role::user);
+        REQUIRE(r.auth_mgr.elevate_session(elevated, std::chrono::seconds(300)).has_value());
+        r.expect_same('c', elevated, true);
+        // A second, never-elevated session of the same account stays refused: the admission
+        // above came from the elevation, not from the account.
+        r.expect_same('c', r.cookie("alice", auth::Role::user), false);
+    }
+}
+
+TEST_CASE("engine panel authz, both regimes: a service-scoped token is refused by both, even one "
+          "minted by an administrator",
+          "[pg][settings][engine_principal][authz][security]") {
+    for (const bool rbac_enabled : {false, true}) {
+        INFO("rbac_on=" << rbac_enabled);
+        YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
+        Rig r{db_.dsn()};
+        r.grant("root", "Administrator");
+        if (rbac_enabled)
+            r.rbac_on();
+        // The unscoped twin of the same creator is admitted, so the refusal below is the
+        // service scope (kServiceScopeGlobalSafe is empty), not a missing grant or a dead token.
+        r.expect_same('b', r.token("root-unscoped", "root"), true);
+        auto raw = r.api_tokens->create_token("root-scoped", "root", now_epoch() + 3600,
+                                              "payments", "readonly");
+        REQUIRE(raw.has_value());
+        r.expect_same('b', *raw, false);
+    }
 }
 
 // ---- RBAC on: the grant decides, not the account role --------------------------------------
