@@ -157,12 +157,12 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
     // Tabs: the flow (default) and the read-only deployments list. Both anchors carry an
     // href so they stay focusable and Enter-activatable; the Deployments href sets the hash
     // natively (htmx leaves a fragment href alone) so #deployments deep-links.
-    h += "<div class=\"gp-subnav\" id=\"auto-tabs\" role=\"tablist\">"
+    h += "<div class=\"tabs\" id=\"auto-tabs\" role=\"tablist\">"
          "<a href=\"#\" role=\"tab\" class=\"on\" aria-selected=\"true\" "
          "onclick=\"pfTab('flow');return false\">Pre-flight and deploy</a>"
          "<a href=\"#deployments\" role=\"tab\" aria-selected=\"false\" "
          "hx-get=\"/fragments/auto/deployments\" hx-target=\"#auto-list\" hx-swap=\"innerHTML\" "
-         "hx-sync=\"this:replace\" onclick=\"pfTab('list')\">Deployments</a></div>";
+         "hx-sync=\"this:drop\" onclick=\"pfTab('list')\">Deployments</a></div>";
     h += "<div id=\"auto-flow\">";
     h += "<div class=\"af-note\">"
          "Configure the checks (parameters + thresholds), run across a cohort, and get a go/no-go "
@@ -290,7 +290,11 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
          ":'<div class=\\\"failbox\\\" role=\\\"alert\\\">Deployments could not be read just now. "
          "Try again in a moment.</div>';};"
          "document.body.addEventListener('htmx:responseError',fail);"
-         "document.body.addEventListener('htmx:sendError',fail);}"
+         "document.body.addEventListener('htmx:sendError',fail);"
+         "window.addEventListener('hashchange',function(){var d=document.getElementById('auto-deployments');"
+         "if(!d)return;var want=(location.hash==='#deployments');if(want===!d.hidden)return;"
+         "pfTab(want?'list':'flow');if(want)htmx.ajax('GET','/fragments/auto/deployments',"
+         "{target:'#auto-list',swap:'innerHTML'});});}"
          "if(location.hash==='#deployments'&&window.htmx){pfTab('list');"
          "htmx.ajax('GET','/fragments/auto/deployments',{target:'#auto-list',swap:'innerHTML'});}"
          "</script>";

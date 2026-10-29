@@ -183,7 +183,7 @@ TEST_CASE("render_deployments_list: each name drills into the detail fragment wi
     auto plain = row("running");
     const std::string h = render_deployments_list({plain}, {"Run one"}, false);
     CHECK(h.find("<a href=\"#\" hx-get=\"/fragments/auto/deployments/detail?dep=00112233aabbccdd\" "
-                 "hx-target=\"#auto-detail\" hx-swap=\"innerHTML\" hx-sync=\"this:replace\">Chrome 132</a>") !=
+                 "hx-target=\"#auto-detail\" hx-swap=\"innerHTML\" hx-sync=\"#auto-detail:replace\">Chrome 132</a>") !=
           std::string::npos);
     CHECK(h.find("data-dep=\"00112233aabbccdd\"") != std::string::npos);
 

@@ -792,11 +792,16 @@ TEST_CASE("preflight ui: /auto renders the Deployments tab strip, panels, refusa
           "the empty-notice reveal fix",
           "[preflight][routes][ui]") {
     const std::string h = render_auto_config({}, {});
-    CHECK(contains(h, "id=\"auto-tabs\" role=\"tablist\""));
+    CHECK(contains(h, "class=\"tabs\" id=\"auto-tabs\" role=\"tablist\""));
+    CHECK_FALSE(contains(h, "gp-subnav"));
     CHECK(contains(h, "<a href=\"#\" role=\"tab\" class=\"on\" aria-selected=\"true\""));
     CHECK(contains(h, "<a href=\"#deployments\" role=\"tab\" aria-selected=\"false\" "
                       "hx-get=\"/fragments/auto/deployments\" hx-target=\"#auto-list\""));
-    CHECK(contains(h, "hx-sync=\"this:replace\""));
+    CHECK(contains(h, "hx-sync=\"this:drop\""));
+    // Tab wiring: the two onclick handlers and the pfTab switcher.
+    CHECK(contains(h, "window.pfTab=function"));
+    CHECK(contains(h, "onclick=\"pfTab('flow');return false\""));
+    CHECK(contains(h, "onclick=\"pfTab('list')\""));
     const auto flow = h.find("<div id=\"auto-flow\">");
     const auto cfg = h.find("id=\"auto-cfg\"");
     const auto verify = h.find("id=\"auto-verify\"");
@@ -814,6 +819,10 @@ TEST_CASE("preflight ui: /auto renders the Deployments tab strip, panels, refusa
     CHECK(contains(h, "needs the SoftwareDeployment:Read permission."));
     CHECK(contains(h, "Deployments could not be read just now."));
     CHECK(contains(h, "htmx:sendError"));
+    // Browser Back/Forward: a once-guarded hashchange listener that tolerates the panel missing.
+    CHECK(contains(h, "window.addEventListener('hashchange',function(){var d=document.getElementById('auto-deployments');"
+                      "if(!d)return;"));
+    CHECK(contains(h, "if(want===!d.hidden)return;pfTab(want?'list':'flow');"));
     // Deep link calls htmx.ajax (a click on a swapped anchor would run before htmx binds it).
     CHECK(contains(h, "htmx.ajax('GET','/fragments/auto/deployments'"));
     CHECK_FALSE(contains(h, "hx-on"));

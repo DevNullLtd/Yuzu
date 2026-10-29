@@ -58,7 +58,7 @@ std::string render_deployments_list(const std::vector<DeploymentRow>& rows,
                                        : std::string("Run no longer kept");
         h += "<tr data-dep=\"" + esc(d.deployment_id) + "\"><td><a href=\"#\" hx-get=\"/fragments/auto/deployments/detail?dep=" +
              esc(url_query_value(d.deployment_id)) +
-             "\" hx-target=\"#auto-detail\" hx-swap=\"innerHTML\" hx-sync=\"this:replace\">" +
+             "\" hx-target=\"#auto-detail\" hx-swap=\"innerHTML\" hx-sync=\"#auto-detail:replace\">" +
              esc(d.name) + "</a><div class=\"hint\">" + esc(d.artifact_filename) + "</div></td><td>" + esc(target) +
              "</td><td><progress max=\"" + std::to_string(d.total) + "\" value=\"" +
              std::to_string(settled(d)) + "\"></progress> " + std::to_string(settled(d)) + " of " +
