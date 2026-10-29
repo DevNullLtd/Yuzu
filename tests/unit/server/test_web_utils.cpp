@@ -1232,17 +1232,17 @@ TEST_CASE("agent_error_display bounds the FIRST record, not a byte window",
           "[web_utils][agent-error]") {
     // Sol adversarial review. Agent replies are newline-separated records, so a
     // byte-count truncation of the raw output is wrong in both directions.
-    // `tar status`'s offline reply is `error|<long line>` followed by
+    // `echo status`'s offline reply is `error|<long line>` followed by
     // `storage_state|offline`, and the 300-byte window that replaced a 200-byte
     // one ran PAST the newline and rendered a trailing `storage_stat` as debris.
     const std::string offline =
-        "error|TAR storage is offline on this endpoint; the database was closed after a "
+        "error|Echo storage is offline on this endpoint; the database was closed after a "
         "transaction could not be rolled back. Collection and retention are both stopped. The "
-        "read-only query connection is unavailable too, so `tar sql` cannot read the historical "
+        "read-only query connection is unavailable too, so `echo sql` cannot read the historical "
         "data either. Restart the agent to recover.\nstorage_state|offline";
 
     const auto shown = yuzu::server::agent_error_display(offline);
-    CHECK(shown.starts_with("TAR storage is offline")); // prefix stripped
+    CHECK(shown.starts_with("Echo storage is offline")); // prefix stripped
     CHECK(shown.ends_with("Restart the agent to recover."));
     // The whole point: no debris from the NEXT record, at any length.
     CHECK(shown.find("storage_state") == std::string::npos);

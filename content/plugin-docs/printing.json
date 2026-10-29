@@ -110,7 +110,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Lists queued print jobs, optionally filtered to one printer: printer, job id, owner, document name, status, submission time (ISO-8601 UTC), and size in bytes. The document field is the job's user-supplied title/filename — it is treated as instruction-result user content (server instruction-result retention only; never forwarded to daily-sync, TAR, or DEX). It exists so an operator can identify which job a subsequent clear_queue call should target.",
+      "description": "Lists queued print jobs, optionally filtered to one printer: printer, job id, owner, document name, status, submission time (ISO-8601 UTC), and size in bytes. The document field is the job's user-supplied title/filename — it is treated as instruction-result user content (server instruction-result retention only; never forwarded to daily-sync, Echo, or DEX). It exists so an operator can identify which job a subsequent clear_queue call should target.",
       "display_name": "List Print Jobs",
       "execute_roles": [
         "endpoint-admin",
@@ -708,8 +708,8 @@
   "version": "1.0.0",
   "where_the_data_goes": [
     "**Instruction result.** Every row is server instruction-result data — the standard retention policy, served over REST `/api/responses`. Nothing here is a durable server-side table of its own.",
-    "**Not consumed by** daily-sync, TAR, DEX, or metrics — the plugin never runs on a schedule outside an explicit instruction dispatch, and there is no agent daily-sync source for print queues.",
-    "**Sensitivity.** `jobs.document` is the job's user-supplied document title or file name: user content, kept with instruction-result retention only and never forwarded to daily-sync, TAR or DEX. `jobs.owner` is a local account name on the device. A printer's `make_model` and `uri` can name an internal print server.",
+    "**Not consumed by** daily-sync, Echo, DEX, or metrics — the plugin never runs on a schedule outside an explicit instruction dispatch, and there is no agent daily-sync source for print queues.",
+    "**Sensitivity.** `jobs.document` is the job's user-supplied document title or file name: user content, kept with instruction-result retention only and never forwarded to daily-sync, Echo or DEX. `jobs.owner` is a local account name on the device. A printer's `make_model` and `uri` can name an internal print server.",
     "**Siblings:** `crossplatform.printing.printers`, `crossplatform.printing.jobs`."
   ]
 }

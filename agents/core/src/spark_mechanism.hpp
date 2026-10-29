@@ -18,7 +18,7 @@
  * fake wired via SparkEngine::register_mechanism() exercises the whole
  * arm / dedup / fan-out / disarm-teardown path on any platform (the
  * DiskReaderFn seam precedent, generalised to a stateful, thread-owning
- * mechanism — the tar ProcStreamCollector shape). Service (spark_service.cpp,
+ * mechanism — the echo ProcStreamCollector shape). Service (spark_service.cpp,
  * Stage-1 PR 1c) is the first mechanism real on TWO platforms at once (Linux
  * sd-bus + Windows SCM) rather than Windows-only.
  *

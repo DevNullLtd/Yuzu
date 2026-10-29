@@ -105,7 +105,7 @@ namespace {
 // content).
 inline constexpr std::array<CommandCapability, 3> kFixture{{
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "purge_source",
         .dispatch_class = DispatchClass::Destructive,
         .mutability = Mutability::Irreversible,
@@ -116,7 +116,7 @@ inline constexpr std::array<CommandCapability, 3> kFixture{{
         .execute_gate = ExecuteGate::None,
     },
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "query",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -139,12 +139,12 @@ inline constexpr std::array<CommandCapability, 3> kFixture{{
     },
 }};
 
-// A second, independently-authored fragment that redeclares tar.purge_source
+// A second, independently-authored fragment that redeclares echo.purge_source
 // — exercises the Ambiguous classify-miss path, same technique
 // test_command_capability.cpp uses for its own Ambiguous case.
 inline constexpr std::array<CommandCapability, 1> kCollidingFragment{{
     {
-        .plugin = "TAR",
+        .plugin = "Echo",
         .action = "PURGE_SOURCE",
         .dispatch_class = DispatchClass::Destructive,
         .mutability = Mutability::Irreversible,
@@ -195,7 +195,7 @@ std::vector<std::string> ids(std::initializer_list<std::string> v) { return {v};
 TEST_CASE("Destructive row, explicit non-empty agent_ids, no scope: Targeted",
           "[server][dispatch][security]") {
     CommandCapabilityRegistry registry{std::span<const CommandCapability>(kFixture)};
-    auto classified = registry.classify("tar", "purge_source");
+    auto classified = registry.classify("echo", "purge_source");
     REQUIRE(classified.has_value());
 
     const auto gate = evaluate_destructive_targeting(classified,
@@ -203,7 +203,7 @@ TEST_CASE("Destructive row, explicit non-empty agent_ids, no scope: Targeted",
                                                       /*scope_key_present=*/false);
     CHECK(gate.verdict == DestructiveTargetingVerdict::Targeted);
     REQUIRE(gate.capability.has_value());
-    CHECK(gate.capability->plugin == "tar");
+    CHECK(gate.capability->plugin == "echo");
     CHECK(gate.capability->action == "purge_source");
     CHECK_FALSE(gate.miss.has_value());
 }
@@ -211,7 +211,7 @@ TEST_CASE("Destructive row, explicit non-empty agent_ids, no scope: Targeted",
 TEST_CASE("Destructive row, empty/absent agent_ids: RefuseUntargeted",
           "[server][dispatch][security]") {
     CommandCapabilityRegistry registry{std::span<const CommandCapability>(kFixture)};
-    auto classified = registry.classify("tar", "purge_source");
+    auto classified = registry.classify("echo", "purge_source");
     REQUIRE(classified.has_value());
 
     const auto gate = evaluate_destructive_targeting(classified,
@@ -226,7 +226,7 @@ TEST_CASE("Destructive row, agent_ids AND scope both present: RefuseUntargeted �
           "scope:\"__all__\"-alongside-ids combo check_targeting_shape uniquely permits through",
           "[server][dispatch][security]") {
     CommandCapabilityRegistry registry{std::span<const CommandCapability>(kFixture)};
-    auto classified = registry.classify("tar", "purge_source");
+    auto classified = registry.classify("echo", "purge_source");
     REQUIRE(classified.has_value());
 
     // `scope_key_present=true` stands for BOTH real-world request shapes at
@@ -248,7 +248,7 @@ TEST_CASE("Destructive row, agent_ids AND scope both present: RefuseUntargeted �
 TEST_CASE("Destructive row, scope-only or broadcast (no agent_ids): RefuseUntargeted",
           "[server][dispatch][security]") {
     CommandCapabilityRegistry registry{std::span<const CommandCapability>(kFixture)};
-    auto classified = registry.classify("tar", "purge_source");
+    auto classified = registry.classify("echo", "purge_source");
     REQUIRE(classified.has_value());
 
     // Same collapse as above: a real scope expression and a scope:"__all__"
@@ -280,7 +280,7 @@ TEST_CASE("Classify miss (Ambiguous): ClassifyMiss, capability disengaged, error
           "[server][dispatch][security]") {
     CommandCapabilityRegistry registry{std::span<const CommandCapability>(kFixture),
                                        std::span<const CommandCapability>(kCollidingFragment)};
-    auto classified = registry.classify("tar", "purge_source");
+    auto classified = registry.classify("echo", "purge_source");
     REQUIRE_FALSE(classified.has_value());
     CHECK(classified.error() == ClassificationError::Ambiguous);
 
@@ -297,7 +297,7 @@ TEST_CASE("ReadOnly and Mutating rows: NotDestructive regardless of targeting sh
           "[server][dispatch][security]") {
     CommandCapabilityRegistry registry{std::span<const CommandCapability>(kFixture)};
 
-    auto read_only = registry.classify("tar", "query");
+    auto read_only = registry.classify("echo", "query");
     REQUIRE(read_only.has_value());
     // Even with no ids and no scope — NotDestructive means this gate simply
     // does not apply; it is not this function's job to say whether the
@@ -307,7 +307,7 @@ TEST_CASE("ReadOnly and Mutating rows: NotDestructive regardless of targeting sh
                                                        /*scope_key_present=*/false);
     CHECK(gate1.verdict == DestructiveTargetingVerdict::NotDestructive);
     REQUIRE(gate1.capability.has_value());
-    CHECK(gate1.capability->plugin == "tar");
+    CHECK(gate1.capability->plugin == "echo");
 
     auto mutating = registry.classify("tags", "set");
     REQUIRE(mutating.has_value());
@@ -558,7 +558,7 @@ TEST_CASE("Destructive RefuseUntargeted arms carry the Destructive reason/messag
           "Forensics pair",
           "[server][dispatch][security]") {
     CommandCapabilityRegistry registry{std::span<const CommandCapability>(kFixture)};
-    auto classified = registry.classify("tar", "purge_source");
+    auto classified = registry.classify("echo", "purge_source");
     REQUIRE(classified.has_value());
 
     const auto gate = evaluate_destructive_targeting(classified,
@@ -748,7 +748,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 21,
         capdecls::plugin_action_catalogue_remote_access_audit(),
         capdecls::core_dispatch_capabilities(),
     };
-    auto classified = registry.classify("tar", "purge_source");
+    auto classified = registry.classify("echo", "purge_source");
     REQUIRE(classified.has_value());
     CHECK(classified->dispatch_class == DispatchClass::Destructive);
 }
@@ -781,7 +781,7 @@ TEST_CASE("#3685 composition: a Targeted verdict makes NO authorization decision
     // Step 1 — the pure targeting evaluator: explicit ids, no scope, a
     // Destructive row. Targeted means only "proceed to confinement"; it says
     // nothing about whether the caller is authorized to issue the command.
-    auto classified = registry.classify("tar", "purge_source");
+    auto classified = registry.classify("echo", "purge_source");
     REQUIRE(classified.has_value());
     const auto gate = evaluate_destructive_targeting(classified,
                                                       /*valid_nonempty_agent_ids=*/true,
@@ -797,7 +797,7 @@ TEST_CASE("#3685 composition: a Targeted verdict makes NO authorization decision
     // calling the other.
     DispatchCaller caller{.principal = "alice", .principal_role = "operator"};
     auto result =
-        classify_and_authorize_dispatch(registry, caller, "tar", "purge_source", always_deny);
+        classify_and_authorize_dispatch(registry, caller, "echo", "purge_source", always_deny);
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().reason == DispatchDenialReason::Forbidden);
     CHECK(result.error().securable == "Infrastructure");
@@ -900,7 +900,7 @@ TEST_CASE("Destructive+Reversible row gates identically to Destructive+Irreversi
     REQUIRE(classified.has_value());
     REQUIRE(classified->mutability == Mutability::Reversible);
 
-    // Same targeting-shape matrix kFixture's Irreversible tar.purge_source
+    // Same targeting-shape matrix kFixture's Irreversible echo.purge_source
     // row exercises above: Targeted, RefuseUntargeted (no ids), and
     // RefuseUntargeted (ids + scope both present) — the verdict must match
     // in every case, because evaluate_destructive_targeting keys off

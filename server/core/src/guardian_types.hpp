@@ -115,7 +115,7 @@ struct GuaranteedStateEventQuery {
 // found, `std::nullopt` == genuinely no row for this rule_id.
 // `std::unexpected(kDegraded)` == store/pool/query failure — the caller shows
 // a degrade banner/503, never treats it as absent (mirrors
-// `DeviceInventoryStore::CiReadError` / `InventoryReadError` exactly).
+// `CiReadError` (device_inventory_types.hpp) / `InventoryReadError` exactly).
 enum class GuaranteedStateReadError { kDegraded };
 
 // ── Relocated from guardian_model.hpp (verbatim) ─────────────────────────────

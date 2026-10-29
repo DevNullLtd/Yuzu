@@ -79,7 +79,7 @@ INSERT INTO slides (position, slug, title, body_html, data_x, data_y, data_z, da
  '<p>A multiplier executes. A <em>colleague</em> reasons.</p>'
  '<ul>'
  '<li><b>Scope-walking</b> &mdash; one query''s results become the next query''s target.</li>'
- '<li><b>TAR</b> &mdash; time-aware retention to ask "what changed, and when?"</li>'
+ '<li><b>Echo</b> &mdash; time-aware retention to ask "what changed, and when?"</li>'
  '<li><b>Reasoning over live inventory</b> &mdash; correlate, hypothesise, propose &mdash; not just run.</li>'
  '</ul>'
  '<p class="footnote">It brings you the question behind the question.</p>',

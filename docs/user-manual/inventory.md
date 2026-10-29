@@ -510,7 +510,7 @@ place, **Hardware** and **Software**, each its own page:
 
 - **`/hardware`** — a ServiceNow-style Configuration-Item list and record; the successor
   to the old **Devices** tab, extended with a generic action runner. The list shows
-  hostname, **IP** (new — read live from the TAR fleet-snapshot cache, so it is honestly
+  hostname, **IP** (new — read live from the Echo fleet-snapshot cache, so it is honestly
   blank once a device goes offline rather than a stale last-known address), OS,
   online/offline/**stale** status, per-page **DEX score**, agent version, last-seen,
   **Tags** (new — click a chip to filter by that exact `key` or `key=value`, or type
@@ -1118,8 +1118,8 @@ columns, fields, and audit/degrade posture.
 ## App usage inventory (`app_usage`)
 
 A further daily-sync source, **`app_usage`**, is live on the agent and server. It
-derives machine-scope executable usage evidence read-only from TAR's `usage` fold
-(`usage_daily`/`usage_daily_user`/`usage_live` inside `tar.db`) and persists it in
+derives machine-scope executable usage evidence read-only from Echo's `usage` fold
+(`usage_daily`/`usage_daily_user`/`usage_live` inside `echo.db`) and persists it in
 the typed Postgres schema **`app_usage_store`**: per-executable run counts, total
 seconds, first/last-seen, and a distinct-user count over a 30-day sliding window.
 

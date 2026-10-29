@@ -183,6 +183,39 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/groups/list",
+    "capability_id": "get.fragments-groups-list",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/management-groups"
+    },
+    "mcp_twin": "list_management_groups",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/groups/detail",
+    "capability_id": "get.fragments-groups-detail",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/management-groups/{param}"
+    },
+    "mcp_twin": "get_management_group",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/groups/members",
+    "capability_id": "get.fragments-groups-members",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/management-groups/{param}"
+    },
+    "mcp_twin": "get_management_group",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/hardware/ci/app-usage",
     "capability_id": "get.fragments-hardware-ci-app-usage",
     "rest_v1_twin": {

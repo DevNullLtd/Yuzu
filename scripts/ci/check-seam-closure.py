@@ -742,9 +742,9 @@ STORE_DEFINITION_FREE_TUS = [
     "server/core/src/settings_plugins_ui.cpp",
     "server/core/src/settings_security_ui.cpp",
     "server/core/src/settings_ui.cpp",
-    "server/core/src/tar_page_ui.cpp",
-    "server/core/src/tar_timeline_page_ui.cpp",
-    "server/core/src/tar_tree_routes.cpp",
+    "server/core/src/echo_page_ui.cpp",
+    "server/core/src/echo_timeline_page_ui.cpp",
+    "server/core/src/echo_tree_routes.cpp",
     "server/core/src/viz_host_page_ui.cpp",
     "server/core/src/viz_page_ui.cpp",
     "server/core/src/workflows_ui.cpp",
@@ -797,7 +797,7 @@ STORE_DEFINITION_FREE_TUS = [
 # out of them into its own enforced file is the "WS-A4 per-family carve-out sub-tasks
 # (#6558)" table in docs/presentation-core-split-delivery-matrix.md.
 MCP_REGISTRY_TU_GLOB = "mcp_tools_*.cpp"
-MCP_REGISTRY_EXPECTED_TU_COUNT = 3
+MCP_REGISTRY_EXPECTED_TU_COUNT = 4
 MCP_REGISTRY_REGISTRY_HEADER = "server/core/src/mcp_tool_registry.hpp"
 MCP_REGISTRY_HEADERS = [
     "server/core/src/mcp_tool_deps.hpp",
