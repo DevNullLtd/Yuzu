@@ -849,7 +849,7 @@ Tools accept parameters via the `arguments` object in the `tools/call` request.
 Required parameters are validated server-side; missing required fields return a
 `-32602 Invalid params` error.
 
-`arguments` must be a JSON object. Omitting it, or sending `{}`, is fine; for a tool served from the `tools/call` registry (today `discover_routes`, `list_hardware_ci`, `get_hardware_ci` and `list_quarantined_devices`) a `null`, array or scalar value is refused with `-32602` and a `denied` audit row before the tool runs.
+`arguments` must be a JSON object. Omitting it, or sending `{}`, is fine; for a tool served from the `tools/call` registry (today `discover_routes`, `list_hardware_ci`, `get_hardware_ci`, `list_quarantined_devices` and the seven `/crypto` tools: `get_crypto_libraries`, `list_crypto_library_devices`, `export_crypto_cbom`, `list_crypto_widgets`, `get_crypto_dashboard_layout`, `set_crypto_dashboard_layout` and `get_crypto_ca_stats`) a `null`, array or scalar value is refused with `-32602` and a `denied` audit row before the tool runs.
 
 **Integer arguments never wrap into a different value (#4644).** A JSON integer above
 `9223372036854775807` (nlohmann reports it as an unsigned integer) used to wrap to a negative

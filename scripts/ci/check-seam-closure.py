@@ -797,7 +797,7 @@ STORE_DEFINITION_FREE_TUS = [
 # out of them into its own enforced file is the "WS-A4 per-family carve-out sub-tasks
 # (#6558)" table in docs/presentation-core-split-delivery-matrix.md.
 MCP_REGISTRY_TU_GLOB = "mcp_tools_*.cpp"
-MCP_REGISTRY_EXPECTED_TU_COUNT = 3
+MCP_REGISTRY_EXPECTED_TU_COUNT = 4
 MCP_REGISTRY_REGISTRY_HEADER = "server/core/src/mcp_tool_registry.hpp"
 MCP_REGISTRY_HEADERS = [
     "server/core/src/mcp_tool_deps.hpp",
