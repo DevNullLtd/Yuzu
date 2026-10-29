@@ -54,6 +54,7 @@
 
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -105,8 +106,25 @@ constexpr const char* kRevokedId = "engine:revoked1";
 constexpr const char* kRevokeMarker = "credentials_revoked=1; REVOKE-DETAIL-MARKER";
 constexpr const char* kFailedRevokeText = "FAILED-REVOKE-STORE-ERROR connection refused";
 constexpr const char* kLaterRetryText = "LATER-RETRY-credentials_revoked=0";
+// The revoke cell's label. The text beneath it is the EARLIEST success the panel's bounded read
+// retained, which is the revocation's record only when nothing older was pruned or lost.
+constexpr const char* kDetailLabel = "Detail (earliest retained record): ";
+// The Access panel's caveats, appended by the shared revoke_truncation_hint (same words).
+constexpr const char* kTruncatedWithDetail =
+    " <span class=\"hint\">(more than 200 revoke events: this is the oldest success among the "
+    "newest 200, not necessarily the original)</span>";
+constexpr const char* kTruncatedNoSuccess =
+    " <span class=\"hint\">(more than 200 revoke events and none of the newest 200 "
+    "succeeded)</span>";
 
 bool refused(int status) { return status == 401 || status == 403; }
+
+/// The whole Detail cell markup for `escaped_text` (already HTML-escaped) and an optional
+/// truncation caveat, so a test pins the cell and not a substring of it.
+std::string detail_cell(const std::string& escaped_text, const char* caveat = "") {
+    return std::string("<br><span class=\"hint\">") + kDetailLabel + escaped_text + caveat +
+           "</span>";
+}
 
 struct Rig {
     yuzu::test::TempDir tmp{"yuzu_test_engine_panel_authz_"};
@@ -118,6 +136,7 @@ struct Rig {
     EnginePrincipalStore engine_store;
     yuzu::test::ManagementGroupStorePg mgmt_bundle;
     yuzu::test::ApiTokenStorePg api_tokens;
+    yuzu::MetricsRegistry audit_metrics; // BEFORE audit_store: it keeps a pointer to this
     PgPool audit_pool;
     AuditStore audit_store;
     std::shared_mutex oidc_mu;
@@ -142,6 +161,8 @@ struct Rig {
         REQUIRE(rbac.is_open());
         REQUIRE(engine_store.is_open());
         REQUIRE(audit_store.is_open());
+        // The degrade counter is the deterministic observable for "how many audit reads failed".
+        audit_store.set_metrics(&audit_metrics);
         cfg.auth_config_path = tmp.path / "auth.cfg";
         auth_mgr.load_config(cfg.auth_config_path);
         REQUIRE(auth_mgr.upsert_user("root", "correct-horse-battery-staple", auth::Role::admin));
@@ -260,8 +281,9 @@ struct Rig {
         REQUIRE(raw.has_value());
         return *raw;
     }
-    /// An ordinary API token (NO MCP tier): the panel admits it exactly as the twin does, so a
-    /// persona built from it discriminates the gates beneath the panel's MCP-tier belt.
+    /// An ordinary API token (NO MCP tier): it clears the panel's MCP-tier belt, so a persona
+    /// built from it reaches the gates beneath it (the permission gate the panel shares with the
+    /// twin), where an MCP-tier token never would.
     std::string plain_token(const char* name, const char* owner,
                             const std::string& scope_service = {}) {
         auto raw = api_tokens->create_token(name, owner, now_epoch() + 3600, scope_service, "");
@@ -283,6 +305,16 @@ struct Rig {
             if (r.result == "denied" && (action.empty() || r.action == action))
                 ++n;
         return n;
+    }
+
+    /// `yuzu_server_audit_read_degrade_total{reason="query_error"}` as of now: one per failed
+    /// audit read, whatever the wall clock did.
+    long long audit_query_error_degrades() {
+        const std::string key = "yuzu_server_audit_read_degrade_total{reason=\"query_error\"} ";
+        const auto text = audit_metrics.serialize();
+        const auto at = text.find(key);
+        REQUIRE(at != std::string::npos); // set_metrics pre-seeds the series to 0
+        return std::stoll(text.substr(at + key.size()));
     }
 
     /// A custom role holding EnginePrincipal:Read, plus AuditLog:Read when `with_audit_read`.
@@ -653,7 +685,7 @@ private:
 } // namespace
 
 TEST_CASE("engine panel audit: the revoke Detail shows only to a caller who also passes "
-          "AuditLog:Read, and is the ORIGINAL committed revoke, never a failed or later row",
+          "AuditLog:Read, and is the earliest retained committed revoke, never a failed or later row",
           "[pg][settings][engine_principal][authz][audit]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
     Rig r{db_.dsn()};
@@ -666,16 +698,20 @@ TEST_CASE("engine panel audit: the revoke Detail shows only to a caller who also
     r.grant("dave", "EngineAuditReader");
     r.rbac_on();
 
-    // (b) EnginePrincipal:Read + AuditLog:Read: the committed revoke's detail, nothing else.
+    // (b) EnginePrincipal:Read + AuditLog:Read: the committed revoke's detail, nothing else,
+    // under the label that says it is the earliest RETAINED record.
+    const std::string committed = detail_cell(kRevokeMarker);
     const auto b = r.cookie_get(kFragment, r.cookie("dave", auth::Role::user));
     REQUIRE(b);
     REQUIRE(b->status == 200);
     CHECK_THAT(b->body, ContainsSubstring(kRevokedId));
-    CHECK_THAT(b->body, ContainsSubstring("REVOKE-DETAIL-MARKER"));
+    CHECK_THAT(b->body, ContainsSubstring(committed));
     CHECK_THAT(b->body, !ContainsSubstring("FAILED-REVOKE-STORE-ERROR"));
     CHECK_THAT(b->body, !ContainsSubstring("LATER-RETRY"));
-    // A short history is complete: no truncation caveat.
+    // A short history is complete: neither truncation caveat.
     CHECK_THAT(b->body, !ContainsSubstring("not necessarily the original"));
+    CHECK_THAT(b->body, !ContainsSubstring("more than 200 revoke events"));
+    CHECK_THAT(b->body, !ContainsSubstring("none of the newest 200 succeeded"));
 
     // (a) EnginePrincipal:Read only: the panel is admitted (it is the twin's gate) but the
     // audit trail's text is not hers to read.
@@ -826,6 +862,54 @@ TEST_CASE("engine panel audit: the in-page 'store unavailable' note is not a suc
     CHECK(r.fragment_audits.empty());
 }
 
+namespace {
+/// Runs one DDL statement on a fresh connection (the clone database is dropped with the test).
+void exec_ddl(const std::string& dsn, const char* sql) {
+    pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(conn.get(), sql, std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+}
+} // namespace
+
+TEST_CASE("engine panel audit: an unreadable roster writes no success row, an unreadable "
+          "credential count still writes the count=N one (the route answers 503 on both)",
+          "[pg][settings][engine_principal][authz][audit][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
+    Rig r{db_.dsn()};
+    r.seed_revoked_principal(kRevokedId);
+    const auto root = r.cookie("root", auth::Role::admin);
+
+    SECTION("the roster cannot be read") {
+        exec_ddl(db_.dsn(), "ALTER TABLE engine_principal_store.engine_principals "
+                            "RENAME TO engine_principals_gone");
+        r.clear_audits();
+        const auto resp = r.cookie_get(kFragment, root);
+        REQUIRE(resp);
+        CHECK(resp->status == 200); // htmx swaps only a 2xx, so the note rides a 200
+        CHECK_THAT(resp->body, ContainsSubstring("Engine principals unavailable"));
+        CHECK_THAT(resp->body, !ContainsSubstring("<table"));
+        CHECK(r.fragment_audits.empty()); // a view that read nothing is not a successful read
+        CHECK(resp->get_header_value("Sec-Audit-Failed").empty());
+    }
+
+    SECTION("a credential count cannot be read") {
+        exec_ddl(r.api_tokens.dsn(),
+                 "ALTER TABLE api_token_store.api_tokens RENAME TO api_tokens_gone");
+        r.clear_audits();
+        const auto resp = r.cookie_get(kFragment, root);
+        REQUIRE(resp);
+        CHECK(resp->status == 200);
+        CHECK_THAT(resp->body, ContainsSubstring("<span class=\"muted\">unavailable</span>"));
+        // The roster WAS read, so the success row is written with the count the page shows; the
+        // revoked row's Detail was not looked up, and says so.
+        CHECK(r.fragment_audits ==
+              std::vector<std::string>{"engine_principal.list/success/count=" +
+                                       std::to_string(r.roster_size())});
+        CHECK_THAT(resp->body, ContainsSubstring(detail_cell("(unavailable)")));
+    }
+}
+
 TEST_CASE("engine panel audit: a dropped audit row and a locked audit table degrade the panel, "
           "they do not break it, and never widen what a caller without AuditLog:Read sees",
           "[pg][settings][engine_principal][authz][audit][chaos]") {
@@ -849,7 +933,7 @@ TEST_CASE("engine panel audit: a dropped audit row and a locked audit table degr
     REQUIRE(dropped);
     CHECK(dropped->status == 200);
     CHECK(dropped->get_header_value("Sec-Audit-Failed") == "true");
-    CHECK_THAT(dropped->body, ContainsSubstring("REVOKE-DETAIL-MARKER"));
+    CHECK_THAT(dropped->body, ContainsSubstring(detail_cell(kRevokeMarker)));
     r.drop_audit_writes = false;
 
     // The audit table is locked: the revoke-detail lookup cannot answer (its pool statement
@@ -863,7 +947,7 @@ TEST_CASE("engine panel audit: a dropped audit row and a locked audit table degr
         REQUIRE(b);
         served += (a->status == 200) + (b->status == 200);
         marker_leaks_a += a->body.find("REVOKE-DETAIL-MARKER") != std::string::npos;
-        CHECK_THAT(b->body, ContainsSubstring("(unavailable)")); // not recorded would be a lie
+        CHECK_THAT(b->body, ContainsSubstring(detail_cell("(unavailable)"))); // "not recorded" would lie
         CHECK_THAT(b->body, !ContainsSubstring("FAILED-REVOKE-STORE-ERROR"));
         CHECK_THAT(b->body, !ContainsSubstring("LATER-RETRY"));
     }
@@ -875,11 +959,11 @@ TEST_CASE("engine panel audit: a dropped audit row and a locked audit table degr
     const auto after = r.cookie_get(kFragment, dave);
     REQUIRE(after);
     CHECK(after->status == 200);
-    CHECK_THAT(after->body, ContainsSubstring("REVOKE-DETAIL-MARKER"));
+    CHECK_THAT(after->body, ContainsSubstring(detail_cell(kRevokeMarker)));
 }
 
-TEST_CASE("engine panel audit: more than 200 revoke events never present a retry as the original "
-          "revoke without the Access panel's caveat",
+TEST_CASE("engine panel audit: more than 200 revoke events never present a retry as the "
+          "revocation's record without the Access panel's caveat",
           "[pg][settings][engine_principal][authz][audit][truncation]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
     Rig r{db_.dsn()};
@@ -899,11 +983,48 @@ TEST_CASE("engine panel audit: more than 200 revoke events never present a retry
     const auto a = r.cookie_get(kFragment, dave);
     REQUIRE(a);
     REQUIRE(a->status == 200);
-    CHECK_THAT(a->body, ContainsSubstring("LATER-RETRY"));
+    // The whole cell: the retry's text under the label, then the Access panel's caveat in the
+    // same words and the same markup, inside the cell's span.
+    CHECK_THAT(a->body, ContainsSubstring(detail_cell(kLaterRetryText, kTruncatedWithDetail)));
     CHECK_THAT(a->body, !ContainsSubstring("REVOKE-DETAIL-MARKER"));
-    // The detail is labelled exactly as the Access panel labels it, in the same words.
-    CHECK_THAT(a->body, ContainsSubstring("more than 200 revoke events: this is the oldest success "
-                                          "among the newest 200, not necessarily the original"));
+    CHECK_THAT(a->body, !ContainsSubstring("none of the newest 200 succeeded"));
+}
+
+TEST_CASE("engine panel audit: the 200 vs 201 event boundary: 200 events are a complete history, "
+          "201 drop the oldest and say so",
+          "[pg][settings][engine_principal][authz][audit][truncation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
+    Rig r{db_.dsn()};
+    r.custom_reader_role("EngineAuditReader", /*with_audit_read=*/true);
+    r.account("dave", auth::Role::user);
+    r.grant("dave", "EngineAuditReader");
+    r.rbac_on();
+    const auto dave = r.cookie("dave", auth::Role::user);
+
+    // Exactly 200 events (199 retries and the original, the oldest): nothing is dropped, so the
+    // oldest success IS the original and no caveat is drawn.
+    auto complete = Rig::repeated(199, "success", kLaterRetryText);
+    complete.push_back({100000, "success", kRevokeMarker});
+    r.seed_revoked("engine:events200", complete);
+    const auto a = r.cookie_get(kFragment, dave);
+    REQUIRE(a);
+    REQUIRE(a->status == 200);
+    CHECK_THAT(a->body, ContainsSubstring(detail_cell(kRevokeMarker)));
+    CHECK_THAT(a->body, !ContainsSubstring("more than 200 revoke events"));
+    CHECK_THAT(a->body, !ContainsSubstring("LATER-RETRY"));
+
+    // 201 events (200 retries and the older original): the read fetches the 201st, drops it from
+    // the window, and the caveat variant that implies truncation is drawn over a retry's text.
+    // Without the drop the original would show here and no caveat would be needed.
+    auto over = Rig::repeated(200, "success", kLaterRetryText);
+    over.push_back({100000, "success", kRevokeMarker});
+    r.seed_revoked("engine:events201", over);
+    const auto b = r.cookie_get(kFragment, dave);
+    REQUIRE(b);
+    REQUIRE(b->status == 200);
+    CHECK_THAT(b->body, ContainsSubstring(detail_cell(kLaterRetryText, kTruncatedWithDetail)));
+    // The 200-event principal's row still reads complete beside it.
+    CHECK_THAT(b->body, ContainsSubstring(detail_cell(kRevokeMarker)));
 }
 
 TEST_CASE("engine panel audit: more than 200 revoke events none of the newest 200 succeeded is not "
@@ -923,16 +1044,18 @@ TEST_CASE("engine panel audit: more than 200 revoke events none of the newest 20
     const auto a = r.cookie_get(kFragment, r.cookie("dave", auth::Role::user));
     REQUIRE(a);
     REQUIRE(a->status == 200);
-    CHECK_THAT(a->body, ContainsSubstring("Detail: (not recorded)"));
-    CHECK_THAT(a->body, ContainsSubstring("more than 200 revoke events and none of the newest 200 "
-                                          "succeeded"));
+    CHECK_THAT(a->body, ContainsSubstring(detail_cell("(not recorded)", kTruncatedNoSuccess)));
     CHECK_THAT(a->body, !ContainsSubstring("FAILED-REVOKE-STORE-ERROR")); // store text never shown
+    CHECK_THAT(a->body, !ContainsSubstring("not necessarily the original"));
 }
 
 TEST_CASE("engine panel audit: once the audit store fails the remaining revoked rows are not "
           "queried, and every row reads unavailable",
           "[pg][settings][engine_principal][authz][audit][chaos]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
+    // The pool's statement timeout is fixed when the pool is built, so the 12 seed INSERTs below
+    // run under it too (a PgPool has no per-phase timeout); they are single-row inserts into an
+    // unlocked table, and the lock is taken only after seeding.
     constexpr int kTimeoutMs = 400;
     constexpr int kRevoked = 4;
     Rig r{db_.dsn(), /*wire_engine_store=*/true, kTimeoutMs};
@@ -943,11 +1066,13 @@ TEST_CASE("engine panel audit: once the audit store fails the remaining revoked 
     r.grant("dave", "EngineAuditReader");
     r.rbac_on();
     const auto dave = r.cookie("dave", auth::Role::user);
+    REQUIRE(r.audit_query_error_degrades() == 0);
 
     AuditTableLock lock{db_.dsn()};
-    // Each lookup against the locked table waits out the pool's statement timeout, so without the
-    // latch this request holds a worker for kRevoked x kTimeoutMs. With it, only the first row
-    // waits. Total elapsed is the deterministic observable (no query counter is exposed).
+    // Each lookup against the locked table waits out the pool's statement timeout and counts one
+    // degrade, so without the latch this request holds a worker for kRevoked x kTimeoutMs and
+    // counts kRevoked. The degrade counter is the deterministic observable: exactly ONE failed
+    // read, however slow the box. The wall clock is only a loose sanity bound beside it.
     const auto t0 = std::chrono::steady_clock::now();
     const auto resp = r.cookie_get(kFragment, dave);
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -957,14 +1082,28 @@ TEST_CASE("engine panel audit: once the audit store fails the remaining revoked 
     REQUIRE(resp);
     CHECK(resp->status == 200);
     INFO("elapsed " << elapsed << " ms for " << kRevoked << " revoked rows");
-    CHECK(elapsed < 2 * kTimeoutMs);
+    CHECK(r.audit_query_error_degrades() == 1);
+    CHECK(elapsed >= kTimeoutMs * 3 / 4);            // the one lookup did wait out its timeout
+    CHECK(elapsed < (kRevoked - 1) * kTimeoutMs);    // generous: no per-row wait on a shared box
     std::size_t unavailable = 0;
-    for (std::size_t at = 0; (at = resp->body.find("Detail: (unavailable)", at)) != std::string::npos;
-         ++at)
+    const std::string cell = detail_cell("(unavailable)");
+    for (std::size_t at = 0; (at = resp->body.find(cell, at)) != std::string::npos; ++at)
         ++unavailable;
     CHECK(unavailable == static_cast<std::size_t>(kRevoked));
-    CHECK_THAT(resp->body, !ContainsSubstring("Detail: (not recorded)")); // a failed read is not "none"
+    CHECK_THAT(resp->body, !ContainsSubstring("Detail (earliest retained record): (not recorded)"));
     CHECK_THAT(resp->body, !ContainsSubstring("REVOKE-DETAIL-MARKER"));
+
+    // Recovered without a restart: the next view looks every row up again.
+    const auto after = r.cookie_get(kFragment, dave);
+    REQUIRE(after);
+    CHECK(after->status == 200);
+    std::size_t committed = 0;
+    for (std::size_t at = 0; (at = after->body.find(detail_cell(kRevokeMarker), at)) !=
+                             std::string::npos;
+         ++at)
+        ++committed;
+    CHECK(committed == static_cast<std::size_t>(kRevoked));
+    CHECK_THAT(after->body, !ContainsSubstring("(unavailable)"));
 }
 
 TEST_CASE("engine panel audit: the AuditLog:Read probe is issued only when a revoked row exists; a "
@@ -987,14 +1126,18 @@ TEST_CASE("engine panel audit: the AuditLog:Read probe is issued only when a rev
     CHECK_THAT(none->body, ContainsSubstring(kSlug));
     CHECK(r.denied_rows("auth.permission_required") == before);
 
-    // A revoked row exists: the probe is issued. CHARACTERISATION, not a desired property: a
-    // token (unlike an interactive cookie session) keeps the probe's denial row on a 200 view,
-    // and documentation says so (audit-log.md). Asserted so that a later change is deliberate.
+    // Revoked rows exist: the probe is issued, ONCE per view however many there are (three here,
+    // so a per-row probe would write three). CHARACTERISATION, not a desired property: a token
+    // (unlike an interactive cookie session) keeps the probe's denial row on a 200 view, and
+    // documentation says so (audit-log.md). Asserted so that a later change is deliberate.
     r.seed_revoked_principal(kRevokedId);
+    r.seed_revoked_principal("engine:revoked2");
+    r.seed_revoked_principal("engine:revoked3");
     const auto some = r.bearer_get(kFragment, raw);
     REQUIRE(some);
     CHECK(some->status == 200);
-    CHECK_THAT(some->body, ContainsSubstring("Detail: (withheld:"));
+    CHECK_THAT(some->body, ContainsSubstring(detail_cell(
+                               "(withheld: needs AuditLog:Read, or it could not be confirmed)")));
     CHECK(r.denied_rows("auth.permission_required") == before + 1);
 
     // The same caller as a cookie session: the probe is quiet, no row.
@@ -1018,7 +1161,9 @@ TEST_CASE("engine panel audit: markup in a revoke row's detail is escaped, never
     const auto resp = r.cookie_get(kFragment, r.cookie("dave", auth::Role::user));
     REQUIRE(resp);
     REQUIRE(resp->status == 200);
-    CHECK_THAT(resp->body, ContainsSubstring("&lt;img src=x onerror=1&gt;"));
+    // Every metacharacter of the seed, escaped in order, inside the cell.
+    CHECK_THAT(resp->body, ContainsSubstring(detail_cell(
+                               "&lt;img src=x onerror=1&gt;&amp;&quot;&#39;")));
     CHECK_THAT(resp->body, !ContainsSubstring("<img"));
 }
 
@@ -1039,15 +1184,18 @@ TEST_CASE("engine panel audit: the three Detail cell states read as their exact 
     const auto dave = r.cookie_get(kFragment, r.cookie("dave", auth::Role::user));
     REQUIRE(dave);
     REQUIRE(dave->status == 200);
-    CHECK_THAT(dave->body, ContainsSubstring("Detail: (not recorded)"));
+    CHECK_THAT(dave->body, ContainsSubstring(detail_cell("(not recorded)")));
+    // No truncation caveat without truncation, in either wording.
+    CHECK_THAT(dave->body, !ContainsSubstring("more than 200 revoke events"));
+    CHECK_THAT(dave->body, !ContainsSubstring("none of the newest 200 succeeded"));
 
     // Hedged like the Access tokens panel: the probe failing for any reason reads the same.
     const auto carol = r.cookie_get(kFragment, r.cookie("carol", auth::Role::user));
     REQUIRE(carol);
     REQUIRE(carol->status == 200);
-    CHECK_THAT(carol->body, ContainsSubstring("Detail: (withheld: needs AuditLog:Read, or it could "
-                                              "not be confirmed)"));
-    CHECK_THAT(carol->body, !ContainsSubstring("Detail: (not recorded)"));
+    CHECK_THAT(carol->body, ContainsSubstring(detail_cell(
+                                "(withheld: needs AuditLog:Read, or it could not be confirmed)")));
+    CHECK_THAT(carol->body, !ContainsSubstring("(not recorded)"));
 }
 
 // ---- the page itself is unchanged -------------------------------------------------------------
