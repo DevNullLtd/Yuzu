@@ -45,7 +45,7 @@ Context is the scarce resource. Keep this thread lean; spend file-reading budget
 - **Summarise and hand off proactively** — record files touched, facts learned, open questions, next
   command; then continue or spawn a fresh agent.
 - **For code changes:** owning module → its tests → smallest coherent patch → targeted suite
-  (`meson test -C build-<os> --suite <agent|server|tar>`) before the broad one.
+  (`meson test -C build-<os> --suite <agent|server|echo>`) before the broad one.
 
 ## Agent team & governance
 
@@ -148,7 +148,7 @@ Provisioning a native runner: `deploy/windows/README.md`.
 Every test target carries a `suite:` label so `--suite` filters directly:
 
 ```bash
-meson test -C build-linux --suite <server|agent|tar> --print-errorlogs   # omit --suite for everything
+meson test -C build-linux --suite <server|agent|echo> --print-errorlogs   # omit --suite for everything
 ```
 
 Tests need `-Dbuild_tests=true`. Catch2 tag filtering and the per-component symlinks are in

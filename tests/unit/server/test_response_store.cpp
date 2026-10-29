@@ -3148,7 +3148,7 @@ TEST_CASE("response facet metrics: server.cpp still calls seed_response_facet_me
 
 // ── #4990: the Forensics tier on every read ──────────────────────────────────
 //
-// One instruction, six rows: two non-Forensics CONTROL rows (plugin "tar", agents A and B) and four
+// One instruction, six rows: two non-Forensics CONTROL rows (plugin "echo", agents A and B) and four
 // Forensics-plugin rows (agents A, B, A again under a MIXED-CASE plugin name, and C, an agent whose
 // only row is Forensics). A test with only Forensics rows cannot tell filtering from an empty store,
 // so the control rows are load-bearing. Every public read is asserted against EXACT rows/counts for
@@ -3166,8 +3166,8 @@ const ForensicsPluginSet& tier_plugin_set() {
 }
 
 // "<agent>|<output>" identifies a row independent of its generated id.
-constexpr const char* kK1 = "agent-A|ctl|a1";       // tar (control)
-constexpr const char* kK2 = "agent-B|ctl|b1";       // tar (control)
+constexpr const char* kK1 = "agent-A|ctl|a1";       // echo (control)
+constexpr const char* kK2 = "agent-B|ctl|b1";       // echo (control)
 constexpr const char* kK3 = "agent-A|forensic|a1";  // execution_artifacts
 constexpr const char* kK4 = "agent-B|forensic|b1";  // app_usage
 constexpr const char* kK5 = "agent-A|forensic|a2";  // Browser_Inventory (mixed case)
@@ -3185,8 +3185,8 @@ constexpr const char* kTierExec = "exec-tier";
 void seed_tier_matrix(ResponseStore& store) {
     struct Row { const char* agent; const char* plugin; const char* output; const char* key; };
     const Row rows[] = {
-        {"agent-A", "tar", "ctl|a1", kK1},
-        {"agent-B", "tar", "ctl|b1", kK2},
+        {"agent-A", "echo", "ctl|a1", kK1},
+        {"agent-B", "echo", "ctl|b1", kK2},
         {"agent-A", "execution_artifacts", "forensic|a1", kK3},
         {"agent-B", "app_usage", "forensic|b1", kK4},
         {"agent-A", "Browser_Inventory", "forensic|a2", kK5},

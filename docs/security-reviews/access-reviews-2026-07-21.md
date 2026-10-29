@@ -225,9 +225,9 @@ for this grant at all" and carries a different investigative next step.
 
 ### PII judgment — `last_activity_ms`/`last_activity_kind` are NOT behavioral-PII-tier
 
-The device-pages / DEX / TAR routed concern (see `docs/user-manual/
+The device-pages / DEX / Echo routed concern (see `docs/user-manual/
 device-management.md` and `CLAUDE.md`'s "Device pages" row) establishes that
-**behavioral-PII** access — per-device DEX signals, process trees, TAR
+**behavioral-PII** access — per-device DEX signals, process trees, Echo
 capture data — must funnel through `server/core/src/rest_audit.hpp`'s
 `emit_behavioral_audit` chokepoint (REST fail-closed 503 + `Sec-Audit-Failed`
 on an audit-persist failure; dashboard/MCP set-and-proceed). This feature's

@@ -127,15 +127,15 @@ TEST_CASE("trigger_type_from_string unknown defaults to Interval", "[trigger_eng
 // parse_trigger_config — the C-ABI trigger-registration parse point
 // ═══════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("parse_trigger_config: TAR interval config round-trips", "[trigger_engine][parsing]") {
-    // This is exactly what the TAR plugin's init() passes across the C ABI.
+TEST_CASE("parse_trigger_config: Echo interval config round-trips", "[trigger_engine][parsing]") {
+    // This is exactly what the Echo plugin's init() passes across the C ABI.
     auto cfg = parse_trigger_config(
-        "tar.fast", "interval",
-        R"({"interval_seconds":60,"plugin":"tar","action":"collect_fast","parameters":{}})");
+        "echo.fast", "interval",
+        R"({"interval_seconds":60,"plugin":"echo","action":"collect_fast","parameters":{}})");
     REQUIRE(cfg.has_value());
-    CHECK(cfg->id == "tar.fast");
+    CHECK(cfg->id == "echo.fast");
     CHECK(cfg->type == TriggerType::Interval);
-    CHECK(cfg->plugin == "tar");
+    CHECK(cfg->plugin == "echo");
     CHECK(cfg->action == "collect_fast");
     CHECK(cfg->interval_seconds == 60);
     CHECK(cfg->parameters.empty());
@@ -153,14 +153,14 @@ TEST_CASE("parse_trigger_config: missing plugin or action returns nullopt",
     CHECK_FALSE(
         parse_trigger_config("x", "interval", R"({"interval_seconds":60,"action":"collect_fast"})")
             .has_value());
-    CHECK_FALSE(parse_trigger_config("x", "interval", R"({"interval_seconds":60,"plugin":"tar"})")
+    CHECK_FALSE(parse_trigger_config("x", "interval", R"({"interval_seconds":60,"plugin":"echo"})")
                     .has_value());
 }
 
 TEST_CASE("parse_trigger_config: parameters object is forwarded", "[trigger_engine][parsing]") {
     auto cfg = parse_trigger_config(
         "p", "interval",
-        R"({"interval_seconds":30,"plugin":"tar","action":"rollup","parameters":{"mode":"full","keep":"7"}})");
+        R"({"interval_seconds":30,"plugin":"echo","action":"rollup","parameters":{"mode":"full","keep":"7"}})");
     REQUIRE(cfg.has_value());
     REQUIRE(cfg->parameters.size() == 2);
     CHECK(cfg->parameters.at("mode") == "full");

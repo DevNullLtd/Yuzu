@@ -37,6 +37,12 @@ namespace yuzu::server::mcp {
 /// existing wire value; this is a rename, not a re-tuning.
 inline constexpr std::int64_t kMcpStoreFaultRetryMs = 5000;
 
+/// The remediation of a /crypto read refused because the Postgres pool is too small to spare it
+/// (CryptoReadError::unavailable_until_restart): no retry hint, a retry fails identically.
+/// Shared by mcp_tools_crypto.cpp and the `list_issued_certs` branch that stays in mcp_server.cpp.
+inline constexpr std::string_view kCryptoPoolTooSmallRemedy =
+    "restart the server with a larger --postgres-pool-size; a retry fails identically until then";
+
 /// `retry_after_ms` for the plugin-config / API-token rotation family (the
 /// ~20-site bare-`2000` family). Anchor: `rotate_api_token`'s existing
 /// "mirrors the REST twin's 503 + Retry-After: 2 posture" — the REST 503

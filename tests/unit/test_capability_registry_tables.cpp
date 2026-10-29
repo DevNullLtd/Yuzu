@@ -144,8 +144,8 @@ TEST_CASE("service_states.tsv matches service_support::kStates", "[capability][r
 // Spark's factories are the one non-header-only registry that fits this
 // suite (agents/core/src/spark_*.cpp, same library the two registries above
 // live in) — capture_sources() and dex_obs_platforms() get their own suite
-// homes (test_tar_capability_table.cpp, test_dex_obs_table.cpp) since they
-// live in the tar plugin and server_core respectively.
+// homes (test_echo_capability_table.cpp, test_dex_obs_table.cpp) since they
+// live in the echo plugin and server_core respectively.
 TEST_CASE("spark_mechanisms.tsv matches the platform mechanism factories",
          "[capability][registries][spark]") {
     using namespace yuzu::agent;

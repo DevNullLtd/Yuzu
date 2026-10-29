@@ -1492,11 +1492,11 @@ TEST_CASE("static_js_bundle: kVizHostPageHtml renders IPC graph mount point", "[
     CHECK_THAT(html, ContainsSubstring("id=\"ipc-graph\""));
 }
 
-TEST_CASE("static_js_bundle: kVizHostPageHtml renders TAR tree mount point", "[viz-host][page]") {
+TEST_CASE("static_js_bundle: kVizHostPageHtml renders Echo tree mount point", "[viz-host][page]") {
     std::string html(kVizHostPageHtml);
-    CHECK_THAT(html, ContainsSubstring("id=\"tar-tree\""));
+    CHECK_THAT(html, ContainsSubstring("id=\"echo-tree\""));
     // The pane fills itself over htmx on load; losing either attribute leaves it empty.
-    CHECK_THAT(html, ContainsSubstring("hx-get=\"/fragments/tar/process-tree?device={{AGENT_ID}}\""));
+    CHECK_THAT(html, ContainsSubstring("hx-get=\"/fragments/echo/process-tree?device={{AGENT_ID}}\""));
     CHECK_THAT(html, ContainsSubstring("hx-trigger=\"load\""));
 }
 
@@ -1664,14 +1664,14 @@ TEST_CASE("static_js_bundle: kYuzuVizHostJs dispatches process-select CustomEven
     // Slice 4 invariant: clicking a process node in the IPC graph dispatches
     // a 'yuzu:select-process' CustomEvent carrying the pid; the page-shell
     // listens for it and scrolls/highlights the matching <details data-pid>
-    // in the TAR tree below. One-way (IPC graph → TAR tree) for v1.
+    // in the Echo tree below. One-way (IPC graph → Echo tree) for v1.
     CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("yuzu:select-process"));
     CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("CustomEvent"));
 }
 
 TEST_CASE("static_js_bundle: kVizHostPageHtml listens for process-select CustomEvent",
           "[viz-host][page][sync]") {
-    // The receiver side lives inline in the page-shell HTML so the TAR
+    // The receiver side lives inline in the page-shell HTML so the Echo
     // fragment's <details data-pid> can be reached after HTMX swap.
     std::string html(kVizHostPageHtml);
     CHECK_THAT(html, ContainsSubstring("yuzu:select-process"));
@@ -1680,9 +1680,9 @@ TEST_CASE("static_js_bundle: kVizHostPageHtml listens for process-select CustomE
 
 TEST_CASE("static_js_bundle: kVizHostPageHtml has a resizable splitter persisted in localStorage",
           "[viz-host][page][splitter]") {
-    // The splitter between #ipc-graph and #tar-tree is draggable; the
+    // The splitter between #ipc-graph and #echo-tree is draggable; the
     // ratio persists across reloads via localStorage so an operator's
-    // preferred layout sticks. Default 60/40 (IPC top, TAR bottom) per
+    // preferred layout sticks. Default 60/40 (IPC top, Echo bottom) per
     // the grilling decisions.
     std::string html(kVizHostPageHtml);
     CHECK_THAT(html, ContainsSubstring("yuzuVizHostSplitRatio"));
