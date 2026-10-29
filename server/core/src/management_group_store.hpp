@@ -31,6 +31,8 @@
 /// over `management_groups`/`management_group_members`/`management_group_roles` instead —
 /// silent unless real rows are found, never blocks boot.
 
+#include "management_group_types.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <expected>
@@ -49,25 +51,6 @@ class PgPool;
 }
 
 namespace yuzu::server {
-
-struct ManagementGroup {
-    std::string id;
-    std::string name;
-    std::string description;
-    std::string parent_id;        // empty for root groups
-    std::string membership_type;  // "static" or "dynamic"
-    std::string scope_expression; // for dynamic groups (evaluated by scope engine)
-    std::string created_by;
-    int64_t created_at{0};
-    int64_t updated_at{0};
-};
-
-struct ManagementGroupMember {
-    std::string group_id;
-    std::string agent_id;
-    std::string source; // "static" or "dynamic"
-    int64_t added_at{0};
-};
 
 struct GroupRoleAssignment {
     std::string group_id;

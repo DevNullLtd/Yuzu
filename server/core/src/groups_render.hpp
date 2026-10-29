@@ -28,8 +28,8 @@
 /// Every dynamic value reaches the output through `html_escape` (attributes included) and every
 /// id in a URL through `url_query_value`.
 
-#include "access_render.hpp"
-#include "management_group_store.hpp"
+#include "fragment_states.hpp"
+#include "management_group_types.hpp"
 
 #include <cstddef>
 #include <optional>

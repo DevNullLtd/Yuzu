@@ -18,14 +18,15 @@
 ///
 /// Every fragment handler sets `Cache-Control: no-store` as its first statement, so a gate's
 /// 401/403/503 and the 400 for a malformed `id` carry it too. A malformed `id` is a 400 before
-/// any gate or read. No fragment writes an audit row (the REST twins write none).
+/// any gate or read. No fragment writes a success audit row (the REST twins write none); a refused call writes the
+/// gate's ordinary denial row.
 ///
 /// The page's three enrolment panels re-use the fragments that already exist under
 /// `/fragments/settings/{tokens,pending,auto-approve}` (same routes, same `admin_fn_` gate,
 /// same mutation routes and audit rows).
 
 #include "authz_gates.hpp"
-#include "management_group_store.hpp"
+#include "management_group_types.hpp"
 
 #include <yuzu/server/auth.hpp>
 
