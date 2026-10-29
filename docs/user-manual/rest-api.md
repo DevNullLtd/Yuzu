@@ -13055,7 +13055,10 @@ below).
 **Permission:** the same credential as `POST /mcp/v1/`, plus the session's
 `Mcp-Session-Id` header. The credential is re-checked once per tick (~3 s), whether or
 not a heartbeat frame is emitted, so revoking it ends a *live* stream, not just future
-ones.
+ones. A service-scoped API token is refused outright (`403`, below). The session is
+bound to the principal and credential class that created it (authentication source,
+principal kind, MCP tier, service scope; not elevation state), and stream liveness is
+principal-level while the class is checked at attach.
 
 **Required headers:** `Mcp-Session-Id` (from `initialize`), `Accept: text/event-stream`.
 **Optional:** `Last-Event-ID` to resume.
@@ -13066,8 +13069,9 @@ ones.
 |---|---|
 | `200` | SSE stream (`text/event-stream`, chunked, held open) |
 | `400` | `Mcp-Session-Id` absent (`-32600`) |
-| `404` | Session unknown, expired, another principal's, **or** the `Last-Event-ID` cursor is outside the replay window (`-32007`) — re-initialize |
+| `404` | Session unknown, expired, another principal's, another credential class's, **or** the `Last-Event-ID` cursor is outside the replay window (`-32007`) — re-initialize with the credential you will use |
 | `403` | `Origin` not in `--mcp-allowed-origin` (`-32008`) |
+| `403` | Service-scoped API token (`-32003`; no `permission` field, because no permission grant would admit the caller; use a token without `scope_service`). Checked after the kill switches, `Origin`, protocol version and authentication, and before the session header, `Accept` and the stream lease, so it answers even when `Mcp-Session-Id` is absent. Audited `mcp.session.reject` `reason=service_scoped` |
 | `405` | Streaming disabled (`--mcp-no-streaming`) |
 | `406` | `Accept` did not include `text/event-stream` (`-32011`) |
 | `429` | Concurrent-stream cap, or a superseded stream on this session is still closing (`-32012`; honour `retry_after_ms`) |
@@ -13087,7 +13091,7 @@ name the reason in that same A4 shape.
 #### `DELETE /mcp/v1/`
 
 Ends the session named by `Mcp-Session-Id` (and closes its stream). `200` on success;
-`404` if the session is unknown or belongs to another principal; `400` if the header is
+`404` if the session is unknown, expired, already ended, or belongs to another principal or another credential class (call `initialize` to start a new session; the original session is not terminated by a class mismatch); `400` if the header is
 absent.
 
 #### `POST /mcp/v1/`
@@ -13235,8 +13239,8 @@ carrying `_meta.progressToken` (see `docs/user-manual/mcp.md`'s `progressToken`
 definition for the type/length contract; an out-of-spec value is silently treated as
 absent — no error, no progress) opts into progress tracking — **this requires an
 active session**: a non-empty `Mcp-Session-Id` header from a prior `initialize`. A
-`Mcp-Session-Id` that is present but invalid (unknown, expired, or another
-principal's) fails the **entire call** with `404`/`-32007` before progress tracking is
+`Mcp-Session-Id` that is present but invalid (unknown, expired, another
+principal's, or another credential class's) fails the **entire call** with `404`/`-32007` before progress tracking is
 even considered — that is a property of every non-`initialize` method on this
 endpoint, not specific to progress tracking, and is covered above under `GET /mcp/v1/`.
 The table below assumes a valid session or none at all; where progress *is* tracked,

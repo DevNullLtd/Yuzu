@@ -249,6 +249,51 @@ the documented case; see `docs/user-manual/upgrading.md`). Breaking for
 service-scoped tokens only; human sessions, engine principals and MCP tiers are
 unchanged. Evidence for this entry is the governance ledger for #3526.
 
+**Addendum: the MCP stream endpoint and MCP sessions, authorisation gap closed (CC6.1/CC6.3/CC7.2, #4754, 2026-10-29).**
+Before this change `GET /mcp/v1/` (the session's SSE channel, which replays a
+bounded per-session ring of frames) required authentication only, and a session id
+was bound to the username alone. Two reaches existed. A service-scoped API token
+could open the channel and receive replayed frames, although the channel has no
+per-target parameter to confine them against. And a weaker credential of the same
+user (for example a `readonly` token, a tierless token or a cookie session) that
+obtained the session id of a stronger session (for example one minted by a
+`supervised` token) could attach to it and receive that session's replayed frames.
+Now the `GET` refuses a service-scoped token (`403`, JSON-RPC `-32003`, audited
+`mcp.session.reject` `reason=service_scoped`), and a session is bound to the
+principal and the credential class that minted it (authentication source, principal
+kind, MCP tier, service scope; not elevation state): any other class presenting the
+id gets the same `404` as an unknown id, audited `reason=credential_mismatch`. The
+REST sibling `GET /api/v1/events` is deliberately not denied to a service-scoped
+token (it is confined by the fleet-read gate and needs an `execution_id`); the
+asymmetry is recorded in
+`docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
+**For any assessment covering a period before this change, treat a service-scoped
+token, and a weaker credential of a user who knew a stronger session's id, as having
+been able to read that session's replayed frames.** The id is 128-bit and is returned
+only in the `initialize` response header, so the exposure needed the id as well as
+the credential; no measurement exists of whether any deployment issued
+service-scoped tokens that used the channel.
+Risk-register entry: an elevated cookie session's replay ring is readable by a
+non-elevated credential of the same class that holds the session id, until the
+tierless-human refusal at `/mcp/v1/` (#4309, PR B) lands, which refuses the only
+credential kind that can be elevated. JIT elevation is per-request state outside
+the class; the residual is accepted by the maintainer with that PR as the stated
+closure. The existing mitigation is that the session id must be protected like a
+credential. Stream liveness is principal-level and the class is checked at attach.
+Further residuals: a class switch strands the old-class sessions against the
+per-principal cap (8) for up to the 30-minute idle TTL with no administrator reap
+path; and during a rolling upgrade the gap stays open on any replica not yet
+upgraded.
+Audit evidence: the `mcp.session.*` rows are written set-and-proceed (a failure to
+persist one is logged and the denial is still answered) and they are queryable through
+`GET /api/v1/audit`, but they are NOT in the CC7.2 authentication sample
+(`GET /api/v1/audit/auth-sample` selects the `auth.`, `mfa.`, `session.` and
+`engine_principal.` prefixes only), so an auditor sampling that surface does not see
+them. The `service_scoped` denial is recorded `result=failure`, like every
+`mcp.session.reject` transport denial, so a SIEM rule keyed on `result=denied` does
+not see it. Breaking for service-scoped tokens on `GET /mcp/v1/` and for clients that
+switch credential class within a session; see `docs/user-manual/upgrading.md`.
+
 **Addendum — machine-identity resource-bounding (CC6.6, PR 4.4).** Engine
 principals (ADR-1005 class) resolve authority from default-deny RBAC, and
 assignment refuses the `admin` / `Administrator` role names and the built-in
