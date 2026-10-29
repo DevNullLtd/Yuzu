@@ -676,9 +676,12 @@ void AuthManager::maybe_refresh_session_generation() const {
         // cached sessions, bounded only by the 8 h absolute lifetime. This
         // replica never writes `cached_session_gen_` on a local mutation (its
         // own bump is observed by this same poll like any other), so an
-        // unchanged read is the only no-op and there is no clear loop. Two
-        // overlapping polls returning out of order can cost one extra clear;
-        // over-clearing only forces durable re-reads, never drops a durable row
+        // unchanged read is the only no-op and there is no clear loop. The gate
+        // above only stamps a timestamp before the unlocked read, so a read
+        // slower than the interval lets a second poll start; if they finish out
+        // of order the stale one re-adopts the older value and the next poll
+        // adopts the newer one again: up to two extra clears. Over-clearing
+        // only forces durable re-reads, never drops a durable row
         // (a session held only in this cache, whose write-through failed, is
         // lost on a clear, which is fail-closed). The generation read MUST come
         // from the primary: a reader answered by alternating nodes with
