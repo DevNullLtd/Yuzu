@@ -16,7 +16,20 @@
  * server instance reads the same row.
  *
  * NOT part of the document: the cohort floor and the statistics. They are fixed
- * constants of the score, not settings.
+ * constants of the score, not settings. (The interval confidence LEVEL is a
+ * setting: it is the `model` block's, below.)
+ *
+ * VERSIONS. Version 1 is the document before the model parameters existed;
+ * version 2 adds the `model` block. The writer stamps version 2 ONLY when the
+ * policy uses a model parameter (dex_score_policy_uses_model_parameters: a
+ * global value off its default, or ANY override naming a model field, even at
+ * the global value, because presence pins the application). Every other policy
+ * dumps as exactly the version-1 text it always did, so an existing stored
+ * document's revision never changes and an older replica keeps reading it. The
+ * reader enforces the other direction: `model` (root or override) in a
+ * document below version 2 is refused as "requires version 2", so "model
+ * present implies version 2" holds for every stored text, and a replica that
+ * only knows version 1 falls back whole on a version-2 text.
  *
  * Failure direction (the reader's contract, see dex_policy_in_force_from_stored):
  *   - nothing stored        -> the shipped defaults, source "default", no fault.
@@ -24,7 +37,7 @@
  *                              names the reason. Never half-applied.
  *   - version above the one this build supports
  *                           -> the shipped defaults, source "default", `fault`
- *                              "unsupported_version at version: N above the supported 1",
+ *                              "unsupported_version at version: N above the supported 2",
  *                              checked BEFORE the strict parse so a newer document with
  *                              keys this reader does not know still falls back whole.
  *   - store unreadable      -> not decided here; the provider serves the last
@@ -32,13 +45,19 @@
  *
  * Wire shape (every key optional on read except an override's "image"; unknown
  * keys are refused):
- *   { "version": 1,
+ *   { "version": 1 | 2,
  *     "tiers":   { "edges": {excellent, good, fair},
  *                  "names": {excellent, good, fair, poor} },
  *     "weights": { breadth, crashes, hangs, regression },
+ *     "model":   { per_device_event_cap, regression_full_ratio,
+ *                  regression_start_ratio, interval_confidence },   // version 2
  *     "overrides": [ { "image": "<exact image name>",
  *                      "tiers":   { "edges": {..}, "names": {..} },
- *                      "weights": {..} } ] }
+ *                      "weights": {..},
+ *                      "model":   { per_device_event_cap, regression_full_ratio,
+ *                                   regression_start_ratio } } ] }   // version 2
+ * An override's model has no interval_confidence (global only; an unknown key
+ * there). per_device_event_cap must be a JSON integer.
  * "version" is an integer of at least 1; absent reads as 1, and the canonical text
  * always carries it. An override sets only the fields it names; the rest inherit the global policy.
  * Numbers must be JSON numbers (the string "90" is refused). Poor's lower edge
@@ -75,8 +94,12 @@ namespace yuzu::server {
 
 /// Runtime-config key holding the policy document.
 inline constexpr std::string_view kDexScorePolicyKey = "dex_score_policy";
-/// The document version this build reads and writes.
-inline constexpr std::int64_t kDexScorePolicyVersion = 1;
+/// The highest document version this build reads, and the one it writes when a
+/// model parameter is in use.
+inline constexpr std::int64_t kDexScorePolicyVersion = 2;
+/// The version of a document with no model parameter, and of every document
+/// written before the model parameters existed.
+inline constexpr std::int64_t kDexScorePolicyBaseVersion = 1;
 /// Revision reported when no document is stored.
 inline constexpr std::string_view kDexScorePolicyDefaultRevision = "default";
 /// Largest stored text that is parsed. A legitimate document is about 130 KB at the
@@ -202,6 +225,43 @@ template <class T>
                             {"regression", w[3]}});
 }
 
+/// The "model" object, shared by the global policy (plain targets) and an
+/// override (optional targets, `confidence` null: interval_confidence is global
+/// only, so inside an override it is an unknown key). The cap must be a JSON
+/// integer (an unsigned above INT64_MAX clamps and the validator refuses it).
+template <class I, class D>
+[[nodiscard]] std::optional<Err> read_model(const json& o, std::string_view path, I* cap, D* full,
+                                            D* start, double* confidence) {
+    const auto mo = object_at(o, path, "model");
+    if (!mo)
+        return mo.error();
+    if (!*mo)
+        return std::nullopt;
+    const std::string p = join(path, "model");
+    // interval_confidence is the global block's only; in an override it is an unknown key.
+    if (const auto e = unknown_key(**mo, p,
+                                   {"per_device_event_cap", "regression_full_ratio",
+                                    "regression_start_ratio",
+                                    confidence ? "interval_confidence" : "per_device_event_cap"}))
+        return e;
+    if (const auto it = (*mo)->find("per_device_event_cap"); it != (*mo)->end()) {
+        if (!it->is_number_integer())
+            return Err{join(p, "per_device_event_cap"), "must be an integer"};
+        constexpr auto kMax = (std::numeric_limits<std::int64_t>::max)();
+        *cap = it->is_number_unsigned() && it->template get<std::uint64_t>() >
+                                               static_cast<std::uint64_t>(kMax)
+                   ? kMax
+                   : it->template get<std::int64_t>();
+    }
+    if (const auto e = read_numbers<D>(**mo, p,
+                                       {{"regression_full_ratio", full},
+                                        {"regression_start_ratio", start}}))
+        return e;
+    if (confidence)
+        return read_numbers<double>(**mo, p, {{"interval_confidence", confidence}});
+    return std::nullopt;
+}
+
 /// File-local FNV-1a 64-bit, 16 lower-hex digits.
 [[nodiscard]] inline std::string fnv1a64_hex(std::string_view s) {
     std::uint64_t h = 14695981039346656037ull; // FNV-1a 64 offset basis
@@ -259,8 +319,11 @@ dex_score_policy_from_json(const nlohmann::json& doc) {
     if (*ver > kDexScorePolicyVersion)
         return std::unexpected(Err{"version", "above the supported " +
                                                   std::to_string(kDexScorePolicyVersion)});
-    if (const auto e = unknown_key(doc, "", {"version", "tiers", "weights", "overrides"}))
+    if (const auto e = unknown_key(doc, "", {"version", "tiers", "weights", "model", "overrides"}))
         return std::unexpected(*e);
+    // `model` is a version-2 key: below it the document is refused, so the writer's
+    // stamp and the reader's check agree and an older replica never half-reads one.
+    const bool model_allowed = *ver >= 2;
     DexScorePolicy p;
     const auto to = object_at(doc, "", "tiers");
     if (!to)
@@ -275,6 +338,14 @@ dex_score_policy_from_json(const nlohmann::json& doc) {
             doc, "", {&p.weights.breadth, &p.weights.crashes, &p.weights.hangs,
                       &p.weights.regression}))
         return std::unexpected(*e);
+    if (doc.contains("model")) {
+        if (!model_allowed)
+            return std::unexpected(Err{"model", "requires version 2"});
+        if (const auto e = read_model<std::int64_t, double>(
+                doc, "", &p.model.per_device_event_cap, &p.model.regression_full_ratio,
+                &p.model.regression_start_ratio, &p.interval_confidence))
+            return std::unexpected(*e);
+    }
     if (const auto it = doc.find("overrides"); it != doc.end()) {
         if (!it->is_array())
             return std::unexpected(Err{"overrides", "must be an array"});
@@ -283,7 +354,7 @@ dex_score_policy_from_json(const nlohmann::json& doc) {
             const std::string path = "overrides[" + std::to_string(i) + "]";
             if (!o.is_object())
                 return std::unexpected(Err{path, "must be an object"});
-            if (const auto e = unknown_key(o, path, {"image", "tiers", "weights"}))
+            if (const auto e = unknown_key(o, path, {"image", "tiers", "weights", "model"}))
                 return std::unexpected(*e);
             DexScoreOverride ov;
             const auto img = o.find("image");
@@ -301,17 +372,42 @@ dex_score_policy_from_json(const nlohmann::json& doc) {
             if (const auto e = read_weights<std::optional<double>>(
                     o, path, {&ov.breadth, &ov.crashes, &ov.hangs, &ov.regression}))
                 return std::unexpected(*e);
+            if (o.contains("model")) {
+                if (!model_allowed)
+                    return std::unexpected(Err{join(path, "model"), "requires version 2"});
+                if (const auto e = read_model<std::optional<std::int64_t>, std::optional<double>>(
+                        o, path, &ov.per_device_event_cap, &ov.regression_full_ratio,
+                        &ov.regression_start_ratio, nullptr))
+                    return std::unexpected(*e);
+            }
             p.overrides.push_back(std::move(ov));
         }
     }
     return p;
 }
 
+/// True when the policy needs the version-2 document: a global model value off
+/// its default, or any override naming a model field (presence, not value, so an
+/// override pinned at the shipped value still pins that application when the
+/// global one later changes). False means the canonical text is the version-1
+/// text, with no `model` key anywhere.
+[[nodiscard]] inline bool dex_score_policy_uses_model_parameters(const DexScorePolicy& p) {
+    if (!(p.model == kStabilityModel) || p.interval_confidence != kDexStatsConfidence)
+        return true;
+    return std::any_of(p.overrides.begin(), p.overrides.end(), [](const DexScoreOverride& o) {
+        return o.per_device_event_cap || o.regression_full_ratio || o.regression_start_ratio;
+    });
+}
+
 /// The full global document plus, per override, only the fields it sets. Key
 /// order is fixed (nlohmann objects are key-sorted), so equal policies dump to
-/// equal text.
+/// equal text. A policy that uses no model parameter dumps EXACTLY the version-1
+/// text it always did (equal text, equal revision); otherwise version 2 with the
+/// root `model` (all four fields) and each override's `model` (only the fields
+/// it sets).
 [[nodiscard]] inline nlohmann::json dex_score_policy_to_json(const DexScorePolicy& p) {
     using json = nlohmann::json;
+    const bool v2 = dex_score_policy_uses_model_parameters(p);
     json edges{{"excellent", p.tiers.edges.excellent},
                {"good", p.tiers.edges.good},
                {"fair", p.tiers.edges.fair}};
@@ -319,13 +415,18 @@ dex_score_policy_from_json(const nlohmann::json& doc) {
                {"good", p.tiers.names[1]},
                {"fair", p.tiers.names[2]},
                {"poor", p.tiers.names[3]}};
-    json doc{{"version", kDexScorePolicyVersion},
+    json doc{{"version", v2 ? kDexScorePolicyVersion : kDexScorePolicyBaseVersion},
              {"tiers", {{"edges", std::move(edges)}, {"names", std::move(names)}}},
              {"weights",
               {{"breadth", p.weights.breadth},
                {"crashes", p.weights.crashes},
                {"hangs", p.weights.hangs},
                {"regression", p.weights.regression}}}};
+    if (v2)
+        doc["model"] = {{"per_device_event_cap", p.model.per_device_event_cap},
+                        {"regression_full_ratio", p.model.regression_full_ratio},
+                        {"regression_start_ratio", p.model.regression_start_ratio},
+                        {"interval_confidence", p.interval_confidence}};
     json arr = json::array();
     for (const auto& o : p.overrides) {
         json oe = json::object(), on = json::object(), ow = json::object();
@@ -347,6 +448,13 @@ dex_score_policy_from_json(const nlohmann::json& doc) {
             ow["hangs"] = *o.hangs;
         if (o.regression)
             ow["regression"] = *o.regression;
+        json om = json::object();
+        if (o.per_device_event_cap)
+            om["per_device_event_cap"] = *o.per_device_event_cap;
+        if (o.regression_full_ratio)
+            om["regression_full_ratio"] = *o.regression_full_ratio;
+        if (o.regression_start_ratio)
+            om["regression_start_ratio"] = *o.regression_start_ratio;
         json ov{{"image", o.image}};
         json tiers = json::object();
         if (!oe.empty())
@@ -357,6 +465,8 @@ dex_score_policy_from_json(const nlohmann::json& doc) {
             ov["tiers"] = std::move(tiers);
         if (!ow.empty())
             ov["weights"] = std::move(ow);
+        if (!om.empty())
+            ov["model"] = std::move(om);
         arr.push_back(std::move(ov));
     }
     doc["overrides"] = std::move(arr);
@@ -380,7 +490,7 @@ dex_score_policy_from_json(const nlohmann::json& doc) {
 
 /// Field path of a validator rejection. The validator reports the group that
 /// failed, not the single edge or weight, so the path names the group
-/// (tiers.edges, tiers.names, weights); a per-override fault carries the
+/// (tiers.edges, tiers.names, weights, model); a per-override fault carries the
 /// override's index.
 [[nodiscard]] inline std::string dex_policy_fault_field(const DexPolicyRejection& r) {
     if (r.fault == DexPolicyFault::TooManyOverrides)
@@ -399,6 +509,11 @@ dex_score_policy_from_json(const nlohmann::json& doc) {
     case DexPolicyFault::WeightInvalid:
     case DexPolicyFault::WeightSumAboveMaximum:
         return base + "weights";
+    case DexPolicyFault::EventCapOutOfRange:
+    case DexPolicyFault::RegressionRatioOutOfRange:
+    case DexPolicyFault::RegressionRatiosNotAscending:
+    case DexPolicyFault::IntervalConfidenceOutOfRange:
+        return base + "model";
     case DexPolicyFault::OverrideKeyInvalid:
     case DexPolicyFault::OverrideKeyDuplicate:
         return global ? std::string("overrides") : base + "image";
@@ -414,7 +529,7 @@ dex_score_policy_from_json(const nlohmann::json& doc) {
 /// accepts is a text the reader serves, and the two never word a refusal differently.
 /// On refusal `.field` is the dotted path of the offending value ("document" for the root) and
 /// `.message` is the fault string the reader reports: "oversized at document: ...",
-/// "unparseable at <path>: <msg>", "unsupported_version at version: N above the supported 1" or
+/// "unparseable at <path>: <msg>", "unsupported_version at version: N above the supported 2" or
 /// "<validator token> at <path>".
 [[nodiscard]] inline std::expected<DexScorePolicy, DexPolicyParseError>
 dex_score_policy_validate_text(const std::string& text) {

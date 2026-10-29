@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 93534d76a8aa
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 0c437dc4008f
 == action=list
 lic|apt||3.0.3|open_source||unknown||package_metadata|heuristic|||machine|
 lic|autoconf||2.72-3.1|open_source||unknown||package_metadata|heuristic|||machine|

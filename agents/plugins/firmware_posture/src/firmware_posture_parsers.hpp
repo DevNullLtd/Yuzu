@@ -18,6 +18,7 @@
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
 
 #include <constraint_accumulator.hpp>
+#include <smbios_parsers.hpp>
 #include <wmi_error_token.hpp>
 
 #include <algorithm>
@@ -169,44 +170,13 @@ inline bool all_digits(std::string_view s) noexcept {
     return !s.empty() && std::all_of(s.begin(), s.end(), [](char c) { return c >= '0' && c <= '9'; });
 }
 
-inline std::string rtrim(std::string_view s) {
-    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\n' ||
-                          s.back() == '\r' || s.back() == '\0'))
-        s.remove_suffix(1);
-    return std::string{s};
-}
+using yuzu::shared::smbios::rtrim; // moved to the shared SMBIOS walker; the callers below are unchanged
 
 inline std::optional<unsigned> to_uint(std::string_view s) noexcept {
     if (!all_digits(s) || s.size() > 9) return std::nullopt;
     unsigned v = 0;
     for (char c : s) v = v * 10 + static_cast<unsigned>(c - '0');
     return v;
-}
-
-inline constexpr std::size_t kRsmbHeader = 8; // Used20CallingMethod, Major, Minor, Dmi, u32 Length
-
-inline std::uint32_t le32(std::span<const std::uint8_t> b, std::size_t o) noexcept {
-    return static_cast<std::uint32_t>(b[o]) | static_cast<std::uint32_t>(b[o + 1]) << 8 |
-           static_cast<std::uint32_t>(b[o + 2]) << 16 | static_cast<std::uint32_t>(b[o + 3]) << 24;
-}
-inline std::uint16_t le16(std::span<const std::uint8_t> b, std::size_t o) noexcept {
-    return static_cast<std::uint16_t>(b[o] | b[o + 1] << 8);
-}
-
-/// 1-based SMBIOS string index into the string-set at [start, end) (end = one past the final
-/// double NUL). nullopt = index runs past the set (malformed).
-inline std::optional<std::string> smbios_string(std::span<const std::uint8_t> t, std::size_t start,
-                                                std::size_t end, unsigned idx) {
-    std::size_t p = start;
-    for (unsigned i = 1;; ++i) {
-        if (p >= end || t[p] == 0) return std::nullopt; // ran out of strings
-        std::size_t q = p;
-        while (q < end && t[q] != 0) ++q;
-        if (i == idx) {
-            return rtrim(std::string_view{reinterpret_cast<const char*>(t.data() + p), q - p});
-        }
-        p = q + 1;
-    }
 }
 
 inline std::string clean_component(std::string_view s) { // keep `;`/`=` out of the composite
@@ -304,12 +274,20 @@ struct Smbios0Result {
 };
 
 /// Parses the first type-0 structure of an RSMB blob as GetSystemFirmwareTable('RSMB') returns
-/// it (8-byte RawSMBIOSData header, then the structure table). Bounds-checked at every step:
-/// a blob shorter than the header's own Length claim, a structure or string-set running past
-/// the end, or a malformed structure all return `constrained` with a token; nothing throws.
+/// it (8-byte RawSMBIOSData header, then the structure table). A thin adapter over the shared
+/// bounds-checked walker (agents/shared/smbios_parsers.hpp); nothing throws. Precedence, which
+/// reproduces the former early-return exactly because the walker keeps every entry decoded
+/// before a framing fault:
+///   1. type 0 decoded            -> ok; the walker's `error` is IGNORED (the former loop returned
+///                                   at type 0 and never read the tail);
+///   2. type 0 malformed          -> smbios:malformed (error ignored for the same reason);
+///   3. no type 0 and a fault      -> smbios:truncated / smbios:malformed (the fault came before
+///                                   any type 0, where the former loop stopped);
+///   4. no type 0, no fault        -> smbios:no_type0 (type 127 or the end of the table).
+/// An empty string is an absent field.
 [[nodiscard]] inline Smbios0Result parse_smbios_type0(std::span<const std::uint8_t> raw) {
-    using detail::le16;
-    using detail::le32;
+    namespace sm = yuzu::shared::smbios;
+    const sm::SmbiosTable table = sm::parse_rsmb(raw);
     Smbios0Result res;
     auto bad = [&](std::string_view tok) {
         res.constrained = true;
@@ -317,68 +295,24 @@ struct Smbios0Result {
         res.data = {};
         return res;
     };
-    if (raw.size() < detail::kRsmbHeader) return bad("smbios:truncated");
-    const std::uint32_t claimed = le32(raw, 4);
-    if (raw.size() - detail::kRsmbHeader < claimed) return bad("smbios:truncated");
-    const auto t = raw.subspan(detail::kRsmbHeader, claimed);
-
-    std::size_t off = 0;
-    while (off < t.size()) {
-        if (t.size() - off < 4) return bad("smbios:truncated");
-        const std::uint8_t type = t[off];
-        const std::size_t len = t[off + 1];
-        if (len < 4) return bad("smbios:malformed");
-        if (t.size() - off < len) return bad("smbios:truncated");
-        const std::size_t sstart = off + len;
-        // String-set: NUL-terminated strings ended by one extra NUL (two NULs when empty).
-        std::size_t p = sstart;
-        for (;; ++p) {
-            if (p + 1 >= t.size()) return bad("smbios:truncated");
-            if (t[p] == 0 && t[p + 1] == 0) break;
-        }
-        const std::size_t send = p + 2;
-        if (type == 127) return bad("smbios:no_type0"); // end-of-table before any type 0
-        if (type != 0) {
-            off = send;
-            continue;
-        }
-        if (len < 0x12) return bad("smbios:malformed");
-        Smbios0 d;
-        auto str = [&](std::size_t at, Field& f) {
-            const unsigned idx = t[off + at];
-            if (idx == 0) return true; // no string: absent
-            auto s = detail::smbios_string(t, sstart, send, idx);
-            if (!s) return false;
-            if (!s->empty()) f.value = std::move(*s);
-            return true;
-        };
-        if (!str(4, d.vendor) || !str(5, d.version) || !str(8, d.release_date))
-            return bad("smbios:malformed");
-        const unsigned rom = t[off + 9];
-        if (rom != 0xFF) {
-            d.rom_size_bytes = static_cast<std::uint64_t>(rom + 1) * 64ull * 1024ull;
-        } else if (len >= 0x1A) { // SMBIOS 3.1+: Extended BIOS ROM Size, bits 15:14 = unit
-            const std::uint16_t ext = le16(t, off + 0x18);
-            const unsigned unit = ext >> 14;
-            const std::uint64_t n = ext & 0x3FFFu;
-            if (unit == 0) d.rom_size_bytes = n * 1024ull * 1024ull;
-            else if (unit == 1) d.rom_size_bytes = n * 1024ull * 1024ull * 1024ull;
-            // units 2/3 are reserved: leave unset (unmodelled, not guessed)
-        }
-        if (len >= 0x18) { // SMBIOS 2.4+: 0xFF in a release byte = not specified
-            auto rel = [&](std::size_t at) -> std::optional<unsigned> {
-                const unsigned v = t[off + at];
-                return v == 0xFF ? std::nullopt : std::optional<unsigned>{v};
-            };
-            d.bios_major = rel(0x14);
-            d.bios_minor = rel(0x15);
-            d.ec_major = rel(0x16);
-            d.ec_minor = rel(0x17);
-        }
-        res.data = std::move(d);
-        return res;
+    if (table.bios.status == sm::Status::malformed) return bad("smbios:malformed");
+    if (table.bios.status == sm::Status::absent) {
+        if (!table.error) return bad("smbios:no_type0");
+        return bad(*table.error == sm::Error::truncated ? "smbios:truncated" : "smbios:malformed");
     }
-    return bad("smbios:no_type0");
+    const sm::Type0& b = table.bios.data;
+    auto field = [](const std::optional<std::string>& s, Field& f) {
+        if (s && !s->empty()) f.value = *s;
+    };
+    field(b.vendor, res.data.vendor);
+    field(b.version, res.data.version);
+    field(b.release_date, res.data.release_date);
+    res.data.rom_size_bytes = b.rom_size_bytes;
+    res.data.bios_major = b.bios_major;
+    res.data.bios_minor = b.bios_minor;
+    res.data.ec_major = b.ec_major;
+    res.data.ec_minor = b.ec_minor;
+    return res;
 }
 
 /// vendor/version/release_date always (absent when no string); the rest only when specified,

@@ -53,15 +53,45 @@
 ///      `approver_assurance_required:<reason>`. (Over REST an engine principal
 ///      is already refused by the central check; the `engine_principal` reason
 ///      is reachable on the MCP surface.)
-///   4. `deps.step_up_fn` -- the same closure the other step-up-gated routes
+///   3b. `deps.step_up_fn` -- the same closure the other step-up-gated routes
 ///      use. It consumes the central check's pass for this request (it
 ///      evaluates afresh, and writes its own 401, only if no pass was armed).
 ///      An UNWIRED `step_up_fn` is a 503, not a skip: this is the one place a
-///      null closure must not read as "no step-up required".
+///      null closure must not read as "no step-up required". With the central
+///      check active (window > 0) a stale proof, a SAML session or an engine
+///      principal is answered there, before this handler runs, with the generic
+///      `mfa.step_up.required` row and no ticket-specific row.
+///   4. `deps.approver_mfa_fn` (#6079) -- an ENROLLED second factor with a proof no
+///      older than the approver window (at most 300 s): `require_enrolled_fresh_mfa`.
+///      It does not replace step 3b: the generic gate passes un-enrolled accounts
+///      and bearers and honours a window of 0, none of which may decide a
+///      four-eyes approval. Its outcome is switched on, and every non-pass leaves
+///      the ticket untouched: a stale or enrolment-predating proof -> the 401 it
+///      wrote, plus a ticket-specific `denied` row
+///      (`approver_assurance:mfa_proof_stale`); an unreadable enrolment -> 503
+///      (`retry_after_ms`) plus an `error` row
+///      (`approver_assurance:mfa_store_unavailable`); an SSO proof dated after the database
+///      clock -> 503 with no retry hint plus an `error` row
+///      (`approver_assurance:mfa_proof_clock_skew`); no usable factor (not enrolled, no
+///      SSO attestation, SAML, a deactivated or deleted account) -> 403
+///      `approver_assurance_required:<reason>` plus a `denied` row. An UNWIRED
+///      `approver_mfa_fn` is a 503, not a skip: this is the one place a null
+///      closure must not read as "no step-up required". If a refusal's audit row
+///      cannot be persisted the refusal still stands and the response carries
+///      `Sec-Audit-Failed: true`.
 ///   5. AUDIT BEFORE MUTATE (#5823): an `attempted` row is written first; if it
 ///      does not persist the response is a 503 (`Sec-Audit-Failed: true`) and
 ///      the ticket is left pending. The post-decision `success` / `denied` row
-///      is kept as well, so a decision leaves two rows.
+///      is kept as well, so a decision leaves two rows. The `attempted` and
+///      `success` rows carry the detail `approver_assurance:enrolled_fresh_mfa`,
+///      which also marks a row written after the enrolled-factor requirement.
+///
+/// TICKET ID IN AUDIT ROWS: the path segment is attacker-shaped (`[^/]+`), so a
+/// segment that is not 1-128 of `[A-Za-z0-9_-]` is audited and logged as the
+/// fixed `target_id` `invalid-id`, never as the raw bytes. The refusals above
+/// keep their order and status; past the gate such an id is answered 400
+/// `approval not found` with a `denied` row (detail `invalid_approval_id`) and
+/// the store is not asked.
 /// The store's reviewer != submitted_by check is untouched and still runs last.
 ///
 /// STORE-UNAVAILABLE ASYMMETRY (preserved verbatim, not a defect introduced
@@ -74,13 +104,18 @@
 /// AUDIT ASYMMETRY (also preserved verbatim): GET /api/approvals and GET
 /// .../pending/count are both pure reads and unaudited. The store-
 /// unavailable 503 on all three gated-past routes is unaudited (it returns
-/// before `deps.audit_fn` is ever reached), as is the unresolvable-session
-/// 503. The same-site refusal writes its own `csrf.denied` row, an assurance
-/// refusal writes a best-effort `"denied"` row (detail
-/// `approver_assurance:<reason>`), and a step-up refusal writes its own
-/// `mfa.step_up.required` row. Past those, approve/reject write an
-/// `"attempted"` row BEFORE the store call (fail closed, see above) and then
-/// audit BOTH outcomes — a denied review (e.g. the store's
+/// before `deps.audit_fn` is ever reached), as is the unresolvable-session 503.
+/// The same-site refusal writes its own `csrf.denied` row, a step-up refusal
+/// writes its own `mfa.step_up.required` row, and the class-check refusal writes a
+/// `denied` row through `emit_behavioral_audit`; the approver MFA-gate refusals
+/// (step 4) write a ticket-specific `denied` / `error` row the same way. For those
+/// ticket-specific rows a failed write sets `Sec-Audit-Failed: true` on the
+/// response while the 403 / 503 / 401 still stands and the ticket is untouched. The
+/// gate's OWN `mfa.step_up.required` row (left on a stale proof by
+/// `detail::write_step_up_challenge`) is best effort: a failure to write it is
+/// logged and never surfaced in the response. Past those,
+/// approve/reject write an `"attempted"` row BEFORE the store call (fail closed, see
+/// above) and then audit BOTH outcomes: a denied review (e.g. the store's
 /// self-approval segregation-of-duties block) is audited as `"denied"`
 /// with `result.error()` as the detail, and a successful one as
 /// `"success"` — and additionally emit an `approval.approved`/
@@ -96,7 +131,8 @@
 /// collided with PR-7's independent promotion of the identical function into
 /// a different header; reconciled at merge time by dropping this PR's copy.
 
-#include "mfa_step_up.hpp" // StepUpFn
+#include "mfa_factor_state.hpp" // ApproverMfaOutcome
+#include "mfa_step_up.hpp"      // StepUpFn
 
 #include <yuzu/server/auth.hpp>
 
@@ -165,14 +201,25 @@ struct Deps {
     EmitEventFn emit_event_fn;
     /// The shared MFA step-up closure (server.cpp's `step_up_fn`, i.e.
     /// `require_mfa_step_up` bound to AuthDB + `--mfa-step-up-window-secs` +
-    /// the audit sink). On a stale proof it has already written a 401 and the
-    /// handler must return. Unlike GuardianRoutes' `step_up_fn_`, an EMPTY
-    /// closure is NOT permissive here: approve/reject answer 503 so a wiring
-    /// regression cannot silently drop the freshness requirement of a
-    /// four-eyes control. NOTE the closure itself skips users with no MFA
-    /// enrolled and `--mfa-step-up-window-secs=0` (see mfa_step_up.hpp), so
-    /// "fresh step-up" means exactly what it means on every other gated route.
+    /// the audit sink). It consumes the pass the central check armed for this
+    /// request, or evaluates afresh; on a stale proof it has already written a 401
+    /// and the handler must return. An EMPTY closure is NOT permissive here:
+    /// approve/reject answer 503 so a wiring regression cannot silently drop the
+    /// freshness requirement of a four-eyes control. The closure itself skips users
+    /// with no MFA enrolled and `--mfa-step-up-window-secs=0`; `approver_mfa_fn`
+    /// below is what refuses those for a four-eyes decision.
     StepUpFn step_up_fn;
+    /// The approver MFA gate (server.cpp binds `require_enrolled_fresh_mfa` to
+    /// AuthDB + `--mfa-step-up-window-secs` + the audit sink + `/metrics`). On
+    /// `kChallengeWritten` it has already written the 401 and the handler must
+    /// return. An EMPTY closure is NOT permissive: approve/reject answer 503 so a
+    /// wiring regression cannot silently drop the second-factor requirement of a
+    /// four-eyes control. A server with no AuthDB binds a closure that answers
+    /// `kStoreUnavailable`, never `kPass`.
+    using ApproverMfaFn =
+        std::function<ApproverMfaOutcome(const httplib::Request&, httplib::Response&,
+                                         const auth::Session&, const std::string& action_label)>;
+    ApproverMfaFn approver_mfa_fn;
     /// `Config::csrf_trusted_origins` (normalised at boot) for the same-site
     /// write gate on approve/reject (`WriteGate::refuse_cross_site`,
     /// `audited_write.hpp`) -- extra origins a cookie-authorised POST may

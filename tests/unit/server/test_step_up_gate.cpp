@@ -2233,6 +2233,36 @@ TEST_CASE("refuse_step_up_store_unwired: 503 + audit + metric", "[stepup][gate]"
     CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
 }
 
+// An OIDC `sub` or SAML NameID reaches session.username with spaces, '=' and ',' intact. The
+// refusal row is read as space-delimited key=value by SIEM rules, so the subject must not be
+// able to add tokens: a hostile subject must not forge `reason=engine_principal_denied` (#6079).
+TEST_CASE("refusal audit: a hostile subject is neutralised in every decision's detail",
+          "[stepup][gate]") {
+    const std::string hostile = "evil reason=engine_principal_denied,x";
+    const std::string safe = "evil_reason_engine_principal_denied_x";
+    for (const auto decision : {StepUpDecision::kChallenge, StepUpDecision::kSamlDenied,
+                                StepUpDecision::kStoreUnavailable, StepUpDecision::kStatusFailed,
+                                StepUpDecision::kUnwired, StepUpDecision::kUnsupportedClass,
+                                StepUpDecision::kEvaluationFailed, StepUpDecision::kEngineDenied}) {
+        Rig rig;
+        StepUpVerdict v;
+        v.decision = decision;
+        v.user = hostile;
+        v.age_secs = 5;
+        v.window_secs = 300;
+        httplib::Request req;
+        emit_step_up_refusal_effects(req, v, rig.audit, "POST /api/v1/elevate", {}, &rig.metrics);
+        REQUIRE(rig.audits.size() == 1);
+        INFO("decision " << static_cast<int>(decision));
+        CHECK(rig.audits[0].detail.rfind("user=" + safe, 0) == 0);
+        // Exactly one reason= token at most: the forged one is gone.
+        const auto first = rig.audits[0].detail.find("reason=");
+        if (first != std::string::npos)
+            CHECK(rig.audits[0].detail.find("reason=", first + 1) == std::string::npos);
+        CHECK(rig.audits[0].detail.find(hostile) == std::string::npos);
+    }
+}
+
 // ── equivalence matrix against a real AuthDB ─────────────────────────────────
 
 namespace {

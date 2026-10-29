@@ -35,7 +35,7 @@ init_includes_cluster_discovery_child_spec_test() ->
 -define(CORE, [yuzu_gw_registry, yuzu_gw_upstream, yuzu_gw_upstream_pressure,
                yuzu_gw_heartbeat_buffer, yuzu_gw_router,
                yuzu_gw_gauge, yuzu_gw_cluster_discovery, yuzu_gw_health,
-               yuzu_gw_memory_shedder, yuzu_gw_agent_sup, yuzu_gw_mgmt_pins]).
+               yuzu_gw_memory_shedder, yuzu_gw_mem_reclaim, yuzu_gw_agent_sup, yuzu_gw_mgmt_pins]).
 
 entry(Name) ->
     #{name => Name, service_protos => [agent_pb],
@@ -138,7 +138,7 @@ channel_children_precede_their_callers_test() ->
                       {yuzu_grpc_client_channel, second_channel},
                       yuzu_gw_upstream, yuzu_gw_upstream_pressure, yuzu_gw_heartbeat_buffer,
                       yuzu_gw_router, yuzu_gw_gauge, yuzu_gw_cluster_discovery, yuzu_gw_health,
-                      yuzu_gw_memory_shedder, yuzu_gw_agent_sup, yuzu_gw_mgmt_pins],
+                      yuzu_gw_memory_shedder, yuzu_gw_mem_reclaim, yuzu_gw_agent_sup, yuzu_gw_mgmt_pins],
                      child_ids())
     end) end).
 

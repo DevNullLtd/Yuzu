@@ -35,6 +35,8 @@
 #include "software_licensing_store.hpp"
 #include "app_usage_ingestion.hpp"
 #include "app_usage_store.hpp"
+#include "certificate_inventory_ingestion.hpp"
+#include "certificate_inventory_store.hpp"
 #include "peer_ip.hpp"
 
 #include <yuzu/log_token.hpp>
@@ -1805,8 +1807,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
 
     // Generic per-source blob persistence (sync-framework baseline; backs the
     // kInventoryQuery scope source + the inventory eval engine). The TYPED sources
-    // (installed_software / app_perf / device_ci / software_licensing) are persisted
-    // via their own normalized stores + shared seams below — skip them here, or they
+    // (kTypedInventorySources, typed_inventory_sources.hpp) are persisted via their
+    // own normalized stores + shared seams below — skip them here, or they
     // double-store into the generic InventoryStore. That generic store is read on
     // Infrastructure:Read (query_inventory/get_agent_inventory), so a typed source
     // leaking into it bypasses its own securable AND breaks direct/gateway parity
@@ -1947,6 +1949,24 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
             response->add_need_full("app_usage");
             spdlog::warn("[gateway] ProxyInventory: app_usage ingest threw (unknown) for "
                          "agent={} — nacked",
+                         agent_id);
+        }
+    }
+    // Typed fleet certificate inventory via its shared seam (slice-2 PR 2a-2a) — byte-identical
+    // to the direct ReportInventory path; the generic loop above skips the source.
+    if (certificate_inventory_store_ && certificate_inventory_store_->is_open()) {
+        try {
+            ingest_certificate_inventory_report(*certificate_inventory_store_, agent_id, *request,
+                                                *response, metrics_);
+        } catch (const std::exception& ex) {
+            cert_ingest_metric::handle_exception(*request, *response, metrics_);
+            spdlog::warn("[gateway] ProxyInventory: certificate_inventory ingest threw for "
+                         "agent={} — nacked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            cert_ingest_metric::handle_exception(*request, *response, metrics_);
+            spdlog::warn("[gateway] ProxyInventory: certificate_inventory ingest threw (unknown) "
+                         "for agent={} — nacked",
                          agent_id);
         }
     }

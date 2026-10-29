@@ -1063,9 +1063,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // loaded HKU hive): what changed, with its old and new value. LIVE TIER
         // ONLY, no rollups (P-008, same rationale as power above). Mechanism: a
         // RegNotifyChangeKeyValue subtree watch + a per-root baseline diff
-        // (tar_state `registry:<root>`). The actor columns are in the schema for
-        // writer attribution, which follows in a later change; until then they
-        // hold 0 / ''.
+        // (tar_state `registry:<root>`) say WHAT changed; a write-only
+        // Kernel-Registry ETW session says WHO, by correlation on value name, type,
+        // size and time window. actor_pid / actor_image hold the correlated writer
+        // (a lead to verify, not proof) and are 0 / '' when none is named; `detail`
+        // says why (attr:corr | ambiguous | none | degraded | off | lost-restart).
         // Values are stored UNMASKED: `data`/`prev_data` are readable through
         // tar.sql. Retention is a row count.
         // Replay idempotence via the UNIQUE record_key index below.
@@ -1075,9 +1077,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
             .default_enabled = true,
             .unique_key_column = "record_key",
             .os_support = {
-                {"windows", OsSupportStatus::kSupported, "regnotify",
+                {"windows", OsSupportStatus::kSupported, "regnotify+etw",
                  "RegNotifyChangeKeyValue subtree watch + baseline diff (what changed, old/new "
-                 "value); cursor-model (tar_cursor.hpp). Rows carry no actor yet."},
+                 "value) and a write-only Kernel-Registry ETW session that names the writing "
+                 "process by correlation; cursor-model (tar_cursor.hpp). Without an elevated "
+                 "agent the session cannot open and rows carry attr:off."},
                 {"linux",   OsSupportStatus::kUnsupported, "",
                  "The Windows registry does not exist on this platform."},
                 {"macos",   OsSupportStatus::kUnsupported, "",
@@ -1104,11 +1108,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"prev_data",           "TEXT"},
                         {"prev_data_size",      "INTEGER"},
                         {"prev_data_truncated", "INTEGER"},
-                        {"actor_pid",           "INTEGER"}, // 0 = unattributed
-                        {"actor_image",         "TEXT"},    // '' until a writer is attributed
+                        {"actor_pid",           "INTEGER"}, // 0 = no writer named (see detail)
+                        {"actor_image",         "TEXT"},    // '' when no writer is named
                         {"source",              "TEXT"},    // notify | reconcile
                         {"observed_at",         "INTEGER"}, // unix ms the read saw it
-                        {"detail",              "TEXT"},    // the gap text; '' on a change row
+                        {"detail",              "TEXT"},    // attr:* on a change row; the gap text on a gap
                         {"record_key",          "TEXT"},    // UNIQUE — replay idempotence
                     },
                 },
@@ -1464,7 +1468,9 @@ bool is_queryable_table(std::string_view real_table_name) {
         // entirely unobservable -- no reset path exists, and the only remedy is
         // deleting tar.db, which destroys every OTHER source's history too.
         // Reading it exposes a source name, a position and updated_at; the
-        // cursor payload is the source's own bookkeeping, not captured content.
+        // cursor payload is the source's own bookkeeping, not captured content --
+        // with one exception: the registry cursor row holds, for about one tick, the
+        // rendered old and new values of changes whose writer is not settled yet.
         // tar_state carries the registry baselines (`registry:<root>`, rendered
         // values), readable here consistently with registry_live's own unmasked
         // values; purge_source("registry") erases the table, the cursor row and

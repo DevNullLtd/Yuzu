@@ -23,6 +23,7 @@
  * crashes under TSan with no TSan report (#438).
  */
 
+#include "test_principal_lock_gate.hpp"
 #include "settings_routes.hpp"
 
 #include "api_token_store.hpp"
@@ -39,6 +40,7 @@
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
 #include "../test_log_capture.hpp"
+#include "source_scan.hpp"
 #include "test_principal_lock_gate.hpp" // SessionWipeFault
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -51,6 +53,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <shared_mutex>
@@ -192,6 +195,33 @@ struct MfaSettingsHarness {
         return {};
     }
 };
+
+/// Detaches the SessionStore from the AuthManager on every exit path, so a failed REQUIRE
+/// never leaves the manager holding a pointer to a destroyed store.
+struct SessionStoreDetach {
+    auth::AuthManager& m;
+    ~SessionStoreDetach() { m.set_session_store(nullptr); }
+};
+
+/// Enrol `user` with a verified TOTP factor (a usable second factor).
+void enrol_verified(MfaSettingsHarness& h, const std::string& user = "admin") {
+    auto init = h.auth_db->mfa_init_enrollment(user, "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+    REQUIRE(h.auth_db->mfa_verify_enrollment(user, code, std::nullopt).has_value());
+}
+
+/// The `result` column of every captured `mfa.disabled` row, in write order.
+std::vector<std::string> disable_results(const MfaSettingsHarness& h) {
+    std::vector<std::string> out;
+    for (const auto& a : h.audit_calls)
+        if (a.action == "mfa.disabled")
+            out.push_back(a.result);
+    return out;
+}
 
 /// Convenience: POST with same-origin Origin header so the CSRF gate
 /// passes (host equality after default-port normalisation).
@@ -809,17 +839,389 @@ TEST_CASE("POST /api/settings/mfa/disable clears state + emits mfa.disabled",
     auto res = post_same_origin(h.sink, "/api/settings/mfa/disable");
     REQUIRE(res);
     CHECK(res->status == 200);
-    // After disable, mfa_disabled_at is stamped — the renderer shows the
-    // "Disabled" pill (not "Not enrolled") so the operator can tell the
-    // difference between "never enrolled" and "explicitly disabled".
-    CHECK(res->body.find("Disabled") != std::string::npos);
+    // The account's sessions end with the factor (#6079), so the response is the logout
+    // exit: the cookie is dropped and htmx is sent to the landing page.
+    CHECK(res->get_header_value("HX-Redirect") == "/home");
+    CHECK(res->get_header_value("Set-Cookie").find("Max-Age=0") != std::string::npos);
     CHECK(h.has_audit("mfa.disabled", "ok", "admin"));
+    // Two rows: the intent row is written BEFORE the clear, the outcome row after (#6079 au-F1).
+    CHECK(disable_results(h) == std::vector<std::string>{"attempted", "ok"});
 
     // DB-side: secret cleared + recovery codes deleted (atomic via TxnGuard).
     auto status = h.auth_db->mfa_status("admin");
     REQUIRE(status.has_value());
     CHECK_FALSE(status->enrolled);
     CHECK(status->recovery_codes_remaining == 0);
+}
+
+TEST_CASE("POST /api/settings/mfa/disable ends EVERY session of the account, the caller's included "
+          "(#6079)",
+          "[pg][mfa][routes][settings]") {
+    MfaSettingsHarness h;
+    yuzu::server::SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    SessionStoreDetach detach{h.auth_mgr};
+
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
+
+    {
+        auto salt = auth::AuthManager::random_bytes(16);
+        REQUIRE(h.auth_db
+                    ->upsert_user("bob",
+                                  auth::AuthManager::pbkdf2_sha256("bobpassword12", salt, 100'000),
+                                  auth::AuthManager::bytes_to_hex(salt), auth::Role::user)
+                    .has_value());
+    }
+    const auto mine = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    const auto other = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    const auto bobs = h.auth_mgr.create_local_session_for_test("bob", auth::Role::user, false);
+    REQUIRE_FALSE(mine.empty());
+    REQUIRE_FALSE(other.empty());
+    REQUIRE_FALSE(bobs.empty());
+
+    // Warm the validate cache so the assertions below prove the local erase, not a cold miss.
+    REQUIRE(h.auth_mgr.validate_session(mine).has_value());
+    REQUIRE(h.auth_mgr.validate_session(other).has_value());
+    REQUIRE(h.auth_mgr.validate_session(bobs).has_value());
+
+    // The row is written after the actor's own session is deleted, so it must go through the
+    // session-bound writer: record what that writer is handed.
+    std::string bound_user, bound_role, bound_action, bound_result;
+    std::vector<std::string> bound_results;
+    h.routes.set_audit_as_session_fn([&](const httplib::Request&, const auth::Session& s,
+                                         const std::string& role, const std::string& action,
+                                         const std::string& result, const std::string&,
+                                         const std::string&, const std::string&) {
+        bound_user = s.username;
+        bound_role = role;
+        bound_action = action;
+        bound_result = result;
+        bound_results.push_back(result);
+        return true;
+    });
+
+    auto res = h.sink.dispatch("POST", "/api/settings/mfa/disable", {},
+                               "application/x-www-form-urlencoded",
+                               {{"Host", "yuzu.example"},
+                                {"Origin", "http://yuzu.example"},
+                                {"Cookie", "yuzu_session=" + mine}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(bound_user == "admin");
+    CHECK(bound_role == "admin");
+    CHECK(bound_action == "mfa.disabled");
+    CHECK(bound_result == "ok");
+    // Intent row first, outcome row last, both through the session-bound writer.
+    CHECK(bound_results == std::vector<std::string>{"attempted", "ok"});
+    CHECK(res->get_header_value("HX-Redirect") == "/home");
+    CHECK(res->get_header_value("Set-Cookie").find("Max-Age=0") != std::string::npos);
+    // Written through the session-bound writer, not the request-resolving one.
+    CHECK_FALSE(h.has_audit("mfa.disabled"));
+
+    // Durable view: both sessions of the account are gone, an unrelated user's row survives.
+    CHECK_FALSE(sessions.find(auth::AuthManager::sha256_hex(mine)).value().has_value());
+    CHECK_FALSE(sessions.find(auth::AuthManager::sha256_hex(other)).value().has_value());
+    CHECK(sessions.find(auth::AuthManager::sha256_hex(bobs)).value().has_value());
+    // Cache view (warmed above): neither account session validates; bob's still does.
+    CHECK_FALSE(h.auth_mgr.validate_session(mine).has_value());
+    CHECK_FALSE(h.auth_mgr.validate_session(other).has_value());
+    CHECK(h.auth_mgr.validate_session(bobs).has_value());
+}
+
+TEST_CASE("POST /api/settings/mfa/disable reports a failed session delete and audits it as partial "
+          "(#6079)",
+          "[pg][mfa][routes][settings]") {
+    MfaSettingsHarness h;
+    yuzu::server::SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    SessionStoreDetach detach{h.auth_mgr};
+
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
+    const auto mine = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    REQUIRE_FALSE(mine.empty());
+
+    // The factor clear commits first, so a session store that cannot delete leaves the factor
+    // cleared and the sessions alive: the response must say so and must not redirect.
+    yuzu::test::SqlFault fault(h.auth_db.pool(),
+                               "ALTER TABLE session_store.sessions RENAME TO sessions_gone",
+                               "ALTER TABLE session_store.sessions_gone RENAME TO sessions");
+    fault.arm();
+    auto res = h.sink.dispatch("POST", "/api/settings/mfa/disable", {},
+                               "application/x-www-form-urlencoded",
+                               {{"Host", "yuzu.example"},
+                                {"Origin", "http://yuzu.example"},
+                                {"Cookie", "yuzu_session=" + mine}});
+    fault.repair();
+    REQUIRE(res);
+    CHECK(res->get_header_value("HX-Redirect").empty());
+    CHECK(res->body.find("sessions could not be ended") != std::string::npos);
+    CHECK(res->body.find("Try again") == std::string::npos);
+    CHECK(h.has_audit("mfa.disabled", "partial", "admin"));
+    CHECK(disable_results(h) == std::vector<std::string>{"attempted", "partial"});
+    CHECK(h.audit_detail("mfa.disabled").find("sessions_ended=failed") != std::string::npos);
+    auto status = h.auth_db->mfa_status("admin");
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->enrolled);
+}
+
+TEST_CASE("POST /api/settings/mfa/disable cancelling an unfinished enrolment keeps the sessions "
+          "(#6079)",
+          "[pg][mfa][routes][settings]") {
+    MfaSettingsHarness h;
+    yuzu::server::SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    SessionStoreDetach detach{h.auth_mgr};
+    // A provisional secret that was never verified: no usable factor exists.
+    REQUIRE(h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt).has_value());
+    const auto mine = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    REQUIRE_FALSE(mine.empty());
+
+    auto res = h.sink.dispatch("POST", "/api/settings/mfa/disable", {},
+                               "application/x-www-form-urlencoded",
+                               {{"Host", "yuzu.example"},
+                                {"Origin", "http://yuzu.example"},
+                                {"Cookie", "yuzu_session=" + mine}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("HX-Redirect").empty());
+    CHECK(h.has_audit("mfa.disabled", "ok", "admin"));
+    CHECK(h.audit_detail("mfa.disabled") == "no verified factor to clear");
+    CHECK(sessions.find(auth::AuthManager::sha256_hex(mine)).value().has_value());
+    CHECK(h.auth_mgr.validate_session(mine).has_value());
+}
+
+TEST_CASE("POST /api/settings/mfa/disable still ends the sessions when the clear fails "
+          "(#6079)",
+          "[pg][mfa][routes][settings]") {
+    MfaSettingsHarness h;
+    yuzu::server::SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    SessionStoreDetach detach{h.auth_mgr};
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
+    const auto mine = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    REQUIRE_FALSE(mine.empty());
+
+    // The clear may commit with its acknowledgement lost: an enrolled account's sessions end
+    // even though the call reports failure. Break the users table so mfa_disable errors.
+    yuzu::test::SqlFault fault(h.auth_db.pool(), "ALTER TABLE auth.users RENAME TO users_gone",
+                               "ALTER TABLE auth.users_gone RENAME TO users");
+    fault.arm();
+    auto res = h.sink.dispatch("POST", "/api/settings/mfa/disable", {},
+                               "application/x-www-form-urlencoded",
+                               {{"Host", "yuzu.example"},
+                                {"Origin", "http://yuzu.example"},
+                                {"Cookie", "yuzu_session=" + mine}});
+    fault.repair();
+    REQUIRE(res);
+    CHECK(h.has_audit("mfa.disabled", "error", "admin"));
+    CHECK(h.audit_detail("mfa.disabled") == "disable failed (sessions_ended=1)");
+    CHECK(disable_results(h) == std::vector<std::string>{"attempted", "error"});
+    CHECK(res->get_header_value("HX-Redirect") == "/home");
+    CHECK_FALSE(sessions.find(auth::AuthManager::sha256_hex(mine)).value().has_value());
+}
+
+TEST_CASE("AuthDB::mfa_disable_report reports the pre-image of the clear itself (#6079)",
+          "[pg][mfa][auth_db]") {
+    MfaSettingsHarness h;
+    // Provisional secret only: nothing verified, so the report is false.
+    REQUIRE(h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt).has_value());
+    auto provisional = h.auth_db->mfa_disable_report("admin");
+    REQUIRE(provisional.has_value());
+    CHECK_FALSE(*provisional);
+
+    // Verified factor: true, and the factor is gone afterwards.
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
+    auto verified = h.auth_db->mfa_disable_report("admin");
+    REQUIRE(verified.has_value());
+    CHECK(*verified);
+    auto status = h.auth_db->mfa_status("admin");
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->enrolled);
+
+    // Already cleared: false (idempotent). An unknown account matches no row and reports true,
+    // so a caller deciding whether to end sessions fails safe.
+    auto again = h.auth_db->mfa_disable_report("admin");
+    REQUIRE(again.has_value());
+    CHECK_FALSE(*again);
+    auto unknown = h.auth_db->mfa_disable_report("nobody");
+    REQUIRE(unknown.has_value());
+    CHECK(*unknown);
+}
+
+TEST_CASE("POST /api/settings/mfa/disable says the state is unknown when neither the clear nor "
+          "the delete is confirmed (#6079)",
+          "[pg][mfa][routes][settings]") {
+    MfaSettingsHarness h;
+    yuzu::server::SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    SessionStoreDetach detach{h.auth_mgr};
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
+    const auto mine = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    REQUIRE_FALSE(mine.empty());
+
+    yuzu::test::SqlFault users_fault(h.auth_db.pool(),
+                                     "ALTER TABLE auth.users RENAME TO users_gone",
+                                     "ALTER TABLE auth.users_gone RENAME TO users");
+    yuzu::test::SqlFault sessions_fault(
+        h.auth_db.pool(), "ALTER TABLE session_store.sessions RENAME TO sessions_gone",
+        "ALTER TABLE session_store.sessions_gone RENAME TO sessions");
+    users_fault.arm();
+    sessions_fault.arm();
+    auto res = h.sink.dispatch("POST", "/api/settings/mfa/disable", {},
+                               "application/x-www-form-urlencoded",
+                               {{"Host", "yuzu.example"},
+                                {"Origin", "http://yuzu.example"},
+                                {"Cookie", "yuzu_session=" + mine}});
+    sessions_fault.repair();
+    users_fault.repair();
+    REQUIRE(res);
+    CHECK(res->get_header_value("HX-Redirect").empty());
+    CHECK(res->body.find("state is unknown") != std::string::npos);
+    CHECK(h.has_audit("mfa.disabled", "error", "admin"));
+    CHECK(h.audit_detail("mfa.disabled") == "disable failed (sessions_ended=failed)");
+}
+
+// au-F1 (#6079): the intent row is the fail-closed gate. A clear that cannot be recorded does not
+// happen: the factor stays enrolled, every session survives, and the response is a 503 carrying
+// Sec-Audit-Failed.
+TEST_CASE("POST /api/settings/mfa/disable refuses to clear when the intent audit row cannot be "
+          "written (#6079)",
+          "[pg][mfa][routes][settings]") {
+    MfaSettingsHarness h;
+    yuzu::server::SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    SessionStoreDetach detach{h.auth_mgr};
+    enrol_verified(h);
+    const auto mine = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    REQUIRE_FALSE(mine.empty());
+
+    std::vector<std::string> results;
+    h.routes.set_audit_as_session_fn(
+        [&](const httplib::Request&, const auth::Session&, const std::string&, const std::string&,
+            const std::string& result, const std::string&, const std::string&, const std::string&) {
+            results.push_back(result);
+            return false; // the audit store rejects every row
+        });
+    yuzu::test::LogCapture logs;
+    auto res = h.sink.dispatch("POST", "/api/settings/mfa/disable", {},
+                               "application/x-www-form-urlencoded",
+                               {{"Host", "yuzu.example"},
+                                {"Origin", "http://yuzu.example"},
+                                {"Cookie", "yuzu_session=" + mine}});
+    logs.stop();
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->get_header_value("HX-Redirect").empty());
+    CHECK(res->get_header_value("Set-Cookie").find("Max-Age=0") == std::string::npos);
+    CHECK(res->body.find("MFA was not changed") != std::string::npos);
+    CHECK(res->get_header_value("Retry-After") == "5");
+    // /settings drops a 5xx body, so the refusal also rides an HX-Trigger toast.
+    const auto toast = nlohmann::json::parse(res->get_header_value("HX-Trigger"));
+    CHECK(toast["showToast"]["message"] == "Audit store unavailable; MFA was not changed.");
+    CHECK(toast["showToast"]["level"] == "error");
+    // Only the intent row was attempted: nothing after it ran.
+    CHECK(results == std::vector<std::string>{"attempted"});
+    CHECK(logs.text().find("MFA was NOT changed") != std::string::npos);
+    // The factor is untouched and the session is intact, durably and in the cache.
+    auto status = h.auth_db->mfa_status("admin");
+    REQUIRE(status.has_value());
+    CHECK(status->enrolled);
+    CHECK(sessions.find(auth::AuthManager::sha256_hex(mine)).value().has_value());
+    CHECK(h.auth_mgr.validate_session(mine).has_value());
+}
+
+// The clear has no undo, so a lost OUTCOME row neither stops it nor changes the response; it is
+// logged at error level so the missing evidence is not silent.
+TEST_CASE("POST /api/settings/mfa/disable logs a lost outcome audit row and still completes "
+          "(#6079)",
+          "[pg][mfa][routes][settings]") {
+    MfaSettingsHarness h;
+    yuzu::server::SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    SessionStoreDetach detach{h.auth_mgr};
+    enrol_verified(h);
+    const auto mine = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    REQUIRE_FALSE(mine.empty());
+
+    std::vector<std::string> results;
+    h.routes.set_audit_as_session_fn(
+        [&](const httplib::Request&, const auth::Session&, const std::string&, const std::string&,
+            const std::string& result, const std::string&, const std::string&, const std::string&) {
+            results.push_back(result);
+            return result == "attempted"; // the intent row lands, the outcome row does not
+        });
+    yuzu::test::LogCapture logs;
+    auto res = h.sink.dispatch("POST", "/api/settings/mfa/disable", {},
+                               "application/x-www-form-urlencoded",
+                               {{"Host", "yuzu.example"},
+                                {"Origin", "http://yuzu.example"},
+                                {"Cookie", "yuzu_session=" + mine}});
+    logs.stop();
+    REQUIRE(res);
+    // Same response as when the outcome row lands: the logout exit.
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("HX-Redirect") == "/home");
+    CHECK(res->get_header_value("Set-Cookie").find("Max-Age=0") != std::string::npos);
+    CHECK(results == std::vector<std::string>{"attempted", "ok"});
+    CHECK(logs.text().find("MFA cleared for 'admin' but the outcome audit row failed to persist") !=
+          std::string::npos);
+    auto status = h.auth_db->mfa_status("admin");
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->enrolled);
+    CHECK_FALSE(sessions.find(auth::AuthManager::sha256_hex(mine)).value().has_value());
+}
+
+// The disable handler falls back to the request-resolving AuditFn when the session-bound writer
+// is unwired, which would silently write an empty principal (the actor's session is gone by the
+// time the row is written). A handler test cannot see server.cpp, so pin the production binding.
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+TEST_CASE("settings: server.cpp binds the session-bound audit writer to AuthRoutes (#6079)",
+          "[mfa][settings]") {
+    // Comments are stripped first: a commented-out binding must not satisfy the pin (#6079).
+    const std::string& src = yuzu::test::source_scan::comment_free_source("server.cpp");
+    CHECK(src.find(
+              "settings_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn())") !=
+          std::string::npos);
 }
 
 TEST_CASE("POST /api/settings/mfa/disable is blocked for self under enforcement (PR3 invariant)",

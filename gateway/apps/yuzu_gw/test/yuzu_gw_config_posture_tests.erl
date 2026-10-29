@@ -298,11 +298,32 @@ check_strict(Path) ->
     YuzuEnv = proplists:get_value(yuzu_gw, Cfg, []),
     Pins = proplists:get_value(mgmt_peer_pins, YuzuEnv, []),
     ?assertMatch([_ | _], Pins),
-    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(Listeners, Pins, false)),
-    %% ...and non-vacuously: strip the pins and the same evaluation must
-    %% REFUSE, proving the guard actually recognised the mgmt listener.
+    %% The peer authorization exactly as the boot guard resolves it (#6016): a
+    %% strict config ships the PIN mode (the identity is an explicit opt-in, never
+    %% shipped on), so the server is admitted by its pin, and the deny-list is
+    %% well-formed.
+    {ok, #{mode := Mode} = Auth} =
+        yuzu_gw_mgmt_identity:resolve(proplists:get_value(mgmt_peer_auth_mode, YuzuEnv, undefined),
+                                      proplists:get_value(mgmt_peer_identity, YuzuEnv, undefined),
+                                      proplists:get_value(mgmt_peer_denied, YuzuEnv, []),
+                                      Listeners, Pins),
+    ?assertEqual(pin, Mode),
+    ?assertEqual(pin, proplists:get_value(mgmt_peer_auth_mode, YuzuEnv, undefined)),
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(Listeners, Pins, false, Auth)),
+    %% ...and non-vacuously: strip the pins and the same evaluation must REFUSE,
+    %% proving the guard actually recognised the mgmt listener.
     ?assertMatch({error, {insecure_mgmt_listener, _}},
-                 yuzu_gw_app:evaluate_mgmt_posture(Listeners, [], false)),
+                 yuzu_gw_app:evaluate_mgmt_posture(Listeners, [], false, Auth)),
+    %% ...and, were the operator to opt in, a resolved identity alone is enough in
+    %% the identity modes, with no pin at all; an unresolved one is not.
+    Opted = Auth#{identity := <<"yuzu://INSTALL/server">>},
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(
+                       Listeners, [], false, Opted#{mode := identity})),
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(
+                       Listeners, [], false, Opted#{mode := identity_or_pin})),
+    ?assertMatch({error, {insecure_mgmt_listener, _}},
+                 yuzu_gw_app:evaluate_mgmt_posture(
+                   Listeners, [], false, (Opted#{mode := identity})#{identity := undefined})),
     lists:foreach(fun(L) ->
         ?assertEqual(?AUTH_FUN, maps:get(auth_fun, L, missing)),
         ?assertMatch(#{certfile := [_ | _], keyfile := [_ | _], cacertfile := [_ | _]},

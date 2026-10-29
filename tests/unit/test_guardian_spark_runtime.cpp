@@ -11000,7 +11000,7 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
     // its own reservation attempt until we release it below.
     b->arm_park.park_every = 1;
     constexpr int kFillerCount = 4;
-    const int base_entries = b->arm_entries.load();
+    const auto rules_before_fillers = rt->rule_count();
     std::vector<std::thread> fillers;
     std::vector<std::expected<std::uint64_t, std::string>> filler_results(
         static_cast<std::size_t>(kFillerCount));
@@ -11025,14 +11025,15 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
         }
     } filler_cleanup{&b->arm_park, &fillers};
     REQUIRE(yuzu::test::spin_until(
-        [&] { return b->arm_entries.load() == base_entries + kFillerCount; },
+        [&] {
+            std::lock_guard<std::mutex> lk(b->arm_park.mu);
+            return b->arm_park.parked == kFillerCount;
+        },
         std::chrono::seconds(10)));
-    // TSan finding (2026-09-16): arm_entries is bumped at arm() ENTRY, before
-    // maybe_park() takes arm_park.mu (see arm()/maybe_park() above), so a filler
-    // thread can still be racing toward that lock the instant spin_until above
-    // is satisfied. An unguarded write here can interleave with maybe_park()'s
-    // guarded read of park_every. Take the same lock to make this write visible
-    // with the same mutex maybe_park() reads park_every under.
+    // TSan finding (2026-09-16): park_every is read by maybe_park() under
+    // arm_park.mu, so take the same lock to make this write. (The wait above is on
+    // the gate's parked count, not on arm_entries, which is bumped at arm() ENTRY
+    // before the park - #6681.)
     {
         std::lock_guard<std::mutex> lk(b->arm_park.mu);
         b->arm_park.park_every = 0; // stop parking future arrivals - r2 must reach
@@ -11055,6 +11056,16 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
 
     CHECK(rt->compensation_reservation_refused() >= 1);
     CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Failed);
+
+    // #6681: the four fillers' arms are still parked on detached executor workers. Their
+    // attach_rule() calls have returned, so joining the filler threads (FillerCleanup, at scope
+    // exit) waits for nothing, and the commits land after the test case. Exit segfaults were
+    // seen in that window, with the log showing these commits after main() returned (cause not
+    // backtraced). Release the gate and wait for every one to commit now.
+    b->arm_park.pulse();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return rt->rule_count() >= rules_before_fillers + kFillerCount; },
+        std::chrono::seconds(10)));
 }
 
 // ── rung 9c PR-5c (#4221 up-2): immediate refusal of a genuinely new claimant onto
@@ -11303,6 +11314,27 @@ TEST_CASE("Governance Gate 8 finding (rung 9c PR-5d /governance run): an ordinar
     CHECK(rt->armed_key_count() == 1);
 }
 
+// #6681: `FakeBackend::disarms` is bumped when disarm() RETURNS, but the runtime retires the
+// retained wedge from its FIFO in a completion continuation that runs after that, so for a
+// moment the key can still hold the wedge and the runtime correctly refuses a new claimant
+// ("spark key wedged"). That refusal of a brand-new rule id mutates no rule state, so a test
+// that asserts the runtime is healthy afterwards retries until the result stops being exactly
+// that refusal; a key that never un-wedges still fails at the deadline. Only that exact string
+// is tolerated: any other error, including "arm timed out", ends the retry.
+template <class Attempt>
+auto attach_past_wedge_refusal(Attempt&& attempt) {
+    decltype(attempt()) res{};
+    const bool settled = yuzu::test::spin_until(
+        [&] {
+            res = attempt();
+            return res.has_value() || res.error() != "spark key wedged";
+        },
+        std::chrono::seconds(10));
+    CAPTURE(res.has_value() ? std::string{} : res.error());
+    REQUIRE(settled);
+    return res;
+}
+
 TEST_CASE("#4508: re-observation supersedes a different wedged key before withdrawal",
           "[spark][runtime][liveness]") {
     auto r = std::make_shared<FakeReader>();
@@ -11366,8 +11398,10 @@ TEST_CASE("#4508: re-observation supersedes a different wedged key before withdr
     // The runtime stays healthy afterward - a fresh attach on either key arms
     // normally, proving neither key's index/subscription state was left corrupt
     // by the orphaned-then-disarmed claim.
-    const auto res_fresh = rt->attach_rule("r-fresh", file_spec("/b"), file_exists_rule("r-fresh"),
-                                           true);
+    const auto res_fresh = attach_past_wedge_refusal([&] {
+        return rt->attach_rule("r-fresh", file_spec("/b"), file_exists_rule("r-fresh"), true);
+    });
+    CAPTURE(res_fresh.has_value() ? std::string{} : res_fresh.error());
     REQUIRE(res_fresh.has_value());
     CHECK(rt->rule_count() == 1);
     CHECK(rt->armed_key_count() == 1);
@@ -11439,8 +11473,10 @@ TEST_CASE("#4508: a later timeout yields to the re-observed candidate",
     // The runtime stays healthy afterward - a fresh attach on either key arms
     // normally, proving neither key's index/subscription state was left corrupt by
     // the orphaned-then-disarmed claim.
-    const auto res_fresh = rt->attach_rule("r-fresh", file_spec("/a"), file_exists_rule("r-fresh"),
-                                           true);
+    const auto res_fresh = attach_past_wedge_refusal([&] {
+        return rt->attach_rule("r-fresh", file_spec("/a"), file_exists_rule("r-fresh"), true);
+    });
+    CAPTURE(res_fresh.has_value() ? std::string{} : res_fresh.error());
     REQUIRE(res_fresh.has_value());
     CHECK(rt->rule_count() == 1);
     CHECK(rt->armed_key_count() == 1);
@@ -11531,8 +11567,10 @@ TEST_CASE("This rung 9c PR-5d /governance run's own Gate 4 unhappy-path pass (fi
     // The runtime stays healthy afterward - a fresh attach on either key arms
     // normally, proving neither key's index/subscription state was left corrupt by
     // the orphaned-then-disarmed claim.
-    const auto res_fresh = rt->attach_rule("r-fresh", file_spec("/a"), file_exists_rule("r-fresh"),
-                                           true);
+    const auto res_fresh = attach_past_wedge_refusal([&] {
+        return rt->attach_rule("r-fresh", file_spec("/a"), file_exists_rule("r-fresh"), true);
+    });
+    CAPTURE(res_fresh.has_value() ? std::string{} : res_fresh.error());
     REQUIRE(res_fresh.has_value());
     CHECK(rt->rule_count() == 1);
     CHECK(rt->armed_key_count() == 1);

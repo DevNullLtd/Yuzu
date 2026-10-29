@@ -46,7 +46,8 @@ threads (cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog,
 projector, the two store-worker delivery pools, and — since HA WS-8 — the Postgres
 reachability probe) each get their own entry too — the 2026-09-07 sweep
 (methodology recorded in the `kBackgroundJobs` header) brought the table to 40 after
-an earlier revision missed eight of these; later additions are recorded in that header.
+an earlier revision missed eight of these; later additions (48 passes now, including the one-shot
+`inventory_store.purge_typed_sources` on `typed_purge_thread_`) are recorded in that header.
 
 ## How classification is enforced — and its honest limit
 
@@ -57,7 +58,8 @@ an earlier revision missed eight of these; later additions are recorded in that 
   `consteval` lookup that makes removing/renaming its table entry a **build failure**
   (the `command_capability.hpp` ExecuteGate precedent): all FencedLeaderOnly and
   DisabledUntilFixed passes (incl. the concurrency reconciler), plus the load-bearing
-  ReplicaSafe ones (the event-outbox poll, the four retention prunes (incl.
+  ReplicaSafe ones (the event-outbox poll, the one-shot typed-source purge
+  `inventory_store.purge_typed_sources` (2a-1b), the four retention prunes (incl.
   `offline_endpoint_store.run_retention_prune`, #5678), the app_perf rollup upsert,
   and the must-run-per-replica / shared-PG-writing passes the sweep added: cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
   projector, MCP bridge sweep + session gc, the Guardian reconcile claim sweep

@@ -19,8 +19,11 @@
 // file-level half of that rule is a lexical test (test_mcp_dispatch_coverage.cpp):
 // an mcp_tools_*.cpp includes none of *_store.hpp, agent_registry.hpp,
 // mcp_server.hpp, auth_db* or pg/. That test checks DIRECT includes only; a
-// header reached transitively through an allowed include is not caught, so the
-// denylist is a tripwire for the first reach for a store, not a proof.
+// header reached transitively through an allowed include is not caught by it, so
+// that denylist is a tripwire for the first reach for a store, not a proof. The
+// transitive include closure of every mcp_tools_*.cpp and of this header is held
+// store-free by scripts/ci/check-seam-closure.py's MCP registry lane (#6558),
+// against that script's store-header patterns.
 //
 // Ownership: McpServer holds one ToolDeps by value (set once via
 // McpServer::set_tool_deps before build_handler) and the tools/call lookup site
@@ -35,7 +38,7 @@
 
 #include "authz_gates.hpp"        // authz::FleetReadGate
 #include "hardware_list_model.hpp" // HardwareCiDetail
-#include "inventory_routes.hpp"   // InventoryDevicesResult
+#include "inventory_types.hpp"    // InventoryDevicesResult
 #include "quarantine_visible.hpp" // QuarantineListFn
 
 #include <httplib.h>

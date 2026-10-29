@@ -243,6 +243,30 @@ TEST_CASE("operate pages: Approvals copy is exact and claims no second person",
     CHECK_FALSE(has(js, "onclick"));
 }
 
+TEST_CASE("operate pages: the Approvals dialog shows an approver refusal's remediation (#6079)",
+          "[ui][operate][pages]") {
+    const auto& js = yuzu::server::kYuzuOperateJs;
+    // The helper is guarded on BOTH the message prefix and a string remediation, and the one
+    // use is the 403 branch of the decide dialog; its error text is a textContent sink.
+    CHECK(count_of(js, "function approverRefusalText(env)") == 1);
+    CHECK(has(js, "e.message.indexOf('approver_assurance_required:') === 0"));
+    CHECK(has(js, "typeof e.remediation === 'string' && e.remediation) return e.remediation;\n     "
+                  " return '';"));
+    CHECK(has(js, "if (r.status === 403) return approverRefusalText(r.data) ||"));
+    // A 503 shows error.message and error.remediation together as one text (MFA state
+    // unreadable, clock fault, audit store down), with the generic text as the fallback;
+    // 400/401/403 keep their own text.
+    CHECK(count_of(js, "function unavailableText(env)") == 1);
+    CHECK(has(js, "return m && r ? m.replace(/[.\\s]+$/, '') + '. ' + r : m || r;"));
+    CHECK(has(js, "if (r.status === 503) return unavailableText(r.data) ||\n"
+                  "                'Could not confirm the decision. Refresh to see the current "
+                  "state.';"));
+    CHECK(has(js, "if (r.status === 401) return 'Your session has expired. Sign in again.';"));
+    // The text reaches the page through textContent only (the toast sink the comment relies on).
+    CHECK(has(js, "t.textContent = msg;"));
+    CHECK(has(js, "'You do not have permission to decide approvals.'"));
+}
+
 TEST_CASE("operate pages: the Executions template carries every hook the controller binds",
           "[ui][operate][pages]") {
     const std::string html(kExecutionsPageHtml);

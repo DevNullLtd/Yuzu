@@ -177,22 +177,30 @@ disclosure of session ids in logs; some log lines still include session ids.
 
 The gateway **management plane** (`:50063`) — the port the server's command
 forwarding dials — is the highest-value gateway surface: whoever it admits can
-run commands on every connected agent. Its secure shape is strict mTLS **plus a
-peer pin** (#1422): the listener's `auth_fun` (run by the gateway's gRPC layer before any handler exists) accepts only a client cert whose
-key matches `{yuzu_gw, mgmt_peer_pins}` (your server's cert) AND carries the
-`serverAuth` EKU — a CA-issued cert alone (any agent's leaf, the gateway's own
-leaf) is rejected with `UNAUTHENTICATED`. The gateway **refuses to boot** when a
+run commands on every connected agent. Its secure shape is strict mTLS **plus peer
+authorization** (#1422, #6016): the listener's `auth_fun` (run by the gateway's gRPC layer before any handler exists) accepts only a client cert that carries the
+`serverAuth` EKU AND is admitted by `{yuzu_gw, mgmt_peer_auth_mode}`: its key matches
+`{yuzu_gw, mgmt_peer_pins}` (your server's cert), or it carries the server identity URI SAN
+`yuzu://<install>/server` that the install CA puts on the server's built-in certificate, or either,
+depending on the mode (unset means `pin`; the identity is an explicit opt-in, and the shipped reference configs set `pin`) — a CA-issued cert alone (any agent's leaf, the gateway's own
+leaf) is rejected with `UNAUTHENTICATED`. A pin needs the server's private key; the identity needs only a
+certificate the install CA signed with that URI, so a deployment that guards the CA key separately from
+the server key should stay in `pin` mode or use `identity` with a pin (which requires both). The identity also trusts the issuing CA's issuance policy: do not enable it where the listener's `cacertfile` is a corporate CA that lets a requester choose a URI SAN with serverAuth (stay in `pin`), and an identity over a `cacertfile` that is not demonstrably exactly one readable certificate (a bundle, or an empty, unreadable or half-written file) refuses to boot unless the mode is `identity` with a pin configured (`identity_over_ca_bundle`). A serial
+deny-list, `mgmt_peer_denied`, refuses a withdrawn certificate in every mode and is read at boot (a change
+takes effect at the next gateway restart, which disconnects the node's agents; a gateway rolled back to a
+pre-#6016 binary does not honour it). The gateway **refuses to boot** when a
 network-reachable mgmt listener lacks this posture; never set
 `{allow_insecure_mgmt, true}` outside an isolated lab rig, and never publish
 `:50063` from a plaintext stack. See `docs/user-manual/gateway.md` "TLS posture"
-for pin configuration and rotation.
+for pin configuration and rotation, and "Authorizing the server by its identity" and
+`docs/adr/2004-gateway-mgmt-server-identity.md` for the identity modes.
 
 **Firewall the management port (known, accepted limitation).** The management listener
 holds at most 256 connections (`limits.max_connections`), and that is a file-descriptor
 bound, not protection. Before the TLS handshake, anyone with layer-4 reach to the port can
 hold a slot for up to the 10 s handshake timeout; after the handshake, any holder of a
 certificate issued by the install CA (every enrolled agent has one) can hold it for as long
-as `PING`s keep the connection busy, because the SPKI peer pin runs later, per stream. About
+as `PING`s keep the connection busy, because peer authorization (pin and/or identity) runs later, per stream. About
 256 held connections would stop the server making **new** connections to the gateway;
 connections already established are unaffected. The gateway does not fix this; you must
 restrict `:50063` (and any alternative port set by `YUZU_GW_MGMT_PORT`) so that only the

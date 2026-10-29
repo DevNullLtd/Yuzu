@@ -10,7 +10,7 @@
 /// insertion order; plain `nlohmann::json` would alphabetise the keys and change the bytes the
 /// REST route has always served (pinned by `test_rest_quarantine_routes.cpp`,
 /// "body bytes are pinned"). `QuarantineRecord::id` and `released_at` are deliberately NOT
-/// exposed (see the field comment in quarantine_store.hpp).
+/// exposed (see the field comment in quarantine_types.hpp).
 ///
 /// Serialising: the REST route used a hand-rolled builder whose escaping matches nlohmann's
 /// (short escapes for \b \f \n \r \t, lowercase `\u00xx` for the other control bytes, `/` and
@@ -20,7 +20,7 @@
 /// instead of throwing out of a request handler. The store's text columns cannot hold invalid
 /// UTF-8, so this is defence in depth.
 
-#include "quarantine_store.hpp"
+#include "quarantine_types.hpp"
 
 #include <nlohmann/json.hpp>
 

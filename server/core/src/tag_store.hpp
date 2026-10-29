@@ -57,6 +57,8 @@
 /// see ADR-0050's Update. `server.cpp` now runs a detect-and-warn probe over
 /// the legacy file instead.
 
+#include "tag_types.hpp"
+
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -75,14 +77,6 @@ class PgPool;
 }
 
 namespace yuzu::server {
-
-struct DeviceTag {
-    std::string agent_id;
-    std::string key;
-    std::string value;
-    std::string source;    // "agent", "server", "api", "mcp"
-    int64_t updated_at{0}; // epoch seconds
-};
 
 struct TagCategory {
     std::string_view key;
@@ -104,14 +98,6 @@ const std::vector<TagCategory>& get_tag_categories();
 /// write channels only; the typed `TagReadError` reads carry `kDegraded` as
 /// a distinct type, not a string to classify.
 inline constexpr const char* kTagDbErrorPrefix = "db_error: ";
-
-/// Error type for the authoritative reads. The success type is an
-/// `std::optional<T>`/container: a value == found, absent/empty == the read
-/// succeeded and there is genuinely nothing there. `std::unexpected(kDegraded)`
-/// == store/pool/query failure — the caller MUST NOT treat this the same as
-/// "not found"/"no tags" on any path that feeds a scope/dispatch/confinement
-/// decision (`tag:<key>` resolution, service-scoped token confinement).
-enum class TagReadError { kDegraded };
 
 /// Device tags usable in scope expressions via `tag:<key>`.
 class TagStore {

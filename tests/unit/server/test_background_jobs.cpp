@@ -48,7 +48,7 @@ TEST_CASE("background-job table classifies every audited pass correctly",
     // Count tripwire — forces a conscious table update when a pass is added or
     // removed (a silent count change is exactly what WS-10 exists to prevent).
     // Update this number ONLY alongside a real classification change.
-    CHECK(kBackgroundJobs.size() == 47);
+    CHECK(kBackgroundJobs.size() == 48);
 
     // The load-bearing per-pass calls — a regression here is the WS-10 hazard.
     SECTION("MUST-run-per-replica passes are ReplicaSafe, never leader-gated") {
@@ -88,6 +88,12 @@ TEST_CASE("background-job table classifies every audited pass correctly",
         REQUIRE(j != nullptr);
         CHECK(j->cls == BackgroundJobClass::ReplicaSafe);
         CHECK(j->owning_thread == "result_set_maint_thread_");
+    }
+    SECTION("2a-1b: the typed-source purge is ReplicaSafe on its own one-shot thread") {
+        auto* j = find("inventory_store.purge_typed_sources");
+        REQUIRE(j != nullptr);
+        CHECK(j->cls == BackgroundJobClass::ReplicaSafe);
+        CHECK(j->owning_thread == "typed_purge_thread_");
     }
     SECTION("the sweep-added MUST-run-per-replica / idempotent passes are ReplicaSafe") {
         for (std::string_view p : {"cert_reloader.run_loop",

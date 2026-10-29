@@ -213,11 +213,11 @@ TEST_CASE("score-policy routes: GET returns the policy in force with its ETag an
         CHECK(j["data"]["document"]["tiers"]["edges"]["excellent"] == 95.0);
     }
     SECTION("a stored invalid text: defaults with the fault, and its own revision") {
-        h.stored = R"({"version":2})";
+        h.stored = R"({"version":3})";
         const auto res = h.send("GET", kPath);
         const auto j = json::parse(res->body);
         CHECK(j["data"]["source"] == "default");
-        CHECK(j["data"]["fault"] == "unsupported_version at version: 2 above the supported 1");
+        CHECK(j["data"]["fault"] == "unsupported_version at version: 3 above the supported 2");
         CHECK(j["data"]["revision"] == dex_score_policy_revision(*h.stored));
     }
     SECTION("an unreadable store is a 503 with retry_after_ms, never a default policy") {

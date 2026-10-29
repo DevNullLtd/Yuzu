@@ -3084,7 +3084,10 @@ private:
             static constexpr std::pair<std::string_view, std::string_view> kRegistryKeys[] = {
                 {"registry_capture_method", "none"},   {"registry_watch_roots", "0"},
                 {"registry_watch_roots_unarmed", "0"}, {"registry_roots_unreadable", "0"},
-                {"registry_roots_capped", "0"},
+                {"registry_roots_capped", "0"},        {"registry_etw_events", "0"},
+                {"registry_etw_dropped", "0"},         {"registry_etw_lost", "0"},
+                {"registry_attr_attributed", "0"},     {"registry_attr_ambiguous", "0"},
+                {"registry_attr_none", "0"},
             };
             for (const auto& [key, def] : kRegistryKeys)
                 ctx.write_output(std::format("config|{}|{}", key,

@@ -442,6 +442,38 @@ TEST_CASE("approvals_fragment_routes: Approve/Reject render only for a session t
     }
 }
 
+// #6079: the fragment has no AuthDB and no MFA dependency (approvals_fragment::Deps carries
+// neither), so it cannot know whether the viewer has an enrolled factor. It renders the
+// controls for any class-ok session holding Approval:Approve; the decide route is the
+// authority and answers a missing factor with approver_assurance_required:<reason>. This pins
+// that no MFA-enrolment condition was added to the render decision.
+TEST_CASE("approvals_fragment_routes: Approve/Reject still render for a class-ok "
+          "Approval:Approve session whatever its MFA enrolment (#6079)",
+          "[pg][server][routes][approvals_fragment_routes]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    REQUIRE(mgr->submit("def-mfa-blind", "submitter1", "group:x", "", ApprovalOrigin::kInstruction)
+                .has_value());
+
+    // The harness wires no AuthDB, so every session below is an un-enrolled one as far as
+    // the route's gate is concerned; the render decision must not depend on that.
+    for (const char* source : {"local", "oidc"}) {
+        SECTION(std::string("class-ok ") + source + " session: buttons and can-decide present") {
+            Harness h;
+            h.approval_manager = mgr.get();
+            h.auth_username = "reviewer1";
+            h.auth_source = source;
+            h.wire();
+            auto tab = h.sink.Get("/fragments/approvals");
+            REQUIRE(tab);
+            CHECK(tab->body.find("/approve\"") != std::string::npos);
+            CHECK(tab->body.find("/reject\"") != std::string::npos);
+            auto page = h.sink.Get("/fragments/approvals?view=page");
+            REQUIRE(page);
+            CHECK(page->body.find("data-can-decide=\"1\"") != std::string::npos);
+        }
+    }
+}
+
 TEST_CASE("approvals_fragment_routes: the tab offers Approve/Reject only to a caller who also "
           "holds Approval:Approve, matching the page view (#6061)",
           "[pg][server][routes][approvals_fragment_routes]") {

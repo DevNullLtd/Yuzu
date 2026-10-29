@@ -502,10 +502,29 @@
   function stepUpEnvelope(env) {
     return !!(env && env.meta && env.meta.mfa_step_up_required === true);
   }
+  /* #6079: an approver_assurance_required refusal names the exact next step in
+     error.remediation. Show that instead of the bare reason token; any other 403 keeps
+     its message. The text reaches the toast through textContent only. */
+  function approverRefusalText(env) {
+    var e = env && env.error;
+    if (e && typeof e.message === 'string' && e.message.indexOf('approver_assurance_required:') === 0 &&
+        typeof e.remediation === 'string' && e.remediation) return e.remediation;
+    return '';
+  }
+  /* #6079: a 503 (MFA state unreadable, clock fault, audit store down) carries error.message
+     (the problem) and error.remediation (the next step). Show both as ONE text: the message, a
+     full stop, then the remediation; either alone when only one is a non-empty string; '' when
+     neither. Same textContent-only path as the 403 text above. */
+  function unavailableText(env) {
+    var e = env && env.error;
+    var m = e && typeof e.message === 'string' ? e.message : '';
+    var r = e && typeof e.remediation === 'string' ? e.remediation : '';
+    return m && r ? m.replace(/[.\s]+$/, '') + '. ' + r : m || r;
+  }
   doc.body.addEventListener('htmx:responseError', function (evt) {
     var d = evt.detail;
     var x = d && d.xhr;
-    if (!x || (x.status !== 401 && x.status !== 403)) return;
+    if (!x || (x.status !== 401 && x.status !== 403 && x.status !== 503)) return;
     var path = (d.pathInfo && d.pathInfo.requestPath) ||
                (d.requestConfig && d.requestConfig.path) || '';
     var m = /^\/api\/approvals\/[^\/]+\/(approve|reject)$/.exec(path);
@@ -513,8 +532,16 @@
     var env = null;
     try { env = JSON.parse(x.responseText); } catch (e) { env = null; }
     var msg = env && env.error && typeof env.error.message === 'string' ? env.error.message : '';
+    if (x.status === 503) {
+      // The central step-up check answers its own 503 with an HX-Trigger toast carrying the
+      // message; htmx shows that one, so a second toast here would double it.
+      if (x.getResponseHeader('HX-Trigger')) return;
+      toast(unavailableText(env) ||
+            'Could not confirm the decision. Refresh to see the current state.', 'error');
+      return;
+    }
     if (x.status === 403) {
-      toast(msg || 'You do not have permission to decide approvals.', 'error');
+      toast(approverRefusalText(env) || msg || 'You do not have permission to decide approvals.', 'error');
       return;
     }
     if (!stepUpEnvelope(env)) {
@@ -528,9 +555,12 @@
       } else if (r.status === 401) {
         if (!stepUpEnvelope(r.data)) toast('Your session expired; sign in again.', 'error');
       } else if (r.status === 403) {
-        toast(r.message || 'You do not have permission to decide approvals.', 'error');
+        toast(approverRefusalText(r.data) || r.message || 'You do not have permission to decide approvals.', 'error');
       } else if (r.status === 400) {
         toast(r.message || 'The request was refused.', 'error');
+      } else if (r.status === 503) {
+        toast(unavailableText(r.data) ||
+              'Could not confirm the decision. Refresh to see the current state.', 'error');
       } else {
         toast('Could not confirm the decision. Refresh to see the current state.', 'error');
       }

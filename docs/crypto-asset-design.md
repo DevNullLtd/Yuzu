@@ -187,9 +187,9 @@ differ, it governs.
   - It must be registered in `typed_inventory_sources.hpp` in the same change. Otherwise the
     gateway path also stores it in the generic store, which `Infrastructure:Read` can read. That is
     a lower bar than the source's own securable.
-  - The generic read path has no typed-source filter, so a mixed-version deployment can leave a
-    stray row readable until the next boot purge. `app_usage` and `device_ci` already accept this
-    gap; a new source must accept it explicitly or close it.
+  - The generic reads exclude every typed source in SQL (`kTypedInventorySources`, ADR-0070 D12),
+    so a stray row from a mixed-version deployment is never readable through them. Adding the source
+    to that one list covers the gateway skip, the boot purge and the read filter together.
 - **Hashing.** Choose deliberately between server-side canonical reconstruction (the
   installed-software store's approach) and raw-byte hashing (`app_usage`'s). Rows are sorted
   deterministically before hashing, and only absolute timestamps are synced.

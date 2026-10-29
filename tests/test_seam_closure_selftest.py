@@ -241,6 +241,34 @@ S0_DELIBERATELY_NOT_STORE_DEFINITION_FREE = [
     "server/core/src/enrollment_directory_routes.cpp",
     "server/core/src/nvd_routes.cpp",
 ]
+# #6558: the MCP registry LANE (not a family): every globbed `mcp_tools_*.cpp` plus three shared
+# headers, held to a store-free include closure. The glob RESULT is pinned, so a new registry file
+# is a loud edit here (and to MIN_REGISTRY_FILES in check-api-parity.py and kRegistryDomainFiles in the
+# C++ dispatch test), never a silent widening.
+EXPECTED_MCP_REGISTRY_TU_GLOB = "mcp_tools_*.cpp"
+EXPECTED_MCP_REGISTRY_TU_COUNT = 3
+EXPECTED_MCP_REGISTRY_CPPS = [
+    "server/core/src/mcp_tools_containment.cpp",
+    "server/core/src/mcp_tools_discovery.cpp",
+    "server/core/src/mcp_tools_hardware.cpp",
+]
+EXPECTED_MCP_REGISTRY_HEADERS = [
+    "server/core/src/mcp_tool_deps.hpp",
+    "server/core/src/mcp_tool_helpers.hpp",
+    "server/core/src/mcp_tool_registry.hpp",
+]
+# The store-free types headers the lane enrols DIRECTLY (not merely by being reached: a header
+# nothing includes any more would otherwise leave the lane unguarded).
+EXPECTED_MCP_REGISTRY_TYPES_HEADERS = [
+    "server/core/src/device_inventory_types.hpp",
+    "server/core/src/discover_catalog_types.hpp",
+    "server/core/src/inventory_types.hpp",
+    "server/core/src/offline_endpoint_types.hpp",
+    "server/core/src/quarantine_types.hpp",
+    "server/core/src/software_inventory_types.hpp",
+    "server/core/src/tag_types.hpp",
+]
+EXPECTED_MCP_REGISTRY_REGISTRY_HEADER = "server/core/src/mcp_tool_registry.hpp"
 # --- Impl-purity rule constants (ADR-0031 WS-A4, Fable review). Pinned so a
 # --- narrowing (dropping an impl TU, weakening the presentation-header set, or
 # --- silently widening the httplib allowlist) is a loud, reviewed change.
@@ -441,6 +469,97 @@ def main() -> int:
                   failures)
     if len(set(mod.STORE_DEFINITION_FREE_TUS)) != len(mod.STORE_DEFINITION_FREE_TUS):
         _fail("STORE_DEFINITION_FREE_TUS contains a duplicate entry", failures)
+
+    # 2f. #6558: the MCP registry lane is pinned (glob, count, the glob's RESULT, the shared
+    #     headers) and disjoint from every other enforced set - a TU enforced twice is a silent
+    #     ownership ambiguity. The lane is a LANE, not a family: FAMILIES (and so the docstring's
+    #     family count) must not have grown a member for it.
+    if mod.MCP_REGISTRY_TU_GLOB != EXPECTED_MCP_REGISTRY_TU_GLOB:
+        _fail(f"MCP_REGISTRY_TU_GLOB {mod.MCP_REGISTRY_TU_GLOB!r} != frozen "
+              f"{EXPECTED_MCP_REGISTRY_TU_GLOB!r}", failures)
+    if mod.MCP_REGISTRY_EXPECTED_TU_COUNT != EXPECTED_MCP_REGISTRY_TU_COUNT:
+        _fail(f"MCP_REGISTRY_EXPECTED_TU_COUNT {mod.MCP_REGISTRY_EXPECTED_TU_COUNT} != frozen "
+              f"{EXPECTED_MCP_REGISTRY_TU_COUNT}", failures)
+    if list(mod.MCP_REGISTRY_HEADERS) != EXPECTED_MCP_REGISTRY_HEADERS:
+        _fail("MCP_REGISTRY_HEADERS differs from its frozen pin: "
+              + _diff(mod.MCP_REGISTRY_HEADERS, EXPECTED_MCP_REGISTRY_HEADERS), failures)
+    if list(mod.MCP_REGISTRY_TYPES_HEADERS) != EXPECTED_MCP_REGISTRY_TYPES_HEADERS:
+        _fail("MCP_REGISTRY_TYPES_HEADERS differs from its frozen pin: "
+              + _diff(mod.MCP_REGISTRY_TYPES_HEADERS, EXPECTED_MCP_REGISTRY_TYPES_HEADERS), failures)
+    if mod.MCP_REGISTRY_REGISTRY_HEADER != EXPECTED_MCP_REGISTRY_REGISTRY_HEADER \
+            or mod.MCP_REGISTRY_REGISTRY_HEADER not in mod.MCP_REGISTRY_HEADERS:
+        _fail("MCP_REGISTRY_REGISTRY_HEADER drifted from its frozen pin, or is not one of the lane's "
+              "shared headers (the accessor cross-check would read a file the lane does not guard)",
+              failures)
+    # Every `*_types.hpp` this change introduced is enrolled: a types header the lane does not
+    # name is guarded only while some registry TU happens to include it.
+    on_disk_types = sorted(
+        p.relative_to(mod.ROOT).as_posix()
+        for p in mod.SERVER_SRC.glob("*_types.hpp")
+        if p.relative_to(mod.ROOT).as_posix() in EXPECTED_MCP_REGISTRY_TYPES_HEADERS)
+    if on_disk_types != sorted(EXPECTED_MCP_REGISTRY_TYPES_HEADERS):
+        _fail(f"a pinned MCP-lane types header is missing on disk: "
+              f"{sorted(set(EXPECTED_MCP_REGISTRY_TYPES_HEADERS) - set(on_disk_types))!r}", failures)
+    lane_expected = (EXPECTED_MCP_REGISTRY_CPPS + EXPECTED_MCP_REGISTRY_HEADERS
+                     + EXPECTED_MCP_REGISTRY_TYPES_HEADERS)
+    lane_tus = mod.mcp_registry_tus()
+    if lane_tus != lane_expected:
+        _fail("mcp_registry_tus() (the globbed registry files + shared headers + types headers) "
+              "differs from the frozen pin - a registry file was added, renamed or removed: "
+              + _diff(lane_tus, lane_expected), failures)
+    # The live tree must satisfy its own accessor contract (a renamed-out-of-glob registry file
+    # or a missing accessor), and carry no registry-file symlink.
+    live_acc = mod.mcp_registry_accessor_errors()
+    if live_acc:
+        _fail(f"the live tree violates the registry accessor contract: {live_acc!r}", failures)
+    if mod.mcp_registry_symlinks():
+        _fail(f"the live tree has a registry-file symlink: {mod.mcp_registry_symlinks()!r}", failures)
+    # The registry-file count is pinned in FOUR places that must agree (a drift between any two
+    # is a red CI round on the PR that adds a registry file): this checker, check-api-parity.py's
+    # MIN_REGISTRY_FILES, the C++ dispatch test's kRegistryDomainFiles, and (above) this selftest.
+    import re as _re
+    def _pin(path, rx):
+        try:
+            txt = (mod.ROOT / path).read_text(encoding="utf-8")
+        except OSError as exc:
+            _fail(f"could not read {path} for the registry-count pin cross-check ({exc}); it was "
+                  f"moved or renamed - update this selftest with it", failures)
+            return None
+        m = _re.search(rx, txt, _re.M)
+        return int(m.group(1)) if m else None
+    parity_pin = _pin("scripts/ci/check-api-parity.py", r"^MIN_REGISTRY_FILES\s*=\s*(\d+)")
+    cpp_pin = _pin("tests/unit/server/test_mcp_dispatch_coverage.cpp",
+                   r"constexpr\s+std::size_t\s+kRegistryDomainFiles\s*=\s*(\d+)")
+    for label, val in (("MIN_REGISTRY_FILES (scripts/ci/check-api-parity.py)", parity_pin),
+                       ("kRegistryDomainFiles (tests/unit/server/test_mcp_dispatch_coverage.cpp)",
+                        cpp_pin)):
+        if val is None:
+            _fail(f"could not read {label} - the pin cross-check would pass vacuously", failures)
+        elif val != EXPECTED_MCP_REGISTRY_TU_COUNT:
+            _fail(f"{label} = {val} but the seam lane pins {EXPECTED_MCP_REGISTRY_TU_COUNT}: the "
+                  f"registry-file count must be bumped in all four places together", failures)
+    if len(set(lane_tus)) != len(lane_tus):
+        _fail("mcp_registry_tus() contains a duplicate entry", failures)
+    def _lane_overlap(lane, sibling_sets):
+        return sorted(set(lane) & set().union(*sibling_sets.values()))
+    _siblings = {"FAMILIES": family_tus, "STORE_DEFINITION_FREE_TUS": set(mod.STORE_DEFINITION_FREE_TUS),
+                 "IMPL_TUS": set(mod.IMPL_TUS), "ABSTRACT_API_HEADERS": set(mod.ABSTRACT_API_HEADERS)}
+    if sorted(_siblings) != ["ABSTRACT_API_HEADERS", "FAMILIES", "IMPL_TUS", "STORE_DEFINITION_FREE_TUS"]:
+        _fail("the lane disjointness check no longer compares against all four sibling sets", failures)
+    lane_overlap = _lane_overlap(lane_tus, _siblings)
+    # The comparison above runs over real data, where no overlap exists, so a dropped term would
+    # pass silently. Prove each sibling set is actually consulted: a lane file placed in exactly
+    # one sibling set must be reported, for EACH of the four.
+    for _name in _siblings:
+        _synthetic = {k: set() for k in _siblings}
+        _synthetic[_name] = {lane_tus[0]}
+        if _lane_overlap(lane_tus, _synthetic) != [lane_tus[0]]:
+            _fail(f"the lane disjointness union does not see a lane file placed in {_name}", failures)
+    if lane_overlap:
+        _fail(f"the MCP registry lane overlaps another enforced set: {lane_overlap!r}", failures)
+    if "mcp_registry" in mod.FAMILIES:
+        _fail("`mcp_registry` is a LANE and must not be a FAMILIES key (it would change the "
+              "family count and the docstring pin)", failures)
 
     # 2e. The probe lists are DERIVED from the pins, never an independent copy (a
     #     probe list that can drift from the pin silently shrinks coverage), and every
@@ -1356,7 +1475,16 @@ def main() -> int:
         if inspect.signature(fn).parameters["patterns"].default is not mod.FORBIDDEN_HEADER_PATTERNS:
             _fail(f"{fn.__name__}'s `patterns=` default is no longer FORBIDDEN_HEADER_PATTERNS - "
                   f"run_check() would enforce a different policy than the one pinned above", failures)
+    if inspect.signature(mod.check_mcp_registry_lane).parameters["patterns"].default \
+            is not mod.FORBIDDEN_HEADER_PATTERNS:
+        _fail("check_mcp_registry_lane's `patterns=` default is no longer "
+              "FORBIDDEN_HEADER_PATTERNS", failures)
+    if inspect.signature(mod.check_mcp_registry_lane).parameters["expected_count"].default \
+            != EXPECTED_MCP_REGISTRY_TU_COUNT:
+        _fail("check_mcp_registry_lane's `expected_count=` default drifted from the frozen pin",
+              failures)
     for fn in (mod.check_family, mod.check_impl_purity, mod.check_abstract_headers_store_type_free,
+               mod.check_mcp_registry_lane, mod.mcp_registry_tus, mod.mcp_registry_cpps,
                mod.closure, mod.resolve_include):
         if inspect.signature(fn).parameters["roots"].default is not mod.DEFAULT_ROOTS:
             _fail(f"{fn.__name__}'s `roots=` default is not DEFAULT_ROOTS", failures)
@@ -1378,12 +1506,14 @@ def main() -> int:
     #     a FAMILIES loop body into `pass` all left both scripts green. Swap the three check
     #     functions for recorders and assert run_check() calls each lane exactly once with the
     #     module's own list and no override, and that ANY failing lane fails the run.
-    real_fns = (mod.check_family, mod.check_impl_purity, mod.check_abstract_headers_store_type_free)
+    real_fns = (mod.check_family, mod.check_impl_purity, mod.check_abstract_headers_store_type_free,
+                mod.check_mcp_registry_lane)
     first_family = next(iter(mod.FAMILIES))
     try:
-        for failing in (None, "store_definition_free", first_family, "impl", "abstract"):
+        for failing in (None, "store_definition_free", first_family, "impl", "abstract",
+                        "mcp_registry"):
             fam_calls: list = []
-            other_calls: dict = {"impl": [], "abstract": []}
+            other_calls: dict = {"impl": [], "abstract": [], "mcp_registry": []}
 
             def fake_family(name, tus, *a, _failing=failing, **kw):
                 fam_calls.append((name, list(tus), a, dict(kw)))
@@ -1397,9 +1527,14 @@ def main() -> int:
                 other_calls["abstract"].append((list(headers), a, dict(kw)))
                 return _failing != "abstract"
 
+            def fake_lane(*a, _failing=failing, **kw):
+                other_calls["mcp_registry"].append((a, dict(kw)))
+                return _failing != "mcp_registry"
+
             mod.check_family = fake_family
             mod.check_impl_purity = fake_impl
             mod.check_abstract_headers_store_type_free = fake_abstract
+            mod.check_mcp_registry_lane = fake_lane
             captured19 = io.StringIO()
             with contextlib.redirect_stdout(captured19), contextlib.redirect_stderr(io.StringIO()):
                 rc = mod.run_check()
@@ -1418,15 +1553,264 @@ def main() -> int:
                 if len(calls) != 1 or calls[0][0] != list(want_list) or calls[0][1] or calls[0][2]:
                     _fail(f"run_check() must call the {lane} lane exactly once with the module "
                           f"list and no override; got {calls!r} (failing={failing!r})", failures)
+            lane_calls = other_calls["mcp_registry"]
+            if lane_calls != [((), {})]:
+                _fail(f"run_check() must call check_mcp_registry_lane exactly once with NO args "
+                      f"or overrides (its defaults are pinned above); got {lane_calls!r} "
+                      f"(failing={failing!r})", failures)
             if (rc == 0) != (failing is None):
                 _fail(f"run_check() returned {rc} with the {failing!r} lane failing - any failing "
                       f"lane must fail the run, and a clean run must return 0", failures)
             if failing is None and f"{len(mod.STORE_DEFINITION_FREE_TUS)} store-definition-free" \
                     not in captured19.getvalue():
                 _fail("run_check() OK line does not report the store-definition-free TU count", failures)
+            if failing is None and f"{len(mod.mcp_registry_tus())} MCP registry lane TUs" \
+                    not in captured19.getvalue():
+                _fail("run_check() OK line does not report the MCP registry lane TU count", failures)
     finally:
         (mod.check_family, mod.check_impl_purity,
-         mod.check_abstract_headers_store_type_free) = real_fns
+         mod.check_abstract_headers_store_type_free, mod.check_mcp_registry_lane) = real_fns
+
+    # 20L. #6558 MCP REGISTRY LANE probes, on a synthetic tree (the older "20." above is the
+    #      unrelated parser-fixture block). Every shared and types header the lane enrols must
+    #      exist (a missing one is a hard error by design), so the tree starts clean.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td).resolve()
+        src = root / "server" / "core" / "src"
+        inc = root / "server" / "core" / "include"
+        common = root / "common" / "include"
+        for d in (src, inc, common):
+            d.mkdir(parents=True)
+        roots = mod.Roots(root, src, inc, common)
+        for h in list(mod.MCP_REGISTRY_HEADERS) + list(mod.MCP_REGISTRY_TYPES_HEADERS):
+            (root / h).write_text("#pragma once\n", encoding="utf-8")
+        reg_hdr = root / mod.MCP_REGISTRY_REGISTRY_HEADER
+
+        def declare(*domains):
+            reg_hdr.write_text("#pragma once\n" + "".join(
+                f"std::span<const ToolRecord> {d}_tool_records();\n" for d in domains),
+                encoding="utf-8")
+
+        declare("a")
+        (src / "evil_store.hpp").write_text("#pragma once\nclass EvilStore {};\n", encoding="utf-8")
+        (src / "clean_types.hpp").write_text("#pragma once\nstruct Row {};\n", encoding="utf-8")
+        A_CLEAN = '#include "mcp_tool_deps.hpp"\n#include "clean_types.hpp"\n'
+        (src / "mcp_tools_a.cpp").write_text(A_CLEAN, encoding="utf-8")
+
+        def lane(**kw):
+            cap = io.StringIO()
+            with contextlib.redirect_stderr(cap), contextlib.redirect_stdout(io.StringIO()):
+                ok = mod.check_mcp_registry_lane(roots=roots, expected_count=1, **kw)
+            return ok, cap.getvalue()
+
+        # 20a. negative control: clean registry file, right count -> passes.
+        ok, _ = lane()
+        if not ok:
+            _fail("MCP registry lane flagged a clean registry file (false positive)", failures)
+
+        # 20b. positive fire: a registry file whose closure reaches a `*_store.hpp`.
+        (src / "mcp_tools_a.cpp").write_text('#include "evil_store.hpp"\n', encoding="utf-8")
+        ok, err = lane()
+        if ok or "mcp_tools_a.cpp" not in err or "MCP registry lane" not in err \
+                or "evil_store.hpp" not in err or "lane 'mcp_registry'" not in err:
+            _fail(f"MCP registry lane did not fire (naming the file, the lane and the chain) on a "
+                  f"registry file including a store header; ok={ok} stderr={err!r}", failures)
+        (src / "mcp_tools_a.cpp").write_text(A_CLEAN, encoding="utf-8")
+
+        # 20c. a shared lane HEADER that reaches a store fails the lane even though every
+        #      registry .cpp is clean (the header is included by all of them).
+        deps = root / mod.MCP_REGISTRY_HEADERS[0]
+        deps.write_text('#pragma once\n#include "evil_store.hpp"\n', encoding="utf-8")
+        ok, err = lane()
+        if ok or "mcp_tools_a.cpp -> server/core/src/mcp_tool_deps.hpp -> server/core/src/evil_store.hpp" not in err:
+            _fail(f"MCP registry lane did not catch a store reached through a shared lane header "
+                  f"(with the full chain from the registry file); ok={ok} stderr={err!r}", failures)
+        deps.write_text("#pragma once\n", encoding="utf-8")
+
+        # 20d. the glob is LIVE: a NEW leaking `mcp_tools_*.cpp` is enrolled the moment it exists
+        #      (its leak is reported by name) - and the count pin ALSO fails, so the enrolment is a
+        #      reviewed edit. Both directions of the pin are exercised.
+        declare("a", "zz")
+        (src / "mcp_tools_zz.cpp").write_text('#include "evil_store.hpp"\n', encoding="utf-8")
+        ok, err = lane()
+        if ok or "mcp_tools_zz.cpp" not in err or any(
+                pin not in err for pin in ("MCP_REGISTRY_EXPECTED_TU_COUNT",
+                                           "EXPECTED_MCP_REGISTRY_TU_COUNT",
+                                           "EXPECTED_MCP_REGISTRY_CPPS", "MIN_REGISTRY_FILES",
+                                           "kRegistryDomainFiles")):
+            _fail(f"a newly added mcp_tools_*.cpp (name chosen to survive a narrowed glob such as "
+                  f"[a-h]*) was not both checked and count-pinned; ok={ok} stderr={err!r}", failures)
+        (src / "mcp_tools_zz.cpp").unlink()
+        declare("a")
+        cap = io.StringIO()
+        with contextlib.redirect_stderr(cap), contextlib.redirect_stdout(io.StringIO()):
+            ok = mod.check_mcp_registry_lane(roots=roots, expected_count=2)
+        if ok or "MCP_REGISTRY_EXPECTED_TU_COUNT" not in cap.getvalue():
+            _fail("a registry file that disappeared (found 1, expected 2) did not fail the count "
+                  "pin - the lane would quietly cover less than it claims", failures)
+
+        # 20e. the glob boundary: a non-`mcp_tools_*` file is NOT enrolled, even when it leaks.
+        (src / "mcp_helper.cpp").write_text('#include "evil_store.hpp"\n', encoding="utf-8")
+        ok, _ = lane()
+        if not ok:
+            _fail("MCP registry lane enrolled a file outside the `mcp_tools_*.cpp` glob", failures)
+        (src / "mcp_helper.cpp").unlink()
+
+        # 20f. the `patterns=` argument is LIVE (a dropped pass-through survived mutation testing):
+        #      a custom pattern fires on a header the default policy ignores, and the default
+        #      store pattern does NOT fire when the custom list omits it.
+        (src / "x_evil.hpp").write_text("#pragma once\n", encoding="utf-8")
+        (src / "mcp_tools_a.cpp").write_text(A_CLEAN + '#include "x_evil.hpp"\n', encoding="utf-8")
+        ok, err = lane(patterns=["*_evil.hpp"])
+        if ok or "x_evil.hpp" not in err:
+            _fail(f"check_mcp_registry_lane ignored its `patterns` argument (custom pattern did not "
+                  f"fire); ok={ok} stderr={err!r}", failures)
+        (src / "mcp_tools_a.cpp").write_text(A_CLEAN + '#include "evil_store.hpp"\n', encoding="utf-8")
+        ok, _ = lane(patterns=["*_evil.hpp"])
+        if not ok:
+            _fail("check_mcp_registry_lane applied the DEFAULT patterns although a custom list was "
+                  "passed", failures)
+        (src / "mcp_tools_a.cpp").write_text(A_CLEAN, encoding="utf-8")
+
+        # 20g. a missing shared lane header is a HARD ERROR naming the lists to edit, never a
+        #      silent skip (the lane would otherwise quietly cover less than it claims).
+        helpers = root / mod.MCP_REGISTRY_HEADERS[1]
+        helpers.unlink()
+        ok, err = lane()
+        if ok or "expected family TU not found" not in err or "MCP_REGISTRY_HEADERS" not in err \
+                or Path(mod.MCP_REGISTRY_HEADERS[1]).name not in err:
+            _fail(f"a missing shared lane header was not a hard error naming MCP_REGISTRY_HEADERS; "
+                  f"ok={ok} stderr={err!r}", failures)
+        helpers.write_text("#pragma once\n", encoding="utf-8")
+
+        # 20h. a DIRECTORY named like a registry file is not counted; an OUT-OF-REPO symlink named
+        #      like one is refused with a clear error and NO traceback (it used to crash the walk).
+        (src / "mcp_tools_dir.cpp").mkdir()
+        ok, err = lane()
+        if not ok:
+            _fail(f"a directory named mcp_tools_dir.cpp was counted/rejected as a registry file; "
+                  f"stderr={err!r}", failures)
+        (src / "mcp_tools_dir.cpp").rmdir()
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / "elsewhere.cpp"
+            target.write_text("int x;\n", encoding="utf-8")
+            link = src / "mcp_tools_link.cpp"
+            try:
+                link.symlink_to(target)
+                made_link = True
+            except (OSError, NotImplementedError):
+                made_link = False        # e.g. Windows without symlink privilege: probe not applicable
+                print("note: 20h symlink probes skipped (cannot create symlinks here)", file=sys.stderr)
+            if made_link:
+                try:
+                    ok, err = lane()
+                except Exception as exc:                      # a traceback is the defect
+                    ok, err = None, f"RAISED {type(exc).__name__}: {exc}"
+                if ok is not False or "symlink" not in err or "RAISED" in err:
+                    _fail(f"an out-of-repo symlink registry file was not refused cleanly; "
+                          f"ok={ok} stderr={err!r}", failures)
+                link.unlink()
+                # an IN-repo symlink to a real registry file is refused too (not silently counted twice)
+                inrepo = src / "mcp_tools_in.cpp"
+                inrepo.symlink_to(src / "mcp_tools_a.cpp")
+                ok, err = lane()
+                if ok or "mcp_tools_in.cpp" not in err or "symlink" not in err:
+                    _fail(f"an in-repo symlink registry file was not refused; ok={ok} stderr={err!r}",
+                          failures)
+                inrepo.unlink()
+                # a symlinked SHARED/types header is refused with a clear error, never a traceback
+                hdr_path = root / mod.MCP_REGISTRY_TYPES_HEADERS[0]
+                hdr_path.unlink()
+                hdr_path.symlink_to(target)
+                try:
+                    ok, err = lane()
+                except Exception as exc:
+                    ok, err = None, f"RAISED {type(exc).__name__}: {exc}"
+                if ok is not False or "symlink" not in err or "RAISED" in err:
+                    _fail(f"an out-of-repo symlinked types header was not refused cleanly; ok={ok} "
+                          f"stderr={err!r}", failures)
+                hdr_path.unlink()
+                hdr_path.write_text("#pragma once\n", encoding="utf-8")
+
+        # 20i. RENAME + ADD keeps the count right while a registry file has left the glob: the
+        #      accessor cross-check must still fail, naming BOTH the orphaned accessor and the
+        #      accessor-less new file (chaos CH-1; verified to pass green before the cross-check).
+        declare("a", "b")                                     # b's file is "renamed" out of the glob
+        (src / "mcp_tool_b.cpp").write_text('#include "evil_store.hpp"\n', encoding="utf-8")
+        (src / "mcp_tools_c.cpp").write_text(A_CLEAN, encoding="utf-8")   # the "added" file
+        cap = io.StringIO()
+        with contextlib.redirect_stderr(cap), contextlib.redirect_stdout(io.StringIO()):
+            ok = mod.check_mcp_registry_lane(roots=roots, expected_count=2)  # count 2 == 2: pin passes
+        err = cap.getvalue()
+        if ok or "b_tool_records()" not in err or "mcp_tools_c.cpp" not in err \
+                or "MCP_REGISTRY_EXPECTED_TU_COUNT" in err:
+            _fail(f"rename+add (count still satisfied) was not caught by the accessor cross-check "
+                  f"alone; ok={ok} stderr={err!r}", failures)
+        (src / "mcp_tool_b.cpp").unlink()
+        (src / "mcp_tools_c.cpp").unlink()
+        declare("a")
+
+        # 20i2. the SAME rename+add must be caught when the renamed file's accessor is re-spelled
+        #       in a form a strict declaration regex would miss (noexcept / `ToolRecord const` /
+        #       qualified name / trailing return) - the evasion a Gate 8 review verified against
+        #       the first cut of the cross-check. The scan is loose, so each spelling still counts.
+        for spelling in ("std::span<const ToolRecord> b_tool_records() noexcept;",
+                         "std::span<ToolRecord const> b_tool_records();",
+                         "std::span<const yuzu::server::mcp::ToolRecord> b_tool_records();",
+                         "auto b_tool_records() -> std::span<const ToolRecord>;"):
+            reg_hdr.write_text("#pragma once\nstd::span<const ToolRecord> a_tool_records();\n"
+                               + spelling + "\n", encoding="utf-8")
+            (src / "mcp_tool_b.cpp").write_text('#include "evil_store.hpp"\n', encoding="utf-8")
+            (src / "mcp_tools_c.cpp").write_text(A_CLEAN, encoding="utf-8")
+            cap = io.StringIO()
+            with contextlib.redirect_stderr(cap), contextlib.redirect_stdout(io.StringIO()):
+                ok = mod.check_mcp_registry_lane(roots=roots, expected_count=2)
+            if ok or "b_tool_records()" not in cap.getvalue():
+                _fail(f"rename+add with the accessor spelled {spelling!r} evaded the accessor "
+                      f"cross-check; ok={ok} stderr={cap.getvalue()!r}", failures)
+            (src / "mcp_tool_b.cpp").unlink()
+            (src / "mcp_tools_c.cpp").unlink()
+        # 20k. accessor names inside COMMENTS do not count as declarations (a documentation example
+        #      in the registry header must not demand a file) ...
+        reg_hdr.write_text("#pragma once\nstd::span<const ToolRecord> a_tool_records();\n"
+                           "// std::span<const ToolRecord> ghost_tool_records();\n"
+                           "/* std::span<const ToolRecord> ghost2_tool_records(); */\n", encoding="utf-8")
+        ok, err = lane()
+        if not ok:
+            _fail(f"a commented-out accessor was treated as a declaration; stderr={err!r}", failures)
+        # 20l. ... and a domain name with an underscore or digit pairs with its file (guards the
+        #      accessor scan against a `[a-z]+` narrowing).
+        declare("a", "a_b2")
+        (src / "mcp_tools_a_b2.cpp").write_text(A_CLEAN, encoding="utf-8")
+        cap = io.StringIO()
+        with contextlib.redirect_stderr(cap), contextlib.redirect_stdout(io.StringIO()):
+            ok = mod.check_mcp_registry_lane(roots=roots, expected_count=2)
+        if not ok:
+            _fail(f"a domain named a_b2 did not pair with mcp_tools_a_b2.cpp; stderr={cap.getvalue()!r}",
+                  failures)
+        (src / "mcp_tools_a_b2.cpp").unlink()
+        declare("a")
+        # the aggregator is not a domain accessor: declaring it must not manufacture a false red
+        reg_hdr.write_text("#pragma once\nstd::span<const ToolRecord> a_tool_records();\n"
+                           "std::span<const ToolRecord> registered_tool_records();\n", encoding="utf-8")
+        ok, err = lane()
+        if not ok:
+            _fail(f"`registered_tool_records()` was treated as a domain accessor; stderr={err!r}", failures)
+        declare("a")
+
+        # 20j. a store include added to a types header that NO registry TU includes is still
+        #      caught (the types headers are enrolled directly, not merely reached) - chaos CH-2/CH-7.
+        tp = root / mod.MCP_REGISTRY_TYPES_HEADERS[1]
+        tp.write_text('#pragma once\n#include "evil_store.hpp"\n', encoding="utf-8")
+        ok, err = lane()
+        if ok or Path(mod.MCP_REGISTRY_TYPES_HEADERS[1]).name not in err:
+            _fail(f"a store include in an UNREACHED types header was not caught; ok={ok} "
+                  f"stderr={err!r}", failures)
+        tp.write_text("#pragma once\n", encoding="utf-8")
+        ok, err = lane()
+        if not ok:
+            _fail(f"the lane did not return to green after the probes restored the tree; "
+                  f"stderr={err!r}", failures)
 
     if _gnu_gxx() is not None:
         stray = sorted(set(ORACLE_NO_VERDICT) - EXPECTED_NO_VERDICT)

@@ -33,8 +33,8 @@ return it no agents; enable RBAC and grant it a role to give it access. See
 Every mutating operation on this surface requires:
 
 - An **admin session** with **MFA step-up** (REST) or the **`supervised`**
-  MCP tier plus **maker-checker approval** (an approver who is not the
-  submitter) for the six mutating MCP tools.
+  MCP tier plus **maker-checker approval** (an approver account other than the
+  submitter's) for the six mutating MCP tools.
 - The `owner_username` (and, for a transfer, the `new_owner`) must already
   exist as a real Yuzu user — creation and transfer both fail closed
   (`400`) against an unknown username.
