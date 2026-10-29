@@ -21,13 +21,18 @@
 # linux/amd64 ONLY. The pinned erlang:28-alpine index below is mixed: its amd64
 # entry is on Alpine 3.23 (musl 1.2.5) while every other entry, arm64 included,
 # is on Alpine 3.24 (musl 1.2.6). The runtime stage is alpine:3.23, so an arm64
-# build trips the #2150 abi-guard only after the whole rebar3 build, and no
-# OTP 28 tag keeps arm64 on 3.23 (re-pinning cannot fix it). Moving arm64 to
-# 3.24 is not an option either: musl 1.2.6 with OTP < 29.1 aborts beam.smp at
+# build trips the #2150 abi-guard only after the whole rebar3 build. Moving
+# arm64 to 3.24 is not an option: musl 1.2.6 with OTP < 29.1 aborts beam.smp at
 # boot on AMX CPUs (#1743). The first RUN below therefore refuses any other
 # architecture up front, with the reason.
 #
-# Lift this only together with the move to OTP 29.1 or newer. The marker line
+# This is a scoping choice, not a ceiling: older erlang:28-alpine indexes exist
+# whose amd64 AND arm64 entries are both on Alpine 3.23 (checked in #6711 for
+# 28.5.0.0, 28.5.0.1 and 28.4.x), so re-pinning to one would make arm64 buildable
+# at the cost of an older OTP patch than the 28.5.0.2 used here. That trade is
+# tracked separately; published gateway images are amd64-only either way.
+#
+# Lift this with that re-pin or with the move to OTP 29.1 or newer. The marker line
 # is read by scripts/ci/check-gateway-base-index.py, which fails when the
 # listed platforms are not all annotated, in the pinned index, as built on the
 # runtime stage's Alpine release; add a platform to the marker and to the guard
