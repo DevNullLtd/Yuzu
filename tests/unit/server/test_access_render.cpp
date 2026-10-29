@@ -96,6 +96,12 @@ AssignmentsView view_of(std::vector<PrincipalRole> rows, std::string self = "ali
     return v;
 }
 
+AssignmentsView unconfirmed_view_of(std::vector<PrincipalRole> rows) {
+    auto v = view_of(std::move(rows), "alice", /*can_assign=*/false, {});
+    v.admin_unconfirmed = true;
+    return v;
+}
+
 std::string assign_html(AssignmentsView v, std::size_t cap = kAssignmentsRenderCap) {
     return render_assignments(std::move(v), cap);
 }
@@ -136,8 +142,10 @@ std::vector<std::string> every_output() {
         render_enforcement(EnforcementView{true, false, true}),
         render_enforcement(EnforcementView{false, false, false}),
         render_enforcement(EnforcementView{true, true, true}),
+        render_enforcement(EnforcementView{true, false, false, true}),
         render_enforcement(Unavailable{}),
         assign_html(view_of({grant("user", "bob", "Viewer"), grant("group", "ops", "Operator")})),
+        assign_html(unconfirmed_view_of({grant("user", "bob", "Viewer")})),
         assign_html(view_of({})),
         render_assignments(Unavailable{}),
         render_your_account("alice", "local"),
@@ -556,6 +564,21 @@ TEST_CASE("access assignments: a viewer who cannot administer sees the table and
     CHECK_THAT(html, ContainsSubstring("<td class=\"long\">bob</td>"));
 }
 
+TEST_CASE("access assignments: an unconfirmed authority check disables Assign with the reason, never hides it",
+          "[access][render]") {
+    const auto html = assign_html(unconfirmed_view_of({grant("user", "bob", "Viewer")}));
+    CHECK_THAT(html, ContainsSubstring("<button type=\"button\" class=\"btn sm\" disabled title=\"" +
+                                       std::string(kAdminUnconfirmed) + "\">Assign role</button>"));
+    CHECK_THAT(html, !ContainsSubstring("data-act="));
+    CHECK_THAT(html, ContainsSubstring("<td class=\"long\">bob</td>"));
+    // A confirmed refusal still draws nothing, so the two states stay distinguishable.
+    CHECK_THAT(assign_html(view_of({}, "alice", /*can_assign=*/false)), !ContainsSubstring("Assign role"));
+    // can_assign wins if both were ever set: the live control is never replaced by the reason.
+    auto both = view_of({}, "alice", true, {"Viewer"});
+    both.admin_unconfirmed = true;
+    CHECK_THAT(assign_html(both), ContainsSubstring("data-act=\"assign\""));
+}
+
 TEST_CASE("access assignments: the Assign button carries exactly the offered roles, or is disabled",
           "[access][render]") {
     const auto with = assign_html(view_of({}, "alice", true, {"Operator", "Viewer"}));
@@ -623,36 +646,6 @@ TEST_CASE("access derived cells: the Users and Roles tables ship 'Not shown' hoo
     CHECK_THAT(roles, ContainsSubstring("<th class=\"r\">Assigned</th>"));
 }
 
-TEST_CASE("access hint: may_attempt_rbac_admin follows the base role on a local cookie session only",
-          "[access][render]") {
-    auto s = [](auth::Role role, std::string source = "local") {
-        auth::Session x;
-        x.role = role;
-        x.auth_source = std::move(source);
-        return x;
-    };
-    CHECK(may_attempt_rbac_admin(s(auth::Role::admin)));
-    CHECK_FALSE(may_attempt_rbac_admin(s(auth::Role::user)));
-    CHECK_FALSE(may_attempt_rbac_admin(s(auth::Role::admin, "oidc")));
-    CHECK_FALSE(may_attempt_rbac_admin(s(auth::Role::admin, "saml")));
-    CHECK_FALSE(may_attempt_rbac_admin(s(auth::Role::admin, "api_token")));
-    auto scoped = s(auth::Role::admin);
-    scoped.token_scope_service = "payments";
-    CHECK_FALSE(may_attempt_rbac_admin(scoped));
-    auto mcp = s(auth::Role::admin);
-    mcp.mcp_tier = "operator";
-    CHECK_FALSE(may_attempt_rbac_admin(mcp));
-    auto engine = s(auth::Role::admin);
-    engine.principal_kind = "engine";
-    CHECK_FALSE(may_attempt_rbac_admin(engine));
-    // A JIT elevation makes the EFFECTIVE role admin but not the base role: no hint.
-    auto elevated = s(auth::Role::user);
-    elevated.elevated_until = std::chrono::system_clock::now() + std::chrono::hours(1);
-    elevated.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
-    REQUIRE(auth::effective_role(elevated) == auth::Role::admin); // the fixture really is elevated
-    CHECK_FALSE(may_attempt_rbac_admin(elevated));
-}
-
 // ── Your account ─────────────────────────────────────────────────────────────
 
 TEST_CASE("access account: Change password only for a local account; the disabled control carries a reason",
@@ -700,6 +693,19 @@ TEST_CASE("access enforcement: the switch reflects the state and is live only fo
         CHECK_THAT(ro, !ContainsSubstring("data-act="));
         CHECK_THAT(ro, ContainsSubstring(enabled ? "On. Only a durable Administrator can change this."
                                                  : "Off. Only a durable Administrator can change this."));
+    }
+}
+
+TEST_CASE("access enforcement: an unconfirmed authority check disables the switch with the reason",
+          "[access][render]") {
+    for (const bool enabled : {true, false}) {
+        INFO(enabled);
+        const auto html = render_enforcement(EnforcementView{enabled, false, false, true});
+        CHECK_THAT(html, ContainsSubstring(" disabled title=\"" + std::string(kAdminUnconfirmed) + "\">"));
+        CHECK_THAT(html, ContainsSubstring(std::string(enabled ? "On. " : "Off. ") + std::string(kAdminUnconfirmed)));
+        CHECK_THAT(html, !ContainsSubstring("data-act="));
+        CHECK_THAT(html, !ContainsSubstring("Only a durable Administrator can change this."));
+        CHECK(count_of(html, "checked") == (enabled ? 1u : 0u));
     }
 }
 

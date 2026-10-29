@@ -324,6 +324,9 @@ std::string render_assignments(const std::variant<AssignmentsView, Unavailable>&
     std::string out = "<div class=\"hd\"><h2>Role assignments</h2><span class=\"sub\">Fleet-wide grants</span>";
     if (v->can_assign)
         out += "<div class=\"end\">" + assign_button(*v) + "</div>";
+    else if (v->admin_unconfirmed)
+        out += "<div class=\"end\"><button type=\"button\" class=\"btn sm\" disabled title=\"" +
+               esc(kAdminUnconfirmed) + "\">Assign role</button></div>";
     out += "</div>";
     if (capped)
         out += "<div class=\"pb\"><div class=\"note warn\">Showing the first " + std::to_string(cap) + " of " +
@@ -347,11 +350,6 @@ std::string render_assignments(const std::variant<AssignmentsView, Unavailable>&
            "(ITServiceOwner) are set per management group, not here. Roles held through a management group are "
            "not listed.</p></div>";
     return out;
-}
-
-bool may_attempt_rbac_admin(const auth::Session& s) {
-    return s.role == auth::Role::admin && s.auth_source == "local" && s.token_scope_service.empty() &&
-           s.mcp_tier.empty() && !s.is_engine();
 }
 
 std::string render_your_account(const std::string& username, const std::string& auth_source) {
@@ -386,7 +384,9 @@ std::string render_enforcement(const std::variant<EnforcementView, Unavailable>&
                "<span class=\"pill warn\">Unconfirmed</span></div><div class=\"pb\">" + retry + "</div>" + out_slot;
 
     std::string text;
-    if (!v->may_toggle)
+    if (!v->may_toggle && v->admin_unconfirmed)
+        text = std::string(v->enabled ? "On. " : "Off. ") + std::string(kAdminUnconfirmed);
+    else if (!v->may_toggle)
         text = std::string(v->enabled ? "On." : "Off.") + " Only a durable Administrator can change this.";
     else if (v->enabled)
         text = "On: access follows each person's RBAC roles. Off: access follows the account role, so admins can "
@@ -397,8 +397,12 @@ std::string render_enforcement(const std::variant<EnforcementView, Unavailable>&
     std::string sw = "<input class=\"sw\" type=\"checkbox\" role=\"switch\" aria-label=\"RBAC enforcement\"";
     if (v->enabled)
         sw += " checked";
-    sw += v->may_toggle ? " data-act=\"enforce\">"
-                        : " disabled title=\"Only a durable Administrator can change this.\">";
+    if (v->may_toggle)
+        sw += " data-act=\"enforce\">";
+    else if (v->admin_unconfirmed)
+        sw += " disabled title=\"" + esc(kAdminUnconfirmed) + "\">";
+    else
+        sw += " disabled title=\"Only a durable Administrator can change this.\">";
     return title + "<div class=\"tog\"><div class=\"t\"><b>Enforce roles</b><span>" + esc(text) + "</span></div>" + sw +
            "</div>" + out_slot;
 }

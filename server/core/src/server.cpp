@@ -158,6 +158,7 @@
 #include "result_set_store.hpp"
 #include "result_sets_ui.hpp"
 #include "scope_yaml.hpp"
+#include "rbac_admin_predicate.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_confined
@@ -16205,8 +16206,8 @@ private:
                     return rbac_store_->list_all_principal_roles_checked();
                 },
                 // Display accessors only: the cached view FIRST (reading it refreshes it), then the
-                // staleness flag. The enforcement-label and administrator predicates are
-                // deliberately not used here (routed A2/A1 row, clauses 3 and 4).
+                // staleness flag. Whether the switch is live is NOT decided here: that is
+                // `rbac_admin_hint_fn` below.
                 .enforcement_state_fn =
                     [this]() -> std::expected<yuzu::server::access::EnforcementView, std::string> {
                     if (!rbac_store_ || !rbac_store_->is_open())
@@ -16223,6 +16224,17 @@ private:
                         return auth_routes_->deny_service_scoped_session(req, res, action, message,
                                                                           target_type, target_id);
                     },
+                // The ONE call site of `rbac_admin_hint` (routed A2/A1 row): the page draws the
+                // Assign button and the enforcement switch from the authority the A2/A1 routes
+                // apply (the durable-Administrator predicate, then the regime check), not from
+                // the session's base account role. kRest because the controls call the REST
+                // routes. HINT ONLY: every action keeps its own gate. Null stores fold to
+                // kUnconfirmed inside the hint.
+                .rbac_admin_hint_fn = [this](const auth::Session& s) {
+                    return yuzu::server::rbac_admin_hint(
+                        s, auth_db_.get(), rbac_store_.get(),
+                        yuzu::server::RbacAdminSurface::kRest);
+                },
             });
 
         // Tokens and principals page (Phase 2 UI): /access/tokens, its three

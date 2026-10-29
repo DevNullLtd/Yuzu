@@ -200,8 +200,16 @@ TEST_CASE("rbac_admin_hint == POST assign: durable demotion after sign-in, RBAC 
           "[pg][rbac_admin_predicate][rbac_admin_hint]") {
     RbacRoleHarness h;
     make_user(h, h.session_user, auth::Role::admin);
-    make_user(h, h.session_user, auth::Role::user); // the durable row is re-read, never the session
-    check_assign(h, RbacAdminHint::kMayNot);
+    {
+        // upsert_user refuses to demote an account (#4966); break-glass SQL stands in for the
+        // demotion that landed after this session was minted.
+        auto lease = h.auth_db.pool().acquire();
+        REQUIRE(lease);
+        auto r = pg::exec_params(lease.get(), "UPDATE auth.users SET role = 'user' WHERE username = $1",
+                                 std::vector<std::string>{h.session_user});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    check_assign(h, RbacAdminHint::kMayNot); // the durable row is re-read, never the session
 }
 
 TEST_CASE("rbac_admin_hint == POST assign: a principal with no auth.users row at all, RBAC off",

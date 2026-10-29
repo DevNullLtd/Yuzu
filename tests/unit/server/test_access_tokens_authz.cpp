@@ -165,6 +165,7 @@ struct Rig {
         u.deny_service_scoped_fn = [](const httplib::Request&, httplib::Response&,
                                       const std::string&, const std::string&, const std::string&,
                                       const std::string&) { return false; };
+        u.rbac_admin_hint_fn = [](const auth::Session&) { return RbacAdminHint::kMayNot; }; // unused here
         access::register_access_routes(sink, std::move(u));
     }
 
