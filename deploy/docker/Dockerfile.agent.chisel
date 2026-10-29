@@ -65,8 +65,9 @@ COPY vcpkg.json vcpkg-configuration.json ./
 #
 # Agent-only: the meson configure below is -Dbuild_server=false -Dbuild_tests=false,
 # so --x-no-default-features opts out of vcpkg.json's default `server` + `tests`
-# features (libpq, xmlsec, drogon, catch2). Add --x-feature=agent once it has content, and --x-feature=tests if
-# -Dbuild_tests=true is ever set below (tests/meson.build needs Catch2).
+# features (libpq, xmlsec, drogon, catch2). Add --x-feature=agent once it has content,
+# and --x-feature=tests if -Dbuild_tests=true is ever set below (tests/meson.build
+# needs Catch2).
 RUN --mount=type=cache,target=/opt/vcpkg/buildtrees,sharing=locked \
     --mount=type=cache,target=/opt/vcpkg/downloads \
     --mount=type=cache,target=/root/.cache/vcpkg \
