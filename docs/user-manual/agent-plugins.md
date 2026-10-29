@@ -44,7 +44,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `installed_apps` | ✅ ✅ ✅ | Inventories installed applications and queries by name | [README](../../agents/plugins/installed_apps/README.md) |
 | `interaction` | ✅ ✅ ✅ | Desktop user interaction — notifications, message boxes, input dialogs, surveys, DND | [README](../../agents/plugins/interaction/README.md) |
 | `ioc` | ✅ ✅ ✅ | Indicator of Compromise checking — match IOCs against local endpoint state | [README](../../agents/plugins/ioc/README.md) |
-| `license_scan` | ✅ 🟡 🟡 | Detects software licences across OS, vendor and per-user surfaces | [README](../../agents/plugins/license_scan/README.md) |
+| `license_scan` | ✅ ✅ 🟡 | Detects software licences across OS, vendor and per-user surfaces | [README](../../agents/plugins/license_scan/README.md) |
 | `local_security_policy` | 🟡 🟡 🟡 | Reports local password, lockout and audit policy posture and sudoers content | [README](../../agents/plugins/local_security_policy/README.md) |
 | `mgmt_posture` | 🟡 ✅ 🟡 | Management-plane posture: which plane controls the device (facts only) | [README](../../agents/plugins/mgmt_posture/README.md) |
 | `msi_packages` | ✅ ✅ ⛔ | Enumerates installed packages and product codes (Windows MSI / macOS pkgutil) | [README](../../agents/plugins/msi_packages/README.md) |

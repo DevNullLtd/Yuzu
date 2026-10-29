@@ -53,6 +53,7 @@
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
 #include "app_usage_store.hpp"
+#include "certificate_inventory_store.hpp"
 #include "tag_store.hpp"
 #include "update_registry.hpp"
 #include "upload_grant_store.hpp"
@@ -767,6 +768,13 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // with no ingest and the Forensics REST/MCP reads degrade to
             // 503/kInternalError — surface that boot state (latched, #3061).
             {"app_usage_store", deps.app_usage_store && deps.app_usage_store->is_open()},
+            // Slice-2 PR 2a-2a born-on-Pg store (ADR-0070 D12 "Lifecycle"). Same rationale as
+            // app_usage_store above: fail-closed at boot; a store that failed to open would make
+            // ReportInventory/ProxyInventory acknowledge the certificate_inventory blob with no
+            // rows (and, from 2a-2b, every certificate read answer 503) — surface that boot
+            // state (latched, #3061).
+            {"certificate_inventory_store",
+             deps.certificate_inventory_store && deps.certificate_inventory_store->is_open()},
             {"product_registry_store",
              deps.product_registry_store && deps.product_registry_store->is_open()},
             // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing

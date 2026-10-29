@@ -15,16 +15,22 @@
  *   breadth     60 * A / N                       share of devices affected
  *   crashes     20 * crash_events / (N * cap)    crash intensity, fleet-normalised
  *   hangs        8 * hang_events  / (N * cap)    hangs weigh less than crashes
- *   regression  12 * clamp((lower - 1) / (3 - 1), 0, 1)
+ *   regression  12 * clamp((lower - start) / (full - start), 0, 1)
+ *
+ * The weights (60 / 20 / 8 / 12) are StabilityWeights; `cap` (default 5),
+ * `start` (default 1) and `full` (default 3) are the StabilityModel. All are
+ * parameters, and the defaults reproduce the formulas above to the bit.
  *
  * - Breadth comes first: how many devices are hit matters more than how often
- *   one device is hit. Intensity is capped per device at 5 events, so one
- *   crash-looping device cannot outweigh a widespread problem. The value
- *   mirrors the function-local kCap in dex_read_model.cpp; the scope differs:
- *   the device score caps per signal family (summed over its signals), this
- *   module caps crashes and hangs separately (up to 10 events per device).
+ *   one device is hit. Intensity is capped per device at `cap` events (default
+ *   5), so one crash-looping device cannot outweigh a widespread problem. The
+ *   default mirrors the function-local kCap in dex_read_model.cpp; the scope
+ *   differs: the device score caps per signal family (summed over its
+ *   signals), this module caps crashes and hangs separately (up to 2 * cap
+ *   events per device).
  * - The per-device cap is the CALLER's job: crash_events and hang_events must
- *   be sums of min(events_d, kStabilityPerDeviceEventCap) over devices. A sum
+ *   be sums of min(events_d, model.per_device_event_cap) over devices, with the
+ *   same cap the scorer is handed. A sum
  *   above A * cap proves the cap was skipped, and is withheld as
  *   "inconsistent" rather than clamped (an aggregate clamp is not per-device
  *   capping). The check is necessary, not sufficient: an uncapped feed that
@@ -33,8 +39,9 @@
  *   previous version is supplied. It uses the interval's LOWER bound, so only
  *   a regression the data supports counts. An interval containing 1 or lying
  *   below 1 scores 0 points: an improving version earns no credit. Regression
- *   takes its full weight at a 3x lower-bound rate ratio
- *   (kStabilityRegressionFullRatio); 2x takes half. An interval is usable when
+ *   starts at a lower-bound rate ratio of `start` (default 1) and takes its
+ *   full weight at `full` (default 3): at the defaults 2x takes half. An
+ *   interval is usable when
  *   lower is finite and >= 0 and lower <= upper. Upper may be +infinity (the
  *   previous version had no events): only lower is read, upper serves the
  *   ordering check. An unusable interval leaves regression unassessed at 0
@@ -95,20 +102,21 @@
  * - "no_population" is the ordinary no-data state (N <= 0, including a
  *   negative N). "inconsistent" covers: a negative A, crash or hang count;
  *   A > N; crash or hang above A * cap; crash + hang below A (every affected
- *   device has an event). "inconsistent", "invalid_weights" and
- *   "invalid_edges" are fault states.
+ *   device has an event). "inconsistent", "invalid_weights", "invalid_edges"
+ *   and "invalid_model" are fault states.
  * - In every result of compute_stability_score, score, band and the four
  *   deductions are present together exactly when `withheld` is empty. No
  *   withheld result carries N, A or any count, whatever the reason. A page
  *   that shows a count from its own input may show N, and only N, for
  *   below_floor; never A, crash or hang counts, which are the individual
  *   behaviour the floor withholds, and never any count for no_population,
- *   inconsistent, invalid_weights or invalid_edges.
+ *   inconsistent, invalid_weights, invalid_edges or invalid_model.
  * - The string vocabulary is closed and wire-stable: withheld reasons
- *   (no_population, invalid_weights, invalid_edges, inconsistent,
- *   below_floor; the Apps list adds offline_affected outside this module), deduction names (breadth, crashes, hangs, regression) and
- *   band labels (excellent, good, fair, poor). Renaming one is a contract
- *   break. `name` and `withheld` are always string literals (static storage),
+ *   (no_population, invalid_weights, invalid_edges, invalid_model,
+ *   inconsistent, below_floor; the Apps list adds offline_affected outside this
+ *   module), deduction names (breadth, crashes, hangs, regression) and band
+ *   labels (excellent, good, fair, poor). Adding a token is additive; renaming
+ *   one is a contract break. `name` and `withheld` are always string literals (static storage),
  *   never owned, never freed; compare them by content (std::string_view(x) ==
  *   "...", strcmp), never by applying == to the raw pointer, which compares
  *   addresses.
@@ -119,8 +127,8 @@
  *   never by re-summing rows. Custom weights summing above 100 can push the
  *   TOTAL past 100, which clamps the score to 0; the rows keep raw points.
  *
- * The constants are uncalibrated against real fleet data; recalibration is a
- * constant edit.
+ * The defaults are uncalibrated against real fleet data; recalibration is a
+ * default edit (or a policy parameter, dex_score_policy.hpp).
  */
 
 #include <algorithm>
@@ -151,6 +159,7 @@ static_assert(kStabilityWeights.breadth + kStabilityWeights.crashes + kStability
 
 inline constexpr std::int64_t kStabilityPerDeviceEventCap = 5;
 inline constexpr double kStabilityRegressionFullRatio = 3.0;
+inline constexpr double kStabilityRegressionStartRatio = 1.0;
 inline constexpr double kStabilityBandExcellent = 90.0;
 inline constexpr double kStabilityBandGood = 75.0;
 inline constexpr double kStabilityBandFair = 60.0;
@@ -165,6 +174,21 @@ struct StabilityBandEdges {
 };
 
 inline constexpr StabilityBandEdges kStabilityBandEdges{};
+
+/// The model parameters that were constants: the per-device event cap and the
+/// regression ratios (lower-bound rate ratio at which the deduction starts, and
+/// at which it takes its full weight). The defaults reproduce the previous
+/// constants, so every number is unchanged.
+struct StabilityModel {
+    std::int64_t per_device_event_cap{kStabilityPerDeviceEventCap};
+    double regression_full_ratio{kStabilityRegressionFullRatio};
+    double regression_start_ratio{kStabilityRegressionStartRatio};
+    [[nodiscard]] bool operator==(const StabilityModel&) const = default;
+};
+
+inline constexpr StabilityModel kStabilityModel{};
+inline constexpr std::int64_t kStabilityMaxPerDeviceEventCap = 1000;
+inline constexpr double kStabilityMaxRegressionRatio = 1000.0;
 /// Display resolution: scores are shown at one decimal (10 steps per point).
 inline constexpr double kStabilityScoreScale = 10.0;
 
@@ -181,6 +205,18 @@ inline constexpr double kStabilityScoreScale = 10.0;
 /// are the policy validator's (dex_score_policy.hpp).
 [[nodiscard]] inline bool stability_edges_valid(const StabilityBandEdges& e) {
     return 100.0 > e.excellent && e.excellent > e.good && e.good > e.fair && e.fair > 0.0;
+}
+
+/// Cap in [1, 1000]; start finite in [1, 1000] (below 1 would penalise an
+/// interval whose lower bound admits improvement); full finite in (start, 1000].
+/// The chains are false for NaN and +-infinity.
+[[nodiscard]] inline bool stability_model_valid(const StabilityModel& m) {
+    return m.per_device_event_cap >= 1 && m.per_device_event_cap <= kStabilityMaxPerDeviceEventCap &&
+           std::isfinite(m.regression_start_ratio) && m.regression_start_ratio >= 1.0 &&
+           m.regression_start_ratio <= kStabilityMaxRegressionRatio &&
+           std::isfinite(m.regression_full_ratio) &&
+           m.regression_full_ratio > m.regression_start_ratio &&
+           m.regression_full_ratio <= kStabilityMaxRegressionRatio;
 }
 
 /// The score as displayed: rounded half away from zero at one decimal.
@@ -233,7 +269,7 @@ struct StabilityInputs {
     /// N: distinct devices that reported THIS application/version in the window.
     std::int64_t reporting_devices{0};
     std::int64_t devices_affected{0}; ///< A: distinct devices with >= 1 crash or hang
-    /// Per-device-capped sums: sum over devices of min(events_d, kStabilityPerDeviceEventCap).
+    /// Per-device-capped sums: sum over devices of min(events_d, model.per_device_event_cap).
     /// The caller owns the capping; a sum above A * cap is withheld as inconsistent.
     std::int64_t crash_events{0};
     std::int64_t hang_events{0};
@@ -265,11 +301,13 @@ namespace stability_detail {
 } // namespace stability_detail
 
 /// Withheld reasons, checked in this order: no_population, invalid_weights,
-/// invalid_edges, inconsistent, below_floor.
+/// invalid_edges, invalid_model, inconsistent, below_floor. invalid_model is a
+/// fault state, reachable only by a caller handing in an unvalidated model.
 [[nodiscard]] inline StabilityScore
 compute_stability_score(const StabilityInputs& in, std::int64_t floor,
                         const StabilityWeights& w = kStabilityWeights,
-                        const StabilityBandEdges& edges = kStabilityBandEdges) {
+                        const StabilityBandEdges& edges = kStabilityBandEdges,
+                        const StabilityModel& m = kStabilityModel) {
     const std::int64_t reporting = in.reporting_devices;
     const std::int64_t affected = in.devices_affected;
     const std::int64_t crash = in.crash_events;
@@ -281,14 +319,16 @@ compute_stability_score(const StabilityInputs& in, std::int64_t floor,
         return stability_detail::withheld_result("invalid_weights");
     if (!stability_edges_valid(edges))
         return stability_detail::withheld_result("invalid_edges");
+    if (!stability_model_valid(m))
+        return stability_detail::withheld_result("invalid_model");
     // Overflow-safe: above INT64_MAX / cap every representable count is under
     // affected * cap, so skipping the multiply is exact. After the non-negative
     // checks affected - crash cannot overflow.
     const bool cap_checkable =
-        affected <= (std::numeric_limits<std::int64_t>::max)() / kStabilityPerDeviceEventCap;
+        affected <= (std::numeric_limits<std::int64_t>::max)() / m.per_device_event_cap;
     if (affected < 0 || crash < 0 || hang < 0 || affected > reporting ||
-        (cap_checkable && (crash > affected * kStabilityPerDeviceEventCap ||
-                           hang > affected * kStabilityPerDeviceEventCap)) ||
+        (cap_checkable && (crash > affected * m.per_device_event_cap ||
+                           hang > affected * m.per_device_event_cap)) ||
         affected - crash > hang)
         return stability_detail::withheld_result("inconsistent");
     if (reporting < floor)
@@ -296,7 +336,7 @@ compute_stability_score(const StabilityInputs& in, std::int64_t floor,
 
     const double n = static_cast<double>(reporting);
     const double a = static_cast<double>(affected);
-    const double cap = static_cast<double>(kStabilityPerDeviceEventCap);
+    const double cap = static_cast<double>(m.per_device_event_cap);
 
     StabilityScore r;
     r.deductions.reserve(4);
@@ -312,7 +352,9 @@ compute_stability_score(const StabilityInputs& in, std::int64_t floor,
         if (std::isfinite(lo) && lo >= 0.0 && lo <= hi) {
             reg.assessed = true;
             reg.points = w.regression *
-                         std::clamp((lo - 1.0) / (kStabilityRegressionFullRatio - 1.0), 0.0, 1.0);
+                         std::clamp((lo - m.regression_start_ratio) /
+                                        (m.regression_full_ratio - m.regression_start_ratio),
+                                    0.0, 1.0);
         }
     }
     r.deductions.push_back(reg);

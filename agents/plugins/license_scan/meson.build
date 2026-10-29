@@ -16,6 +16,12 @@ if host_machine.system() == 'windows'
     cxx.find_library('oleaut32'),
     cxx.find_library('advapi32'),
   ]
+elif host_machine.system() == 'linux'
+  # licensing_x509.hpp (header-only, included by licensing_linux.cpp): the
+  # in-process libcrypto PEM -> notAfter read that replaced the
+  # `openssl x509` subprocess on the entitlement_certs surface. Same shape as
+  # agents/plugins/certificates/meson.build's non-Windows openssl dependency.
+  license_scan_deps += dependency('openssl', required: true, include_type: 'system')
 endif
 
 license_scan_plugin_lib = shared_library(
