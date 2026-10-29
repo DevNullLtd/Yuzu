@@ -29,13 +29,17 @@ Usage:
 digest check is skipped because a file has no registry digest to compare against).
 The pure `check()` is what tests/test_gateway_base_index.py exercises.
 
-To disable this check if it proves unusable: delete the `gateway-base-index` job in
-.github/workflows/docker-healthcheck-invariants.yml and the "Gateway base index lint"
-step in docs-lint.yml. Nothing else depends on it; the abi-guard remains.
+To disable the networked check if it proves unusable, put `if: false` on (or delete) the
+`gateway-base-index` job in .github/workflows/docker-healthcheck-invariants.yml; if that job
+was ever made a required check, take it out of branch protection first. KEEP this script,
+tests/test_gateway_base_index.py and the "Gateway base index lint" step in docs-lint.yml:
+the test also holds the executed arch-guard contract for Dockerfile.gateway. The build's
+abi-guard remains the build-time enforcement either way.
 """
 
 import argparse
 import hashlib
+import http.client
 import json
 import re
 import sys
@@ -62,6 +66,7 @@ BUILDER_RE = re.compile(
 RUNTIME_RE = re.compile(r"^FROM\s+alpine:(?P<tag>[0-9]+\.[0-9]+)(?:@sha256:[0-9a-f]{64})?\s*$", re.M | re.I)
 
 RETRY_DELAYS = (2, 5, 15)  # seconds before attempts 2, 3 and 4
+MAX_BODY = 8 * 1024 * 1024  # an index is a few KiB; refuse anything absurd
 
 
 class InputDefect(Exception):
@@ -69,7 +74,15 @@ class InputDefect(Exception):
 
 
 class RegistryError(Exception):
-    """The registry could not be read, or served a body that is not the pinned one (exit 2)."""
+    """The registry could not be read, or served a body that is not the pinned one (exit 2).
+
+    `transient` is True for faults a re-run may clear (outage, rate limit, truncated body) and
+    False for ones it will not (a 4xx for the pinned digest, a body that is not the pinned one).
+    """
+
+    def __init__(self, message, transient=True):
+        super().__init__(message)
+        self.transient = transient
 
 
 def platform_key(entry):
@@ -135,28 +148,45 @@ def parse_dockerfile(text):
                           f"found {len(builder)}")
     if len(runtimes) != 1:
         raise InputDefect(f"expected exactly one `FROM alpine:X.Y` runtime stage, found {len(runtimes)}")
-    return marker[0].split(), builder[0].groupdict(), runtimes[0]
+    b = builder[0].groupdict()
+    if b["digest"] != b["digest"].lower():
+        raise InputDefect(f"the pinned digest {b['digest']} is not lower-case hex (Docker rejects it too)")
+    return marker[0].split(), b, runtimes[0]
+
+
+def _retry_after(headers):
+    """Seconds to wait per a Retry-After header: 1..30, or None when absent/unusable."""
+    value = headers.get("Retry-After") if headers else None
+    if value and value.isascii() and value.isdigit():
+        return max(1, min(int(value), 30))
+    return None
 
 
 def _get(url, headers, attempts=len(RETRY_DELAYS) + 1):
-    """GET with bounded retries on 429/5xx/network faults; returns the raw body."""
-    last = None
+    """GET with bounded retries on 429/5xx/network faults; returns the raw body (at most MAX_BODY)."""
+    last, transient = None, True
     for i in range(attempts):
+        delay = None
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "yuzu-ci-gateway-base-index", **headers})
             with urllib.request.urlopen(req, timeout=30) as r:
-                return r.read()
+                body = r.read(MAX_BODY + 1)
+            if len(body) > MAX_BODY:
+                raise RegistryError(f"{url}: response larger than {MAX_BODY} bytes", transient=False)
+            return body
         except urllib.error.HTTPError as exc:
             last = exc
             if exc.code != 429 and exc.code < 500:
+                transient = False
                 break
-            retry_after = exc.headers.get("Retry-After") if exc.headers else None
-            delay = min(int(retry_after), 30) if retry_after and retry_after.isdigit() else None
-        except (urllib.error.URLError, OSError) as exc:
-            last, delay = exc, None
+            delay = _retry_after(exc.headers)
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+            # IncompleteRead and BadStatusLine are HTTPException, not OSError: a truncated or garbled
+            # response is as transient as a refused connection.
+            last = exc
         if i < attempts - 1:
             time.sleep(delay if delay is not None else RETRY_DELAYS[i])
-    raise RegistryError(f"{url}: {last}")
+    raise RegistryError(f"{url}: {last}", transient=transient)
 
 
 def fetch_index(repo, digest):
@@ -166,17 +196,20 @@ def fetch_index(repo, digest):
     tok_url = f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repo}:pull"
     try:
         token = json.loads(_get(tok_url, {}))["token"]
-    except (ValueError, KeyError) as exc:
-        raise RegistryError(f"token response not understood: {exc!r}")
+        if not isinstance(token, str) or not token:
+            raise ValueError("token is not a non-empty string")
+    except (ValueError, KeyError, TypeError, RecursionError) as exc:
+        raise RegistryError(f"token response not understood: {exc!r}", transient=False)
     body = _get(f"https://registry-1.docker.io/v2/{repo}/manifests/{digest}",
                 {"Authorization": f"Bearer {token}", "Accept": ", ".join(INDEX_TYPES)})
     got = "sha256:" + hashlib.sha256(body).hexdigest()
     if got != digest:
-        raise RegistryError(f"the registry served a body hashing to {got}, not the pinned {digest}")
+        raise RegistryError(f"the registry served a body hashing to {got}, not the pinned {digest}",
+                            transient=False)
     try:
         return json.loads(body)
     except ValueError as exc:
-        raise RegistryError(f"the pinned index is not JSON: {exc}")
+        raise RegistryError(f"the pinned index is not JSON: {exc}", transient=False)
 
 
 def main(argv=None):
@@ -199,11 +232,18 @@ def main(argv=None):
         print(f"FATAL: {exc}", file=sys.stderr)
         return 3
     except RegistryError as exc:
-        print(f"FATAL: could not read the pinned index (registry unavailable, or the body is not the "
-              f"pinned one): {exc}", file=sys.stderr)
+        advice = ("this looks transient: re-run the job" if exc.transient else
+                  "re-running will not help: check the pinned digest in Dockerfile.gateway "
+                  "(deleted, or not the index it claims to be)")
+        print(f"FATAL: could not read the pinned index; {advice}: {exc}", file=sys.stderr)
         return 2
-    except OSError as exc:
-        print(f"FATAL: could not read an input file: {exc}", file=sys.stderr)
+    except (OSError, ValueError, RecursionError) as exc:
+        # Unreadable or non-UTF-8 input file, JSON nested past the recursion limit, and the like.
+        print(f"FATAL: could not read an input file: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 3
+    except Exception as exc:  # noqa: BLE001 - a lint defect must not read as the exit-1 verdict
+        print(f"FATAL: internal error in the lint ({type(exc).__name__}: {exc}); this is a defect in "
+              "scripts/ci/check-gateway-base-index.py, not a platform mismatch", file=sys.stderr)
         return 3
 
     print(f"gateway-base-index: {builder['repo']}:{builder['tag']}@{builder['digest'][:19]} "

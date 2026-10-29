@@ -12,6 +12,7 @@ only matched the guard's text stayed green when `exit 1` became `exit 0` or when
 
 import contextlib
 import hashlib
+import http.client
 import importlib.util
 import io
 import json
@@ -103,6 +104,12 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIn("3.24", failures[0])
 
+    def test_duplicate_platform_entries_fail_whichever_order_the_bad_one_is_in(self):
+        good, bad = entry("amd64", "alpine:3.23"), entry("amd64", "alpine:3.24", variant="v2")
+        for order in ((good, bad), (bad, good)):
+            with self.subTest(first=order[0]["annotations"][mod.BASE_NAME_KEY]):
+                self.assertEqual(len(mod.check({"manifests": list(order)}, ["linux/amd64"], "3.23")[0]), 1)
+
     def test_single_manifest_digest_is_an_input_defect_not_a_missing_platform(self):
         single = {"schemaVersion": 2, "config": {}, "layers": []}
         with self.assertRaisesRegex(mod.InputDefect, "image index"):
@@ -172,9 +179,71 @@ class MainTests(unittest.TestCase):
         self.assertEqual(self.run_main(self.GOOD, {"layers": []})[0], 3)
         self.assertEqual(self.run_main(self.GOOD, "{not json")[0], 3)
 
+    def test_marker_and_builder_must_each_appear_exactly_once(self):
+        for name, text in {
+            "two markers": "# yuzu:gateway-platforms linux/amd64\n" + self.GOOD,
+            "two builders": self.GOOD + "FROM erlang:28-alpine@sha256:" + "c" * 64 + " AS deps\n",
+        }.items():
+            with self.subTest(name), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(self.run_main(text, MIXED)[0], 3)
+
+    def test_runtime_from_is_case_insensitive(self):
+        rc, _, _ = self.run_main(self.GOOD.replace("FROM alpine:3.23", "from alpine:3.23"), MIXED)
+        self.assertEqual(rc, 0)
+
     def test_builder_stage_name_is_case_insensitive(self):
         rc, _, _ = self.run_main(self.GOOD.replace(" AS deps", " as deps"), MIXED)
         self.assertEqual(rc, 0)
+
+    def test_non_utf8_dockerfile_and_deeply_nested_index_are_3_not_a_traceback(self):
+        df = self.dir / "Dockerfile"
+        df.write_bytes(b"# yuzu:gateway-platforms linux/amd64\n\xff\xfe\n")
+        idx = self.dir / "index.json"
+        idx.write_text("{}", encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(mod.main(["--dockerfile", str(df), "--index-file", str(idx)]), 3)
+        self.assertIn("could not read an input file", err.getvalue())
+        deep = "[" * 200000
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.run_main(self.GOOD, deep)[0], 3)
+
+    def test_uppercase_pinned_digest_is_an_input_defect_not_a_registry_error(self):
+        text = self.GOOD.replace("sha256:" + "a" * 64, "sha256:" + "A" * 64)
+        rc, _, err = self.run_main(text, MIXED)
+        self.assertEqual(rc, 3)
+        self.assertIn("lower-case", err)
+
+    def test_unexpected_exception_is_3_never_the_exit_1_verdict(self):
+        orig = mod.check
+        mod.check = lambda *a: (_ for _ in ()).throw(KeyError("boom"))
+        self.addCleanup(lambda: setattr(mod, "check", orig))
+        rc, _, err = self.run_main(self.GOOD, MIXED)
+        self.assertEqual(rc, 3)
+        self.assertIn("internal error", err)
+
+    def run_registry_failure(self, exc):
+        df = self.dir / "Dockerfile"
+        df.write_text(self.GOOD, encoding="utf-8")
+        orig = mod.fetch_index
+
+        def raiser(repo, digest):
+            raise exc
+
+        mod.fetch_index = raiser
+        self.addCleanup(lambda: setattr(mod, "fetch_index", orig))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = mod.main(["--dockerfile", str(df)])
+        return rc, err.getvalue()
+
+    def test_registry_failures_are_2_and_say_whether_to_rerun(self):
+        rc, err = self.run_registry_failure(mod.RegistryError("503", transient=True))
+        self.assertEqual(rc, 2)
+        self.assertIn("re-run the job", err)
+        rc, err = self.run_registry_failure(mod.RegistryError("404", transient=False))
+        self.assertEqual(rc, 2)
+        self.assertIn("re-running will not help", err)
 
     def test_missing_index_file_is_3(self):
         df = self.dir / "Dockerfile"
@@ -218,6 +287,110 @@ class FetchTests(unittest.TestCase):
         with self.assertRaises(mod.RegistryError):
             mod._get("https://example.invalid/x", {})
         self.assertEqual(len(calls), len(mod.RETRY_DELAYS) + 1)
+
+    def patch_urlopen(self, fn):
+        orig = mod.urllib.request.urlopen
+        mod.urllib.request.urlopen = fn
+        self.addCleanup(lambda: setattr(mod.urllib.request, "urlopen", orig))
+
+    def test_truncated_body_is_retried_and_ends_as_a_transient_registry_error(self):
+        calls = []
+
+        def trunc(req, timeout=0):
+            calls.append(1)
+            raise http.client.IncompleteRead(b"abc", 997)
+
+        self.patch_urlopen(trunc)
+        with self.assertRaises(mod.RegistryError) as cm:
+            mod._get("https://example.invalid/x", {})
+        self.assertTrue(cm.exception.transient)
+        self.assertEqual(len(calls), len(mod.RETRY_DELAYS) + 1)
+
+    def test_a_4xx_registry_error_is_not_transient(self):
+        def nf(req, timeout=0):
+            raise mod.urllib.error.HTTPError(req.full_url, 404, "nf", {}, None)
+
+        self.patch_urlopen(nf)
+        with self.assertRaises(mod.RegistryError) as cm:
+            mod._get("https://example.invalid/x", {})
+        self.assertFalse(cm.exception.transient)
+
+    def test_retry_after_is_honoured_clamped_and_never_crashes(self):
+        cases = {"7": 7, "0": 1, "999999": 30, "abc": None, "-5": None, "1.5": None, "\u00b2": None, "": None}
+        for value, want in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(mod._retry_after({"Retry-After": value}), want)
+        self.assertIsNone(mod._retry_after(None))
+        self.assertIsNone(mod._retry_after({}))
+
+    def test_429_sleeps_for_retry_after_then_gives_up(self):
+        slept = []
+        mod.time.sleep = slept.append
+
+        def throttled(req, timeout=0):
+            raise mod.urllib.error.HTTPError(req.full_url, 429, "slow down", {"Retry-After": "4"}, None)
+
+        self.patch_urlopen(throttled)
+        with self.assertRaises(mod.RegistryError):
+            mod._get("https://example.invalid/x", {})
+        self.assertEqual(slept, [4, 4, 4])
+
+    def test_connection_failures_use_the_default_backoff(self):
+        slept = []
+        mod.time.sleep = slept.append
+
+        def down(req, timeout=0):
+            raise mod.urllib.error.URLError("refused")
+
+        self.patch_urlopen(down)
+        with self.assertRaises(mod.RegistryError):
+            mod._get("https://example.invalid/x", {})
+        self.assertEqual(slept, list(mod.RETRY_DELAYS))
+
+    def test_oversized_body_is_refused(self):
+        class Big:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, n=-1):
+                return b"x" * n
+
+        self.patch_urlopen(lambda req, timeout=0: Big())
+        with self.assertRaisesRegex(mod.RegistryError, "larger than"):
+            mod._get("https://example.invalid/x", {})
+
+    def test_a_non_string_token_is_refused_before_the_manifest_request(self):
+        for body in (b'{"token": null}', b'{"token": ["a"]}', b'{"token": ""}', b'{"token": 7}'):
+            with self.subTest(body=body):
+                calls = []
+
+                def fake(url, headers, attempts=4, b=body):
+                    calls.append(url)
+                    return b
+
+                mod._get = fake
+                with self.assertRaises(mod.RegistryError) as cm:
+                    mod.fetch_index("erlang", "sha256:" + "0" * 64)
+                self.assertFalse(cm.exception.transient)
+                self.assertEqual(len(calls), 1, "the manifest was requested with a bad token")
+
+    def test_a_matching_but_non_json_body_is_a_registry_error(self):
+        body = b"<html>not json</html>"
+        digest = "sha256:" + hashlib.sha256(body).hexdigest()
+        mod._get = lambda url, headers, attempts=4: b'{"token": "t"}' if "auth.docker.io" in url else body
+        with self.assertRaisesRegex(mod.RegistryError, "not JSON"):
+            mod.fetch_index("erlang", digest)
+
+    def test_malformed_token_responses_are_registry_errors(self):
+        for body in (b"[]", b'"abc"', b"null", b"123", b'{"token": null}', b'{"token": ["a"]}', b"<html>",
+                     b"[" * 200000):
+            with self.subTest(body=body[:20]):
+                mod._get = lambda url, headers, attempts=4, b=body: b
+                with self.assertRaises(mod.RegistryError):
+                    mod.fetch_index("erlang", "sha256:" + "0" * 64)
 
     def test_does_not_retry_a_client_error(self):
         calls = []

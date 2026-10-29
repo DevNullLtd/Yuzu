@@ -47,7 +47,8 @@ RUN case "${TARGETARCH:-amd64}" in amd64) ;; *) \
            "runtime stage, and the newer musl with OTP < 29.1 aborts beam.smp at boot on AMX CPUs (#1743)." \
            "Build with --platform linux/amd64. See #6711 and docs/operations/troubleshooting.md." \
            "A single-node demo can use deploy/docker/Dockerfile.gateway.chisel (demo variant: no" \
-           "gateway-entrypoint.sh, so it cannot form a cluster; do not use it for a clustered gateway)."; \
+           "gateway-entrypoint.sh, so it cannot resolve its own cluster advertise address; do not use" \
+           "it for a scaled or clustered gateway)."; \
       exit 1;; esac
 
 RUN apk add --no-cache git

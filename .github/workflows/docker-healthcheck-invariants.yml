@@ -234,9 +234,13 @@ jobs:
   # entries are built independently upstream, and the runtime stage is a fixed
   # alpine:X.Y. This reads the pinned index from the registry and fails when a
   # platform the Dockerfile claims to support (its `yuzu:gateway-platforms` marker)
-  # is not annotated as built on the runtime stage's Alpine release, so a Dependabot digest refresh
-  # that moves it is caught in the PR rather than after a full build. It needs no
-  # Docker, only registry reads, so it runs on a hosted runner.
+  # is not annotated as built on the runtime stage's Alpine release, so a
+  # Dependabot digest refresh that moves it is caught in the PR rather than after
+  # a full build. It needs no Docker, only registry reads, so it runs on a hosted
+  # runner. Exit 1 = mismatch, 2 = registry unreadable (the log says whether a
+  # re-run can help), 3 = a Dockerfile or index the script does not understand.
+  # To switch it off, put `if: false` on the job (first take it out of branch
+  # protection if it was ever made required); keep the script and its test.
   #
   # NOT a matrix job and NOT path-filtered (the #1978 trap above): a skipped plain
   # job reports "skipped", which satisfies a required check.

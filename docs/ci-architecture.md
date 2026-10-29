@@ -703,9 +703,12 @@ runner with no Docker: it fetches the pinned `erlang:28-alpine` index from Docke
 on `Dockerfile.gateway`'s `# yuzu:gateway-platforms` marker (today `linux/amd64`) is not
 annotated as built on the runtime stage's Alpine release. That is the early check on a
 Dependabot digest refresh; the build's abi-guard stays the build-time enforcement.
-Exit 1 is a mismatch, 2 an unreadable registry (rerun), 3 an input the script does not
-understand. A skipped plain job satisfies a required check, so it needs no stub. To
-disable it, delete the job and the `docs-lint.yml` "Gateway base index lint" step.
+Exit 1 is a mismatch, 2 an unreadable registry or a body that is not the pinned digest (the
+log says whether a re-run can help), 3 an input the script does not understand. A skipped
+plain job satisfies a required check, so it needs no stub. To disable the networked check, put `if: false` on the job (and take it out of branch protection
+first if it was ever made required). Keep the script, `tests/test_gateway_base_index.py` and
+the `docs-lint.yml` "Gateway base index lint" step: that test also holds the executed
+arch-guard contract for `Dockerfile.gateway`.
 
 The PR matrix reuses release.yml's local buildcache **read-only** (`cache-from`
 with no `cache-to`), so it never evicts release layers and adds no cache directory
