@@ -638,6 +638,33 @@ TEST_CASE("mcp crypto tools: a degraded read is a retryable error with an audit 
     REQUIRE(r.contains("error"));
     CHECK(r["error"]["code"] == mcp::kInvalidParams);
     CHECK(audit_count(bad.generic_rows, "mcp.list_crypto_library_devices|failure") == 0);
+    // ... but it is a caller-input refusal, and no row exists yet, so it leaves the denied row.
+    CHECK(audit_count(bad.generic_rows, "mcp.list_crypto_library_devices|denied") == 1);
+}
+
+TEST_CASE("mcp crypto tools: a store-reported invalid layout leaves ONE failure row, not a denied one too",
+          "[mcp][crypto][widgets]") {
+    // The post-read refusals already wrote their failure row, so they answer through the row-less
+    // answer_invalid_params; going through refuse_params would write a second (denied) row.
+    using K = CryptoReadError::Kind;
+    {
+        Twin t;
+        t.api->layout = std::unexpected(CryptoReadError{K::kInvalid, "layout rejected"});
+        const json r = t.call("get_crypto_dashboard_layout");
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInvalidParams);
+        CHECK(audit_count(t.generic_rows, "mcp.get_crypto_dashboard_layout|failure") == 1);
+        CHECK(audit_count(t.generic_rows, "mcp.get_crypto_dashboard_layout|denied") == 0);
+    }
+    {
+        Twin t;
+        t.api->set_error = CryptoReadError{K::kInvalid, "layout rejected"};
+        const json r = t.call("set_crypto_dashboard_layout", args_for("set_crypto_dashboard_layout"));
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInvalidParams);
+        CHECK(audit_count(t.generic_rows, "mcp.set_crypto_dashboard_layout|failure") == 1);
+        CHECK(audit_count(t.generic_rows, "mcp.set_crypto_dashboard_layout|denied") == 0);
+    }
 }
 
 TEST_CASE("mcp crypto tools: a degraded or corrupt layout read is an error with an audit row, never "
@@ -741,10 +768,14 @@ TEST_CASE("mcp crypto tools: strict arguments are refused before any read or wri
     };
     for (const auto& [tool, args] : bad) {
         INFO(tool << " " << args.dump());
+        t.clear_audit();
         const json r = t.call(tool, args);
         REQUIRE(r.contains("error"));
         CHECK(r["error"]["code"] == mcp::kInvalidParams);
         CHECK_FALSE(r.contains("result"));
+        // A rejected argument leaves exactly one denied row (refuse_params) and no success row.
+        CHECK(audit_count(t.generic_rows, "mcp." + tool + "|denied") == 1);
+        CHECK(audit_count(t.generic_rows, "mcp." + tool + "|success") == 0);
     }
     CHECK(t.api->calls() == 0);
     // No attempted row for a write refused on its arguments.
@@ -812,6 +843,10 @@ TEST_CASE("mcp crypto tools: an unwired provider is an internal error, never an 
         CHECK(t.api->calls() == 0);
     }
     SECTION("no audit sink: the four domain-row readers fail closed instead of succeeding row-less") {
+        // The harness keeps the generic sink (generic_rows) separate from deps->audit_fn, so the
+        // |failure == 1 below proves the seam contract, not production behaviour: in production
+        // both rows share one sink, and with none wired neither can be written. What this section
+        // proves is that the readers REFUSE (error + no read) instead of succeeding row-less.
         Twin::Opts o;
         o.wire_audit = false;
         Twin t(o);

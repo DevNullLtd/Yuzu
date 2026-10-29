@@ -44,8 +44,9 @@
 // and writes the generic failure row, so a call that reaches the handler leaves an `mcp.<tool>`
 // row (the registry seam test, test_mcp_server.cpp, requires that of the default harness). Three
 // cases write none: a refusal by the fleet-read gate (the gate writes its own body), the
-// export_crypto_cbom CSPRNG failure, and a deployment whose audit sink is unwired (nothing to
-// write to; production always wires it). The legacy branches answered a bare
+// export_crypto_cbom CSPRNG failure, and a server whose generic audit sink (the one `ctx.audit`
+// writes through) is unwired, where nothing can be written; production wires one sink for both
+// the generic and the domain rows, so unwiring it drops both. The legacy branches answered a bare
 // `error_response(kInternalError, ...)` with no row; that is a change. The four tools that write
 // a domain audit row (the three confined reads and get_crypto_ca_stats) now also refuse when
 // `audit_fn` is unwired, because `try_persist_audit` would otherwise call an empty sink
