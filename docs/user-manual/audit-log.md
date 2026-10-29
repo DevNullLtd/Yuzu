@@ -80,6 +80,18 @@ required.
 > do not alert on `mcp.query_responses` denials as errors on a scoped multi-operator
 > deployment.
 
+> **The seven `/crypto` MCP tools write a generic `mcp.<tool>` row on three more paths.**
+> A rejected argument (an unknown key, a wrongly typed value, a bad cursor) writes
+> `result=denied`, `detail` `invalid arguments: <reason>`; the `<reason>` is fixed text and
+> never echoes the caller's input. A server whose provider, caller identity or audit sink is
+> not wired answers an internal error and writes `result=failure` where an audit sink exists.
+> Those wiring failures cannot occur on a correctly started server, so a `failure` row with
+> a `provider unwired` or `audit sink unwired` detail is a deployment fault to fix, not a
+> client error. The four tools that write a `crypto.*.view` row (`get_crypto_libraries`,
+> `list_crypto_library_devices`, `export_crypto_cbom`, `get_crypto_ca_stats`) refuse the call
+> when the audit sink is not wired instead of succeeding without a row. Treat a burst of
+> `denied` rows from one principal as a misbehaving client, not as a gap in access control.
+
 > **Per-principal quota-cap rejections (PR 4.4, ADR-1005 class engine
 > principals) are deliberately NOT audited.** When an **engine principal**
 > (`principal_kind=="engine"`, username `engine:<slug>`) exceeds its
