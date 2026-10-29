@@ -89,6 +89,13 @@ readable through `GET /api/v1/network/discovered-devices`, the MCP tool
 Permission required: **`Infrastructure:Read`**. Each read is audited as
 `network.discovered.view`, and a service-scoped API token is refused.
 
+- On the **Network quality** page the same read is the **Discovered** tab, next to
+  **Quality**. Opening it (or `/network#discovered`) loads the fragment; each
+  activation is one `network.discovered.view` audit row. The tab sits inside the
+  overview, which needs `GuaranteedState:Read`, so an account holding only
+  `Infrastructure:Read` cannot reach it from the page and uses the REST list
+  instead. An account with the overview but not `Infrastructure:Read` sees a
+  message naming the missing permission rather than an empty tab.
 - When RBAC is enforced, an operator confined to a management group is refused
   (`403`): this read is gated by a flat `Infrastructure:Read` check, as the
   device list is (that one needs `GuaranteedState:Read`), and does not yet narrow

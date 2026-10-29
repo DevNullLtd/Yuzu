@@ -296,6 +296,36 @@ TEST_CASE("overview render: empty population is honest", "[network][ui]") {
     CHECK(html.find("No network telemetry yet") != std::string::npos);
 }
 
+TEST_CASE("overview render: Quality / Discovered tab strip, panels and script", "[network][ui]") {
+    const auto has = [](const std::string& h, const char* n) { return h.find(n) != std::string::npos; };
+    NetPerfSnapshot snap;
+    snap.devices.push_back(dev("lnx-1", 40.0, 0.4, 3.0e6));
+    NetPerfSnapshot silent;
+    silent.devices.push_back(dev("silent", std::nullopt, std::nullopt, std::nullopt));
+    // Both the populated and the no-telemetry (early-return) paths carry the strip.
+    for (const auto& sn : {snap, silent}) {
+        const auto html = render_network_overview_fragment(net_perf_fleet_now(sn));
+        CHECK(has(html, "id=\"net-tabs\""));
+        CHECK(has(html, "href=\"#\" role=\"tab\" class=\"on\" aria-selected=\"true\""));
+        CHECK(has(html, "href=\"#discovered\" role=\"tab\" aria-selected=\"false\" "
+                        "hx-get=\"/fragments/network/discovered\" hx-target=\"#net-discovered\""));
+        CHECK(has(html, "<div id=\"net-discovered\" hidden>"));
+        CHECK(has(html, "<div id=\"net-quality\">"));
+        CHECK(has(html, "window.netTab=function"));
+        // 403 copy names the permission; listener registered once per page life.
+        CHECK(has(html, "needs the Infrastructure:Read permission"));
+        CHECK(has(html, "if(!window.__netErr){window.__netErr=1;"));
+        // Deep link boots the Discovered tab.
+        CHECK(has(html, "location.hash==='#discovered'"));
+        // CSP-safe: inline handlers only, never hx-on.
+        CHECK_FALSE(has(html, "hx-on"));
+        CHECK(one_dx_style(html));
+    }
+    const auto fleet = render_network_overview_fragment(net_perf_fleet_now(snap));
+    CHECK(fleet.find("<div id=\"net-quality\">") < fleet.find("Fleet now"));
+    CHECK(fleet.find("Fleet now") < fleet.find("<div id=\"net-discovered\""));
+}
+
 TEST_CASE("devices render: worst-first + co-occurrence flags inline", "[network][ui]") {
     NetPerfSnapshot snap;
     snap.devices.push_back(dev("lnx-low", 40.0, std::nullopt, std::nullopt));
