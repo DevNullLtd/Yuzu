@@ -63,20 +63,8 @@ const char* name_of(RbacAdminHint h) {
     return "?";
 }
 
-/// The session the harness hands the REST routes, rebuilt field for field so the hint is asked
-/// about exactly the caller the route sees.
-auth::Session rest_session(const RbacRoleHarness& h) {
-    auth::Session s;
-    s.username = h.session_user;
-    s.token_scope_service = h.session_token_scope_service;
-    s.principal_kind = h.session_principal_kind;
-    s.auth_source = h.session_auth_source;
-    s.mcp_tier = h.rest_session_mcp_tier;
-    return s;
-}
-
 RbacAdminHint hint_of(RbacRoleHarness& h) {
-    return rbac_admin_hint(rest_session(h), h.auth_db.get(), h.rbac.get(), RbacAdminSurface::kRest);
+    return rbac_admin_hint(h.rest_session(), h.auth_db.get(), h.rbac.get(), RbacAdminSurface::kRest);
 }
 
 /// The hint equals the real POST assign answer, and the hint wrote no audit row.
@@ -184,7 +172,7 @@ TEST_CASE("rbac_admin_hint == POST assign: SSO principal with the grant but NO a
 
     // The predicate admits (bare principal_roles membership); the regime check needs an active
     // auth.users row, so the route refuses. A predicate-only hint would overstate here.
-    REQUIRE(is_rbac_administrator(rest_session(h), h.auth_db.get(), h.rbac.get(),
+    REQUIRE(is_rbac_administrator(h.rest_session(), h.auth_db.get(), h.rbac.get(),
                                   RbacAdminSurface::kRest) == RbacAdminGate::kAdmin);
     check_assign(h, RbacAdminHint::kMayNot);
 }
@@ -267,7 +255,7 @@ TEST_CASE("rbac_admin_hint == POST assign: regime store unreadable, RBAC on (P13
                                  std::vector<std::string>{});
         REQUIRE(r.status() == PGRES_COMMAND_OK);
     }
-    REQUIRE(is_rbac_administrator(rest_session(h), h.auth_db.get(), h.rbac.get(),
+    REQUIRE(is_rbac_administrator(h.rest_session(), h.auth_db.get(), h.rbac.get(),
                                   RbacAdminSurface::kRest) == RbacAdminGate::kAdmin);
     check_assign(h, RbacAdminHint::kUnconfirmed);
 }
@@ -367,7 +355,7 @@ TEST_CASE("rbac_admin_hint: a session elevated to admin is still kMayNot without
           "[pg][rbac_admin_predicate][rbac_admin_hint]") {
     RbacRoleHarness h;
     make_user(h, h.session_user, auth::Role::user);
-    auto s = rest_session(h);
+    auto s = h.rest_session();
     s.role = auth::Role::admin; // the effective role a JIT elevation produces
     s.elevated_until = std::chrono::system_clock::now() + std::chrono::hours(1);
     s.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
