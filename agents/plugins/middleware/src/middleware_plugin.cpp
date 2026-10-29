@@ -40,15 +40,6 @@ using yuzu::middleware::kProducts;
 constexpr const char* kMacosMechanism =
     "installer-metadata read, not yet wired on macOS (every product)";
 
-/// The action names (the table's ids) plus the null terminator the plugin ABI requires.
-constexpr auto kActionNames = [] {
-    std::array<const char*, kProducts.size() + 1> a{};
-    for (std::size_t i = 0; i < kProducts.size(); ++i)
-        a[i] = kProducts[i].id;
-    a.back() = nullptr;
-    return a;
-}();
-
 /// One descriptor per product: Linux and Windows straight from the table, macOS the shared PLANNED
 /// leg. Rung 1 on every leg (installer-metadata file reads).
 constexpr auto kActionDescriptors = [] {
@@ -63,6 +54,9 @@ constexpr auto kActionDescriptors = [] {
     return d;
 }();
 
+static_assert(kProducts.size() == 1 && std::string_view{kProducts[0].id} == "ibm_mq",
+              "MiddlewarePlugin::actions() lists the product table's ids: update both together");
+
 } // namespace
 
 class MiddlewarePlugin final : public yuzu::Plugin {
@@ -73,7 +67,12 @@ public:
         return "Installed middleware inventory from installer metadata (table-driven; IBM MQ)";
     }
 
-    const char* const* actions() const noexcept override { return kActionNames.data(); }
+    const char* const* actions() const noexcept override {
+        // Literal because tests/test_capability_catalogue_complete.py reads this body from source;
+        // the static_asserts below the class pin it to the product table.
+        static const char* const acts[] = {"ibm_mq", nullptr};
+        return acts;
+    }
 
     const YuzuActionDescriptor* action_descriptors() const noexcept override {
         return kActionDescriptors.data();
