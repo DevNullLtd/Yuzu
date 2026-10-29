@@ -132,10 +132,11 @@ row(s)`), and that principal signs in again.
 
 **What to do.** No action is needed, with one precondition. Do not start the upgrade while
 `pg_dump` or another long transaction is running: the migration takes a brief exclusive lock on
-`sessions`, and a boot refused with `canceling statement due to lock timeout` (or a deadlock
-abort) rolls the whole migration back and is safe to retry once the transaction ends. The server
-applies a 10 second lock timeout unless your connection string sets its own. An older binary can
-still run against the upgraded database.
+`sessions` and waits at most 3 seconds for it. If it cannot get the lock the migration rolls back
+completely and the server refuses to start, logging `canceling statement due to lock timeout` on
+the preceding `PgMigrationRunner` line; start it again once the transaction ends. While it waits,
+sign-ins and session checks on replicas that are still running pause for up to those 3 seconds.
+An older binary can still run against the upgraded database.
 
 ## Behaviour change: engine principals are default-deny when RBAC is off
 

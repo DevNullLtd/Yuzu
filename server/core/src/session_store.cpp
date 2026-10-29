@@ -175,13 +175,18 @@ const std::vector<pg::PgMigration>& migrations() {
         // DELETE (row locks) followed by the ALTER (lock upgrade) deadlocks with a live
         // session writer waiting on a row the DELETE removed (reproduced on postgres:18), and
         // a row committed between the DELETE and the ALTER would fail the ADD's validation
-        // and refuse boot. The write_generation bump is
-        // LAST so the session_meta row lock is taken after the sessions locks (see
+        // and refuse boot. The lock wait is capped at 3 s by this migration's own SET LOCAL
+        // lock_timeout (the CaStore v4 precedent), whatever the pool or a DSN `options`
+        // setting says: while the request queues behind a long transaction (pg_dump), every
+        // new sessions query on a running peer queues behind it, so a short cap keeps that
+        // stall short, and the whole migration rolls back and retries on the next boot.
+        // The write_generation bump is LAST so the session_meta row lock is taken after the sessions locks (see
         // session_store_sql_helpers.hpp "take it LAST"; bump first would invite a lock-order
         // deadlock with a live session writer): a peer replica's validate cache then drops
         // the deleted rows on its next generation poll instead of serving them until some
         // unrelated login bumps it. v2 has not shipped, so it is edited in place.
-        {2, "LOCK TABLE sessions IN ACCESS EXCLUSIVE MODE;"
+        {2, "SET LOCAL lock_timeout = '3s';"
+            "LOCK TABLE sessions IN ACCESS EXCLUSIVE MODE;"
             "DO $$ DECLARE n bigint; BEGIN"
             " DELETE FROM sessions WHERE NOT ("
             "(principal_kind = 'human' AND auth_source <> 'engine_token')"

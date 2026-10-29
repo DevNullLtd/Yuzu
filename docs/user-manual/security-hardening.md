@@ -443,7 +443,9 @@ Five classes that used to appear on this list no longer belong on it:
   validate cache, so there is no session-token column to encrypt — or to leak in
   a dump. Sessions survive a server restart, so a restart is **not** a session
   revocation: use `DELETE /api/v1/sessions?username=<name>` (force sign-out of
-  one operator) or `DELETE /api/v1/sessions/me` (sign out everywhere).
+  one operator) or `DELETE /api/v1/sessions/me` (sign out everywhere). The
+  all-operators emergency procedure is in
+  [Auth database recovery](../ops-runbooks/auth-db-recovery.md#sessions-are-durable).
 - **Offload-target credentials** (`offload_target_store.offload_targets.auth_credential`)
   are `SecretCodec`-encrypted as of 2026-08-25 (ADR-0059). Same backup-pairing
   requirement as MFA TOTP secrets above: a Postgres dump alone cannot recover a
