@@ -138,7 +138,6 @@ int seam_execute(YuzuCommandContext* raw, const char* action, const YuzuParam* /
     return yuzu::shares::execute_list(ctx, action, Leg, "linux:leg:exception");
 }
 
-#if !defined(__APPLE__) // the macOS placeholder emits no share rows
 /// Splits a wire row on its unescaped pipes.
 std::vector<std::string> wire_fields(const std::string& row) {
     std::vector<std::string> f;
@@ -169,16 +168,15 @@ bool share_row_is_wellformed(const std::string& row) {
         return std::ranges::any_of(set, [&](const char* s) { return v == s; });
     };
     return f[0] == "share" && in(f[1], {"nfs", "smb"}) && in(f[4], {"ro", "rw", "mixed", "-"}) &&
-           in(f[5], {"true", "false", "-"}) && in(f[7], {"exports", "exports_d", "smb_conf", "netshareenum"});
+           in(f[5], {"true", "false", "-"}) && in(f[7], {"exports", "exports_d", "smb_conf", "netshareenum", "sharing"});
 }
-#endif
 
 } // namespace
 
-// MUTATION: flip a leg's declared support without changing the code behind it (macOS to
-// SUPPORTED while it is still the placeholder, Linux or Windows to PLANNED) -> the exact-level
-// checks fail. The mechanism/notes prose is not pinned: the capability-matrix check gates it.
-TEST_CASE("shares plugin: the descriptor declares Linux and Windows supported and macOS planned",
+// MUTATION: flip a leg's declared support or rung without changing the code behind it (any leg
+// to PLANNED, macOS to rung 1) -> the exact-level checks fail. The mechanism/notes prose is not
+// pinned: the capability-matrix check gates it.
+TEST_CASE("shares plugin: the descriptor declares all three legs supported",
           "[shares][descriptors]") {
     auto plugin = load_plugin();
     if (!plugin) {
@@ -193,7 +191,7 @@ TEST_CASE("shares plugin: the descriptor declares Linux and Windows supported an
     CHECK(std::string_view{d.action} == "list");
     CHECK(d.linux_leg.support == YUZU_SUPPORT_SUPPORTED);
     CHECK(d.linux_leg.rung == 1);
-    CHECK(d.macos_leg.support == YUZU_SUPPORT_PLANNED);
+    CHECK(d.macos_leg.support == YUZU_SUPPORT_SUPPORTED);
     CHECK(d.macos_leg.rung == 2);
     CHECK(d.windows_leg.support == YUZU_SUPPORT_SUPPORTED);
     CHECK(d.windows_leg.rung == 1);
@@ -248,12 +246,23 @@ TEST_CASE("shares plugin: status row first, source rows next, then well-formed s
     }
 
 #if defined(__APPLE__)
-    // PLANNED leg (macOS): exactly one row and UNAVAILABLE/UNKNOWN.
-    // MUTATION: wiring any read here changes this row.
-    constexpr const char* kPlanned = "macos:planned";
-    REQUIRE(rows.size() == 1);
-    CHECK(rows[0] == std::string{"status|list|unsupported|"} + kPlanned);
-    CHECK(result.result_provenance == kPlanned);
+    // macOS leg: both source rows on every arm (exports, then sharing), then share rows. The
+    // tool's answer on a CI runner is unknown, so only the shape is asserted; a runner whose
+    // `sharing` fails reports a constrained listing with a named token, never an empty success.
+    REQUIRE(rows.size() >= 3);
+    CHECK(starts_with(rows[1], "source|exports|"));
+    CHECK(starts_with(rows[2], "source|sharing|"));
+    CHECK_FALSE(starts_with(rows[0], "status|list|unsupported|"));
+    if (starts_with(rows[0], "status|list|supported|"))
+        CHECK(starts_with(rows[2], "source|sharing|read|"));
+    for (std::size_t i = 3; i < rows.size(); ++i) {
+        INFO("row " << i << ": " << rows[i]);
+        REQUIRE(share_row_is_wellformed(rows[i]));
+        if (starts_with(rows[i], "share|smb|"))
+            CHECK(rows[i].ends_with("|sharing"));
+        else
+            CHECK((starts_with(rows[i], "share|nfs|") && rows[i].ends_with("|exports")));
+    }
 #elif defined(_WIN32)
     // NetShareEnum leg: status row, then one source row on every arm.
     REQUIRE(rows.size() >= 2);

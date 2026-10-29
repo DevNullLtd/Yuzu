@@ -6,8 +6,10 @@
 // portable so the unit tests run on every host; no file I/O, no subprocess, no OS header.
 //
 //   parse_exports       Linux exports(5) grammar (/etc/exports, /etc/exports.d/*.exports)
+//   parse_bsd_exports   macOS exports(5) grammar as Apple's mountd reads /etc/exports
 //   parse_smb_conf      Samba smb.conf: share sections, synonyms, `copy =` and [global]
 //                       inheritance, plus detection of the parts this plugin does not read
+//   parse_sharing_json  macOS `sharing -l -f json` share points (SMB)
 //
 // NAMES AND PATHS ONLY, NEVER ACLs. NFS client host lists are never emitted: a share carries
 // `clients_<n>` and an `anonymous` flag only. Every parser charges a caller-owned
@@ -17,6 +19,7 @@
 // The `status|list|...` row is NOT built here; shares_legs.hpp's report_list owns it.
 
 #include <ini_parse.hpp>
+#include <nlohmann/json.hpp>
 #include <row_byte_budget.hpp>
 #include <wire_utf8.hpp>
 #include <yuzu/string_utils.hpp>
@@ -50,8 +53,8 @@ struct Share {
     std::string path;
     Access access = Access::unknown;
     std::optional<bool> anonymous;
-    /// closed vocabulary: hidden, unavailable, special, no_root_squash, clients_<n>, and the
-    /// Windows share kind (exactly one per row): disk, print, device, ipc, other; temporary.
+    /// closed vocabulary: hidden, unavailable, special, sealed (macOS: SMB encryption required),
+    /// no_root_squash, clients_<n>, and the Windows share kind (exactly one per row): disk, print, device, ipc, other; temporary.
     /// Windows `hidden` is a non-special share whose name ends in `$`
     std::vector<std::string> flags;
     std::string source;
@@ -462,6 +465,291 @@ inline void parse_exports(std::string_view text, std::string_view source,
 }
 
 // ---------------------------------------------------------------------------
+// BSD / macOS exports(5)
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+/// One field as Apple's mountd `nextfield` bounds it: blanks (space, tab) skipped, a leading
+/// single or double quote runs to the matching unescaped quote or the end of the entry (a
+/// backslash makes the next character literal), an unquoted field ends at the first
+/// unescaped space or tab. The raw field is returned, quotes kept; empty at end of entry.
+inline std::string_view bsd_nextfield(std::string_view s, std::size_t& i) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t'))
+        ++i;
+    const std::size_t b = i;
+    if (i >= s.size())
+        return {};
+    const char q = s[i];
+    if (q == '\'' || q == '"') {
+        ++i;
+        bool esc = false;
+        for (; i < s.size(); ++i) {
+            if (esc)
+                esc = false;
+            else if (s[i] == '\\')
+                esc = true;
+            else if (s[i] == q)
+                break;
+        }
+        if (i < s.size())
+            ++i; // the closing quote
+        return s.substr(b, i - b);
+    }
+    for (; i < s.size(); ++i) {
+        if (s[i] == '\\') {
+            if (++i >= s.size())
+                break;
+        } else if (s[i] == ' ' || s[i] == '\t') {
+            break;
+        }
+    }
+    return s.substr(b, i - b);
+}
+
+/// mountd `clean_pathname`: quotes removed, escapes resolved, an unquoted path ends at the
+/// first blank, trailing slashes stripped (`/` itself is kept).
+inline std::string bsd_clean_path(std::string_view f) {
+    std::string s;
+    char q = '\0';
+    std::size_t p = 0;
+    if (!f.empty() && (f[0] == '\'' || f[0] == '"')) {
+        q = f[0];
+        p = 1;
+    }
+    bool esc = false;
+    for (; p < f.size(); ++p) {
+        const char c = f[p];
+        if (esc) {
+            s += c;
+            esc = false;
+        } else if (q != '\0' && c == q) {
+            break;
+        } else if (c == '\\') {
+            esc = true;
+        } else if (q == '\0' && (c == ' ' || c == '\t')) {
+            break;
+        } else {
+            s += c;
+        }
+    }
+    while (s.size() > 1 && s.back() == '/')
+        s.pop_back();
+    return s;
+}
+
+/// The family of a `-network` / `-mask` value in mountd's `get_net` order: an IPv6 literal, a
+/// digit-led IPv4 form (inet_network), else a network name (never resolved here). A digit-led
+/// value that is no IPv4 form (`0.0.0.0/0`), an empty value and a non-name (`::/0`) are ones
+/// Apple rejects, the whole line with them.
+enum class BsdNetKind { v4, v6, name, rejected };
+
+inline BsdNetKind bsd_net_kind(std::string_view v) {
+    if (is_v6(v))
+        return BsdNetKind::v6;
+    if (is_v4(v, false))
+        return BsdNetKind::v4;
+    if (v.empty() || std::isdigit(static_cast<unsigned char>(v[0])) != 0)
+        return BsdNetKind::rejected;
+    // A name must be one getnetbyname could hold; anything else (`::/0`, `a/b`) Apple rejects.
+    const bool plain = std::ranges::all_of(v, [](unsigned char c) {
+        return std::isalnum(c) != 0 || c == '-' || c == '_' || c == '.';
+    });
+    return plain ? BsdNetKind::name : BsdNetKind::rejected;
+}
+
+/// Whether a `-network` / `-mask` pair admits every client under Apple's matching. An IPv6
+/// network with no mask, or an all-zero one, is the world: mountd zero-fills an absent IPv6
+/// mask and both its masked compare and the kernel's radix lookup (a zero mask is the default
+/// entry) then match every address. An IPv4 network never is: a zero or absent IPv4 mask is
+/// replaced by the classful one, so `0.0.0.0` exports 0.0.0.0/8. A named network or mask never
+/// is. `net` / `mask` are empty when not given.
+inline bool bsd_net_is_world(std::string_view net, std::string_view mask) {
+    if (net.empty() || bsd_net_kind(net) != BsdNetKind::v6)
+        return false;
+    if (mask.empty())
+        return true;
+    return is_v6(mask) && mask.find_first_not_of("0:") == std::string_view::npos;
+}
+
+/// Names that take a value in mountd's `do_opt`, and whether a root-ish credential raises
+/// `no_root_squash`.
+inline bool bsd_root_map_opt(std::string_view n) {
+    return n == "maproot" || n == "mapall" || n == "root" || n == "r";
+}
+
+/// What one accepted entry exports: its distinct paths and the facts they share.
+struct BsdEntry {
+    std::vector<std::string> paths;
+    bool ro = false;
+    bool offline = false;
+    bool root = false;
+    std::size_t hosts = 0;
+    bool world = false;
+    std::size_t clients = 0;
+};
+
+/// Parses one joined entry. false => Apple rejects it (no row, no token): an option or host
+/// before any path, a path after an option or host, a repeated -network / -mask, a -network
+/// together with a host, a rejected network or mask value, mismatched families.
+inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
+    std::size_t i = 0;
+    std::string_view f = bsd_nextfield(entry, i);
+    if (f.empty() || f[0] == '#')
+        return false; // a comment or empty entry: no row, and no error either
+    bool got_nondir = false;
+    bool have_net = false;
+    bool have_mask = false;
+    std::string net;
+    std::string mask;
+    BsdNetKind net_kind = BsdNetKind::name;
+    BsdNetKind mask_kind = BsdNetKind::name;
+    for (; !f.empty(); f = bsd_nextfield(entry, i)) {
+        if (f[0] == '-') {
+            if (e.paths.empty())
+                return false;
+            got_nondir = true;
+            // do_opt: comma-separated `name` / `name=value`; the LAST item without `=` takes
+            // the next field as its value when that field exists and does not start with `-`.
+            const auto items = split(f.substr(1), ',');
+            for (std::size_t k = 0; k < items.size(); ++k) {
+                std::string_view item = items[k];
+                std::string_view arg;
+                bool has_arg = false;
+                bool from_next = false;
+                std::size_t after_next = i;
+                if (const auto eq = item.find('='); eq != std::string_view::npos) {
+                    arg = item.substr(eq + 1);
+                    item = item.substr(0, eq);
+                    has_arg = true;
+                } else if (k + 1 == items.size()) {
+                    std::size_t j = i;
+                    const auto nf = bsd_nextfield(entry, j);
+                    if (!nf.empty() && nf[0] != '-') {
+                        arg = nf;
+                        has_arg = from_next = true;
+                        after_next = j;
+                    }
+                }
+                bool used_next = false;
+                if (item == "ro" || item == "o") {
+                    e.ro = true;
+                } else if (has_arg && bsd_root_map_opt(item)) {
+                    const auto user = arg.substr(0, arg.find(':'));
+                    if (user == "root" || user == "0")
+                        e.root = true;
+                    used_next = from_next;
+                } else if (has_arg && (item == "mask" || item == "m")) {
+                    if (have_mask)
+                        return false;
+                    mask_kind = bsd_net_kind(arg);
+                    if (mask_kind == BsdNetKind::rejected)
+                        return false;
+                    mask.assign(arg);
+                    have_mask = true;
+                    used_next = from_next;
+                } else if (has_arg && (item == "network" || item == "n")) {
+                    if (have_net)
+                        return false;
+                    net_kind = bsd_net_kind(arg);
+                    if (net_kind == BsdNetKind::rejected)
+                        return false;
+                    net.assign(arg);
+                    have_net = true;
+                    used_next = from_next;
+                } else if (has_arg && item == "sec") {
+                    used_next = from_next;
+                } else if (item == "offline") {
+                    e.offline = true;
+                } else if (item == "alldirs" || item == "32bitclients" || item == "manglednames" ||
+                           item == "fspath" || item == "fsuuid") {
+                    // accepted and ignored; a next-field value is NOT consumed (mountd leaves it
+                    // to be read as a field of its own)
+                } else {
+                    break; // unrecognised (or a value-taking name with no value): the rest of
+                           // this option field is dropped, as mountd drops it
+                }
+                if (used_next) {
+                    i = after_next;
+                    break;
+                }
+            }
+        } else if (f[0] == '/' || ((f[0] == '\'' || f[0] == '"') && f.size() > 1 && f[1] == '/')) {
+            if (got_nondir)
+                return false; // "Directories must be first"
+            auto p = bsd_clean_path(f);
+            if (std::ranges::find(e.paths, p) == e.paths.end())
+                e.paths.push_back(std::move(p));
+        } else {
+            if (e.paths.empty())
+                return false;
+            got_nondir = true;
+            ++e.hosts; // a host or netgroup: counted, never resolved or emitted
+        }
+    }
+    if (e.paths.empty())
+        return false;
+    if (have_net && e.hosts > 0)
+        return false;
+    const auto fam = [](BsdNetKind k) { return k == BsdNetKind::v4 || k == BsdNetKind::v6; };
+    if (have_net && have_mask && fam(net_kind) && fam(mask_kind) && net_kind != mask_kind)
+        return false;
+    e.clients = e.hosts + (have_net ? 1 : 0);
+    e.world = (e.hosts == 0 && !have_net) || bsd_net_is_world(net, mask);
+    return true;
+}
+
+} // namespace detail
+
+/// macOS exports(5) as Apple's mountd reads /etc/exports: `<path>... [-opts] [hosts |
+/// -network net [-mask mask]]`. Entries are joined as get_export_entry joins them (trailing
+/// blanks, CR and backslashes stripped, a stripped backslash appends the next physical line
+/// directly; a continuation still open at end of file loses its entry), a field starting
+/// `#` makes the entry a comment, and fields are bounded by nextfield (single or double
+/// quotes, backslash escapes). One share per distinct path; hosts and netgroups are counted,
+/// never emitted. Access is `ro` for `-ro` / `-o`, else `rw`; `-offline` flags the share
+/// `unavailable`; `-maproot` / `-mapall` / `-root` / `-r` naming `root` or `0` raises
+/// `no_root_squash`. Anonymous is Apple's world test (see detail::bsd_net_is_world). A line
+/// Apple rejects yields no row and no token, as the Linux parser skips a malformed line.
+inline void parse_bsd_exports(std::string_view text, std::string_view source,
+                              yuzu::shared::RowByteBudget& budget, ExportsParse& out) {
+    std::string entry;
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        auto nl = text.find('\n', pos);
+        if (nl == std::string_view::npos)
+            nl = text.size();
+        std::string_view raw = text.substr(pos, nl - pos);
+        pos = nl + 1;
+        bool cont = false;
+        while (!raw.empty() && (raw.back() == ' ' || raw.back() == '\t' || raw.back() == '\r' ||
+                                raw.back() == '\\')) {
+            cont = cont || raw.back() == '\\';
+            raw.remove_suffix(1);
+        }
+        entry.append(raw);
+        if (cont || entry.empty())
+            continue;
+        detail::BsdEntry e;
+        const bool ok = detail::parse_bsd_entry(entry, e);
+        entry.clear();
+        if (!ok)
+            continue;
+        for (const auto& p : e.paths) {
+            std::vector<std::string> flags;
+            if (e.offline)
+                flags.emplace_back("unavailable");
+            if (e.root)
+                flags.emplace_back("no_root_squash");
+            flags.emplace_back("clients_" + std::to_string(e.clients));
+            if (!detail::emit_nfs_share(out, budget, source, p, e.ro ? Access::ro : Access::rw,
+                                        e.world, std::move(flags)))
+                return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Samba smb.conf
 // ---------------------------------------------------------------------------
 
@@ -708,6 +996,100 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
 }
 
 // ---------------------------------------------------------------------------
+// macOS `sharing -l -f json`
+// ---------------------------------------------------------------------------
+
+/// What `sharing -l` prints when no share point exists. Taken from the tool's string table
+/// (/usr/sbin/sharing), not observed live: an empty-host capture may widen what is recognised.
+inline constexpr std::string_view kNoSharePoints = "No share point records.";
+
+struct SharingParse {
+    std::vector<Share> shares;
+    bool recognised = false; ///< a JSON object, `{}` or the exact no-records text
+    std::size_t malformed_records = 0;
+    bool truncated = false;
+    bool field_oversized = false;
+};
+
+namespace detail {
+
+/// An integer or boolean member as a number; nullopt when absent or any other type.
+inline std::optional<long long> json_flag(const nlohmann::json& rec, const char* key) {
+    const auto it = rec.find(key);
+    if (it == rec.end())
+        return std::nullopt;
+    if (it->is_boolean())
+        return it->get<bool>() ? 1 : 0;
+    if (it->is_number_integer())
+        return it->get<long long>();
+    return std::nullopt;
+}
+
+} // namespace detail
+
+/// The JSON object `sharing -l -f json` prints, keyed by record name. Each member must be an
+/// object with a string `path`, else it is counted in malformed_records and skipped (valid
+/// siblings are still emitted). The name is `smb_name` when a string, else the key. A record
+/// with `smb_shared` 0 is flagged `unavailable`, `smb_sealed` 1 (encryption required) `sealed`;
+/// `smb_read_only` gives the access, `smb_guest_access` the anonymous flag. Empty or
+/// whitespace-only text is NOT recognised: no capture shows what an empty host prints, so it is
+/// a named failure upstream, never an empty success. ACLs and permissions are never read.
+inline SharingParse parse_sharing_json(std::string_view text, yuzu::shared::RowByteBudget& budget) {
+    SharingParse out;
+    constexpr std::string_view kBlanks = " \t\r\n";
+    const auto b = text.find_first_not_of(kBlanks);
+    if (b == std::string_view::npos)
+        return out;
+    const auto trimmed = text.substr(b, text.find_last_not_of(kBlanks) - b + 1);
+    if (trimmed == kNoSharePoints) {
+        out.recognised = true;
+        return out;
+    }
+    const auto j = nlohmann::json::parse(text.begin(), text.end(), nullptr, false);
+    if (j.is_discarded() || !j.is_object())
+        return out;
+    out.recognised = true;
+    for (const auto& [key, rec] : j.items()) {
+        if (!rec.is_object()) {
+            ++out.malformed_records;
+            continue;
+        }
+        const auto pit = rec.find("path");
+        if (pit == rec.end() || !pit->is_string()) {
+            ++out.malformed_records;
+            continue;
+        }
+        const std::string& path = pit->get_ref<const std::string&>();
+        std::string_view name = key;
+        if (const auto n = rec.find("smb_name"); n != rec.end() && n->is_string())
+            name = n->get_ref<const std::string&>();
+        std::vector<std::string> flags;
+        if (const auto v = detail::json_flag(rec, "smb_shared"); v && *v == 0)
+            flags.emplace_back("unavailable");
+        if (const auto v = detail::json_flag(rec, "smb_sealed"); v && *v == 1)
+            flags.emplace_back("sealed");
+        if (!detail::charge_share(budget, name.size(), path.size(), detail::flags_bytes(flags))) {
+            out.truncated = true;
+            break;
+        }
+        Share s;
+        s.proto = Proto::smb;
+        s.source = "sharing";
+        s.name = detail::cut(name, out.field_oversized);
+        s.path = detail::cut(path, out.field_oversized);
+        s.flags = std::move(flags);
+        if (const auto v = detail::json_flag(rec, "smb_read_only"); v && *v == 1)
+            s.access = Access::ro;
+        else if (v && *v == 0)
+            s.access = Access::rw;
+        if (const auto v = detail::json_flag(rec, "smb_guest_access"); v && (*v == 0 || *v == 1))
+            s.anonymous = *v == 1;
+        out.shares.push_back(std::move(s));
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Row formatters
 // ---------------------------------------------------------------------------
 
@@ -749,7 +1131,7 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
     return r;
 }
 
-/// `source|<exports|exports_d|smb_conf|netshareenum>|<state>|<share count or ->`
+/// `source|<exports|exports_d|smb_conf|netshareenum|sharing>|<state>|<share count or ->`
 [[nodiscard]] inline std::string source_row(std::string_view kind, SourceState state,
                                             std::optional<std::size_t> count = std::nullopt) {
     std::string r = "source|";

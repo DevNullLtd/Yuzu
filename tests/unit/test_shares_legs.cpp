@@ -1,18 +1,23 @@
 /**
- * test_shares_legs.cpp -- fault tests for the OS-free `list_linux` and `list_windows`: every
- * boundary is a canned fake (no disk, no uid dependence, no Windows API).
+ * test_shares_legs.cpp -- fault tests for the OS-free `list_linux`, `list_windows` and
+ * `list_macos`: every boundary is a canned fake (no disk, no uid dependence, no Windows API,
+ * no process).
  *
  * Provenance: every specimen is a RECONSTRUCTION built from the documented layouts (the
  * Windows pages from the SHARE_INFO_1/2 and STYPE_* documentation). The native capture
  * agents/plugins/shares/docs/samples/windows.txt (kingsley, LocalSystem, 2026-10-27) has the
  * same row shapes: kind and special flags, '-' for the IPC$ path, backslash paths folded to '/'.
- * The SDK side is pinned by shares_win.cpp's static_asserts and the tripwire case below.
+ * The SDK side is pinned by shares_win.cpp's static_asserts and the tripwire case below. The
+ * macOS cases feed `sharing -l -f json` text shaped like the native capture
+ * agents/plugins/shares/docs/samples/macos.txt (braga, 2026-10-29); the runner outcomes
+ * (deadline, signal, truncation, exit codes) are reconstructions.
  */
 #include <catch2/catch_test_macros.hpp>
 
 #include "shares_legs.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -708,4 +713,246 @@ TEST_CASE("shares windows: the shell's SDK constants are pinned (portable tripwi
     CHECK(kNerrServerNotStarted == 2114);
     CHECK(kRpcServerUnavailable == 1722);
     CHECK(kRpcUnknownIf == 1717);
+}
+
+// ---------------------------------------------------------------------------
+// macOS: list_macos over a fake read boundary and a fake runner
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using yuzu::agent::SubprocessOptions;
+using yuzu::agent::SubprocessResult;
+using yuzu::agent::TerminationReason;
+
+constexpr const char* kOneShare =
+    R"({"Pub":{"path":"\/Users\/jsmith\/Public","smb_guest_access":1,"smb_name":"Pub","smb_read_only":0,"smb_sealed":0,"smb_shared":1}})";
+
+SubprocessResult ran(std::string output, int exit_code = 0) {
+    SubprocessResult r;
+    r.tool_ran = true;
+    r.exit_code = exit_code;
+    r.termination_reason = TerminationReason::exited;
+    r.output = std::move(output);
+    return r;
+}
+
+SubprocessResult ended(TerminationReason why) {
+    SubprocessResult r;
+    r.termination_reason = why;
+    r.tool_ran = why != TerminationReason::spawn_error;
+    r.timed_out = why == TerminationReason::deadline;
+    return r;
+}
+
+/// Canned macOS boundaries. `order` records the sequence of boundary calls so the test can
+/// pin that /etc/exports is read before the tool runs.
+struct FakeMac {
+    FileReadLike exports = io(ENOENT);
+    SubprocessResult result = ran("{}");
+    std::vector<std::string> order, reads, argv;
+    SubprocessOptions opts;
+    int runs = 0;
+
+    Listing run() {
+        MacFs fs;
+        fs.exports_path = kExports;
+        fs.read = [this](const std::string& p) {
+            order.push_back("read");
+            reads.push_back(p);
+            return exports;
+        };
+        fs.run = [this](const std::vector<std::string>& a, const SubprocessOptions& o) {
+            order.push_back("run");
+            ++runs;
+            argv = a;
+            opts = o;
+            return result;
+        };
+        return list_macos(fs);
+    }
+};
+
+std::size_t unescaped(const std::string& row) {
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < row.size(); ++i)
+        if (row[i] == '|' && (i == 0 || row[i - 1] != '\\'))
+            ++n;
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("shares macos: argv and bounds are pinned and the exports read comes first", "[shares]") {
+    FakeMac f;
+    f.result = ran(kOneShare);
+    const auto l = f.run();
+    CHECK(f.runs == 1);
+    CHECK(f.argv == std::vector<std::string>{"/usr/sbin/sharing", "-l", "-f", "json"});
+    CHECK(f.opts.deadline == std::chrono::milliseconds{5000});
+    CHECK_FALSE(f.opts.merge_stderr);
+    CHECK(f.opts.max_lines == 1);
+    CHECK(f.opts.output_cap_bytes == 2 * kMaxShareBytes);
+    CHECK(f.reads == std::vector<std::string>{kExports}); // nothing else is read
+    CHECK(f.order == std::vector<std::string>{"read", "run"});
+    CHECK(l.status == StatusState::supported);
+}
+
+TEST_CASE("shares macos: a tool that does not finish fails the sharing source only", "[shares]") {
+    const std::pair<TerminationReason, const char*> cases[] = {
+        {TerminationReason::spawn_error, "spawn_error"}, {TerminationReason::deadline, "deadline"},
+        {TerminationReason::cancelled, "cancelled"},     {TerminationReason::signaled, "signaled"},
+        {TerminationReason::line_limit, "line_limit"}};
+    for (const auto& [why, name] : cases) {
+        INFO(name);
+        FakeMac f;
+        f.exports = ok("/srv\n");
+        f.result = ended(why);
+        f.result.output = kOneShare; // even complete-looking output is not trusted
+        const auto l = f.run();
+        CHECK(l.status == StatusState::constrained);
+        CHECK(l.reason == std::string{"macos:shares:sharing:"} + name);
+        REQUIRE(l.rows.size() == 3);
+        CHECK(l.rows[0] == "source|exports|read|1");
+        CHECK(l.rows[1] == "source|sharing|failed|-");
+        CHECK(l.rows[2] == "share|nfs|-|/srv|rw|true|clients_0|exports");
+    }
+}
+
+TEST_CASE("shares macos: truncation exit codes and unrecognised output", "[shares]") {
+    {
+        FakeMac f;
+        f.result = ran(kOneShare);
+        f.result.output_truncated = true;
+        const auto l = f.run();
+        CHECK(l.status == StatusState::constrained);
+        CHECK(l.reason == "macos:shares:sharing:output_truncated");
+        CHECK(has(l, "source|sharing|failed|-"));
+        CHECK(count_prefix(l, "share|") == 0);
+    }
+    {
+        FakeMac f;
+        f.result = ran(kOneShare, 1);
+        const auto l = f.run();
+        CHECK(l.status == StatusState::constrained);
+        CHECK(l.reason == "macos:shares:sharing:exit_nonzero");
+        CHECK(count_prefix(l, "share|") == 0);
+    }
+    for (const int code : {0, 1}) { // the exact no-records text is not a failure at any exit code
+        FakeMac f;
+        f.result = ran("  No share point records.\n", code);
+        const auto l = f.run();
+        CHECK(l.status == StatusState::supported);
+        CHECK(l.rows == std::vector<std::string>{"source|exports|absent|-", "source|sharing|read|0"});
+    }
+    for (const char* text : {"", "  \n", "[]", "not json", "{\"truncated\":", "No share point records. x"}) {
+        INFO(text);
+        FakeMac f;
+        f.result = ran(text);
+        const auto l = f.run();
+        CHECK(l.status == StatusState::constrained);
+        CHECK(l.reason == "macos:shares:sharing:unrecognised_output");
+        CHECK(has(l, "source|sharing|failed|-"));
+        CHECK(has(l, "source|exports|absent|-"));
+    }
+}
+
+TEST_CASE("shares macos: a malformed record is a token and its siblings are kept", "[shares]") {
+    FakeMac f;
+    f.result = ran(R"({"bad":{"smb_name":"x"},"good":{"path":"/ok"}})");
+    const auto l = f.run();
+    CHECK(l.status == StatusState::constrained);
+    CHECK(l.reason == "macos:shares:sharing:malformed_records_1");
+    CHECK(has(l, "source|sharing|read|1"));
+    CHECK(has(l, "share|smb|good|/ok|-|-|-|sharing"));
+}
+
+TEST_CASE("shares macos: exports absent refused and failed against a good tool", "[shares]") {
+    {
+        FakeMac f;
+        f.result = ran(kOneShare);
+        const auto l = f.run();
+        CHECK(l.status == StatusState::supported);
+        CHECK(l.reason.empty());
+        REQUIRE(l.rows.size() == 3);
+        CHECK(l.rows[0] == "source|exports|absent|-");
+        CHECK(l.rows[1] == "source|sharing|read|1");
+        CHECK(l.rows[2] == "share|smb|Pub|/Users/jsmith/Public|rw|true|-|sharing");
+    }
+    {
+        FakeMac f; // refused exports + a read tool: constrained, not permission_denied
+        f.exports = io(EACCES);
+        f.result = ran(kOneShare);
+        const auto l = f.run();
+        CHECK(l.status == StatusState::constrained);
+        CHECK(l.reason == "macos:shares:exports:permission_denied");
+        CHECK(has(l, "source|exports|refused|-"));
+        CHECK(has(l, "source|sharing|read|1"));
+    }
+    {
+        FakeMac f; // refused exports + a failed tool: nothing was read
+        f.exports = io(EPERM);
+        f.result = ended(TerminationReason::deadline);
+        const auto l = f.run();
+        CHECK(l.status == StatusState::permission_denied);
+        CHECK(reason_has(l, "macos:shares:exports:permission_denied"));
+        CHECK(reason_has(l, "macos:shares:sharing:deadline"));
+        CHECK(count_prefix(l, "source|") == 2);
+    }
+    const std::pair<FileReadLike, const char*> failures[] = {
+        {kind(ReadErr::symlink_refused), "macos:shares:exports:symlink_refused"},
+        {kind(ReadErr::oversized), "macos:shares:exports:oversized"},
+        {ok(std::string("/srv\0x", 6)), "macos:shares:exports:invalid_bytes"}};
+    for (const auto& [read, token] : failures) {
+        INFO(token);
+        FakeMac f;
+        f.exports = read;
+        f.result = ran(kOneShare);
+        const auto l = f.run();
+        CHECK(l.status == StatusState::constrained);
+        CHECK(l.reason == token);
+        CHECK(has(l, "source|exports|failed|-"));
+        CHECK(has(l, "source|sharing|read|1"));
+    }
+}
+
+TEST_CASE("shares macos: one budget spans both sources and NFS is charged first", "[shares]") {
+    std::string exports;
+    for (int i = 0; i < 510; ++i)
+        exports += "/p" + std::to_string(i) + "\n";
+    FakeMac f;
+    f.exports = ok(exports);
+    f.result = ran(R"({"a":{"path":"/1"},"b":{"path":"/2"},"c":{"path":"/3"},"d":{"path":"/4"}})");
+    const auto l = f.run();
+    CHECK(l.status == StatusState::constrained);
+    CHECK(l.reason == "macos:shares:row_cap");
+    CHECK(has(l, "source|exports|read|510"));
+    CHECK(has(l, "source|sharing|read|2")); // only the rows the remaining budget admits
+    CHECK(count_prefix(l, "share|nfs|") == 510);
+    CHECK(count_prefix(l, "share|smb|") == 2);
+    CHECK(has(l, "share|smb|a|/1|-|-|-|sharing"));
+    CHECK_FALSE(has(l, "share|smb|c|/3|-|-|-|sharing"));
+}
+
+TEST_CASE("shares macos: an oversized field is cut and reported", "[shares]") {
+    FakeMac f;
+    f.result = ran(R"({"k":{"path":"/p","smb_name":")" + std::string(5000, 'n') + R"("}})");
+    const auto l = f.run();
+    CHECK(l.status == StatusState::constrained);
+    CHECK(l.reason == "macos:shares:field_oversized");
+    CHECK(count_prefix(l, "share|smb|") == 1);
+}
+
+TEST_CASE("shares macos: rows are the two source rows then the shares each pipe-clean", "[shares]") {
+    FakeMac f;
+    f.exports = ok("/srv -ro friends\n");
+    f.result = ran(R"({"k":{"path":"/p|q","smb_name":"a|b"}})");
+    const auto l = f.run();
+    REQUIRE(l.rows.size() == 4);
+    CHECK(l.rows[0] == "source|exports|read|1");
+    CHECK(l.rows[1] == "source|sharing|read|1");
+    CHECK(l.rows[2] == "share|nfs|-|/srv|ro|false|clients_1|exports");
+    CHECK(l.rows[3].starts_with("share|smb|"));
+    CHECK(unescaped(l.rows[2]) == 7);
+    CHECK(unescaped(l.rows[3]) == 7);
 }

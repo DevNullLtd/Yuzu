@@ -5,15 +5,17 @@
  *   "list" -- the shares this host is CONFIGURED to serve, names and paths only:
  *               Linux   /etc/exports, the /etc/exports.d snippets (*.exports) and
  *                       /etc/samba/smb.conf (bounded no-follow file reads);
- *               macOS   PLANNED (share points plus /etc/exports; not read yet);
+ *               macOS   the share points `sharing -l -f json` records (bounded argv leaf)
+ *                       plus /etc/exports in Apple's BSD grammar (bounded no-follow read);
  *               Windows the LIVE shares of the Server service through NetShareEnum
  *                       (level 2; level 1 names without paths when level 2 is refused).
  *
- * READ-ONLY and FACTS ONLY. Linux reports configured shares as written, not live nfsd/smbd
- * state; Windows reports what the Server service publishes now. ACLs, `valid users` and NFS
+ * READ-ONLY and FACTS ONLY. Linux and macOS report configured shares as written, not live
+ * nfsd/smbd state; Windows reports what the Server service publishes now. ACLs, `valid users` and NFS
  * client host lists are never emitted (NFS clients are a count plus an `anonymous` flag). A
- * refused or failed read is reported as permission_denied/constrained with a token, and a
- * stopped Windows Server service as unsupported, never as an empty result.
+ * refused or failed read, or a macOS `sharing` that cannot run or answers unrecognisably, is
+ * reported as permission_denied/constrained with a token, and a stopped Windows Server service
+ * as unsupported, never as an empty result.
  *
  * This TU is portable except for its single dispatch #if, which selects the platform's leg
  * function and exception token (`kLeg`, `kLegExceptionToken`) and ends in an #error. All
@@ -40,8 +42,16 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "include= files and usershares are not read (constrained token); a symlinked config "
          "file or exports.d is refused"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_PLANNED, 2, "share-point listing plus /etc/exports (BSD syntax)",
-         "not read yet: one unsupported status row, macos:planned"},
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "/usr/sbin/sharing -l -f json through the bounded runner (5 s deadline, no shell) plus a "
+         "byte-capped no-follow read of /etc/exports (BSD exports(5) grammar as mountd parses it)",
+         "share points as recorded, not live smbd state (a record with SMB sharing off is flagged "
+         "unavailable, SMB encryption required is flagged sealed; AFP is not reported); "
+         "/etc/exports as written, not live nfsd state, hosts counted never listed, an IPv6 "
+         "network with no or a zero mask is anonymous as the kernel treats it, an IPv4 network "
+         "never is (classful mask); a tool that cannot start, times out, exits nonzero or prints "
+         "anything but a JSON object or its no-records text fails the sharing source with a "
+         "named token"},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "NetShareEnum level 2 (netapi32); level 1 (names, no paths) when level 2 is refused",
@@ -54,8 +64,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     },
 };
 
-// This build's leg and its exception token, defined together. The macOS leg is the PLANNED
-// placeholder.
+// This build's leg and its exception token, defined together.
 #if defined(_WIN32)
 constexpr yuzu::shares::LegFn kLeg = &yuzu::shares::run_windows;
 constexpr const char* kLegExceptionToken = "windows:leg:exception";

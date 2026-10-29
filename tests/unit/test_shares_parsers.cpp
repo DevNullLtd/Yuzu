@@ -1,6 +1,6 @@
 /**
- * test_shares_parsers.cpp -- pure tests for the shares plugin's exports(5) and smb.conf
- * parsers and its row formatters. Portable, no I/O.
+ * test_shares_parsers.cpp -- pure tests for the shares plugin's exports(5) (Linux and BSD),
+ * smb.conf and `sharing -l -f json` parsers and its row formatters. Portable, no I/O.
  *
  * Fixture provenance (labelled per case):
  *   REAL CAPTURE     -- the stock /etc/exports (nfs-kernel-server 1:2.8.3-1) and
@@ -12,7 +12,14 @@
  *                       2026-10-12, and kept here verbatim so the sample's rows are asserted.
  *   RECONSTRUCTION   -- every other specimen (populated exports lines, Samba synonym / copy= /
  *                       registry / include / usershare cases), rebuilt from exports(5) and
- *                       smb.conf(5). None is a capture.
+ *                       smb.conf(5). None is a capture. The BSD cases are the exports(5) man
+ *                       page lines plus shapes read off Apple's mountd.c (get_export_entry,
+ *                       nextfield, clean_pathname, do_opt, get_net) and the kernel's
+ *                       nfsrv_hang_addrlist / nfsrv_export_lookup.
+ *   REDACTED CAPTURE -- kSharingCapture: `sharing -l -f json` on macOS 26.6.2 arm64 (braga,
+ *                       2026-10-29) with the account name and share name replaced (jsmith).
+ *                       `No share point records.` is NOT a capture: it is the tool's string
+ *                       table entry, never observed live.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -889,4 +896,282 @@ TEST_CASE("shares formatters: every bad byte becomes '?' and the field count hol
     CHECK(yuzu::shared::count_invalid_wire_bytes(row) == 0);
     // 2 + 3 + 4 + 1 bad bytes, then the escaped pipe, the folded backslash, NUL as '?'.
     CHECK(row.find("|/p??????????\\|/?end|") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// BSD / macOS exports(5): Apple's mountd grammar
+// ---------------------------------------------------------------------------
+
+namespace {
+
+ExportsParse bsd(std::string_view text, std::size_t rows = kMaxShareRows) {
+    auto b = yuzu::shared::RowByteBudget{rows, kMaxShareBytes};
+    ExportsParse p;
+    parse_bsd_exports(text, "exports", b, p);
+    return p;
+}
+
+/// `path access anonymous flags` for one share, the facts the cases pin.
+std::string sig(const Share& s) {
+    std::string out = s.path + ' ' + std::string{access_token(s.access)} + ' ' +
+                      (s.anonymous ? (*s.anonymous ? "anon" : "named") : "?") + ' ' + flags_of(s);
+    return out;
+}
+
+std::vector<std::string> sigs(const ExportsParse& p) {
+    std::vector<std::string> v;
+    for (const auto& s : p.shares)
+        v.push_back(sig(s));
+    return v;
+}
+
+using Sigs = std::vector<std::string>;
+
+} // namespace
+
+TEST_CASE("shares bsd exports: the man page shapes", "[shares]") {
+    CHECK(sigs(bsd("/usr /usr/local -maproot=0:10 friends")) ==
+          Sigs{"/usr rw named no_root_squash,clients_1", "/usr/local rw named no_root_squash,clients_1"});
+    CHECK(sigs(bsd("/usr -maproot=daemon grumpy.cis.uoguelph.ca 131.104.48.16")) ==
+          Sigs{"/usr rw named clients_2"});
+    CHECK(sigs(bsd("/usr -ro -mapall=nobody")) == Sigs{"/usr ro anon clients_0"});
+    CHECK(sigs(bsd("/u -maproot=bin: -network 131.104.48 -mask 255.255.255.0")) ==
+          Sigs{"/u rw named clients_1"});
+    CHECK(sigs(bsd("/u1 -alldirs -network 2001:DB8:: -mask ffff:ffff::")) ==
+          Sigs{"/u1 rw named clients_1"});
+    CHECK(sigs(bsd("/u2 -maproot=root friends")) == Sigs{"/u2 rw named no_root_squash,clients_1"});
+    CHECK(sigs(bsd("/u2 -alldirs -network cis-net -mask cis-mask")) == Sigs{"/u2 rw named clients_1"});
+}
+
+TEST_CASE("shares bsd exports: comma lists and next-field option values", "[shares]") {
+    CHECK(sigs(bsd("/srv -ro,maproot=root")) == Sigs{"/srv ro anon no_root_squash,clients_0"});
+    for (const char* line : {"/srv -maproot root", "/srv -mapall root", "/srv -r root", "/srv -root=0"})
+        CHECK(sigs(bsd(line)) == Sigs{"/srv rw anon no_root_squash,clients_0"});
+    CHECK(sigs(bsd("/srv -network 10.1.0.0 -mask 255.255.0.0")) == Sigs{"/srv rw named clients_1"});
+    CHECK(sigs(bsd("/srv -n=10.1.0.0 -m=255.255.0.0")) == Sigs{"/srv rw named clients_1"});
+    // `friends` is offered to the last item (alldirs) as a value but alldirs takes none, so it
+    // stays a host.
+    CHECK(sigs(bsd("/srv -ro,alldirs friends")) == Sigs{"/srv ro named clients_1"});
+    for (const char* line : {"/srv -maproot=nobody", "/srv -mapall=nobody:group", "/srv -maproot=bin:",
+                             "/srv -maproot nobody"})
+        CHECK(sigs(bsd(line)) == Sigs{"/srv rw anon clients_0"});
+    // An unrecognised name ends that option field only.
+    CHECK(sigs(bsd("/srv -bogus,ro")) == Sigs{"/srv rw anon clients_0"});
+    CHECK(sigs(bsd("/srv -bogus -ro")) == Sigs{"/srv ro anon clients_0"});
+    // fspath takes no next-field value, so the path after it is a path after an option.
+    CHECK(sigs(bsd("/srv -fspath /x")).empty());
+    CHECK(sigs(bsd("/srv -fspath=/x")) == Sigs{"/srv rw anon clients_0"});
+}
+
+TEST_CASE("shares bsd exports: entries are joined as get_export_entry joins them", "[shares]") {
+    // A stripped backslash appends the next physical line with NO separator.
+    CHECK(sigs(bsd("/a \\\n/b")) == Sigs{"/a/b rw anon clients_0"});
+    CHECK(sigs(bsd("/a \\\n\t/b")) == Sigs{"/a rw anon clients_0", "/b rw anon clients_0"});
+    CHECK(sigs(bsd("/a -ro \\\n friends")) == Sigs{"/a ro named clients_1"});
+    // Trailing blanks and CR are stripped.
+    CHECK(sigs(bsd("/srv \t \r\n")) == Sigs{"/srv rw anon clients_0"});
+    CHECK(sigs(bsd("/srv\r\n/b\r\n")) == Sigs{"/srv rw anon clients_0", "/b rw anon clients_0"});
+    // A comment is an entry whose FIRST field starts with `#`; its backslash continues it.
+    CHECK(sigs(bsd("# /srv\n/b")) == Sigs{"/b rw anon clients_0"});
+    CHECK(sigs(bsd("#/srv\n  # /c\n")).empty());
+    CHECK(sigs(bsd("# note \\\n/swallowed\n/b")) == Sigs{"/b rw anon clients_0"});
+    // A `#` anywhere else is an ordinary field: here a host.
+    CHECK(sigs(bsd("/srv #friends")) == Sigs{"/srv rw named clients_1"});
+    // A continuation still open at end of file loses its entry (fgetln returns NULL).
+    CHECK(sigs(bsd("/a\n/b \\")) == Sigs{"/a rw anon clients_0"});
+    // Blank lines and a lone backslash are skipped.
+    CHECK(sigs(bsd("\n\n  \n\\\n/a\n")) == Sigs{"/a rw anon clients_0"});
+}
+
+TEST_CASE("shares bsd exports: offline quoting escapes and trailing slashes", "[shares]") {
+    CHECK(sigs(bsd("/srv -o")) == Sigs{"/srv ro anon clients_0"});
+    CHECK(sigs(bsd("/srv -offline")) == Sigs{"/srv rw anon unavailable,clients_0"});
+    CHECK(sigs(bsd("\"/my share\" -ro")) == Sigs{"/my share ro anon clients_0"});
+    CHECK(sigs(bsd("'/a b'")) == Sigs{"/a b rw anon clients_0"});
+    CHECK(sigs(bsd("/a\\ b friends")) == Sigs{"/a b rw named clients_1"});
+    CHECK(sigs(bsd("\"/a\\\"b\"")) == Sigs{"/a\"b rw anon clients_0"});
+    // An unterminated quote runs to end of line: one path, as Apple reads it.
+    CHECK(sigs(bsd("\"/srv/x -ro\n/b")) == Sigs{"/srv/x -ro rw anon clients_0", "/b rw anon clients_0"});
+    CHECK(sigs(bsd("/srv/\n///\n/")) == Sigs{"/srv rw anon clients_0", "/ rw anon clients_0",
+                                             "/ rw anon clients_0"});
+    // Options written after the host list are honoured.
+    CHECK(sigs(bsd("/srv friends -ro")) == Sigs{"/srv ro named clients_1"});
+}
+
+TEST_CASE("shares bsd exports: one row per path and per line", "[shares]") {
+    CHECK(sigs(bsd("/a /b /c -ro")) == Sigs{"/a ro anon clients_0", "/b ro anon clients_0",
+                                             "/c ro anon clients_0"});
+    CHECK(sigs(bsd("/a\n/a -ro")) == Sigs{"/a rw anon clients_0", "/a ro anon clients_0"});
+    // The same path twice on ONE line is a duplicate directory Apple drops.
+    CHECK(sigs(bsd("/a /a/ /b")) == Sigs{"/a rw anon clients_0", "/b rw anon clients_0"});
+}
+
+TEST_CASE("shares bsd exports: lines Apple rejects yield no row and no token", "[shares]") {
+    for (const char* line :
+         {"-ro /srv", "friends /srv", "friends", "-ro", "/a -ro /b", "/a friends /b",
+          "/srv -network 10.0.0.0 -network 10.1.0.0", "/srv -mask 255.0.0.0 -mask 255.255.0.0",
+          "/srv -network 10.0.0.0 friends", "/srv friends -network 10.0.0.0",
+          "/srv -network 0.0.0.0/0", "/srv -network ::/0", "/srv -network=",
+          "/srv -network 10.0.0.0 -mask ffff::", "/srv -network 2001:db8:: -mask 255.0.0.0",
+          "/srv -mask ffff:: -network 10.0.0.0"}) {
+        INFO(line);
+        const auto p = bsd(line);
+        CHECK(p.shares.empty());
+        CHECK_FALSE(p.truncated);
+        CHECK_FALSE(p.field_oversized);
+    }
+    // The line after a rejected one still parses.
+    CHECK(sigs(bsd("/a -ro /b\n/c")) == Sigs{"/c rw anon clients_0"});
+}
+
+TEST_CASE("shares bsd exports: hostile bytes stay inside one escaped row", "[shares]") {
+    const auto p = bsd(std::string("/p|\xff\xC0\xAF") + "q\\\\ friends\n/ok");
+    REQUIRE(p.shares.size() == 2);
+    const auto row = share_row(p.shares[0]);
+    CHECK(unescaped_pipes(row) == 7);
+    CHECK(yuzu::shared::count_invalid_wire_bytes(row) == 0);
+    CHECK(share_row(p.shares[1]) == "share|nfs|-|/ok|rw|true|clients_0|exports");
+}
+
+TEST_CASE("shares bsd exports: world classification is Apple's", "[shares]") {
+    const auto anon = [](const char* line) { return bsd(line).shares.at(0).anonymous.value(); };
+    CHECK(anon("/srv"));
+    // IPv6: an absent or all-zero mask is the world (the kernel's default radix entry).
+    CHECK(anon("/srv -network ::"));
+    CHECK(anon("/srv -network 2001:DB8::"));
+    CHECK(anon("/srv -network 2001:DB8:: -mask ::"));
+    CHECK(anon("/srv -network 2001:DB8:: -mask 0:0:0:0:0:0:0:0"));
+    CHECK_FALSE(anon("/srv -network 2001:DB8:: -mask ffff:ffff::"));
+    // IPv4: a zero or absent mask becomes the classful mask, never the world.
+    CHECK_FALSE(anon("/srv -network 0.0.0.0"));
+    CHECK_FALSE(anon("/srv -network 0.0.0.0 -mask 0.0.0.0"));
+    CHECK_FALSE(anon("/srv -network 10.0.0.0 -mask 0.0.0.0"));
+    CHECK_FALSE(anon("/srv -network 131.104.48 -mask 255.255.255.0"));
+    CHECK_FALSE(anon("/srv -network cis-net"));
+    CHECK_FALSE(anon("/srv friends"));
+    CHECK(bsd("/srv -network 2001:DB8::").shares[0].flags.back() == "clients_1");
+    CHECK(bsd("/srv").shares[0].flags.back() == "clients_0");
+}
+
+TEST_CASE("shares bsd exports: a value-taking option with no value is ignored", "[shares]") {
+    CHECK(sigs(bsd("/srv -network\n/b")) == Sigs{"/srv rw anon clients_0", "/b rw anon clients_0"});
+    CHECK(sigs(bsd("/srv -network -ro")) == Sigs{"/srv ro anon clients_0"});
+    CHECK(sigs(bsd("/srv -mask")) == Sigs{"/srv rw anon clients_0"});
+}
+
+TEST_CASE("shares bsd exports: the budget is charged before a Share is built", "[shares]") {
+    const auto p = bsd("/a /b /c", 2);
+    CHECK(p.shares.size() == 2);
+    CHECK(p.truncated);
+    // The cut stops the file, not just the line.
+    CHECK(bsd("/a\n/b\n/c", 1).shares.size() == 1);
+    const auto big = bsd("/" + std::string(5000, 'x'));
+    REQUIRE(big.shares.size() == 1);
+    CHECK(big.shares[0].path.size() == kMaxFieldBytes);
+    CHECK(big.field_oversized);
+}
+
+// ---------------------------------------------------------------------------
+// macOS `sharing -l -f json`
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// REDACTED CAPTURE: `/usr/sbin/sharing -l -f json`, macOS 26.6.2 arm64 (braga), 2026-10-29,
+// verbatim except the account and share name (jsmith) and the shape's whitespace.
+constexpr const char* kSharingCapture = R"JSON({
+  "J Smith’s Public Folder" : {
+    "path" : "\/Users\/jsmith\/Public",
+    "smb_guest_access" : 1,
+    "smb_name" : "J Smith’s Public Folder",
+    "smb_read_only" : 0,
+    "smb_sealed" : 0,
+    "smb_shared" : 1
+  }
+}
+)JSON";
+
+SharingParse sharing(std::string_view text, std::size_t rows = kMaxShareRows) {
+    auto b = yuzu::shared::RowByteBudget{rows, kMaxShareBytes};
+    return parse_sharing_json(text, b);
+}
+
+} // namespace
+
+TEST_CASE("shares sharing json: the redacted braga capture", "[shares]") {
+    const auto p = sharing(kSharingCapture);
+    CHECK(p.recognised);
+    CHECK(p.malformed_records == 0);
+    REQUIRE(p.shares.size() == 1);
+    CHECK(share_row(p.shares[0]) == "share|smb|J Smith’s Public Folder|/Users/jsmith/Public|rw|true|-|sharing");
+}
+
+TEST_CASE("shares sharing json: flags name fallback and typing", "[shares]") {
+    // smb_name absent: the record key names the share.
+    auto p = sharing(R"({"Key":{"path":"/p"}})");
+    REQUIRE(p.shares.size() == 1);
+    CHECK(share_row(p.shares[0]) == "share|smb|Key|/p|-|-|-|sharing");
+    // ro, guest off, sharing off, sealed.
+    p = sharing(R"({"k":{"path":"/p","smb_read_only":1,"smb_guest_access":0,"smb_shared":0,"smb_sealed":1}})");
+    REQUIRE(p.shares.size() == 1);
+    CHECK(share_row(p.shares[0]) == "share|smb|k|/p|ro|false|unavailable,sealed|sharing");
+    // Boolean-typed flags are accepted.
+    p = sharing(R"({"k":{"path":"/p","smb_read_only":true,"smb_guest_access":true,"smb_shared":false}})");
+    REQUIRE(p.shares.size() == 1);
+    CHECK(share_row(p.shares[0]) == "share|smb|k|/p|ro|true|unavailable|sharing");
+    // String-typed flags are unknown: ignored.
+    p = sharing(R"({"k":{"path":"/p","smb_read_only":"1","smb_guest_access":"1","smb_shared":"0","smb_sealed":"1"}})");
+    REQUIRE(p.shares.size() == 1);
+    CHECK(share_row(p.shares[0]) == "share|smb|k|/p|-|-|-|sharing");
+}
+
+TEST_CASE("shares sharing json: what is recognised and what is not", "[shares]") {
+    for (const char* t : {"{}", "  {}\n", "No share point records.", "\n  No share point records.\n\n"}) {
+        INFO(t);
+        const auto p = sharing(t);
+        CHECK(p.recognised);
+        CHECK(p.shares.empty());
+    }
+    // Empty and whitespace-only output are NOT an empty success: no capture shows them.
+    for (const char* t : {"", "  \n\t", "[]", "\"x\"", "{\"a\":", "No share point records. extra",
+                          "garbage", "12"}) {
+        INFO(t);
+        CHECK_FALSE(sharing(t).recognised);
+        CHECK(sharing(t).shares.empty());
+    }
+}
+
+TEST_CASE("shares sharing json: a malformed member is counted and siblings are kept", "[shares]") {
+    const auto p = sharing(R"({"a":1,"b":{"smb_name":"x"},"c":{"path":3},"d":{"path":"/ok"}})");
+    CHECK(p.recognised);
+    CHECK(p.malformed_records == 3);
+    REQUIRE(p.shares.size() == 1);
+    CHECK(p.shares[0].path == "/ok");
+}
+
+TEST_CASE("shares sharing json: a hostile name yields one well-formed row", "[shares]") {
+    // pipe, newline, backslash and NUL (JSON escapes) in the name.
+    const auto p = sharing(R"({"k":{"path":"/p","smb_name":"a|b\nc\\d\u0000e"}})");
+    REQUIRE(p.shares.size() == 1);
+    const auto row = share_row(p.shares[0]);
+    CHECK(unescaped_pipes(row) == 7);
+    CHECK(row.find('\n') == std::string::npos);
+    CHECK(row.find('\0') == std::string::npos);
+    CHECK(yuzu::shared::count_invalid_wire_bytes(row) == 0);
+
+    // Invalid UTF-8 never reaches a row: the JSON parser refuses the text, a named failure upstream.
+    CHECK_FALSE(sharing(std::string(R"({"k":{"path":"/p","smb_name":"a)") + "\xff" + R"("}})").recognised);
+
+    const auto big = sharing(R"({"k":{"path":"/p","smb_name":")" + std::string(5000, 'n') + R"("}})");
+    REQUIRE(big.shares.size() == 1);
+    CHECK(big.shares[0].name.size() == kMaxFieldBytes);
+    CHECK(big.field_oversized);
+}
+
+TEST_CASE("shares sharing json: the budget is charged before a Share is built", "[shares]") {
+    const auto p = sharing(R"({"a":{"path":"/1"},"b":{"path":"/2"},"c":{"path":"/3"}})", 2);
+    CHECK(p.recognised);
+    CHECK(p.shares.size() == 2);
+    CHECK(p.truncated);
+    CHECK(p.malformed_records == 0);
 }

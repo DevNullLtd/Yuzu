@@ -1,24 +1,26 @@
 /**
  * shares_legs.hpp -- shared seam between the shares plugin TU and its three per-OS leg
  * TUs (mgmt_posture_legs.hpp shape). Linux reads CONFIGURED shares from files; Windows
- * reads the LIVE shares through NetShareEnum; the macOS leg is a PLANNED placeholder.
+ * reads the LIVE shares through NetShareEnum; macOS reads the share points `sharing -l`
+ * records plus /etc/exports.
  *
  * Holds (a) the per-OS entry-point declarations, (b) report_list, the SINGLE owner of the
  * `status|list|...` row (no leg and no parser writes one), pairing each status with its
  * result status/completeness, (c) execute_list, the plugin's whole execute() body
  * (dispatch + ABI containment), and (d) the OS-free DECISION logic, `list_linux` and
- * `list_windows`, over injected boundaries (file readers, an exports.d lister, a directory
- * probe; a NetShareEnum page source) so the refused-vs-absent and paging rules are
+ * `list_windows` and `list_macos`, over injected boundaries (file readers, an exports.d lister,
+ * a directory probe; a NetShareEnum page source; a bounded subprocess runner) so the refused-vs-absent and paging rules are
  * unit-tested with canned results and no disk, uid or Windows dependence. The leg TUs keep
  * only the OS shell.
  *
  * Row contract (pipe rows, status row first):
  *   status|list|<supported|constrained|permission_denied|unsupported>|<tokens or ->
- *   source|<exports|exports_d|smb_conf|netshareenum>|<read|absent|refused|failed>|<n or ->
+ *   source|<exports|exports_d|smb_conf|netshareenum|sharing>|<read|absent|refused|failed>|<n or ->
  *   share|<nfs|smb>|<name>|<path>|<ro|rw|mixed|->|<true|false|->|<flags or ->|<source>
  * One `source` row per source the leg knows about is emitted on EVERY arm, so zero `share`
  * rows is never an ambiguous empty success. Linux rows are CONFIGURED shares, not live
- * nfsd/smbd state; Windows rows are the live Server-service shares. ACLs are never read.
+ * nfsd/smbd state; macOS rows are the recorded share points and /etc/exports as written;
+ * Windows rows are the live Server-service shares. ACLs are never read.
  *
  * Each entry point is a READ and returns 0: a degraded read is not a failed command.
  */
@@ -27,12 +29,15 @@
 #include "shares_parsers.hpp"
 
 #include <constraint_accumulator.hpp>
+#include <yuzu/agent/runner_status.hpp>
+#include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -108,7 +113,7 @@ struct Listing {
 
 /// A leg that reads nothing reports `{StatusState::unsupported, <token>, rows}`:
 /// ONE `unsupported` status row and UNAVAILABLE/UNKNOWN carrying the same token. Callers:
-/// the macOS placeholder, list_windows' service-stopped arm (with its failed `source` row)
+/// list_windows' service-stopped arm (with its failed `source` row)
 /// and execute_list's catch arm (`<os>:leg:exception`).
 inline void report_list(yuzu::CommandContext& ctx, const Listing& p) {
     report_list(ctx, p.rows, p.status, p.reason);
@@ -571,6 +576,94 @@ inline Listing list_windows(const WinPageFn& page) {
     if (t.field_oversized)
         t.acc.add_failure("windows:shares:field_oversized");
     return t.finish({source_row(kSrc, SourceState::read, n)});
+}
+
+// ---------------------------------------------------------------------------
+// macOS decision logic (OS-free; the shell in shares_macos.cpp injects both boundaries)
+// ---------------------------------------------------------------------------
+
+using RunFn = std::function<yuzu::agent::SubprocessResult(
+    const std::vector<std::string>& argv, const yuzu::agent::SubprocessOptions&)>;
+
+/// The injected macOS boundaries: the /etc/exports path with its bounded no-follow reader, and
+/// the bounded subprocess runner that `/usr/sbin/sharing` goes through.
+struct MacFs {
+    std::string exports_path;
+    ReadFn read;
+    RunFn run;
+};
+
+/// NFS exports from /etc/exports (Apple's BSD grammar), then the SMB share points `sharing -l
+/// -f json` records. Both sources are always attempted and BOTH source rows are emitted on every
+/// arm, so zero `share` rows is never an ambiguous empty success. /etc/exports is read and
+/// parsed FIRST, so one budget charges the NFS rows before the SMB ones, deterministically.
+///
+/// The `sharing` source is `failed` (with a `macos:shares:sharing:<reason>` token, the listing
+/// constrained, the exports rows kept) when the tool cannot start, is killed at its deadline or
+/// cancelled, dies by signal, is line-limited, has its output cut at the cap, exits nonzero
+/// (unless it printed its exact no-records text) or prints anything but a JSON object. Empty or
+/// whitespace-only output is `unrecognised_output` too: no capture shows what an empty host
+/// prints. A refused /etc/exports is permission_denied only when `sharing` was not read.
+inline Listing list_macos(const MacFs& fs) {
+    Tally t;
+
+    // --- /etc/exports (before the tool runs) ---
+    const FileReadLike er = fs.read(fs.exports_path);
+    const SrcOutcome eo = classify_read(er, "macos", "exports");
+    std::size_t n_exports = 0;
+    if (eo.state == SourceState::read) {
+        ExportsParse p;
+        parse_bsd_exports(er.data, "exports", t.budget, p);
+        n_exports = p.shares.size();
+        t.take(p);
+    }
+    t.note(eo);
+
+    // --- sharing -l -f json ---
+    // Compile-time argv, no shell, no PATH search. `lines` is never parsed (max_lines 1);
+    // `output` is, bounded by output_cap_bytes, so the share-text budget is reached first.
+    static const std::vector<std::string> kArgv{"/usr/sbin/sharing", "-l", "-f", "json"};
+    yuzu::agent::SubprocessOptions opts;
+    opts.deadline = std::chrono::milliseconds{5000};
+    opts.max_lines = 1;
+    opts.merge_stderr = false;
+    opts.output_cap_bytes = 2 * kMaxShareBytes;
+    const auto r = fs.run(kArgv, opts);
+
+    const auto failed = [](std::string_view cause) {
+        return SrcOutcome{SourceState::failed, src_token("macos", "sharing", cause)};
+    };
+    SrcOutcome so{SourceState::read, {}};
+    std::size_t n_sharing = 0;
+    if (const auto f = yuzu::agent::classify_runner_failure(r)) {
+        // `subprocess_runner:<reason>`: the reason alone keeps the token inside the plugin's
+        // documented token shape.
+        const std::string_view prov = f->provenance;
+        so = failed(prov.substr(prov.rfind(':') + 1));
+    } else if (r.output_truncated) {
+        so = failed("output_truncated");
+    } else if (r.exit_code != 0 && yuzu::shared::ini_trim(r.output) != kNoSharePoints) {
+        so = failed("exit_nonzero");
+    } else {
+        auto sp = parse_sharing_json(r.output, t.budget);
+        if (!sp.recognised) {
+            so = failed("unrecognised_output");
+        } else {
+            n_sharing = sp.shares.size();
+            if (sp.malformed_records > 0)
+                t.acc.add_failure(src_token("macos", "sharing",
+                                            "malformed_records_" + std::to_string(sp.malformed_records)));
+            t.take(sp);
+        }
+    }
+    t.note(so);
+
+    if (t.truncated)
+        t.acc.add_failure("macos:shares:row_cap");
+    if (t.field_oversized)
+        t.acc.add_failure("macos:shares:field_oversized");
+    return t.finish({source_row("exports", eo.state, count_if_read(eo.state, n_exports)),
+                     source_row("sharing", so.state, count_if_read(so.state, n_sharing))});
 }
 
 } // namespace yuzu::shares
