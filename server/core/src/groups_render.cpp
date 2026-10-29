@@ -3,6 +3,7 @@
 #include "groups_render.hpp"
 
 #include "enrolment_render.hpp"
+#include "management_group_store.hpp"
 #include "web_utils.hpp"
 
 #include <algorithm>
