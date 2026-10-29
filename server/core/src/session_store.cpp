@@ -156,22 +156,41 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE INDEX sessions_username_idx ON sessions (username);"
          "CREATE INDEX sessions_expires_idx ON sessions (expires_at_ms);"
          "CREATE TABLE session_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"},
-        // v2 (#2343): keep the stored principal class inside {human, engine} and consistent
-        // with the authentication source. Token sessions (api/mcp/engine tokens) are never
-        // persisted, and every persist_new_session caller hard-codes a local, oidc or saml
-        // auth_source with the default 'human' kind, so no binary writes a row this
-        // constraint rejects; only a hand-edited row can. Such a row is untrusted by
-        // definition and a session is ephemeral, so the DELETE costs that principal one
-        // sign-in. Both statements stay ONE migration (the runner commits each migration as
-        // one transaction), DELETE first, so a retry clears any row an older binary wrote
-        // between attempts before the ALTER validates (same shape as AuditStore v2). Without
-        // the constraint, code that reads the stored kind alone and code that reads
-        // Session::is_engine() could classify one session differently.
-        {2, "DELETE FROM sessions WHERE principal_kind NOT IN ('human', 'engine')"
-            " OR (auth_source = 'engine_token' AND principal_kind <> 'engine');"
+        // v2 (#2343): the stored principal class is exactly one of two pairings: a human
+        // session (any source but engine_token) or an engine session (engine_token). Token
+        // sessions (api/mcp/engine tokens) are never persisted, and every persist_new_session
+        // caller hard-codes a local, oidc or saml auth_source with the default 'human' kind,
+        // so no binary writes a row this constraint rejects; only a hand-edited row can. Such
+        // a row is untrusted by definition and a session is ephemeral, so the DELETE costs
+        // that principal one sign-in; the count is raised as a server-log WARNING (a forced
+        // sign-out leaves a trace). Without the constraint, code that reads the stored kind
+        // alone and code that reads Session::is_engine() could classify one session
+        // differently.
+        // Shape: ONE migration (the runner commits each migration as one transaction),
+        // DELETE first so a retry clears any row an older binary wrote between attempts
+        // before the ALTER validates (same shape as AuditStore v2). The DROP ... IF EXISTS
+        // makes the ADD idempotent against a constraint of the same name applied by hand
+        // (otherwise 42710 would refuse boot on every restart). The write_generation bump is
+        // LAST so the session_meta row lock is taken after the sessions locks (see
+        // session_store_sql_helpers.hpp "take it LAST"; bump first would invite a lock-order
+        // deadlock with a live session writer): a peer replica's validate cache then drops
+        // the deleted rows on its next generation poll instead of serving them until some
+        // unrelated login bumps it. v2 has not shipped, so it is edited in place.
+        {2, "DO $$ DECLARE n bigint; BEGIN"
+            " DELETE FROM sessions WHERE NOT ("
+            "(principal_kind = 'human' AND auth_source <> 'engine_token')"
+            " OR (principal_kind = 'engine' AND auth_source = 'engine_token'));"
+            " GET DIAGNOSTICS n = ROW_COUNT;"
+            " IF n > 0 THEN RAISE WARNING 'session_store v2 (#2343): deleted % inconsistent"
+            " session row(s); each affected principal must sign in again', n; END IF;"
+            " END $$;"
+            "ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_principal_kind_consistent;"
             "ALTER TABLE sessions ADD CONSTRAINT sessions_principal_kind_consistent CHECK ("
-            "principal_kind IN ('human', 'engine')"
-            " AND (auth_source <> 'engine_token' OR principal_kind = 'engine'));"},
+            "(principal_kind = 'human' AND auth_source <> 'engine_token')"
+            " OR (principal_kind = 'engine' AND auth_source = 'engine_token'));"
+            "INSERT INTO session_store.session_meta (key, value) VALUES ('write_generation', '1')"
+            " ON CONFLICT (key) DO UPDATE SET value ="
+            " (session_store.session_meta.value::bigint + 1)::text;"},
     };
     return kMigrations;
 }

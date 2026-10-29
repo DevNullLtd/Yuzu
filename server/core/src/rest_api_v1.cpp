@@ -291,10 +291,9 @@ std::string list_json(std::string_view data_json, int64_t total, int64_t start =
 // session belongs to an engine principal — an engine session must never be
 // able to mint/rotate/revoke/transfer engine-principal identities, even if a
 // future RBAC misconfiguration somehow granted it Security:Write. Keyed on
-// the persisted `principal_kind` FIRST (the durable discriminator, design
-// doc §6), with `auth_source=="engine_token"` as a second belt so a future
-// second engine authentication path cannot silently bypass a string-keyed
-// deny. Returns true (and has already written the 403 A4 body) when the
+// `Session::is_engine()` (the stored `principal_kind` or an `engine_token`
+// authentication source, design doc §6), so a future second engine
+// authentication path cannot silently bypass a string-keyed deny. Returns true (and has already written the 403 A4 body) when the
 // caller must stop; false when the session is human and the route may
 // proceed.
 static bool deny_engine_session(const auth::Session& s, const httplib::Request& req,
@@ -7075,10 +7074,9 @@ void RestApiV1::register_routes(
     // ── Sessions (/api/v1/sessions) ──────────────────────────────────────
     //
     // Two entry points to `AuthManager::invalidate_user_sessions`, which wipes
-    // the in-memory `sessions_` map. (Pre-ADR-0006 this was a dual-write that
-    // also deleted `auth.db` session rows; sessions are now in-memory-ONLY —
-    // there is no durable session table on the Postgres auth store, so a
-    // restart is itself a fleet-wide revocation.):
+    // the in-memory `sessions_` cache and deletes the user's durable rows in
+    // `SessionStore` (HA WS-1/1a); sessions survive a restart, so a restart is
+    // NOT a revocation:
     //   - DELETE /api/v1/sessions?username=<name> — admin force-logout
     //     of another user. Cookie sessions only; API tokens deliberately
     //     left intact (operator might be revoking a leaked cookie while

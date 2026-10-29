@@ -1019,7 +1019,7 @@ yuzu_server_principal_quota_admits_total{side="operator"} 0
 
 All 4 `exhausted_total` series (the closed `side` × `limit` cross-product)
 are pre-seeded to `0` at startup, so `absent()` alerts stay meaningful. The
-gate applies only to `principal_kind=="engine"` sessions (username
+gate applies only to engine-classed sessions (stored `principal_kind` `engine` or an `engine_token` authentication source; username
 `engine:<slug>`) at the server's single pre-routing chokepoint —
 human/agent/anonymous traffic never touches it. `side` distinguishes which
 principal's budget was debited (`engine` is the only value emitted in PR

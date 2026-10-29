@@ -765,7 +765,7 @@ public:
     /// principal" returns false negatives (Gate 4 consistency B3).
     ///
     /// `principal_class_override`: `make_audit_event` re-stamps the class from the
-    /// resolved session's `principal_kind`, so an engine principal audits as "engine"
+    /// resolved session's `Session::is_engine()`, so an engine principal audits as "engine"
     /// rather than the "agent" its bearer-token presentation implies. A caller that
     /// already knows the class (because it captured it while the session was live) must
     /// pass it, or its rows will disagree with the request-time rows for the same actor.
@@ -782,7 +782,7 @@ public:
     /// `audit_log_for_principal` for a SESSION the caller already resolved (#6065 PR-Q,
     /// `RestApiV1::AuditAsSessionFn`): stamps the session's username, the `principal_role`
     /// the caller passes (it captures `effective_role` once per request), and the engine
-    /// class when `session.principal_kind == "engine"`, so a row carries the fields
+    /// class when `session.is_engine()`, so a row carries the fields
     /// `make_audit_event` would have stamped for that session without re-resolving the
     /// request (cookie first, then bearer), which can name a different actor.
     bool audit_log_for_session(const httplib::Request& req, const auth::Session& session,

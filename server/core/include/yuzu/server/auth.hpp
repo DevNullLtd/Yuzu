@@ -226,10 +226,12 @@ struct Session {
     /// True iff this session authenticates as an ADR-0031 engine principal.
     /// The canonical engine-session discriminator (#2343): every decision, gate
     /// and audit-class site on a `Session` uses this, so a session classified as
-    /// an engine by either field is an engine everywhere. Three helpers take
-    /// bare fields instead of a `Session` and so cannot call it
-    /// (`principal_quota_gate.hpp`'s `apply_engine_quota_gate`,
-    /// `same_site_write_policy.hpp`, `web_utils.hpp`).
+    /// an engine by either field is an engine everywhere. One helper takes bare
+    /// fields instead of a `Session` and copies this predicate by hand:
+    /// `principal_quota_gate.hpp`'s `apply_engine_quota_gate`, which must change
+    /// together with it. `same_site_write_policy.hpp` and `web_utils.hpp` also take
+    /// a bare `auth_source`, but they classify the transport (bearer token or
+    /// cookie), not engine-ness.
     [[nodiscard]] bool is_engine() const {
         return principal_kind == "engine" || auth_source == "engine_token";
     }
