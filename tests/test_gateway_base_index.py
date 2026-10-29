@@ -257,6 +257,13 @@ class MainTests(unittest.TestCase):
         self.assertIn("re-run once", err)
         self.assertNotIn("will not help", err)
 
+    def test_a_bad_command_line_is_3_not_the_registry_code(self):
+        for argv in (["--bogus"], ["--dockerfile"], ["--index-file", "a", "b"]):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    mod.main(argv)
+                self.assertEqual(cm.exception.code, 3)
+
     def test_missing_index_file_is_3(self):
         df = self.dir / "Dockerfile"
         df.write_text(self.GOOD, encoding="utf-8")

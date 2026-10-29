@@ -22,9 +22,11 @@
 # entry is on Alpine 3.23 (musl 1.2.5) while every other entry, arm64 included,
 # is on Alpine 3.24 (musl 1.2.6). The runtime stage is alpine:3.23, so an arm64
 # build trips the #2150 abi-guard only after the whole rebar3 build. Moving
-# arm64 to 3.24 is not an option: musl 1.2.6 with OTP < 29.1 aborts beam.smp at
-# boot on AMX CPUs (#1743). The first RUN below therefore refuses any other
-# architecture up front, with the reason.
+# arm64 to 3.24 is not an option either: the abi-guard below bans musl >= 1.2.6
+# with OTP < 29.1 on every architecture, because that pairing aborts beam.smp at
+# boot on AMX CPUs (#1743). AMX is x86-only, so for arm64 this is the
+# builder/runtime lockstep policy, not a measured arm64 fault. The first RUN
+# below therefore refuses any other architecture up front, with the reason.
 #
 # This is a scoping choice, not a ceiling: older erlang:28-alpine indexes exist
 # whose amd64 AND arm64 entries are both on Alpine 3.23 (checked in #6711 for
@@ -32,7 +34,7 @@
 # at the cost of an older OTP patch than the 28.5.0.2 used here. That trade is
 # tracked separately; published gateway images are amd64-only either way.
 #
-# Lift this with that re-pin or with the move to OTP 29.1 or newer. The marker line
+# Lift this with that re-pin or with the move to OTP 29.1 or newer (#6740). The marker line
 # is read by scripts/ci/check-gateway-base-index.py, which fails when the
 # listed platforms are not all annotated, in the pinned index, as built on the
 # runtime stage's Alpine release; add a platform to the marker and to the guard
@@ -49,8 +51,10 @@ ARG TARGETARCH
 RUN case "${TARGETARCH:-amd64}" in amd64) ;; *) \
       echo "FATAL: Dockerfile.gateway supports linux/amd64 only (TARGETARCH=${TARGETARCH})." \
            "Upstream builds this architecture of the pinned erlang:28-alpine on a newer Alpine than the" \
-           "runtime stage, and the newer musl with OTP < 29.1 aborts beam.smp at boot on AMX CPUs (#1743)." \
-           "Build with --platform linux/amd64. See #6711 and docs/operations/troubleshooting.md." \
+           "runtime stage, which the abi-guard (#2150) refuses until the gateway is on OTP 29.1 (#1743)." \
+           "Build with --platform linux/amd64 (on an arm64 host that is emulation, which has crashed in" \
+           "the Erlang deps stage under OrbStack; prefer an amd64 host or CI)." \
+           "See #6711 and docs/operations/troubleshooting.md." \
            "A single-node demo can use deploy/docker/Dockerfile.gateway.chisel (demo variant: no" \
            "gateway-entrypoint.sh, so it cannot resolve its own cluster advertise address; do not use" \
            "it for a scaled or clustered gateway)."; \
