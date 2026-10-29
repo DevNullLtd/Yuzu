@@ -91,8 +91,8 @@ empty detail, so the cell shows no text and reads "(not recorded)"). Its states:
 Past 200 revoke events for one principal the cell adds "(more than 200 revoke events:
 this is the oldest success among the newest 200, not necessarily the original)" after
 the text, or "(more than 200 revoke events and none of the newest 200 succeeded)" after
-"(not recorded)"; the second can be wrong when a committed revoke with an empty detail
-(an MCP revoke given no reason) is inside the window. The full list of what the cell can
+"(not recorded)"; the second can be wrong when the oldest success in the window has an
+empty detail (an MCP revoke given no reason). The full list of what the cell can
 and cannot say is in [upgrading](upgrading.md) ("The Detail cell").
 
 If the list or an engine principal's credentials cannot be read (for example

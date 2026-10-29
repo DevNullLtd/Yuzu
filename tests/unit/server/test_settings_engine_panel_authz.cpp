@@ -1,35 +1,40 @@
 /**
  * @file test_settings_engine_panel_authz.cpp
  * @brief [pg] Settings > Engine Principals panel (`GET /fragments/settings/engine-principals`)
- *        against its REST twin (`GET /api/v1/engine-principals`), both driven through the REAL
+ *        against its REST route (`GET /api/v1/engine-principals`), both driven through the REAL
  *        AuthRoutes gates over a real RbacStore, EnginePrincipalStore, ApiTokenStore and
- *        AuditStore (#5882). The panel applies the same permission test as the twin: it gates on
- *        EnginePrincipal:Read with the quiet probe, the twin with the loud `require_permission`,
+ *        AuditStore (#5882). The panel applies the same permission test as the route: it gates on
+ *        EnginePrincipal:Read with the quiet probe, the route with the loud `require_permission`,
  *        and server.cpp binds exactly these functions. Each difference is stricter, a different
  *        refusal, a different rendering of a store failure, or a different audit record; none
- *        admits a caller the twin refuses. They are SEVEN, numbered here exactly as in the
+ *        admits a caller the route refuses. They are SEVEN, numbered here exactly as in the
  *        handler comment in settings_routes.cpp and listed once, with rationale, in
  *        docs/user-manual/upgrading.md.
  *
  * Classification rule: a status of 401 or 403 is "refused at the gate"; anything else (200, or
- * the twin's 503 for a closed store) is "admitted at the gate". Raw statuses are NOT compared
- * for an admitted caller whose store is unavailable: the twin answers 503 before it reads the
+ * the route's 503 for a closed store) is "admitted at the gate". Raw statuses are NOT compared
+ * for an admitted caller whose store is unavailable: the route answers 503 before it reads the
  * session, the panel answers its in-page "store unavailable" note with 200 (htmx does not swap
  * a 4xx/5xx, so the degraded note must ride a 200). That is difference one, pinned here for a
  * human cookie only. Difference two: an engine session with the store absent gets 403 from the
  * fragment, whose engine-session belt runs after the permission gate and before the store
- * note, but 503 from the twin, whose store check precedes its session read. Difference three
+ * note, but 503 from the route, whose store check precedes its session read. Difference three
  * (owner ruling, 2026-10-29): the panel refuses an MCP-tier token (403, audited as
  * `mcp_session_denied`, like the Access tokens panel and the pre-#5882 administrator gate,
- * #520) where the twin admits an administrator's MCP token on its creator's authority.
+ * #520) where the route admits an administrator's MCP token on its creator's authority.
  * `expect_same`'s `mcp_panel_refuses` argument names it at every call site that meets it.
- * Differences four and five (a credential count or the roster that cannot be read) are render
- * cases: the render is pinned in test_engine_principal_lifecycle.cpp and the audit rows
- * (roster unreadable writes none, credential unreadable still writes the count=N success row)
- * by the "engine panel audit" cases here. Difference six (the revoke Detail needs
- * AuditLog:Read, the twin returns no audit text) and difference seven (a refused cookie
- * session writes no denial row on the panel, a token lacking AuditLog:Read writes one extra on
- * a view that lists a revoked principal) are pinned by the "engine panel audit" cases.
+ * Difference four, in two cases ((a) a credential count that cannot be read; (b) no token store
+ * wired, a test or embedding seam, which renders as (a) with a Retry that cannot help while the
+ * route answers 200 with every count 0) and difference five (the roster that cannot be read)
+ * are render cases: the render is pinned in test_engine_principal_lifecycle.cpp and the audit
+ * rows (roster unreadable writes none, credential unreadable still writes the count=N success
+ * row) by the "engine panel audit" cases here. Difference six (the revoke Detail needs
+ * AuditLog:Read, the route returns no audit text; separately, a revoked row also shows
+ * revoked_at and superseded_by, which the list route omits and GET /{id} returns under the same
+ * permission) and difference seven (a refused cookie session writes no denial row on the panel,
+ * a token lacking AuditLog:Read writes one extra on a view that lists a revoked principal) are
+ * pinned by the "engine panel audit" cases, except the revoked_at and superseded_by clause of
+ * six, which no case here asserts.
  *
  * Personas, each with RBAC off and on: an account administrator WITHOUT the grant; a
  * non-administrator WITH EnginePrincipal:Read (Viewer); an account administrator holding the
@@ -37,7 +42,7 @@
  * unauthenticated caller; a JIT-elevated user; a service-scoped token.
  *
  * Audit: a refused interactive cookie session leaves no auth.permission_required row on the
- * panel (it auto-loads) but does on the twin; a refused token keeps its row on both.
+ * panel (it auto-loads) but does on the route; a refused token keeps its row on both.
  *
  * Needs YUZU_TEST_POSTGRES_DSN (SKIPs without it); run serially.
  */

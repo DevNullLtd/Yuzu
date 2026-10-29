@@ -325,7 +325,7 @@ admitted; the floor never overrides a live RBAC grant.)
 | `ServerConfig:Read` (#4028) | Server runtime-configuration read-twins — `GET /api/v1/settings/server-config`, `/settings/gateway`, `/settings/mcp` and `/settings/data-retention` |
 | `AnalyticsConfig:Read` (#4028) | Analytics/offload configuration status, `GET /api/v1/settings/analytics` |
 | `Forensics:Read` | Windows forensic-artefact and per-device application-usage reads (Wave 7 PR7.2), per-app privacy-permission grants and per-account SSH access (`remote_access_audit`); also the stored responses of those Forensics-tier plugins on every response read path (REST, MCP, dashboard), which are served only to a caller holding it |
-| `AuditLog:Read` (#5771) | The audit trail itself (SOC 2 CC6.1/CC7.2 evidence): `GET /api/audit`, `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, `GET /api/v1/engine-principals/audit/no-admin`, the `query_audit_log` and `audit_engine_no_admin` MCP tools, and the `yuzu://audit/recent` MCP resource; and the dashboard views that quote the audit trail's text, including the revoke Detail of the Settings **Engine Principals** panel, the revocation detail of the Access **Tokens and principals** page, the Access audit log and sample fragments (`/fragments/access/audit/log`, `/fragments/access/audit/sample`) and the Dashboard activity panel (`/fragments/dashboard/activity`) |
+| `AuditLog:Read` (#5771) | The audit trail itself (SOC 2 CC6.1/CC7.2 evidence): `GET /api/audit`, `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, `GET /api/v1/engine-principals/audit/no-admin`, the `query_audit_log` and `audit_engine_no_admin` MCP tools, and the `yuzu://audit/recent` MCP resource; and the dashboard views that quote the audit trail's text, including the revoke Detail of the Settings **Engine Principals** panel, the revocation detail of the Access **Tokens and principals** page, the Access audit log and sample fragments (`/fragments/access/audit/log`, `/fragments/access/audit/sample`) and the Dashboard activity panel (`/fragments/dashboard/activity`, which first requires the Administrator account role and then the grant) |
 
 **Why this exists.** With RBAC **disabled**, the legacy fallback described
 above allows any authenticated non-engine session to perform every `Read` —
@@ -565,10 +565,9 @@ Settings uses, so the two stay equivalent.
      enforcement on, the `Administrator` grants joined to the active local accounts (RBAC and
      authentication tables together), or, with enforcement off, the active local administrator
      accounts only, with no grant read. So an outage of either store produces it in either
-     regime. Check
-     the pool alerts first (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`; `/readyz` stays
-     green under pure pool saturation), then the `YuzuRbacReadDegraded` alert and
-     `yuzu_server_rbac_read_degrade_total`. The hint's own reads (the grants, the regime check
+     regime. Check the pool alerts first (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`;
+     `/readyz` stays green under pure pool saturation), then the `YuzuRbacReadDegraded`
+     alert and `yuzu_server_rbac_read_degrade_total`. The hint's own reads (the grants, the regime check
      and the account read) log no warning and may not move that counter, so a flat counter and
      a quiet log do not mean the stores are healthy; only other reads that coincide with the
      outage, such as `RbacStore` warnings from unrelated requests, warn.

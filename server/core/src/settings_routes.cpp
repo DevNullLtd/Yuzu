@@ -982,14 +982,16 @@ std::string SettingsRoutes::render_engine_principals_fragment(
             // The row is selected by `committed_revoke_detail`, the Access
             // tokens panel's own rule (the OLDEST success in the bounded read): a
             // later FAILED attempt writes the same action with a store error string
-            // as its detail, and a retried revoke writes a newer success row
-            // `credentials_revoked=0`; neither is chosen while an older success
-            // survives. The cell is labelled "earliest retained record" because
+            // as its detail, and a retried revoke writes a newer success row (through
+            // the REST route its detail is `credentials_revoked=0`, with
+            // `; superseded_by=X` appended when the retry names a successor; through
+            // the MCP tool it is the retry's own typed reason); neither is chosen
+            // while an older success survives. The cell is labelled "earliest retained record" because
             // the read cannot say it is THE revocation's record, and it is not when
             // (1) audit retention pruned the revoking row but a later retry survives,
             // (2) the revoke committed but its success row failed to persist (the
-            // route answers 503), so a later retry of the same revoke, which writes
-            // `credentials_revoked=0`, is the first success row, or (3) an MCP revoke
+            // route answers 503), so a later retry of the same revoke (text of the
+            // kind just described) is the first success row, or (3) an MCP revoke
             // given no reason wrote an empty detail, which reads "(not recorded)".
             // Best-effort evidence; the facts beside it come from the principal
             // store. It is the audit trail's text, so it is shown only to a caller
@@ -1178,8 +1180,10 @@ std::string SettingsRoutes::render_engine_principals_fragment(
     }
 
     html += "  </tbody></table>";
-    // Only with rows: an empty roster has no row hint to point at it, and for a store that was
-    // never wired a retry cannot help.
+    // Only with rows: an empty roster has no row hint to point at it. With no token store wired
+    // `credentials_unreadable` is true from the start, so a roster with rows DOES draw the Retry
+    // (a Retry cannot fix an unwired server; that is a test or embedding seam), and an empty one
+    // does not.
     if (credentials_unreadable && !principals.empty())
         html += "<p>" + std::string(kEngineRetryControl) + "</p>";
 
@@ -2950,8 +2954,9 @@ void SettingsRoutes::register_routes(
     //  4. credential counts, in two cases: (a) a count that cannot be read renders
     //     "unavailable" on a 200 (no Mint or Rotate) and still writes the success row, where
     //     the route answers 503 with a failure row; (b) with no token store wired (not a
-    //     production configuration) the panel renders as in (a), with a Retry that cannot
-    //     help, while the route answers 200 with every count 0 and its success row;
+    //     production configuration) the panel renders as in (a), with a Retry (drawn when the
+    //     roster has rows) that cannot help, while the route answers 200 with every count 0
+    //     and its success row;
     //  5. an unreadable roster renders a note with Retry on a 200 and writes no row; the
     //     route answers 503 with a failure row;
     //  6. the revoke Detail cell shows the audit trail's text, so it needs AuditLog:Read
