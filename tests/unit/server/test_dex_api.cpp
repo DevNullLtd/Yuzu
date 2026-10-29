@@ -41,6 +41,7 @@
 #include <string>
 #include <vector>
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 using yuzu::server::build_dex_device_score_model;
@@ -49,6 +50,7 @@ using yuzu::server::GuaranteedStateEventRow;
 using yuzu::server::GuaranteedStateStore;
 using yuzu::server::make_local_dex_api;
 using yuzu::server::pg::PgPool;
+using Catch::Approx;
 
 namespace {
 
@@ -1153,4 +1155,164 @@ TEST_CASE("DexApi: apps read over its concurrency budget is refused as a degrade
     store.set_apps_read_budget_for_test(1);
     CHECK_FALSE(api->apps("7d").degraded);
     CHECK_FALSE(api->apps("7d").degraded);
+}
+
+// -- AP-2.17 model parameters --------------------------------------------------
+
+// The per-device event cap reaches the store per application: capme.exe has 7 crashes on
+// a1 and 1 on a2 (both in fleet20's online set, so the affected devices are all online and
+// the score is published). The crashes deduction is 20 * capped / (20 * cap) and the hangs
+// deduction 8 * capped / (20 * cap). Hangs above the cap and a second version of capme.exe
+// (and of the unaffected app.exe) cover the per-version caps and the once-per-application
+// cap: capped events are summed per device and version for a version row, and per device
+// across versions for the application row.
+TEST_CASE("DexApi: a per-application event cap override reaches the store", "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    int n = 0;
+    auto id = [&] { return "cap" + std::to_string(++n); };
+    for (int i = 0; i < 7; ++i)
+        seed_obs_v(store, id(), "a1", "capme.exe", "process.crashed", "1.0", kTs);
+    seed_obs_v(store, id(), "a2", "capme.exe", "process.crashed", "1.0", kTs);
+    // The store keeps a subject's bytes, so this is its own row; the policy still folds
+    // its name to capme.exe.
+    for (int i = 0; i < 3; ++i)
+        seed_obs_v(store, id(), "a3", "CapMe.EXE", "process.crashed", "1.0", kTs);
+    // Hangs, and a second version. Per (version, device) crash/hang counts for capme.exe:
+    //   1.0: a1 7/6, a2 1/1, a4 3/3        2.0: a1 4/4, a4 3/3
+    // a4 stays under cap 5 in each version but sums to 6 across them; CapMe.EXE: a3 3/4.
+    const auto seed_n = [&](const char* agent, const char* app, const char* type, const char* ver,
+                            int count) {
+        for (int i = 0; i < count; ++i)
+            seed_obs_v(store, id(), agent, app, type, ver, kTs);
+    };
+    seed_n("a1", "capme.exe", "process.hung", "1.0", 6);
+    seed_n("a2", "capme.exe", "process.hung", "1.0", 1);
+    seed_n("a4", "capme.exe", "process.crashed", "1.0", 3);
+    seed_n("a4", "capme.exe", "process.hung", "1.0", 3);
+    seed_n("a1", "capme.exe", "process.crashed", "2.0", 4);
+    seed_n("a1", "capme.exe", "process.hung", "2.0", 4);
+    seed_n("a4", "capme.exe", "process.crashed", "2.0", 3);
+    seed_n("a4", "capme.exe", "process.hung", "2.0", 3);
+    seed_n("a3", "CapMe.EXE", "process.hung", "1.0", 4);
+    // A subject that differs from the override key "capmi.exe" only by a non-ASCII byte pair
+    // (U+0130): a locale-aware lower() can fold it to ASCII "i", the ASCII-only fold must not.
+    seed_n("a3", "CAPM\xC4\xB0.EXE", "process.crashed", "1.0", 4);
+    // The unaffected control: a2 hangs 3 on each of app.exe's two versions (6 across them).
+    seed_n("a2", "app.exe", "process.hung", "1.0.0.0", 3);
+    seed_n("a2", "app.exe", "process.hung", "2.0.0.0", 3);
+    using yuzu::server::DexAppsModel;
+    using yuzu::server::DexPolicyInForce;
+    using yuzu::server::DexPolicyProfile;
+
+    const auto apps_under = [&](const std::string& doc) {
+        auto fn = [doc]() -> std::expected<DexPolicyInForce, std::string> {
+            return yuzu::server::dex_policy_in_force_from_stored(doc);
+        };
+        return make_local_dex_api(&store, fleet20, fn)->apps("7d");
+    };
+    const auto row = [](const DexAppsModel& m, const std::string& subject) -> decltype(m.apps.front()) {
+        const auto it = std::find_if(m.apps.begin(), m.apps.end(),
+                                     [&](const auto& a) { return a.subject == subject; });
+        REQUIRE(it != m.apps.end());
+        return *it;
+    };
+    const auto crashes_points = [](const auto& a) {
+        REQUIRE(a.figures.score.score.has_value());
+        return a.figures.score.deductions[1].points;
+    };
+    const auto hangs_points = [](const auto& a) {
+        REQUIRE(a.figures.score.score.has_value());
+        return a.figures.score.deductions[2].points;
+    };
+    const auto version_of = [](const auto& a, const std::string& v) -> const auto& {
+        const auto it = std::find_if(a.versions.begin(), a.versions.end(),
+                                     [&](const auto& x) { return x.version == v; });
+        REQUIRE(it != a.versions.end());
+        return *it;
+    };
+
+    // Default policy (cap 5). capme.exe application row: a1 5, a2 1, a4 min(6, 5) = 5 capped
+    // crashes (11) and, the same, 11 capped hangs; 1.0 row 5+1+3 = 9, 2.0 row 4+3 = 7 (both
+    // kinds). The unfolded subject: 3 crashes, 4 hangs.
+    const auto base = make_local_dex_api(&store, fleet20)->apps("7d");
+    REQUIRE_FALSE(base.degraded);
+    CHECK(crashes_points(row(base, "capme.exe")) == Approx(20.0 * 11 / (20 * 5)));
+    CHECK(hangs_points(row(base, "capme.exe")) == Approx(8.0 * 11 / (20 * 5)));
+    CHECK(crashes_points(version_of(row(base, "capme.exe"), "1.0.0.0")) == Approx(20.0 * 9 / (20 * 5)));
+    CHECK(hangs_points(version_of(row(base, "capme.exe"), "1.0.0.0")) == Approx(8.0 * 9 / (20 * 5)));
+    CHECK(crashes_points(version_of(row(base, "capme.exe"), "2.0.0.0")) == Approx(20.0 * 7 / (20 * 5)));
+    CHECK(hangs_points(version_of(row(base, "capme.exe"), "2.0.0.0")) == Approx(8.0 * 7 / (20 * 5)));
+    CHECK(crashes_points(row(base, "CapMe.EXE")) == Approx(20.0 * 3 / (20 * 5)));
+    CHECK(hangs_points(row(base, "CapMe.EXE")) == Approx(8.0 * 4 / (20 * 5)));
+    // app.exe hangs: 1.0.0.0 a1 1 + a2 3 = 4, 2.0.0.0 a2 3, application a1 1 + a2 min(6, 5) = 6.
+    CHECK(hangs_points(row(base, "app.exe")) == Approx(8.0 * 6 / (20 * 5)));
+    CHECK(hangs_points(version_of(row(base, "app.exe"), "1.0.0.0")) == Approx(8.0 * 4 / (20 * 5)));
+    CHECK(hangs_points(version_of(row(base, "app.exe"), "2.0.0.0")) == Approx(8.0 * 3 / (20 * 5)));
+    CHECK(row(base, "capme.exe").profile == DexPolicyProfile::Default);
+    const double app_exe_base = crashes_points(row(base, "app.exe"));
+
+    // An override for capme.exe (cap 2): the application row a1 2, a2 1, a4 2 = 5 (a4's two
+    // versions are capped once, not 2 + 2); 1.0 row 2+1+2 = 5, 2.0 row 2+2 = 4, for both kinds.
+    const auto over = apps_under(
+        R"({"version":2,"overrides":[{"image":"capme.exe","model":{"per_device_event_cap":2}}]})");
+    REQUIRE_FALSE(over.degraded);
+    CHECK(over.policy.fault.empty());
+    CHECK(crashes_points(row(over, "capme.exe")) == Approx(20.0 * 5 / (20 * 2)));
+    CHECK(hangs_points(row(over, "capme.exe")) == Approx(8.0 * 5 / (20 * 2)));
+    CHECK(crashes_points(version_of(row(over, "capme.exe"), "1.0.0.0")) == Approx(20.0 * 5 / (20 * 2)));
+    CHECK(hangs_points(version_of(row(over, "capme.exe"), "1.0.0.0")) == Approx(8.0 * 5 / (20 * 2)));
+    CHECK(crashes_points(version_of(row(over, "capme.exe"), "2.0.0.0")) == Approx(20.0 * 4 / (20 * 2)));
+    CHECK(hangs_points(version_of(row(over, "capme.exe"), "2.0.0.0")) == Approx(8.0 * 4 / (20 * 2)));
+    CHECK(row(over, "capme.exe").profile == DexPolicyProfile::Override);
+    // The ASCII fold in SQL and in the resolver agree: the unfolded subject gets the override too.
+    CHECK(crashes_points(row(over, "CapMe.EXE")) == Approx(20.0 * 2 / (20 * 2)));
+    CHECK(hangs_points(row(over, "CapMe.EXE")) == Approx(8.0 * 2 / (20 * 2)));
+    CHECK(row(over, "CapMe.EXE").profile == DexPolicyProfile::Override);
+    // Sibling of the ASCII fold: a non-ASCII-different subject neither matches nor gets the
+    // override (a lower()-based join would give it cap 2).
+    const auto ovi = apps_under(
+        R"({"version":2,"overrides":[{"image":"capmi.exe","model":{"per_device_event_cap":2}}]})");
+    REQUIRE_FALSE(ovi.degraded);
+    CHECK(row(ovi, "CAPM\xC4\xB0.EXE").profile == DexPolicyProfile::Default);
+    CHECK(crashes_points(row(ovi, "CAPM\xC4\xB0.EXE")) == Approx(20.0 * 4 / (20 * 5)));
+    // Other applications keep the global cap.
+    CHECK(crashes_points(row(over, "app.exe")) == Approx(app_exe_base));
+    CHECK(hangs_points(row(over, "app.exe")) == Approx(8.0 * 6 / (20 * 5)));
+    CHECK(hangs_points(version_of(row(over, "app.exe"), "1.0.0.0")) == Approx(8.0 * 4 / (20 * 5)));
+    CHECK(hangs_points(version_of(row(over, "app.exe"), "2.0.0.0")) == Approx(8.0 * 3 / (20 * 5)));
+    CHECK(row(over, "app.exe").profile == DexPolicyProfile::Default);
+
+    // A global cap of 1 with no override: application row 1+1+1 = 3, 1.0 row 3, 2.0 row 2.
+    const auto glob = apps_under(R"({"version":2,"model":{"per_device_event_cap":1}})");
+    REQUIRE_FALSE(glob.degraded);
+    CHECK(crashes_points(row(glob, "capme.exe")) == Approx(20.0 * 3 / (20 * 1)));
+    CHECK(hangs_points(row(glob, "capme.exe")) == Approx(8.0 * 3 / (20 * 1)));
+    CHECK(crashes_points(version_of(row(glob, "capme.exe"), "1.0.0.0")) == Approx(20.0 * 3 / (20 * 1)));
+    CHECK(hangs_points(version_of(row(glob, "capme.exe"), "1.0.0.0")) == Approx(8.0 * 3 / (20 * 1)));
+    CHECK(crashes_points(version_of(row(glob, "capme.exe"), "2.0.0.0")) == Approx(20.0 * 2 / (20 * 1)));
+    CHECK(hangs_points(version_of(row(glob, "capme.exe"), "2.0.0.0")) == Approx(8.0 * 2 / (20 * 1)));
+    CHECK(row(glob, "capme.exe").profile == DexPolicyProfile::Default);
+    // app.exe hangs at cap 1: 1.0.0.0 a1 1 + a2 1 = 2, 2.0.0.0 a2 1, application a1 1 + a2 1 = 2.
+    CHECK(hangs_points(row(glob, "app.exe")) == Approx(8.0 * 2 / (20 * 1)));
+    CHECK(hangs_points(version_of(row(glob, "app.exe"), "1.0.0.0")) == Approx(8.0 * 2 / (20 * 1)));
+    CHECK(hangs_points(version_of(row(glob, "app.exe"), "2.0.0.0")) == Approx(8.0 * 1 / (20 * 1)));
+
+    // A global cap of 1 with an override of 3: capme.exe takes the override (application row
+    // 3+1+3 = 7, 1.0 row 7, 2.0 row 3+3 = 6, both kinds), app.exe keeps the global 1.
+    const auto mixed = apps_under(
+        R"({"version":2,"model":{"per_device_event_cap":1},)"
+        R"("overrides":[{"image":"capme.exe","model":{"per_device_event_cap":3}}]})");
+    REQUIRE_FALSE(mixed.degraded);
+    CHECK(crashes_points(row(mixed, "capme.exe")) == Approx(20.0 * 7 / (20 * 3)));
+    CHECK(hangs_points(row(mixed, "capme.exe")) == Approx(8.0 * 7 / (20 * 3)));
+    CHECK(crashes_points(version_of(row(mixed, "capme.exe"), "1.0.0.0")) == Approx(20.0 * 7 / (20 * 3)));
+    CHECK(hangs_points(version_of(row(mixed, "capme.exe"), "1.0.0.0")) == Approx(8.0 * 7 / (20 * 3)));
+    CHECK(crashes_points(version_of(row(mixed, "capme.exe"), "2.0.0.0")) == Approx(20.0 * 6 / (20 * 3)));
+    CHECK(hangs_points(version_of(row(mixed, "capme.exe"), "2.0.0.0")) == Approx(8.0 * 6 / (20 * 3)));
+    CHECK(hangs_points(row(mixed, "CapMe.EXE")) == Approx(8.0 * 3 / (20 * 3)));
+    CHECK(hangs_points(row(mixed, "app.exe")) == Approx(8.0 * 2 / (20 * 1)));
 }
