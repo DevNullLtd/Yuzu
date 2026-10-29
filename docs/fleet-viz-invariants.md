@@ -264,7 +264,8 @@ Standing rules:
 - **Socket primitives.** `SphereGeometry(SOCKET_DOT_RADIUS, 10, 8)` on a
   ring of radius `CUBE_SIZE * 0.32` on the cube top face; port label
   Sprite floats `0.55` units above each sphere. Listener sphere and
-  `:port` label colour is coral (`0xff6b7a`, the `--c4` chart token) —
+  `:port` label colour is coral (`0xff6b7a`; the label text reads the `--c4` chart token, the
+  sphere material is fixed) —
   the one chart colour no process category or OS cube uses, so
   operators see them as "ports" not "processes" or "machines".
 - **Cross-machine edges.** ESTABLISHED-state `connections` outbound
