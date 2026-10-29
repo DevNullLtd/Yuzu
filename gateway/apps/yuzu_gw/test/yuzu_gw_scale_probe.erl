@@ -474,9 +474,15 @@ linux_sockets(Ports) ->
 %% @doc The kernel's per-connection memory beyond the socket buffers: slab.
 %% Read from /proc/slabinfo (root only on most hosts, so `sudo -n cat' is
 %% tried when the plain read is refused; with neither, only the socket
-%% buffers are reported and `slab_source' says so). Each cache's memory is
-%% num_slabs * pagesperslab * page size (what the cache holds, slack
-%% included). The caches a connection touches, in four groups:
+%% buffers are reported and `slab_source' says so). A group's figure is
+%% active_objs * objsize summed over its caches: the objects in use. The
+%% pages a cache holds (num_slabs * pagesperslab * page size) are not used for
+%% the groups, because a cache with free space in its existing slabs absorbs
+%% new objects without new pages, so the page count follows the host's
+%% history more than the connections (at 200 kTLS connections on rocky9 the
+%% kmalloc pages grew 0.5 KB per connection for about 4 KB of objects); at
+%% thousands of connections the two converge. `slab_total' is every cache's
+%% pages, kept for reference. The caches a connection touches, in four groups:
 %%
 %%   slab_pair      one object per socket at EACH end of a connection: TCP,
 %%                  TCPv6, sock_inode_cache, filp, dentry, eventpoll_epi,
@@ -503,7 +509,7 @@ linux_sockets(Ports) ->
 kernel_memory(Allocated, HostTcp) ->
     case slabinfo() of
         {Source, Rows} ->
-            G = fun(Pred) -> lists:sum([B || {Name, B} <- Rows, Pred(Name)]) end,
+            G = fun(Pred) -> lists:sum([B || {Name, B, _} <- Rows, Pred(Name)]) end,
             Pair = G(fun(N) -> lists:member(N, ["TCP", "TCPv6", "sock_inode_cache", "filp",
                                                 "dentry", "eventpoll_epi", "eventpoll_pwq",
                                                 "lsm_inode_cache", "lsm_file_cache"]) end),
@@ -514,7 +520,7 @@ kernel_memory(Allocated, HostTcp) ->
                                   orelse lists:member(N, ["tcp_bind_bucket", "inet_peer_cache"]) end),
             HostTcpB = case HostTcp of null -> 0; _ -> HostTcp end,
             #{slab_source => Source, slab_pair => Pair, slab_kmalloc => Kmalloc,
-              slab_conntrack => Ct, slab_net => Net, slab_total => G(fun(_) -> true end),
+              slab_conntrack => Ct, slab_net => Net, slab_total => lists:sum([P || {_, _, P} <- Rows]),
               kernel => Pair div 2 + Kmalloc + Ct + Net + Allocated,
               kernel_host => Pair + Kmalloc + Ct + Net + HostTcpB};
         none ->
@@ -534,10 +540,13 @@ slabinfo() ->
         none -> none;
         {Src, T1} ->
             Page = page_size(),
-            {Src, [{Name, NumSlabs * PagesPerSlab * Page}
+            %% {Name, objects in use (bytes), pages held (bytes)}
+            {Src, [{Name, Active * Size, NumSlabs * PagesPerSlab * Page}
                    || L <- string:split(T1, "\n", all),
-                      [Name, _Active, _Num, _Size, _PerSlab, PPS | Rest] <- [string:lexemes(L, " ")],
+                      [Name, A, _Num, Sz, _PerSlab, PPS | Rest] <- [string:lexemes(L, " ")],
                       hd(Name) =/= $#, Name =/= "slabinfo",
+                      {Active, []} <- [string:to_integer(A)],
+                      {Size, []} <- [string:to_integer(Sz)],
                       {PagesPerSlab, []} <- [string:to_integer(PPS)],
                       ["slabdata", _ActiveSlabs, NS | _] <- [lists:dropwhile(fun(X) -> X =/= "slabdata" end, Rest)],
                       {NumSlabs, []} <- [string:to_integer(NS)]]}
