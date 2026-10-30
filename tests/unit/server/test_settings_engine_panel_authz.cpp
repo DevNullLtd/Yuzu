@@ -739,16 +739,23 @@ TEST_CASE("engine panel authz: the panel's own belt 403s (engine session, MCP-ti
     r.rbac_on();
     r.grant("root", "Administrator");
 
+    // The recorded denial names the arm that refused, so each 403 below is proven to come from the
+    // belt arm its test line names and not from the permission gate (which writes its own row).
     const auto engine = r.bearer_get(kFragment, r.token("engine-bearer", kSlug, "readonly", "engine"));
     REQUIRE(engine);
     CHECK(engine->status == 403);
     CHECK(engine->get_header_value("Cache-Control") == "no-store");
+    CHECK(r.fragment_audits ==
+          std::vector<std::string>{"engine_principal.list/denied/engine_session_denied"});
 
     // An administrator's MCP-tier token clears the permission gate and reaches the MCP arm.
+    r.clear_audits();
     const auto mcp = r.bearer_get(kFragment, r.token("root-mcp", "root"));
     REQUIRE(mcp);
     CHECK(mcp->status == 403);
     CHECK(mcp->get_header_value("Cache-Control") == "no-store");
+    CHECK(r.fragment_audits ==
+          std::vector<std::string>{"engine_principal.list/denied/mcp_session_denied"});
 }
 
 // ---- revoke detail (sec-1) and the success audit row (sec-2): the CH-3 matrix ---------------
