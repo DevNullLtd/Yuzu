@@ -559,7 +559,8 @@ outside this rule; this ADR adds none of it.
 - **No parsing.**
   - `status_tags_pb` is `bytes` (D2), never decoded.
   - `TopologyDigest` is passed through as a field of the heartbeat it already decodes, never read.
-  - `ReportTopology` is forwarded as received (D7).
+  - `ReportTopology` is decoded and re-encoded by the gateway without being interpreted (D7: the
+    `report_inventory/2` pattern receives a decoded map), so its `digest` is `bytes` too.
 - **No new per-agent state.** Resync is a server-to-agent command on the existing command path
   (D8). The gateway holds no resync bits and no per-agent tag or digest state. There are no new
   `BatchHeartbeatResponse` fields.
@@ -831,7 +832,7 @@ rpc ReportTopology(TopologyReport) returns (TopologyAck);
 message TopologyReport {
   string session_id = 1;
   yuzu.common.v1.Timestamp sent_at = 2;
-  string digest = 3;                // must equal the body's content_digest
+  bytes digest = 3;                 // ASCII "v1:" + 32 lowercase hex; must equal the body's content_digest
   bytes fleet_snapshot_json = 4;    // fleet_snapshot.v1, <= 2 MiB
   TopologyReportReason reason = 5;  // CHANGED | REFRESH | STARTUP | RESYNC
 }
