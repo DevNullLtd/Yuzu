@@ -1801,7 +1801,8 @@ It should say:
   does not reach them. Their heartbeats are counted `absent` on `yuzu_server_heartbeat_tags_total`;
   they are sent no `__resync__` and do not move the divergence alert;
 - how to verify the rollout and find stragglers: `yuzu_server_agents_tags_absent` (D13) falls to 0
-  when the last agent is upgraded, and `YuzuAgentsTagsAbsent` raises a ticket while it stays above 0;
+  when the last agent is upgraded, and `YuzuAgentsTagsAbsent` raises a ticket once it has stayed
+  above 0 for 24 h (D13), which a rollout staged over more than a day is expected to trigger;
   the rate of `yuzu_server_heartbeat_tags_total{outcome="absent"}` falls with it; MCP `list_agents`
   lists each connected agent with the version it registered with, which is the straggler list.
   `yuzu_fleet_agents_by_version` cannot list them, because it is built from status tags;
