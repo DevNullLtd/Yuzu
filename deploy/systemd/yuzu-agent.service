@@ -45,7 +45,8 @@ EnvironmentFile=-/etc/yuzu-agent/yuzu-agent.env
 #    the firmware tables are root-only; root just reads, and every write into the
 #    agent-writable state directory is done by the helper as the service account.
 # A leading '-' makes a failed step non-fatal: the agent still starts, without a
-# snapshot. The helper is installed by the .deb and .rpm; a unit copied without it
+# snapshot. It does not absorb a step that runs past TimeoutStartSec, which fails the
+# start. The helper is installed by the .deb and .rpm; a unit copied without it
 # simply gets no snapshot, for the same reason. The unit is designed for systemd 239
 # and later; 239 is untested.
 ExecStartPre=-/bin/rm -rf /var/lib/yuzu-agent/dmi /var/lib/yuzu-agent/dmi.tmp

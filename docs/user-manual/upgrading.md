@@ -6,13 +6,17 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **What changed.** The `.deb` and `.rpm` agent's systemd unit now grants the agent one Linux capability, `CAP_DAC_READ_SEARCH`, as an ambient capability. The capability bounding set is that one capability, and `NoNewPrivileges=true` is kept. Before, a packaged agent ran with no capabilities, so the system serial number and UUID (root-only `0400` files under `/sys/class/dmi/id`) read back as `unknown`.
 
-**What you will see after the upgrade.**
+**What you will see once the upgraded agent has restarted.**
 
 - The hardware plugin's `system` action returns the serial and UUID instead of `unknown`.
 - `mgmt_posture` now reads `/etc/sssd/sssd.conf` and `remote_access_audit` now opens users' `authorized_keys`. Both previously answered `PERMISSION_DENIED` or `unknown` on a packaged agent, and now return data.
 - At every start the unit copies the firmware tables (`DMI` and `smbios_entry_point`) into `/var/lib/yuzu-agent/dmi/` (directory `0700`, files `0600`, owned by the agent account). It is removed and rebuilt each start, and absent when the host has no DMI or the copy fails. No plugin reads this copy yet.
 
-**Disclosure: what the capability allows.** Every plugin runs inside the agent process, so every plugin on a packaged Linux agent can now read any file on the host, read-only. That includes `/etc/shadow`, `/etc/sssd/sssd.conf` (and any bind credential in it) and users' `authorized_keys`. It does not allow writing, and it does not allow anything else: no other capability is granted. Scripts and helper programs the agent starts do not get it: the agent clears its inheritable and ambient capability sets at start, so after exec an ordinary child (non-root, no file capabilities) has no capabilities. The exceptions are a host binary that carries its own file capabilities (it keeps them) and the short window between fork and exec, when the child is still agent code. Setuid-root programs cannot elevate under `NoNewPrivileges`.
+**Upgrade and rollback.** The grant takes effect when the agent restarts. The `.rpm` restarts the agent on upgrade. The `.deb` only reloads systemd and enables the unit, so run `systemctl restart yuzu-agent` (or reboot) to apply it. Drop-ins under `/etc/systemd/system/yuzu-agent.service.d/` survive a package upgrade. Downgrading to a build without the grant removes the capability but leaves `/var/lib/yuzu-agent/dmi/` on disk (the older unit does not remove it); delete that directory by hand.
+
+**Disclosure: what the capability allows.** Every plugin runs inside the agent process, so every plugin on a packaged Linux agent can now read any file on the host, read-only. That includes `/etc/shadow`, `/etc/sssd/sssd.conf` (and any bind credential in it) and users' `authorized_keys`. It does not allow writing, and it does not allow anything else: no other capability is granted. Scripts and helper programs the agent starts do not get it: the agent clears its inheritable and ambient capability sets at start, so after exec an ordinary child (non-root, no file capabilities) has no capabilities. The exceptions are a host binary that carries file capabilities (it can gain at most this one capability, because the bounding set allows no other), the short window between fork and exec, when the child is still agent code, and a descriptor a plugin leaves open: a plugin that opens a root-only file without close-on-exec and then starts a child with `popen` or `system` hands the child that open descriptor, and the child can read the file through it. The agent's own subprocess runner marks every inherited descriptor close-on-exec, and a plugin must open such files close-on-exec. Setuid-root programs cannot elevate under `NoNewPrivileges`.
+
+**If the agent refuses to start.** On every Linux launch, packaged or not, the agent first clears its inheritable and ambient capabilities and does not run if it cannot. It prints `yuzu-agent: cannot clear inheritable/ambient capabilities; refusing to start` to stderr (the journal, under systemd) and exits with a failure. A seccomp profile or `SystemCallFilter=` that denies `capget`, `capset` or `prctl` causes this; allow those three calls for the agent.
 
 **Verify.**
 
@@ -31,7 +35,7 @@ On the agent's main process `CapEff`, `CapPrm` and `CapBnd` read `00000000000000
    AmbientCapabilities=
    ```
 
-2. *Capability and hardware-table copy.* Also disables the root helper and removes the existing copy at the next start.
+2. *Capability and hardware-table copy.* Also disables the root helper and removes the existing copy at the next start. Once the agent has restarted, `test ! -e /var/lib/yuzu-agent/dmi` succeeds.
 
    ```ini
    [Service]
@@ -40,9 +44,11 @@ On the agent's main process `CapEff`, `CapPrm` and `CapBnd` read `00000000000000
    ExecStartPre=-/bin/rm -rf /var/lib/yuzu-agent/dmi /var/lib/yuzu-agent/dmi.tmp
    ```
 
-With the capability removed, serial and UUID read `unknown` again and the two plugins above return to their refusal answers.
+With the capability removed, serial and UUID read `unknown` again and the two plugins above return to their refusal answers. If your policy forbids ambient capabilities, or you want SELinux or AppArmor alone to decide what the agent can read, use choice 1 or 2.
 
-**Tested and untested.** A check of the live unit's capability sets and the copy behaviour is part of CI on a self-hosted Linux runner. It has been run on a Linux host under systemd 259 as root. Real firmware tables and the CI-job form are untested until the first CI run on that runner, and systemd 239 (RHEL 8) is designed for but untested.
+**Existing capability drop-ins.** The unit's capability bounding set is now exactly one capability, so a drop-in of yours that adds a capability (for example `AmbientCapabilities=CAP_NET_BIND_SERVICE`) no longer gets it. On systemd 259 the agent still starts and the added capability is silently dropped (observed on a Linux host; other systemd versions are untested). Add the same capability to `CapabilityBoundingSet=` in that drop-in too (both settings add to the unit's values), restart the agent, and check `CapBnd` with the verify command.
+
+**Tested and untested.** A check of the live unit's capability sets and the copy behaviour is part of CI on a self-hosted Linux runner. It has been run on a Linux host under systemd 259 as root. Real firmware tables and the CI-job form are untested until the first CI run on that runner, and systemd 239 (RHEL 8) is designed for but untested: on RHEL 8, verify with the command above after the upgrade. Whether SELinux or AppArmor confines `CAP_DAC_READ_SEARCH` is also untested.
 
 ## Behaviour change: the activity-record feature is renamed Echo (tar.db adopted as echo.db; stored references migrated)
 

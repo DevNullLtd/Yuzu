@@ -155,11 +155,15 @@ done
 
 unit_helper=$(sed -n 's|^ExecStartPre=-+/bin/bash \([^ ]*\) .*|\1|p' "$UNIT_FILE")
 rpm_helper="%{_datadir}${unit_helper#/usr/share}"
-if [[ $unit_helper == /usr/share/*/yuzu-agent-dmi-snapshot.sh ]] &&
-   grep -qF "chmod 0755 \"\$PKG$unit_helper\"" "$DEB_SCRIPT"; then
-    pass "unit helper path ($unit_helper) is installed 0755 by build-deb.sh"
+# Comment lines are dropped first, so a commented-out cp or chmod cannot keep this green.
+deb_code=$(grep -v '^[[:space:]]*#' "$DEB_SCRIPT" || true)
+deb_cp="deploy/systemd/${unit_helper##*/}\" \"\$PKG${unit_helper%/*}/\""
+deb_chmod="chmod 0755 \"\$PKG$unit_helper\""
+if [[ $unit_helper == /usr/share/*/yuzu-agent-dmi-snapshot.sh &&
+      $deb_code == *"$deb_cp"* && $deb_code == *"$deb_chmod"* ]]; then
+    pass "unit helper path ($unit_helper) is copied and installed 0755 by build-deb.sh"
 else
-    fail "unit helper path ('$unit_helper') is not installed 0755 by build-deb.sh"
+    fail "unit helper path ('$unit_helper') is not copied and installed 0755 by build-deb.sh"
 fi
 if [[ $unit_helper == /usr/share/* ]] &&
    grep -qF "install -D -m 0755 %{_sourcedir}/${unit_helper##*/} %{buildroot}$rpm_helper" "$RPM_SPEC" &&
@@ -387,6 +391,16 @@ as_root install -m 0644 "$run_dir/src/smbios_entry_point" "$run_dir/src-nr/smbio
 helper_case "helper with a non-regular source" "not a readable file" "$run_dir/st-nr" "$SVC_USER" "$run_dir/src-nr"
 absent "non-regular source: dmi/ not published" "$run_dir/st-nr/dmi"
 absent "non-regular source: dmi.tmp removed" "$run_dir/st-nr/dmi.tmp"
+
+# The helper's own stale-pair removal. In the unit path the shipped pre-clean line runs before
+# the helper, so only a direct run shows the helper cleaning up: seed a stale dmi/ and dmi.tmp
+# in an agent-owned state dir and give it a source with DMI missing.
+as_root install -d -m 0755 "$run_dir/src-part"
+as_root install -m 0644 "$run_dir/src/smbios_entry_point" "$run_dir/src-part/smbios_entry_point"
+seed_stale "$run_dir/st-stale"
+helper_case "helper over a stale pair with a partial source" "not a readable file" "$run_dir/st-stale" "$SVC_USER" "$run_dir/src-part"
+absent "stale pair, partial source: stale dmi/ removed" "$run_dir/st-stale/dmi"
+absent "stale pair, partial source: stale dmi.tmp removed" "$run_dir/st-stale/dmi.tmp"
 
 # --- agent unit: the real binary ---------------------------------------------------------
 agent_state=/var/lib/$id

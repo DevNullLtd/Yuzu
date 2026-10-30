@@ -1694,8 +1694,12 @@ jobs:
       # view of the capabilities a process under it holds (needs systemd as PID 1 and
       # passwordless sudo; a missing precondition fails the step, it never skips). Covers the
       # ambient CAP_DAC_READ_SEARCH grant, the agent clearing inheritable/ambient so exec'd
-      # children get nothing, and the DMI snapshot helper. Prints no firmware bytes.
+      # children get nothing, and the DMI snapshot helper. Prints no firmware bytes. One leg
+      # is enough: the unit and the agent's capability handling do not vary by compiler or
+      # build type.
       - name: Agent systemd unit capability check
+        if: matrix.compiler == 'gcc-15' && matrix.build_type == 'debug'
+        timeout-minutes: 5
         env:
           YUZU_AGENT_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/core/yuzu-agent
           YUZU_PLUGIN_DIR: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/plugins
