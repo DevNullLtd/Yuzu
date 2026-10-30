@@ -826,8 +826,10 @@ When several conditions hold, the first in this order wins:
     - the queue is capped at `kPushedMapHardCap` rows (a retained slot conflicts at most once per
       reconnect, but a flapping agent through a degraded pool can conflict on each reconnect); an
       overflow drops the oldest row, counts it (`result="dropped"`) and logs it at WARN;
-    - on stop the issuer drains the queue before it exits, each write bounded by one lease
-      budget and the whole drain by a 5 s deadline, so a stop does not lose a row while the audit
+    - on stop the issuer drains the queue before it exits; it starts no drain write after 5 s,
+      and each drain write runs under `SET LOCAL statement_timeout` of 1 s, so a lease-held write
+      cannot run on to the pool's 10 s `lock_timeout` or 30 s `statement_timeout` and the drain
+      ends within about 6 s, so a stop does not lose a row while the audit
       store is healthy and the queue is short; a row it cannot write, or has not reached when the
       deadline passes, is logged at WARN with the total and the first and last conflict. Its
       `dropped` count is best-effort, because the process is exiting and is normally not scraped
@@ -1196,7 +1198,7 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     re-claim audit drain), `gw_mgmt_pool_` (its own gateway forwarders) and the Postgres pool it
     calls. On stop it cancels its in-flight forwards (`ClientContext::TryCancel`) before joining
     them. Shutdown latency is bounded by one in-flight lease budget plus the pool's
-    `statement_timeout`, plus the re-claim audit drain's 5 s deadline (D6); the forwarders' 10 s
+    `statement_timeout`, plus the re-claim audit drain's bound of about 6 s (D6); the forwarders' 10 s
     deadline does not add to it because they are cancelled first. The slice-6 shutdown test also
     stops during an in-flight forward and during the audit drain. The pass swaps the pending set out under the set's mutex and never holds
     that mutex across `build_classified_command`, a Postgres call or `send_to`, so ingestion's
