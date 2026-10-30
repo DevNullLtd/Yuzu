@@ -1173,7 +1173,12 @@ The owner ruled 2026-10-26: no live customers; aggressive changes for the better
     `yuzu_viz_topology_fetch_duration_seconds`. Cold start becomes roster placeholders filled by
     resync, not a fleet-wide pull down the Subscribe streams;
   - the `echo.fleet_snapshot` row in `core_dispatch_capabilities.hpp` stays `system_reserved`
-    with no server caller. It must not move to an operator-dispatchable catalogue fragment.
+    with no server caller. It must not move to an operator-dispatchable catalogue fragment. The
+    header's file comment (its "dispatches the SERVER issues to itself" lead and the row's bullet,
+    which calls it the periodic fleet-wide snapshot pull) and the docstring of
+    `tests/test_capability_catalogue_complete.py` are rewritten to say so: the row is kept only to
+    keep the pair off operator surfaces, and the agent's pump runs the action through its local
+    dispatcher.
 - **Gateway heartbeat buffer** (`yuzu_gw_heartbeat_buffer.erl`): these go:
   - newest-snapshot coalescing (header l.13-24, `coalesce/2` at about l.588), snapshot-first
     eviction and send-without-snapshot;
