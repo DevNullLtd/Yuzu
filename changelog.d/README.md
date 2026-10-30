@@ -87,10 +87,6 @@ section, resets `[Unreleased]`, and deletes the fragment files; commit the
 result. `scripts/release-preflight.sh` fails if unpromoted fragments remain
 at tag time. The `/release` skill runs this as part of its pre-tag checklist.
 
-### Correcting a promoted section on a release-prep branch
-
-A release-prep branch may hand-correct the facts in the `## [X.Y.Z]` section it has just promoted (a count, a version, a statement a later merge made false) before the tag, because the fragments are already folded and deleted. Rules: it is an operator decision (the release owner approves it in the PR), the edit is made with Bash because the guard covers only the file-edit tools, every hunk stays inside that one section, `[Unreleased]` and fragments are untouched, and the PR lists the hunks. After the tag the section is closed: fix it with a fragment in the next release.
-
 ### Fixes that land after a version was promoted
 
 A version is promoted at its first release candidate, so a fix that lands on

@@ -10,7 +10,7 @@
  * legacy UI contract reads as the whole fleet), and reaches agents through
  * `ServerImpl::dispatch_confined` rather than `/api/command`. Every
  * Destructive row that does not additionally carry
- * `ExecuteGate::AdminOrApproval` — `tar.purge_source`, `registry.delete_key`,
+ * `ExecuteGate::AdminOrApproval` — `echo.purge_source`, `registry.delete_key`,
  * `filesystem.delete_lines`, `tags.clear`, `storage.clear`, … — was
  * fleet-targetable from it by any holder of the declared securable.
  *
@@ -85,7 +85,7 @@ const CommandCapabilityRegistry& real_registry() {
 /// hold their expected class in `catalogue anchors` — if the catalogue ever
 /// reclassifies one, that case fails loudly instead of these tests quietly
 /// becoming about nothing.
-constexpr std::pair<const char*, const char*> kDestructive{"tar", "purge_source"};
+constexpr std::pair<const char*, const char*> kDestructive{"echo", "purge_source"};
 constexpr std::pair<const char*, const char*> kReadOnly{"os_info", "os_version"};
 constexpr std::pair<const char*, const char*> kMutating{"tags", "set"};
 
@@ -99,7 +99,7 @@ struct AuditRow {
 
 /// Make `agents` visible to kUser via a group on which kUser holds a role —
 /// `get_visible_agents` is that role-scoped join. Copied in shape from
-/// `test_dashboard_tar_fragments.cpp`'s helper of the same name.
+/// `test_dashboard_echo_fragments.cpp`'s helper of the same name.
 void grant_visibility(ManagementGroupStore& mg, std::initializer_list<std::string> agents) {
     ManagementGroup g;
     g.name = "All Devices";
@@ -179,7 +179,7 @@ struct ExecHarness {
                                /*instruction_store=*/nullptr);
         // One registration pass only — two would register every route twice
         // and first-match-wins would serve handlers bound to the first call.
-        // #4027: +1 for GET /api/v1/tar/retention-paused.
+        // #4027: +1 for GET /api/v1/echo/retention-paused.
         REQUIRE(sink.route_count() == 13);
 
         if (wire_classifier)

@@ -106,7 +106,7 @@ inline Result<uint64_t> read_u64(std::span<const uint8_t> in, size_t offset,
 /// A raw value smaller than the 1601->1970 delta cannot be a valid post-1970
 /// timestamp (a zeroed/uninitialised field, most commonly) and maps to 0
 /// rather than an underflowed negative — same honest-sentinel convention as
-/// tar_mapdrive_collector.cpp's filetime_to_epoch, adapted to milliseconds.
+/// echo_mapdrive_collector.cpp's filetime_to_epoch, adapted to milliseconds.
 constexpr uint64_t kFiletimeEpochDelta100ns = 116444736000000000ULL;
 inline int64_t filetime_to_epoch_ms(uint64_t ticks100ns) {
     if (ticks100ns < kFiletimeEpochDelta100ns)

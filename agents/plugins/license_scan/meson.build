@@ -1,5 +1,5 @@
 # license_scan — software licence detection plugin (SLE, ADR-0024 D2).
-# Per-OS translation units are #ifdef-gated internally (the tar-plugin
+# Per-OS translation units are #ifdef-gated internally (the echo-plugin
 # pattern): licensing_win.cpp compiles empty off Windows, licensing_linux.cpp
 # / licensing_macos.cpp likewise on their platforms. The bounded WMI
 # enumerator this plugin's slp_wmi surface uses lives at the all-inline,

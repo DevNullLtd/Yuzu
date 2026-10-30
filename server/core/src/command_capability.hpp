@@ -188,7 +188,7 @@ public:
     /// Case-insensitive on both `plugin` and `action`, matching the
     /// lowercase normalisation `server.cpp` (`:6360-6368`) applies to the
     /// action before dispatch — extended here to the plugin half too, so
-    /// `classify("TAR", "Fleet_Snapshot")` and `classify("tar",
+    /// `classify("Echo", "Fleet_Snapshot")` and `classify("echo",
     /// "fleet_snapshot")` resolve to the same row regardless of which case a
     /// caller used.
     [[nodiscard]] std::expected<CommandCapability, ClassificationError>

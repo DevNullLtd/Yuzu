@@ -7,12 +7,19 @@
  * filesystem_posture_legs.hpp, which is the most recent plugin to establish
  * this shape.
  *
- * ROW SCHEMAS. Both are fixed-width: every row of a given kind carries the
+ * ROW SCHEMAS. All are fixed-width: every row of a given kind carries the
  * same field count, with "-" where a value is inapplicable. A consumer keying
  * on position must never have to guess which shape it received.
  *
  *   smart|<device>|<model>|<bus>|<media>|<health>|<pct_used>|<spare_pct>|<detail>
  *   volume|<volume>|<mount_points>|<device>|<fstype>|<total_bytes>|<detail>
+ *   partition|<disk>|<partition>|<size_bytes>|<type>|<mount_points>|<detail>
+ *   topology|<kind>|<name>|<uuid>|<members>|<detail>
+ *
+ * `partitions` and `topology` are PLANNED on every OS: until their leg PRs land they answer
+ * one `status|<action>|unsupported|<os>:planned` row (agents/shared/planned_leg.hpp). The
+ * leg PR that fills one adds its row formatter; the columns are declared in
+ * content/definitions/disk_actions.yaml.
  *
  * `health`, `bus` and `media` are FIXED vocabularies emitted verbatim (they are
  * derived from enums, never from parsed text); every other field is untrusted
@@ -49,6 +56,8 @@ namespace yuzu::disk_actions {
 
 int emit_smart(yuzu::CommandContext& ctx);
 int emit_volumes(yuzu::CommandContext& ctx);
+int emit_partitions(yuzu::CommandContext& ctx);
+int emit_topology(yuzu::CommandContext& ctx);
 
 // ── fixed vocabularies ──────────────────────────────────────────────────
 

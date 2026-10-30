@@ -124,8 +124,8 @@ std::vector<Row> golden_rows() {
     rej("device.asset_tags.sync", {{"environment", "staging"}}, "not a member");
     acc("windows.features.list", {{"state", "pending"}}, "a declared state");
     rej("windows.features.list", {{"state", "all"}}, "the plugin ignored an unknown state");
-    acc("crossplatform.tar.query", {{"type", "dns"}}, "a declared type");
-    rej("crossplatform.tar.query", {{"type", "bogus"}}, "an unknown type");
+    acc("crossplatform.echo.query", {{"type", "dns"}}, "a declared type");
+    rej("crossplatform.echo.query", {{"type", "bogus"}}, "an unknown type");
 
     // Over-maximum values the plugin used to clamp.
     acc("device.agent_logging.get_log", {{"lines", 1}}, "get_log at its minimum");
@@ -164,9 +164,9 @@ std::vector<Row> golden_rows() {
     acc("device.os_info.os_name", nullptr, "params omitted");
     rej("device.os_info.os_name", json::array(), "a non-object params when a schema is stored");
     rej("device.wol.check", json::object(), "host omitted");
-    rej("crossplatform.tar.sql", json::object(), "no default for sql");
+    rej("crossplatform.echo.sql", json::object(), "no default for sql");
     acc("device.wol.check", {{"host", "h"}}, "only the required name supplied");
-    acc("crossplatform.tar.recent_processes", json::object(), "required sql has a default");
+    acc("crossplatform.echo.recent_processes", json::object(), "required sql has a default");
     rej("device.wol.check", {{"host", "h"}, {"legacy_param", 1}}, "undeclared name");
     rej("device.wol.check", {{"host", std::string("a") + '\0' + "b"}}, "embedded NUL");
     rej("device.wol.check", {{"host", "h"}, {"count", std::string(70 * 1024, '7')}}, "70 KiB patterned value");

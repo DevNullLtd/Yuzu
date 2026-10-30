@@ -378,11 +378,11 @@ struct IptablesRule {
 // ── Linux: nftables (rung 1, netlink) ───────────────────────────────────
 //
 // Pure decode over NETLINK_NETFILTER/NFNL_SUBSYS_NFTABLES dump-reply bytes —
-// zero socket/OS dependency, mirroring tar_netqual_nstat.hpp's split between
+// zero socket/OS dependency, mirroring echo_netqual_nstat.hpp's split between
 // a transcribed wire-format namespace (here: nft_raw) and free decode
 // functions, and firewall_plugin.cpp's own header docblock claim that every
 // parser in this file is OS-free and unit-tested on every host. Unlike
-// tar_netqual_nstat.hpp's private/unversioned Darwin nstat ABI, the structs
+// echo_netqual_nstat.hpp's private/unversioned Darwin nstat ABI, the structs
 // below transcribe STABLE, VERSIONED kernel UAPI headers (linux/netlink.h,
 // linux/netfilter/nfnetlink.h, linux/netfilter/nf_tables.h) — confidence is
 // correspondingly higher, and this leg HAS since been verified against a
@@ -538,7 +538,7 @@ struct RawNlMsg {
 /// message whose declared `len` is shorter than the header or overruns the
 /// buffer stops the walk at that point (truncated input decodes to "as much
 /// as could be safely read", never an out-of-bounds read) — same contract as
-/// tar_netqual_nstat.hpp's nstat_frame_messages().
+/// echo_netqual_nstat.hpp's nstat_frame_messages().
 [[nodiscard]] inline std::vector<RawNlMsg> split_nlmsgs(std::span<const std::byte> buf) {
     std::vector<RawNlMsg> msgs;
     std::size_t off = 0;
