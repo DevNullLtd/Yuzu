@@ -2023,7 +2023,13 @@ live state; the other live terms have no named measure yet (D16). This ADR is a 
 that work, because without it the payload terms dominate any measurement.
 
 **Bandwidth.** At 10k agents and 150 KB bodies, topology falls from about 50 MB/s to about 1.7 MB/s
-plus churn. Tags fall from about 4 KB to a few hundred bytes per beat.
+plus churn. The churn term is not bounded here: the digest covers every process and every live
+connection, ports included, so a host with ordinary churn (short-lived processes, ephemeral
+ports) may change digest on most pump runs and send a `CHANGED` body almost every interval, and
+nothing caps `CHANGED` frequency per agent. The saving over today's push, and D8's body-ingest
+sizing, therefore rest on an assumed low change rate. Slice 2 measures the fraction of pump runs
+whose digest changes on the rig; if it is high, a minimum interval between `CHANGED` reports, or
+leaving ephemeral-port connections out of the digest, is a follow-up change to this ADR. Tags fall from about 4 KB to a few hundred bytes per beat.
 
 ### Server stores
 
@@ -2466,7 +2472,8 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
    - `common/include/yuzu/status_tag_classes.hpp` and `status_tag_digest.hpp`, with completeness
      and canonical-form tests.
    - Echo `content_digest` (`schema_minor` bump) and its classification list.
-   - The pump records digest, `last_pump_at` and outcome.
+   - The pump records digest, `last_pump_at` and outcome, and the rig measures the fraction of
+     runs whose digest changes (*Bandwidth*).
    - `yuzu_agent_heartbeat_would_be_delta_bytes`, computed locally from the class table, which
      measures the tag saving before the wire changes (removed in slice 5).
 2b. **`AgentRegistrationStore`, written on every successful registration** (direct and gateway).
