@@ -38,6 +38,19 @@ Group=yuzu-agent
 # via /proc, don't trust file-presence alone. A present file with a malformed VALUE
 # makes the agent fail to start instead. Re-enable = remove the assignment.
 EnvironmentFile=-/etc/yuzu-agent/yuzu-agent.env
+# Hardware table snapshot (DMI + SMBIOS entry point), rebuilt at every start.
+# 1. The first line removes any old snapshot as the service account, so a failed
+#    refresh never leaves a stale one behind.
+# 2. The second line runs ONLY the helper as root ('+' = outside the sandbox) because
+#    the firmware tables are root-only; root just reads, and every write into the
+#    agent-writable state directory is done by the helper as the service account.
+# A leading '-' makes a failed step non-fatal: the agent still starts, without a
+# snapshot. It does not absorb a step that runs past TimeoutStartSec, which fails the
+# start. The helper is installed by the .deb and .rpm; a unit copied without it
+# simply gets no snapshot, for the same reason. The unit is designed for systemd 239
+# and later; 239 is untested.
+ExecStartPre=-/bin/rm -rf /var/lib/yuzu-agent/dmi /var/lib/yuzu-agent/dmi.tmp
+ExecStartPre=-+/bin/bash /usr/share/yuzu/scripts/yuzu-agent-dmi-snapshot.sh /var/lib/yuzu-agent yuzu-agent
 ExecStart=/usr/local/bin/yuzu-agent \
     --server %H:50051 \
     --plugin-dir /usr/lib/yuzu/plugins \
@@ -49,6 +62,15 @@ StateDirectory=yuzu-agent
 
 # Security hardening
 NoNewPrivileges=true
+# CAP_DAC_READ_SEARCH lets the agent read root-only files, chiefly the 0400 DMI
+# serial and UUID under /sys/class/dmi/id. It is granted as an ambient capability and
+# the bounding set is exactly this one capability, so nothing else can be gained.
+# Every plugin runs in the agent process, so every plugin can now read ANY file on the
+# host (read-only). The agent clears its inheritable and ambient sets at start, so an
+# ordinary exec'd child (a script, dmidecode) has no capabilities after execve.
+# To opt out, see docs/user-manual/upgrading.md.
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
 ProtectSystem=strict
 ReadWritePaths=/var/lib/yuzu-agent
 PrivateTmp=true

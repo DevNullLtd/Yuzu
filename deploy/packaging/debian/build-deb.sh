@@ -98,6 +98,10 @@ else
     echo "ERROR: yuzu-agent not found in $BIN_DIR" >&2; exit 1
 fi
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-agent.service" "$PKG/usr/lib/systemd/system/"
+# DMI snapshot helper, run by the unit's ExecStartPre (see yuzu-agent.service).
+mkdir -p "$PKG/usr/share/yuzu/scripts"
+cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-agent-dmi-snapshot.sh" "$PKG/usr/share/yuzu/scripts/"
+chmod 0755 "$PKG/usr/share/yuzu/scripts/yuzu-agent-dmi-snapshot.sh"
 
 # Agent core shared library (plugins link against it)
 AGENT_CORE_FOUND=0

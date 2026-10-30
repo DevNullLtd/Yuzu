@@ -55,7 +55,7 @@
   ],
   "caveats": [
     "**Linux only, Chromium-family only.** On macOS and Windows every action returns the fixed `status|<action>|unsupported|<os_tag>:planned` row and `UNAVAILABLE`; those legs, Safari, Firefox and a per-profile `extensions` action are planned and not implemented. An operator cannot use this plugin to inventory browsers on those systems.",
-    "**An unprivileged agent sees little.** `profiles` opens each home under `/home` plus `/root`, and a denied open is reported as a constraint rather than skipped, so on a host where the service account cannot enter other users' homes (the common default) the status is `CONSTRAINED` with `permission_denied` and rows appear only for readable homes. Treat `CONSTRAINED` as the normal outcome there and read the rows that are present, not the status alone.",
+    "**An agent without `CAP_DAC_READ_SEARCH` sees little.** `profiles` opens each home under `/home` plus `/root`, and a denied open is reported as a constraint rather than skipped, so on a host where the service account cannot enter other users' homes (the common default without the capability, which the packaged unit grants by default and an operator opt-out, a dev install or a manual launch lacks) the status is `CONSTRAINED` with `permission_denied` and rows appear only for readable homes. Treat `CONSTRAINED` as the normal outcome there and read the rows that are present, not the status alone.",
     "**Fixed paths, presence only.** `browsers` probes three exact binary paths and `profiles` three exact config directories, so browsers installed through Snap or Flatpak, in a user-local directory or under another name read as `0` or as no profiles. The `Local State` profile list is a registry, not evidence of use: a listed profile may no longer have a directory, and no timestamps are read.",
     "**Off until an operator turns it on.** Neither action dispatches until `PUT /api/v1/plugin-config/browser_inventory/kill-switch {\"enabled\":true}`; on a fresh install the server refuses the dispatch before the plugin runs, which is not reported as a plugin failure."
   ],
@@ -218,7 +218,7 @@
       "runs_as": "n/a"
     },
     {
-      "grant": "None granted. `browsers` presence-checks fixed system-wide paths that are world-readable. `profiles` can only enter a home directory the account is allowed to enter, so with default home permissions most users' browser data is out of reach",
+      "grant": "None for `browsers`, which presence-checks fixed system-wide paths that are world-readable. `profiles` can only enter a home directory the account is allowed to enter. The packaged unit grants `CAP_DAC_READ_SEARCH` as an ambient capability by default, so it enters other users' homes there (not measured for this plugin); without it (an operator opt-out, a dev install, or a manual launch), with default home permissions most users' browser data is out of reach",
       "if_refused": "`constrained` with a `linux:browser_inventory:<cause>` token (for example `permission_denied`); a genuinely absent browser or home gives fewer rows, not `constrained`",
       "measured": "Container capture as root only; no capture as the unprivileged service account, and no real Chrome install (Chrome fixtures are synthetic, shaped like a real Edge capture)",
       "os": "Linux",

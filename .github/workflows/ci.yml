@@ -1690,6 +1690,21 @@ jobs:
           YUZU_PLUGIN_DIR: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/plugins
         run: bash scripts/test/agent-shutdown-smoke.sh
 
+      # Installs the shipped agent unit under unique runtime names and reads the kernel's
+      # view of the capabilities a process under it holds (needs systemd as PID 1 and
+      # passwordless sudo; a missing precondition fails the step, it never skips). Covers the
+      # ambient CAP_DAC_READ_SEARCH grant, the agent clearing inheritable/ambient so exec'd
+      # children get nothing, and the DMI snapshot helper. Prints no firmware bytes. One leg
+      # is enough: the unit and the agent's capability handling do not vary by compiler or
+      # build type.
+      - name: Agent systemd unit capability check
+        if: matrix.compiler == 'gcc-15' && matrix.build_type == 'debug'
+        timeout-minutes: 5
+        env:
+          YUZU_AGENT_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/core/yuzu-agent
+          YUZU_PLUGIN_DIR: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/plugins
+        run: bash scripts/test/agent-unit-capcheck.sh
+
       # Mirror the windows job's upload step so a Linux test failure is
       # diagnosable. meson `--print-errorlogs` truncates per-test output to
       # the last 100 lines, which is enough for a Catch2 failure but loses

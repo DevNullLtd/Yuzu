@@ -1989,7 +1989,7 @@
       "runs_as": "**root** (LaunchDaemon, no `UserName`; see the TL;DR and the `echo.*` row of `docs/agent-privilege-model.md`)"
     },
     {
-      "grant": "A file capability on the binary does not take effect under the packaged unit's `NoNewPrivileges=true`, so on the packaged unit the working route is `AmbientCapabilities=CAP_DAC_READ_SEARCH` in a drop-in (not measured for this plugin). Service enumeration (`systemctl`) runs as bounded argv under the agent account, not elevated.",
+      "grant": "A file capability on the binary does not take effect under the packaged unit's `NoNewPrivileges=true`, so the packaged unit grants `CAP_DAC_READ_SEARCH` as an ambient capability by default. Without it (an operator opt-out, a dev install without the capability, or a manual launch; see `docs/user-manual/upgrading.md`, \"Behaviour change: the packaged Linux agent can read root-only files\") reads of root-only files are refused. The grant is not measured for this plugin. Service enumeration (`systemctl`) runs as bounded argv under the agent account, not elevated.",
       "if_refused": "Not observed in this capture.",
       "measured": "2026-09-06, container, captured at **euid 0 (root)** — broader than the deployed unprivileged account.",
       "os": "Linux",
