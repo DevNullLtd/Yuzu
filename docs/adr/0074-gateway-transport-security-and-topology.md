@@ -17,10 +17,10 @@
 
 | Hop | Today | Gap |
 |---|---|---|
-| Agent to server, direct | Mutual TLS. The agent presents its CA-issued leaf (`yuzu://<ca-fingerprint>/agent/<id>`, about a year, renewed at two thirds). One port asks for a certificate but does not require one, so an unenrolled agent can bootstrap; the application enforces the rest. | Only single-server installs use it. ADR-2002 section 2 makes the gateway mandatory in HA. |
-| Agent to gateway (`:50051`) | One-way TLS (PKI PR5c). The gateway proves itself; it does not check the agent's certificate. The agent proves itself with its enrollment token, and heartbeats are bound to its Subscribe connection. | No transport identity for the agent at the edge that will face the internet. |
+| Agent to server, direct | Mutual TLS. The agent presents its CA-issued leaf (`yuzu://<ca-fingerprint>/agent/<id>`, about a year, renewed at two thirds). Under the generated default certificates the port asks for a certificate but does not require one, so an unenrolled agent can bootstrap; the application enforces the rest. With operator-supplied certificates the port requires one (`server/core/src/grpc_tls_credentials.cpp`, `server.cpp`). | Only single-server installs use it. ADR-2002 section 2 makes the gateway mandatory in HA. |
+| Agent to gateway (`:50051`) | One-way TLS (PKI PR5c). The gateway proves itself; it does not check the agent's certificate. The agent proves itself with its enrollment token, and heartbeats are bound to its Subscribe connection. | No transport identity for the agent at the edge that will face the internet. The enrollment token is presented only at first enrollment: the agent removes its token file once a registration is accepted (`agents/core/src/agent.cpp`), so after that an approved agent's `ProxyRegister` carries no per-agent secret. Revoking a gateway-proxied agent does not cut it off (`docs/auth-architecture.md`, "Gateway-proxied agents: revocation scope"). |
 | Gateway to server (`:50055`) | Mutual TLS. The server admits the gateway by an SPKI pin fixed at boot. | Pins are per pair and do not scale to many gateways and many servers. No revocation. |
-| Server to gateway management (`:50063`) | Strict mutual TLS. SPKI pin, or (opt-in, #6016) the server's URI SAN `yuzu://<ca-fingerprint>/server`. | No revocation. Pins again. |
+| Server to gateway management (`:50063`) | Strict mutual TLS. SPKI pin, or (opt-in, #6016) the server's URI SAN `yuzu://<install>/server` (the install id is derived from the CA fingerprint). | No CRL; a manual serial deny-list (`mgmt_peer_denied`) read at boot. Pins again. |
 
 So gateway and server already authenticate each other in both directions. The missing link is the agent at the gateway.
 
@@ -61,6 +61,7 @@ All three, in this order:
 - **Enrollment port.** It accepts connections without a certificate, and the only thing it serves is enrollment. It has its own rate limit and connection cap at all times.
 - **Clean break.** This ships as a breaking change in the next release, with no fallback to the single-port behaviour. There are no customers yet.
 - **A routed-concern rule changes with it.** `.claude/routed-concerns-access-control.md` (the PKI row) forbids an `auth_fun` on the `:50051` agent listener, because it would reject every certless peer and stop agent bootstrap fleet-wide. That rule exists because today one port does both jobs. The change that splits the ports must amend the row in the same PR, with `security-guardian`: certless bootstrap moves to the enrollment port, which must never require a certificate.
+- **Open: the direct port.** Whether the direct agent-to-server port of single-server installs gets the same split into an enrollment port and a strict main port. Wave 2 decides.
 
 ### D3. Identities are SPIFFE IDs
 
@@ -142,7 +143,7 @@ The difference from nginx is recorded: nginx runs handshakes in worker processes
 - **In Erlang:** the gateway checks the SPIFFE identity and the EKU of the verified certificate just after the handshake, before any gRPC request is served. Identity rules will change as SPIFFE and customer intermediates arrive, so they live where they are easy to change and test.
 - **The same split on the fallback path:** OTP `ssl` checks chain and CRL, and the same Erlang identity check runs. The shared accept/refuse suite covers both.
 
-The current refusal of `ktls` with `verify_peer` goes away.
+The kTLS branch (`perf/gateway-idle-mem-ktls`, not on `dev`) currently refuses `ktls` together with `verify_peer`; that refusal goes away.
 
 ### D9. Discovery and choosing a gateway
 
@@ -276,3 +277,4 @@ Resolved in wave 0 (2026-10-29): the SPIFFE trust domain (D3), D5's scope, and w
 - **For wave 1:** checking a customer intermediate's revocation: the leaf only, or the customer's root CRL as well (D7).
 - **For wave 2:** the TLS version on the main port and, if TLS 1.3, the KeyUpdate policy (D8).
 - The ephemeral-port limit on load generators for wave 7: one source address to one gateway port gives about 16,000 connections on macOS defaults.
+- **For wave 2:** whether the direct agent-to-server port of single-server installs gets the same enrollment and main port split (D2).
