@@ -252,6 +252,26 @@ std::size_t find_live_call(const std::string& src, const std::string& call) {
 }
 } // namespace
 
+// #4309: /mcp/v1/ admission. admit() (mcp_admission.hpp) is unit-tested on its own, but nothing
+// else exercises ServerImpl, so deleting or commenting out the call in the MCP auth lambda would
+// leave every admit() case green while the real server serves tierless cookie sessions on all
+// three verbs. The live call must sit in the lines following the register_routes literal (the
+// auth lambda is its first argument); a commented-out call does not begin its line, so it fails.
+TEST_CASE("mcp route registration: wiring -- the MCP auth lambda calls admit() after "
+          "register_routes(",
+          "[server][routes][mcp][authz][4309]") {
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    const auto reg = find_live_call(src, "mcp_server_->register_routes(");
+    REQUIRE(reg != std::string::npos);
+    // The auth lambda is the first argument, so the call is within a short window of the literal.
+    const auto window = src.substr(reg, 2500);
+    CHECK(find_live_call(window, "if (!mcp::admit(") != std::string::npos);
+    // The lambda must hand admit() the session require_auth resolved, not skip the resolution.
+    CHECK(find_live_call(window, "auto sess = require_auth(req, res);") != std::string::npos);
+}
+
 TEST_CASE("mcp route registration: wiring -- server.cpp wires the software sync runner before "
           "register_routes",
           "[server][routes][mcp]") {
