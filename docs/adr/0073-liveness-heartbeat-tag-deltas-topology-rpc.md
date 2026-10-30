@@ -1543,7 +1543,9 @@ count-valued histograms here are not latencies, so they declare their own:
   `replayed` and `unverified_session` values on the three state counters, every
   `yuzu_server_reattach_challenge_total` outcome, `gateway_refused_total{reason="pre_wave2"}`
   and `audit_state_rows_total{result="dropped"}`) is registered at 0 at start, so `increase()`
-  sees the first event; the promtool firing cases start with the series absent;
+  sees the first event; the promtool firing cases therefore seed each series at 0 and then step
+  it to 1, and one case with the series absent asserts the alert stays quiet (the reason the
+  registration is required);
 - gauge `yuzu_server_agents_state_unsigned` (slice 11, from ADR-0074 wave 2): the sessions on this
   replica whose latest state payload was `unsigned` (D16: an agent older than slice 11), on the
   same timer and published at 0;
