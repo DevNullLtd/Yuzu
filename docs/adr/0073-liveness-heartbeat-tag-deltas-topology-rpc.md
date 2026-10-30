@@ -1194,9 +1194,13 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     each issuance costs that read as well as its record write. `kill_switch_decision` cannot tell
     a switch that is set from a degraded store (both deny), so when a pass is denied the issuer
     classifies the denial with the tri-state `PluginConfigStore::get_kill_switch` read
-    (`std::expected<KillSwitchEntry, Error>`): a switch that is set is `send_failed`; an `Error`
-    (a degraded store) or a failed record write ends the pass, rather than sending the rest with
-    skipped records, and leaves the remaining marks in the set, counted `deferred`. A Postgres outage therefore delays resyncs and never
+    (`std::expected<KillSwitchEntry, Error>`), which has three outcomes: a switch that is set is
+    `send_failed`; an `Error` (a degraded store) ends the pass; and an entry that reads
+    `enabled = true` means the first read was the degraded one (the switch is not set, so the
+    denial came from a store failure), which also ends the pass. A failed record write ends the
+    pass too. A pass that ends leaves the remaining marks in the set, counted `deferred`, never
+    `send_failed`, rather than sending the rest with skipped records. The classifier is a pure
+    function with a unit test for all three outcomes. A Postgres outage therefore delays resyncs and never
     blocks heartbeat ingestion.
   - **The issuer's lifecycle.** The issuer is a `ServerImpl`-owned thread with a stop flag. Its
     rate and between-pass waits are condition-variable waits the stop flag wakes, so it never
