@@ -1876,11 +1876,24 @@ message ReattachResponse {
   - steps 5 and 6 still run, so the server can send the challenge, but the session is installed
     `challenge_pending` and its route row is written `challenge_pending`. Until the agent's
     signature over the challenge verifies, the route-directory reader's `routable` predicate
-    refuses the row, so the CONNECTED re-announce publishes no route, and `send_to`, the one send
-    every dispatch surface reaches (operator dispatch through `dispatch_confined_arms`, the five
-    cascade sites, the schedule runner, the policy evaluator, the Guardian push and every
-    `SystemReservedPush`, `__resync__` included), refuses the session; the challenge push is the
-    one exempt send. The issuer treats such a session as not installed (D8);
+    refuses the row, so the CONNECTED re-announce publishes no route. The registry has three
+    sends, and every dispatch surface (operator dispatch through `dispatch_confined_arms`, the five
+    cascade sites, the legacy Broadcast forwarder, the schedule runner, the policy evaluator, the
+    Guardian push and every `SystemReservedPush`, `__resync__` included) reaches one of them:
+    `send_to`, `send_to_all` (the broadcast send, which does not call `send_to`) and
+    `send_via_directory`. `send_to` and `send_to_all`'s per-session loop both refuse a
+    `challenge_pending` session through one shared predicate, and `send_via_directory` refuses it
+    through `routable`; the challenge push is the one exempt send. The issuer treats such a
+    session as not installed (D8);
+  - `challenge_pending` is an authentication gate, not an enablement gate, so it refuses the
+    protective actions too: the quarantine row's rule that no enablement gate refuses the
+    protective set does not reach it, because a send to an unverified session may be a send to a
+    gateway impersonating the device. A quarantine stored before or during the window is
+    re-applied on verification from the stored record through `redispatch_stored_containment`,
+    never from a caller-supplied value. A fresh operator quarantine refused during the window is
+    written to the store as today (the store write does not depend on reach) and reported with a
+    `challenge_pending` zero-reach cause, added at all five cascade sites, so it does not read as a
+    permanent failure;
   - on verification the server clears `challenge_pending` on both, then runs the #3425
     reconnect reconciler's containment re-application and marks a tags resync (D16): a
     containment re-dispatch refused during the window is re-fired, never dropped;
@@ -2088,10 +2101,15 @@ lands. The two are kept consistent as follows.
     most recently verified D5 challenge (its challenge epoch: at session start, or after a
     reattach, D14), the payload kind, and a per-kind sequence (one for heartbeat state, one for
     `TopologyReport`, since they travel on different paths) that the server requires to increase
-    within the epoch. Every send, a retry included, is re-signed with a fresh sequence. The floor
-    is held with the session on the replica that holds it; a restart, a prune or a replica change
-    loses it, but a new epoch is then required, so a payload signed under an earlier epoch is
-    refused whatever the floor;
+    within the epoch. Every send, a retry included, is re-signed with a fresh sequence. The
+    per-kind floors and the verified epoch live in the installed session record (the
+    `AgentRegistry` session), never in the `AgentHealthStore` entry: they are dropped only when
+    the session is uninstalled, so the 90 s prune of a health entry with a live session leaves
+    them intact. A restart or a replica change loses the session record, and the session then has
+    no verified epoch on that replica until a challenge verifies (a Register's, or the
+    post-reattach one, D14), so a payload signed under an earlier epoch is refused whatever the
+    floor. A test withholds heartbeats past 90 s and then replays an older in-epoch signed full
+    set; it is refused as `replayed`;
   - **until the challenge verifies, no state content is accepted.** A session with no verified
     epoch on this replica (a fresh Register, or a reattach whose challenge is pending) applies no
     `StatusTags` and no digest and pushes no body; they are counted `unverified_session`. After
@@ -2114,7 +2132,10 @@ lands. The two are kept consistent as follows.
     `agent.state.bad_signature` audit row through `audit_token`; later ones are counted only;
   - **key.** The server verifies against the key of the certificate the session's challenge was
     verified with. Revocation is checked at the challenge and by ADR-0074's revocation poll, not
-    per payload. A renewal mid-session re-binds at the next challenge; how and when a renewed
+    per payload. Until a re-bind, the agent keeps signing with the key bound at the session's last
+    verified challenge, and once that certificate passes its notAfter the server refuses state
+    content as `unverified_session` (never `bad_signature`, so expiry never feeds the withholding).
+    A renewal mid-session re-binds at the next challenge; how and when a renewed
     agent re-answers is ADR-0074 wave 2's to define;
   - the liveness fields (`session_id`, `sent_at`, the fact that a heartbeat arrived) stay unsigned,
     as ADR-0074 D5 decided.
