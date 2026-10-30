@@ -275,13 +275,14 @@ been able to read that session's replayed frames.** The id is 128-bit and is ret
 only in the `initialize` response header, so the exposure needed the id as well as
 the credential; no measurement exists of whether any deployment issued
 service-scoped tokens that used the channel.
-Risk-register entry: an elevated cookie session's replay ring is readable by a
-non-elevated credential of the same class that holds the session id, until the
-tierless-human refusal at `/mcp/v1/` (#4309, PR B) lands, which refuses the only
-credential kind that can be elevated. JIT elevation is per-request state outside
-the class; the residual is accepted by the maintainer with that PR as the stated
-closure. The existing mitigation is that the session id must be protected like a
-credential. Stream liveness is principal-level: the class is checked when the stream attaches and is not re-derived from the live credential afterwards (the per-tick credential recheck compares the principal only, and the per-tick session check compares the class captured at attach).
+Risk-register entry (closed by #4309): an elevated cookie session's replay ring
+was readable by a non-elevated credential of the same class that held the session
+id. JIT elevation is per-request state outside the class. `/mcp/v1/` now refuses
+every credential with no MCP tier (`403`, `-32003`, audited `mcp.session.reject`
+`reason=tier_required`), which includes the only credential kind that can be
+elevated, so a cookie session can no longer hold an `/mcp/v1/` session; for a
+period before that change the residual stood as described. The session id should
+still be protected like a credential. Stream liveness is principal-level: the class is checked when the stream attaches and is not re-derived from the live credential afterwards (the per-tick credential recheck compares the principal only, and the per-tick session check compares the class captured at attach).
 Further residuals: a class switch strands the old-class sessions against the
 per-principal cap (fixed at 8, no flag) for up to the 30-minute idle TTL (longer while
 a stream stays attached, because the stream's per-tick liveness check keeps the
