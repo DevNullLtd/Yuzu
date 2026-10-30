@@ -134,7 +134,8 @@ move:
   tag. The un-upgraded agents are counted by a gauge of their own (D13) and listed by the
   registration-time version that MCP `list_agents` reports.
 
-The recommended practice, stated in `docs/user-manual/upgrading.md` (*Upgrade*): roll agents out in
+The recommended practice, stated in *Upgrade (breaking)* below and carried into the new
+`docs/user-manual/upgrading.md` section: roll agents out in
 short stages right after the server and gateways, and pause Guardian policy changes until the last
 stage is done.
 
@@ -143,7 +144,7 @@ Between an agent and the server, command dispatch, responses, inventory and live
 in either direction. Between a gateway and the server they are not: a new gateway in front of an old
 server cannot reattach its agents after a server restart (the old server has no `ProxyReattach`),
 so those agents have no installed session there until they reconnect. The upgrade order (server,
-then gateways) never creates that pairing, and a rollback must not either (*Upgrade*).
+then gateways) never creates that pairing, and a rollback must not either (*Upgrade (breaking)*).
 
 ## Context
 
@@ -1335,7 +1336,8 @@ on the sustained condition and staying quiet on the expected one.
   - Tests: quiet during an 8-minute post-restart drain; fires when the set stays non-empty for
     30 min; fires on one `send_failed`.
 - `YuzuAgentsTagsAbsent`: `yuzu_server_agents_tags_absent` stays above 0 for 24 h. It bounds the
-  window in which un-upgraded agents are invisible to the health and posture gauges (*Upgrade*).
+  window in which un-upgraded agents are invisible to the health and posture gauges (*Upgrade
+  (breaking)*).
   Responder: list stragglers with MCP `list_agents` and upgrade them. Tests: quiet at 0; fires after
   24 h above 0.
 
@@ -2254,7 +2256,8 @@ of every ~30 s. The content is unchanged.
 - `docs/user-manual/gateway.md`: the heartbeat batching text (about l.199-227), including that
   `heartbeat_batch_interval_ms` must stay well below the heartbeat interval (D4); registration replay
   becomes reattach; the live management RPCs are `SendCommand` and `WatchEvents`, the other three
-  deprecated and `UNIMPLEMENTED`.
+  deprecated and `UNIMPLEMENTED`; the new `upstream_topology_concurrency` key and its `topology`
+  pool (*Configuration*).
 - `docs/user-manual/metrics.md`: every new family and its closed label set (D13); the retired
   `yuzu_viz_topology_fetch_duration_seconds` and `yuzu_viz_agent_dispatch_timeout_total` rows and
   their example alerts removed; the new meaning of the kept cache and refill families and of
