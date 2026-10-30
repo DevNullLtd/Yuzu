@@ -1,6 +1,7 @@
 # ADR-0074: Gateway transport security and topology: mutual TLS on every hop, SPIFFE identities, many gateways, many servers
 
 - **Status:** Proposed. The owner's decisions below were taken on 2026-10-28 and 2026-10-29; the whole ADR needs the owner's sign-off at the end of wave 0.
+- **Shipped:** nothing in D1 to D14. Today the agent-to-gateway hop is one-way TLS (see Context). Do not cite this ADR as a current capability.
 - **Date:** 2026-10-28 (wave 0 decisions folded in 2026-10-29)
 - **Authors:** Nathan Dornbrook
 - **Supersedes:** nothing. Amends ADR-2002 (see its section 7h, added with this ADR). Amends ADR-2004 (the server identity form and the `mgmt_peer_auth_mode` default; see "Rules this design re-opens").
@@ -58,8 +59,8 @@ All three, in this order:
 ### D2. The agent edge: a separate enrollment port, and a strict main port
 
 - **Main port.** It requires a valid client certificate at the TLS layer. A connection without one never reaches application code.
-- **Enrollment port.** It accepts connections without a certificate, and the only thing it serves is enrollment. It has its own rate limit and connection cap at all times.
-- **Clean break.** This ships as a breaking change in the next release, with no fallback to the single-port behaviour. There are no customers yet.
+- **Enrollment port.** It accepts connections without a certificate, and the only thing it serves is enrollment. It has its own rate limit and connection cap at all times. The port is certless and faces the internet, so its cap must not be holdable by clients that never enroll: wave 2 must show that per-source limits (or an equivalent) keep it usable, and set a recovery target for a mass re-enrollment after an outage longer than a day.
+- **Clean break.** This ships as a breaking change in the next release, with no fallback to the single-port behaviour. There are no production customers at the time of writing (2026-10-30); wave 2 re-checks this before it merges, and if a pilot runs agents through a gateway the upgrade note becomes a merge gate.
 - **A routed-concern rule changes with it.** `.claude/routed-concerns-access-control.md` (the PKI row) forbids an `auth_fun` on the `:50051` agent listener, because it would reject every certless peer and stop agent bootstrap fleet-wide. That rule exists because today one port does both jobs. The change that splits the ports must amend the row in the same PR, with `security-guardian`: certless bootstrap moves to the enrollment port, which must never require a certificate.
 - **Open: the direct port.** Whether the direct agent-to-server port of single-server installs gets the same split into an enrollment port and a strict main port. Wave 2 decides.
 
@@ -131,7 +132,7 @@ Why signed messages rather than a key agreed per session with a MAC on every mes
 
 ### D8. kTLS is the default at the agent edge; OTP `ssl` is the fallback
 
-The reasons are the measurements above, and that nginx and HAProxy run the same design: OpenSSL's TLS state machine and X.509 code in their own process, then (where enabled) kernel record encryption. **Neither makes kTLS a default (verified 2026-10-29).** nginx offers it as an opt-in since 1.21.4 (2021), through `ssl_conf_command Options KTLS`. HAProxy offers it as an experimental option since 3.3 (2025), through `ktls on`, refused unless the configuration also sets `expose-experimental-directives`. Our default is therefore a stronger position than either, and the requirements below are what make it acceptable. HAProxy, like the gateway, is one multi-threaded process, so a memory-safety bug there also costs every connection; nginx isolates it to one worker.
+The reasons are the measurements above, and that nginx and HAProxy run the same design: OpenSSL's TLS state machine and X.509 code in their own process, then (where enabled) kernel record encryption. **Neither makes kTLS a default (verified 2026-10-29).** nginx offers it as an opt-in since 1.21.4 (2021), through `ssl_conf_command Options KTLS`. HAProxy offers it as an experimental option since 3.3 (2025), through `ktls on`, refused unless the configuration also sets `expose-experimental-directives`. Our default is therefore a stronger position than either, but only if the requirements below are met; they are what make it acceptable. HAProxy, like the gateway, is one multi-threaded process, so a memory-safety bug there also costs every connection; nginx isolates it to one worker.
 
 **TLS version.** TLS 1.2 sends the client certificate in the clear, so on an internet-facing gateway a passive observer reads every agent's SPIFFE ID. That argues for TLS 1.3 on the main port. A TLS 1.3 peer can send KeyUpdate to change keys mid-connection. Under kTLS the kernel must install the new receive key, and only newer kernels can (the rekey support is documented for Linux 6.14). Rocky 9's 5.14 cannot: there a KeyUpdate ends the connection (BigColin K2, 2026-10; no Yuzu agent stack was seen to send one). If wave 2 chooses TLS 1.3 it needs two things:
 - **A KeyUpdate policy:** refuse it and close the connection, or require a kernel with rekey support on gateway hosts, or keep the receive side in user space.
@@ -233,6 +234,10 @@ Several standing rules, and one earlier ADR, say the opposite of a decision abov
 7. **The design target.** ADR-0069 records 100,000 agents per gateway. Dave has been steering to a solid 5,000 per gateway now, nothing that blocks 50,000 and beyond, and 500,000 as the long-term horizon. **Decided by Nathan on 2026-10-28** (Dave to see): waves 1 to 5 must pass at 5,000 agents on both rigs, with nothing that blocks 50,000; wave 6 tests failover under a 5,000-agent load; wave 7 is the 100,000-agent per-box budget (D14); 500,000 stays the long-term horizon, outside this programme.
 8. **D13 against ADR-2002 section 11. Still open: for wave 6.** Section 11's default is one primary plus two synchronous standbys (`ANY 1`), with an async profile as a documented opt-out (section 13 keeps it). WS-7 measured that strict no-degrade mode blocks writes for minutes after a single failover, against D13's 60-second target, so the shipped default is async with degrade on total standby loss (`YUZU_PG_SYNC_STRICT` defaults to false in `deploy/docker/ha-postgres/patroni-entrypoint.sh`). D13 supersedes section 11's default and its async opt-out only once wave 6 reconciles the two, or revises one of them. Until then the shipped default is unchanged. Wave 6 works on the existing Patroni rig (`deploy/docker/docker-compose.ha-postgres.yml`), not a new one.
 
+## Audit and evidence
+
+The waves add audit records or metrics for: certificate issuance, renewal and revocation; CRL publication and gateway pulls; handshake refusals by reason; entry into and exit from fail-closed; enrollment by machine certificate; D5 signature refusals; and the drain lifecycle (order, abort, completion). Each wave names its own audit verbs and metrics. Mutations fail closed on audit failure (ADR-1005).
+
 ## Accepted risks
 
 Each is re-accepted at the owner's sign-off at the end of wave 0.
@@ -294,7 +299,8 @@ Wave 0 compared this design with open-source systems that answer the same questi
 
 ## Consequences
 
-- The release that ships wave 2 breaks every existing agent-to-gateway deployment: new port, new certificates, agents re-enroll. This is acceptable only because there are no customers yet.
+- The release that ships wave 2 breaks every existing agent-to-gateway deployment: new port, new certificates, agents re-enroll. This is acceptable only because there are no production customers at the time of writing (2026-10-30); wave 2 re-checks this before it merges, and if a pilot runs agents through a gateway the upgrade note becomes a merge gate.
+- Wave 2 ships with an upgrade section in `docs/user-manual/upgrading.md` (the new enrollment port and its firewall rule; the upgrade order server, then gateway, then agents; re-enrollment and its prerequisites; roll-forward), a changelog fragment marked Breaking, and an update to `docs/user-manual/gateway.md`'s "Moving the agent edge to mutual TLS".
 - The CA signs far more often: each agent renews every 12 hours instead of about every eight months. At 1.2 million agents that is about 28 signatures per second, around the clock, before any mass re-enrolment. Its signing path, its `ca_issued` table and its CRL size must be measured before wave 2, not after.
 - The gateway gains C code that faces the internet. The fuzzing, ASan and advisory-tracking requirements in D8 are permanent.
 - `docs/pki-architecture.md`, `docs/user-manual/gateway.md`, the reference composes, the compose wizard and the agent installer all change with waves 1, 2 and 4.
