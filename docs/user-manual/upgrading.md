@@ -42,7 +42,7 @@ On the agent's main process `CapEff`, `CapPrm` and `CapBnd` read `00000000000000
 
 With the capability removed, serial and UUID read `unknown` again and the two plugins above return to their refusal answers.
 
-**Tested and untested.** The mechanism is verified on systemd 259 and, in CI, on a self-hosted Linux runner that asserts the live unit's capability sets and the copy behaviour. Real firmware tables had not been exercised before that CI check, and systemd 239 (RHEL 8) is designed for but untested.
+**Tested and untested.** A check of the live unit's capability sets and the copy behaviour is part of CI on a self-hosted Linux runner. It has been run on a Linux host under systemd 259 as root. Real firmware tables and the CI-job form are untested until the first CI run on that runner, and systemd 239 (RHEL 8) is designed for but untested.
 
 ## Behaviour change: the activity-record feature is renamed Echo (tar.db adopted as echo.db; stored references migrated)
 
