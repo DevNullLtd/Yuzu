@@ -994,10 +994,11 @@ relayed by the gateway like any command (no new gateway state).
   - one id-prefix skip in `notify_exec_tracker`;
   - a small `CommandResponse` relayed back up, and dropped at ingest (below): no `ResponseStore`
     row and no provenance lookup.
-  - **Combined Postgres rate after a server restart.** A reattach costs about three Postgres
-    operations (enrollment read, route CAS, record read; D14) at up to `--reattach-rate`, and each
+  - **Combined Postgres rate after a server restart.** A reattach costs about four Postgres
+    operations (enrollment read, route CAS, record read; D14; and the `announce_connected` route
+    write of the CONNECTED re-announce that follows it) at up to `--reattach-rate`, and each
     issued resync one record write at up to `--tag-resync-rate` plus `--topology-resync-rate`. At
-    the defaults, overlapping, that is up to about 8,000 operations per second per replica against
+    the defaults, overlapping, that is up to about 10,200 operations per second per replica against
     the default `--postgres-pool-size` of 16. Agents that re-register instead (`NO_RECORD`) add one
     registration-record transaction each (D14). It is unmeasured. It is to be measured against the
     pool size alongside ADR-0074's wave-2 measurement of a mass re-enrollment after an outage,
