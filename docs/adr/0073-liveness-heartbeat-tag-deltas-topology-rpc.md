@@ -815,9 +815,11 @@ When several conditions hold, the first in this order wins:
     conflict detail. The caller writes `topology.push.rejected` (detail `reason=reclaim_conflict`
     with the claimant, the IP and the owner, each sanitised as today) after the lock is released,
     as `push_snapshot` audits today, so no Postgres write is held under the fleet-wide mutex. The
-    fresh body then goes through first-claim-wins. This audit write is the one Postgres write on
-    heartbeat ingestion: at most once per reconnect conflict, bounded by the audit store's write
-    lease. The anti-spoof evidence chain therefore records a refused re-claim exactly as
+    fresh body then goes through first-claim-wins. The caller does not write the row on the
+    heartbeat path either: it queues it for the resync issuer's thread (D8), which writes it
+    before its next pass, so several conflicts in one `BatchHeartbeat` under a degraded pool
+    cannot push the batch past the gateway's 5 s call timeout. The queue is bounded by the slot
+    cap, because a retained slot conflicts at most once per reconnect. The anti-spoof evidence chain therefore records a refused re-claim exactly as
     it records a refused push.
 
   A gateway restart thus costs zero bodies for agents back within five minutes. Eviction is lazy (in
@@ -1125,7 +1127,8 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
   - **Ingestion only marks.** A heartbeat that requests a resync (D3, D6) adds the agent to a
     per-replica pending set: one entry per agent and action, deduplicated, so the set is bounded by
     the agents whose heartbeats reach this replica (gauge `yuzu_server_resync_pending{action}`).
-    Ingestion does no Postgres work and no send for it, so a resync adds nothing to a batch's
+    Ingestion does no Postgres work and no send for it (the D6 re-claim audit is queued to the
+    issuer too), so a resync adds nothing to a batch's
     #5686 per-batch Postgres budget or to the gateway's 5 s BatchHeartbeat call timeout
     (`yuzu_grpc_client`'s default, per the `yuzu_gw_heartbeat_buffer.erl` header). A slow pool
     cannot push a batch past the timeout and make the gateway resend it.
