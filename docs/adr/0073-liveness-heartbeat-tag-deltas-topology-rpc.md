@@ -1189,9 +1189,13 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     rate and between-pass waits are condition-variable waits the stop flag wakes, so it never
     sleeps through a stop. `stop()` and `~ServerImpl` stop and join it after the gRPC services
     have stopped (so ingestion can no longer mark; a mark made after the stop is dropped) and
-    before the registry, `plugin_config_store_`, the execution tracker and the Postgres pool it
-    calls. Shutdown latency is bounded by one in-flight lease budget plus the pool's
-    `statement_timeout`, plus the re-claim audit drain's 5 s deadline (D6). The pass swaps the pending set out under the set's mutex and never holds
+    before the registry, `plugin_config_store_`, the execution tracker, `audit_store_` (the
+    re-claim audit drain), `gw_mgmt_pool_` (its own gateway forwarders) and the Postgres pool it
+    calls. On stop it cancels its in-flight forwards (`ClientContext::TryCancel`) before joining
+    them. Shutdown latency is bounded by one in-flight lease budget plus the pool's
+    `statement_timeout`, plus the re-claim audit drain's 5 s deadline (D6); the forwarders' 10 s
+    deadline does not add to it because they are cancelled first. The slice-6 shutdown test also
+    stops during an in-flight forward and during the audit drain. The pass swaps the pending set out under the set's mutex and never holds
     that mutex across `build_classified_command`, a Postgres call or `send_to`, so ingestion's
     mark never waits on Postgres. The pass is a new background job: it gets a
     `background_jobs.hpp` row (WS-10; a diff against that array, never a silent addition),
