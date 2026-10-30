@@ -1159,7 +1159,7 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     since this ADR.
   - `__resync__` is **not** in the protective set. A whole-action kill switch on it refuses it;
     that is counted `send_failed`, and divergence persists until the next permitted issuance. A
-    degraded enablement store fails the issuer's once-per-pass kill-switch read, which ends the
+    degraded enablement store is told apart from a set switch by the issuer's tri-state read, which ends the
     pass with the marks counted `deferred` (below), never `send_failed`. A per-OS kill switch is not applied:
     `send_system_reserved` ignores the per-OS withhold `build_classified_command` returns, as it
     does for `__sync__.now` and every other system-reserved push (only `dispatch_confined` applies
