@@ -47,8 +47,9 @@ D1-D16; each item names the D-sections that hold its detail, and terms such as `
    `StatusTags` delta serialized into an **opaque `bytes` field** the gateway never decodes (D2),
    and a ~70-byte `TopologyDigest` (D5).
    - "Liveness-only", here and in the title, means no bulk body. The heartbeat still carries
-     liveness plus state-tag deltas and a topology digest, and that state content is not signed
-     (D16).
+     liveness plus state-tag deltas and a topology digest. That state content, and the topology
+     report, are signed by the agent from ADR-0074 wave 2 (owner decision, 2026-10-30; D16); the
+     liveness fields stay unsigned.
    - `fleet_snapshot_json` (field 4) is **no longer used**.
    - The flat `status_tags` map (field 3) is **no longer used** either. It is replaced, not extended.
    - Both stay in the proto, marked `[deprecated = true]` with a comment naming ADR-0073 (D15). The
@@ -894,7 +895,7 @@ message TopologyReport {
 }
 message TopologyAck {
   bool accepted = 1;
-  TopologyRejectReason reject_reason = 2; // PARSE | DIGEST_MISMATCH | IP_CONFLICT | OVERSIZE | UNKNOWN_SESSION
+  TopologyRejectReason reject_reason = 2; // PARSE | DIGEST_MISMATCH | IP_CONFLICT | OVERSIZE | UNKNOWN_SESSION | BAD_SIGNATURE (wave 2, D16)
 }
 // GatewayUpstream
 rpc ProxyTopology(yuzu.agent.v1.TopologyReport) returns (yuzu.agent.v1.TopologyAck);
@@ -1491,7 +1492,8 @@ count-valued histograms here are not latencies, so they declare their own:
 
 **Server:**
 - `yuzu_server_heartbeat_tags_total{via,outcome}`, with `via` `direct|gateway|register` and
-  `outcome` `synced|full|diverged|no_base|rejected|absent|unverifiable` (D3);
+  `outcome` `synced|full|diverged|no_base|rejected|absent|unverifiable`, plus `bad_signature`
+  from ADR-0074 wave 2 (D3, D16);
 - `yuzu_server_tag_resync_total{outcome}`, with `sent|deferred|send_failed`;
 - gauge `yuzu_server_resync_pending{action}`, with `tags|topology`: the size of the pending set
   (D8);
@@ -1514,8 +1516,9 @@ count-valued histograms here are not latencies, so they declare their own:
 - `yuzu_viz_topology_reclaim_audit_total{result}`, with `written|deferred|dropped` (D6: the queued
   `reclaim_conflict` audit row; a non-zero `dropped` is a lost evidence row);
 - `yuzu_viz_topology_reclaim_audit_queued`, a gauge (D6: the re-claim audit rows still queued);
-- `yuzu_viz_topology_digest_total{via,outcome}`, with `match|mismatch|no_slot|empty|disabled|absent`
-  (`empty`: an empty digest; `disabled`: `DISABLED`; `absent`: no field);
+- `yuzu_viz_topology_digest_total{via,outcome}`, with `match|mismatch|no_slot|empty|disabled|absent`,
+  plus `bad_signature` from ADR-0074 wave 2 (D16;
+  `empty`: an empty digest; `disabled`: `DISABLED`; `absent`: no field);
 - `yuzu_viz_topology_resync_total{outcome}`, with `sent|deferred|send_failed`;
 - gauge `yuzu_viz_topology_slots{state}`, with `fresh`, `disconnected`, `agent_silent`,
   `pump_stuck`, `body_pending`, `report_rejected`, `awaiting_report` and `not_reported`: `fresh`
@@ -1859,14 +1862,21 @@ message ReattachResponse {
   refuses a session superseded by a different live one, but a tombstoned or absent row is reclaimed
   under any well-formed session id. Reattach rests on the same two things as the ProxyRegister fast
   path, so removing the token removes exposure, not a check.
-- **Reattach and ADR-0074 D5's per-session signature, stated plainly.** As designed here, reattach
-  has no agent step: it carries ids only and is invisible to the agent. It therefore cannot carry
-  the D5 per-session proof, which is the agent signing a server challenge at session start. Until
-  the owner resolves this (open point 13), a reattached session, and the route its CONNECTED
-  re-announce writes, carry the route-claim risk stated in ADR-0074 Conflict 1, which ADR-0074
-  lists for explicit acceptance at its sign-off and which holds only until its wave 2 (D5): a compromised
-  gateway with a valid certificate can reattach any enrolled agent whose route row is not held by
-  a different live session, and claim that route.
+- **Reattach and ADR-0074 D5's per-session signature: the challenge after reattach (decided by the
+  owner, 2026-10-30; lands in ADR-0074 wave 2).** Reattach itself carries ids only and has no
+  agent step, so it cannot carry the D5 per-session proof. The requirement is:
+  - after a reattach, the server sends a signed session-start challenge down the existing stream,
+    the same challenge D5 issues at the start of every session;
+  - until the agent's signature over that challenge verifies, the route is not published (the
+    CONNECTED re-announce changes no route row) and no command but the challenge is routed to the
+    agent, `__resync__` included; the issuer treats such a session as not yet installed (D8);
+  - a signature that fails to verify, or no answer within the challenge's expiry, tears the stream
+    down, and the agent registers again through the full path.
+  Until wave 2 lands, a reattached session, and the route its CONNECTED re-announce writes, carry
+  the route-claim risk stated in ADR-0074 Conflict 1, which ADR-0074 lists for explicit
+  acceptance at its sign-off and which holds only until its wave 2 (D5): a compromised gateway
+  with a valid certificate can reattach any enrolled agent whose route row is not held by a
+  different live session, and claim that route.
 
 **What the server persists: `AgentRegistrationStore`.**
 - **Placement.** Born on Postgres, schema `agent_registration_store` (ADR-0006/0008 naming,
@@ -2037,12 +2047,31 @@ lands. The two are kept consistent as follows.
   any gateway could rebuild is allowed (ADR-0074's Conflict 5, decided 2026-10-29).
 - **Signing.** ADR-0074 D5's scope was decided on 2026-10-29: the server signs every command and
   the gateway list, the agent signs every result, and the agent signs a per-session challenge.
-  Liveness heartbeats stay unsigned. That scope does not include `ReportTopology` or the state
-  tags. ADR-0074 accepts unsigned heartbeats as **liveness** only, and it lists "honest heartbeats"
-  among what D5 does not give.
-- **What that leaves a compromised gateway, stated plainly.** The tag delta and the topology
-  digest ride the unsigned heartbeat, and the topology body rides an unsigned unary. They carry no
-  integrity beyond the agent's TLS session to the gateway.
+  Liveness heartbeats stay unsigned. That scope, as ADR-0074 states it at its governed head, does
+  not include `ReportTopology` or the state tags; ADR-0074 accepts unsigned heartbeats as
+  **liveness** only, and it lists "honest heartbeats" among what D5 does not give.
+- **Signed state content (decided by the owner, 2026-10-30; lands in ADR-0074 wave 2).** The agent
+  signs its state content with its D5 agent key, and the server rejects anything a gateway
+  altered. The requirement:
+  - every `StatusTags` payload the agent sends is signed, a delta or a full set, on the heartbeat
+    and in Register, together with the heartbeat's `TopologyDigest`; and every `TopologyReport`
+    body is signed;
+  - each signature covers the bytes as the agent serialized them and binds the agent id, the
+    session id and a per-session sequence the server requires to increase, so a payload replayed
+    from another session, or an older one replayed in this session, is rejected; the gateway's
+    keep-newest coalescing (D4) only drops whole heartbeats, so it never breaks a signature;
+  - the server verifies against the certificate it issued that agent, before the D3 digest check
+    and before `push_snapshot`. A payload that fails is rejected whole and changes nothing: the
+    tag outcome and the digest outcome are `bad_signature`, a `TopologyReport` is refused with
+    `BAD_SIGNATURE` (D13), and the per-agent `rejected` backoff applies;
+  - the liveness fields (`session_id`, `sent_at`, the fact that a heartbeat arrived) stay unsigned,
+    as ADR-0074 D5 decided.
+  The signature fields are additive proto fields (no subtraction), and the agent's signing cost and
+  the server's verification rate are measured in wave 2 alongside ADR-0074's result-signature
+  measure. Until wave 2 lands, the state content is unsigned and the gap below stands.
+- **What that leaves a compromised gateway until wave 2, stated plainly.** Until then, the tag
+  delta and the topology digest ride the unsigned heartbeat, and the topology body rides an
+  unsigned unary. They carry no integrity beyond the agent's TLS session to the gateway.
   - The state digest (D3) detects loss and coalescing. It does not detect tampering: it is
     unkeyed, and it travels in the same unsigned bytes, so a gateway that rewrites a delta can
     rewrite the digest to match.
@@ -2054,8 +2083,9 @@ lands. The two are kept consistent as follows.
     signed command does not make the answer honest.
   - A forged topology digest keeps a host's slot confirmed and its IP claims alive (D6). A forged
     `ReportTopology` body can claim IPs for the agent.
-  - This is wider than ADR-0074's accepted heartbeat risk, which is liveness only. Open point 12
-    asks the owner to accept it or to require agent signatures on this content.
+  - This is wider than ADR-0074's accepted heartbeat risk, which is liveness only. The owner's
+    2026-10-30 decision closes it at wave 2 (above); until then it is not covered by any row in
+    ADR-0074's accepted-risks table as ADR-0074 stands at its governed head.
 - **Gateway choice.** ADR-0074 lets agents move freely between gateways. Reattach adds no gateway
   affinity: a reattach succeeds on any server replica (D14, *HA*), and its adopt decision is the one
   ProxyRegister uses. The connection-level precondition in *Server stores* is about the gateway's
@@ -2387,12 +2417,14 @@ per replica, for N agents whose heartbeats reach it (estimates, unmeasured; slic
   test row.
 - **Its authority is unchanged and cannot enrol** (D14). It rests on the gateway's peer
   authorization and the same enrolled-status read as the ProxyRegister fast path; the shared adopt
-  CAS fences supersession but proves no session possession. Reattach cannot carry ADR-0074 D5's
-  per-session agent signature as designed (D14; open point 13).
+  CAS fences supersession but proves no session possession. From ADR-0074 wave 2 the server
+  challenges every reattached session and publishes no route until the agent's signature verifies
+  (D14, decided 2026-10-30); until then it carries ADR-0074 Conflict 1's route-claim risk.
 - **`AgentRegistrationStore` holds no secret** (ADR-0010).
-- **Heartbeat state content and the topology body are unsigned** under ADR-0074 D5's decided
-  scope. D16 states what a compromised gateway can do with that; it is not covered by ADR-0074's
-  liveness-only acceptance (open point 12).
+- **Heartbeat state content and the topology body are signed by the agent from ADR-0074 wave 2**
+  (D16, decided 2026-10-30), and the server rejects altered content. Until wave 2 they are unsigned;
+  D16 states what a compromised gateway can do with that, and it is not covered by ADR-0074's
+  liveness-only acceptance.
 - **Quarantine containment is unchanged in its rules, but its exempt channels change:**
   - a reattach installs a session exactly as a replay-adopt does, so the heartbeat-driven
     reconnect reconciler (#3425) applies;
@@ -2702,12 +2734,11 @@ per-agent bytes on the agent, at no fleet count.
   slice 7b. Whether any of them may merge before acceptance is the owner's call (open point 17);
   none has a tracking epic yet, and the implementing PRs open one.
 - **Slice 7b against ADR-0074 wave 2.** If 7b lands before wave 2, reattach carries today's replay
-  authority (D14, *Authority is unchanged*). Either way, open point 13 must be decided before
-  ADR-0074 wave 2 lands: wave 2 gates the route write on a verified per-session agent signature
-  (its exit criterion: a CONNECTED notification without one changes no route), which reattach
-  cannot carry as designed. If 7b is already on `dev` when wave 2 lands, every reattached agent
-  would otherwise be left with no route after a server restart until it reconnects; if wave 2
-  lands first, 7b waits for the decision.
+  authority (D14, *Authority is unchanged*). Wave 2 gates the route write on a verified
+  per-session agent signature (its exit criterion: a CONNECTED notification without one changes no
+  route), and slice 11 adds the post-reattach challenge the owner decided on 2026-10-30 (D14), so
+  slice 11 must land with wave 2: if 7b is on `dev` without it when wave 2 lands, every reattached
+  agent is left with no route after a server restart until it reconnects.
 
 **No release or pilot build between slice 3 and slice 10.** From slice 3, status tags and topology
 are inert on `dev` (tags until slices 4-6, topology until slice 9), so a build cut in that range has
@@ -2827,6 +2858,20 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
     - The harness and rig rerun recorded as the measured outcome, using ADR-0074 D14's method.
     - The chaos scenarios S1-S6 (*Tests*) recorded with their results, and the two freshness SLIs
       (D13) measured.
+11. **Signed state content and the reattach challenge (lands with ADR-0074 wave 2;** owner
+    decisions of 2026-10-30, D14 and D16**).**
+    - Agent: signs every `StatusTags` payload (heartbeat and Register) with the `TopologyDigest`,
+      and every `TopologyReport`, binding agent id, session id and a per-session sequence; answers
+      a session-start challenge arriving mid-stream after a reattach.
+    - Server: verifies before the D3 digest check and before `push_snapshot`; the `bad_signature`
+      outcomes and `BAD_SIGNATURE`; the post-reattach challenge, with no route published and no
+      command but the challenge routed until it verifies, and teardown on failure or expiry.
+    - Proto: the additive signature and sequence fields.
+    - Tests: a gateway-altered delta, digest and topology body are each rejected and change
+      nothing; a replay from another session and an older in-session payload are rejected; a
+      reattached session gets no route and no `__resync__` before its challenge verifies, and is
+      torn down on a bad or missing answer. The signing and verification costs are measured on the
+      wave-2 rig.
 
 ## Open points for the owner
 
@@ -2855,21 +2900,14 @@ make a new choice.
    fact the server cannot rebuild.
 10. **`yuzu.uptime_s` retired for `yuzu.started_at`** (D1).
 11. **Pump default 60 s**: changed-host topology lags up to about 82 s instead of about 40 s.
-12. **Unsigned state content on the heartbeat, and the unsigned topology body** (D16). ADR-0074 D5
-    accepts unsigned heartbeats as liveness only, and excludes heartbeat honesty. It does not
-    cover state tags or `ReportTopology`: a compromised gateway can set any state tag the server
-    accepts as synced, keep IP claims alive with a forged topology digest, and claim IPs with a
-    forged body. The digest check does not bound this. The owner either accepts it, as a new row in
-    ADR-0074's accepted-risks table, or requires the agent to sign the `StatusTags` bytes and the
-    `TopologyReport` under its D5 key.
-13. **How reattach meets ADR-0074 D5's per-session signature** (D14). Reattach is ids-only and has
-    no agent step, so it cannot carry the per-session proof as written. Until this is decided, a
-    reattached session inherits ADR-0074 Conflict 1's route-claim risk. The owner chooses:
-    - (a) after the reattach, the server sends a signed session-start challenge down the existing
-      stream. The route is not published, and no command but the challenge is dispatched, until the
-      agent's signature verifies. A failure tears the stream down and the agent registers again; or
-    - (b) reattach is exempt from the D5 per-session proof, recorded as a new row in ADR-0074's
-      accepted-risks table.
+12. **Unsigned state content on the heartbeat, and the unsigned topology body** (D16). *Decided by
+    the owner on 2026-10-30:* the agent signs its `StatusTags` deltas and full sets, the
+    `TopologyDigest` and the `TopologyReport`, and the server rejects anything a gateway altered.
+    Lands in ADR-0074 wave 2 (slice 11). Kept here, numbered, so references stay stable.
+13. **How reattach meets ADR-0074 D5's per-session signature** (D14). *Decided by the owner on
+    2026-10-30:* after a reattach the server sends a signed challenge, and the agent must answer it
+    before the route is published or any command is routed to it. Lands in ADR-0074 wave 2
+    (slice 11). Kept here, numbered, so references stay stable.
 14. **Per-RPC balancing of `GatewayUpstream`** (*Server stores*). As written, the per-replica,
     in-memory delta base needs every heartbeat of one agent session to reach one replica for the
     life of a gateway upstream connection, and per-RPC balancing is unsupported. Supporting it needs
