@@ -828,8 +828,15 @@ rpc ProxyTopology(yuzu.agent.v1.TopologyReport) returns (yuzu.agent.v1.TopologyA
 **Gateway:**
 - a `report_topology/2` handler in `yuzu_gw_agent_service.erl`, admitted like `report_inventory/2`
   (`yuzu_gw_heartbeat_admission:admit_inventory/2`) but with its **own** permit pool;
-- a 2 MiB per-RPC message cap;
-- forwarding via `ProxyTopology` on the gateway's upstream connection. The gateway has one upstream
+- a 2 MiB message cap for this route. That is new mechanism: today `max_message_bytes` is a
+  per-listener limit only (the listener's `limits`, 4 MiB in `gateway/config/sys.config`, read once
+  in `yuzu_grpc_stream_h:start/3`). The route table (`yuzu_grpc_route`) gains an optional
+  per-route `max_message_bytes`, and `yuzu_grpc_stream_h` uses the smaller of it and the listener's
+  limit once the route is looked up, before any request DATA is read. `yuzu_grpc_frame:read/3` then
+  refuses an over-cap message as soon as its 5-byte header is in, before any of its body is
+  assembled;
+- forwarding via `ProxyTopology` on the existing upstream channel, as `report_inventory/2` forwards
+  through `yuzu_gw_upstream:proxy_inventory/2`. The gateway has one upstream
   and no per-session replica routing; the server resolves the session (above);
 - **no buffering**: an unforwardable report fails `UNAVAILABLE` and the agent retries.
 
@@ -865,8 +872,7 @@ joined on disconnect). These reasons make a report due:
   first report; the server sends one only after it has seen a non-empty digest, so it never
   repeats a request the agent cannot answer.
 
-**Sender lifecycle.** The sender is a background thread on the agent's per-connection teardown
-path, and it follows the daily-sync thread's contract exactly (`agent.cpp`, `sync_thread_`):
+**Sender lifecycle.** The sender is a per-connection background thread, and it follows the daily-sync thread's contract exactly (`agent.cpp`, `sync_thread_`):
 - **Waits are stop-interruptible.** Every wait (a reason's delay, the floor, a back-off) is a
   sliced sleep of at most 2 s that checks its stop flag and a wake flag on every slice, as the
   daily-sync loop checks `sync_wake_`. A condition variable is equally acceptable. No wait is a
@@ -1889,7 +1895,9 @@ of every ~30 s. The content is unchanged.
 - owner restart restores from ids;
 - the management service serves only `SendCommand` and `WatchEvents` (the three deprecated RPCs
   answer UNIMPLEMENTED);
-- `ProxyTopology` admission, permit pool, cap, no buffering and peer-guard row;
+- `ProxyTopology` admission, permit pool, cap, no buffering and peer-guard row; the per-route cap
+  refuses a 2 MiB + 1 byte message at its header on a listener whose own limit is 4 MiB, and other
+  routes keep the listener limit;
 - collect-after-64 KiB;
 - the gateway tests that assert `yuzu.uptime_s` are updated.
 
