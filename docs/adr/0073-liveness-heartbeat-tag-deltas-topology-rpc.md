@@ -1055,10 +1055,12 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     per-agent interval.
   - `topology`: the topology sender sends `RESYNC` after a uniform delay in `[0, window_s]` (D7).
 - **Ownership on the agent.** The delta base (the last acknowledged state set and its digest) is
-  owned by the heartbeat thread: only it reads or writes the base. The `tags` request atomic is set
-  by the reader thread and cleared by the heartbeat thread, only after the second acknowledged full
-  heartbeat. A new connection resets the base to the Register's full set (D2) and clears the
-  request.
+  owned by the heartbeat thread: only it reads or writes the base. The `tags` request is a
+  generation counter: the reader thread increments it; the heartbeat thread records the
+  generation it is serving and stops sending full sets only after two acknowledged full
+  heartbeats started after the latest generation, so a second request arriving during the
+  sequence restarts it rather than being absorbed. A new connection resets the base to the
+  Register's full set (D2) and treats every request as served.
 - **Reserved name on the agent.** `__resync__` is added to `kReservedPluginNames`
   (`agents/core/include/yuzu/agent/plugin_loader.hpp`, #822), so no plugin can claim the name.
 - **Server.**
