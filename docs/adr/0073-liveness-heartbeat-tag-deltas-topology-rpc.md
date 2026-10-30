@@ -1105,6 +1105,18 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     ends the pass, rather than sending the rest with skipped records, and leaves the remaining
     marks in the set, counted `deferred`. A Postgres outage therefore delays resyncs and never
     blocks heartbeat ingestion.
+  - **The issuer's lifecycle.** The issuer is a `ServerImpl`-owned thread with a stop flag. Its
+    rate and between-pass waits are condition-variable waits the stop flag wakes, so it never
+    sleeps through a stop. `stop()` and `~ServerImpl` stop and join it after the gRPC services
+    have stopped (so ingestion can no longer mark; a mark made after the stop is dropped) and
+    before the registry, `plugin_config_store_`, the execution tracker and the Postgres pool it
+    calls. Shutdown latency is bounded by one in-flight lease budget plus the pool's
+    `statement_timeout`. The pass swaps the pending set out under the set's mutex and never holds
+    that mutex across `build_classified_command`, a Postgres call or `send_to`, so ingestion's
+    mark never waits on Postgres. The pass is a new background job: it gets a
+    `background_jobs.hpp` row (WS-10; a diff against that array, never a silent addition),
+    `BackgroundJobClass::ReplicaSafe`, never leader-gated (above), and a
+    `YUZU_ASSERT_BACKGROUND_JOB` site.
   - **No installed session yet.** A mark for an agent this replica has no installed session for
     (after a restart, until its reattach lands, D14) stays in the set, counted `deferred`, and is
     tried on a later pass. Only a send attempted on an installed session is ever `send_failed`.
@@ -2468,7 +2480,10 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
    `yuzu.started_at`, `yuzu.uptime_s` removed, agent tag metrics.
 6. **`__resync__`, both ends.**
    - Agent: reserved dispatch, decision function, dedup claim.
-   - Server: the pending set and the issuer, and its call site in heartbeat ingestion (D3);
+   - Server: the pending set and the issuer, its lifecycle (owner, stop, join and teardown
+     position) and its `background_jobs.hpp` row (D8), and its call site in heartbeat ingestion
+     (D3); a test that a shutdown during each wait and during a held write joins within the
+     bound;
      `--tag-resync-rate` and `--topology-resync-rate`, the per-agent intervals and the backoff after
      `rejected`; the resync metrics (`yuzu_server_tag_resync_total`,
      `yuzu_viz_topology_resync_total`, `yuzu_server_resync_pending`); the reply drop at ingest;
