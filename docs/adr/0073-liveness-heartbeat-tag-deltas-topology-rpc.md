@@ -827,8 +827,9 @@ When several conditions hold, the first in this order wins:
       reconnect, but a flapping agent through a degraded pool can conflict on each reconnect); an
       overflow drops the oldest row, counts it (`result="dropped"`) and logs it at WARN;
     - on stop the issuer drains the queue before it exits, each write bounded by one lease
-      budget, so a stop does not lose a row while the audit store is healthy; a row it cannot
-      write then is counted `dropped` and logged;
+      budget and the whole drain by a 5 s deadline, so a stop does not lose a row while the audit
+      store is healthy and the queue is short; a row it cannot write, or has not reached when the
+      deadline passes, is counted `dropped` and logged at WARN;
     - an unclean exit (OOM, `SIGKILL`, a crash) loses every row still queued, at most
       `kPushedMapHardCap`, and nothing counts them: the queue is in memory. A clean `stop()`
       never does. This is the cost of keeping the write off the heartbeat path; the conflict
@@ -1176,7 +1177,7 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     have stopped (so ingestion can no longer mark; a mark made after the stop is dropped) and
     before the registry, `plugin_config_store_`, the execution tracker and the Postgres pool it
     calls. Shutdown latency is bounded by one in-flight lease budget plus the pool's
-    `statement_timeout`, plus one lease budget per queued re-claim audit row it drains (D6). The pass swaps the pending set out under the set's mutex and never holds
+    `statement_timeout`, plus the re-claim audit drain's 5 s deadline (D6). The pass swaps the pending set out under the set's mutex and never holds
     that mutex across `build_classified_command`, a Postgres call or `send_to`, so ingestion's
     mark never waits on Postgres. The pass is a new background job: it gets a
     `background_jobs.hpp` row (WS-10; a diff against that array, never a silent addition),
