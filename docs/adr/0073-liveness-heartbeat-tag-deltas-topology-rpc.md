@@ -2004,10 +2004,17 @@ message ReattachResponse {
     session's challenge state under `stream_mu` and hands it to the verifier, a bounded pool
     (four threads, unmeasured) owned by the issuer and joined in its stop stage, which runs the
     signature check and the revocation read with its in-expiry retries. A challenge accepts
-    exactly one answer: the first response on the forward's stream (or the first challenge reply
-    on a direct agent's Subscribe stream) fills a single slot that is never overwritten, the
-    gateway call is then finished or cancelled, and any further message is dropped unverified and
-    counted (`yuzu_server_reattach_challenge_extra_answer_total`). The verifier's queue therefore
+    exactly one answer, by the same rule on both paths: the first TERMINAL `CommandResponse`
+    whose `command_id` is the challenge's and whose plugin field is the challenge reply's fills a
+    single slot that is never overwritten. Non-terminal frames (status `RUNNING`, the `__timing__`
+    and `__keepalive__` sentinels included) are discarded on the polling thread without filling
+    the slot or reaching the verifier, and a gateway call that carries more than four of them is
+    cancelled, so a gateway cannot stream non-answers until the client deadline. Once the slot is
+    filled the gateway call is finished or cancelled, and any further message is dropped
+    unverified and counted (`yuzu_server_reattach_challenge_extra_answer_total`). The agent
+    answers `__session__.challenge` inline in its reserved-name dispatch, as it does `__resync__`,
+    writing exactly one terminal frame and no `__timing__` frame; a slice-11 test forwards a
+    `RUNNING` `__timing__` frame before a valid answer and asserts `verified`. The verifier's queue therefore
     holds at most one entry per `challenge_pending` session, bounded by the pending gauge's bound,
     and slice 11's Resource Ledger entry for the pool names that bound; a slice-11 test streams
     many answers on one gateway challenge and repeats a direct agent's reply, and asserts one
