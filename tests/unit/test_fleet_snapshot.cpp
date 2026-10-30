@@ -454,4 +454,3 @@ TEST_CASE("parse_proc_status: a stream that throws part-way keeps what parsed", 
 }
 
 #endif // __linux__ || __APPLE__
-

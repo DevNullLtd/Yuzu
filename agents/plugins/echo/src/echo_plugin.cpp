@@ -701,7 +701,7 @@ public:
             // Best effort: init() is not contained at the plugin seam, and the map also fills
             // from the stream and the next poll, so a failed seed must not fail the plugin.
             try {
-                note_pid_names(yuzu::agent::enumerate_processes());
+                note_pid_names(yuzu::agent::enumerate_processes(), now_epoch_seconds());
             } catch (const std::exception& e) {
                 spdlog::warn("ECHO: process-name seed failed: {}", e.what());
             } catch (...) {
@@ -1141,9 +1141,17 @@ public:
     // point for all of them -- before this, a throw from any of the dispatch chain (a
     // std::ios_base::failure from a /proc read, a bad_alloc, a std::length_error) terminated the
     // agent. The catch also rolls back a transaction the unwind left open on the shared write
-    // connection (purge_source and the other raw-BEGIN paths allocate between BEGIN and COMMIT),
-    // so the next writer cannot silently join it. No lock is held here: every lock_guard in the
-    // chain has already been released by the unwind.
+    // connection (purge_source and the other raw-BEGIN paths allocate between BEGIN and COMMIT).
+    // What that guarantees: the connection is back in autocommit before this action returns.
+    // What it does not: the unwind releases mu_ before the catch re-takes it, so another thread
+    // can write in between. A transactional writer fails its own BEGIN; the two standalone
+    // writers (set_config, set_state) refuse while a transaction is open and report failure
+    // instead of a success the rollback would discard. The one per-call-locked writer left,
+    // the roll-up's execute_sql_range, can still join and be discarded. Its mark is written by
+    // set_config, which refuses while the transaction is open, so that window is rolled up
+    // again at the next pass; if the rollback lands first the mark is written and the window
+    // is not re-run (a missing hourly summary, never a lost raw capture row). A throw between
+    // BEGIN and COMMIT plus a writer in the unwind-to-catch gap is the whole exposure.
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
         try {
             return execute_dispatch(ctx, action, params);
@@ -1236,9 +1244,14 @@ public:
             }
         }
     }
-    void note_pid_names(const std::vector<yuzu::agent::ProcessInfo>& procs) {
+    // Poll leg: a snapshot has no stop events, so a pid missing from the UNFILTERED enumeration
+    // is stamped exited at `ts` (same epoch-seconds clock as the stream's ts_unix), which is what
+    // makes the grace window hold on a platform with no process stream. Starts first, so a pid
+    // observed again after a stamp is reset to running by note_pid_start.
+    void note_pid_names(const std::vector<yuzu::agent::ProcessInfo>& procs, std::int64_t ts) {
         for (const auto& p : procs)
             note_pid_start(p.pid, p.name);
+        yuzu::echo::note_pid_exits(pid_name_, procs, ts);
     }
 
     // #1567: idempotent reconcile of the persisted quarantine fact (echo_config)
@@ -1616,7 +1629,7 @@ private:
                     // since the fallback. (Mirrors the poll branch's enumerate +
                     // stabilization-exclusion filter, minus the diff/insert.)
                     auto current = yuzu::agent::enumerate_processes();
-                    note_pid_names(current);
+                    note_pid_names(current, ts);
                     if (!stab_excl.empty()) {
                         std::erase_if(current, [&](const auto& p) {
                             return yuzu::echo::should_redact(p.name, stab_excl);
@@ -1637,7 +1650,8 @@ private:
                 // No active stream (poll-only platform, or stream unavailable):
                 // snapshot-diff poll.
                 auto current = yuzu::agent::enumerate_processes();
-                note_pid_names(current); // before the exclusions: a noisy process still names its sockets
+                // Before the exclusions: a noisy process still names its sockets.
+                note_pid_names(current, ts);
 
                 // Stabilization exclusions: drop processes whose name matches any
                 // exclusion pattern. The patterns reuse the same matching as

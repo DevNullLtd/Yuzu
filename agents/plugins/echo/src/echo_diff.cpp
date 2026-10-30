@@ -16,6 +16,7 @@
 #include <format>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace yuzu::echo {
@@ -554,6 +555,18 @@ void fill_process_names(std::vector<NetConnection>& conns,
     for (auto& c : conns) {
         if (c.process_name.empty())
             c.process_name = pid_name_lookup(names, c.pid, ts);
+    }
+}
+
+void note_pid_exits(std::unordered_map<uint32_t, PidName>& names,
+                    const std::vector<yuzu::agent::ProcessInfo>& running, int64_t ts) {
+    std::unordered_set<uint32_t> alive;
+    alive.reserve(running.size());
+    for (const auto& p : running)
+        alive.insert(p.pid);
+    for (auto& [pid, entry] : names) {
+        if (entry.exited_at == 0 && !alive.contains(pid))
+            entry.exited_at = ts;
     }
 }
 

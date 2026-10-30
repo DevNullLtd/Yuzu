@@ -1047,11 +1047,6 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
     }
     const DWORD max_sub = before.max_sub, max_data = before.max_data;
     auto& values = ctx.out->keys[full]; // present even when empty: a vanished key is detectable
-    // The key's write time as first queried: a row takes it as its time. A key written during
-    // this walk makes the read Capped below, so nothing is built from a stale stamp.
-    ctx.out->written[full] = static_cast<std::int64_t>(
-        (static_cast<std::uint64_t>(before.written.dwHighDateTime) << 32) |
-        before.written.dwLowDateTime);
     // lpData is never null: with a null buffer RegEnumValueW answers ERROR_SUCCESS and only
     // reports the size, so a value that grew since QueryInfoKey would be copied from nullptr.
     const std::size_t buf_len =
@@ -1146,8 +1141,16 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
     // can no longer be queried was deleted mid-walk, which is the same answer. Control flow
     // reaches here only when neither `capped` nor `unreadable` is set.
     KeyInfo after;
-    if (query_key(key, after) != ERROR_SUCCESS || !(after == before))
+    if (query_key(key, after) != ERROR_SUCCESS || !(after == before)) {
         ctx.capped = true;
+        return;
+    }
+    // The key's write time, published only now that the two queries agree: a row takes it as
+    // its time. A key written during the walk, or one the walk left early (capped, unreadable),
+    // gets no stamp, and its candidates fall back to the end of the read.
+    ctx.out->written[full] = static_cast<std::int64_t>(
+        (static_cast<std::uint64_t>(before.written.dwHighDateTime) << 32) |
+        before.written.dwLowDateTime);
 }
 
 SubtreeRead read_root(const std::string& root, std::int64_t deadline) noexcept {

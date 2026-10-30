@@ -2402,6 +2402,19 @@ TEST_CASE("registry rows: the time is the key's LastWriteTime, clamped to the re
         const auto row = registry_row_from_candidate(one_change(0), 0, "", "attr:none", 1);
         CHECK(row.ts == filetime_to_unix_ms(read_end) / 1000);
     }
+    SECTION("a Capped read that visited a key but published no stamp for it uses the read end") {
+        // The reader stamps a key only after its final validation; a walk that ended early or
+        // saw the key written leaves `written` without the key, and the row must not be timed
+        // from any earlier query.
+        SubtreeRead part = complete({{root + "\\A", {{"v", vread(P::kRegDword, dword(2))}}}});
+        part.status = RegistryReadStatus::Capped;
+        REQUIRE_FALSE(part.written.contains(root + "\\A"));
+        const auto d = diff_registry_snapshot(base.baseline, part, root, "notify", win, read_end);
+        REQUIRE(d.candidates.size() == 1);
+        CHECK(d.candidates[0].key_written == 0);
+        const auto row = registry_row_from_candidate(d.candidates[0], 0, "", "attr:none", 1);
+        CHECK(row.ts == filetime_to_unix_ms(read_end) / 1000);
+    }
     SECTION("a key_removed row has no write time and uses the read end") {
         SubtreeRead gone;
         gone.status = RegistryReadStatus::Absent;

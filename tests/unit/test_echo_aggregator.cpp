@@ -3034,4 +3034,3 @@ TEST_CASE("parse_budget_bytes accepts whole bytes at or above the minimum only",
     CHECK(*parse_budget_bytes("9223372036854775807") == INT64_MAX);
     CHECK(kEchoDbBudgetBytesMin == 33554432);
 }
-

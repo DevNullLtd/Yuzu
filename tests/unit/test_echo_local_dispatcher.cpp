@@ -862,7 +862,12 @@ TEST_CASE("echo plugin: a polled tcp row is named by the process source, and sta
     for (const auto& p : yuzu::agent::enumerate_processes())
         if (p.pid == current_pid())
             expected = p.name;
-    REQUIRE_FALSE(expected.empty());
+    if (expected.empty()) {
+        // A sandbox or container that denies process listing: the poll could not have named
+        // this process either, so the case has nothing to check. Same idiom as the root skip.
+        WARN("process enumeration cannot name this process -- skipping (restricted environment)");
+        return;
+    }
 
     // The client end of a pair: the row whose local port is the client's and whose remote port
     // is the listener's.

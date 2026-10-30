@@ -3902,6 +3902,23 @@ TEST_CASE("EchoDatabase: rollback_open_transaction clears a transaction an unwin
     CHECK(count_table_rows(t.db, "tcp_live") == 2);
 }
 
+TEST_CASE("EchoDatabase: set_config and set_state refuse to join a transaction left open",
+          "[echo][store][budget]") {
+    // The window between an unwind releasing mu_ and fail_internal's rollback: a standalone
+    // write that joined the abandoned transaction would report success and then be discarded.
+    auto t = make_test_db();
+    REQUIRE(t.db.set_config("yuzu_test_key", "before"));
+    REQUIRE(t.db.execute_sql("BEGIN"));
+    CHECK_FALSE(t.db.set_config("yuzu_test_key", "joined"));
+    CHECK_FALSE(t.db.set_state("yuzu_test_collector", "{\"joined\":1}"));
+    t.db.rollback_open_transaction();
+    CHECK(t.db.get_config("yuzu_test_key", "") == "before"); // nothing was written, nothing lost
+    CHECK(t.db.set_config("yuzu_test_key", "after"));
+    CHECK(t.db.set_state("yuzu_test_collector", "{\"after\":1}"));
+    CHECK(t.db.get_config("yuzu_test_key", "") == "after");
+    CHECK(t.db.get_state("yuzu_test_collector") == "{\"after\":1}");
+}
+
 TEST_CASE("EchoDatabase: a pre-auto_vacuum database converts with one VACUUM",
           "[echo][store][budget]") {
     yuzu::test::TempDbFile tmp{"yuzu_test_echo_av_"};
@@ -3940,4 +3957,3 @@ TEST_CASE("EchoDatabase: a pre-auto_vacuum database converts with one VACUUM",
         CHECK(db.storage_bytes().wal_bytes == 0); // TRUNCATE reclaimed the WAL file
     }
 }
-

@@ -981,6 +981,36 @@ TEST_CASE("Echo fill_process_names: a reused pid does not inherit a stale name p
     CHECK(name_at(t + 300) == "b");
 }
 
+TEST_CASE("Echo note_pid_exits: a pid absent from the poll snapshot is stamped and expires",
+          "[echo][diff][network][pidname]") {
+    // The polling leg has no stop events: the snapshot reconcile is the only exit stamp there.
+    constexpr std::int64_t t = 5000;
+    std::unordered_map<std::uint32_t, PidName> names;
+    names[100] = PidName{"gone", 0};
+    names[200] = PidName{"alive", 0};
+    names[300] = PidName{"earlier", t - 1000}; // stamped by a previous tick: left alone
+    ProcessInfo alive;
+    alive.pid = 200;
+    alive.name = "alive";
+    note_pid_exits(names, {alive}, t);
+    CHECK(names[100].exited_at == t);
+    CHECK(names[200].exited_at == 0);
+    CHECK(names[300].exited_at == t - 1000);
+    // Inside the grace the departed name still resolves; after it the pid is unknown.
+    CHECK(pid_name_lookup(names, 100, t + kPidNameGraceSec) == "gone");
+    CHECK(pid_name_lookup(names, 100, t + kPidNameGraceSec + 1).empty());
+    CHECK(pid_name_lookup(names, 200, t + 10000) == "alive");
+    // Re-observed running (what note_pid_start writes before the reconcile): back to running,
+    // and the reconcile does not re-stamp a pid that is present.
+    names[100] = PidName{"gone", 0};
+    ProcessInfo back;
+    back.pid = 100;
+    back.name = "gone";
+    note_pid_exits(names, {alive, back}, t + 10000);
+    CHECK(names[100].exited_at == 0);
+    CHECK(pid_name_lookup(names, 100, t + 20000) == "gone");
+}
+
 TEST_CASE("Echo utmp_text stops at the first NUL and at the field width",
           "[echo][diff][user]") {
     const char with_nul[8] = {'a', 'l', 'i', 'c', 'e', '\0', 'x', 'y'};

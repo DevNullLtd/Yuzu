@@ -973,6 +973,9 @@ private:
 
     /// Internal set_config that assumes caller already holds mu_.
     bool set_config_locked(const std::string& key, const std::string& value);
+    /// True (after a warn) when the write connection is inside a transaction. Only the two
+    /// standalone writers (set_config, set_state) ask: mu_ held, db_ non-null.
+    bool refuse_open_transaction_locked(const char* what) const;
 
     // ATOMIC because it is written at RUNTIME, not only at open/close: the
     // wedged-rollback path in execute_atomic_batch nulls it under mu_ while

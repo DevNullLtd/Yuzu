@@ -640,6 +640,14 @@ void fill_process_names(std::vector<NetConnection>& conns,
 [[nodiscard]] std::string pid_name_lookup(const std::unordered_map<uint32_t, PidName>& names,
                                           uint32_t pid, int64_t ts);
 
+/// Poll-leg exit reconcile: every entry still believed running (`exited_at == 0`) whose pid is
+/// absent from `running` is stamped exited at `ts`, so the grace window applies on a platform
+/// with no process stream. `running` must be the UNFILTERED enumeration (a process dropped by a
+/// stabilization exclusion is still running). Entries already stamped, and pids present, are
+/// untouched. O(|running| + |names|), bounded by the caller's map cap.
+void note_pid_exits(std::unordered_map<uint32_t, PidName>& names,
+                    const std::vector<yuzu::agent::ProcessInfo>& running, int64_t ts);
+
 std::vector<ServiceEvent> compute_service_events(const std::vector<ServiceInfo>& previous,
                                                  const std::vector<ServiceInfo>& current,
                                                  int64_t timestamp, int64_t snapshot_id);

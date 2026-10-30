@@ -1483,9 +1483,23 @@ EchoDatabase::try_get_state(const std::string& collector) {
     return std::optional<std::string>{}; // succeeded, no row
 }
 
+// A standalone (non-transactional) write must not join a transaction that an exception unwound
+// past on this connection: it would report success and then be discarded by the ROLLBACK that
+// EchoPlugin::fail_internal runs once it re-takes mu_. Every BEGIN site holds mu_ for its whole
+// span, so an open transaction seen by a caller that has just taken mu_ is abandoned by
+// definition. Refuse; the caller reports the failure and the next attempt lands.
+bool EchoDatabase::refuse_open_transaction_locked(const char* what) const {
+    if (sqlite3_get_autocommit(db_) != 0)
+        return false;
+    spdlog::warn("EchoDatabase::{} refused: a transaction left open on the write connection is "
+                 "about to be rolled back",
+                 what);
+    return true;
+}
+
 bool EchoDatabase::set_state(const std::string& collector, const std::string& json) {
     std::lock_guard lock(mu_);
-    if (!db_)
+    if (!db_ || refuse_open_transaction_locked("set_state"))
         return false;
     return upsert_state_locked(db_, collector, json);
 }
@@ -2124,6 +2138,8 @@ std::string EchoDatabase::get_config(const std::string& key, const std::string& 
 
 bool EchoDatabase::set_config(const std::string& key, const std::string& value) {
     std::lock_guard lock(mu_);
+    if (!db_ || refuse_open_transaction_locked("set_config"))
+        return false;
     return set_config_locked(key, value);
 }
 
