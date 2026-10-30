@@ -2745,7 +2745,14 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
      OF THE BYPASS entries; the issuer's own gateway forwarder (the `send_system_reserved`
      variant that never uses `gw_pending_`, the pure batching function with its never-empty
      `agent_ids` and 2,000-id rules, at most 8 forwards in flight and one per (cluster, action),
-     `timeout_seconds` 10, `TryCancel` at stop) and its tests. The multi-agent forward is a
+     `timeout_seconds` 10 with a 12 s client deadline, the set-membership response classifier
+     and the per-agent outcome rule, `TryCancel` at stop) and its tests; the `send_to` check
+     function shared by `send_to` and the variant, returning its cause, with the
+     per-OS-behind-a-gateway refusal test on the issuer path and the per-OS refusal backoff; the
+     tri-state kill-switch denial classifier (set: `send_failed`; `Error` or enabled on the
+     re-read: the pass ends, `deferred`) and its three-outcome test; and the forwarders'
+     mutex-guarded in-flight `ClientContext` table, with the TSan stop-versus-completion race
+     test. The multi-agent forward is a
      prerequisite to reshape before ADR-0074 D5 wave 2 (open point 20).
 
    Covers both `tags` and `topology`; the `topology` action is inert until slice 8.
