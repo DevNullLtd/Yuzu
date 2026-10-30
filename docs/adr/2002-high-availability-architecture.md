@@ -145,15 +145,25 @@ server+everything model.
   guarantee is only **"effect-once, result-maybe-lost,"** which the ADR would then have to state. We do
   **not** promise exactly-once (a crash between claim commit and RPC send is unavoidable; durable
   receiver dedup **plus outcome-replay** is what closes it).
+  *Update (2026-10-30, ADR-0074 conflict 8): under the decided asynchronous default a failover can lose a
+  claim, and a reclaimed step is sent under a new command id that WS-0 dedup does not absorb; this holds
+  across a failover only once ADR-0074 D13's command-outbox-and-dispatch and execute-once-claims
+  requirements are met.*
 - **Events/SSE: at-least-once with gap detection.** Durable monotonic event IDs; consumers replay
   from a cursor / `Last-Event-ID`; NOTIFY is a latency hint only. A consumer may see a duplicate
   event and must tolerate it.
+  *Update (2026-10-30, ADR-0074 conflict 8): under the decided asynchronous default this holds across a
+  failover only once ADR-0074 D13's event-outbox requirement is met.*
 - **Leadership: fenced, not exclusive-by-wall-clock.** A fencing token is checked in the same
   transaction as every side-effecting claim; two momentary leaders cannot both commit the same
   occurrence.
+  *Update (2026-10-30, ADR-0074 conflict 8): under the decided asynchronous default the fence holds across
+  a failover only once ADR-0074 D13's leader-epoch requirement is met.*
 - **Durability: selectable.** RPO=0 holds **while a synchronous-commit quorum is available**; the
   shipped default is 3-node quorum (see §11/§13). It is *not* "writes always available" — loss of
   quorum blocks writes by design (fail-closed, consistent with ADR-0007).
+  *Update (2026-10-30, ADR-0074 conflict 8): the decided default becomes asynchronous replication, and
+  RPO=0 for acknowledged writes is no longer a target; see the updates at the end of §11 and §13.*
 - **Session expiry: absolute wall-clock, DB-clock-integrity-dependent.** Moving sessions to Postgres
   trades per-host monotonicity for a single shared wall clock; this is weaker on the monotonic axis
   and depends on DB-primary clock integrity (§4).
@@ -235,6 +245,10 @@ outbox** with **durable monotonic event IDs** (replacing the per-process channel
   against **core's spine API** (never the `yuzu` outbox directly) and **tolerate duplicates**
   (at-least-once). Cursor ownership: the client cursor is core's; presentation is a stateless relay.
 - The outbox inherits the **clock-guarded retention** rules (routed concern). Its rows are also the schedule runner's spent-ticket ledger (#6096, `approval_id`), so any reaper must retain approval-bearing rows at least 7 days from creation.
+- *Update (2026-10-30, ADR-0074 conflict 8):* under the decided asynchronous default, a failover can
+  lose outbox rows and let the promoted primary issue transaction ids below a replica's last-seen
+  cursor, so polling forward from it can skip events; ADR-0074 D13's event-outbox requirement must be
+  met before this delivery invariant holds across a failover.
 
 **Load-bearing prerequisite:** cross-instance correlation requires execution state in Postgres.
 `execution_tracker` (SQLite) and `cmd_execution_ids_` (in-process map, `agent_service_impl.hpp:330`)
@@ -2243,6 +2257,21 @@ and the boot warning for a channel with more than one connection (`docs/user-man
 per-endpoint signals once item 2 lands; a fleet-wide simultaneous breaker open is the signature of a shared
 cause (the database pair), not of one bad server, and the runbook should say so.
 
+### 7h. Transport security and topology (ADR-0074, 2026-10-28)
+
+**Status: proposed with ADR-0074; to be ratified at the end of its wave 0.** Added by Nathan Dornbrook. This section records what ADR-0074 proposes in this ADR's terms; the decisions themselves and their reasons are in ADR-0074. Every bullet below is proposed, not shipped.
+
+- **Gateway and server** admit each other by CA trust, then identity in the certificate, then revocation, in both directions, instead of per-pair SPKI pins (ADR-0074 D1).
+- **Section 2 stands.** In HA every agent terminates on a gateway. ADR-0074 adds mutual TLS at that edge: a separate enrollment port, and a main port that requires a client certificate (ADR-0074 D2).
+- **Section 7g, item 3 (#5649), direction chosen:** each agent's stream goes to one server chosen by consistent hashing on `agent_id`, so the reconcile is sticky on the gateway side (ADR-0074 D12). It must still be shown correct when an agent's owning server changes (server loss or drain). A server that does not own an agent cannot reach it today (`AgentRegistry::send_to` only reaches agents in its own memory), so ADR-0074 D12's "any server sends straight to the gateway" is new server code.
+- **Adds to section 7g:** gateways find servers by DNS, and agents find their first gateway by DNS (ADR-0074 D9, D12).
+- **Agent-to-cluster affinity (#4669, the sticky `home_cluster_id`) is dropped (decided 2026-10-29).** Draining moves agents across gateways and possibly clusters (ADR-0074 D11), and from ADR-0074's wave 4 the choice of gateway is free. Until ADR-0074 D5 lands in its wave 2, a compromised gateway holding a valid gateway certificate can claim any agent's route; D5 (a per-session agent signature, server-signed commands and gateway lists, agent-signed results) closes that only once the route write depends on the server's verification of the session's agent signature, which ADR-0074's wave 2 makes so. One Erlang cluster of gateways is one `cluster_id` (WS-4 4.3): every member carries the same id, and a `cluster_id` mismatch check at join guards against misconfiguration only, because admission is the TLS distribution certificate (ADR-0074 conflicts 1 and 6).
+- **Gateway state:** no per-agent state beyond the connection. Fleet-level state any gateway could rebuild (cached CRL, drain flag, gateway list, cluster membership) is allowed (ADR-0074 conflict 5).
+- **Section 8, PKI:** the CA issues SPIFFE-form identities, 24-hour agent certificates and 7-day gateway and server certificates, from the Yuzu root or a customer-signed intermediate. Gateways pull the CRL that `CaStore::publish_next_crl` publishes; the published CRL drops revoked certificates past their notAfter while `ca_issued`'s revoked rows stay append-only (the PKI routed-concern wording, and section 8's sentence that each CRL is a superset of the one before it, are amended in ADR-0074's wave 1). CRL signing never waits for a standby, so losing a standby or a failover does not make gateways fail closed, and the CRL number never goes backwards or repeats across a failover: gateways keep the highest number they have seen (decided 2026-10-30, ADR-0074 D7). The SPIFFE trust domain is a random UUID generated at install. Renewing every 12 hours means about 28 signatures per second at 1.2 million agents, so the signing path and CRL size must be measured before the agent edge changes (ADR-0074 D3, D4, D6, D7).
+- **Sections 11 and 13, Postgres (decided by Nathan Dornbrook on 2026-10-30, ADR-0074 conflict 8):** asynchronous replication by default, replacing ADR-0074's earlier proposal of one synchronous standby that never degrades; RPO zero for acknowledged writes is no longer a target, and each store's failover loss must meet the requirement ADR-0074 D13 sets for it in ADR-0074's wave 1 or wave 6; write downtime under 60 seconds; no standby reads in the first version; one DNS name or a multi-host DSN with `target_session_attrs=read-write`. Patroni is the on-premises reference (ADR-0074 D13). The shipped default is unchanged until ADR-0074's wave 6 changes it; see the dated updates at the end of sections 11 and 13.
+- **Gateway drain** is a new operator action through the server: weight zero, GOAWAY in staggered batches over a window, and results accepted through a different gateway than the one that carried the command (ADR-0074 D11). It relies on WS-0's durable command idempotency within its bounded ring, and needs new code: gateways forward results for commands they did not dispatch, and a re-drive for lost operator results (ADR-0074 D11.4).
+- **Gateway-to-gateway:** an Erlang cluster only inside a corporate network, over TLS distribution; coordination through the server everywhere else (ADR-0074 D10).
+
 ### 8. PKI / CA high availability (Q8)
 Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced *(the
 "collapse into the KEK problem" framing and the first two bullets are superseded — see the Update
@@ -2412,6 +2441,17 @@ Yuzu ships Postgres, so HA Postgres is a delivery artifact we own.
   shipped-single, shipped-HA.
 - **Shipped operator-plane LB** in the HA profile, with **BYO-LB / VIP / DNS round-robin** supported.
 
+> **Update (2026-10-30, ADR-0074 conflict 8; decided by Nathan Dornbrook).** The text above is kept as
+> written; two facts now qualify it. (1) **The shipped default today** is the `quorum3` profile without
+> strict mode (the WS-7 note above; `YUZU_PG_DURABILITY=quorum3`, `YUZU_PG_SYNC_STRICT=false` in
+> `deploy/docker/ha-postgres/patroni-entrypoint.sh`): non-strict synchronous replication, where every
+> commit waits for one standby while any standby is up, and replication degrades to asynchronous only
+> on total standby loss. (2) **The decided default is asynchronous replication**: no commit waits for
+> a standby (except a transaction ADR-0074 D13's per-store requirements make wait), and the synchronous profiles become an operator's choice. Many enterprise data-centre
+> pairs are more than 2 ms apart, too far for a standby wait on every commit. The shipped default
+> changes in ADR-0074's wave 6; until then it is unchanged. What a failover can then lose, and the
+> requirement each store must meet in ADR-0074's wave 1 or wave 6, are in ADR-0074 D13.
+
 ### 12. Ingress / LB + health contract + MCP (Q11)
 - **Scope: operator/API plane incl. MCP + streaming.** MCP behind active–active pulls MCP state into
   §4/§5, **held as core-owned durable state**: the **MCP session registry → durable (core)** and the
@@ -2556,6 +2596,15 @@ Proposed targets for the team to ratify:
   "no acknowledged-write loss while quorum exists," **not** "writes always available" — quorum loss
   blocks writes deliberately. Async profile is a documented opt-out with a bounded loss window.
 
+> **Update (2026-10-30, ADR-0074 conflict 8; decided by Nathan Dornbrook).** The Postgres-primary
+> bullet above is kept as written. RPO zero for acknowledged writes is no longer a target: with the
+> decided asynchronous default (the update at the end of §11), a failover can lose writes the old
+> primary acknowledged but had not yet sent to the promoted standby. That loss is an accepted risk
+> (ADR-0074, Accepted risks), and each store must meet the requirement ADR-0074 D13 sets for it. This
+> decision does not change the RTO targets above. Asynchronous replication is the decided default (it ships in
+> ADR-0074's wave 6), not an opt-out; ADR-0074 sets no bound on its loss window beyond the failover
+> tool's lag cap, which its wave 6 sets deliberately (ADR-0074 D13).
+
 ### 14. Testing — failover harness (Q12)
 A **failover test harness** stands up the Patroni+etcd+HAProxy stack and **injects a primary kill
 mid-test**, asserting: pool reconnects to the promoted primary; **operator sessions survive** (§4);
@@ -2564,6 +2613,12 @@ effectively-once at the receiver** (§5/§6); NOTIFY listeners **cursor-poll for
 committed events (§5); in-flight commands re-drive (§7); **directory re-home races do not lose or
 duplicate** (§7). It must also cover **standby loss** (quorum-degrade behavior, §11). Owned by
 `build-ci` + `release-deploy`; scenarios by `chaos-injector`.
+
+> **Update (2026-10-30, ADR-0074 conflict 8).** The standby-loss scenario above applies to every profile; on the
+> synchronous profiles it also covers quorum-degrade. Under the decided asynchronous default, the harness also runs a failover that
+> loses acknowledged writes, against the per-store requirements in ADR-0074 D13. On that failover the
+> assertions above (sessions survive, no committed event lost, no double-dispatch) hold only as far as
+> those requirements make them hold.
 
 ## Decomposition into child workstreams
 
@@ -2590,7 +2645,7 @@ This ADR records the model and principles. Each area becomes a child ADR/issue:
 6. **PKI/CA HA** — shared CA key custody + node admission (not `SecretCodec`; §8 Update
    2026-09-23), CRL publication state machine, KEK versioning/rollout, enrollment to PG (§8).
 7. **HA-PG delivery** — Patroni+etcd+HAProxy profile with **selectable durability (3-node quorum
-   default)** + operator-plane LB (§11).
+   default)** + operator-plane LB (§11). *(Update 2026-10-30: the decided default becomes asynchronous; ADR-0074 conflict 8, §11 update.)*
 8. **Health contract + BYO-LB doc** (§12).
 9. **Failover test harness** incl. quorum-degrade + re-home-race cases (§14).
 10. **Background-job replica-safety classification (finding 4).** Active–active means every *existing*
@@ -2618,7 +2673,7 @@ This ADR records the model and principles. Each area becomes a child ADR/issue:
 - HA deployments **require the gateway** and take on **net-new distributed intra-cluster routing** and
   **shared presence state** — the honestly-priced cost of gateway-fronting.
 - We take on **operating a shipped HA-PG stack** (Patroni/etcd/HAProxy) with a **3-node quorum**
-  default footprint.
+  default footprint. *(Update 2026-10-30: the decided default becomes asynchronous; ADR-0074 conflict 8, §11 update.)*
 - We accept a **session-expiry monotonicity regression** on the DB host in exchange for shareable
   durable sessions (§4).
 - The **effectively-once** guarantee is contingent on **WS-0** (durable agent dedup); until it lands
