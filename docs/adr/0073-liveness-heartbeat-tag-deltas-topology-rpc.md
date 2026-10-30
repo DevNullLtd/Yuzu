@@ -596,7 +596,8 @@ outside this rule; this ADR adds none of it.
 - **Every other lossy path is unchanged in behaviour and becomes self-healing.** All of these lose a
   delta, and the server then diverges and resyncs:
   - the buffer-full drop;
-  - the oversize drop, now judged on the **whole encoded heartbeat's** byte size only;
+  - the oversize drop, now judged on the **whole encoded heartbeat's** byte size only, through
+    `estimate_bytes/1` counting the new fields (slice 3);
   - the non-transient rejection.
 - **What the gateway stops doing.** It no longer decodes, counts, size-checks or UTF-8-repairs
   individual tags (`yuzu_gw_heartbeat_buffer.erl`, about l.483-583); that moves to the server (D3,
@@ -2477,7 +2478,12 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
    The C++ readers and writers go here: the agent's field-4 attach and field-3 build, and the
    server's field-3 and field-4 reads. The gateway's handling of fields 3 and 4 (the per-tag
    checks and snapshot coalescing) goes in slice 7; until then the gateway screens and coalesces
-   fields that are now always empty, which is harmless.
+   fields that are now always empty. That much is harmless, but the gateway's byte estimate is
+   not: `yuzu_gw_heartbeat_buffer:estimate_bytes/1` (about l.686-690) counts only the session id,
+   `fleet_snapshot_json` and the status-tags map, and it feeds the 64 MiB buffer cap, the
+   oversize screen and chunk packing. So this slice, not slice 7, makes it add
+   `byte_size(status_tags_pb)` and an encoded-size bound for the topology digest; otherwise from
+   slice 5 the cap and the oversize drop stop bounding what the buffer holds.
 
    The tree is coherent but tags and topology are inert until slices 4-9 land: tags until slice 6
    (slice 4 applies them, slice 5 sends them, slice 6 heals divergence), topology until slice 9. In
