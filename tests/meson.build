@@ -3608,7 +3608,8 @@ test('mgmt_posture definition columns',
 
 # shares' definition-column contract (content/definitions/shares.yaml): row_kind first, then the
 # generic field_1..field_7 sequence pinned to the wire rows shares_parsers.hpp emits (the test
-# holds the expected literals; it does not read the C++).
+# holds the expected literals), plus the macOS best-effort disclosure phrases (it reads
+# shares_plugin.cpp as plain text for one of them, with no C++ parsing).
 test('shares definition columns',
   _python3_test,
   args: [files('test_shares_definition.py')],
