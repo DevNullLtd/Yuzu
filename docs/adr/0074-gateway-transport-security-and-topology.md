@@ -221,6 +221,7 @@ Three proposals change the plan. All three were accepted by Nathan on 2026-10-28
 2. **Accepted by Nathan on 2026-10-28; now in waves 1 and 2.** Measure the Register rate and certificate issuance against the real server in waves 1 and 2, plain and with mutual TLS, with the pool at 16 and 64. RR7 registered 5,000 agents in 17.0 s (about 290 per second); D14 needs about 1,700 per second.
 3. **Accepted by Nathan on 2026-10-28; now in wave 0.** The common memory baseline first (D14): OS anonymous memory plus kernel per-connection memory, after settling, TLS on, realistic heartbeats, at 5,000 and 10,000 agents, on merged `dev` and the kTLS branch, run on both BigColin's rig and ours.
 
+## Delivery plan
 
 Each wave ends with the owner's guidance before the next starts. Waves 1 to 6 are gated at 5,000 agents on both rigs (conflict 7); wave 7 at 100,000. Pull requests target `dev` and merge by the repository's usual rules.
 
