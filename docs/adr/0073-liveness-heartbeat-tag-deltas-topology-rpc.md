@@ -1689,7 +1689,7 @@ on the sustained condition and staying quiet on the expected one.
   quiet; the honest baseline is measured in slice 11), or an `unverified_session` share above
   0.05 of state payloads for 1 h. `unsigned` is not counted (a rollout in progress), and neither is
   `replayed` (an honest reorder produces it; it is counted, not alerted). Meaning: a gateway altered
-  replayed agent content, challenges are failing, or long-lived sessions have passed their bound
+  agent content, challenges are failing, or long-lived sessions have passed their bound
   certificate's notAfter with no re-bind (D16), so their state has stopped flowing. Responder: the
   `agent.reattach.challenge` row for a `bad_signature` is never suppressed and names the agent and
   the gateway peer; an `agent.state.bad_signature` row is written for the first failure per
@@ -1986,8 +1986,13 @@ message ReattachResponse {
     not take), so `build_classified_command`'s kill-switch read applies: a whole-action or per-OS
     switch on `__session__.challenge`, or an unreadable switch, resolves the challenge
     `kill_switched` (uninstalled, the record kept, not audited per agent, never in the per-agent
-    back-off), and every gateway session stays unroutable until the switch is cleared, which is
-    the point of a switch; `YuzuReattachChallengeDegraded` names it. A slice-11 test sets the
+    back-off), and every gateway session whose challenge has not yet verified stays unroutable
+    until the switch is cleared, which is the point of a switch. That includes protective delivery
+    (the quarantine control actions and `__guard__.push_rules`) to a gateway agent that reattaches
+    or registers while the switch is set or its read fails; a session already verified is
+    unaffected. Whether the carrier should instead be exempt from the switch, so that no
+    enablement gate can hold the protective set back this way, is an open owner decision; slice 11
+    does not ship until it is taken; `YuzuReattachChallengeDegraded` names it. A slice-11 test sets the
     switch during a reattach wave and asserts `kill_switched` only, no back-off entries, and
     verification resuming once it is cleared. `notify_exec_tracker` skips its prefix, and its reply is
     dropped at both ingest paths before the provenance lookup, keyed on the response's plugin
@@ -2060,7 +2065,13 @@ message ReattachResponse {
     by the connected gateways, with a floor of 8, so one blackholed or hostile gateway cannot hold
     every slot. The global `--reattach-challenge-concurrency` still binds when the per-gateway
     floors sum above it; a change in the connected-gateway count recomputes the per-gateway cap
-    for new starts only, never cancelling a call in flight. A challenge that cannot start because
+    for new starts only, never cancelling a call in flight. The global and per-gateway counts are
+    owned by the call table: a slot is charged at start to the `gateway_node` recorded on the call
+    object and released only when that call's final tag returns, never at resolution; any
+    resolution while the call is still in flight (`superseded`, `kill_switched`, `capacity`,
+    `expired`) calls `TryCancel` on it, so the slot is held for the cancel latency, not the client
+    deadline. The 40-gateway blackhole test asserts the in-flight count per `gateway_node` never
+    exceeds its cap, across a re-target included. A challenge that cannot start because
     of other gateways' occupancy is requeued, and if it is still requeued at its CONNECTED-wait
     deadline it resolves `capacity` (uninstalled, the record kept, not audited, not in the
     per-agent back-off); the backlog admission below is computed per gateway so that is the
@@ -2120,8 +2131,11 @@ message ReattachResponse {
     `send_via_directory`. `send_to` and `send_to_all`'s per-session loop both refuse a
     `challenge_pending` session through one shared predicate, and `send_via_directory` refuses it
     through `routable`. The predicate is fail-closed: it admits a session only when its challenge
-    state is `verified`, so `pending`, `failed`, `expired` and `superseded` are all refused, and
-    `routable` refuses the row on the same rule. From wave 2 the gate covers every session a
+    state is `verified` or `not_required`, so `pending` and every terminal outcome are refused,
+    and `routable` refuses the row on the same rule. `not_required` is written only by the direct
+    `Register`/`Subscribe` install on the server's own agent listener; no Proxy* path, adopt CAS
+    or replay ever writes it, and the field has no default-constructed admitted value (it starts
+    `pending`). From wave 2 the gate covers every session a
     gateway delivers, ProxyRegister and ProxyReattach alike: a gateway session from a full Register
     is installed `challenge_pending` too and is admitted only once D5's session-start challenge
     verifies (ADR-0074 wave 2 gates the route write on that signature for every session), so a
@@ -2129,7 +2143,9 @@ message ReattachResponse {
     enrolled agent. ADR-0074 must define that session-start challenge as this mechanism (the same
     carrier, verifier and session fields); until it does, slice 11 cannot ship. A direct session
     is authenticated by the agent's own mTLS connection to the server, with no gateway between, and
-    is not gated by this predicate (ADR-0074 leaves the direct port open). A slice-11 test sends a
+    is installed `not_required` (ADR-0074 leaves the direct port open). A slice-11 test asserts a
+    direct session dispatches with no challenge and that no ProxyRegister or ProxyReattach path
+    can install `not_required`; another sends a
     forged full ProxyRegister for an enrolled agent and asserts zero sends and no published route
     until its challenge verifies. The one exemption is the `session_challenge` push, sent through the
     issuer's `send_system_reserved` variant (D8) with the challenge flag, never a fourth send
@@ -2162,11 +2178,16 @@ message ReattachResponse {
     floors (D16) live on the `AgentSession` under its `stream_mu`, the lock `send_to` and
     `send_to_all` already read routing fields under; slice 11 amends the `AgentSession`
     publication-discipline comment in `agent_registry.hpp` to list them. Resolving a challenge is
-    one transition, `pending` to `verified`, `failed` or `expired`, taken under that lock; only
-    the winner runs its side effects, so a late answer cannot revive an expired session and an
-    expiry cannot tear down a verified one. A winning `failed` or `expired` transition writes the
-    challenge state under `stream_mu`, and because the send predicate admits only `verified` (or
-    never-challenged) sessions, that write alone takes the session out of every send at once.
+    one transition, from `pending` to `verified` or to any one terminal outcome (`bad_signature`,
+    `cert_invalid`, `expired`, `degraded`, `send_failed`, `superseded`, `unsupported`, `capacity`
+    or `kill_switched`), taken under that lock; only the winner runs its side effects, so a late
+    answer cannot revive an expired session and an expiry cannot tear down a verified one. A
+    gateway session's state is written `pending` when it is constructed, before it is inserted
+    into the session map under `mu_`, never afterwards, so no send can observe it in an admitted
+    state first (a TSan test races `send_to_all` against a gateway ProxyRegister install and
+    asserts zero sends). A winning terminal transition writes the challenge state under
+    `stream_mu`, and because the send predicate admits only `verified` or `not_required`
+    sessions, that write alone takes the session out of every send at once.
     Removing it from the registry's session map happens afterwards in the registry's existing
     lock order, `mu_` then `stream_mu`, re-checking that the session is the same one; `mu_` is
     never taken while `stream_mu` is held, and the amended `AgentSession` comment states that
@@ -2542,9 +2563,13 @@ lands. The two are kept consistent as follows.
     `reclaim_conflict` rows are, with the same cap, stop-time drain and WARN-logged loss, and
     counted on `yuzu_server_audit_state_rows_total{verb,result}` with `written|deferred|dropped`;
     a non-zero `dropped` is a lost tamper-detection row and is ticketed by its own rule (D13).
-    `agent.reattach.challenge` rows are written by the verifier pool off every RPC path,
-    set-and-proceed (a failed write is counted `dropped` on the same counter, never withholds the
-    verdict). A slice-11 test sends a multi-session `bad_signature` batch with the pool degraded
+    `agent.reattach.challenge` rows are never written by the verifier pool either: the winning
+    transition queues them to the same drain, with the same cap, stop-time drain, WARN-logged loss
+    and counter, so the verifier's stop bound (one read or lease per thread) is unchanged and a
+    row queued before the stop flag is drained, not skipped; a failed or dropped row never
+    withholds the verdict. The slice-11 stop test stops during a `bad_signature` resolution and
+    asserts the row is written or `dropped` moves with a WARN line, with the join inside the
+    bound. A slice-11 test sends a multi-session `bad_signature` batch with the pool degraded
     and asserts the `BatchHeartbeat` answers inside the gateway's 5 s timeout;
   - **key.** The server verifies against the key of the certificate the session's challenge was
     verified with. That key is parsed once, at verification, and stored on the session with its
@@ -3257,6 +3282,9 @@ of every ~30 s. The content is unchanged.
 - `docs/user-manual/rest-api.md` and `docs/user-manual/mcp.md`: `stale_reason` and freshness, `ts`
   as the body's build time, `fresh` as a render-cache rebuild that never contacts an agent, and the
   host call's not-found meaning.
+- `docs/user-manual/rest-api.md`, `docs/user-manual/mcp.md` and `docs/mcp-server.md`'s
+  `execute_instruction` bullet (slice 11): the retryable `challenge_pending` zero-reach reason,
+  the `agents_challenge_pending` count and its `retry_after_ms`.
 - `docs/command-dedup.md`: the dedup tags are carried as state; `__resync__` is a second
   dedup-claimed reserved name alongside `__sync__`.
 - `docs/user-manual/upgrading.md`.
