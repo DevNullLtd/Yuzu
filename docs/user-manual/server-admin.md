@@ -269,7 +269,7 @@ The server's configuration file (`--config`, default `/etc/yuzu/yuzu-server.cfg`
 > - **SAN limitation.** Default leaf SANs cover `localhost`, `127.0.0.1`, `::1`, and the boot-time hostname only. Reaching the dashboard/agent listener by a LAN IP or a different FQDN needs operator-provided certs (or DNS that resolves to a covered name). A host rename invalidates the SAN — rotate the certs after renaming.
 > - **No silent re-root.** If `ca_store` (the internal-CA Postgres store, ADR-0053) already holds a CA root but the on-disk certs in `--ca-dir` are missing/corrupt (e.g. a wiped cert dir on a persistent data volume, or ordinary later damage to an established install — a bad partial restore, a lost leaf file), the server **refuses to start** rather than mint a new CA that would orphan every enrolled agent — **unless this exact instance can prove it minted the still-incomplete root** (its local CA key file still resolves and cryptographically pairs with the stored root), in which case it resumes automatically and re-mints its own default leaves under the same root (ADR-0053). When that self-heal condition does not hold, restore `default-*.{pem,key}` from backup (matching the `ca_store` root), or perform a deliberate clean re-root by clearing `ca_store.ca_root`/`ca_issued`/`ca_crl_versions` directly against Postgres — see `docs/pki-architecture.md` "Operator runbook" for the full procedure.
 
-> **Enrollment tokens and the pending-agent approval queue are in PostgreSQL** (WS-6 6.2, `auth.enrollment_tokens` / `auth.pending_agents` — see [PostgreSQL Substrate](#postgresql-substrate)), not `--data-dir` files: every server replica shares one authoritative view, and `--generate-tokens` mints straight into the same store the running server reads. A pre-6.2 install's `enrollment-tokens.cfg` / `pending-agents.cfg` are imported once, automatically, at the first 6.2 boot, then renamed to `<name>.cfg.imported` and never read again (see the `enrollment.import` audit action and the `yuzu_server_enrollment_import_total` metric).
+> **Enrollment tokens and the pending-agent approval queue are in PostgreSQL** (WS-6 6.2, `auth.enrollment_tokens` / `auth.pending_agents` — see [PostgreSQL Substrate](#postgresql-substrate)), not `--data-dir` files: every server replica shares one authoritative view, and `--generate-tokens` mints straight into the same store the running server reads. If `enrollment-tokens.cfg` or `pending-agents.cfg` is present in the data or config directory at first boot, the server imports it once as live credentials, without checking where it came from, then renames it to `<name>.cfg.imported` (see the `enrollment.import` audit action and the `yuzu_server_enrollment_import_total` metric). A fresh deployment must not start with such files left over from another install.
 
 > **File permissions (Unix):** `yuzu-server.cfg` is `0600` after every write, and the KEK files in `--ca-dir` are created `0600`. No manual `chmod` is required.
 
@@ -359,6 +359,8 @@ separately.
 ---
 
 ## Upgrade Notes
+
+> **Fresh deployment only for 0.15.0.** The steps below are historical and are not a supported upgrade, rollback or restore path for an earlier build's database or backups (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)).
 
 ### vNEXT — the offline user-hive file check is now the default for autoruns, installed_apps, license_scan, registry and tar (related issue #5291; breaking for fleets with non-standard profile roots)
 
@@ -457,6 +459,8 @@ Check your own unit, env file, compose file or installer arguments before upgrad
 
 ### vNEXT — the shipped Docker Compose files keep `/etc/yuzu/certs` on a volume (#5370; action needed before you recreate a 0.14.0 container)
 
+> **Fresh deployment only for 0.15.0.** The steps below are historical and are not a supported upgrade, rollback or restore path for an earlier build's database or backups (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)).
+
 **Action required before upgrading from 0.14.0 on Docker Compose: copy `/etc/yuzu/certs` out of the running server container first ([Upgrading](upgrading.md) → "Docker Compose: copy `/etc/yuzu/certs` out of the server container before you recreate it").** Affected: a 0.14.0 Docker Compose stack whose server has no named volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the 0.14.0 README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode, with 'Persist generated certs' unticked, or with named volumes off and an external Postgres. Not affected: `docker-compose.reference.yml` (which the README quickstart saves as `docker-compose.yml` since #5419) and `docker-compose.reference-gateway.yml` (their `certs` volume).
 
 `deploy/docker/docker-compose.yml`, `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` and the Compose Wizard's Default and Plaintext output (with named volumes on, or with an external Postgres) now mount a `server-certs` volume on `/etc/yuzu/certs`, which holds the internal CA and the secrets KEK. In 0.14.0 that directory sat in the container's own layer, so recreating the container deleted the KEK. Postgres still had it registered, so the server refused to start (`kek_unresolvable`). The reference composes already persisted it, on their `certs` volume. The Upgrading section gives the copy-out commands, the diagnostics to run before anything destructive, a rollback that keeps the keys, and the recovery path if the files are already gone. See also [What must persist](#docker-compose).
@@ -523,6 +527,8 @@ The server's own CA, default certificates and key-encryption keys stay where the
 **Upgrading from an earlier version.** (This describes what the installer does when it finds an earlier installation's directory. It does not make an upgrade of an earlier build's database supported in 0.15.0: see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md).) Its data directory is not locked, so the installer builds a new, locked one. It copies across only plain files that are owned by Administrators or SYSTEM and that no other account can change, from folders that are owned by Administrators or SYSTEM and in which no other account can delete or rename anything: the configuration, `postgres.dsn`, `oidc-client-secret`, and the files directly in `certs\` and `data\`. Subdirectories stay behind. The old directory is renamed to `%ProgramData%\Yuzu Server.insecure-<date>-<time>`; it is never changed or deleted.
 
 If any file that would be copied, or a folder holding one, fails that check, or a file is a link or a hard link, the upgrade stops and names it, and nothing is changed. This also catches a folder that a standard user created before the original install: they stay its owner, so they could have swapped its files for their own. Inspect what is named. If it is yours, remove it, or make Administrators its owner and reset its permissions (`icacls <path> /setowner *S-1-5-32-544 /L`, then `icacls <path> /reset /L`), then run the installer again. An unlocked `%ProgramData%\Yuzu Server` with no Yuzu Server installation registered on the machine is refused, because it cannot be shown that an administrator created it. A junction or symbolic link at that path is always refused.
+
+> **Fresh deployment only for 0.15.0.** The steps below are historical and are not a supported upgrade, rollback or restore path for an earlier build's database or backups (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)).
 
 **After upgrading from an earlier version:**
 
@@ -4922,7 +4928,7 @@ docker exec yuzu-postgres pg_dump -U postgres --format=custom yuzu \
   > "yuzu-pg-$(date +%F).dump"
 ```
 
-Restore with the server stopped, then start the server (the migration runner reconciles schema versions at boot). On a **fresh disaster-recovery target**, the app role and database must exist before `pg_restore` — run `install-server-postgres.sh` (or your managed-DB provisioning) first:
+Restore only a dump taken from this 0.15.0 deployment (a dump written by an earlier build is unsupported), with the server stopped, then start the server (the migration runner reconciles schema versions at boot). On a **fresh disaster-recovery target**, the app role and database must exist before `pg_restore` — run `install-server-postgres.sh` (or your managed-DB provisioning) first:
 
 ```bash
 # Native — same env-file + PGPASSWORD/DSN_NOPASS preamble as the backup recipe

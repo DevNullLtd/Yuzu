@@ -12,10 +12,10 @@
 > (HA WS-6 6.2, `auth.enrollment_tokens` / `auth.pending_agents`) — back them
 > up via the same `pg_dump`/`pg_restore` procedure as the rest of the `auth`
 > schema, not as local files. `enrollment-tokens.cfg`/`pending-agents.cfg` are
-> no longer written by a 6.2+ server; a pre-6.2 backup restored onto a fresh
-> Postgres is imported exactly once, at the first 6.2 boot (the marker+
-> fingerprint mechanics that make a restored OLD backup with different content
-> REFUSED rather than silently merged are in
+> no longer written by a 6.2+ server; a copy found at first boot is imported
+> exactly once as live credentials, without any check of where it came from (the
+> marker+fingerprint mechanics that refuse a later file with different content
+> are in
 > `docs/adr/2002-high-availability-architecture.md` §8).
 >
 > 0.15.0 supports initial deployment into a fresh database only: restore a backup
