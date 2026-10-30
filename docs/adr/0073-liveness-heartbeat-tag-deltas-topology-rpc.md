@@ -760,8 +760,13 @@ When several conditions hold, the first in this order wins:
 
   A gateway restart thus costs zero bodies for agents back within five minutes. Eviction is lazy (in
   `confirm` and `build_snapshot`), so no background loop is added.
-- **Connection ages.** The stored body's ages are rebased at render time:
-  `last_seen_seconds_ago + (now - body_received_at)`. A closed row older than 3600 s is dropped.
+- **Connection ages.** Only **closed** rows are rebased: the rows that carry
+  `last_seen_seconds_ago`, which the builder sets only on rows from TAR's connection history. At
+  render time they show `last_seen_seconds_ago + (now - body_received_at)`, measured on
+  `steady_clock`, and a closed row older than 3600 s is dropped. A **live** row carries no
+  `last_seen_seconds_ago` and keeps age 0. Age 0 means "live when the body was built, and the
+  digest has not changed since". It does not mean the connection was observed at render time: the
+  body may be up to one refresh floor (12-18 min) old, and its build time is the machine's `ts`.
 
 ### D7. `ReportTopology` and its gateway proxy
 
@@ -1696,13 +1701,27 @@ point 14).
 - **Viz:**
   - a non-stale host's topology is at most one pump interval plus 10 s behind, plus the 60 s render
     cache;
-  - `stale` carries a reason;
-  - MCP `fresh=true` bypasses only the render cache and never dispatches.
+  - `stale` is true exactly when `stale_reason` is not null (D6);
+  - a machine's `ts` keeps its meaning, the time the agent built the body, and stops being a
+    freshness signal: a quiet host's `ts` can be up to 18 min old while it is fresh. Freshness is
+    `stale` and `stale_reason`. An `offline` placeholder keeps `ts = 0`;
+  - **`fresh`.** REST `?fresh=1` and MCP `fresh=true` drop the 60 s render cache and rebuild from
+    the slots the store already holds. With the dispatch fetcher removed (D10) they never contact
+    an agent. The `viz.fleet_topology.invalidate` audit verb keeps its name and now records only
+    that rebuild. The MCP parameter's description changes from "Force a live re-fetch" to "Rebuild
+    from the latest reported bodies, bypassing the shared 60 s render cache", and the REST and
+    OpenAPI descriptions and the audit-log row change with it.
 - **MCP tools:** `get_fleet_topology` and `get_host_topology` gain `stale_reason` in their typed
   output schema (A5), with updated descriptions. It is declared as a closed JSON-schema `enum` of
   the eight D6 values plus `null`, in both MCP output schemas and in the OpenAPI schemas of both REST
   twins, `/api/v1/viz/fleet/topology` and `/api/v1/viz/host/{id}/topology`. A new value is a schema
   change, never a free string.
+- **`get_host_topology` and its REST twin** slice one machine from the same snapshot, so they carry
+  the same `stale` and `stale_reason`. A connected agent with no slot (`not_reported`,
+  `awaiting_report`, `report_rejected`) and a retained `disconnected` slot are found. Not-found
+  (MCP `kInvalidParams` "host not found", REST 404) means the agent has neither a slot nor a
+  connected session on this replica. The host call does not merge the durable offline roster,
+  unchanged from today, so an `offline` host is not-found there.
 
 ### Security
 
@@ -1799,6 +1818,9 @@ of every ~30 s. The content is unchanged.
   `confirmed_at`, so a quiet, confirmed owner keeps its IPs past 300 s without a new body;
 - at the cap, a `disconnected` slot is evicted before any connected one, and a quiet confirmed host
   is never the victim while a less recently confirmed one exists;
+- age rebasing touches only rows carrying `last_seen_seconds_ago`; a live row renders age 0 however
+  old the body is;
+- `fresh` rebuilds from stored slots and dispatches nothing;
 - a wall-clock step of an hour in either direction changes no `stale_reason`, no IP claim and no
   retention outcome (an injected `steady_clock` and wall clock that move independently);
 - the no-slot grace (a normal start sends one body, no RESYNC), and no resync while a rejected
@@ -1899,7 +1921,9 @@ of every ~30 s. The content is unchanged.
 - `docs/user-manual/metrics.md`.
 - `docs/observability-conventions.md`: the heartbeat-buffer drop reasons (about l.109), plus the new
   families.
-- `docs/user-manual/rest-api.md` and `docs/user-manual/mcp.md`: `stale_reason` and freshness.
+- `docs/user-manual/rest-api.md` and `docs/user-manual/mcp.md`: `stale_reason` and freshness, `ts`
+  as the body's build time, `fresh` as a render-cache rebuild that never contacts an agent, and the
+  host call's not-found meaning.
 - `docs/command-dedup.md`: the dedup tags are carried as state; `__resync__` is a second
   dedup-claimed reserved name alongside `__sync__`.
 - `docs/user-manual/upgrading.md`.
@@ -1914,7 +1938,9 @@ of every ~30 s. The content is unchanged.
 - The decommission blast-radius lists: `sle_routes.hpp`/`.cpp`, `rest_api_v1.cpp`'s delete block,
   ADR-0024 Decisions 9 and 11, and `docs/user-manual/rest-api.md` (the cascade header's step (d)).
 - `docs/auth-architecture.md`: the gateway no longer holds enrollment tokens; reattach authority.
-- `docs/user-manual/audit-log.md`: the `agent.reattach` refusal row; `topology.push.rejected`'s
+- `docs/user-manual/audit-log.md`: the `agent.reattach` refusal row; the
+  `viz.fleet_topology.invalidate` row, which today says the request forced a cache invalidation
+  and now records a rebuild from stored bodies with no agent contacted; `topology.push.rejected`'s
   `reason` detail (`ip_conflict`, `reclaim_conflict`) and the paths that write each topology verb.
 - The agent CLI reference.
 - The ADR-2002 incident paragraph: a pointer to this ADR.
