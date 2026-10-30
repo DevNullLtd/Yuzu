@@ -1533,7 +1533,7 @@ message ReattachResponse {
   has no agent step: it carries ids only and is invisible to the agent. It therefore cannot carry
   the D5 per-session proof, which is the agent signing a server challenge at session start. Until
   the owner resolves this (open point 13), a reattached session, and the route its CONNECTED
-  re-announce writes, inherit ADR-0074 Conflict 1's accepted route-claim risk: a compromised
+  re-announce writes, carry the route-claim risk stated in ADR-0074 Conflict 1: a compromised
   gateway with a valid certificate can reattach any enrolled agent whose route row is not held by
   a different live session, and claim that route.
 
