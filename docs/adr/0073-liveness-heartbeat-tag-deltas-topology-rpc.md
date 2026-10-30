@@ -791,7 +791,7 @@ When several conditions hold, the first in this order wins:
 | 4 | `pump_stuck` | `now - pump_advanced_at > T`, or `last_outcome ∈ {TRUNCATED, FAILED}` and `now - outcome_since > T`, where `T = 3 × 1.2 × pump_interval_s + 90 s` | Three missed runs at the longest jittered sleep, plus the 90 s heartbeat window, because the server sees a run only on the next heartbeat after it. `pump_interval_s` is clamped to the 30-900 s flag range before use, and a value of 0 (`DISABLED`) never evaluates this row. At the 60 s default `T` is 306 s; at 900 s it is 3,330 s. The server never assumes the default. |
 | 5 | `report_rejected` | connected, last report rejected, digest unchanged since: no slot, or a slot whose body differs from the rejected digest (so a slotted agent with a pending rejected digest reads this, not `body_pending`) | new; the reason is in the metric and, for `IP_CONFLICT`, the audit row (D7) |
 | 6 | `body_pending` | `mismatch_since` older than `kReportGrace` | new |
-| 7 | `awaiting_report` | connected, no slot, a non-empty digest seen: within `kReportGrace` of the first sighting, or a resync sent or `deferred` | new. After a server restart every reporting agent reads this until its body lands, which can take about 8 min per 100,000 agents (D8). |
+| 7 | `awaiting_report` | connected, no slot, a non-empty digest seen: within `kReportGrace` of the first sighting, or a resync sent or `deferred` | new. After a server restart a host reads `offline` (row 1), or is absent if it is not in the durable roster, until its reattach lands; then it reads this until its body lands, which can take about 8 min per 100,000 agents (D8). |
 | 8 | `not_reported` | connected, no slot, and no non-empty digest: no field, an empty digest, `DISABLED`, or no heartbeat on this replica yet | today's roster placeholder |
 
 - **IP-claim reclaim** stays at 300 s, keyed on `confirmed_at`. A quiet host keeps its claim with a
@@ -1994,8 +1994,9 @@ Gathered here from D3, D8, D13 and D14, for 100,000 agents on one replica:
 - state-derived fleet gauges are absent, not zero, for each agent until its full set lands, about
   two minutes after its reattach; the last is back about 3 to 6 minutes after the restart. Interval
   gauges (`/dex` performance, `/network`) are back on each agent's first heartbeat (D13);
-- `/viz` shows every reporting host `awaiting_report` until its body lands, about 8 minutes after
-  the reattach wave (D6, D8);
+- `/viz` shows each host `offline` (or omits it, if it is not in the durable roster) until its
+  reattach lands, then `awaiting_report` until its body lands, about 8 minutes after the reattach
+  wave (D6, D8);
 - Guardian generation reconcile and the Echo corruption sink skip each agent until its state map is
   back (D3);
 - the reattach and resync counters move, and `yuzu_server_resync_pending` rises and drains; no alert
