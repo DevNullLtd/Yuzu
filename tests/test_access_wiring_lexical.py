@@ -282,7 +282,7 @@ def difference_list_problems(md, cpp, hpp, test_src):
     for name, text, pattern in (
         ("settings_routes.cpp handler comment", cpp, r"There are ([A-Za-z]+), listed once"),
         ("settings_routes.hpp comment", hpp, r"its ([A-Za-z]+) differences"),
-        ("test_settings_engine_panel_authz.cpp header", test_src, r"They are ([A-Za-z]+), numbered here"),
+        ("test_settings_engine_panel_authz.cpp header", test_src, r"They are ([A-Za-z]+), numbered 1 to"),
     ):
         stated = count_word(text, pattern)
         if stated is None:

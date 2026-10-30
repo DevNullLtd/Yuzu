@@ -2939,9 +2939,9 @@ void SettingsRoutes::register_routes(
     // test as the route. Each difference is stricter, a different refusal, a different
     // rendering of a store failure, or a different audit record; none admits a caller the
     // route refuses. There are SEVEN, listed once with their rationale in
-    // docs/user-manual/upgrading.md (numbered identically in
-    // test_settings_engine_panel_authz.cpp's header, which pins 1 to 3, 6 and 7; the render
-    // cases of 4 and 5 are in test_engine_principal_lifecycle.cpp, their audit halves in
+    // docs/user-manual/upgrading.md (the count is pinned lexically by DifferenceListCount in
+    // tests/test_access_wiring_lexical.py; the render cases of 4 and 5 are in
+    // test_engine_principal_lifecycle.cpp, their audit halves in
     // test_settings_engine_panel_authz.cpp):
     //  1. an absent engine-principal store is an in-page note on a 200 (the route answers
     //     503), because htmx would not swap the note otherwise;
