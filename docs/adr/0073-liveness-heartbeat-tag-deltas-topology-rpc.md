@@ -1071,10 +1071,16 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     with `send_system_reserved` to the agent's own stream (plus `forward_gateway_pending` for a
     gateway agent), as `__sync__.now` is. That is a `DispatchCaller` construction, of the
     existing system kind; it threads no operator authority and adds no `approval_provenance`
-    stamping site. It is not a fleet dispatch. `SystemReservedPush` gains one enumerator for it.
-  - `__resync__` is **not** in the protective set. A kill switch on it, or a degraded enablement
-    store, refuses it at `build_classified_command`; that is counted `send_failed`, and divergence
-    persists until the next permitted issuance.
+    stamping site. It is not a fleet dispatch. `SystemReservedPush` gains one enumerator for it,
+    which also means bumping the size of the `kSystemReservedPushes` array (the boot pre-seed) and
+    adding the enumerator's entry to the SCOPE OF THE BYPASS list in `dispatch_confined_arms.hpp`,
+    which that header requires of every new enumerator.
+  - `__resync__` is **not** in the protective set. A whole-action kill switch on it, or a degraded
+    enablement store, refuses it at `build_classified_command`; that is counted `send_failed`, and
+    divergence persists until the next permitted issuance. A per-OS kill switch is not applied:
+    `send_system_reserved` ignores the per-OS withhold `build_classified_command` returns, as it
+    does for `__sync__.now` and every other system-reserved push (only `dispatch_confined` applies
+    per-OS withholds).
   - **Ingestion only marks.** A heartbeat that requests a resync (D3, D6) adds the agent to a
     per-replica pending set: one entry per agent and action, deduplicated, so the set is bounded by
     the agents whose heartbeats reach this replica (gauge `yuzu_server_resync_pending{action}`).
