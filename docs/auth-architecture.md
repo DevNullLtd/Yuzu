@@ -3439,6 +3439,14 @@ MCP twins).
    `GET /api/v1/engine-principals/{id}`, `GET
    /api/v1/engine-principals/{id}/roles`, and the MCP twins
    `list_engine_principals`, `get_engine_principal`, `list_engine_roles`.
+   The dashboard fragments gate on the same permission with the quiet
+   `probe_permission` (a refused cookie session leaves no denial row, because
+   the panels auto-load), then read the session, then refuse an engine-classed
+   or MCP-tier session with an audited 403 (`engine_session_denied` /
+   `mcp_session_denied`, `Cache-Control: no-store`): the Settings Engine
+   Principals fragment (`GET /fragments/settings/engine-principals`, #5882)
+   and the Access page's principals list and detail fragments
+   (`GET /fragments/access/principals/list` and `/detail`).
    This is the same move #2324 made cutting `AccessReview` away from
    `AuditLog:*` (see "Periodic access reviews" → "#2225 round 2" below) —
    the same shape of over-broad-securable defect, closed the same way.
