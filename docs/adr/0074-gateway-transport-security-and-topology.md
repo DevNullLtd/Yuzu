@@ -3,13 +3,13 @@
 - **Status:** Proposed. The owner's decisions below were taken on 2026-10-28 and 2026-10-29; the whole ADR needs the owner's sign-off at the end of wave 0.
 - **Date:** 2026-10-28 (wave 0 decisions folded in 2026-10-29)
 - **Authors:** Nathan Dornbrook
-- **Supersedes:** nothing. Amends ADR-2002 (see its section 7h, added with this ADR).
+- **Supersedes:** nothing. Amends ADR-2002 (see its section 7h, added with this ADR). Amends ADR-2004 (the server identity form and the `mgmt_peer_auth_mode` default; see "Rules this design re-opens").
 - **Related:**
   - ADR-0069 (the owned gRPC layer over Cowboy and gun, and the overload model), ADR-0066 (gRPC is the permanent transport).
   - ADR-2002 (high availability), ADR-0053 (the CA store on Postgres), ADR-0010 (secrets; the CA key stays behind `KeyProvider`).
   - ADR-0073 (draft: liveness-only heartbeat over a stateless gateway relay). It goes to PR after this ADR is ratified.
   - `docs/pki-architecture.md` (the current trust model and the per-hop TLS table).
-  - Issues: #6016 (server identity by URI SAN, open), #5647 to #5651 (several upstream servers, open), #5649 (the reconcile decision, open), #4669 (agent-to-cluster affinity, closed).
+  - Issues: #1292 and #5578 (cryptographic agent identity through the gateway; `docs/user-manual/gateway.md` tracks the agent-edge mutual TLS design there; D5 answers #5578's R-5, binding the identity to `agent_id`, and R-6, per-gateway `agent_id` scoping, is still open), #6016 (server identity by URI SAN, open), #5647 to #5651 (several upstream servers, open), #5649 (the reconcile decision, open), #4669 (agent-to-cluster affinity, closed).
 
 ## Context
 
@@ -201,6 +201,16 @@ These are targets, not yet evidence. On merged `dev` the gateway holds about 320
 The memory measures in this ADR's companion change (on `dev` since commit 857ac374e) are: a garbage collection of the large processes after an agent-count drop, plus a second pass 30 seconds later; and a periodic `malloc_trim(0)` through a small NIF. The trim acts on glibc only, and does nothing on the default musl image. `+MMmcs 0` and `MALLOC_ARENA_MAX=2` are not in it: they are deferred to the hibernation work, because they gave no measurable memory gain and had a measured idle-CPU cost.
 
 `malloc_trim` is a glibc feature. It acts on the chiselled Ubuntu image (`Dockerfile.gateway.chisel`), where it was measured. The default image (`Dockerfile.gateway`) is Alpine with musl, and musl has no `malloc_trim`. musl's allocator returns freed memory differently, and that is not yet measured. The glibc builders (the chisel builder, CI, and the Meson-driven gateway build on Linux) already compile the trim NIF (`gateway/apps/yuzu_gw/rebar.config`, `c_src/build_mem_trim_nif.sh`). Only the Alpine builder in `Dockerfile.gateway` has no C toolchain; the kTLS NIF must add one there (`build-base`, `openssl-dev`, `linux-headers`). Both NIFs are Linux-only: Windows and macOS gateway builds skip them. kTLS itself does not need glibc. Checked on 2026-10-28: the NIF builds without warnings against musl in `erlang:28-alpine` (with `openssl-dev` and `linux-headers`) and loads in the BEAM there. What kTLS needs is the host kernel's `tls` module, because a container shares the host's kernel and cannot load modules itself.
+
+### Rules this design re-opens
+
+Several standing rules, and one earlier ADR, say the opposite of a decision above. Until the named wave amends each one, with `security-guardian`, the current rule stands and code must follow it.
+
+- **No `auth_fun` on the `:50051` agent listener** (the PKI row of `.claude/routed-concerns-access-control.md`; D2). It is also enforced in code: the gateway refuses to boot with `auth_fun_on_agent_listener` (`yuzu_grpc_listener.erl`), and the manual's stage 3 in `docs/user-manual/gateway.md` ("Moving the agent edge to mutual TLS") says the same. The enrollment port also needs a per-listener method allow-list, which the layer does not have: new code. **Wave 2.**
+- **Each CRL is a superset of the last** (the PKI row; D7). **Wave 1.**
+- **The gateway-upstream peer row,** clause (2) (CA membership never substitutes for the pin) and clause (3) (pins fixed at boot, no revocation read, and re-opening them means re-opening `docs/security-reviews/gateway-peer-authz-minimal-2026-10-07.md`). D1 re-opens both. **Wave 1.**
+- **The mgmt-plane peer row and ADR-2004:** clause (2), one byte-exact identity `yuzu://<install>/server`, against D3's window that accepts both forms and its per-instance `.../server/<name>`; clause (3), an unset `mgmt_peer_auth_mode` is always `pin`, against D1's optional pins; clause (4), `identity_over_ca_bundle` refuses a CA file that is not exactly one certificate, which a customer intermediate plus its root (D4) is; and the identity derived from the CA fingerprint, against D3's UUID trust domain. **Wave 1.**
+- **Alternatives ADR-2004 rejected and this ADR takes up:** short-lived server certificates (rejected there because the server never renews its leaf and client credentials have no hot reload), and CRL checks at the handshake only on the long-lived management connection. So wave 1 must add credential hot reload on server and gateway, and the teardown of a live connection whose peer certificate is revoked.
 
 ## Conflicts this ADR creates, to resolve in wave 0
 
