@@ -1528,7 +1528,11 @@ message ReattachResponse {
   then `__resync__.topology`, converge them (D3, D8).
 - **Reattach is a continuation, not a registration.** A successful reattach fires no
   `agent.registered` webhook or offload event and writes no registration audit row, because the
-  agent did not enrol or register again. Every outcome is counted on
+  agent did not enrol or register again. The install it shares with Register (step 6) still
+  publishes `agent-online`, which is correct (the session is newly live on this replica), and
+  would increment `yuzu_agents_registered_total`: reattach skips that increment, so the counter
+  keeps meaning registrations, and the adopt is counted on the reattach family instead. Every
+  outcome is counted on
   `yuzu_server_agent_reattach_total{outcome}` (D13). The refusals that say something about the
   caller, `NOT_ENROLLED` and `MALFORMED_SESSION`, also write an `agent.reattach` audit row with
   `result=refused` and the refusal: principal the authorized gateway peer, `gateway-peer:<spki8>`
@@ -1552,6 +1556,14 @@ message ReattachResponse {
   | presented id malformed, or body and metadata differ | `FAILED_PRECONDITION` | `MALFORMED_SESSION` | disconnect the agent's stream | neutral |
   | enrollment, record or directory read degraded | `UNAVAILABLE` | `DEGRADED` | **keep the stream**; leave the session to the next targeted replay, after `retry_after_ms` | neutral |
   | over `--reattach-rate` | not applicable | `RATE_LIMITED` | keep the stream; requeue the session after `retry_after_ms` | neutral |
+  | install refused at step 6: `DeviceTokenStore::revoke_by_device` failed for a prior session on this replica (#3401, fail-closed) | `UNAVAILABLE` | `DEGRADED` | keep the stream; as for `DEGRADED` above | neutral |
+  | install refused at step 6: a concurrent registration superseded it | `UNAVAILABLE` | `SUPERSEDED` | disconnect the agent's stream | success |
+
+  `AgentRegistry::register_agent` has these two refusals of its own (`agent_registry.cpp`, about
+  l.178-188 and l.222-231). Both come after step 5's adopt CAS has already renewed or reclaimed the
+  route row; that row is left to the winning or the next session, as on ProxyRegister today, which
+  answers both with gRPC `UNAVAILABLE`. ProxyReattach maps them to values instead, so neither feeds
+  the breaker as a failure.
 
   `DEGRADED` must never disconnect: a Postgres outage would otherwise tear down every agent the
   gateway holds. `SUPERSEDED` stays a breaker success, as `FAILED_PRECONDITION` is on replay today,
