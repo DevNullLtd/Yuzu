@@ -1034,8 +1034,8 @@ relayed by the gateway like any command (no new gateway state).
     operations (enrollment read, route CAS, record read; D14; and the `announce_connected` route
     write of the CONNECTED re-announce that follows it) at up to `--reattach-rate`, and each
     issued resync one record write at up to `--tag-resync-rate` plus `--topology-resync-rate`
-    (plus one kill-switch read per issuer pass). At
-    the defaults, overlapping, that is up to about 10,200 operations per second per replica against
+    (plus one kill-switch read per issuance, inside `build_classified_command`). At
+    the defaults, overlapping, that is up to about 12,400 operations per second per replica (four per reattach, two per issuance) against
     the default `--postgres-pool-size` of 16. Agents that re-register instead (`NO_RECORD`) add one
     registration-record transaction each (D14). It is unmeasured. It is to be measured against the
     pool size alongside ADR-0074's wave-2 measurement of a mass re-enrollment after an outage,
@@ -1177,11 +1177,13 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     Each drain pass is one loop with one `DispatchRecordLatch` (`dispatch_record_policy.hpp`), so
     each record write uses the 250 ms fan-out lease budget. `build_classified_command` also reads
     the kill-switch decision from `PluginConfigStore` on every call (a lease and a select, failing
-    closed), so the issuer reads the `__resync__` decision once per pass instead: still
-    fail-closed, and one read per pass rather than one per issuance. At the first refusal from the
-    dispatch path (that read failing, or a record write failing) the issuer ends the pass, rather
-    than sending the rest with skipped records, and leaves the remaining marks in the set,
-    counted `deferred`; only a refusal by a kill switch that is actually set is `send_failed`. A Postgres outage therefore delays resyncs and never
+    closed, never memoized: the emergency-stop contract), and the issuer does not change that, so
+    each issuance costs that read as well as its record write. `kill_switch_decision` cannot tell
+    a switch that is set from a degraded store (both deny), so when a pass is denied the issuer
+    classifies the denial with the tri-state `PluginConfigStore::get_kill_switch` read
+    (`std::expected<KillSwitchEntry, Error>`): a switch that is set is `send_failed`; an `Error`
+    (a degraded store) or a failed record write ends the pass, rather than sending the rest with
+    skipped records, and leaves the remaining marks in the set, counted `deferred`. A Postgres outage therefore delays resyncs and never
     blocks heartbeat ingestion.
   - **The issuer's lifecycle.** The issuer is a `ServerImpl`-owned thread with a stop flag. Its
     rate and between-pass waits are condition-variable waits the stop flag wakes, so it never
