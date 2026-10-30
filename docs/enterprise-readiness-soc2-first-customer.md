@@ -249,7 +249,7 @@ the documented case; see `docs/user-manual/upgrading.md`). Breaking for
 service-scoped tokens only; human sessions, engine principals and MCP tiers are
 unchanged. Evidence for this entry is the governance ledger for #3526.
 
-**Addendum: the MCP stream endpoint and MCP sessions, authorisation gap closed (the replay residual by #4309, the stream and session binding by #4754) (CC6.1/CC6.3/CC7.2, 2026-10-29).**
+**Addendum: the MCP stream endpoint and MCP sessions, the tier-and-approval gap closed (#4309) and the stream and session-binding gap closed (#4754); further residuals are listed below (CC6.1/CC6.3/CC7.2, 2026-10-29).**
 Before this change `GET /mcp/v1/` (the session's SSE channel, which replays a
 bounded per-session ring of frames) required authentication only, and a session id
 was bound to the username alone. Two reaches existed. A service-scoped API token
@@ -286,9 +286,20 @@ still be protected like a credential.
 **Audit-period disclosure (#4309).** Before this change a human principal with an
 empty MCP tier (a cookie session or an API token minted without `mcp_tier`) could
 call the MCP tool surface without the tier ceiling or the supervised-tier approval
-gate; RBAC still applied to every call. The fix is not retroactive: for any audit
-period before it shipped, MCP calls made by a tierless principal were not subject
-to the tier or approval controls.
+gate; per-tool authorization (RBAC, or the legacy role check when enforcement was
+off) still applied to every call. The fix is not retroactive: for any audit period
+covered by builds that predate this change, MCP calls made by a tierless principal
+were not subject to the tier or approval controls. The check is enforced per
+replica, so a replica not yet upgraded during a rolling upgrade, or one rolled back,
+admits tierless callers again; see `docs/user-manual/upgrading.md` for the
+rolling-upgrade and rollback windows.
+Questionnaire wording: every tierless request to `/mcp/v1/` is refused (`403`) and
+counted. An audit row (`mcp.session.reject`, `reason=tier_required`) is written for
+the first refusals of each principal and source in a 10-second window (up to 10 per
+key; beyond 64 distinct keys in a window they share one 10-row bucket); further rows
+are suppressed and counted in a separate counter
+(`yuzu_mcp_admission_audit_suppressed_total`), and a failed audit write does not
+change the refusal.
 Stream liveness is principal-level: the class is checked when the stream attaches and is not re-derived from the live credential afterwards (the per-tick credential recheck compares the principal only, and the per-tick session check compares the class captured at attach).
 Further residuals: a class switch strands the old-class sessions against the
 per-principal cap (fixed at 8, no flag) for up to the 30-minute idle TTL (longer while
@@ -296,7 +307,8 @@ a stream stays attached, because the stream's per-tick liveness check keeps the
 session alive) with no administrator reap path; and during a rolling upgrade the gap stays open on any replica not yet
 upgraded.
 Audit evidence: the `mcp.session.*` rows are written set-and-proceed (a failure to
-persist one is logged at warning level and the denial is still answered) and they are queryable through
+persist one is logged at warning level and the denial is still answered; `tier_required`
+rows are rate-limited per principal, and the refused counter is complete) and they are queryable through
 `GET /api/v1/audit`, but they are NOT in the CC7.2 authentication sample
 (`GET /api/v1/audit/auth-sample` selects the `auth.`, `mfa.`, `session.` and
 `engine_principal.` prefixes only), so an auditor sampling that surface does not see

@@ -314,7 +314,9 @@ The `--mcp-no-streaming` kill switch disables all of the above (no minting;
 `GET`/`DELETE` → `405`; plain POST only), useful behind a buffering reverse proxy.
 Session open/close and every denial are audited (`mcp.session.open` /
 `mcp.session.close` / `mcp.session.reject`; a rejected session shows `reason=service_scoped`
-or `reason=credential_mismatch` in the `detail`, see `docs/user-manual/audit-log.md`), and
+or `reason=credential_mismatch` in the `detail`, see `docs/user-manual/audit-log.md`;
+`reason=tier_required` rows are rate-limited per principal, while the refused counter is
+complete), and
 each stream attach/close is audited
 too (`mcp.stream.attach` / `mcp.stream.close`, the latter carrying the close reason).
 
@@ -362,12 +364,14 @@ it also lacks a session id, and the kill switches, the `Origin` check and the
 protocol-version check still answer first where they apply. The refusal is
 audited as `mcp.session.reject` with `reason=tier_required` and counted on
 `yuzu_mcp_admission_refused_total{reason="tier_required"}`. The `403` body has no
-`permission` field and carries a remediation hint: mint an API token with
-`mcp_tier` `readonly`, `operator` or `supervised` and an `expires_at` at most 90
-days out (`POST /api/v1/tokens`, or Settings > API tokens), then send it as
-`Authorization: Bearer`, without a session cookie. The `403` and the
-counter are never limited; the audit row is budgeted (see the note on audit rows
-in [Troubleshooting](#-32003-permission-denied-rbac)). There is no flag that turns this check off. The
+`permission` field and carries a remediation hint: a human operator must mint an
+API token with `mcp_tier` `readonly`, `operator` or `supervised` (the lowest tier
+that covers the tools needed) and an `expires_at` at most 90 days out (unix
+seconds), via Settings > API Tokens or `POST /api/v1/tokens`, then configure the
+client to send only `Authorization: Bearer <token>`, with no session cookie. The
+`403` and the counter are never limited; the audit row is rate-limited per
+principal (see the note on audit rows in
+[Troubleshooting](#-32003-permission-denied-rbac)). There is no flag that turns this check off. The
 per-tool tier-less guards listed under [Available Tools](#available-tools) remain
 as defence in depth; a tier-less caller no longer reaches them.
 
@@ -1723,20 +1727,26 @@ HTTP `403` with the message `/mcp/v1/ requires an MCP-tier bearer token`, an
 `id` of `null`, and no `permission` field. It is audited as `mcp.session.reject`
 with `reason=tier_required` and counted on
 `yuzu_mcp_admission_refused_total{reason="tier_required"}`. **Fix**: mint an API
-token with `mcp_tier` `readonly`, `operator` or `supervised` and an `expires_at`
-at most 90 days out (`POST /api/v1/tokens`, or Settings > API tokens), then send
-it as `Authorization: Bearer`. Send no session cookie with it: the server
-resolves a live cookie first, so the request is classed as the cookie and
-refused even though it also carries a valid token.
+token with `mcp_tier` `readonly`, `operator` or `supervised` (the lowest tier
+that covers the tools needed) and an `expires_at` at most 90 days out (unix
+seconds), via Settings > API Tokens or `POST /api/v1/tokens`, then configure the
+client to send only `Authorization: Bearer <token>`. Send no session cookie with
+it: the server resolves a live cookie first, so the request is classed as the
+cookie and refused even though it also carries a valid token. The `remediation`
+in the `403` body says the same: this credential has no MCP tier and retrying will
+not help, and a human operator must mint the token.
 
 Every refusal is answered and counted, but the audit row is budgeted per key
 `tier_required|<auth_source>|<principal>`: at most 10 rows per key per 10-second
 window (up to twice that across a window boundary), at most 64 distinct keys per
-window with the rest sharing one overflow bucket (also 10 rows per window), and
-the first refusal of each key in a window always writes its row. One budget serves
-`GET`, `POST` and `DELETE`. Rows can therefore be suppressed under a flood while
-the counter still counts every refusal; a window that suppressed rows ends with one
-aggregate warning in the server log carrying the suppressed count. Read the
+window with the rest sharing one overflow bucket (also 10 rows per window). The
+first refusal of each tracked key (the first 64 `(source, principal)` keys in a
+window) writes its row, but further principals share the one overflow bucket, so a
+new principal's first refusal can be suppressed. One budget serves `GET`, `POST`
+and `DELETE`. Every refusal whose row is suppressed increments
+`yuzu_mcp_admission_audit_suppressed_total`; the aggregate warning with the
+suppressed count is logged when the NEXT refusal opens a new window, so a burst
+followed by silence is never logged (use that counter for it). Read the refused
 counter, not the row count, for how many requests were turned away.
 
 The last two ticket-recall causes (a ticket minted through a different Yuzu

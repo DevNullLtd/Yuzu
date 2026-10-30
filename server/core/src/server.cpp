@@ -1018,6 +1018,11 @@ public:
                           "Requests refused at /mcp/v1/ admission by reason - tier_required is "
                           "a credential with no MCP tier (cookie session or tierless token)",
                           "counter");
+        metrics_.describe("yuzu_mcp_admission_audit_suppressed_total",
+                          "/mcp/v1/ admission refusals whose mcp.session.reject audit row was not "
+                          "written because the per-principal audit budget was spent (the refused "
+                          "counter still counts every refusal)",
+                          "counter");
         metrics_.describe("yuzu_mcp_initialize_protocol_total",
                           "MCP initialize handshakes by negotiated protocol revision", "counter");
         metrics_.describe("yuzu_mcp_cancel_notifications_total",
@@ -1987,6 +1992,7 @@ public:
         // #4309: the admission refusal family (mcp_admission.hpp), pre-seeded so a
         // dashboard reads "0" before the first refusal. Closed set: tier_required.
         metrics_.counter("yuzu_mcp_admission_refused_total", {{"reason", "tier_required"}});
+        metrics_.counter("yuzu_mcp_admission_audit_suppressed_total");
         // Pre-seed both supported MCP protocol revisions to 0 so a
         // revision-deprecation dashboard reads "0" (not absent) for an unused
         // revision (observability-conventions.md; 2g PR 1). Values mirror the

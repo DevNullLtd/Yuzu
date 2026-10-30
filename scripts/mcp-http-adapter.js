@@ -3,7 +3,7 @@
 //
 // Bridges Claude Code's stdio MCP transport to Yuzu's HTTP JSON-RPC endpoint.
 // Reads JSON-RPC requests from stdin, forwards to Yuzu's /mcp/v1/, writes
-// responses to stdout.
+// responses to stdout. Requires Node 10 or newer (object spread, optional catch binding).
 //
 // Usage:
 //   YUZU_MCP_URL=http://localhost:8080/mcp/v1/ YUZU_MCP_TOKEN=<token> node scripts/mcp-http-adapter.js
@@ -16,10 +16,17 @@
 //
 // Refusals: any HTTP status >= 400 writes one line to stderr (status, request
 // method, JSON-RPC error code and message, remediation when present; never the
-// token). The server's refusal for a missing MCP tier carries `id: null`, so the
-// adapter re-addresses a JSON-RPC error with a null id to the in-flight request's
-// id before writing it to stdout; otherwise a stdio client that matches replies on
-// id would wait for its timeout. Notifications (no id) are not re-addressed.
+// token; control characters stripped; a body that is not a JSON-RPC error is
+// reported by size only). A stdio client matches replies on request id, so the
+// adapter always answers a request that carried an id:
+//   - a JSON-RPC error with a null id (the server's refusal for a missing MCP tier
+//     is decided before the body is read) is re-addressed to the request's id;
+//   - an HTTP error whose body is not a JSON-RPC error (non-JSON, or JSON without
+//     jsonrpc/error) is answered with a synthesized -32000 error carrying that id.
+// A notification (no id) refused with an HTTP error gets nothing on stdout.
+//
+// Shutdown: when stdin closes, requests already in flight are still answered; the
+// process exits once they have all been written (nothing else keeps it alive).
 
 const http = require('http');
 const https = require('https');
@@ -27,6 +34,8 @@ const { URL } = require('url');
 
 const MCP_URL = process.env.YUZU_MCP_URL || 'http://localhost:8080/mcp/v1/';
 const MCP_TOKEN = process.env.YUZU_MCP_TOKEN || '';
+// A reply that never comes would otherwise keep the process alive after stdin closes.
+const REQUEST_TIMEOUT_MS = 120000;
 
 if (process.env.YUZU_MCP_COOKIE) {
   process.stderr.write(
@@ -37,28 +46,43 @@ if (process.env.YUZU_MCP_COOKIE) {
 const url = new URL(MCP_URL);
 const transport = url.protocol === 'https:' ? https : http;
 
-function clip(value, max) {
-  const s = String(value);
+// Strip control characters (C0 and DEL) so server- or client-supplied text cannot
+// forge extra log lines or drive a terminal, then clip.
+function clean(value, max) {
+  const s = String(value).replace(/[\u0000-\u001f\u007f]/g, '');
   return s.length > max ? `${s.slice(0, max)}...` : s;
+}
+
+function isObject(v) {
+  return v !== null && typeof v === 'object';
+}
+
+// A JSON-RPC error response: an object with `jsonrpc` and an `error` object.
+function isRpcError(body) {
+  return isObject(body) && body.jsonrpc !== undefined && isObject(body.error);
 }
 
 // One stderr line for any HTTP status >= 400: the status, the request method, and
 // the JSON-RPC error code, message and remediation when the body carries them.
+// Any other body is reported by size only, never echoed.
 // Never prints the token (it is only ever sent in the Authorization header).
-function logHttpError(status, request, body, rawBody) {
-  const method = request && request.method ? request.method : '?';
-  const err = body && typeof body === 'object' ? body.error : undefined;
+function logHttpError(status, method, body, rawBody) {
   let detail;
-  if (err && typeof err === 'object') {
-    detail = `JSON-RPC error ${err.code}: ${clip(err.message, 200)}`;
-    const remediation = err.data && err.data.remediation;
-    if (remediation) detail += ` (remediation: ${clip(remediation, 300)})`;
+  if (isRpcError(body)) {
+    const err = body.error;
+    detail = `JSON-RPC error ${clean(err.code, 20)}: ${clean(err.message, 200)}`;
+    const remediation = isObject(err.data) ? err.data.remediation : undefined;
+    if (remediation) detail += ` (remediation: ${clean(remediation, 300)})`;
+  } else if (body === undefined) {
+    detail = `non-JSON body (${Buffer.byteLength(rawBody)} bytes)`;
   } else {
-    detail = `body: ${clip(rawBody, 200)}`;
+    detail = `non-JSON-RPC body (${Buffer.byteLength(rawBody)} bytes)`;
   }
-  process.stderr.write(`[mcp-adapter] HTTP ${status} for ${method}: ${detail}\n`);
+  process.stderr.write(`[mcp-adapter] HTTP ${status} for ${clean(method, 64)}: ${detail}\n`);
 }
 
+// Resolves { status, body, raw }: body is the parsed JSON, or undefined when the
+// response is not JSON.
 function forward(jsonRpcRequest) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(jsonRpcRequest);
@@ -74,29 +98,94 @@ function forward(jsonRpcRequest) {
       path: url.pathname,
       method: 'POST',
       headers,
+      agent: false,  // no pooled socket outliving the exchange
     };
 
     const req = transport.request(opts, (res) => {
       let data = '';
+      res.setEncoding('utf8');
       res.on('data', (chunk) => { data += chunk; });
       res.on('end', () => {
         let parsedBody;
         try {
           parsedBody = JSON.parse(data);
         } catch {
-          if (res.statusCode >= 400) logHttpError(res.statusCode, jsonRpcRequest, undefined, data);
-          reject(new Error(`Invalid JSON from server: ${data.slice(0, 200)}`));
-          return;
+          parsedBody = undefined;
         }
-        if (res.statusCode >= 400) logHttpError(res.statusCode, jsonRpcRequest, parsedBody, data);
-        resolve(parsedBody);
+        resolve({ status: res.statusCode, body: parsedBody, raw: data });
       });
     });
 
+    req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+      req.destroy(new Error('timed out waiting for the MCP server'));
+    });
     req.on('error', reject);
     req.write(body);
     req.end();
   });
+}
+
+function writeReply(obj) {
+  process.stdout.write(JSON.stringify(obj) + '\n');
+}
+
+function handleLine(rawLine) {
+  const line = rawLine.trim();
+  if (!line) return;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    process.stderr.write(`[mcp-adapter] Invalid JSON from stdin: ${clean(line.slice(0, 100), 100)}\n`);
+    return;
+  }
+
+  // `null`, a number or an array parses fine but has no id; it is still forwarded.
+  const hasObject = isObject(parsed) && !Array.isArray(parsed);
+  const id = hasObject ? parsed.id : undefined;
+  const hasId = id !== undefined && id !== null;
+  const method = hasObject && typeof parsed.method === 'string' ? parsed.method : '?';
+
+  forward(parsed)
+    .then(({ status, body, raw }) => {
+      if (status >= 400) logHttpError(status, method, body, raw);
+
+      // A refused notification has no client waiting on it: the stderr line above is
+      // the whole report, and nothing goes to stdout.
+      if (status >= 400 && !hasId) return;
+
+      // An HTTP error whose body is not a JSON-RPC error (an HTML error page, a
+      // proxy's text, a JSON object without jsonrpc/error): answer the request so the
+      // client does not wait for its timeout.
+      if (status >= 400 && !isRpcError(body)) {
+        writeReply({ jsonrpc: '2.0', id,
+                     error: { code: -32000, message: `HTTP ${status} from MCP server`,
+                              data: { http_status: status } } });
+        return;
+      }
+
+      if (body === undefined) throw new Error(`Invalid JSON from server: ${raw.slice(0, 200)}`);
+
+      // The server's pre-parse refusals (e.g. the 403 for a credential without an
+      // MCP tier) are JSON-RPC errors with `id: null`, because they are decided
+      // before the body is read. A stdio client matches replies on request id and
+      // would wait for its timeout, so answer the in-flight request's id instead.
+      let response = body;
+      if (isObject(response) && isObject(response.error) && response.id === null && hasId) {
+        response = { ...response, id };
+      }
+      writeReply(response);
+    })
+    .catch((err) => {
+      process.stderr.write(`[mcp-adapter] Error: ${clean(err.message, 300)}\n`);
+      // Return a JSON-RPC error so the caller doesn't hang
+      writeReply({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: err.message },
+        id: hasId ? id : null,
+      });
+    });
 }
 
 // Read newline-delimited JSON-RPC from stdin
@@ -106,50 +195,20 @@ process.stdin.on('data', (chunk) => {
   buffer += chunk;
   let newlineIdx;
   while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
-    const line = buffer.slice(0, newlineIdx).trim();
+    const line = buffer.slice(0, newlineIdx);
     buffer = buffer.slice(newlineIdx + 1);
-    if (!line) continue;
-
-    let parsed;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      process.stderr.write(`[mcp-adapter] Invalid JSON from stdin: ${line.slice(0, 100)}\n`);
-      continue;
-    }
-
-    forward(parsed)
-      .then((response) => {
-        // The server's pre-parse refusals (e.g. the 403 for a credential without an
-        // MCP tier) are JSON-RPC errors with `id: null`, because they are decided
-        // before the body is read. A stdio client matches replies on request id and
-        // would wait for its timeout, so answer the in-flight request's id instead.
-        // Notifications (no id) are left as the server sent them.
-        if (response && typeof response === 'object' && response.error &&
-            typeof response.error === 'object' && response.id === null &&
-            parsed.id !== undefined && parsed.id !== null) {
-          response = { ...response, id: parsed.id };
-        }
-        process.stdout.write(JSON.stringify(response) + '\n');
-      })
-      .catch((err) => {
-        process.stderr.write(`[mcp-adapter] Error: ${err.message}\n`);
-        // Return a JSON-RPC error so the caller doesn't hang
-        const errResp = {
-          jsonrpc: '2.0',
-          error: { code: -32603, message: err.message },
-          id: parsed.id || null,
-        };
-        process.stdout.write(JSON.stringify(errResp) + '\n');
-      });
+    handleLine(line);
   }
 });
 
+// No process.exit here: requests still in flight keep the event loop alive, are
+// answered, and the process ends on its own once the last reply is written.
 process.stdin.on('end', () => {
-  process.exit(0);
+  handleLine(buffer);  // a final line with no trailing newline
+  buffer = '';
 });
 
 // Prevent unhandled rejection crashes
 process.on('unhandledRejection', (err) => {
-  process.stderr.write(`[mcp-adapter] Unhandled: ${err.message}\n`);
+  process.stderr.write(`[mcp-adapter] Unhandled: ${clean(err && err.message, 300)}\n`);
 });

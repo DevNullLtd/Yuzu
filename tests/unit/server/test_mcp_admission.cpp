@@ -18,6 +18,8 @@
 #include "step_up_gate.hpp" // step_up_source_label: the sibling closed list (C1 lock below)
 #include "test_route_sink.hpp"
 
+#include "../test_log_capture.hpp"
+
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
@@ -68,6 +70,12 @@ struct Harness {
                                            yuzu::server::kDefaultAuditWindowMs,
                                            [this] { return now_ms; },
                                            yuzu::server::kDefaultAuditMaxKeys};
+
+    /// yuzu_mcp_admission_audit_suppressed_total as exported.
+    std::size_t suppressed_count() {
+        return static_cast<std::size_t>(
+            metrics.counter("yuzu_mcp_admission_audit_suppressed_total").value());
+    }
 
     bool run(const yuzu::server::auth::Session& s) {
         auto audit = [this](const httplib::Request&, const std::string& action,
@@ -140,9 +148,11 @@ TEST_CASE("mcp admission: a tierless session is refused with the exact envelope,
     CHECK_FALSE(cid.empty());
     CHECK(data.at("retry_after_ms").is_null());
     CHECK(data.at("remediation") ==
-          "mint an API token with mcp_tier readonly, operator or supervised and an expires_at at "
-          "most 90 days out (POST /api/v1/tokens, or Settings > API tokens), then send it as "
-          "Authorization: Bearer; do not send a session cookie with it");
+          "This credential has no MCP tier and retrying will not help. A human operator must mint "
+          "an API token with mcp_tier readonly, operator or supervised (the lowest tier that "
+          "covers the tools needed) and an expires_at at most 90 days out (unix seconds), via "
+          "Settings > API Tokens or POST /api/v1/tokens; then configure this client to send only "
+          "Authorization: Bearer <token>, with no session cookie.");
     // Service-scope clause 5: no .permission field that would claim a false self-remediation.
     CHECK_FALSE(data.contains("permission"));
     CHECK_FALSE(err.contains("permission"));
@@ -332,6 +342,11 @@ struct RoutesHarness {
         std::string marker;
     };
     std::vector<Row> audits;
+
+    std::size_t suppressed_count() {
+        return static_cast<std::size_t>(
+            metrics.counter("yuzu_mcp_admission_audit_suppressed_total").value());
+    }
 
     yuzu::server::test::TestRouteSink sink; // LAST: handlers capture this struct's members
 
@@ -543,10 +558,13 @@ TEST_CASE("mcp admission budget: a flood from one principal writes at most max_r
     CHECK(h.audits.size() == yuzu::server::kDefaultAuditMaxRows);
     CHECK(h.metrics.serialize().find(std::string{kCounterLine} + " 25\n") != std::string::npos);
     CHECK(h.budget.suppressed_total() == kFlood - yuzu::server::kDefaultAuditMaxRows);
+    // Every suppressed row is counted, so rows + suppressed == refusals.
+    CHECK(h.suppressed_count() == kFlood - yuzu::server::kDefaultAuditMaxRows);
+    CHECK(h.audits.size() + h.suppressed_count() == static_cast<std::size_t>(kFlood));
 }
 
-TEST_CASE("mcp admission budget: the first refusal of a key always writes its row with the "
-          "exact tuple",
+TEST_CASE("mcp admission budget: the first refusal of a key (below the key bound) writes its "
+          "row with the exact tuple",
           "[mcp][a5][authz][4309]") {
     Harness h;
     // Exhaust alice/local, then ask for a fresh key.
@@ -604,7 +622,7 @@ TEST_CASE("mcp admission budget: the next window re-admits (injected clock, no s
 }
 
 TEST_CASE("mcp admission budget: distinct principals beyond the key bound share the overflow "
-          "bucket, and memory stays bounded",
+          "bucket (no first-row guarantee), and memory stays bounded",
           "[mcp][a5][authz][4309]") {
     Harness h;
     // 64 distinct principals fill the key table, one row each.
@@ -616,21 +634,24 @@ TEST_CASE("mcp admission budget: distinct principals beyond the key bound share 
         (void)h.run(make_session("local", "", "human", "late" + std::to_string(i)));
     CHECK(h.audits.size() == yuzu::server::kDefaultAuditMaxKeys + yuzu::server::kDefaultAuditMaxRows);
     CHECK(h.budget.live_keys() <= 2 * yuzu::server::kDefaultAuditMaxKeys + 1);
-    // Every refusal counted.
+    // Every refusal counted; the 20 late principals past the overflow bucket's 10 rows are
+    // suppressed (their first refusal wrote no row), and the suppressed counter says so.
     CHECK(h.metrics.serialize().find(std::string{kCounterLine} + " 94\n") != std::string::npos);
+    CHECK(h.suppressed_count() == 20);
+    CHECK(h.audits.size() + h.suppressed_count() == 94);
 }
 
 TEST_CASE("mcp admission budget: the key is bounded for any username or source",
           "[mcp][a5][authz][4309]") {
     auto s = make_session(std::string(70'000, 'x'), "", "human", std::string(70'000, 'u'));
     const auto key = yuzu::server::mcp::admission_budget_key(s);
-    CHECK(key.size() <= 96);
+    // "tier_required|other|" is 20 bytes, plus the principal cut to 64.
+    CHECK(key.size() == 84);
     CHECK(key.rfind("tier_required|other|", 0) == 0);
-    CHECK(key.size() == std::string{"tier_required|other|"}.size() +
-                            yuzu::server::mcp::kAdmissionBudgetPrincipalBytes);
-    // The longest legitimate prefix still fits inside the budget's own bound with room to spare.
+    // The longest legitimate source label ("engine_token") gives the longest key: 27 + 64 = 91,
+    // inside the budget's own 96-byte bound, so the budget never cuts into the principal.
     auto t = make_session("engine_token", "", "engine", std::string(200, 'e'));
-    CHECK(yuzu::server::mcp::admission_budget_key(t).size() <= 96);
+    CHECK(yuzu::server::mcp::admission_budget_key(t).size() == 91);
 }
 
 TEST_CASE("mcp admission budget: an admitted request never touches the budget",
@@ -676,11 +697,74 @@ TEST_CASE("mcp admission budget: through the real routes a flood is refused and 
     CHECK(del->status == 403);
     CHECK(h.audits.size() == yuzu::server::kDefaultAuditMaxRows + 1);
 
+    // One millisecond short of the factory's window: still spent (pins the factory's own
+    // window, not just the primitive's).
+    h.now_ms += yuzu::server::kDefaultAuditWindowMs - 1;
+    auto short_of = h.send("POST", "alice-short", kToolsCallBody);
+    REQUIRE(short_of != nullptr);
+    CHECK(short_of->status == 403);
+    CHECK(h.audits.size() == yuzu::server::kDefaultAuditMaxRows + 1);
+    // Every refusal so far is either a row or a counted suppression: 30 + 1 + 1 + 1.
+    CHECK(h.audits.size() + h.suppressed_count() == 33);
+
     // Next window: alice writes again.
-    h.now_ms += yuzu::server::kDefaultAuditWindowMs;
+    h.now_ms += 1;
     auto again = h.send("POST", "alice-again", kToolsCallBody);
     REQUIRE(again != nullptr);
     CHECK(again->status == 403);
     REQUIRE(h.audits.size() == yuzu::server::kDefaultAuditMaxRows + 2);
     CHECK(h.audits.back().marker == "alice-again");
+}
+
+TEST_CASE("mcp admission budget: the next window's first refusal logs one aggregate count line "
+          "with no caller content",
+          "[mcp][a5][authz][4309]") {
+    Harness h;
+    const auto session = make_session("oidc", "", "human", "zz_distinct_principal");
+    // 15 refusals: 10 rows, 5 suppressed. No line is logged inside the window.
+    yuzu::test::LogCapture cap;
+    for (int n = 0; n < 15; ++n)
+        (void)h.run(session);
+    cap.stop();
+    CHECK(cap.text().find("audit rows suppressed") == std::string::npos);
+
+    // The line comes from the refusal that OPENS the next window, not from the burst's end.
+    h.now_ms += yuzu::server::kDefaultAuditWindowMs;
+    yuzu::test::LogCapture cap2;
+    (void)h.run(session);
+    cap2.stop();
+    const std::string text = cap2.text();
+    CHECK(text.find("5 tier_required audit rows suppressed in the last window") !=
+          std::string::npos);
+    // A count only: no principal, no auth_source, no correlation id.
+    CHECK(text.find("zz_distinct_principal") == std::string::npos);
+    CHECK(text.find("oidc") == std::string::npos);
+    CHECK(text.find("cid=") == std::string::npos);
+    CHECK(text.find("tier_required|") == std::string::npos);
+}
+
+TEST_CASE("mcp admission budget: a budget that throws never turns the refusal into an exception",
+          "[mcp][a5][authz][4309]") {
+    httplib::Request req;
+    httplib::Response res;
+    yuzu::MetricsRegistry metrics;
+    // try_admit reads the clock first, so a throwing clock is a throwing budget.
+    yuzu::server::DenialAuditBudget budget(
+        yuzu::server::kDefaultAuditMaxRows, yuzu::server::kDefaultAuditWindowMs,
+        []() -> std::int64_t { throw std::runtime_error("clock failed"); });
+    int audit_calls = 0;
+    auto audit = [&audit_calls](const httplib::Request&, const std::string&, const std::string&,
+                                const std::string&, const std::string&,
+                                const std::string&) -> bool {
+        ++audit_calls;
+        return true;
+    };
+    bool admitted = true;
+    REQUIRE_NOTHROW(admitted = admit(make_session("local", ""), req, res, audit, &metrics, budget));
+    CHECK_FALSE(admitted);
+    CHECK(res.status == 403);
+    CHECK(audit_calls == 0); // not admitted: no row
+    CHECK(metrics.serialize().find(std::string{kCounterLine} + " 1\n") != std::string::npos);
+    // The suppressed counter accounts for the row that was not written.
+    CHECK(metrics.counter("yuzu_mcp_admission_audit_suppressed_total").value() == 1.0);
 }

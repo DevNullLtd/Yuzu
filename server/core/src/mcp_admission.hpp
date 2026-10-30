@@ -47,9 +47,14 @@
 /// per refusal on an httplib worker. Rows go through the shared `DenialAuditBudget`
 /// (bounded_audit_budget.hpp; the gateway peer guard is the precedent): keyed
 /// `tier_required|<bounded auth_source>|<principal>`, so one principal's flood spends only
-/// its own rows and cannot starve another principal's evidence row, and the FIRST refusal
-/// of every key always writes its row. The counter stays complete, so suppressed rows are
-/// still visible as a number, and the window-opening call logs one aggregate count line.
+/// its own rows and cannot starve another principal's evidence row. The first refusal of a
+/// key writes its row only while at most 64 (source, principal) keys are live in the
+/// window; keys beyond that share the `tier_required|*` overflow bucket (10 rows per window)
+/// and can be suppressed. The counter stays complete, and every suppressed row is counted on
+/// `yuzu_mcp_admission_audit_suppressed_total`, so for N refusals rows + suppressed == N
+/// (when the audit hook succeeds). A client may therefore hold a `correlation_id` that has no
+/// audit row. The refusal that opens the NEXT window logs one aggregate count line; a burst
+/// followed by silence is never logged, so alert on the suppressed counter, not the log line.
 
 #include "bounded_audit_budget.hpp" // DenialAuditBudget, the default limits
 #include "mcp_jsonrpc.hpp"      // error_response_null_a4, kPermissionDenied
@@ -84,10 +89,14 @@ inline constexpr std::string_view kTierRequiredReason = "tier_required";
 inline constexpr std::string_view kTierRequiredMessage =
     "/mcp/v1/ requires an MCP-tier bearer token";
 inline constexpr std::string_view kTierRequiredRemediation =
-    "mint an API token with mcp_tier readonly, operator or supervised and an expires_at at "
-    "most 90 days out (POST /api/v1/tokens, or Settings > API tokens), then send it as "
-    "Authorization: Bearer; do not send a session cookie with it";
+    "This credential has no MCP tier and retrying will not help. A human operator must mint an "
+    "API token with mcp_tier readonly, operator or supervised (the lowest tier that covers the "
+    "tools needed) and an expires_at at most 90 days out (unix seconds), via Settings > API "
+    "Tokens or POST /api/v1/tokens; then configure this client to send only Authorization: "
+    "Bearer <token>, with no session cookie.";
 inline constexpr std::string_view kAdmissionRefusedMetric = "yuzu_mcp_admission_refused_total";
+inline constexpr std::string_view kAdmissionAuditSuppressedMetric =
+    "yuzu_mcp_admission_audit_suppressed_total";
 inline constexpr std::string_view kSessionRejectAction = "mcp.session.reject";
 
 /// True when the session must be refused at /mcp/v1/ admission: it carries no MCP
@@ -146,8 +155,11 @@ inline constexpr std::size_t kAdmissionBudgetPrincipalBytes = 64;
 /// is the only effect the budget bounds: it is written only when `budget.try_admit(key)`
 /// admits, where the key separates principals, so one looping client cannot spend another's
 /// evidence row and cannot turn its own refusals into unbounded synchronous audit-store
-/// writes on an httplib worker. The call that opens a new budget window logs one aggregate
-/// line with how many rows the closed window suppressed (a count only, no caller content).
+/// writes on an httplib worker. Every refusal whose row the budget suppresses bumps
+/// `yuzu_mcp_admission_audit_suppressed_total`. The refusal that opens the NEXT budget window
+/// logs one aggregate line with how many rows the closed window suppressed (a count only, no
+/// caller content); a burst followed by silence is never logged, which is why the suppressed
+/// counter exists.
 ///
 /// `audit_fn` is the server's `audit_log` hook (bool(req, action, result, target_type,
 /// target_id, detail)); a null function or a failed write is NOT a reason to admit.
@@ -159,14 +171,31 @@ inline constexpr std::size_t kAdmissionBudgetPrincipalBytes = 64;
         return true;
 
     const auto cid = yuzu::server::detail::make_correlation_id();
-    const auto row = budget.try_admit(admission_budget_key(session),
-                                      std::string{kTierRequiredReason} + "|*");
-    if (row.closed_window_suppressed > 0) {
-        spdlog::warn("mcp admission: {} tier_required audit rows suppressed in the last window "
-                     "(yuzu_mcp_admission_refused_total is complete)",
-                     row.closed_window_suppressed);
+    // The refused counter and the 403 are unconditional: nothing below may stop either.
+    if (metrics != nullptr) {
+        metrics
+            ->counter(std::string{kAdmissionRefusedMetric},
+                      {{"reason", std::string{kTierRequiredReason}}})
+            .increment();
     }
-    if (row.admitted) {
+
+    // Everything that bounds or writes the audit row is contained: a throwing budget (or log
+    // sink) is treated as "row not admitted" and counted as suppressed, so it can never turn a
+    // refusal into an exception on an httplib worker.
+    bool row_admitted = false;
+    try {
+        const auto row = budget.try_admit(admission_budget_key(session),
+                                          std::string{kTierRequiredReason} + "|*");
+        row_admitted = row.admitted;
+        if (row.closed_window_suppressed > 0) {
+            spdlog::warn("mcp admission: {} tier_required audit rows suppressed in the last "
+                         "window (yuzu_mcp_admission_refused_total is complete)",
+                         row.closed_window_suppressed);
+        }
+    } catch (...) {
+        row_admitted = false;
+    }
+    if (row_admitted) {
         std::string detail = "reason=";
         detail += kTierRequiredReason;
         detail += " auth_source=";
@@ -176,12 +205,13 @@ inline constexpr std::size_t kAdmissionBudgetPrincipalBytes = 64;
         (void)yuzu::server::detail::try_persist_audit(
             audit_fn, req, std::string{kSessionRejectAction}, "failure", "McpSession",
             std::string{}, detail);
-    }
-    if (metrics != nullptr) {
-        metrics
-            ->counter(std::string{kAdmissionRefusedMetric},
-                      {{"reason", std::string{kTierRequiredReason}}})
-            .increment();
+    } else if (metrics != nullptr) {
+        // One increment per refusal whose row was not written, so for N refusals (and an audit
+        // hook that succeeds) rows + this counter == N.
+        try {
+            metrics->counter(std::string{kAdmissionAuditSuppressedMetric}, {}).increment();
+        } catch (...) {
+        }
     }
     write_tier_required(res, cid);
     return false;
