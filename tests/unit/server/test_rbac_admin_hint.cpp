@@ -16,7 +16,11 @@
  *      classified: 2xx / 400 / 409 = authority admitted (kMay), 403 = kMayNot, 503 = kUnconfirmed.
  *      A 403 or 503 counts only when its message is one of the gates the hint models (see
  *      `classify`), so a refusal from the wrong gate fails the persona. The hint must equal that
- *      classification, and must not have written an audit row.
+ *      classification, and must not have written an audit row (every route, the MCP twins
+ *      included, is checked against an `AuditWatch` that is shown to see a write). A persona the
+ *      hint calls kMay must also get the exact success status its route answers (`admitted_status`
+ *      at each call site), so a 400 or a 409 from a gate the hint does not model cannot pass for
+ *      "authority admitted".
  *   2. The fold itself: structural denies need no store, a null or degraded store is
  *      kUnconfirmed, `RbacAdminSurface` has no default argument.
  *
@@ -87,6 +91,30 @@ std::optional<RbacAdminHint> classify(int status, const std::string& body) {
             return RbacAdminHint::kUnconfirmed;
         return std::nullopt;
     }
+    return std::nullopt;
+}
+
+/// The MCP twin of `classify`, over the same closed set of refusal messages. A tool answers a
+/// JSON-RPC `result` when it acted (kMay) or an `error` whose message names the gate that refused.
+/// The enforcement tool's destination-guard refusal ("refused: ...", the REST route's 409) is an
+/// answer about the request after the authority gates passed, so it is kMay, except the regime
+/// refusal ("refused: caller does not currently hold ...") which IS an authority refusal. Any other
+/// error (the empty-tier guard, the tier gate, a store fault) returns nullopt.
+std::optional<RbacAdminHint> classify_mcp(const nlohmann::json& body) {
+    if (body.contains("error")) {
+        const std::string message = body["error"].value("message", "");
+        if (message == kRbacAdminGateDeniedMessage ||
+            starts_with(message, "refused: caller does not currently hold"))
+            return RbacAdminHint::kMayNot;
+        if (message == kRbacAdminGateUnavailableMessage ||
+            message == "RBAC store write failed; retry shortly")
+            return RbacAdminHint::kUnconfirmed;
+        if (starts_with(message, "refused: "))
+            return RbacAdminHint::kMay;
+        return std::nullopt;
+    }
+    if (body.contains("result"))
+        return RbacAdminHint::kMay;
     return std::nullopt;
 }
 
@@ -186,8 +214,20 @@ void make_regime_store_unreadable(RbacRoleHarness& h) {
     REQUIRE(r.status() == PGRES_COMMAND_OK);
 }
 
+/// A persona the hint calls kMay is held to the exact status its route answers, not to "any of
+/// 2xx/400/409": a 400 or 409 from a gate the hint does not model would otherwise pass for
+/// "authority admitted". `admitted_status` is mandatory for a kMay persona and ignored otherwise
+/// (a refusal's status is already pinned by the closed message set in `classify`). No persona
+/// below legitimately varies its admitted status.
+void check_admitted_status(RbacAdminHint expected, int admitted_status, int actual) {
+    if (expected != RbacAdminHint::kMay)
+        return;
+    REQUIRE(admitted_status != 0); // a kMay call site must name the status it expects
+    CHECK(actual == admitted_status);
+}
+
 /// The hint equals the real POST assign answer, and the hint wrote no audit row.
-void check_assign(RbacRoleHarness& h, RbacAdminHint expected) {
+void check_assign(RbacRoleHarness& h, RbacAdminHint expected, int admitted_status = 0) {
     AuditWatch watch{h};
     const auto audits_before = watch.rows();
     const auto hint = hint_of(h);
@@ -201,12 +241,13 @@ void check_assign(RbacRoleHarness& h, RbacAdminHint expected) {
     const auto classified = classify(res->status, res->body);
     REQUIRE(classified.has_value());
     CHECK(*classified == hint);
+    check_admitted_status(expected, admitted_status, res->status);
 }
 
 /// The hint equals the real DELETE unassign answer. The target holds the grant first, so a
 /// request that clears both gates succeeds (2xx) instead of answering 404, which is not an
 /// authority answer and fails the classification loudly.
-void check_unassign(RbacRoleHarness& h, RbacAdminHint expected) {
+void check_unassign(RbacRoleHarness& h, RbacAdminHint expected, int admitted_status = 0) {
     REQUIRE(h.rbac->assign_role({"user", "hint-target", "Viewer"}).has_value());
     AuditWatch watch{h};
     const auto audits_before = watch.rows();
@@ -221,12 +262,17 @@ void check_unassign(RbacRoleHarness& h, RbacAdminHint expected) {
     const auto classified = classify(res->status, res->body);
     REQUIRE(classified.has_value());
     CHECK(*classified == hint);
+    check_admitted_status(expected, admitted_status, res->status);
 }
 
 /// The hint equals the real PUT enforcement answer for a REAL transition (`target` is the
 /// opposite of the current state, so the idempotent no-op path never hides the gates).
-void check_enforcement(RbacRoleHarness& h, RbacAdminHint expected, bool target) {
+void check_enforcement(RbacRoleHarness& h, RbacAdminHint expected, bool target,
+                       int admitted_status = 0) {
+    AuditWatch watch{h};
+    const auto audits_before = watch.rows();
     const auto hint = hint_of(h);
+    check_hint_silent(watch, audits_before);
     INFO("hint=" << name_of(hint) << " expected=" << name_of(expected));
     CHECK(hint == expected);
     const auto res = h.set_enforcement_rest(target);
@@ -235,6 +281,7 @@ void check_enforcement(RbacRoleHarness& h, RbacAdminHint expected, bool target) 
     const auto classified = classify(res->status, res->body);
     REQUIRE(classified.has_value());
     CHECK(*classified == hint);
+    check_admitted_status(expected, admitted_status, res->status);
 }
 
 void make_user(RbacRoleHarness& h, const std::string& name, auth::Role role) {
@@ -257,7 +304,7 @@ TEST_CASE("rbac_admin_hint == POST assign: base admin, RBAC off (P1)",
           "[pg][rbac_admin_predicate][rbac_admin_hint]") {
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/false);
-    check_assign(h, RbacAdminHint::kMay);
+    check_assign(h, RbacAdminHint::kMay, /*admitted_status=*/201);
 }
 
 TEST_CASE("rbac_admin_hint == POST assign: base admin with NO Administrator grant, RBAC on (P2)",
@@ -274,14 +321,15 @@ TEST_CASE("rbac_admin_hint == POST assign: base admin WITH the Administrator gra
     h.rbac->set_rbac_enabled(true);
     make_user(h, h.session_user, auth::Role::admin);
     REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
-    check_assign(h, RbacAdminHint::kMay);
+    check_assign(h, RbacAdminHint::kMay, /*admitted_status=*/201);
 }
 
 TEST_CASE("rbac_admin_hint == POST assign: base user WITH the Administrator grant and an active row, RBAC on (P4)",
           "[pg][rbac_admin_predicate][rbac_admin_hint]") {
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/true); // role=user + grant + active auth.users row
-    check_assign(h, RbacAdminHint::kMay);  // the #6034 headline: the old hint drew nothing
+    check_assign(h, RbacAdminHint::kMay,
+                 /*admitted_status=*/201); // the #6034 headline: the old hint drew nothing
 }
 
 TEST_CASE("rbac_admin_hint == POST assign: Administrator grant is inert while RBAC is off (P5)",
@@ -325,7 +373,7 @@ TEST_CASE("rbac_admin_hint == POST assign: SSO-labelled principal WITH a break-g
     h.rbac->set_rbac_enabled(true);
     make_user(h, h.session_user, auth::Role::user); // the documented SQL-provisioned row
     REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
-    check_assign(h, RbacAdminHint::kMay);
+    check_assign(h, RbacAdminHint::kMay, /*admitted_status=*/201);
 }
 
 TEST_CASE("rbac_admin_hint == POST assign: durable demotion after sign-in, RBAC off (P14)",
@@ -356,7 +404,7 @@ TEST_CASE("rbac_admin_hint == DELETE unassign: base user WITH the Administrator 
           "[pg][rbac_admin_predicate][rbac_admin_hint]") {
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/true);
-    check_unassign(h, RbacAdminHint::kMay);
+    check_unassign(h, RbacAdminHint::kMay, /*admitted_status=*/200);
 }
 
 TEST_CASE("rbac_admin_hint == DELETE unassign: SSO principal with the grant but NO auth.users row (P7)",
@@ -401,7 +449,7 @@ TEST_CASE("rbac_admin_hint == POST assign: plain API-token session of an adminis
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/false);
     h.session_auth_source = "api_token"; // no tier, unscoped: the gates never read auth_source
-    check_assign(h, RbacAdminHint::kMay);
+    check_assign(h, RbacAdminHint::kMay, /*admitted_status=*/201);
 }
 
 TEST_CASE("rbac_admin_hint == POST assign: regime store unreadable, RBAC on (P13)",
@@ -423,7 +471,7 @@ TEST_CASE("rbac_admin_hint == PUT enforcement: durable admin holding the grant, 
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/false);
     REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
-    check_enforcement(h, RbacAdminHint::kMay, /*target=*/true);
+    check_enforcement(h, RbacAdminHint::kMay, /*target=*/true, /*admitted_status=*/200);
 }
 
 TEST_CASE("rbac_admin_hint == PUT enforcement: base admin with NO grant, RBAC on (P2)",
@@ -440,16 +488,17 @@ TEST_CASE("rbac_admin_hint == PUT enforcement: base admin with the grant, RBAC o
     h.rbac->set_rbac_enabled(true);
     make_user(h, h.session_user, auth::Role::admin);
     REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
-    check_enforcement(h, RbacAdminHint::kMay, /*target=*/false);
+    check_enforcement(h, RbacAdminHint::kMay, /*target=*/false, /*admitted_status=*/200);
 }
 
 TEST_CASE("rbac_admin_hint == PUT enforcement: base user with the grant, RBAC on -> off (P4)",
           "[pg][rbac_admin_predicate][rbac_admin_hint]") {
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/true);
-    // Authority is admitted; the destination guard may still answer 409 (the caller would not
-    // remain a local admin), which classifies as admitted, not as a refusal of authority.
-    check_enforcement(h, RbacAdminHint::kMay, /*target=*/false);
+    // Authority is admitted; the destination guard then answers 409 every time (the caller would
+    // not remain a local admin, see the CHARACTERISATION cases), which classifies as admitted, not
+    // as a refusal of authority, and is pinned as the exact status.
+    check_enforcement(h, RbacAdminHint::kMay, /*target=*/false, /*admitted_status=*/409);
 }
 
 TEST_CASE("rbac_admin_hint == PUT enforcement: SSO principal with the grant and no row, RBAC on (P7)",
@@ -480,34 +529,58 @@ TEST_CASE("rbac_admin_hint == PUT enforcement: engine session (P11)",
 // gate wording (kMayNot / kUnconfirmed).
 
 namespace {
-void check_mcp_assign(RbacRoleHarness& h, RbacAdminHint expected) {
+/// The kMcp hint for the harness's MCP session, the silence check around it, and the real tool's
+/// classified answer (ticket-then-recall through the harness). Returns what the tool answered so
+/// the caller can check the side effect that tool owns.
+RbacAdminHint check_mcp_tool(RbacRoleHarness& h, RbacAdminHint expected, const char* tool,
+                             const nlohmann::json& args) {
+    AuditWatch watch{h};
+    const auto audits_before = watch.rows();
     const auto hint = rbac_admin_hint(h.session_with_tier(h.session_mcp_tier), h.auth_db.get(),
                                       h.rbac.get(), RbacAdminSurface::kMcp);
-    INFO("hint=" << name_of(hint) << " expected=" << name_of(expected));
+    check_hint_silent(watch, audits_before);
+    INFO(tool << " hint=" << name_of(hint) << " expected=" << name_of(expected));
     CHECK(hint == expected);
 
-    const auto res = h.mcp_call_tool_approved(
-        "assign_rbac_role",
-        {{"principal_type", "user"}, {"principal_id", "hint-target"}, {"role", "Viewer"}});
+    const auto res = h.mcp_call_tool_approved(tool, args);
     REQUIRE(res);
     INFO("mcp body=" << res->body);
     const auto body = nlohmann::json::parse(res->body, nullptr, /*allow_exceptions=*/false);
     REQUIRE_FALSE(body.is_discarded());
-    std::optional<RbacAdminHint> classified;
-    if (body.contains("error")) {
-        const std::string message = body["error"].value("message", "");
-        if (message == kRbacAdminGateDeniedMessage)
-            classified = RbacAdminHint::kMayNot;
-        else if (message == kRbacAdminGateUnavailableMessage)
-            classified = RbacAdminHint::kUnconfirmed;
-    } else if (body.contains("result")) {
-        classified = RbacAdminHint::kMay;
-    }
+    const auto classified = classify_mcp(body);
     REQUIRE(classified.has_value());
     CHECK(*classified == hint);
+    return *classified;
+}
+
+void check_mcp_assign(RbacRoleHarness& h, RbacAdminHint expected) {
+    const auto answered = check_mcp_tool(
+        h, expected, "assign_rbac_role",
+        {{"principal_type", "user"}, {"principal_id", "hint-target"}, {"role", "Viewer"}});
     // The side effect agrees: only an admitted caller's assignment happened.
     CHECK(h.rbac->get_principal_roles("user", "hint-target").empty() ==
-          (*classified != RbacAdminHint::kMay));
+          (answered != RbacAdminHint::kMay));
+}
+
+/// The target holds the grant first, so an admitted request removes it (a request that clears
+/// both gates but names a missing grant would answer an error that is not an authority answer).
+void check_mcp_unassign(RbacRoleHarness& h, RbacAdminHint expected) {
+    REQUIRE(h.rbac->assign_role({"user", "hint-target", "Viewer"}).has_value());
+    const auto answered = check_mcp_tool(h, expected, "unassign_rbac_role",
+                                         {{"principal_id", "hint-target"}, {"role", "Viewer"}});
+    CHECK(h.rbac->get_principal_roles("user", "hint-target").empty() ==
+          (answered == RbacAdminHint::kMay));
+}
+
+/// `target` is the opposite of the current state, so the idempotent no-op never hides the gates.
+/// Every persona below that expects kMay can really transition, so the state must move exactly
+/// when the caller was admitted.
+void check_mcp_enforcement(RbacRoleHarness& h, RbacAdminHint expected, bool target) {
+    const bool before = h.rbac->is_rbac_enabled();
+    REQUIRE(before != target);
+    const auto answered =
+        check_mcp_tool(h, expected, "set_rbac_enforcement", {{"enabled", target}});
+    CHECK(h.rbac->is_rbac_enabled() == (answered == RbacAdminHint::kMay ? target : before));
 }
 } // namespace
 
@@ -532,6 +605,65 @@ TEST_CASE("rbac_admin_hint (kMcp) == MCP assign_rbac_role: regime store unreadab
     h.make_caller_admin(/*rbac_on=*/true);
     make_regime_store_unreadable(h);
     check_mcp_assign(h, RbacAdminHint::kUnconfirmed);
+}
+
+// The unassign and enforcement twins are reached through the same harness path. Not modelled, on
+// purpose: the empty-mcp_tier personas. Both tools deny an empty tier AFTER the authority gate
+// with a message of their own (not one of the gate's), and the hint folds authority only; the
+// harness's `session_mcp_tier` is "supervised" for every case here so the tier ladder is not what
+// is under test. Also unmodelled: the gate being unavailable on the FIRST read (the predicate), as
+// opposed to the regime read: the regime persona below covers the 503 shape, and no case here
+// builds a store that fails the predicate's read while the regime read still works.
+
+TEST_CASE("rbac_admin_hint (kMcp) == MCP unassign_rbac_role: base user WITH the Administrator "
+          "grant, RBAC on",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true);
+    check_mcp_unassign(h, RbacAdminHint::kMay);
+}
+
+TEST_CASE("rbac_admin_hint (kMcp) == MCP unassign_rbac_role: base admin with NO grant, RBAC on",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.rbac->set_rbac_enabled(true);
+    make_user(h, h.session_user, auth::Role::admin);
+    check_mcp_unassign(h, RbacAdminHint::kMayNot);
+}
+
+TEST_CASE("rbac_admin_hint (kMcp) == MCP unassign_rbac_role: regime store unreadable, RBAC on",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true);
+    make_regime_store_unreadable(h);
+    check_mcp_unassign(h, RbacAdminHint::kUnconfirmed);
+}
+
+TEST_CASE("rbac_admin_hint (kMcp) == MCP set_rbac_enforcement: durable admin holding the grant, "
+          "RBAC off -> on",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
+    check_mcp_enforcement(h, RbacAdminHint::kMay, /*target=*/true);
+}
+
+TEST_CASE(
+    "rbac_admin_hint (kMcp) == MCP set_rbac_enforcement: base admin with NO grant, RBAC on -> off",
+    "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.rbac->set_rbac_enabled(true);
+    make_user(h, h.session_user, auth::Role::admin);
+    check_mcp_enforcement(h, RbacAdminHint::kMayNot, /*target=*/false);
+}
+
+TEST_CASE(
+    "rbac_admin_hint (kMcp) == MCP set_rbac_enforcement: regime store unreadable, RBAC on -> off",
+    "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true);
+    make_regime_store_unreadable(h);
+    check_mcp_enforcement(h, RbacAdminHint::kUnconfirmed, /*target=*/false);
 }
 
 // ── More personas on the PUT and DELETE routes (qe-2) ────────────────────────
@@ -590,7 +722,7 @@ TEST_CASE("rbac_admin_hint == PUT enforcement: plain API-token session of an adm
     h.make_caller_admin(/*rbac_on=*/false);
     REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
     h.session_auth_source = "api_token";
-    check_enforcement(h, RbacAdminHint::kMay, /*target=*/true);
+    check_enforcement(h, RbacAdminHint::kMay, /*target=*/true, /*admitted_status=*/200);
 }
 
 TEST_CASE("rbac_admin_hint == DELETE unassign: MCP-tier token on the REST surface (P9)",
@@ -729,9 +861,76 @@ TEST_CASE("rbac_admin_hint classify: a refusal counts as an authority answer onl
     CHECK_FALSE(classify(500, a4_body(500, "boom")).has_value());
 }
 
+TEST_CASE("rbac_admin_hint classify: every arm of the closed refusal set classifies, each by its "
+          "production text, and a near miss does not",
+          "[rbac_admin_predicate][rbac_admin_hint]") {
+    // The texts below are the routes' own (rest_api_v1.cpp:318/358/7917/8263/8446, matched by
+    // prefix where the route appends detail; rbac_admin_authority_owner.cpp:594/607), so a dead arm
+    // in `classify` is a failure here and not a silent pass for a persona that happens to hit
+    // another arm.
+    const char* const kMayNotTexts[] = {
+        "engine principals cannot access this endpoint",
+        "MCP tokens cannot perform admin operations; use the MCP tool assign_rbac_role instead",
+        "service-scoped tokens cannot manage RBAC role assignments",
+        "service-scoped tokens cannot change RBAC enforcement",
+        "refused: caller does not currently hold a fleet-wide Administrator grant, required to "
+        "change "
+        "enforcement while it is on",
+        "refused: caller does not currently hold the local admin role, required to change "
+        "enforcement "
+        "while it is off",
+    };
+    for (const char* text : kMayNotTexts) {
+        INFO(text);
+        CHECK(classify(403, a4_body(403, text)) == RbacAdminHint::kMayNot);
+        // The same text on any other status is not an authority answer of that kind.
+        CHECK_FALSE(classify(500, a4_body(500, text)).has_value());
+    }
+    // The 503 arms: the shared "cannot confirm" and the enforcement write failure.
+    CHECK(classify(503, a4_body(503, "RBAC store write failed; retry shortly")) ==
+          RbacAdminHint::kUnconfirmed);
+    // A 403 text is not accepted on a 503, nor the reverse.
+    CHECK_FALSE(
+        classify(503, a4_body(503, "engine principals cannot access this endpoint")).has_value());
+    CHECK_FALSE(classify(403, a4_body(403, "RBAC store write failed; retry shortly")).has_value());
+    // Near misses: a prefix that is not the closed text, and the post-gate self-removal refusal.
+    CHECK_FALSE(classify(403, a4_body(403, "refused: caller is not an administrator")).has_value());
+    CHECK_FALSE(classify(403, a4_body(403, "engine principals cannot")).has_value());
+    CHECK_FALSE(classify(403, a4_body(403, "self_admin_unassign_blocked")).has_value());
+    CHECK_FALSE(classify(403, a4_body(403, "cannot remove your own Administrator role assignment"))
+                    .has_value());
+}
+
+TEST_CASE("rbac_admin_hint classify_mcp: the tool answers classify by the same closed set",
+          "[rbac_admin_predicate][rbac_admin_hint]") {
+    const auto err = [](const std::string& message) {
+        return nlohmann::json{{"error", {{"code", 1}, {"message", message}}}};
+    };
+    CHECK(classify_mcp({{"result", {{"ok", true}}}}) == RbacAdminHint::kMay);
+    CHECK(classify_mcp(err(std::string(kRbacAdminGateDeniedMessage))) == RbacAdminHint::kMayNot);
+    CHECK(classify_mcp(
+              err("refused: caller does not currently hold a fleet-wide Administrator grant")) ==
+          RbacAdminHint::kMayNot);
+    CHECK(classify_mcp(err(std::string(kRbacAdminGateUnavailableMessage))) ==
+          RbacAdminHint::kUnconfirmed);
+    CHECK(classify_mcp(err("RBAC store write failed; retry shortly")) ==
+          RbacAdminHint::kUnconfirmed);
+    // The destination guard's refusal is about the request, after the authority gates passed.
+    CHECK(classify_mcp(err("refused: enabling RBAC enforcement would leave the caller with no "
+                           "fleet-wide Administrator grant")) == RbacAdminHint::kMay);
+    // Anything else, including the tool's empty-tier guard and the self-removal refusal, is not an
+    // authority answer.
+    CHECK_FALSE(
+        classify_mcp(err("set_rbac_enforcement requires an MCP-tier bearer token")).has_value());
+    CHECK_FALSE(
+        classify_mcp(err("cannot remove your own Administrator role assignment")).has_value());
+    CHECK_FALSE(classify_mcp(nlohmann::json::object()).has_value());
+}
+
 // ── The fold itself ──────────────────────────────────────────────────────────
 
-TEST_CASE("rbac_admin_hint: structural denies need no store", "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+TEST_CASE("rbac_admin_hint: structural denies need no store",
+          "[rbac_admin_predicate][rbac_admin_hint]") {
     auth::Session engine;
     engine.username = "e";
     engine.principal_kind = "engine";
