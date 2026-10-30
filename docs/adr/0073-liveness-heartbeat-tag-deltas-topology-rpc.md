@@ -238,6 +238,14 @@ from 189 to 60 KB.
 ADR-0074 D14 records the same order of magnitude on merged `dev` at 5,000 agents (about 320 to 470 KB
 per agent).
 
+ADR-0074's own Context table gives 85.0 KB of OS anonymous memory per idle agent for 100 Windows
+agents under OTP `ssl`. That is not a contradiction of the 417-468 KiB above, and the two are not
+comparable: ADR-0074's figure comes from the `perf/gateway-idle-mem-ktls` branch with idle agents,
+while the rig run above carried today's heartbeat (a 150 KB body and the full tag map every 30 s)
+on PR #5695 without settling. The difference is roughly the payload terms this ADR removes. Neither
+figure is the baseline: ADR-0074 wave 0's common baseline (one method, 5,000 and 10,000 agents, on
+merged `dev` and the kTLS branch) replaces both.
+
 **Collection and buffering.**
 - The gateway's connection process collects only after 1 MiB of request bytes
   (`gateway/apps/yuzu_gw/src/yuzu_grpc_stream_h.erl:79`, `COLLECT_AFTER_BYTES`).
@@ -1624,8 +1632,10 @@ message ReattachResponse {
    N = 100,000, and tags converge in about two minutes after an agent's reattach.
 3. **Topology follows.** `__resync__.topology` runs at 200/s per replica, about 8 min for
    N = 100,000.
-4. **Agents do not reconnect** in steady state. Reattach is invisible to them. Only `NO_RECORD`
-   agents reconnect, under jittered backoff.
+4. **Agents do not reconnect** in steady state. Reattach is invisible to the agent's connection:
+   no stream is closed and nothing is re-sent. It is not invisible to operators, who see the
+   effects summarised under *Consequences, Operator-visible behaviour after a server restart*. Only
+   `NO_RECORD` agents reconnect, under jittered backoff.
 
    After this release every agent has registered at least once (no back-compat: agents are
    upgraded with the server, and the upgraded agent's first connection registers fresh), so
@@ -1677,9 +1687,11 @@ lands. The two are kept consistent as follows.
 - **Budget.** ADR-0074 D14 is the budget this ADR is measured against: 100,000 idle agents per
   8-core, 16 GB gateway, and the 64 KiB-per-agent CI regression check including the kernel. This ADR
   removes the per-agent payload terms (the snapshot binary, the tag-decode heap, the retained
-  Register). It does not by itself meet the check; the remaining live state (TLS, the Cowboy
-  connection, the relay, the inet port and buffer, the index rows) is addressed by ADR-0074's memory
-  measures and kTLS (its D8).
+  Register). It does not by itself meet the check. Of the remaining live state, kTLS (ADR-0074 D8)
+  addresses the TLS term (fewer processes per agent). ADR-0074's memory measures do not address
+  live state: the collection after an agent-count drop and `malloc_trim` reclaim garbage and
+  allocator slack. The Cowboy connection, the relay, the inet port and buffer and the index rows
+  have no named measure in either ADR yet; ADR-0074 defers that to its hibernation work.
 - **State.** Both ADRs use the same rule: no per-agent state beyond the connection. Fleet-level state
   any gateway could rebuild is allowed (ADR-0074's Conflict 5, decided 2026-10-29).
 - **Signing.** ADR-0074 D5's scope was decided on 2026-10-29: the server signs every command and
@@ -1818,6 +1830,52 @@ lead "**Breaking: liveness-only heartbeat**". It names the deprecated, no-longer
 the new RPCs, the tag-delta semantics and the upgrade-together requirement. `CHANGELOG.md` is not
 edited.
 
+### Configuration
+
+Every new setting, where it lives and how it changes. None is reloaded at run time: each is read at
+process start, and a change takes a restart of that process.
+
+| Setting | Process | Default | Range | Environment | Scope |
+|---|---|---|---|---|---|
+| `--topology-interval` | agent | 60 s | 30-900 s | `YUZU_TOPOLOGY_INTERVAL` | per agent |
+| `--no-topology` | agent | off | flag | `YUZU_NO_TOPOLOGY`, read value-aware (`1`, `true`, `yes`, `on`), as `--tls-system-roots` is, because CLI11 binds an environment variable to a flag by presence only (`agents/core/src/main.cpp`) | per agent |
+| `--tag-resync-rate` | server | 2000/s | 1-100,000/s | `YUZU_TAG_RESYNC_RATE` | per replica |
+| `--topology-resync-rate` | server | 200/s | 1-10,000/s | `YUZU_TOPOLOGY_RESYNC_RATE` | per replica |
+| `--reattach-rate` | server | 2000/s | 1-100,000/s | `YUZU_REATTACH_RATE` | per replica |
+| `upstream_topology_concurrency` | gateway (`sys.config`, `yuzu_gw` app) | 8 | 1 to the regulator's maximum, as `upstream_inventory_concurrency` | none: gateway pool sizes are `sys.config` keys | per gateway |
+
+- **Per replica, not fleet-wide.** The three server rates are token buckets on each replica. A fleet
+  of R replicas issues up to R times each rate in total, against one Postgres. The pool-pressure
+  figure in D8 is per replica.
+- **The gateway pool.** `upstream_topology_concurrency` is a new pool, `topology`, in
+  `yuzu_gw_upstream_regulator.erl`, read when the regulator starts, as the other pool sizes are. It
+  has **no wait queue**: a report that finds every permit held fails `UNAVAILABLE` at once (D7, no
+  buffering), because a queued report would hold up to 2 MiB of gateway memory while it waited.
+- **No fleet-wide topology off switch.** `--no-topology` is set per agent. Nothing on the server or
+  the gateway stops topology for the whole fleet: `--viz-disable` refuses the viz endpoints but not
+  ingestion, and a plugin kill switch does not reach the pump, which runs `echo.fleet_snapshot`
+  through the agent's `LocalDispatcher`, not through a server dispatch. Whether one is needed is
+  open point 16.
+- **Where they are documented:** the agent flags in `docs/user-manual/device-management.md`
+  ("Agent CLI Flags"), the server flags in `docs/user-manual/server-admin.md`, the gateway key in
+  `docs/user-manual/gateway.md` and the shipped `sys.config` files.
+
+### Operator-visible behaviour after a server restart
+
+Gathered here from D3, D8, D13 and D14, for 100,000 agents on one replica:
+- agents keep their connections; the gateway reattaches them by ids in about 50 s to 3.5 min,
+  depending on the number of gateways (D14). A command to an agent that has not reattached yet
+  finds no session on the replica and is refused, as after a restart today;
+- state-derived fleet gauges are absent, not zero, for each agent until its full set lands, about
+  two minutes after its reattach; the last is back about 3 to 6 minutes after the restart. Interval
+  gauges (`/dex` performance, `/network`) are back on each agent's first heartbeat (D13);
+- `/viz` shows every reporting host `awaiting_report` until its body lands, about 8 minutes after
+  the reattach wave (D6, D8);
+- Guardian generation reconcile and the Echo corruption sink skip each agent until its state map is
+  back (D3);
+- the reattach and resync counters move, and `yuzu_server_resync_pending` rises and drains; no alert
+  fires on an expected drain (D13).
+
 ### Gateway memory
 
 Idle connections stop receiving:
@@ -1845,8 +1903,10 @@ remaining live state is about 45 KiB of BEAM terms:
 - the relay, the inet port and buffer, and the index rows.
 
 The check is all-in, so the kernel's per-connection memory and allocator slack count on top of that.
-Closing the rest is ADR-0074's work: its memory measures and kTLS at the agent edge (its D8). This
-ADR is a precondition for that work, because without it the payload terms dominate any measurement.
+Closing the rest is ADR-0074's work. kTLS at the agent edge (its D8) shrinks the ssl term; its
+memory measures reclaim garbage and allocator slack, which counts in an all-in check but is not
+live state; the other live terms have no named measure yet (D16). This ADR is a precondition for
+that work, because without it the payload terms dominate any measurement.
 
 **Bandwidth.** At 10k agents and 150 KB bodies, topology falls from about 50 MB/s to about 1.7 MB/s
 plus churn. Tags fall from about 4 KB to a few hundred bytes per beat.
@@ -1895,6 +1955,22 @@ Under the precondition, HA is no worse than today: a replica that lacks a base o
 it, rate-limited. It is not cleaner: a replica change costs a resync wave. A shared or
 per-session-sticky delta base, which per-RPC balancing would need, is not decided here (open
 point 14).
+
+**Server capacity.** The capacity statements in *Gateway memory* cover the gateway. On the server,
+per replica, for N agents whose heartbeats reach it (estimates, unmeasured; slice 10 measures them):
+- **The delta base.** One state map per agent (about 97 keys, about 4 KB of keys and values, as
+  today's map), plus a 35-byte digest, a version counter and the rejection count and backoff. It
+  replaces today's map rather than adding to it: about 0.4 GB at N = 100,000, as today.
+- **Topology slots.** Unchanged in kind: each holds the parsed body, bounded by
+  `kPushedMapHardCap` (100,000). Retained `disconnected` slots count against the same cap for their
+  300 s. The no-slot entries and the per-slot D6 fields are tens of bytes each.
+- **The resync pending set.** At most two entries per agent (`tags`, `topology`), a few dozen bytes
+  each.
+- **`agent_registration_store`.** One `registrations` row per agent that has registered (identity
+  columns plus the scopable tags, typically well under 1 KB), so on the order of 100 MB at 100,000
+  agents including indexes; plus one `plugin_sets` row per distinct agent build, about 25 KB each
+  for a 69-plugin build. It grows with enrolled agents, not with time (D14, *Lifecycle and
+  retention*).
 
 ### Consumers
 
@@ -2301,3 +2377,7 @@ release and merge to `dev` inside one release window. ADR-0074 gates its own wav
 15. **Freshness objectives** (D13). The ADR defines two SLIs, the tag-sync share and the topology
     freshness share, and slice 10 measures them. It sets no target. The owner decides whether either
     becomes an SLO, and at what value, once the measured values exist.
+16. **A fleet-wide topology off switch** (*Configuration*). Today the only way to stop topology is
+    `--no-topology` on each agent. A fleet-wide switch would need new mechanism, for example the
+    server answering every `ReportTopology` with a new refusal and issuing no `__resync__.topology`.
+    The owner decides whether one is needed.
