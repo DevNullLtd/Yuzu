@@ -66,6 +66,17 @@ export function settled(page) {
   );
 }
 
+// Waits until the page has gone quiet: two animation frames and a zero-delay timer have run
+// since the call, so errors raised by work scheduled during load are already delivered to
+// watch(). Event-based and bounded by WAIT_MS. Call it before reading a watcher.
+export async function quiesce(page) {
+  await page.evaluate(() => {
+    window.__quiet = false;
+    requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(() => { window.__quiet = true; }, 0)));
+  });
+  await page.waitForFunction(() => window.__quiet === true, { timeout: WAIT_MS });
+}
+
 export async function visit(page, path) {
   const res = await page.goto(path.startsWith('http') ? path : cfg.baseUrl + path, {
     waitUntil: 'load',
@@ -129,7 +140,13 @@ function stateFor(page) {
     st.log.push(entry);
     const rule = st.rules.find((r) => r.method === entry.method && r.path === entry.path &&
       (!r.search || u.search.includes(r.search)));
-    if (!rule) { req.continue(); return; }
+    if (!rule) {
+      // A write nobody stubbed must not reach the server (the default target is a live UAT
+      // stack): it is logged above, then refused.
+      if (entry.method === 'GET' || entry.method === 'HEAD') req.continue();
+      else req.abort('blockedbyclient');
+      return;
+    }
     rule.calls.push(entry);
     req.respond({
       status: rule.status,
@@ -141,7 +158,8 @@ function stateFor(page) {
   return st;
 }
 
-// Starts recording every request the page issues (requestLog) without answering any.
+// Starts recording every request the page issues (requestLog). GET and HEAD pass through
+// unless a stub answers them; any other method is stubbed or aborted, never sent.
 export async function trace(page) {
   stateFor(page);
   await page.setRequestInterception(true);

@@ -32,6 +32,17 @@ node tests/puppeteer/ui-smoke.mjs
 The defaults match `scripts/start-UAT.sh`. The server needs no agent or gateway; the dashboard
 pages are enough. One line is printed per check.
 
+```bash
+node tests/puppeteer/ui-smoke.mjs --selftest
+```
+
+The selftest needs only puppeteer: no server, database or login. It serves a fake shell from a
+local `127.0.0.1` fixture and bends it one way per case, asserting that the real crawl and
+overflow checks fail for the right reason: a nav without `/`, an href outside `EXPECTED`, errors
+raised after load, a missing or `unsafe-eval` CSP, a submit button outside its form, a form with
+no submit control, and a 404 route. A baseline case first proves the clean fixture passes. `/test`
+runs it before the live run, and a selftest failure fails the gate. Add a case when you add a check.
+
 ## What it checks
 
 1. Nav crawl: every route the shell links to answers 200 with the CSP header and no page error.
@@ -45,6 +56,8 @@ pages are enough. One line is printed per check.
 
 ## Writing a scenario
 
-Use the harness; do not sleep. Wait on `settled(page)` or `page.waitForFunction`. Install a
-`stub()` before the request it answers is issued, and assert on DOM facts and on the request log.
+Use the harness; do not sleep. Wait on `settled(page)` or `page.waitForFunction`, and call
+`quiesce(page)` before reading a `watch()` collector. Install a `stub()` before the request it
+answers is issued (a write nobody stubbed is aborted, never sent), and assert on DOM facts and on
+the request log. Match a toast by its exact text: error toasts do not auto-remove.
 Create temporary files under `os.tmpdir()` with a `yuzu_test_` prefix, never in the tree.

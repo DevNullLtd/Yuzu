@@ -492,8 +492,10 @@ gate_run "Synthetic UAT" "synthetic-uat.log" \
 
 # Browser smoke — unlike the legacy Puppeteer block above, a failure here is FAIL, not WARN:
 # the script is deterministic (no sleeps; stubbed writes, nothing reaches the stack). It
-# crawls the shell nav (200 + CSP + no page errors), checks submit-control bounds and runs
-# the stubbed write scenarios. Same SKIP when puppeteer is not installed.
+# first runs --selftest (a local fixture, no stack: proves each crawl/overflow check can
+# fail; a failing selftest fails the gate), then crawls the shell nav (200 + CSP + no page
+# errors), checks submit-control bounds and runs the stubbed write scenarios. Same SKIP
+# when puppeteer is not installed.
 if [[ ! -d tests/puppeteer/node_modules/puppeteer ]]; then
     bash scripts/test/test-db-write.sh gate \
         --run-id "$RUN_ID" --phase 5 --gate "Browser smoke" \
@@ -501,7 +503,7 @@ if [[ ! -d tests/puppeteer/node_modules/puppeteer ]]; then
         --notes "puppeteer not installed; run: (cd tests/puppeteer && npm ci)" &
 else
     gate_run "Browser smoke" "browser-smoke.log" \
-        "node tests/puppeteer/ui-smoke.mjs"
+        "node tests/puppeteer/ui-smoke.mjs --selftest && node tests/puppeteer/ui-smoke.mjs"
 fi
 
 # Instructions content-suite gate — schema-driven REST exerciser.
