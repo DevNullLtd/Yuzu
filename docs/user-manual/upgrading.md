@@ -146,6 +146,33 @@ Two limits. The stored audit events carry `principal`, `principal_role`, `princi
 
 **Config-as-code replay.** A caller that is not an administrator account (for example an MCP-tier token) no longer reads the administrator-only overrides at all: `GET /api/config` leaves them out of `overrides`, so a backup taken with such a token silently lacks them, and a reconcile client that treats a missing key as "unset" sees them as unset. Writing one of those keys back with that caller still stops with `403`, so keys written before that point stay applied and the rest are not. `GET /api/v1/config` lists the withheld keys in `withheld_keys`: treat each as indeterminate, not unset. Take the backup, and replay, with an administrator API token that is not MCP-tier, or write the seven keys separately (the Settings pages for the six that have one, `PUT /api/config/audit_retention_days` with an administrator account for the seventh).
 
+## Behaviour change: the sessions table rejects an inconsistent principal class (#2343)
+
+**What changed.** The durable `sessions` table (schema `session_store`) gains a `CHECK` that allows
+exactly two pairings: a human session (any source except `engine_token`) or an engine session
+(`engine_token`). The migration runs automatically at boot. Every decision, gate and audit-class
+site that reads a session now classifies an engine with the same `Session::is_engine()` rule.
+
+**Who is affected.** Nobody in normal operation: the server writes only `human` sessions from a
+local, OIDC or SAML sign-in, and API, MCP and engine token sessions are never stored. Only a
+session row edited by hand into another pairing is affected: the migration deletes it, logs a
+`WARNING` in the Postgres server log (`session_store v2 (#2343): deleted N inconsistent session
+row(s)`; with the default libpq notice handling it also appears, prefixed `WARNING:`, on the
+server process's standard error, so check the journal there if the Postgres log is not
+available to you), and that principal signs in again. The migration also bumps the session write generation in that case, so other replicas drop
+their cached copy of the deleted rows within about a second. A clean upgrade deletes nothing and
+bumps nothing.
+
+**What to do.** No action is needed, with one precondition. Do not start the upgrade while
+`pg_dump` or another long transaction is running: the migration takes a brief exclusive lock on
+`sessions` and waits at most 3 seconds to acquire it; once held, the migration scans the table
+once, and the table normally holds only a few dozen rows, so the hold is brief. If it cannot get the lock the migration rolls back
+completely and the server refuses to start, logging `canceling statement due to lock timeout` on
+the preceding `PgMigrationRunner` line; start it again once the transaction ends. While it waits,
+sign-ins and session checks on replicas that are still running pause for up to those 3 seconds,
+plus the time the migration then holds the lock.
+An older binary can still run against the upgraded database.
+
 ## Behaviour change: engine principals are default-deny when RBAC is off
 
 **What changed.** An engine principal's only authority is an explicit RBAC grant. With RBAC off, the
