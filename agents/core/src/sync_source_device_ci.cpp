@@ -19,12 +19,10 @@ namespace yuzu::agent {
 namespace {
 
 // Caps. The field cap MUST match the server seam (device_ci_ingestion.cpp) so the server's
-// parse never truncates differently from what this source hashed. The blob cap must stay
-// <= the server's (server >= agent): the server accepts everything this source can send.
+// parse never truncates differently from what this source hashed. The blob cap
+// (kDeviceCiMaxBlobBytes, sync_source_device_ci.hpp) must stay <= the server's (server >= agent):
+// the server accepts everything this source can send; the two are equal by contract.
 constexpr std::size_t kMaxFieldLen = 1024;
-// The device-CI canonical blob is a single small record (~22 short fields); 64 KiB
-// is far above any real machine and well below the gRPC 4 MiB receive ceiling.
-constexpr std::size_t kMaxBlobBytes = 64u * 1024;
 
 // ── UTF-8 scrub + field clamp ───────────────────────────────────────────────
 // sanitize_utf8_strict / clamp_field live in sync_canonical.{hpp,cpp} — one
@@ -295,9 +293,9 @@ SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,
         }
 
         std::string blob = device_ci_canonical_blob(rec);
-        if (blob.size() > kMaxBlobBytes) {
+        if (blob.size() > kDeviceCiMaxBlobBytes) {
             spdlog::warn("sync: device_ci blob {} B exceeds {} B cap — skipping this cycle",
-                         blob.size(), kMaxBlobBytes);
+                         blob.size(), kDeviceCiMaxBlobBytes);
             return std::nullopt;
         }
         std::string hash = sha256_hex(blob);

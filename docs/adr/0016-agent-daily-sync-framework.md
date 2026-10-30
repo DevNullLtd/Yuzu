@@ -563,22 +563,49 @@ and 0x1E-terminated. A blob whose first byte is not `0x02` parses exactly as bef
 |---|---|
 | `scalar_record` | positions 0-21 = the frozen v1 fields (unchanged order); positions 22-32 appended: `chassis_type`, `chassis_serial`, `chassis_asset_tag`, `chassis_source`, `board_vendor`, `board_product`, `board_serial`, `board_source`, `machine_id_hash`, `machine_id_algorithm`, `machine_id_source`. Missing trailing positions stay blank; extras are ignored. |
 | status record | `status` 1F `<section>` 1F `<level>` 1F `<reason>` — one per registered section, including the three status-only ones (`chassis`, `baseboard`, `machine_id`, whose values are the appended scalars). Last wins. An unregistered section is ignored. |
-| list row | `<kind>` 1F `<c1>` ... `<cn>` — columns per kind below. A short row is padded blank, extra fields are ignored, an unknown kind is ignored. |
-| blob cap | 1 MiB total, fixed (a v1 agent's own 64 KiB cap sits inside it). The agent writer adopts the same value, so a host near every row cap below is never dropped whole. A blob over the cap is dropped and nacked `need_full`; its base fields never land. Every field is clamped to 1,024 bytes. |
+| list row | `<kind>` 1F `<c1>` ... `<cn>` — columns per kind below. A short row is padded blank, extra fields are ignored, an unknown kind is ignored. Each blob's ignored tokens (unknown kinds and sections, kinds that carried extra columns) are named in one debug log line, so version skew is diagnosable. |
+| blob ceiling | 96 KiB (98,304 bytes) total, on the server and, equal by contract, on the agent (`kDeviceCiMaxBlobBytes` in `device_ci_kinds.hpp` and in `sync_source_device_ci.hpp`; the two binaries share no header, so each side's test pins its own constant to the literal 98304). The v1 agent's cap moves from 64 KiB to 96 KiB with it; that is behaviour-neutral, as its record is about 1 KiB. Derived from the section registry below, not from a transport limit: a p99 large host is about 25 KiB, and every kind at its row cap with a p99.9-wide row sums to about 75 KiB (table below). A conforming sender never reaches the ceiling (see "A host over the caps"). Every field is clamped to 1,024 bytes. |
 
 Section registry (one declaration, `server/core/src/device_ci_kinds.hpp`, shared by the
-parser and the store; the agent-side v2 writer MUST apply the same caps):
+parser and the store; the agent-side v2 writer MUST apply the same caps). The row budget is the
+declared p99.9 row width in wire bytes (kind token, separators and the record terminator
+included): a budget, not a bound. The 1,024-byte field clamp bounds each field and the
+ceiling bounds the blob.
 
-| Section / row kind | Columns | Row cap |
-|---|---|---|
-| `chassis`, `baseboard`, `machine_id` | status only | n/a |
-| `cpu` | idx, model, cores, threads, clock_mhz, socket_designation, stepping | 32 |
-| `dimm` | slot, size_mb, type, speed_mhz, manufacturer, part_number, serial | 64 |
-| `disk` | idx, model, size_gb, media_type, interface | 128 |
-| `swap` | device, total_mb, source | 16 |
-| `volume` | volume, mount_points, device, fstype, total_bytes, detail | 256 |
-| `partition` | disk, partition, size_bytes, type, mount_points, detail | 512 |
-| `topology` | topo_kind, name, uuid, members, detail | 512 |
+| Section / row kind | Columns | Row cap | Row budget (B) | Cap x budget (B) |
+|---|---|---|---|---|
+| `chassis`, `baseboard`, `machine_id` | status only | n/a | n/a | n/a |
+| `cpu` | idx, model, cores, threads, clock_mhz, socket_designation, stepping | 32 | 96 | 3,072 |
+| `dimm` | slot, size_mb, type, speed_mhz, manufacturer, part_number, serial | 64 | 96 | 6,144 |
+| `disk` | idx, model, size_gb, media_type, interface | 128 | 64 | 8,192 |
+| `swap` | device, total_mb, source | 16 | 56 | 896 |
+| `volume` | volume, mount_points, device, fstype, total_bytes, detail | 128 | 144 | 18,432 |
+| `partition` | disk, partition, size_bytes, type, mount_points, detail | 192 | 120 | 23,040 |
+| `topology` | topo_kind, name, uuid, members, detail | 96 | 144 | 13,824 |
+| rows subtotal | | | | 73,600 |
+| scalar record + status records | declared budget | | | 3,072 |
+| registry-derived total | 74.9 KiB, 78.0% of the 98,304-byte ceiling | | | 76,672 |
+
+A `static_assert` in `device_ci_kinds.hpp` holds that total to at most 80% of the ceiling, so
+changing a cap or a budget fails the build until the ceiling is reconsidered on both the server
+and the agent. A second `static_assert` keeps every row budget between the shortest possible row
+and the clamp-bound row.
+
+**A host over the caps (sender contract).** No agent v2 writer exists in this change; this is
+the contract it is built to. The sender keeps the first N rows of each kind (N = the kind's row
+cap) in a fixed sorted order, so the blob and its hash are stable day to day, and marks the
+section `constrained` with kept-of-total counts in its reason (a token distinct from the
+server's own `server_cap:<cap>`). If the blob would still exceed the ceiling it trims whole
+sections' tail rows, least valuable first: `topology`, `partition`, `volume`, `dimm`, `disk`,
+`cpu`, each trimmed section staying `constrained` with its kept-of-total. The scalar record and
+the per-section status records are never trimmed (together about 2-3 KiB, budgeted at 3 KiB), so
+a record always fits and the base fields always land. Trimmed rows are not stored: the daily
+record is a bounded summary, the live actions return the full data, and the daily record keeps
+no history. Any later report or search over these tables must present a `constrained` host as
+incomplete, not as one with fewer rows. The server drops and nacks `need_full` a blob over the
+ceiling as a backstop for a non-conforming sender only (its base fields then never land); each
+such drop writes one warn log line (`device_ci: oversized blob from agent=...`) and counts
+`yuzu_inventory_ingest_total{source="device_ci",outcome="dropped"}`.
 
 **Plugin-action to section mapping (agent-side writer obligation).** The section identifier on
 the wire is always the row-kind token, never the plugin action name: `chassis`->`chassis`,
@@ -611,9 +638,13 @@ cap or clamp mismatch would otherwise store the server's bounded view and storm
 `need_full`). The "raw-byte hashing must be done for all sources together" note above
 concerns changing v1 semantics and does not apply to a new format. A digest failure yields
 a v2 record with an empty hash; the store refuses it (`kError`, nack `need_full`) rather
-than store under a placeholder. A v1 agent whose manufacturer begins with byte `0x02`
-would be misread as v2 (not a real DMI/WMI value; the cost is a per-agent `need_full`
-loop).
+than store under a placeholder. A v1 agent whose manufacturer begins with byte `0x02` is
+read as v2. Its blob is its canonical bytes, so the server's sha256 of the received bytes
+equals the hash the agent claims and there is no `need_full` loop. The record is stored as v2
+with no sections and blank appended scalars, and the manufacturer loses that leading byte (it
+was taken for the version byte). The next cycle's hash-only report matches and is touched, so
+the record does not self-heal until the value changes or the agent emits v2. This is not a
+real DMI/WMI value.
 
 **Store.** Migration 2 is additive: `blob_version` plus the 11 scalars on `device_ci`, a
 `device_ci_section` status table and one typed table per list kind, each referencing

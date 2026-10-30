@@ -18,7 +18,10 @@
 #include "pg/pg_pool.hpp"
 #include "sha256_hex.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <array>
 #include <atomic>
@@ -26,6 +29,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <iterator>
 #include <latch>
 #include <optional>
 #include <stdexcept>
@@ -247,8 +251,29 @@ void exec_stmt(PgPool& pool, const std::string& sql) {
     REQUIRE(res.status() == PGRES_COMMAND_OK);
 }
 
-// The server blob cap (ADR-0016 update "device_ci blob v2"): 1 MiB, fixed.
-constexpr std::size_t kBlobCap = 1024u * 1024;
+// The server blob ceiling (ADR-0016 update "device_ci blob v2"): 96 KiB. An INDEPENDENT literal,
+// deliberately not read from device_ci_kinds.hpp (the kCrossPinHash pattern): the agent's
+// equal constant is pinned to the same 98304 in tests/unit/test_device_ci_sync.cpp, so a
+// one-sided change to either ceiling fails one of the two tests.
+constexpr std::size_t kBlobCap = 98304;
+
+// The registry, restated as an independent literal table: per list kind the row cap, the wire
+// width (columns per row) and the declared row budget (p99.9 row width in wire bytes). Also
+// never read from the registry: if a cap, a width or a budget drifts, this table disagrees.
+struct KindExpect {
+    const char* kind;
+    int cap;
+    int width;
+    int budget;
+};
+constexpr KindExpect kKindExpect[] = {{"cpu", 32, 7, 96},       {"dimm", 64, 7, 96},
+                                      {"disk", 128, 5, 64},     {"swap", 16, 3, 56},
+                                      {"volume", 128, 6, 144},  {"partition", 192, 6, 120},
+                                      {"topology", 96, 5, 144}};
+// The declared scalar record + status records budget, and the registry-derived total:
+// sum(cap x budget) = 73,600, plus 3,072 = 76,672 (78.0% of the ceiling; the build holds <= 80%).
+constexpr std::size_t kScalarStatusBudget = 3072;
+constexpr std::size_t kRegistryTotal = 76672;
 
 // Comma-separated registry column list -> names.
 std::vector<std::string> column_names(const char* columns) {
@@ -406,7 +431,7 @@ TEST_CASE("parse_device_ci_blob round-trips fields positionally", "[device_ci][p
         DeviceCiRecord p = parse_device_ci_blob(std::string(kBlobCap + 1, 'x'));
         CHECK(p.manufacturer.empty());
     }
-    SECTION("a blob exactly at the 1 MiB cap still parses") {
+    SECTION("a blob exactly at the 96 KiB ceiling still parses") {
         DeviceCiRecord p = parse_device_ci_blob(std::string(kBlobCap, 'x'));
         CHECK(p.manufacturer.size() == 1024); // one clamped field, not rejected
     }
@@ -602,17 +627,9 @@ TEST_CASE("v2 rows past the kind cap are dropped and disclosed as constrained",
 
 TEST_CASE("v2 row caps hold for every list kind (independent literal table)",
           "[device_ci][parse][v2]") {
-    // Deliberately NOT read from the registry (the kCrossPinHash pattern): if a registry cap
-    // or width drifts, this table disagrees. cap+1 rows in -> exactly cap kept, disclosed.
-    struct Expect {
-        const char* kind;
-        int cap;
-        int width;
-    };
-    constexpr Expect kExpect[] = {{"cpu", 32, 7},      {"dimm", 64, 7},        {"disk", 128, 5},
-                                  {"swap", 16, 3},     {"volume", 256, 6},     {"partition", 512, 6},
-                                  {"topology", 512, 5}};
-    for (const auto& e : kExpect) {
+    // cap+1 rows in -> exactly cap kept, disclosed. The expectations are kKindExpect, NOT the
+    // registry: if a registry cap or width drifts, this table disagrees.
+    for (const auto& e : kKindExpect) {
         INFO("kind " << e.kind);
         std::vector<std::vector<std::string>> recs = {{"status", e.kind, "ok", ""}};
         for (int i = 0; i < e.cap + 1; ++i) {
@@ -634,23 +651,93 @@ TEST_CASE("v2 row caps hold for every list kind (independent literal table)",
     }
 }
 
-TEST_CASE("v2 blob above the previous 64 KiB bound parses in full (blob cap is 1 MiB)",
+TEST_CASE("v2 registry budgets and the blob ceiling agree with the independent literal table",
           "[device_ci][parse][v2]") {
-    // A realistic near-cap host: every partition row at its cap with ~40-byte fields lands
-    // well past 64 KiB; the whole blob must still be accepted, rows intact.
-    std::vector<std::vector<std::string>> recs = {{"status", "partition", "ok", ""}};
-    for (int i = 0; i < 512; ++i)
-        recs.push_back({"partition", std::string(40, 'd'), std::to_string(i), std::string(40, 's'),
-                        std::string(40, 't'), std::string(40, 'm'), std::string(40, 'x')});
+    using yuzu::server::kDeviceCiSections;
+    // The server ceiling is the literal 98304 (the agent twin pins the same number).
+    CHECK(yuzu::server::kDeviceCiMaxBlobBytes == 98304u);
+    CHECK(yuzu::server::kDeviceCiMaxBlobBytes == kBlobCap);
+    CHECK(yuzu::server::kDeviceCiScalarStatusBudget == kScalarStatusBudget);
+
+    std::size_t rows_sum = 0;
+    for (const auto& e : kKindExpect) {
+        INFO("kind " << e.kind);
+        const auto i = yuzu::server::device_ci_section_index(e.kind);
+        REQUIRE(i.has_value());
+        const auto& d = kDeviceCiSections[*i];
+        CHECK(d.row_cap == e.cap);
+        CHECK(d.n_fields == e.width);
+        CHECK(d.row_budget == e.budget);
+        rows_sum += static_cast<std::size_t>(e.cap) * static_cast<std::size_t>(e.budget);
+    }
+    // Every registered list kind is in the table (a new kind must be added to it).
+    int list_kinds = 0;
+    for (const auto& d : kDeviceCiSections)
+        list_kinds += d.table != nullptr ? 1 : 0;
+    CHECK(list_kinds == static_cast<int>(std::size(kKindExpect)));
+
+    CHECK(rows_sum == 73600);
+    CHECK(rows_sum + kScalarStatusBudget == kRegistryTotal);
+    CHECK(yuzu::server::device_ci_registry_budget() == kRegistryTotal);
+    // Real headroom: the declared worst plausible blob stays within 80% of the ceiling.
+    CHECK(kRegistryTotal * 5 <= kBlobCap * 4);
+}
+
+namespace {
+// One list record of exactly `budget` wire bytes (kind token, separators and terminator
+// included) for a kind with `width` columns; column c is filled with letter 'a'+c so a swapped or
+// truncated column cannot round-trip by accident.
+std::vector<std::string> row_at_budget(const char* kind, int width, int budget) {
+    const int total = budget - static_cast<int>(std::string(kind).size()) - width - 1;
+    REQUIRE(total >= width);
+    std::vector<std::string> row{kind};
+    for (int c = 0; c < width; ++c) {
+        const int len = total / width + (c < total % width ? 1 : 0);
+        row.emplace_back(static_cast<std::size_t>(len), static_cast<char>('a' + c));
+    }
+    return row;
+}
+} // namespace
+
+TEST_CASE("v2 blob at the registry-derived maximum fits the ceiling and parses in full",
+          "[device_ci][parse][v2]") {
+    // Every list kind at its cap, every row exactly its declared budget wide: the heaviest blob
+    // the registry plans for. It is past the old 64 KiB bound, under the 96 KiB ceiling, and
+    // nothing is dropped or disclosed. Expectations come from kKindExpect, not the registry.
+    std::vector<std::vector<std::string>> recs = {
+        {"status", "chassis", "ok", ""}, {"status", "baseboard", "ok", ""},
+        {"status", "machine_id", "ok", ""}};
+    std::size_t rows_bytes = 0;
+    for (const auto& e : kKindExpect) {
+        recs.push_back({"status", e.kind, "ok", ""});
+        for (int i = 0; i < e.cap; ++i) {
+            recs.push_back(row_at_budget(e.kind, e.width, e.budget));
+            rows_bytes += static_cast<std::size_t>(e.budget);
+        }
+    }
+    REQUIRE(rows_bytes == 73600);
     const std::string blob = build_blob_v2(v2_scalars(), recs);
+    // The scalar record and the ten status records are far under their declared 3 KiB budget.
     REQUIRE(blob.size() > 64u * 1024);
+    REQUIRE(blob.size() <= kRegistryTotal + 1); // +1: the version byte
     REQUIRE(blob.size() <= kBlobCap);
+
     DeviceCiRecord r = parse_device_ci_blob(blob);
-    const auto* part = find_section(r, "partition");
-    REQUIRE(part != nullptr);
-    CHECK(part->rows.size() == 512);
-    CHECK(part->level == "ok"); // at the cap exactly: untouched
-    CHECK(r.chassis_serial == "CHS-0001"); // the scalar record survived with it
+    CHECK(r.chassis_serial == "CHS-0001"); // the scalar record survived with them
+    for (const auto& e : kKindExpect) {
+        INFO("kind " << e.kind);
+        const auto* sec = find_section(r, e.kind);
+        REQUIRE(sec != nullptr);
+        CHECK(static_cast<int>(sec->rows.size()) == e.cap);
+        CHECK(sec->level == "ok"); // at the cap exactly: untouched, not disclosed
+        CHECK(sec->reason.empty());
+        const auto want = row_at_budget(e.kind, e.width, e.budget);
+        for (const auto& row : sec->rows) {
+            REQUIRE(row.size() == static_cast<std::size_t>(e.width));
+            CHECK(row[0] == want[1]);
+            CHECK(row.back() == want.back());
+        }
+    }
 }
 
 TEST_CASE("v2 duplicate status records: the last wins; a server disclosure still beats it",
@@ -772,6 +859,62 @@ TEST_CASE("v2 fields get the same scrub + clamp as v1", "[device_ci][parse][v2]"
         REQUIRE(cc != nullptr);
         REQUIRE(cc->rows.size() == 1);
         CHECK(cc->rows[0][1] == "ab\tc");
+    }
+}
+
+TEST_CASE("v2 parse names what it ignored in ONE debug line per blob, bounded and neutralised",
+          "[device_ci][parse][v2]") {
+    const auto count_of = [](const std::string& hay, const std::string& needle) {
+        std::size_t n = 0;
+        for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1))
+            ++n;
+        return n;
+    };
+    const std::string kLine = "ignored unregistered tokens";
+
+    SECTION("unknown kind, unknown status section, a row for a status-only section, extra columns") {
+        std::vector<std::vector<std::string>> recs = {
+            {"status", "nic", "ok", ""},                                // unregistered section
+            {"gpu", "0", "x"},                                          // unknown kind
+            {"gpu", "1", "y"},                                          // same token again
+            {"chassis", "stray"},                                       // row for a status-only kind
+            {"cpu", "0", "M", "1", "1", "1", "s", "1", "extra", "more"}, // 9 columns, cpu has 7
+        };
+        yuzu::test::LogCapture cap(spdlog::level::debug);
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        cap.stop();
+        const std::string logs = cap.text();
+        CHECK(count_of(logs, kLine) == 1); // one line for the whole blob
+        CHECK(logs.find("'nic'") != std::string::npos);
+        CHECK(logs.find("'gpu'") != std::string::npos);
+        CHECK(count_of(logs, "'gpu'") == 1); // a repeated token is named once
+        CHECK(logs.find("'chassis'") != std::string::npos);
+        CHECK(logs.find("extra columns on kinds [cpu]") != std::string::npos);
+        const auto* c = find_section(r, "cpu"); // the row itself still stores, columns clipped
+        REQUIRE(c != nullptr);
+        CHECK(c->rows.size() == 1);
+        CHECK(c->rows[0].size() == 7);
+    }
+    SECTION("a conforming blob logs nothing") {
+        yuzu::test::LogCapture cap(spdlog::level::debug);
+        parse_device_ci_blob(fixture_blob_v2());
+        cap.stop();
+        CHECK(count_of(cap.text(), kLine) == 0);
+    }
+    SECTION("a hostile blob of many unknown kinds is capped and cannot split the line") {
+        std::vector<std::vector<std::string>> recs = {{"bad\nkind\r\ttoken", "v"}};
+        for (int i = 0; i < 50; ++i)
+            recs.push_back({"k" + std::to_string(i), "v"});
+        yuzu::test::LogCapture cap(spdlog::level::debug);
+        parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        cap.stop();
+        const std::string logs = cap.text();
+        REQUIRE(count_of(logs, kLine) == 1);
+        CHECK(logs.find("'bad_kind__token'") != std::string::npos); // control bytes neutralised
+        CHECK(logs.find("'k6'") != std::string::npos);
+        CHECK(logs.find("'k7'") == std::string::npos); // at most 8 distinct tokens in the line
+        // The one captured record is one physical line: only the logger's own terminator.
+        CHECK(count_of(logs, "\n") == 1);
     }
 }
 
@@ -962,17 +1105,31 @@ TEST_CASE("ingest_device_ci_report end-to-end (all wire shapes)", "[pg][device_c
         CHECK(ack.need_full(0) == "device_ci");
     }
 
-    SECTION("oversized blob is dropped + nacked, nothing stored") {
+    SECTION("oversized blob is dropped + nacked, logged once, counted, nothing stored") {
+        // The backstop for a non-conforming sender (a conforming one trims to fit): the ONE
+        // existing warn line and the `dropped` outcome are the operator's signal, pinned here.
+        yuzu::MetricsRegistry metrics;
+        yuzu::test::LogCapture cap(spdlog::level::warn);
         agentpb::InventoryReport rpt;
         (*rpt.mutable_content_hashes())["device_ci"] = "somehash";
-        (*rpt.mutable_plugin_data())["device_ci"] = std::string(kBlobCap + 1, 'x'); // > 1 MiB
+        (*rpt.mutable_plugin_data())["device_ci"] = std::string(kBlobCap + 1, 'x'); // > 96 KiB
         agentpb::InventoryAck ack;
-        yuzu::server::ingest_device_ci_report(store, "agent-big", rpt, ack, nullptr);
+        yuzu::server::ingest_device_ci_report(store, "agent-big", rpt, ack, &metrics);
+        cap.stop();
         REQUIRE(ack.need_full_size() == 1);
         CHECK(ack.need_full(0) == "device_ci");
         auto r = store.get_device_ci("agent-big");
         REQUIRE(r.has_value());
         CHECK(!r->has_value()); // nothing stored
+        CHECK(metrics
+                  .counter("yuzu_inventory_ingest_total",
+                           {{"source", "device_ci"}, {"outcome", "dropped"}})
+                  .value() == 1.0);
+        const std::string logs = cap.text();
+        const std::string needle = "oversized blob from agent=agent-big";
+        const auto first = logs.find(needle);
+        REQUIRE(first != std::string::npos);
+        CHECK(logs.find(needle, first + 1) == std::string::npos); // once per blob
     }
 
     SECTION("source absent from the report → no-op, no nack") {

@@ -142,6 +142,14 @@ TEST_CASE("device_ci v2 blob layout hashes to the forward cross-pin", "[sync][de
     CHECK(sha256_hex(v2_blob_by_hand()) == kCrossPinHashV2);
 }
 
+TEST_CASE("device_ci blob ceiling is the literal 96 KiB, equal to the server's",
+          "[sync][device_ci][v2]") {
+    // The agent and the server share no header, so each side pins its own constant to the SAME
+    // literal (the server twin is in tests/unit/server/test_device_inventory_store.cpp). A
+    // one-sided change fails one of the two; the server accepts everything the agent can send.
+    CHECK(yuzu::agent::kDeviceCiMaxBlobBytes == 98304u);
+}
+
 TEST_CASE("device_ci canonical hash matches the cross-pin", "[sync][device_ci][hash]") {
     CHECK(sha256_hex(device_ci_canonical_blob(sample())) == kCrossPinHash);
 }
