@@ -73,6 +73,31 @@ state across restarts. The state `--keep` preserves includes the server's CA
 and secrets key on the `server-certs` volume, which a one-shot
 `server-certs-init` service hands to the server user before it starts (#5370).
 
+The launcher fails rather than printing "Cedar & Vale demo is up" over a stack
+that cannot work:
+
+- **Gateway image vs. config.** `demo-gateway-sys.config` uses the
+  `{yuzu_gw, grpc_listeners}` shape, which a gateway older than 0.15.0 does not
+  understand: it binds no listener yet still answers `/healthz` and `/readyz`
+  with 200. Before starting anything, in the default and `--pull` modes, the
+  launcher refuses a pinned `YUZU_VERSION` older than 0.15.0 and tells you to
+  use `--build` or a newer `--version`. A local `--build` of this tree is
+  accepted at any tag, because `--build` labels the gateway image with the
+  config shape it reads.
+- **Gateway listeners.** Once the gateway is healthy, the launcher checks its
+  socket table and fails if it is not listening on 50051 (agents) and 50063
+  (management). This catches a mismatched image whatever its tag says.
+- **Agent registration.** If fewer than N agents have registered within
+  `DEMO_REGISTER_TIMEOUT` seconds (default 120), the launcher prints the
+  server's count and the gateway's last 30 log lines, leaves the stack running
+  for inspection, and exits non-zero.
+
+The demo's agents connect to `gateway:50051`, never to the server directly; the
+server's own agent port is not published. To run the demo beside another rig
+that holds its ports, set `DEMO_HTTP_PORT`, `DEMO_GATEWAY_AGENT_PORT`,
+`DEMO_GATEWAY_HEALTH_PORT` and `DEMO_GATEWAY_METRICS_PORT` (defaults 8080,
+50051, 8081 and 9568).
+
 ## The stability contract
 
 Every image in `docker-compose.demo.yml` is pinned to `${YUZU_VERSION:-X.Y.Z}`.

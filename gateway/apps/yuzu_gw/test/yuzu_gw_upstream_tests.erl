@@ -1,7 +1,7 @@
 %%%-------------------------------------------------------------------
 %%% @doc Tests for yuzu_gw_upstream — heartbeat batching and proxying.
 %%%
-%%% Mocks grpcbox_client to test batching logic in isolation, without
+%%% Mocks yuzu_grpc_client to test batching logic in isolation, without
 %%% a real upstream server.
 %%%
 %%% Key assertions:
@@ -45,8 +45,8 @@ upstream_test_() ->
      ]}.
 
 setup() ->
-    meck:new(grpcbox_client, [non_strict, no_link]),
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
     meck:new(telemetry, [passthrough, no_link]),
@@ -69,7 +69,7 @@ cleanup({HBPid, UpPid}) ->
     catch unlink(UpPid),
     catch gen_server:stop(UpPid, shutdown, 5000),
     catch gen_server:stop(HBPid, shutdown, 5000),
-    meck:unload([grpcbox_client, telemetry]),
+    meck:unload([yuzu_grpc_client, telemetry]),
     ok.
 
 %%%===================================================================
@@ -84,8 +84,8 @@ heartbeats_batched() ->
     %% No RPC should have been called yet (interval is 10 minutes).
     timer:sleep(50),
     %% The unary mock records calls. Check that BatchHeartbeat was NOT called.
-    Calls = meck:history(grpcbox_client),
-    BatchCalls = [C || {_, {grpcbox_client, unary, [_, Path, _, _, _]}, _} = C <- Calls,
+    Calls = meck:history(yuzu_grpc_client),
+    BatchCalls = [C || {_, {yuzu_grpc_client, unary, [_, Path, _, _, _]}, _} = C <- Calls,
                        binary:match(Path, <<"BatchHeartbeat">>) =/= nomatch],
     ?assertEqual(0, length(BatchCalls)).
 
@@ -96,13 +96,13 @@ flush_sends_batch() ->
     %% Why: the original `! flush; timer:sleep(100)` pattern was racy
     %% under coverage-instrumented BEAM — the cast queue could outpace
     %% the 20ms settle window and the assertion would see <2 heartbeats.
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
     ok = yuzu_gw_heartbeat_buffer:flush_sync(),
     %% Now reset and set up the real assertion mock.
-    meck:reset(grpcbox_client),
-    meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->
+    meck:reset(yuzu_grpc_client),
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, Req, _, _) ->
         case binary:match(Path, <<"BatchHeartbeat">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
@@ -116,8 +116,8 @@ flush_sends_batch() ->
     yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"f2">>}),
     ok = yuzu_gw_heartbeat_buffer:flush_sync(),
     %% Check that BatchHeartbeat was called with exactly 2 heartbeats.
-    Calls = meck:history(grpcbox_client),
-    BatchCalls = [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
+    Calls = meck:history(yuzu_grpc_client),
+    BatchCalls = [Req || {_, {yuzu_grpc_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
                          binary:match(Path, <<"BatchHeartbeat">>) =/= nomatch],
     ?assert(length(BatchCalls) > 0),
     [LastBatch | _] = BatchCalls,
@@ -125,16 +125,16 @@ flush_sends_batch() ->
     ?assertEqual(2, length(HBs)).
 
 empty_flush_no_rpc() ->
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     %% Flush with empty buffer — just reschedules the timer.
     whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(50),
     %% No RPC calls should have been made.
-    Calls = meck:history(grpcbox_client),
+    Calls = meck:history(yuzu_grpc_client),
     ?assertEqual(0, length(Calls)).
 
 proxy_register_ok() ->
-    meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, _, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
             _       -> {ok, #{session_id => <<"new-sess">>}, #{}}
@@ -144,35 +144,36 @@ proxy_register_ok() ->
     ?assertMatch({ok, #{session_id := <<"new-sess">>}}, Result).
 
 proxy_register_error() ->
-    %% HA WS-4 4.4 fix: grpcbox_client:unary/5's REAL error return for a
+    %% HA WS-4 4.4 fix: yuzu_grpc_client:unary/5's REAL error return for a
     %% genuine (non-transport) grpc status is a 3-ELEMENT tuple — `error`,
-    %% the `{Status, Message}` pair, and the trailers map
-    %% (grpcbox_client.erl's unary_handler, via recv_trailers/1) — not the
-    %% OLD mocked shape here (`{error, {Status, Message, Trailers}}`, a
-    %% 2-element tuple whose 2nd element was itself a 3-tuple), which this
-    %% test previously used and do_rpc's matching clause mirrored. That
-    %% shape does not match ANYTHING grpcbox actually returns, so do_rpc's
-    %% corresponding clause could never fire against the real dependency —
-    %% both were wrong together. Fixed to the real shape.
-    meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
+    %% the `{Status, Message}` pair (Status a decimal BINARY, <<"14">>), and
+    %% the meta map holding the headers and trailers (yuzu_grpc_client.erl's
+    %% status/4) — not the OLD mocked shape here
+    %% (`{error, {Status, Message, Trailers}}`, a 2-element tuple whose 2nd
+    %% element was itself a 3-tuple), which this test previously used and
+    %% do_rpc's matching clause mirrored. That shape does not match ANYTHING
+    %% the client actually returns, so do_rpc's corresponding clause could
+    %% never fire against the real dependency — both were wrong together.
+    %% Fixed to the real shape.
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, _, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
-            _       -> {error, {14, <<"UNAVAILABLE">>}, #{}}
+            _       -> {error, {<<"14">>, <<"UNAVAILABLE">>}, #{}}
         end
     end),
     Result = yuzu_gw_upstream:proxy_register(#{info => #{}}),
-    ?assertMatch({error, {14, _}}, Result).
+    ?assertMatch({error, {<<"14">>, _}}, Result).
 
 proxy_register_http_error() ->
     %% HA WS-4 4.4 round-2 review fix (consistency-auditor c-1 / chaos-injector
-    %% CH-2): a FOURTH real grpcbox_client:unary/5 return shape,
-    %% `{http_error, {Status, Message}, Trailers}` (a non-grpc-layer HTTP
+    %% CH-2): a FOURTH real yuzu_grpc_client:unary/5 return shape,
+    %% `{http_error, {Status, Message}, Meta}` (a non-grpc-layer HTTP
     %% error), previously matched no clause in do_rpc and would have crashed
     %% this gen_server with a case_clause exception.
-    meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, _, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
-            _       -> {http_error, {502, <<>>}, #{}}
+            _       -> {http_error, {<<"502">>, <<>>}, #{}}
         end
     end),
     Result = yuzu_gw_upstream:proxy_register(#{info => #{}}),
@@ -181,7 +182,7 @@ proxy_register_http_error() ->
     ?assert(is_pid(whereis(yuzu_gw_upstream))).
 
 proxy_inventory_ok() ->
-    meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, _, _, _) ->
         case binary:match(Path, <<"ProxyInventory">>) of
             nomatch -> {ok, #{}, #{}};
             _       -> {ok, #{received => true}, #{}}
@@ -191,11 +192,16 @@ proxy_inventory_ok() ->
     ?assertMatch({ok, #{received := true}}, Result).
 
 notify_no_crash() ->
-    %% Make the notify RPC fail — should not crash the upstream process.
-    meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
-        case binary:match(Path, <<"NotifyStreamStatus">>) of
-            nomatch -> {ok, #{}, #{}};
-            _       -> {error, connection_refused}
+    %% Make the notify RPC fail once — should not crash the upstream process.
+    %% (A failed send is held again and retried, #5695, so failing every call
+    %% would open the breaker for the tests after this one.)
+    Fails = atomics:new(1, []),
+    atomics:put(Fails, 1, 1),
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, _, _, _) ->
+        case binary:match(Path, <<"NotifyStreamStatus">>) =/= nomatch
+             andalso atomics:sub_get(Fails, 1, 1) =:= 0 of
+            false -> {ok, #{}, #{}};
+            true  -> {error, connection_refused}
         end
     end),
     yuzu_gw_upstream:notify_stream_status(<<"a1">>, <<"s1">>, connected, <<"127.0.0.1">>,
@@ -211,8 +217,8 @@ notify_no_crash() ->
 %% dispatch chokepoint that this gateway build carries
 %% CommandRequest.dispatch_tag = 9 through untouched.
 notify_advertises_dispatch_tag_capability() ->
-    meck:reset(grpcbox_client),
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:reset(yuzu_grpc_client),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged => true}, #{}}
     end),
     yuzu_gw_upstream:notify_stream_status(<<"a1">>, <<"s1">>, connected, <<"127.0.0.1">>,
@@ -226,7 +232,7 @@ notify_advertises_dispatch_tag_capability() ->
 
 buffer_retained_on_failure() ->
     %% First drain any existing buffer.
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
     HBPid = whereis(yuzu_gw_heartbeat_buffer),
@@ -234,7 +240,7 @@ buffer_retained_on_failure() ->
     %% Barrier, not a sleep: the reply proves the drain flush was handled
     %% before meck history is reset (see await_rpcs/1).
     _ = sys:get_state(HBPid),
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
 
     %% Queue 3 heartbeats.
     yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"r1">>}),
@@ -243,14 +249,14 @@ buffer_retained_on_failure() ->
     timer:sleep(20),
 
     %% Make flush fail.
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
     _ = flush_and_await(),
 
     %% Now make flush succeed and add one more heartbeat.
-    meck:reset(grpcbox_client),
-    meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->
+    meck:reset(yuzu_grpc_client),
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, Req, _, _) ->
         case binary:match(Path, <<"BatchHeartbeat">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
@@ -270,7 +276,7 @@ buffer_retained_on_failure() ->
 
 buffer_cap_on_failure() ->
     %% Max buffer is set to 5 in setup. First drain any existing buffer.
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
     HBPid = whereis(yuzu_gw_heartbeat_buffer),
@@ -278,7 +284,7 @@ buffer_cap_on_failure() ->
     %% Barrier, not a sleep: the reply proves the drain flush was handled
     %% before meck history is reset (see await_rpcs/1).
     _ = sys:get_state(HBPid),
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
 
     %% Queue 10 heartbeats (exceeds cap of 5).
     lists:foreach(fun(I) ->
@@ -287,14 +293,14 @@ buffer_cap_on_failure() ->
     timer:sleep(20),
 
     %% Make flush fail.
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
     _ = flush_and_await(),
 
     %% Now make flush succeed.
-    meck:reset(grpcbox_client),
-    meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->
+    meck:reset(yuzu_grpc_client),
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, Req, _, _) ->
         case binary:match(Path, <<"BatchHeartbeat">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
@@ -310,7 +316,7 @@ buffer_cap_on_failure() ->
     HBs = maps:get(heartbeats, LastBatch, []),
     ?assert(length(HBs) =< 5).
 
-%% Poll meck history for the grpcbox_client:unary requests whose path contains
+%% Poll meck history for the yuzu_grpc_client:unary requests whose path contains
 %% PathBin; returns them in call order. Replaces a fixed `timer:sleep(N)` before
 %% reading history, which is an UPPER-bound race on a loaded runner (#4851 runs
 %% this suite on macOS CI for the first time; BigMags shares its CPU between
@@ -324,8 +330,8 @@ await_rpcs(PathBin) ->
     await_rpcs(PathBin, erlang:monotonic_time(millisecond) + 2000).
 
 await_rpcs(PathBin, Deadline) ->
-    Reqs = [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _}
-                       <- meck:history(grpcbox_client),
+    Reqs = [Req || {_, {yuzu_grpc_client, unary, [_, Path, Req, _, _]}, _}
+                       <- meck:history(yuzu_grpc_client),
                    binary:match(Path, PathBin) =/= nomatch],
     case Reqs =:= [] andalso erlang:monotonic_time(millisecond) < Deadline of
         true -> timer:sleep(10), await_rpcs(PathBin, Deadline);

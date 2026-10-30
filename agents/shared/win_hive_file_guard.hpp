@@ -70,6 +70,11 @@ struct HiveFileFacts {
     std::size_t depth = 0;
     bool ancestor_reparse = false;
     bool is_reparse = false;
+    /// The leaf has a link count other than 1: a second name means the path may be a hard link to
+    /// another hive file (a SYSTEM write through it lands there). A failed read is
+    /// hive_stat_failed:win32_<n>, never this; LeafFacts::links defaults to 0, so a probe that
+    /// never sets it fails closed here.
+    bool leaf_hardlinked = false;
     bool is_directory = false;
     bool is_disk_file = true;
     /// FILE_ATTRIBUTE_OFFLINE / RECALL_ON_OPEN / RECALL_ON_DATA_ACCESS: a cloud or tiered
@@ -93,6 +98,7 @@ inline constexpr std::string_view kHivePathNotFixed = "hive_path_not_fixed";
 inline constexpr std::string_view kHivePathTooDeep = "hive_path_too_deep";
 inline constexpr std::string_view kHivePathReparseAncestor = "hive_path_reparse_ancestor";
 inline constexpr std::string_view kHiveReparsePoint = "hive_reparse_point";
+inline constexpr std::string_view kHiveHardlinked = "hive_hardlinked";
 inline constexpr std::string_view kHiveNotRegular = "hive_not_regular";
 inline constexpr std::string_view kHiveNotResident = "hive_not_resident";
 inline constexpr std::string_view kHiveOwnerUnexpected = "hive_owner_unexpected";
@@ -113,14 +119,16 @@ inline constexpr std::string_view kHiveTimeout = "timeout";
 }
 
 /// The first refusal token for a hive file's facts, in this fixed order, or nullopt to proceed.
-/// UNC, drive, depth and ancestor reparse come first; then the leaf (reparse, kind, residency,
-/// owner, final path, size); then the sidecars. When several are true, the first is reported.
+/// UNC, drive, depth and ancestor reparse come first; then the leaf (reparse, link count, kind,
+/// residency, owner, final path, size); then the sidecars. When several are true, the first is
+/// reported.
 [[nodiscard]] inline std::optional<std::string> classify_hive_file(const HiveFileFacts& f) {
     if (f.path_is_unc) return std::string{kHivePathUnc};
     if (f.drive_type != kDriveFixed) return std::string{kHivePathNotFixed};
     if (f.depth > kMaxHivePathDepth) return std::string{kHivePathTooDeep};
     if (f.ancestor_reparse) return std::string{kHivePathReparseAncestor};
     if (f.is_reparse) return std::string{kHiveReparsePoint};
+    if (f.leaf_hardlinked) return std::string{kHiveHardlinked};
     if (f.is_directory || !f.is_disk_file) return std::string{kHiveNotRegular};
     if (f.not_resident) return std::string{kHiveNotResident};
     if (!hive_owner_allowed(f.owner_sid, f.profile_sid)) return std::string{kHiveOwnerUnexpected};
@@ -164,6 +172,7 @@ struct LeafFacts {
     std::uint32_t attributes = 0;
     bool is_disk_file = true;
     std::uint64_t size = 0;
+    std::uint32_t links = 0; // BY_HANDLE_FILE_INFORMATION::nNumberOfLinks; 0 (never set) is refused: fail closed
     std::string owner_sid;
     bool final_path_matches = true;
     FileId id;
@@ -306,6 +315,7 @@ struct HiveFileGuard {
         apply_attributes(leaf.attributes, f);
         f.is_disk_file = leaf.is_disk_file;
         f.size = leaf.size;
+        f.leaf_hardlinked = leaf.links != 1;
         f.owner_sid = leaf.owner_sid;
         f.final_path_matches = leaf.final_path_matches;
         // `cur` is the leaf's directory, already hop-verified above.

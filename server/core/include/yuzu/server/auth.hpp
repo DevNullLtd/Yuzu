@@ -213,18 +213,25 @@ struct Session {
     std::string token_scope_service;  // Non-empty = token scoped to this service
     std::string mcp_tier;             // "readonly", "operator", "supervised", or "" (not MCP)
     /// Discriminator for the session's principal class — "human" (default) or
-    /// "engine". In-memory only (no auth.db schema change: token sessions are
-    /// synthesized fresh per request, never persisted — see design doc §6).
-    /// Set by `synthesize_token_session` from the source `ApiToken::principal_kind`;
-    /// every other session-creation site leaves the "human" default. This is the
-    /// discriminator the Phase-4/5 self-target destruction guard (§9) keys on —
-    /// never infer principal kind from the shape of `username`.
+    /// "engine". Token sessions are synthesized fresh per request and never
+    /// persisted (design doc §6); `synthesize_token_session` sets this from the
+    /// source `ApiToken::principal_kind` and every other session-creation site
+    /// leaves the "human" default. The durable `sessions` row carries the column
+    /// (session_store.cpp), and a CHECK on it keeps the stored value inside
+    /// {human, engine} and consistent with `auth_source`. Do NOT branch on this
+    /// field to decide whether a session is an engine: use `is_engine()` below.
+    /// Never infer principal kind from the shape of `username`.
     std::string principal_kind{"human"};
 
     /// True iff this session authenticates as an ADR-0031 engine principal.
-    /// The canonical engine-session discriminator (mirrors the belts in
-    /// rest_api_v1.cpp deny_engine_session / mcp_server.cpp
-    /// deny_if_engine_session / principal_quota_gate.hpp apply_engine_quota_gate).
+    /// The canonical engine-session discriminator (#2343): every decision, gate
+    /// and audit-class site on a `Session` uses this, so a session classified as
+    /// an engine by either field is an engine everywhere. One helper takes bare
+    /// fields instead of a `Session` and copies this predicate by hand:
+    /// `principal_quota_gate.hpp`'s `apply_engine_quota_gate`, which must change
+    /// together with it. `same_site_write_policy.hpp` and `web_utils.hpp` also take
+    /// a bare `auth_source`, but they classify the transport (bearer token or
+    /// cookie), not engine-ness.
     [[nodiscard]] bool is_engine() const {
         return principal_kind == "engine" || auth_source == "engine_token";
     }
@@ -335,6 +342,31 @@ inline constexpr auto kMaxElevationWindow = std::chrono::hours(24);
 /// suspend). Bounds suspend over-extension to this slack + the residual, negligible
 /// against an 8h session / 24h elevation ceiling.
 inline constexpr auto kWallSanitySkew = std::chrono::minutes(5);
+
+/// One authoritative read of a session's durable MFA proof (the approver freshness gate,
+/// #6079; `AuthManager::read_durable_mfa_proof`). `mfa_verified_ms` is the Postgres-authored
+/// proof instant (an OIDC session carries the IdP-asserted instant, clamped at login) and
+/// `db_now_ms` the database clock read in the SAME SELECT, so `db_now_ms - mfa_verified_ms`
+/// is a proof age that no replica clock, steady or wall, can stretch (ADR-2002 s4). Only
+/// `kRow` carries the two instants. A value-initialised result is `kUnavailable`: a caller
+/// that forgets to fill it fails closed. So does an `AuthManager` with no SessionStore
+/// attached: a serving process always has one (the server refuses to boot without Postgres),
+/// so that shape is a wiring fault and is reported as an unavailable read, never aged on a
+/// replica clock.
+struct DurableMfaProof {
+    enum class Source {
+        kUnavailable, ///< read degraded or no store attached: fail closed, never "no proof"
+        kAbsent,      ///< no such durable session, or it belongs to another principal
+        kRow,         ///< `mfa_verified_ms` / `db_now_ms` are valid
+    };
+    Source source{Source::kUnavailable};
+    std::int64_t mfa_verified_ms{0}; ///< 0 = the row carries no proof
+    std::int64_t db_now_ms{0};
+};
+static_assert(DurableMfaProof{}.source == DurableMfaProof::Source::kUnavailable,
+              "a default-constructed DurableMfaProof must refuse (fail closed)");
+static_assert(static_cast<int>(DurableMfaProof::Source::kUnavailable) == 0,
+              "kUnavailable must stay the zero value");
 
 /// True iff `s` currently holds an unexpired, in-ceiling JIT admin elevation.
 /// Decided against the local MONOTONIC steady deadline derived at populate
@@ -924,6 +956,16 @@ public:
     /// Look up a session by cookie token. An empty token (no cookie) and an over-long one
     /// never match; both return nullopt before any cache or store access.
     std::optional<Session> validate_session(const std::string& token) const;
+
+    /// Authoritative read of `token`'s durable MFA proof for the approver freshness gate
+    /// (#6079). Always goes to `SessionStore::find` (never the validate cache), so a cached
+    /// session on a replica whose steady clock was paused by a suspend cannot vouch for itself.
+    /// `kUnavailable` when no store is wired (a wiring fault, not counted) or on a degraded
+    /// read (counted under the existing `validate` op); `kAbsent` for an empty / oversized
+    /// token, a missing row, or a row whose principal is not `expected_username`. Read-only:
+    /// no mutation, no cache write.
+    [[nodiscard]] DurableMfaProof read_durable_mfa_proof(const std::string& token,
+                                                         std::string_view expected_username) const;
 
 private:
     /// Store-backed validate path (HA WS-1/1a): cache-first, then authoritative

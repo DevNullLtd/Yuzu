@@ -7,10 +7,9 @@
  *
  * Pins three contracts called out in #117 (response-streaming coverage):
  *
- *   1. record_execution_id() registers the command_id → execution_id
+ *   1. record_command_dispatch() registers the command_id → (plugin, execution_id)
  *      mapping consumed at response receipt; passing an empty
- *      execution_id removes the entry (the documented "clear" semantics
- *      from agent_service_impl.cpp:586).
+ *      execution_id keeps the recorded one (it never clears it).
  *
  *   2. process_gateway_response() stamps execution_id onto every
  *      StoredResponse (RUNNING and terminal branches both), so the
@@ -35,6 +34,7 @@
 #include "agent_registry.hpp"
 #include "app_usage_store.hpp"
 #include "audit_store.hpp"
+#include "certificate_inventory_store.hpp"
 #include "enrollment_token_rejection.hpp"
 #include "event_bus.hpp"
 #include "execution_tracker.hpp"
@@ -44,10 +44,13 @@
 #include "notification_store.hpp"
 #include "offload_target_store.hpp"
 #include "peer_ip.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "test_auth_db_pg_helper.hpp" // WS-6 6.2: enrollment state is PG-backed
+#include "test_forensics_tier_fixture.hpp" // #4990: the catalogue-derived Forensics plugin set
 #include "test_offload_target_store_pg_helper.hpp"
+#include "test_provenance_fake.hpp" // #4990: harness record source when no tracker is wired
 #include "test_tracker_scope.hpp"
 #include "test_webhook_store_pg_helper.hpp"
 #include "typed_inventory_sources.hpp"
@@ -83,6 +86,12 @@ using yuzu::server::OffloadAuthType;
 using yuzu::server::OffloadTargetStore;
 using yuzu::server::ResponseStore;
 using yuzu::server::StoredResponse;
+
+// #4990: reads in this file are test oracles, not an operator surface, so they take no tier
+// restriction (the tier itself is pinned in test_response_store.cpp / test_response_tier_filter.cpp).
+namespace {
+const auto kAllRows = yuzu::server::ResponseTierFilter::unrestricted_internal_consumer();
+} // namespace
 using yuzu::server::WebhookStore;
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::AgentServiceImpl;
@@ -177,6 +186,12 @@ struct GatewayResponseHarness {
         REQUIRE(audit->is_open());
         svc.set_response_store(&responses);
         svc.set_audit_store(audit.get());
+        // #4990: unwired fails closed (error_detail is sanitized for every plugin), so the
+        // ordinary-plugin cases below need the set wired like production.
+        svc.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
+        // #4990: a frame's plugin comes from a dispatch record; without a tracker this harness
+        // answers with the id's prefix (a TrackerScope clears it and reads real records).
+        yuzu::test::use_prefix_provenance(svc);
     }
 
     static apb::CommandResponse make_response(const std::string& command_id,
@@ -203,23 +218,23 @@ struct GatewayResponseHarness {
 // in svc is nulled before the tracker destructs (mirrors the production
 // shutdown contract documented on AgentServiceImpl::set_execution_tracker).
 
-// ── record_execution_id ────────────────────────────────────────────────────
+// ── record_command_dispatch ────────────────────────────────────────────────
 
-TEST_CASE("record_execution_id: terminal response stamps mapped execution_id",
+TEST_CASE("record_command_dispatch: terminal response stamps mapped execution_id",
           "[pg][agent_service][executions][pr2]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
-    // HA WS-1(1b): record_execution_id now routes through ExecutionTracker
+    // HA WS-1(1b): record_command_dispatch routes through ExecutionTracker
     // (PG-backed), so this test needs one wired — mirrors the #872 tests.
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-A", "exec-42");
+    h.svc.record_command_dispatch("cmd-A", "echo", "exec-42");
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS,
                                                       /*output=*/"", /*exit_code=*/0);
     h.svc.process_gateway_response("agent-1", resp);
 
-    auto rows_opt = h.responses.query_by_execution("exec-42");
+    auto rows_opt = h.responses.query_by_execution("exec-42", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
@@ -229,26 +244,25 @@ TEST_CASE("record_execution_id: terminal response stamps mapped execution_id",
     CHECK(rows[0].status == static_cast<int>(apb::CommandResponse::SUCCESS));
 }
 
-TEST_CASE("record_execution_id: empty execution_id removes the mapping",
+TEST_CASE("record_command_dispatch: an empty execution_id never erases a recorded one",
           "[pg][agent_service][executions][pr2]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-A", "exec-42");
-    h.svc.record_execution_id("cmd-A", ""); // documented clear semantics
+    h.svc.record_command_dispatch("cmd-A", "echo", "exec-42");
+    // A re-drive of the same occurrence that does not carry the execution id (#4990): the record
+    // keeps the correlation, and the plugin stays the first writer's.
+    h.svc.record_command_dispatch("cmd-A", "echo", "");
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", resp);
 
-    auto by_exec = h.responses.query_by_execution("exec-42");
+    auto by_exec = h.responses.query_by_execution("exec-42", kAllRows);
     REQUIRE(by_exec.has_value());
-    CHECK(by_exec->empty()); // mapping cleared → row not tagged
-    auto by_cmd_opt = h.responses.get_by_instruction("cmd-A");
-    REQUIRE(by_cmd_opt.has_value());
-    const auto& by_cmd = *by_cmd_opt;
-    REQUIRE(by_cmd.size() == 1);
-    CHECK(by_cmd[0].execution_id.empty());
+    REQUIRE(by_exec->size() == 1);
+    CHECK((*by_exec)[0].execution_id == "exec-42");
+    CHECK((*by_exec)[0].plugin == "echo");
 }
 
 // ── process_gateway_response: per-status branches ──────────────────────────
@@ -263,14 +277,14 @@ TEST_CASE("process_gateway_response: RUNNING streaming row carries execution_id"
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-stream", "exec-stream");
+    h.svc.record_command_dispatch("cmd-stream", "echo", "exec-stream");
 
     auto running =
         GatewayResponseHarness::make_response("cmd-stream", apb::CommandResponse::RUNNING,
                                               /*output=*/"row-1");
     h.svc.process_gateway_response("agent-1", running);
 
-    auto rows_opt = h.responses.query_by_execution("exec-stream");
+    auto rows_opt = h.responses.query_by_execution("exec-stream", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
@@ -284,7 +298,7 @@ TEST_CASE("process_gateway_response: FAILURE preserves error_detail and executio
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-fail", "exec-fail");
+    h.svc.record_command_dispatch("cmd-fail", "echo", "exec-fail");
 
     auto resp = GatewayResponseHarness::make_response("cmd-fail", apb::CommandResponse::FAILURE,
                                                       /*output=*/"",
@@ -292,7 +306,7 @@ TEST_CASE("process_gateway_response: FAILURE preserves error_detail and executio
     resp.mutable_error()->set_message("plugin returned non-zero");
     h.svc.process_gateway_response("agent-1", resp);
 
-    auto rows_opt = h.responses.query_by_execution("exec-fail");
+    auto rows_opt = h.responses.query_by_execution("exec-fail", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
@@ -321,7 +335,7 @@ TEST_CASE("process_gateway_response: a #4672 synthetic gateway-forward terminal 
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-gwfwd", "exec-gwfwd");
+    h.svc.record_command_dispatch("cmd-gwfwd", "echo", "exec-gwfwd");
 
     auto synth = yuzu::server::build_gateway_forward_terminal_failure(
         "cmd-gwfwd", "gateway_unauthenticated",
@@ -329,7 +343,7 @@ TEST_CASE("process_gateway_response: a #4672 synthetic gateway-forward terminal 
         "not delivered");
     h.svc.process_gateway_response("agent-1", synth);
 
-    auto rows_opt = h.responses.query_by_execution("exec-gwfwd");
+    auto rows_opt = h.responses.query_by_execution("exec-gwfwd", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
@@ -361,7 +375,7 @@ TEST_CASE("process_gateway_response: a command left RUNNING then hit by a #4672 
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-stuck", "exec-stuck");
+    h.svc.record_command_dispatch("cmd-stuck", "echo", "exec-stuck");
 
     auto running = GatewayResponseHarness::make_response(
         "cmd-stuck", apb::CommandResponse::RUNNING, /*output=*/"still going");
@@ -372,7 +386,7 @@ TEST_CASE("process_gateway_response: a command left RUNNING then hit by a #4672 
         "Gateway unreachable after 3 attempts — command not delivered");
     h.svc.process_gateway_response("agent-1", synth);
 
-    auto rows_opt = h.responses.query_by_execution("exec-stuck");
+    auto rows_opt = h.responses.query_by_execution("exec-stuck", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1); // updated in place, not a second orphaned row
@@ -410,7 +424,7 @@ TEST_CASE("process_gateway_response: each of the five #4672 reason codes produce
             yuzu::server::build_gateway_forward_terminal_failure(c.command_id, c.reason, c.reason);
         h.svc.process_gateway_response("agent-1", synth);
 
-        auto by_cmd_opt = h.responses.get_by_instruction(c.command_id);
+        auto by_cmd_opt = h.responses.get_by_instruction(c.command_id, kAllRows);
         REQUIRE(by_cmd_opt.has_value());
         const auto& by_cmd = *by_cmd_opt;
         REQUIRE(by_cmd.size() == 1);
@@ -422,7 +436,7 @@ TEST_CASE("process_gateway_response: each of the five #4672 reason codes produce
 TEST_CASE("process_gateway_response: unmapped command_id stamps empty execution_id",
           "[pg][agent_service][executions][pr2]") {
     // Out-of-band dispatch (CLI / direct gRPC) bypasses the dispatch path
-    // that calls record_execution_id. The receipt path must degrade to an
+    // that calls record_command_dispatch. The receipt path must degrade to an
     // empty execution_id rather than crashing or inventing a value.
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -434,7 +448,7 @@ TEST_CASE("process_gateway_response: unmapped command_id stamps empty execution_
     auto resp = GatewayResponseHarness::make_response("cmd-orphan", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", resp);
 
-    auto by_cmd_opt = h.responses.get_by_instruction("cmd-orphan");
+    auto by_cmd_opt = h.responses.get_by_instruction("cmd-orphan", kAllRows);
     REQUIRE(by_cmd_opt.has_value());
     const auto& by_cmd = *by_cmd_opt;
     REQUIRE(by_cmd.size() == 1);
@@ -469,7 +483,7 @@ TEST_CASE("process_gateway_response: terminal branch does NOT erase mapping "
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-fan", "exec-fan");
+    h.svc.record_command_dispatch("cmd-fan", "echo", "exec-fan");
 
     struct AgentTerminal {
         const char* agent;
@@ -486,7 +500,7 @@ TEST_CASE("process_gateway_response: terminal branch does NOT erase mapping "
         h.svc.process_gateway_response(t.agent, r);
     }
 
-    auto rows_opt = h.responses.query_by_execution("exec-fan");
+    auto rows_opt = h.responses.query_by_execution("exec-fan", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 4);
@@ -510,16 +524,16 @@ TEST_CASE("process_gateway_response: __timing__ sentinel takes the early-return 
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-time", "exec-time");
+    h.svc.record_command_dispatch("cmd-time", "echo", "exec-time");
 
     auto timing = GatewayResponseHarness::make_response("cmd-time", apb::CommandResponse::RUNNING,
                                                         /*output=*/"__timing__|elapsed=42");
     h.svc.process_gateway_response("agent-1", timing);
 
-    auto time_by_exec = h.responses.query_by_execution("exec-time");
+    auto time_by_exec = h.responses.query_by_execution("exec-time", kAllRows);
     REQUIRE(time_by_exec.has_value());
     CHECK(time_by_exec->empty());
-    auto time_by_cmd = h.responses.get_by_instruction("cmd-time");
+    auto time_by_cmd = h.responses.get_by_instruction("cmd-time", kAllRows);
     REQUIRE(time_by_cmd.has_value());
     CHECK(time_by_cmd->empty());
 }
@@ -537,7 +551,7 @@ TEST_CASE("process_gateway_response: terminal SUCCESS folds into existing RUNNIN
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-mix", "exec-mix");
+    h.svc.record_command_dispatch("cmd-mix", "echo", "exec-mix");
 
     auto r1 = GatewayResponseHarness::make_response("cmd-mix", apb::CommandResponse::RUNNING,
                                                     /*output=*/"line-1");
@@ -548,7 +562,7 @@ TEST_CASE("process_gateway_response: terminal SUCCESS folds into existing RUNNIN
     auto r3 = GatewayResponseHarness::make_response("cmd-mix", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", r3);
 
-    auto rows_opt = h.responses.query_by_execution("exec-mix");
+    auto rows_opt = h.responses.query_by_execution("exec-mix", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 2);
@@ -568,12 +582,12 @@ TEST_CASE("process_gateway_response: terminal frame WITH output still inserts",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-direct", "exec-direct");
+    h.svc.record_command_dispatch("cmd-direct", "echo", "exec-direct");
     auto only = GatewayResponseHarness::make_response("cmd-direct", apb::CommandResponse::SUCCESS,
                                                       /*output=*/"final-data");
     h.svc.process_gateway_response("agent-1", only);
 
-    auto rows_opt = h.responses.query_by_execution("exec-direct");
+    auto rows_opt = h.responses.query_by_execution("exec-direct", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
@@ -597,22 +611,22 @@ TEST_CASE("process_gateway_response: re-mapping a command_id updates the stamp",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
-    h.svc.record_execution_id("cmd-re", "exec-old");
+    h.svc.record_command_dispatch("cmd-re", "echo", "exec-old");
     auto first = GatewayResponseHarness::make_response("cmd-re", apb::CommandResponse::RUNNING,
                                                        /*output=*/"old");
     h.svc.process_gateway_response("agent-1", first);
 
-    h.svc.record_execution_id("cmd-re", "exec-new");
+    h.svc.record_command_dispatch("cmd-re", "echo", "exec-new");
     auto second = GatewayResponseHarness::make_response("cmd-re", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", second);
 
-    auto old_rows_opt = h.responses.query_by_execution("exec-old");
+    auto old_rows_opt = h.responses.query_by_execution("exec-old", kAllRows);
     REQUIRE(old_rows_opt.has_value());
     const auto& old_rows = *old_rows_opt;
     REQUIRE(old_rows.size() == 1);
     CHECK(old_rows[0].status == static_cast<int>(apb::CommandResponse::RUNNING));
 
-    auto new_rows_opt = h.responses.query_by_execution("exec-new");
+    auto new_rows_opt = h.responses.query_by_execution("exec-new", kAllRows);
     REQUIRE(new_rows_opt.has_value());
     const auto& new_rows = *new_rows_opt;
     REQUIRE(new_rows.size() == 1);
@@ -2116,6 +2130,21 @@ TEST_CASE("ProxyRegister: a wired signer issues a per-agent cert for a gateway-e
 }
 
 namespace {
+// True when the generic store holds a raw row for (agent_id, plugin). Read in SQL,
+// NOT through InventoryStore::get: get() excludes typed sources (ADR-0070 D12), so
+// a get()-based check would stay green with the gateway skip deleted.
+bool generic_row_exists(yuzu::server::pg::PgPool& pool, const std::string& agent_id,
+                        const std::string& plugin) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT 1 FROM inventory_store.inventory_data WHERE agent_id = $1 AND plugin = $2",
+        std::vector<std::string>{agent_id, plugin});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    return PQntuples(res.get()) > 0;
+}
+
 // Pre-migrated template (see PgTestTemplate in test_helpers.hpp): the generic
 // InventoryStore is the only PG store these two [pg] tests construct.
 yuzu::test::PgTestTemplate inventory_h1_tpl{"agent_svc_inventory", [](const std::string& dsn) {
@@ -2163,13 +2192,15 @@ TEST_CASE("ProxyInventory: device_ci is NOT double-stored into the generic Inven
     apb::InventoryReport rpt;
     rpt.set_session_id(session_id);
     (*rpt.mutable_plugin_data())["device_ci"] = "raw-canonical-blob"; // typed → must be skipped
+    (*rpt.mutable_plugin_data())["certificate_inventory"] = "raw-cert-blob"; // typed, no seam yet
     (*rpt.mutable_plugin_data())["custom_source"] = "{\"k\":1}";      // generic → must be stored
     apb::InventoryAck ack;
     REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
 
-    auto device_ci_row = inv.get("agent-gw-inv", "device_ci");
-    REQUIRE(device_ci_row.has_value());      // not degraded
-    CHECK_FALSE(device_ci_row->has_value()); // H1: not in the generic store
+    CHECK_FALSE(generic_row_exists(pool, "agent-gw-inv", "device_ci")); // H1: not stored
+    // ADR-0070 D12 (slice-2 PR 2a-1): certificate_inventory is reserved as typed
+    // before its seam exists, so the gateway drops it rather than storing it here.
+    CHECK_FALSE(generic_row_exists(pool, "agent-gw-inv", "certificate_inventory"));
     auto custom_row = inv.get("agent-gw-inv", "custom_source");
     REQUIRE(custom_row.has_value());
     CHECK(custom_row->has_value()); // generic source still works
@@ -2218,9 +2249,7 @@ TEST_CASE("ProxyInventory: software_licensing is NOT double-stored into the gene
     apb::InventoryAck ack;
     REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
 
-    auto lic_row = inv.get("agent-gw-lic", "software_licensing");
-    REQUIRE(lic_row.has_value());      // not degraded
-    CHECK_FALSE(lic_row->has_value()); // not double-stored
+    CHECK_FALSE(generic_row_exists(pool, "agent-gw-lic", "software_licensing")); // not stored
     auto custom_row = inv.get("agent-gw-lic", "custom_source");
     REQUIRE(custom_row.has_value());
     CHECK(custom_row->has_value()); // generic source still works
@@ -2368,12 +2397,132 @@ TEST_CASE("ProxyInventory: app_usage is NOT double-stored into the generic Inven
     REQUIRE(rows.has_value());
     CHECK(rows->size() == 1);
     // ...but the generic store never sees it.
-    auto usage_row = inv.get("agent-gw-usage-mixed", "app_usage");
-    REQUIRE(usage_row.has_value());      // not degraded
-    CHECK_FALSE(usage_row->has_value()); // not double-stored
+    CHECK_FALSE(generic_row_exists(pool, "agent-gw-usage-mixed", "app_usage")); // not stored
     auto custom_row = inv.get("agent-gw-usage-mixed", "custom_source");
     REQUIRE(custom_row.has_value());
     CHECK(custom_row->has_value()); // generic source still works
+}
+
+namespace {
+// Pre-migrated template for the certificate_inventory composition tests (slice-2 PR 2a-2a): the
+// generic InventoryStore (the gateway must NOT double-store into it) and the typed store.
+yuzu::test::PgTestTemplate cert_inventory_composition_tpl{
+    "agent_svc_cert_inventory", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::InventoryStore inv_store{pool};
+        yuzu::server::CertificateInventoryStore cert_store{pool};
+        if (!inv_store.is_open() || !cert_store.is_open())
+            throw std::runtime_error(
+                "agent_svc_cert_inventory template: a store failed to migrate");
+    }};
+
+// A minimal valid `certificate_inventory` blob: one ok store and one certificate in it.
+std::string make_cert_inventory_blob() {
+    const std::string sha(64, 'a');
+    return "ver|1\n"
+           "store|LocalMachine\\\\Root|machine|ok||1\n"
+           "cert|" + sha + "|" + std::string(40, 'b') + "|" + std::string(64, 'c') +
+           "|3|0A1B|CN=x|CN=y|" + std::string(64, 'd') + "|" + std::string(64, 'e') +
+           "|2020-01-01T00:00:00Z|2030-01-01T00:00:00Z\n"
+           "loc|" + sha + "|LocalMachine\\\\Root|\n";
+}
+
+bool cert_inventory_nacked(const apb::InventoryAck& ack) {
+    return std::find(ack.need_full().begin(), ack.need_full().end(), "certificate_inventory") !=
+           ack.need_full().end();
+}
+} // namespace
+
+TEST_CASE("ReportInventory (direct): certificate_inventory is stored, then erased by "
+          "delete_agent",
+          "[pg][agent_service][certinv]") {
+    using yuzu::server::CertificateInventoryStore;
+    YUZU_REQUIRE_PG_DB_TPL(db, cert_inventory_composition_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    GatewayResponseHarness h(pool);
+    CertificateInventoryStore certs{pool};
+    REQUIRE(certs.is_open());
+    h.svc.set_certificate_inventory_store(&certs);
+
+    auto raw = mint_enrollment_token(h.auth_mgr, "t1", /*max_uses=*/1, std::chrono::hours(1));
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id("agent-direct-cert");
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+    req.set_enrollment_token(raw);
+    apb::RegisterResponse resp;
+    REQUIRE(h.svc.Register(/*context=*/nullptr, &req, &resp).ok());
+    REQUIRE(resp.accepted());
+
+    apb::InventoryReport rpt;
+    rpt.set_session_id(resp.session_id());
+    (*rpt.mutable_content_hashes())["certificate_inventory"] = "claimed-hash";
+    (*rpt.mutable_plugin_data())["certificate_inventory"] = make_cert_inventory_blob();
+    apb::InventoryAck ack;
+    REQUIRE(h.svc.ReportInventory(/*context=*/nullptr, &rpt, &ack).ok());
+    CHECK_FALSE(cert_inventory_nacked(ack));
+    REQUIRE(certs.row_counts("agent-direct-cert").has_value());
+    CHECK(certs.row_counts("agent-direct-cert")->cert_fact == 1);
+    CHECK(certs.row_counts("agent-direct-cert")->cert_location == 1);
+
+    // Erase the device: every certificate row goes.
+    REQUIRE(certs.delete_agent("agent-direct-cert"));
+    const auto rc = certs.row_counts("agent-direct-cert");
+    REQUIRE(rc.has_value());
+    CHECK(rc->agent_state + rc->store_state + rc->cert_location + rc->cert_fact + rc->cert_san +
+              rc->cert_eku + rc->cert_cdp ==
+          0);
+}
+
+TEST_CASE("ProxyInventory (gateway): certificate_inventory reaches the typed store, never the "
+          "generic one, and delete_agent erases it",
+          "[pg][agent_service][gateway][inventory][certinv]") {
+    using yuzu::server::CertificateInventoryStore;
+    using yuzu::server::InventoryStore;
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, cert_inventory_composition_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+    InventoryStore inv{pool};
+    REQUIRE(inv.is_open());
+    gateway_svc.set_inventory_store(&inv);
+    CertificateInventoryStore certs{pool};
+    REQUIRE(certs.is_open());
+    gateway_svc.set_certificate_inventory_store(&certs);
+
+    auto reg = make_gw_register(h.auth_mgr, "agent-gw-cert", /*csr_pem=*/"");
+    apb::RegisterResponse rresp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &reg, &rresp).ok());
+    REQUIRE(rresp.accepted());
+
+    apb::InventoryReport rpt;
+    rpt.set_session_id(rresp.session_id());
+    (*rpt.mutable_content_hashes())["certificate_inventory"] = "claimed-hash";
+    (*rpt.mutable_plugin_data())["certificate_inventory"] = make_cert_inventory_blob(); // typed
+    (*rpt.mutable_plugin_data())["custom_source"] = "{\"k\":1}";                      // generic
+    apb::InventoryAck ack;
+    REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
+    CHECK_FALSE(cert_inventory_nacked(ack));
+
+    REQUIRE(certs.row_counts("agent-gw-cert").has_value());
+    CHECK(certs.row_counts("agent-gw-cert")->cert_fact == 1);
+    CHECK_FALSE(generic_row_exists(pool, "agent-gw-cert", "certificate_inventory"));
+    auto custom_row = inv.get("agent-gw-cert", "custom_source");
+    REQUIRE(custom_row.has_value());
+    CHECK(custom_row->has_value()); // generic sources still work
+
+    REQUIRE(certs.delete_agent("agent-gw-cert"));
+    const auto rc = certs.row_counts("agent-gw-cert");
+    REQUIRE(rc.has_value());
+    CHECK(rc->agent_state + rc->store_state + rc->cert_location + rc->cert_fact + rc->cert_san +
+              rc->cert_eku + rc->cert_cdp ==
+          0);
+    CHECK_FALSE(generic_row_exists(pool, "agent-gw-cert", "certificate_inventory"));
 }
 
 TEST_CASE("ProxyInventory: over-cap source maps are rejected before generic writes",
@@ -2746,7 +2895,7 @@ TEST_CASE("notify_exec_tracker: RUNNING maps to status='running' with "
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
-    h.svc.record_execution_id("cmd-A", exec_id);
+    h.svc.record_command_dispatch("cmd-A", "echo", exec_id);
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::RUNNING,
                                                       /*output=*/"row-1");
@@ -2775,7 +2924,7 @@ TEST_CASE("process_gateway_response: the __keepalive__ sentinel renews the concu
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
-    h.svc.record_execution_id("cmd-keepalive", exec_id);
+    h.svc.record_command_dispatch("cmd-keepalive", "echo", exec_id);
 
     auto ping = GatewayResponseHarness::make_response("cmd-keepalive", apb::CommandResponse::RUNNING,
                                                        /*output=*/"__keepalive__");
@@ -2791,7 +2940,7 @@ TEST_CASE("process_gateway_response: the __keepalive__ sentinel renews the concu
     CHECK(ka_statuses[0].completed_at == 0);
 
     // Did NOT reach ResponseStore::store — no row landed for the drawer/SSE.
-    auto rows_opt = h.responses.query_by_execution(exec_id);
+    auto rows_opt = h.responses.query_by_execution(exec_id, kAllRows);
     REQUIRE(rows_opt.has_value());
     CHECK(rows_opt->empty());
 }
@@ -2804,11 +2953,11 @@ TEST_CASE("notify_exec_tracker: the by-command concurrency-claim fallback fires 
     // renew_concurrency_claim_by_command restore claim release/renewal...",
     // test_execution_tracker.cpp) proves the fallback methods work in
     // isolation. It does NOT prove notify_exec_tracker's own decision logic
-    // (the RUNNING-vs-terminal switch, the resolve_execution_id-miss branch
+    // (the RUNNING-vs-terminal switch, the unrecorded-execution-id branch
     // condition) actually reaches them correctly when driven through the
     // real AgentServiceImpl entry point a live agent connection uses. This
-    // test closes that gap: deliberately never calls record_execution_id
-    // (so resolve_execution_id genuinely misses, matching an unresolved
+    // test closes that gap: deliberately never calls record_command_dispatch
+    // (so the provenance lookup genuinely misses, matching an unresolved
     // workflow-step dispatch or a correlation-table degrade), claims a slot
     // directly on the tracker, then drives real CommandResponses through
     // process_gateway_response and asserts the claim renews then releases.
@@ -2855,7 +3004,7 @@ TEST_CASE("notify_exec_tracker: the by-command concurrency-claim fallback fires 
     // Confirms nothing leaked into the normal execution_id-resolved path
     // (no agent_exec_status row, since no execution was ever created/
     // correlated for this command_id).
-    CHECK(h.responses.query_by_execution("exec-unresolved")->empty());
+    CHECK(h.responses.query_by_execution("exec-unresolved", kAllRows)->empty());
 }
 
 TEST_CASE("notify_exec_tracker: a __guard__- command_id short-circuits the by-command fallback "
@@ -2900,7 +3049,7 @@ TEST_CASE("notify_exec_tracker: SUCCESS maps to status='success' and stamps "
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
-    h.svc.record_execution_id("cmd-A", exec_id);
+    h.svc.record_command_dispatch("cmd-A", "echo", exec_id);
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS,
                                                       /*output=*/"", /*exit_code=*/0);
@@ -2921,7 +3070,7 @@ TEST_CASE("notify_exec_tracker: FAILURE preserves error_detail and exit_code",
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
-    h.svc.record_execution_id("cmd-A", exec_id);
+    h.svc.record_command_dispatch("cmd-A", "echo", exec_id);
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::FAILURE,
                                                       /*output=*/"", /*exit_code=*/3);
@@ -2943,7 +3092,7 @@ TEST_CASE("notify_exec_tracker: TIMEOUT maps to status='timeout'",
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
-    h.svc.record_execution_id("cmd-A", exec_id);
+    h.svc.record_command_dispatch("cmd-A", "echo", exec_id);
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::TIMEOUT);
     h.svc.process_gateway_response("agent-1", resp);
@@ -2976,7 +3125,7 @@ TEST_CASE("notify_exec_tracker: REJECTED maps to status='rejected'",
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
-    h.svc.record_execution_id("cmd-A", exec_id);
+    h.svc.record_command_dispatch("cmd-A", "echo", exec_id);
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::REJECTED);
     h.svc.process_gateway_response("agent-1", resp);
@@ -3000,7 +3149,7 @@ TEST_CASE("notify_exec_tracker: REJECTED maps to status='rejected'",
 
 TEST_CASE("notify_exec_tracker: unmapped command_id is a no-op",
           "[pg][agent_service][executions][issue872]") {
-    // Out-of-band dispatch (CLI / direct gRPC) never calls record_execution_id.
+    // Out-of-band dispatch (CLI / direct gRPC) never calls record_command_dispatch.
     // notify_exec_tracker must early-return on empty execution_id rather than
     // upserting under a fabricated id — those rows would be invisible to every
     // tracker query (all filter by execution_id) but would still bloat the
@@ -3011,7 +3160,7 @@ TEST_CASE("notify_exec_tracker: unmapped command_id is a no-op",
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
-    // Deliberately do NOT call record_execution_id — cmd-orphan is unmapped.
+    // Deliberately do NOT call record_command_dispatch — cmd-orphan is unmapped.
 
     auto resp = GatewayResponseHarness::make_response("cmd-orphan", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", resp);
@@ -3031,7 +3180,7 @@ TEST_CASE("notify_exec_tracker: non-tracked correlation-id prefixes produce "
     // agent-transition SSE event. test_execution_tracker.cpp proves the
     // STORE round-trips these values opaquely; THIS test proves the
     // actual DECISION SITE (notify_exec_tracker, reached only through
-    // resolve_execution_id -> ExecutionTracker::lookup_execution_id, the
+    // resolve_response_provenance -> ExecutionTracker::lookup_command_record, the
     // PG-backed path this PR migrated) still honours the skip — the
     // property a prior version of this PR's own test claimed to prove
     // but didn't (it looked up an unwritten key, never exercising this
@@ -3045,7 +3194,7 @@ TEST_CASE("notify_exec_tracker: non-tracked correlation-id prefixes produce "
          {"polchk-abc123", "bundle-def456", "preflight-run1-check2", "deployment-xyz-stage"}) {
         CAPTURE(execution_id);
         const std::string command_id = "plugin-cmd-" + execution_id;
-        h.svc.record_execution_id(command_id, execution_id);
+        h.svc.record_command_dispatch(command_id, "echo", execution_id);
 
         auto resp = GatewayResponseHarness::make_response(command_id, apb::CommandResponse::SUCCESS);
         h.svc.process_gateway_response("agent-1", resp);
@@ -3054,7 +3203,7 @@ TEST_CASE("notify_exec_tracker: non-tracked correlation-id prefixes produce "
     }
 }
 
-TEST_CASE("resolve_execution_id bumps yuzu_exec_correlation_read_degrade_total "
+TEST_CASE("resolve_response_provenance bumps yuzu_exec_correlation_read_degrade_total "
           "by reason (adversarial review, PR #3780)",
           "[pg][agent_service][executions]") {
     // The read-degrade counter is the only signal for a sustained lookup
@@ -3069,7 +3218,7 @@ TEST_CASE("resolve_execution_id bumps yuzu_exec_correlation_read_degrade_total "
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
 
-    h.svc.record_execution_id("cmd-A", "exec-42"); // a mapping DOES exist...
+    h.svc.record_command_dispatch("cmd-A", "echo", "exec-42"); // a mapping DOES exist...
 
     {
         auto lease = pool.acquire();
@@ -3084,13 +3233,19 @@ TEST_CASE("resolve_execution_id bumps yuzu_exec_correlation_read_degrade_total "
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", resp);
 
-    // A terminal response resolves execution_id from TWO independent call
-    // sites (response-store stamping at agent_service_impl.cpp:1577, then
-    // again inside notify_exec_tracker at :1606) — both hit the dropped
-    // table, so the counter increments twice per response, not once.
+    // A frame's provenance is resolved ONCE (#4990), with one bounded retry on a degraded read:
+    // both attempts hit the dropped table, so the counter increments twice per response, and the
+    // frame is counted as lookup_degraded and stored as unverified, never as ordinary.
     CHECK(h.metrics
               .counter("yuzu_exec_correlation_read_degrade_total", {{"reason", "query_failed"}})
               .value() == 2.0);
+    CHECK(h.metrics
+              .counter("yuzu_server_response_provenance_total", {{"outcome", "lookup_degraded"}})
+              .value() == 1.0);
+    auto rows = h.responses.get_by_instruction("cmd-A", kAllRows);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].plugin == std::string(yuzu::server::kUnverifiedProvenanceLabel));
 }
 
 TEST_CASE("notify_exec_tracker: null tracker pointer is a no-op (shutdown contract)",
@@ -3110,7 +3265,7 @@ TEST_CASE("notify_exec_tracker: null tracker pointer is a no-op (shutdown contra
         // ~TrackerScope calls set_execution_tracker(nullptr) before destroying
         // the tracker, leaving svc.execution_tracker_ at nullptr.
     }
-    h.svc.record_execution_id("cmd-A", "exec-42");
+    h.svc.record_command_dispatch("cmd-A", "echo", "exec-42");
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS);
     // Must not crash, must not dereference the destroyed tracker.
@@ -4036,6 +4191,27 @@ TEST_CASE("typed_inventory_sources: app_usage is a typed source (PR7b.3 guard)",
     CHECK(yuzu::server::is_typed_inventory_source("app_perf"));
     CHECK(yuzu::server::is_typed_inventory_source("device_ci"));
     CHECK(yuzu::server::is_typed_inventory_source("software_licensing"));
+}
+
+TEST_CASE("typed_inventory_sources: one list drives the predicate, and certificate_inventory "
+          "is reserved before its seam exists (ADR-0070 D12)",
+          "[server][inventory][typed]") {
+    using yuzu::server::is_typed_inventory_source;
+    using yuzu::server::kTypedInventorySources;
+    // The predicate (gateway skip), the boot purge and the read filter all iterate
+    // kTypedInventorySources. Pin the exact set, so removing or renaming a source
+    // fails here rather than silently reopening that source's generic read.
+    static_assert(kTypedInventorySources.size() == 6);
+    for (const auto name : {"installed_software", "app_perf", "device_ci", "software_licensing",
+                            "app_usage", "certificate_inventory"})
+        CHECK(is_typed_inventory_source(name));
+    CHECK(is_typed_inventory_source("certificate_inventory"));
+    static_assert(is_typed_inventory_source("certificate_inventory"));
+    // A generic source and near-misses are not typed.
+    CHECK_FALSE(is_typed_inventory_source("custom_source"));
+    CHECK_FALSE(is_typed_inventory_source("certificates"));
+    CHECK_FALSE(is_typed_inventory_source(""));
+    CHECK_FALSE(is_typed_inventory_source("App_Usage"));
 }
 
 // ── WS-6 6.2 — token SHAPE pre-check + descriptive-field sanitising ─────────

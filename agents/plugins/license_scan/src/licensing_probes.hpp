@@ -27,6 +27,7 @@
 
 #include "licensing_record.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <ctime>
 #include <optional>
@@ -39,6 +40,34 @@ namespace yuzu::license_scan {
 
 enum class Platform { windows_os, linux_os, macos_os };
 enum class Scope { machine, user };
+
+/// Result of ProbeHost::read_file_capped. Exactly one of three shapes:
+///   - data set, err 0, oversized false  — the whole file, <= cap bytes;
+///   - oversized true, data nullopt, err 0 — the file is larger than the cap
+///     (never a truncated read: a caller must not parse half a certificate);
+///   - data nullopt, err != 0 — the open/read failed; `err` is the errno the
+///     failing call reported (copied at the failure site, never read from the
+///     ambient errno afterwards). A non-regular file (FIFO, device) reports
+///     EINVAL.
+/// Callers distinguish absence (ENOENT/ENOTDIR) from refusal (EACCES/EPERM);
+/// the plain ifstream-based read_file_prefix cannot.
+struct CappedRead {
+    std::optional<std::string> data;
+    int err = 0;
+    bool oversized = false;
+};
+
+/// Result of ProbeHost::list_dir: the entry NAMES of one directory (no `.`/`..`,
+/// no stat, no filtering), in readdir order. `err` is the open errno (0 on
+/// success), so an absent directory (ENOENT/ENOTDIR) is distinguishable from
+/// one the agent may not list (EACCES/EPERM). `truncated` is set when
+/// `max_entries` was reached with entries still unread: `names` is then a
+/// prefix and the caller must report an incomplete scan, never a clean one.
+struct DirListing {
+    std::vector<std::string> names;
+    int err = 0;
+    bool truncated = false;
+};
 
 /// I/O the engine and interpreters may perform. Filesystem operations have
 /// working defaults (licensing_probes.cpp, std::filesystem — bounded);
@@ -81,10 +110,32 @@ public:
     /// First max_bytes of a file, or nullopt when unreadable.
     virtual std::optional<std::string> read_file_prefix(std::string_view path,
                                                         std::size_t max_bytes);
+    /// Whole regular file up to `cap` bytes with errno-aware failure (see
+    /// CappedRead). The final path component IS followed (Leaf::follow). The
+    /// trees read are /etc/pki/entitlement (root-owned) and /Applications/*.app,
+    /// which is admin-writable (/Applications is root:admin 775 -- a local admin
+    /// can link Contents/Info.plist elsewhere); the cap and the regular-file
+    /// check bound what such a link costs. POSIX implementation:
+    /// yuzu::shared::read_file; the Windows default is a fail-closed stub
+    /// (err = EIO; Windows never calls it).
+    virtual CappedRead read_file_capped(std::string_view path, std::size_t cap);
+    /// Entry names of one directory, errno-aware and bounded (see DirListing).
+    /// The leaf is followed (Leaf::follow), same reasoning as read_file_capped.
+    /// POSIX implementation: yuzu::shared::open_dir + readdir on the fd; the
+    /// Windows default is a fail-closed stub (err = EIO; Windows never calls
+    /// it).
+    virtual DirListing list_dir(std::string_view path, std::size_t max_entries);
 
     /// Collection time (UTC epoch seconds) — virtual so tests can pin it and
     /// countdown→absolute-date conversions stay deterministic per run.
     virtual long long now_epoch() { return static_cast<long long>(::time(nullptr)); }
+
+    /// Monotonic clock for cooperative start gates (the entitlement_certs 10 s
+    /// budget) -- virtual so a test injects a controllable clock instead of
+    /// sleeping. Plugin-internal seam, not part of the plugin ABI.
+    virtual std::chrono::steady_clock::time_point now_steady() {
+        return std::chrono::steady_clock::now();
+    }
 };
 
 inline constexpr std::size_t kGlobMaxMatches = 512;
@@ -146,6 +197,20 @@ struct SurfaceRun {
 
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
 SurfaceRun run_platform_surfaces();
+#endif
+
+/// Individual per-OS surface runners, exported (like run_probe_specs and
+/// jetbrains_key_interpreter above) so a unit test can drive the shell that turns
+/// the pure seams into rows and probe outcomes through a controlled ProbeHost.
+/// Each appends its records and exactly one ProbeOutcome (entitlement_certs /
+/// mas_receipt) to the vectors it is given.
+#ifdef __linux__
+void run_entitlement_certs_surface(ProbeHost& host, std::vector<LicRecord>& records,
+                                   std::vector<ProbeOutcome>& outcomes);
+#endif
+#ifdef __APPLE__
+void run_mas_receipt_surface(ProbeHost& host, std::vector<LicRecord>& records,
+                             std::vector<ProbeOutcome>& outcomes);
 #endif
 
 } // namespace yuzu::license_scan

@@ -626,14 +626,15 @@ TEST_CASE("access routes: Assign is offered to a local account admin only, with 
     h.roles_result = std::vector<RbacRole>{role("Administrator", "d"), role("ITServiceOwner", "d"),
                                            role("Operator", "d"), role("Auditor.eu", "d"),
                                            role("PlatformEngineer", "d"), role("ApiTokenManager", "d"),
-                                           role("Viewer", "d"), role("Reviewer", "d")};
+                                           role("Viewer", "d"), role("Reviewer", "d"),
+                                           role("ForensicsAnalyst", "d")};
     h.wire();
     auto res = h.sink.dispatch("GET", "/fragments/access/roles/assignments");
     REQUIRE(res);
-    // The literal six, in catalogue order. A fixed list on purpose: comparing with the array the
+    // The literal seven, in catalogue order. A fixed list on purpose: comparing with the array the
     // code reads would stay green if someone added ITServiceOwner to it.
     CHECK_THAT(res->body, ContainsSubstring("data-roles=\"Administrator,Operator,PlatformEngineer,"
-                                            "ApiTokenManager,Viewer,Reviewer\""));
+                                            "ApiTokenManager,Viewer,Reviewer,ForensicsAnalyst\""));
     CHECK_THAT(res->body, !ContainsSubstring("ITServiceOwner,"));
     CHECK_THAT(res->body, !ContainsSubstring("Auditor.eu"));
 

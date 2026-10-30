@@ -511,7 +511,7 @@ keep them green and extend them to the new surface. Test names are the case titl
   Per-version author history is out of scope.
 - **Stale-payload ordering** is not closed fleet-wide until PR7 (agent stale-generation rejection).
 - **Mutating-class writes** (for example `filesystem.write_content`, `registry.set_value`),
-  `tar.*`, `power_health.set_power_plan`, `printing.clear_queue` and `content_dist` via the
+  `echo.*`, `power_health.set_power_plan`, `printing.clear_queue` and `content_dist` via the
   deployment pipeline (#3686) are not in the mandatory set.
 - **Scheduled execution of mandatory pairs is refused** (intent, PR5), not approved.
 - **Engine-submitted gated effects are refused** (D4), not rooted to an owner.
@@ -522,6 +522,12 @@ keep them green and extend them to the new surface. Test names are the case titl
 - **Step-up window 0 collapses assurance to session-only.** `--mfa-step-up-window-secs=0` already
   logs a boot warning; PR6 is intended to add an operational alert. Requiring an enrolled factor
   of every approver is #6079.
+
+  *Supersession note:* the SAML, window-0 and enrolled-factor items in this list describe the state
+  before #6079. SAML approvers are now refused in every configuration, the window-0 collapse of
+  approval assurance is closed (the approver window is 300 seconds at a setting of 0), and the
+  enrolled-factor requirement is implemented. See the #6079 note in
+  `docs/adr/1005-headless-platform-use-case-engines.md`.
 - **Emergency disarm is single-admin and alert-only.**
 - Arm-direction break-glass, per-version author history, and a plan-hash for Guardian group
   targeting are deferred.

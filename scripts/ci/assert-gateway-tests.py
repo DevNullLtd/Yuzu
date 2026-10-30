@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Fail a CI leg whose Meson configure did not register the gateway tests.
 
-meson.build builds the Erlang gateway and registers `gateway eunit` /
-`gateway ct` only when rebar3 is found AND an Erlang/OTP passing the pin
+meson.build builds the Erlang gateway and registers the `gateway eunit
+shard <X>` tests and `gateway ct` only when rebar3 is found AND an Erlang/OTP passing the pin
 (scripts/erlang_toolchain.py, 28.4 or any later 28.x) is resolved. Otherwise
 it skips them and the leg stays green with no gateway built or tested: the
 macOS leg ran that way from the start (#4841), and a runner that loses Erlang
@@ -17,13 +17,16 @@ meson.options predates it ("Unknown options"). The option stays available for
 local fresh setups. Pinned by tests/test_gateway_test_summary.py.
 
 Usage: assert-gateway-tests.py BUILDDIR
-Exit: 0 both tests registered; 1 missing (a ::error:: line is printed); 2 usage.
+Exit: 0 every test registered; 1 missing (a ::error:: line is printed); 2 usage.
 """
 import json
 import os
 import sys
 
-REQUIRED = ("gateway eunit", "gateway ct")
+# The eunit shard names track root meson.build's `_gw_eunit_shards`; adding a
+# shard there means adding its name here (tests/test_gateway_eunit_shards.py
+# fails until the two agree).
+REQUIRED = ("gateway eunit shard A", "gateway eunit shard B", "gateway ct")
 
 
 def missing_tests(intro_tests):

@@ -447,7 +447,7 @@ jobs:
   # - fedora:42, gateway: the bundled OTP crypto NIF needs OpenSSL SM4
   #   symbols Red Hat's OpenSSL lacks (#5171).
   #
-  # NON-GATING legs (matrix.experimental, ADR-2003 (Proposed, PR #5631) slice
+  # NON-GATING legs (matrix.experimental, ADR-2003 (Accepted, PR #5631) slice
   # S0): rockylinux:8 (the agent's glibc 2.28 floor) and amazonlinux:2023 are
   # expected to FAIL on the 0.14.x artefacts until the EL8-built agent lands
   # (ADR-2003 S2). They run so the gap is measured on every pre-release.

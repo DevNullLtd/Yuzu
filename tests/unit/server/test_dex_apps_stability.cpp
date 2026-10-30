@@ -19,6 +19,8 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <set>
@@ -268,7 +270,7 @@ TEST_CASE("apps json: a custom policy's source and revision and fault appear ver
 TEST_CASE("apps builder: a hand-built invalid in-force policy still degrades", "[dex][apps_model]") {
     DexPolicyInForce f;
     f.policy.tiers.edges.good = 95.0; // not below excellent
-    const auto m = build_dex_apps_model(nullptr, "7d", "2026-10-07T00:00:00Z",
+    const auto m = build_dex_apps_model(nullptr, "7d", "2026-10-07T00:00:00Z", "windows",
                                         std::vector<std::string>(50, "id"), f);
     CHECK(m.degraded);
     CHECK(m.degraded_reason == "score_policy_invalid");
@@ -278,7 +280,7 @@ TEST_CASE("apps builder: a hand-built invalid in-force policy still degrades", "
 // The invalid-policy arm needs an open store to discriminate, so it lives in
 // test_dex_api.cpp; a null store degrades regardless of the policy.
 TEST_CASE("apps builder: a null store degrades, never scores", "[dex][apps_model]") {
-    const auto m = build_dex_apps_model(nullptr, "7d", "2026-10-07T00:00:00Z",
+    const auto m = build_dex_apps_model(nullptr, "7d", "2026-10-07T00:00:00Z", "windows",
                                        std::vector<std::string>(50, "id"), def());
     CHECK(m.degraded);
     CHECK(m.apps.empty());
@@ -417,6 +419,31 @@ TEST_CASE("apps model: share and rate and score use the online figures only", "[
     CHECK(std::string(f.score.withheld) == "offline_affected");
 }
 
+TEST_CASE("apps scope: dex_normalize_apps_scope accepts the four tokens and nothing else",
+          "[dex][apps_model]") {
+    for (const char* s : {"all", "windows", "macos", "linux"})
+        CHECK(dex_normalize_apps_scope(s) == s);
+    for (const char* s : {"", "darwin", "Windows", "win"})
+        CHECK(dex_normalize_apps_scope(s).empty());
+}
+
+TEST_CASE("apps scope: dex_apps_online_ids selects the connected agents of the scope",
+          "[dex][apps_model]") {
+    DexFleet f;
+    f.connected_agents = {{"w1", "windows"}, {"l1", "linux"}, {"m1", "macos"}};
+    CHECK(dex_apps_online_ids(f, "windows") == std::vector<std::string>{"w1"});
+    CHECK(dex_apps_online_ids(f, "linux") == std::vector<std::string>{"l1"});
+    CHECK(dex_apps_online_ids(f, "macos") == std::vector<std::string>{"m1"});
+    CHECK(dex_apps_online_ids(f, "all") == std::vector<std::string>{"w1", "l1", "m1"});
+    CHECK(dex_apps_online_ids(DexFleet{}, "all").empty());
+}
+
+TEST_CASE("apps scope: the population basis is the scope plus _online", "[dex][apps_model]") {
+    CHECK(dex_apps_population_basis("windows") == "windows_online");
+    CHECK(dex_apps_population_basis("all") == "all_online");
+    CHECK(dex_apps_population_basis("linux") == "linux_online");
+}
+
 TEST_CASE("apps model: the score is published when every affected device is online",
           "[dex][apps_model]") {
     // The affected devices are all in the online set, so the online figures are the whole picture.
@@ -435,4 +462,130 @@ TEST_CASE("apps model: the score is published when every affected device is onli
     o.affected_online = 1;
     const auto u = dex_apps_model_from_rows("7d", {o}, std::nullopt, def());
     CHECK(std::string(u.apps[0].figures.score.withheld) == "no_population");
+}
+
+// -- AP-2.17 model parameters --------------------------------------------------
+
+namespace {
+DexPolicyInForce policy_in_force(DexScorePolicy p) {
+    DexPolicyInForce d;
+    d.policy = std::move(p);
+    d.source = "custom";
+    d.revision = "0123456789abcdef";
+    return d;
+}
+
+// The exact apps JSON the base build (before the model parameters) emitted for
+// total_row("a.exe", 12, 3, 7, 10, 3) at a population of 50 under the default policy,
+// captured from it and pinned as a literal.
+constexpr const char* kBaseAppsJson =
+    R"({"apps":[{"crashes":12,"distinct_devices":7,"distinct_devices_online":7,"hangs":3,"last_seen":"2026-10-14T00:00:00Z","profile":"default","rate_per_1000":{"estimate":300.0,"lower":167.9077226556663,"reliable":false,"upper":494.80437742971685},"score":{"band":"excellent","deductions":[{"assessed":true,"name":"breadth","points":8.4},{"assessed":true,"name":"crashes","points":0.8},{"assessed":true,"name":"hangs","points":0.096},{"assessed":false,"name":"regression","points":0.0}],"score":90.7,"withheld":null},"share_affected":{"estimate":0.14,"lower":0.06950833427016294,"reliable":false,"upper":0.2618619371058554},"subject":"a.exe","version_count":1,"versions":[],"versions_truncated":false}],"apps_total":0,"apps_truncated":false,"policy":{"fault":null,"revision":"default","source":"default","tiers":{"excellent":{"edge":90.0,"name":"excellent"},"fair":{"edge":60.0,"name":"fair"},"good":{"edge":75.0,"name":"good"},"poor":{"edge":0.0,"name":"poor"}}},"population":50,"population_basis":"windows_online","window":"7d"})";
+
+// Structural JSON equality: keys, types, integers, strings and bools exact; floats at a
+// 1e-12 relative tolerance. The rate and share bounds go through libm (lgamma/exp/log),
+// which differs across platforms in the last digits, so a byte compare is not portable.
+bool json_near(const nlohmann::json& a, const nlohmann::json& b) {
+    if (a.is_number_float() && b.is_number_float()) {
+        const double x = a.get<double>(), y = b.get<double>();
+        return x == y || std::abs(x - y) <= 1e-12 * std::abs(y);
+    }
+    if (a.type() != b.type())
+        return false;
+    if (a.is_object()) {
+        if (a.size() != b.size())
+            return false;
+        for (const auto& [k, v] : a.items())
+            if (!b.contains(k) || !json_near(v, b.at(k)))
+                return false;
+        return true;
+    }
+    if (a.is_array()) {
+        if (a.size() != b.size())
+            return false;
+        for (std::size_t i = 0; i < a.size(); ++i)
+            if (!json_near(a[i], b[i]))
+                return false;
+        return true;
+    }
+    return a == b;
+}
+} // namespace
+
+TEST_CASE("apps model: the default policy reproduces the base build's JSON byte for byte",
+          "[dex][apps_model]") {
+    const auto m = dex_apps_model_from_rows("7d", {total_row("a.exe", 12, 3, 7, 10, 3)}, 50, def());
+    CHECK(json_near(nlohmann::json::parse(dex_apps_json(m)), nlohmann::json::parse(kBaseAppsJson)));
+}
+
+TEST_CASE("apps model: the policy's interval confidence sets the share and rate intervals",
+          "[dex][apps_model]") {
+    auto p = dex_default_score_policy();
+    p.interval_confidence = 0.90;
+    const auto m = dex_apps_model_from_rows("7d", {total_row("a.exe", 12, 3, 7, 10, 3)}, 50,
+                                            policy_in_force(p));
+    const auto base = dex_apps_model_from_rows("7d", {total_row("a.exe", 12, 3, 7, 10, 3)}, 50, def());
+    const auto& f = m.apps[0].figures;
+    const auto& b = base.apps[0].figures;
+    REQUIRE((f.share_affected && f.rate_per_1000));
+    const auto share = dex_proportion(7, 50, 0.90);
+    CHECK(f.share_affected->lower == share->lower);
+    CHECK(f.share_affected->upper == share->upper);
+    CHECK(f.share_affected->lower > b.share_affected->lower); // narrower than at 95 percent
+    CHECK(f.share_affected->upper < b.share_affected->upper);
+    const auto rate = dex_rate(15, 50.0 / 1000.0, 0.90);
+    CHECK(f.rate_per_1000->lower == rate->lower);
+    CHECK(f.rate_per_1000->upper == rate->upper);
+    CHECK(f.rate_per_1000->estimate == b.rate_per_1000->estimate);
+    // The score is not an interval statistic: the same number and band.
+    REQUIRE(f.score.score);
+    CHECK(*f.score.score == Approx(90.704));
+    CHECK(*f.score.band == StabilityBand::Excellent);
+    CHECK(*f.score.score == *b.score.score);
+}
+
+TEST_CASE("apps model: a per-application regression start ratio marks the row an override",
+          "[dex][apps_model]") {
+    auto p = dex_default_score_policy();
+    DexScoreOverride o;
+    o.image = "a.exe";
+    o.regression_start_ratio = 1.5;
+    p.overrides.push_back(o);
+    REQUIRE_FALSE(dex_score_policy_fault(p).has_value());
+    const auto m = dex_apps_model_from_rows(
+        "7d", {total_row("a.exe", 12, 3, 7, 10, 3), total_row("b.exe", 2, 0, 1, 2, 0)}, 50,
+        policy_in_force(p));
+    REQUIRE(m.apps.size() == 2);
+    const auto& a = m.apps[0].subject == "a.exe" ? m.apps[0] : m.apps[1];
+    const auto& other = m.apps[0].subject == "a.exe" ? m.apps[1] : m.apps[0];
+    CHECK(a.profile == DexPolicyProfile::Override);
+    CHECK(other.profile == DexPolicyProfile::Default);
+    // Regression is not assessed on this read, so the score is the default one.
+    REQUIRE(a.figures.score.score);
+    CHECK(*a.figures.score.score == Approx(90.704));
+}
+
+TEST_CASE("apps model: a global per-device cap normalises the deductions and leaves the rest",
+          "[dex][apps_model]") {
+    auto p = dex_default_score_policy();
+    p.model.per_device_event_cap = 10;
+    const auto cap10 = dex_apps_model_from_rows("7d", {total_row("a.exe", 12, 3, 7, 10, 3)}, 50,
+                                                policy_in_force(p));
+    const auto base = dex_apps_model_from_rows("7d", {total_row("a.exe", 12, 3, 7, 10, 3)}, 50, def());
+    const auto& f = cap10.apps[0].figures;
+    const auto& b = base.apps[0].figures;
+    // Raw counts and both intervals do not depend on the cap.
+    CHECK(f.crashes == b.crashes);
+    CHECK(f.hangs == b.hangs);
+    CHECK(f.share_affected->lower == b.share_affected->lower);
+    CHECK(f.share_affected->upper == b.share_affected->upper);
+    CHECK(f.rate_per_1000->lower == b.rate_per_1000->lower);
+    CHECK(f.rate_per_1000->upper == b.rate_per_1000->upper);
+    // The capped sums come from the store rows; the normalisation n * cap comes from
+    // the policy, so crashes and hangs deduct exactly half of their default points.
+    REQUIRE((f.score.deductions.size() == 4 && b.score.deductions.size() == 4));
+    CHECK(f.score.deductions[0].points == b.score.deductions[0].points); // breadth
+    CHECK(f.score.deductions[1].points == Approx(b.score.deductions[1].points / 2.0));
+    CHECK(f.score.deductions[2].points == Approx(b.score.deductions[2].points / 2.0));
+    CHECK(f.score.deductions[1].points == Approx(0.4));
+    CHECK(f.score.deductions[2].points == Approx(0.048));
 }

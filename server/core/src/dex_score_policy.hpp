@@ -5,18 +5,24 @@
  * Pure, validated score policy for the application stability score, and the
  * resolver that returns the effective policy for one application.
  *
- * Header-only, includes only the standard library and dex_stability_score.hpp,
- * no I/O, no clock, no JSON. A customer's risk appetite is data: the three
- * lower band edges, the four tier display names and the four deduction
- * weights, globally and per application.
+ * Header-only, includes only the standard library, dex_stability_score.hpp and
+ * dex_stats.hpp (for the confidence range), no I/O, no clock, no JSON. A
+ * customer's risk appetite is data: the three lower band edges, the four tier
+ * display names, the four deduction weights and the scoring model parameters
+ * (per-device event cap, regression full-weight and start ratios, interval
+ * confidence level), globally and per application.
  *
- * Customisable: band edges, tier display names, deduction weights, and
- * per-application overrides of any of them. NOT customisable: the cohort
- * floor, the statistics, and the wire tokens (band labels, deduction names,
- * withheld reasons), which stay the closed vocabulary of dex_stability_score.hpp.
- * A display name is for people; a consumer keys on stability_band_label. The
- * withheld reason invalid_edges is the scorer's own refusal of a stored policy
- * that reached it without passing this validator.
+ * Customisable: band edges, tier display names, deduction weights, the
+ * per-device event cap and the two regression ratios, and per-application
+ * overrides of any of those. The interval confidence level is GLOBAL ONLY (an
+ * override cannot set it): it is the level of the Apps share and rate
+ * intervals, one for the whole page. NOT customisable: the cohort floor
+ * (kDexCohortFloor, a privacy constant), the statistics, and the wire tokens
+ * (band labels, deduction names, withheld reasons), which stay the closed
+ * vocabulary of dex_stability_score.hpp. A display name is for people; a
+ * consumer keys on stability_band_label. The withheld reasons invalid_edges and
+ * invalid_model are the scorer's own refusal of a stored policy that reached it
+ * without passing this validator.
  *
  * Overrides are keyed by the exact ASCII-lowercased image name, apply to every
  * version of that application, replace only the fields they set and inherit
@@ -38,16 +44,25 @@
  *      {99.37, 0.33, 0.26, 0.04} validates) so the decomposition identity
  *      holds (WeightSumAboveMaximum). All-zero weights are valid and score
  *      every application 100.
+ *   3b. global model (model_fault): per-device event cap an integer in [1, 1000]
+ *      (EventCapOutOfRange); then the start ratio and the full ratio each
+ *      finite and in [1, 1000] (RegressionRatioOutOfRange; a start below 1
+ *      would penalise an interval whose lower bound admits improvement); then
+ *      start < full (RegressionRatiosNotAscending).
+ *   3c. global interval confidence: finite and in [0.5, 0.999]
+ *      (IntervalConfidenceOutOfRange).
  *   4. at most 200 overrides (TooManyOverrides).
  *   5. per override i: key 1 to kDexPolicyMaxKeyBytes (260) bytes of printable
  *      ASCII 0x20-0x7E and byte-identical to its ASCII lowercase
  *      (OverrideKeyInvalid); key not equal to an earlier key
- *      (OverrideKeyDuplicate); then the EFFECTIVE tiers and weights (the
- *      override merged onto the global policy) pass the same edge, name and
- *      weight checks, reported at index i. A partial edge that conflicts with
- *      an inherited one is therefore refused, reported at that override's
- *      index, including when the conflict comes from a later change to a global
- *      edge; the writer then edits either the override or the global.
+ *      (OverrideKeyDuplicate); then the EFFECTIVE tiers, weights and model (the
+ *      override merged onto the global policy) pass the same edge, name,
+ *      weight and model checks, reported at index i. A partial edge or ratio
+ *      that conflicts with an inherited one (an override setting only
+ *      regression_full_ratio below an inherited start) is therefore refused,
+ *      reported at that override's index, including when the conflict comes
+ *      from a later change to a global value; the writer then edits either the
+ *      override or the global.
  * Names and keys are printable ASCII in this cut; widening to UTF-8 later
  * relaxes the validator and never invalidates a stored document. Lowercasing is
  * the ASCII-only fold (A-Z to a-z, no locale); a writer folds keys the same
@@ -75,8 +90,10 @@
  *    and the fallback is surfaced apart from the profile label, which would
  *    read "default".
  *  - A reader scores with dex_score_under_policy(in, kDexCohortFloor, eff),
- *    the one spelling that keeps weights and edges from one effective policy
- *    together, and never re-bands; shows dex_tier_name beside the unchanged
+ *    the one spelling that keeps weights, edges and model from one effective
+ *    policy together, and never re-bands; it feeds the per-device-capped sums
+ *    with eff.model.per_device_event_cap (the scorer withholds a sum above
+ *    A * cap as inconsistent) and prints its intervals at eff.interval_confidence; shows dex_tier_name beside the unchanged
  *    wire token stability_band_label; and serialises
  *    dex_policy_profile_label(eff.profile). Names are display text: this
  *    validator is not an escaper, every sink escapes.
@@ -90,6 +107,7 @@
  */
 
 #include "dex_stability_score.hpp"
+#include "dex_stats.hpp" // kDexStatsConfidence and its valid range
 
 #include <array>
 #include <cmath>
@@ -151,6 +169,9 @@ static_assert(sizeof(StabilityWeights) == 4 * sizeof(double),
               "a new weight must be mirrored in DexScoreOverride and apply_override");
 static_assert(sizeof(StabilityBandEdges) == 3 * sizeof(double),
               "a new edge must be mirrored in DexScoreOverride and apply_override");
+static_assert(sizeof(StabilityModel) == sizeof(std::int64_t) + 2 * sizeof(double),
+              "a new model parameter must be mirrored in DexScoreOverride, apply_override and "
+              "model_fault");
 
 /// Every field optional: an unset field inherits the global policy.
 struct DexScoreOverride {
@@ -158,11 +179,16 @@ struct DexScoreOverride {
     std::optional<double> excellent, good, fair;
     std::array<std::optional<std::string>, 4> names;
     std::optional<double> breadth, crashes, hangs, regression;
+    std::optional<std::int64_t> per_device_event_cap;
+    std::optional<double> regression_full_ratio, regression_start_ratio;
 };
 
 struct DexScorePolicy {
     DexTierPolicy tiers;
     StabilityWeights weights{kStabilityWeights};
+    StabilityModel model{kStabilityModel};
+    /// Two-sided level of the Apps share and rate intervals; global only.
+    double interval_confidence{kDexStatsConfidence};
     std::vector<DexScoreOverride> overrides;
 };
 
@@ -183,6 +209,10 @@ enum class DexPolicyFault {
     OverrideKeyInvalid,
     OverrideKeyDuplicate,
     TooManyOverrides,
+    EventCapOutOfRange,
+    RegressionRatioOutOfRange,
+    RegressionRatiosNotAscending,
+    IntervalConfidenceOutOfRange,
 };
 
 /// Closed snake_case tokens.
@@ -208,6 +238,14 @@ enum class DexPolicyFault {
         return "override_key_duplicate";
     case DexPolicyFault::TooManyOverrides:
         return "too_many_overrides";
+    case DexPolicyFault::EventCapOutOfRange:
+        return "event_cap_out_of_range";
+    case DexPolicyFault::RegressionRatioOutOfRange:
+        return "regression_ratio_out_of_range";
+    case DexPolicyFault::RegressionRatiosNotAscending:
+        return "regression_ratios_not_ascending";
+    case DexPolicyFault::IntervalConfidenceOutOfRange:
+        return "interval_confidence_out_of_range";
     }
     return "weight_invalid";
 }
@@ -232,10 +270,11 @@ namespace dex_score_policy_detail {
 struct Merged {
     DexTierPolicy tiers;
     StabilityWeights weights;
+    StabilityModel model;
 };
 
 [[nodiscard]] inline Merged apply_override(const DexScorePolicy& p, const DexScoreOverride& o) {
-    Merged m{p.tiers, p.weights};
+    Merged m{p.tiers, p.weights, p.model};
     if (o.excellent)
         m.tiers.edges.excellent = *o.excellent;
     if (o.good)
@@ -253,6 +292,12 @@ struct Merged {
         m.weights.hangs = *o.hangs;
     if (o.regression)
         m.weights.regression = *o.regression;
+    if (o.per_device_event_cap)
+        m.model.per_device_event_cap = *o.per_device_event_cap;
+    if (o.regression_full_ratio)
+        m.model.regression_full_ratio = *o.regression_full_ratio;
+    if (o.regression_start_ratio)
+        m.model.regression_start_ratio = *o.regression_start_ratio;
     return m;
 }
 
@@ -322,6 +367,19 @@ struct Merged {
     return std::nullopt;
 }
 
+/// Cap, then start, then full, then the ordering. nullopt means the model passes
+/// stability_model_valid (the ratio range is [1, 1000], the NaN chain is false).
+[[nodiscard]] inline std::optional<DexPolicyFault> model_fault(const StabilityModel& m) {
+    if (m.per_device_event_cap < 1 || m.per_device_event_cap > kStabilityMaxPerDeviceEventCap)
+        return DexPolicyFault::EventCapOutOfRange;
+    for (const double r : {m.regression_start_ratio, m.regression_full_ratio})
+        if (!std::isfinite(r) || r < 1.0 || r > kStabilityMaxRegressionRatio)
+            return DexPolicyFault::RegressionRatioOutOfRange;
+    if (!(m.regression_full_ratio > m.regression_start_ratio))
+        return DexPolicyFault::RegressionRatiosNotAscending;
+    return std::nullopt;
+}
+
 } // namespace dex_score_policy_detail
 
 /// nullopt means the policy is valid; nothing else is a success sentinel.
@@ -331,6 +389,11 @@ dex_score_policy_fault(const DexScorePolicy& p) {
         return DexPolicyRejection{*f, kDexPolicyGlobalIndex};
     if (const auto f = dex_score_policy_detail::weight_fault(p.weights))
         return DexPolicyRejection{*f, kDexPolicyGlobalIndex};
+    if (const auto f = dex_score_policy_detail::model_fault(p.model))
+        return DexPolicyRejection{*f, kDexPolicyGlobalIndex};
+    if (!dex_stats_confidence_valid(p.interval_confidence))
+        return DexPolicyRejection{DexPolicyFault::IntervalConfidenceOutOfRange,
+                                  kDexPolicyGlobalIndex};
     if (p.overrides.size() > kDexPolicyMaxOverrides)
         return DexPolicyRejection{DexPolicyFault::TooManyOverrides, kDexPolicyGlobalIndex};
     for (std::size_t i = 0; i < p.overrides.size(); ++i) {
@@ -345,6 +408,8 @@ dex_score_policy_fault(const DexScorePolicy& p) {
             return DexPolicyRejection{*f, i};
         if (const auto f = dex_score_policy_detail::weight_fault(m.weights))
             return DexPolicyRejection{*f, i};
+        if (const auto f = dex_score_policy_detail::model_fault(m.model))
+            return DexPolicyRejection{*f, i};
     }
     return std::nullopt;
 }
@@ -358,6 +423,9 @@ enum class DexPolicyProfile { Default, Override };
 struct DexEffectivePolicy {
     DexTierPolicy tiers;
     StabilityWeights weights;
+    StabilityModel model;
+    /// The global policy's level: an override cannot set it.
+    double interval_confidence;
     DexPolicyProfile profile{DexPolicyProfile::Default};
 };
 
@@ -367,17 +435,18 @@ struct DexEffectivePolicy {
                                                                  std::string_view image) {
     // No valid key is longer (key_valid), so a longer query cannot match: skip the fold.
     if (image.size() > kDexPolicyMaxKeyBytes)
-        return {p.tiers, p.weights, DexPolicyProfile::Default};
+        return {p.tiers, p.weights, p.model, p.interval_confidence, DexPolicyProfile::Default};
     const std::string key = dex_score_policy_detail::ascii_lower(image);
     // Known ceiling: linear scan over <=200 overrides, per-application lookups
     // on a page of a few hundred apps; upgrade to a map if a profile ever shows it.
     for (const auto& o : p.overrides) {
         if (o.image == key) {
             auto m = dex_score_policy_detail::apply_override(p, o);
-            return {std::move(m.tiers), m.weights, DexPolicyProfile::Override};
+            return {std::move(m.tiers), m.weights, m.model, p.interval_confidence,
+                    DexPolicyProfile::Override};
         }
     }
-    return {p.tiers, p.weights, DexPolicyProfile::Default};
+    return {p.tiers, p.weights, p.model, p.interval_confidence, DexPolicyProfile::Default};
 }
 
 /// The reference points into `t`: bind it only while `t` lives.
@@ -390,16 +459,16 @@ struct DexEffectivePolicy {
 const std::string& dex_tier_name(DexTierPolicy&&, StabilityBand) = delete;
 const std::string& dex_tier_name(const DexTierPolicy&&, StabilityBand) = delete;
 
-/// Scores under ONE effective policy: its weights and its edges together. The
+/// Scores under ONE effective policy: its weights, edges and model together. The
 /// one spelling a consumer uses; compute_stability_score's defaulted edges
 /// would otherwise let a caller drop them or take them from another policy.
 /// It does not re-validate: `eff` must come from a policy that passed
 /// dex_score_policy_fault. The scorer's own refusals (invalid_edges,
-/// invalid_weights) are structural only and do not stand in for that check.
+/// invalid_weights, invalid_model) are structural only and do not stand in for that check.
 [[nodiscard]] inline StabilityScore dex_score_under_policy(const StabilityInputs& in,
                                                            std::int64_t floor,
                                                            const DexEffectivePolicy& eff) {
-    return compute_stability_score(in, floor, eff.weights, eff.tiers.edges);
+    return compute_stability_score(in, floor, eff.weights, eff.tiers.edges, eff.model);
 }
 
 } // namespace yuzu::server

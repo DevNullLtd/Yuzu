@@ -94,7 +94,7 @@ the mere presence of an outcome row: a ticket can carry several `attempted` rows
 such as a self-approval, writes `attempted` then `denied`, and the real reviewer's decision then
 writes its own pair), so a surviving `denied` row would hide a lost `success` row from a per-ticket
 "has any outcome row" test. Count `success` rows plus `denied` rows that are not the
-`approver_assurance:` class refusal (that refusal is written with no `attempted` row). Example
+`approver_assurance:` refusal, class or MFA (those refusals are written with no `attempted` row; the MFA store-unavailable row has `result=error` and is not counted). Example
 (timestamps are epoch seconds; set the window to the incident, and leave out the last minute, where a
 request may simply be in flight):
 

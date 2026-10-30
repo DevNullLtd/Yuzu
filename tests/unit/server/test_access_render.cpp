@@ -464,7 +464,7 @@ TEST_CASE("access roles: descriptions and names are escaped; an unreadable catal
     // A 10 KB description does not truncate the document.
     CHECK_THAT(roles_html({role("R", std::string(10 * 1024, 'x'))}), ContainsSubstring("</table>"));
 
-    // An unanswered store and an empty answer (the store seeds seven roles) are both the red
+    // An unanswered store and an empty answer (the store seeds eight roles) are both the red
     // box: an empty role list reads as "nobody has any access".
     for (const auto& bad : {render_roles_list(Unavailable{}), roles_html({})}) {
         CHECK_THAT(bad, ContainsSubstring("role=\"alert\""));

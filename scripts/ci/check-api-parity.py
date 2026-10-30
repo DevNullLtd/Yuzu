@@ -233,7 +233,7 @@ MCP_REGISTRY_DIR = None
 # with the C++ twin constant `kRegistryDomainFiles` in tests/unit/server/test_mcp_dispatch_coverage.cpp;
 # a new mcp_tool*.hpp header needs `kToolHeaderFiles` there instead (this script does not count headers).
 # tests/test_docs_drift_selftest.py builds its --root fixture from this value, so it self-adjusts.
-MIN_REGISTRY_FILES = 3
+MIN_REGISTRY_FILES = 4
 LEDGER_DOC = ROOT / "docs" / "api-parity-ledger.md"
 
 DOC_BEGIN = ("<!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; "
@@ -476,8 +476,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # `exception:#520` (its REST twin is MCP-free by decision); both count untwinned: +2 on the 225 of dev, 227.
 #
 # 227 (origin/dev) -> 228 (Users and roles page): GET /fragments/access/enforcement has only the REST twin
-# GET /api/v1/me, which omits the unconfirmed (degraded) bit, and no MCP twin
-# (`twinned-rest-only`); the missing REST/MCP read is tracked in #6033.
+# GET /api/v1/me, which omits the unconfirmed (degraded) bit (`twinned-rest-only`). The MCP tool
+# get_me is the twin of the raw flag only, so this row still needs the degraded-bit read tracked in
+# #6033.
 #
 # 228 -> 225 (Seam PR2): the three hardware rows (get.fragments-hardware-list, -hardware-ci,
 # -hardware-quarantine) gained MCP twins (list_hardware_ci, get_hardware_ci, list_quarantined_devices).
@@ -492,7 +493,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # to the #4041 exception, because its MCP tool list_agents is unconfined; see get.api-agents.
 # 215 -> 213 (runtime configuration twins): get.api-config and put.api-config-param flipped to `twinned`
 # (GET/PUT /api/v1/config and the MCP tools get_runtime_config / set_runtime_config).
-BASELINE_UNTWINNED = 213
+# 213 -> 212 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me flipped from planned to twinned
+# (GET /api/v1/me + the get_me MCP tool).
+BASELINE_UNTWINNED = 212
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
@@ -502,7 +505,8 @@ BASELINE_UNTWINNED = 213
 # 86 -> 84 (runtime configuration twins): get.api-config and put.api-config-param became twinned.
 GENERIC_PLANNED_STATUS = "planned:#2146"
 GENERIC_PLANNED_ISSUE = 2146
-BASELINE_GENERIC_PLANNED = 84
+# 84 -> 83 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me became twinned.
+BASELINE_GENERIC_PLANNED = 83
 
 # A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
 # today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.
@@ -619,8 +623,8 @@ GRANDFATHERED_LEGACY_EXCEPTIONS = frozenset({
     "get.fragments-auto-nvd",
     "get.fragments-settings-nvd",
     "post.api-v1-users-me-password",
-    "get.fragments-tar-process-tree-detail",
-    "get.fragments-tar-process-tree-result",
+    "get.fragments-echo-process-tree-detail",
+    "get.fragments-echo-process-tree-result",
 })
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
@@ -650,7 +654,7 @@ ALLOWLIST_OPENAPI_MISSING = [
 # in tests/unit/server/test_api_parity_ledger_catalogue.cpp and `kLedgerFiles` in
 # tests/unit/server/test_twin_completeness.cpp. Adding or removing a domain edits all three.
 DOMAINS = [
-    "devices", "inventory", "dex", "guardian", "tar", "auto-preflight",
+    "devices", "inventory", "dex", "guardian", "echo", "auto-preflight",
     "auto-deploy", "auto-verify", "network", "viz", "executions",
     "scope-result-sets", "instructions", "compliance-policy", "settings",
     "rbac", "auth-mfa", "engine-principals", "access-reviews", "ca-pki",
@@ -663,7 +667,7 @@ PATH_DOMAIN_RULES = [
     (re.compile(r"^/fragments/network/"), "network"),
     (re.compile(r"^/(fragments/)?device/guardian"), "guardian"),
     (re.compile(r"^/(fragments/)?guardian/"), "guardian"),
-    (re.compile(r"^/(fragments/)?tar/"), "tar"),
+    (re.compile(r"^/(fragments/)?echo/"), "echo"),
     (re.compile(r"^/fragments/auto/preflight"), "auto-preflight"),
     (re.compile(r"^/fragments/auto/deploy"), "auto-deploy"),
     (re.compile(r"^/fragments/auto/verify"), "auto-verify"),
@@ -673,7 +677,7 @@ PATH_DOMAIN_RULES = [
     (re.compile(r"^/fragments/device"), "devices"),
     (re.compile(r"^/fragments/devices"), "devices"),
     (re.compile(r"^/fragments/results"), "executions"),
-    (re.compile(r"^/api/dashboard/(execute|group-from-results|tar-execute)"), "executions"),
+    (re.compile(r"^/api/dashboard/(execute|group-from-results|echo-execute)"), "executions"),
     (re.compile(r"^/fragments/crypto/"), "crypto"),
     (re.compile(r"^/fragments/compliance"), "compliance-policy"),
     (re.compile(r"^/api/(compliance|polic(y|ies))"), "compliance-policy"),
@@ -715,7 +719,7 @@ OWNER_FILE_DOMAIN_FALLBACK = {
     "dex_perf_ui.cpp": "dex",
     "dex_app_perf_ui.cpp": "dex",
     "guardian_routes.cpp": "guardian",
-    "tar_tree_routes.cpp": "tar",
+    "echo_tree_routes.cpp": "echo",
     "preflight_routes.cpp": "auto-preflight",
     "deployment_routes.cpp": "auto-deploy",
     "deployment_ui.cpp": "auto-deploy",
@@ -2359,7 +2363,7 @@ GATE_PARITY_KNOWN_MISMATCHES = {
 # holds no gate call this script recognises (owner-only reads that call auth_fn alone, helper
 # gates such as sw_admit, member-function gates) cannot be compared, so it fails closed unless it
 # is named here.
-GATE_PARITY_NO_GATE_MAX = 12
+GATE_PARITY_NO_GATE_MAX = 13
 GATE_PARITY_NO_GATE_ALLOWED = {
     ("DELETE", "/api/v1/result-sets/{param}", "delete_result_set"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
@@ -2375,6 +2379,13 @@ GATE_PARITY_NO_GATE_ALLOWED = {
     ("GET", "/api/v1/inventory/software/catalogue/versions", "get_software_versions"): (
         "gated by the sw_admit helper closure (Inventory:Read confined read), not a recognised "
         "gate call"),
+    ("GET", "/api/v1/me", "get_me"): (
+        "session-only self-description: the route calls auth_fn alone and reads no per-resource "
+        "authority; the tool is gated at Infrastructure:Read for the MCP tier ladder only. REST "
+        "permits a service-scoped token to describe itself while get_me is service-scope class "
+        "`denied`, a documented asymmetry; an explicit self-only service-scope policy is a "
+        "follow-up recorded as exception:#6432 revisit:2026-11-30, confirmed "
+        "by the ADR owner (ADR-1005 2026-10-24 entry)"),
     ("GET", "/api/v1/result-sets", "list_result_sets"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
         "call (result-set precedent)"),
@@ -2697,7 +2708,10 @@ def registry_floor_errors(count):
     return [f"registry files: found {count} mcp_tools_*.cpp file(s) under server/core/src but "
             f"MIN_REGISTRY_FILES is {MIN_REGISTRY_FILES} - set MIN_REGISTRY_FILES to {count} in THIS "
             f"change (a new registry file bumps it, a removed one lowers it) and move the C++ twin "
-            f"constant kRegistryDomainFiles in tests/unit/server/test_mcp_dispatch_coverage.cpp with it; "
+            f"constant kRegistryDomainFiles in tests/unit/server/test_mcp_dispatch_coverage.cpp with it, "
+            f"and the seam-closure lane pins (MCP_REGISTRY_EXPECTED_TU_COUNT in "
+            f"scripts/ci/check-seam-closure.py; EXPECTED_MCP_REGISTRY_TU_COUNT and "
+            f"EXPECTED_MCP_REGISTRY_CPPS in tests/test_seam_closure_selftest.py); "
             f"a new mcp_tool*.hpp header needs kToolHeaderFiles there, not this constant"]
 
 
@@ -3466,11 +3480,11 @@ def _selftest_body():
          ("must be a JSON object", "status must be a string", "must be strings")),
         ("twin-dict-fields", base_rows + [_mk("t4", "retire", rest_v1_twin={"method": "GET"})], {}, ("rest_v1_twin must be",)),
         ("domain-guard", base_rows, {"extra_files": {"foo.json": "[]"}}, ("not one of the declared domains",)),
-        ("top-level", base_rows, {"extra_files": {"tar.json": "5"}}, ("top level must be a JSON array",)),
-        ("bad-bytes", base_rows, {"extra_files": {"tar.json": b"\xff\xfe\x00["}}, ("invalid JSON",)),
-        ("bad-syntax", base_rows, {"extra_files": {"tar.json": "{bad"}}, ("invalid JSON",)),
-        ("huge-int", base_rows, {"extra_files": {"tar.json": "1" * 5000}}, ("invalid JSON",)),
-        ("too-deep", base_rows, {"extra_files": {"tar.json": "[" * 200000}}, ("invalid JSON",)),
+        ("top-level", base_rows, {"extra_files": {"echo.json": "5"}}, ("top level must be a JSON array",)),
+        ("bad-bytes", base_rows, {"extra_files": {"echo.json": b"\xff\xfe\x00["}}, ("invalid JSON",)),
+        ("bad-syntax", base_rows, {"extra_files": {"echo.json": "{bad"}}, ("invalid JSON",)),
+        ("huge-int", base_rows, {"extra_files": {"echo.json": "1" * 5000}}, ("invalid JSON",)),
+        ("too-deep", base_rows, {"extra_files": {"echo.json": "[" * 200000}}, ("invalid JSON",)),
         ("composed-of", base_rows + [_mk("c2", "composed-of:no.such.id")], {}, ("unknown capability id",)),
         ("plain-twinned", base_rows + [_mk("t2", "twinned", rest_v1_twin=rest_tw)], {}, ("plain twinned needs BOTH",)),
         ("bad-resource", base_rows + [_mk("t3", "twinned", rest_v1_twin=rest_tw, mcp_twin="resource:yuzu://gone")], {},
@@ -3577,7 +3591,7 @@ def _selftest_body():
            "method must be 1-16 upper-case", absent=("\n::error::injected",))
     expect("bad-path", _drive(base_rows + [_mk("bp", "retire", path="/x\n::error::injected")]), 1,
            "path must be", absent=("\n::error::injected",))
-    expect("missing-domain", _drive(base_rows, skip_domains=("tar",)), 1, "missing for declared domain")
+    expect("missing-domain", _drive(base_rows, skip_domains=("echo",)), 1, "missing for declared domain")
     expect("planned-lookalike", _drive(base_rows + [_mk("p21460", "planned:#21460")]), 0)
     # checks 6 and 7 are wired into the gate: a finding from the gate runner fails the run, a clean one
     # passes, and an AnchorError becomes a failure rather than a crash

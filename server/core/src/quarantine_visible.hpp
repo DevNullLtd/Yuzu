@@ -21,7 +21,7 @@
 ///   * an unwired list read is `StoreDegraded` — never an unfiltered list.
 
 #include "authz_model.hpp"
-#include "quarantine_store.hpp"
+#include "quarantine_types.hpp"
 
 #include <httplib.h>
 

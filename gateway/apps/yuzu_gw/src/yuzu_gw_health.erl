@@ -4,13 +4,30 @@
 %%%
 %%% Listens on a configurable port (default 8081) and responds to:
 %%%   GET /healthz — liveness probe (200 if process is responding)
-%%%   GET /readyz  — readiness probe (200 if all core processes alive,
-%%%                  503 if any are down or circuit breaker is open)
+%%%   GET /readyz  — readiness probe (200 if all core processes alive and
+%%%                  every configured gRPC listener is running, 503 if any
+%%%                  is down or circuit breaker is open)
 %%%
 %%% Readiness also requires the registry's session index table: without it
-%%% every heartbeat is rejected.
+%%% every heartbeat is rejected. It requires every listener of
+%%% {yuzu_gw, grpc_listeners} to be running in Ranch (the gateway answers nothing
+%%% on a port whose listener is down, and /healthz alone would still say 200),
+%%% at least one of them routing the AgentService (a key of its `services', the
+%%% rule the boot guard applies), and is not ready when none is configured unless
+%%% {yuzu_gw, allow_no_listeners} is the literal `true' (which also excuses the
+%%% absence of an agent listener, as it does at boot). The check asks Ranch
+%%% for the listener's status; it does not connect to the port.
 %%%
 %%% Designed to coexist with the Prometheus /metrics endpoint (port 9568).
+%%%
+%%% Each accepted connection is served by its own short-lived process, which
+%%% waits at most ?REQUEST_TIMEOUT_MS for the request and then closes, so a
+%%% client that connects and sends nothing holds up nobody but itself (served
+%%% one at a time with a 5 s wait, one idle connection stalled /healthz and
+%%% /readyz alike). At most ?MAX_HANDLERS connections are served at once; past
+%%% that the endpoint stops accepting until one finishes, and new connections
+%%% wait in the listen backlog. The answers are built from reads that make no
+%%% call into another process, so a handler never waits on the gateway.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_health).
@@ -18,15 +35,27 @@
 
 %% API
 -export([start_link/0, port/0]).
+-export([check_upstream_tls_files/0]). %% for testing
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(SERVER, ?MODULE).
 -define(DEFAULT_PORT, 8081).
+%% How long a connection may take to send its request. A probe sends it with the
+%% connect; a client that has not after this long is closed.
+-define(REQUEST_TIMEOUT_MS, 2000).
+%% Connections served at once. A probe takes about a millisecond, so only idle
+%% or stalled clients come near this; it bounds the processes they can cost.
+-define(MAX_HANDLERS, 64).
 
 -record(state, {
-    listen_sock :: gen_tcp:socket()
+    listen_sock :: gen_tcp:socket(),
+    %% the monitors of the connection handlers running now
+    handlers = #{} :: #{reference() => true},
+    %% true while an `accept' message is pending; false while the endpoint is
+    %% at ?MAX_HANDLERS and waits for a handler to finish
+    accepting = true :: boolean()
 }).
 
 %%%===================================================================
@@ -78,23 +107,55 @@ handle_cast(_Msg, State) ->
 handle_info(accept, #state{listen_sock = LSock} = State) ->
     case gen_tcp:accept(LSock, 1000) of
         {ok, Sock} ->
-            _ = handle_request(Sock),
-            gen_tcp:close(Sock),
-            self() ! accept,
-            {noreply, State};
+            next_accept(serve(Sock, State));
         {error, timeout} ->
-            self() ! accept,
-            {noreply, State};
+            next_accept(State);
         {error, closed} ->
             {stop, normal, State};
         {error, Reason} ->
             logger:warning("Health endpoint accept error: ~p", [Reason]),
-            self() ! accept,
-            {noreply, State}
+            next_accept(State)
+    end;
+
+%% A connection handler finished: room for another connection.
+handle_info({'DOWN', Ref, process, _Pid, _Reason}, #state{handlers = Handlers} = State)
+  when is_map_key(Ref, Handlers) ->
+    State1 = State#state{handlers = maps:remove(Ref, Handlers)},
+    case State1#state.accepting of
+        true -> {noreply, State1};
+        false -> next_accept(State1)
     end;
 
 handle_info(_Info, State) ->
     {noreply, State}.
+
+%% Hand the connection to a process of its own. The socket's owner becomes the
+%% handler, so it closes with the handler whatever becomes of it.
+serve(Sock, #state{handlers = Handlers} = State) ->
+    {Pid, Ref} = spawn_monitor(fun() ->
+                                       receive {serve, S} -> serve_connection(S) end
+                               end),
+    case gen_tcp:controlling_process(Sock, Pid) of
+        ok ->
+            Pid ! {serve, Sock};
+        {error, _} ->
+            %% the client is already gone
+            gen_tcp:close(Sock),
+            exit(Pid, kill)
+    end,
+    State#state{handlers = Handlers#{Ref => true}}.
+
+serve_connection(Sock) ->
+    _ = handle_request(Sock),
+    gen_tcp:close(Sock).
+
+%% Accept the next connection now, or once a handler finishes when the
+%% endpoint is serving ?MAX_HANDLERS of them.
+next_accept(#state{handlers = Handlers} = State) when map_size(Handlers) >= ?MAX_HANDLERS ->
+    {noreply, State#state{accepting = false}};
+next_accept(State) ->
+    self() ! accept,
+    {noreply, State#state{accepting = true}}.
 
 terminate(_Reason, #state{listen_sock = LSock}) ->
     gen_tcp:close(LSock),
@@ -105,7 +166,7 @@ terminate(_Reason, #state{listen_sock = LSock}) ->
 %%%===================================================================
 
 handle_request(Sock) ->
-    case gen_tcp:recv(Sock, 0, 5000) of
+    case gen_tcp:recv(Sock, 0, ?REQUEST_TIMEOUT_MS) of
         {ok, Data} ->
             Path = extract_path(Data),
             {Status, Body} = route(Path),
@@ -131,6 +192,8 @@ readiness_check() ->
         check_process(<<"upstream">>, yuzu_gw_upstream),
         check_process(<<"agent_sup">>, yuzu_gw_agent_sup),
         check_process(<<"router">>, yuzu_gw_router),
+        check_listeners(),
+        check_upstream_tls_files(),
         check_circuit_breaker()
     ],
     AllOk = lists:all(fun({_, V}) -> V end, Checks),
@@ -154,9 +217,49 @@ check_process(Name, RegisteredName) ->
 check_session_index() ->
     {<<"sessions_index">>, yuzu_gw_registry:session_index_available()}.
 
+check_listeners() ->
+    {<<"listeners">>, listeners_ready(application:get_env(yuzu_gw, grpc_listeners, []))}.
+
+listeners_ready([]) ->
+    allow_no_listeners();
+listeners_ready([_ | _] = Listeners) ->
+    yuzu_grpc_listener:proper_list(Listeners)
+        andalso lists:all(fun listener_running/1, Listeners)
+        andalso (lists:any(fun yuzu_grpc_listener:routes_agent/1, Listeners)
+                 orelse allow_no_listeners());
+listeners_ready(_) ->
+    false.
+
+allow_no_listeners() ->
+    application:get_env(yuzu_gw, allow_no_listeners, false) =:= true.
+
+listener_running(#{name := Name}) ->
+    try ranch:get_status({yuzu_grpc, Name}) =:= running
+    catch _:_ -> false
+    end;
+listener_running(_) ->
+    false.
+
+%% Not ready while any upstream channel's most recent connection attempt failed
+%% because its TLS options are unusable (a missing, empty or wrong CA, certificate
+%% or key file; yuzu_grpc_client_channel:config_error/1). Such a gateway can reach
+%% no server, and the breaker above stays closed until five calls have failed. A
+%% table read, never a call into the channel, so a slow upstream cannot hold it.
+check_upstream_tls_files() ->
+    Names = case yuzu_grpc_client_config:from_env() of
+                {ok, Channels} -> [N || #{name := N} <- Channels];
+                {error, _}     -> []
+            end,
+    {<<"upstream_tls_files">>,
+     lists:all(fun(N) -> yuzu_grpc_client_channel:config_error(N) =:= none end, Names)}.
+
+%% Read from the state the upstream process publishes, never by a call into it:
+%% a call queues behind the RPC in progress, so against a slow server it waited
+%% out its 5 s timeout and /readyz answered 503 with the breaker closed (#5680).
+%% Not running is not ready: circuit_state_now/0 then exits, as a call would.
 check_circuit_breaker() ->
     try
-        case yuzu_gw_upstream:circuit_state() of
+        case yuzu_gw_upstream:circuit_state_now() of
             closed    -> {<<"circuit_breaker">>, true};
             half_open -> {<<"circuit_breaker">>, true};  % allowing probes
             open      -> {<<"circuit_breaker">>, false}

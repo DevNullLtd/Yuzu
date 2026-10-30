@@ -11,11 +11,29 @@
 -module(yuzu_gw_app).
 -behaviour(application).
 
--export([start/2, stop/1]).
+-export([start/2, prep_stop/1, stop/1]).
+
+%% The pid of the Prometheus endpoint's inets httpd service, from start to
+%% stop (stop_metrics_httpd/0).
+-define(METRICS_HTTPD, {?MODULE, metrics_httpd}).
+
+%% The planned stop's budget (prep_stop/1): shutdown_flush_budget_ms.
+-define(DEFAULT_FLUSH_BUDGET_MS, 20000).
+-define(MAX_FLUSH_BUDGET_MS, 600000).
 -export([apply_env_overrides/0, evaluate_cookie/3]).  %% exported for testing
--export([client_has_https/1, client_tls_posture/1, servers_have_tls/1]). %% for testing
--export([evaluate_upstream_posture/2, listener_tls_traps/1]).            %% for testing
--export([evaluate_mgmt_posture/3]).                                      %% for testing
+-export([client_has_https/1, client_tls_posture/1, listeners_have_tls/1]). %% for testing
+-export([client_all_present_client_cert/1, client_tls_weakest/1, client_has_unverified/1, client_mixed_channels/1]). %% for testing
+-export([check_upstream_tls_posture/0, check_upstream_channel_mix/0, warn_replaced_options/0,
+         check_upstream_tls_files/0]).
+-export([evaluate_upstream_posture/2, evaluate_listeners/1]).             %% for testing
+-export([evaluate_mgmt_posture/3, evaluate_mgmt_posture/4,
+         apply_listener_port_overrides/0]).                                %% for testing
+-export([check_legacy_grpcbox_servers/0, check_legacy_grpcbox_client/0,
+         legacy_grpcbox_in_files/2, check_grpc_listeners/0,
+         check_upstream_client_config/0,
+         check_mgmt_listener_posture/0, check_memory_shedding/0,
+         check_mgmt_pin_refresh/0, check_mgmt_auth_config/0,
+         startup_guards/0]).                                               %% for testing
 -export([evaluate_cluster_id/2, evaluate_cluster_id/3]).                  %% for testing
 -export([apply_env_overrides/1]).                                          %% for testing
 
@@ -44,52 +62,80 @@ do_start() ->
     end.
 
 do_start_checked() ->
-    %% Log the ACTUAL transport TLS posture. grpcbox reads its own
-    %% {grpcbox, client|servers} config at boot and is the source of truth; the
-    %% yuzu_gw `tls`/`tls_enabled` env is advisory only (nothing wires it into
-    %% grpcbox — see docs/pki-architecture.md "Gateway TLS"). The previous code
-    %% matched `{ok, _}` against application:get_env/3, which returns the bare
-    %% value (never `{ok, _}`), so it was dead — and a real `tls` proplist would
-    %% have crashed boot with a case_clause.
+    %% A leftover {grpcbox, servers} is refused before anything else is said about
+    %% the listeners: the summary below would read "none configured" for it, and
+    %% the refusal is the whole explanation.
+    case check_legacy_grpcbox_servers() of
+        ok ->
+            case check_legacy_grpcbox_client() of
+                ok -> do_start_guarded();
+                {error, _} = Error -> Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+do_start_guarded() ->
+    %% Log the ACTUAL transport TLS posture: the {yuzu_gw, grpc_listeners} entries
+    %% for the two listeners and {yuzu_gw, upstream_client} for the upstream hop;
+    %% the yuzu_gw `tls`/`tls_enabled` env is advisory only (nothing wires it into
+    %% a listener or the channel -- see docs/pki-architecture.md "Gateway TLS").
     log_tls_state(),
 
+    %% Every guard below runs on configuration alone, before the supervision
+    %% tree is started, and the listeners are the tree's last children: nothing
+    %% is bound while a guard can still refuse.
+    %%
     %% #PR5: fail CLOSED on a misconfigured-but-encrypted upstream (https without
-    %% verify_peer is MITM-able) — same fail-closed philosophy as the distribution
+    %% verify_peer and a CA of its own is MITM-able) -- same fail-closed philosophy as the distribution
     %% cookie guard, rather than booting with only a log warning. PLAINTEXT upstream
     %% is still allowed (the legitimate UAT/dev posture); only the "TLS but
     %% unauthenticated" footgun is refused.
-    case check_upstream_tls_posture() of
-        {error, Reason} ->
-            {error, Reason};
-        ok ->
-            case check_mgmt_listener_posture() of
-                {error, Reason2} -> {error, Reason2};
-                ok               -> do_start_services()
-            end
+    run_guards(startup_guards(), fun do_start_services/0).
+
+%% The boot guards, in order. check_mgmt_auth_config/0 publishes the management
+%% peer authorization that check_mgmt_listener_posture/0 then judges, so it must
+%% come first; exported so a test can pin both facts.
+-spec startup_guards() -> [fun(() -> ok | {error, term()})].
+startup_guards() ->
+    [fun ?MODULE:check_grpc_listeners/0,
+     fun ?MODULE:check_upstream_client_config/0,
+     fun ?MODULE:check_upstream_channel_mix/0,
+     fun ?MODULE:check_upstream_tls_posture/0,
+     fun ?MODULE:check_upstream_tls_files/0,
+     fun ?MODULE:check_mgmt_auth_config/0,
+     fun ?MODULE:check_mgmt_listener_posture/0,
+     fun ?MODULE:check_mgmt_pin_refresh/0,
+     fun ?MODULE:check_memory_shedding/0].
+
+run_guards([], Next) ->
+    Next();
+run_guards([Guard | Rest], Next) ->
+    case Guard() of
+        ok -> run_guards(Rest, Next);
+        {error, _} = Error -> Error
     end.
 
 do_start_services() ->
     %% Attach telemetry/prometheus handlers.
     yuzu_gw_telemetry:setup(),
     %% Heartbeat-rejection summary log state: created before the supervision
-    %% tree serves heartbeats, so a burst of first rejections shares one rate
-    %% limit. The agent listener belongs to the grpcbox dependency application,
-    %% which can start first; the lazy path in yuzu_gw_heartbeat_admission
-    %% covers that window.
+    %% tree (whose last children are the listeners) serves heartbeats, so a burst
+    %% of first rejections shares one rate limit. The lazy path in
+    %% yuzu_gw_heartbeat_admission covers a heartbeat that races it.
     ok = yuzu_gw_heartbeat_admission:init_summary_state(),
     %% The same for the WARN limit of the calls that carry a registration
     %% request (yuzu_gw_safe_call): a burst of first failures shares one limit.
     ok = yuzu_gw_safe_call:init_limits(),
-
-    %% TCP_NODELAY on the upstream channel, before the supervision tree below
-    %% (the only caller of the channel) exists: grpcbox already started the
-    %% channel from sys.config, so this restarts it with the rewritten endpoints.
-    ok = yuzu_gw_upstream_channel:apply_nodelay(),
+    %% And for the runner's WARN limit (yuzu_grpc_runner): the same burst, the
+    %% same reason, and no lock to take when it comes.
+    ok = yuzu_grpc_runner:init_throttle(),
 
     %% Start Prometheus HTTP exporter for /metrics endpoint.
     Port = application:get_env(yuzu_gw, prometheus_port, 9568),
     application:set_env(prometheus, prometheus_http, [{port, Port}, {path, "/metrics"}]),
-    {ok, _} = prometheus_httpd:start(),
+    {ok, Httpd} = prometheus_httpd:start(),
+    persistent_term:put(?METRICS_HTTPD, Httpd),
     logger:info("Prometheus metrics endpoint started on port ~p", [Port]),
     logger:info("Heartbeat admission is connection-bound: a heartbeat is "
                 "admitted only on the connection that opened its session"),
@@ -97,10 +143,16 @@ do_start_services() ->
     %% Start the supervision tree. The crash-report filter goes in first so
     %% the upstream's first crash is already redacted (it holds registration
     %% credentials in its mailbox); a tree that does not start removes it again.
+    %% The connection-kill counter filter goes in beside it (it counts the VM's
+    %% max_heap_size report for a connection the memory bound killed).
     ok = yuzu_gw_crash_redact:install(),
+    ok = yuzu_gw_conn_watch:install(),
     case yuzu_gw_sup:start_link() of
         {ok, _} = Started -> Started;
-        Other             -> ok = yuzu_gw_crash_redact:remove(), Other
+        Other             -> ok = yuzu_gw_conn_watch:remove(),
+                             ok = yuzu_gw_crash_redact:remove(),
+                             ok = stop_metrics_httpd(),
+                             Other
     end.
 
 %%--------------------------------------------------------------------
@@ -203,76 +255,224 @@ evaluate_cookie(_Node, Cookie, Allow) ->
             ok
     end.
 
-stop(_State) ->
-    logger:info("Gateway shutting down — entering drain phase"),
-
-    %% 1. Stop accepting new commands via the router.
+%% @doc Planned stop, before the supervision tree goes (#5695). OTP calls this
+%% while every process is still alive; stop/1 runs after the tree is gone, so
+%% nothing that needs a process can happen there. Within one budget,
+%% shutdown_flush_budget_ms (default 20000, valid 0..600000):
+%%   1. The upstream stops taking work (yuzu_gw_upstream:begin_stop/0):
+%%      proxied Registers and inventory reports are refused UNAVAILABLE, so
+%%      agents go to another gateway; no registration replay runs.
+%%   2. No new agent connection: the memory shedder is stopped (it could
+%%      resume a listener) and every agent listener is suspended (Ranch keeps
+%%      the established connections). The router stops taking commands.
+%%   3. In-flight commands get min(3 s, 30% of the budget) to finish.
+%%   4. Every local session is ended through its own agent process
+%%      (yuzu_gw_agent:disconnect/1), which closes its stream and casts the
+%%      DISCONNECTED notice with the session's own stream_home_id (the server
+%%      matches a DISCONNECTED to the placement by it, and it lives only in the
+%%      agent process, not in the registry table), up to min(5 s, 40% of the
+%%      budget) for them to finish.
+%%   5. The heartbeat buffer is flushed.
+%%   6. The upstream sends every held notification as a last gasp, whatever
+%%      the breaker state, until none is left or the budget ends
+%%      (yuzu_gw_upstream:last_gasp/1); what is left is counted and logged.
+%% Each step is skipped when its process is not running. A kill -9, or a stop
+%% that outlasts the container's or unit's stop timeout, gives no last gasp:
+%% the server then keeps those sessions until the agents register again. The
+%% compose files and the systemd unit give the stop 40 s, the budget plus the
+%% tree's own shutdown (docs/user-manual/gateway.md, "Planned stop").
+prep_stop(State) ->
+    Budget = yuzu_gw_env:env_int(shutdown_flush_budget_ms, ?DEFAULT_FLUSH_BUDGET_MS, 0,
+                                 ?MAX_FLUSH_BUDGET_MS),
+    T0 = erlang:monotonic_time(millisecond),
+    Deadline = T0 + Budget,
+    logger:info("Gateway stopping: ending agent sessions and sending their DISCONNECTED "
+                "notices to the server (budget ~b ms)", [Budget]),
+    _ = safely(fun yuzu_gw_upstream:begin_stop/0),
+    _ = safely(fun() -> supervisor:terminate_child(yuzu_gw_sup, yuzu_gw_memory_shedder) end),
+    [safely(fun() -> ranch:suspend_listener(Ref) end) || Ref <- agent_listener_refs()],
     case whereis(yuzu_gw_router) of
         undefined -> ok;
-        RouterPid ->
-            logger:info("Notifying router to stop accepting new commands"),
-            RouterPid ! drain,
+        RouterPid -> RouterPid ! drain
+    end,
+    drain_pending(min(T0 + min(3000, Budget * 3 div 10), Deadline)),
+    end_sessions(min(erlang:monotonic_time(millisecond) + min(5000, Budget * 4 div 10),
+                     Deadline)),
+    _ = safely(fun yuzu_gw_heartbeat_buffer:flush_sync/0),
+    case safely(fun() -> yuzu_gw_upstream:last_gasp(Deadline) end) of
+        #{sent := Sent, left := Left} ->
+            logger:info("Gateway stop: ~b notice(s) sent upstream, ~b left, in ~b ms",
+                        [Sent, Left, erlang:monotonic_time(millisecond) - T0]);
+        _ ->
             ok
     end,
+    State.
 
-    %% 2. Wait for in-flight commands to complete (up to 10 seconds).
-    DrainDeadline = erlang:monotonic_time(second) + 10,
-    drain_pending(DrainDeadline),
-
-    %% 3. Flush heartbeat buffer synchronously.
-    logger:info("Flushing heartbeat buffer"),
-    try yuzu_gw_heartbeat_buffer:flush_sync()
-    catch _:_ ->
-        %% flush_sync failed (process already down) — allow brief drain.
-        timer:sleep(500)
-    end,
-
-    %% The filter outlives the supervision tree (already down by now), so the
-    %% upstream's shutdown reports are redacted too.
+stop(_State) ->
+    %% The supervision tree is already down: the drain happened in prep_stop/1.
+    %% The metrics endpoint served until now; it is stopped here, before the
+    %% application master kills what is left of the application (see
+    %% stop_metrics_httpd/0).
+    ok = stop_metrics_httpd(),
+    %% The filter outlives the supervision tree, so the upstream's shutdown
+    %% reports are redacted too.
     ok = yuzu_gw_crash_redact:remove(),
+    ok = yuzu_gw_conn_watch:remove(),
+    %% The management peer authorization published at boot describes the listeners
+    %% that just went down; a later start resolves and publishes its own.
+    ok = yuzu_gw_mgmt_identity:reset(),
     logger:info("Gateway shutdown complete"),
     ok.
 
-%% @private Wait for pending commands to drain or until deadline.
+%% Stop the Prometheus endpoint (an inets httpd service, outside the
+%% supervision tree). It must stop before this application does: inets keeps the
+%% service under its own supervisor, but its listen-socket owner is a plain
+%% process spawned by prometheus_httpd:start/0's caller, which is this
+%% application's start, so it carries this application's group leader. On a stop
+%% the application master kills every such process; the service's acceptor,
+%% linked to the owner, was killed with it, and every restart of the acceptor
+%% failed to link to the dead owner (noproc): about 20 crash reports and as many
+%% supervisor reports at every stop, until inets gave the service up. Stopped
+%% here, the acceptor ends with `shutdown' and the owner, which traps exits,
+%% ends with it. A failure to stop it is ignored: the stop goes on.
+stop_metrics_httpd() ->
+    case persistent_term:get(?METRICS_HTTPD, undefined) of
+        undefined ->
+            ok;
+        Pid ->
+            _ = persistent_term:erase(?METRICS_HTTPD),
+            _ = (catch inets:stop(httpd, Pid)),
+            ok
+    end.
+
+%% Run Fun, turning an exit or error into `skipped': a step of a stop whose
+%% process is gone is skipped, not fatal (an exception here would stop the
+%% application master from stopping the tree).
+safely(Fun) ->
+    try Fun()
+    catch _:_ -> skipped
+    end.
+
+%% The Ranch refs of the listeners that route the agent service (never the
+%% management listener, which stays up while the stop drains commands).
+agent_listener_refs() ->
+    case application:get_env(yuzu_gw, grpc_listeners, []) of
+        Listeners when is_list(Listeners) ->
+            [{yuzu_grpc, maps:get(name, E)}
+             || E <- Listeners, is_map(E), maps:is_key(name, E),
+                yuzu_grpc_listener:routes_agent(E)];
+        _ ->
+            []
+    end.
+
+%% The agent processes of this node: the registry's routing table, filtered to
+%% real yuzu_gw_agent processes ([] once the registry, and with it the table,
+%% is down).
+local_agent_pids() ->
+    lists:usort(yuzu_gw_registry:local_agent_pids()).
+
+%% @private Wait for pending commands to drain or until Deadline (monotonic
+%% ms). Each agent is asked with a short timeout; the walk stops at the deadline.
 drain_pending(Deadline) ->
-    Now = erlang:monotonic_time(second),
-    case Now >= Deadline of
+    case erlang:monotonic_time(millisecond) >= Deadline of
         true ->
-            logger:warning("Drain deadline reached — proceeding with shutdown");
+            ok;
         false ->
-            %% Check if any agent processes still have pending commands.
-            %% pg:get_members may fail if pg is already shutting down.
-            Agents = try pg:get_members(yuzu_gw, all_agents) catch _:_ -> [] end,
             HasPending = lists:any(fun(Pid) ->
-                try gen_statem:call(Pid, pending_count, 1000) > 0
-                catch _:_ -> false
-                end
-            end, Agents),
+                                       erlang:monotonic_time(millisecond) < Deadline andalso
+                                       (try gen_statem:call(Pid, pending_count, 200) > 0
+                                        catch _:_ -> false
+                                        end)
+                                   end, local_agent_pids()),
             case HasPending of
                 false ->
-                    logger:info("All in-flight commands drained");
+                    ok;
                 true ->
-                    logger:info("Draining: waiting for in-flight commands..."),
-                    timer:sleep(1000),
+                    logger:info("Gateway stop: waiting for in-flight commands"),
+                    timer:sleep(min(200, max(0, Deadline - erlang:monotonic_time(millisecond)))),
                     drain_pending(Deadline)
             end
+    end.
+
+%% @private End every local session through its agent process and wait, until
+%% Deadline, for the processes to finish (each casts its DISCONNECTED before it
+%% exits). One that is still running at the deadline is left to the tree.
+%%
+%% The agents are the routing table's AND the agent supervisor's children: an
+%% agent still inside its registry call (the `registering' state) is not in the
+%% table yet, and ending only the table's agents would let it register, announce
+%% CONNECTED and never send its DISCONNECTED. It postpones the disconnect until
+%% its registration is done, then ends like the others. A second pass ends any
+%% agent started meanwhile (a Subscribe for a session registered just before the
+%% stop); at most three passes.
+end_sessions(Deadline) ->
+    {Ended, Left} = end_sessions(Deadline, #{}, 3),
+    case Left of
+        0 -> logger:info("Gateway stop: ended ~b agent session(s)", [Ended]);
+        _ -> logger:warning("Gateway stop: ~b of ~b agent session(s) had not ended by the "
+                            "deadline", [Left, Ended])
+    end.
+
+end_sessions(_Deadline, Seen, 0) ->
+    {map_size(Seen), 0};
+end_sessions(Deadline, Seen, Passes) ->
+    case [P || P <- agent_pids(), not is_map_key(P, Seen)] of
+        [] ->
+            {map_size(Seen), 0};
+        Pids ->
+            Mons = [{erlang:monitor(process, P), P} || P <- Pids],
+            [yuzu_gw_agent:disconnect(P) || P <- Pids],
+            Seen1 = maps:merge(Seen, maps:from_keys(Pids, true)),
+            case await_down(maps:from_list(Mons), Deadline) of
+                0    -> end_sessions(Deadline, Seen1, Passes - 1);
+                Left -> {map_size(Seen1), Left}
+            end
+    end.
+
+agent_pids() ->
+    Children = try supervisor:which_children(yuzu_gw_agent_sup)
+               catch _:_ -> []
+               end,
+    lists:usort(local_agent_pids() ++ [P || {_, P, _, _} <- Children, is_pid(P)]).
+
+await_down(Mons, _Deadline) when map_size(Mons) =:= 0 ->
+    0;
+await_down(Mons, Deadline) ->
+    Wait = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {'DOWN', Ref, process, _, _} when is_map_key(Ref, Mons) ->
+            await_down(maps:remove(Ref, Mons), Deadline)
+    after Wait ->
+        [erlang:demonitor(R, [flush]) || R <- maps:keys(Mons)],
+        map_size(Mons)
     end.
 
 %%--------------------------------------------------------------------
 %% Environment variable overrides for container deployment
 %%--------------------------------------------------------------------
 
+%% YUZU_GW_UPSTREAM_ADDR / YUZU_GW_UPSTREAM_PORT used to be copied into the
+%% upstream_addr / upstream_port app env, which nothing reads: the server the
+%% gateway dials is the endpoint list of the channel in {yuzu_gw, upstream_client}.
+%% They logged "ENV override" as if they applied. They are not applied, and a
+%% variable set in an operator's compose file now says so instead of looking
+%% like it worked.
+warn_inert_upstream_env() ->
+    [logger:warning("~s is set but has no effect: the upstream server is the endpoint "
+                    "list of the channel in {yuzu_gw, upstream_client} (see "
+                    "docs/user-manual/gateway.md 'The upstream client').", [Var])
+     || Var <- ["YUZU_GW_UPSTREAM_ADDR", "YUZU_GW_UPSTREAM_PORT"],
+        os:getenv(Var) =/= false],
+    ok.
+
 apply_env_overrides() ->
+    warn_inert_upstream_env(),
     apply_env_overrides(file:native_name_encoding()).
 
 %% The environment text is interpreted in the node's native name encoding
 %% (yuzu_gw_env:env_utf8_binary/2); the parameter lets a test run both.
 apply_env_overrides(Encoding) ->
     Overrides = [
-        {"YUZU_GW_UPSTREAM_ADDR",    upstream_addr,    fun(V) -> V end},
-        {"YUZU_GW_UPSTREAM_PORT",    upstream_port,    fun list_to_integer/1},
-        {"YUZU_GW_AGENT_PORT",       agent_listen_port, fun list_to_integer/1},
-        {"YUZU_GW_MGMT_PORT",        mgmt_listen_port,  fun list_to_integer/1},
         {"YUZU_GW_PROMETHEUS_PORT",  prometheus_port,   fun list_to_integer/1},
         {"YUZU_GW_HEALTH_PORT",      health_port,       fun list_to_integer/1},
         {"YUZU_GW_HEARTBEAT_INTERVAL_MS", heartbeat_batch_interval_ms, fun list_to_integer/1},
@@ -356,8 +556,93 @@ apply_env_overrides(Encoding) ->
             end
     end,
 
+    %% The listener ports are not app keys any more: they are inside the
+    %% listener entries.
+    apply_listener_port_overrides(),
+
     %% TLS cert overrides (these set the tls proplist)
     apply_tls_overrides().
+
+%% @doc Apply YUZU_GW_AGENT_PORT / YUZU_GW_MGMT_PORT to the listener entries:
+%% the port of the entry that serves agent_pb (resp. management_pb), and ONLY
+%% when exactly one entry serves that proto. With none, or with several (the
+%% two-agent-listener topology: one for a load balancer, one for a router), a
+%% single variable cannot say which entry it means and moving them all would
+%% put two on one port, so the variable is ignored with a warning. An entry that
+%% serves both protos has one port, which YUZU_GW_AGENT_PORT sets;
+%% YUZU_GW_MGMT_PORT is ignored for it. Read from the process environment, not
+%% from the {yuzu_gw, agent_listen_port} / {yuzu_gw, mgmt_listen_port} keys the
+%% deployed configs may still carry: nothing reads those.
+-spec apply_listener_port_overrides() -> ok.
+apply_listener_port_overrides() ->
+    Overrides = [{agent_pb, "YUZU_GW_AGENT_PORT"}, {management_pb, "YUZU_GW_MGMT_PORT"}],
+    case application:get_env(yuzu_gw, grpc_listeners, []) of
+        [_ | _] = Listeners ->
+            case yuzu_grpc_listener:proper_list(Listeners) of
+                true ->
+                    Updated = lists:foldl(fun({Proto, Var}, Acc) ->
+                                              override_proto_port(Proto, Var, Acc)
+                                          end, Listeners, Overrides),
+                    application:set_env(yuzu_gw, grpc_listeners, Updated);
+                false ->
+                    ok  %% check_grpc_listeners/0 refuses it
+            end;
+        _ ->
+            ok
+    end.
+
+override_proto_port(Proto, Var, Listeners) ->
+    case os:getenv(Var) of
+        false ->
+            Listeners;
+        Value ->
+            case [L || L <- Listeners, serves_proto(L, Proto)] of
+                [Only] ->
+                    case Proto =:= management_pb andalso serves_proto(Only, agent_pb) of
+                        true ->
+                            logger:warning("ENV override: ~s is ignored: the one listener "
+                                           "that serves management_pb also serves agent_pb "
+                                           "and has one port, set by YUZU_GW_AGENT_PORT", [Var]),
+                            Listeners;
+                        false ->
+                            [case L of
+                                 Only -> with_port(L, Value, Var);
+                                 _ -> L
+                             end || L <- Listeners]
+                    end;
+                Serving ->
+                    logger:warning("ENV override: ~s is ignored: it applies only when exactly "
+                                   "one grpc_listeners entry serves ~s and ~b do",
+                                   [Var, Proto, length(Serving)]),
+                    Listeners
+            end
+    end.
+
+serves_proto(Entry, Proto) ->
+    yuzu_grpc_listener:serves_proto(Entry, Proto).
+
+with_port(Listener, Value, Var) ->
+    try list_to_integer(Value) of
+        Port when Port >= 0, Port =< 65535 ->
+            case maps:get(listen, Listener, #{}) of
+                Listen when is_map(Listen) ->
+                    logger:info("ENV override: ~s = ~p", [Var, Port]),
+                    Listener#{listen => Listen#{port => Port}};
+                _ ->
+                    %% A `listen' that is not a map is left for validate/1 to
+                    %% refuse (bad_listen); no port is applied to it.
+                    logger:warning("ENV override: ~s is ignored: the entry's `listen' is not "
+                                   "a map", [Var]),
+                    Listener
+            end;
+        _ ->
+            logger:warning("ENV override: ~s has invalid value '~s', ignoring", [Var, Value]),
+            Listener
+    catch
+        error:badarg ->
+            logger:warning("ENV override: ~s has invalid value '~s', ignoring", [Var, Value]),
+            Listener
+    end.
 
 cluster_id_from_env(Value, Encoding) ->
     case yuzu_gw_env:env_utf8_binary(Value, Encoding) of
@@ -464,87 +749,258 @@ apply_tls_overrides() ->
 
 -type tls_posture() :: verified | unverified | plaintext.
 
-%% @private Report the real transport TLS posture from grpcbox's OWN config —
-%% the authoritative source (grpcbox reads {grpcbox, client|servers} at boot,
-%% not yuzu_gw's advisory `tls` env). Never crashes on unexpected shapes.
+%% @private Report the real transport TLS posture: the listener entries of
+%% {yuzu_gw, grpc_listeners} and, for the upstream hop, the upstream channel
+%% config {yuzu_gw, upstream_client} (see yuzu_grpc_client_config). Never crashes
+%% on unexpected shapes.
 -spec log_tls_state() -> ok.
 log_tls_state() ->
     case application:get_env(yuzu_gw, tls_enabled, auto) of
         false ->
-            logger:warning("YUZU_GW_TLS_ENABLED=false is advisory only — the actual "
-                           "transport is whatever the grpcbox config selects (below)");
+            logger:warning("YUZU_GW_TLS_ENABLED=false is advisory only -- the actual "
+                           "transport is whatever the listener entries and the upstream "
+                           "client config select (below)");
         _ -> ok
     end,
-    Up = client_tls_posture(application:get_env(grpcbox, client, undefined)),
-    Listen = servers_have_tls(application:get_env(grpcbox, servers, undefined)),
-    %% This reflects the CONFIGURED grpcbox posture, not a live handshake — the
-    %% upstream channel connects lazily (and the server may not have generated
-    %% certs yet at boot), so a startup file/handshake probe would false-alarm.
-    logger:info("Gateway transport TLS (configured): upstream->server=~s, "
-                "listeners(agent/mgmt)=~s", [posture_word(Up), tls_word(Listen)]),
+    %% The WEAKEST endpoint decides what the line says: calls travel over all of
+    %% them, so a verified endpoint beside a plaintext one is not "mutual-TLS".
+    Up = client_tls_weakest(application:get_env(yuzu_gw, upstream_client, undefined)),
+    Listeners = application:get_env(yuzu_gw, grpc_listeners, []),
+    %% This reflects the CONFIGURED posture, not a live handshake -- the
+    %% upstream channel starts after this line and keeps retrying a connection
+    %% that fails (and the server may not have generated certs yet at boot), so
+    %% a startup file/handshake probe would false-alarm.
+    logger:info("Gateway transport TLS (configured): upstream->server=~s, listeners: ~s",
+                [posture_word(Up, client_all_present_client_cert(
+                                  application:get_env(yuzu_gw, upstream_client, undefined))),
+                 listeners_summary(Listeners)]),
     case Up of
         plaintext ->
             logger:warning("Gateway->server upstream is PLAINTEXT. For production point "
-                           "the grpcbox default_channel at {https,...} with the gateway "
+                           "the upstream default_channel at {https,...} with the gateway "
                            "leaf + CA (see config/sys.config.prod / deploy gateway-sys.config).");
         unverified ->
-            %% https without {verify,verify_peer}: encrypted but NOT authenticated —
+            %% https without {verify,verify_peer}: encrypted but NOT authenticated --
             %% an active MITM can impersonate the server. Do not report this as "TLS".
             logger:warning("Gateway->server upstream is ENCRYPTED but does NOT verify the "
-                           "server certificate ({verify,verify_peer} missing from the "
-                           "grpcbox default_channel SslOpts) — vulnerable to MITM. Add "
-                           "{verify,verify_peer} + {cacertfile,...}.");
+                           "server certificate against a CA of its own ({verify,verify_peer} "
+                           "or {cacertfile,...} missing from an upstream channel's SslOpts) "
+                           "-- vulnerable to MITM. Add {verify,verify_peer} + {cacertfile,...}.");
         verified -> ok
     end,
-    %% Listener footgun: cert material in transport_opts but no `ssl => true`
-    %% means grpcbox serves PLAINTEXT on that port despite the cert config — the
-    %% operator believes the agent/mgmt hop is encrypted, it is not. Warn loudly
-    %% (same "looks secure, isn't" class the upstream `unverified` guard refuses).
-    case listener_tls_traps(application:get_env(grpcbox, servers, undefined)) of
-        [] -> ok;
-        TrapPorts ->
-            logger:warning("Gateway listener(s) on port(s) ~p carry TLS cert material in "
-                           "transport_opts but `ssl` is not set to `true` (missing, or set "
-                           "to another value like verify_peer) — grpcbox runs PLAINTEXT on "
-                           "these ports despite the cert config (silent downgrade). "
-                           "transport_opts must be a MAP with `ssl => true`. See "
-                           "config/sys.config.prod.", [TrapPorts])
-    end,
     %% Advisory-env footgun: an operator who set YUZU_GW_TLS_* populated only the
-    %% unconsumed yuzu_gw `tls` env; it does NOT configure grpcbox, REGARDLESS of
-    %% the actual upstream posture. Warn whenever it is set so the misconception is
+    %% unconsumed yuzu_gw `tls` env; it does NOT configure a listener, REGARDLESS
+    %% of the actual posture. Warn whenever it is set so the misconception is
     %% always surfaced (not only when the upstream happens to be plaintext).
     case application:get_env(yuzu_gw, tls, []) of
         [] -> ok;
         _ ->
             logger:warning("yuzu_gw `tls` env is set (YUZU_GW_TLS_*) but those env vars are "
-                           "advisory and do NOT configure grpcbox (it reads its own config). "
-                           "Set TLS in the grpcbox block of sys.config. See "
+                           "advisory and do NOT configure a listener (each reads the `tls` "
+                           "map of its own {yuzu_gw, grpc_listeners} entry). See "
                            "docs/pki-architecture.md 'Gateway TLS'.")
     end,
     ok.
 
-%% @private Fail-closed guard: refuse to boot if the grpcbox upstream channel is
-%% TLS-but-unverified (https without {verify,verify_peer}) — encrypted yet
-%% MITM-able. PLAINTEXT upstream is permitted (the legitimate UAT/dev posture);
+%% "agent: one-way TLS, mgmt: mutual TLS": one phrase per listener entry.
+-spec listeners_summary(term()) -> string().
+listeners_summary([_ | _] = Listeners) ->
+    case yuzu_grpc_listener:proper_list(Listeners) of
+        true -> lists:flatten(lists:join(", ", [listener_summary(L) || L <- Listeners]));
+        false -> "unrecognised entries"
+    end;
+listeners_summary(_) ->
+    "none configured".
+
+listener_summary(#{name := Name} = L) ->
+    Origin = case maps:get(origin, L, undefined) of
+        #{mode := Mode} when Mode =/= transport -> io_lib:format(" behind ~p", [Mode]);
+        _ -> ""
+    end,
+    lists:flatten(io_lib:format("~p=~s~s", [Name, tls_word(L), Origin]));
+listener_summary(_) ->
+    "unrecognised entry".
+
+-spec tls_word(map()) -> string().
+tls_word(#{tls := Tls}) when is_map(Tls) ->
+    case maps:get(verify, Tls, verify_peer) of
+        verify_peer ->
+            case maps:get(fail_if_no_peer_cert, Tls, true) of
+                true -> "mutual-TLS";
+                _ -> "TLS(client certificate requested)"
+            end;
+        _ -> "one-way TLS"
+    end;
+tls_word(_) ->
+    "plaintext".
+
+%% @private Refuse to boot with an upstream channel config the client cannot
+%% use, and with none. The value is `{yuzu_gw, upstream_client}' (see
+%% yuzu_grpc_client_config); a channel dropped as unreadable would leave the
+%% gateway with no upstream, and one whose TLS options were ignored would be
+%% worse than none. Nothing of the offending value is logged, only its shape:
+%% an endpoint's SSL options name key files.
+%%
+%% The two callers of the channel, yuzu_gw_upstream and yuzu_gw_heartbeat_buffer,
+%% use `default_channel'. A gateway without one registers no agent and forwards
+%% no heartbeat while /readyz answers (its upstream check is that a process is
+%% alive), so it is refused unless {yuzu_gw, allow_no_upstream} is the literal
+%% `true' (a gateway under test).
+-spec check_upstream_client_config() -> ok | {error, bad_upstream_client_config | no_upstream_channel}.
+check_upstream_client_config() ->
+    case yuzu_grpc_client_config:from_env() of
+        {ok, Channels} ->
+            warn_replaced_options(),
+            warn_multi_connection(Channels),
+            Has = lists:any(fun(#{name := N}) -> N =:= default_channel end, Channels),
+            case Has orelse application:get_env(yuzu_gw, allow_no_upstream, false) =:= true of
+                true ->
+                    ok;
+                false ->
+                    logger:critical(
+                        "Refusing to start: no upstream channel is configured. Set "
+                        "{yuzu_gw, [{upstream_client, #{channels => [{default_channel, "
+                        "[Endpoint], #{}}]}}]} (see config/sys.config and "
+                        "docs/user-manual/gateway.md); without it the gateway can register "
+                        "no agent and forward no heartbeat."),
+                    {error, no_upstream_channel}
+            end;
+        {error, Why} ->
+            logger:critical(
+                "Refusing to start: the upstream channel configuration "
+                "{yuzu_gw, upstream_client} is unusable (~p). Each channel is "
+                "{Name, [Endpoint], Options}; an endpoint is "
+                "{http | https, Host, Port, SslOptions} (see config/sys.config and "
+                "docs/user-manual/gateway.md).", [Why]),
+            {error, bad_upstream_client_config}
+    end.
+
+%% A channel option that is present but not an integer in its range is replaced
+%% by its default (yuzu_grpc_client_config:channel/2), which is a different gateway
+%% from the one the file describes: a pool_size of 100 runs as 1, a connect_timeout
+%% of 0 as 5000. Said at boot, one line per option, naming the channel, the option,
+%% what was given (a number or a type word, never the contents) and what runs. The
+%% gateway still starts: a refusal here would turn a typo in a tuning knob into a
+%% fleet outage on the next restart.
+-spec warn_replaced_options() -> ok.
+warn_replaced_options() ->
+    [logger:warning(
+       "Upstream channel ~s: ~s is ~s, not an integer from ~b to ~b; the default ~b is "
+       "used instead (docs/user-manual/gateway.md 'Bad values replaced by defaults').",
+       [Channel, Option, Given, Min, Max, Default])
+     || #{channel := Channel, option := Option, given := Given,
+          min := Min, max := Max, default := Default}
+            <- yuzu_grpc_client_config:replaced_options(
+                 application:get_env(yuzu_gw, yuzu_grpc_client_config:env_key(), undefined))],
+    ok.
+
+%% A channel holding more than one connection (pool_size above 1, or several
+%% endpoints) sends its calls round-robin over them. Behind a layer-4 virtual IP
+%% in front of several core replicas that spreads ONE gateway's calls over
+%% different replicas, which the registration reconcile (ADR-2002 7c) assumes
+%% does not happen. Allowed, and said at boot.
+warn_multi_connection(Channels) ->
+    [logger:warning("Upstream channel ~s holds ~b connections (pool_size ~b, ~b endpoint(s)): "
+                    "its calls go round-robin over them. Behind a layer-4 VIP in front of "
+                    "several core replicas that spreads one gateway's calls over different "
+                    "replicas; keep one connection per gateway unless that is intended "
+                    "(docs/user-manual/gateway.md 'The upstream client').",
+                    [N, Size * length(Es), Size, length(Es)])
+     || #{name := N, pool_size := Size, endpoints := Es} <- Channels, Size * length(Es) > 1],
+    ok.
+
+%% @private The files an https endpoint's TLS options name, looked at once at
+%% boot. A file that is missing, empty or holds no certificate is WARNED about
+%% and the gateway starts: the server creates its certificates on first start,
+%% possibly after the gateway's, the channel keeps retrying, and its own error
+%% line and /readyz carry on saying so until a connection is made. A DIRECTORY
+%% (or other non-file) where a file belongs is REFUSED: it can never become one
+%% by waiting, and it is what a container runtime creates in place of a
+%% bind-mounted file that does not exist on the host. Reads files, not the option
+%% values: a key file's path is never logged (yuzu_gw_tls_files).
+-spec check_upstream_tls_files() -> ok | {error, unusable_upstream_tls_file}.
+check_upstream_tls_files() ->
+    case yuzu_grpc_client_config:from_env() of
+        {ok, Channels} ->
+            Found = [{N, H, P, Problem}
+                     || #{name := N, endpoints := Es} <- Channels,
+                        #{host := H, port := P} = E <- Es,
+                        Problem <- yuzu_gw_tls_files:diagnose_endpoint(E)],
+            [logger:warning("Upstream channel ~s endpoint ~s:~b: ~ts. Every connection to it "
+                            "fails until this is fixed.~ts",
+                            [N, H, P, yuzu_gw_tls_files:describe(Problem),
+                             case yuzu_gw_tls_files:has_definite_defect([Problem]) of
+                                 true  -> "";
+                                 false -> " The gateway starts anyway because the server may "
+                                          "create the file after the gateway does; /readyz stays "
+                                          "503 until a connection is made."
+                             end])
+             || {N, H, P, Problem} <- Found],
+            case yuzu_gw_tls_files:has_definite_defect([Pr || {_, _, _, Pr} <- Found]) of
+                false ->
+                    ok;
+                true ->
+                    logger:critical(
+                        "Refusing to start: a TLS file of an upstream endpoint is a directory "
+                        "or not a regular file (see the warning above). It cannot become a file "
+                        "by waiting. A container runtime creates a directory in place of a "
+                        "bind-mounted file that does not exist on the host: create the file, "
+                        "or fix the path (docs/user-manual/gateway.md 'The upstream client')."),
+                    {error, unusable_upstream_tls_file}
+            end;
+        {error, _} ->
+            ok
+    end.
+
+%% @private Refuse to boot if one channel lists both plaintext (http) and TLS
+%% (https) endpoints. A call goes round-robin over every live connection of its
+%% channel, so some calls would travel unencrypted (a ProxyRegister carries the
+%% enrollment token and the CSR) whatever the https endpoint is verified against,
+%% and the boot log would still have said the upstream was TLS. A channel is
+%% one scheme.
+-spec check_upstream_channel_mix() -> ok | {error, mixed_upstream_endpoints}.
+check_upstream_channel_mix() ->
+    case client_mixed_channels(application:get_env(yuzu_gw, upstream_client, undefined)) of
+        [] ->
+            ok;
+        [Name | _] ->
+            logger:critical(
+                "Refusing to start: the upstream channel ~p lists both plaintext (http) "
+                "and TLS (https) endpoints. Calls go round-robin over every live "
+                "connection of a channel, so some would travel unencrypted. Give a "
+                "channel one scheme.", [Name]),
+            {error, mixed_upstream_endpoints}
+    end.
+
+%% @private Fail-closed guard: refuse to boot if ANY https upstream endpoint is
+%% TLS-but-unverified (no {verify,verify_peer}, or no {cacertfile,...} /
+%% {cacerts,...} of its own) — encrypted yet MITM-able, or trusting every CA in
+%% the operating system's store. PLAINTEXT upstream is permitted (the legitimate UAT/dev posture);
 %% only the dangerous "looks secure, isn't" middle state is refused. Mirrors the
 %% distribution-cookie guard's fail-closed posture. Dev/CI override:
 %% YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1.
 -spec check_upstream_tls_posture() -> ok | {error, unverified_upstream_tls}.
 check_upstream_tls_posture() ->
-    Posture = client_tls_posture(application:get_env(grpcbox, client, undefined)),
+    Client = application:get_env(yuzu_gw, upstream_client, undefined),
+    %% ANY unverified https endpoint refuses, even beside a verified one: calls
+    %% are spread over all of them.
+    Posture = case client_has_unverified(Client) of
+                  true  -> unverified;
+                  false -> client_tls_weakest(Client)
+              end,
     Allow = os:getenv("YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM") =:= "1",
     case evaluate_upstream_posture(Posture, Allow) of
         {error, unverified_upstream_tls} ->
             logger:critical(
-                "Refusing to start: the grpcbox upstream channel uses TLS (https) WITHOUT "
-                "{verify,verify_peer} — encrypted but UNAUTHENTICATED (MITM-able). Add "
+                "Refusing to start: the upstream channel uses TLS (https) WITHOUT "
+                "{verify,verify_peer} and a {cacertfile,...} of its own — encrypted but "
+                "UNAUTHENTICATED (MITM-able), or trusting the operating system's CAs. Add "
                 "{verify,verify_peer} + {cacertfile,...} to the default_channel SslOpts "
                 "(see config/sys.config.prod). Dev/CI may override with "
                 "YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1."),
             {error, unverified_upstream_tls};
         ok when Posture =:= unverified ->
-            logger:warning("Upstream TLS is unverified (no verify_peer) but "
+            logger:warning("Upstream TLS is unverified (no verify_peer, or no CA of its own) but "
                            "YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1 — proceeding (dev/CI only)."),
             ok;
         ok ->
@@ -552,12 +1008,412 @@ check_upstream_tls_posture() ->
     end.
 
 %% @doc Pure upstream-posture policy decision — exported for testing. Only
-%% `unverified` (https without verify_peer) without an explicit override is
-%% refused; `verified` and `plaintext` boot.
+%% `unverified` (https without verify_peer, or without a CA of its own) without
+%% an explicit override is refused; `verified` and `plaintext` boot.
 -spec evaluate_upstream_posture(tls_posture(), boolean()) ->
           ok | {error, unverified_upstream_tls}.
 evaluate_upstream_posture(unverified, false) -> {error, unverified_upstream_tls};
 evaluate_upstream_posture(_Posture, _Allow)  -> ok.
+
+%%--------------------------------------------------------------------
+%% Listener configuration guards
+%%--------------------------------------------------------------------
+
+%% @private Refuse to boot with a non-empty {grpcbox, servers}. The listeners are
+%% {yuzu_gw, grpc_listeners}; the gateway does not contain grpcbox, so nothing
+%% reads a leftover block, and the operator who kept it believes a listener is
+%% configured that is not. It is refused rather than ignored for that reason.
+-spec check_legacy_grpcbox_servers() -> ok | {error, legacy_grpcbox_servers}.
+check_legacy_grpcbox_servers() ->
+    case legacy_grpcbox_value(servers) of
+        absent ->
+            ok;
+        found ->
+            logger:critical(
+                "Refusing to start: {grpcbox, servers} is set. The gateway's listeners "
+                "are configured in {yuzu_gw, grpc_listeners} (one entry per listener) "
+                "and nothing reads {grpcbox, servers}: that block would configure no "
+                "listener. Move the listener settings into grpc_listeners and remove "
+                "the {servers, ...} block (see config/sys.config.prod and "
+                "docs/user-manual/gateway.md)."),
+            {error, legacy_grpcbox_servers}
+    end.
+
+%% @private Refuse to boot with a {grpcbox, client}. The upstream channels are
+%% {yuzu_gw, upstream_client} (same value); nothing reads the old key. Left in
+%% place it would be INVISIBLE, not merely unused: OTP applies a sys.config entry
+%% only to a loaded application, and none is named grpcbox, so the gateway would
+%% start with no TLS client options and the operator would read the file and
+%% see them.
+-spec check_legacy_grpcbox_client() -> ok | {error, legacy_grpcbox_client}.
+check_legacy_grpcbox_client() ->
+    case legacy_grpcbox_value(client) of
+        absent ->
+            ok;
+        found ->
+            logger:critical(
+                "Refusing to start: {grpcbox, [{client, ...}]} is set. The upstream "
+                "channels are configured in {yuzu_gw, [{upstream_client, ...}]} and "
+                "nothing reads the old key. Move the value across unchanged and remove "
+                "the {grpcbox, ...} block (see config/sys.config and "
+                "docs/user-manual/gateway.md)."),
+            {error, legacy_grpcbox_client}
+    end.
+
+%% A `grpcbox' key counts when it is in the application env (set at run time) or
+%% in one of the config files the VM was started with. The files have to be read
+%% because a sys.config entry for an application that is not loaded never reaches
+%% the application env. A key whose value is empty or undefined is no key.
+legacy_grpcbox_value(Key) ->
+    case application:get_env(grpcbox, Key) of
+        {ok, V} when V =/= [], V =/= undefined -> found;
+        _ -> legacy_grpcbox_in_files(Key, config_files())
+    end.
+
+config_files() ->
+    case init:get_argument(config) of
+        {ok, Lists} -> [P || L <- Lists, P <- L];
+        error       -> []
+    end.
+
+%% @doc Whether a `{grpcbox, KVs}' entry with a non-empty `Key' is in any of
+%% these config files (or a file they name; nesting is followed a few levels).
+%% A file that cannot be read or parsed is skipped: the gateway's own boot is the
+%% place that fails on a bad config, not this scan. Exported for testing.
+-spec legacy_grpcbox_in_files(servers | client, [file:filename()]) -> found | absent.
+legacy_grpcbox_in_files(Key, Paths) ->
+    case lists:any(fun(P) -> scan_config(P, Key, 4) end, Paths) of
+        true  -> found;
+        false -> absent
+    end.
+
+scan_config(_Path, _Key, 0) ->
+    false;
+scan_config(Path, Key, Depth) ->
+    case read_config(Path) of
+        {ok, File, Terms} -> scan_terms(Terms, Key, Depth, filename:dirname(File));
+        error             -> false
+    end.
+
+read_config(Path) ->
+    Candidates = [Path, Path ++ ".config"],
+    try
+        [{File, Terms} | _] = [{C, T} || C <- Candidates, {ok, [T]} <- [file:consult(C)]],
+        {ok, File, Terms}
+    catch
+        _:_ -> error
+    end.
+
+%% A config file named inside another is resolved against the directory of the
+%% file that names it, as the VM does; a path relative to the working directory
+%% would find a different file, or none, and the scan would report `absent' for
+%% a file the VM loads.
+nested_path(Nested, Dir) ->
+    case filename:pathtype(Nested) of
+        absolute -> Nested;
+        _        -> filename:join(Dir, Nested)
+    end.
+
+scan_terms(Terms, Key, Depth, Dir) when is_list(Terms) ->
+    lists:any(fun({grpcbox, KVs}) when is_list(KVs) ->
+                      case proplists:get_value(Key, KVs, undefined) of
+                          undefined -> false;
+                          []        -> false;
+                          _         -> true
+                      end;
+                 (Nested) when is_list(Nested), Nested =/= [], is_integer(hd(Nested)) ->
+                      scan_config(nested_path(Nested, Dir), Key, Depth - 1);
+                 (_) ->
+                      false
+              end, Terms);
+scan_terms(_, _, _, _) ->
+    false.
+
+%% @private Refuse to boot with a listener entry that cannot start, and with no
+%% entries at all. Everything checked here is checked before any child of the
+%% supervision tree starts: an entry that fails (an incomplete `tls', a key the
+%% layer does not read, an origin mode with no sources, a service module that
+%% exports none of its service's methods) never binds a port. A module that
+%% exports only SOME of them is accepted: the route table leaves the others out
+%% and a request for one answers UNIMPLEMENTED (yuzu_grpc_route). An unset or
+%% empty `grpc_listeners' is a gateway that accepts no agent and no command
+%% while /healthz answers -- what an operator gets by removing the refused
+%% {grpcbox, servers} block and adding nothing -- so it is refused unless
+%% {yuzu_gw, allow_no_listeners} is the literal `true' (a gateway under test, or
+%% one that only routes). The same holds for entries none of which routes the
+%% AgentService (check_agent_listener/1).
+-spec check_grpc_listeners() ->
+          ok | {error, bad_grpc_listeners | no_grpc_listeners | no_agent_listener}.
+check_grpc_listeners() ->
+    case application:get_env(yuzu_gw, grpc_listeners, []) of
+        [] ->
+            case application:get_env(yuzu_gw, allow_no_listeners, false) of
+                true ->
+                    logger:warning("No gRPC listeners are configured ({yuzu_gw, grpc_listeners}) "
+                                   "and {yuzu_gw, allow_no_listeners} is true: this gateway "
+                                   "accepts no agent or management connection."),
+                    ok;
+                _ ->
+                    logger:critical(
+                        "Refusing to start: {yuzu_gw, grpc_listeners} is unset or empty, so this "
+                        "gateway would accept no agent and no management connection. Configure "
+                        "the listeners in the yuzu_gw block (one entry per listener; see "
+                        "config/sys.config.prod and docs/user-manual/gateway.md). A gateway that "
+                        "is meant to serve none (a test) sets {yuzu_gw, allow_no_listeners} to "
+                        "true."),
+                    {error, no_grpc_listeners}
+            end;
+        Listeners ->
+            case evaluate_listeners(Listeners) of
+                ok ->
+                    check_agent_listener(Listeners);
+                {error, Defects} ->
+                    logger:critical(
+                        "Refusing to start: invalid {yuzu_gw, grpc_listeners} entry/entries ~p. "
+                        "See docs/user-manual/gateway.md for the entry shape.", [Defects]),
+                    {error, bad_grpc_listeners}
+            end
+    end.
+
+%% Entries that are all valid but none of which routes the agent service: no agent
+%% could ever connect, and /readyz (which requires one) would never answer ready,
+%% so a clear refusal is better than a gateway that boots and is never put in
+%% rotation. "Routes" is the strict test (yuzu_grpc_listener:routes_agent/1): the
+%% AgentService is a key of the entry's `services'. An entry that only lists
+%% agent_pb in its service_protos builds a route table without it and answers
+%% every agent RPC UNIMPLEMENTED. Excused by {yuzu_gw, allow_no_listeners} (the
+%% literal `true') like the empty list.
+check_agent_listener(Listeners) ->
+    case lists:any(fun yuzu_grpc_listener:routes_agent/1, Listeners) of
+        true ->
+            ok;
+        false ->
+            case application:get_env(yuzu_gw, allow_no_listeners, false) of
+                true ->
+                    logger:warning("No {yuzu_gw, grpc_listeners} entry routes the agent service "
+                                   "and {yuzu_gw, allow_no_listeners} is true: this gateway "
+                                   "accepts no agent connection."),
+                    ok;
+                _ ->
+                    logger:critical(
+                        "Refusing to start: no {yuzu_gw, grpc_listeners} entry routes the "
+                        "AgentService (its `services' map has no 'yuzu.agent.v1.AgentService' "
+                        "key), so no agent could connect and /readyz would never report "
+                        "ready. Add the agent listener (see config/sys.config.prod and "
+                        "docs/user-manual/gateway.md). A gateway that is meant to serve none "
+                        "(a test) sets {yuzu_gw, allow_no_listeners} to true."),
+                    {error, no_agent_listener}
+            end
+    end.
+
+%% @doc Fail-closed guard: refuse to boot on a {yuzu_gw, memory_shedding} config
+%% that is malformed (keys and value types) or, when shedding is enabled, whose
+%% watermarks cannot work once resolved against the memory limit read now: a low
+%% mark not below the high mark, a mark at or above the memory limit, a mark
+%% that is not positive (yuzu_gw_memory_shedder:check_config/1). One absolute
+%% mark alone is valid: the other is derived from it. A fractional mark with no
+%% memory limit readable is environmental and does not fail boot: the shedder
+%% runs inactive and yuzu_gw_memory_shedding_inactive reads 1. An unset key is
+%% valid (the defaults apply).
+-spec check_memory_shedding() -> ok | {error, bad_memory_shedding}.
+check_memory_shedding() ->
+    Cfg = application:get_env(yuzu_gw, memory_shedding, #{}),
+    case yuzu_gw_memory_shedder:check_config(Cfg) of
+        ok -> ok;
+        {error, Reason} ->
+            logger:critical(
+                "Refusing to start: {yuzu_gw, memory_shedding}: ~ts. See "
+                "docs/user-manual/gateway.md \"Node-wide memory load shedding\".",
+                [yuzu_gw_memory_shedder:format_error(Reason)]),
+            {error, bad_memory_shedding}
+    end.
+
+%% @doc Fail-closed guard: refuse to boot on a {yuzu_gw, mgmt_pin_refresh_ms}
+%% that is set but is not an integer from 100 to 3600000 (ms). It is how often
+%% yuzu_gw_mgmt_pins re-reads the {cert_file, Path} management pins, so it bounds
+%% how long a rotated server leaf is refused (#5696). Unset is valid (5000).
+-spec check_mgmt_pin_refresh() -> ok | {error, bad_mgmt_pin_refresh_ms}.
+check_mgmt_pin_refresh() ->
+    case yuzu_gw_mgmt_pins:validate_refresh_ms(
+           application:get_env(yuzu_gw, mgmt_pin_refresh_ms, undefined)) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            logger:critical(
+              "Refusing to start: invalid {yuzu_gw, mgmt_pin_refresh_ms}: ~p. It must be "
+              "an integer number of milliseconds from 100 to 3600000, or unset (5000). "
+              "See docs/user-manual/gateway.md.", [Reason]),
+            {error, bad_mgmt_pin_refresh_ms}
+    end.
+
+%% @doc Fail-closed guard (#6016): resolve the management peer authorization
+%% (`mgmt_peer_auth_mode', `mgmt_peer_identity', `mgmt_peer_denied') and publish
+%% it for yuzu_gw_authz, whose per-stream check does no I/O. A mode that is not
+%% one of the three, an explicit identity that is not `yuzu://<install>/server',
+%% a deny entry that is not a hex serial, and two management listeners that
+%% derive different identities each refuse the boot. An identity that merely
+%% cannot be derived (a CA bundle, an unreadable file) is not refused here: the
+%% posture guard decides whether the listener may run without it, and the check
+%% rejects every peer that needs it (`identity_unresolved').
+-spec check_mgmt_auth_config() -> ok | {error, bad_mgmt_peer_auth}.
+check_mgmt_auth_config() ->
+    case yuzu_gw_mgmt_identity:resolve() of
+        {ok, #{mode := Mode, identity := Identity, denied := Denied} = State} ->
+            ok = yuzu_gw_mgmt_identity:publish(State),
+            Pins = application:get_env(yuzu_gw, mgmt_peer_pins, []),
+            %% Only a management listener that runs the auth_fun needs the identity;
+            %% a plaintext lab-rig listener has none to resolve and nothing to warn of.
+            Guarded = lists:any(fun(S) -> maps:get(auth_fun, S, undefined) =/= undefined end,
+                                mgmt_listener_entries()),
+            case Mode =:= pin andalso
+                 application:get_env(yuzu_gw, mgmt_peer_identity, undefined) =/= undefined of
+                true ->
+                    logger:warning(
+                      "{yuzu_gw, mgmt_peer_identity} is set but mgmt_peer_auth_mode is "
+                      "pin (the default), so the identity is ignored and only a pin "
+                      "admits the server. Set mgmt_peer_auth_mode to identity_or_pin or "
+                      "identity to use the identity.");
+                false ->
+                    ok
+            end,
+            case Guarded andalso Mode =/= pin andalso Identity =:= undefined of
+                true ->
+                    logger:warning(
+                      "Management peer authorization mode ~p could not resolve the "
+                      "server identity (no management listener whose cacertfile holds "
+                      "exactly one certificate, and no {yuzu_gw, mgmt_peer_identity}): "
+                      "~s. Set {yuzu_gw, mgmt_peer_identity} to "
+                      "yuzu://<install>/server.",
+                      [Mode, case Mode of
+                                 identity -> "every management peer is refused "
+                                             "(identity_unresolved)";
+                                 identity_or_pin -> "only a pinned key is admitted"
+                             end]);
+                false ->
+                    ok
+            end,
+            warn_identity_differs(Mode, Identity),
+            log_denied(Denied),
+            logger:info("Management peer authorization: mode=~p identity=~s pins=~p "
+                        "denied_serials=~p",
+                        [Mode,
+                         case {Mode, Identity} of
+                             {pin, _}       -> "not used (mode pin)";
+                             {_, undefined} -> "unresolved";
+                             _              -> "resolved"
+                         end,
+                         try length(Pins) catch _:_ -> invalid end,
+                         length(Denied)]),
+            ok;
+        {error, Defects} ->
+            logger:critical(
+              "Refusing to start: invalid management peer authorization "
+              "configuration: ~p. mgmt_peer_auth_mode must be pin, identity_or_pin or "
+              "identity; mgmt_peer_identity must be yuzu://<install>/server; "
+              "mgmt_peer_denied must be a list of {serial, Hex} (1 to 40 hex digits, at most 4096 entries); "
+              "management listeners must not derive different identities; an "
+              "identity over a CA bundle needs mode identity AND a configured pin "
+              "(identity_over_ca_bundle). See docs/user-manual/gateway.md.", [Defects]),
+            {error, bad_mgmt_peer_auth}
+    end.
+
+%% An explicit mgmt_peer_identity that is not the identity the management
+%% listener's own cacertfile derives is almost always a typo, a lower-case copy
+%% of the fingerprint (the server mints UPPER-case hex) or a value left over from
+%% before a CA re-root: no peer can match it, so say so at boot rather than at
+%% the first refused command. Not a refusal: a deliberate value is possible.
+warn_identity_differs(pin, _Identity) ->
+    ok;
+warn_identity_differs(_Mode, undefined) ->
+    ok;
+warn_identity_differs(_Mode, Identity) ->
+    case yuzu_gw_mgmt_identity:derive_for_listeners(application:get_env(yuzu_gw, grpc_listeners, [])) of
+        {ok, Derived} when is_binary(Derived), Derived =/= Identity ->
+            Hint = case string:lowercase(Derived) =:= string:lowercase(Identity) of
+                       true  -> " (they differ only in letter case: the install id is UPPER-case hex)";
+                       false -> ""
+                   end,
+            logger:warning("{yuzu_gw, mgmt_peer_identity} (~s) is not the identity derived from "
+                           "the management listener's cacertfile (~s)~s: no peer certificate "
+                           "of this install will match it. Correct it, or remove it to use "
+                           "the derived one.", [Identity, Derived, Hint]);
+        _ ->
+            ok
+    end.
+
+%% The deny-list as parsed: the canonical upper-case hex of each serial, so an
+%% operator who wrote a DECIMAL serial (read as hex) sees what is actually denied.
+%% Serials are public certificate fields, not secrets; bounded to 20 on the line.
+log_denied([]) ->
+    ok;
+log_denied(Denied) ->
+    Shown = lists:sublist(Denied, 20),
+    %% Each entry in hex, with the decimal it equals: an operator who wrote a decimal
+    %% serial (read as hex) sees at once that it is not the number they meant.
+    logger:info("Management peer deny-list (serials, upper-case hex as parsed): ~s~s",
+                [lists:join(", ", [[integer_to_list(N, 16), " (decimal ", integer_to_list(N), ")"]
+                                   || N <- Shown]),
+                 case length(Denied) > 20 of true -> ", ..."; false -> "" end]).
+
+%% The configured management_pb listener entries ([] for an unusable listeners value).
+mgmt_listener_entries() ->
+    case application:get_env(yuzu_gw, grpc_listeners, []) of
+        L when is_list(L) ->
+            case yuzu_grpc_listener:proper_list(L) of
+                true -> [S || S <- L, is_map(S), is_mgmt_listener(S)];
+                false -> []
+            end;
+        _ -> []
+    end.
+
+%% @doc Pure listener-configuration decision -- exported for testing. A defect
+%% is `{Name, Reason}' (Name is `unknown' for an entry that has none): the
+%% entry's own validation (yuzu_grpc_listener:validate/1), the route table it
+%% would build, a name used twice, or a fixed port used twice.
+-spec evaluate_listeners(term()) -> ok | {error, [{term(), term()}]}.
+evaluate_listeners(Listeners) when is_list(Listeners) ->
+    case yuzu_grpc_listener:proper_list(Listeners) of
+        true -> evaluate_entries(Listeners);
+        false -> {error, [{unknown, grpc_listeners_not_a_list}]}
+    end;
+evaluate_listeners(_) ->
+    {error, [{unknown, grpc_listeners_not_a_list}]}.
+
+evaluate_entries(Listeners) ->
+    Names = [N || #{name := N} <- Listeners],
+    Ports = [P || #{listen := #{port := P}} <- Listeners, is_integer(P), P > 0],
+    Defects = lists:flatmap(fun listener_defects/1, Listeners)
+        ++ [{N, duplicate_name} || N <- lists:usort(Names -- lists:usort(Names))]
+        ++ [{port, {duplicate_port, P}} || P <- lists:usort(Ports -- lists:usort(Ports))],
+    case Defects of
+        [] -> ok;
+        _ -> {error, Defects}
+    end.
+
+listener_defects(Entry) when is_map(Entry) ->
+    Name = maps:get(name, Entry, unknown),
+    case yuzu_grpc_listener:validate(Entry) of
+        {error, Reason} ->
+            [{Name, Reason}];
+        ok ->
+            case yuzu_grpc_route:build(maps:get(service_protos, Entry), maps:get(services, Entry)) of
+                {ok, _Routes} -> [];
+                {error, Reason} -> [{Name, {bad_routes, Reason}}]
+            end
+    end;
+listener_defects(_) ->
+    [{unknown, entry_not_a_map}].
+
+%% @doc True if any listener entry serves TLS (it has a `tls' map). Pure;
+%% exported for testing.
+-spec listeners_have_tls(term()) -> boolean().
+listeners_have_tls([_ | _] = Listeners) ->
+    yuzu_grpc_listener:proper_list(Listeners)
+        andalso lists:any(fun(#{tls := Tls}) when is_map(Tls) -> true;
+                             (_) -> false
+                          end, Listeners);
+listeners_have_tls(_) ->
+    false.
 
 %%--------------------------------------------------------------------
 %% Mgmt-listener posture guard (#1422)
@@ -565,152 +1421,217 @@ evaluate_upstream_posture(_Posture, _Allow)  -> ok.
 
 %% @private Fail-closed guard for the PRIVILEGED command plane: refuse to boot
 %% when a management_pb listener is network-reachable without the full #1422
-%% posture (strict mTLS + the SPKI-pin auth_fun + configured pins). A
+%% posture (strict mTLS + the approved auth_fun + a way to admit the server:
+%% pins and/or a resolved identity, per `mgmt_peer_auth_mode'). A
 %% mgmt listener without it hands fleet-wide command execution to any peer
-%% that can reach the port — the finding this guard makes non-recurring.
+%% that can reach the port -- the finding this guard makes non-recurring.
 %%
-%% Placement caveat: grpcbox is an application DEPENDENCY, so its listeners
-%% are already up when this runs; refusing here halts the release moments
-%% after listen. In that window the router/registry are not yet started, so
-%% a mgmt RPC cannot dispatch — acceptable, and consistent with the other
-%% posture guards in this module. A pre-listen validator inside the vendored
-%% grpcbox is tracked follow-up hardening.
+%% This runs on configuration before the supervision tree starts, and the
+%% listeners are the tree's last children: when it refuses, no management port
+%% was ever bound.
 %%
-%% Escape hatch: {yuzu_gw, allow_insecure_mgmt} set to the literal `true`
-%% boots anyway with a loud warning — an ACKNOWLEDGEMENT for lab/UAT rigs
+%% Escape hatch: {yuzu_gw, allow_insecure_mgmt} set to the literal `true'
+%% boots anyway with a loud warning -- an ACKNOWLEDGEMENT for lab/UAT rigs
 %% (which the tracked rig configs set explicitly), not a mitigation.
 -spec check_mgmt_listener_posture() -> ok | {error, insecure_mgmt_listener}.
 check_mgmt_listener_posture() ->
-    Servers = application:get_env(grpcbox, servers, []),
+    Listeners = application:get_env(yuzu_gw, grpc_listeners, []),
     Pins = application:get_env(yuzu_gw, mgmt_peer_pins, []),
     Allow = application:get_env(yuzu_gw, allow_insecure_mgmt, false) =:= true,
-    case evaluate_mgmt_posture(Servers, Pins, Allow) of
+    case evaluate_mgmt_posture(Listeners, Pins, Allow, yuzu_gw_mgmt_identity:current()) of
         ok ->
             ok;
         {ok_insecure, Details} ->
             logger:warning(
                 "Management listener(s) ~p lack the #1422 secure posture but "
-                "{yuzu_gw, allow_insecure_mgmt} is true — booting anyway. This "
+                "{yuzu_gw, allow_insecure_mgmt} is true -- booting anyway. This "
                 "plane fans commands to the ENTIRE fleet; this override is for "
                 "isolated lab/UAT rigs only, never production.", [Details]),
             ok;
         {error, {insecure_mgmt_listener, Details}} ->
             logger:critical(
                 "Refusing to start: management listener(s) ~p are network-"
-                "reachable without the required posture (strict mTLS with "
+                "reachable without the required posture (a `tls' map with "
                 "certfile+keyfile+cacertfile, verify_peer, fail_if_no_peer_cert, "
-                "auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1, and non-empty "
-                "{yuzu_gw, mgmt_peer_pins}). Anyone reaching this port could "
-                "otherwise command the entire fleet (#1422). Fix the grpcbox "
-                "listener config (see config/sys.config.prod), bind it to "
-                "loopback, or — isolated lab/UAT rigs ONLY — set "
+                "auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1, no proxied "
+                "origin, and a way to admit the server: non-empty "
+                "{yuzu_gw, mgmt_peer_pins} (mode pin), a resolvable server identity "
+                "(mode identity), or either (mode identity_or_pin)). Anyone reaching "
+                "this port could otherwise command the entire fleet (#1422). Fix "
+                "the grpc_listeners entry (see config/sys.config.prod), bind it to "
+                "loopback, or -- isolated lab/UAT rigs ONLY -- set "
                 "{yuzu_gw, allow_insecure_mgmt} to true.", [Details]),
             {error, insecure_mgmt_listener}
     end.
 
-%% @doc Pure mgmt-posture policy decision — exported for testing. Returns a
+%% @doc Pure mgmt-posture policy decision -- exported for testing. Returns a
 %% per-listener defect list keyed by listen port; the escape hatch converts a
 %% refusal into {ok_insecure, Details} (boot + warn), never a silent pass.
 -spec evaluate_mgmt_posture(term(), term(), boolean()) ->
           ok | {ok_insecure, [term()]} | {error, {insecure_mgmt_listener, [term()]}}.
-evaluate_mgmt_posture(Servers, Pins, Allow) when is_list(Servers) ->
+evaluate_mgmt_posture(Listeners, Pins, Allow) ->
+    evaluate_mgmt_posture(Listeners, Pins, Allow,
+                          #{mode => pin, identity => undefined, denied => []}).
+
+%% @doc As evaluate_mgmt_posture/3, with the resolved peer authorization
+%% (yuzu_gw_mgmt_identity): what must be configured to admit the server depends
+%% on the mode. Exported for testing.
+-spec evaluate_mgmt_posture(term(), term(), boolean(), yuzu_gw_mgmt_identity:state()) ->
+          ok | {ok_insecure, [term()]} | {error, {insecure_mgmt_listener, [term()]}}.
+evaluate_mgmt_posture([_ | _] = Listeners, Pins, Allow, Auth) ->
+    case yuzu_grpc_listener:proper_list(Listeners) of
+        true -> mgmt_posture(Listeners, Pins, Allow, Auth);
+        %% An improper list cannot be walked, so no listener can be shown NOT to
+        %% be a management one: refused, whatever the escape hatch says.
+        false -> {error, {insecure_mgmt_listener, [{unknown, improper_list}]}}
+    end;
+evaluate_mgmt_posture(_Listeners, _Pins, _Allow, _Auth) ->
+    %% No listeners, or an unrecognisable listeners config: nothing provably
+    %% exposes management_pb (evaluate_listeners/1 refuses an unusable one
+    %% separately).
+    ok.
+
+mgmt_posture(Listeners, Pins, Allow, Auth) ->
     Details = [{listener_port(S), D}
-               || S <- Servers, is_mgmt_listener(S),
+               || S <- Listeners, is_mgmt_listener(S),
                   not loopback_bound(S),
-                  D <- [mgmt_defects(S, Pins)],
+                  D <- [mgmt_defects(S, Pins, Auth)],
                   D =/= []],
     case {Details, Allow} of
         {[], _}     -> ok;
         {_, true}   -> {ok_insecure, Details};
         {_, false}  -> {error, {insecure_mgmt_listener, Details}}
-    end;
-evaluate_mgmt_posture(_Servers, _Pins, _Allow) ->
-    %% Unrecognisable servers config: nothing provably exposes management_pb.
-    ok.
-
-%% @private A listener serving the management proto. Identified by
-%% service_protos — never by port or the advisory yuzu_gw env keys.
--spec is_mgmt_listener(term()) -> boolean().
-is_mgmt_listener(S) when is_map(S) ->
-    Protos = opt_value(service_protos, maps:get(grpc_opts, S, #{})),
-    is_list(Protos) andalso lists:member(management_pb, Protos);
-is_mgmt_listener(_) ->
-    false.
-
-%% @private Loopback-only binds have no network attack surface. A missing or
-%% unrecognised ip is EXPOSED (grpcbox defaults to {0,0,0,0}). The map `ip` is
-%% authoritative ONLY when `socket_options` cannot override the bind: grpcbox
-%% DELETES the ip whenever socket_options carries an inherited `{fd, _}`
-%% descriptor (grpcbox_socket:maybe_adjust_port_opts_for_fdopt/2 — the socket
-%% binds wherever the fd points, e.g. systemd socket activation), and an
-%% `{ip, _}` inside socket_options is appended after the map ip in the inet
-%% option list, where the later occurrence wins. Either shape makes a nominal
-%% `ip => {127,0,0,1}` a dead letter, so both forfeit the exemption
-%% (PR #3905 review, Doomgoose blocking finding — verified live: the fd shape
-%% previously evaluated `ok` with zero TLS/auth_fun/pins).
--spec loopback_bound(map()) -> boolean().
-loopback_bound(S) ->
-    ListenOpts = maps:get(listen_opts, S, #{}),
-    Overridable = case opt_value(socket_options, ListenOpts) of
-        undefined -> false;
-        L when is_list(L) ->
-            lists:keymember(fd, 1, L) orelse lists:keymember(ip, 1, L);
-        _ -> true  % unrecognised shape: cannot prove the bind — exposed
-    end,
-    case {Overridable, maps:get(ip, ListenOpts, undefined)} of
-        {true, _}                        -> false;
-        {false, {127, _, _, _}}          -> true;
-        {false, {0, 0, 0, 0, 0, 0, 0, 1}} -> true;
-        _                                -> false
     end.
 
-%% @private Everything wrong with one mgmt listener's posture. `ssl => true`
-%% alone is NOT TLS: grpcbox_pool silently falls back to TCP unless certfile,
-%% keyfile AND cacertfile are all present. TLS with verify_none would let a
-%% self-signed cert reach the auth_fun, and without fail_if_no_peer_cert a
-%% certless peer skips it entirely — both count as defects. The auth_fun must
-%% be exactly the approved pin callback, and the pin set non-empty.
--spec mgmt_defects(map(), term()) -> [atom()].
-mgmt_defects(S, Pins) ->
-    T = maps:get(transport_opts, S, #{}),
-    GrpcOpts = maps:get(grpc_opts, S, #{}),
-    HasMaterial = lists:all(fun(K) -> has_material(K, T) end,
-                            [certfile, keyfile, cacertfile]),
-    %% verify / fail_if_no_peer_cert default to the patched grpcbox's strict
-    %% values when omitted, so absent is fine; an explicit relaxation is not.
-    Verify = case opt_value(verify, T) of undefined -> verify_peer; V -> V end,
-    FailNoPeer = case opt_value(fail_if_no_peer_cert, T) of
-                     undefined -> true;
-                     F -> F
-                 end,
-    %% grpcbox selects TLS only when transport_opts is a MAP with ssl => true —
-    %% a PROPLIST carrying {ssl, true} still serves plaintext TCP (the same
-    %% shape is_tls_trap/1 flags), so the guard must demand the map form.
+%% @private A listener serving the management proto. Identified by
+%% service_protos -- never by port or the advisory yuzu_gw env keys.
+-spec is_mgmt_listener(term()) -> boolean().
+is_mgmt_listener(S) ->
+    yuzu_grpc_listener:serves_proto(S, management_pb).
+
+%% @private Loopback-only binds have no network attack surface. A missing or
+%% unrecognised ip is EXPOSED (the listener binds {0,0,0,0} by default). The
+%% `ip' of `listen' is authoritative ONLY when `socket_opts' cannot override the
+%% bind: an inherited `{fd, _}' descriptor makes the socket bind wherever the fd
+%% points (e.g. systemd socket activation), and an `{ip, _}' or `{ifaddr, _}'
+%% inside socket_opts is appended after the map ip in the inet option list,
+%% where the later occurrence wins. Any of them makes a nominal
+%% `ip => {127,0,0,1}' a dead letter, so all forfeit the exemption (PR #3905
+%% review, Doomgoose blocking finding). yuzu_grpc_listener:validate/1 refuses
+%% these options outright on every listener; this stays the fail-safe for a
+%% caller that reaches the posture decision without it.
+-spec loopback_bound(map()) -> boolean().
+loopback_bound(S) ->
+    case maps:get(listen, S, #{}) of
+        Listen when is_map(Listen) -> loopback_bound_listen(Listen);
+        _ -> false  % unrecognised shape: cannot prove the bind -- exposed
+    end.
+
+loopback_bound_listen(Listen) ->
+    Overridable = case maps:get(socket_opts, Listen, undefined) of
+        undefined -> false;
+        L when is_list(L) ->
+            not yuzu_grpc_listener:proper_list(L)  % unrecognised shape: exposed
+                orelse lists:keymember(fd, 1, L) orelse lists:keymember(ip, 1, L)
+                orelse lists:keymember(ifaddr, 1, L) orelse lists:keymember(local, 1, L)
+                orelse lists:member(local, L);
+        _ -> true  % unrecognised shape: cannot prove the bind -- exposed
+    end,
+    case {Overridable, maps:get(ip, Listen, undefined)} of
+        {true, _}                         -> false;
+        {false, {127, _, _, _}}           -> true;
+        {false, {0, 0, 0, 0, 0, 0, 0, 1}} -> true;
+        _                                 -> false
+    end.
+
+%% @private Everything wrong with one mgmt listener's posture. A listener without
+%% a `tls' map is plaintext, and an incomplete map cannot start at all
+%% (yuzu_grpc_listener:validate/1), so there is no "cert material but plaintext"
+%% state to catch. TLS with verify_none would let a self-signed cert reach the
+%% auth_fun, and without fail_if_no_peer_cert a certless peer skips it entirely
+%% -- both count as defects. The auth_fun must be exactly the approved callback,
+%% there must be a way to admit the server (no_admission_path/3), and the origin
+%% must be the TCP peer: this plane takes
+%% its authority from the certificate, and a proxied listener would not be
+%% reachable by the server's own client.
+-spec mgmt_defects(map(), term(), yuzu_gw_mgmt_identity:state()) -> [atom()].
+mgmt_defects(S, Pins, Auth) ->
+    Tls = maps:get(tls, S, undefined),
+    IsTls = is_map(Tls),
+    HasMaterial = IsTls andalso lists:all(fun(K) -> has_material(K, Tls) end,
+                                          [certfile, keyfile, cacertfile]),
+    %% verify defaults to verify_peer and fail_if_no_peer_cert to "verify is
+    %% verify_peer" (yuzu_grpc_listener:ssl_opts/1), so absent is fine; an
+    %% explicit relaxation is not.
+    Verify = case IsTls of true -> maps:get(verify, Tls, verify_peer); false -> undefined end,
+    FailNoPeer = case IsTls of
+        true -> maps:get(fail_if_no_peer_cert, Tls, Verify =:= verify_peer);
+        false -> undefined
+    end,
+    Origin = maps:get(origin, S, #{mode => transport}),
+    Mode = maps:get(mode, Auth, pin),
+    Identity = maps:get(identity, Auth, undefined),
     Checks =
-        [{plaintext, not (is_map(T) andalso maps:get(ssl, T, undefined) =:= true)},
-         {missing_cert_material, not HasMaterial},
-         {verify_not_peer, opt_value(ssl, T) =:= true andalso
-                           Verify =/= verify_peer},
-         {peer_cert_not_required, opt_value(ssl, T) =:= true andalso
-                                  FailNoPeer =/= true},
+        [{plaintext, not IsTls},
+         {missing_cert_material, IsTls andalso not HasMaterial},
+         {verify_not_peer, IsTls andalso Verify =/= verify_peer},
+         {peer_cert_not_required, IsTls andalso FailNoPeer =/= true},
          {missing_or_wrong_auth_fun,
-          maps:get(auth_fun, GrpcOpts, undefined) =/=
-              fun yuzu_gw_authz:check_mgmt_peer/1},
-         {no_mgmt_peer_pins, not (is_list(Pins) andalso Pins =/= [])}],
+          maps:get(auth_fun, S, undefined) =/= fun yuzu_gw_authz:check_mgmt_peer/1},
+         {auth_defect_name(Mode), no_admission_path(Mode, Pins, Identity)},
+         {proxied_origin, not (is_map(Origin) andalso maps:get(mode, Origin, undefined) =:= transport)}],
     [Defect || {Defect, true} <- Checks].
 
--spec tls_word(boolean()) -> string().
-tls_word(true)  -> "TLS";
-tls_word(false) -> "plaintext".
+%% Nothing could admit the server in this mode: no pin in `pin'; no resolved
+%% identity in `identity' (a configured pin is an extra constraint there, never a
+%% way in); neither in `identity_or_pin'.
+no_admission_path(Mode, Pins, Identity) ->
+    HasPins = is_list(Pins) andalso Pins =/= [],
+    HasIdentity = is_binary(Identity),
+    case Mode of
+        identity_or_pin -> not (HasPins orelse HasIdentity);
+        identity -> not HasIdentity;
+        _ -> not HasPins
+    end.
 
--spec posture_word(tls_posture()) -> string().
-posture_word(verified)   -> "mutual-TLS";
-posture_word(unverified) -> "TLS(UNVERIFIED!)";
-posture_word(plaintext)  -> "plaintext".
+auth_defect_name(identity)        -> no_mgmt_peer_identity;
+auth_defect_name(identity_or_pin) -> no_mgmt_peer_pins_or_identity;
+auth_defect_name(_)               -> no_mgmt_peer_pins.
 
-%% @doc Strongest TLS posture across grpcbox client channels: `verified` (an
-%% `https` endpoint with {verify,verify_peer}), `unverified` (https without it),
-%% else `plaintext`. Pure; exported for testing.
+%% "mutual-TLS" is said only when the gateway also PRESENTS a certificate on
+%% every endpoint (certfile + keyfile); a verified channel without one
+%% authenticates the server to the gateway and nothing more.
+-spec posture_word(tls_posture(), boolean()) -> string().
+posture_word(verified, true)  -> "mutual-TLS";
+posture_word(verified, false) -> "server-authenticated TLS (no client certificate)";
+posture_word(unverified, _)   -> "TLS(UNVERIFIED!)";
+posture_word(plaintext, _)    -> "plaintext".
+
+%% @doc True if there is at least one endpoint and every https endpoint of every
+%% channel carries both a {certfile,..} and a {keyfile,..} (or {key,..}/{cert,..}).
+%% Pure; exported for testing.
+-spec client_all_present_client_cert(term()) -> boolean().
+client_all_present_client_cert(#{channels := Channels}) when is_list(Channels) ->
+    Es = [E || {_N, Endpoints, _O} <- Channels, is_list(Endpoints), E <- Endpoints],
+    Es =/= [] andalso lists:all(fun presents_client_cert/1, Es);
+client_all_present_client_cert(_) ->
+    false.
+
+presents_client_cert(E) when is_tuple(E), tuple_size(E) >= 4, element(1, E) =:= https ->
+    Ssl = element(4, E),
+    is_list(Ssl)
+        andalso (proplists:is_defined(certfile, Ssl) orelse proplists:is_defined(cert, Ssl))
+        andalso (proplists:is_defined(keyfile, Ssl) orelse proplists:is_defined(key, Ssl));
+presents_client_cert(_) ->
+    false.
+
+%% @doc Strongest TLS posture across the upstream client channels: `verified` (an
+%% `https` endpoint with {verify,verify_peer} and a {cacertfile,..}/{cacerts,..}
+%% of its own), `unverified` (https without both), else `plaintext`. This is the
+%% STRONGEST endpoint: it answers "is there TLS at all" (client_has_https/1). The
+%% boot guard and the boot log use the weakest one (client_tls_weakest/1,
+%% client_has_unverified/1), because calls travel over every endpoint. Pure;
+%% exported for testing.
 -spec client_tls_posture(term()) -> tls_posture().
 client_tls_posture(#{channels := Channels}) when is_list(Channels) ->
     lists:foldl(fun(Ch, Acc) -> strongest(channel_posture(Ch), Acc) end,
@@ -718,10 +1639,48 @@ client_tls_posture(#{channels := Channels}) when is_list(Channels) ->
 client_tls_posture(_) ->
     plaintext.
 
-%% @doc True if any grpcbox client channel has an `https` endpoint (verified or
+%% @doc True if any upstream client channel has an `https` endpoint (verified or
 %% not). Pure; exported for testing.
 -spec client_has_https(term()) -> boolean().
 client_has_https(Client) -> client_tls_posture(Client) =/= plaintext.
+
+%% @doc The WEAKEST posture of any endpoint of any channel: `plaintext` if any
+%% endpoint is http, else `unverified` if any https endpoint is, else `verified`
+%% (no endpoint at all is `plaintext`). Pure; exported for testing.
+-spec client_tls_weakest(term()) -> tls_posture().
+client_tls_weakest(Client) ->
+    case endpoint_postures(Client) of
+        [] -> plaintext;
+        Ps -> case {lists:member(plaintext, Ps), lists:member(unverified, Ps)} of
+                  {true, _}      -> plaintext;
+                  {false, true}  -> unverified;
+                  {false, false} -> verified
+              end
+    end.
+
+%% @doc True if any https endpoint of any channel is unverified. Pure; exported
+%% for testing.
+-spec client_has_unverified(term()) -> boolean().
+client_has_unverified(Client) ->
+    lists:member(unverified, endpoint_postures(Client)).
+
+%% @doc The names of the channels that list both plaintext and TLS endpoints.
+%% Pure; exported for testing.
+-spec client_mixed_channels(term()) -> [term()].
+client_mixed_channels(#{channels := Channels}) when is_list(Channels) ->
+    [Name || {Name, Endpoints, _Opts} <- Channels, is_list(Endpoints),
+             begin
+                 Ps = [endpoint_posture(E) || E <- Endpoints],
+                 lists:member(plaintext, Ps) andalso lists:any(fun(P) -> P =/= plaintext end, Ps)
+             end];
+client_mixed_channels(_) ->
+    [].
+
+endpoint_postures(#{channels := Channels}) when is_list(Channels) ->
+    [endpoint_posture(E) || {_Name, Endpoints, _Opts} <- Channels, is_list(Endpoints),
+                            E <- Endpoints];
+endpoint_postures(_) ->
+    [].
 
 -spec channel_posture(term()) -> tls_posture().
 channel_posture({_Name, Endpoints, _Opts}) when is_list(Endpoints) ->
@@ -732,13 +1691,35 @@ channel_posture(_) ->
 
 -spec endpoint_posture(term()) -> tls_posture().
 endpoint_posture(E) when is_tuple(E), tuple_size(E) >= 4, element(1, E) =:= https ->
+    %% verify_peer AND a trust anchor of the operator's own. Without one, gun
+    %% fills in the operating system's CA store ({cacerts, system}), where ssl
+    %% on its own refuses verify_peer with no CA; a channel left that way would
+    %% trust every public CA to vouch for the gateway's own server, which is not
+    %% what a pinned private PKI means, so it counts as unverified.
     SslOpts = element(4, E),
-    case is_list(SslOpts) andalso proplists:get_value(verify, SslOpts) =:= verify_peer of
+    case is_list(SslOpts)
+         andalso proplists:get_value(verify, SslOpts) =:= verify_peer
+         andalso has_trust_anchor(SslOpts) of
         true  -> verified;
         false -> unverified
     end;
 endpoint_posture(_) ->
     plaintext.
+
+%% A CA file named (a non-empty string or binary) or certificates given (a
+%% non-empty list of them): not an atom, not an empty value. Whether the file
+%% EXISTS is not asked here: the server may generate its certificates after the
+%% gateway has started, and a missing file fails the first connection loudly.
+has_trust_anchor(SslOpts) ->
+    anchor_file(proplists:get_value(cacertfile, SslOpts))
+        orelse anchor_certs(proplists:get_value(cacerts, SslOpts)).
+
+anchor_file(File) when is_binary(File) -> File =/= <<>>;
+anchor_file(File) when is_list(File)   -> File =/= [] andalso io_lib:printable_unicode_list(File);
+anchor_file(_)                         -> false.
+
+anchor_certs([_ | _]) -> true;
+anchor_certs(_)       -> false.
 
 -spec strongest(tls_posture(), tls_posture()) -> tls_posture().
 strongest(verified, _)            -> verified;
@@ -747,66 +1728,11 @@ strongest(unverified, _)          -> unverified;
 strongest(_, unverified)          -> unverified;
 strongest(plaintext, plaintext)   -> plaintext.
 
-%% @doc True if any grpcbox server (listener) carries TLS transport_opts
-%% (`ssl => true`). Pure; exported for testing.
--spec servers_have_tls(term()) -> boolean().
-servers_have_tls(Servers) when is_list(Servers) ->
-    lists:any(fun(S) when is_map(S) ->
-                      case maps:get(transport_opts, S, #{}) of
-                          #{ssl := true} -> true;
-                          _ -> false
-                      end;
-                 (_) -> false
-              end, Servers);
-servers_have_tls(_) ->
-    false.
-
-%% @doc Listener TLS footgun detector: returns the listen ports of any grpcbox
-%% server whose `transport_opts` carries cert material (certfile/keyfile/
-%% cacertfile) but is MISSING `ssl => true`. grpcbox_pool enables TLS ONLY on
-%% `ssl => true`, so such a listener serves PLAINTEXT despite the cert config —
-%% the silent-downgrade "looks secure, isn't" middle state. Pure; exported for
-%% testing. Mirrors the upstream `unverified` detection on the listener side.
--spec listener_tls_traps(term()) -> [term()].
-listener_tls_traps(Servers) when is_list(Servers) ->
-    lists:filtermap(fun(S) when is_map(S) ->
-                            case is_tls_trap(maps:get(transport_opts, S, #{})) of
-                                true  -> {true, listener_port(S)};
-                                false -> false
-                            end;
-                       (_) -> false
-                    end, Servers);
-listener_tls_traps(_) ->
-    [].
-
-%% @private cert material present but `ssl` not exactly `true`. Handles BOTH the
-%% grpcbox map form (`#{ssl => true, certfile => ...}`) AND a proplist
-%% (`[{certfile, ...}]`): a proplist is itself a misconfiguration — grpcbox
-%% expects a map and yields plaintext — so flagging it is correct. Keys with an
-%% undefined/empty value don't count as material (avoids warning on placeholders).
-%% The material key set covers both file-path (certfile/keyfile/cacertfile/dhfile)
-%% and inline-DER (cert/key/cacert) ssl options.
--spec is_tls_trap(term()) -> boolean().
-is_tls_trap(T) when is_map(T); is_list(T) ->
-    HasCertMaterial = lists:any(fun(K) -> has_material(K, T) end,
-                                [certfile, keyfile, cacertfile, dhfile,
-                                 cert, key, cacert]),
-    SslOn = opt_value(ssl, T) =:= true,
-    HasCertMaterial andalso not SslOn;
-is_tls_trap(_) ->
-    false.
-
-%% @private fetch an option value from a map or a proplist; undefined if absent.
--spec opt_value(atom(), map() | list()) -> term().
-opt_value(K, Opts) when is_map(Opts) -> maps:get(K, Opts, undefined);
-opt_value(K, Opts) when is_list(Opts) -> proplists:get_value(K, Opts, undefined);
-opt_value(_, _) -> undefined.
-
 %% @private true if the key carries a non-empty value (undefined/""/<<>> don't
-%% count — a placeholder shouldn't trigger the trap warning).
--spec has_material(atom(), map() | list()) -> boolean().
+%% count -- a placeholder is not material).
+-spec has_material(atom(), map()) -> boolean().
 has_material(K, Opts) ->
-    case opt_value(K, Opts) of
+    case maps:get(K, Opts, undefined) of
         undefined -> false;
         ""        -> false;
         <<>>      -> false;
@@ -815,7 +1741,7 @@ has_material(K, Opts) ->
 
 -spec listener_port(map()) -> term().
 listener_port(S) ->
-    case maps:get(listen_opts, S, #{}) of
+    case maps:get(listen, S, #{}) of
         #{port := P} -> P;
         _            -> unknown
     end.

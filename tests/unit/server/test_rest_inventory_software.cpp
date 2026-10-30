@@ -36,6 +36,8 @@
 #include "audit_store.hpp"
 #include "auth_routes.hpp"
 #include "authz_gates.hpp"
+#include "hardware_list_model.hpp"
+#include "openapi_spec_access.hpp"
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
 #include "pg/pg_pool.hpp"
@@ -297,6 +299,155 @@ TEST_CASE("REST inventory/software: path is in the OpenAPI spec (A1 discoverabil
         CHECK(ok["headers"].contains(header));
     // ...and so is the export's media type (carried in the 200 description)
     CHECK(ok["description"].get<std::string>().find("text/csv") != std::string::npos);
+}
+
+TEST_CASE("REST inventory/software: the 200 body is typed in the OpenAPI spec and matches the row model",
+          "[rest][inventory_software]") {
+    InvHarness h{/*store=*/nullptr};
+    auto res = h.sink.Get("/api/v1/openapi.json");
+    REQUIRE(res);
+    auto spec = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(spec.is_discarded());
+
+    const auto& ok = spec["paths"]["/inventory/software"]["get"]["responses"]["200"];
+    REQUIRE(ok.contains("content"));
+    CHECK(ok["content"]["application/json"]["schema"]["$ref"] ==
+          "#/components/schemas/InstalledSoftwarePage");
+    CHECK(ok["content"].contains("text/csv"));
+
+    const auto& schemas = spec["components"]["schemas"];
+    REQUIRE(schemas.contains("InstalledSoftwarePage"));
+    REQUIRE(schemas.contains("InstalledSoftwareRow"));
+
+    // The schema's row keys are exactly the keys the route serialises: a field added to or dropped
+    // from device_row_json without the spec following fails here.
+    const auto row = software_catalogue::device_row_json(SoftwareFleetRow{});
+    std::set<std::string> served;
+    for (const auto& [k, v] : row.items())
+        served.insert(k);
+    std::set<std::string> properties;
+    for (const auto& [k, v] : schemas["InstalledSoftwareRow"]["properties"].items())
+        properties.insert(k);
+    std::set<std::string> required;
+    for (const auto& k : schemas["InstalledSoftwareRow"]["required"])
+        required.insert(k.get<std::string>());
+    CHECK(properties == served);
+    CHECK(required == served);
+
+    // The page envelope's keys are those devices_response_json emits (result_truncated_by_cap is
+    // conditional, so it is a property but not required).
+    const auto page = software_catalogue::devices_response_json({}, "", 0, true);
+    const auto& data = schemas["InstalledSoftwarePage"]["properties"]["data"];
+    for (const auto& [k, v] : page.items())
+        CHECK(data["properties"].contains(k));
+    CHECK(data["properties"]["next_cursor"]["nullable"] == true);
+}
+
+// The Hardware routes' typed 200/202 bodies. Same drift guard as above: the schema's keys must be
+// exactly the keys the serialisers in hardware_list_model.cpp emit.
+TEST_CASE("REST hardware: the 200/202 bodies are typed in the OpenAPI spec and match the serialisers",
+          "[rest][hardware]") {
+    InvHarness h{/*store=*/nullptr};
+    auto res = h.sink.Get("/api/v1/openapi.json");
+    REQUIRE(res);
+    auto spec = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(spec.is_discarded());
+
+    const auto ref_of = [&](const char* path, const char* verb, const char* status) {
+        const auto& r = spec["paths"][path][verb]["responses"][status];
+        REQUIRE(r.contains("content"));
+        return r["content"]["application/json"]["schema"]["$ref"].get<std::string>();
+    };
+    CHECK(ref_of("/hardware", "get", "200") == "#/components/schemas/HardwareListPage");
+    CHECK(ref_of("/hardware/{id}", "get", "200") == "#/components/schemas/HardwareRecordResponse");
+    CHECK(ref_of("/hardware/{id}/sync", "post", "202") ==
+          "#/components/schemas/HardwareSyncAccepted");
+
+    const auto& schemas = spec["components"]["schemas"];
+    const auto keys_of = [](const nlohmann::json& obj) {
+        std::set<std::string> out;
+        for (const auto& [k, v] : obj.items())
+            out.insert(k);
+        return out;
+    };
+    const auto required_of = [](const nlohmann::json& schema) {
+        std::set<std::string> out;
+        for (const auto& k : schema["required"])
+            out.insert(k.get<std::string>());
+        return out;
+    };
+
+    // List row.
+    const auto row = keys_of(hardware_row_json(InventoryDeviceRow{}));
+    REQUIRE(schemas.contains("HardwareListRow"));
+    CHECK(keys_of(schemas["HardwareListRow"]["properties"]) == row);
+    CHECK(required_of(schemas["HardwareListRow"]) == row);
+
+    // List page: data keys, kpis keys, query keys.
+    const auto page_json = hardware_list_json(HardwareListPage{}, false, 0, false);
+    const auto& page = schemas["HardwareListPage"]["properties"]["data"];
+    CHECK(keys_of(page["properties"]) == keys_of(page_json));
+    CHECK(required_of(page) == keys_of(page_json));
+    CHECK(keys_of(page["properties"]["kpis"]["properties"]) == keys_of(page_json["kpis"]));
+    CHECK(keys_of(page["properties"]["query"]["properties"]) == keys_of(page_json["query"]));
+
+    // Record: top-level keys and the ci object.
+    HardwareCiDetail detail;
+    detail.identity = InventoryDeviceRow{};
+    detail.ci = std::optional<DeviceCiRecord>(DeviceCiRecord{});
+    detail.software = std::vector<SoftwareEntry>{};
+    detail.tags = std::vector<DeviceTag>{};
+    const auto rec = hardware_ci_json(detail, 0);
+    REQUIRE(schemas.contains("HardwareRecord"));
+    CHECK(keys_of(schemas["HardwareRecord"]["properties"]) == keys_of(rec));
+    CHECK(required_of(schemas["HardwareRecord"]) == keys_of(rec));
+    REQUIRE(schemas.contains("HardwareCiRecord"));
+    CHECK(keys_of(schemas["HardwareCiRecord"]["properties"]) == keys_of(rec["ci"]));
+    CHECK(required_of(schemas["HardwareCiRecord"]) == keys_of(rec["ci"]));
+}
+
+// The per-group guides are for people reading /swagger. The default document, and so the MCP resource
+// yuzu://openapi and the discover tools that serve the same string, leaves them out.
+TEST_CASE("REST openapi.json: guides are opt-in; the default document is the lean form",
+          "[rest][openapi]") {
+    InvHarness h{/*store=*/nullptr};
+
+    auto lean = h.sink.Get("/api/v1/openapi.json");
+    REQUIRE(lean);
+    REQUIRE(lean->status == 200);
+    CHECK(lean->body == openapi_spec_json());
+    auto lean_doc = nlohmann::json::parse(lean->body, nullptr, false);
+    REQUIRE_FALSE(lean_doc.is_discarded());
+    REQUIRE(lean_doc["tags"].is_array());
+    CHECK_FALSE(lean_doc["tags"].empty());
+    for (const auto& t : lean_doc["tags"]) {
+        CHECK(t.contains("name"));
+        CHECK(t.contains("description")); // the one-line summary stays
+        CHECK_FALSE(t.contains("x-yuzu-guide"));
+    }
+
+    for (const char* q : {"/api/v1/openapi.json?guides=true", "/api/v1/openapi.json?guides=1"}) {
+        INFO(q);
+        auto full = h.sink.Get(q);
+        REQUIRE(full);
+        REQUIRE(full->status == 200);
+        CHECK(full->body == openapi_spec_with_guides_json());
+        auto doc = nlohmann::json::parse(full->body, nullptr, false);
+        REQUIRE_FALSE(doc.is_discarded());
+        for (const auto& t : doc["tags"])
+            CHECK(t.contains("x-yuzu-guide"));
+        CHECK(full->body.size() > lean->body.size());
+    }
+
+    // Anything else is the default.
+    auto other = h.sink.Get("/api/v1/openapi.json?guides=no");
+    REQUIRE(other);
+    CHECK(other->body == lean->body);
+
+    // Lean and full describe the same operations.
+    auto full_doc = nlohmann::json::parse(h.sink.Get("/api/v1/openapi.json?guides=true")->body);
+    CHECK(full_doc["paths"] == lean_doc["paths"]);
+    CHECK(full_doc["components"] == lean_doc["components"]);
 }
 
 // ── Live-PG branches ─────────────────────────────────────────────────────────

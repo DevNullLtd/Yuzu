@@ -36,10 +36,13 @@ struct DexAgentResponse {
     int status{0}; ///< CommandResponse::Status enum value (0=RUNNING, 1=SUCCESS, 2=FAILURE, …)
     std::string output;
     std::string error_detail;
+    /// The plugin that wrote the row (`StoredResponse::plugin`). Filled only by a producer whose
+    /// consumer audits Forensics-tier reads (#4990: the hardware result poll); empty elsewhere.
+    std::string plugin{};
 };
 
 /// A4: dispatch a plugin command to specific agents (same 5-param shape as
-/// DashboardRoutes' DispatchFn). Used ONLY for the canned `tar.sql` device
+/// DashboardRoutes' DispatchFn). Used ONLY for the canned `echo.sql` device
 /// perf query. May be empty → the perf panel renders "unavailable".
 using DexDispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
     const std::string& plugin, const std::string& action,

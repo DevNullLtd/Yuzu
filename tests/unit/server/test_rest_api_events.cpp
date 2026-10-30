@@ -714,7 +714,7 @@ TEST_CASE("OpenAPI spec lists /events under the agentic-first surface", "[pg][ev
     // documented OpenAPI surface. The text-shape check is enough — the
     // JSON parse is exercised by the OpenAPI ecosystem, not here.
     REQUIRE(res->body.find(R"("/events":)") != std::string::npos);
-    REQUIRE(res->body.find("agentic-first JSON Server-Sent Events") != std::string::npos);
+    REQUIRE(res->body.find("Authenticated JSON Server-Sent Events channel") != std::string::npos);
     REQUIRE(res->body.find("Execution:Read") != std::string::npos);
 }
 
@@ -770,9 +770,12 @@ TEST_CASE("OpenAPI spec declares ExecutionSseEvent and A4ErrorEnvelope schemas",
     // BLOCKING.
     REQUIRE(res->body.find(R"("ExecutionSseEvent":)") != std::string::npos);
     REQUIRE(res->body.find(R"("A4ErrorEnvelope":)") != std::string::npos);
-    REQUIRE(res->body.find(R"("$ref": "#/components/schemas/ExecutionSseEvent")") !=
+    // The served document is re-serialised compact, so compare the refs on the
+    // compact form and not on the spacing of the source literal.
+    const auto compact = nlohmann::json::parse(res->body).dump();
+    REQUIRE(compact.find(R"("$ref":"#/components/schemas/ExecutionSseEvent")") !=
             std::string::npos);
-    REQUIRE(res->body.find(R"("$ref": "#/components/schemas/A4ErrorEnvelope")") !=
+    REQUIRE(compact.find(R"("$ref":"#/components/schemas/A4ErrorEnvelope")") !=
             std::string::npos);
 }
 

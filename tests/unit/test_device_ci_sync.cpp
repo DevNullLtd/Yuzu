@@ -98,6 +98,24 @@ TEST_CASE("core_identity_unavailable: AND of manufacturer+model unknown", "[sync
     CHECK(core_identity_unavailable(r)); // both unknown → WMI/DMI wholesale down → skip
 }
 
+TEST_CASE("build_device_ci_record tolerates appended cpu/dimm columns", "[sync][device_ci]") {
+    // The hardware plugin appends `socket_designation|stepping` to cpu rows and
+    // `manufacturer|part_number|serial` to dimm rows (always `-` until a leg reads them).
+    // The device-CI parse reads cpu rows positionally (>= 5 fields) and dimm rows (>= 3):
+    // pinned here so a stricter width check fails in this suite, not in the fleet.
+    using yuzu::agent::build_device_ci_record;
+    using yuzu::agent::CiPluginOutputs;
+    CiPluginOutputs o;
+    o.processors = "cpu|0|Intel i7|4|8|2800|-|-\ncpu|1|Intel i7|4|8|2800|-|-";
+    o.memory = "dimm|DIMM0|8192|DDR4|3200|-|-|-\ndimm|DIMM1|8192|DDR4|3200|-|-|-";
+
+    auto r = build_device_ci_record(o);
+    CHECK(r.cpu_model == "Intel i7");
+    CHECK(r.cpu_cores == "8");
+    CHECK(r.cpu_threads == "16");
+    CHECK(r.ram_bytes == std::to_string(16384LL * 1024 * 1024));
+}
+
 TEST_CASE("build_device_ci_record parses + aggregates plugin outputs", "[sync][device_ci]") {
     using yuzu::agent::build_device_ci_record;
     using yuzu::agent::CiPluginOutputs;

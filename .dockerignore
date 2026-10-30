@@ -20,6 +20,8 @@ vcpkg_installed/
 # Documentation (not needed in build context)
 *.md
 docs/
+# …except the TSV server/core/meson.build embeds at build time (files('../../docs/...')).
+!docs/capability-registries/echo_retention_tiers.tsv
 
 # Tests (excluded from production builds)
 tests/
@@ -40,6 +42,9 @@ gateway/ebin/
 gateway/erl_crash.dump
 gateway/rebar3.crashdump
 gateway/test_ebin/
+# The malloc_trim NIF a glibc host build leaves in priv/: an image builds its own
+# (glibc builders, through the rebar3 hook) or ships none (Alpine/musl).
+gateway/apps/yuzu_gw/priv/*.so
 
 # UAT / test artifacts
 # Git ignore rules do not exclude files from a Docker build context.

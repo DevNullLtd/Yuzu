@@ -20,13 +20,13 @@ The plugin deliberately never distinguishes "not domain-joined" from "the AD loo
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Inventory.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host]
-  HOST --> EX[device_identity.execute]
-  EX --> WIN[Windows leg<br/>GetComputerNameExA /<br/>NetGetJoinInformation /<br/>GetComputerObjectNameA]
-  EX --> MAC[macOS leg<br/>gethostname(3) /<br/>dsconfigad -show via bounded runner]
-  EX --> LIN[Linux leg<br/>gethostname(3) /<br/>resolv.conf + sd-bus InfoPipe /<br/>realm list]
-  WIN & MAC & LIN --> ROWS[key|value rows] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator / workflow"] --> SRV["Server - authz: Inventory.Read"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"]
+  HOST --> EX["device_identity.execute"]
+  EX --> WIN["Windows leg - GetComputerNameExA / NetGetJoinInformation / GetComputerObjectNameA"]
+  EX --> MAC["macOS leg - gethostname(3) / dsconfigad -show via bounded runner"]
+  EX --> LIN["Linux leg - gethostname(3) / resolv.conf + sd-bus InfoPipe / realm list"]
+  WIN & MAC & LIN --> ROWS["key|value rows"] --> RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
 
 ## OS capability
@@ -89,7 +89,7 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 ### Where the data goes
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, rendered as `Agent · Key · Value` (`device_identity` is in `kKeyValuePlugins`, `server/core/src/result_parsing.hpp:63`) for SSE, ResponseStore facet extraction, and dashboard fragments.
-- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no reference to `device_identity` or its definition ids was found outside the instruction-result path.
+- **Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics — no reference to `device_identity` or its definition ids was found outside the instruction-result path.
 - **Sensitivity.** `device_name` is the host's own hostname, and `domain`/`ou` report its AD domain membership and organizational-unit placement — all three directly identify the specific device (and, via the OU, the org unit it belongs to); nothing here names a person or installed software.
 - **Siblings:** `os_info`, `hardware`, `status` — other inventory/system plugins declared alongside `device_identity` in the same ABI4 capability pass (`changelog.d/2204-declarations-group-b.added.md`).
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.device_identity.domain")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.

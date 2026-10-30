@@ -43,7 +43,7 @@
 /// `command_capability.hpp` ExecuteGate precedent): all FencedLeaderOnly and
 /// DisabledUntilFixed passes (schedule/policy/quarantine dispatch, ca.publish_crl,
 /// nvd_sync, the concurrency reconciler), plus the load-bearing ReplicaSafe ones —
-/// the event-outbox poll, the four retention prunes, the app_perf rollup upsert,
+/// the event-outbox poll, the four retention prunes, the app_perf rollup upsert, the typed-source purge,
 /// and the MUST-run-per-replica / shared-PG-writing passes found by the sweep
 /// (cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
 /// projector, MCP bridge sweep + session gc, store-worker delivery pools, the
@@ -94,13 +94,14 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (47 passes). Verified against the source sweep
+/// The exhaustive inventory (48 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
 /// `gateway_route_store.reap_stale_routes`, 2026-09-11, the HA WS-8 addition
 /// of `pg_reachability_probe.tick`, 2026-09-24, and the #4982 Part B addition
 /// of `execution_tracker.reap_stuck_running_executions`, 2026-09-29, the #5678
 /// addition of `offline_endpoint_store.run_retention_prune`, 2026-10-12, and the #5513
-/// addition of `guardian_reconcile_gate.sweep`); keep the count
+/// addition of `guardian_reconcile_gate.sweep`, and the 2a-1b addition of
+/// `inventory_store.purge_typed_sources`); keep the count
 /// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
@@ -160,6 +161,12 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "skip (PR #4299 round-2 external review); matches the other reaper classifications (WS-4 4.2a)"},
     {"result_set_store.counts", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "read-only gauge refresh"},
+
+    // ---- typed_purge_thread_ (one-shot at boot) ----
+    {"inventory_store.purge_typed_sources", "typed_purge_thread_", BackgroundJobClass::ReplicaSafe,
+     "idempotent keyset-batched DELETE of rows that must not exist (typed sources); one-shot per boot, "
+     "no clock cutoff (clock-guarded-retention parts 1-4/6/7 n/a, part 5 cap = the per-batch bound; "
+     "see docs/clock-guarded-retention.md), so a concurrent purge on another replica only finds fewer rows"},
 
     // ---- app_perf_rollup_thread_ (1h tick) ----
     {"app_perf_rollup.roll_window", "app_perf_rollup_thread_", BackgroundJobClass::ReplicaSafe,

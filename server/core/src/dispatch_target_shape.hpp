@@ -59,7 +59,7 @@
 /// CLOSED (this range): the Dashboard form routes DO distinguish an omitted
 /// `scope` from a supplied-but-empty `scope=` and refuse the latter —
 /// `form_value_supplied()` (`web_utils.hpp`) for the urlencoded body,
-/// `req.has_param("scope")` for the TAR sibling. `extract_form_value` alone
+/// `req.has_param("scope")` for the Echo sibling. `extract_form_value` alone
 /// cannot tell them apart, which is the form-encoded twin of the
 /// `extract_json_string_array` erasure this header names as the defect.
 /// They still pass `broadcast_on_none=true` for a different and narrower
@@ -274,7 +274,7 @@ inline constexpr std::string_view kReasonParseErrorExcluded{"parse_error_exclude
 /// no longer runs inline on a raw `httplib::Server` inside `Server::start()`,
 /// so the in-process `TestRouteSink` harness can reach it directly. Earlier
 /// revisions of this comment cited #1786 for the prior gap, which was a
-/// different issue entirely — the TAR retention-paused dashboard fragments in
+/// different issue entirely — the Echo retention-paused dashboard fragments in
 /// `dashboard_routes.cpp`, closed by #2534 without touching `/api/command`.
 /// That citation was inherited from a review summary and repeated without
 /// reading the issue.
@@ -346,7 +346,7 @@ enum class DispatchArm {
 /// decision with fleet-wide blast radius is unit-testable.
 ///
 /// It was not testable before: the closures live inside `Server::start()`,
-/// which no harness can reach (#2557 — NOT #1786, which covers the TAR
+/// which no harness can reach (#2557 — NOT #1786, which covers the Echo
 /// dashboard fragments and was closed by #2534), and the route tests assert against STUB
 /// dispatch closures — so reverting the real sink's default broke nothing.
 /// Governance's words: "the highest-blast-radius line in the PR is unverified".

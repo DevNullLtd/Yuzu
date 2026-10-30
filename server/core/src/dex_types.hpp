@@ -177,8 +177,9 @@ struct DexDeviceBoot {             // slowest-booting devices
 /// lenses. `total_online` is context. A struct (not a registry dep) keeps
 /// render pure + testable.
 struct DexFleet {
-    /// Equals the count of `connected_agents` whose os is "windows": the Apps list
-    /// (DexApi::apps) takes its population and its numerator ids from that list.
+    /// Equals the count of `connected_agents` whose os is "windows". The Apps list
+    /// (DexApi::apps) takes its population and numerator ids from `connected_agents`
+    /// filtered to its platform scope, not from this count.
     int64_t windows_online{0};
     int64_t total_online{0};
     /// Distinct OS tokens (lowercased: "windows"/"linux"/"darwin") of the agents

@@ -1,14 +1,15 @@
 %%%-------------------------------------------------------------------
 %%% @doc End-to-end Common Test suite for the Yuzu gateway.
 %%%
-%%% This suite tests the full gRPC flow using actual grpcbox client
-%%% calls to simulate agent behavior. It requires:
-%%%   - The gateway to be fully started (grpcbox servers running)
+%%% This suite drives the agent service handlers in-process, the way a
+%%% connected agent would, with the gateway's own processes running. It
+%%% requires:
+%%%   - The gateway processes (registry, router, heartbeat buffer) started
 %%%   - Mock upstream handlers for the C++ server
 %%%
 %%% Test scenarios:
 %%%   1. Full agent lifecycle: Register → Subscribe → Heartbeat → Disconnect
-%%%   2. Command fanout through actual gRPC channels
+%%%   2. Command fanout through the router to the agent processes
 %%%   3. Error handling and recovery
 %%%   4. Concurrent agent connections
 %%% @end
@@ -31,9 +32,6 @@
     agent_reconnection/1,
     command_fanout_e2e/1
 ]).
-
--define(AGENT_PORT, 50151).  %% Test port for agent service
--define(MGMT_PORT, 50152).   %% Test port for management service
 
 %% These cases call the agent service handlers in-process (no real
 %% connection), so the connection key heartbeat admission compares is
@@ -58,12 +56,9 @@ all() ->
 init_per_suite(Config) ->
     %% Ensure all required applications are started.
     application:ensure_all_started(telemetry),
-    application:ensure_all_started(gproc),
     application:ensure_all_started(gpb),
 
     %% Configure gateway for testing.
-    application:set_env(yuzu_gw, agent_listen_port, ?AGENT_PORT),
-    application:set_env(yuzu_gw, mgmt_listen_port, ?MGMT_PORT),
     application:set_env(yuzu_gw, upstream_addr, "127.0.0.1"),
     application:set_env(yuzu_gw, upstream_port, 59999),  %% unused port
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 500),
@@ -74,9 +69,7 @@ init_per_suite(Config) ->
     application:set_env(yuzu_gw, max_sessions_per_connection, 1000),
 
     %% Mock upstream so we don't need a real C++ server.
-    meck:new(grpcbox_channel, [non_strict, no_link]),
-    meck:expect(grpcbox_channel, pick, fun(_, _) -> {ok, mock_channel} end),
-    meck:new(grpcbox_client, [non_strict, no_link]),
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
     setup_upstream_mocks(),
 
     %% Connection key for the in-process agent service calls (see ?CONN_KEY).
@@ -102,7 +95,7 @@ end_per_suite(_Config) ->
     stop_gateway_processes(),
 
     %% Unload mocks.
-    meck:unload([grpcbox_channel, grpcbox_client, yuzu_gw_conn]),
+    meck:unload([yuzu_grpc_client, yuzu_gw_conn]),
     application:unset_env(yuzu_gw, max_sessions_per_connection),
 
     ok.
@@ -259,7 +252,7 @@ heartbeat_batching_e2e(_Config) ->
     ct:pal("Testing heartbeat batching"),
 
     %% Reset meck history so we can check for new BatchHeartbeat calls.
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
 
     %% Heartbeats are admitted only for sessions this node holds, on the
     %% connection that opened them: hold ten live sessions bound to
@@ -283,8 +276,8 @@ heartbeat_batching_e2e(_Config) ->
     timer:sleep(700),
 
     %% Verify a batch was sent by inspecting meck history.
-    Calls = meck:history(grpcbox_client),
-    BatchCalls = [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
+    Calls = meck:history(yuzu_grpc_client),
+    BatchCalls = [Req || {_, {yuzu_grpc_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
                          binary:match(Path, <<"BatchHeartbeat">>) =/= nomatch],
     ?assert(length(BatchCalls) > 0),
     [LastBatch | _] = BatchCalls,
@@ -409,7 +402,7 @@ stop_gateway_processes() ->
 
 setup_upstream_mocks() ->
     SessionCounter = atomics:new(1, []),
-    meck:expect(grpcbox_client, unary, fun(_, Path, _Req, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, _Req, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch ->
                 case binary:match(Path, <<"BatchHeartbeat">>) of

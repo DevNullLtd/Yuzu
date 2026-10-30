@@ -18,6 +18,7 @@
 #include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
 #include "response_store.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 #include "test_export_cap_guard.hpp"
 
@@ -76,10 +77,16 @@ struct VizHarness {
     // own TOP convention.
     authz::VisibleSet fleet_read_scope{std::nullopt};
     std::vector<AuditRecord> audit_log;
+    // #4990: the caller's Forensics visibility (admin by default; the tier case flips it).
+    yuzu::server::test::ForensicsCaller forensics;
+    // #4990: an audit verb whose row does NOT persist (every other row does).
+    std::string audit_fail_action;
 
     RestApiV1 api;
 
     explicit VizHarness(pg::PgPool& pool, RestApiV1::ResponseScopeFn scope_fn = {}) {
+        api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
+        api.set_forensics_visibility_fn(forensics.fn());
         // ADR-0058: InstructionStore is now a migrated Postgres store — shares
         // the same pool/database as ResponseStore below (schema-per-store).
         instruction_store = std::make_unique<InstructionStore>(pool);
@@ -127,7 +134,7 @@ struct VizHarness {
                                const std::string& tt, const std::string& ti,
                                const std::string& d) -> bool {
             audit_log.push_back({a, r, tt, ti, d});
-            return true;
+            return a != audit_fail_action;
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -199,11 +206,12 @@ struct VizHarness {
     /// Push a response into the store keyed by `instruction_id` (a.k.a.
     /// command_id, a.k.a. the {id} path parameter on the visualization route).
     void push_response(const std::string& instruction_id, const std::string& agent,
-                       const std::string& output) {
+                       const std::string& output, const std::string& plugin = "") {
         StoredResponse r;
         r.instruction_id = instruction_id;
         r.agent_id = agent;
         r.output = output;
+        r.plugin = plugin;
         r.status = 0;
         r.timestamp = 1000;
         response_store->store(r);
@@ -355,6 +363,122 @@ TEST_CASE("REST visualization: pie chart over procfetch responses → 200 with b
     // Detail format: "<def_id> index=<N>" — issue #587 added the index
     // suffix so multi-chart fetches are distinguishable in the audit log.
     CHECK(h.audit_log[0].detail == def_id + " index=0");
+}
+
+TEST_CASE("REST visualization: Forensics rows are charted only for a caller with Forensics:Read",
+          "[pg][rest][visualization][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
+    auto spec = R"({"type":"pie","processor":"single_series","labelField":1,
+                    "title":"Top procs"})";
+    auto def_id = h.make_def(spec, "procfetch");
+
+    h.push_response("cmd-tier", "agent-1", "1|ordinary-one|/x|d", "procfetch");
+    h.push_response("cmd-tier", "agent-2", "1|secret-forensics|/x|d",
+                    yuzu::server::test::kForensicsPlugin);
+
+    auto charted = [&] {
+        auto res = h.sink.Get("/api/v1/executions/cmd-tier/visualization?definition_id=" + def_id);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        std::map<std::string, double> got;
+        const auto& d = body["data"];
+        for (size_t i = 0; i < d["labels"].size(); ++i)
+            got[d["labels"][i].get<std::string>()] = d["series"][0]["data"][i].get<double>();
+        return std::make_pair(got, d["meta"]["responses_total"].get<int>());
+    };
+
+    h.forensics.viewer();
+    {
+        const auto [got, total] = charted();
+        CHECK(got == std::map<std::string, double>{{"ordinary-one", 1}});
+        CHECK(total == 1);
+    }
+    h.forensics.admin();
+    {
+        const auto [got, total] = charted();
+        CHECK(got == std::map<std::string, double>{{"ordinary-one", 1}, {"secret-forensics", 1}});
+        CHECK(total == 2);
+    }
+}
+
+TEST_CASE("REST visualization: an Unknown Forensics decision is a retryable 503, not a partial chart",
+          "[pg][rest][visualization][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
+    auto spec = R"({"type":"pie","processor":"single_series","labelField":1,
+                    "title":"Top procs"})";
+    auto def_id = h.make_def(spec, "procfetch");
+    h.push_response("cmd-unk", "agent-1", "1|ordinary-one|/x|d", "procfetch");
+
+    h.forensics.unknown();
+    auto res = h.sink.Get("/api/v1/executions/cmd-unk/visualization?definition_id=" + def_id);
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["retry_after_ms"] == 5000);
+    CHECK(res->body.find("ordinary-one") == std::string::npos);
+    CHECK(h.audit_log.empty());
+
+    h.forensics.viewer();
+    auto ok = h.sink.Get("/api/v1/executions/cmd-unk/visualization?definition_id=" + def_id);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("REST visualization: response.forensics.read is written only when Forensics rows feed "
+          "the chart",
+          "[pg][rest][visualization][audit][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
+    auto spec = R"({"type":"pie","processor":"single_series","labelField":1,
+                    "title":"Top procs"})";
+    auto def_id = h.make_def(spec, "procfetch");
+    h.push_response("cmd-faud", "agent-1", "1|ordinary-one|/x|d", "procfetch");
+    h.push_response("cmd-faud", "agent-2", "1|secret-forensics|/x|d",
+                    yuzu::server::test::kForensicsPlugin);
+    const std::string path = "/api/v1/executions/cmd-faud/visualization?definition_id=" + def_id;
+    auto verb_rows = [&] {
+        std::vector<AuditRecord> out;
+        for (const auto& a : h.audit_log)
+            if (a.action == "response.forensics.read")
+                out.push_back(a);
+        return out;
+    };
+
+    h.forensics.viewer();
+    {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(verb_rows().empty());
+    }
+    h.forensics.admin();
+    h.audit_log.clear();
+    {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto rows = verb_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "success");
+        CHECK(rows[0].target_id == "cmd-faud");
+        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory surface=rest");
+    }
+    h.audit_log.clear();
+    h.audit_fail_action = "response.forensics.read";
+    {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(res->body.find("secret-forensics") == std::string::npos);
+        CHECK(res->body.find("ordinary-one") == std::string::npos);
+    }
 }
 
 TEST_CASE("REST visualization: multi-chart definition (#587)",

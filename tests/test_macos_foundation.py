@@ -41,7 +41,7 @@ class FoundationTests(unittest.TestCase):
                         return status.replace('dropped|0', 'dropped|1') if scenario == 'drops' and status_calls[0] > 1 else status
                     if action == 'os_name':
                         return 'os_name|Darwin'
-                    self.assertEqual((plugin, action), ('tar', 'sql'))
+                    self.assertEqual((plugin, action), ('echo', 'sql'))
                     self.assertIn(markers[0].name, params['sql'])
                     return '' if scenario == 'no-events' else 'started\nstopped'
                 stack.enter_context(patch.object(foundation.time, 'monotonic', side_effect=lambda: clock[0]))
@@ -98,7 +98,7 @@ class FoundationTests(unittest.TestCase):
         with patch.object(client, 'request', side_effect=[{'command_id': 'test'}, [row(0, 'started\nstopped')]]), \
              patch.object(foundation.time, 'monotonic', side_effect=[0, 1, 31]), \
              patch.object(foundation.time, 'sleep'), self.assertRaises(foundation.CheckFailed):
-            client.command('tar', 'sql')
+            client.command('echo', 'sql')
 
     def test_cookie_only_passed_as_path_no_redirect_or_tls_bypass(self):
         client = foundation.Client('https://localhost', Path('/private/cookies'), 'test-agent')

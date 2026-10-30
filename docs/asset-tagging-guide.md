@@ -391,9 +391,9 @@ When you set a `service` tag on a device, Yuzu automatically creates a **managem
 - Setting `service=payments` creates group "Service: payments"
 - Setting `service=hr-portal` creates group "Service: hr-portal"
 
-These groups use `dynamic` membership — the scope engine can refresh which devices belong to each group based on tag expressions.
+These groups are stored as `dynamic` groups with the scope expression `tag:service == "<value>"`, but membership is a snapshot. The group starts with the devices that carry that `service` tag at the moment it is created. If the group already exists, a later `service` tag write leaves it unchanged, so a device tagged afterwards is not added and a device untagged afterwards is not removed. Add or remove members with `POST /api/v1/management-groups/{id}/members`.
 
-This means an ITServiceOwner assigned to "Service: payments" automatically has scoped access to every device tagged with `service=payments`.
+This means an ITServiceOwner assigned to "Service: payments" has scoped access to the devices that are members of that group, which is not always the same set as the devices currently tagged `service=payments`.
 
 **Two distinct confinement axes.** The ITServiceOwner *role* documented above confines a
 management-group-scoped user via RBAC — that is unaffected by, and independent of, a

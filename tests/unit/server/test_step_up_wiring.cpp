@@ -562,6 +562,7 @@ struct ApprovalWiringServer {
 
     ApprovalManager* approval_manager{nullptr};
     int window_secs{300};
+    std::atomic<int> approver_mfa_calls{0};
 
     std::mutex mu;
     std::optional<auth::Session> session;
@@ -677,6 +678,14 @@ struct ApprovalWiringServer {
             return detail::run_in_handler_step_up(req, res, sess, label, /*auth_db=*/nullptr,
                                                   window_secs, audit, "optional", &metrics);
         };
+        // The approver gate (#6079) runs after the generic step-up. This harness exercises the
+        // central check and the pass; the approver gate has its own tests, so it passes here.
+        deps.approver_mfa_fn = [this](const httplib::Request&, httplib::Response&,
+                                      const auth::Session&, const std::string&) {
+            approver_mfa_calls.fetch_add(1);
+            return ApproverMfaOutcome{ApproverMfaOutcome::Kind::kPass,
+                                      MfaFactorState::kEnrolledLocal};
+        };
         HttplibRouteSink sink(svr);
         approval::register_approval_routes(sink, std::move(deps));
 
@@ -744,6 +753,7 @@ TEST_CASE("wiring: the approve and reject routes compose with the central step-u
             CHECK(body["meta"].value("mfa_step_up_required", false) == true);
             CHECK(s.perm_calls.load() == 0); // the handler never ran
             CHECK(s.handler_audit_rows.load() == 0);
+            CHECK(s.approver_mfa_calls.load() == 0);
             CHECK(s.gate_count("refused", "local") == 1);
         }
         SECTION(std::string(verb) + ": an engine principal is a 403 engine_principal_denied from "
@@ -922,6 +932,8 @@ TEST_CASE("wiring: the approve and reject handlers consume the central pass with
             }
             CHECK(s.perm_calls.load() == 1);
             CHECK(s.handler_audit_rows.load() == 2); // attempted + success
+            // The approver gate ran exactly once, after the generic step-up that consumed the pass.
+            CHECK(s.approver_mfa_calls.load() == 1);
 
             auto row = mgr->get(*id);
             REQUIRE(row.has_value());
@@ -952,8 +964,10 @@ TEST_CASE("wiring: the approve handler does not consume a pass earned by another
     CHECK(s.handler_step_up_calls.load() == 1);
     // The refused pass was spent, so no skipped gate is reported for this request.
     CHECK(s.gate_count("handler_skipped", "local") == 0);
-    // Nothing was decided: no `attempted` audit row and the ticket is still pending.
+    // Nothing was decided: no `attempted` audit row and the ticket is still pending. The generic
+    // step-up refused first, so the approver gate was never reached.
     CHECK(s.handler_audit_rows.load() == 0);
+    CHECK(s.approver_mfa_calls.load() == 0);
     auto row = mgr->get(*id);
     REQUIRE(row.has_value());
     CHECK(row->status == "pending");

@@ -1,7 +1,7 @@
 ## Disk Actions Definitions
 ## Reports physical drive health and the mapping between physical drives and
 ## the logical volumes they back.
-## Plugin: disk_actions | Actions: smart, volumes
+## Plugin: disk_actions | Actions: smart, volumes, partitions, topology
 ##
 ## Sources by platform:
 ##   Windows: IOCTL_STORAGE_QUERY_PROPERTY — StorageDeviceProperty (identity,
@@ -219,6 +219,168 @@ spec:
         - device
       operations:
         - count
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.storage.partitions
+  displayName: Partitions
+  version: 1.0.0
+  description: >
+    Reports the partitions of each physical disk with size, partition type and
+    mount points. Not read yet on any OS: every dispatch answers one unsupported
+    status row (windows:planned, linux:planned or macos:planned) until its leg
+    lands. On-demand only; it is not part of any daily sync.
+  tags: [storage, disk, partitions]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: disk_actions
+    action: partitions
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|partitions|<level>|<reason>   (always first; the only row until a leg lands)
+    # partition|<disk>|<partition>|<size_bytes>|<type>|<mount_points>|<detail>
+    columns:
+      - name: row_kind
+        type: string
+        description: >-
+          Row shape discriminator (the wire row's leading tag). Values: status
+          (exactly one per result, always first), partition (one per record read).
+        values: [status, partition]
+        example: status
+        platforms: [windows, linux, darwin]
+      - name: disk
+        type: string
+        description: >-
+          Physical disk the partition belongs to. Status rows: the action name.
+        example: "disk0"
+        platforms: [windows, linux, darwin]
+      - name: partition
+        type: string
+        description: >-
+          Partition identifier. Status rows: the level (unsupported).
+        example: "disk0s2"
+        platforms: [windows, linux, darwin]
+      - name: size_bytes
+        type: string
+        description: >-
+          Partition size in bytes, or "-" when unread. Status rows: the reason token (<os>:planned).
+        example: "494384795648"
+        platforms: [windows, linux, darwin]
+      - name: type
+        type: string
+        description: >-
+          Partition type or filesystem hint, or "-". Absent on status rows.
+        example: "apfs"
+        platforms: [windows, linux, darwin]
+      - name: mount_points
+        type: string
+        description: >-
+          Comma-separated mount points or drive letters, or "-". Absent on status rows.
+        example: "/"
+        platforms: [windows, linux, darwin]
+      - name: detail
+        type: string
+        description: >-
+          Free text, or "-". Absent on status rows.
+        example: "-"
+        platforms: [windows, linux, darwin]
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.storage.topology
+  displayName: Storage Topology
+  version: 1.0.0
+  description: >
+    Reports the logical storage layers above the physical disks: LVM volume
+    groups and logical volumes, md arrays, multipath maps and APFS containers.
+    Not read yet on any OS: every dispatch answers one unsupported status row
+    (windows:planned, linux:planned or macos:planned) until its leg lands;
+    Windows has no source ruled yet and stays planned. On-demand only; it is not
+    part of any daily sync.
+  tags: [storage, disk, topology]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: disk_actions
+    action: topology
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|topology|<level>|<reason>   (always first; the only row until a leg lands)
+    # topology|<kind>|<name>|<uuid>|<members>|<detail>
+    columns:
+      - name: row_kind
+        type: string
+        description: >-
+          Row shape discriminator (the wire row's leading tag). Values: status
+          (exactly one per result, always first), topology (one per record read).
+        values: [status, topology]
+        example: status
+        platforms: [windows, linux, darwin]
+      - name: kind
+        type: string
+        description: >-
+          Layer kind. Values: lvm_vg, lvm_lv, md, multipath, apfs_container. Status rows: the action name.
+        example: "lvm_vg"
+        platforms: [windows, linux, darwin]
+      - name: name
+        type: string
+        description: >-
+          Layer name. Status rows: the level (unsupported).
+        example: "vg0"
+        platforms: [windows, linux, darwin]
+      - name: uuid
+        type: string
+        description: >-
+          Layer UUID, or "-". Status rows: the reason token (<os>:planned).
+        example: "-"
+        platforms: [windows, linux, darwin]
+      - name: members
+        type: string
+        description: >-
+          Comma-separated member devices, or "-". Absent on status rows.
+        example: "sda2,sdb2"
+        platforms: [windows, linux, darwin]
+      - name: detail
+        type: string
+        description: >-
+          Free text, or "-". Absent on status rows.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   approval:
     mode: auto

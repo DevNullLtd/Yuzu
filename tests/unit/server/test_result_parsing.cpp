@@ -93,3 +93,25 @@ TEST_CASE("installed_apps rows split as key|remainder (pre-existing server decod
     CHECK(split_fields("installed_apps", "app|X|-|-|-|a\\|b|-") ==
           std::vector<std::string>{"app", "X|-|-|-|a|b|-"});
 }
+
+TEST_CASE("filesystem find_by_hash rows: a path ending in a backslash is folded so the size "
+          "separator stays a delimiter (#5624)",
+          "[result_parsing]") {
+    // The decoder undoes exactly one backslash before a pipe. `match|foo\|3` (an unfolded path
+    // ending in a backslash) reads as an ESCAPED pipe, gluing the size onto the path; the plugin
+    // therefore folds a trailing backslash to '/', giving `match|foo/|3`.
+    //
+    // filesystem is a key/value plugin here (kKeyValuePlugins): key = the row kind, value = the
+    // rest of the row with escaped pipes undone. The folded row keeps path and size apart by an
+    // unescaped pipe; the unfolded one collapses them into one pipe-containing token.
+    CHECK(split_fields("filesystem", "match|foo/|3") ==
+          std::vector<std::string>{"match", "foo/|3"});
+    CHECK(split_fields("filesystem", "match|foo\\|3") ==
+          std::vector<std::string>{"match", "foo|3"});
+
+    // A reader that splits on EVERY unescaped pipe (any plugin outside the key/value set) shows
+    // the same defect as a field count: three fields folded, two unfolded.
+    CHECK(split_fields("an_all_pipes_plugin", "match|foo/|3") ==
+          std::vector<std::string>{"match", "foo/", "3"});
+    CHECK(split_fields("an_all_pipes_plugin", "match|foo\\|3").size() == 2);
+}

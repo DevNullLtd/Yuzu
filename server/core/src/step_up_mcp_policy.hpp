@@ -97,7 +97,7 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::pending("approve_request",                      "POST",   R"(/api/approvals/([^/]+)/approve)"),
     step_up_mcp_detail::pending("reject_request",                       "POST",   R"(/api/approvals/([^/]+)/reject)"),
     // Execution:Execute
-    step_up_mcp_detail::exempt ("create_result_set_from_tar_query",     step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/from-tar-query)"),
+    step_up_mcp_detail::exempt ("create_result_set_from_echo_query",     step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/from-echo-query)"),
     step_up_mcp_detail::exempt ("create_result_set_from_instruction_result", step_up_detail::kOperationalData, "POST", R"(/api/v1/result-sets/from-instruction-result)"),
     step_up_mcp_detail::exempt ("execute_bundle",                       step_up_detail::kExecutionDispatch, "POST",   R"(/api/v1/bundles)"),
     step_up_mcp_detail::exempt ("execute_instruction",                  step_up_detail::kExecutionDispatch),

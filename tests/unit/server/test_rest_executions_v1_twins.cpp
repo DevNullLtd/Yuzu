@@ -24,8 +24,10 @@
 #include "response_export_metrics.hpp"
 #include "rest_api_v1.hpp"
 #include "response_store.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -40,6 +42,7 @@
 #include <algorithm>
 #include <chrono>
 #include <memory>
+#include <set>
 #include <shared_mutex>
 #include <unordered_map>
 #include <stdexcept>
@@ -98,15 +101,25 @@ struct ExecV1Harness {
     authz::VisibleSet fleet_read_scope{std::nullopt};
     std::string session_username{"tester"};
     std::vector<AuditRecord> audit_log;
+    // #4990: the caller's Forensics visibility (admin by default; the tier cases flip it).
+    yuzu::server::test::ForensicsCaller forensics;
+    // #4990: an audit verb whose row does NOT persist (every other row does).
+    std::string audit_fail_action;
 
     RestApiV1 api;
 
     // wire_fleet_read=false leaves fleet_read_fn unwired (exercises the 503 guard).
     // real_fleet_read, when set, replaces the mocked gate with a production-shaped one.
     // wire_tracker=false registers the routes with a null ExecutionTracker* (the 503 guard).
+    // real_forensics_fn, when set, replaces the stubbed ForensicsCaller with a production-shaped
+    // resolver (#4990 role cases drive the REAL resolver over a real RbacStore).
     explicit ExecV1Harness(pg::PgPool& pool, bool wire_fleet_read = true,
-                           RestApiV1::FleetReadFn real_fleet_read = {}, bool wire_tracker = true) {
+                           RestApiV1::FleetReadFn real_fleet_read = {}, bool wire_tracker = true,
+                           ForensicsVisibilityFn real_forensics_fn = {}) {
         yuzu::server::seed_response_metrics(metrics);
+        api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
+        api.set_forensics_visibility_fn(real_forensics_fn ? std::move(real_forensics_fn)
+                                                           : forensics.fn());
         execution_tracker = std::make_unique<ExecutionTracker>(pool);
         REQUIRE(execution_tracker->is_open());
         instruction_store = std::make_unique<InstructionStore>(pool);
@@ -144,7 +157,7 @@ struct ExecV1Harness {
                                const std::string& tt, const std::string& ti,
                                const std::string& d) -> bool {
             audit_log.push_back({a, r, tt, ti, d});
-            return true;
+            return a != audit_fail_action;
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -489,6 +502,366 @@ TEST_CASE("GET /api/v1/executions/:id/responses: mirrors query_responses' execut
             audited = true;
     }
     CHECK(audited);
+}
+
+// #4990: the Forensics tier. Real PG-backed store, exact rendered rows, a non-Forensics control row.
+TEST_CASE("GET /api/v1/executions/:id/responses: Forensics rows follow the caller's Forensics "
+          "visibility",
+          "[pg][rest][executions][v1][responses][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto exec_id = h.make_exec_with_agents("def-resp-tier");
+
+    auto put = [&](const std::string& agent, const std::string& plugin, const std::string& out,
+                   int64_t ts) {
+        StoredResponse r;
+        r.instruction_id = "def-resp-tier";
+        r.agent_id = agent;
+        r.timestamp = ts;
+        r.status = 0;
+        r.output = out;
+        r.plugin = plugin;
+        r.execution_id = exec_id;
+        h.response_store->store(r);
+    };
+    using yuzu::server::test::kForensicsPlugin;
+    using yuzu::server::test::kOrdinaryPlugin;
+    put("agent-A", kForensicsPlugin, "forensics-A", 1735689610);
+    put("agent-B", kForensicsPlugin, "forensics-B", 1735689611);
+    put("agent-A", kOrdinaryPlugin, "ordinary-A", 1735689612);
+    put("agent-B", kOrdinaryPlugin, "ordinary-B", 1735689613);
+
+    auto outputs = [&](const std::string& q = "") {
+        auto res = h.sink.Get("/api/v1/executions/" + exec_id + "/responses" + q);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        std::set<std::string> out;
+        for (const auto& r : body["data"])
+            out.insert(r["output"].get<std::string>());
+        return out;
+    };
+    using Outputs = std::set<std::string>;
+
+    h.forensics.viewer();
+    CHECK(outputs() == Outputs{"ordinary-A", "ordinary-B"});
+    h.forensics.admin();
+    CHECK(outputs() == Outputs{"forensics-A", "forensics-B", "ordinary-A", "ordinary-B"});
+    h.forensics.unsupported_subset({"agent-B"}); // unsupported: fails closed like a viewer
+    CHECK(outputs() == Outputs{"ordinary-A", "ordinary-B"});
+
+    // A confined caller (gate scope engaged): the in-scope agent set is derived from the
+    // permitted rows, so an agent that answered only with a Forensics row is not even enumerated.
+    h.forensics.viewer();
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+    CHECK(outputs() == Outputs{"ordinary-A"});
+}
+
+// #4990: the delegable ForensicsAnalyst role through the REAL resolver. The route's own gates are the
+// harness mocks (open); what is real here is the Forensics visibility, resolved by the production
+// `resolve_forensics_visible` over a real AuthRoutes + RbacStore + ManagementGroupStore from the
+// caller's session cookie.
+TEST_CASE("GET /api/v1/executions/:id/responses through the REAL resolver: a ForensicsAnalyst holder "
+          "reads Forensics rows, a Viewer does not, and the role carries no Execution:Execute",
+          "[pg][rest][executions][v1][responses][security][forensics][forensics_analyst]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    ManagementGroupStore& mgmt = *mgmt_bundle;
+    yuzu::test::ApiTokenStorePg api_tokens;
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    AuthRoutes ar(cfg, auth_mgr, &rbac, api_tokens.get(), /*audit_store=*/nullptr, &mgmt,
+                  /*tag_store=*/nullptr, /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+
+    ForensicsVisibilityDeps deps{.auth_routes = &ar, .metrics = nullptr};
+    ExecV1Harness h(pool, true, {}, true, [&deps](const httplib::Request& req) {
+        return resolve_forensics_visible(deps, req);
+    });
+    auto exec_id = h.make_exec_with_agents("def-resp-analyst");
+
+    using yuzu::server::test::kForensicsPlugin;
+    using yuzu::server::test::kOrdinaryPlugin;
+    auto put = [&](const std::string& agent, const std::string& plugin, const std::string& out,
+                   int64_t ts) {
+        StoredResponse r;
+        r.instruction_id = "def-resp-analyst";
+        r.agent_id = agent;
+        r.timestamp = ts;
+        r.status = 0;
+        r.output = out;
+        r.plugin = plugin;
+        r.execution_id = exec_id;
+        h.response_store->store(r);
+    };
+    put("agent-A", kForensicsPlugin, "forensics-A", 1735689610);
+    put("agent-B", kForensicsPlugin, "forensics-B", 1735689611);
+    put("agent-A", kOrdinaryPlugin, "ordinary-A", 1735689612);
+    put("agent-B", kOrdinaryPlugin, "ordinary-B", 1735689613);
+
+    auto cookie_for = [&](const std::string& user) {
+        REQUIRE(auth_mgr.upsert_user(user, "correct-horse-battery-staple", auth::Role::user));
+        auto token = auth_mgr.create_local_session_for_test(user, auth::Role::user, true);
+        return std::unordered_map<std::string, std::string>{{"Cookie", "yuzu_session=" + token}};
+    };
+    using Outputs = std::set<std::string>;
+    auto outputs = [&](const std::unordered_map<std::string, std::string>& headers) {
+        auto res = h.sink.Get("/api/v1/executions/" + exec_id + "/responses", headers);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        Outputs out;
+        for (const auto& r : body["data"])
+            out.insert(r["output"].get<std::string>());
+        return out;
+    };
+
+    REQUIRE(rbac.assign_role({"user", "ana", "ForensicsAnalyst"}).has_value());
+    REQUIRE(rbac.assign_role({"user", "vic", "Viewer"}).has_value());
+    REQUIRE(rbac.assign_role({"user", "oli", "Operator"}).has_value());
+    const auto ana = cookie_for("ana");
+    const auto vic = cookie_for("vic");
+    const auto oli = cookie_for("oli");
+
+    // The analyst reads the Forensics-tier rows AND the ordinary ones; a Viewer and an Operator
+    // (both hold Response:Read) still see only the ordinary rows.
+    CHECK(outputs(ana) == Outputs{"forensics-A", "forensics-B", "ordinary-A", "ordinary-B"});
+    CHECK(outputs(vic) == Outputs{"ordinary-A", "ordinary-B"});
+    CHECK(outputs(oli) == Outputs{"ordinary-A", "ordinary-B"});
+
+    // Operator + ForensicsAnalyst: the Forensics rows appear for the combined holder.
+    REQUIRE(rbac.assign_role({"user", "oli", "ForensicsAnalyst"}).has_value());
+    CHECK(outputs(oli) == Outputs{"forensics-A", "forensics-B", "ordinary-A", "ordinary-B"});
+
+    // Reading is all the role grants: it carries no Execution:Execute (the gate the dispatch routes
+    // ask first; their refusal of an analyst is pinned in test_command_routes.cpp and
+    // test_mcp_server.cpp, and the chokepoint alone would not stop one, see test_rbac_store.cpp),
+    // the combined holder keeps only the Operator's own Execute, and the Forensics tier gains no write.
+    auto probe = [&](const std::unordered_map<std::string, std::string>& headers,
+                     const char* securable, const char* op) {
+        httplib::Request req;
+        for (const auto& [k, v] : headers)
+            req.headers.emplace(k, v);
+        return ar.has_permission(req, securable, op);
+    };
+    CHECK_FALSE(probe(ana, "Execution", "Execute"));
+    CHECK(probe(ana, "Forensics", "Read"));
+    CHECK_FALSE(probe(ana, "Forensics", "Write"));
+    CHECK_FALSE(probe(ana, "Infrastructure", "Execute"));
+    CHECK_FALSE(probe(vic, "Forensics", "Read"));
+    CHECK(probe(oli, "Execution", "Execute")); // the Operator role's, unchanged
+
+    // Revoking the role takes the rows away again, with no restart.
+    REQUIRE(rbac.unassign_role("user", "ana", "ForensicsAnalyst").has_value());
+    CHECK(outputs(ana) == Outputs{"ordinary-A", "ordinary-B"});
+
+    // RBAC off: the grant is inert and the floor stands, so a non-admin sees no Forensics row.
+    rbac.set_rbac_enabled(false);
+    CHECK(outputs(oli) == Outputs{"ordinary-A", "ordinary-B"});
+}
+
+// #4990: the same REAL resolver, with the authorization read genuinely failing. A caller whose
+// global Forensics proof could not be determined gets the retryable 503, never a 200 with the
+// Forensics rows silently missing; once the store recovers the same caller reads again.
+TEST_CASE("GET /api/v1/executions/:id/responses through the REAL resolver: a failed RBAC read is a "
+          "retryable 503 and counted, not a silently filtered 200",
+          "[pg][rest][executions][v1][responses][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    yuzu::MetricsRegistry metrics;
+    seed_forensics_tier_metrics(metrics);
+    RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    ManagementGroupStore& mgmt = *mgmt_bundle;
+    yuzu::test::ApiTokenStorePg api_tokens;
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    AuthRoutes ar(cfg, auth_mgr, &rbac, api_tokens.get(), /*audit_store=*/nullptr, &mgmt,
+                  /*tag_store=*/nullptr, /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+    ForensicsVisibilityDeps deps{.auth_routes = &ar, .metrics = &metrics};
+    ExecV1Harness h(pool, true, {}, true, [&deps](const httplib::Request& req) {
+        return resolve_forensics_visible(deps, req);
+    });
+    auto exec_id = h.make_exec_with_agents("def-resp-degraded");
+    StoredResponse r;
+    r.instruction_id = "def-resp-degraded";
+    r.agent_id = "agent-A";
+    r.timestamp = 1735689610;
+    r.status = 0;
+    r.output = "ordinary-A";
+    r.plugin = yuzu::server::test::kOrdinaryPlugin;
+    r.execution_id = exec_id;
+    h.response_store->store(r);
+
+    REQUIRE(auth_mgr.upsert_user("gus", "correct-horse-battery-staple", auth::Role::user));
+    REQUIRE(rbac.assign_role({"user", "gus", "Viewer"}).has_value());
+    const auto token = auth_mgr.create_local_session_for_test("gus", auth::Role::user, true);
+    const std::unordered_map<std::string, std::string> cookie{{"Cookie", "yuzu_session=" + token}};
+    const std::string path = "/api/v1/executions/" + exec_id + "/responses";
+
+    auto withheld = [&] {
+        return metrics.counter(kForensicsTierWithheldMetric, {{"reason", "rbac_unavailable"}}).value();
+    };
+
+    // The role read (the first query of a permission-cache miss) fails for real.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult a{PQexec(conn.get(),
+                              "ALTER TABLE rbac_store.principal_roles RENAME TO principal_roles_gone")};
+        REQUIRE(a.ok());
+    }
+    auto restore = [&] {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult a{PQexec(conn.get(),
+                              "ALTER TABLE rbac_store.principal_roles_gone RENAME TO principal_roles")};
+        REQUIRE(a.ok());
+    };
+
+    auto res = h.sink.Get(path, cookie);
+    if (!res || res->status != 503)
+        restore(); // never leave the schema broken behind a failed REQUIRE
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == 503);
+    CHECK(body["error"]["retry_after_ms"] == 5000);
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK(res->body.find("ordinary-A") == std::string::npos);
+    CHECK(withheld() == 1.0);
+
+    // Recovery: the same caller is answered again (a Viewer: the ordinary row, nothing Forensics).
+    restore();
+    auto ok = h.sink.Get(path, cookie);
+    REQUIRE(ok);
+    REQUIRE(ok->status == 200);
+    CHECK(ok->body.find("ordinary-A") != std::string::npos);
+    CHECK(withheld() == 1.0);
+}
+
+// #4990: an Unknown Forensics decision is a retryable 503 on the machine surface, never a partial 200.
+TEST_CASE("GET /api/v1/executions/:id/responses: an Unknown Forensics decision is a retryable 503",
+          "[pg][rest][executions][v1][responses][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto exec_id = h.make_exec_with_agents("def-resp-unk");
+    StoredResponse r;
+    r.instruction_id = "def-resp-unk";
+    r.agent_id = "agent-A";
+    r.timestamp = 1735689610;
+    r.status = 0;
+    r.output = "ordinary-A";
+    r.plugin = yuzu::server::test::kOrdinaryPlugin;
+    r.execution_id = exec_id;
+    h.response_store->store(r);
+
+    h.forensics.unknown();
+    auto res = h.sink.Get("/api/v1/executions/" + exec_id + "/responses");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == 503);
+    CHECK(body["error"]["retry_after_ms"] == 5000);
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK(res->body.find("ordinary-A") == std::string::npos);
+
+    // Control: a Denied decision serves the ordinary row.
+    h.forensics.viewer();
+    auto ok = h.sink.Get("/api/v1/executions/" + exec_id + "/responses");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(ok->body.find("ordinary-A") != std::string::npos);
+}
+
+// #4990: the `response.forensics.read` audit row on the execution-scoped read.
+TEST_CASE("GET /api/v1/executions/:id/responses: response.forensics.read is written only when "
+          "Forensics rows are served",
+          "[pg][rest][executions][v1][responses][audit][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto exec_id = h.make_exec_with_agents("def-resp-faud");
+
+    auto put = [&](const std::string& agent, const std::string& plugin, const std::string& out,
+                   int64_t ts) {
+        StoredResponse r;
+        r.instruction_id = "def-resp-faud";
+        r.agent_id = agent;
+        r.timestamp = ts;
+        r.status = 0;
+        r.output = out;
+        r.plugin = plugin;
+        r.execution_id = exec_id;
+        h.response_store->store(r);
+    };
+    using yuzu::server::test::kForensicsPlugin;
+    using yuzu::server::test::kOrdinaryPlugin;
+    put("agent-A", kForensicsPlugin, "forensics-A", 1735689610);
+    put("agent-B", kForensicsPlugin, "forensics-B", 1735689611);
+    put("agent-A", kOrdinaryPlugin, "ordinary-A", 1735689612);
+
+    auto verb_rows = [&] {
+        std::vector<AuditRecord> out;
+        for (const auto& a : h.audit_log)
+            if (a.action == "response.forensics.read")
+                out.push_back(a);
+        return out;
+    };
+    const std::string path = "/api/v1/executions/" + exec_id + "/responses";
+
+    h.forensics.viewer();
+    {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(verb_rows().empty());
+    }
+    h.forensics.admin();
+    h.audit_log.clear();
+    {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto rows = verb_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "success");
+        CHECK(rows[0].target_type == "Execution");
+        CHECK(rows[0].target_id == exec_id);
+        CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory surface=rest");
+    }
+    h.forensics.unsupported_subset({"agent-B"}); // unsupported: fails closed like a viewer
+    h.audit_log.clear();
+    {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        // No Forensics row was served, so no verb row is written (as for a viewer).
+        CHECK(verb_rows().empty());
+    }
+    h.forensics.admin();
+    h.audit_log.clear();
+    h.audit_fail_action = "response.forensics.read";
+    {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(res->body.find("forensics-") == std::string::npos);
+        CHECK(res->body.find("ordinary-") == std::string::npos);
+    }
 }
 
 // #4030 Gate 8 fix (happy-path, Gate 4, HIGH/I3): `offset` over this

@@ -339,6 +339,20 @@ const std::vector<pg::PgMigration>& migrations() {
         // so an old binary's rows are one-directionally distinguishable.
         {3, "ALTER TABLE policy_status ADD COLUMN remediation_claim_gen BIGINT NOT NULL DEFAULT 0;"},
         {4, "CREATE SEQUENCE IF NOT EXISTS remediation_claim_seq;"},
+        // v5 (Echo rename, upgrade window): a guard fragment names its check / fix / post-check
+        // instructions by id (policy_evaluator resolves them with get_definition and dispatches
+        // nothing on an unknown id), so they follow the renamed definition ids. Idempotent.
+        {5,
+         "UPDATE policy_fragments SET "
+         "  check_instruction = replace(check_instruction, 'crossplatform.tar.', 'crossplatform.echo.'),"
+         "  fix_instruction = replace(fix_instruction, 'crossplatform.tar.', 'crossplatform.echo.'),"
+         "  post_check_instruction = replace(post_check_instruction, "
+         "    'crossplatform.tar.', 'crossplatform.echo.'),"
+         "  yaml_source = replace(yaml_source, 'crossplatform.tar.', 'crossplatform.echo.') "
+         "WHERE check_instruction LIKE 'crossplatform.tar.%' "
+         "   OR fix_instruction LIKE 'crossplatform.tar.%' "
+         "   OR post_check_instruction LIKE 'crossplatform.tar.%' "
+         "   OR yaml_source LIKE '%crossplatform.tar.%';"},
     };
     return kMigrations;
 }

@@ -10,7 +10,7 @@ namespace yuzu::agent::win {
 namespace {
 
 // Saturating delta for cumulative counters: a regression reads as "no data"
-// (0), never as a giant unsigned wrap (the tar_perf idiom).
+// (0), never as a giant unsigned wrap (the echo_perf idiom).
 std::uint64_t delta(std::uint64_t prev, std::uint64_t cur) {
     return cur >= prev ? cur - prev : 0;
 }
@@ -172,7 +172,7 @@ std::uint64_t ft_to_u64(const FILETIME& ft) {
     return (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
 }
 
-// Sum IOCTL_DISK_PERFORMANCE over \\.\PhysicalDrive0..31 (the tar_perf
+// Sum IOCTL_DISK_PERFORMANCE over \\.\PhysicalDrive0..31 (the echo_perf
 // pattern). A missing index or an unsupported disk (some virtual disks) is
 // skipped; disk_valid only when at least one disk responded. Open with zero
 // access rights — the IOCTL needs none (works for the unprivileged dev agent).

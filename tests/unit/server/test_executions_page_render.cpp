@@ -407,4 +407,14 @@ TEST_CASE("executions_page_render: collapsed responses say capped, degraded or u
     CHECK(has(render_exec_devices(v), "Responses unavailable."));
     v.responses_state = ResponsesState::kUnavailable;
     CHECK(has(render_exec_devices(v), "Response store not available."));
+    // #4990: an unconfirmed permission check carries no count, no rows, and its own sentence.
+    v.responses_state = ResponsesState::kPermissionUnconfirmed;
+    v.responses_total = 7;
+    v.responses.push_back({"agent-0", "secret-out", "", 0, kAt, kAt * 1000});
+    const auto unconfirmed = render_exec_devices(v);
+    CHECK(has(unconfirmed, "data-responses-permission-unconfirmed"));
+    CHECK(has(unconfirmed, "permission check for this view could not be completed"));
+    CHECK_FALSE(has(unconfirmed, "Show responses"));
+    CHECK_FALSE(has(unconfirmed, "secret-out"));
+    CHECK_FALSE(has(unconfirmed, "(7)"));
 }

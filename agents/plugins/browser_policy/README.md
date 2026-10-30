@@ -14,19 +14,55 @@
 
 ## How it works
 
-`policies` reports which enterprise-managed browser policies an administrator has configured on the device, as facts only. One `policy` row is written per configured policy: the browser (Chrome, Chromium or Edge), whether the policy is mandatory or recommended, its scope, its name, its typed value and the file it was read from. On Linux the rows come from the JSON policy files under `/etc/opt/chrome/policies`, `/etc/chromium/policies` and `/etc/opt/edge/policies`, in their `managed` and `recommended` subdirectories. Every directory below the root is opened without following symlinks, every file is read with a 1 MiB cap (16 MiB parsed in total per run), and the parse is done with the vendored `nlohmann` JSON library. The plugin reads local configuration and nothing else: no subprocess, no network, no write. It enforces nothing and judges nothing; a policy is a row, not a verdict. When a read cannot be completed, or on a host whose leg is still a placeholder, a summary `status` row leads the output and repeats the typed result status (a constrained read adds per-path `status` rows after it), so the outcome is visible wherever rows are (see Result status). The Windows and macOS legs are placeholders (see Caveats).
+`policies` reports which enterprise-managed browser policies an administrator has configured on the device, as facts only. It reads local policy files, in a fixed order: Chrome (`/etc/opt/chrome/policies`), then Chromium (`/etc/chromium/policies`), then Edge (`/etc/opt/edge/policies`), and within each the `managed` directory before `recommended`. Every `*.json` file in those directories is parsed and each top-level key becomes one `policy` row: browser, level (mandatory or recommended), scope, policy name, typed value and the file it came from. Directories are opened one hop at a time without following symlinks, each file is capped at 1 MiB (16 MiB in total per run), and a file that is not a regular file is refused.
 
-The plugin seeds no default-off kill switch, on purpose: it reads operator/IT-authored config, not personal data, so it carries neither the default-off switch nor an execute gate (the operator-settable per-plugin kill switch still applies to it).
+The plugin starts no process, uses no network and writes nothing. It enforces and judges nothing: a policy is a row, not a verdict. A missing policy directory means "nothing managed" and produces no rows. A directory or file that exists but cannot be read or decoded makes the result partial and is also written as a `status` row at the top of the output. Only Linux reads policy today; on Windows and macOS the action answers with a single `status` row saying the host was not inspected (see Caveats). The action carries no default-off kill switch because the data is IT-authored configuration, not personal data; the operator-settable per-plugin kill switch still applies.
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Inventory.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[browser_policy.execute]
-  EX --> WIN[Windows leg<br/>placeholder: one status row, UNAVAILABLE windows:planned]
-  EX --> MAC[macOS leg<br/>placeholder: one status row, UNAVAILABLE macos:planned]
-  EX --> LIN[Linux leg<br/>/etc/opt/chrome, /etc/chromium, /etc/opt/edge policy JSON reads]
-  WIN & MAC & LIN --> ROWS[rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator or workflow"] --> SRV["Server: authz Inventory, Read"]
+  SRV -->|"gRPC mTLS"| EX["Agent: browser_policy policies"]
+  EX --> LIN["Linux: read policy JSON under /etc"]
+  EX --> WIN["Windows: placeholder status row"]
+  EX --> MAC["macOS: placeholder status row"]
+  LIN --> ROWS["policy rows and typed result status"]
+  WIN --> ROWS
+  MAC --> ROWS
+  ROWS --> RS[("ResponseStore")]
+  RS --> API["REST /api/responses"]
 ```
+
+### What you can decide with it
+
+| Question | Linux | Windows | macOS |
+|---|---|---|---|
+| Is a browser policy configured on this device, and which ones? | Yes, from the three vendor directories. | No answer: one `status` row, `windows:planned`. | No answer: one `status` row, `macos:planned`. |
+| Is a given policy mandatory or only recommended? | Yes: the `level` column. | No answer. | No answer. |
+| Which file set it, so an administrator can trace it? | Yes: the `source` column. | No answer. | No answer. |
+| Is this policy actually in force in the browser? | No. Rows are what the files say, not what the browser applied. | No answer. | No answer. |
+
+Use `policies` for a fleet question such as "which devices force-install an extension or pin a homepage". A clean Linux result (`OK`, zero rows, no `status` row) means the three directories were read and held no policy files; it does not mean no browser on the host is managed (per-user policy, snap or flatpak paths and Firefox are out of scope). Never read an empty result from Windows or macOS as "no policy": those hosts were not inspected, and the `status` row says so. Pair it with `installed_apps` to know which browsers are installed at all.
+
+### Diagrams
+
+#### How a Linux read becomes a result
+
+```mermaid
+flowchart TD
+  S["Start: for each vendor directory in order"] --> O{"Open /etc/.../policies"}
+  O -->|"does not exist"| N["Nothing managed: no rows, no status row"]
+  O -->|"refused or symlink"| C["Constrained: per-path status row"]
+  O -->|"opened"| L["List *.json in managed, then recommended"]
+  L --> F{"Read and parse each file"}
+  F -->|"parsed"| R["One policy row per top-level key"]
+  F -->|"unreadable, oversized or invalid"| C
+  R --> D{"Row or byte cap hit"}
+  D -->|"yes"| C
+  D -->|"no"| E["OK and FULL if nothing failed"]
+  C --> P["PARTIAL: summary status row first, rows already read kept"]
+```
+
+The read never treats a failure as an absence. A directory that does not exist is the only silent case; everything else that cannot be completed turns the result into `CONSTRAINED` / `PARTIAL`, writes a summary `status` row first and a per-path `status` row for each failure, and keeps the policy rows it did read. The caps are a lower bound: when one is hit, the file that crossed it is named and the walk stops.
 
 ## OS capability
 
@@ -45,13 +81,11 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | n/a - planned placeholder | n/a - planned placeholder | n/a - planned placeholder (the registry probe below is evidence, not a measurement of this plugin) | n/a - the placeholder reports `UNAVAILABLE` with `windows:planned` and reads nothing |
-| macOS | n/a - planned placeholder | n/a - planned placeholder | n/a - planned placeholder | n/a - the placeholder reports `UNAVAILABLE` with `macos:planned` and reads nothing |
-| Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`) | None to read - the policy directories are root-owned but must be world-readable for the browser itself to load them | Measured 2026-09-23 in a Debian 13 container as euid 0 (`docs/samples/linux.txt`: the seeded policy files read with no extra grant); the refusal path (`permission_denied`) is proven by the unit suite as a non-root user, not by a service-account run on a real host | `CONSTRAINED` / partial with a `linux:<detail>` token (for example `linux:permission_denied` or `linux:symlink_refused`); the unreadable directory or file contributes no rows, one `status` row repeats the outcome, and the result never reads as "no policy configured" |
+| Windows | n/a - placeholder leg | n/a - the leg reads nothing | n/a - the leg reads nothing | n/a - the placeholder reports `UNAVAILABLE` with `windows:planned` and reads nothing |
+| macOS | n/a - placeholder leg | n/a - the leg reads nothing | n/a - the leg reads nothing | n/a - the placeholder reports `UNAVAILABLE` with `macos:planned` and reads nothing |
+| Linux | agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`) | None to read - the policy directories are root-owned and, as shipped by the browser packages, world-readable (the browser runs as the user, so it needs the same read access; not verified here) | Measured in a Debian 13 container as euid 0 (`docs/samples/linux.txt`: the seeded policy files read with no extra grant); the refusal path (`permission_denied`) is proven by the unit suite as a non-root user, not by a service-account run on a real host | `CONSTRAINED` / partial with a `linux:<detail>` token (for example `linux:permission_denied` or `linux:symlink_refused`); the unreadable directory or file contributes no rows, one `status` row repeats the outcome, and the result never reads as "no policy configured" |
 
 No external binaries, no subprocesses, no shell-out and no network use: the Linux leg is an in-process, bounded read of local files.
-
-**Windows LocalSystem probe (evidence, not a measured outcome of this plugin).** The Windows leg is a planned placeholder that reads nothing, so the plugin has no LocalSystem outcome of its own yet. Separately, a registry probe on the-rig (2026-09-21) of `HKLM\SOFTWARE\Policies\Google\Chrome` and `HKLM\SOFTWARE\Policies\Microsoft\Edge` returned byte-identical output whether run as the interactive user or as SYSTEM: both roots were present with no values at the root and one subkey, `LocalNetworkAccessAllowedForUrls`, holding a value named `1` (`REG_SZ`), and the `Recommended` subkeys were absent (a real `reg query` exit 1).
 
 ## Data contract
 
@@ -98,8 +132,8 @@ Every result other than a complete read is ALSO written as a summary `status` ro
 ### Where the data goes
 
 - **Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `policies` is also a gathered definition (`crossplatform.browser_policy.policies`, `gather.ttlSeconds` 300: informational, nothing re-dispatches on it).
-- **Not consumed by** daily-sync, TAR, DEX, or metrics.
-- **Sensitivity.** Rows are operator/IT-authored configuration: policy names and values such as homepage URLs, allowed or blocked extension ids and proxy settings can disclose part of an organisation's browser-management posture and internal hostnames. They carry no browsing history, bookmarks, cookies or per-user data, and on the Linux leg the `scope` column always reports `machine`, never a user (the macOS leg's descriptor already documents per-user Managed Preferences, so this is a Linux-only fact). Values are reported verbatim and are not screened: a value an administrator wrote can itself hold a credential-bearing URL or an enrollment token (for example a proxy address with embedded credentials), and the files are world-readable so the browser can load them, so treat the rows as sensitive. Stored responses are kept for the ResponseStore's retention period (90 days by default, `docs/user-manual/response-store.md`); with RBAC off, the default, any authenticated session can read a stored result, but dispatching still needs an admin session (the legacy fallback's rule for any non-read operation); with RBAC on, dispatch needs `Execution:Execute` plus `Inventory:Read` and reading needs `Response:Read`. **This is a deliberate, reviewed classification, not a default** (review 5323890403): unlike `browser_inventory`'s per-user browsing data, this content is IT-authored machine policy the organisation itself wrote, fully and explicitly disclosed here rather than hidden, and no routed-concern or ADR anchor mandates a stricter tier for this data class — `Inventory:Read`/`ExecuteGate::None` stays the classification.
+- **Not consumed by** daily-sync, Echo, DEX, or metrics.
+- **Sensitivity.** Rows are operator/IT-authored configuration: policy names and values such as homepage URLs, allowed or blocked extension ids and proxy settings can disclose part of an organisation's browser-management posture and internal hostnames. They carry no browsing history, bookmarks, cookies or per-user data, and the Linux leg's `scope` column always reports `machine`, never a user. Values are reported verbatim and are not screened: a value an administrator wrote can itself hold a credential-bearing URL or an enrollment token, and the files are world-readable so the browser can load them, so treat the rows as sensitive. Stored responses are kept for the ResponseStore's retention period (90 days by default, `docs/user-manual/response-store.md`); with RBAC on, dispatch needs `Execution:Execute` plus `Inventory:Read` and reading needs `Response:Read`. The classification is deliberate: unlike `browser_inventory`'s per-user browsing data, this content is machine policy the organisation itself wrote, so the action is an ordinary `Inventory:Read` with no execute gate.
 - **Sibling:** `installed_apps` (which browsers are installed, not how they are managed).
 
 ## Sample output
@@ -125,15 +159,15 @@ policy|chrome|recommended|machine|BookmarkBarEnabled|bool|true|/etc/opt/chrome/p
 ```
 <!-- END GENERATED -->
 
-The Linux capture is taken from a real Debian container that was seeded, for the capture only, with two SYNTHETIC Chrome policy files (Alex sign-off 2026-09-21; the image ships no browser): `/etc/opt/chrome/policies/managed/seeded.json` holding `ExtensionInstallForcelist`, `HomepageLocation` and `RestoreOnStartup`, and `/etc/opt/chrome/policies/recommended/seeded.json` holding `BookmarkBarEnabled`, so the sample shows the shipping leg reading real files through the production root. The same container with no policy files reports zero rows with `OK`/`FULL`. The walk, the caps and every failure token the tests can provoke are covered by the fixture-driven unit tests over `tests/unit/fixtures/wave10/browser_policy/linux`; the kernel-error tokens (`stat_failed`, `readdir_error`, `open_failed`, `read_failed`) cannot be provoked without a syscall seam and are not. The planned legs are status-only: the macOS capture shows the one `status` row and the placeholder status (`UNAVAILABLE`/`PARTIAL`, `macos:planned`), and there is no Windows capture.
+The Linux capture is taken from a real Debian container that was seeded, for the capture only, with two synthetic Chrome policy files (the image ships no browser): `/etc/opt/chrome/policies/managed/seeded.json` holding `ExtensionInstallForcelist`, `HomepageLocation` and `RestoreOnStartup`, and `/etc/opt/chrome/policies/recommended/seeded.json` holding `BookmarkBarEnabled`. The sample therefore shows the shipping leg reading real files through the production root; the same container with no policy files reports zero rows with `OK` / `FULL`. The walk, the caps and every failure token the tests can provoke are covered by the fixture-driven unit tests; the kernel-error tokens (`stat_failed`, `readdir_error`, `open_failed`, `read_failed`) cannot be provoked without a syscall seam and are not. The macOS capture shows the one placeholder `status` row, and there is no Windows capture.
 
 ## Caveats and known gaps
 
-1. **Configured policy, not effective policy.** Rows are what is written in the policy files, not what the browser enforces, and Chromium's own reader is more lenient than this leg: it accepts trailing commas and other non-strict JSON (this leg reports `linux:json_unparseable` for that file), it follows symlinks (this leg refuses them: a symlinked file is `linux:symlink_refused`, a symlinked directory too), and where two files set one policy it applies the last file in name order (this leg reports one row per file, each with its `source`). It also parses every file in a policy directory, not only `*.json`, so a valid policy file with another name is applied by the browser but skipped here with no constraint reported: the one direction in which this leg can read as complete while missing a policy.
-2. **No default-off kill switch, by design.** `browser_policy` reads operator/IT-authored config, not personal data, so it seeds no default-off gate and the action is an ordinary `Inventory` read (`Inventory:Read`, no execute gate), unlike plugins that read per-user data. The operator-settable per-plugin kill switch applies to it like any other plugin.
-3. **Windows and macOS legs planned.** Each follows as its own PR; until then `policies` on those hosts returns one `status` row (`unavailable`) with result status `UNAVAILABLE` and provenance `windows:planned` or `macos:planned`, so a host that was not inspected never reads as having no policy.
-4. **Linux reads machine-level JSON policy files in three vendor directories only.** Only the `managed` and `recommended` `*.json` files under `/etc/opt/chrome`, `/etc/chromium` and `/etc/opt/edge` are read; per-user policy, snap and flatpak Chromium paths, other Chromium-based browsers and Firefox `policies.json` are not, and every row reports scope `machine`. `OK`/`FULL` therefore means those directories were read completely, not that no browser on the host has a policy. Each file is read to end-of-file after one `fstat`, with no second stability check: a file that grows while it is read is `linux:oversized` or `linux:json_unparseable`, a file truncated and rewritten in place during the read is `linux:json_unparseable` (a strict JSON parse accepts no partial document), but a same-size in-place overwrite that lands during the read can parse as a mix of old and new content for that one run, with no `modified_during_read` token (`update_source_trust` has one; a writer that replaces the file by rename is unaffected). The 16 MiB per-run cap counts the bytes of files that were read in full; a file whose read fails part-way is reported (`linux:read_failed`, `linux:oversized`) but its bytes are not counted against that cap, so a run of failing reads is bounded by the per-file (1 MiB) and per-directory (4096 entries) caps instead.
-5. **Values are reported, not validated.** A policy name is emitted as written and is not checked against the browser's policy schema, so a misspelt or unsupported policy still appears as a row; lists and dicts are emitted as compact JSON text, and an embedded backslash in a value is folded to `/` by the escaper (flagged `json_escaped` in `detail` for a list/dict, since the result is then lossy and not trustworthy as the original JSON — an escaped quote can make it syntactically invalid), and a name, value or source longer than 64 KiB is cut and flagged `truncated`. `value_type` describes how the value is stored in its source, not the browser's schema: a future Windows registry DWORD holding a boolean policy will report `int` where the Linux JSON file reports `bool`.
+1. **Configured policy, not effective policy.** Rows are what is written in the policy files, not what the browser enforces. What this leg does is shown by its code: it parses JSON with comments ignored and nothing else relaxed (anything else that does not parse is `linux:json_unparseable`), refuses symlinks (`linux:symlink_refused`), reports one row per file with its `source` rather than resolving which file wins, and reads only files named `*.json`. Chromium's own policy loader is documented upstream to be more lenient (non-strict JSON, symlinks followed, the last file in name order winning, every file in the directory parsed); that upstream behaviour is not verified here. If it holds, a valid policy file with another name is applied by the browser and skipped here with no constraint reported, so this leg can read as complete while missing a policy.
+2. **Windows and macOS are placeholders.** `policies` on those hosts returns one `status` row (`unavailable`) with result status `UNAVAILABLE` and provenance `windows:planned` or `macos:planned`, so a host that was not inspected never reads as having no policy. The Windows registry and macOS Managed Preferences legs are declared but not yet implemented.
+3. **Linux reads machine-level JSON policy files in three vendor directories only.** Only the `managed` and `recommended` `*.json` files under `/etc/opt/chrome`, `/etc/chromium` and `/etc/opt/edge` are read; per-user policy, snap and flatpak Chromium paths, other Chromium-based browsers and Firefox `policies.json` are not, and every row reports scope `machine`. `OK` / `FULL` therefore means those directories were read completely, not that no browser on the host has a policy.
+4. **A file rewritten during the read can be misread for that run.** Each file is read to end after one `fstat` with no second stability check: a file that grows is `linux:oversized` or `linux:json_unparseable`, but a same-size in-place overwrite that lands during the read can parse as a mix of old and new content for that one run, with no token raised. A writer that replaces the file by rename is unaffected, and a run of failing reads is bounded by the per-file (1 MiB) and per-directory (4096 entries) caps rather than the 16 MiB total.
+5. **Values are reported, not validated.** A policy name is emitted as written and is not checked against the browser's schema, so a misspelt policy still appears as a row. Lists and dicts are emitted as compact JSON text, a backslash inside one is folded to `/` and flagged `json_escaped`, and a name, value or source longer than 64 KiB is cut and flagged `truncated`. `value_type` describes how the value is stored in its source, not the browser's schema.
 
 ## Source and tests
 

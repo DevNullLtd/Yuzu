@@ -18,12 +18,14 @@ out/
 deploy/docker/.agent-bundle-build/
 
 # Erlang / rebar3
-# `_build/` is the canonical rebar3 base dir. `_build_eunit/` and
-# `_build_ct/` are per-suite base dirs set via REBAR_BASE_DIR in
-# meson.build so parallel meson test invocations don't race on a
-# shared ebin tree (Windows `.bea#`→`.beam` rename race in `proper`).
+# `_build/` is the canonical rebar3 base dir. `_build_eunit_<K>/` (one per
+# eunit shard) and `_build_ct/` are per-test base dirs set via
+# REBAR_BASE_DIR in meson.build so parallel meson test invocations don't
+# race on a shared ebin tree (Windows `.bea#`→`.beam` rename race in
+# `proper`). The glob also covers the pre-shard `_build_eunit/` and
+# scripts/ci/check-gateway-eunit-order.sh's `_build_eunit_order/`.
 gateway/_build/
-gateway/_build_eunit/
+gateway/_build_eunit*/
 gateway/_build_eunit_test/
 gateway/_build_ct/
 gateway/_build_ct_realup/
@@ -207,6 +209,9 @@ spike/
 # tests/prometheus/run_promtool_tests.py; a fresh mkdtemp per gate() call
 # since #2340 PR-4, so only a killed run leaves one of these behind)
 .promtool-canary-*/
+# promtool test shards written beside the test file by run_test_rules(); same
+# story - only a killed run (SIGKILL, cancelled job) skips the cleanup
+tests/prometheus/.promtool-shard-*.test.yml
 
 # marker-extracted yuzu-guardian-journal rules (#2340 PR-4), materialized
 # fresh on every run by tests/prometheus/run_promtool_tests.py from the

@@ -294,7 +294,7 @@ jobs:
 
           tar czf "yuzu-linux-x64.tar.gz" "${STAGING}"
 
-      # Linux ELF floor gate, ADR-2003 (Proposed, PR #5631) slice S0:
+      # Linux ELF floor gate, ADR-2003 (Accepted, PR #5631) slice S0:
       # REPORT-ONLY. Measures the versioned-symbol requirements of everything
       # just staged against the committed floor files (agent: glibc 2.28;
       # server: 2.34) and records them. continue-on-error, and the script exits
@@ -470,6 +470,9 @@ jobs:
     timeout-minutes: 30
     env:
       ImageOS: ubuntu24
+      # yuzu_gw_config_files_tests reads the SHIPPED sys.config files; a layout
+      # it cannot find the repository root in must fail the release, not skip.
+      YUZU_REQUIRE_CONFIG_FILES_TEST: "1"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -487,15 +490,6 @@ jobs:
       # cache/restore@v5 calls were already restore-only and the local
       # persistence is functionally equivalent without GHA round-trip.
       # Issue #569.
-
-      # PKI PR5c: the gateway vendors a 2-line-patched grpcbox in
-      # _checkouts/grpcbox (one-way TLS on the agent listener). This gate fails
-      # the build if that copy is ever anything other than upstream grpcbox at the
-      # rebar.config-pinned tag + the documented grpcbox.yuzu.patch — catching
-      # tamper, drift, or version skew. See gateway/_checkouts/grpcbox/YUZU_PATCH.md.
-      - name: Verify vendored grpcbox integrity
-        working-directory: gateway
-        run: bash scripts/verify-vendored-grpcbox.sh
 
       - name: Compile gateway
         working-directory: gateway
@@ -526,9 +520,38 @@ jobs:
         working-directory: gateway
         run: rebar3 dialyzer
 
+      # rebar3 does not prune lib/ directories left by an earlier release (a
+      # release assembled over an old _build kept grpcbox/chatterbox/gproc/hpack
+      # beside gun), and the tarball, .deb and .rpm below package the whole tree.
+      # Start from nothing, then assert the result below.
       - name: Build production release
         working-directory: gateway
-        run: rebar3 as prod release
+        run: |
+          rm -rf _build/prod/rel
+          rebar3 as prod release
+
+      # The release's lib/ must be EXACTLY the applications its .rel names: an
+      # extra directory (grpcbox*, chatterbox*, ...) is shipped dead code and a
+      # missing one is a gateway that cannot boot. Plain shell on the .rel text
+      # (one {app,"vsn"} tuple per application; erts is not under lib/).
+      - name: Assert release lib/ matches the .rel application list
+        working-directory: gateway
+        run: |
+          set -euo pipefail
+          rel_dir=_build/prod/rel/yuzu_gw
+          rel_file="$(ls "$rel_dir"/releases/*/yuzu_gw.rel)"
+          [ "$(printf '%s\n' "$rel_file" | wc -l)" -eq 1 ] || { echo "::error::expected exactly one yuzu_gw.rel"; exit 1; }
+          grep -oE '\{[a-z_0-9]+,"[^"]+"\}' "$rel_file" \
+            | grep -v '^{erts,' \
+            | sed -E 's/\{([a-z_0-9]+),"([^"]+)"\}/\1-\2/' \
+            | LC_ALL=C sort > expected-libs.txt
+          ls -1 "$rel_dir/lib" | LC_ALL=C sort > actual-libs.txt
+          [ -s expected-libs.txt ] || { echo "::error::parsed no applications from $rel_file"; exit 1; }
+          if ! diff -u expected-libs.txt actual-libs.txt; then
+            echo "::error::release lib/ does not match the .rel application list (< missing, > extra, e.g. stale grpcbox/chatterbox)"
+            exit 1
+          fi
+          echo "release lib/ matches the .rel: $(wc -l < actual-libs.txt) applications"
 
       - name: Package release tarball
         run: |

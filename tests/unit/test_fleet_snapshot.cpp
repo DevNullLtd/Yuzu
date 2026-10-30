@@ -1,5 +1,5 @@
 /**
- * test_fleet_snapshot.cpp -- Unit tests for tar.fleet_snapshot JSON builder
+ * test_fleet_snapshot.cpp -- Unit tests for echo.fleet_snapshot JSON builder
  *
  * Covers shape (schema/ts/hostname/local_ips), redaction propagation,
  * truncation flags, and stability of optional/empty fields. Tests the
@@ -7,8 +7,8 @@
  * exercised end-to-end by the integration UAT.
  */
 
-#include "tar_collectors.hpp"
-#include "tar_fleet_snapshot.hpp"
+#include "echo_collectors.hpp"
+#include "echo_fleet_snapshot.hpp"
 
 #include <yuzu/agent/process_enum.hpp>
 
@@ -19,9 +19,9 @@
 #include <vector>
 
 using yuzu::agent::ProcessInfo;
-using yuzu::tar::build_fleet_snapshot_json;
-using yuzu::tar::kFleetSnapshotMaxRows;
-using yuzu::tar::NetConnection;
+using yuzu::echo::build_fleet_snapshot_json;
+using yuzu::echo::kFleetSnapshotMaxRows;
+using yuzu::echo::NetConnection;
 using json = nlohmann::json;
 
 namespace {
@@ -54,7 +54,7 @@ NetConnection make_conn(std::string proto, std::string local_addr, int local_por
 
 } // namespace
 
-TEST_CASE("fleet_snapshot: empty inputs produce a valid envelope", "[tar][fleet]") {
+TEST_CASE("fleet_snapshot: empty inputs produce a valid envelope", "[echo][fleet]") {
     auto out = build_fleet_snapshot_json({}, {}, {}, "host-1", 1715299200);
     auto j = json::parse(out);
 
@@ -71,7 +71,7 @@ TEST_CASE("fleet_snapshot: empty inputs produce a valid envelope", "[tar][fleet]
     CHECK(j["truncated_connections"] == false);
 }
 
-TEST_CASE("fleet_snapshot: processes round-trip", "[tar][fleet]") {
+TEST_CASE("fleet_snapshot: processes round-trip", "[echo][fleet]") {
     std::vector<ProcessInfo> procs = {
         make_proc(1, 0, "init", "/sbin/init", "root"),
         make_proc(42, 1, "firefox", "firefox --new-tab", "alice"),
@@ -90,7 +90,7 @@ TEST_CASE("fleet_snapshot: processes round-trip", "[tar][fleet]") {
     CHECK(j["processes"][1]["cmdline"] == "firefox --new-tab");
 }
 
-TEST_CASE("fleet_snapshot: connections round-trip", "[tar][fleet]") {
+TEST_CASE("fleet_snapshot: connections round-trip", "[echo][fleet]") {
     auto c1 =
         make_conn("tcp", "10.0.0.7", 5432, "10.0.0.42", 54321, "ESTABLISHED", 100, "postgres");
     c1.remote_host = "db.internal";
@@ -115,7 +115,7 @@ TEST_CASE("fleet_snapshot: connections round-trip", "[tar][fleet]") {
     CHECK(j["connections"][1]["remote_host"] == "");
 }
 
-TEST_CASE("fleet_snapshot: source_paused markers emitted when sources disabled", "[tar][fleet]") {
+TEST_CASE("fleet_snapshot: source_paused markers emitted when sources disabled", "[echo][fleet]") {
     // plugin-B1 / compliance-F1 fix: paused process or tcp source must not
     // silently leak data; the snapshot carries explicit markers.
     auto out = build_fleet_snapshot_json({}, {}, {}, "h", 1, {},
@@ -127,7 +127,7 @@ TEST_CASE("fleet_snapshot: source_paused markers emitted when sources disabled",
     CHECK(j["schema_minor"] == 2);
 }
 
-TEST_CASE("fleet_snapshot: schema_minor present in envelope", "[tar][fleet]") {
+TEST_CASE("fleet_snapshot: schema_minor present in envelope", "[echo][fleet]") {
     auto out = build_fleet_snapshot_json({}, {}, {}, "h", 1);
     auto j = json::parse(out);
     CHECK(j["schema_minor"] == 2);
@@ -137,13 +137,13 @@ TEST_CASE("fleet_snapshot: schema_minor present in envelope", "[tar][fleet]") {
 }
 
 TEST_CASE("merge_live_and_recent_connections: recent-only rows survive with computed age",
-          "[tar][fleet][merge]") {
-    // A connection observed in TAR's tcp_live 30 minutes ago that isn't
+          "[echo][fleet][merge]") {
+    // A connection observed in Echo's tcp_live 30 minutes ago that isn't
     // currently in /proc/net/tcp must still appear in the merged output,
     // with last_seen_seconds_ago = now_ts - recent.ts.
-    using yuzu::tar::merge_live_and_recent_connections;
-    using yuzu::tar::NetworkEvent;
-    yuzu::tar::NetworkEvent recent;
+    using yuzu::echo::merge_live_and_recent_connections;
+    using yuzu::echo::NetworkEvent;
+    yuzu::echo::NetworkEvent recent;
     recent.ts = 4000;
     recent.proto = "tcp";
     recent.local_addr = "10.0.0.10";
@@ -163,13 +163,13 @@ TEST_CASE("merge_live_and_recent_connections: recent-only rows survive with comp
 }
 
 TEST_CASE("merge_live_and_recent_connections: live row preempts a same-5-tuple recent row",
-          "[tar][fleet][merge]") {
+          "[echo][fleet][merge]") {
     // /proc shows the connection right now, and tcp_live remembers an
     // earlier observation of the same 5-tuple+pid. The live row wins —
     // it's the most authoritative current state.
-    using yuzu::tar::merge_live_and_recent_connections;
+    using yuzu::echo::merge_live_and_recent_connections;
     auto live = make_conn("tcp", "10.0.0.10", 50001, "10.0.0.20", 5432, "ESTABLISHED", 100, "node");
-    yuzu::tar::NetworkEvent recent;
+    yuzu::echo::NetworkEvent recent;
     recent.ts = 4000;
     recent.proto = "tcp";
     recent.local_addr = "10.0.0.10";
@@ -185,10 +185,10 @@ TEST_CASE("merge_live_and_recent_connections: live row preempts a same-5-tuple r
     CHECK(merged[0].last_seen_seconds_ago == 0); // live row, not historical
 }
 
-TEST_CASE("merge_live_and_recent_connections: distinct 5-tuples coexist", "[tar][fleet][merge]") {
-    using yuzu::tar::merge_live_and_recent_connections;
+TEST_CASE("merge_live_and_recent_connections: distinct 5-tuples coexist", "[echo][fleet][merge]") {
+    using yuzu::echo::merge_live_and_recent_connections;
     auto live = make_conn("tcp", "10.0.0.10", 50001, "10.0.0.20", 5432, "ESTABLISHED", 100, "node");
-    yuzu::tar::NetworkEvent recent;
+    yuzu::echo::NetworkEvent recent;
     recent.ts = 4000;
     recent.proto = "tcp";
     recent.local_addr = "10.0.0.10";
@@ -208,8 +208,8 @@ TEST_CASE("merge_live_and_recent_connections: distinct 5-tuples coexist", "[tar]
 }
 
 TEST_CASE("fleet_snapshot: last_seen_seconds_ago round-trips for historical connections",
-          "[tar][fleet][recent]") {
-    // PR 9-pre / Slice 2 follow-up: TAR widens fleet_snapshot from "currently
+          "[echo][fleet][recent]") {
+    // PR 9-pre / Slice 2 follow-up: Echo widens fleet_snapshot from "currently
     // ESTABLISHED" to "ESTABLISHED within the last hour" by joining /proc
     // (live) with tcp_live (recent). Each connection carries its age so the
     // server can later distinguish live tubes from recently-recent ones.
@@ -236,7 +236,7 @@ TEST_CASE("fleet_snapshot: last_seen_seconds_ago round-trips for historical conn
     CHECK(j["schema_minor"] == 2);
 }
 
-TEST_CASE("fleet_snapshot: cmdline redaction applied", "[tar][fleet][redaction]") {
+TEST_CASE("fleet_snapshot: cmdline redaction applied", "[echo][fleet][redaction]") {
     std::vector<ProcessInfo> procs = {
         make_proc(1, 0, "myapp", "myapp --password=hunter2", "alice"),
         make_proc(2, 0, "noisy", "noisy --regular-flag", "bob"),
@@ -244,11 +244,11 @@ TEST_CASE("fleet_snapshot: cmdline redaction applied", "[tar][fleet][redaction]"
     auto out = build_fleet_snapshot_json(procs, {}, {}, "h", 1, {"*password*"});
     auto j = json::parse(out);
 
-    CHECK(j["processes"][0]["cmdline"] == "[REDACTED by TAR]");
+    CHECK(j["processes"][0]["cmdline"] == "[REDACTED by Echo]");
     CHECK(j["processes"][1]["cmdline"] == "noisy --regular-flag");
 }
 
-TEST_CASE("fleet_snapshot: default redaction patterns redact secrets", "[tar][fleet][redaction]") {
+TEST_CASE("fleet_snapshot: default redaction patterns redact secrets", "[echo][fleet][redaction]") {
     std::vector<ProcessInfo> procs = {
         make_proc(1, 0, "a", "a --token=abc123", "u"),
         make_proc(2, 0, "b", "b --api_key=xyz", "u"),
@@ -258,13 +258,13 @@ TEST_CASE("fleet_snapshot: default redaction patterns redact secrets", "[tar][fl
     auto out = build_fleet_snapshot_json(procs, {}, {}, "h", 1);
     auto j = json::parse(out);
 
-    CHECK(j["processes"][0]["cmdline"] == "[REDACTED by TAR]");
-    CHECK(j["processes"][1]["cmdline"] == "[REDACTED by TAR]");
+    CHECK(j["processes"][0]["cmdline"] == "[REDACTED by Echo]");
+    CHECK(j["processes"][1]["cmdline"] == "[REDACTED by Echo]");
     CHECK(j["processes"][2]["cmdline"] == "c --ordinary --flag");
 }
 
 TEST_CASE("fleet_snapshot: process truncation sets flag and caps array",
-          "[tar][fleet][truncation]") {
+          "[echo][fleet][truncation]") {
     std::vector<ProcessInfo> procs;
     for (int i = 0; i < 5; ++i)
         procs.push_back(make_proc(static_cast<uint32_t>(i), 0, "p" + std::to_string(i), "", "u"));
@@ -277,7 +277,7 @@ TEST_CASE("fleet_snapshot: process truncation sets flag and caps array",
 }
 
 TEST_CASE("fleet_snapshot: connection truncation sets flag and caps array",
-          "[tar][fleet][truncation]") {
+          "[echo][fleet][truncation]") {
     std::vector<NetConnection> conns;
     for (int i = 0; i < 5; ++i)
         conns.push_back(make_conn("tcp", "10.0.0.1", 1000 + i, "10.0.0.2", 80, "EST", 1, "p"));
@@ -289,7 +289,7 @@ TEST_CASE("fleet_snapshot: connection truncation sets flag and caps array",
     CHECK(j["truncated_processes"] == false);
 }
 
-TEST_CASE("fleet_snapshot: max_rows<=0 falls back to default", "[tar][fleet][truncation]") {
+TEST_CASE("fleet_snapshot: max_rows<=0 falls back to default", "[echo][fleet][truncation]") {
     std::vector<ProcessInfo> procs;
     for (int i = 0; i < 10; ++i)
         procs.push_back(make_proc(static_cast<uint32_t>(i), 0, "p", "", "u"));
@@ -300,7 +300,7 @@ TEST_CASE("fleet_snapshot: max_rows<=0 falls back to default", "[tar][fleet][tru
     CHECK(j["truncated_processes"] == false);
 }
 
-TEST_CASE("fleet_snapshot: local_ips passed through verbatim", "[tar][fleet]") {
+TEST_CASE("fleet_snapshot: local_ips passed through verbatim", "[echo][fleet]") {
     std::vector<std::string> ips = {"10.0.0.7", "192.168.1.5", "fd00::1"};
     auto out = build_fleet_snapshot_json({}, {}, ips, "h", 1);
     auto j = json::parse(out);
@@ -311,7 +311,7 @@ TEST_CASE("fleet_snapshot: local_ips passed through verbatim", "[tar][fleet]") {
     CHECK(j["local_ips"][2] == "fd00::1");
 }
 
-TEST_CASE("fleet_snapshot: payload bound at full cap", "[tar][fleet][size]") {
+TEST_CASE("fleet_snapshot: payload bound at full cap", "[echo][fleet][size]") {
     // Worst-realistic case at the cap: kFleetSnapshotMaxRows procs + conns
     // with average-length names/cmdlines. JSON verbosity puts this around
     // ~1.3 MB; we assert <2 MB so the server can size receive buffers.

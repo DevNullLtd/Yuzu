@@ -2,8 +2,9 @@
  * dex_stats.hpp -- the one home for the statistics the DEX application views
  * print, so every number is derived once and tested once.
  *
- * What is here (intervals are two-sided at kDexStatsConfidence = 95 percent,
- * except the one-sided rule of three):
+ * What is here (intervals are two-sided at kDexStatsConfidence = 95 percent
+ * unless the caller passes a confidence level, and the one-sided rule of three
+ * is always 95 percent):
  *   - dex_proportion      Wilson score interval for events / trials
  *   - dex_rule_of_three   plain-language upper bound when zero events were seen
  *   - dex_rate            Poisson interval for events / exposure: exact (Garwood)
@@ -14,6 +15,15 @@
  *                         cohort floor (kDexCohortFloor devices, one since the
  *                         2026-10-14 ruling: an empty cohort) only the DEVICE
  *                         count and a below-floor flag are returned
+ *
+ * The confidence level is a parameter of dex_proportion and dex_rate only
+ * (default kDexStatsConfidence, valid range [kDexStatsConfidenceMin,
+ * kDexStatsConfidenceMax], a level outside it is invalid input and yields
+ * nullopt). Its one caller is the Apps stability read, where the score policy
+ * sets it (dex_score_policy.hpp); dex_rate_ratio, dex_rule_of_three and the
+ * floored helpers stay at 95 percent. At the default level the pinned
+ * kDexStatsZ is used, so every number is bit-identical to the fixed-level
+ * code; any other level takes its normal quantile by bisection on erfc.
  *
  * Honesty rules:
  *   - std::optional carries ONE meaning: "no statistic can be stated for these
@@ -47,7 +57,7 @@
  *     two-decimal formatter such as the REST JObj::add(double) (a rate under
  *     0.005 prints as 0.00 there). A consumer that only uses the bounds need not
  *     gate on `reliable`.
- *   - 95 percent coverage assumes independent Poisson events (independent
+ *   - The stated coverage assumes independent Poisson events (independent
  *     trials for a proportion). Events clustered on one crash-looping device
  *     make the interval falsely narrow.
  *   - Cost, at -O2 on one thread: about 0.4 ms per rate at one million events
@@ -110,9 +120,20 @@ namespace yuzu::server {
 /// rule of three excepted).
 inline constexpr double kDexStatsConfidence = 0.95;
 
-/// Normal quantile for kDexStatsConfidence, pinned rather than computed (no
-/// inverse-normal code); the unit test locks the pair together.
+/// Normal quantile for kDexStatsConfidence, pinned rather than computed so the
+/// default level stays bit-identical; the unit test locks the pair together.
 inline constexpr double kDexStatsZ = 1.959963984540054;
+
+/// Closed range of the confidence level a caller may request (the score policy
+/// validates against it). Below 0.5 an interval is narrower than its own
+/// estimate's noise; above 0.999 the bisection quantile loses its meaning.
+inline constexpr double kDexStatsConfidenceMin = 0.5;
+inline constexpr double kDexStatsConfidenceMax = 0.999;
+
+/// Finite and inside [kDexStatsConfidenceMin, kDexStatsConfidenceMax] (false for NaN).
+[[nodiscard]] inline bool dex_stats_confidence_valid(double c) {
+    return c >= kDexStatsConfidenceMin && c <= kDexStatsConfidenceMax;
+}
 
 /// A rate or proportion on fewer numerator events than this is flagged
 /// unreliable (NCHS small-count convention). For a Poisson count the relative
@@ -337,38 +358,58 @@ struct Bounds {
     double upper;
 };
 
+/// Standard normal quantile for a two-sided level `c` (valid range only). The
+/// default level returns the pinned kDexStatsZ; any other solves
+/// Phi(z) = 1 - (1 - c) / 2 by bisection on Phi(z) = erfc(-z / sqrt(2)) / 2
+/// over [0, 40] (the same identity the unit test pins kDexStatsZ against),
+/// under the kBisections cap.
+inline double z_for_confidence(double c) {
+    if (c == kDexStatsConfidence)
+        return kDexStatsZ;
+    const double target = 1.0 - (1.0 - c) / 2.0;
+    double lo = 0.0;
+    double hi = 40.0;
+    for (int i = 0; i < kBisections; ++i) {
+        const double mid = 0.5 * (lo + hi);
+        if (mid <= lo || mid >= hi)
+            break;
+        (0.5 * std::erfc(-mid / std::sqrt(2.0)) < target ? lo : hi) = mid;
+    }
+    return 0.5 * (lo + hi);
+}
+
 /// Exact (Garwood) Poisson bounds on the mean for k observed events. They equal
 /// chi2(alpha/2; 2k) / 2 and chi2(1 - alpha/2; 2k + 2) / 2.
-inline Bounds poisson_bounds_exact(double k) {
-    return {k == 0.0 ? 0.0 : gamma_quantile(k, kAlpha / 2.0),
-            gamma_quantile(k + 1.0, 1.0 - kAlpha / 2.0)};
+inline Bounds poisson_bounds_exact(double k, double alpha = kAlpha) {
+    return {k == 0.0 ? 0.0 : gamma_quantile(k, alpha / 2.0),
+            gamma_quantile(k + 1.0, 1.0 - alpha / 2.0)};
 }
 
 /// Wilson-Hilferty approximation of the same bounds: chi2_p(nu) ~
 /// nu * (1 - 2 / (9 nu) + z_p * sqrt(2 / (9 nu)))^3. Used only above
 /// kDexStatsExactMaxEvents, where it is within 1e-10 relative of the exact
 /// bounds (measured about 1.5e-11 at the switch).
-inline Bounds poisson_bounds_large(double k) {
+inline Bounds poisson_bounds_large(double k, double z = kDexStatsZ) {
     const auto chi2_half = [](double nu, double z) {
         const double t = 2.0 / (9.0 * nu);
         const double u = 1.0 - t + z * std::sqrt(t);
         return 0.5 * nu * u * u * u;
     };
-    return {chi2_half(2.0 * k, -kDexStatsZ), chi2_half(2.0 * k + 2.0, kDexStatsZ)};
+    return {chi2_half(2.0 * k, -z), chi2_half(2.0 * k + 2.0, z)};
 }
 
 /// Wilson score bounds for proportion p over n trials (p in [0, 1], n > 0).
-inline Bounds wilson_bounds(double p, double n) {
-    const double z2 = kDexStatsZ * kDexStatsZ;
+inline Bounds wilson_bounds(double p, double n, double z = kDexStatsZ) {
+    const double z2 = z * z;
     const double denom = 1.0 + z2 / n;
     const double centre = (p + z2 / (2.0 * n)) / denom;
-    const double half = kDexStatsZ / denom * std::sqrt(p * (1.0 - p) / n + z2 / (4.0 * n * n));
+    const double half = z / denom * std::sqrt(p * (1.0 - p) / n + z2 / (4.0 * n * n));
     return {(std::max)(0.0, centre - half), (std::min)(1.0, centre + half)};
 }
 
 } // namespace dex_stats_detail
 
-/// A point estimate with its 95 percent interval, shared by every statistic
+/// A point estimate with its two-sided interval, shared by every statistic
 /// here; see each function for what `estimate` and `reliable` mean.
 struct DexInterval {
     double estimate;
@@ -381,14 +422,17 @@ struct DexInterval {
 /// `reliable` is events >= kDexStatsReliableMinEvents, judged on the numerator
 /// the caller counts (crashes, say), never its complement. nullopt iff
 /// trials <= 0, events < 0 or events > trials. events == 0 gives lower exactly
-/// 0 and events == trials gives upper exactly 1.
-[[nodiscard]] inline std::optional<DexInterval> dex_proportion(std::int64_t events,
-                                                                 std::int64_t trials) {
-    if (trials <= 0 || events < 0 || events > trials)
+/// 0 and events == trials gives upper exactly 1. `confidence` is the two-sided
+/// level (default 95 percent); one outside [kDexStatsConfidenceMin,
+/// kDexStatsConfidenceMax] is invalid input and gives nullopt.
+[[nodiscard]] inline std::optional<DexInterval>
+dex_proportion(std::int64_t events, std::int64_t trials,
+               double confidence = kDexStatsConfidence) {
+    if (trials <= 0 || events < 0 || events > trials || !dex_stats_confidence_valid(confidence))
         return std::nullopt;
     const double n = static_cast<double>(trials);
     const double p = static_cast<double>(events) / n;
-    auto b = dex_stats_detail::wilson_bounds(p, n);
+    auto b = dex_stats_detail::wilson_bounds(p, n, dex_stats_detail::z_for_confidence(confidence));
     if (events == 0)
         b.lower = 0.0;
     if (events == trials)
@@ -421,14 +465,20 @@ struct DexInterval {
 /// exposure and `reliable` is events >= kDexStatsReliableMinEvents. There is no
 /// minimum exposure here (dex_rate_ratio has one). nullopt iff events < 0 or
 /// exposure is non-finite or <= 0, or the rate or a bound overflows a double
-/// (never infinity), or a kernel does not converge.
-[[nodiscard]] inline std::optional<DexInterval> dex_rate(std::int64_t events, double exposure) {
-    if (events < 0 || !std::isfinite(exposure) || exposure <= 0.0)
+/// (never infinity), or a kernel does not converge, or `confidence` (the
+/// two-sided level, default 95 percent) lies outside [kDexStatsConfidenceMin,
+/// kDexStatsConfidenceMax].
+[[nodiscard]] inline std::optional<DexInterval>
+dex_rate(std::int64_t events, double exposure, double confidence = kDexStatsConfidence) {
+    if (events < 0 || !std::isfinite(exposure) || exposure <= 0.0 ||
+        !dex_stats_confidence_valid(confidence))
         return std::nullopt;
     const double k = static_cast<double>(events);
+    const double alpha = 1.0 - confidence;
     const auto lam = events <= kDexStatsExactMaxEvents
-                         ? dex_stats_detail::poisson_bounds_exact(k)
-                         : dex_stats_detail::poisson_bounds_large(k);
+                         ? dex_stats_detail::poisson_bounds_exact(k, alpha)
+                         : dex_stats_detail::poisson_bounds_large(
+                               k, dex_stats_detail::z_for_confidence(confidence));
     const double rate = k / exposure;
     const double lower = lam.lower / exposure;
     const double upper = lam.upper / exposure;

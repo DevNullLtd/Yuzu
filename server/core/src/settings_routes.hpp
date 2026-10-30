@@ -114,6 +114,17 @@ public:
     /// to `admin_fn`, so an unwired probe can only be louder, never weaker.
     void set_read_admin_fn(AdminFn fn) { read_admin_fn_ = std::move(fn); }
 
+    /// Audit writer for a session the handler already resolved (#6079): `mfa.disable` ends the
+    /// actor's own session before it writes its row, so the request-resolving `AuditFn` would
+    /// stamp an empty principal. Same `std::function` type as `AuthRoutes::AuditAsSessionFn`;
+    /// server.cpp binds `AuthRoutes::audit_as_session_fn()`. Left unset (tests, other callers)
+    /// the handler falls back to `AuditFn`.
+    using AuditAsSessionFn = std::function<bool(
+        const httplib::Request&, const auth::Session&, const std::string& principal_role,
+        const std::string& action, const std::string& result, const std::string& target_type,
+        const std::string& target_id, const std::string& detail)>;
+    void set_audit_as_session_fn(AuditAsSessionFn fn) { audit_as_session_fn_ = std::move(fn); }
+
     /// Test seam like `set_cert_dir_for_test`; null in production, and server.cpp never sets it.
     /// When set, POST /api/settings/mfa/verify calls it inside the step-up stamp block,
     /// immediately before `mark_session_mfa_verified`, so a test can make the stamp throw
@@ -346,6 +357,7 @@ private:
     }
     PermFn perm_fn_;
     AuditFn audit_fn_;
+    AuditAsSessionFn audit_as_session_fn_;
     AuditReadFn audit_read_fn_; // #4028 — fail-closed REST audit hook, see AuditReadFn doc comment
     std::function<void()> dex_alert_apply_fn_; // F1 live-apply hook (may be empty)
     std::filesystem::path cert_dir_override_;  // test seam; empty = auth::default_cert_dir()

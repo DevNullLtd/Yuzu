@@ -88,6 +88,52 @@ TEST_CASE("developer routes table: escapes agent/document text and filters case-
     CHECK(has(none, "&lt;b&gt;zzz"));
 }
 
+TEST_CASE("developer routes table: an unserved operation keeps its row and is marked unavailable",
+          "[developer][render]") {
+    const json doc{{"count", 2},
+                   {"routes",
+                    json::array({
+                        {{"method", "GET"},
+                         {"path", "/api/v1/devices"},
+                         {"summary", "List devices"},
+                         {"tags", json::array({"Devices"})}},
+                        {{"method", "GET"},
+                         {"path", "/api/v1/licenses"},
+                         {"summary", "List <b>licenses</b>"},
+                         {"tags", json::array({"License"})},
+                         {"unavailable", "not registered: <i>license store</i> not wired"}},
+                    })}};
+    const auto html = render_routes_table(doc, "");
+    // The row stays (the catalogue count is unchanged) and carries the marker, escaped.
+    CHECK(has(html, "/api/v1/licenses"));
+    CHECK(has(html, "<span class=\"pill warn\">unavailable</span>"));
+    CHECK(has(html, "not registered: &lt;i&gt;license store&lt;/i&gt; not wired"));
+    CHECK_FALSE(has(html, "<i>license store"));
+    // Exactly one marker: the served row has none.
+    const auto first = html.find("<span class=\"pill warn\">unavailable</span>");
+    REQUIRE(first != std::string::npos);
+    CHECK(html.find("<span class=\"pill warn\">unavailable</span>", first + 1) == std::string::npos);
+    CHECK(html.find("/api/v1/devices") < first);
+
+    // An empty marker string is not a marker.
+    json blank = doc;
+    blank["routes"][1]["unavailable"] = "";
+    CHECK_FALSE(has(render_routes_table(blank, ""), "pill warn"));
+}
+
+TEST_CASE("developer api panel: links the API reference page beside the raw document",
+          "[developer][render]") {
+    const auto ok = render_api_panel(245);
+    CHECK(has(ok, "href=\"/swagger\""));
+    CHECK(has(ok, "Open API reference"));
+    CHECK(has(ok, "href=\"/api/v1/openapi.json\""));
+    CHECK(has(ok, "Open OpenAPI document"));
+    // New-tab links to a same-origin page still carry rel=noopener.
+    CHECK(has(ok, "href=\"/swagger\" target=\"_blank\" rel=\"noopener\""));
+    // The link does not depend on the catalogue being readable.
+    CHECK(has(render_api_panel(0), "href=\"/swagger\""));
+}
+
 TEST_CASE("developer routes table: cap banner and degraded catalogue", "[developer][render]") {
     json rows = json::array();
     for (std::size_t i = 0; i < kRoutesCap + 5; ++i)

@@ -193,7 +193,7 @@ enum class SsoOnlyLocalGate : std::uint8_t {
 /// reaches a panel URL is anomalous and keeps the auditing behaviour, so a revoked or
 /// low-tier machine credential probing the Dashboard still leaves its row (PR #5859 review).
 [[nodiscard]] inline bool denial_row_may_be_withheld(const auth::Session& s) noexcept {
-    if (s.principal_kind == "engine")
+    if (s.is_engine())
         return false;
     return s.auth_source == "local" || s.auth_source == "oidc" || s.auth_source == "saml";
 }
@@ -298,6 +298,22 @@ public:
     [[nodiscard]] bool probe_permission(const httplib::Request& req, httplib::Response& res,
                                         const std::string& securable_type,
                                         const std::string& operation);
+
+    /// `probe_permission` with ONE difference: an RBAC read that could not be completed (store not
+    /// open, circuit breaker open, pool acquire timeout, a failed role or permission query) is
+    /// answered with a retryable 503 (`retry_after_ms`, no `permission` field) instead of the
+    /// fail-closed 403 that `require_permission` gives every route (ADR-0041). Same decision path
+    /// otherwise (elevation, engine principals, MCP tier, service scope, RBAC, legacy floor), same
+    /// `AuditProbeScope`. NOT a parallel evaluator and NOT a gate: it exists for the one consumer
+    /// whose correctness depends on telling "could not determine" from "definitively denied", the
+    /// Forensics-tier resolver (`resolve_forensics_visible`), where a collapsed answer would
+    /// silently serve a 200 with the Forensics rows missing. A new caller needs the same
+    /// justification; do not switch `require_permission` itself (about a hundred routes document
+    /// the 403).
+    [[nodiscard]] bool probe_permission_unavailable_aware(const httplib::Request& req,
+                                                          httplib::Response& res,
+                                                          const std::string& securable_type,
+                                                          const std::string& operation);
 
     /// `require_list_read` for a resource that is NOT agent-scoped (plugin configuration): the same
     /// decision (ADR-0017 admit-then-filter, elevation, engine principals, MCP tier, service
@@ -749,7 +765,7 @@ public:
     /// principal" returns false negatives (Gate 4 consistency B3).
     ///
     /// `principal_class_override`: `make_audit_event` re-stamps the class from the
-    /// resolved session's `principal_kind`, so an engine principal audits as "engine"
+    /// resolved session's `Session::is_engine()`, so an engine principal audits as "engine"
     /// rather than the "agent" its bearer-token presentation implies. A caller that
     /// already knows the class (because it captured it while the session was live) must
     /// pass it, or its rows will disagree with the request-time rows for the same actor.
@@ -766,7 +782,7 @@ public:
     /// `audit_log_for_principal` for a SESSION the caller already resolved (#6065 PR-Q,
     /// `RestApiV1::AuditAsSessionFn`): stamps the session's username, the `principal_role`
     /// the caller passes (it captures `effective_role` once per request), and the engine
-    /// class when `session.principal_kind == "engine"`, so a row carries the fields
+    /// class when `session.is_engine()`, so a row carries the fields
     /// `make_audit_event` would have stamped for that session without re-resolving the
     /// request (cookie first, then bearer), which can name a different actor.
     bool audit_log_for_session(const httplib::Request& req, const auth::Session& session,
@@ -1055,6 +1071,24 @@ public:
     }
 
 private:
+    /// How `require_permission_impl` answers an RBAC read that could not be completed.
+    enum class RbacDegradeMapping : std::uint8_t {
+        DenyAs403,       ///< ADR-0041 default: fail closed with the 403 every route documents
+        UnavailableAs503 ///< opt-in (`probe_permission_unavailable_aware`): retryable 503
+    };
+
+    /// The body of `require_permission`. `degrade` only changes the answer for an RBAC read that
+    /// could not be completed (the engine branch and the ordinary RBAC branch); the service-scoped
+    /// branch, the legacy fallback and every definitive outcome are identical in both modes.
+    bool require_permission_impl(const httplib::Request& req, httplib::Response& res,
+                                 const std::string& securable_type, const std::string& operation,
+                                 RbacDegradeMapping degrade);
+
+    /// Write the audit row and the retryable 503 for an unavailable RBAC read (opt-in mode only).
+    void respond_rbac_unavailable(const httplib::Request& req, httplib::Response& res,
+                                  const std::string& securable_type, const std::string& operation,
+                                  const char* who);
+
     std::function<void()> after_first_provider_check_for_test_;
 
     /// Whether `(securable_type, operation)` clears the service-scope

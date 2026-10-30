@@ -329,9 +329,9 @@ TEST_CASE("device live result: output renders, server survives the poll", "[devi
     }
     SECTION("command_id whose prefix doesn't match the kind's plugin is rejected") {
         LiveHarness h;
-        // kind=uptime expects os_info-; a tar- id must not be pollable here.
+        // kind=uptime expects os_info-; an echo- id must not be pollable here.
         auto r = h.sink.Get(
-            "/fragments/device/live/result?command_id=tar-deadbeef&agent_id=a-1&kind=uptime&n=1");
+            "/fragments/device/live/result?command_id=echo-deadbeef&agent_id=a-1&kind=uptime&n=1");
         REQUIRE(r);
         CHECK(r->status == 400);
     }
@@ -424,7 +424,7 @@ TEST_CASE("device live run: expanded kinds map to the right plugin/action + audi
         {"dns_cache", "network_config", "dns_cache", "device.live.dns_cache"},
         {"listening", "network_diag", "listening", "device.live.listening"},
         {"connections", "network_diag", "connections", "device.live.connections"},
-        {"capture_sources", "tar", "status", "device.live.capture_sources"},
+        {"capture_sources", "echo", "status", "device.live.capture_sources"},
         {"disk", "disk_space", "free", "device.live.disk"},
         // Round-3 item 11: ten physical-hardware "generic pipe-row" kinds
         // (live_kinds.hpp LiveKind::columns/.row_prefix + device_ui.cpp
@@ -489,9 +489,9 @@ TEST_CASE("device live process_tree: dual-dispatch (list_tree + connections), jo
     }
     SECTION("a network_diag- secondary id is the ONLY accepted command_id2 prefix") {
         LiveHarness h;
-        // A foreign secondary prefix (e.g. tar-) must be rejected.
+        // A foreign secondary prefix (e.g. echo-) must be rejected.
         auto r = h.sink.Get("/fragments/device/live/result?command_id=processes-test"
-                            "&command_id2=tar-evil&agent_id=a-1&kind=process_tree&n=1");
+                            "&command_id2=echo-evil&agent_id=a-1&kind=process_tree&n=1");
         REQUIRE(r);
         CHECK(r->status == 400);
     }
@@ -639,19 +639,32 @@ TEST_CASE("device live result: table kinds parse + render", "[device][routes]") 
     }
 }
 
-TEST_CASE("device live capture_sources: tar status -> read-only source table", "[device][routes]") {
+TEST_CASE("device live capture_sources: echo status -> read-only source table", "[device][routes]") {
     LiveHarness h;
     h.fake_rows = {{"a-1", 1,
                     "config|process_enabled|true\nconfig|process_live_rows|1234\n"
                     "config|arp_enabled|false\nconfig|arp_live_rows|0",
                     ""}};
-    auto r = h.sink.Get("/fragments/device/live/result?command_id=tar-test"
+    auto r = h.sink.Get("/fragments/device/live/result?command_id=echo-test"
                         "&agent_id=a-1&kind=capture_sources&n=1");
     REQUIRE(r);
     CHECK(r->body.find("$Process_Live") != std::string::npos);
     CHECK(r->body.find("1234") != std::string::npos);                  // live-row count
     CHECK(r->body.find("id=\"ls-cnt-capture_sources\"") != std::string::npos); // OOB "X of N on"
-    CHECK(r->body.find("/tar") != std::string::npos);                  // configure-on-TAR link
+    CHECK(r->body.find("/echo") != std::string::npos);                  // configure-on-Echo link
+}
+
+TEST_CASE("device live capture_sources: registry row renders with the System category",
+          "[device][routes]") {
+    LiveHarness h;
+    h.fake_rows = {{"a-1", 1, "config|registry_enabled|true\nconfig|registry_live_rows|7", ""}};
+    auto r = h.sink.Get("/fragments/device/live/result?command_id=echo-test"
+                        "&agent_id=a-1&kind=capture_sources&n=1");
+    REQUIRE(r);
+    CHECK(r->body.find("<span class=\"src-on\">registry</span>") != std::string::npos);
+    CHECK(r->body.find("<code>$Registry_Live</code></td><td class=\"ls-num\">7</td>"
+                       "<td><span class=\"ls-pill\">System</span>") != std::string::npos);
+    CHECK(r->body.find("1 of 1 on") != std::string::npos);
 }
 
 // Round-3 item 11: the ten new physical-hardware live kinds share ONE generic

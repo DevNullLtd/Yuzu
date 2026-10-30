@@ -25,6 +25,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "test_forensics_tier_fixture.hpp" // #4990
 #include "test_mgmt_group_pg_helper.hpp"
 #include "policy_evaluator.hpp"
 #include "policy_store.hpp"
@@ -156,6 +157,7 @@ struct Harness {
             REQUIRE(is.create_definition(d).has_value());
         };
         def("test.check", "checkp");
+        def("test.check_forensic", yuzu::server::test::kForensicsPlugin); // #4990
         def("test.fix", "fixp");
         def("test.verify", "verifyp");
 
@@ -178,6 +180,7 @@ struct Harness {
         d.tag_store = nullptr;
         d.custom_properties_store = nullptr;
         d.mgmt_group_store = &mg;
+        d.forensics_plugins = &yuzu::server::test::forensics_plugin_set(); // #4990
         d.grace_seconds = 15;
         d.default_interval_seconds = 3600;
         d.fixing_stale_seconds = 1800;
@@ -263,10 +266,11 @@ struct Harness {
 
     // Author a fragment + policy bound to the static group. Returns policy id.
     std::string author(const std::string& check_cel, bool with_fix = false,
-                       int64_t interval_seconds = 0) {
+                       int64_t interval_seconds = 0,
+                       const std::string& check_instruction = "test.check") {
         std::string frag = std::string("apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\n") +
-                           "spec:\n  check:\n    instruction: test.check\n    compliance: \"" +
-                           check_cel + "\"\n";
+                           "spec:\n  check:\n    instruction: " + check_instruction +
+                           "\n    compliance: \"" + check_cel + "\"\n";
         if (with_fix) {
             frag += "  fix:\n    instruction: test.fix\n";
             frag += "  postCheck:\n    instruction: test.verify\n    compliance: \"result.fixed "
@@ -1441,4 +1445,77 @@ TEST_CASE("policy evaluator: a scope-expression policy's target resolution repor
 
     REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
                 .status() == PGRES_COMMAND_OK);
+}
+
+TEST_CASE("policy evaluator: a Forensics-plugin check scores unknown and stores no output "
+          "(#4990)",
+          "[pg][policy][evaluator][forensics_tier]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    constexpr const char* kMarker = "marker-4990-check-output";
+    const std::string plugin = yuzu::server::test::kForensicsPlugin;
+    h.canned["agentA|" + plugin] = {1, out_json("hostname", kMarker)};
+    h.canned["agentB|" + plugin] = {1, out_json("hostname", kMarker)};
+    // The expression would be COMPLIANT if the row were read: it is not, so the verdict cannot
+    // come from Forensics output.
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/false, /*interval=*/0,
+                        "test.check_forensic");
+
+    PolicyEvaluator ev(h.deps());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20; // past grace
+    ev.tick(true);
+
+    REQUIRE(h.dispatch_calls == 1);
+    CHECK(h.dispatched_plugins.front() == plugin); // the system-caller dispatch itself still ran
+    for (const char* agent : {"agentA", "agentB"}) {
+        CHECK(h.status_of(pid, agent) == "unknown");
+        auto st = h.ps.get_agent_status(pid, agent);
+        REQUIRE(st.has_value());
+        REQUIRE(st->has_value());
+        CHECK((*st)->check_result.empty());
+        CHECK((*st)->check_result.find(kMarker) == std::string::npos);
+    }
+}
+
+TEST_CASE("policy evaluator: an ordinary check still gets its verdict and stored output (#4990 "
+          "control)",
+          "[pg][policy][evaluator][forensics_tier]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "marker-4990-ordinary")};
+    h.canned["agentB|checkp"] = {1, out_json("hostname", "")};
+    auto pid = h.author("result.hostname != ''");
+
+    PolicyEvaluator ev(h.deps());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20;
+    ev.tick(true);
+
+    CHECK(h.status_of(pid, "agentA") == "compliant");
+    CHECK(h.status_of(pid, "agentB") == "non_compliant");
+    auto st = h.ps.get_agent_status(pid, "agentA");
+    REQUIRE(st.has_value());
+    REQUIRE(st->has_value());
+    CHECK((*st)->check_result.find("marker-4990-ordinary") != std::string::npos);
+}
+
+TEST_CASE("policy evaluator: an unwired Forensics plugin set scores every check unknown (#4990)",
+          "[pg][policy][evaluator][forensics_tier]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "yuzu-a")};
+    h.canned["agentB|checkp"] = {1, out_json("hostname", "yuzu-b")};
+    auto pid = h.author("result.hostname != ''");
+
+    auto deps = h.deps();
+    deps.forensics_plugins = nullptr;
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    CHECK(h.status_of(pid, "agentA") == "unknown");
 }

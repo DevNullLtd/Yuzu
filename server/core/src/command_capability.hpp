@@ -5,8 +5,12 @@
 #include <expected>
 #include <initializer_list>
 #include <span>
+#include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <vector>
+#include "ascii_fold.hpp" // #4990: the one ASCII plugin-name fold
 
 #include "authz_model.hpp"
 
@@ -184,7 +188,7 @@ public:
     /// Case-insensitive on both `plugin` and `action`, matching the
     /// lowercase normalisation `server.cpp` (`:6360-6368`) applies to the
     /// action before dispatch — extended here to the plugin half too, so
-    /// `classify("TAR", "Fleet_Snapshot")` and `classify("tar",
+    /// `classify("Echo", "Fleet_Snapshot")` and `classify("echo",
     /// "fleet_snapshot")` resolve to the same row regardless of which case a
     /// caller used.
     [[nodiscard]] std::expected<CommandCapability, ClassificationError>
@@ -208,16 +212,54 @@ public:
         return *found;
     }
 
-private:
-    [[nodiscard]] static constexpr char to_lower_ascii(char c) noexcept {
-        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    /// True when any row of the composed catalogue names `plugin` (case-insensitive). The one
+    /// "is this a plugin the server dispatches" lookup: callers validate against it rather than
+    /// keep a list of their own.
+    [[nodiscard]] bool knows_plugin(std::string_view plugin) const noexcept {
+        for (std::size_t i = 0; i < source_count_; ++i) {
+            for (const auto& cap : sources_[i]) {
+                if (ci_equal(cap.plugin, plugin))
+                    return true;
+            }
+        }
+        return false;
     }
 
+    /// Calls `f(const CommandCapability&)` for every row of every composed source (boot-time and
+    /// test use; a handful of fragments). Lets a consistency check read the catalogue without
+    /// the registry growing one accessor per question.
+    template <class F>
+    void for_each_row(F&& f) const {
+        for (std::size_t i = 0; i < source_count_; ++i)
+            for (const auto& cap : sources_[i])
+                f(cap);
+    }
+
+    /// Every distinct plugin name carrying at least one row whose `securable` equals `securable`,
+    /// lowercased and sorted. Derived from the composed sources on each call (a handful of
+    /// fragments, boot-time use), so a new fragment row is reflected with no second list to keep.
+    /// A plugin is reported if ANY of its rows is on the securable: a mixed-tier plugin is
+    /// therefore over-inclusive by design (the store records only the plugin, not the action).
+    [[nodiscard]] std::vector<std::string> plugins_on_securable(std::string_view securable) const {
+        std::vector<std::string> out;
+        for (std::size_t i = 0; i < source_count_; ++i) {
+            for (const auto& cap : sources_[i]) {
+                if (cap.securable != securable)
+                    continue;
+                out.push_back(ascii_lower(cap.plugin));
+            }
+        }
+        std::ranges::sort(out);
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }
+
+private:
     [[nodiscard]] static bool ci_equal(std::string_view a, std::string_view b) noexcept {
         if (a.size() != b.size())
             return false;
         for (std::size_t i = 0; i < a.size(); ++i) {
-            if (to_lower_ascii(a[i]) != to_lower_ascii(b[i]))
+            if (ascii_lower_char(a[i]) != ascii_lower_char(b[i]))
                 return false;
         }
         return true;

@@ -25,7 +25,7 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_session_cap_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("grpcbox/include/grpcbox.hrl").
+-include("yuzu_grpc.hrl").
 
 -export([handle_event/4, log/2]).
 
@@ -422,24 +422,19 @@ subscribe_handler_refuses_before_start() ->
     S = session(9),
     true = ets:insert(yuzu_gw_pending, {S, info(agent(9), conn_a),
                                         erlang:monotonic_time(millisecond)}),
-    ok = meck:new(grpcbox_stream, [non_strict, no_link]),
-    try
-        ok = meck:expect(grpcbox_stream, ctx,
-                         fun(_State) ->
-                             ctx:set(ctx:background(), md_incoming_key,
-                                     #{<<"x-yuzu-session-id">> => S})
-                         end),
-        Result = try yuzu_gw_agent_service:subscribe(make_ref(), not_a_stream_state)
-                 catch throw:T -> {thrown, T}
-                 end,
-        ?assertMatch({thrown, {grpc_error, {?GRPC_STATUS_UNAVAILABLE, _}}}, Result),
-        ?assertEqual(1, refused()),
-        %% No error-level report (a crash of a started agent process would be one).
-        ?assertEqual([], [T || {_, log, T} <- ets:tab2list(?EVENTS_TAB),
-                               binary:match(T, <<"crasher">>) =/= nomatch])
-    after
-        meck:unload(grpcbox_stream)
-    end.
+    Stream = #yuzu_grpc_stream{conn = self(), stream_id = 1,
+                               ctx = yuzu_grpc:new_ctx(#{<<"x-yuzu-session-id">> => S},
+                                                       self(), undefined, undefined, undefined),
+                               method = <<"/yuzu.agent.v1.AgentService/Subscribe">>,
+                               pb = agent_pb, output = 'yuzu.agent.v1.CommandRequest'},
+    Result = try yuzu_gw_agent_service:subscribe(make_ref(), Stream)
+             catch throw:T -> {thrown, T}
+             end,
+    ?assertMatch({thrown, {grpc_error, {?GRPC_STATUS_UNAVAILABLE, _}}}, Result),
+    ?assertEqual(1, refused()),
+    %% No error-level report (a crash of a started agent process would be one).
+    ?assertEqual([], [T || {_, log, T} <- ets:tab2list(?EVENTS_TAB),
+                           binary:match(T, <<"crasher">>) =/= nomatch]).
 
 agent_process_refused() ->
     mock_handler_deps(),
@@ -543,7 +538,7 @@ concurrent_registers_proxy_at_most_cap() ->
     mock_handler_deps(),
     Parent = self(),
     ok = meck:expect(yuzu_gw_upstream, proxy_register,
-                     fun(#{info := #{agent_id := Id}}) ->
+                     fun(#{info := #{agent_id := Id}}, _Opts) ->
                          Parent ! {in_proxy, self()},
                          receive {release, Parent} -> ok after 20000 -> error(not_released) end,
                          {ok, #{session_id => <<"reg-session-", Id/binary>>}}
@@ -584,7 +579,7 @@ concurrent_same_id_registers_proxy_at_most_cap() ->
     Parent = self(),
     N = 20,
     ok = meck:expect(yuzu_gw_upstream, proxy_register,
-                     fun(#{info := #{agent_id := Id}}) ->
+                     fun(#{info := #{agent_id := Id}}, _Opts) ->
                          Parent ! {in_proxy, self()},
                          receive {release, Parent} -> ok after 20000 -> error(not_released) end,
                          {ok, #{session_id => <<"reg-session-", Id/binary,
@@ -695,7 +690,7 @@ failed_proxy_releases_reservation() ->
     %% More failures than the cap: each releases the slot it claimed.
     Failures = [{error, upstream_down}, {ok, not_a_map}],
     [begin
-         ok = meck:expect(yuzu_gw_upstream, proxy_register, fun(_) -> Failure end),
+         ok = meck:expect(yuzu_gw_upstream, proxy_register, fun(_, _Opts) -> Failure end),
          [?assertMatch({grpc_error, {?GRPC_STATUS_INTERNAL, _}}, Reg(conn_a, I))
           || I <- lists:seq(1, 2 * ?CAP)],
          ?assertEqual([], reserved_rows())
@@ -704,7 +699,7 @@ failed_proxy_releases_reservation() ->
     ?assertEqual([], pending_rows(conn_a)),
     %% Control: with a working upstream the connection admits exactly the cap.
     ok = meck:expect(yuzu_gw_upstream, proxy_register,
-                     fun(#{info := #{agent_id := Id}}) ->
+                     fun(#{info := #{agent_id := Id}}, _Opts) ->
                          {ok, #{session_id => <<"reg-session-", Id/binary>>}}
                      end),
     [?assertMatch({ok, _, _}, Reg(conn_a, I)) || I <- lists:seq(1, ?CAP)],
@@ -872,7 +867,7 @@ handler_superseded_register_is_retryable() ->
     %% While this Register is proxied upstream a newer one of the same agent
     %% commits (its row is stamped later than the row this Register stores).
     ok = meck:expect(yuzu_gw_upstream, proxy_register,
-                     fun(#{info := #{agent_id := Id}}) ->
+                     fun(#{info := #{agent_id := Id}}, _Opts) ->
                          Newer = <<"newer-session">>,
                          true = ets:insert(yuzu_gw_pending,
                                            {Newer, info(A, conn_a),
@@ -1236,6 +1231,6 @@ mock_handler_deps() ->
     ok = meck:new(yuzu_gw_upstream, [non_strict, no_link]),
     ok = meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _, _) -> ok end),
     ok = meck:expect(yuzu_gw_upstream, proxy_register,
-                     fun(#{info := #{agent_id := Id}}) ->
+                     fun(#{info := #{agent_id := Id}}, _Opts) ->
                          {ok, #{session_id => <<"reg-session-", Id/binary>>}}
                      end).

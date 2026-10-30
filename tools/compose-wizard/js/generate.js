@@ -360,10 +360,6 @@ ${c.tlsMode === 'plaintext'
     y += `    content: |\n`;
     y += `      [\n`;
     y += `          {yuzu_gw, [\n`;
-    y += `              {agent_listen_addr, "0.0.0.0"},\n`;
-    y += `              {agent_listen_port, 50051},\n`;
-    y += `              {mgmt_listen_addr, "0.0.0.0"},\n`;
-    y += `              {mgmt_listen_port, 50063},\n`;
     y += `              {upstream_addr, "server"},\n`;
     y += `              {upstream_port, ${c.gwUpstreamPort}},\n`;
     y += `              {upstream_pool_size, ${c.gwPoolSize}},\n`;
@@ -374,35 +370,37 @@ ${c.tlsMode === 'plaintext'
     y += `              {telemetry_gauge_interval_ms, 10000},\n`;
     y += `              {circuit_breaker_failure_threshold, 5},\n`;
     y += `              {circuit_breaker_reset_timeout_ms, 10000},\n`;
-    y += `              {circuit_breaker_max_reset_timeout_ms, 300000},\n`;
+    y += `              {circuit_breaker_max_reset_timeout_ms, 30000},\n`;
     y += `              {backpressure_threshold, 1000},\n`;
     y += `              {hash_ring_vnodes, 256},\n`;
     y += `              %% #1422 escape hatch: this generated stack's mgmt listener is\n`;
     y += `              %% plaintext on 0.0.0.0 and the gateway otherwise refuses to\n`;
     y += `              %% boot. Safe only while :50063 stays unpublished on this\n`;
     y += `              %% compose network. Never copy into production.\n`;
-    y += `              {allow_insecure_mgmt, true}\n`;
-    y += `          ]},\n`;
+    y += `              {allow_insecure_mgmt, true},\n`;
+    y += `              %% gRPC listeners (plaintext: no tls key).\n`;
+    y += `              {grpc_listeners, [\n`;
+    y += `                  #{name => agent,\n`;
+    y += `                    service_protos => [agent_pb],\n`;
+    y += `                    services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service},\n`;
+    y += `                    listen => #{port => 50051, ip => {0,0,0,0}}},\n`;
+    y += `                  #{name => mgmt,\n`;
+    y += `                    service_protos => [management_pb],\n`;
+    y += `                    services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service},\n`;
+    y += `                    listen => #{port => 50063, ip => {0,0,0,0}}}\n`;
+    y += `              ]},\n`;
     // Plaintext gateway: gateway + TLS isn't generated yet (see the C1/N2 guard),
     // so this path is only reached in plaintext mode — the gateway dials the server
     // over plain HTTP/2 and its listeners are plaintext.
     // ⚠️ Do NOT internet-expose :50051 in this mode (command fan-out = fleet RCE).
-    y += `          {grpcbox, [\n`;
-    y += `              {client, #{channels => [\n`;
+    // The upstream channels live in the yuzu_gw env (upstream_client), NOT under a
+    // {grpcbox, client} key: OTP applies a sys.config entry only to a loaded
+    // application, none is named grpcbox, and the gateway refuses to boot if the
+    // old key is present.
+    y += `              %% Upstream channel to the server (plaintext HTTP/2).\n`;
+    y += `              {upstream_client, #{channels => [\n`;
     y += `                  {default_channel, [{http, "server", ${c.gwUpstreamPort}, []}], #{}}\n`;
-    y += `              ]}},\n`;
-    y += `              {servers, [\n`;
-    y += `                  #{grpc_opts => #{\n`;
-    y += `                      service_protos => [agent_pb],\n`;
-    y += `                      services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service}\n`;
-    y += `                  },\n`;
-    y += `                  listen_opts => #{port => 50051, ip => {0,0,0,0}}},\n`;
-    y += `                  #{grpc_opts => #{\n`;
-    y += `                      service_protos => [management_pb],\n`;
-    y += `                      services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service}\n`;
-    y += `                  },\n`;
-    y += `                  listen_opts => #{port => 50063, ip => {0,0,0,0}}}\n`;
-    y += `              ]}\n`;
+    y += `              ]}}\n`;
     y += `          ]},\n`;
     y += `          {kernel, [\n`;
     y += `              {connect_all, false},\n`;
@@ -767,10 +765,19 @@ ${c.tlsMode === 'plaintext'
   // Gateway
   if (c.gateway) {
     y += `\n  # ── Yuzu Gateway (Erlang/OTP) ────────────────────────────────────────\n`;
+    y += `  # The gateway-sys-config above uses the {yuzu_gw, grpc_listeners} shape, so\n`;
+    y += `  # this image must be from the first release containing that shape. An older\n`;
+    y += `  # image ignores the config, binds no listener and still answers /healthz\n`;
+    y += `  # with 200: the stack looks up while no agent can connect. Image and config\n`;
+    y += `  # are an atomic pair (docs/user-manual/upgrading.md, "Upgrading the Gateway").\n`;
     y += `  gateway:\n`;
     y += `    image: ghcr.io/devnullltd/yuzu-gateway:\${YUZU_VERSION:-${c.version}}\n`;
     y += `    container_name: yuzu-gateway\n`;
     y += `    restart: unless-stopped\n`;
+    // #5695: a planned stop sends the sessions' DISCONNECTED notices within
+    // shutdown_flush_budget_ms (20 s); Docker's default 10 s would cut it short.
+    y += `    # Planned stop: DISCONNECTED notices are flushed within 20 s; 40 s covers it.\n`;
+    y += `    stop_grace_period: 40s\n`;
     y += `    ports:\n`;
     y += `      - "${c.gwAgentPort}:50051"   # Agent-facing gRPC (mapped to avoid conflict with server)\n`;
     // #1422: NEVER publish :50063 (management/command fan-out) from this

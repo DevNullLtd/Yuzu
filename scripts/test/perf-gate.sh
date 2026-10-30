@@ -37,6 +37,10 @@
 #   --heartbeats N    — YUZU_PERF_HEARTBEATS override (default: 20000)
 #   --fanout N        — YUZU_PERF_FANOUT override (default: 5000)
 #   --groups LIST     — CT groups (default: registration,heartbeat,fanout,churn)
+#   --scale-agents N  — also run yuzu_gw_scale_SUITE (the multi-node scale
+#                       scenarios, docs/testing/gateway-scale-tests.md) with N
+#                       agents and record a curated set of its SCALE_METRIC
+#                       lines as perf_scale_* metrics (default: 0 = skip)
 #   --allow-busy      — skip the quiesce check (debug only — numbers will
 #                       be contended)
 #
@@ -63,6 +67,7 @@ PERF_AGENTS="5000"
 PERF_HEARTBEATS="20000"
 PERF_FANOUT="5000"
 PERF_GROUPS="registration,heartbeat,fanout,churn"
+SCALE_AGENTS="0"
 ALLOW_BUSY=0
 
 usage() {
@@ -79,6 +84,7 @@ Optional:
   --heartbeats N             YUZU_PERF_HEARTBEATS (default: 20000)
   --fanout N                 YUZU_PERF_FANOUT (default: 5000)
   --groups LIST              CT groups (default: registration,heartbeat,fanout,churn)
+  --scale-agents N           also run yuzu_gw_scale_SUITE with N agents (default: 0 = skip)
 EOF
 }
 
@@ -90,6 +96,7 @@ while [[ $# -gt 0 ]]; do
         --heartbeats)         PERF_HEARTBEATS="$2"; shift 2 ;;
         --fanout)             PERF_FANOUT="$2"; shift 2 ;;
         --groups)             PERF_GROUPS="$2"; shift 2 ;;
+        --scale-agents)       SCALE_AGENTS="$2"; shift 2 ;;
         -h|--help)            usage; exit 0 ;;
         # Removed-as-of-2026-05-03 flags. The gate no longer reads a baseline
         # file or supports tolerance/capture/report-only modes. Reject loudly
@@ -234,7 +241,7 @@ CT_RC=0
     YUZU_PERF_HEARTBEATS="$PERF_HEARTBEATS" \
     YUZU_PERF_FANOUT="$PERF_FANOUT" \
     rebar3 ct \
-        --dir apps/yuzu_gw/test \
+        --dir apps/yuzu_gw/test/ct \
         --suite yuzu_gw_perf_SUITE \
         --group "$PERF_GROUPS" \
         --verbose \
@@ -242,6 +249,29 @@ CT_RC=0
 ) || CT_RC=$?
 
 echo "perf-gate: rebar3 ct exit=$CT_RC" | tee -a "$GATE_LOG"
+
+# ── Optional: the multi-node scale suite ──────────────────────────────────
+#
+# yuzu_gw_scale_SUITE starts its own gateway, fake server and load-generator
+# nodes; it prints one SCALE_METRIC line per number. Only the headline ones are
+# recorded (the full set is in the suite's JSON files under the CT log dir).
+
+SCALE_LOG_RAW="$LOG_DIR/scale-suite.log"
+SCALE_RC=0
+if [[ "$SCALE_AGENTS" =~ ^[0-9]+$ ]] && (( SCALE_AGENTS > 0 )); then
+    : > "$SCALE_LOG_RAW"
+    echo "perf-gate: running yuzu_gw_scale_SUITE (agents=$SCALE_AGENTS)" | tee -a "$GATE_LOG"
+    (
+        cd "$YUZU_ROOT/gateway"
+        YUZU_GW_SCALE_AGENTS="$SCALE_AGENTS" \
+        rebar3 ct \
+            --dir apps/yuzu_gw/test/ct \
+            --suite yuzu_gw_scale_SUITE \
+            --verbose \
+            >>"$SCALE_LOG_RAW" 2>&1
+    ) || SCALE_RC=$?
+    echo "perf-gate: scale suite exit=$SCALE_RC" | tee -a "$GATE_LOG"
+fi
 
 LOADAVG_POST=$(loadavg_1m)
 echo "perf-gate: loadavg post=$LOADAVG_POST" | tee -a "$GATE_LOG"
@@ -299,7 +329,31 @@ parse_metrics() {
     done
 }
 
+# The headline SCALE_METRIC names (scenario, metric, agent count).
+SCALE_KEEP='^scale_[a-z_]+_(register_first_attempt_failed|register_unregistered_at_budget|register_first_attempt_latency_ms_p(50|95|99)|time_to_all_registered_ms|time_to_all_reregistered_ms|register_failures_after_restart|replay_time_to_full_replay_ms|replay_peak_inflight|disconnected_lost|stop_ms|fanout_completion_ms|fanout_answered|fanout_connection_drops|latency_ms_p(50|95|99)|upstream_register_peak_inflight|upstream_wasted_register_rpcs|gateway_memory_per_connection_bytes|gateway_probe_mailbox_hwm_yuzu_gw_(upstream|registry|router))_n[0-9]+$'
+
+parse_scale_metrics() {
+    local log="$1" line name value
+    [[ -s "$log" ]] || return 0
+    while IFS= read -r line; do
+        line=$(echo "$line" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g')
+        case "$line" in
+            *"SCALE_METRIC "*"="*)
+                name=$(echo "$line" | sed -nE 's/.*SCALE_METRIC ([a-z0-9_]+)=.*/\1/p')
+                value=$(echo "$line" | sed -nE 's/.*SCALE_METRIC [a-z0-9_]+=([-0-9.]+).*/\1/p')
+                if [[ -n "$name" && -n "$value" && "$name" =~ $SCALE_KEEP ]]; then
+                    printf "%s=%s\n" "$name" "$value"
+                fi
+                ;;
+        esac
+    done < "$log"
+}
+
 PARSED="$(parse_metrics "$PERF_LOG_RAW")"
+SCALE_PARSED="$(parse_scale_metrics "$SCALE_LOG_RAW")"
+if [[ -n "$SCALE_PARSED" ]]; then
+    PARSED="$(printf "%s\n%s" "$PARSED" "$SCALE_PARSED" | sed '/^$/d')"
+fi
 METRIC_COUNT=0
 if [[ -n "$PARSED" ]]; then
     METRIC_COUNT=$(echo "$PARSED" | grep -c "=")
@@ -353,6 +407,8 @@ while IFS='=' read -r name value; do
         *_ops_sec)      write_metric "perf_$name" "$value" "ops/sec" ;;
         *_ms_per_agent) write_metric "perf_$name" "$value" "ms/agent" ;;
         *_ms)           write_metric "perf_$name" "$value" "ms" ;;
+        *_ms_n[0-9]*|*_ms_p[0-9]*_n[0-9]*) write_metric "perf_$name" "$value" "ms" ;;
+        *_bytes_n[0-9]*) write_metric "perf_$name" "$value" "bytes" ;;
         *)              write_metric "perf_$name" "$value" "" ;;
     esac
 done <<< "$PARSED"

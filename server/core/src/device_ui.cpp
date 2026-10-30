@@ -16,7 +16,7 @@
 #include "device_routes.hpp"
 
 #include "dex_view_types.hpp"    // dex_signal_label for the DEX lens (store-free)
-#include "tar_process_tree.hpp"  // tar_is_suspicious_spawn — shared LOLBin/shell denylist
+#include "echo_process_tree.hpp"  // echo_is_suspicious_spawn — shared LOLBin/shell denylist
 #include "web_utils.hpp"
 
 #include <algorithm>
@@ -327,13 +327,13 @@ std::string render_device_dex_lens(const std::string& agent_id, int score,
     return h;
 }
 
-// Component CSS for the live-snapshot cards + the TAR-style process tree. Injected
+// Component CSS for the live-snapshot cards + the Echo-style process tree. Injected
 // inline by the shell fragment (the shared page shell carries only the `.gp-*`
-// component CSS; `.ls-*`/`.tar-tree-*` are feature-local). CSP allows inline <style>
-// (style-src 'unsafe-inline'). The tree classes mirror tar_page_ui.cpp (PR1551) so
-// the viewer matches /tar. Mockup: docs/mockups/device-live-snapshot.html.
+// component CSS; `.ls-*`/`.echo-tree-*` are feature-local). CSP allows inline <style>
+// (style-src 'unsafe-inline'). The tree classes mirror echo_page_ui.cpp (PR1551) so
+// the viewer matches /echo. Mockup: docs/mockups/device-live-snapshot.html.
 const char* live_snapshot_css() {
-    // Class names are unique (ls-*/tar-tree-*/tt-*) so the rules are GLOBAL, not
+    // Class names are unique (ls-*/echo-tree-*/tt-*) so the rules are GLOBAL, not
     // scoped to #device-live — the pop-out clones a card body into a <dialog> outside
     // that container and must stay styled. Generic names are prefixed (.ls-pill/.ls-sw)
     // and `.name` is scoped to `.ls-tbl` to avoid colliding with shared dashboard CSS.
@@ -378,16 +378,16 @@ const char* live_snapshot_css() {
     .ls-sw::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:2px;background:var(--raise)}
     .ls-sw.on::after{left:18px;background:var(--on-primary)}
     .src-on{color:var(--ok);font-weight:600}.src-off{color:var(--mut)}
-    .tar-tree-node{margin:0}
-    .tar-tree-node>summary{display:flex;align-items:center;list-style:none;cursor:pointer;padding:1px 0}
-    .tar-tree-node>summary::-webkit-details-marker{display:none}
-    .tar-tree-node>summary::before{content:"\25B8";flex:0 0 16px;text-align:center;color:var(--faint);font-size:12px}
-    .tar-tree-node[open]>summary::before{content:"\25BE"}
-    .tar-tree-children{margin-left:8px;padding-left:12px;border-left:1px solid var(--line2)}
-    .tar-tree-leaf{display:flex;align-items:center;padding:1px 0 1px 16px}
-    .tar-tree-row{display:inline-flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;padding:1px 6px;border-radius:3px;color:var(--ink);font-size:13px}
-    .tar-tree-row:hover{background:var(--surface2)}
-    .tar-tree-row[data-anom="1"]{box-shadow:inset 2px 0 0 var(--bad)}
+    .echo-tree-node{margin:0}
+    .echo-tree-node>summary{display:flex;align-items:center;list-style:none;cursor:pointer;padding:1px 0}
+    .echo-tree-node>summary::-webkit-details-marker{display:none}
+    .echo-tree-node>summary::before{content:"\25B8";flex:0 0 16px;text-align:center;color:var(--faint);font-size:12px}
+    .echo-tree-node[open]>summary::before{content:"\25BE"}
+    .echo-tree-children{margin-left:8px;padding-left:12px;border-left:1px solid var(--line2)}
+    .echo-tree-leaf{display:flex;align-items:center;padding:1px 0 1px 16px}
+    .echo-tree-row{display:inline-flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;padding:1px 6px;border-radius:3px;color:var(--ink);font-size:13px}
+    .echo-tree-row:hover{background:var(--surface2)}
+    .echo-tree-row[data-anom="1"]{box-shadow:inset 2px 0 0 var(--bad)}
     .tt-dot{flex:0 0 auto;width:8px;height:8px;background:var(--ok)}
     .tt-pid{flex:0 0 auto;min-width:54px;color:var(--mut);font-family:var(--mds-font-family-mono);font-size:12.5px;text-align:right;font-variant-numeric:tabular-nums}
     .tt-name{flex:1 1 auto;min-width:0;overflow:hidden;color:var(--ink);font-weight:600;text-overflow:ellipsis;white-space:nowrap}
@@ -461,7 +461,7 @@ std::string render_device_live_shell(const std::string& agent_id) {
         // cards are behind a collapsed <details> by default, so lazy=true defers
         // dispatch to first expand (htmx 2.0.4 `EVENT MODIFIER from:SELECTOR`
         // grammar — see dashboard_ui.cpp/settings_ui.cpp's "... from:body" and
-        // tar_tree_routes.cpp's "change from:#tar-tree-host" for the same "from:"
+        // echo_tree_routes.cpp's "change from:#echo-tree-host" for the same "from:"
         // usage already relied on in this codebase; "closest details" is htmx's
         // standard extended CSS selector for the nearest ancestor <details>).
         c += "<span class=\"ls-prev\">" + std::string(preview) +
@@ -485,7 +485,7 @@ std::string render_device_live_shell(const std::string& agent_id) {
     h += card("dns_cache", "DNS cache", "Win &middot; Linux", "resolver cache");
     h += card("listening", "Listening ports", "", "sockets");
     h += card("connections", "Active connections", "", "established");
-    h += card("capture_sources", "Capture sources", "", "TAR local capture");
+    h += card("capture_sources", "Capture sources", "", "Echo local capture");
     h += card("disk", "Disk space", "", "system volume only");
     h += "</div>"; // close .ls-grid (live)
     h += "</div>"; // close .ls-group[data-lsgroup=live]
@@ -574,7 +574,7 @@ std::string lc(std::string s) {
 }
 
 // A remote address that is NOT loopback / private / link-local / ULA. Drives the
-// public-endpoint highlight (mirrors tar_process_tree's remote_class "pub").
+// public-endpoint highlight (mirrors echo_process_tree's remote_class "pub").
 bool is_public_ip(const std::string& a) {
     if (a.empty() || a == "0.0.0.0" || a == "::" || a == "::1")
         return false;
@@ -598,7 +598,7 @@ std::string endpoint_label(const LiveConn& c) {
                        : (c.remote_addr + ":" + std::to_string(c.remote_port));
 }
 
-// Inline per-process network summary, byte-for-byte the TAR `tt-net` shape: count
+// Inline per-process network summary, byte-for-byte the Echo `tt-net` shape: count
 // badge + up to two distinct endpoints (public first) + "+N", full list in title.
 std::string live_net_cell(const std::vector<const LiveConn*>& conns) {
     if (conns.empty())
@@ -640,7 +640,7 @@ std::string live_net_cell(const std::vector<const LiveConn*>& conns) {
 
 constexpr std::size_t kLiveTreeMaxNodes = 50000;
 constexpr int kLiveTreeDepthCap = 64;
-constexpr std::size_t kLiveGroupThreshold = 5; // collapse N+ same-name siblings (TAR pattern)
+constexpr std::size_t kLiveGroupThreshold = 5; // collapse N+ same-name siblings (Echo pattern)
 
 struct TreeCtx {
     const std::vector<LiveProcNode>& nodes;
@@ -651,7 +651,7 @@ struct TreeCtx {
 };
 
 std::string live_proc_row(const LiveProcNode& n, const TreeCtx& ctx, bool suspicious) {
-    std::string r = "<span class=\"tar-tree-row\"";
+    std::string r = "<span class=\"echo-tree-row\"";
     if (suspicious)
         r += " data-anom=\"1\"";
     r += "><span class=\"tt-dot\"></span><span class=\"tt-pid\">" + std::to_string(n.pid) +
@@ -675,7 +675,7 @@ void render_tree_node(TreeCtx& ctx, std::size_t idx, int depth, const std::strin
 void render_tree_children(TreeCtx& ctx, const std::vector<std::size_t>& kids, int depth,
                           const std::string& parent_name, std::string& out) {
     // Bucket same-name siblings (first-appearance order); collapse a run of >= threshold
-    // into one "name ×N" group (cleans up dozens of svchost.exe), mirroring the TAR tree.
+    // into one "name ×N" group (cleans up dozens of svchost.exe), mirroring the Echo tree.
     std::vector<std::string_view> order;
     std::unordered_map<std::string_view, std::vector<std::size_t>> buckets;
     for (std::size_t i : kids) {
@@ -688,12 +688,12 @@ void render_tree_children(TreeCtx& ctx, const std::vector<std::size_t>& kids, in
     for (std::string_view nm : order) {
         const auto& g = buckets[nm];
         if (g.size() >= kLiveGroupThreshold) {
-            out += "<details class=\"tar-tree-node\"><summary><span class=\"tar-tree-row tt-group\">"
+            out += "<details class=\"echo-tree-node\"><summary><span class=\"echo-tree-row tt-group\">"
                    "<span class=\"tt-group-ico\">\xE2\x96\xA6</span><span class=\"tt-name\">" +
                    esc(nm.empty() ? "(unknown)" : std::string(nm)) +
                    "</span><span class=\"tt-group-count\">\xC3\x97" + std::to_string(g.size()) +
                    "</span><span class=\"tt-meta\">" + std::to_string(g.size()) +
-                   " running</span></span></summary><div class=\"tar-tree-children\">";
+                   " running</span></span></summary><div class=\"echo-tree-children\">";
             for (std::size_t i : g)
                 render_tree_node(ctx, i, depth + 1, parent_name, out);
             out += "</div></details>";
@@ -711,22 +711,22 @@ void render_tree_node(TreeCtx& ctx, std::size_t idx, int depth, const std::strin
     if (idx < ctx.visited.size() && ctx.visited[idx])
         return; // already rendered — a ppid cycle (A→B→A) terminates here
     if (depth > kLiveTreeDepthCap) {
-        out += "<div class=\"tar-tree-leaf tt-meta\">\xE2\x80\xA6 (depth capped)</div>";
+        out += "<div class=\"echo-tree-leaf tt-meta\">\xE2\x80\xA6 (depth capped)</div>";
         return;
     }
     if (idx < ctx.visited.size())
         ctx.visited[idx] = true;
     ++ctx.emitted;
     const LiveProcNode& n = ctx.nodes[idx];
-    const bool suspicious = !parent_name.empty() && tar_is_suspicious_spawn(parent_name, n.name);
+    const bool suspicious = !parent_name.empty() && echo_is_suspicious_spawn(parent_name, n.name);
     auto it = ctx.children.find(n.pid);
     const bool has_children = n.pid != 0 && it != ctx.children.end() && !it->second.empty();
     if (!has_children) {
-        out += "<div class=\"tar-tree-leaf\">" + live_proc_row(n, ctx, suspicious) + "</div>";
+        out += "<div class=\"echo-tree-leaf\">" + live_proc_row(n, ctx, suspicious) + "</div>";
         return;
     }
-    out += depth < 2 ? "<details open class=\"tar-tree-node\">" : "<details class=\"tar-tree-node\">";
-    out += "<summary>" + live_proc_row(n, ctx, suspicious) + "</summary><div class=\"tar-tree-children\">";
+    out += depth < 2 ? "<details open class=\"echo-tree-node\">" : "<details class=\"echo-tree-node\">";
+    out += "<summary>" + live_proc_row(n, ctx, suspicious) + "</summary><div class=\"echo-tree-children\">";
     render_tree_children(ctx, it->second, depth + 1, n.name, out);
     out += "</div></details>";
 }
@@ -984,12 +984,12 @@ std::string render_device_live_generic(const std::vector<std::string>& columns,
 
 std::string render_device_live_capture_sources(const std::vector<LiveCaptureSource>& rows) {
     if (rows.empty())
-        return "<div class=\"gp-note\">TAR is not running on this device, or it reported no "
+        return "<div class=\"gp-note\">Echo is not running on this device, or it reported no "
                "capture sources.</div>";
     std::string h =
-        "<div class=\"gp-note\" style=\"margin-top:0\">TAR warehouse capture on this device "
+        "<div class=\"gp-note\" style=\"margin-top:0\">Echo warehouse capture on this device "
         "(background &middot; distinct from the live snapshot). Read-only here &mdash; "
-        "<a href=\"/tar\" style=\"color:var(--accent)\">configure on TAR &rarr;</a></div>";
+        "<a href=\"/echo\" style=\"color:var(--accent)\">configure on Echo &rarr;</a></div>";
     h += "<table class=\"ls-tbl\"><thead><tr><th></th><th>Source</th><th>Table</th>"
          "<th class=\"ls-num\">Live rows</th><th>Category</th></tr></thead><tbody>";
     for (const auto& r : rows) {

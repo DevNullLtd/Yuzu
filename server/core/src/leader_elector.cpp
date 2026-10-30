@@ -6,6 +6,7 @@
 #include <spdlog/spdlog.h>
 
 #include <charconv>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -186,13 +187,42 @@ bool LeaderElector::connect_locked() {
     return true;
 }
 
-void LeaderElector::drop_leadership_locked() {
+void LeaderElector::drop_leadership_locked(std::optional<LeadershipLoss> cause) {
+    // Count a loss only when leadership was really held (epoch_ is the writer's
+    // authoritative state under mu_); read BEFORE the reset below.
+    if (cause.has_value() && epoch_.has_value())
+        lost_[static_cast<std::size_t>(*cause)].fetch_add(1, std::memory_order_relaxed);
     lock_guard_.reset(); // runs pg_advisory_unlock on conn_ if it was held
     epoch_.reset();
     // Publish "not leader" (slice 3.2, #4013). Release-ordered so a reader that
     // observes 0 has seen every write the drop performed; ordered BEFORE any
     // subsequent reconnect so a live follower never reads a stale leader epoch.
     live_epoch_.store(0, std::memory_order_release);
+}
+
+std::int64_t LeaderElector::steady_now_ns() noexcept {
+    const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+    return ns > 0 ? ns : 1; // 0 is the "never answered" sentinel
+}
+
+void LeaderElector::note_ok_locked() noexcept {
+    last_ok_steady_ns_.store(steady_now_ns(), std::memory_order_relaxed);
+}
+
+LeaderElector::Stats LeaderElector::stats() const noexcept {
+    Stats s;
+    const std::int64_t live = live_epoch_.load(std::memory_order_acquire);
+    s.leader = live > 0;
+    s.epoch = live > 0 ? live : 0;
+    s.acquired = acquired_.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < kAcquireFailureCount; ++i)
+        s.acquire_failed[i] = acquire_failed_[i].load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < kLeadershipLossCount; ++i)
+        s.lost[i] = lost_[i].load(std::memory_order_relaxed);
+    s.last_ok_steady_ns = last_ok_steady_ns_.load(std::memory_order_relaxed);
+    return s;
 }
 
 bool LeaderElector::is_open() const {
@@ -202,18 +232,26 @@ bool LeaderElector::is_open() const {
 
 bool LeaderElector::try_acquire() {
     std::lock_guard<std::mutex> lk(mu_);
-    if (!open_ && !connect_locked())
+    if (!open_ && !connect_locked()) {
+        acquire_failed_[static_cast<std::size_t>(AcquireFailure::Connect)].fetch_add(
+            1, std::memory_order_relaxed);
         return false;
+    }
 
     // Already leader: confirm the connection is live and keep the epoch.
     if (epoch_.has_value()) {
         pg::PgResult live = pg::exec_params(conn_.get(), "SELECT 1", std::vector<std::string>{});
-        if (live.status() == PGRES_TUPLES_OK)
+        if (live.status() == PGRES_TUPLES_OK) {
+            note_ok_locked();
             return true;
+        }
         spdlog::warn("leader_elector: liveness check failed while leading; dropping and reconnecting");
-        drop_leadership_locked();
-        if (!connect_locked())
+        drop_leadership_locked(LeadershipLoss::LivenessFailed);
+        if (!connect_locked()) {
+            acquire_failed_[static_cast<std::size_t>(AcquireFailure::Connect)].fetch_add(
+                1, std::memory_order_relaxed);
             return false;
+        }
     }
 
     // Attempt the session advisory lock on the owned connection.
@@ -230,12 +268,19 @@ bool LeaderElector::try_acquire() {
         // the reconnect at the top of try_acquire is never re-entered, and every
         // subsequent call retries the same dead PGconn. [self-adversarial F1]
         spdlog::warn("leader_elector: try-lock query failed; reconnecting");
+        acquire_failed_[static_cast<std::size_t>(AcquireFailure::LockQuery)].fetch_add(
+            1, std::memory_order_relaxed);
         drop_leadership_locked();
-        connect_locked(); // best-effort; on failure open_ becomes false
+        connect_locked(); // best-effort; on failure open_ becomes false. NOT counted as a
+                          // Connect failure here: the next try_acquire() re-hits the
+                          // `!open_` check above and counts it there.
         return false;
     }
+    // The try-lock was ANSWERED (either verdict): the connection is healthy.
+    note_ok_locked();
     if (PQgetvalue(lock_res.get(), 0, 0)[0] != 't')
-        return false; // another replica holds leadership
+        return false; // another replica holds leadership -- the NORMAL follower
+                      // outcome, deliberately not an acquire failure (WS-11)
 
     // Lock granted: emplace the release guard IMMEDIATELY so the lock cannot
     // leak on any subsequent failure path, then mint + record the new epoch.
@@ -253,6 +298,8 @@ bool LeaderElector::try_acquire() {
     } catch (...) {
         spdlog::error("leader_elector: lock-guard construction threw after the advisory lock was "
                       "granted; closing the coordination connection to release the untracked hold");
+        acquire_failed_[static_cast<std::size_t>(AcquireFailure::LockGuard)].fetch_add(
+            1, std::memory_order_relaxed);
         drop_leadership_locked(); // guard not emplaced (no-op reset) + clears epoch_ + publishes 0
         conn_ = pg::PgConn{};     // finish the connection → session death releases ALL stacked holds
         open_ = false;            // fail closed; next try_acquire() reconnects fresh
@@ -272,12 +319,16 @@ bool LeaderElector::try_acquire() {
         std::vector<std::string>{cfg_.lock_name, cfg_.holder_id});
     if (ep.status() != PGRES_TUPLES_OK || PQntuples(ep.get()) != 1 || PQgetisnull(ep.get(), 0, 0)) {
         spdlog::error("leader_elector: acquired lock but failed to record epoch; releasing");
+        acquire_failed_[static_cast<std::size_t>(AcquireFailure::EpochRecord)].fetch_add(
+            1, std::memory_order_relaxed);
         drop_leadership_locked();
         return false;
     }
     auto parsed = parse_i64(PQgetvalue(ep.get(), 0, 0));
     if (!parsed) {
         spdlog::error("leader_elector: unparseable epoch; releasing");
+        acquire_failed_[static_cast<std::size_t>(AcquireFailure::EpochRecord)].fetch_add(
+            1, std::memory_order_relaxed);
         drop_leadership_locked();
         return false;
     }
@@ -285,8 +336,18 @@ bool LeaderElector::try_acquire() {
     // Publish the minted epoch (slice 3.2, #4013). Minted epochs are >= 1, so a
     // non-zero value unambiguously means "leader at this epoch" to a lock-free
     // reader. Release-ordered to pair with the acquire loads in is_leader/epoch.
+    // The acquisition is counted and the answer stamped BEFORE the publish, so a
+    // lock-free reader that observes the new leadership also observes
+    // acquired >= 1 and a non-zero last_ok (never is_leader=1 with acquired=0).
+    acquired_.fetch_add(1, std::memory_order_relaxed);
+    note_ok_locked();
     live_epoch_.store(*epoch_, std::memory_order_release);
-    spdlog::info("leader_elector: acquired leadership '{}' at epoch {}", cfg_.lock_name, *epoch_);
+    // holder_id (boot-random, not a secret) is logged once per acquire so a
+    // `leader_state.holder_id` row is attributable to a process from its logs
+    // (WS-11: it is deliberately NOT a metric label -- a per-boot value would be
+    // unbounded series churn).
+    spdlog::info("leader_elector: acquired leadership '{}' at epoch {} (holder_id={})",
+                 cfg_.lock_name, *epoch_, cfg_.holder_id);
     return true;
 }
 
@@ -308,10 +369,12 @@ bool LeaderElector::heartbeat() {
     if (!epoch_.has_value())
         return false;
     pg::PgResult live = pg::exec_params(conn_.get(), "SELECT 1", std::vector<std::string>{});
-    if (live.status() == PGRES_TUPLES_OK)
+    if (live.status() == PGRES_TUPLES_OK) {
+        note_ok_locked();
         return true;
+    }
     spdlog::warn("leader_elector: heartbeat failed; dropping leadership");
-    drop_leadership_locked();
+    drop_leadership_locked(LeadershipLoss::LivenessFailed);
     connect_locked(); // best-effort reconnect so a later try_acquire can re-lead
     return false;
 }
@@ -320,7 +383,7 @@ void LeaderElector::resign() {
     std::lock_guard<std::mutex> lk(mu_);
     if (epoch_.has_value())
         spdlog::info("leader_elector: resigning leadership '{}'", cfg_.lock_name);
-    drop_leadership_locked();
+    drop_leadership_locked(LeadershipLoss::Resigned); // counts only if leadership was held
 }
 
 std::string LeaderElector::epoch_fence_sql(const std::string& lock_name, std::int64_t epoch) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# check-elf-floor.sh -- the Linux native-build floor gate (ADR-2003 (Proposed, PR #5631), slice S0).
+# check-elf-floor.sh -- the Linux native-build floor gate (ADR-2003 (Accepted, PR #5631), slice S0).
 #
 # Walks a staging directory, runs `objdump -T` and `readelf -d` over every ELF
 # in it (binaries, plugins, ERTS, crypto.so ...) and compares what each one

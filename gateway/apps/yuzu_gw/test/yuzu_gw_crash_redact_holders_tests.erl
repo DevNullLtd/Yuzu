@@ -229,7 +229,7 @@ other_agent_child_unchanged() ->
 
 init(agent_sup) ->
     {ok, {#{strategy => simple_one_for_one, intensity => 0, period => 1},
-          [#{id => agent, start => {yuzu_gw_agent, start_link, []}, restart => temporary,
+          [#{id => agent, start => {yuzu_gw_agent, start_link_async, []}, restart => temporary,
              shutdown => 5000, type => worker}]}}.
 
 %%%===================================================================

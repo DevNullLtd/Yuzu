@@ -117,13 +117,13 @@
 /// but "grounded" is not "measured byte-for-byte": two different kinds of
 /// reasoning appear beside the exact matches, and BOTH are reasoned rather
 /// than measured. (1) MEASURED-PLUS-MARGIN (`ca_import_chain_dashboard`,
-/// `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`,
+/// `plugin_trust_bundle`, `echo_dashboard_sql`, `echo_result_set_sql`,
 /// `instruction_yaml`): a real handler-level check exists and is cited, but
 /// the pre-routing gate checks the RAW body while the handler checks a
 /// DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-
 /// extracted), so the cap adds an explicit margin over the handler's own
 /// number instead of mirroring it — getting this wrong rejects legitimate
-/// traffic, which is exactly what happened to the two TAR entries before
+/// traffic, which is exactly what happened to the two Echo entries before
 /// this fix (see their comments). (2) JUDGMENT CALL, NO CONTRACT
 /// (`guardian_rule_authoring`, `workflow_yaml`, `product_pack_yaml`,
 /// `instruction_import`, `nvd_match`): no aggregate size contract is defined
@@ -360,7 +360,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     {"POST", "/api/v1/definitions/", 64u * 1024, false, "response_templates"},
     {"PUT", "/api/v1/definitions/", 64u * 1024, false, "response_templates"},
 
-    // POST /api/dashboard/tar-execute — TAR warehouse SQL query, HTMX form
+    // POST /api/dashboard/echo-execute — Echo warehouse SQL query, HTMX form
     // fields `sql` + `scope` (dashboard_routes.cpp:866 `sql.size() > 4096`
     // check on the FORM-DECODED value). The #2407-as-shipped 4096-byte cap
     // capped the RAW body at the SAME number the handler checks against the
@@ -379,11 +379,11 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // "group:<name>", short, but nothing bounds it today) = 12288 + 4096 =
     // 16384 bytes exactly. Reasoned margin, not a byte-for-byte measurement
     // — same category as the CA/plugin-trust dashboard classes below.
-    {"POST", "/api/dashboard/tar-execute", 16u * 1024, false, "tar_dashboard_sql"},
+    {"POST", "/api/dashboard/echo-execute", 16u * 1024, false, "echo_dashboard_sql"},
 
-    // POST /api/v1/result-sets/from-tar-query — TAR result-set SQL, JSON
+    // POST /api/v1/result-sets/from-echo-query — Echo result-set SQL, JSON
     // body (rest_api_v1.cpp:6802, `sql.size() > 100000` check on the JSON-
-    // PARSED `sql` field). Same unit mismatch as tar_dashboard_sql above,
+    // PARSED `sql` field). Same unit mismatch as echo_dashboard_sql above,
     // with almost no headroom to hide it: the old 102400-byte cap left only
     // 2400 bytes over the handler's 100000-character check to absorb JSON
     // string-escaping (quotes, backslashes, and control characters expand
@@ -403,8 +403,8 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // decoded `sql` value is still <=100000 characters passes here and is
     // then decided by the handler's own check, as intended; a raw body over
     // 204800 bytes never reaches the handler at all.
-    {"POST", "/api/v1/result-sets/from-tar-query", 200u * 1024, false,
-     "tar_result_set_sql"},
+    {"POST", "/api/v1/result-sets/from-echo-query", 200u * 1024, false,
+     "echo_result_set_sql"},
 
     // POST /api/v1/guaranteed-state/rules — Guardian rule authoring
     // (rest_api_v1.cpp:7759 handler start; :7842 the legacy path that
@@ -467,7 +467,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // `validate_yaml_source` -> `instruction_yaml::validate_definition_yaml`, which hard-rejects
     // `yaml_source.size() > 1048576` at instruction_yaml.cpp:165 (the exact
     // 1 MiB decoded-value contract create/update also enforce). This is the
-    // SAME raw-vs-decoded shape as tar_dashboard_sql (C1) — the pre-routing
+    // SAME raw-vs-decoded shape as echo_dashboard_sql (C1) — the pre-routing
     // gate sees the percent-encoded RAW body, the handler checks the
     // DECODED `yaml_source` value — so the cap must NOT mirror 1048576
     // directly (the #2407-as-shipped defect this table already paid for

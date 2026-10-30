@@ -620,7 +620,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
             // `version` PRESENT (not merely non-empty) and treats "" as the valid
             // "unknown version" bucket, never "unfiltered" — so the `(no version)`
             // row gets the affordance too (the ONLY bucket Linux procperf ever
-            // reports, tar_proc_perf.cpp).
+            // reports, echo_proc_perf.cpp).
             const std::string devices_qs =
                 "app=" + url_encode(app_name) + "&amp;version=" + url_encode(v.version);
             devices_cell += " <a style=\"cursor:pointer\" class=\"gp-mute\" "

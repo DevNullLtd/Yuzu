@@ -13,6 +13,7 @@ Each regular author owns a thousand-block. Pick the next free number **inside yo
 | `2xxx` | Fraser Jarvis (@fjarvis) |
 | `3xxx` | Alex Young (@Doomgoose) |
 | `4xxx` | Andy Younie (@lesault) |
+| `6xxx` | Liam Somerville (@liamsomerville) |
 
 Not on the list? Use `0xxx` (platform) or ask for a block.
 

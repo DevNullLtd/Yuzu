@@ -142,14 +142,15 @@ TEST_CASE("pkg_inventory: status row is supported+dash when nothing failed, cons
     // (emit_result) and is proven end to end by the seam cases in
     // test_pkg_inventory_macos_parsers.cpp; this pins the formatter and the
     // accumulator's exact-string dedupe + comma join.
-    CHECK(pi::format_status_row("managers", pi::StatusLevel::supported, "") ==
+    CHECK(yuzu::shared::format_status_row("managers", yuzu::shared::StatusLevel::supported, "") ==
           "status|managers|supported|-");
 
     yuzu::shared::ConstraintAccumulator bad;
     bad.add_failure("macos:homebrew_cellar:permission_denied");
     bad.add_failure("macos:homebrew_cellar:permission_denied"); // exact-string dedupe
     bad.add_failure("macos:homebrew_taps:entry_cap");
-    CHECK(pi::format_status_row("packages", pi::StatusLevel::constrained, bad.reason()) ==
+    CHECK(yuzu::shared::format_status_row("packages", yuzu::shared::StatusLevel::constrained,
+                                          bad.reason()) ==
           "status|packages|constrained|"
           "macos:homebrew_cellar:permission_denied,macos:homebrew_taps:entry_cap");
 
@@ -229,7 +230,8 @@ TEST_CASE("pkg_inventory: a trailing backslash or pipe in an OS value never shif
     CHECK(pf[3] == "1\\|2/"); // the pipe survives as ONE escaped field character
     CHECK(pf[4] == "cask");
 
-    const auto status = pi::format_status_row("managers", pi::StatusLevel::constrained, "a\\");
+    const auto status =
+        yuzu::shared::format_status_row("managers", yuzu::shared::StatusLevel::constrained, "a\\");
     CHECK(split_wire(status).size() == 4);
 }
 

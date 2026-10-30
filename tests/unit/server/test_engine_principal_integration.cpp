@@ -441,7 +441,7 @@ TEST_CASE("RBAC engine resolution: assignment, default-deny, and the admin bar",
     // F2 (Hermes pass-2 MEDIUM, worst finding): an 'engine:'-prefixed
     // principal_id must only ever be assigned under principal_type=="engine"
     // — otherwise a caller could mint a shadow ('user','engine:x',role) row
-    // that collect_roles_locked's user arm would match, silently attributing
+    // that collect_roles's user arm would match, silently attributing
     // an engine identity's permissions to a "user" lookup.
     SECTION("assign_role rejects an 'engine:'-prefixed principal_id under principal_type=='user'") {
         auto r = store.assign_role({"user", "engine:vuln", "EngineReader"});

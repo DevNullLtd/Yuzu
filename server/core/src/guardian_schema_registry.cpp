@@ -2,6 +2,7 @@
 
 #include "guardian_schema_registry.hpp"
 
+#include "content_etag.hpp"
 #include "guardian_resilience_schema.hpp"
 
 #include <yuzu/guardian_file_hash_limits.hpp> // kMaxFileHashBytes (#2233 item 6)
@@ -293,19 +294,6 @@ json build_catalog() {
          "master gate; remediation.type is the authored action."},
         {"schemas", std::move(schemas)},
     };
-}
-
-// FNV-1a 64-bit over the serialised catalog → a strong, content-derived ETag so a
-// schema edit invalidates caches automatically (no manual version bump needed).
-std::string content_etag(const std::string& body) {
-    std::uint64_t h = 1469598103934665603ull;
-    for (unsigned char c : body) {
-        h ^= c;
-        h *= 1099511628211ull;
-    }
-    char buf[19];
-    int n = std::snprintf(buf, sizeof(buf), "\"%016llx\"", static_cast<unsigned long long>(h));
-    return std::string(buf, static_cast<std::size_t>(n));
 }
 
 } // namespace

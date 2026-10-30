@@ -77,7 +77,7 @@ flowchart LR
 ### Where the data goes
 
 - **Instruction result.** <store, retention, API>
-- **Not consumed by** <daily-sync, TAR, DEX, metrics>.
+- **Not consumed by** <daily-sync, Echo, DEX, metrics>.
 - **Sensitivity.** <what in the rows could identify a device, a person or installed software, or "nothing beyond the device id">.
 - **Siblings:** <related definitions>.
 

@@ -8,7 +8,7 @@
  * remote_port) — so network_diag and ioc can migrate off their `lsof`
  * shell-outs onto rung 1 (ADR-3002) without a third hand-rolled copy.
  *
- * netstat_plugin.cpp and tar_network_collector.cpp's macOS enumerators now
+ * netstat_plugin.cpp and echo_network_collector.cpp's macOS enumerators now
  * both consume this header directly (#3403 dedupe, PR3.1-b) — the former
  * inline copies are gone, so this is the single macOS socket-walk
  * implementation in the tree. sockwho_plugin.cpp's own copy was retired

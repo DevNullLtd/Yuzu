@@ -325,6 +325,15 @@ class Splicing(unittest.TestCase):
         self.assertEqual(once, twice)
 
 
+class HowItWorksSubsections(unittest.TestCase):
+    def test_subsections_and_fenced_headings(self):
+        readme = ("## How it works\n\nLead.\n\n```mermaid\nflowchart LR\n  A-->B\n```\n\n"
+                  "### Detail\n\nMore.\n\n```text\n## not a heading\n```\n\n"
+                  "## OS capability\n\nNext.\n")
+        self.assertEqual(g.hand_sections_to_manifest(readme)["how_it_works"],
+                         "Lead.\n\n### Detail\n\nMore.")
+
+
 class HandSections(unittest.TestCase):
     def test_sections_split_and_manifest_shape(self):
         sec = g.split_sections(README)
@@ -466,6 +475,18 @@ class ColumnDocKeys(unittest.TestCase):
     def test_values_only_on_string_columns(self):
         with self.assertRaisesRegex(ValueError, "only meaningful on a string column"):
             g.parse_definition_docs(self._doc({"name": "n", "type": "int64", "values": [1, 2]}), "p.yaml")
+
+    def test_discriminator_is_a_boolean_on_the_first_string_column_only(self):
+        with self.assertRaisesRegex(ValueError, "`discriminator` must be a boolean"):
+            g.parse_definition_docs(self._doc({"name": "c", "type": "string", "discriminator": "true"}), "p.yaml")
+        with self.assertRaisesRegex(ValueError, "only meaningful on a string column"):
+            g.parse_definition_docs(self._doc({"name": "c", "type": "int64", "discriminator": True}), "p.yaml")
+        later = self._doc({"name": "a", "type": "string"})
+        later[0]["spec"]["result"]["columns"].append({"name": "b", "type": "string", "discriminator": True})
+        with self.assertRaisesRegex(ValueError, "x.a.b: `discriminator` is only meaningful on the first column"):
+            g.parse_definition_docs(later, "p.yaml")
+        ok = g.parse_definition_docs(self._doc({"name": "c", "type": "string", "discriminator": True}), "p.yaml")
+        self.assertNotIn("discriminator", ok[0].columns[0])  # behavioural, not documentation: not emitted
 
     def test_well_formed_keys_pass(self):
         defs = g.parse_definition_docs(self._doc({"name": "c", "type": "string", "values": ["a", "b"],

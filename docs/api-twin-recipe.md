@@ -55,13 +55,15 @@ a review question into a compile-time impossibility.
 
 ### The exemplar: `discover_routes.{hpp,cpp}`
 
-`server/core/src/discover_routes.hpp` (158 lines) declares five pure builder functions —
+`server/core/src/discover_routes.hpp` declares six pure builder functions —
 `build_permissions_catalog`, `build_instructions_catalog`, `build_routes_catalog`,
-`scope_kinds_catalog`, `build_plugins_catalog` — each taking only the store/registry it needs and
-returning a `DiscoveryDoc { std::string json; std::string etag; }`. The file header states the
-intent explicitly:
+`scope_kinds_catalog`, `plugin_docs_catalog`, `build_plugins_catalog` — each taking only the
+store/registry it needs and returning a `DiscoveryDoc { std::string json; std::string etag; }`.
+`DiscoveryDoc` and the one builder declared outside `discover_routes.hpp`, `build_routes_catalog`,
+are declared in `server/core/src/discover_catalog_types.hpp`, which `discover_routes.hpp`
+re-includes; the other five stay in `discover_routes.hpp`. The file header states the intent explicitly:
 
-> "The five builder functions (`build_*_catalog`) are pure — no I/O beyond reading the
+> "The six builder functions (`build_*_catalog`) are pure — no I/O beyond reading the
 > store/registry pointer passed in — and are declared here specifically so `mcp_server.cpp` can
 > call the SAME functions for the mirrored `discover_*` MCP tools... REST and MCP therefore cannot
 > drift from each other by construction."
@@ -204,6 +206,29 @@ audit verb, full `parameters`, and every realistic `responses` status (200/400/4
 `Sec-Audit-Failed` header block on any audited route — see the `"/network/devices"` path item for
 the header-documentation shape).
 
+Three more things the entry must carry, because the served document is read by code generators
+and by the `/swagger` page as well as by people:
+
+- **`operationId`.** Every operation has one, unique across the document: the lower-case method,
+  then the path (without the `/api/v1` base) in PascalCase, with each path parameter written as
+  `By` plus its name. `GET /hardware/{id}` is `getHardwareById`, `POST /hardware/{id}/sync` is
+  `postHardwareByIdSync`, `DELETE /upload-grants/{grant_id}` is `deleteUploadGrantsByGrantId`. A
+  new operation follows the same rule. Two tests in `tests/unit/server/test_openapi_spec_completeness.cpp`
+  check uniqueness: `openapi_spec_json(): every operation has a unique and well-formed operationId`
+  (which also checks presence and shape) and `openapi documents: every operation has a unique
+  operationId in both forms`.
+- **Group guides.** Prose for a group lives in the guide of the matching top-level `tags` entry
+  under `x-yuzu-guide`, not inside an operation. `GET /api/v1/openapi.json` leaves the guides out
+  and `?guides=true` includes them; the MCP resource `yuzu://openapi` and the discover tools serve
+  only the form without them.
+- **Unserved routes.** An operation that is documented but not registered on a running server,
+  because the store behind it is not started, carries an `x-yuzu-unavailable` string on the
+  operation saying so. The `/swagger` page labels such operations unavailable, and the route
+  catalog (`GET /api/v1/discover/routes`, MCP `discover_routes`) repeats the string as an
+  `unavailable` field on that row. A route that is registered must not carry it. When a store
+  becomes wired in `server.cpp`, remove its markers in the same change:
+  `tests/test_unavailable_store_wiring.py` fails if they disagree.
+
 **The `ecosystem` tokens.** Three placeholders in the literal are expanded once, on first use, by
 `expand_ecosystem_tokens()`: `"@@ECOSYSTEM_ENUM@@"` (the software routes),
 `"@@ECOSYSTEM_ENUM_OR_EMPTY@@"` (routes where a present-empty value selects rows with no
@@ -336,7 +361,14 @@ so the record is not a single point of truth: keep the two in step. (A confined 
    different cases; a tripwire, not a proof). A brand-new `mcp_tools_<domain>.cpp` also sets
    `MIN_REGISTRY_FILES` (an exact count) in `scripts/ci/check-api-parity.py` and `kRegistryDomainFiles`
    in `tests/unit/server/test_mcp_dispatch_coverage.cpp`, and a new `mcp_tool*.hpp` sets
-   `kToolHeaderFiles` there, in the same change.
+   `kToolHeaderFiles` there, in the same change. The seam-closure CI gate
+   (`scripts/ci/check-seam-closure.py`, "MCP registry lane") additionally include-closure-checks every
+   `mcp_tools_*.cpp`, the three shared `mcp_tool*.hpp` headers and the seven store-free `*_types.hpp`
+   headers against its store-header patterns, pins the file count (`MCP_REGISTRY_EXPECTED_TU_COUNT`, with
+   `EXPECTED_MCP_REGISTRY_TU_COUNT` and `EXPECTED_MCP_REGISTRY_CPPS` in its self-test — and
+   `MCP_REGISTRY_HEADERS` / `MCP_REGISTRY_TYPES_HEADERS` for a new shared or types header — which also
+   cross-checks the count against `MIN_REGISTRY_FILES` and `kRegistryDomainFiles`), and checks that each
+   `<domain>_tool_records()` accessor declared in `mcp_tool_registry.hpp` has its `mcp_tools_<domain>.cpp`.
 
 What rejects a mistake: building the catalogue (first done in the `ServerImpl` constructor, so it
 applies under `--mcp-disable` too) throws `std::logic_error` naming the record for a null handler, a
@@ -353,18 +385,21 @@ cannot scan, and the retry-hints check also fails closed on a missing `handle_<n
 
 **Limits, stated plainly.** A handler gets no store, registry or agent access. What it can reach is
 `ctx.deps`, a `ToolDeps` (`mcp_tool_deps.hpp`) of provider closures: the `fleet_read_fn` gate, the
-domain-verb `audit_fn`, and the same roster, CI-detail, DEX-score and quarantine-list closures the REST
-`HardwareRoutes` receives (one instance wired into both in `server.cpp`), so a twin reuses the route's
-composition instead of re-deriving it from a store. `ctx.deps` is `nullptr` when unwired and each closure
+domain-verb `audit_fn`, the same roster, CI-detail, DEX-score and quarantine-list closures the REST
+`HardwareRoutes` receives (one instance wired into both in `server.cpp`), and the `/crypto` closures (five
+forwards to the `CryptoApi` instance `CryptoRoutes` serves, `crypto_access_fn`, and `username_fn`, which
+re-resolves the caller's username from the request because the registry path carries no session), so a
+twin reuses the route's composition instead of re-deriving it from a store. `ctx.deps` is `nullptr` when unwired and each closure
 may be empty: a handler checks both and answers an internal error, never an empty result. A tool that
-needs a store, `AgentRegistry` or a write-capable callable (other than the audit-row writer `audit_fn`) still belongs on the legacy path, and a lexical
+needs a store, `AgentRegistry` or a write-capable callable (other than the audit-row writer `audit_fn` and a closure meeting the criterion in `mcp_tool_deps.hpp`: a pure forward of the REST twin's own `*Api` method, the gate stays central, the handler audits "attempted" first and refuses to run without a sink) still belongs on the legacy path, and a lexical
 test fails an `mcp_tools_*.cpp` that includes a `*_store.hpp`, `agent_registry.hpp`, `mcp_server.hpp`,
 `auth_db*` or `pg/` header. Tools are compiled in-tree with no runtime or plugin registration, and a fork adding a domain file must edit
 `registered_tool_records()` itself. **Served order:** `tools/list` lists the merged legacy and registry
 tools in tool-name order (sorted once in `build_catalogue`), so a migration does not move a tool; clients
 key by name, and `tools/list` advertises `listChanged:false`. The legacy path above remains valid, and is
-the only path for every tool not yet moved (the first moved tool is `discover_routes`, in
-`mcp_tools_discovery.cpp`); #2422 is not closed by this seam alone.
+the only path for every tool not yet moved (`discover_routes`, in `mcp_tools_discovery.cpp`, was the first;
+the seven `/crypto` tools, in `mcp_tools_crypto.cpp`, are the pilot carve of the multi-family
+`mcp_server.cpp`); #2422 is not closed by this seam alone.
 
 ### Tier vs RBAC — and the lesson already paid for once
 

@@ -992,9 +992,10 @@ TEST_CASE("same-site pipeline: oversized and control-byte headers are refused wi
     expect_admitted(f, "POST", kCanary, {{"Cookie", kCookieOk}, {"Origin", f.origin()}});
 }
 
-#endif // YUZU_TSAN_BUILD
-
 // -- Guarded reads -----------------------------------------------------------------------------
+// Inside the TSan guard like everything above: these cases build the same `Pipeline` fixture, so
+// they cannot sit after the guard's `#endif` (#6419). tests/test_tsan_whole_file_guard.py fails
+// the docs-suite gate if code is ever added after that `#endif`.
 
 TEST_CASE("same-site pipeline: a guarded read with cross-site fetch metadata is refused",
           "[csrf][same_site][pipeline]") {
@@ -1166,3 +1167,5 @@ TEST_CASE("same-site pipeline: near-miss spellings of a table path never reach t
     }
 }
 #endif
+
+#endif // YUZU_TSAN_BUILD

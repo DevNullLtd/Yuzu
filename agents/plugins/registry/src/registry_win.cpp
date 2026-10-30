@@ -9,8 +9,10 @@
  * reports REG_CREATED_NEW_KEY / REG_OPENED_EXISTING_KEY; every key is removed by NtDeleteKey on its own
  * handle (ntdll, resolved with GetProcAddress, fail-closed when missing: the
  * agents/core/src/confined_fs_win.cpp precedent), never RegDeleteTreeW, which FOLLOWS a registry link
- * found inside the tree (measured 2026-10-19); RegSetValueExW's cbData includes a string type's
- * terminating NUL. The whole dispatch runs in one try/catch(...): this is the frozen plugin ABI seam.
+ * found inside the tree (measured 2026-10-19): a recursive delete is the core's post-order walk;
+ * RegSetValueExW's cbData includes a string type's terminating NUL; RegFlushKey writes a hive to its file,
+ * which the per-user write arm calls before the unload because RegUnLoadKeyW does not itself modify the
+ * file. The whole dispatch runs in one try/catch(...): this is the frozen plugin ABI seam.
  */
 #include "registry_core.hpp"
 
@@ -29,13 +31,11 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
-#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <format>
 #include <iterator>
-#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -58,6 +58,7 @@ static_assert(kErrorAccessDenied == ERROR_ACCESS_DENIED);
 static_assert(kErrorNotSupported == ERROR_NOT_SUPPORTED);
 static_assert(kErrorMoreData == ERROR_MORE_DATA);
 static_assert(kErrorNoMoreItems == ERROR_NO_MORE_ITEMS);
+static_assert(kErrorInvalidData == ERROR_INVALID_DATA);
 static_assert(kErrorKeyDeleted == ERROR_KEY_DELETED);
 static_assert(kKeyQueryValue == KEY_QUERY_VALUE);
 static_assert(kKeySetValue == KEY_SET_VALUE);
@@ -70,6 +71,7 @@ static_assert(yuzu::profiles::kRegBinary == REG_BINARY);
 static_assert(yuzu::profiles::kRegDword == REG_DWORD);
 static_assert(yuzu::profiles::kRegMultiSz == REG_MULTI_SZ);
 static_assert(yuzu::profiles::kRegQword == REG_QWORD);
+static_assert(kMaxWriteBytes == yuzu::win::kMaxRegValueBytes); // one bound for every value read in the plugin
 
 using yuzu::win::from_wide;
 using yuzu::win::to_wide;
@@ -114,6 +116,9 @@ template <class F> [[nodiscard]] F ntdll_proc(const char* symbol) {
 
 /// NtQueryKey(KeyNameInformation) of an open key as UTF-8. A failure of any kind, STATUS_BUFFER_OVERFLOW
 /// (a name past the 4 KiB buffer) included, is non-zero and leaves `out` empty: a half name is never compared.
+/// A name holding a lone surrogate or a NUL fails closed the same way (ERROR_INVALID_DATA): from_wide would convert
+/// it lossily (U+FFFD, one trailing NUL dropped), and the compare against the requested path must never run on an
+/// approximation of the kernel's name.
 [[nodiscard]] long query_key_name(HKEY key, std::string& out) {
     out.clear();
     static const NtQueryKeyFn fn = ntdll_proc<NtQueryKeyFn>("NtQueryKey");
@@ -130,6 +135,7 @@ template <class F> [[nodiscard]] F ntdll_proc(const char* symbol) {
     // needs), and the bytes were written by the kernel, not through another C++ object.
     const auto* name = reinterpret_cast<const wchar_t*>(buf + sizeof name_bytes);
     const std::size_t n = name_bytes / sizeof(wchar_t);
+    if (!kernel_name_well_formed(std::wstring_view{name, n})) return ERROR_INVALID_DATA;
     if (std::all_of(name, name + n, [](wchar_t c) { return c > 0 && c < 0x80; })) { // the usual name: no NLS call
         out.resize(n);
         std::transform(name, name + n, out.begin(), [](wchar_t c) { return static_cast<char>(c); });
@@ -137,6 +143,17 @@ template <class F> [[nodiscard]] F ntdll_proc(const char* symbol) {
         out = from_wide(name, static_cast<int>(n));
     }
     return out.empty() ? static_cast<long>(ERROR_INVALID_DATA) : static_cast<long>(ERROR_SUCCESS);
+}
+
+/// The name RegEnumValueW / RegEnumKeyExW wrote (`len` units, no NUL) as UTF-8 into `out`. `require_exact`: a name
+/// that is not well-formed UTF-16 (validated on the raw, length-delimited units BEFORE from_wide, which would map a lone
+/// surrogate to U+FFFD) or that fails to convert is ERROR_INVALID_DATA and `out` is left as it was.
+[[nodiscard]] long enumerated_name(const wchar_t* buf, DWORD len, bool require_exact, std::string& out) {
+    if (require_exact && !kernel_name_well_formed(std::wstring_view{buf, len})) return ERROR_INVALID_DATA;
+    std::string name = from_wide(buf, static_cast<int>(len));
+    if (require_exact && len != 0 && name.empty()) return ERROR_INVALID_DATA;
+    out = std::move(name);
+    return ERROR_SUCCESS;
 }
 
 /// The kernel name of a predefined root, read once per process (a function-local static per root):
@@ -268,20 +285,18 @@ public:
         return RegDeleteValueW(as_hkey(key), wname.c_str());
     }
 
-    long enum_value(Handle key, std::uint32_t index, std::string& name) override {
+    long enum_value(Handle key, std::uint32_t index, std::string& name, bool require_exact = false) override {
         wchar_t buf[16384]; // a value name is at most 16,383 characters
         DWORD len = static_cast<DWORD>(std::size(buf));
         const LSTATUS rc = RegEnumValueW(as_hkey(key), index, buf, &len, nullptr, nullptr, nullptr, nullptr);
-        if (rc == ERROR_SUCCESS) name = from_wide(buf, static_cast<int>(len));
-        return rc;
+        return rc == ERROR_SUCCESS ? enumerated_name(buf, len, require_exact, name) : rc;
     }
 
-    long enum_subkey(Handle key, std::uint32_t index, std::string& name) override {
+    long enum_subkey(Handle key, std::uint32_t index, std::string& name, bool require_exact = false) override {
         wchar_t buf[256]; // a key name is at most 255 characters
         DWORD len = static_cast<DWORD>(std::size(buf));
         const LSTATUS rc = RegEnumKeyExW(as_hkey(key), index, buf, &len, nullptr, nullptr, nullptr, nullptr);
-        if (rc == ERROR_SUCCESS) name = from_wide(buf, static_cast<int>(len));
-        return rc;
+        return rc == ERROR_SUCCESS ? enumerated_name(buf, len, require_exact, name) : rc;
     }
 
     long delete_key_by_handle(Handle key) noexcept override {
@@ -290,6 +305,8 @@ public:
         const LONG status = fn(reinterpret_cast<HANDLE>(key));
         return status >= 0 ? static_cast<long>(ERROR_SUCCESS) : nt_failure_code(status); // NT_SUCCESS
     }
+
+    long flush_key(Handle key) override { return RegFlushKey(as_hkey(key)); }
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -297,20 +314,6 @@ public:
 // emit_lines (registry_core.hpp): a sink failure after the real audit line must not add the fixed one.
 int emit(yuzu::CommandContext& ctx, const ActionOutput& out) {
     return emit_lines(ctx, out);
-}
-
-// L7: log access to sensitive registry paths for the agent log. The key is request-supplied and not yet validated,
-// so it is logged through sanitize_field (a CR or LF in it must not forge an agent-log line).
-void audit_sensitive_path(std::string_view hive, std::string_view key_path) {
-    if (hive != "HKLM") return;
-    const auto starts_ci = [&](std::string_view upper_prefix) { // ASCII upper-cased prefix match, no copy of the key
-        return key_path.size() >= upper_prefix.size() &&
-               std::equal(upper_prefix.begin(), upper_prefix.end(), key_path.begin(), [](char p, char c) {
-                   return p == static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-               });
-    };
-    if (starts_ci("SOFTWARE\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\RUN") || starts_ci("SYSTEM\\CURRENTCONTROLSET\\SERVICES"))
-        spdlog::info("Registry: accessing sensitive path HKLM\\{}", sanitize_field(key_path));
 }
 
 struct Target {
@@ -323,23 +326,25 @@ struct Target {
 std::optional<Target> parse_target(yuzu::CommandContext& ctx, yuzu::Params params) {
     const auto hive = params.get("hive");
     const auto key = params.get("key");
-    if (hive.empty() || key.empty()) {
-        ctx.write_output("error|missing required parameters: hive, key");
+    const auto p = resolve_target(hive, key);
+    if (!p) {
+        ctx.write_output(p.error());
         return std::nullopt;
     }
-    const auto h = parse_hive(hive);
-    if (!h) {
-        ctx.write_output("error|invalid hive (use HKLM, HKCU, HKCR, or HKU)");
-        return std::nullopt;
-    }
-    audit_sensitive_path(hive, key);
-    return Target{*h, key, fast_open_hive(*h)};
+    // L7: the key is request-supplied and not yet validated, so it is logged through sanitize_field (a CR or LF in
+    // it must not forge an agent-log line).
+    if (is_sensitive_hklm_path(hive, key))
+        spdlog::info("Registry: accessing sensitive path HKLM\\{}", sanitize_field(key));
+    return Target{*p, key, fast_open_hive(*p)};
 }
 
-/// A refused single action: the audit line and `error|<token>` with rc 1.
-int refuse(yuzu::CommandContext& ctx, const AuditRecord& base, std::string_view reason, bool is_delete_key = false) {
+/// A refused single action: the audit line and `error|<token>` with rc 1. `dry_run` is the request's own flag (when it
+/// parsed), which delete_key's audit line and `dry_run|` row report even for a refusal.
+int refuse(yuzu::CommandContext& ctx, const AuditRecord& base, std::string_view reason, bool is_delete_key = false,
+           bool dry_run = false) {
     WriteOutcome o;
     o.reason = std::string{reason};
+    o.dry_run = dry_run;
     return emit(ctx, render_single_action(base, o, is_delete_key));
 }
 
@@ -367,13 +372,18 @@ int do_get_value(yuzu::CommandContext& ctx, yuzu::Params params) {
         return 1;
     }
 
-    // The whole value, as before (no size bound: get_value's output for existing callers is unchanged);
-    // only the acquisition is the shared guarded read.
-    constexpr std::size_t kWhole = (std::numeric_limits<std::uint32_t>::max)();
+    // The shared guarded read, bounded at kMaxWriteBytes (the bound get_user_value and the write path use): a larger
+    // value is reported by size alone (q.bytes stays empty) and refused, never read whole into memory three times
+    // (the bytes, the hex string, the sanitised copy).
     const Wide wname{val_name};
     QueryResult q;
-    if (query_value_bounded(kWhole, raw_query(opened.get(), wname.c_str()), q, kWhole) != ERROR_SUCCESS) {
-        ctx.write_output("error|value not found");
+    if (const long rc = query_value_bounded(kMaxWriteBytes, raw_query(opened.get(), wname.c_str()), q, kMaxWriteBytes);
+        rc != ERROR_SUCCESS) {
+        ctx.write_output(get_value_error_line(rc, t.key));
+        return 1;
+    }
+    if (q.size > kMaxWriteBytes) {
+        ctx.write_output(yuzu::profiles::render_user_key_error(yuzu::profiles::UserKeyStatus::value_oversized, t.key));
         return 1;
     }
     const DWORD type = q.type;
@@ -449,7 +459,7 @@ int do_enumerate_values(yuzu::CommandContext& ctx, yuzu::Params params) {
     return 0;
 }
 
-// ── per-user hive reads ──────────────────────────────────────────────
+// ── per-user hive reads and writes ───────────────────────────────────
 
 struct ResolvedProfile {
     std::string sid;
@@ -457,9 +467,10 @@ struct ResolvedProfile {
     std::string profile_path;
 };
 
-/// PR1.7: resolves the target profile via ProfileList (username or an explicit sid). Writes its own
-/// `error|...` line and returns false on a miss.
-bool resolve_profile(yuzu::CommandContext& ctx, yuzu::Params params, ResolvedProfile& out) {
+/// PR1.7: resolves the target profile via ProfileList (username or an explicit sid), shared by the per-user read and
+/// write actions. Writes its own `error|...` line and returns false on a miss. A write never resolves a `<SID>.bak`
+/// leftover (its folder may hold the user's real hive and its name can shadow the live profile's): for those it is a miss.
+bool resolve_profile(yuzu::CommandContext& ctx, yuzu::Params params, ResolvedProfile& out, bool for_write) {
     const auto username = params.get("username");
     const auto sid_param = params.get("sid");
     if (username.empty() && sid_param.empty()) {
@@ -478,7 +489,8 @@ bool resolve_profile(yuzu::CommandContext& ctx, yuzu::Params params, ResolvedPro
         return false;
     }
     const auto hku_subkeys = yuzu::win::enumerate_hku_subkeys();
-    const auto profile_list = yuzu::profiles::build_profile_list(records, hku_subkeys);
+    auto profile_list = yuzu::profiles::build_profile_list(records, hku_subkeys);
+    if (for_write) yuzu::profiles::remove_backup_entries(profile_list);
 
     if (!sid_param.empty()) {
         // Membership in the enumerated, non-system profile list is both necessary and sufficient:
@@ -520,7 +532,7 @@ bool resolve_profile(yuzu::CommandContext& ctx, yuzu::Params params, ResolvedPro
 // absent one.
 int do_get_user_value(yuzu::CommandContext& ctx, yuzu::Params params) {
     ResolvedProfile prof;
-    if (!resolve_profile(ctx, params, prof)) return 1;
+    if (!resolve_profile(ctx, params, prof, /*for_write=*/false)) return 1;
     const auto key = params.get("key");
     const auto val_name = params.get("name");
 
@@ -600,37 +612,6 @@ int do_list_profiles(yuzu::CommandContext& ctx, yuzu::Params) {
 
 // ── mutating single actions ──────────────────────────────────────────────
 
-/// The front half of set_value: validate, encode, and record the type and new bytes on the audit record.
-/// `err` is empty on success.
-struct PreparedSet {
-    std::string_view err;
-    std::optional<std::uint32_t> type;
-    Encoded enc;
-};
-
-PreparedSet prepare_set(AuditRecord& au, std::string_view key, std::string_view name, std::string_view type_str,
-                        std::string_view value, std::string_view data_hex) {
-    if (type_str.empty()) type_str = "REG_SZ";
-    au.type_name = std::string{type_str};
-    PreparedSet p;
-    p.err = validate_key_path(key);
-    if (p.err.empty()) p.err = validate_value_name(name);
-    p.type = parse_reg_type(type_str);
-    if (p.err.empty() && !p.type) p.err = kTokInvalidType;
-    if (p.err.empty()) {
-        // On the string-map actions an empty data_hex is the same as an absent one.
-        p.enc = encode_value(*p.type, value, data_hex, !data_hex.empty());
-        p.err = p.enc.error;
-    }
-    if (p.err.empty()) {
-        au.len = static_cast<long long>(p.enc.bytes.size());
-        au.new_bytes = p.enc.bytes;
-        au.new_total = p.enc.bytes.size();
-        au.has_new = true;
-    }
-    return p;
-}
-
 int do_set_value(yuzu::CommandContext& ctx, yuzu::Params params) {
     const auto target = parse_target(ctx, params);
     if (!target) return 1;
@@ -666,11 +647,89 @@ int do_delete_key(yuzu::CommandContext& ctx, yuzu::Params params) {
     if (!target) return 1;
     const Target& t = *target;
     const AuditRecord au = base_record("delete_key", t, {});
-    if (const auto err = validate_key_path(t.key); !err.empty()) return refuse(ctx, au, err, true);
+    const auto recursive = parse_bool_param(params.get("recursive"), false);
+    const auto dry_run = parse_bool_param(params.get("dry_run"), false);
+    std::string_view err = validate_key_path(t.key);
+    if (err.empty() && (!recursive || !dry_run)) err = kTokInvalidData; // neither flag is guessed at
+    if (!err.empty()) return refuse(ctx, au, err, true, dry_run.value_or(false));
 
     Win32Registry reg;
-    const auto o = delete_key_tree(reg, as_handle(hive_root(t.hive)), t.key, t.fast);
+    const auto o = delete_key_tree(reg, as_handle(hive_root(t.hive)), t.key, t.fast, *recursive, *dry_run);
     return emit(ctx, render_single_action(au, o, true));
+}
+
+/// set_user_value / delete_user_value: the core write on the root of the target's hive, through the UNCHANGED
+/// with_user_hive ladder (live HKU\<SID> first, else the offline NTUSER.DAT mount under the process-wide
+/// offline_hive_mutex with the DEFAULT-ON hive-file guard: no custom check, so no deadline). The core runs the WALK on
+/// the hive root (root_name answers NOT_SUPPORTED for a non-predefined root, so no fast open), and on the offline arm
+/// flushes the written key before the unload. `fn` runs under the offline lock: it never re-enters with_user_hive. The
+/// post-unload probe is the pure classify_offline_write_race's input.
+int do_user_write(yuzu::CommandContext& ctx, yuzu::Params params, bool is_delete) {
+    ResolvedProfile prof;
+    if (!resolve_profile(ctx, params, prof, /*for_write=*/true)) return 1;
+    const auto key = params.get("key");
+    const auto name = params.get("name");
+
+    AuditRecord au = base_record(is_delete ? "delete_user_value" : "set_user_value", Target{Hive::hku, key}, name);
+    au.sid = prof.sid;
+    PreparedSet prep;
+    if (is_delete) {
+        prep.err = validate_key_path(key);
+        if (prep.err.empty()) prep.err = validate_value_name(name);
+    } else {
+        prep = prepare_set(au, key, name, params.get("type"), params.get("value"), params.get("data_hex"));
+    }
+    if (!prep.err.empty()) return refuse(ctx, au, prep.err);
+
+    Win32Registry reg;
+    WriteOutcome wo;
+    bool ran = false;
+    yuzu::win::HiveAccessReport report;
+    const auto status = yuzu::win::with_user_hive(
+        prof.sid, prof.profile_path,
+        [&](HKEY root) {
+            ran = true;
+            const bool flush = report.mounted_offline; // set by with_user_hive before the mount was attempted
+            wo = is_delete ? delete_value_verified(reg, as_handle(root), key, name, /*fast_eligible=*/false, flush)
+                           : set_value_verified(reg, as_handle(root), key, name, *prep.type, prep.enc.bytes,
+                                                /*fast_eligible=*/false, flush);
+        },
+        &report);
+
+    // The post-unload probe: is the hive loaded NOW? (classify_offline_write_race explains what it can and cannot see.)
+    long post_rc = ERROR_FILE_NOT_FOUND;
+    const bool wrote = ran && wo.mutated;
+    if (report.mounted_offline && wrote) {
+        yuzu::win::RegKey probe;
+        post_rc = RegOpenKeyExW(HKEY_USERS, to_wide(prof.sid).c_str(), 0, KEY_READ, probe.put());
+    }
+
+    HiveFacts hf;
+    hf.status = status;
+    hf.unload_failed = report.unload_failed;
+    hf.mount_name = report.mount_name;
+    hf.refusal = report.refusal;
+    hf.race_warning = classify_offline_write_race(report.mounted_offline, wrote, post_rc);
+    return emit(ctx, render_user_write(std::move(au), std::move(wo), hf, prof.sid));
+}
+
+/// apply: parse the plan (a whole-plan shape error is one `error|` line and rc 1, nothing resolved and no audit line),
+/// then run it. dry_run defaults to TRUE (an empty value too): changing anything takes an explicit "false".
+int do_apply(yuzu::CommandContext& ctx, yuzu::Params params) {
+    const auto dry_run = parse_bool_param(params.get("dry_run"), true);
+    const auto cont = parse_bool_param(params.get("continue_on_error"), false);
+    if (!dry_run || !cont) {
+        ctx.write_output(std::format("error|{}", kTokInvalidData));
+        return 1;
+    }
+    const auto parsed = parse_plan(params.get("plan"));
+    if (!parsed.error.empty()) {
+        ctx.write_output("error|" + parsed.error);
+        return 1;
+    }
+    Win32Registry reg;
+    return run_apply(ctx, reg, as_handle(HKEY_LOCAL_MACHINE), parsed.items, ApplyOptions{*dry_run, *cont},
+                     /*fast_eligible=*/true); // streams each item's rows as it concludes
 }
 
 int dispatch(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) {
@@ -690,6 +749,9 @@ int dispatch(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params pa
     if (action == "enumerate_values") return do_enumerate_values(ctx, params);
     if (action == "get_user_value") return do_get_user_value(ctx, params);
     if (action == "list_profiles") return do_list_profiles(ctx, params);
+    if (action == "set_user_value") return do_user_write(ctx, params, false);
+    if (action == "delete_user_value") return do_user_write(ctx, params, true);
+    if (action == "apply") return do_apply(ctx, params);
     ctx.write_output(std::format("error|unknown action: {}", sanitize_field(action)));
     return 1;
 }

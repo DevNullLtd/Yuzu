@@ -194,8 +194,8 @@ Two functions, each with exactly one implementation:
 
 Every OPERATOR dispatch surface reaches the second through one of two callers —
 `ServerImpl::dispatch_confined` (the shared closure behind MCP `execute_instruction` /
-`execute_bundle`, the dashboard execute and TAR `purge_source` routes, the per-device DEX live
-query, the three async result-set producers (`POST /api/v1/result-sets/from-tar-query`,
+`execute_bundle`, the dashboard execute and Echo `purge_source` routes, the per-device DEX live
+query, the three async result-set producers (`POST /api/v1/result-sets/from-echo-query`,
 `/from-instruction-result`, `/{id}/re-eval`), and `POST /api/instructions|workflows/{id}/execute`)
 or `command_routes.cpp`'s `/api/command` handler (moved out of server.cpp by #2557). Those two
 callers legitimately differ in how they RESOLVE targets (management-group store, scope engine,
@@ -221,7 +221,7 @@ the failure mode being guarded. A harness that wants genuinely unfiltered dispat
 **returning** `nullopt`; leaving the callback empty is a missing gate, not a synonym for it.
 
 One refinement on top of that floor, by route class. Where the derivation is defense-in-depth behind
-a per-target `scoped_perm_fn` gate (REST bundles, TAR purge, the DEX live query), present-empty is
+a per-target `scoped_perm_fn` gate (REST bundles, Echo purge, the DEX live query), present-empty is
 the whole answer — the primary gate already reports its own absence with a `500`. Where it is the
 **only** per-device authorization — the three async result-set producers, which admit on a bare
 global gate and then dispatch by scope or `__all__` — an unwired derivation answers an **audited
@@ -287,7 +287,7 @@ Three new header-only files under `server/core/src/`, zero `server.cpp` involvem
   {none,rev,irrev}) — later PRs mirror this exact grammar into the proto comment and put it on the
   wire; this header is the one place that gets to change the spelling.
 - **`capability_decls/core_dispatch_capabilities.hpp`** — this package's own fragment: the three
-  dispatches the **server issues to itself** (`tar.fleet_snapshot`, `__guard__.push_rules`,
+  dispatches the **server issues to itself** (`echo.fleet_snapshot`, `__guard__.push_rules`,
   `asset_tags.sync`), each `system_reserved = true`. Every other plugin's rows live in separate
   per-group fragment headers owned by other packages; none of them are aggregated here.
 
@@ -337,8 +337,26 @@ mirror (`kRbacSecurables`):
 
 | Securable | Purpose | Consumed operations | Roles |
 |---|---|---|---|
-| `Forensics` | Read-only forensic artefact reads (ShimCache/AmCache/Prefetch, application usage, per-app privacy-permission grants, per-account SSH authorized-key fingerprints and sshd settings). Every catalogue row on it is `ExecuteGate::AdminOrApproval` AND single-target (below) — Administrator by default; the stored rows of a dispatched read follow `Response:Read`. | `Read`, plus the unused CRUD-loop ops (harmless, keeps the loop uniform) | Administrator (CRUD via the loop); deliberately ABSENT from the Viewer read-list — dispatching a forensic read is never a Viewer-tier operation (the stored results, though, follow `Response:Read`, which Viewer holds) |
+| `Forensics` | Read-only forensic artefact reads (ShimCache/AmCache/Prefetch, application usage, per-app privacy-permission grants, per-account SSH authorized-key fingerprints and sshd settings). Every catalogue row on it is `ExecuteGate::AdminOrApproval` AND single-target (below) — Administrator by default. The stored rows of a dispatched read are served only to a caller who also holds `Forensics:Read` (global only: there is no management-group scoped read tier; the resolver in "Reading the stored rows" below) on top of `Response:Read`: the response store's reads take a required `ResponseTierFilter`, derived from the capability catalogue's `Forensics` plugins (plus the `~unverified` provenance sentinel, below), and pushed into the SQL so caps, counts and aggregates cover only the permitted rows. This replaces the earlier rule that the stored rows follow `Response:Read`. Only the `plugin` is stored with a row, so the filter is per plugin; a plugin that mixed Forensics and ordinary actions would be excluded wholesale until `action` is stored too. The tier is a rule about these plugins' stored rows, not about a kind of data: other plugins (file, registry, WMI and event-log reads, for example) can return comparable information under their own securables, and their stored rows stay under `Response:Read`. | `Read`, plus the unused CRUD-loop ops (harmless, keeps the loop uniform) | Administrator (CRUD via the loop); the read-only `ForensicsAnalyst` role (`Forensics:Read` with `Response:Read`, `Execution:Read` and `Inventory:Read`, fleet-wide assignable only, no Execute and no write); deliberately ABSENT from the Viewer read-list — dispatching a forensic read is never a Viewer-tier operation, and neither is reading its stored results (Viewer holds `Response:Read` but not `Forensics:Read`, so those rows are absent for it) |
 | `Decommission` | The whole-device erasure cascade (`DELETE /api/v1/sle/agents/{id}`). Replaces the three-way `SoftwareLicensing`∧`Inventory`∧`GuaranteedState:Delete` conjunction ADR-0024 Decision 9 originally rejected promoting a dedicated securable for. | `Delete` is the ONLY consumed operation — `Read`/`Write`/`Execute`/`Approve` are meaningless on this securable and are never widened onto it | Administrator (CRUD via the loop, PowerManagement/PluginConfig precedent); ITServiceOwner gets a TARGETED `Decommission:Delete` grant only (preserves the population that could decommission under the old conjunction — ITServiceOwner held CRUD on all three of its members) |
+
+### Reading the stored rows (#4990)
+
+The decision "may this caller read Forensics-tier rows" is made by ONE resolver (`resolve_forensics_visible`, `forensics_visibility.hpp`) and its answer is tri-state:
+
+- **Granted.** A global `Forensics:Read` (decided by `AuthRoutes::probe_permission_unavailable_aware`, the quiet twin of `require_permission` that answers an unavailable authorization read as a `503` instead of the `403` of a refusal, so the topology floor, JIT elevation, engine principals, the MCP tier and service scope all apply as they do for any gate) admits every Forensics row. That is the only way in: the resolver consults no management-group grant, for any caller class.
+- **Denied.** No global grant: present-empty, a definitive and silent answer. A `Forensics:Read` grant scoped to a management group (which no supported route can author, and which the resolver does not consult) reads nothing from the stored-response surfaces; the per-device application-usage read (`GET /api/v1/forensics/agents/{id}/app-usage` and MCP `get_agent_app_usage`) is a different data set with its own per-device scoped gate and still honors such a grant for devices in the group. A service-scoped token, an MCP-tier token and an engine principal each need the global grant, and a service-scoped token is Denied while the seeded-empty service-scope allow-list stays empty (it is today), whatever the store's state. With RBAC off the floor keeps `Forensics:Read` administrator-only. The resolver is deliberately not modelled on the fleet-read gate, which admits every authenticated caller while enforcement is off.
+- **Unknown.** The global permission check could not be completed: the authorization store is not open, its breaker is open, the pool timed out, a role or permission query failed, or a dependency was never wired (`reason` `rbac_unavailable` or `unwired`). It applies to cookie sessions, API tokens, MCP tokens and engine principals. An engine principal is included under a precise condition. Its gate decides through `engine_grant_checked`, the same decision the list-read and fleet-read engine gates use: on a view whose cached flag says RBAC is on (even a stale one) it reads the grant (an explicit grant admits, none gets `403`, a failed read surfaces as the retryable answer where the route opts in); on a view proven fresh and disabled it admits nothing; on a degraded view (the cached flag says RBAC is off and is older than the 5 second stale-serve bound) the enforcement state cannot be confirmed, so no grant is read and the engine is refused, as a retryable answer where the route opts in and otherwise a `403`. An engine has no legacy fallback, so it is never admitted on a grant alone while RBAC may be off. A stale-false view inside the 5 second bound still answers a definitive `403` (it fails closed and discloses nothing). One engine gate still reads the raw `is_rbac_enabled()` flag, `require_scoped_permission`: it is deny-only, fails closed and has the same stale-false window. The username-keyed visibility resolvers (`engine_aware_visibility.hpp`, `RbacStore::authorize_list_read`, `compose_exec_visible`, `schedule_arming_check.hpp`) keep `rbac_enforcement_in_effect`, so a degraded view counts as enforced there and the grant is read; they only narrow visibility or decide dispatch permission. Neither is changed here. A service-scoped token is the exception: under a degraded store it is default-denied (a definitive `403`, so Denied, and the withheld counter does not move). Unknown never admits a row; a machine surface answers a retryable error (A4 `503` with `retry_after_ms` 5000 and no `permission` field on REST, `kInternalError` with `retry_after_ms` on MCP) rather than a partial result, an HTML surface shows a notice, and `yuzu_server_forensics_tier_withheld_total{reason}` counts it. That body shape and counter belong to the Forensics resolver, which runs after the surface's own admission gate (`Response:Read`; `Inventory:Read` and `Execution:Execute` on the Hardware poll). When a whole-store outage fails that earlier gate first, the gate's own answer is returned in its own shape (it can name a `permission`) and the withheld counter does not move. A failed role query is counted as `yuzu_server_rbac_read_degrade_total{reason="query_error"}` and is a failure for the store's breaker (it is the same accounting `get_effective_permissions` uses).
+
+The answer becomes a `ResponseTierFilter`, a required parameter on every `ResponseStore` read, applied in the SQL. Filtered rows are absent without a marker on the query, export, aggregate and MCP routes, so an empty result does not prove that no data exists (the Hardware Actions-lens result poll is the one surface that shows a notice, that the reply needs `Forensics:Read`). The plugin set is derived from this securable's catalogue rows, never kept by hand, and boot refuses an empty set. The server's own consumers use the same type: the policy evaluator and the result-set materializer exclude the Forensics plugins outright (a Forensics policy check scores `unknown`; a set sourced from such a command materializes empty), bundle collation applies the caller's own decision (approval to dispatch does not imply the read) and audits a served Forensics step as `response.forensics.read` with `surface=bundle`, and a Forensics plugin's failure text is reduced to a bounded token (`^[a-z0-9_]{1,32}(:[a-z0-9_.-]{1,48}){1,3}$`, at most 96 bytes, else the fixed value `forensics_error`) before it reaches the execution record, the event outbox and bus, the failure notification, the analytics event or the webhook and offload payload (the plugin is the one the server recorded when it dispatched the command, matched case-insensitively in ASCII against the catalogue-derived set; an unwired set reduces every plugin's text). The stored response row keeps the raw message and is read through the tier. Four call sites read with `unrestricted_internal_consumer()`, each a poll of a command the server dispatched itself from a fixed non-Forensics plugin; they are frozen by `tests/test_response_store_read_tripwire.py`. Not covered: a separate follow-up (#6065) tracks the dispatch-side authorization of policy checks. See `docs/executions-history-ladder.md`.
+
+Deployment boundary. This tier is specified for a deployment created under the hard-cutover contract in the upgrade guide: a fresh database, no data imported from earlier builds, every server writer and serving replica on this build, and earlier binaries excluded from the database. The executable does not enforce that contract (it does not verify the provenance of the database it opens); data written by earlier builds is outside the supported population and nothing here claims anything about it. In particular, notification history is served as stored (no read-time scrub, no retention bound), so a carried-forward database would expose earlier failure text through the notification list to a holder of `Infrastructure:Read`, and nothing in the executable detects one. Within the contract, new writes are reduced at ingest (the failure text carried to the execution record, the notification, the analytics event and the webhook and offload payload is already the bounded token, and a policy check of a Forensics plugin never stores check output) and reads are filtered. The error-text reduction applied when an execution record is read is defense in depth: it covers a row only while the dispatch record (24 hours) is still held, `ExecutionTracker::get_execution()` applies it like its siblings, and a failed record lookup reduces the text rather than showing it (one warning per 60 seconds).
+
+Provenance (the server-authored plugin label). The plugin of a stored response decides its tier and the treatment of every derived sink, so it is not taken from the command id an agent echoes back. The label comes from the server's own dispatch record: `command_execution` carries a `plugin` column and one row per dispatch (an untracked dispatch records an empty execution id), written by the shared dispatch builder (`ServerImpl::build_classified_command`) after classification and authorization and before any frame is sent. Both ingest paths call the one function `resolve_response_provenance` (`response_provenance.hpp`, pinned by `tests/test_forensics_tier_wiring_lexical.py`), which reads that record (retrying a degraded read once) and never parses the id. A response with no usable record (an id the server never issued, a failed record write, a record reaped after the 24 hour window, or a lookup that failed twice) is labelled `~unverified`, a character no plugin name can contain. The sentinel is a member of the Forensics set, so such a response is withheld from every caller without `Forensics:Read`, publishes nothing to the live output stream and is reduced in every sink. `yuzu_server_response_provenance_total{outcome}` counts `verified`, `unrecorded` and `lookup_degraded`. Limits, stated plainly: the record proves that the server issued the command id for that plugin, not who sent the frame, so an endpoint that was legitimately sent a command can replay that id on a frame of its own and label it with that command's plugin; the content of a frame is not validated; a single execution that outlives the 24 hour window is stored `~unverified`; a failed record write hides that dispatch's responses from readers that exclude the Forensics set; and an unrecorded `registry` command id mints no `registry.write` audit row.
+
+A user holding only `ForensicsAnalyst` cannot dispatch: `POST /api/command` refuses `403` at the `Execution:Execute` gate, and on the MCP `execute_instruction` tool at the supervised tier the approval step runs before the tool's own permission check, so an approval ticket can be spent by a call that is then refused for the same reason (an ordering that already applied to any caller lacking `Execution:Execute`). `Operator` plus `ForensicsAnalyst` passes the RBAC step for a Forensics-plugin dispatch and is stopped only by the unchanged `AdminOrApproval` gate.
+
+There is no scoped `Forensics:Read` read tier on the stored-response surfaces. Only a global grant admits Forensics rows there, and a hand-authored management-group scoped `Forensics:Read` grant reads nothing from them. The one other consumer of a scoped `Forensics:Read` grant is the per-device application-usage read, which is not a stored-response surface. Exactly `Administrator` and `ForensicsAnalyst` hold `Forensics:Read`, neither is assignable at management-group scope (the scoped routes accept `Operator` and `Viewer` only), and `test_rbac_store.cpp` pins that exactly those two roles hold it and that `Operator`, `Viewer` and `ITServiceOwner` do not. Adding a scoped tier needs a production authoring path, a fresh review and end-to-end tests.
 
 `Decommission` has **no MCP consumer by design** — the erasure verb is REST-only (ADR-1005
 twin-existence exception #2102). It is still listed in `kRbacSecurables` purely so the
@@ -365,39 +383,33 @@ schedule-creation time), never by a broadcast exemption carved into this targeti
 surface may cite this exception; every other caller of a Forensics-classified row stays
 single-target, no exceptions.
 
-**`execution_artifacts` — planned, not yet built.** This PR ships the `Forensics` securable and
-its single-target dispatch rule with zero registered consumers: no plugin, no
-`capability_decls/*.hpp` row classifies anything `Forensics` yet. `execution_artifacts` (a future
-companion package, referenced elsewhere in this codebase only as a forward-looking name and as a
-synthetic fixture string in `test_dispatch_destructive_gate.cpp`) is planned to be the first
-Forensics-class plugin, but its default-off posture, its kill-switch mechanism, and its enable
-endpoint are planned, not yet designed in detail — there is no `seed_kill_switch_default_off` (or
-equivalent) anywhere in this tree today. Until it lands, `Forensics` exists as authorization
-infrastructure only.
+**The Forensics plugins.** The capability catalogue holds 10 `Forensics` rows over 5 plugins (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`); `test_capability_catalogue.cpp` pins the plugin set and the row count. `execution_artifacts`, `browser_inventory`, `privacy_permissions` and `remote_access_audit` are default-off behind a plugin-config kill switch seeded at server start (`PluginConfigStore::seed_kill_switch_default_off`, `server.cpp`); `app_usage` also has a dedicated read surface (below).
 
 **Wave 7 PR7b: application usage is the first live `Forensics` consumer, not `execution_artifacts`.**
 The `app_usage` plugin's dedicated read surface (single-target, `Forensics:Read`) is the first row
-to actually classify anything `Forensics` — application usage history (TAR's `usage_live`/
+to actually classify anything `Forensics` — application usage history (Echo's `usage_live`/
 `usage_daily`/`usage_daily_user` tables, retained on a 31-day rolling window) is designed to be
 reachable only through that surface (see the residual read-path caveat below). It is deliberately
-unreachable through the generic `tar.sql` endpoint (`Infrastructure:Read`,
+unreachable through the generic `echo.sql` endpoint (`Infrastructure:Read`,
 `plugin_action_catalogue_a.hpp`): the three usage tables are excluded from `is_queryable_table()`'s
-allowlist in `tar_schema_registry.cpp`, so the read-only connection's SQLite authorizer denies every
+allowlist in `echo_schema_registry.cpp`, so the read-only connection's SQLite authorizer denies every
 access path to them — direct name, `$Usage_*` placeholder, alias, JOIN, or subquery — with the same
 no-existence-oracle posture `tar_events` already gets (#760 UP-8). #4260 tracked this gap; closed by
 this exclusion. #2744 (the app_usage measurand ADR) is superseded by the machine-scope decision
 above and closes without a code change.
 
-**Residual read path, accepted not closed:** `app_usage` is also a typed daily-sync source
-(`typed_inventory_sources.hpp`) excluded from the generic `InventoryStore` only on the gateway's
-*write* path, with a boot-time purge cleaning up any stray row from a mixed-version deployment
-window (an older gateway writing before an upgraded server's boot purge runs). The generic *read*
-path (`InventoryStore::get`/`query`/`list_tables`) carries no typed-source filter, so a stray row
-from that window — or a failed purge — stays readable via the far lower-privileged
-`Infrastructure:Read`/`Inventory:Read` securable until the next boot purge. This is the same
-architectural gap `device_ci` already carries (per `typed_inventory_sources.hpp`'s own header
-comment) and is not being retrofitted here either; it was accepted at this feature's planning gate
-in favor of purge-on-upgrade over a read-time filter.
+**Residual read path, closed (ADR-0070 D12):** `app_usage` is also a typed daily-sync source
+(`typed_inventory_sources.hpp`). The gateway's generic *write* path skips it, and a boot-time purge
+removes any stray row an older server wrote during a mixed-version window. This was once an
+accepted gap, because the generic *read* path had no typed-source filter, so such a row stayed
+readable via the far lower-privileged `Infrastructure:Read`/`Inventory:Read` securable until the
+next purge. Every generic read (`InventoryStore::list_tables`/`get`/`query`/`count`) now excludes
+each member of `kTypedInventorySources` in SQL, which closes that window for `app_usage`,
+`device_ci` and every other typed source on each server at or after that change. The closure is
+per server, not per fleet: a server older than that change, or rolled back below it, still stores
+and serves such rows, so in a multi-replica deployment reads routed to an older replica expose them
+until every replica is upgraded. The gateway skip, the boot purge and the read filter iterate the
+same one list.
 
 ## Testing
 

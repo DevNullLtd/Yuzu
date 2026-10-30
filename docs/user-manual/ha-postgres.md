@@ -174,5 +174,6 @@ runbook lands, continue to take backups per your existing disaster-recovery proc
   They are container-local so peer containers cannot read the backend topology.
 - **Patroni REST API** on each node's port `8008`: `GET /primary` (200 on the leader), `GET /replica`
   (200 on a running replica), `GET /health`, `GET /cluster` (full topology).
-- Prometheus metrics for leader identity, replica lag, and quorum state are delivered separately
-  (WS-11).
+- Leader identity ships as the `yuzu_server_leader_*` series on each server replica's `/metrics`
+  (see [metrics.md](metrics.md) "Leader election metrics" and the `yuzu-ha-leader` alert group). Prometheus
+  metrics for replica lag and quorum state are not shipped yet (planned, WS-11).

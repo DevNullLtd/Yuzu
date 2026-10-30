@@ -75,7 +75,7 @@ verifies the SLSA provenance attestation. Registry owner is derived from
 ### Version pinning
 
 The default version (`scripts/build-agent-bundle.sh`) tracks the current GA
-release line — currently **`0.12.0`** — and must equal the version of the demo
+release line — currently **`0.15.0`** — and must equal the version of the demo
 server/gateway the agents enroll into. The bundle can only be built for a version
 whose GitHub release has published the Windows/macOS archives, so when the next
 release ships, bump the `VERSION` default **and** the `docker-compose.demo.yml`

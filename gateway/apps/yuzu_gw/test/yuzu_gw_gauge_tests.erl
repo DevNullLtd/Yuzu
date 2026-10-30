@@ -52,6 +52,17 @@ scheduler_util_mixed_load_test() ->
     Util = yuzu_gw_gauge:compute_scheduler_util(Prev, Curr),
     ?assert(abs(Util - 0.3) < 0.001).
 
+%% statistics(scheduler_wall_time_all) lists the dirty CPU and dirty I/O
+%% schedulers after the normal ones. Mostly idle, they diluted the figure: two
+%% fully busy normal schedulers beside two idle dirty ones read 0.5, not 1.0.
+scheduler_util_counts_normal_schedulers_only_test() ->
+    Prev = [{1, 0, 0}, {2, 0, 0}, {3, 0, 0}, {4, 0, 0}],
+    Curr = [{1, 1000, 1000}, {2, 1000, 1000}, {3, 0, 1000}, {4, 0, 1000}],
+    ?assertEqual([{1, 1000, 1000}, {2, 1000, 1000}], yuzu_gw_gauge:normal_schedulers(Curr, 2)),
+    Util = yuzu_gw_gauge:compute_scheduler_util(yuzu_gw_gauge:normal_schedulers(Prev, 2),
+                                                yuzu_gw_gauge:normal_schedulers(Curr, 2)),
+    ?assert(abs(Util - 1.0) < 0.001).
+
 scheduler_util_empty_test() ->
     Util = yuzu_gw_gauge:compute_scheduler_util([], []),
     ?assertEqual(0.0, Util).

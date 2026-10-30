@@ -18,6 +18,12 @@
 
 using namespace yuzu::server;
 
+// #4990: reads in this file are test oracles, not an operator surface, so they take no tier
+// restriction (the tier itself is pinned in test_response_store.cpp / test_response_tier_filter.cpp).
+namespace {
+const auto kAllRows = yuzu::server::ResponseTierFilter::unrestricted_internal_consumer();
+} // namespace
+
 TEST_CASE("mangle_column_key: lowercase, space/dash -> underscore", "[server][devices]") {
     CHECK(mangle_column_key("PID") == "pid");
     CHECK(mangle_column_key("Local Addr") == "local_addr");
@@ -58,7 +64,7 @@ TEST_CASE("group_agent_count_preview: empty filters is a genuine 0, never touche
           "[server][devices]") {
     // store == nullptr would crash if the empty-filter short-circuit didn't
     // fire before any store call — the absence of a crash IS the assertion.
-    auto count = group_agent_count_preview(nullptr, "cmd-1", {}, std::nullopt);
+    auto count = group_agent_count_preview(nullptr, kAllRows, "cmd-1", {}, std::nullopt);
     REQUIRE(count.has_value());
     CHECK(*count == 0);
 }
@@ -66,7 +72,7 @@ TEST_CASE("group_agent_count_preview: empty filters is a genuine 0, never touche
 TEST_CASE("group_agent_count_preview: non-empty filters against an unconfigured store degrade",
           "[server][devices]") {
     std::vector<FacetFilter> filters{{0, "1234"}};
-    auto count = group_agent_count_preview(nullptr, "cmd-1", filters, std::nullopt);
+    auto count = group_agent_count_preview(nullptr, kAllRows, "cmd-1", filters, std::nullopt);
     CHECK_FALSE(count.has_value()); // nullopt — never a false 0
 }
 
