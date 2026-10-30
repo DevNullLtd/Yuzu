@@ -26,7 +26,13 @@ Rules under test:
   - a server that never finishes (an SSE stream of keepalive comments) is cut off by the TOTAL
     per-request deadline with one -32603 carrying the id, and the process exits;
   - at most YUZU_MCP_MAX_INFLIGHT requests are on the wire at once, and all replies arrive;
-  - an IPv6 literal URL works.
+  - an IPv6 literal URL works;
+  - a request that waited in the queue past the deadline is answered without being sent, the
+    queue is bounded ("adapter queue full"), and notifications/cancelled bypasses both limits;
+  - the three YUZU_MCP_* numbers are parsed strictly (a bad one earns one warning, never an echo);
+  - a 2xx body that parses but is not a JSON-RPC response is never written verbatim (batch
+    responses and response objects pass through);
+  - a malformed error body (object-valued code or message) still yields the server's error.
 
 Skips (77) when `node` is not on PATH. Stdlib only; no fixed ports.
 """
@@ -96,7 +102,7 @@ class Stub:
                 body = self.rfile.read(n)
                 with stub.lock:
                     stub.seen.append({"path": self.path, "headers": dict(self.headers.items()),
-                                      "body": body})
+                                      "body": body, "ts": time.time()})
                     stub.active += 1
                     stub.max_active = max(stub.max_active, stub.active)
                 released = []
@@ -176,12 +182,41 @@ def child_env(url, extra=None):
 
 
 def run_adapter(node, url, stdin_text, extra=None, timeout=40):
+    if isinstance(stdin_text, str):
+        stdin_text = stdin_text.encode("utf-8")
     try:
-        return subprocess.run([node, str(ADAPTER)], input=stdin_text, capture_output=True, text=True,
-                              timeout=timeout, env=child_env(url, extra))
+        r = subprocess.run([node, str(ADAPTER)], input=stdin_text, capture_output=True,
+                           timeout=timeout, env=child_env(url, extra))
     except subprocess.TimeoutExpired as e:
         # An adapter that never exits is a failure to report, not a crash of the test.
         return subprocess.CompletedProcess(e.cmd, 124, "", "adapter did not exit within %ss" % timeout)
+    return subprocess.CompletedProcess(r.args, r.returncode, r.stdout.decode("utf-8", "replace"),
+                                       r.stderr.decode("utf-8", "replace"))
+
+
+def run_adapter_staged(node, url, chunks, gap, extra=None, timeout=30):
+    """Like run_adapter, but the stdin chunks are written `gap` seconds apart.
+
+    A queued request is judged against the time it was ENQUEUED, so cases about queue expiry
+    need the later lines to arrive measurably after the first (a pipe write is otherwise one
+    burst and the margins would be a millisecond wide).
+    """
+    p = subprocess.Popen([node, str(ADAPTER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, env=child_env(url, extra))
+    try:
+        for i, chunk in enumerate(chunks):
+            if i:
+                time.sleep(gap)
+            p.stdin.write(chunk.encode("utf-8"))
+            p.stdin.flush()
+        p.stdin.close()
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        return subprocess.CompletedProcess(p.args, 124, "", "adapter did not exit within %ss" % timeout)
+    return subprocess.CompletedProcess(p.args, p.returncode, out.decode("utf-8", "replace"),
+                                       err.decode("utf-8", "replace"))
 
 
 def out_objs(p):
@@ -388,6 +423,128 @@ def main() -> int:
         check(1 <= stub.max_active <= 4, "cap: max concurrent connections %d, want <= 4" % stub.max_active)
         got_ids = sorted(json.loads(s["body"])["id"] for s in stub.seen)
         check(got_ids == list(range(1, 41)), "cap: every request reached the stub exactly once")
+
+        # 14. a request that waited in the queue past the deadline is answered WITHOUT being
+        #     sent. One slot, a 3 s deadline, a stub that never finishes. Request 1 is sent and
+        #     times out at 3 s. Requests 2 and 3 arrive 1.5 s after it: when the slot frees,
+        #     request 2 has waited 1.5 s (1.5 s inside the deadline), so it is sent and times
+        #     out at 6 s; request 3 has then waited 4.5 s (1.5 s past it) and is answered
+        #     unsent. Every decision has 1.5 s of margin either way, which absorbs scheduler
+        #     jitter on a loaded shared CI runner.
+        stub.reply(sse=True)
+        t0 = time.time()
+        p = run_adapter_staged(node, stub.url,
+                               [lines([dict(PING, id=1)]), lines([dict(PING, id=2), dict(PING, id=3)])],
+                               1.5, {"YUZU_MCP_MAX_INFLIGHT": "1", "YUZU_MCP_TIMEOUT_MS": "3000"})
+        took = time.time() - t0
+        by_id = {o["id"]: o for o in out_objs(p)}
+        check(sorted(by_id) == [1, 2, 3] and all(
+            o["error"]["code"] == -32603 and o["error"]["message"] == "timed out waiting for the MCP server"
+            for o in by_id.values()), "queue expiry: stdout %r" % p.stdout)
+        check(len(stub.seen) == 2, "queue expiry: the stub saw %d requests, want 2 (the third is never sent)"
+              % len(stub.seen))
+        check(sum("queued past the deadline" in x for x in p.stderr.splitlines()) == 1
+              and len(p.stderr.splitlines()) == 3, "queue expiry: stderr %r" % p.stderr)
+        check(p.returncode == 0 and took < 25, "queue expiry: exit %r after %.1fs" % (p.returncode, took))
+
+        # 15. the queue is bounded: with one slot and room for two waiting requests, requests
+        #     4-6 are refused at once with "adapter queue full" and a notification is dropped
+        #     with a stderr line (nothing on stdout for it).
+        stub.reply(sse=True)
+        p = run_adapter_staged(
+            node, stub.url,
+            [lines([dict(PING, id=1)]),
+             lines([dict(PING, id=i) for i in range(2, 7)]
+                   + [{"jsonrpc": "2.0", "method": "notifications/initialized"}])],
+            1.5, {"YUZU_MCP_MAX_INFLIGHT": "1", "YUZU_MCP_MAX_QUEUE": "2",
+                  "YUZU_MCP_TIMEOUT_MS": "3000"})
+        by_id = {o["id"]: o["error"]["message"] for o in out_objs(p)}
+        check(by_id == {1: "timed out waiting for the MCP server", 2: "timed out waiting for the MCP server",
+                        3: "timed out waiting for the MCP server", 4: "adapter queue full",
+                        5: "adapter queue full", 6: "adapter queue full"},
+              "queue cap: replies %r" % by_id)
+        check(len(p.stdout.splitlines()) == 6, "queue cap: stdout %r" % p.stdout)
+        check(any("notification dropped" in x for x in p.stderr.splitlines()),
+              "queue cap: no dropped-notification line: %r" % p.stderr)
+        check(len(stub.seen) == 2, "queue cap: the stub saw %d requests, want 2" % len(stub.seen))
+
+        # 16. notifications/cancelled bypasses the queue and the in-flight cap: with the only
+        #     slot held by a hung call it reaches the stub at once, not after the deadline. The
+        #     deadline is 3 s and the bound is 1.5 s: a bypassed cancel arrives within
+        #     milliseconds, a queued one only when the hung call times out at 3 s.
+        stub.reply(sse=True)
+        cancel = {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}}
+        p = run_adapter(node, stub.url, lines([dict(PING, id=1), cancel]),
+                        {"YUZU_MCP_MAX_INFLIGHT": "1", "YUZU_MCP_TIMEOUT_MS": "3000"}, timeout=30)
+        seen = list(stub.seen)
+        check(len(seen) == 2 and b"notifications/cancelled" in seen[1]["body"]
+              and seen[1]["ts"] - seen[0]["ts"] < 1.5,
+              "cancel: the stub saw %r" % [(round(s["ts"] - seen[0]["ts"], 2), s["body"][:60]) for s in seen])
+        o = out_objs(p)
+        check(len(o) == 1 and o[0]["id"] == 1 and o[0]["error"]["code"] == -32603,
+              "cancel: stdout %r" % p.stdout)
+
+        # 17. the three env values are parsed strictly; a bad one earns one warning naming the
+        #     variable (never the value) and the default is used, so replies still arrive.
+        stub.reply(200, ok)
+        for value, valid in (("30s", False), ("2m", False), ("1e3", False), ("0", False),
+                             ("-5", False), ("abc", False), ("", False),
+                             ("99999999999", True), ("5", True)):
+            for name in ("YUZU_MCP_MAX_INFLIGHT", "YUZU_MCP_TIMEOUT_MS", "YUZU_MCP_MAX_QUEUE"):
+                if value in ("-5", "2m", "1e3") and name != "YUZU_MCP_MAX_INFLIGHT":
+                    continue  # one variable is enough for these; keeps the run short
+                p = run_adapter(node, stub.url, lines([PING]), {name: value})
+                label = "env %s=%r" % (name, value)
+                check(out_objs(p) == [ok] and p.returncode == 0, label + ": stdout %r" % p.stdout)
+                errs = p.stderr.splitlines()
+                if valid:
+                    check(p.stderr == "", label + ": no warning expected, got %r" % p.stderr)
+                else:
+                    check(len(errs) == 1 and name in errs[0] and "positive integer" in errs[0],
+                          label + ": one warning naming the variable, got %r" % p.stderr)
+                    if len(value) > 1:
+                        check(value not in p.stderr, label + ": the value is not echoed")
+
+        # 18. a 2xx body that parses but is not a JSON-RPC response is never written verbatim: a
+        #     request gets a -32603 with its id, a notification gets stderr only.
+        note = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        for body in (b"null", b"5", b'"str"', b"[1,2]", b"[]", b'{"x":1}', b'{"jsonrpc":"2.0"}'):
+            stub.reply(200, body)
+            p = run_adapter(node, stub.url, lines([dict(PING, id=6)]))
+            want = {"jsonrpc": "2.0", "id": 6, "error": {
+                "code": -32603, "message": "Invalid JSON-RPC response from server (%d bytes)" % len(body)}}
+            check(out_objs(p) == [want], "bad 2xx %r: stdout %r" % (body, p.stdout))
+            check(len(p.stderr.splitlines()) == 1 and "not a JSON-RPC response" in p.stderr,
+                  "bad 2xx %r: stderr %r" % (body, p.stderr))
+            p = run_adapter(node, stub.url, lines([note]))
+            check(p.stdout == "" and len(p.stderr.splitlines()) == 1,
+                  "bad 2xx %r for a notification: %r / %r" % (body, p.stdout, p.stderr))
+        # ...while a response object and a batch response pass through unchanged.
+        for good in ({"jsonrpc": "2.0", "id": 7, "result": None},
+                     {"jsonrpc": "2.0", "id": 7, "error": {"code": -1, "message": "x"}},
+                     [{"jsonrpc": "2.0", "id": 1, "result": {}},
+                      {"jsonrpc": "2.0", "id": 2, "error": {"code": -1, "message": "x"}}]):
+            stub.reply(200, good)
+            p = run_adapter(node, stub.url, lines([PING]))
+            check(out_objs(p) == [good] and p.stderr == "", "good 2xx %r: %r / %r" % (good, p.stdout, p.stderr))
+
+        # 19. a malformed error body (code and message are objects) still yields the server's
+        #     error on stdout, re-addressed, and one stderr line; the adapter does not throw.
+        weird = (b'{"jsonrpc":"2.0","id":null,"error":{"code":{"toString":1},"message":{"a":1},'
+                 b'"data":{"remediation":{"x":1}}}}')
+        stub.reply(403, weird)
+        p = run_adapter(node, stub.url, lines([PING]))
+        want = dict(json.loads(weird), id=7)
+        check(p.returncode == 0 and out_objs(p) == [want], "malformed error: stdout %r stderr %r"
+              % (p.stdout, p.stderr))
+        check(len(p.stderr.splitlines()) == 1 and "HTTP 403" in p.stderr and "TypeError" not in p.stderr,
+              "malformed error: stderr %r" % p.stderr)
+
+        # 20. a leading BOM and surrounding whitespace are trimmed from the forwarded line.
+        stub.reply(200, ok)
+        run_adapter(node, stub.url, "﻿  " + json.dumps(PING) + "  \r\n")
+        check(len(stub.seen) == 1 and stub.seen[0]["body"] == json.dumps(PING).encode(),
+              "bom: stub saw %r" % (stub.seen[0]["body"] if stub.seen else None))
     finally:
         stub.close()
 
