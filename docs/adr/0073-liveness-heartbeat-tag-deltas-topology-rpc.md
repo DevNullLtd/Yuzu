@@ -536,7 +536,10 @@ over the agent's current merged state.
 the same function, as a `full` payload, on the replica that handles the registration. The caps, the
 class check and the digest check all apply. Every Register, whatever its tag outcome, first drops
 the agent's existing state map and digest on this replica, so a state map never outlives the
-process that sent it. An empty field is then `absent`. A rejected Register payload installs no
+process that sent it. The drop clears the map and digest under `mu_` but keeps the agent's entry
+and bumps its per-agent version counter, which is monotonic for the life of the entry and never
+reset by a drop, so any `apply` that read before the drop fails its commit check (below) and is
+counted `diverged`; a drop never re-arms a stale apply. An empty field is then `absent`. A rejected Register payload installs no
 state map, so the agent's first heartbeat is `no_base` and requests a resync.
 Registration itself never fails because of the tags.
 
