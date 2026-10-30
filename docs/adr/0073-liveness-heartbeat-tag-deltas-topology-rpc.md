@@ -1663,8 +1663,14 @@ message ReattachResponse {
   `yuzu_server_agent_reattach_total{outcome}` (D13). The refusals that say something about the
   caller, `NOT_ENROLLED` and `MALFORMED_SESSION`, also write an `agent.reattach` audit row with
   `result=refused` and the refusal: principal the authorized gateway peer, `gateway-peer:<spki8>`
-  as the peer guard names it (`gateway_peer_guard.cpp`), `principal_role` `gateway` as the other
-  gateway-upstream audit rows set it (`gateway_service_impl.cpp`), target the `agent_id`, and every
+  in the peer guard's naming (`gateway_peer_guard.cpp`). The guard passes nothing to the inner
+  handler, so the handler derives the leaf SPKI from the same `grpc_peer_evidence.hpp` evidence
+  through one shared helper, never a second derivation; under `--insecure-gateway-peer` no SPKI
+  decision exists and the principal is `gateway-peer:unverified`. The other gateway-upstream rows
+  use `gateway_cluster:<cluster_id>` (a caller-asserted value), so the row also carries the
+  `cluster_id` in its detail for correlation; the principal stays the authenticated peer because
+  that is what admitted the call. `principal_role` is `gateway` as the other gateway-upstream
+  audit rows set it (`gateway_service_impl.cpp`), target the `agent_id`, and every
   caller-supplied field (`agent_id`, the presented session id) through `audit_token` (CWE-117). `SUPERSEDED`, `NO_RECORD`, `DEGRADED`
   and `RATE_LIMITED` are counted only, as ProxyRegister's replay refusals are today: runs of
   `SUPERSEDED` are expected after every reconnect storm, so auditing them would flood the audit log
