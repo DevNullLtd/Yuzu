@@ -1215,7 +1215,10 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     `command_execution` record, so each refused issuance costs two Postgres operations and a
     record for a command never sent. A per-OS refusal therefore backs that agent off as a
     `rejected` outcome does: its per-agent interval doubles for each consecutive per-OS refusal,
-    to a cap of 15 min, and resets on the agent's next successful send. At the cap, W withheld
+    to a cap of 15 min, and resets on the agent's next successful send. So after an operator
+    clears the switch, a long-withheld agent is re-issued only when its backed-off interval
+    elapses: convergence after the clear can lag by up to 15 min per agent, which the runbook
+    states. At the cap, W withheld
     agents cost W / 900 issuances per second (about 56/s for W = 50,000), rather than W / 60, so
     a switch held during an incident leaves the issuer's throughput to the other agents and does
     not load the pool. The refusals still hold the backlog alert's `send_failed` branch true,
@@ -1602,7 +1605,7 @@ on the sustained condition and staying quiet on the expected one.
 | `diverged` plus `no_base` near 100 % | per-RPC balancing in front of the server (*Server stores*) | the load balancer |
 | `yuzu_server_resync_pending` high and `deferred` rising, `send_failed` at 0 | server overload: the issuer is deferring on Postgres (a record write or the enablement read failing) or on the rate | `YuzuPgPoolSaturated`, `--tag-resync-rate`, `--topology-resync-rate` |
 | `yuzu_viz_topology_reclaim_audit_queued` high and not falling | re-claim conflicts arriving faster than the bounded per-pass audit drain writes them (D6); the issuer still runs a pass after each 1 s of writing | Postgres write latency, then the gateway's IP churn |
-| `send_failed` rising | the `__resync__` kill switch (whole-action or per-OS), failed gateway forwards, agents a gateway reported `not_connected`, or a gateway without the dispatch-tag capability; the issuer's WARN log names the cause | plugin configuration, then the gateway management plane |
+| `send_failed` rising | the `__resync__` kill switch (whole-action or per-OS), failed gateway forwards, agents a gateway reported `not_connected`, or a gateway without the dispatch-tag capability; the issuer's WARN log names the cause; after a kill switch is cleared, withheld agents converge within up to 15 min (the per-OS backoff cap) | plugin configuration, then the gateway management plane |
 
 **Freshness SLIs.** Two ratios measure what this ADR changes, per replica:
 - tag sync: the share of heartbeats counted `synced` or `full` among all but `absent` and
