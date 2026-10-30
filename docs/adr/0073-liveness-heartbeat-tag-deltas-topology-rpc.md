@@ -2468,8 +2468,8 @@ of every ~30 s. The content is unchanged.
 - `docs/user-manual/metrics.md`: every new family and its closed label set (D13); the retired
   `yuzu_viz_topology_fetch_duration_seconds` and `yuzu_viz_agent_dispatch_timeout_total` rows and
   their example alerts removed; the new meaning of the kept cache and refill families and of
-  `yuzu_viz_topology_request_seconds` (no 5 s fetcher deadline); the three runbook sections the
-  alerts link to (D13); the peer-guard `rpc` set grown to seven (`proxy_topology`,
+  `yuzu_viz_topology_request_seconds` (no 5 s fetcher deadline); the runbook section for each alert
+  in D13; the peer-guard `rpc` set grown to seven (`proxy_topology`,
   `proxy_reattach`) and the denied-series count from 40 to 56.
 - `docs/observability-conventions.md`: the heartbeat-buffer drop reasons (about l.109), plus the new
   families, and the peer-guard RPC inventory (five to seven RPCs, 40 to 56 series).
