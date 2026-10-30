@@ -870,7 +870,7 @@ rpc ProxyTopology(yuzu.agent.v1.TopologyReport) returns (yuzu.agent.v1.TopologyA
 
 **Peer authorization.** `ProxyTopology` is a new gateway-upstream RPC. It gets an explicit
 `GatewayPeerGuardedService` override (`server/core/src/gateway_peer_guard.hpp`) that calls
-`gateway_peer::decide` first, an `rpc` label, and a test row. When ADR-0074 D1 moves gateway and
+`gateway_peer::decide` first, an `rpc` label (`proxy_topology`, D13), and a test row. When ADR-0074 D1 moves gateway and
 server from pins to CA trust plus identity plus revocation, this RPC follows the same admission as
 every other upstream RPC; it adds no path of its own.
 
@@ -1178,11 +1178,27 @@ outright for the same burst reason the dispatch fetcher is removed.
 
 ### D13. Observability
 
-Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
-`docs/observability-conventions.md`.
+Labels are bounded enums, and every label value set below is closed. Each set is **one `constexpr`
+array** in the code that both pre-seeds the family at boot (every combination at 0, per
+`docs/observability-conventions.md`) and is the only set of values the code may emit, so a new
+value is a change to that array, its test and this list. `via` is always `direct|gateway`, plus
+`register` where noted. Changes follow `docs/observability-conventions.md`.
+
+**Histogram buckets.** Latency histograms use the convention's default buckets. The byte- and
+count-valued histograms here are not latencies, so they declare their own:
+- `yuzu_agent_heartbeat_bytes` and `yuzu_agent_heartbeat_would_be_delta_bytes`: 256, 512, 1 Ki,
+  2 Ki, 4 Ki, 8 Ki, 16 Ki, 64 Ki, 256 Ki and 1 Mi bytes. A quiet delta heartbeat sits in the first
+  buckets; today's full map is about 4 KB; the 256 KiB tag cap is the last real bound;
+- `yuzu_agent_heartbeat_tag_upserts`: 0, 1, 2, 5, 10, 20, 50, 100, 200 and 512 keys, so a quiet
+  beat (0), a single change, and a full set (about 97 keys, at most 512) fall in separate buckets;
+- `yuzu_agent_topology_report_bytes`: 16 Ki, 64 Ki, 128 Ki, 256 Ki, 512 Ki, 1 Mi and 2 Mi bytes,
+  spanning the measured 50-800 KB bodies up to the 2 MiB cap.
 
 **Agent:**
-- `yuzu_agent_heartbeat_bytes` (histogram);
+- `yuzu_agent_heartbeat_bytes` (histogram, the encoded heartbeat);
+- `yuzu_agent_heartbeat_would_be_delta_bytes` (histogram; slice 2 only, see *Implementation
+  slices*: the size the heartbeat would have as a delta, computed locally before the wire changes;
+  removed in slice 5 when the delta is real);
 - `yuzu_agent_heartbeat_tag_upserts` (histogram per beat);
 - `yuzu_agent_status_tags_dropped_total{reason}`, with
   `key_oversize|value_oversize|invalid_utf8|count_cap|total_cap` (D1);
@@ -1190,12 +1206,15 @@ Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
 - `yuzu_agent_commands_executed_total{plugin="__resync__"}` (the existing family);
 - `yuzu_agent_topology_pump_total{outcome}`, with `ok|unchanged|truncated|failed` (`ok` and
   `unchanged` are both `OK` on the wire, D5);
-- `yuzu_agent_topology_reports_total{reason,result}`;
+- `yuzu_agent_topology_reports_total{reason,result}`, with `reason` `changed|refresh|startup|resync`
+  and `result` `accepted|rejected|transport_error|unimplemented` (`rejected`: a `TopologyAck` with
+  `accepted = false`, whose reason the server counts; `transport_error`: any other failed RPC,
+  deadline included);
 - `yuzu_agent_topology_report_bytes` (histogram).
 
 **Server:**
-- `yuzu_server_heartbeat_tags_total{via,outcome}`, with
-  `synced|full|diverged|no_base|rejected|absent|unverifiable` (`via` includes `register`, D3);
+- `yuzu_server_heartbeat_tags_total{via,outcome}`, with `via` `direct|gateway|register` and
+  `outcome` `synced|full|diverged|no_base|rejected|absent|unverifiable` (D3);
 - `yuzu_server_tag_resync_total{outcome}`, with `sent|deferred|send_failed`;
 - gauge `yuzu_server_resync_pending{action}`, with `tags|topology`: the size of the pending set
   (D8);
@@ -1207,8 +1226,9 @@ Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
   status tags and omits them;
 - `yuzu_server_agent_reattach_total{outcome}`, with
   `accepted|no_record|not_enrolled|superseded|malformed_session|degraded|rate_limited` (D14);
-- `yuzu_server_agent_registration_store_failed_total{op}` (D14);
-- `yuzu_viz_topology_pushed_total{via,reason}` (gains `reason`);
+- `yuzu_server_agent_registration_store_failed_total{op}`, with `write|read` (the registration
+  transaction, and the reattach read; D14);
+- `yuzu_viz_topology_pushed_total{via,reason}` (gains `reason`: `changed|refresh|startup|resync`);
 - `yuzu_viz_topology_push_parse_errors_total{via}` (unchanged);
 - `yuzu_viz_topology_report_rejected_total{via,reason}`, with
   `parse|digest_mismatch|ip_conflict|oversize|unknown_session` (D7; `parse` also moves the parse
@@ -1217,35 +1237,114 @@ Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
 - `yuzu_viz_topology_digest_total{via,outcome}`, with `match|mismatch|no_slot|empty|disabled|absent`
   (`empty`: an empty digest; `disabled`: `DISABLED`; `absent`: no field);
 - `yuzu_viz_topology_resync_total{outcome}`, with `sent|deferred|send_failed`;
-- gauge `yuzu_viz_topology_slots{state}`, with `fresh` plus every `stale_reason` value except
-  `offline` (D6), computed from the same enum when a snapshot is built. `offline` hosts are added at
-  read time from the durable roster and are not store entries.
+- gauge `yuzu_viz_topology_slots{state}`, with `fresh`, `disconnected`, `agent_silent`,
+  `pump_stuck`, `body_pending`, `report_rejected`, `awaiting_report` and `not_reported`: `fresh`
+  plus every `stale_reason` value except `offline` (D6), computed from the same enum when a snapshot
+  is built. `offline` hosts are added at read time from the durable roster and are not store
+  entries.
+
+**Existing viz families after the fetcher goes (D10).** Every `yuzu_viz_*` family is accounted for:
+- **Retired with the fetcher:** `yuzu_viz_topology_fetch_duration_seconds` and
+  `yuzu_viz_agent_dispatch_timeout_total`. Only the dispatch fetcher emits them. They stop being
+  described, and their rows and example alerts leave `docs/user-manual/metrics.md`,
+  `docs/user-manual/rest-api.md` and `docs/fleet-viz-invariants.md`.
+- **Kept, with a new meaning:** `yuzu_viz_cache_hit_total` and `yuzu_viz_cache_miss_total` (the
+  60 s render cache stays; a miss now rebuilds from the stored slots), and the single-flight
+  `yuzu_viz_refill_waiters_total`, `yuzu_viz_refill_wait_timeouts_total` and
+  `yuzu_viz_refill_oversize_drops_total` (a refill is now that rebuild; a wait timeout means a slow
+  rebuild, no longer a fetcher past its deadline). `yuzu_viz_topology_request_seconds` stays, but
+  its documented "cache-miss p99 is bounded by the 5 s fetcher deadline" becomes false: a miss is
+  bounded by the rebuild, and the description changes with it.
+- **Unchanged:** `yuzu_viz_topology_push_rejected_total` (the UP-1 spoof guard; it still moves on an
+  `IP_CONFLICT`, which `yuzu_viz_topology_report_rejected_total{reason="ip_conflict"}` also counts),
+  `yuzu_viz_pushed_cap_evictions_total`, `yuzu_viz_pushed_map_size`,
+  `yuzu_viz_oversize_response_total`, `yuzu_viz_offline_hosts_total` and
+  `yuzu_viz_local_edges_dropped_total`.
 
 **Gateway:**
-- `yuzu_gw_topology_proxied_total{result}`;
+- `yuzu_gw_topology_proxied_total{result}`, with `forwarded|no_permit|oversize|upstream_error`;
 - `yuzu_gw_heartbeat_coalesced_total` (unchanged; it counts keep-newest replacements, which now
   predict server-side `diverged` verdicts);
-- `rpc="ProxyTopology"` on the peer-guard metrics;
+- **Peer guard, server side.** `kGatewayUpstreamRpcNames` (`server/core/src/gateway_peer_guard.hpp`)
+  is the closed set of snake_case `rpc` labels. It gains `proxy_topology` and `proxy_reattach`, so
+  it goes from five RPCs to seven, and the pre-seeded `yuzu_server_gateway_peer_denied_total{rpc,reason}`
+  goes from 5 × 8 = 40 series to 7 × 8 = 56. The `static_assert` and the descriptor tripwire in
+  `test_gateway_peer_guard.cpp` enforce it;
 - `snapshot_oversize` and `snapshot_evicted` are retired from
   `yuzu_gw_heartbeat_buffer_dropped_total{reason}`, and their documentation is removed.
   `heartbeat_invalid` stays and now counts only unkeyable-session and encoder-raise drops; its
   documentation is updated to say so.
 
-**Alerts** (`docs/prometheus/yuzu-alerts.yml`, ticket severity, never paging):
-- `YuzuHeartbeatTagDivergenceSustained`: the `diverged` share stays above 1 % of heartbeats for
-  30 min **while the gateway's coalescing rate is near zero**. Outside an outage, that indicates a
-  canonical-form or agent delta defect rather than a fleet event. Its runbook also names the
-  per-RPC-balancing symptom (*Server stores*): a `diverged` plus `no_base` share near 100 %.
-- `YuzuVizTopologyResyncBacklog`: `deferred` stays above 0 for 30 min.
+**Alerts** (`docs/prometheus/yuzu-alerts.yml`, all `severity: ticket`, never paging). Each rule gets
+a `runbook_url` to a section of `docs/user-manual/metrics.md` written in slice 10, a responder
+action in its annotation, and a case in `tests/prometheus/yuzu-alerts.test.yml` that shows it firing
+on the sustained condition and staying quiet on the expected one.
+- `YuzuHeartbeatTagDivergenceSustained`, evaluated **per `via`**:
+  `sum by (via) (rate(yuzu_server_heartbeat_tags_total{via=~"direct|gateway",outcome="diverged"}[30m]))`
+  divided by the same sum over every outcome except `absent` and `unverifiable`, above 0.01, for
+  30 min, **and** that denominator above 1 heartbeat per second (a minimum-traffic guard, so a
+  handful of agents cannot fire it).
+  - For `via="gateway"` it also requires the fleet's coalescing to be low:
+    `sum(rate(yuzu_gw_heartbeat_coalesced_total[30m]))` below 0.1 % of the gateway heartbeat rate,
+    joined with `on()` over the two fleet-wide sums. No per-agent or per-gateway join exists or is
+    needed: the gateway series and the server series share no label.
+  - For `via="direct"` there is no coalescing, so no join.
+  - Meaning: outside an outage, a sustained share indicates a canonical-form or agent delta defect,
+    not a fleet event. Responder: find the agent versions involved (MCP `list_agents`), compare
+    them with the `v1` golden vectors, and check for per-RPC balancing (*Server stores*: a
+    `diverged` plus `no_base` share near 100 %).
+  - Tests: fires at a 2 % share sustained for 30 min; quiet during a 20-minute post-restart
+    `no_base` wave (not `diverged`); quiet below the traffic guard; quiet for `via="gateway"` while
+    coalescing is high.
+- `YuzuVizTopologyResyncBacklog`, either of:
+  - the topology pending set never empties and deferrals continue:
+    `min_over_time(yuzu_server_resync_pending{action="topology"}[30m]) > 0` and
+    `increase(yuzu_viz_topology_resync_total{outcome="deferred"}[30m]) > 0`. The documented drain
+    after a server restart is N / `--topology-resync-rate`: about 8 min for N = 100,000 at the
+    default, well inside 30 min. A replica whose N / rate exceeds 30 min raises the window in the
+    rule; the runbook says so;
+  - `increase(yuzu_viz_topology_resync_total{outcome="send_failed"}[30m]) > 0` or the same on
+    `yuzu_server_tag_resync_total`: a kill switch on `__resync__` or a degraded enablement store
+    (D8), so divergence persists.
+  - Responder: check Postgres pool saturation (`YuzuPgPoolSaturated`, the issuer defers at its
+    first failed record write), the `__resync__` kill switch, and the issuing rate against N.
+  - Tests: quiet during an 8-minute post-restart drain; fires when the set stays non-empty for
+    30 min; fires on one `send_failed`.
 - `YuzuAgentsTagsAbsent`: `yuzu_server_agents_tags_absent` stays above 0 for 24 h. It bounds the
   window in which un-upgraded agents are invisible to the health and posture gauges (*Upgrade*).
+  Responder: list stragglers with MCP `list_agents` and upgrade them. Tests: quiet at 0; fires after
+  24 h above 0.
+
+**Diagnosis.** The series above separate the three usual causes of divergence:
+
+| Symptom | Likely cause | Next check |
+|---|---|---|
+| `diverged` rises on `via="gateway"` only, with `yuzu_gw_heartbeat_coalesced_total` | gateway coalescing: an upstream outage, or `heartbeat_batch_interval_ms` near the heartbeat interval (D4) | upstream breaker state; the flush interval. Self-heals by resync |
+| `diverged` on both `via` values, coalescing near zero | an agent delta or canonical-form defect | agent versions (MCP `list_agents`); the golden vectors |
+| `rejected` rises | an agent encoding or cap defect (D3, step 2) | `yuzu_agent_status_tags_dropped_total` on the agents |
+| `unverifiable` rises | agents with a digest version the server does not implement (D3) | server and agent versions |
+| `diverged` plus `no_base` near 100 % | per-RPC balancing in front of the server (*Server stores*) | the load balancer |
+| `yuzu_server_resync_pending` high and `deferred` rising, `send_failed` at 0 | server overload: the issuer is deferring on Postgres or on the rate | `YuzuPgPoolSaturated`, `--tag-resync-rate`, `--topology-resync-rate` |
+| `send_failed` rising | the `__resync__` kill switch, or a degraded enablement store | plugin configuration |
+
+**Freshness SLIs.** Two ratios measure what this ADR changes, per replica:
+- tag sync: the share of heartbeats counted `synced` or `full` among all but `absent` and
+  `unverifiable`, from `yuzu_server_heartbeat_tags_total`;
+- topology freshness: `yuzu_viz_topology_slots{state="fresh"}` over the sum of every state except
+  `not_reported`.
+
+Slice 10 records their measured values on the rig. No objective is set here (open point 15).
 
 **Fleet-gauge semantics.** `yuzu_fleet_*` are rebuilt from the merged views. While an agent is
 `no_base` (after a server restart, until its full set lands), its state-derived gauges are absent,
-not zero, and its interval-derived gauges are present. The documented consequence: after a server
-restart, state-derived fleet gauges converge in about two minutes for N = 100,000 agents on one
-replica (N / `--tag-resync-rate` of issuing plus up to two jittered heartbeats, D8) instead of one
-heartbeat.
+not zero, and its interval-derived gauges are present. The documented consequence after a server
+restart, for N = 100,000 agents on one replica (D8, D14):
+- an agent's tags converge about two minutes after **its** reattach (up to 36 s to the first
+  heartbeat, issuing at N / `--tag-resync-rate`, about 50 s, then up to 36 s to the full set);
+- the reattach wave itself takes about 50 s (ten or more gateways, at the server's 2000/s cap) to
+  about 3.5 min (one gateway), so the last agent's state-derived gauges are back about 3 to 6 min
+  after the restart, instead of one heartbeat;
+- topology follows at N / `--topology-resync-rate`, about 8 min after the reattach wave.
 
 ### D14. Registration replay by ids: the gateway keeps no RegisterRequest
 
@@ -1684,8 +1783,9 @@ It should say:
   release that ships under a hard-cutover deployment contract (the one `upgrading.md` states for the
   Forensics tier) has no in-place upgrade and no return to an earlier build: it is deployed fresh,
   every agent registers fresh, and recovery is rolling forward;
-- after a server restart, state-derived gauges converge in about two minutes per 100,000 agents on a
-  replica, after those agents reattach, and topology over several minutes;
+- after a server restart, for 100,000 agents on a replica: each agent's state-derived gauges return
+  about two minutes after it reattaches, the last agent's about 3 to 6 minutes after the restart,
+  and topology about 8 minutes after the reattach wave (D13);
 - the new flags: `--topology-interval`, `--no-topology`, `--tag-resync-rate`,
   `--topology-resync-rate`, `--reattach-rate`;
 - `yuzu.uptime_s` is replaced by `yuzu.started_at`;
@@ -1826,7 +1926,8 @@ point 14).
   is held twice in ETS for the whole session, only for replay, and once more in the pending row
   until Subscribe. A token still transits the gateway while a Register is decoded and forwarded;
   the accurate claim is "not retained", not "never in gateway memory".
-- **Reattach is a new gateway-upstream RPC.** It gets a peer-guard override, an `rpc` label and a
+- **Reattach is a new gateway-upstream RPC.** It gets a peer-guard override, an `rpc` label
+  (`proxy_reattach`, D13) and a
   test row.
 - **Its authority is unchanged and cannot enrol** (D14). It rests on the gateway's peer
   authorization and the same enrolled-status read as the ProxyRegister fast path; the shared adopt
@@ -2071,14 +2172,16 @@ release and merge to `dev` inside one release window. ADR-0074 gates its own wav
     It is independent of every other slice.
 1. **Agent jitter and measurement.**
    - Jittered heartbeat and pump sleeps (D9).
-   - `yuzu_agent_heartbeat_bytes`, plus a would-be-delta histogram computed locally. That measures the
-     tag saving before the wire changes.
+   - `yuzu_agent_heartbeat_bytes`. The would-be-delta histogram needs slice 2's class table, so it
+     lands there.
    - An audit that no server heartbeat-age threshold sits under 1.2 × 30 s plus margin.
 2. **Shared pure headers and the Echo digest.**
    - `common/include/yuzu/status_tag_classes.hpp` and `status_tag_digest.hpp`, with completeness
      and canonical-form tests.
    - Echo `content_digest` (`schema_minor` bump) and its classification list.
    - The pump records digest, `last_pump_at` and outcome.
+   - `yuzu_agent_heartbeat_would_be_delta_bytes`, computed locally from the class table, which
+     measures the tag saving before the wire changes (removed in slice 5).
 2b. **`AgentRegistrationStore`, written on every successful registration** (direct and gateway).
     It is additive and wire-compatible, so it can land early. Records accumulate before anything
     reads them.
@@ -2174,3 +2277,6 @@ release and merge to `dev` inside one release window. ADR-0074 gates its own wav
     either a shared delta base (a fleet-wide store written on every state change) or a
     per-session-sticky route from gateway to replica. The owner decides whether to support it, and
     if so which; until then the precondition stands and is documented for operators.
+15. **Freshness objectives** (D13). The ADR defines two SLIs, the tag-sync share and the topology
+    freshness share, and slice 10 measures them. It sets no target. The owner decides whether either
+    becomes an SLO, and at what value, once the measured values exist.
