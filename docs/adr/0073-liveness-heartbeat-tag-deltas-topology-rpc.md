@@ -735,9 +735,19 @@ When several conditions hold, the first in this order wins:
 
 - **IP-claim reclaim** stays at 300 s, keyed on `confirmed_at`. A quiet host keeps its claim with a
   ~70-byte field; a silent host loses it at 300 s, as today.
-- **Retain on disconnect** replaces evict-on-disconnect (`FleetTopologyStore::evict_pushed`). On
-  stream close, IP claims are released **immediately** (UP-5 unchanged), but the body and digest are
-  kept for 300 s, rendered `disconnected`. On the first confirming heartbeat after a reconnect, the
+- **Retain on disconnect** replaces evict-on-disconnect (`FleetTopologyStore::evict_pushed`). This
+  **amends** fleet-viz invariant UP-5 ("Eviction on disconnect", `docs/fleet-viz-invariants.md`):
+  its claim-release half stands, and its slot-drop half is replaced (open point 2). On stream close,
+  IP claims are released **immediately**, but the body and digest are kept for 300 s, rendered
+  `disconnected`.
+- **Only the current session's close marks the slot.** Both disconnect paths call
+  `mark_disconnected` only when `registry_.remove_agent_if_session` returned true
+  (`removed_current_session`). The gateway path already gates `evict_pushed` that way
+  (`gateway_service_impl.cpp`); the direct Subscribe path calls it ungated today
+  (`agent_service_impl.cpp`, after `mirror_departure_to_presence`), and gains the gate. Ungated, a
+  superseded session's late close would release a live session's IP claims and mark its slot
+  `disconnected`. Today the next heartbeat's body repairs that; under D6 no body is due, so the
+  damage would last until the next report. On the first confirming heartbeat after a reconnect, the
   stored `local_ips` are re-claimed. The re-claim and `push_snapshot` call **one claim function**
   (the IP scan, the owner-live test and the install), so the two can never judge a conflict
   differently:
@@ -1776,6 +1786,8 @@ of every ~30 s. The content is unchanged.
 - interval replace semantics (a missing net tag disappears);
 - the D6 confirm, mismatch, grace, `stale_reason`, retain-on-disconnect, re-claim and conflict
   cases;
+- on both the direct and the gateway path, a superseded session's late close does not mark the
+  current session's slot `disconnected` or release its IP claims;
 - `stale_reason` precedence: each pair of simultaneous conditions renders the earlier value; a live
   agent with a late report reads `body_pending`, not `agent_silent`; an offline host past 300 s
   reads `offline` and a `--no-topology` agent `not_reported`; every reporting agent after a restart
@@ -1876,7 +1888,9 @@ of every ~30 s. The content is unchanged.
 
 ### Docs to update in the implementing PRs
 
-- `docs/fleet-viz-invariants.md`: push-ingestion section and the Metrics fetch-histogram bullet.
+- `docs/fleet-viz-invariants.md`: push-ingestion section and the Metrics fetch-histogram bullet,
+  including the UP-5 "Eviction on disconnect" bullet, amended: claims are still released on close,
+  the slot is retained for 300 s.
 - `docs/user-manual/network.md`: the carriage note; the semantics are unchanged.
 - `docs/user-manual/gateway.md`: the heartbeat batching text (about l.199-227), including that
   `heartbeat_batch_interval_ms` must stay well below the heartbeat interval (D4); registration replay
