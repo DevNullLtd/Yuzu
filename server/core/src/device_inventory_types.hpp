@@ -10,8 +10,19 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace yuzu::server {
+
+/// One v2 section: the agent's status for a kind plus (for list kinds) its rows.
+/// `rows[i]` holds the kind's declared column values in wire order. Status-only
+/// sections (chassis, baseboard, machine_id) carry no rows.
+struct DeviceCiSection {
+    std::string kind;
+    std::string level;  ///< agent-reported level, or "constrained" after a server cap
+    std::string reason; ///< agent-reported reason; ";server_cap:<n>" appended on truncation
+    std::vector<std::vector<std::string>> rows;
+};
 
 /// One device-CI record — the typed projection of the `device_ci` canonical wire
 /// blob. All collected fields are carried as strings (the exact wire bytes, so
@@ -19,6 +30,14 @@ namespace yuzu::server {
 /// ADDITIONALLY persisted to BIGINT columns (`apply` parses them). Field order here
 /// IS the canonical-blob order (see the agent's `CiRecord` /
 /// `device_ci_ingestion.cpp`) — adding/reordering is a coordinated cross-side change.
+/// Wire positions 0-21 (manufacturer..arch) are frozen; v2 blobs append positions 22-32
+/// (the chassis/board/machine-id scalars below); list-kind rows follow as separate
+/// records (see `DeviceCiSection`, `device_ci_kinds.hpp`).
+///
+/// PERSONAL DATA: `chassis_serial`, `board_serial` and the DIMM `serial` column join
+/// `serial`/`system_uuid`/MACs in the behavioural-PII tier covered by the audited read
+/// `inventory.device.ci` (ADR-0016). Any read route over them must sit behind that
+/// fail-closed audit.
 struct DeviceCiRecord {
     std::string agent_id; ///< not in the blob; set by the ingest seam / read
     std::string manufacturer;
@@ -45,6 +64,25 @@ struct DeviceCiRecord {
     std::string arch;
     std::int64_t first_seen{0}; ///< server receipt time (epoch seconds)
     std::int64_t last_seen{0};  ///< server receipt time (epoch seconds)
+    // ── v2 additions (appended AFTER last_seen so existing designated initialisers
+    //    keep compiling). Blank on a v1 record. ──
+    int blob_version{1};       ///< 1 = positional 22-field blob, 2 = versioned blob
+    std::string content_hash;  ///< v2 only: sha256 of the received blob (set by the parser)
+    std::string chassis_type;  ///< wire position 22
+    std::string chassis_serial;
+    std::string chassis_asset_tag;
+    std::string chassis_source;
+    std::string board_vendor;
+    std::string board_product;
+    std::string board_serial;
+    std::string board_source;
+    std::string machine_id_hash;
+    std::string machine_id_algorithm;
+    std::string machine_id_source; ///< wire position 32
+    /// v2 only: per-section statuses + list rows, in `kDeviceCiSections` order (only
+    /// sections the blob mentioned). Empty on v1. Not populated by `get_device_ci` —
+    /// read via `get_device_ci_sections`.
+    std::vector<DeviceCiSection> sections;
 };
 
 /// Error type for the authoritative single-record read. The success type is
