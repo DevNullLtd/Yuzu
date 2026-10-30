@@ -21,6 +21,7 @@
 /// carries them as `data-denied` / `data-unavailable` attributes and `yuzu-access.js`
 /// builds its client-side boxes from those attributes.
 
+#include "fragment_states.hpp" // access::Unavailable and access::NotFound live there
 #include "rbac_store.hpp"
 
 #include <yuzu/server/auth.hpp>
@@ -32,11 +33,6 @@
 #include <vector>
 
 namespace yuzu::server::access {
-
-/// The account store did not answer. The route logs the cause; the renderer never sees it.
-struct Unavailable {};
-/// Detail: the store answered and no active account has that name.
-struct NotFound {};
 
 struct UsersList {
     std::vector<auth::UserEntry> users; ///< `AuthDB::list_users()` rows (active accounts only)
@@ -74,7 +70,7 @@ std::string render_select_user();
 // ---- Roles and role permissions ---------------------------------------------------------
 
 /// `RbacStore::list_roles_checked()` rows. A store that did not answer is `Unavailable`; the
-/// store seeds seven roles, so an empty answer is treated as unreadable, never as "no roles".
+/// store seeds eight roles, so an empty answer is treated as unreadable, never as "no roles".
 struct RolesList {
     std::vector<RbacRole> roles;
 };

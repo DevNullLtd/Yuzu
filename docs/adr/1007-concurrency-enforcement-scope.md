@@ -33,7 +33,7 @@ audited for every distinct `concurrency:` value actually in use:
 
 | Value | Count | Plugin ownership |
 |---|---:|---|
-| `per-device` | 191 | 100% real `agents/plugins/` names (`tar`, `filesystem`, `registry`, `hardware`, `windows_updates`, `vuln_scan`, `antivirus`, …) |
+| `per-device` | 191 | 100% real `agents/plugins/` names (`echo`, `filesystem`, `registry`, `hardware`, `windows_updates`, `vuln_scan`, `antivirus`, …) |
 | `per-definition` | 21 | 100% `plugin: server`/`server_internal`/`_server` |
 | `global` | 17 | 100% `plugin: server`/`server_internal`/`_server` |
 | `global-singleton` | 4 | 100% `plugin: server`/`server_internal`/`_server` |
@@ -103,7 +103,7 @@ locally rejects. This ADR deviates from that, for reasons verified against the a
   one, cascading into mirroring `gateway/priv/proto/*/agent.proto` and regenerating `agent_pb.erl`
   (gpb silently drops unmirrored fields). `(plugin, action)` is not a safe proxy key: real
   duplicate pairs exist in shipped content (`antivirus/status`, `filesystem/replace`,
-  `filesystem/get_version_info`, several `tar/sql` definitions) — `instruction_definitions` has no
+  `filesystem/get_version_info`, several `echo/sql` definitions) — `instruction_definitions` has no
   `UNIQUE(plugin, action)` constraint.
 - The agent has no existing in-flight-execution tracking usable for this. `command_dedup_`
   (`agent.cpp`) is keyed on `command_id` for replay protection (HA WS-0) — a different problem
@@ -200,7 +200,7 @@ dispatch resolves its candidate set inside the sink, not in `resolve_and_dispatc
 **This is the primary collision case for many real `per-device` definitions, not an edge case** —
 Gate 3 architect review (2026-08-31) correctly pushed back on this ADR's first draft, which had
 characterized it as a narrow exception. A substantial share of the 191 real `per-device`
-definitions are exactly the kind of operation (`tar.fleet_snapshot`, scheduled scans, patch
+definitions are exactly the kind of operation (`echo.fleet_snapshot`, scheduled scans, patch
 inventory refresh) that operators legitimately dispatch fleet-wide via Broadcast, not to a hand-picked
 group — so a repeated fleet-wide dispatch of one of these definitions in quick succession is the
 realistic way a same-device double-dispatch happens in production, not a corner case. Extending
@@ -376,7 +376,7 @@ to `cmd_dispatch_concurrency` — a pre-existing gap (CONSIST-2/sec-M2, tracked 
 in that file, predating this ADR) where workflow-step dispatch never wires real execution-id
 correlation at all. `claim_concurrency_slots` therefore stores the claim row under
 `execution_id=""`. This section originally documented the consequence as "release-by-TTL-only" —
-the terminal response arrives, but `agent_service_impl::record_execution_id` never populates
+the terminal response arrives, but `agent_service_impl::record_execution_id` (since removed, #4990) never populates
 `cmd_execution_ids_` for an empty `execution_id`, so `notify_exec_tracker` could not resolve one and
 `update_agent_status`/`release_concurrency_claim` were never reached.
 
@@ -436,7 +436,7 @@ definition's open claim when execution_id collides."
 historical.** This section describes the state of the world as it existed when UP-1/UP-2 were fixed,
 BEFORE this branch was reconciled onto 140 commits of `origin/dev` that included HA WS-1(1b)
 (ADR-2002 section 5): a PG-backed `command_id -> execution_id` correlation table
-(`ExecutionTracker::record_command_execution`/`lookup_execution_id`) that fully REPLACED
+(`ExecutionTracker::record_command_execution`/`lookup_execution_id`, since renamed `record_command_dispatch`/`lookup_command_record`, #4990) that fully REPLACED
 `cmd_execution_ids_` — the in-process map named throughout this section no longer exists in the
 shipped code. The by-command fallback this section introduces is still live and still needed, but
 its role narrowed: HA WS-1(1b)'s persisted, replica-safe lookup now handles the restart-survival
@@ -547,9 +547,9 @@ rather than silently dropped):
   direction, not undertaken now.
 - A `command_id`-prefix skip (`__guard__-`) was added to avoid a wasted write-pool lease on every
   guard push/reconcile response (Fable's load finding — the fallback turns every unmatched response
-  into a lease + UPDATE). The same optimization was deliberately NOT extended to `tar-`: `tar` is
+  into a lease + UPDATE). The same optimization was deliberately NOT extended to `echo-`: `echo` is
   also a real agent plugin name, and nothing in the code (only today's content library) guarantees a
-  `per-device`-gated `tar` definition could never exist — a string-prefix skip there would risk
+  `per-device`-gated `echo` definition could never exist — a string-prefix skip there would risk
   silently skipping a legitimate release if that ever changes.
 
 Regression tests: `test_execution_tracker.cpp`, search for "UP-1", "UP-2", "Fable adversarial-review
@@ -748,7 +748,7 @@ ledger alone.
 Between Gate 6 and this point, `origin/dev` was discovered to have moved 140 commits ahead of this
 branch's merge-base, including a change in the exact subsystem ADR-1007 touches: HA WS-1(1b) (ADR-2002
 section 5) shipped a PG-backed `command_id -> execution_id` correlation table
-(`ExecutionTracker::record_command_execution`/`lookup_execution_id`/`reap_command_execution_mappings`)
+(`ExecutionTracker::record_command_execution`/`lookup_execution_id`/`reap_command_execution_mappings`; the first two were renamed `record_command_dispatch`/`lookup_command_record` by #4990)
 that fully replaced the in-process `cmd_execution_ids_` map ADR-1007's UP-1 fix was built around. This
 branch's 15 commits were reconciled onto `origin/dev` as a single squashed patch (operator decision,
 given the same conflict shape would otherwise recur across most of those 15 commits) — see the
@@ -847,7 +847,7 @@ signature change — that shared type's `(command_id, int)` return shape is used
 (`bundle_orchestrator.hpp`, `dashboard_routes.hpp`, `deployment_engine.hpp`, `dex_routes.hpp`,
 `mcp_server.hpp`, `policy_evaluator.hpp`, `preflight_routes.hpp`/`preflight_runner.hpp`,
 `quarantine_containment_reconciler.hpp`, `rest_api_v1.hpp`, `schedule_runner.hpp`,
-`tar_tree_routes.hpp`, `workflow_routes.hpp`), so threading per-target skip reasons through it is
+`echo_tree_routes.hpp`, `workflow_routes.hpp`), so threading per-target skip reasons through it is
 out of proportion here. Six Prometheus signals ARE shipped in this change, via the existing
 post-construction `set_metrics(MetricsRegistry*)` setter (the idiom 20+ other stores already use —
 an earlier draft of this ADR incorrectly claimed this would require a constructor parameter, which

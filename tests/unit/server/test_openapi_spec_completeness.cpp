@@ -58,12 +58,14 @@
 #include <atomic>
 #include <cctype>
 #include <cstddef>
+#include <functional>
 #include <iterator>
-#include <optional>
 #include <map>
+#include <optional>
 #include <regex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -145,7 +147,7 @@ std::string canonicalize(const std::string& path) {
 /// ALLOWLIST_OPENAPI_MISSING - see file header comment. Cross-check against
 /// the Python script's list before adding here. The ten F2-backlog entries
 /// this set used to carry (statistics, topology, inventory/evaluate,
-/// elevation-eligibility, execution-statistics, sessions, tar purge) were
+/// elevation-eligibility, execution-statistics, sessions, echo purge) were
 /// backfilled into openapi_spec() by #3992 (merged 2026-09-06) and pruned
 /// here in lockstep with the Python side's own reconciliation
 /// (commit 3871688f6) - do not let the two allowlists drift again.
@@ -644,6 +646,37 @@ TEST_CASE("openapi_spec_json(): the execution-statistics reads document their de
         REQUIRE(r503.contains("content"));
         CHECK(r503["content"]["application/json"]["schema"]["$ref"] ==
               "#/components/schemas/A4ErrorEnvelope");
+    }
+}
+
+TEST_CASE("openapi_spec_json(): the stored-response reads document the unresolved-Forensics-authority 503 "
+          "(#4990), and only the ones that write a forensics audit row name that audit failure",
+          "[openapi][forensics_tier]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto desc503 = [&](const char* path) {
+        REQUIRE(spec["paths"].contains(path));
+        const auto& r = spec["paths"][path]["get"]["responses"];
+        REQUIRE(r.contains("503"));
+        CHECK(r["503"]["content"]["application/json"]["schema"]["$ref"] ==
+              "#/components/schemas/A4ErrorEnvelope");
+        return r["503"].value("description", "");
+    };
+    constexpr std::string_view kAuthority = "Forensics authority could not be determined (retryable)";
+    constexpr std::string_view kForensicsAudit = "response.forensics.read audit row could not persist";
+    for (const char* path : {"/responses/{id}", "/responses/{id}/export"}) {
+        INFO("path: " << path);
+        const auto d = desc503(path);
+        CHECK(d.find(kAuthority) != std::string::npos);
+        CHECK(d.find(kForensicsAudit) != std::string::npos);
+    }
+    {
+        // The aggregate returns only counts and writes no response.forensics.read row, so it names
+        // the unresolved authority but not that audit failure.
+        const auto d = desc503("/responses/{id}/aggregate");
+        CHECK(d.find(kAuthority) != std::string::npos);
+        CHECK(d.find(kForensicsAudit) == std::string::npos);
+        CHECK(d.find("response.read audit row could not persist") != std::string::npos);
     }
 }
 
@@ -1435,7 +1468,7 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
     // docs/user-manual/upgrading.md and in the change's changelog fragment. The count is
     // derived from the document (it is the number of operations); the one hand-kept number
     // for it lives in the typed-response test's exclusion list, not here.
-    static const std::string kOperationIdChecksum = "\"32508ec3b723d370\"";
+    static const std::string kOperationIdChecksum = "\"22536dd3060e5782\"";
     static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
@@ -1466,6 +1499,63 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
         INFO("sorted operationId pairs hash to " << yuzu::server::content_etag(joined)
              << " (update kOperationIdChecksum, and see the comment above it)");
         CHECK(yuzu::server::content_etag(joined) == kOperationIdChecksum);
+    }
+}
+
+TEST_CASE("openapi documents: no text cites an issue, an ADR, a build wave or the review process",
+          "[openapi][structure]") {
+    // The document is read by operators and by agentic workers integrating with the API, on
+    // /swagger and in generated clients. It states behaviour; it does not cite the issue, ADR
+    // decision, design section, build wave, SOC 2 control, review gate or C++ symbol that shaped
+    // it. Every string value in the document is checked, in both forms (keys are not text).
+    static const std::regex kInternal(
+        R"((^|[^A-Za-z0-9])#[0-9]+\b|\bADR-?[0-9]{4}|\bSOC ?2\b|\b[Ii]ssues? [0-9]|\b[Pp]ull request [0-9]|github\.com|\bmanifest_by_name\b|\bCC-?[0-9]|\bPhase [0-9]|\bWave [0-9]|)"
+        R"(\bPRs? ?[0-9]|\bWS-[A-Z][0-9]|\bA2-R[0-9]|\bINV-[0-9]|\bUP-[0-9]+|\bCDX-|[Gg]overnance|)"
+        R"(\bGate [0-9]|fix round|re-review|[Aa]pi-parity|API-parity|\bBatch [A-Z]\b|\bsprint\b|§|)"
+        R"(decision log|docs/adr/|\badr/[0-9]{4}|[A-Za-z_]+::[A-Za-z_]|\.(hpp|cpp)\b|\b[a-z]+_fn\b|)"
+        R"(\bk[A-Z][a-z]+[A-Z]\w*|\(new\)|\([A-B][0-9]\)|\bA4 (error )?envelope|\bB[12]\b|)"
+        R"(\b[a-z][a-z_]+\(\)|routed-concerns|parity ledger|\bHermes\b|\bAstra\b|\b(SOLE|sole) (gate|authorization)|)"
+        R"([a-z0-9]_fn\b|_(row|detail)_json\b|\bagent_ids_json\b|\bspec_json\b|)"
+        R"(\brequire_(fleet_read|scoped_permission)\b|\bis_rbac_administrator\b|\bdispatch_confined|)"
+        R"((^|[^/A-Za-z0-9])A[1-5]([^A-Za-z0-9]|$)|A4Error|)"
+        R"(\b(ExecutionTracker|WorkflowEngine|SessionStore|TagStore|AuthFn|ExecutionEventBus|MachineNode|ClientValidation)\b|)"
+        R"(\(M[0-9]\b|capability [0-9]+\.[0-9]|UAT non-functional|tracked open|\b(shared|same|one|row)( [A-Za-z_]+)? builder\b|)"
+        R"(authorization-topology floor|\b(ledger|ladder)\b|docs/[a-z-]*(ladder|invariants)\.md|)"
+        R"(\bBRD\b|\bF[0-9]+[a-z]\b|\bSprint\b|\bADR [0-9]|\bGH-[0-9]|\b[Tt]icket [0-9]|\bJira\b|\bEpic [0-9]|\bslice [0-9])");
+    // The line an operator reads first is held to more: no control number, gate word or label.
+    static const std::regex kSummary(R"(SOC ?2|\bCC-?[0-9]|\bGate\b|\bADR\b|\([A-B][0-9]\)|(^|[^A-Za-z0-9])#[0-9]|\bA[1-5]\b|capability [0-9])");
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        std::size_t strings = 0;
+        const std::function<void(const json&, const std::string&)> walk =
+            [&](const json& node, const std::string& where) {
+                if (node.is_string()) {
+                    ++strings;
+                    INFO(where);
+                    const std::string text = node.get<std::string>();
+                    // The one retained schema reference names A4ErrorEnvelope (renaming it would
+                    // change generated clients); no prose may.
+                    if (text != "#/components/schemas/A4ErrorEnvelope") {
+                        std::smatch hit;
+                        const bool internal = std::regex_search(text, hit, kInternal);
+                        INFO("matched: " << hit.str());
+                        CHECK_FALSE(internal);
+                    }
+                } else if (node.is_array()) {
+                    for (std::size_t i = 0; i < node.size(); ++i)
+                        walk(node[i], where + "/" + std::to_string(i));
+                } else if (node.is_object()) {
+                    for (const auto& [key, value] : node.items())
+                        walk(value, where + "/" + key);
+                }
+            };
+        walk(spec, "");
+        CHECK(strings > 1000); // the walk really reached the text
+        for (const auto& o : all_operations(spec)) {
+            INFO(o.where());
+            CHECK_FALSE(std::regex_search(o.op.value("summary", std::string()), kSummary));
+        }
     }
 }
 
@@ -1706,7 +1796,7 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
 }
 
 TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the response builder",
-          "[openapi][retention][tar]") {
+          "[openapi][retention][echo]") {
     json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
     REQUIRE_FALSE(spec.is_discarded());
     const json& schema = spec.at("components").at("schemas").at("SettingsDataRetention");
@@ -1719,12 +1809,12 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
 
     Config cfg;
     const json real = yuzu::server::settings_model::build_data_retention_settings(cfg);
-    REQUIRE(real.contains("tar"));
+    REQUIRE(real.contains("echo"));
     REQUIRE(real.contains("enforced"));
-    REQUIRE(real["tar"].is_object());
-    REQUIRE(real["tar"].contains("tick_seconds"));
-    REQUIRE(real["tar"].contains("tiers"));
-    REQUIRE_FALSE(real["tar"]["tiers"].empty());
+    REQUIRE(real["echo"].is_object());
+    REQUIRE(real["echo"].contains("tick_seconds"));
+    REQUIRE(real["echo"].contains("tiers"));
+    REQUIRE_FALSE(real["echo"]["tiers"].empty());
 
     const auto set_of = [](const json& arr) {
         std::set<std::string> out;
@@ -1756,10 +1846,10 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
         CHECK_FALSE(props.at(k).value("nullable", false));
     }
 
-    // `required` is the builder's keys minus `tar`: a server older than this release omits `tar`,
+    // `required` is the builder's keys minus `echo`: a server older than this release omits `echo`,
     // and the manual tells clients to treat absent like null.
     auto expected_required = keys_of(real);
-    expected_required.erase("tar");
+    expected_required.erase("echo");
     CHECK(set_of(schema.at("required")) == expected_required);
 
     // `enforced`: the same three keys, each a nullable integer, all required.
@@ -1781,21 +1871,21 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
         CHECK(enforced.at("properties").at(k).value("nullable", false));
     }
 
-    const json& tar = props.at("tar");
-    CHECK(tar.value("type", "") == type_of(real["tar"]));
-    CHECK(tar.value("nullable", false));
-    CHECK(keys_of(tar.at("properties")) == keys_of(real["tar"]));
-    CHECK(set_of(tar.at("required")) == keys_of(real["tar"]));
-    CHECK(tar.at("properties").at("tick_seconds").value("type", "") ==
-          type_of(real["tar"]["tick_seconds"]));
-    CHECK_FALSE(tar.at("properties").at("tick_seconds").value("nullable", false));
+    const json& echo = props.at("echo");
+    CHECK(echo.value("type", "") == type_of(real["echo"]));
+    CHECK(echo.value("nullable", false));
+    CHECK(keys_of(echo.at("properties")) == keys_of(real["echo"]));
+    CHECK(set_of(echo.at("required")) == keys_of(real["echo"]));
+    CHECK(echo.at("properties").at("tick_seconds").value("type", "") ==
+          type_of(real["echo"]["tick_seconds"]));
+    CHECK_FALSE(echo.at("properties").at("tick_seconds").value("nullable", false));
 
     // Every real tier: the declared keys, the declared types, and a null depth exactly on rows
     // tiers (so `nullable` is needed and is not decoration).
-    const json& tiers = tar.at("properties").at("tiers");
+    const json& tiers = echo.at("properties").at("tiers");
     const json& item = tiers.at("items");
-    CHECK(tiers.value("type", "") == type_of(real["tar"]["tiers"]));
-    CHECK(item.value("type", "") == type_of(real["tar"]["tiers"][0]));
+    CHECK(tiers.value("type", "") == type_of(real["echo"]["tiers"]));
+    CHECK(item.value("type", "") == type_of(real["echo"]["tiers"][0]));
     CHECK_FALSE(tiers.value("nullable", false));
     CHECK_FALSE(item.value("nullable", false));
     // `tier` and `limit_kind` are open vocabularies: a closed `enum` would make a generated
@@ -1803,11 +1893,11 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     const json& tier_prop = item.at("properties").at("tier");
     CHECK_FALSE(tier_prop.contains("enum"));
     CHECK_FALSE(item.at("properties").at("limit_kind").contains("enum"));
-    CHECK(keys_of(item.at("properties")) == keys_of(real["tar"]["tiers"][0]));
-    CHECK(set_of(item.at("required")) == keys_of(real["tar"]["tiers"][0]));
+    CHECK(keys_of(item.at("properties")) == keys_of(real["echo"]["tiers"][0]));
+    CHECK(set_of(item.at("required")) == keys_of(real["echo"]["tiers"][0]));
     bool saw_rows = false;
     bool saw_seconds = false;
-    for (const auto& tier : real["tar"]["tiers"]) {
+    for (const auto& tier : real["echo"]["tiers"]) {
         INFO("tier: " << tier.dump());
         CHECK(keys_of(tier) == keys_of(item.at("properties")));
         // The `tier` description lists every tier name the table really uses.
@@ -1835,15 +1925,15 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     CHECK(depth.value("type", "") == "integer");
     CHECK(depth.value("nullable", false));
 
-    // The builder's `tar: null` branch (no table available) is the case `nullable` exists for.
+    // The builder's `echo: null` branch (no table available) is the case `nullable` exists for.
     const json no_table =
         yuzu::server::settings_model::build_data_retention_settings(cfg, {}, nullptr);
-    REQUIRE(no_table.contains("tar"));
-    CHECK(no_table["tar"].is_null());
+    REQUIRE(no_table.contains("echo"));
+    CHECK(no_table["echo"].is_null());
 }
 
-TEST_CASE("openapi_spec_json(): the data-retention operation documents the TAR tiers",
-          "[openapi][retention][tar]") {
+TEST_CASE("openapi_spec_json(): the data-retention operation documents the Echo tiers",
+          "[openapi][retention][echo]") {
     json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
     REQUIRE_FALSE(spec.is_discarded());
     REQUIRE(spec.contains("paths"));
@@ -1859,5 +1949,5 @@ TEST_CASE("openapi_spec_json(): the data-retention operation documents the TAR t
         CHECK(description.find(needle) != std::string::npos);
 
     const std::string ok = get_op["responses"]["200"].value("description", "");
-    CHECK(ok.find("tar: {tick_seconds, tiers") != std::string::npos);
+    CHECK(ok.find("echo: {tick_seconds, tiers") != std::string::npos);
 }

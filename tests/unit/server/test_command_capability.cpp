@@ -29,7 +29,7 @@ namespace {
 
 inline constexpr std::array<CommandCapability, 2> kFragmentAlpha{{
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "collect_inventory",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -52,7 +52,7 @@ inline constexpr std::array<CommandCapability, 2> kFragmentAlpha{{
 
 inline constexpr std::array<CommandCapability, 1> kFragmentBeta{{
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "purge_source",
         .dispatch_class = DispatchClass::Destructive,
         .mutability = Mutability::Irreversible,
@@ -63,12 +63,12 @@ inline constexpr std::array<CommandCapability, 1> kFragmentBeta{{
     },
 }};
 
-// Deliberately collides with kFragmentAlpha's tar.collect_inventory row, to
+// Deliberately collides with kFragmentAlpha's echo.collect_inventory row, to
 // exercise the Ambiguous path — a second, independently-authored fragment
 // that happens to declare the same plugin.action.
 inline constexpr std::array<CommandCapability, 1> kFragmentGamma{{
     {
-        .plugin = "TAR",
+        .plugin = "Echo",
         .action = "COLLECT_INVENTORY",
         .dispatch_class = DispatchClass::Mutating,
         .mutability = Mutability::Reversible,
@@ -111,7 +111,7 @@ TEST_CASE("CommandCapabilityRegistry: unknown plugin.action is Unclassified, nev
 TEST_CASE("CommandCapabilityRegistry: an empty registry classifies nothing",
           "[server][dispatch][capability]") {
     CommandCapabilityRegistry registry{};
-    auto result = registry.classify("tar", "collect_inventory");
+    auto result = registry.classify("echo", "collect_inventory");
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == ClassificationError::Unclassified);
 }
@@ -124,13 +124,13 @@ TEST_CASE("CommandCapabilityRegistry: the same plugin.action declared by two sou
         std::span<const CommandCapability>(kFragmentGamma),
     };
 
-    auto result = registry.classify("tar", "collect_inventory");
+    auto result = registry.classify("echo", "collect_inventory");
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == ClassificationError::Ambiguous);
 
     // A DIFFERENT action from the same two sources is unaffected — ambiguity
     // is per plugin.action, not a registry-wide poison.
-    auto other = registry.classify("tar", "purge_source");
+    auto other = registry.classify("echo", "purge_source");
     REQUIRE_FALSE(other.has_value());
     CHECK(other.error() == ClassificationError::Unclassified);
 }
@@ -139,8 +139,8 @@ TEST_CASE("CommandCapabilityRegistry: classify is case-insensitive on both plugi
           "[server][dispatch][capability]") {
     CommandCapabilityRegistry registry{std::span<const CommandCapability>(kFragmentAlpha)};
 
-    auto upper = registry.classify("TAR", "Collect_Inventory");
-    auto lower = registry.classify("tar", "collect_inventory");
+    auto upper = registry.classify("Echo", "Collect_Inventory");
+    auto lower = registry.classify("echo", "collect_inventory");
     REQUIRE(upper.has_value());
     REQUIRE(lower.has_value());
     CHECK(upper->securable == lower->securable);
@@ -178,10 +178,10 @@ TEST_CASE("capdecls::core_dispatch_capabilities: exactly the four system-initiat
 
     CommandCapabilityRegistry registry{rows};
 
-    auto tar = registry.classify("tar", "fleet_snapshot");
-    REQUIRE(tar.has_value());
-    CHECK(tar->dispatch_class == DispatchClass::ReadOnly);
-    CHECK(tar->mutability == Mutability::None);
+    auto echo = registry.classify("echo", "fleet_snapshot");
+    REQUIRE(echo.has_value());
+    CHECK(echo->dispatch_class == DispatchClass::ReadOnly);
+    CHECK(echo->mutability == Mutability::None);
 
     auto guard = registry.classify("__guard__", "push_rules");
     REQUIRE(guard.has_value());
@@ -208,8 +208,8 @@ TEST_CASE("capdecls::core_dispatch_capabilities: exactly the four system-initiat
 
 TEST_CASE("normalize_action_key: lowercases both components and joins with '.'",
           "[server][dispatch][capability]") {
-    CHECK(normalize_action_key("TAR", "Fleet_Snapshot") == "tar.fleet_snapshot");
-    CHECK(normalize_action_key("tar", "fleet_snapshot") == "tar.fleet_snapshot");
+    CHECK(normalize_action_key("Echo", "Fleet_Snapshot") == "echo.fleet_snapshot");
+    CHECK(normalize_action_key("echo", "fleet_snapshot") == "echo.fleet_snapshot");
     CHECK(normalize_action_key("__Guard__", "PUSH_RULES") == "__guard__.push_rules");
 }
 
@@ -227,8 +227,8 @@ TEST_CASE("compute_plan_hash: invariant to parameter map insertion order",
     params_b["zeta"] = "1";
     params_b["alpha"] = "2";
 
-    auto hash_a = compute_plan_hash("tar", "purge_source", params_a, "scope:win", "exec-1");
-    auto hash_b = compute_plan_hash("tar", "purge_source", params_b, "scope:win", "exec-1");
+    auto hash_a = compute_plan_hash("echo", "purge_source", params_a, "scope:win", "exec-1");
+    auto hash_b = compute_plan_hash("echo", "purge_source", params_b, "scope:win", "exec-1");
     CHECK(hash_a == hash_b);
     CHECK_FALSE(hash_a.empty());
 }
@@ -236,28 +236,28 @@ TEST_CASE("compute_plan_hash: invariant to parameter map insertion order",
 TEST_CASE("compute_plan_hash: changes when any single component changes",
           "[server][dispatch][capability]") {
     std::map<std::string, std::string> params{{"key", "value"}};
-    auto base = compute_plan_hash("tar", "purge_source", params, "scope:win", "exec-1");
+    auto base = compute_plan_hash("echo", "purge_source", params, "scope:win", "exec-1");
 
     CHECK(compute_plan_hash("tar2", "purge_source", params, "scope:win", "exec-1") != base);
-    CHECK(compute_plan_hash("tar", "purge_source2", params, "scope:win", "exec-1") != base);
-    CHECK(compute_plan_hash("tar", "purge_source", params, "scope:mac", "exec-1") != base);
-    CHECK(compute_plan_hash("tar", "purge_source", params, "scope:win", "exec-2") != base);
+    CHECK(compute_plan_hash("echo", "purge_source2", params, "scope:win", "exec-1") != base);
+    CHECK(compute_plan_hash("echo", "purge_source", params, "scope:mac", "exec-1") != base);
+    CHECK(compute_plan_hash("echo", "purge_source", params, "scope:win", "exec-2") != base);
 
     std::map<std::string, std::string> params_changed{{"key", "different_value"}};
-    CHECK(compute_plan_hash("tar", "purge_source", params_changed, "scope:win", "exec-1") !=
+    CHECK(compute_plan_hash("echo", "purge_source", params_changed, "scope:win", "exec-1") !=
          base);
 
     std::map<std::string, std::string> params_extra{{"key", "value"}, {"extra", "x"}};
-    CHECK(compute_plan_hash("tar", "purge_source", params_extra, "scope:win", "exec-1") != base);
+    CHECK(compute_plan_hash("echo", "purge_source", params_extra, "scope:win", "exec-1") != base);
 
     std::map<std::string, std::string> empty_params;
-    auto base_empty = compute_plan_hash("tar", "purge_source", empty_params, "scope:win", "exec-1");
+    auto base_empty = compute_plan_hash("echo", "purge_source", empty_params, "scope:win", "exec-1");
     CHECK(base_empty != base);
 }
 
 TEST_CASE("compute_plan_hash: is a lowercase hex digest", "[server][dispatch][capability]") {
     std::map<std::string, std::string> params;
-    auto hash = compute_plan_hash("tar", "purge_source", params, "scope:win", "exec-1");
+    auto hash = compute_plan_hash("echo", "purge_source", params, "scope:win", "exec-1");
     CHECK_FALSE(hash.empty());
     for (char c : hash) {
         CHECK(((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')));
@@ -334,7 +334,7 @@ TEST_CASE("dispatch tag: decode rejects a malformed tag (too few fields, bad cla
 TEST_CASE("dispatch tag: encode/decode round-trips a real compute_plan_hash output",
           "[server][dispatch][capability]") {
     std::map<std::string, std::string> params{{"target", "win"}};
-    auto hash = compute_plan_hash("tar", "purge_source", params, "scope:win", "exec-1");
+    auto hash = compute_plan_hash("echo", "purge_source", params, "scope:win", "exec-1");
     auto tag = encode_dispatch_tag(DispatchClass::Destructive, Mutability::Irreversible, hash);
     auto decoded = decode_dispatch_tag(tag);
     REQUIRE(decoded.has_value());

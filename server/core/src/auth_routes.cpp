@@ -733,6 +733,29 @@ bool AuthRoutes::probe_permission(const httplib::Request& req, httplib::Response
     return require_permission(req, res, securable_type, operation);
 }
 
+bool AuthRoutes::probe_permission_unavailable_aware(const httplib::Request& req,
+                                                    httplib::Response& res,
+                                                    const std::string& securable_type,
+                                                    const std::string& operation) {
+    AuditProbeScope probe; // not const: require_auth records the gate's session into it
+    return require_permission_impl(req, res, securable_type, operation,
+                                   RbacDegradeMapping::UnavailableAs503);
+}
+
+void AuthRoutes::respond_rbac_unavailable(const httplib::Request& req, httplib::Response& res,
+                                          const std::string& securable_type,
+                                          const std::string& operation, const char* who) {
+    audit_log(req, "auth.permission_required", "denied", "", "",
+              std::string(who) + " denied: RBAC unavailable resolving " + securable_type + ":" +
+                  operation);
+    res.status = 503;
+    // A transient store outage is retryable, and no `.permission`: granting it does not fix an
+    // outage, so naming it would advertise a self-remediation that cannot work.
+    res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                      detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                    "application/json");
+}
+
 ListReadGate AuthRoutes::require_global_list_read(const httplib::Request& req,
                                                   httplib::Response& res,
                                                   const std::string& securable_type,
@@ -772,6 +795,16 @@ AuthRoutes::probe_fleet_read(const httplib::Request& req, httplib::Response& res
 bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Response& res,
                                     const std::string& securable_type,
                                     const std::string& operation) {
+    // Every route keeps ADR-0041's documented answer: an RBAC read that could not be completed
+    // is a 403 (deny-on-degrade). Only the Forensics-tier resolver opts into the 503 mapping.
+    return require_permission_impl(req, res, securable_type, operation,
+                                   RbacDegradeMapping::DenyAs403);
+}
+
+bool AuthRoutes::require_permission_impl(const httplib::Request& req, httplib::Response& res,
+                                         const std::string& securable_type,
+                                         const std::string& operation,
+                                         RbacDegradeMapping degrade) {
     auto session = require_auth(req, res);
     if (!session)
         return false;
@@ -798,7 +831,7 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // pre-RBAC legacy fallback below would otherwise hand an engine credential
     // fleet-wide Read the moment RBAC is off (the default). Resolve engine
     // sessions here, RBAC-only, or deny.
-    if (session->principal_kind == "engine") {
+    if (session->is_engine()) {
         if (!rbac_store_ || !rbac_store_->is_open()) {
             // Cannot evaluate authority — fail closed, 503.
             audit_log(req, "auth.permission_required", "denied", "", "",
@@ -810,8 +843,30 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                             "application/json");
             return false;
         }
-        if (!rbac_store_->is_rbac_enabled() ||
-            !rbac_store_->check_permission(session->username, securable_type, operation)) {
+        // The engine decision is `engine_grant_checked`, the same chokepoint the list-read and
+        // fleet-read engine gates use. It reads the grant only on a view proven fresh and
+        // enforced; a view proven fresh and disabled admits nothing; a degraded view, whose
+        // enforcement state cannot be confirmed, is refused without reading a grant, because
+        // RBAC may be genuinely off and an engine has no legacy fallback to land on. Engine
+        // authority stays RBAC-only: an engine is admitted solely through that check, never
+        // through a legacy or service-scoped path. `engine_unavailable` is set when the answer
+        // could not be completed (a failed grant read or an unconfirmed state), so the opt-in
+        // retryable answer surfaces; the default stays 403.
+        bool engine_unavailable = false;
+        bool engine_admitted = false;
+        {
+            const auto checked =
+                engine_grant_checked(rbac_store_, session->username, securable_type, operation);
+            engine_unavailable = !checked && degrade == RbacDegradeMapping::UnavailableAs503;
+            engine_admitted = checked.value_or(false);
+        }
+        if (!engine_admitted) {
+            if (engine_unavailable) {
+                // Opt-in only: still refused, but as the retryable outage it is, not as a
+                // definitive missing grant. The default stays 403.
+                respond_rbac_unavailable(req, res, securable_type, operation, "engine principal");
+                return false;
+            }
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "engine principal denied " + securable_type + ":" + operation);
             res.status = 403;
@@ -972,7 +1027,15 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // This is the SAME predicate the ADR-0017 per-row scope filters key on, so the
     // gate and the filter can never disagree on a corrupt store.
     if (rbac_store_ && rbac_enforcement_in_effect(rbac_store_)) {
-        if (!rbac_store_->check_permission(session->username, securable_type, operation)) {
+        const auto checked =
+            rbac_store_->check_permission_checked(session->username, securable_type, operation);
+        if (!checked && degrade == RbacDegradeMapping::UnavailableAs503) {
+            // Opt-in only (the Forensics-tier resolver): a read that could not be completed is a
+            // retryable outage, not a missing grant. Every other route takes the 403 below.
+            respond_rbac_unavailable(req, res, securable_type, operation, "RBAC");
+            return false;
+        }
+        if (!checked.value_or(false)) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "RBAC denied " + securable_type + ":" + operation);
             res.status = 403;
@@ -1141,7 +1204,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // pre-RBAC legacy fallback below would otherwise hand an engine credential
     // fleet-wide Read the moment RBAC is off (the default). Resolve engine
     // sessions here, RBAC-only, or deny.
-    if (session->principal_kind == "engine") {
+    if (session->is_engine()) {
         if (!rbac_store_ || !rbac_store_->is_open()) {
             // Cannot evaluate authority — fail closed, 503.
             audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
@@ -1459,7 +1522,7 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
     // default-deny). authorize_list_read's own legacy-open branch would
     // otherwise hand an engine credential fleet-wide read the moment RBAC is
     // disabled; resolve engine sessions here, RBAC-only, or deny.
-    if (session->principal_kind == "engine") {
+    if (session->is_engine()) {
         if (!rbac_store_ || !rbac_store_->is_open()) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "engine principal denied: RBAC store unavailable");
@@ -1611,11 +1674,12 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
         // principal_class_of(req) above can only distinguish by credential
         // presentation (bearer token → "agent"), which mislabels an engine
         // principal's bearer-token requests. Re-stamp from the resolved
-        // session's persisted principal_kind so engine-principal actions are
-        // audited truthfully as "engine" (design §6 / adr-1005-execution-plan
+        // session's engine classification (Session::is_engine()) so
+        // engine-principal actions are audited truthfully as "engine"
+        // (design §6 / adr-1005-execution-plan
         // Decision 9 — the AuditStore column reports it now; the HTTP metric
         // is deferred to 4.5).
-        if (session->principal_kind == "engine") {
+        if (session->is_engine()) {
             event.principal_class = "engine";
         }
     }
@@ -1730,7 +1794,7 @@ bool AuthRoutes::audit_log_for_session(const httplib::Request& req, const auth::
     // and, via `make_audit_event_for_principal`, the session correlator and source fields.
     return audit_log_for_principal(req, action, result, session.username, principal_role,
                                    target_type, target_id, detail,
-                                   session.principal_kind == "engine" ? "engine" : std::string{});
+                                   session.is_engine() ? "engine" : std::string{});
 }
 
 AuthRoutes::AuditAsSessionFn AuthRoutes::audit_as_session_fn() {

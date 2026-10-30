@@ -529,7 +529,7 @@
   "version": "1.0.0",
   "where_the_data_goes": [
     "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. Both actions are gathered definitions (`crossplatform.platform_security.secure_boot`, `crossplatform.platform_security.code_integrity`, 300s TTL).",
-    "**Not consumed by** daily-sync, TAR, DEX, or metrics.",
+    "**Not consumed by** daily-sync, Echo, DEX, or metrics.",
     "**Sensitivity.** Rows carry boot-integrity and code-signing settings only: no username, path, process name or installed-software name. The values are a security-posture baseline of the host (for example Secure Boot off, Gatekeeper off, lockdown none), which tells an attacker where enforcement is weak, so the rows warrant the same handling as other `Security` data.",
     "**Siblings:** `vuln_scan` (its configuration checks run `spctl --status` and `csrutil status` through `popen` as pass/fail findings; this plugin reports the raw text and a state over the bounded runner) and `bitlocker` (disk encryption posture)."
   ]

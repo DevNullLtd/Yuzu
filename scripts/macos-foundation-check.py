@@ -114,7 +114,7 @@ def es_status(output):
     for line in output.splitlines():
         parts = line.split('|', 2)
         if len(parts) == 3 and parts[0] == 'config':
-            require(parts[1] not in config, 'Duplicate TAR status field')
+            require(parts[1] not in config, 'Duplicate Echo status field')
             config[parts[1]] = parts[2]
     require(config.get('process_capture_method') == 'endpoint_security',
             'Live Endpoint Security is not active (polling is not ES)')
@@ -148,7 +148,7 @@ def local_integrity():
     require(config.get('UserName', 'root') == 'root', 'Expected root LaunchDaemon')
     run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(APP)])
     plugins = sorted(PLUGINS.glob('*.dylib'))
-    require(any(p.name == 'tar.dylib' for p in plugins), 'Installed TAR plugin is missing')
+    require(any(p.name == 'echo.dylib' for p in plugins), 'Installed Echo plugin is missing')
     for plugin in plugins:
         run(['/usr/bin/codesign', '--verify', '--strict', str(plugin)])
     require(not any((EXE.parent / name).exists() for name in
@@ -162,7 +162,7 @@ def exercise(client, seconds):
     original = local_integrity()
     pid = service_pid()
     started = time.monotonic()
-    initial_drops = es_status(client.command('tar', 'status'))
+    initial_drops = es_status(client.command('echo', 'status'))
     require(any(line.startswith('os_name|') for line in client.command('os_info', 'os_name').splitlines()),
             'Targeted OS command returned no OS name')
     # copyfile deliberately does NOT preserve Apple's restricted system flags.
@@ -178,10 +178,10 @@ def exercise(client, seconds):
         samples = 0
         while time.monotonic() < deadline:
             require(service_pid() == pid, 'LaunchDaemon restarted during observation')
-            # Each dispatch is a fresh snapshot: polling an old receipt cannot see a later TAR drain.
-            lines = client.command('tar', 'sql', {'sql': sql}).splitlines()
+            # Each dispatch is a fresh snapshot: polling an old receipt cannot see a later Echo drain.
+            lines = client.command('echo', 'sql', {'sql': sql}).splitlines()
             events = events or ('started' in lines and 'stopped' in lines)
-            require(es_status(client.command('tar', 'status')) == initial_drops,
+            require(es_status(client.command('echo', 'status')) == initial_drops,
                     'ES counters changed (drop or reset) during observation')
             samples += 1
             print(json.dumps({'phase': 'observing', 'sample': samples,

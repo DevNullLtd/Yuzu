@@ -177,22 +177,30 @@ disclosure of session ids in logs; some log lines still include session ids.
 
 The gateway **management plane** (`:50063`) — the port the server's command
 forwarding dials — is the highest-value gateway surface: whoever it admits can
-run commands on every connected agent. Its secure shape is strict mTLS **plus a
-peer pin** (#1422): the listener's `auth_fun` (run by the gateway's gRPC layer before any handler exists) accepts only a client cert whose
-key matches `{yuzu_gw, mgmt_peer_pins}` (your server's cert) AND carries the
-`serverAuth` EKU — a CA-issued cert alone (any agent's leaf, the gateway's own
-leaf) is rejected with `UNAUTHENTICATED`. The gateway **refuses to boot** when a
+run commands on every connected agent. Its secure shape is strict mTLS **plus peer
+authorization** (#1422, #6016): the listener's `auth_fun` (run by the gateway's gRPC layer before any handler exists) accepts only a client cert that carries the
+`serverAuth` EKU AND is admitted by `{yuzu_gw, mgmt_peer_auth_mode}`: its key matches
+`{yuzu_gw, mgmt_peer_pins}` (your server's cert), or it carries the server identity URI SAN
+`yuzu://<install>/server` that the install CA puts on the server's built-in certificate, or either,
+depending on the mode (unset means `pin`; the identity is an explicit opt-in, and the shipped reference configs set `pin`) — a CA-issued cert alone (any agent's leaf, the gateway's own
+leaf) is rejected with `UNAUTHENTICATED`. A pin needs the server's private key; the identity needs only a
+certificate the install CA signed with that URI, so a deployment that guards the CA key separately from
+the server key should stay in `pin` mode or use `identity` with a pin (which requires both). The identity also trusts the issuing CA's issuance policy: do not enable it where the listener's `cacertfile` is a corporate CA that lets a requester choose a URI SAN with serverAuth (stay in `pin`), and an identity over a `cacertfile` that is not demonstrably exactly one readable certificate (a bundle, or an empty, unreadable or half-written file) refuses to boot unless the mode is `identity` with a pin configured (`identity_over_ca_bundle`). A serial
+deny-list, `mgmt_peer_denied`, refuses a withdrawn certificate in every mode and is read at boot (a change
+takes effect at the next gateway restart, which disconnects the node's agents; a gateway rolled back to a
+pre-#6016 binary does not honour it). The gateway **refuses to boot** when a
 network-reachable mgmt listener lacks this posture; never set
 `{allow_insecure_mgmt, true}` outside an isolated lab rig, and never publish
 `:50063` from a plaintext stack. See `docs/user-manual/gateway.md` "TLS posture"
-for pin configuration and rotation.
+for pin configuration and rotation, and "Authorizing the server by its identity" and
+`docs/adr/2004-gateway-mgmt-server-identity.md` for the identity modes.
 
 **Firewall the management port (known, accepted limitation).** The management listener
 holds at most 256 connections (`limits.max_connections`), and that is a file-descriptor
 bound, not protection. Before the TLS handshake, anyone with layer-4 reach to the port can
 hold a slot for up to the 10 s handshake timeout; after the handshake, any holder of a
 certificate issued by the install CA (every enrolled agent has one) can hold it for as long
-as `PING`s keep the connection busy, because the SPKI peer pin runs later, per stream. About
+as `PING`s keep the connection busy, because peer authorization (pin and/or identity) runs later, per stream. About
 256 held connections would stop the server making **new** connections to the gateway;
 connections already established are unaffected. The gateway does not fix this; you must
 restrict `:50063` (and any alternative port set by `YUZU_GW_MGMT_PORT`) so that only the
@@ -395,7 +403,7 @@ Audit events include: `timestamp`, `principal`, `action`, `target_type`, `target
 ## Database Security
 
 - SQLite databases use WAL mode for concurrent access
-- The TAR database uses `PRAGMA secure_delete = ON` to zero deleted pages
+- The Echo database uses `PRAGMA secure_delete = ON` to zero deleted pages
 - Protect database files with filesystem permissions: `chmod 600 *.db`
 - For encryption at rest, use filesystem-level encryption:
   - Linux: LUKS on the data partition
@@ -429,11 +437,15 @@ Five classes that used to appear on this list no longer belong on it:
   is `SecretCodec`-encrypted as of the `RuntimeConfigStore` Postgres migration
   (ADR-0060) — same KEK-pairing backup rule as MFA secrets above: back the
   database and the `--ca-dir` keys directory up together.
-- **Session tokens** have no durable storage on any substrate. Sessions are
-  in-memory-authoritative (`AuthManager::sessions_`); the Postgres cutover
-  dropped the SQLite-era `sessions` table outright rather than migrating it, so
-  there is no session-token column to encrypt — or to leak in a dump. A restart
-  is itself a fleet-wide session revocation.
+- **Session tokens** are never stored. Operator sessions are durable rows in the
+  `session_store` Postgres schema (`SessionStore`, HA WS-1/1a), keyed by the
+  SHA-256 hash of the token, with `AuthManager::sessions_` as a generation-gated
+  validate cache, so there is no session-token column to encrypt — or to leak in
+  a dump. Sessions survive a server restart, so a restart is **not** a session
+  revocation: use `DELETE /api/v1/sessions?username=<name>` (force sign-out of
+  one operator) or `DELETE /api/v1/sessions/me` (sign out everywhere). The
+  all-operators emergency procedure is in
+  [Auth database recovery](../ops-runbooks/auth-db-recovery.md#sessions-are-durable).
 - **Offload-target credentials** (`offload_target_store.offload_targets.auth_credential`)
   are `SecretCodec`-encrypted as of 2026-08-25 (ADR-0059). Same backup-pairing
   requirement as MFA TOTP secrets above: a Postgres dump alone cannot recover a
@@ -694,8 +706,8 @@ Two consequences worth planning for:
   it is informational only and has no dispatch effect. To stop Guardian rule delivery during an
   incident, disable or remove the rules instead; see
   [Guaranteed State](guaranteed-state.md#baselines--how-guards-reach-agents).
-- **Four server-internal pushes are also exempt, and you should know they exist.** The TAR
-  fleet-topology snapshot request (`tar.fleet_snapshot`), the Guardian rule push
+- **Four server-internal pushes are also exempt, and you should know they exist.** The Echo
+  fleet-topology snapshot request (`echo.fleet_snapshot`), the Guardian rule push
   (`__guard__.push_rules`), the asset-tag sync (`asset_tags.sync`) and the on-demand inventory
   sync (`__sync__.now`) continue to reach a contained device. This is deliberate — gating the Guardian push would stop a quarantined device
   receiving the enforcement rules that make containment meaningful — but it means the containment
@@ -711,7 +723,7 @@ Two consequences worth planning for:
 
   | Channel | What it can do on a contained device |
   |---|---|
-  | `tar.fleet_snapshot` | Requests a read-only topology/process snapshot. No state change. |
+  | `echo.fleet_snapshot` | Requests a read-only topology/process snapshot. No state change. |
   | `asset_tags.sync` | Writes device tags. No code execution. |
   | `__sync__.now` | Requests an on-demand inventory sync — it arms the agent's existing sync scheduler and nothing else. No code execution beyond the plugin's existing daily-sync path. |
   | `__guard__.push_rules` | Delivers Guardian baseline rules, which the agent may *enforce*. Enforcement is **not arbitrary command execution**: the assertion vocabulary is a closed five-value set — file present/absent, file hash, registry value, service running, service stopped — and dangerous registry keys and service names are refused at the `dangerous_enforce_in_spec` chokepoint before a push is ever built. So an operator with Guardian deploy rights can still change *typed, bounded* state on a contained device while their `execute_instruction` is refused. That is deliberate — enforcing a security baseline on a compromised host is the point — but it is the one exempt channel that mutates the endpoint, so scope it accordingly. |

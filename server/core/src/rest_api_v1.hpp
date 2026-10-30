@@ -33,6 +33,7 @@
 #include "product_pack_store.hpp"
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
+#include "forensics_visibility.hpp" // ForensicsVisibilityFn (#4990)
 #include "response_store.hpp"
 #include "result_set_store.hpp"
 #include "schedule_engine.hpp"
@@ -278,13 +279,13 @@ public:
     /// is deliberate:
     ///
     ///   - Routes whose primary authorization is the per-target `scoped_perm_fn`
-    ///     gate (POST /api/v1/bundles, the TAR retention purge, the live device
+    ///     gate (POST /api/v1/bundles, the Echo retention purge, the live device
     ///     query) thread this in as a SECOND, independent confinement check —
     ///     defense-in-depth. Unwired substitutes a present-EMPTY set (deny-all),
     ///     NEVER nullopt: ADR-0033 §1 forbids reading a missing derivation as
     ///     "no filter". `scoped_perm_fn` already 500s when IT is unwired, so the
     ///     primary gate reports the misconfiguration.
-    ///   - The async result-set producers (`from-tar-query`,
+    ///   - The async result-set producers (`from-echo-query`,
     ///     `from-instruction-result`, `{id}/re-eval`) admit on a bare GLOBAL
     ///     `perm_fn("Execution","Execute")` and dispatch by scope/broadcast, so
     ///     this derivation is their ONLY per-device authorization — the PRIMARY
@@ -716,6 +717,20 @@ public:
     /// `set_engine_principal_store`.
     void set_user_exists_fn(UserExistsFn fn) { user_exists_fn_ = std::move(fn); }
 
+    /// #4990 - the Forensics plugin set the stored-response read tier excludes
+    /// (`ServerImpl::forensics_plugin_set_`, borrowed: it outlives this object). MUST be called
+    /// BEFORE `register_routes()`, same timing contract as `set_engine_principal_store`.
+    /// Unset (nullptr, a test harness) fails closed: the response routes refuse every row
+    /// (`tier_filter_for`), so a harness that reads responses must wire it.
+    void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
+
+    /// #4990 - the resolver behind the response routes' Forensics tier (see
+    /// `forensics_visibility.hpp`). Same timing contract as `set_forensics_plugin_set`: BEFORE
+    /// `register_routes()`. Unset resolves to present-empty at the use site.
+    void set_forensics_visibility_fn(ForensicsVisibilityFn fn) {
+        forensics_visibility_fn_ = std::move(fn);
+    }
+
     /// #4981 PR-2 — see `ScopeEvaluateFn`'s doc comment above. MUST be called
     /// BEFORE `register_routes()`, same timing contract as
     /// `set_engine_principal_store`. Unset (`{}`, the default) makes
@@ -835,6 +850,8 @@ private:
     AuditAsSessionFn audit_as_session_fn_;
     EnginePrincipalStore* engine_principal_store_{nullptr};
     UserExistsFn user_exists_fn_;
+    const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990 - see set_forensics_plugin_set
+    ForensicsVisibilityFn forensics_visibility_fn_;         // #4990 - see set_forensics_visibility_fn
     PasswordChangeDeps password_deps_;
     std::vector<std::string> csrf_trusted_origins_;
     ScopeEvaluateFn scope_evaluate_fn_;

@@ -67,7 +67,10 @@ collect_check_responses(ResponseStore& store, const std::string& run_id,
         // empty one. `cr.degraded` lets every grid-persisting caller decline
         // to persist this tick's (falsely-empty) result over an already-good
         // stored verdict, rather than silently downgrading it to Incomplete.
-        auto rows_opt = store.query_by_execution(check_execution_id(run_id, key), q);
+        // #4990: internal consumer. Pre-flight checks are read-only dispatches of fixed
+        // non-Forensics plugins; the grid is evaluated server-side, never returned as raw rows.
+        auto rows_opt = store.query_by_execution(
+            check_execution_id(run_id, key), ResponseTierFilter::unrestricted_internal_consumer(), q);
         cr.degraded = !rows_opt.has_value();
         auto rows = rows_opt.value_or(std::vector<StoredResponse>{});
         if (static_cast<int>(rows.size()) >= fetch_cap) {

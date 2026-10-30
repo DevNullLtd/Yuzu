@@ -774,7 +774,8 @@ def main():
                 isinstance(m, dict) and m.get("schema") for m in (r.get("content") or {}).values())
                 for code, r in (op.get("responses") or {}).items())
             py["unavail" if op.get("x-yuzu-unavailable") else ("typed" if has_schema else "untyped")] += 1
-    # The upgrade note and the changelog quote these figures by hand: pin them to the document.
+    # The upgrade note quotes these figures by hand: pin them to the document. (The released
+    # changelog section is deliberately not pinned: that would freeze live OpenAPI counts.)
     # An operation counts as typed here when it has a success schema, whether or not it is
     # unavailable, which is how both texts count.
     n_ops = py["typed"] + py["untyped"] + py["unavail"]
@@ -786,10 +787,7 @@ def main():
     n_guides = sum(1 for t in real.get("tags", []) if isinstance(t, dict) and t.get("x-yuzu-guide"))
     root = pathlib.Path(__file__).resolve().parent.parent
     for rel, pat in (("docs/user-manual/upgrading.md", "gives %d of its %d operations" % (n_typed, n_ops)),
-                     ("changelog.d/2026-10-22-openapi-typed-responses.changed.md", "success response of %d of its %d operations" % (n_typed, n_ops)),
-                     ("changelog.d/2026-10-22-openapi-typed-responses.changed.md", "%d component schemas" % n_schemas),
                      ("docs/user-manual/upgrading.md", "%d tag groups" % n_guides),
-                     ("changelog.d/2026-10-22-swagger-api-reference-page.added.md", "%d groups opens with a guide" % n_guides),
                      ("docs/user-manual/upgrading.md", "**Operations the server does not serve.** %d operations" % py["unavail"])):
         check(pat in (root / rel).read_text(encoding="utf-8"),
               "%s must say %r (the document has %d operations, %d typed, %d schemas)" % (rel, pat, n_ops, n_typed, n_schemas))

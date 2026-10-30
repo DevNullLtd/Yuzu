@@ -259,7 +259,7 @@ Pipe-delimited text rows, one per line of output. The first field is the fixed a
 ### Where the data goes
 
 - **Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. Each action is a gathered definition (`crossplatform.local_security_policy.<action>`, 300s TTL).
-- **Not consumed by** daily-sync, TAR, DEX, or metrics.
+- **Not consumed by** daily-sync, Echo, DEX, or metrics.
 - **Sensitivity.** Password, lockout and audit rows are a compliance baseline of the host (a short minimum length, no lockout, auditing off), which is useful to an attacker choosing a target. `sudoers` rows carry account and group names, run-as targets, `NOPASSWD` flags and command text verbatim (an argument can embed a secret), i.e. who may become root. The rows stay in the response store under its generic retention. With RBAC enforcement off, any authenticated session that can dispatch to the device can read them; the actions are `Security:Read`, not `UserManagement:Read`, because they sit with the other privilege-posture reads. Treat all four like other `Security` data.
 - **Siblings:** `firewall`, `bitlocker` and `antivirus` (other `Security` posture plugins) and `users` (account and group membership; this plugin reports policy, not accounts).
 
@@ -382,5 +382,4 @@ sudoers|/etc/sudoers.d/90-ops|defaults|user:ops|-|-|!authenticate
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_local_security_policy.hpp`
 - Tests: `tests/unit/test_local_security_policy_local_dispatcher.cpp` · `tests/unit/test_local_security_policy_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-09-29-local_security_policy-windows-sudoers.added.md` · `changelog.d/5069-local_security_policy.added.md`
 <!-- END GENERATED -->

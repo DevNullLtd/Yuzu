@@ -610,7 +610,7 @@ Full design: `docs/auth-mfa-design.md`. Summary:
 - **RFC 6238 TOTP** (HMAC-SHA1, 30 s step, 6 digits, ±1 step skew with
   replay protection). 10 single-use base32 recovery codes per
   enrollment, PBKDF2-SHA256 hashed.
-- **Self-service enrollment** via Settings → Security and sign-in → Two-factor sign-in.
+- **Enrolment by an administrator for its own account** via Settings → Security and sign-in → Two-factor sign-in (the Settings enrolment routes are administrator-only; a non-admin enrols only at sign-in, when `--mfa-enforcement` protects it).
   One-time `otpauth://` reveal in the same `<div class="token-reveal">`
   pattern as API-token issuance.
 - **Login challenge** — `POST /login` returns HTTP 202 +
@@ -904,16 +904,76 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
 
 - an **interactive cookie session** (local or OIDC); API-token and MCP bearer sessions are refused
   with a typed `403` (A4 envelope);
-- a **fresh MFA step-up** through the same `require_mfa_step_up` gate as the other step-up endpoints
-  (so the same pass-through for an account the gate cannot ask for a factor applies: a local account
-  with no enrolled factor, which `mfa_step_up.cpp` passes in every `--mfa-enforcement` mode, and an OIDC
-  session without an `amr` proof whenever the mode does not protect its role, i.e. everything except
-  `--mfa-enforcement=required` and, for admins, `admin-only`). `required` closes the OIDC case only when
-  the IdP asserts an MFA-method `amr`; otherwise an OIDC session gets `401` and loops through re-SSO
-  at every step-up endpoint, not only approval (recovery is restarting in `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards), not just any non-`required` mode, because an `amr`-less OIDC admin is still gated under `admin-only`; see [MFA on SSO sessions](user-manual/authentication.md#mfa-on-sso-sessions-pr-3) and the [recovery runbook](ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). A requirement
-  that the approver holds an enrolled factor in every mode is tracked in #6079;
+- an **enrolled MFA factor with a fresh proof** (#6079). The central step-up check (see
+  "Two layers, one proof" below) runs first on these routes, as on the other step-up endpoints, but it can only ask
+  for a factor the account has and so passes an unenrolled caller. On top of it the handler runs
+  `require_enrolled_fresh_mfa` (`mfa_step_up.{hpp,cpp}`), which first probes the factor of the
+  **session's own identity** (never a namesake row that happens to share a username) and refuses
+  before any proof is judged:
+  - a **local** session needs a currently enrolled TOTP factor read from `AuthDB`, and a proof
+    (`mfa_verified_at`) within the approver window. The proof must also not predate the account's
+    current enrolment (`mfa_enrolled_at`, both read from Postgres): disabling MFA and enrolling again
+    invalidates older proofs, answered with `401` and audit detail `reason=proof_predates_enrolment`;
+  - an **OIDC** session has no local enrolment to check. Its proof is "fresh" only in this sense: the
+    identity provider issued an ID token with an MFA-method `amr` within the window (the server ages the
+    token's `iat`, clamped to the server's own clock at sign-in). The MFA itself may predate the token,
+    because the provider can reuse its own session: `oidc_provider.cpp` sends neither `prompt=login` nor
+    `max_age`. It does **not** mean a second factor was presented again at approval time, and any single MFA-method
+    `amr` value the gate accepts counts. Real re-authentication (`auth_time` with `max_age`) is a named
+    follow-up. An OIDC session with no MFA `amr` proof (no MFA `amr`, or `iat` missing or not positive,
+    so no proof was seeded at sign-in) is refused `403` `mfa_proof_missing` by the approver rule; a proof that is present but
+    older than the window is the step-up `401` with `challenge_url=/auth/oidc/start`. With the step-up window
+    above `0` and `--mfa-enforcement` protecting the role (`required`, or `admin-only` for an administrator), the
+    central check answers a session with no `amr` proof first, with that same `401` and no ticket row, so an
+    identity provider that never asserts an MFA `amr` loops through re-sign-in instead of seeing
+    `mfa_proof_missing`;
+  - a **SAML** session is refused (#4935), in every configuration, with `saml_mfa_unsupported` from the approver rule;
+    with the window above `0` the central check answers it first with its generic `403`, and the typed refusal
+    appears only with `--mfa-step-up-window-secs=0`;
+  - a **local** session whose `auth.users` row is deleted, deactivated or has an invalid username is
+    refused `account_unavailable` (a different remedy from "not enrolled"; the refusal never passes). The typed
+    `403` is reached only when the central check does not answer first: with the step-up window above `0` the
+    central check's own `mfa_status` read fails for such an account and answers `401` `MFA step-up required`
+    (remediation `auth_db unavailable: retry shortly or contact an administrator`), so the typed refusal is what a
+    window of `0` returns, or an account that disappears between the two reads;
+  - any other non-local session is refused as non-interactive.
+
+  **The approver window** is `min(--mfa-step-up-window-secs, 300)`, and 300 when that setting is `0` or
+  negative. It is independent of `--mfa-enforcement`, of `--jit-oidc-amr-elevation` and of
+  `--mfa-step-up-window-secs=0`, so no configuration lengthens it past 300 seconds or switches it off.
+  The ceiling is enforced against the durable proof timestamp (`session_store.sessions.mfa_verified_ms`) on the
+  database clock: the gate reads the row and `db_now_ms` in one SELECT and requires `0 <= db_now_ms - mfa_verified_ms <= window`,
+  with no `kWallSanitySkew` allowance, in addition to the cached monotonic check. A suspended host or paused VM freezes the
+  monotonic anchor, so the cached check alone is not a ceiling; the replica's own `system_clock` is never the authority.
+  A degraded read is `503`; a missing or future-dated proof is a step-up `401` for a local session. An OIDC session with no usable cached proof is refused earlier, `403` `mfa_proof_missing`, with one exception: when the cached anchor is empty because the stored proof is dated after the database clock (the replica that took the sign-in ran ahead of the database; the sign-in clamps the ID-token `iat` to that replica's own clock, so an identity provider running ahead cannot future-date the proof by itself; `derive_session_deadlines` drops such a proof), the refusal is its own `503` while the database clock is still behind that instant, because signing in again cannot fix it (see below). With no SessionStore attached (a wiring fault: a serving process always has one) the
+  gate answers `503` and nothing is decided; the replica's wall clock never stands in for the database clock.
+  Once the central check has passed (or with the window at `0`), a refusal for an unenrolled or proof-less caller is a `403`
+  (`approver_assurance_required:mfa_not_enrolled`, `mfa_proof_missing`, `saml_mfa_unsupported`,
+  `account_unavailable`), not a step-up prompt. These typed reasons are not all reachable in every configuration:
+  `mfa_not_enrolled` is the one that is typed at every window, while at the default window `mfa_proof_missing`
+  is typed only when `--mfa-enforcement` does not protect the role, and `saml_mfa_unsupported` and
+  `account_unavailable` are typed only with the window at `0` (`account_unavailable` also when the account disappears between two reads); a stale or pre-enrolment proof is the step-up `401`; and when the
+  approver rule's own read fails (an unreadable stored proof, or an MFA-store fault at its own read) the answer is a
+  `503` with `retry_after_ms` and `yuzu_auth_secret_unavailable_total{route="approval"}`. The clock-skew refusal is a separate outcome
+  (`ApproverMfaOutcome::Kind::kProofClockSkew`): `503`, audit `result=error` with detail `approver_assurance:mfa_proof_clock_skew`, an A4
+  error naming the database clock and a remediation to correct clock synchronisation, `retry_after_ms` null (the key is present), and no increment of the
+  `route="approval"` counter, which stays a store-fault signal; the server logs an error line. A degraded durable-proof read is decided
+  first and answers the ordinary store-unavailable `503`. This `503` is typed only when the central check does not answer first (default `--mfa-enforcement=optional`, `admin-only` for a non-administrator approver, or the window at `0`). Once the database clock has passed the stored instant (after at most as long as the skew is large, even while
+  the skew persists), a session whose cached proof was dropped keeps an empty anchor until its cache re-derives (a session create, MFA mark, elevation or delete by any user clears it; an activity touch does not; so does a server restart) and answers `403` `mfa_proof_missing`, whose remediation always ends by asking the administrator to check clock
+  synchronisation; signing in again re-creates the same state while the skew persists. Under `required` (or `admin-only` for an administrator)
+  with the window above `0` the central check answers first: the OIDC approver sees a repeating `401` step-up challenge, no `approval.*` skew row
+  and no skew log line, and `yuzu_auth_mfa_step_up_gate_total{outcome="refused"}` rises. With the window above `0`
+  the central check answers first for a SAML session (generic `403`), for a deleted or deactivated local account
+  (`401` `MFA step-up required`), for a stale proof (`401`, normally: the central
+  and approver windows are both 300 by default, so the ticket-specific `approver_assurance:mfa_proof_stale` row exists
+  only in the band of about a second between the central whole-second test and the approver millisecond ceiling, for
+  `proof_predates_enrolment`, or when the configured window exceeds 300) and for an unreadable local MFA store (`503`
+  without `retry_after_ms`, counted `route="mfa_stepup"`). Break-glass accounts get no exemption: they
+  are enrolled by validation and are judged like any local account;
 - a **human principal**, never an engine principal;
-- a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`);
+- a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`). The comparison is
+  reviewer account name against submitter account name, so one person holding two identities counts as two
+  reviewers; this is a recorded exception (ADR-1005, 2026-10-19 addendum), not a guarantee of distinct people;
 - on the REST routes (the dashboard page included), a **same-site `Origin` (or `Referer`)** on the
   cookie `POST`, decided centrally by the server-wide check (after authentication and before step-up
   evaluation, challenge emission and route-handler effects; the route's own copy, after the permission
@@ -928,24 +988,98 @@ Consequences, each deliberate:
   step-up envelope before the handler's own `403`s, and an engine principal receives `403`
   `engine_principal_denied` (audited as `mfa.step_up.required`) in place of the handler's approver-class
   refusal. The central check passes an API-token or MCP-token session (it has no MFA factor), so the
-  handler's refusal of those sessions is unchanged. The handler keeps its own step-up call, which only
-  consumes the central pass and evaluates nothing again.
+  handler's refusal of those sessions is unchanged. The handler keeps its own step-up call, which consumes the central pass
+  and normally evaluates nothing again (it evaluates afresh when no pass was consumed, for example when the
+  central check is switched off with `--mfa-step-up-window-secs=0`), and then applies the approver rule on top.
 - **MCP can never approve.** The refusal is unconditional on the MCP transport, which runs no MFA step-up: the two MCP tools always
   return the typed refusal, for a bearer token and for a cookie session that reaches `/mcp/v1/` alike. This is an exception recorded in ADR-1005's exception ledger (entry 2026-10-18, "human review
   is a human-session act"; legacy REST rows `exception:#6061 revisit:2027-01-18`). The tools remain registered; listing pending approvals via MCP is unchanged. The MCP
   tier/permission mapping for both tools is `Approval:Approve` (it was mapped as `Approval:Write`;
   #3151).
-- **SAML approvers are blocked while step-up is on.** SAML sessions can never pass step-up (#4935),
-  so a SAML-authenticated user cannot approve. This is the SAML consequence of "MFA enforcement with
-  SAML" below, not a separate rule. With `--mfa-step-up-window-secs=0` the window check returns before
-  the SAML branch and a SAML session is admitted. A SAML-only deployment therefore has no working
-  approver path until #4935 is decided (known limitation, tracked in #6098).
-- **`--mfa-step-up-window-secs=0` lowers the assurance to "interactive session" only.** The step-up
-  gate is off for approvals as for every other step-up endpoint. Operators who rely on approvals as a
-  control should not set it; if they do, review every `approval.approve` row with `result=success` and check every `attempted` row that has
-  no outcome row, comparing counts per `target_id` (each decision also leaves a `result=attempted`
-  row first, and a decision whose outcome row failed to write leaves only that row; see
-  `docs/user-manual/audit-log.md`).
+- **SAML approvers are blocked.** SAML sessions can never pass step-up (#4935), so a SAML-authenticated
+  user cannot approve, whatever `--mfa-step-up-window-secs` is set to. The approver rule refuses SAML
+  itself (it does not rely on the generic gate's SAML branch described in "MFA enforcement with SAML"
+  below). Before #6079, `--mfa-step-up-window-secs=0`
+  returned before the SAML branch and admitted a SAML approver; it no longer does. A SAML-only
+  deployment therefore has no working approver path until #4935 is decided (known limitation, tracked
+  in #6098).
+- **`--mfa-step-up-window-secs=0` no longer lowers approval assurance.** The approver window is 300
+  seconds when the setting is `0`, so approvals keep their enrolled-factor and fresh-proof requirement
+  while every other step-up endpoint is switched off. Decisions recorded before the upgrade (including
+  any made with the setting at `0`) gain no retroactive assurance; review them as described in
+  `docs/user-manual/upgrading.md`.
+- **A non-admin approver cannot enrol itself.** On the shipped default (RBAC enforcement off, `--mfa-enforcement=optional`)
+  the only approvers are administrators and none is forced to enrol, so each administrator is refused
+  `mfa_not_enrolled` until it enrols itself in Settings (another administrator cannot enrol it). Local MFA enrolment fires at sign-in only when
+  `--mfa-enforcement` protects the account (`optional` protects nobody, `admin-only` protects
+  administrators), and the Settings enrolment routes are administrator-only. The seeded `Operator` role
+  holds `Approval:Approve`, so with RBAC enforcement on and `--mfa-enforcement` at `optional` or
+  `admin-only` a non-admin approver is refused `mfa_not_enrolled` until an administrator runs an enrolment sign-in window or promotes the account
+  to administrator long enough to enrol and then demotes it
+  (`docs/ops-runbooks/auth-db-recovery.md`, "Enrolling a non-admin approver"). Self-service enrolment
+  for non-admins is a named follow-up. With RBAC enforcement off (the shipped default) the legacy gate
+  in `AuthRoutes::require_permission` requires the `admin` role for `Approval:Approve`, so a non-admin
+  is refused `403` "admin role required" before the MFA gate, and the enrolment paths achieve nothing
+  until enforcement is turned on.
+- **Sessions ended when the CLI or Settings clears a factor (API tokens are not; the two steps are not atomic).** The
+  factor clear and the session delete are two separate database commits, so a failed delete or a process kill
+  between them leaves the factor cleared and the sessions live, and the direct-SQL fallback in the recovery runbook,
+  which clears the factor in one transaction and writes no audit row, is written to end the sessions in that
+  same transaction. Both paths audit a clear in two phases. An `attempted` intent row (`mfa.reset.breakglass` or
+  `mfa.disabled`) is written BEFORE the clear and fails closed: the CLI prints `error: audit store did not accept the
+  intent row; nothing was changed` and exits `1`, and Settings answers `503` with `Sec-Audit-Failed: true`, in
+  either case with nothing changed. The outcome row follows the work, so no factor is cleared unless the intent row
+  is durable (on the Settings route that relies on the audit store having opened and the audit writer being wired in, which
+  server boot requires; the CLI checks the write result directly) and an `attempted` row with no outcome row marks a clear that
+  was requested and whose outcome is unknown. The residual, until the clear and the session delete share one transaction, is the
+  loss of the outcome row (the process dies after the clear, or the outcome write fails after it): the factor is cleared, the
+  sessions may be live, and the `attempted` row has nothing after it; a process that dies before the clear leaves the same lone
+  row with the factor intact.
+  `yuzu-server --mfa-reset` deletes the account's durable
+  sessions in the same one-shot (`SessionStore::invalidate_user`, which bumps the generation so every
+  replica drops its cached copy), and exits non-zero if that fails; the outcome row is `success` with
+  `sessions_ended=<n>`, or `partial` with `sessions_ended=failed`. If its clear fails, no session is ended, the outcome row is
+  `error` and the command exits non-zero: the state is unknown, because the commit acknowledgement may have been lost
+  and the clear may have landed. Disabling MFA from Settings (`mfa_disable_report`) deletes EVERY session of the account, the caller's
+  included (`AuthManager::invalidate_user_sessions`, same generation bump), clears the cookie and sends the
+  browser to `/home`; the outcome row records `sessions_ended=<n>`, or result `partial` with
+  `sessions_ended=failed` when the durable delete failed (the factor stays cleared and the page has no retry
+  control: the Disable form exists only in the enrolled view, so an administrator ends the sessions with
+  `DELETE /api/v1/sessions?username=<name>` or `--mfa-reset`). When the clear itself fails the sessions are still ended (the had-a-verified-factor pre-image is
+  read from the clear's own row lock by `AuthDB::mfa_disable_report`, so an enrolment verified in between cannot be
+  missed, and a failed clear leaves it unknown, which counts as a verified factor), because the clear may
+  have committed with its acknowledgement lost (audit `error`, `disable failed (sessions_ended=<n>|failed)`; the user
+  is signed out when the delete succeeded, and when it also failed the page says the state is unknown and asks an
+  administrator to check the account and end its sessions);
+  cancelling an enrolment that was never verified ends none (audit `ok`, `no verified factor to clear`). The rows are
+  written through the session-bound audit writer, so the actor's principal, role and session are recorded even
+  though that session was just deleted. A lost Settings outcome row cannot undo the clear, so it is a server ERROR line and
+  the request completes; `--mfa-reset` instead exits non-zero when its outcome row cannot be written.
+  `sessions_ended` counts the durable session rows deleted, expired rows the reaper has not yet removed included.
+  Neither path ends API tokens. These are the only two production paths that clear a factor. The proof-versus-enrolment comparison above remains the second line: it assumes the
+  database primary clock does not step backward (ADR-2002 section 4 treats database clock integrity as
+  a security dependency; the shipped control is the `YuzuSessionReapClockAnomaly` alert, which fires only when a
+  session reap pass declines: it sees a backward step only when it exceeds the time since the last accepted
+  pass, about 15 minutes at most, and a forward step only when it exceeds about a year). The check is an admission boundary: a clearance committed before the read is honoured, one
+  committed after it is seen from the next request, and the two session resolves on the route are not
+  atomic.
+- **Mixed versions and rollback.** The enrolled-factor requirement is in force only while every replica
+  serving `/api/approvals/*` runs a build that has it; a replica without it still applies the weaker
+  rule. Rolling those replicas first shortens the exposure window; the gap closes only when approval traffic
+  reaches upgraded replicas only (pin or drain approvals), and stop-all, upgrade, start-all is the default
+  recommendation. Running more than one server replica is unsupported today (the safe-to-scale gate,
+  `docs/ha-delivery-matrix.md`), so this describes a rolling upgrade, not a supported deployment. Rolling back is a
+  security-policy downgrade. Endpoint agents are unaffected.
+- **The gate decides at the gate instant.** The factor, role and session reads happen before the `attempted` audit
+  row and the ticket update, and nothing holds them across those two writes. A factor clear, role change or session
+  end that commits after the gate and before the ticket update does not undo that decision: the ticket is decided
+  with `detail` `approver_assurance:enrolled_fresh_mfa`, and a clear that commits just before the gate is refused
+  (`mfa_not_enrolled`). The window is the time the audit write and the ticket update take: the audit write waits at most 4 s for a
+  pooled connection, the ticket update at most 1.5 s for its read and 2 s for its write, and each statement then runs
+  under the pool's statement timeout (30 s by default), so under a database brownout the window is bounded by those
+  waits and statement times and can be seconds, and normally it is a few short queries. Order the rows by the audit `id` (`timestamp` is whole seconds) to read the interleaving, for example
+  `approval.approve` `attempted`, `mfa.disabled` `attempted`, `mfa.disabled` outcome, `approval.approve` `success`.
+  Making the clear atomic with the session delete does not close this window.
 - **Fail closed.** An unresolvable session (the "degraded session read", #4128) answers `503` and the
   ticket stays pending; it is no longer recorded with the reviewer `unknown`. The approval attempt
   is audited before the decision is applied, and an audit-write failure answers `503` with nothing
@@ -1943,7 +2077,13 @@ receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"`, regardless of `--mfa-enforcement` mode (the one exception is a disabled window: with
 `--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 37 routes enforced by the
 central check, but not the three JIT-elevation routes, which own their gate and substitute a
-300 s window, so those still deny SAML). The step-up decision
+300 s window, so those still deny SAML). Approval approve/reject are among the 37 central
+routes, so with the window enabled the central check answers a SAML session first with this
+generic 403, and the handler never runs. They also carry their own, stricter approver gate
+(#6079), which refuses a SAML session in every configuration; the typed
+`approver_assurance_required:saml_mfa_unsupported` is what it answers with
+`--mfa-step-up-window-secs=0` (where the central check passes SAML through), and the
+generic `403` above answers first otherwise. The step-up decision
 (`decide_step_up` in `step_up_gate.cpp`, shared by the chokepoint and
 `require_mfa_step_up` in `mfa_step_up.cpp`) exits with an honest denial
 before reaching the local
@@ -1958,8 +2098,9 @@ row). This means:
 - `--mfa-enforcement=optional` — same: the SAML-specific exit fires before
   enforcement mode is consulted.
 
-A SAML user therefore cannot approve or reject approval tickets while step-up is on
-(see "Approver assurance" above).
+A SAML user cannot approve or reject approval tickets in any configuration (the generic `403` above
+with the window above `0`, `approver_assurance_required:saml_mfa_unsupported` with it at `0`; see "Approver
+assurance" above).
 
 **Recommendation:** Use `--mfa-enforcement=optional` or `--mfa-enforcement=admin-only`
 when SAML is in use, and configure your IdP to enforce MFA at login time. Avoid
@@ -3239,7 +3380,7 @@ counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
 
 ## Granular RBAC (Phase 3)
 
-- 7 roles, 38 securable types, per-operation permissions, deny-override logic.
+- 8 roles (adds `ForensicsAnalyst`, the read-only delegable Forensics tier, #4990), 38 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO**: Full PKCE flow, OIDC Discovery, JWT validation, group-to-role mapping. Endpoints and `jwks_uri` are never derived from the issuer: `OidcProvider::ensure_discovered` reads them lazily from the issuer's discovery document (an explicit `OidcConfig` field is authoritative for that one field), fails closed with no fallback, and applies one validation, shared with the Settings "Test Connection" button: `issuer` byte-equal to the configured issuer (OIDC Discovery 4.3, the mix-up defense) and every endpoint an absolute URL on the issuer's scheme, at most 2048 bytes, with a well-formed `host[:port]` authority. Test Connection shares only the fetch and validation functions: it never reads or clears the provider's discovery state, so it is a connectivity check and not a guarantee of what a sign-in will hit.
   - All IdP GETs go through one bounded primitive (`http_get_bounded`): 5 s per-operation timeouts and a total bound of 2 x that timeout, 10 s by default, from the start of the request, covering name resolution (on POSIX the resolver is capped at the per-operation timeout where httplib's non-blocking resolver is compiled in: the Linux build; not checked on macOS. On Windows `resolve_host_addresses` runs its own overlapped `GetAddrInfoExW` lookup, canceled at that timeout rounded up to whole seconds, with up to 5 s more for the canceled lookup to complete; a lookup still not complete then is not freed (the OS may still write into it) but handed to a process-wide ledger that destroys it once its event is signaled, holds at most 16 such requests plus lookups in flight, and makes a new lookup fail closed with "the host name did not resolve" while 16 are stuck: `oidc_abandoned_ledger.hpp`), connect and the response; 256 KiB body cap, redirects not followed.
   - A watchdog thread shuts the socket down at that deadline, and again every 50 ms because a pre-connect shutdown does not persist on macOS (measured), so the bound also covers the TLS handshake, which httplib's own `set_max_timeout` does not. On POSIX the watchdog holds a descriptor it reserved before the client existed (an alias of the socket, made by dup2 from httplib's socket-options callback, so exhaustion fails the request closed with `request failed: no file descriptor available` rather than leaving it unwatched). On Windows it takes a private duplicate of the socket (`WSADuplicateSocketW`, so it never touches a socket number httplib may close and Windows may reuse), and a duplicate that cannot be taken fails the request closed with the same text; from the deadline it calls `CancelIoEx` on the duplicate and shuts the connection down every 50 ms, and after 10 such cuts (500 ms) closes the duplicate with `SO_LINGER` zero, an abortive close that resets the connection (the count restarts for each socket httplib hands it). httplib 0.37.1 waits with `WSAPoll` on Windows; the evidence for the cut is the end-to-end Windows drip test. Per-OS test provenance is in `docs/test-coverage.md`.
@@ -3427,11 +3568,18 @@ ADR-0041, currently at v3).
 
 ## Render-time permission probes (capability hints)
 
-Five `AuthRoutes` methods answer a permission question without writing a denial row for an
+Six `AuthRoutes` methods answer a permission question without writing a denial row for an
 interactive sign-in, for pages
 that decide what to DRAW: `has_permission` (the verdict only), `probe_permission` (the verdict
-with the gate's own response kept, so "denied" and "store unavailable" stay distinguishable),
-`probe_admin` (`require_admin`'s decision), `probe_fleet_read` (`require_fleet_read`'s decision and
+with the gate's own response kept: it receives the 401/403/503 the gate wrote, and the 503 appears
+only where the gate itself writes one, such as an engine principal with the store not open; an RBAC
+read that fails (breaker open, pool timeout, a failed role or permission query) is a `403` here and
+cannot be told apart from a refusal), `probe_permission_unavailable_aware` (`probe_permission`
+with one difference: such a failed RBAC read is answered with a retryable `503`, `retry_after_ms`
+5000 and no `permission` field. It exists for the one consumer whose correctness depends on telling
+"could not determine" from "definitively denied", the Forensics-tier resolver, where a collapsed
+answer would serve a `200` with the Forensics rows silently missing; a new caller needs the same
+justification, and `require_permission` itself stays a `403` on a degrade, ADR-0041), `probe_admin` (`require_admin`'s decision), `probe_fleet_read` (`require_fleet_read`'s decision and
 scope) and `probe_global_list_read` (`require_list_read`'s decision, with a management-group-
 confined admission refused as a denial, for a resource that is not agent-scoped; its loud twin
 `require_global_list_read` is the gate of the plugin-config REST list). Each runs the gate's own
@@ -3658,7 +3806,7 @@ A **service-scoped API token** is bound to one IT service's agents (`session->to
 
 **Explicit denies for gate-less routes (§3e).** A route that never calls `require_permission`/`require_scoped_permission`/C8 at all is untouched by the flip regardless of how the flip itself is tuned — these needed their own deny. `AuthRoutes::deny_service_scoped_session` is `server.cpp`'s shared gate for this shape (health-summary fragment, the legacy `/events` SSE stream, the instructions-list fragment, and the six result-set HTMX fragments); `ComplianceRoutes` and `WorkflowRoutes` carry their own file-local equivalents for the same reason every other route-owner class in this list does (below). A residual grep sweep of every `auth_fn`/`perm_fn` call site in `rest_api_v1.cpp` (74 sites) and `mcp_server.cpp` (3 sites) found four more real instances — three sharing one shape (`management-groups/{id}/roles` GET/POST/DELETE, plus the `POST /api/v1/tokens` service-scope minting check, all bypassing `require_permission` via a **direct** `rbac_store->check_permission` call) and the eight-route `/api/v1/result-sets*` REST family (the twin of the HTMX fragments above) — plus one **distinct, more severe, not service-scope-specific** bug in the same pass: `POST /api/v1/result-sets/from-inventory-query` had no authorization check of any kind (CWE-862), missed by an earlier fix that gated its three dispatch siblings. Full inventory, including document-only dispositions and the sweep's own accounting: `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
 
-**The per-file `deny_service_scoped_*`/`deny_fleet_wide_service_scoped` helpers are now a SECOND, largely-redundant layer, not the primary defense.** For any route that also calls `require_permission`/`require_scoped_permission` (the vast majority), the flip above already denies a service-scoped token structurally — four of the remaining original in-handler deny sites (`list_schedules`, `list_dex_perf_devices`, `compare_app_perf_versions`, `list_network_devices`) are still double-denies, kept for now and scheduled for Phase 2 retirement. Two are retired: `query_installed_software`'s in the first Phase 2 migration (below) and `get_dex_group_app_perf`'s in #3290 Phase 2 bucket 1a (both were provably dead, fired after their route's own `perm_fn`). A THIRD group — `GET /api/v1/dex/signals/{obs_type}`+`GET /api/v1/dex/app`+`GET /api/v1/dex/overview` (REST) and their MCP twins `get_dex_signal_detail`/`get_dex_app`/`get_dex_overview` — stays on `perm_fn` + `deny_fleet_wide_service_scoped` (WS-A4 PR-1): these three routes' fields are all fleet-wide aggregates not yet confined per caller (ADR-0017 INV-3), so they stay global-only rather than moving onto `AuthRoutes::require_fleet_read` — see `docs/presentation-core-split-delivery-matrix.md`'s WS-A4 row; their `deny_fleet_wide_service_scoped` call sites are therefore LIVE again, fired BEFORE `perm_fn`/`tier_allows`, same class as the four sites below. The four sites that remain are live-but-redundant (their deny fires BEFORE `perm_fn`, so retiring them changes the observable response, not just deletes unreachable code — a different, more cautious backlog item). Same bucket-1a pass also retired `deny_service_scoped_schedule` (`schedule_routes.{hpp,cpp}`) entirely — its four call sites (`schedule.create`/`.list`/`.delete`/`.enable`) all fired after their route's own `require_permission`. The remaining per-file helpers (below) stay in place; they remain load-bearing **only** for routes with no other RBAC gate call at all (the §3e class above) — `EXTEND the pattern, do not fork a new copy` still applies to *that* subset. Current call sites, including this PR's additions: `deny_service_scoped_`/`deny_service_scoped_mutation_` (`guardian_routes.{hpp,cpp}`), `deny_service_scoped_` (`dex_routes.{hpp,cpp}`, `deployment_routes.{hpp,cpp}`, `preflight_routes.{hpp,cpp}`, and the new `compliance_routes.{hpp,cpp}`), `deny_service_scoped_schedule_list` + the new `deny_service_scoped_scope_estimate` (both local lambdas in `workflow_routes.cpp`), the shared `deny_fleet_wide_service_scoped` lambda in `rest_api_v1.cpp` (now covering the result-set REST family too) and `mcp_server.cpp`, the new `AuthRoutes::deny_service_scoped_session` (`server.cpp`'s shared gate for its own gate-less routes), plus inline checks in `device_routes.cpp` / `network_routes.cpp` / `inventory_routes.cpp` / `tar_tree_routes.cpp`.
+**The per-file `deny_service_scoped_*`/`deny_fleet_wide_service_scoped` helpers are now a SECOND, largely-redundant layer, not the primary defense.** For any route that also calls `require_permission`/`require_scoped_permission` (the vast majority), the flip above already denies a service-scoped token structurally — four of the remaining original in-handler deny sites (`list_schedules`, `list_dex_perf_devices`, `compare_app_perf_versions`, `list_network_devices`) are still double-denies, kept for now and scheduled for Phase 2 retirement. Two are retired: `query_installed_software`'s in the first Phase 2 migration (below) and `get_dex_group_app_perf`'s in #3290 Phase 2 bucket 1a (both were provably dead, fired after their route's own `perm_fn`). A THIRD group — `GET /api/v1/dex/signals/{obs_type}`+`GET /api/v1/dex/app`+`GET /api/v1/dex/overview` (REST) and their MCP twins `get_dex_signal_detail`/`get_dex_app`/`get_dex_overview` — stays on `perm_fn` + `deny_fleet_wide_service_scoped` (WS-A4 PR-1): these three routes' fields are all fleet-wide aggregates not yet confined per caller (ADR-0017 INV-3), so they stay global-only rather than moving onto `AuthRoutes::require_fleet_read` — see `docs/presentation-core-split-delivery-matrix.md`'s WS-A4 row; their `deny_fleet_wide_service_scoped` call sites are therefore LIVE again, fired BEFORE `perm_fn`/`tier_allows`, same class as the four sites below. The four sites that remain are live-but-redundant (their deny fires BEFORE `perm_fn`, so retiring them changes the observable response, not just deletes unreachable code — a different, more cautious backlog item). Same bucket-1a pass also retired `deny_service_scoped_schedule` (`schedule_routes.{hpp,cpp}`) entirely — its four call sites (`schedule.create`/`.list`/`.delete`/`.enable`) all fired after their route's own `require_permission`. The remaining per-file helpers (below) stay in place; they remain load-bearing **only** for routes with no other RBAC gate call at all (the §3e class above) — `EXTEND the pattern, do not fork a new copy` still applies to *that* subset. Current call sites, including this PR's additions: `deny_service_scoped_`/`deny_service_scoped_mutation_` (`guardian_routes.{hpp,cpp}`), `deny_service_scoped_` (`dex_routes.{hpp,cpp}`, `deployment_routes.{hpp,cpp}`, `preflight_routes.{hpp,cpp}`, and the new `compliance_routes.{hpp,cpp}`), `deny_service_scoped_schedule_list` + the new `deny_service_scoped_scope_estimate` (both local lambdas in `workflow_routes.cpp`), the shared `deny_fleet_wide_service_scoped` lambda in `rest_api_v1.cpp` (now covering the result-set REST family too) and `mcp_server.cpp`, the new `AuthRoutes::deny_service_scoped_session` (`server.cpp`'s shared gate for its own gate-less routes), plus inline checks in `device_routes.cpp` / `network_routes.cpp` / `inventory_routes.cpp` / `echo_tree_routes.cpp`.
 
 **Phase 2 progress (#3290).** The first migration landed: `GET /api/v1/inventory/software` + its MCP twin `query_installed_software` are now on `require_fleet_read` — both surfaces' `deny_fleet_wide_service_scoped`/blanket-deny call sites are retired for this tool pair (the REST call was already provably dead, firing after `perm_fn`; the MCP call was live and is now gone). `require_fleet_read` itself gained the elevated/engine/mcp_tier caller-class branches it was missing at Phase 0 (mirroring `require_list_read`'s ladder — see its own doc comment). Prioritization for this and future migrations is **documented reasoning, not the metric** — no production fleet exists yet, so `yuzu_auth_service_scope_default_denied_total` has no real traffic to rank by; the criterion-1 substitute and the ranked backlog live in `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`. The §3d `authorize_list_read` supersede→intersect migration (below) is a separate, not-yet-started stream.
 
@@ -3740,7 +3888,8 @@ resulting latency bounds.
   `require_list_read` (the last is the ADR-0017 admit-then-filter list-read
   gate, #3038 — see the Authentication/RBAC row in
   `.claude/routed-concerns-access-control.md`) all
-  branch on `session->principal_kind == "engine"` **before** falling through
+  branch on `session->is_engine()` (the stored `principal_kind` or an engine-token
+  `auth_source`, #2343) **before** falling through
   to the legacy pre-RBAC path or the MCP-tier/service-scoped resolution used
   for human and agent sessions. An engine session's authority is resolved
   **exclusively** against `RbacStore`:
@@ -3760,7 +3909,7 @@ resulting latency bounds.
   the concrete mechanism behind design §4.2's promise: *"An engine principal
   with no assignments can do nothing."*
 - **Audit attribution.** `AuthRoutes::make_audit_event` re-stamps
-  `principal_class="engine"` from the resolved session's `principal_kind`
+  `principal_class="engine"` when the resolved session `is_engine()`
   after the generic (credential-presentation-based) classification runs —
   an engine principal's bearer-token requests previously mislabelled as
   `"agent"` in the audit trail (design §6 / `adr-1005-execution-plan.md`
@@ -3839,7 +3988,7 @@ unfiltered.**
    `deny_service_scoped_`/`deny_service_scoped_mutation_` (`guardian_routes.*`), `deny_service_scoped_`
    (`dex_routes.*`, `deployment_routes.*`, `preflight_routes.*`), the shared
    `deny_fleet_wide_service_scoped` lambda (`rest_api_v1.cpp`, `mcp_server.cpp`), plus inline checks in
-   `device_routes.cpp`/`network_routes.cpp`/`inventory_routes.cpp`/`tar_tree_routes.cpp`.
+   `device_routes.cpp`/`network_routes.cpp`/`inventory_routes.cpp`/`echo_tree_routes.cpp`.
 
    These per-file helpers are now a SECOND, largely-redundant layer for routes the flip already
    covers — scheduled for Phase 2 retirement, not removed here. `schedule_routes.*`'s
@@ -3866,7 +4015,7 @@ unfiltered.**
    its 4 call sites (each already passed a correctly-typed permission per operation — the defect was
    unactionability, not a wrong permission TYPE, a claim the routed row previously made in error), and
    the inline checks in `device_routes.cpp`/`network_routes.cpp`/`inventory_routes.cpp` (×2)/
-   `tar_tree_routes.cpp` (×2). #5047 added `AuthRoutes::require_tier_policy`'s
+   `echo_tree_routes.cpp` (×2). #5047 added `AuthRoutes::require_tier_policy`'s
    `actionable_permission` parameter — a THIRD shape, not a fourth call-site-by-call-site migration:
    a single production factory, `AuthRoutes::gateless_tier_policy_fn()`, is the ONE place all 8
    gate-less-route call sites (the 4 result-set REST write routes plus their 4 dashboard-fragment
@@ -4835,6 +4984,8 @@ outage. **Use `yuzu_auth_read_degrade_total{reason="secret_unavailable"}`, not
 the coarser `yuzu_auth_secret_unavailable_total`, to alert on a KEK/secret
 outage** — the latter also moves on a plain pool blip (it counts every
 store-unavailable `503` on the secret path, not only secret-decrypt failures).
+The approve and reject routes (`route="approval"`) increment only the coarser counter, never
+`yuzu_auth_read_degrade_total`, so that series does not cover them.
 The other `is_store_unavailable`→`503` auth sites (`/login/mfa`, step-up,
 enrollment, elevate) are not yet reason-instrumented (finer cardinality and
 wider coverage tracked as #2401).
@@ -5078,7 +5229,7 @@ DENYING reasons (`pool_acquire_timeout` / `query_error` /
 `generation_refresh_failed`): each failed read denies the request that
 needed it (operator permission and list-read checks on a permission-cache
 miss, service-scoped tokens on every `require_fleet_read` or
-`require_scoped_permission` request whose `ITServiceOwner` ceiling read fails), so a non-zero rate on one of these is an authorization-availability
+`require_scoped_permission` request whose `ITServiceOwner` ceiling read fails). A failed role query, the read that precedes a permission check, counts `query_error` and books a breaker failure on every path that makes it (`require_permission`'s RBAC branch included; `get_effective_permissions`, a display read that denies nobody, counts it too), while the `ITServiceOwner` ceiling read inside `require_permission` is uncounted. So a non-zero rate on one of these is an authorization-availability
 event, though not necessarily one that denies every caller, and the
 `YuzuRbacReadDegraded` alert pages on exactly this subset.
 Two OBSERVE-ONLY reasons share the same metric but deny nothing — the read

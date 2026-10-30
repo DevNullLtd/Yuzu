@@ -158,7 +158,7 @@ A token names the source family (`apt_sources`, `apt_keyring` or `rpm_repo`), no
 ### Where the data goes
 
 - **Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `sources` is also a gathered definition (`crossplatform.security.update_source_trust`, 300s TTL).
-- **Not consumed by** daily-sync, TAR, DEX, or metrics.
+- **Not consumed by** daily-sync, Echo, DEX, or metrics.
 - **Sensitivity.** Rows name the repositories a device installs software from (URIs, key paths), which discloses part of its software supply chain. URL userinfo (`user:pass@`) is redacted in every URL-bearing field; a secret carried in a URL query string or path (a vendor entitlement token) cannot be recognised and is emitted as written, and so is any user name inside a configured path or URL (`file:///home/<user>/repo`, `signed-by=/home/<user>/key.gpg`, `~user`): the plugin adds none of its own. Key material is never emitted, only key file paths, formats and sizes. Rows stay in the ResponseStore for the response retention period (90 days by default) and are not purged individually, so treat a credential seen in a row as exposed and rotate it.
 - **Siblings:** `windows_updates` (patch compliance and reachability of update sources, not their trust) and `installed_apps` (what is installed, not where it came from).
 
@@ -209,5 +209,4 @@ apt_keyring|/etc/apt/trusted.gpg.d/debian-archive-trixie-stable.asc|trusted_gpg_
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_update_source_trust.hpp`
 - Tests: `tests/test_update_source_trust_definition.py` · `tests/test_update_source_trust_tokens.py` · `tests/unit/test_update_source_trust_linux_parsers.cpp` · `tests/unit/test_update_source_trust_local_dispatcher.cpp` · `tests/unit/test_update_source_trust_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/wave10-pr10.1d-update_source_trust.added.md`
 <!-- END GENERATED -->

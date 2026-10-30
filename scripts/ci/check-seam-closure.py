@@ -133,16 +133,26 @@ and model translation units, plus the abstract in-process API header and (since
 set is the FAMILIES dict below. Separately, `STORE_DEFINITION_FREE_TUS` (WS-A4 S0,
 NOT a family and not counted above) enrols route/renderer TUs whose closure reaches no
 store DEFINITION (not "touches no store": see that list's KNOWN LIMITS), so they stay so; and S0 widened `FORBIDDEN_HEADER_PATTERNS` to the store-backed headers the
-`*_store.hpp` glob missed. Each family's REST-handler TWIN registrations
-live inside `rest_api_v1.cpp` (or the family's own routes TU), and its MCP-tool
-twin inside `mcp_server.cpp` - BOTH are
+`*_store.hpp` glob missed. Also separately (#6558, again a LANE and not a family),
+the MCP REGISTRY LANE include-closure-checks every `mcp_tools_<domain>.cpp` (globbed, with a pinned
+count and an accessor cross-check) plus the three headers a registry file may include
+(`mcp_tool_deps.hpp`, `mcp_tool_helpers.hpp`, `mcp_tool_registry.hpp`) and the seven
+store-free `*_types.hpp` headers they use: a registry file reaches data only through
+`ToolDeps` provider closures, so its closure must reach no header matching a store pattern
+(see the lane's KNOWN LIMITS: patterns only, include closure only, not linkage). Each family's REST-handler TWIN
+registrations live inside `rest_api_v1.cpp` (or the family's own routes TU), and its MCP-tool
+twin inside `mcp_server.cpp` (or, once carved, a registry file under the lane above) -
+`rest_api_v1.cpp` and `mcp_server.cpp` are
 multi-family translation units that legitimately hold real store access for
 ~20 OTHER families each. An include-closure check applied to either whole
 file would trivially fail (or be gamed by scoping) and would say nothing
 meaningful about a given family specifically. Those two files' per-family
 sections are therefore INSPECTED-NOT-ENFORCED - reviewed by hand today, not
-gated by this script - until a block-scoped or symbol-scoped successor
-exists. Do not read a clean run of this script as covering them.
+gated by this script - until each family is carved out into its own enforced file
+(the "WS-A4 per-family carve-out sub-tasks (#6558)" table in docs/presentation-core-split-delivery-matrix.md)
+or a block-scoped or symbol-scoped successor exists. Do not read a clean run of this
+script as covering them: the registry lane covers only the tools ALREADY carved into
+`mcp_tools_*.cpp`, not the inline branches still in `mcp_server.cpp`.
 
 USAGE
   check-seam-closure.py          # run the gate (CI mode); 0 pass / 1 fail
@@ -732,13 +742,85 @@ STORE_DEFINITION_FREE_TUS = [
     "server/core/src/settings_plugins_ui.cpp",
     "server/core/src/settings_security_ui.cpp",
     "server/core/src/settings_ui.cpp",
-    "server/core/src/tar_page_ui.cpp",
-    "server/core/src/tar_timeline_page_ui.cpp",
-    "server/core/src/tar_tree_routes.cpp",
+    "server/core/src/echo_page_ui.cpp",
+    "server/core/src/echo_timeline_page_ui.cpp",
+    "server/core/src/echo_tree_routes.cpp",
     "server/core/src/viz_host_page_ui.cpp",
     "server/core/src/viz_page_ui.cpp",
     "server/core/src/workflows_ui.cpp",
 ]
+
+
+# MCP REGISTRY LANE (#6558, WS-A4) - a LANE, not a family. Every `mcp_tools_<domain>.cpp`
+# is a store-free registry file: a tool handler reaches data only through the provider
+# closures on `ToolDeps` (`mcp_tool_deps.hpp`), never a store, so its include closure must
+# reach no store DEFINITION. The TU set is GLOBBED (a new `mcp_tools_*.cpp` is enrolled the
+# moment it exists - nobody has to remember to add it here), and the file count is PINNED so
+# adding one is still a loud, reviewed edit rather than a silent widening. A count alone
+# cannot see a RENAME paired with an ADD (the count stays right while one file leaves the
+# glob), so the glob is also cross-checked against the one-accessor-per-domain contract in
+# `mcp_tool_registry.hpp` (`<domain>_tool_records()` <-> `mcp_tools_<domain>.cpp`, both
+# directions). The three shared headers are listed explicitly: they are the headers a
+# registry file may include (`mcp_server.hpp` includes `mcp_tool_deps.hpp`), so a store
+# header reached through any of them leaks into every registry file that includes it.
+#
+# The row/view types these files need live in store-free `*_types.hpp` headers
+# (MCP_REGISTRY_TYPES_HEADERS below); a store header re-includes its types header, never the
+# reverse. A registry file that wants a type still defined in a store header moves that
+# type out first - it does not get an exemption here. The types headers are enrolled
+# DIRECTLY, not merely reached through a registry TU: a header nothing includes any more
+# would otherwise leave the lane unguarded, and a store include added to it unseen.
+#
+# KNOWN LIMITS - read before quoting this lane as "store-free":
+#   - "store-free" means: no header matching FORBIDDEN_HEADER_PATTERNS is reachable. A
+#     store OWNER that no pattern names (`*_owner.hpp`, `*_sql_helpers.hpp`, the `app_perf_*`
+#     readers, `sqlite_raii.hpp`, `migration_runner.hpp`) passes the lane. Widening the
+#     patterns changes every family's policy and is a separate, not-yet-filed decision.
+#   - it proves an INCLUDE closure only, not linkage: a registry object can still link a store
+#     through a .cpp it does not include (`hardware_list_model.cpp` calls
+#     `TagStore::validate_key`; `build_routes_catalog`, declared in `discover_catalog_types.hpp`,
+#     is defined in `discover_routes.cpp`, whose TU includes `agent_registry.hpp`). Linkage is not
+#     checked here; the `nm` tripwire
+#     (check_core_presentation_link.py) covers only its own enrolled families (today `dex`), not
+#     registry objects.
+#   - the same include-closure-only limits as STORE_DEFINITION_FREE_TUS: a header that merely
+#     forward-declares a store is allowed, and a macro-built `#include` is invisible.
+#   - a registry TU outside the glob (another name, a subdirectory) is invisible to the
+#     glob; only the accessor cross-check notices one whose accessor is declared in
+#     `mcp_tool_registry.hpp` (a declaration elsewhere is caught only by the compiled
+#     dispatch test, tests/unit/server/test_mcp_dispatch_coverage.cpp). That cross-check is a
+#     lowercase `[a-z0-9_]` name scan of the comment-stripped header and is preprocessor-blind:
+#     an upper/camel-case accessor or a macro-pasted one is invisible, and an accessor kept in
+#     `#if 0` still counts as declared.
+# The `mcp_server.cpp` inline tool branches and the `rest_api_v1.cpp` route registrations are
+# NOT covered by this lane - they are still INSPECTED-NOT-ENFORCED, and carving each family
+# out of them into its own enforced file is the "WS-A4 per-family carve-out sub-tasks
+# (#6558)" table in docs/presentation-core-split-delivery-matrix.md.
+MCP_REGISTRY_TU_GLOB = "mcp_tools_*.cpp"
+MCP_REGISTRY_EXPECTED_TU_COUNT = 4
+MCP_REGISTRY_REGISTRY_HEADER = "server/core/src/mcp_tool_registry.hpp"
+MCP_REGISTRY_HEADERS = [
+    "server/core/src/mcp_tool_deps.hpp",
+    "server/core/src/mcp_tool_helpers.hpp",
+    MCP_REGISTRY_REGISTRY_HEADER,
+]
+MCP_REGISTRY_TYPES_HEADERS = [
+    "server/core/src/device_inventory_types.hpp",
+    "server/core/src/discover_catalog_types.hpp",
+    "server/core/src/inventory_types.hpp",
+    "server/core/src/offline_endpoint_types.hpp",
+    "server/core/src/quarantine_types.hpp",
+    "server/core/src/software_inventory_types.hpp",
+    "server/core/src/tag_types.hpp",
+]
+# One accessor per domain file, declared in mcp_tool_registry.hpp (see its own comment). The scan
+# is deliberately LOOSE - any `<name>_tool_records(` in the comment-stripped header - not the one
+# spelling the header uses today: a strict form-match would FAIL OPEN for a declaration written
+# another way (`noexcept`, a qualified or `const`-after `ToolRecord`, a trailing return type),
+# letting a registry file rename out of the glob unseen. `registered_tool_records` is the
+# aggregator (defined in mcp_server.cpp), not a domain accessor.
+_MCP_ACCESSOR_RE = re.compile(r'\b([a-z0-9_]+)_tool_records\s*\(')
+_MCP_ACCESSOR_NOT_DOMAINS = frozenset({"registered"})
 
 # The directive itself. By the time this runs every comment is already gone (see
 # `strip_comments`), backslash-newline is already joined, and string literals are intact, so
@@ -1251,15 +1333,17 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
     defect this gate exists to prevent), reported and then EXCLUDED from the
     closure walk so the remaining members are still checked."""
     ok = True
+    kind = "lane" if name == "mcp_registry" else "family"
     seen_unresolved: set = set()
     existing: list[Path] = []
     for rel in tus:
         p = (roots.root / rel).resolve()
         if not p.is_file():
             gh("error", f"check-seam-closure: expected family TU not found: "
-                        f"{rel} (family {name!r}) - if it was renamed or deleted, "
+                        f"{rel} ({kind} {name!r}) - if it was renamed or deleted, "
                         f"update "
                         + ("STORE_DEFINITION_FREE_TUS" if name == "store_definition_free"
+                           else "MCP_REGISTRY_HEADERS / MCP_REGISTRY_TYPES_HEADERS" if name == "mcp_registry"
                            else f"FAMILIES[{name!r}]")
                         + " AND the frozen pin in tests/test_seam_closure_selftest.py")
             ok = False
@@ -1269,7 +1353,7 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
     for tu in existing:
         rel_tu = tu.relative_to(roots.root)
         visited, parent, unresolved = closure(tu, roots)
-        if not report_unresolved(f"family {name!r}", rel_tu, unresolved, roots, seen_unresolved):
+        if not report_unresolved(f"{kind} {name!r}", rel_tu, unresolved, roots, seen_unresolved):
             ok = False
         for f in sorted(visited, key=str):
             hit, pat = is_forbidden_header(f, roots.root, patterns)
@@ -1278,13 +1362,18 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
             chain = chain_to(f, parent, tu)
             chain_str = " -> ".join(str(c.relative_to(roots.root)) for c in chain)
             gh("error",
-               f"check-seam-closure: family {name!r}: {rel_tu} reaches "
+               f"check-seam-closure: {kind} {name!r}: {rel_tu} reaches "
                f"forbidden header {f.relative_to(roots.root)} (matches "
                f"forbidden pattern {pat!r}) via include chain: {chain_str}"
                + (" - this TU is enrolled as store-definition-free: route the data through an "
                   "injected provider or a `*Api` seam instead of including the store "
                   "(see STORE_DEFINITION_FREE_TUS)"
-                  if name == "store_definition_free" else "")
+                  if name == "store_definition_free"
+                  else " - this TU is in the MCP registry lane, which must stay store-free: reach "
+                       "data through a provider closure on `ToolDeps`, and move any row type it "
+                       "needs out of the store header into a `*_types.hpp` (see "
+                       "MCP_REGISTRY_HEADERS / MCP_REGISTRY_TYPES_HEADERS)"
+                  if name == "mcp_registry" else "")
                + " [ADR-0031 migration step 3; docs/presentation-core-split-delivery-matrix.md, "
                  "WS-A4]")
             ok = False
@@ -1407,6 +1496,111 @@ def check_abstract_headers_store_type_free(headers: list[str],
     return ok
 
 
+def mcp_registry_cpps(roots: Roots = DEFAULT_ROOTS) -> list[str]:
+    """Root-relative paths of every regular `mcp_tools_*.cpp` under `roots.server_src`, sorted so
+    the order is stable. A symlink is NOT returned (see mcp_registry_symlinks)."""
+    return sorted(
+        p.relative_to(roots.root).as_posix()
+        for p in roots.server_src.glob(MCP_REGISTRY_TU_GLOB)
+        if p.is_file() and not p.is_symlink())
+
+
+def mcp_registry_symlinks(roots: Roots = DEFAULT_ROOTS) -> list[str]:
+    """Root-relative paths of glob matches that are symlinks. A registry file is a real file in
+    the tree; a link can point outside the repo and would crash the closure walk, so it is
+    reported and refused rather than followed."""
+    return sorted(
+        p.relative_to(roots.root).as_posix()
+        for p in roots.server_src.glob(MCP_REGISTRY_TU_GLOB) if p.is_symlink())
+
+
+def mcp_registry_tus(roots: Roots = DEFAULT_ROOTS) -> list[str]:
+    """Root-relative TU list for the MCP registry lane: the globbed registry files, the shared
+    headers (MCP_REGISTRY_HEADERS) and the store-free types headers (MCP_REGISTRY_TYPES_HEADERS)."""
+    return (mcp_registry_cpps(roots) + list(MCP_REGISTRY_HEADERS)
+            + list(MCP_REGISTRY_TYPES_HEADERS))
+
+
+def mcp_registry_accessor_errors(roots: Roots = DEFAULT_ROOTS) -> list[str]:
+    """Cross-check the globbed registry files against the one-accessor-per-domain contract in
+    mcp_tool_registry.hpp: every declared `<d>_tool_records()` must have a globbed
+    `mcp_tools_<d>.cpp`, and every globbed file must have its accessor. This is what notices a
+    RENAME paired with an ADD, which leaves the count pin satisfied while a registry file has
+    left the glob (and so left the lane). Returns human-readable error strings."""
+    hdr = roots.root / MCP_REGISTRY_REGISTRY_HEADER
+    if not hdr.is_file():
+        return [f"cannot cross-check registry accessors: {MCP_REGISTRY_REGISTRY_HEADER} not found"]
+    text = hdr.read_text(encoding="utf-8", errors="replace")
+    declared = set(_MCP_ACCESSOR_RE.findall(_strip_comments(text))) - _MCP_ACCESSOR_NOT_DOMAINS
+    globbed = {Path(c).name[len("mcp_tools_"):-len(".cpp")] for c in mcp_registry_cpps(roots)}
+    errs = []
+    for d in sorted(declared - globbed):
+        errs.append(f"{d}_tool_records() is declared in {MCP_REGISTRY_REGISTRY_HEADER} but "
+                    f"mcp_tools_{d}.cpp is not among the globbed registry files - a registry "
+                    f"file renamed (or moved) out of `{MCP_REGISTRY_TU_GLOB}` leaves this lane "
+                    f"unchecked while the count pin still passes (rename the file back to "
+                    f"mcp_tools_{d}.cpp, or rename the accessor to match; if the one-accessor-per-domain "
+                    f"contract itself is being changed, update _MCP_ACCESSOR_RE and "
+                    f"docs/api-twin-recipe.md in the same PR)")
+    for d in sorted(globbed - declared):
+        errs.append(f"mcp_tools_{d}.cpp is globbed as a registry file but "
+                    f"{MCP_REGISTRY_REGISTRY_HEADER} declares no {d}_tool_records() accessor "
+                    f"- a registry file serves nothing until its accessor is declared there and "
+                    f"listed in mcp_server.cpp's registered_tool_records() (if the "
+                    f"one-accessor-per-domain contract itself is being changed, update "
+                    f"_MCP_ACCESSOR_RE and docs/api-twin-recipe.md in the same PR)")
+    return errs
+
+
+def check_mcp_registry_lane(roots: Roots = DEFAULT_ROOTS,
+                            expected_count: int = MCP_REGISTRY_EXPECTED_TU_COUNT,
+                            patterns=FORBIDDEN_HEADER_PATTERNS) -> bool:
+    """The MCP registry lane (#6558): pin the globbed file count, cross-check the glob against
+    the accessor contract, refuse symlinks, then run the same closure check every family gets.
+    A count mismatch is a hard error in BOTH directions - fewer means a registry file was
+    renamed or deleted (the lane would quietly cover less than it claims); more means a new
+    registry file arrived and its enrolment was never reviewed. Either way the fix is one
+    reviewed edit across ALL of these pins, which must agree: MCP_REGISTRY_EXPECTED_TU_COUNT and
+    EXPECTED_MCP_REGISTRY_TU_COUNT / EXPECTED_MCP_REGISTRY_CPPS in
+    tests/test_seam_closure_selftest.py, MIN_REGISTRY_FILES in scripts/ci/check-api-parity.py,
+    and kRegistryDomainFiles in tests/unit/server/test_mcp_dispatch_coverage.cpp."""
+    ok = True
+    for link in mcp_registry_symlinks(roots):
+        gh("error",
+           f"check-seam-closure: MCP registry lane: {link} is a symlink - a registry file must "
+           f"be a regular file in the tree (a link can point outside the repo); refusing to "
+           f"follow it [ADR-0031 WS-A4, #6558]")
+        ok = False
+    # A symlinked shared/types header gets the same refusal as a symlinked registry file (an
+    # out-of-repo link would otherwise crash the closure walk), and is left out of the walk.
+    tus = []
+    for rel in mcp_registry_tus(roots):
+        if (roots.root / rel).is_symlink():
+            gh("error",
+               f"check-seam-closure: MCP registry lane: {rel} is a symlink - a lane header must "
+               f"be a regular file in the tree; refusing to follow it [ADR-0031 WS-A4, #6558]")
+            ok = False
+        else:
+            tus.append(rel)
+    n_cpp = len(mcp_registry_cpps(roots))
+    if n_cpp != expected_count:
+        gh("error",
+           f"check-seam-closure: MCP registry lane: found {n_cpp} `{MCP_REGISTRY_TU_GLOB}` "
+           f"file(s) under {roots.server_src.relative_to(roots.root).as_posix()}, expected "
+           f"{expected_count} - enrol a new registry file (or retire a removed one) by updating "
+           f"ALL of: MCP_REGISTRY_EXPECTED_TU_COUNT here; EXPECTED_MCP_REGISTRY_TU_COUNT and "
+           f"EXPECTED_MCP_REGISTRY_CPPS in tests/test_seam_closure_selftest.py; MIN_REGISTRY_FILES "
+           f"in scripts/ci/check-api-parity.py; kRegistryDomainFiles in "
+           f"tests/unit/server/test_mcp_dispatch_coverage.cpp [ADR-0031 WS-A4, #6558]")
+        ok = False
+    for msg in mcp_registry_accessor_errors(roots):
+        gh("error", f"check-seam-closure: MCP registry lane: {msg} [ADR-0031 WS-A4, #6558]")
+        ok = False
+    if not check_family("mcp_registry", tus, roots, patterns):
+        ok = False
+    return ok
+
+
 def run_check() -> int:
     ok = True
     checked = 0
@@ -1415,6 +1609,8 @@ def run_check() -> int:
         if not check_family(name, spec["tus"]):
             ok = False
     if not check_family("store_definition_free", STORE_DEFINITION_FREE_TUS):
+        ok = False
+    if not check_mcp_registry_lane():
         ok = False
     impl_ok = check_impl_purity(IMPL_TUS)
     if not impl_ok:
@@ -1426,6 +1622,7 @@ def run_check() -> int:
         print(f"check-seam-closure: OK ({checked} famil"
               f"{'y' if checked == 1 else 'ies'} header-closure checked + "
               f"{len(STORE_DEFINITION_FREE_TUS)} store-definition-free presentation TUs checked + "
+              f"{len(mcp_registry_tus())} MCP registry lane TUs checked + "
               f"{len(IMPL_TUS)} impl TUs impl-purity checked + "
               f"{len(ABSTRACT_API_HEADERS)} abstract headers store-type-free checked; "
               f"all closures free of store-layer / core-only `*_api_local.hpp` headers, "

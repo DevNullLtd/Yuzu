@@ -184,13 +184,13 @@ shasum() { echo 'testdigest fixture'; }
                 if layout != "no core":
                     (binaries / "agents/core/libyuzu_agent_core.dylib").write_bytes(b"core fixture")
                 if layout != "empty":
-                    plugins = binaries / ("plugins" if layout == "flat" else "agents/plugins/tar")
+                    plugins = binaries / ("plugins" if layout == "flat" else "agents/plugins/echo")
                     plugins.mkdir(parents=True)
-                    (plugins / "tar.dylib").write_bytes(b"plugin fixture")
+                    (plugins / "echo.dylib").write_bytes(b"plugin fixture")
                 if layout == "duplicate":
                     other = binaries / "agents/plugins/other"
                     other.mkdir()
-                    (other / "tar.dylib").write_bytes(b"collision")
+                    (other / "echo.dylib").write_bytes(b"collision")
                 tools = root / "tools"
                 tools.mkdir()
                 captured = root / "manifest"
@@ -226,7 +226,7 @@ shasum() { echo 'testdigest fixture'; }
                     self.assertEqual(result.returncode, 0, result.stderr)
                     # The first line names the package version (governance rd-2).
                     self.assertEqual(captured.read_text(), "# package-version 1.0\n" +
-                                     ("" if layout == "empty" else "plugins/tar.dylib\n"))
+                                     ("" if layout == "empty" else "plugins/echo.dylib\n"))
 
     def _build_loose(self, root: Path, plugin_name: str,
                      extra_tools: dict[str, str] | None = None, version: str = "1.0") -> subprocess.CompletedProcess:
@@ -271,7 +271,7 @@ shasum() { echo 'testdigest fixture'; }
                                   ("1.0;rm", False), ("1.0 x", False), ("_1.0", False), ("1.0/..", False)):
             with self.subTest(version=version), tempfile.TemporaryDirectory(prefix="yuzu_test_pkg_version_") as temporary:
                 root = Path(temporary)
-                result = self._build_loose(root, "tar.dylib", version=version)
+                result = self._build_loose(root, "echo.dylib", version=version)
                 self.assertEqual(result.returncode == 0, accepted, result.stderr)
                 if accepted:
                     self.assertEqual((root / "scripts/package-files.list").read_text().splitlines()[0],
@@ -279,7 +279,7 @@ shasum() { echo 'testdigest fixture'; }
                 else:
                     self.assertIn("--version must be a plain version string", result.stderr)
         with tempfile.TemporaryDirectory(prefix="yuzu_test_pkg_version_") as temporary:
-            result = self._build_loose(Path(temporary), "tar.dylib", version="")
+            result = self._build_loose(Path(temporary), "echo.dylib", version="")
             self.assertNotEqual(result.returncode, 0)
 
     @posix_shell
@@ -289,13 +289,13 @@ shasum() { echo 'testdigest fixture'; }
         # merge helper ships there too, never in the payload below /usr/local.
         with tempfile.TemporaryDirectory(prefix="yuzu_test_pkg_scripts_") as temporary:
             root = Path(temporary)
-            result = self._build_loose(root, "tar.dylib")
+            result = self._build_loose(root, "echo.dylib")
             self.assertEqual(result.returncode, 0, result.stderr)
             scripts = root / "scripts"
             self.assertEqual(sorted(path.name for path in scripts.iterdir()),
                              ["merge-launchd-plist.js", "package-files.list", "package-info", "postinstall", "preinstall"])
             self.assertEqual((scripts / "package-info").read_text(), "mode=loose\nunsigned_plugins=1\n")
-            self.assertEqual((scripts / "package-files.list").read_text(), "# package-version 1.0\nplugins/tar.dylib\n")
+            self.assertEqual((scripts / "package-files.list").read_text(), "# package-version 1.0\nplugins/echo.dylib\n")
             self.assertEqual((scripts / "merge-launchd-plist.js").read_bytes(), MERGE_PLIST_HELPER.read_bytes())
             payload = (root / "payload.txt").read_text()
             self.assertNotIn("merge-launchd-plist", payload)
@@ -307,7 +307,7 @@ shasum() { echo 'testdigest fixture'; }
         import hashlib
         with tempfile.TemporaryDirectory(prefix="yuzu_test_plugin_hashes_") as temporary:
             root = Path(temporary)
-            result = self._build_loose(root, "tar.dylib")
+            result = self._build_loose(root, "echo.dylib")
             self.assertEqual(result.returncode, 0, result.stderr)
             agent = hashlib.sha256(b"agent fixture").hexdigest()
             core = hashlib.sha256(b"core fixture").hexdigest()
@@ -316,7 +316,7 @@ shasum() { echo 'testdigest fixture'; }
             # the delivered bytes before promoting them (governance ch-5).
             self.assertEqual((root / "hashes").read_text(),
                              f"{agent}  bin/yuzu-agent\n{core}  bin/libyuzu_agent_core.dylib\n"
-                             f"{expected}  plugins/tar.dylib\n")
+                             f"{expected}  plugins/echo.dylib\n")
 
     @posix_shell
     def test_builder_rejects_a_plugin_name_with_whitespace(self) -> None:
@@ -334,7 +334,7 @@ shasum() { echo 'testdigest fixture'; }
         real = ('[ -x /usr/bin/shasum ] && exec /usr/bin/shasum "$@"\n'
                 '[ "$1" = -a ] && shift 2\nexec sha256sum "$@"\n')
         for target, name, message in (
-                ("*/tar.dylib", "tar.dylib", "cannot hash plugin|invalid SHA-256 for plugin"),
+                ("*/echo.dylib", "echo.dylib", "cannot hash plugin|invalid SHA-256 for plugin"),
                 ("*/.yuzu-agent.incoming", "yuzu-agent", "cannot hash yuzu-agent|invalid SHA-256 for yuzu-agent"),
                 ("*/.libyuzu_agent_core.incoming.dylib", "libyuzu_agent_core.dylib",
                  "cannot hash libyuzu_agent_core.dylib|invalid SHA-256 for libyuzu_agent_core.dylib")):
@@ -343,7 +343,7 @@ shasum() { echo 'testdigest fixture'; }
                 with self.subTest(target=name, shasum=label), \
                         tempfile.TemporaryDirectory(prefix="yuzu_test_plugin_nohash_") as temporary:
                     root = Path(temporary)
-                    result = self._build_loose(root, "tar.dylib", {"shasum": shasum})
+                    result = self._build_loose(root, "echo.dylib", {"shasum": shasum})
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(name, result.stderr)
                     self.assertRegex(result.stderr, message)
@@ -366,25 +366,25 @@ PLUGIN_DIR="{root}/plugins"; MANIFEST="{root}/package-files.list"; HASHES="{root
         with tempfile.TemporaryDirectory(prefix="yuzu_test_plugin_owner_") as temporary:
             root = Path(temporary)
             (root / "plugins").mkdir()
-            (root / "plugins/tar.dylib").write_bytes(b"package bytes")
-            (root / "package-files.list").write_text("plugins/tar.dylib\n")
+            (root / "plugins/echo.dylib").write_bytes(b"package bytes")
+            (root / "package-files.list").write_text("plugins/echo.dylib\n")
             (root / "package-files.sha256").write_text(
-                f"{hashlib.sha256(b'package bytes').hexdigest()}  plugins/tar.dylib\n")
+                f"{hashlib.sha256(b'package bytes').hexdigest()}  plugins/echo.dylib\n")
             ok = self._ownership_harness(
-                root, 'if was_managed_plugin tar.dylib; then echo MANAGED; fi\nharden_managed_plugins "$MANIFEST"\necho OWNED')
+                root, 'if was_managed_plugin echo.dylib; then echo MANAGED; fi\nharden_managed_plugins "$MANIFEST"\necho OWNED')
             self.assertEqual(ok.returncode, 0, ok.stderr)
             self.assertEqual(ok.stdout.split(), ["MANAGED", "OWNED"])
             self.assertIn("CHOWN root:wheel", (root / "chown.log").read_text())
             (root / "chown.log").unlink()
-            (root / "plugins/tar.dylib").write_bytes(b"replaced by someone else")
-            managed = self._ownership_harness(root, 'if was_managed_plugin tar.dylib; then echo MANAGED; else echo NOT-MANAGED; fi')
+            (root / "plugins/echo.dylib").write_bytes(b"replaced by someone else")
+            managed = self._ownership_harness(root, 'if was_managed_plugin echo.dylib; then echo MANAGED; else echo NOT-MANAGED; fi')
             self.assertIn("NOT-MANAGED", managed.stdout)
             harden = self._ownership_harness(root, 'harden_managed_plugins "$MANIFEST"')
             self.assertNotEqual(harden.returncode, 0)
             self.assertIn("does not match the package's recorded hash", harden.stderr)
-            self.assertNotIn("tar.dylib", (root / "chown.log").read_text() if (root / "chown.log").exists() else "")
+            self.assertNotIn("echo.dylib", (root / "chown.log").read_text() if (root / "chown.log").exists() else "")
             (root / "package-files.sha256").unlink()   # an older, name-only package
-            legacy = self._ownership_harness(root, 'if was_managed_plugin tar.dylib; then echo MANAGED; fi')
+            legacy = self._ownership_harness(root, 'if was_managed_plugin echo.dylib; then echo MANAGED; fi')
             self.assertIn("MANAGED", legacy.stdout)
 
     @unittest.skipIf(os.name == "nt", "POSIX receipt fixture")
@@ -395,19 +395,19 @@ PLUGIN_DIR="{root}/plugins"; MANIFEST="{root}/package-files.list"; HASHES="{root
                              ("receipt_plugin_entries", "adopt_receipted_plugins")).replace("/usr/sbin/pkgutil", "pkgutil")
         # (receipt listing, --pkg-info status, --files status, manifest, succeeds)
         for receipt, info_status, files_status, expected, succeeds in (
-            ("usr/local/lib/yuzu/plugins/tar.dylib\nusr/local/lib/other.dylib\n", 0, 0, "plugins/tar.dylib\n", True),
+            ("usr/local/lib/yuzu/plugins/echo.dylib\nusr/local/lib/other.dylib\n", 0, 0, "plugins/echo.dylib\n", True),
             ("usr/local/lib/yuzu/plugins/sub/evil.dylib\n", 0, 0, None, False),
             ("usr/local/lib/yuzu/plugins/../evil.dylib\n", 0, 0, None, False),
             ("usr/local/lib/yuzu/plugins/a\tb.dylib\n", 0, 0, None, False),
             ("usr/local/lib/yuzu/plugins/.hidden.dylib\n", 0, 0, None, False),
             # AppleDouble metadata a build host leaves in the receipt is skipped (xp-15).
-            ("usr/local/lib/yuzu/plugins/._tar.dylib\nusr/local/lib/yuzu/plugins/tar.dylib\n", 0, 0,
-             "plugins/tar.dylib\n", True),
+            ("usr/local/lib/yuzu/plugins/._echo.dylib\nusr/local/lib/yuzu/plugins/echo.dylib\n", 0, 0,
+             "plugins/echo.dylib\n", True),
             # No receipt at all: nothing to adopt, not an error.
-            ("usr/local/lib/yuzu/plugins/tar.dylib\n", 1, 0, None, True),
+            ("usr/local/lib/yuzu/plugins/echo.dylib\n", 1, 0, None, True),
             # uh8r4-1: a receipt that exists but cannot be listed is an error, never
             # "no receipt" (which would disown its plugins).
-            ("usr/local/lib/yuzu/plugins/tar.dylib\n", 0, 1, None, False),
+            ("usr/local/lib/yuzu/plugins/echo.dylib\n", 0, 1, None, False),
         ):
             with self.subTest(receipt=receipt, info_status=info_status, files_status=files_status), \
                     tempfile.TemporaryDirectory(prefix="yuzu_test_receipt_") as temporary:
@@ -822,7 +822,7 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 root = Path(temporary)
                 recovery = self._recovery_layout(root)
                 (recovery / "yuzu/plugins").mkdir(parents=True)
-                (recovery / "yuzu/plugins/tar.dylib").write_bytes(b"previous plugin")
+                (recovery / "yuzu/plugins/echo.dylib").write_bytes(b"previous plugin")
                 plugins = root / "ul/lib/yuzu/plugins"
                 (plugins / "listed.dylib").write_bytes(b"current plugin")
                 (root / "ul/lib/yuzu/package-files.list").write_text("plugins/listed.dylib\n")
@@ -921,7 +921,7 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 root = Path(temporary)
                 recovery = self._recovery_layout(root)
                 (recovery / "yuzu/plugins").mkdir(parents=True)
-                (recovery / "yuzu/plugins/tar.dylib").write_bytes(b"previous plugin")
+                (recovery / "yuzu/plugins/echo.dylib").write_bytes(b"previous plugin")
                 elsewhere = root / "elsewhere"
                 elsewhere.mkdir()
                 plugins = root / "ul/lib/yuzu/plugins"
@@ -1581,9 +1581,9 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
             (app.parent / "Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "1.0"}))
             plugins = root / "bundle/plugins"
             plugins.mkdir()
-            plugin = plugins / "tar.dylib"
+            plugin = plugins / "echo.dylib"
             plugin.write_bytes(b"final Apple-signed byte fixture")
-            (plugins / "tar.dylib.sig").write_bytes(plugin.read_bytes())
+            (plugins / "echo.dylib.sig").write_bytes(plugin.read_bytes())
             (plugins / "plugin-signing-policy.json").write_text(json.dumps(
                 {"runtime_plugin_trust_bundle": "/etc/yuzu-agent/certs/plugins.pem"}))
             trust = root / "trust.pem"
@@ -1681,16 +1681,16 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
             with self.assertRaisesRegex(bundle.BundleError, "architectures x86_64, expected arm64"):
                 bundle.require_matching_architectures(Path("agent"), [Path("plugin")])
 
-    def test_builder_requires_the_exact_tar_plugin_basename(self) -> None:
+    def test_builder_requires_the_exact_echo_plugin_basename(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_bundle_") as temporary:
             plugin_dir = Path(temporary) / "plugins"
             plugin_dir.mkdir()
-            (plugin_dir / "not_tar.dylib").touch()
-            with self.assertRaisesRegex(bundle.BundleError, "TAR plugin"):
+            (plugin_dir / "not_echo.dylib").touch()
+            with self.assertRaisesRegex(bundle.BundleError, "Echo plugin"):
                 bundle.find_plugins(Path(temporary))
-            (plugin_dir / "tar.dylib").touch()
+            (plugin_dir / "echo.dylib").touch()
             self.assertEqual({plugin.name for plugin in bundle.find_plugins(Path(temporary))},
-                             {"not_tar.dylib", "tar.dylib"})
+                             {"not_echo.dylib", "echo.dylib"})
 
     def test_payload_is_staged_before_postinstall_promotes_it(self) -> None:
         preinstall = (ROOT / "deploy/packaging/macos/preinstall").read_text()
@@ -1839,8 +1839,8 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 plistlib.dump({"CFBundleShortVersionString": "1.0"}, output)
             plugins = root / "bundle/plugins"
             plugins.mkdir()
-            (plugins / "tar.dylib").write_bytes(b"tar")
-            (plugins / "tar.dylib.sig").write_bytes(b"tar sidecar")
+            (plugins / "echo.dylib").write_bytes(b"echo")
+            (plugins / "echo.dylib.sig").write_bytes(b"echo sidecar")
             (plugins / "other.dylib").write_bytes(b"missing sidecar")
             (plugins / "plugin-signing-policy.json").write_text(
                 json.dumps({"runtime_plugin_trust_bundle": "/etc/yuzu-agent/certs/plugins.pem"}) + "\n")
@@ -1894,7 +1894,7 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 plistlib.dump({"CFBundleShortVersionString": "1.0"}, output)
             plugins = root / "bundle/plugins"
             plugins.mkdir()
-            source_plugin = plugins / "tar.dylib"
+            source_plugin = plugins / "echo.dylib"
             source_plugin.write_bytes(b"original staged bytes")
             tools = root / "tools"
             tools.mkdir()
@@ -1902,7 +1902,7 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
             for name, body in {
                 "codesign": "#!/bin/sh\ncase \"$*\" in */YuzuAgent.app*) printf 'mutated source bytes' > \"$RACE_SOURCE\"; printf 'mutated source plist' > \"$RACE_INFO\" ;; esac\nexit 0\n",
                 "lipo": "#!/bin/sh\necho arm64\n",
-                "pkgbuild": "#!/bin/sh\nroot=; last=\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --root) root=\"$2\"; shift 2 ;; *) last=\"$1\"; shift ;; esac; done\ncp \"$root/usr/local/lib/yuzu/.plugins.incoming/tar.dylib\" \"$CAPTURED_PLUGIN\"\n: > \"$last\"\n",
+                "pkgbuild": "#!/bin/sh\nroot=; last=\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --root) root=\"$2\"; shift 2 ;; *) last=\"$1\"; shift ;; esac; done\ncp \"$root/usr/local/lib/yuzu/.plugins.incoming/echo.dylib\" \"$CAPTURED_PLUGIN\"\n: > \"$last\"\n",
                 "productbuild": "#!/bin/sh\nfor last; do :; done\n: > \"$last\"\n",
             }.items():
                 tool = tools / name
@@ -1929,7 +1929,7 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
         with (app.parent / "Info.plist").open("wb") as output:
             plistlib.dump({"CFBundleShortVersionString": "1.0"}, output)
         (root / "bundle/plugins").mkdir()
-        (root / "bundle/plugins/tar.dylib").write_bytes(b"plugin")   # no plugin-signing-policy.json
+        (root / "bundle/plugins/echo.dylib").write_bytes(b"plugin")   # no plugin-signing-policy.json
         tools = root / "tools"
         tools.mkdir()
         for name, body in {
@@ -2128,10 +2128,10 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
 
     def test_final_plugin_sidecars_use_the_shared_agent_verifier(self) -> None:
         with mock.patch.object(bundle, "run", return_value="") as run:
-            bundle.verify_final_plugin_sidecar(Path("/bundle/yuzu-agent"), Path("/plugins/tar.dylib"),
+            bundle.verify_final_plugin_sidecar(Path("/bundle/yuzu-agent"), Path("/plugins/echo.dylib"),
                                                Path("/trust/plugins.pem"))
         run.assert_called_once_with([str(Path("/bundle/yuzu-agent")), "--verify-plugin-signature",
-                                     str(Path("/plugins/tar.dylib")), "--plugin-trust-bundle",
+                                     str(Path("/plugins/echo.dylib")), "--plugin-trust-bundle",
                                      str(Path("/trust/plugins.pem"))])
 
     @unittest.skipUnless(sys.platform == "darwin", "native macOS archive/plist integration")
@@ -2147,8 +2147,8 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 plistlib.dump({"CFBundleShortVersionString": "1.0"}, output)
             plugins = root / "bundle/plugins"
             plugins.mkdir()
-            (plugins / "tar.dylib").write_bytes(b"stale-final-plugin-bytes")
-            (plugins / "tar.dylib.sig").write_bytes(b"stale-sidecar")
+            (plugins / "echo.dylib").write_bytes(b"stale-final-plugin-bytes")
+            (plugins / "echo.dylib.sig").write_bytes(b"stale-sidecar")
             (plugins / "plugin-signing-policy.json").write_text(
                 json.dumps({"runtime_plugin_trust_bundle": "/etc/yuzu-agent/certs/plugins.pem"}) + "\n")
             trust = root / "plugins.pem"
@@ -3060,9 +3060,9 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 self._write_plist(root / "LaunchDaemons/.com.yuzu.agent.incoming.plist", arguments, environment)
                 incoming = root / "ul/lib/yuzu/.plugins.incoming"
                 incoming.mkdir(parents=True)
-                (incoming / "tar.dylib").write_bytes(b"plugin")
+                (incoming / "echo.dylib").write_bytes(b"plugin")
                 if signed:
-                    (incoming / "tar.dylib.sig").write_bytes(b"sidecar")
+                    (incoming / "echo.dylib.sig").write_bytes(b"sidecar")
                 result = self._installer_harness(
                     root, "postinstall",
                     ("cli11_flag_value_enabled", "plugin_signatures_required_by",
@@ -3071,7 +3071,7 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 self.assertEqual(result.returncode == 0, accepted, result.stderr)
                 self.assertEqual("ACCEPTED" in result.stdout, accepted)
                 if not accepted:
-                    self.assertIn("tar.dylib has no signature", result.stderr)
+                    self.assertIn("echo.dylib has no signature", result.stderr)
 
     # ── Governance er-2: every operator YUZU_* setting survives an upgrade ─────
     @unittest.skipUnless(sys.platform == "darwin", "native macOS plist integration")
@@ -3556,7 +3556,7 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 if core_bytes is not None:
                     (bin_dir / ".libyuzu_agent_core.incoming.dylib").write_bytes(core_bytes)
                 (lib / ".package-files.sha256.incoming").write_text(
-                    "".join(record[key] for key in recorded.split()) + "0" * 64 + "  plugins/tar.dylib\n")
+                    "".join(record[key] for key in recorded.split()) + "0" * 64 + "  plugins/echo.dylib\n")
                 result = self._installer_harness(root, "postinstall", ("verify_incoming_loose_code",),
                                                  "verify_incoming_loose_code\necho VERIFIED\n")
                 self.assertEqual(result.returncode == 0, accepted, result.stderr)

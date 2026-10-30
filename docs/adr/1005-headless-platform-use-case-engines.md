@@ -410,7 +410,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `/api/compliance*`) — marked **settings-plane exception** with a
        **2027-Q1** proposed re-home target (PO-adjustable; no committed
        date until an owning module is scoped). `/fragments/*` surfaces
-       (e.g. `/fragments/auto/*`, `/fragments/tar/*`,
+       (e.g. `/fragments/auto/*`, `/fragments/echo/*`,
        `/fragments/device/live/*`, `/fragments/executions`) remain under
        item 1 above; they carry no migration date — tracked separately.
 
@@ -443,7 +443,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      | POST | `/api/scope/validate` | `dashboard_api_routes.cpp` | settings-plane exception | 2027-Q1 |
      | POST | `/api/dashboard/execute` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
      | POST | `/api/dashboard/group-from-results` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
-     | POST | `/api/dashboard/tar-execute` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/dashboard/echo-execute` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
      | GET | `/api/deployment-jobs` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
      | POST | `/api/deployment-jobs` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
      | DELETE | `/api/deployment-jobs/([a-f0-9]+)` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
@@ -682,7 +682,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      has an open tracker that owns a date: the two NVD fragments
      (grandfathered surface #2, 2027-Q1 target, #4099 open); the
      self-service password change (a permanent exception, ADR 2026-10-04);
-     the two TAR process-tree fragments (waiting on a /run twin; #4027
+     the two Echo process-tree fragments (waiting on a /run twin; #4027
      closed, #3994 open design issue). The two dashboard api-tokens routes
      left this set when they were recorded as `twinned` (#6009). Plain growth
      of the set is machine-caught,
@@ -733,6 +733,13 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        clause is met only for approvers whose account has an enrolled factor (or an `amr` proof)
        until #6079 ships. The base route had no step-up at all before this change, so this is
        strictly stricter than what it replaces, not a new gap.
+     - **Superseded by #6079 (2026-10-19).** The pass-through described in the previous bullet is
+       closed: approve and reject now require an enrolled MFA factor with a fresh proof in every
+       `--mfa-enforcement` mode (local: an enrolled TOTP factor and a proof within the approver window
+       that does not predate the enrolment; OIDC: an MFA-method `amr` on a token issued within the
+       window; SAML: refused). The approver window is `min(--mfa-step-up-window-secs, 300)`, and 300
+       when that is `0`, so `0` no longer disables it. The text above is kept as the record of what
+       was accepted on 2026-10-18; see `docs/auth-architecture.md`, "Approver assurance".
      - **Acceptance.** Acceptor: Dave Rae (maintainer). Date: 2026-10-18. Ruling
        source: the maintainer ruling in the #6061 work session (epic #6060) to
        convert the two legacy approve/reject api-parity rows to
@@ -750,6 +757,42 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        later ADR enables non-human approvers as ADR-0033 section 6 describes.
        The same shape of reasoning is recorded for the self-service password
        change in the 2026-10-04 entry above.
+     - **Addendum 2026-10-19 (scope exception recorded by the maintainer, #6079).**
+       The distinct-human requirement is enforced as reviewer username not equal
+       to submitter username, and nothing stronger. One person who holds both a
+       local and an SSO identity, or two SSO identities, is counted as two
+       humans. This is not a four-eyes guarantee across identities. The check
+       predates #6079 and is out of its scope; this entry does not claim that
+       it compares human roots. Operator wording: `docs/user-manual/instructions.md`
+       "Who can approve", Known limitation.
+     - **Acceptance (addendum).** Acceptor: Dave Rae (maintainer). Date:
+       2026-10-19. Ruling source: the maintainer ruling in the #6079 working
+       session. As with the entry above, this is a working-session statement,
+       not a signed decision. The acceptor is also the author of the commits
+       that introduce this addendum, so independent review of this acceptance
+       rests on the pull request review (expected, not enforced by tooling),
+       not on a second approver.
+       Compensating controls an operator can apply today, none enforced by
+       Yuzu: narrowing the identity sources in use (for example
+       `--auth-mode=sso-only`, which still leaves a local break-glass account);
+       a check of each approver and submitter account against the
+       organisation's own HR mapping of accounts to people when the CC6.2
+       access-review export is reviewed (the export names an account, not a
+       person: for a user `display_name` equals `principal_id`, so the
+       mapping must come from the organisation); and periodic sampling of
+       reviewer and submitter pairs, which needs a join, because an
+       `approval.approve` audit row carries the reviewer and the approval id
+       but not the submitter: look the ticket up (`GET /api/v1/approvals/{id}`)
+       and compare its `submitted_by` with the row's principal. The ticket
+       list endpoint returns at most 100 tickets, so use the per-ticket lookup
+       for a sample.
+     - **Revisit 2027-01-18** is a re-confirmation date, not a deadline. It
+       is the same date as the 2026-10-18 entry above, so one re-confirmation
+       covers the pair. The maintainer confirmed it on 2026-10-19 (a
+       working-session statement, not a signed decision). The entry is revisited
+       earlier when the planned follow-up that resolves identities to a human
+       root lands. No issue exists for that follow-up yet (update this line when
+       it is filed). Until a revisit, the entry stands as accepted.
      - Design record: `docs/auth-architecture.md` "Approver assurance
        (maker-checker, #6061)"; operator description:
        `docs/user-manual/instructions.md` "Who can approve".
@@ -951,6 +994,94 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        worker shown to need guide text the default document lacks, or the
        first release that ships the `/swagger` page. The date is not
        machine-checked.
+   - **2026-10-24 - `get_me` as the MCP twin of `GET /api/v1/me`, and one
+     `GATE_PARITY_NO_GATE_ALLOWED` entry. Confirmed 2026-10-24 by the ADR owner,
+     as written.** Three parts.
+     First, `get.api-me` flips from `planned:#2146` to `twinned` (untwinned 215
+     to 214, generic `planned:#2146` 86 to 85; these are the figures at the time
+     of this ruling, and the runtime configuration twins that merged later moved
+     them, so the live pins are the ones in
+     `scripts/ci/check-api-parity.py`). Second, the gate-parity check
+     reads `GET /api/v1/me` as a route with no gate call it can read: the
+     handler calls `auth_fn` alone, because the route is session-only
+     self-description with no per-resource authority, so there is nothing to
+     gate on. The tool's `Infrastructure:Read` row drives MCP tier
+     classification only. Reason: adding an artificial REST gate would invent
+     an authority the route does not have. The legacy `GET /api/me` was already
+     reviewed as a document-only disposition (it returns only the caller's own
+     identity metadata; `service-scope-flip-route-inventory-2026-08.md`, the
+     "Document-only dispositions" table); `GET /api/v1/me` shares the same
+     builder (`me_response.hpp`) but the inventory does not list it. One entry,
+     `("GET", "/api/v1/me", "get_me")`, is added to
+     `GATE_PARITY_NO_GATE_ALLOWED` and `GATE_PARITY_NO_GATE_MAX` rises from 12
+     to 13. Third, the one asymmetry this leaves: REST lets a service-scoped
+     token describe itself, while `get_me` has service-scope class `denied` and
+     refuses it. That is the conservative default for a new tool, and it is a
+     documented difference rather than a defect; a self-only service-scope
+     policy that would let both transports agree is the follow-up, recorded as
+     `exception:#6432 revisit:2026-11-30` (revisit date confirmed by the owner;
+     issue filed as #6432). Scope of the twin: `rbac_enabled` is the server's
+     cached view of the RBAC switch and does not report the degraded state in
+     which enforcement fails closed; that bit is owned by #6033, not by this twin.
+     The owner gave the confirmation in the authoring session and this entry
+     records it; like the entries above it is not a separately signed
+     decision.
+
+    - **2026-10-28 - mixed-version admission during a rolling upgrade (scope
+      exception recorded by the maintainer, #6079).** The approver gate
+      (`require_enrolled_fresh_mfa`) runs on each server replica and no
+      minimum-version check exists. While a rolling upgrade is in progress, or
+      after a replica is rolled back, a replica that predates the gate can admit
+      an approve or reject decision the upgraded gate would refuse. Those rows
+      lack the `approver_assurance:enrolled_fresh_mfa` marker. The upgraded
+      build does not relax its own gate; the exception covers only the window in
+      which the control is not yet in force on every replica. Running more than
+      one server replica is unsupported today (the safe-to-scale gate in
+      `docs/ha-delivery-matrix.md`), so the entry covers the rolling-upgrade
+      case and is not a statement that multi-replica operation is supported.
+      Operator wording: `docs/user-manual/upgrading.md` "Mixed-version
+      admission".
+     - **Conditions of this exception.** The upgrade is controlled: the
+       operator records each replica's upgrade timestamp (UTC) in the change
+       ticket (SOC 2 CC8.1) as the roll happens, because the audit row does not
+       name the replica, and keeps the load balancer log for the window. The
+       marker query in `upgrading.md` lists the decisions in the window that
+       carry no marker. Those controls are customer-operated: Yuzu neither
+       enforces nor evidences them.
+     - **Acceptance.** Acceptor: Dave Rae (maintainer). Date: 2026-10-28. Ruling
+       source: the maintainer's answer during the #6079 PR 1 governance working
+       session, given after the governance ledger raised this as finding UP-9.
+       As with the entries above, this is a working-session statement, not a
+       signed decision. The acceptor is also the author of the commits that
+       introduce this entry, so independent review of this acceptance rests on
+       the pull request review (expected, not enforced by tooling), not on a
+       second approver. This entry replaces the earlier statements in
+       `upgrading.md` and `docs/enterprise-readiness-soc2-first-customer.md`
+       that cited an acceptance dated 2026-10-19: no repository record of an
+       acceptance of this exposure existed on that date. The 2026-10-19 addendum
+       above concerns distinct humans only.
+     - **Revisit** when a minimum-version admission check exists, or when
+       multi-replica operation leaves the unsupported state in the safe-to-scale
+       gate, whichever comes first. No calendar date is set.
+   - **2026-10-28 - the Echo rename retires every TAR-named surface with no
+     deprecation window.** `docs/api-versioning-policy.md` treats an endpoint or
+     tool rename as a Breaking change that keeps the old name for a window; this
+     rename retires the old names outside that cycle, by the owner's ruling at the
+     rename's planning (2026-10-28): a hard cut, no aliases. Scope: the REST
+     routes `/api/v1/tar/...` and `/api/dashboard/tar-*`, the MCP tools
+     `*_tar_*`, the metrics `yuzu_tar_*`, the audit actions `tar.*` (no longer
+     written; old rows keep their spelling and the `echo.*` filters match both),
+     the instruction ids `crossplatform.tar.*`, the result-set matcher kind
+     `tar_rows_ge` and the agent plugin name `tar`. Replacement names substitute
+     `echo` for `tar` (`/api/v1/echo/...`, `*_echo_*`, `yuzu_echo_*`, `echo.*`,
+     `crossplatform.echo.*`, `echo_rows_ge`, plugin `echo`). The only retained
+     compatibility is the upgrade-window plugin-name shim (the server accepts an
+     agent that still reports `tar` and writes that name on the wire to it),
+     removed with the other legacy-name shims. Rationale: the feature is renamed
+     outright, so a retained alias would keep the old name alive in every
+     surface; the migration guide (`docs/user-manual/upgrading.md`) lists the
+     old and new names. The ledger records the retirement because the policy
+     requires it.
 
 ## Interim rules (until the named follow-ups ship)
 

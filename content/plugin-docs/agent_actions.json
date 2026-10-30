@@ -449,7 +449,7 @@
   "version": "0.1.0",
   "where_the_data_goes": [
     "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response into the ResponseStore. The dashboard renders `agent_actions` output as a generic `Agent | Key | Value` table — it is in the `kKeyValuePlugins` set, not a custom schema (`server/core/src/result_parsing.hpp:53-67`).",
-    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no reference to `agent_actions` or `device.agent_actions.*` exists outside the capability catalogue, `result_parsing.hpp`, and `agent_registry.cpp`'s action-description registry.",
+    "**Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics — no reference to `agent_actions` or `device.agent_actions.*` exists outside the capability catalogue, `result_parsing.hpp`, and `agent_registry.cpp`'s action-description registry.",
     "**Sensitivity.** `info` rows can carry `agent_id` (this device's own identifier) and `agent_version` (the installed agent software's version); `server_address`, `heartbeat_interval`, and `plugins_count` describe the deployment rather than a device, person, or third-party software. `set_log_level` rows carry nothing beyond a log-level name.",
     "**Siblings:** none — both actions are this plugin's whole surface; no other definition shares its config-read or log-level mechanism.",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.agent_actions.info\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`, rendered as an `Agent | Key | Value` table (`server/core/src/result_parsing.hpp:53-67`)."

@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 
 #include <algorithm>
@@ -429,30 +430,34 @@ void render_step_up_refusal(const httplib::Request& req, httplib::Response& res,
 void emit_step_up_refusal_effects(const httplib::Request& req, const StepUpVerdict& verdict,
                                   const StepUpAuditFn& audit_fn, const std::string& action_label,
                                   std::string_view detail_suffix, yuzu::MetricsRegistry* metrics) {
+    // The subject is IdP- or operator-controlled (an OIDC `sub` or SAML NameID reaches
+    // session.username with spaces, '=' and ',' intact), and this row is parsed as space-delimited
+    // key=value by SIEM rules: neutralise it (CWE-117) so it cannot forge `reason=...` tokens.
+    const std::string user = yuzu::log_token(verdict.user);
     std::string detail_str;
     switch (verdict.decision) {
     case StepUpDecision::kSamlDenied:
-        detail_str = "user=" + verdict.user + " reason=saml_session_no_mfa_this_release";
+        detail_str = "user=" + user + " reason=saml_session_no_mfa_this_release";
         break;
     case StepUpDecision::kStoreUnavailable:
     case StepUpDecision::kStatusFailed:
-        detail_str = "user=" + verdict.user + " reason=mfa_status_unavailable";
+        detail_str = "user=" + user + " reason=mfa_status_unavailable";
         break;
     case StepUpDecision::kUnwired:
-        detail_str = "user=" + verdict.user + " reason=auth_store_unwired";
+        detail_str = "user=" + user + " reason=auth_store_unwired";
         break;
     case StepUpDecision::kUnsupportedClass:
-        detail_str = "user=" + verdict.user + " reason=step_up_class_unsupported";
+        detail_str = "user=" + user + " reason=step_up_class_unsupported";
         break;
     case StepUpDecision::kEvaluationFailed:
-        detail_str = "user=" + verdict.user + " reason=chokepoint_exception";
+        detail_str = "user=" + user + " reason=chokepoint_exception";
         break;
     case StepUpDecision::kEngineDenied:
-        detail_str = "user=" + verdict.user + " reason=engine_principal_denied";
+        detail_str = "user=" + user + " reason=engine_principal_denied";
         break;
     case StepUpDecision::kChallenge:
     case StepUpDecision::kPass:
-        detail_str = "user=" + verdict.user + " age_secs=" + std::to_string(verdict.age_secs) +
+        detail_str = "user=" + user + " age_secs=" + std::to_string(verdict.age_secs) +
                      " window_secs=" + std::to_string(verdict.window_secs);
         break;
     }
