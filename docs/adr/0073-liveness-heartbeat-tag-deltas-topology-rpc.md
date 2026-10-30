@@ -881,7 +881,7 @@ enrollment token, CSR, certificate or attestation.
 rpc ProxyReattach(ReattachRequest) returns (ReattachResponse);
 message ReattachRequest {
   string agent_id = 1;
-  string session_id = 2;          // also sent as x-yuzu-session-id, as replay does today
+  string session_id = 2;          // authoritative; x-yuzu-session-id must equal it or MALFORMED_SESSION
   string observed_peer = 3;
 }
 message ReattachResponse {
@@ -903,6 +903,10 @@ message ReattachResponse {
 
   Only the payload changes, from a stored request to two ids and a peer address. That removes the
   `local_error` encode-failure branch of `replay_send/4`.
+- **Which session id counts.** The body's `session_id` is the session presented. The gateway also
+  sends it as `x-yuzu-session-id`, as replay does today. The server refuses `MALFORMED_SESSION`
+  when the metadata value is present and differs from the body, or when the body's id is not a
+  server-minted session id (`is_server_minted_session_id`, the check ProxyRegister applies).
 - **Server** (`GatewayUpstreamServiceImpl::ProxyReattach`, `server/core/src/gateway_service_impl.cpp`):
   0. `onbehalf::enforce(context)`, before any side effect, as in every gateway-upstream handler;
   1. gateway peer authorization (`GatewayPeerGuardedService` override; D7's rule for a new upstream
@@ -914,14 +918,16 @@ message ReattachResponse {
      `NOT_ENROLLED`. Reattach can never enrol. "Revoked" is not an enrollment state: certificate
      revocation is serial-scoped, and it does not gate reattach, just as it does not gate the
      ProxyRegister fast path today;
-  4. **the same adopt decision ProxyRegister uses** (`renew_leases` / `reclaim_tombstoned_session`
+  4. read the agent's `AgentRegistrationStore` record and its interned plugin set. A missing
+     record, or one whose stored `session_id` is not the presented session id, answers
+     `NO_RECORD`; a degraded read answers `DEGRADED`, retryable and fail-closed. The read comes
+     before the adopt step, so a refusal here leaves the route directory untouched. **Never
+     install a session from partial facts:** an empty plugin list would make dispatch report
+     `plugin_not_found`, and empty scopable tags would silently change scope results;
+  5. **the same adopt decision ProxyRegister uses** (`renew_leases` / `reclaim_tombstoned_session`
      CAS, `server/core/src/gateway_route_store.hpp` and its FORWARD NOTE), extracted into one shared
      function and called from both RPCs. Never a second copy. Whatever ADR-0074 decides about
      cluster affinity (its Conflict 1) therefore applies to both RPCs at once;
-  5. read the agent's `AgentRegistrationStore` record and its interned plugin set. A missing record
-     answers `NO_RECORD`; a degraded read answers `DEGRADED`, retryable and fail-closed. **Never
-     install a session from partial facts:** an empty plugin list would make dispatch report
-     `plugin_not_found`, and empty scopable tags would silently change scope results;
   6. install the `AgentSession` from the record, the adopted session id and `observed_peer`.
 
   The CONNECTED re-announce then sets `gateway_node`, wire capabilities and `stream_home_id`, as
@@ -935,7 +941,7 @@ message ReattachResponse {
 
   `__resync__` cannot serve here. It is a Subscribe command, so the server must already hold an
   installed session to route it, and installing a session without the registration facts is exactly
-  what step 5 refuses.
+  what step 4 refuses.
 - **Authority is unchanged, and stated so it stays that way.** Today's replay presents the stored
   request, but for an enrolled agent the server takes the fast path and ignores the token. Replay
   authority already rests on two things:
@@ -959,7 +965,8 @@ message ReattachResponse {
   ADR-0012 store contract, `docs/postgres-store-playbook.md`). Construction fails closed per
   ADR-0007/0012.
 - **Table `registrations`:**
-  - columns: `agent_id TEXT PRIMARY KEY`, `hostname`, `os`, `arch`, `agent_version`, `cluster_id`,
+  - columns: `agent_id TEXT PRIMARY KEY`, `session_id TEXT NOT NULL` (the session of the
+    registration that wrote the row), `hostname`, `os`, `arch`, `agent_version`, `cluster_id`,
     `scopable_tags JSONB`, `plugin_set_hash TEXT NOT NULL`, `registered_at BIGINT NOT NULL`;
   - `registered_at` is authored by Postgres `now()` in SQL, never the replica's clock (the ADR-2002
     #3715 DB-clock rule);
@@ -971,11 +978,21 @@ message ReattachResponse {
     per agent. Replicas cache rows by hash in memory; the table is immutable per hash.
 - **Writes.** One upsert of the agent's row, plus an insert-if-absent of its plugin set, in one
   transaction, after every successful fresh registration (direct `Register` and `ProxyRegister`).
-  - It runs after the session is installed and is not on the enrollment decision.
+  - It runs synchronously in the registration handler, after the session is installed and before
+    the RPC returns, with the store's bounded lease acquire (ADR-0012). On `ProxyRegister` it runs
+    inside `registration_lock_for(agent_id)`; direct `Register` has no such lock today. It is not on
+    the enrollment decision.
+  - `registration_lock_for` is per replica, so it does not order a Register on one replica against
+    a reattach on another. The session binding does: a reattach installs only from a row written by
+    the session it presents (step 4).
   - A failed write is logged and counted (`yuzu_server_agent_registration_store_failed_total{op}`)
-    and the registration proceeds. The cost of a lost write is bounded: the agent's next reattach
-    answers `NO_RECORD`, and the agent re-registers.
-  - Reads on reattach fail closed (step 5).
+    and the registration proceeds. A failed upsert leaves the previous row, which names the previous
+    session, so the agent's next reattach answers `NO_RECORD` rather than installing stale plugin or
+    tag facts, and the agent re-registers.
+  - Reads on reattach fail closed (step 4).
+- **Backup and restore.** The schema is in the standard Postgres backup scope, like every
+  server store. After a restore, rows whose `session_id` no longer matches the session an agent
+  presents answer `NO_RECORD`, and those agents re-register once.
 - **Lifecycle.**
   - Rows are deleted by the agent decommission/deregistration cascade
     (`server/core/src/agent_decommission.hpp`), which gains this store as a member.
@@ -1288,6 +1305,9 @@ of every ~30 s. The content is unchanged.
   (`reject_revoked_peer`, label `report_topology`);
 - `ProxyReattach`: adopt via the shared decision (one function, called by both RPCs); every refusal;
   fail-closed on a degraded record read; never installs from partial facts; the rate limit;
+  a record written by a different session (a failed upsert, a cross-replica race, a restored
+  backup) answers `NO_RECORD`; a body and metadata session-id mismatch answers `MALFORMED_SESSION`;
+  a refusal before the adopt step leaves the route directory untouched;
 - `AgentRegistrationStore` under the ADR-0012 test conventions (`YUZU_REQUIRE_PG_DB`): upsert, plugin
   interning, the decommission cascade, DB-authored timestamps;
 - the `apply` outcomes (synced, full, diverged, no_base, rejected), and the moved tag caps;
