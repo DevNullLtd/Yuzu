@@ -236,7 +236,7 @@ Several standing rules, and one earlier ADR, say the opposite of a decision abov
 
 ## Audit and evidence
 
-The waves add audit records or metrics for: certificate issuance, renewal and revocation; CRL publication and gateway pulls; handshake refusals by reason; entry into and exit from fail-closed; enrollment by machine certificate; D5 signature refusals; and the drain lifecycle (order, abort, completion). Each wave names its own audit verbs and metrics. Mutations fail closed on audit failure (ADR-1005).
+The waves add audit records or metrics for: certificate issuance, renewal and revocation; CRL publication and gateway pulls; handshake refusals by reason; entry into and exit from fail-closed; enrollment by machine certificate; D5 signature refusals; the drain lifecycle (order, abort, completion); and changes to the gateway list the server signs. Each wave's Done-when lists the audit verbs and metrics it adds. Audit records go to the existing audit log, with its retention (365 days by default) and its `AuditLog:Read` gate. Issuance records and CRL versions stay in `ca_store`, where a revoked row is never deleted. Mutations fail closed on audit failure (ADR-1005).
 
 ## Accepted risks
 
@@ -295,7 +295,7 @@ Each line is something the named wave must state, decide or test. None is decide
 - The gateway closes an agent's connection when the server ends a revoked session.
 - `forwarded_for` cannot work on a strict main port, and PROXY protocol must be parsed before the kTLS handshake.
 - The privacy classification of `agent_id`, as an input to the TLS version choice (D8).
-- The signed-result evidence window: the shorter of response retention and `ca_issued` retention.
+- The signed-result evidence window. As designed, a signed result can be checked only while both the response (kept 90 days by default) and the signing certificate's `ca_issued` record are kept; whether evidence must outlive that is open.
 - How agents already running behind a gateway get the wave-2 agent binary, and who confirms the pilot check before wave 2 merges.
 
 **Wave 4**
