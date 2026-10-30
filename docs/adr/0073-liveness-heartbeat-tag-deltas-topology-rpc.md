@@ -1074,10 +1074,16 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     with `send_system_reserved` to the agent's own stream (plus `forward_gateway_pending` for a
     gateway agent), as `__sync__.now` is. That is a `DispatchCaller` construction, of the
     existing system kind; it threads no operator authority and adds no `approval_provenance`
-    stamping site. It is not a fleet dispatch. `SystemReservedPush` gains one enumerator for it,
-    which also means bumping the size of the `kSystemReservedPushes` array (the boot pre-seed) and
-    adding the enumerator's entry to the SCOPE OF THE BYPASS list in `dispatch_confined_arms.hpp`,
-    which that header requires of every new enumerator.
+    stamping site. It is not a fleet dispatch. `SystemReservedPush` gains two enumerators, one per
+    action (`resync_tags` labelled `__resync__.tags`, `resync_topology` labelled
+    `__resync__.topology`), because each enumerator maps to one `plugin.action` capability label
+    on `yuzu_server_system_reserved_push_total` (`system_reserved_push_label`). That also means
+    growing the `kSystemReservedPushes` array (the boot pre-seed) from 4 to 6 and adding each
+    enumerator's entry to the SCOPE OF THE BYPASS list in `dispatch_confined_arms.hpp`, which that
+    header requires of every new enumerator. The `echo_fleet_snapshot` enumerator loses its only
+    caller with D10; it stays as a zero series (removing it is a subtraction from a closed label
+    set operators may query), and its SCOPE OF THE BYPASS entry is marked as having no caller
+    since this ADR.
   - `__resync__` is **not** in the protective set. A whole-action kill switch on it, or a degraded
     enablement store, refuses it at `build_classified_command`; that is counted `send_failed`, and
     divergence persists until the next permitted issuance. A per-OS kill switch is not applied:
@@ -2116,7 +2122,7 @@ per replica, for N agents whose heartbeats reach it (estimates, unmeasured; slic
   - `__resync__` is a `SystemReservedPush` (`dispatch_confined_arms.hpp`), so, like `__sync__.now`,
     it reaches a contained device. It only arms a full-tag heartbeat or a topology report; no code
     runs. It is counted on `yuzu_server_system_reserved_push_total` under its own capability label,
-    and not audited, as the other pushes are. The `echo.fleet_snapshot` push is no longer sent
+    and not audited, as the other pushes are, one label per action. The `echo.fleet_snapshot` push is no longer sent
     (D10). `docs/user-manual/security-hardening.md`'s list of channels that reach a contained
     device changes with it.
 
