@@ -1025,6 +1025,41 @@ TEST_CASE("shares bsd exports: an empty credential user is refused as parsecred 
     CHECK(sigs(bsd("/a -maproot=\n/b")) == Sigs{"/b rw anon clients_0"});
 }
 
+TEST_CASE("shares bsd exports: a group list of only empty names is refused as parsecred refuses it",
+          "[shares]") {
+    // A non-empty group list whose every name is empty finds no group (getgrnam("") is NULL),
+    // so parsecred fails with "no groups found" and mountd drops the entry.
+    for (const char* line : {"/srv -maproot=0::", "/srv -maproot=0:::", "/srv -mapall=0::",
+                             "/srv -r=0::", "/srv -root=root::", "/srv -maproot 0::",
+                             "/srv -ro,maproot=bin::"}) {
+        INFO(line);
+        CHECK(rejected(line));
+    }
+    // `0:` is the explicit "no groups" credential, and one real group makes the list valid.
+    CHECK(sigs(bsd("/srv -maproot=0:")) == Sigs{"/srv rw anon no_root_squash,clients_0"});
+    CHECK(sigs(bsd("/srv -maproot=0::1")) == Sigs{"/srv rw anon no_root_squash,clients_0"});
+    CHECK(sigs(bsd("/srv -maproot=0:1:")) == Sigs{"/srv rw anon no_root_squash,clients_0"});
+    // The line after a rejected one still parses.
+    CHECK(sigs(bsd("/a -maproot=0::\n/b")) == Sigs{"/b rw anon clients_0"});
+}
+
+TEST_CASE("shares bsd exports: a quote-led credential user is refused as parsecred refuses it",
+          "[shares]") {
+    // do_opt never strips quotes from an option value (only a directory path loses them), so
+    // parsecred looks `"0"` up as an account name that starts with a quote.
+    for (const char* line : {"/srv -maproot=\"0\"", "/srv -maproot=\"root\"", "/srv -maproot \"0\"",
+                             "/srv -maproot \"root\"", "/srv -mapall='0'", "/srv -r='0':1",
+                             "/srv -maproot=\"0\":1", "/srv -maproot \"\""}) {
+        INFO(line);
+        CHECK(rejected(line));
+    }
+    // Unquoted spellings of the same users are ordinary credentials.
+    CHECK(sigs(bsd("/srv -maproot=root")) == Sigs{"/srv rw anon no_root_squash,clients_0"});
+    CHECK(sigs(bsd("/srv -maproot=0")) == Sigs{"/srv rw anon no_root_squash,clients_0"});
+    // The line after a rejected one still parses.
+    CHECK(sigs(bsd("/a -maproot=\"0\"\n/b")) == Sigs{"/b rw anon clients_0"});
+}
+
 TEST_CASE("shares bsd exports: entries are joined as get_export_entry joins them", "[shares]") {
     // A stripped backslash appends the next physical line with NO separator.
     CHECK(sigs(bsd("/a \\\n/b")) == Sigs{"/a/b rw anon clients_0"});
@@ -1332,10 +1367,32 @@ TEST_CASE("shares bsd exports: the budget is charged before a Share is built", "
     CHECK(p.truncated);
     // The cut stops the file, not just the line.
     CHECK(bsd("/a\n/b\n/c", 1).shares.size() == 1);
-    const auto big = bsd("/" + std::string(5000, 'x'));
-    REQUIRE(big.shares.size() == 1);
-    CHECK(big.shares[0].path.size() == kMaxFieldBytes);
-    CHECK(big.field_oversized);
+}
+
+TEST_CASE("shares bsd exports: a cleaned path over 255 bytes drops the whole entry", "[shares]") {
+    // RPCMNT_NAMELEN: get_exportlist measures the CLEANED path and drops the entry, siblings
+    // included, so the 4096-byte field cut can never fire on this parser.
+    const auto path = [](std::size_t n) { return "/" + std::string(n - 1, 'a'); };
+    CHECK(sigs(bsd(path(255))) == Sigs{path(255) + " rw anon clients_0"});
+    CHECK(rejected(path(256)));
+    CHECK(rejected(path(5001)));
+    // Quotes and escapes are resolved before the measure.
+    CHECK(sigs(bsd("\"" + path(255) + "\"")) == Sigs{path(255) + " rw anon clients_0"});
+    CHECK(rejected("\"" + path(256) + "\""));
+    CHECK(rejected("'" + path(256) + "'"));
+    // (The final byte is not a blank or backslash, which the entry join would strip.)
+    std::string escaped = "/";
+    for (int k = 0; k < 253; ++k)
+        escaped += "\\ ";
+    CHECK(bsd(escaped + "b").shares.size() == 1); // 255 cleaned bytes from 508 raw bytes
+    CHECK(rejected(escaped + "\\ b"));            // 256 cleaned bytes
+    // Trailing slashes are stripped first: 255 cleaned bytes pass whatever follows, 256 do not.
+    CHECK(sigs(bsd(path(255) + "///")) == Sigs{path(255) + " rw anon clients_0"});
+    CHECK(rejected(path(256) + "/"));
+    // One over-long path drops its sibling, in either order, and the next line is still read.
+    CHECK(rejected("/ok " + path(256)));
+    CHECK(rejected(path(256) + " /ok"));
+    CHECK(sigs(bsd("/ok " + path(256) + "\n/next")) == Sigs{"/next rw anon clients_0"});
 }
 
 // ---------------------------------------------------------------------------

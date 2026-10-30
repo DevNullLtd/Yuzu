@@ -755,6 +755,27 @@ inline bool is_root_user(std::string_view user) {
 /// refuses one whose length is this long or longer.
 inline constexpr std::size_t kBsdMaxPathLen = 1024;
 
+/// RPCMNT_NAMELEN: get_exportlist drops the whole entry when a cleaned directory path is longer
+/// than this. It is not the `-fspath` bound above.
+inline constexpr std::size_t kBsdNameLen = 255;
+
+/// Whether parsecred can accept a `-maproot` / `-mapall` credential `user[:group...]` on any
+/// host: the user is not empty and does not start with a quote (do_opt never strips quotes from
+/// an option value, so `"0"` reaches getpwnam with its quote; an account name starting with a
+/// quote is treated as unresolvable, the same premise as the empty user), and a group list that
+/// is present is not made only of empty names (an empty name never resolves, so no group is
+/// found and parsecred fails). A named user or group is host data and is not looked up.
+inline bool bsd_cred_valid(std::string_view cred) {
+    const auto colon = cred.find(':');
+    const auto user = cred.substr(0, colon);
+    if (user.empty() || user[0] == '"' || user[0] == '\'')
+        return false;
+    if (colon == std::string_view::npos)
+        return true;
+    const auto groups = cred.substr(colon + 1);
+    return groups.empty() || groups.find_first_not_of(':') != std::string_view::npos;
+}
+
 /// Whether mountd's `get_sec_flavors` accepts a `-sec` value: colon-separated flavours, an empty
 /// component skipped, a repeat of an accepted flavour skipped, and a component that is not
 /// `sys` / `krb5` / `krb5i` / `krb5p` (exact case) voids the whole list, so `sys:bogus` is as bad
@@ -812,8 +833,10 @@ struct BsdEntry {
 /// together with a host, a malformed network or mask value (a name is never resolved, so an
 /// unresolvable one is still accepted; an all-ones IPv4 value is INADDR_NONE, which get_net
 /// refuses), mismatched families, a -mask without a -network, -maproot (or -root / -r) together
-/// with -mapall (mountd `check_options`), an empty -maproot / -mapall / -root / -r user
-/// (parsecred), and a bad -sec, -fspath or -fsuuid value (do_opt).
+/// with -mapall (mountd `check_options`), a -maproot / -mapall / -root / -r credential parsecred
+/// cannot accept on any host (an empty or quote-led user, a group list of only empty names; see
+/// bsd_cred_valid), a bad -sec, -fspath or -fsuuid value (do_opt), and a cleaned path longer than
+/// 255 bytes (get_exportlist).
 inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
     std::size_t i = 0;
     std::string_view f = bsd_nextfield(entry, i);
@@ -861,13 +884,12 @@ inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
                 } else if (has_arg && (item == "maproot" || item == "mapall" || item == "root" ||
                                        item == "r")) { // mountd do_opt: the credential-taking names
                     // parsecred resets the credential on every call, so the LAST mapping wins.
-                    // An empty user (`-maproot=`, `-mapall=:0`) is getpwnam("") in parsecred,
-                    // which no host can satisfy: do_opt fails and mountd drops the entry. The
-                    // group part after the `:` depends on the host's groups and is not modelled.
-                    const auto user = arg.substr(0, arg.find(':'));
-                    if (user.empty())
+                    // A credential no host can satisfy (see bsd_cred_valid) fails do_opt and
+                    // mountd drops the entry; a named user or group depends on the host and is
+                    // not modelled.
+                    if (!bsd_cred_valid(arg))
                         return false;
-                    e.root = is_root_user(user);
+                    e.root = is_root_user(arg.substr(0, arg.find(':')));
                     if (item == "mapall")
                         have_mapall = true;
                     else
@@ -920,6 +942,8 @@ inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
             if (got_nondir)
                 return false; // "Directories must be first"
             auto p = bsd_clean_path(f);
+            if (p.size() > kBsdNameLen)
+                return false; // get_exportlist: "pathname too long", the whole entry is dropped
             if (std::ranges::find(e.paths, p) == e.paths.end())
                 e.paths.push_back(std::move(p));
         } else {
