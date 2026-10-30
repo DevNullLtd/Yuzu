@@ -1205,10 +1205,16 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     honoured: `send_to` applies the per-OS withhold to every caller, `send_system_reserved`
     included (#5294, enforced at send time against the session's OS), and the variant calls the
     same check. A withheld agent is refused and counted `send_failed`, left out of any gateway
-    forward, and re-marked by its next diverged heartbeat, so it is re-issued (and refused again)
-    once per per-agent interval while the switch stays set; that holds the backlog alert's
-    `send_failed` branch true, which is the intended signal that an operator switch is blocking
-    convergence.
+    forward, and re-marked by its next diverged heartbeat. The withhold is applied at send time,
+    after `build_classified_command` has already made its kill-switch read and written a
+    `command_execution` record, so each refused issuance costs two Postgres operations and a
+    record for a command never sent. A per-OS refusal therefore backs that agent off as a
+    `rejected` outcome does: its per-agent interval doubles for each consecutive per-OS refusal,
+    to a cap of 15 min, and resets on the agent's next successful send. At the cap, W withheld
+    agents cost W / 900 issuances per second (about 56/s for W = 50,000), rather than W / 60, so
+    a switch held during an incident leaves the issuer's throughput to the other agents and does
+    not load the pool. The refusals still hold the backlog alert's `send_failed` branch true,
+    which is the intended signal that an operator switch is blocking convergence.
   - **Ingestion only marks.** A heartbeat that requests a resync (D3, D6) adds the agent to a
     per-replica pending set: one entry per agent and action, deduplicated, so the set is bounded by
     the agents whose heartbeats reach this replica (gauge `yuzu_server_resync_pending{action}`).
