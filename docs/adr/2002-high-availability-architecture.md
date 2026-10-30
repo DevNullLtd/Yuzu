@@ -148,9 +148,13 @@ server+everything model.
 - **Events/SSE: at-least-once with gap detection.** Durable monotonic event IDs; consumers replay
   from a cursor / `Last-Event-ID`; NOTIFY is a latency hint only. A consumer may see a duplicate
   event and must tolerate it.
+  *Update (2026-10-30, ADR-0074 conflict 8): under the decided asynchronous default this holds across a
+  failover only once ADR-0074 D13's event-outbox requirement is met.*
 - **Leadership: fenced, not exclusive-by-wall-clock.** A fencing token is checked in the same
   transaction as every side-effecting claim; two momentary leaders cannot both commit the same
   occurrence.
+  *Update (2026-10-30, ADR-0074 conflict 8): under the decided asynchronous default the fence holds across
+  a failover only once ADR-0074 D13's leader-epoch requirement is met.*
 - **Durability: selectable.** RPO=0 holds **while a synchronous-commit quorum is available**; the
   shipped default is 3-node quorum (see §11/§13). It is *not* "writes always available" — loss of
   quorum blocks writes by design (fail-closed, consistent with ADR-0007).
@@ -237,6 +241,10 @@ outbox** with **durable monotonic event IDs** (replacing the per-process channel
   against **core's spine API** (never the `yuzu` outbox directly) and **tolerate duplicates**
   (at-least-once). Cursor ownership: the client cursor is core's; presentation is a stateless relay.
 - The outbox inherits the **clock-guarded retention** rules (routed concern). Its rows are also the schedule runner's spent-ticket ledger (#6096, `approval_id`), so any reaper must retain approval-bearing rows at least 7 days from creation.
+- *Update (2026-10-30, ADR-0074 conflict 8):* under the decided asynchronous default, a failover can
+  lose outbox rows and let the promoted primary issue transaction ids below a replica's last-seen
+  cursor, so polling forward from it can skip events; ADR-0074 D13's event-outbox requirement must be
+  met before this delivery invariant holds across a failover.
 
 **Load-bearing prerequisite:** cross-instance correlation requires execution state in Postgres.
 `execution_tracker` (SQLite) and `cmd_execution_ids_` (in-process map, `agent_service_impl.hpp:330`)
@@ -2589,8 +2597,9 @@ Proposed targets for the team to ratify:
 > decided asynchronous default (the update at the end of §11), a failover can lose writes the old
 > primary acknowledged but had not yet sent to the promoted standby. That loss is an accepted risk
 > (ADR-0074, Accepted risks), and each store must meet the requirement ADR-0074 D13 sets for it. This
-> decision does not change the RTO targets above. Asynchronous replication is now the default, not an
-> opt-out, and no bound is set on its loss window (ADR-0074 D13).
+> decision does not change the RTO targets above. Asynchronous replication is the decided default (it ships in
+> ADR-0074's wave 6), not an opt-out; ADR-0074 sets no bound on its loss window beyond the failover
+> tool's lag cap, which its wave 6 sets deliberately (ADR-0074 D13).
 
 ### 14. Testing — failover harness (Q12)
 A **failover test harness** stands up the Patroni+etcd+HAProxy stack and **injects a primary kill
@@ -2603,7 +2612,9 @@ duplicate** (§7). It must also cover **standby loss** (quorum-degrade behavior,
 
 > **Update (2026-10-30, ADR-0074 conflict 8).** The standby-loss scenario above applies to the optional
 > synchronous profiles. Under the decided asynchronous default, the harness also runs a failover that
-> loses acknowledged writes, against the per-store requirements in ADR-0074 D13.
+> loses acknowledged writes, against the per-store requirements in ADR-0074 D13. On that failover the
+> assertions above (sessions survive, no committed event lost, no double-dispatch) hold only as far as
+> those requirements make them hold.
 
 ## Decomposition into child workstreams
 
