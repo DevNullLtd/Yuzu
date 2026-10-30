@@ -1129,12 +1129,15 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     frame onto the shared `gw_pending_` queue that the next `forward_gateway_pending()` from any
     caller drains. So the issuer uses a `send_system_reserved` variant: still the single
     system-reserved door, the same enumerators and the same `sent`/`undelivered` metering on
-    `yuzu_server_system_reserved_push_total`, and for a gateway session it runs `send_to`'s own
-    checks (the `gateway_capability_missing` deny for a gateway without
-    `kGatewayWireCapabilityDispatchTagV1`, the `cluster_id` stamp, `wire_for`) and hands the frame
-    to the issuer's own batch, never to `gw_pending_`. A test asserts a resync never appears in
-    `drain_gateway_pending()`, and one that a gateway lacking the dispatch-tag capability is
-    denied on the issuer path. Gateway resyncs therefore do **not** go through
+    `yuzu_server_system_reserved_push_total`, and it keeps one copy of the door's checks: the
+    variant is a refactor of `send_to`, not a re-listing of it. `send_to`'s session lookup and its
+    checks (the #5294 per-OS withhold, `tag_is_valid`, the `gateway_capability_missing` deny for a
+    gateway without `kGatewayWireCapabilityDispatchTagV1`, the `cluster_id` stamp, `wire_for`) are
+    extracted into one function that `send_to` and the variant both call; the variant then hands a
+    gateway session's frame to the issuer's own batch, never to `gw_pending_`. A test asserts a
+    resync never appears in `drain_gateway_pending()`, one that a gateway lacking the dispatch-tag
+    capability is denied on the issuer path, and one that a per-OS-switched agent behind a gateway
+    is refused on the issuer path. Gateway resyncs therefore do **not** go through
     `forward_gateway_pending`: that path starts one untracked,
     detached thread per command, holds a `SendCommand` open for up to 300 s with three retries,
     and is never joined at stop (#3279). At the issuer's rates, with the per-agent re-issue while
@@ -1176,10 +1179,14 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
   - `__resync__` is **not** in the protective set. A whole-action kill switch on it refuses it;
     that is counted `send_failed`, and divergence persists until the next permitted issuance. A
     degraded enablement store is told apart from a set switch by the issuer's tri-state read, which ends the
-    pass with the marks counted `deferred` (below), never `send_failed`. A per-OS kill switch is not applied:
-    `send_system_reserved` ignores the per-OS withhold `build_classified_command` returns, as it
-    does for `__sync__.now` and every other system-reserved push (only `dispatch_confined` applies
-    per-OS withholds).
+    pass with the marks counted `deferred` (below), never `send_failed`. A per-OS kill switch is
+    honoured: `send_to` applies the per-OS withhold to every caller, `send_system_reserved`
+    included (#5294, enforced at send time against the session's OS), and the variant calls the
+    same check. A withheld agent is refused and counted `send_failed`, left out of any gateway
+    forward, and re-marked by its next diverged heartbeat, so it is re-issued (and refused again)
+    once per per-agent interval while the switch stays set; that holds the backlog alert's
+    `send_failed` branch true, which is the intended signal that an operator switch is blocking
+    convergence.
   - **Ingestion only marks.** A heartbeat that requests a resync (D3, D6) adds the agent to a
     per-replica pending set: one entry per agent and action, deduplicated, so the set is bounded by
     the agents whose heartbeats reach this replica (gauge `yuzu_server_resync_pending{action}`).
