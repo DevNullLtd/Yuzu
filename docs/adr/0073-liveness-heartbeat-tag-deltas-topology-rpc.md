@@ -792,7 +792,11 @@ digest, the server issues no `__resync__.topology` for that agent: a resync woul
 body and the same rejection, every 5 minutes, defeating the agent's own back-off. The agent's retry
 rule covers it instead (D7: a full floor after `IP_CONFLICT`, exponential back-off otherwise). A new
 digest clears the record. `UNKNOWN_SESSION` is refused before the session is resolved, so it
-records nothing.
+records nothing. From ADR-0074 wave 2 (D16) three more reasons exist, and none of them records the
+rejected digest or suppresses the topology resync: on `UNVERIFIED_SESSION` the agent retries once
+its session's challenge has verified, with no back-off step; on `REPLAYED` it re-signs with a
+fresh sequence and retries once; on `BAD_SIGNATURE` it backs off exponentially, as for any other
+rejection. A slice-11 test covers each.
 
 **`stale_reason` is a closed enum.** Every rendered machine carries `stale` and `stale_reason`.
 `stale` is true exactly when `stale_reason` is not null; a fresh machine has `stale_reason = null`.
@@ -845,6 +849,12 @@ When several conditions hold, the first in this order wins:
     - the queue is capped at `kPushedMapHardCap` rows (a retained slot conflicts at most once per
       reconnect, but a flapping agent through a degraded pool can conflict on each reconnect); an
       overflow drops the oldest row, counts it (`result="dropped"`) and logs it at WARN;
+    - once the issuer's stop flag is set (at the start of `stop()`, D8), the heartbeat path stops
+      queueing: ingestion is still live until the gRPC services stop, so a re-claim conflict after
+      the flag would otherwise queue a row nobody writes. It logs the row's facts at WARN in the
+      stop-time drain's shape and counts it `result="dropped"`; the conflict stays on
+      `yuzu_viz_topology_reclaim_total{outcome="conflict"}`. This is a logged loss case, listed
+      with the others below, and slice 8's stop test covers a conflict after the flag;
     - on stop the issuer drains the queue before it exits; it starts no drain write after 5 s,
       and each drain write runs under `SET LOCAL statement_timeout` of 1 s, so a lease-held write
       cannot run on to the pool's 10 s `lock_timeout` or 30 s `statement_timeout` and the drain
@@ -858,7 +868,8 @@ When several conditions hold, the first in this order wins:
       `YuzuVizTopologyReclaimAuditDropped` sees runtime overflow drops only;
     - an unclean exit (OOM, `SIGKILL`, a crash) loses every row still queued, at most
       `kPushedMapHardCap`, and nothing counts them: the queue is in memory. A clean `stop()`
-      never does. This is the cost of keeping the write off the heartbeat path; the conflict
+      never does, except for a conflict after the issuer's stop flag, which is logged and counted
+      `dropped` (above). This is the cost of keeping the write off the heartbeat path; the conflict
       itself is still counted on `yuzu_viz_topology_reclaim_total{outcome="conflict"}`, which
       survives in Prometheus, so a gap between conflicts and written rows is visible.
 
@@ -897,7 +908,7 @@ message TopologyReport {
 }
 message TopologyAck {
   bool accepted = 1;
-  TopologyRejectReason reject_reason = 2; // PARSE | DIGEST_MISMATCH | IP_CONFLICT | OVERSIZE | UNKNOWN_SESSION | BAD_SIGNATURE (wave 2, D16)
+  TopologyRejectReason reject_reason = 2; // PARSE | DIGEST_MISMATCH | IP_CONFLICT | OVERSIZE | UNKNOWN_SESSION | BAD_SIGNATURE | REPLAYED | UNVERIFIED_SESSION (wave 2, D16)
 }
 // GatewayUpstream
 rpc ProxyTopology(yuzu.agent.v1.TopologyReport) returns (yuzu.agent.v1.TopologyAck);
@@ -1061,7 +1072,9 @@ relayed by the gateway like any command (no new gateway state).
     write of the CONNECTED re-announce that follows it) at up to `--reattach-rate`, and each
     issued resync one record write at up to `--tag-resync-rate` plus `--topology-resync-rate`
     (plus one kill-switch read per issuance, inside `build_classified_command`). At
-    the defaults, overlapping, that is up to about 12,400 operations per second per replica (four per reattach, two per issuance) against
+    the defaults, overlapping, that is up to about 12,400 operations per second per replica (four per reattach, two per issuance; from
+    ADR-0074 wave 2 each reattach adds the `challenge_pending` clear on the route row and the
+    challenge's own kill-switch read and record, so seven, about 18,400 per second) against
     the default `--postgres-pool-size` of 16. Agents that re-register instead (`NO_RECORD`) add one
     registration-record transaction each (D14). It is unmeasured. It is to be measured against the
     pool size alongside ADR-0074's wave-2 measurement of a mass re-enrollment after an outage,
@@ -1366,7 +1379,9 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     `diverged` or `no_base` outcome keeps the 60 s interval.
 - **Loss.** A command that cannot be sent (no stream) is not retried by itself. The agent's next
   diverged heartbeat marks it again, and it is issued after the per-agent interval. An agent whose stream is down
-  reconnects, and its Register carries the full set anyway.
+  reconnects, and its Register carries the full set anyway (until ADR-0074 wave 2; from then the
+  Register's tags are ignored and the full set arrives through the resync after the session's
+  challenge verifies, D16).
 
 **Direct-connected agents use the same command.** There is one mechanism, not a response flag on one
 path and a command on the other.
@@ -1569,7 +1584,9 @@ action in its annotation, and a case in `tests/prometheus/yuzu-alerts.test.yml` 
 on the sustained condition and staying quiet on the expected one.
 - `YuzuHeartbeatTagDivergenceSustained`, evaluated **per `via`**:
   `sum by (via) (rate(yuzu_server_heartbeat_tags_total{via=~"direct|gateway",outcome="diverged"}[30m]))`
-  divided by the same sum over every outcome except `absent` and `unverifiable`, above 0.01, for
+  divided by the same sum over every outcome except `absent`, `unverifiable` and the wave-2
+  `bad_signature`, `replayed` and `unverified_session` (D16; counted by their own rule below, so a
+  registration's `unverified_session` window never dilutes the ratio), above 0.01, for
   30 min, **and** that denominator above 1 heartbeat per second (a minimum-traffic guard, so a
   handful of agents cannot fire it).
   - For `via="gateway"` it also requires the fleet's coalescing to be low:
@@ -1599,7 +1616,7 @@ on the sustained condition and staying quiet on the expected one.
   - `increase(yuzu_viz_topology_resync_total{outcome="send_failed"}[30m]) > 0` or the same on
     `yuzu_server_tag_resync_total`: a send attempted on an installed session failed, so divergence
     persists. The causes are a kill switch on `__resync__`, a failed gateway forward (its 15 s
-    deadline or an upstream error), an agent the gateway reported `not_connected`, a gateway without the dispatch-tag capability, or a stream
+    deadline or an upstream error), an agent the gateway reported `not_connected` or `agent_disconnected`, a gateway without the dispatch-tag capability, or a stream
     that ended between the session check and the send (D8). A single transient failure therefore
     raises the ticket. A per-OS kill switch on `__resync__` for the agent's OS is a cause too.
     The shared `send_to` check function returns its cause (`per_os_withheld`, `tag_invalid`,
@@ -1628,6 +1645,18 @@ on the sustained condition and staying quiet on the expected one.
   registration storms, so the next restart repeats the storm for them. Responder: check Postgres
   pool saturation and the store's logs; the agents recover on their next registration. Tests:
   quiet at 0; fires on one failed write.
+- `YuzuStateSignatureRefused` (ticket; slice 11, from ADR-0074 wave 2):
+  `increase(yuzu_server_heartbeat_tags_total{outcome="bad_signature"}[30m]) > 0` or the same on
+  `yuzu_viz_topology_digest_total` and `yuzu_viz_topology_report_rejected_total{reason="bad_signature"}`,
+  or `increase(yuzu_server_reattach_challenge_total{outcome=~"bad_signature|expired"}[30m]) > 0`,
+  or `yuzu_server_reattach_challenge_pending` above 0 for 10 min without falling, or an
+  `unverified_session` share above 0.05 of state payloads for 1 h. Meaning: a gateway altered or
+  replayed agent content, challenges are failing, or long-lived sessions have passed their bound
+  certificate's notAfter with no re-bind (D16), so their state has stopped flowing. Responder: the
+  `agent.state.bad_signature` and `agent.reattach.challenge` audit rows name the agent and the
+  gateway; check that gateway first, then certificate renewal. Tests: quiet through an expected
+  post-restart challenge wave (`expired` 0, the pending gauge draining); fires on one
+  `bad_signature`, on a stuck pending gauge, and on a sustained `unverified_session` share.
 
 **Diagnosis.** The series above separate the three usual causes of divergence:
 
@@ -1640,7 +1669,7 @@ on the sustained condition and staying quiet on the expected one.
 | `diverged` plus `no_base` near 100 % | per-RPC balancing in front of the server (*Server stores*) | the load balancer |
 | `yuzu_server_resync_pending` high and `deferred` rising, `send_failed` at 0 | server overload: the issuer is deferring on Postgres (a record write or the enablement read failing) or on the rate | `YuzuPgPoolSaturated`, `--tag-resync-rate`, `--topology-resync-rate` |
 | `yuzu_viz_topology_reclaim_audit_queued` high and not falling | re-claim conflicts arriving faster than the bounded per-pass audit drain writes them (D6); the issuer still runs a pass after each 1 s of writing | Postgres write latency, then the gateway's IP churn |
-| `send_failed` rising | the `__resync__` kill switch (whole-action or per-OS), failed gateway forwards, agents a gateway reported `not_connected`, or a gateway without the dispatch-tag capability; the issuer's WARN log names the cause; after a kill switch is cleared, withheld agents converge within up to 15 min (the per-OS backoff cap) | plugin configuration, then the gateway management plane |
+| `send_failed` rising | the `__resync__` kill switch (whole-action or per-OS), failed gateway forwards, agents a gateway reported `not_connected` or `agent_disconnected`, or a gateway without the dispatch-tag capability; the issuer's WARN log names the cause; after a kill switch is cleared, withheld agents converge within up to 15 min (the per-OS backoff cap) | plugin configuration, then the gateway management plane |
 
 **Freshness SLIs.** Two ratios measure what this ADR changes, per replica:
 - tag sync: the share of heartbeats counted `synced` or `full` among all but `absent` and
@@ -1651,7 +1680,9 @@ on the sustained condition and staying quiet on the expected one.
 Slice 10 records their measured values on the rig. No objective is set here (open point 15).
 
 **Fleet-gauge semantics.** `yuzu_fleet_*` are rebuilt from the merged views. While an agent is
-`no_base` (after a server restart, until its full set lands), its state-derived gauges are absent,
+`no_base` (after a server restart, until its full set lands; from ADR-0074 wave 2 also after every
+registration, a gateway restart or reconnect included, until the challenge round trip, the resync
+issuance and the next heartbeat have passed, D16), its state-derived gauges are absent,
 not zero, and its interval-derived gauges are present. The documented consequence after a server
 restart, for N = 100,000 agents on one replica, at the configured rates (upper-rate figures: D8
 gives the issuer's real throughput bounds, under which tag issuing may take 100-400 s, or about
@@ -1870,9 +1901,36 @@ message ReattachResponse {
 - **Reattach and ADR-0074 D5's per-session signature: the challenge after reattach (decided by the
   owner, 2026-10-30; lands in ADR-0074 wave 2).** Reattach itself carries ids only and has no
   agent step, so it cannot carry the D5 per-session proof. The requirement is:
-  - after a reattach, the server sends a signed session-start challenge down the existing stream,
-    the same challenge D5 issues at the start of every session, single-use, with a fresh nonce and
-    an expiry (`--reattach-challenge-timeout`, default 30 s, unmeasured);
+  - after a reattach, the server sends a signed session-start challenge, the same challenge D5
+    issues at the start of every session, single-use, with a fresh nonce and an expiry
+    (`--reattach-challenge-timeout`, default 30 s, unmeasured; slice 11 measures it on the S1 rig);
+  - **carrier.** The challenge is a system-reserved command, `__session__.challenge`, built with
+    `build_classified_command(DispatchCaller{.system = true}, ...)` like every system push: a
+    `system_reserved` catalogue pair with `ExecuteGate::None`, a third `SystemReservedPush`
+    enumerator (`session_challenge`; `kSystemReservedPushes` grows to 7, with its SCOPE OF THE
+    BYPASS entry), refused to every operator surface by `classify_and_authorize_dispatch`. Its id
+    is minted fresh per challenge, so the agent's dedup claim (the safe default; `__guard__`
+    stays the only bypass) is harmless. `notify_exec_tracker` skips its prefix, and its reply is
+    dropped at both ingest paths before the provenance lookup, keyed on the response's plugin
+    field as the `__resync__` reply is, and handed to the challenge verifier instead. A
+    direct-connected agent gets it on its Subscribe stream. For a gateway agent there is no
+    server-held stream: it goes as a `SendCommand` on the management plane, which needs the
+    session's `gateway_node` and `cluster_id`, and those are set only by the CONNECTED
+    re-announce (which the gateway casts and may drop). So the challenge is sent once CONNECTED
+    has set them on the `challenge_pending` session, and the expiry starts at the send; a session
+    whose CONNECTED never arrives within the expiry is counted `expired`;
+  - **forwarding.** A gateway challenge never uses `gw_pending_` or `forward_gateway_pending`
+    (one detached thread per command, 300 s, three retries, #3279), for the reason D8 gives for
+    resyncs. It goes through the issuer-owned forwarder (D8: the in-flight table, `TryCancel` at
+    stop, joined before `gw_mgmt_pool_`) as one forward per agent, because each challenge is
+    signed for one agent, with `timeout_seconds` equal to the challenge expiry, a client deadline
+    a few seconds above it, and no retries. At most `--reattach-challenge-concurrency` (default
+    256, unmeasured) challenge forwards are in flight per replica, driven by the gRPC async
+    client on the issuer's thread rather than a thread per forward; a challenge that cannot start
+    before its expiry is counted `send_failed` and resolved as `expired`. The answer is taken from
+    that forward's `SendCommandResponse` stream and handed to the verifier; it is never ingested,
+    exec-tracked or stored. The containment re-application after verification goes through the
+    same bounded forwarder;
   - steps 5 and 6 still run, so the server can send the challenge, but the session is installed
     `challenge_pending` and its route row is written `challenge_pending`. Until the agent's
     signature over the challenge verifies, the route-directory reader's `routable` predicate
@@ -1883,8 +1941,9 @@ message ReattachResponse {
     `send_to`, `send_to_all` (the broadcast send, which does not call `send_to`) and
     `send_via_directory`. `send_to` and `send_to_all`'s per-session loop both refuse a
     `challenge_pending` session through one shared predicate, and `send_via_directory` refuses it
-    through `routable`; the challenge push is the one exempt send. The issuer treats such a
-    session as not installed (D8);
+    through `routable`. The one exemption is the `session_challenge` push, sent through the
+    issuer's `send_system_reserved` variant (D8) with the challenge flag, never a fourth send
+    path. The issuer treats such a session as not installed (D8);
   - `challenge_pending` is an authentication gate, not an enablement gate, so it refuses the
     protective actions too: the quarantine row's rule that no enablement gate refuses the
     protective set does not reach it, because a send to an unverified session may be a send to a
@@ -1900,18 +1959,45 @@ message ReattachResponse {
     (both are refused before targeting) and before `invalid_scope`; slice 11 amends the
     `ConfinedDispatchOutcome` doc comment and the `docs/mcp-server.md` cascade bullet, and a test
     at each of the five sites pins the rank;
+  - **locking.** The challenge state, the verified epoch, the bound key and the per-kind sequence
+    floors (D16) live on the `AgentSession` under its `stream_mu`, the lock `send_to` and
+    `send_to_all` already read routing fields under; slice 11 amends the `AgentSession`
+    publication-discipline comment in `agent_registry.hpp` to list them. Resolving a challenge is
+    one transition, `pending` to `verified`, `failed` or `expired`, taken under that lock; only
+    the winner runs its side effects, so a late answer cannot revive an expired session and an
+    expiry cannot tear down a verified one. Slice 11's TSan tests race verification against
+    expiry (exactly one outcome counted, a consistent route row);
   - on verification the server clears `challenge_pending` on both, then runs the #3425
     reconnect reconciler's containment re-application and marks a tags resync (D16): a
     containment re-dispatch refused during the window is re-fired, never dropped;
-  - a signature that fails to verify, or no answer within the expiry, makes the server uninstall
-    the session and tombstone its route row itself (it does not rely on the gateway closing the
-    stream), and the agent registers again through the full path;
+  - **failure ends the session for good.** A signature that fails to verify, or no answer within
+    the expiry, makes the server uninstall the session, tombstone its route row and, in the same
+    transaction, clear the `AgentRegistrationStore` record's `session_id`, itself; it does not rely
+    on the gateway closing the stream. The gateway's next targeted replay for that session then
+    gets `NO_RECORD`, which closes the agent's stream, so the agent registers again through the
+    full path under its jittered reconnect backoff, and the session is never reattached and
+    challenged again in a loop. A degraded read while verifying (the revocation check, or the
+    store) is neither `bad_signature` nor `expired`: the check is retried within the expiry, and
+    if it is still degraded at expiry the session is uninstalled without clearing the record,
+    counted `degraded`, and the agent may reattach again under `--reattach-rate`;
+  - **expiry is swept, not timed per challenge.** The issuer's pass (D8) scans `challenge_pending`
+    sessions past their deadline and resolves each through the transition above; there is no
+    per-challenge timer and no detached thread. The tombstone and record write runs on a bounded
+    lease outside every registry lock, and it adds no shutdown stage (the issuer's join already
+    bounds it); a stop with challenges pending leaves them to the restart path, and a slice-11
+    test checks `stop()` joins cleanly with one pending;
   - every outcome is counted (`yuzu_server_reattach_challenge_total{outcome}`, with
-    `verified|bad_signature|expired`, and the gauge `yuzu_server_reattach_challenge_pending`), and
-    a failure writes an `agent.reattach.challenge` audit row through `audit_token`;
+    `verified|bad_signature|expired|degraded|send_failed`, and the gauge
+    `yuzu_server_reattach_challenge_pending`, at most min(`--reattach-rate` × expiry, the sessions
+    held)). A failure writes an `agent.reattach.challenge` audit row through `audit_token`, at
+    most once per agent per 10 min; later failures are counted only, as the ADR already declines
+    to audit reconnect-storm outcomes row by row;
   - tests assert the exact send set: a reattached, unverified session receives no operator,
-    scheduled, policy, Guardian or system-reserved command, and a quarantined device gets its
-    containment re-applied after verification.
+    scheduled, policy, Guardian or system-reserved command, broadcast included, and a quarantined
+    device gets its containment re-applied after verification; a session whose challenge expires
+    is not reattached a second time and its next session comes from a full Register; a
+    blackholed gateway management plane during a reattach wave leaves the forwarder count
+    bounded; and the challenge and its signed answer survive a real gateway relay byte for byte.
   Until wave 2 lands, a reattached session, and the route its CONNECTED re-announce writes, carry
   the route-claim risk stated in ADR-0074 Conflict 1, which ADR-0074 lists for explicit
   acceptance at its sign-off and which holds only until its wave 2 (D5): a compromised gateway
@@ -2102,7 +2188,14 @@ lands. The two are kept consistent as follows.
     would not verify, which is why the envelope is opaque; coalescing is not the hazard, because
     keep-newest (D4) only drops whole heartbeats. The envelope fields are additive (no
     subtraction); the typed fields they supersede are deprecated and ignored from wave 2, and both
-    proto copies and the gateway's `*_pb.erl` carry the new fields;
+    proto copies and the gateway's `*_pb.erl` carry the new fields. `session_id` stays an
+    unsigned top-level field on `HeartbeatRequest` and `TopologyReport`, because the gateway admits
+    on it; a signed copy rides in the binding and must match it. The gateway's
+    `yuzu_gw_heartbeat_buffer:estimate_bytes/1`, which sums named fields only, counts the heartbeat
+    envelope, so the per-heartbeat oversize drop, the buffer byte cap and chunk packing keep
+    bounding the state payload (an EUnit case drops an over-cap envelope as oversize). The agent
+    caps a topology body at 2 MiB less a 4 KiB envelope allowance, so a signed report always fits
+    the `ProxyTopology` route's 2 MiB message cap;
   - **binding.** Each signature binds the agent id, the session id, the nonce of the session's
     most recently verified D5 challenge (its challenge epoch: at session start, or after a
     reattach, D14), the payload kind, and a per-kind sequence (one for heartbeat state, one for
@@ -2122,12 +2215,23 @@ lands. The two are kept consistent as follows.
     verification the server marks a tags resync, and the first signed full set under the new
     epoch becomes the base. `RegisterRequest.status_tags_pb` is therefore not trusted state from
     wave 2: the agent has no session id when it builds Register (the server mints it), so that
-    payload cannot be bound, and it is ignored and counted `unverified_session`. This costs one
-    tags resync per registration, which the issuer's rate already budgets for a restart (D8);
+    payload cannot be bound, and it is ignored and counted `unverified_session`; from wave 2 the
+    agent stops populating it (deprecated, never removed), so about 4 KB per Register is not sent
+    to be dropped. This costs one tags resync per registration, not only per server restart: a
+    gateway restart or reconnect storm now issues N tag resyncs, at the issuer throughput D8
+    gives, and *Fleet-gauge semantics* and S1/S3 count that;
   - **order.** For a heartbeat: the raw size cap, then the signature, then decode and the D3 steps.
     For `ReportTopology`: the 2 MiB cap, then session resolution, then the signature, then parse.
     So bytes are authenticated before they are parsed, and an altered payload is counted
-    `bad_signature`, never `rejected` or `unverifiable`;
+    `bad_signature`, never `rejected` or `unverifiable`. Verification runs outside every registry
+    and session lock: the verifier copies the epoch, the key handle and the floor out under the
+    session's `stream_mu` (D14 *locking*), verifies, then under that lock re-checks that the epoch
+    is unchanged and the sequence is above the floor and advances the floor in the same critical
+    section; otherwise the payload is `replayed` or `unverified_session`. So two copies of one
+    signed payload apply exactly once (a TSan test). On `BatchHeartbeat` a full 3 MiB chunk must
+    verify within 1 s of the gateway's 5 s call timeout on the wave-2 rig with the chosen key
+    type, measured in slice 11; if it does not, verification moves to a bounded worker pool, never
+    to an unbounded one;
   - **refusal.** From wave 2 a payload without a valid signature, a stripped one included, is
     `bad_signature` (`BAD_SIGNATURE` for a `TopologyReport`), never `absent` and never accepted;
     the clean break (ADR-0074) means every agent signs. It applies nothing; like any payload that
@@ -2137,7 +2241,12 @@ lands. The two are kept consistent as follows.
     reorder cannot back an agent off. The first `bad_signature` per session writes an
     `agent.state.bad_signature` audit row through `audit_token`; later ones are counted only;
   - **key.** The server verifies against the key of the certificate the session's challenge was
-    verified with. Revocation is checked at the challenge and by ADR-0074's revocation poll, not
+    verified with. That key is parsed once, at verification, and stored on the session with its
+    notAfter as an owning, refcounted handle (a `shared_ptr` with an `EVP_PKEY_free` deleter, or a
+    wrapper copied out with `EVP_PKEY_up_ref`); a verifier holds its own reference, and a re-bind
+    or an uninstall swaps or drops the session's reference under the lock and never frees one a
+    verifier holds (an ASan test uninstalls a session during an in-flight verify). Slice 11's
+    Resource Ledger lists it. Revocation is checked at the challenge and by ADR-0074's revocation poll, not
     per payload. Until a re-bind, the agent keeps signing with the key bound at the session's last
     verified challenge, and once that certificate passes its notAfter the server refuses state
     content as `unverified_session` (never `bad_signature`, so expiry never feeds the withholding).
@@ -2242,6 +2351,12 @@ lands. The two are kept consistent as follows.
 `docs/user-manual/upgrading.md` gains: "⚠️ Breaking: the heartbeat carries status-tag changes and a
 topology digest; fleet topology moved to its own RPC; upgrade server, gateways and agents together".
 It should say:
+- for slice 11 (ADR-0074 wave 2): the server goes first. An old agent against a wave-2 server sends
+  unsigned state, which is refused as `bad_signature` and withheld (loud, not silent: the new
+  outcome counters and `YuzuStateSignatureRefused` are the canary); a wave-2 agent against an
+  older server sends only the envelope, which that server does not read, so its state is `absent`.
+  Slice 11 ships in no release tag before ADR-0074 defines the re-bind after a certificate renewal
+  (D16, *key*);
 - the order: server, then gateways, then agents. The server and gateways move in one maintenance
   window; the agents follow in short stages, and Guardian policy changes are paused until the last
   stage is done;
@@ -2662,6 +2777,12 @@ of every ~30 s. The content is unchanged.
     ingestion is unaffected, resyncs are `deferred` and drain once the pool recovers, and a reattach
     whose read fails answers `DEGRADED` without closing a stream; `DEGRADED` reattach attempts per
     second stay at or below min(held sessions / 2.5 s, `--reattach-rate`), the full-jitter mean;
+  - **S1 and S2 again with slice 11** (signed state, the post-reattach challenge and inline
+    verification on): the same assertions (`BatchHeartbeat` p99 under 2 s, no heartbeat batch
+    retried, the breaker closed), plus `yuzu_server_reattach_challenge_total{outcome="expired"}`
+    at 0 for honest agents, the pending gauge at most min(`--reattach-rate` × expiry, held
+    sessions) and draining to 0, no session torn down on a degraded revocation read, and the
+    gateway-restart case converging tags through the per-registration resync;
   - **S3, two replicas behind per-RPC balancing** (slices 4 and 6): asserts the connection-affinity
     precondition (*Server stores*) by showing the documented symptom, a `diverged` plus `no_base`
     share near 100 %, and that connection-level balancing converges;
@@ -2947,7 +3068,7 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
     - The alert rules (`YuzuHeartbeatTagDivergenceSustained`, `YuzuVizTopologyResyncBacklog` and
       `YuzuAgentsTagsAbsent`, `YuzuAgentRegistrationStoreWriteFailing`,
       `YuzuVizTopologyReclaimAuditDropped`); this is the only slice
-      that adds them.
+      that adds them, except that slice 11 adds `YuzuStateSignatureRefused` (D13).
     - Every doc listed above, the upgrading.md section and the changelog fragment.
     - The harness and rig rerun recorded as the measured outcome, using ADR-0074 D14's method.
     - The chaos scenarios S1-S6 (*Tests*) recorded with their results, and the two freshness SLIs
@@ -2957,8 +3078,11 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
     - Agent: the signed envelopes for heartbeat state (with the `TopologyDigest`) and for
       `TopologyReport`, bound to agent id, session id, challenge epoch, kind and a per-kind
       sequence, re-signed on every send; answering a session-start challenge arriving mid-stream
-      after a reattach.
-    - Server: verification in the stated order (cap, signature, then parse); refusal of unsigned
+      after a reattach, carried as `__session__.challenge`; no longer populating
+      `RegisterRequest.status_tags_pb`; the topology body cap of 2 MiB less 4 KiB.
+    - Server: verification in the stated order (cap, signature, then parse), outside every lock
+      with the floor advanced by a locked re-check, the parsed key held as a refcounted handle, and
+      the `BatchHeartbeat` per-chunk bound measured; refusal of unsigned
       payloads; no state applied before the challenge verifies, and the tags resync after it;
       `RegisterRequest.status_tags_pb` ignored; the `bad_signature`, `replayed` and
       `unverified_session` outcomes, `BAD_SIGNATURE`, and the `agent.state.bad_signature` audit
@@ -2967,17 +3091,31 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
       `send_to_all` and the `routable` refusal, the `challenge_pending` zero-reach cause at all
       five cascade sites, the floors and epoch held in the session record, the reconciler re-application after verification, and
       the server-side uninstall and tombstone on failure or expiry; the challenge counter, gauge
-      and audit verb; `--reattach-challenge-timeout`.
+      and audit verb (at most once per agent per 10 min); `--reattach-challenge-timeout` and
+      `--reattach-challenge-concurrency`; the `__session__.challenge` catalogue pair, the
+      `session_challenge` enumerator (`kSystemReservedPushes` to 7) and its exec-tracker skip and
+      ingest drop; the challenge forwarded through the issuer's bounded forwarder after CONNECTED,
+      never `gw_pending_`; the single-winner challenge transition under `stream_mu` and the amended
+      `AgentSession` publication-discipline comment; the expiry swept by the issuer's pass; the
+      registration record's `session_id` cleared on failure so the next replay answers
+      `NO_RECORD`; the `degraded` outcome; `REPLAYED` and `UNVERIFIED_SESSION` with the agent's
+      retry rules; the after-the-flag re-claim drop; `YuzuStateSignatureRefused`.
     - Proto and gateway: the additive envelope fields in both proto copies and the gateway's
-      `*_pb.erl`, passed through unchanged.
+      `*_pb.erl`, passed through unchanged (checked by `check-proto-codegen.sh`); `session_id`
+      kept top-level and unsigned; `estimate_bytes/1` counting the heartbeat envelope, with an
+      EUnit oversize case.
     - Tests: a gateway-altered, stripped or replayed payload is refused and changes nothing; a
       pre-restart signed full set replayed after a restart and a reattach is refused (new epoch);
       honest reordering across the two paths and a lost-ack retry are accepted; a signed payload
       through a real gateway relay verifies; a reattached, unverified session receives no command
       of any kind, broadcast included (exact send set), and no route, a quarantine stored in the
       window is re-applied from the stored record after verification, and is uninstalled and tombstoned on a bad or
-      missing answer; containment is re-applied after verification. Signing and verification
-      costs are measured on the wave-2 rig at the heartbeat rate.
+      missing answer; containment is re-applied after verification; the D14 tests (no second
+      reattach after an expiry, a bounded forwarder count with a blackholed management plane,
+      the challenge surviving a gateway relay byte for byte, verification racing expiry under
+      TSan, an uninstall during an in-flight verify under ASan, two copies of one payload applied
+      once, `stop()` with a challenge pending); S1 and S2 re-run with slice 11 on. Signing and
+      verification costs are measured on the wave-2 rig at the heartbeat rate.
 
 ## Open points for the owner
 
