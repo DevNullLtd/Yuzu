@@ -685,6 +685,21 @@ Every row below sets `last_heartbeat_at` and the pump fields when the agent has 
 | empty digest (no good run since the agent started) | no request: there is no body to ask for. The slot, if any, is not confirmed, so its claims are not refreshed |
 | no field, or `DISABLED` | no request. Drop any slot and release its IP claims: there is no evict rule for a connected agent's slot, so it is not left to age |
 
+**An accepted report** (any reason) installs or replaces the slot. It sets `digest` and
+`body_received_at`, sets `confirmed_at = now`, clears `mismatch_since`, and claims the body's
+`local_ips` through first-claim-wins, which also refreshes them. It drops the agent's no-slot entry.
+`last_heartbeat_at` and the pump fields stay heartbeat-driven. The owner-live test inside
+`push_snapshot` (today `now - server_received_at > kIpClaimReclaimAfter` on the owner's slot) reads
+the owner's `confirmed_at`, so a quiet owner confirmed by heartbeats keeps its IPs, and a
+retained `disconnected` slot holds no claims to defend.
+
+**The slot cap.** `kPushedMapHardCap` (100,000) still bounds the map. When it is reached and a new
+agent's slot is installed, the victim is chosen in this order: a retained `disconnected` slot
+first, oldest disconnect first; otherwise the slot with the oldest `confirmed_at`. Today the victim
+is the oldest `server_received_at` (`fleet_topology_store.cpp`), which under this ADR would be the
+quietest healthy host, whose body is the oldest because nothing changed. Each eviction still writes
+`topology.push.evicted_for_cap`.
+
 **No-slot entries.** For a connected agent with no slot, the store keeps a small entry: the first
 sighting of a non-empty digest, `last_heartbeat_at`, and the digest and reason of the agent's last
 rejected report. An entry is dropped when a slot is installed or the agent's stream closes, so the
@@ -1597,7 +1612,9 @@ plus churn. Tags fall from about 4 KB to a few hundred bytes per beat.
 - `stale_reason`;
 - age rebasing;
 - the `Fetcher` seam is removed;
-- the `kPushedMapHardCap` LRU orders by `body_received_at`.
+- the `kPushedMapHardCap` victim order: retained `disconnected` slots first, then the oldest
+  `confirmed_at` (D6);
+- the no-slot entries (D6).
 
 Both stores stay in-memory and per-replica. That rests on one precondition, stated so it is not
 assumed.
@@ -1736,6 +1753,10 @@ of every ~30 s. The content is unchanged.
   agent with a late report reads `body_pending`, not `agent_silent`; an offline host past 300 s
   reads `offline` and a `--no-topology` agent `not_reported`; every reporting agent after a restart
   reads `awaiting_report` until its body lands; the schema enum matches the C++ enum;
+- an accepted report sets `confirmed_at` and claims its IPs; the owner-live test reads
+  `confirmed_at`, so a quiet, confirmed owner keeps its IPs past 300 s without a new body;
+- at the cap, a `disconnected` slot is evicted before any connected one, and a quiet confirmed host
+  is never the victim while a less recently confirmed one exists;
 - a wall-clock step of an hour in either direction changes no `stale_reason`, no IP claim and no
   retention outcome (an injected `steady_clock` and wall clock that move independently);
 - the no-slot grace (a normal start sends one body, no RESYNC), and no resync while a rejected
