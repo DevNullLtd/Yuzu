@@ -727,6 +727,30 @@ TEST_CASE("engine panel authz: an engine session that DOES hold EnginePrincipal:
     }
 }
 
+TEST_CASE("engine panel authz: the panel's own belt 403s (engine session, MCP-tier token) are "
+          "Cache-Control: no-store, as the Access tokens panel's",
+          "[pg][settings][engine_principal][authz][cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
+    Rig r{db_.dsn()};
+    // An engine session that HOLDS the read reaches the engine arm of the belt.
+    REQUIRE(r.rbac.create_role({"EngineLister", "reads engine principals", false, 0}).has_value());
+    REQUIRE(r.rbac.set_permission({"EngineLister", "EnginePrincipal", "Read", "allow"}).has_value());
+    REQUIRE(r.rbac.assign_role({"engine", kSlug, "EngineLister"}).has_value());
+    r.rbac_on();
+    r.grant("root", "Administrator");
+
+    const auto engine = r.bearer_get(kFragment, r.token("engine-bearer", kSlug, "readonly", "engine"));
+    REQUIRE(engine);
+    CHECK(engine->status == 403);
+    CHECK(engine->get_header_value("Cache-Control") == "no-store");
+
+    // An administrator's MCP-tier token clears the permission gate and reaches the MCP arm.
+    const auto mcp = r.bearer_get(kFragment, r.token("root-mcp", "root"));
+    REQUIRE(mcp);
+    CHECK(mcp->status == 403);
+    CHECK(mcp->get_header_value("Cache-Control") == "no-store");
+}
+
 // ---- revoke detail (sec-1) and the success audit row (sec-2): the CH-3 matrix ---------------
 
 namespace {

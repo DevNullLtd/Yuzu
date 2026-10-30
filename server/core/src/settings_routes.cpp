@@ -2992,6 +2992,8 @@ void SettingsRoutes::register_routes(
                          "EnginePrincipal", "",
                          engine ? "engine_session_denied" : "mcp_session_denied");
                      res.status = 403;
+                     // As the Access tokens panel's own belt 403 (access_tokens_routes.cpp).
+                     res.set_header("Cache-Control", "no-store");
                      res.set_content(
                          detail::a4_error(res, engine ? "engine principals cannot access this endpoint"
                                                       : "this credential cannot access this endpoint"),
