@@ -781,7 +781,8 @@ relayed by the gateway like any command (no new gateway state).
     operations (enrollment read, route CAS, record read; D14) at up to `--reattach-rate`, and each
     issued resync one record write at up to `--tag-resync-rate` plus `--topology-resync-rate`. At
     the defaults, overlapping, that is up to about 8,000 operations per second per replica against
-    the default `--postgres-pool-size` of 16. It is unmeasured. It is to be measured against the
+    the default `--postgres-pool-size` of 16. Agents that re-register instead (`NO_RECORD`) add one
+    registration-record transaction each (D14). It is unmeasured. It is to be measured against the
     pool size alongside ADR-0074's wave-2 measurement of a mass re-enrollment after an outage,
     before the defaults are relied on.
 - It is paid **only when divergence occurs**: after a server restart, replica change, upstream
