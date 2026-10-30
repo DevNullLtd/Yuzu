@@ -1103,7 +1103,8 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     - per pass, one `SendCommand` per gateway cluster per action, carrying that pass's agents in
       `SendCommandRequest`'s repeated `agent_ids` under one fresh command id (the agent's dedup is
       per agent, so one id per pass suffices), from a bounded set of forwarder threads the issuer
-      owns and joins at stop (at most `upstream_topology_concurrency`-sized: 8);
+      owns and joins at stop, at most 8 in flight per replica (a fixed bound, unmeasured; slice 10
+      measures it);
     - a 10 s deadline and no retries: the agent's next diverged heartbeat re-marks it;
     - no re-issue to an agent while an earlier forward for it is in flight; a mark above the
       in-flight bound stays `deferred`;
