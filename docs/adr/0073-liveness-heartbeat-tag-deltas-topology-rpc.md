@@ -582,10 +582,22 @@ gateway memory only for that decode and forward.
 ```proto
 message TopologyDigest {
   bytes digest = 1;                           // ASCII "v1:" + 32 lowercase hex; empty until the first good run
-  yuzu.common.v1.Timestamp last_pump_at = 2;  // agent clock, last successful run; compared for CHANGE only
+  yuzu.common.v1.Timestamp last_pump_at = 2;  // agent clock, last COMPLETED run, any outcome; compared for CHANGE only
   TopologyPumpOutcome last_outcome = 3;       // OK | TRUNCATED | FAILED | DISABLED
+  uint32 pump_interval_s = 4;                 // configured base pump interval (--topology-interval); 0 when DISABLED
 }
 ```
+
+- `last_pump_at` advances at the end of every run the pump completes, whatever its outcome (`OK`,
+  `TRUNCATED` or `FAILED`). It is the pump's progress marker, so the server can tell a pump that
+  stopped running from one that runs and fails. It never advances under `DISABLED`, because no run
+  happens.
+- `pump_interval_s` is the base interval before jitter. The server needs it because
+  `--topology-interval` is tunable from 30 to 900 s (D9), so no fixed staleness threshold fits
+  every agent (D6).
+- `last_outcome` is the wire view of the last run. `yuzu_agent_topology_pump_total{outcome}` (D13)
+  splits `OK` into `ok` (the digest changed) and `unchanged` (the digest equals the previous
+  run's); the wire carries `OK` for both. `DISABLED` has no metric label, because no run happens.
 
 The owner's ruling described "one tiny digest tag". It is a typed field instead, for three reasons:
 - a per-run-changing tag would turn into a state-tag delta on every pump;
@@ -626,7 +638,11 @@ Each topology slot gains these fields, all on the server's wall clock:
 - `body_received_at`;
 - `confirmed_at`: the last heartbeat whose digest equalled the slot's;
 - `pump_marker` and `pump_advanced_at`: when `last_pump_at` last **changed**. The comparison is
-  inequality, never ordering, so an agent clock step cannot keep a slot fresh or age it;
+  inequality, never ordering, so an agent clock step cannot keep a slot fresh or age it. It is
+  updated on every heartbeat for an agent that has a slot, whether or not the digest matches, since
+  a pump that runs and finds new content is not stuck;
+- `last_outcome`, `outcome_since` (when `last_outcome` last changed value) and `pump_interval_s`,
+  from the latest heartbeat;
 - `mismatch_since`.
 
 | Heartbeat says | Server does |
@@ -641,7 +657,7 @@ Rendered as `stale_reason`:
 | `stale_reason` | Condition | Notes |
 |---|---|---|
 | `agent_silent` | `now - confirmed_at > 90 s` | Same 90 s as `kPushedStaleAfter`: two jittered heartbeats (at most 36 s each) plus gateway flush slack. |
-| `pump_stuck` | `now - pump_advanced_at > 240 s`, or `last_outcome ∈ {TRUNCATED, FAILED}` for that long | 240 s ≥ 3 × 72 s (60 s pump, +20 % jitter) plus one heartbeat. |
+| `pump_stuck` | `now - pump_advanced_at > T`, or `last_outcome ∈ {TRUNCATED, FAILED}` and `now - outcome_since > T`, where `T = 3 × 1.2 × pump_interval_s + 90 s` | Three missed runs at the longest jittered sleep, plus the 90 s heartbeat window, because the server sees a run only on the next heartbeat after it. `pump_interval_s` is clamped to the 30-900 s flag range before use, and a value of 0 (`DISABLED`) never evaluates this row. At the 60 s default `T` is 306 s; at 900 s it is 3,330 s. The server never assumes the default. |
 | `body_pending` | `mismatch_since` older than `kReportGrace` | new |
 | `disconnected` | slot retained after disconnect | below |
 | `not_reported` | roster agent with no slot | today's placeholder |
@@ -908,7 +924,7 @@ path and a command on the other.
 | Timer | Value |
 |---|---|
 | Heartbeat | 30 s, each sleep uniform ×[0.8, 1.2]; first beat after connect uniform [0, 30 s]. The cadence is unchanged so the interval tags keep their meaning. Rates divide by measured `steady_clock` elapsed (`agents/core/src/net_quality_sampler.cpp`), so jitter does not bias them. |
-| Topology pump | 60 s, each sleep uniform ×[0.8, 1.2]; first run uniform 5-65 s. Flags: `--topology-interval` (30-900 s) and `--no-topology` (no pump; `DISABLED` on the wire). |
+| Topology pump | 60 s, each sleep uniform ×[0.8, 1.2]; first run uniform 5-65 s. Flags: `--topology-interval` (30-900 s; the base value rides every heartbeat as `TopologyDigest.pump_interval_s`, D5) and `--no-topology` (no pump; `DISABLED` on the wire). |
 | Change report | uniform 0-10 s after change |
 | Refresh floor | uniform 12-18 min |
 | Startup report | uniform 0-60 s |
@@ -994,7 +1010,8 @@ Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
   `key_oversize|value_oversize|invalid_utf8|count_cap|total_cap` (D1);
 - `yuzu_agent_heartbeat_full_tags_total{reason}`, with `register|resync`;
 - `yuzu_agent_commands_executed_total{plugin="__resync__"}` (the existing family);
-- `yuzu_agent_topology_pump_total{outcome}`, with `ok|unchanged|truncated|failed`;
+- `yuzu_agent_topology_pump_total{outcome}`, with `ok|unchanged|truncated|failed` (`ok` and
+  `unchanged` are both `OK` on the wire, D5);
 - `yuzu_agent_topology_reports_total{reason,result}`;
 - `yuzu_agent_topology_report_bytes` (histogram).
 
@@ -1651,6 +1668,10 @@ of every ~30 s. The content is unchanged.
 - interval replace semantics (a missing net tag disappears);
 - the D6 confirm, mismatch, grace, `stale_reason`, retain-on-disconnect, re-claim and conflict
   cases;
+- `pump_stuck` derived from `pump_interval_s` at 30, 60, 300 and 900 s: a healthy pump at each
+  interval never reads `pump_stuck`, a stopped one does after `T`, a `FAILED` outcome held past `T`
+  does, a busy pump whose digest changes every run does not, and `pump_interval_s = 0` never
+  evaluates the row;
 - resync rate limits.
 
 **Gateway eunit:**
