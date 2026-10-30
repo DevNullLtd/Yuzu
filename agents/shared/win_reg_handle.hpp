@@ -5,15 +5,15 @@
 // HiveUnloadGuard-class mount/unload owners, three plain-HKEY closers, and
 // two .put()-style wrappers, enumerated below); #2771 swept the
 // three HiveUnloadGuard copies feeding the per-user hive ladder specifically
-// (licensing_win.cpp's, installed_apps_plugin.cpp's, tar_mapdrive_collector
+// (licensing_win.cpp's, installed_apps_plugin.cpp's, echo_mapdrive_collector
 // .cpp's -- all deleted, replaced by ScopedUserHive) onto this header. Their
 // sibling plain-HKEY closers remain as local types in three of those same
 // files (licensing_win.cpp's HKeyCloser, installed_apps_plugin.cpp's
-// function-local HKeyCloser, tar_mapdrive_collector.cpp's RegKeyGuard) --
+// function-local HKeyCloser, echo_mapdrive_collector.cpp's RegKeyGuard) --
 // they are still used for OTHER (non-hive-mount) opens in those files, e.g.
 // enumerate_uninstall_key, WinRegProbeHost, MRU/network-drive reads, and
 // were out of this PR's scope. rdp_control_plugin.cpp's and
-// tar_software_collector.cpp's .put()-style wrappers are likewise untouched.
+// echo_software_collector.cpp's .put()-style wrappers are likewise untouched.
 // Sweeping any of these remaining copies onto RegKey is a separate
 // follow-up, matching the win_sc_handle.hpp (#1822) precedent's own note
 // about win_str.hpp/#1681.
@@ -149,7 +149,7 @@ private:
 // mounted branch, recoverable without reboot once that holder releases; a
 // genuinely stuck holder is the rarer case reboot actually resolves:
 // installed_apps_plugin.cpp:165-166, licensing_win.cpp:70-104, and
-// tar_mapdrive_collector.cpp each independently hit and documented exactly
+// echo_mapdrive_collector.cpp each independently hit and documented exactly
 // this failure mode. with_root() is the only
 // sanctioned way to read the mounted hive through this type: it hands the
 // caller a borrowed HKEY for the duration of one callback and closes that

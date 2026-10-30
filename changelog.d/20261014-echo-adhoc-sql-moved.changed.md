@@ -1,0 +1,1 @@
+- **Ad-hoc Echo SQL moved to Result sets.** The Echo page no longer carries the Ad-hoc Echo SQL form; a short note links to Result sets, where **From Echo query** takes the same parent scope, SQL, name and include-empty fields and shows the SQL in a confirm before anything is sent.

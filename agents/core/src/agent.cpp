@@ -17,6 +17,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/cloud_identity.hpp>
 #include <yuzu/agent/command_dedup_store.hpp>
 #include <yuzu/agent/dex_observer.hpp>
+#include <yuzu/agent/echo_db_legacy_rename.hpp> // tar.db -> echo.db adoption (boot, upgrade window)
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
@@ -82,6 +83,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <unistd.h>      // gethostname
 #endif
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -295,7 +297,7 @@ struct CommandContextImpl {
     // When `capture` is non-null, plugin output is accumulated into
     // this string (newline-joined between calls) instead of being
     // streamed back to the server. The snapshot-pump thread uses this
-    // path to invoke `tar.fleet_snapshot` locally and harvest the JSON
+    // path to invoke `echo.fleet_snapshot` locally and harvest the JSON
     // payload without touching the gRPC channel. `stream` and
     // `write_mu` are nullptr/unused in that mode; `flush_output_locked`
     // short-circuits.
@@ -849,6 +851,38 @@ public:
             }
         }
 
+        // 1b''. Upgrade-window step (removed with the other legacy-name shims): the activity-record
+        // feature was renamed from TAR to Echo. Adopt a pre-rename tar.db as echo.db and re-key its
+        // KV namespace, BEFORE any plugin init or dispatch (the plugin scan above only registers
+        // descriptors and opens no database). This is the ONLY adopter - the plugins never
+        // rename - so nothing can have the database open while it moves, and
+        // EchoDatabase::open refuses to create a fresh echo.db beside an unadopted tar.db.
+        // Neither step is fatal: a failed adoption leaves the echo plugin refusing to open.
+        //
+        // Deferred while the plugin dir still holds only the retired tar plugin: OTA replaces the
+        // agent binary alone, so the renamed plugin may not be installed yet. Adopting now would
+        // strand the history under a plugin that is not there (and a roll-back of the binary
+        // would find no tar.db); the package install that brings echo.<ext> lets the next start
+        // adopt. The loader rejects the stale tar plugin, so it never runs against the renamed
+        // core; the rejection is how this block learns it is present.
+        std::vector<std::string_view> loaded_plugin_names;
+        loaded_plugin_names.reserve(candidates.size());
+        for (const auto& handle : candidates) {
+            loaded_plugin_names.emplace_back(handle.descriptor()->name);
+        }
+        if (yuzu::agent::defer_legacy_echo_adoption(scan.errors, loaded_plugin_names)) {
+            spdlog::warn("legacy tar plugin still installed; adoption deferred until echo.<ext> is "
+                         "installed (tar.db and the tar KV namespace left as they are)");
+        } else {
+            if (auto adopted = adopt_legacy_echo_db(cfg_.data_dir / "echo.db"); !adopted) {
+                spdlog::error("Legacy tar.db adoption failed: {}", adopted.error());
+            }
+            if (kv_store_ && !kv_store_->rename_plugin("tar", "echo")) {
+                spdlog::warn(
+                    "KV namespace re-key tar -> echo failed; Echo health history restarts");
+            }
+        }
+
         // 1b'. Open the durable command-dedup store (HA WS-0, ADR-2002). Survives
         // restart and remembers each command's terminal outcome so a redelivered
         // duplicate replays the original result instead of a bare REJECTED. A
@@ -988,6 +1022,8 @@ public:
                 // or outside [A-Za-z0-9_]) — distinct from a reserved-name
                 // attempt so operators can alert on crafted-name loads.
                 reason = "invalid_name";
+            } else if (err.reason.starts_with(yuzu::agent::kRetiredNameReason)) {
+                reason = "retired_name";
             } else if (err.reason.starts_with(yuzu::agent::kDuplicateNameReason)) {
                 reason = "duplicate_name";
             } else if (err.reason.starts_with(yuzu::agent::kSignatureMissingReason)) {
@@ -1132,8 +1168,8 @@ public:
                 spark_engine_->stop();
             // #1420 / #1434 — quiesce and join the Run()-spawned worker threads
             // (snapshot pump, heartbeat, OTA updater) FIRST, before any plugin
-            // teardown. The snapshot pump dispatches `tar.fleet_snapshot` into
-            // the TAR plugin through a borrowed descriptor, so it must not
+            // teardown. The snapshot pump dispatches `echo.fleet_snapshot` into
+            // the Echo plugin through a borrowed descriptor, so it must not
             // outlive the plugins; and leaving any of these `this`-capturing
             // threads joinable on an early `return` out of Run() (the hard
             // registration rejection and the PKI persist/rebuild bail-outs)
@@ -1630,20 +1666,20 @@ public:
         // the link was down, the first reconnected heartbeat carries
         // the latest snapshot.
         //
-        // Pump is gated on the TAR plugin being loaded; minimal /
-        // embedded agent variants without TAR simply leave the slot
+        // Pump is gated on the Echo plugin being loaded; minimal /
+        // embedded agent variants without Echo simply leave the slot
         // empty and the server falls back to dispatch-on-get.
         {
-            const YuzuPluginDescriptor* tar_descriptor = nullptr;
+            const YuzuPluginDescriptor* echo_descriptor = nullptr;
             for (const auto& handle : plugins_) {
-                if (std::string_view{handle.descriptor()->name} == "tar") {
-                    tar_descriptor = handle.descriptor();
+                if (std::string_view{handle.descriptor()->name} == "echo") {
+                    echo_descriptor = handle.descriptor();
                     break;
                 }
             }
-            if (tar_descriptor) {
-                snapshot_pump_thread_ = std::thread([this, tar_descriptor]() {
-                    spdlog::info("Snapshot pump started (interval=30s, action=tar.fleet_snapshot)");
+            if (echo_descriptor) {
+                snapshot_pump_thread_ = std::thread([this, echo_descriptor]() {
+                    spdlog::info("Snapshot pump started (interval=30s, action=echo.fleet_snapshot)");
                     constexpr auto kFirstDelay = std::chrono::seconds{5};
                     constexpr auto kInterval = std::chrono::seconds{30};
                     auto sleep_for = [this](std::chrono::seconds total) {
@@ -1662,7 +1698,7 @@ public:
                         // (capture buffer, byte cap, truncation sentinel)
                         // live in LocalDispatcher. The pump just decides
                         // what to do with each cycle's result.
-                        auto result = dispatcher.run(tar_descriptor, "fleet_snapshot");
+                        auto result = dispatcher.run(echo_descriptor, "fleet_snapshot");
                         if (result.truncated) {
                             spdlog::warn("Snapshot pump: capture truncated at {}B; "
                                          "dropping this cycle's snapshot",
@@ -1672,7 +1708,7 @@ public:
                             latest_snapshot_ = std::move(result.captured);
                             latest_snapshot_seq_.fetch_add(1, std::memory_order_acq_rel);
                         } else if (result.rc != 0) {
-                            spdlog::warn("Snapshot pump: tar.fleet_snapshot rc={}, captured={}B",
+                            spdlog::warn("Snapshot pump: echo.fleet_snapshot rc={}, captured={}B",
                                          result.rc, result.captured.size());
                         }
                         sleep_for(kInterval);
@@ -1680,7 +1716,7 @@ public:
                     spdlog::info("Snapshot pump stopped");
                 });
             } else {
-                spdlog::info("Snapshot pump skipped: TAR plugin not loaded");
+                spdlog::info("Snapshot pump skipped: Echo plugin not loaded");
             }
         }
 
@@ -2224,7 +2260,7 @@ public:
                     // installed_software (ADR-0016): every loaded plugin by name; the source
                     // picks the inventory actions it needs and skips absent ones.
                     SyncPluginMap sync_plugins;
-                    const YuzuPluginDescriptor* tar_descriptor = nullptr;
+                    const YuzuPluginDescriptor* echo_descriptor = nullptr;
                     // device_ci source plugins (ADR-0016): hardware / device_identity /
                     // os_info / network_config, reused in-process via LocalDispatcher.
                     const YuzuPluginDescriptor* hw_descriptor = nullptr;
@@ -2234,16 +2270,16 @@ public:
                     // SLE (ADR-0024): the software_licensing source's backing plugin.
                     const YuzuPluginDescriptor* license_descriptor = nullptr;
                     // Wave 7 PR7.2: the app_usage source's backing plugin (last-used
-                    // state, read-only over TAR's usage_daily fold).
+                    // state, read-only over Echo's usage_daily fold).
                     const YuzuPluginDescriptor* app_usage_descriptor = nullptr;
                     for (const auto& handle : plugins_) {
                         const std::string_view pname{handle.descriptor()->name};
                         // The loader rejects duplicate names at scan (kDuplicateNameReason),
                         // so plugins_ carries unique names and emplace-first cannot diverge
-                        // from last-wins siblings (tar_descriptor-style lookups).
+                        // from last-wins siblings (echo_descriptor-style lookups).
                         sync_plugins.emplace(std::string(pname), handle.descriptor());
-                        if (pname == "tar")
-                            tar_descriptor = handle.descriptor();
+                        if (pname == "echo")
+                            echo_descriptor = handle.descriptor();
                         else if (pname == "hardware")
                             hw_descriptor = handle.descriptor();
                         else if (pname == "device_identity")
@@ -2268,7 +2304,7 @@ public:
                     } else {
                     sync_stop_.store(false, std::memory_order_release);
                     auto sync_stub = pb::AgentService::NewStub(channel);
-                    sync_thread_ = std::thread([this, sync_plugins, tar_descriptor, hw_descriptor,
+                    sync_thread_ = std::thread([this, sync_plugins, echo_descriptor, hw_descriptor,
                                                 devid_descriptor, osinfo_descriptor,
                                                 netcfg_descriptor, license_descriptor,
                                                 app_usage_descriptor,
@@ -2350,9 +2386,9 @@ public:
                         }};
                         // DEX app-perf-over-time B1. Rides the same daily-sync thread +
                         // transport; collection is further gated by procperf_enabled (an
-                        // empty rollup → the source skips the cycle) and the TAR plugin
+                        // empty rollup → the source skips the cycle) and the Echo plugin
                         // being loaded (null descriptor → idle).
-                        scheduler.add_source(make_app_perf_source(tar_descriptor));
+                        scheduler.add_source(make_app_perf_source(echo_descriptor));
                         // ADR-0016 device-CI inventory: stable hardware/OS identity (CMDB
                         // CI record). Idles unless all four source plugins are loaded.
                         scheduler.add_source(make_device_ci_source(hw_descriptor, devid_descriptor,
@@ -2382,9 +2418,9 @@ public:
                             scheduler.add_source(make_software_licensing_source(
                                 license_descriptor, std::move(lic_cfg)));
                         }
-                        // Wave 7 PR7.2: per-executable last-used state, derived from TAR's
+                        // Wave 7 PR7.2: per-executable last-used state, derived from Echo's
                         // usage_daily fold via the read-only app_usage plugin. Idles when
-                        // the app_usage plugin isn't loaded (null descriptor) or TAR's usage
+                        // the app_usage plugin isn't loaded (null descriptor) or Echo's usage
                         // source is disabled (constrained capture — skipped, not idled).
                         // Registered here (before installed_software) rather than last: it's
                         // a fast, local SQLite read, not the slow collector the reorder below
@@ -4290,7 +4326,7 @@ private:
     // pump, the per-connection heartbeat, and the OTA-updater thread. Every one
     // of them must be stopped and joined before the agent's plugins are torn
     // down and before AgentImpl is destroyed:
-    //   * the snapshot pump dispatches `tar.fleet_snapshot` into the TAR plugin
+    //   * the snapshot pump dispatches `echo.fleet_snapshot` into the Echo plugin
     //     through a borrowed descriptor — a cycle that runs after plugin
     //     teardown is a use-after-free (#1420);
     //   * any Run() exit that leaves one of these threads joinable aborts the
@@ -4673,7 +4709,7 @@ private:
 
     // PR 10 / UAT 2026-05-12 — Push-based fleet topology ingestion.
     //
-    // `snapshot_pump_thread_` runs `tar.fleet_snapshot` locally on a
+    // `snapshot_pump_thread_` runs `echo.fleet_snapshot` locally on a
     // 30 s interval, captures the JSON, and stashes it under
     // `snapshot_mu_`. The heartbeat thread reads `latest_snapshot_`
     // each iteration; if `latest_snapshot_seq_` advanced since the

@@ -72,10 +72,10 @@
 #include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): the public in-process workflow-read API seam
 #include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
 #include "workflow_engine.hpp" // still needed for the WorkflowEngine* build_handler param -- see set_workflow_api's doc comment
-// #4027: DeviceRow (via device_routes.hpp) + TarRetentionPausedScan/
-// TarPausedSourceRow + the tar_*_json pure builders the read-twin MCP tools
+// #4027: DeviceRow (via device_routes.hpp) + EchoRetentionPausedScan/
+// EchoPausedSourceRow + the echo_*_json pure builders the read-twin MCP tools
 // share with their REST siblings (api-twin-recipe.md Rule 1).
-#include "tar_tree_routes.hpp"
+#include "echo_tree_routes.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -137,7 +137,7 @@ class BaselineStore;
 // (pointer-only in build_handler/register_routes); the .cpp includes
 // product_pack_model.hpp, which pulls in product_pack_store.hpp.
 class ProductPackStore;
-// #4027: backs list_tar_retention_paused — forward-declared (pointer-only via
+// #4027: backs list_echo_retention_paused — forward-declared (pointer-only via
 // set_dashboard_routes below); the .cpp includes dashboard_routes.hpp for the
 // full definition.
 class DashboardRoutes;
@@ -703,9 +703,9 @@ public:
     }
 
     /// #4143 review fix (external colleague review, BLOCKING, confirmed against
-    /// ADR-0017 INV-4/INV-7 by direct source inspection): `list_tar_process_
-    /// tree_devices`/`list_tar_capture_sources_devices` previously intersected
-    /// `fleet_read_fn_`'s admit-scope with `tar_devices_fn_`'s direct-
+    /// ADR-0017 INV-4/INV-7 by direct source inspection): `list_echo_process_
+    /// tree_devices`/`list_echo_capture_sources_devices` previously intersected
+    /// `fleet_read_fn_`'s admit-scope with `echo_devices_fn_`'s direct-
     /// membership-only pre-filter — two divergent resolvers, so an operator
     /// admitted via an ancestor-ward management-group role (not a DIRECT
     /// member) could see an incomplete or empty list despite being admitted
@@ -720,10 +720,10 @@ public:
     using AllDevicesFn = std::function<std::vector<DeviceRow>()>;
     void set_all_devices_fn(AllDevicesFn fn) { all_devices_fn_ = std::move(fn); }
 
-    /// #4027: `list_tar_retention_paused`'s data source — the SAME
-    /// `DashboardRoutes::gather_tar_retention_paused` the REST twin
-    /// `GET /api/v1/tar/retention-paused` calls, reached via a raw borrowed
-    /// pointer (same lifetime contract as `tar_tree_routes_`/
+    /// #4027: `list_echo_retention_paused`'s data source — the SAME
+    /// `DashboardRoutes::gather_echo_retention_paused` the REST twin
+    /// `GET /api/v1/echo/retention-paused` calls, reached via a raw borrowed
+    /// pointer (same lifetime contract as `echo_tree_routes_`/
     /// `dashboard_routes_` in `server.cpp`'s `ServerImpl`: a persistent
     /// `std::unique_ptr` member that outlives the web server, per `stop()`'s
     /// join-before-destruct ordering — safe to borrow raw, same reasoning as
@@ -841,17 +841,25 @@ public:
 
     /// ADR-0031 WS-A4 (tenth family): the SAME in-process crypto-library read seam the
     /// `/crypto` page and REST `GET /api/v1/crypto/libraries[/devices]` use - server.cpp wires
-    /// the IDENTICAL instance so `get_crypto_libraries` / `list_crypto_library_devices` can
-    /// never disagree with them. A SETTER, not a `build_handler` parameter, like the sibling
-    /// seams above. Unset (null, no software-inventory store) => the tools answer an internal
+    /// the IDENTICAL instance. A SETTER, not a `build_handler` parameter, like the sibling
+    /// seams above. Unset (null, no software-inventory store) => the tool answers an internal
     /// error, never an empty result.
+    ///
+    /// Only `list_issued_certs` (the filtered CA-certificate form) still reads this member. The
+    /// seven /crypto tools (get_crypto_libraries, list_crypto_library_devices,
+    /// export_crypto_cbom, list_crypto_widgets, get_crypto_dashboard_layout,
+    /// set_crypto_dashboard_layout, get_crypto_ca_stats) live in mcp_tools_crypto.cpp and reach
+    /// the same instance through ToolDeps' forwarding closures (server.cpp builds both from one
+    /// `crypto_api_`), so this seam and those closures cannot diverge.
     void set_crypto_api(std::shared_ptr<const CryptoApi> a) { crypto_api_ = std::move(a); }
 
     /// The ONE non-auditing /crypto availability callback (server.cpp builds it once and wires
-    /// the SAME function into CryptoRoutes): `list_crypto_widgets`' availability, the R2
-    /// confinement withhold of `get_crypto_ca_stats`' twin answers and of `list_issued_certs`
-    /// (both the filtered and the unfiltered form). It decides what is DRAWN or withheld, never a grant (every data tool keeps
-    /// its own gate). Unset => those paths answer an internal error, never a guessed answer.
+    /// the SAME function into CryptoRoutes and into ToolDeps::crypto_access_fn, which serves
+    /// `list_crypto_widgets` from mcp_tools_crypto.cpp; `get_crypto_ca_stats` gates on
+    /// fleet_read_fn instead): this member serves the R2 confinement withhold of
+    /// `list_issued_certs` (both the filtered and the unfiltered form). It decides what is DRAWN
+    /// or withheld, never a grant (every data tool keeps its own gate). Unset => that path
+    /// answers an internal error, never a guessed answer.
     using CryptoAccessFn = std::function<crypto_widgets::Access(
         const httplib::Request&, crypto_widgets::WidgetGate, const std::string& securable_type,
         const std::string& operation)>;

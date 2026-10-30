@@ -275,7 +275,7 @@ struct ProcInfo {
 // insertion) runs between opendir() and the matching closedir(), so an
 // exception there would previously skip the manual cleanup and leak the fd
 // for the life of the agent (CLAUDE.md's non-RAII-manual-cleanup floor).
-// Same idiom as tar_proc_perf.cpp's read_proc_counters().
+// Same idiom as echo_proc_perf.cpp's read_proc_counters().
 void build_socket_and_proc_maps(std::unordered_map<uint64_t, int>& inode_map,
                                 std::unordered_map<int, ProcInfo>& proc_map) {
     const std::unique_ptr<DIR, int (*)(DIR*)> proc_dir{opendir("/proc"), &closedir};

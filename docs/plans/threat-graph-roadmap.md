@@ -222,7 +222,7 @@ either needs a new plugin or a new action on an existing plugin.
 
 | Need | Plugin | Status |
 |---|---|---|
-| TLS-termination annotation per listening socket | extend existing `certificates` + new join in `tar` | `certificates` plugin exists; needs `which-pid-serves-which-cert` join |
+| TLS-termination annotation per listening socket | extend existing `certificates` + new join in `echo` | `certificates` plugin exists; needs `which-pid-serves-which-cert` join |
 | Container runtime awareness — detect docker / k8s / podman | extend existing `os_info` or new `container_runtime` | not present; `os_info` returns OS-level facts only |
 | RFC1918 + RFC4193 + Docker default range classification | **server-side** in `fleet_topology_store` | new logic; no plugin |
 
@@ -241,7 +241,7 @@ Stacks on top of the existing 11-PR ladder. Each demo should be operator-eyeball
 
 | # | Title | Demo |
 |---|---|---|
-| 12 | Unix-socket IPC edges | New `unix_sockets` plugin; agent emits Unix sockets into `tar.fleet_snapshot`; renderer draws a green-tinted line for Unix-socket edges in Threat mode |
+| 12 | Unix-socket IPC edges | New `unix_sockets` plugin; agent emits Unix sockets into `echo.fleet_snapshot`; renderer draws a green-tinted line for Unix-socket edges in Threat mode |
 | 13 | Threat-mode toggle | `localStorage.yuzuVizMode`, `T`-key shortcut, mode-state in URL hash, ghost-overlay rendering scaffold (empty) |
 | 14 | Process posture overlay | Composite glyph per process; vuln + signed + AV synthesis; recommended Sprite-glyph rendering |
 | 15 | Process binary hashing | Extend `processes` plugin to emit SHA-256; server-side VirusTotal cache + lookup; posture envelope carries hash + VT score |

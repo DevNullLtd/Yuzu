@@ -127,7 +127,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [Tags (Legacy)](#tags-legacy)
   - [Analytics and NVD](#analytics-and-nvd)
   - [SSE Event Stream](#sse-event-stream) — includes `GET /events`, `GET /sse/executions/{id}`, and the agentic `GET /api/v1/events`
-  - [Dashboard TAR](#dashboard-tar)
+  - [Dashboard Echo](#dashboard-echo)
 - [MCP (Model Context Protocol)](#mcp-model-context-protocol)
 - [Authentication Endpoints](#authentication-endpoints)
 - [SCIM v2 Provisioning](#scim-v2-provisioning)
@@ -282,7 +282,7 @@ Routes that parse strictly (the response routes are listed in
 | DEX window | `GET /api/v1/dex/signals`, `/dex/scope` and `/dex/signals/{obs_type}`: `window` must be `24h`, `7d`, `30d` or `all` (omitted = `7d`; an empty `?window=` is `400`, like on every other DEX route); `90d`, `30`, `junk` or an empty value used to be answered with 7 days of data |
 | Fleet visualization | `GET /api/v1/viz/fleet/topology`: `machines_max` |
 | Verification | the app-performance compare route: `window` (a malformed value used to fall back to 7 days). This dashboard fragment keeps its own rejection style: an honest `200` note ("The window must be a whole number of days."), because the dashboard's htmx config drops `4xx` bodies; nothing is computed or audited. The other dashboard fragments in this table (results, hardware, DEX perf, network quality) still answer a JSON `400` that an operator in the dashboard never sees: that is a known UX gap, tracked in issue #5637, not a deliberate inconsistency |
-| Dashboard fragments | `GET /fragments/results`: `page`, `per_page`; the three software inventory fragments (`/fragments/inventory/software`, `/software/devices`, `/software/versions`): a malformed `limit` answers `200` with an `inv-caveat` note, not a JSON `400` (htmx drops `4xx` bodies), and the store is not read; a well-formed `limit` is validated and then ignored, because these fragments use a fixed page size; the DEX perf devices fragment and the network quality devices fragment: `limit`; the hardware list fragment and `GET /api/v1/hardware`: `offset`, `limit` (a negative value is refused too, it used to be clamped to `0`); the hardware sync poll: `await_since` (a malformed freshness bound used to read as "no bound", so a stale snapshot could be served as fresh); `GET /fragments/tar/process-tree/detail`: `node` (`stoul` read `-1` as the largest node id and `5x` as `5`) |
+| Dashboard fragments | `GET /fragments/results`: `page`, `per_page`; the three software inventory fragments (`/fragments/inventory/software`, `/software/devices`, `/software/versions`): a malformed `limit` answers `200` with an `inv-caveat` note, not a JSON `400` (htmx drops `4xx` bodies), and the store is not read; a well-formed `limit` is validated and then ignored, because these fragments use a fixed page size; the DEX perf devices fragment and the network quality devices fragment: `limit`; the hardware list fragment and `GET /api/v1/hardware`: `offset`, `limit` (a negative value is refused too, it used to be clamped to `0`); the hardware sync poll: `await_since` (a malformed freshness bound used to read as "no bound", so a stale snapshot could be served as fresh); `GET /fragments/echo/process-tree/detail`: `node` (`stoul` read `-1` as the largest node id and `5x` as `5`) |
 | Delivery and list routes | `GET /api/notifications`: `limit`, `offset` (a negative value is `400` too, where the store answered an empty `200`); `GET /api/webhooks/{id}/deliveries` and `GET /api/v1/offload-targets/{id}/deliveries`: `limit`; `GET /api/v1/ca/issued`: `limit`, `offset`; `GET /api/v1/preflight/runs`: `limit`; the pre-flight run form: `min_gib` and `window` (a malformed value is `400`; a negative `min_gib` is `400` too) and the version thresholds `app_min`, `app_max` and `os_min` (empty, or a dotted-decimal version with an optional `-beta` / `+build` suffix; anything else is `400`, see [Pre-flight readiness checks](preflight.md)); `GET /api/v1/result-sets` and `GET /api/v1/result-sets/{id}/members`: `limit` (trailing characters are `400`, not their numeric prefix; an integer outside the route's page range still uses the default page size); `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/perf/devices` and `GET /api/v1/network/devices`: `limit`; `GET /api/v1/guaranteed-state/events`: `limit` and `offset` (a negative value is `400` too; both are parsed before the `dex.device.view` audit row is written, so a `400` leaves no access row) |
 | Event streams | `GET /api/v1/events`: `since` (a non-negative integer; a malformed value is `400`, answered before the stream budget is touched). A malformed `Last-Event-ID` **header** on `GET /api/v1/events` or the workflow execution stream is served **live only**: nothing buffered is replayed (never the whole ring buffer) and it is not a `400`, because the header is browser-supplied inference and a `400` would fail a reconnect. The cursor is parsed strictly, so `-1` and `5abc` are never accepted as a position (`5abc` used to replay from position 5; `-1` wrapped past every event and also replayed nothing, so that input's outcome is unchanged); valid ids replay exactly as before. A rejected `?since` leaves no success audit row, because it is parsed before the audit write |
 | Settings forms | `POST /api/settings/dex-alerts/blast` (`min_devices`, `window_seconds`, `cooldown_seconds`): a malformed value is `400` and nothing is saved (it used to persist the clamped minimum); `POST /api/settings/enrollment-tokens` and `/batch` (`max_uses`, `ttl_hours`, `count`): `0x5` used to read as `0`, and `max_uses` `0` means unlimited, so a mistyped limit minted an unlimited token (only a value that parses to a literal `0` such as `0`, `-0` or `00` means unlimited or no expiry; an **empty** field takes the default of 100 uses and 72 hours, and on `/batch` an empty `max_uses` defaults to `1` and an empty `ttl_hours` to 72 hours; a **negative** `ttl_hours` is refused with `400` because it would compute `0`, a token that never expires); the API-token create form `ttl_hours` (the same `0x5` read as a token that never expires; it is refused with the form's usual `200` feedback span, `Invalid TTL value.`, a negative value too, and nothing is minted); the OTA package `rollout_pct` on upload and on the rollout route (an out-of-range integer on upload is clamped to 0..100 as before): a malformed value used to become `100`, a full-fleet rollout. **Behaviour change on the rollout change route only:** an empty `rollout_pct` and a value above `100` are also `400` there (an empty value used to mean `100` and a larger one was clamped to `100`), while a negative value still clamps to `0` (the least exposure); the upload route is unchanged. Each enrollment and OTA `400` also sets an error toast (`HX-Trigger`), because the dashboard drops `4xx` bodies |
@@ -292,7 +292,7 @@ On the query-parameter routes in the table above, a parameter that is **present 
 
 Not covered by this change, and still lenient (the list is not exhaustive): the `n` retry-attempt
 counter on the live-snapshot poll fragments (the deployment, device, hardware, DEX, pre-flight and
-TAR process-tree polls), which is clamped to a fixed range per poll (`1` to `100000` on the
+Echo process-tree polls), which is clamped to a fixed range per poll (`1` to `100000` on the
 deployment and pre-flight polls, at most `50` on the others); and values that are parsed from stored rows, agent output or server
 configuration rather than from a request. Numeric path segments matched by a `(\d+)` pattern
 (`/api/notifications/{id}/read`, `/dismiss` and the webhook routes) answer `404` for an id that
@@ -354,8 +354,8 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | POST | `/saml/acs` | 1 MiB | `saml_acs` | A legitimate signed `SAMLResponse` is well under 64 KiB; headroom against amplification, not judgment. |
 | POST | `/api/v1/definitions/` | 64 KiB | `response_templates` | Widest literal prefix the segment-boundary matcher can key on for the regex-captured `{id}`/`{template_id}` routes underneath; a future mutation route added elsewhere under this prefix inherits it unless it gets its own, more specific entry. |
 | PUT | `/api/v1/definitions/` | 64 KiB | `response_templates` | Same. |
-| POST | `/api/dashboard/tar-execute` | 16 KiB | `tar_dashboard_sql` | † The handler checks the FORM-DECODED `sql` field at 4096 chars, not the raw body this gate sees — 3× worst-case percent-encoding of that 4096-char value, plus 4 KiB flat headroom for field-name framing and the companion `scope` field. The as-shipped 4 KiB cap matched the raw body to the decoded-field number directly and rejected legitimate queries (measured: a 4085-char query produced a 5078-byte body, 24% over that cap) — fixed here. |
-| POST | `/api/v1/result-sets/from-tar-query` | 200 KiB | `tar_result_set_sql` | † The handler checks the JSON-PARSED `sql` field at 100000 chars; 2× that for JSON-escaping headroom plus the request's other keys. The as-shipped 100 KiB cap left only ~2400 bytes of margin over the 100000-char check, which JSON escaping alone can exceed — fixed here. The handler answers `400` for its own condition; this gate answers `413` for a raw body over 200 KiB — these are two different checks on two different values, not one check enforced twice. |
+| POST | `/api/dashboard/echo-execute` | 16 KiB | `echo_dashboard_sql` | † The handler checks the FORM-DECODED `sql` field at 4096 chars, not the raw body this gate sees — 3× worst-case percent-encoding of that 4096-char value, plus 4 KiB flat headroom for field-name framing and the companion `scope` field. The as-shipped 4 KiB cap matched the raw body to the decoded-field number directly and rejected legitimate queries (measured: a 4085-char query produced a 5078-byte body, 24% over that cap) — fixed here. |
+| POST | `/api/v1/result-sets/from-echo-query` | 200 KiB | `echo_result_set_sql` | † The handler checks the JSON-PARSED `sql` field at 100000 chars; 2× that for JSON-escaping headroom plus the request's other keys. The as-shipped 100 KiB cap left only ~2400 bytes of margin over the 100000-char check, which JSON escaping alone can exceed — fixed here. The handler answers `400` for its own condition; this gate answers `413` for a raw body over 200 KiB — these are two different checks on two different values, not one check enforced twice. |
 | POST | `/api/v1/guaranteed-state/rules` | 16 MiB | `guardian_rule_authoring` | ‡ **Judgment call, not a measurement** — no aggregate Guardian-rule-size contract exists yet anywhere in the codebase. |
 | PUT | `/api/v1/guaranteed-state/rules/` | 16 MiB | `guardian_rule_authoring` | ‡ The sibling update route — same class, same bound. (As shipped, this route fell through to the 4 MiB catch-all, so a rule created up to 16 MiB could never be edited back through the same-sized route; fixed here.) |
 | POST | `/api/workflows` | 16 MiB | `workflow_yaml` | ‡ Judgment call, same reasoning — arbitrary YAML/legacy `yaml_source` bodies with no size contract yet. No PUT/PATCH update route exists for this class today. |
@@ -374,10 +374,10 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | any | `/api/v1/config` | 16 KiB | `config` | The runtime-configuration REST v1 subtree. The only body-bearing route is `PUT /api/v1/config/{key}` (`{"value": ...}`, one scalar: an integer, a flag, a log level, a tag key, an OIDC client secret or a string holding a short JSON array); 16 KiB is far above any legal value. Any method, because the sibling `GET /api/v1/config` is bodyless and shares the prefix. The legacy `PUT /api/config/{key}` stays on the catch-all. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
-† = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `tar_dashboard_sql`/`tar_result_set_sql` history above is a shipped example).
+† = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `echo_dashboard_sql`/`echo_result_set_sql` history above is a shipped example).
 ‡ = a generous, explicit, judgment-call bound because no aggregate size contract exists for that class yet, reasoned against that class's OWN realistic scale rather than copy-pasted from a sibling — **not** a fixed multiple below httplib's 100 MiB backstop: it ranges from ~12.5× for the 8 MiB `nvd_match` entry (just over one order of magnitude) down to 6.25× for the five 16 MiB entries (under one order of magnitude) — none of the ‡ entries reach two orders of magnitude. Do not read either footnote as license to invent a number for a different route — see the header block of `body_cap_policy.hpp`.
 
-Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **36 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, the policy-generation raise `guardian_policy_generation`, #5342 `users`, and then `crypto`, `config` and `dex_score_policy`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **32 classes** overall (the catch-all `default` included). Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
+Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `echo_dashboard_sql`, `echo_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **36 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, the policy-generation raise `guardian_policy_generation`, #5342 `users`, and then `crypto`, `config` and `dex_score_policy`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **32 classes** overall (the catch-all `default` included). Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
 
 **Raising a cap.** Edit the table in `body_cap_policy.hpp` (with review) and update this table to match — never reach for `Server::set_payload_max_length`, which is global across every route on the listener (see "Why not one global cap?" above). See also `docs/user-manual/server-admin.md`'s upgrade note for this change and `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for observing rejections.
 
@@ -2253,7 +2253,7 @@ Quarantine a device.
 > plugin's own four actions (`quarantine`, `unquarantine`, `status`,
 > `whitelist`) are exempt so that release stays reachable, and so are four
 > server-internal pushes that are not operator dispatch —
-> `tar.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync` and
+> `echo.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync` and
 > `__sync__.now`, a closed set counted (not per-event audited) by
 > `yuzu_server_system_reserved_push_total`.
 > Nothing else is.
@@ -5601,7 +5601,7 @@ is absent or not open, which is "unknown", not zero. The two differ after a runt
 `PUT /api/config/<key>`, which is stored but not applied (see
 [When a change takes effect](#when-a-change-takes-effect)).
 
-`tar` publishes the TAR warehouse retention tiers: `tick_seconds` (the agent's prune
+`echo` publishes the Echo warehouse retention tiers: `tick_seconds` (the agent's prune
 tick, 900) and `tiers`, one row per source and tier (`live`, `hourly`, `daily`, `monthly`,
 `boot`). Each row has `limit_kind` (`rows` or `seconds`), `limit`, `bucket_seconds` (the
 roll-up bucket: 0 for `live`/`boot`, 3600, 86400, or 2678400 for a month, the 31-day worst
@@ -5617,15 +5617,15 @@ that tier, not a deeper tier. The
 set (20,000 runs) before this limit can apply.
 
 These are the registry **defaults** an agent of this server's release applies (agents on other
-releases may differ), not per-device readings: TAR prunes on the agent, so the server has no
+releases may differ), not per-device readings: Echo prunes on the agent, so the server has no
 live value. Every source's tiers are declared on every OS; where a source does not run on the
-agent's OS (see the OS compatibility matrix in the TAR manual) its tier applies to an empty
-table. A paused or errored source is never pruned (per-device paused sources: [`GET /api/v1/tar/retention-paused`](#get-apiv1tarretention-paused)); while the agent is running, rows may
+agent's OS (see the OS compatibility matrix in the Echo manual) its tier applies to an empty
+table. A paused or errored source is never pruned (per-device paused sources: [`GET /api/v1/echo/retention-paused`](#get-apiv1echoretention-paused)); while the agent is running, rows may
 outlive their limit by up to `tick_seconds` (an offline agent or a disabled plugin prunes
 nothing), longer when the retention clock guard declines a prune, shorter by any plausible
 forward skew of the endpoint clock, which the guard does not decline (the depth is measured on
 the agent's own clock), and longer still while a backlog drains through the per-pass delete cap
-(5,000 rows per table per tick). `tar` is `null` only if the server's embedded table cannot be read. A server older than this release omits `tar`; treat absent like `null`.
+(5,000 rows per table per tick). `echo` is `null` only if the server's embedded table cannot be read. A server older than this release omits `echo`; treat absent like `null`.
 
 The order of `tiers` is unspecified; match rows by (`source`, `tier`). Clients must tolerate
 unknown `tier` and `limit_kind` values: a new tier is an additive change. A per-device or
@@ -5642,7 +5642,7 @@ server-enforced reading, if one ever ships, lands under a new key, never by rede
       "audit_retention_days": 365,
       "guardian_event_retention_days": 30
     },
-    "tar": {
+    "echo": {
       "tick_seconds": 900,
       "tiers": [
         { "source": "process", "tier": "live", "limit_kind": "rows", "limit": 100000,
@@ -7003,7 +7003,7 @@ most 1000 rows of up to 2 MiB of raw bytes per field, before the U+FFFD growth d
 the dashboard results fragment's FILTERED branch (it reads by response id, not through
 `query_bounded`) is not bounded either. **Bounded by the same 50 MiB cap in SQL (#4644):** the
 execution visualization route (`GET /api/v1/executions/{id}/visualization`), the dashboard results
-fragment's unfiltered read and the TAR retention-paused scan page's read, each up to 10,000 rows;
+fragment's unfiltered read and the Echo retention-paused scan page's read, each up to 10,000 rows;
 a cut there is signalled (see those routes), never silent. Other internal reads
 also bypass it and take their limit from something other than a request parameter; for example (not an exhaustive list), the fleet
 visualization snapshot's collect poll sizes it from the number of agents it dispatched to
@@ -7261,7 +7261,7 @@ Published (`enabled_only=true`) `InstructionDefinition` catalog, the commands an
 How a client should read `input_schema`:
 
 - **Dialect.** It is a JSON Schema subset, but the server (not the client) is the validator. `minLength` and `maxLength` count UTF-8 bytes. `pattern` uses RE2 syntax, so a generic JSON Schema validator in JavaScript may disagree with the server: `(?P<name>...)` named groups are valid RE2 but rejected by JavaScript, and `\A` / `\z` anchors are valid RE2 but JavaScript accepts them as a literal `A` / `z`. An `integer` property accepts a decimal digit string (`"24"`) or a JSON integer; the execute route refuses a non-integral number such as `24.5` and also an integral float such as `24.0`.
-- **Defaults.** `default` is published as documentation only. The server never injects it, and a parameter that has a default is not listed in `required`, so the client must still send it unless the target plugin applies its own default (some plugins reject an omitted defaulted parameter: `crossplatform.tar.recent_processes` declares a default `sql`, and the `tar` plugin's `sql` action answers `missing required 'sql' parameter` without it). See [docs/yaml-dsl-spec.md](../yaml-dsl-spec.md) for the DSL side of the same rule.
+- **Defaults.** `default` is published as documentation only. The server never injects it, and a parameter that has a default is not listed in `required`, so the client must still send it unless the target plugin applies its own default (some plugins reject an omitted defaulted parameter: `crossplatform.echo.recent_processes` declares a default `sql`, and the `echo` plugin's `sql` action answers `missing required 'sql' parameter` without it). See [docs/yaml-dsl-spec.md](../yaml-dsl-spec.md) for the DSL side of the same rule.
 - **MCP.** The MCP `execute_instruction` tool takes string-valued `params`, so send an `integer` or `boolean` property in its string form (`"24"`, `"true"`).
 - **Plugins catalogue.** `GET /api/v1/discover/plugins` still carries each action's inline `parameter_schema` in the raw stored DSL form (`int32`, `displayName`); the canonical form is `input_schema` here, for published definitions.
 
@@ -7505,12 +7505,12 @@ their HTMX dashboard twins — also deny a service-scoped token outright:
 own service tag, so without this a service token could reach any other
 token the same minter held.
 
-#### `POST /api/v1/result-sets/from-tar-query`<br>`POST /api/v1/result-sets/from-instruction-result`<br>`POST /api/v1/result-sets/{id}/re-eval`
+#### `POST /api/v1/result-sets/from-echo-query`<br>`POST /api/v1/result-sets/from-instruction-result`<br>`POST /api/v1/result-sets/{id}/re-eval`
 
 The three **asynchronous** result-set producers. Unlike `from-inventory-query`,
 which answers from server-side inventory, these **dispatch a command to agents**
 and materialise the set once the responses land — so they are operator dispatch
-surfaces, not reads. `from-tar-query` runs SQL on TAR agents; `from-instruction-result`
+surfaces, not reads. `from-echo-query` runs SQL on Echo agents; `from-instruction-result`
 runs an `InstructionDefinition` and filters responders by `matcher`; `{id}/re-eval`
 re-runs a set's own source query and creates a **sibling** (same parent, new id).
 
@@ -7532,8 +7532,8 @@ re-runs a set's own source query and creates a **sibling** (same parent, new id)
 rechecked against the same bound values used elsewhere, because the original
 row may have been minted through `POST /api/v1/result-sets` directly (which
 carries no `source_kind` allowlist) rather than through
-`from-tar-query`/`from-instruction-result`, and so may never have been
-validated at all: `sql` (tar_query) at 100 KiB, the bound `from-tar-query`
+`from-echo-query`/`from-instruction-result`, and so may never have been
+validated at all: `sql` (echo_query) at 100 KiB, the bound `from-echo-query`
 itself already enforces at creation time; and `instruction_id`
 (instruction_result) at 256 bytes plus `params` at 32 keys / 256-byte keys /
 64 KiB values, the same bounds REST's own `from-instruction-result` route now
@@ -7543,7 +7543,7 @@ not a JSON object (a string, array, or number) is refused outright rather
 than silently dispatching with an empty params map. A type-mismatched
 `sql`/`instruction_id` value (not a JSON string) is treated as absent, taking
 the existing missing-field 400 path, rather than surfacing as an uncaught
-exception (#4406, fixed on both `from-tar-query` and `from-instruction-result`
+exception (#4406, fixed on both `from-echo-query` and `from-instruction-result`
 in the same change).
 
 **`{id}/re-eval` is refused, never broadcast, when the recorded parent is gone (#4306).**
@@ -7554,7 +7554,7 @@ rule the parent_id-empty guard above enforces for a caller-supplied empty string
 letting that happen here would silently turn "re-ask the same narrow question" into "ask
 the whole visible fleet". If the live parent is gone **and** the original's stored
 `source_payload` shows it was narrowed at creation time (a non-empty `scope_input_id` --
-recorded by every result-set create route that accepts `parent_id` — `from-tar-query`/
+recorded by every result-set create route that accepts `parent_id` — `from-echo-query`/
 `from-instruction-result`/`from-inventory-query` (which always build a well-formed object
 payload) and the generic `POST /api/v1/result-sets` (#4306 follow-up), except when the
 generic route's caller-supplied `source_payload` is itself not a JSON object, in which case
@@ -7572,9 +7572,9 @@ re-eval, unchanged.
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent set; or missing `sql` / `instruction_id`. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
-| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` with `"kind":"tar_rows_ge"` whose `n` is present but not a JSON integer from `1` to `2147483647` (a wrong type or a wrapped value used to throw in the maintenance tick, which re-threw every 2 seconds and starved the result-set GC; an `n` or `kind` already stored that is malformed, or an `n` below 1, now matches no device). A `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too, and so is a column matcher (no `kind`) whose `column`, `op` or `value` is present but not a string or whose `value_set` is present but not an array (`{"column":5,"op":"eq"}` used to qualify every responder; a stored one now matches no device, while a MISSING key keeps the accept-all default so a typo cannot silently empty the set); it used to be dropped, which meant every responder qualified (omit `matcher` for that default). Nothing is dispatched (#4644) |
-| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` that carries `declared_columns`, `plugin` or `row_discriminator`. These three keys are server-authored: when the matcher's `column` is a column the instruction definition declares in its `result_schema`, the server stores them (`declared_columns` = field names in output order, `plugin` = the definition's plugin) so a column matcher works on any plugin's pipe-row output, not only TAR or JSON. The header row and short status rows (`status\|not_found`, `not_available\|<reason>`) are skipped. A column the definition does not declare stores nothing extra |
-| 400 | `sql`/`instruction_id`/`name` present but not a JSON string (a clean 400 rather than an uncaught exception, #4406); `name` over 256 bytes on `from-tar-query` or `from-instruction-result` |
+| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` with `"kind":"echo_rows_ge"` whose `n` is present but not a JSON integer from `1` to `2147483647` (a wrong type or a wrapped value used to throw in the maintenance tick, which re-threw every 2 seconds and starved the result-set GC; an `n` or `kind` already stored that is malformed, or an `n` below 1, now matches no device). A `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too, and so is a column matcher (no `kind`) whose `column`, `op` or `value` is present but not a string or whose `value_set` is present but not an array (`{"column":5,"op":"eq"}` used to qualify every responder; a stored one now matches no device, while a MISSING key keeps the accept-all default so a typo cannot silently empty the set); it used to be dropped, which meant every responder qualified (omit `matcher` for that default). Nothing is dispatched (#4644) |
+| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` that carries `declared_columns`, `plugin` or `row_discriminator`. These three keys are server-authored: when the matcher's `column` is a column the instruction definition declares in its `result_schema`, the server stores them (`declared_columns` = field names in output order, `plugin` = the definition's plugin) so a column matcher works on any plugin's pipe-row output, not only Echo or JSON. The header row and short status rows (`status\|not_found`, `not_available\|<reason>`) are skipped. A column the definition does not declare stores nothing extra |
+| 400 | `sql`/`instruction_id`/`name` present but not a JSON string (a clean 400 rather than an uncaught exception, #4406); `name` over 256 bytes on `from-echo-query` or `from-instruction-result` |
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
 | 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
 | 500 | `RESULT_SET_GATE_UNCONFIGURED` — the server's dispatch-visibility gate is not wired. Fails **closed**: nothing is dispatched, and the refusal is audited. An operator seeing this has a server misconfiguration, not an authorization problem |
@@ -8185,11 +8185,11 @@ The `/fragments/crypto/dashboard`, `/fragments/crypto/widget/{id}` and `/fragmen
 
 ### Result Sets
 
-The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-walking-design.md](../scope-walking-design.md) for the full design and the four **producer** routes documented above under [Inventory](#inventory) (`POST /api/v1/result-sets/from-inventory-query`, `from-tar-query`, `from-instruction-result`, `{id}/re-eval`). `ResultSetStore` (ADR-0036) is always constructed in a running server (Postgres is mandatory; a construction failure halts startup rather than degrading serving, ADR-0012 §1) — these routes are always registered.
+The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-walking-design.md](../scope-walking-design.md) for the full design and the four **producer** routes documented above under [Inventory](#inventory) (`POST /api/v1/result-sets/from-inventory-query`, `from-echo-query`, `from-instruction-result`, `{id}/re-eval`). `ResultSetStore` (ADR-0036) is always constructed in a running server (Postgres is mandatory; a construction failure halts startup rather than degrading serving, ADR-0012 §1) — these routes are always registered.
 
-**JSON nesting depth bound (json-dump-depth-guard fix), all four producers plus re-eval.** `nlohmann::json::dump()` is unboundedly recursive; the [MCP transport's 32-level guard](../mcp-server.md) (#2437) checked only the live `/mcp/` request body, leaving a gap on REST. `POST /api/v1/result-sets`, `/from-inventory-query`, `/from-tar-query`, and `/from-instruction-result` now reject (`400 RESULT_SET_BAD_REQUEST`) a request body nesting deeper than 32 levels before it is parsed, reusing the same `kMcpMaxJsonDepth` constant MCP enforces so the two surfaces cannot drift apart. `POST /api/v1/result-sets/{id}/re-eval` applies the same check to the row's **stored** `source_payload` before parsing it, since the table is shared with MCP's `reevaluate_result_set` and a row poisoned by any write path (including one predating this fix) would otherwise be re-dumped on a later read. **Heal on reject (#4493).** This specific re-eval attempt still fails with `400 RESULT_SET_BAD_REQUEST`, but the route now also discards the poisoned `source_payload` in place (status-agnostic - `materialized` and `failed` rows are healed too, not just `pending`) before returning, so every subsequent read of the row is safe instead of re-detecting the same poison forever; the row's `status` and members are never touched. The response body says "...and has been discarded..." only when the heal write actually committed - a rare heal-write failure returns a differently-worded `400` and leaves the row unchanged for the next retry.
+**JSON nesting depth bound (json-dump-depth-guard fix), all four producers plus re-eval.** `nlohmann::json::dump()` is unboundedly recursive; the [MCP transport's 32-level guard](../mcp-server.md) (#2437) checked only the live `/mcp/` request body, leaving a gap on REST. `POST /api/v1/result-sets`, `/from-inventory-query`, `/from-echo-query`, and `/from-instruction-result` now reject (`400 RESULT_SET_BAD_REQUEST`) a request body nesting deeper than 32 levels before it is parsed, reusing the same `kMcpMaxJsonDepth` constant MCP enforces so the two surfaces cannot drift apart. `POST /api/v1/result-sets/{id}/re-eval` applies the same check to the row's **stored** `source_payload` before parsing it, since the table is shared with MCP's `reevaluate_result_set` and a row poisoned by any write path (including one predating this fix) would otherwise be re-dumped on a later read. **Heal on reject (#4493).** This specific re-eval attempt still fails with `400 RESULT_SET_BAD_REQUEST`, but the route now also discards the poisoned `source_payload` in place (status-agnostic - `materialized` and `failed` rows are healed too, not just `pending`) before returning, so every subsequent read of the row is safe instead of re-detecting the same poison forever; the row's `status` and members are never touched. The response body says "...and has been discarded..." only when the heal write actually committed - a rare heal-write failure returns a differently-worded `400` and leaves the row unchanged for the next retry.
 
-**MCP twins (#2146 Batch B2):** every one of these 12 REST v1 operations has an MCP tool twin (`list_result_sets`, `create_result_set`, `create_result_set_from_inventory_query`, `create_result_set_from_tar_query`, `create_result_set_from_instruction_result`, `reevaluate_result_set`, `get_result_set`, `get_result_set_members`, `get_result_set_lineage`, `pin_result_set`, `unpin_result_set`, `delete_result_set`) — see [mcp-server.md](../mcp-server.md)'s "Result sets" tool family. The three async producer tools share the exact same `Execution:Execute` + per-device confined-dispatch gate (#1788) as their REST twins below; all 9 of the remaining tools/routes are owner-scoped exactly like the REST routes (a service-scoped API token is denied outright). **`create_result_set_from_inventory_query`/`POST /api/v1/result-sets/from-inventory-query` joined them in #4980**: both gate via the admit-then-filter `fleet_read_fn`/`fleet_read_fn_` chokepoint for scope confinement, but a service-scoped token is now hard-denied structurally BEFORE that chokepoint ever runs on either transport — MCP already enforced this via its C8 generic-tier gate's structural `ServiceScopeClass::denied` default (empirically verified during #4980, never actually reachable there); the REST route lacked the equivalent and gated purely via `fleet_read_fn`, whose service-scope branch admits-and-confines a service-scoped token rather than denying it outright — since the created result set is still owner-scoped to the minting token's principal, a service token could mint a set the minter's other tokens/session could then read. This REST-side gap was originally tracked as #4307 and is closed by #4980's `deny_fleet_wide_service_scoped` call on the route, matching its 8 siblings.
+**MCP twins (#2146 Batch B2):** every one of these 12 REST v1 operations has an MCP tool twin (`list_result_sets`, `create_result_set`, `create_result_set_from_inventory_query`, `create_result_set_from_echo_query`, `create_result_set_from_instruction_result`, `reevaluate_result_set`, `get_result_set`, `get_result_set_members`, `get_result_set_lineage`, `pin_result_set`, `unpin_result_set`, `delete_result_set`) — see [mcp-server.md](../mcp-server.md)'s "Result sets" tool family. The three async producer tools share the exact same `Execution:Execute` + per-device confined-dispatch gate (#1788) as their REST twins below; all 9 of the remaining tools/routes are owner-scoped exactly like the REST routes (a service-scoped API token is denied outright). **`create_result_set_from_inventory_query`/`POST /api/v1/result-sets/from-inventory-query` joined them in #4980**: both gate via the admit-then-filter `fleet_read_fn`/`fleet_read_fn_` chokepoint for scope confinement, but a service-scoped token is now hard-denied structurally BEFORE that chokepoint ever runs on either transport — MCP already enforced this via its C8 generic-tier gate's structural `ServiceScopeClass::denied` default (empirically verified during #4980, never actually reachable there); the REST route lacked the equivalent and gated purely via `fleet_read_fn`, whose service-scope branch admits-and-confines a service-scoped token rather than denying it outright — since the created result set is still owner-scoped to the minting token's principal, a service token could mint a set the minter's other tokens/session could then read. This REST-side gap was originally tracked as #4307 and is closed by #4980's `deny_fleet_wide_service_scoped` call on the route, matching its 8 siblings.
 
 `ResultSet` is not a seeded RBAC securable; every route below is session-authenticated and **owner-scoped** instead (a result set is only readable/mutable by the principal that created it). A service-scoped API token is denied outright on every route (`403`): ownership keys on `session->username`, which for a service token is the **minting operator's** identity, not the token's own service tag — without this deny, any other service token the same operator holds could reach the same owner-scoped result sets.
 
@@ -8212,7 +8212,7 @@ The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-wal
 }
 ```
 
-`parent_id` is `""` when the set has no parent. `source_kind` is one of `manual_curate` (direct `POST /result-sets`), `inventory_query`, `tar_query`, or `instruction_result`. `status` is `pending` until an asynchronous producer's dispatch responses land, then `materialized` (or `failed` if the dispatch could not be materialized).
+`parent_id` is `""` when the set has no parent. `source_kind` is one of `manual_curate` (direct `POST /result-sets`), `inventory_query`, `echo_query`, or `instruction_result`. `status` is `pending` until an asynchronous producer's dispatch responses land, then `materialized` (or `failed` if the dispatch could not be materialized).
 
 #### `GET /api/v1/result-sets`
 
@@ -8378,7 +8378,7 @@ Pin (exempt from TTL expiry) or unpin a result set.
 
 ### Forensics
 
-The **per-agent app-usage** discovery surface (Wave 7 PR7.2, ADR-0016 §5). Data is derived on the agent from TAR's `usage_daily` fold via the read-only `app_usage` plugin and synced daily into `AppUsageStore`, projecting each executable's retained-window first/last-seen plus a trailing-30-day run-count/total-seconds window. `Forensics` is **held by default only by Administrator and the read-only `ForensicsAnalyst` role** — deliberately absent from the seeded Viewer read-list.
+The **per-agent app-usage** discovery surface (Wave 7 PR7.2, ADR-0016 §5). Data is derived on the agent from Echo's `usage_daily` fold via the read-only `app_usage` plugin and synced daily into `AppUsageStore`, projecting each executable's retained-window first/last-seen plus a trailing-30-day run-count/total-seconds window. `Forensics` is **held by default only by Administrator and the read-only `ForensicsAnalyst` role** — deliberately absent from the seeded Viewer read-list.
 
 #### `GET /api/v1/forensics/agents/{agent_id}/app-usage`
 
@@ -8402,7 +8402,7 @@ One device's per-executable last-used projection — the per-agent drill. Becaus
 }
 ```
 
-`first_seen`/`last_seen` are **within TAR's retained usage window** (31 days default, operator-tunable) — never a value spanning the executable's full run history. An executable absent from `apps` has not run inside that retained window; it does not mean the executable has never run. An agent that genuinely reported no rows for the window is `200` with `apps: []`.
+`first_seen`/`last_seen` are **within Echo's retained usage window** (31 days default, operator-tunable) — never a value spanning the executable's full run history. An executable absent from `apps` has not run inside that retained window; it does not mean the executable has never run. An agent that genuinely reported no rows for the window is `200` with `apps: []`.
 
 **Error responses:**
 
@@ -9462,7 +9462,7 @@ Get infrastructure topology data. For full topology rendering, use the HTMX frag
 
 ### Fleet Visualization (3D)
 
-The fleet-visualization endpoints expose a single aggregate `fleet_topology.v1` document that the `/viz/fleet` 3D renderer consumes. The endpoint dispatches `tar.fleet_snapshot` to every connected agent on cache miss, aggregates per-agent snapshots into machine cubes + interior process nodes + connection edges, and applies a 60 s LRU-of-2 cache (keyed on `include_vuln`).
+The fleet-visualization endpoints expose a single aggregate `fleet_topology.v1` document that the `/viz/fleet` 3D renderer consumes. The endpoint dispatches `echo.fleet_snapshot` to every connected agent on cache miss, aggregates per-agent snapshots into machine cubes + interior process nodes + connection edges, and applies a 60 s LRU-of-2 cache (keyed on `include_vuln`).
 
 #### `GET /viz/fleet`
 
@@ -9485,17 +9485,17 @@ Browser-facing page that renders the 3D fleet topology. The page itself is auth-
 
 **Renderer behaviour (PR 6):**
 
-The page renders one translucent cube per fleet machine on a deterministic grid. Per-OS palette: Linux `#2dd4bf`, macOS/Darwin `#f5c542`, Windows `#4c9aff`, default `#9aa2ae`. Live agents render at opacity `0.18`; stale agents (no response within the 5 s `tar.fleet_snapshot` deadline) render at opacity `0.08` so they remain visible without competing for attention. Hostname labels appear below each cube as `Sprite` text and always face the camera; labels longer than 24 characters truncate with an ellipsis (the full hostname is visible in the hover tooltip). Layout is seeded by an FNV-1a 32-bit hash of `agent_id` so the same fleet renders identically across reloads even when the server returns rows in a different order.
+The page renders one translucent cube per fleet machine on a deterministic grid. Per-OS palette (on the default Slate scheme; the other schemes follow their own chart tokens): Linux `#2dd4bf`, macOS/Darwin `#f5c542`, Windows `#4c9aff`, default `#9aa2ae`. Live agents render at opacity `0.18`; stale agents (no response within the 5 s `echo.fleet_snapshot` deadline) render at opacity `0.08` so they remain visible without competing for attention. Hostname labels appear below each cube as `Sprite` text and always face the camera; labels longer than 24 characters truncate with an ellipsis (the full hostname is visible in the hover tooltip). Layout is seeded by an FNV-1a 32-bit hash of `agent_id` so the same fleet renders identically across reloads even when the server returns rows in a different order.
 
 **Renderer behaviour (PR 7):**
 
-Each machine cube contains interior `SphereGeometry` dots, one per process reported in the `processes` array of the topology payload. Dots are coloured by process category using a fixed six-colour palette: system `#9aa2ae`, browser `#4c9aff`, database `#f5c542`, web `#2dd4bf`, runtime `#a78bfa`, other `#9199a6`. Category values in the JSON payload are lowercase strings matching `category_to_string()` in the server's process classifier (`server/core/src/process_category.hpp`); the renderer normalises with `String(category).trim().toLowerCase()` and uses `Object.prototype.hasOwnProperty.call` for the palette lookup so unknown / mixed-case / whitespace-padded values fall through to `other` and prototype keys (`constructor`, `__proto__`) cannot poison the colour pipeline.
+Each machine cube contains interior `SphereGeometry` dots, one per process reported in the `processes` array of the topology payload. Dots are coloured by process category using a six-colour palette (on the default Slate scheme; the other schemes follow their own chart tokens): system `#9aa2ae`, browser `#4c9aff`, database `#f5c542`, web `#2dd4bf`, runtime `#a78bfa`, other `#9199a6`. Category values in the JSON payload are lowercase strings matching `category_to_string()` in the server's process classifier (`server/core/src/process_category.hpp`); the renderer normalises with `String(category).trim().toLowerCase()` and uses `Object.prototype.hasOwnProperty.call` for the palette lookup so unknown / mixed-case / whitespace-padded values fall through to `other` and prototype keys (`constructor`, `__proto__`) cannot poison the colour pipeline.
 
 Dot positions are deterministic across reloads — `hash(pid|ppid)`-mod-bucket layout inside 78% of the cube's interior volume, with per-process `hash('j|pid')` jitter to break visual stripes. Per-machine processes are attached as a named child group (`yuzu-processes`) of each cube so they orbit and pan with the cube under OrbitControls without synchronisation overhead. To bound the worst-case render cost on heavily-threaded hosts (e.g. JVM thread pools), the renderer soft-caps at **1000 dots per cube**; the cube tooltip's `processes` count still reflects the true total reported by the agent.
 
 Hover-then-tooltip is rAF-throttled — `mousemove` fires up to ~120 Hz on macOS trackpads but the bidirectional raycast (process dots + cube meshes) only runs once per `requestAnimationFrame` tick (~60 Hz) so the dominant CPU cost stays bounded even at large fleets.
 
-To suppress process-level visibility for specific agents (privacy-sensitive hosts, regulated workloads, etc.), set `process_enabled=false` on those agents via `tar.configure` — see [`docs/user-manual/agent-plugins.md`](agent-plugins.md) §TAR for the per-source enable/disable surface. The `tar.fleet_snapshot` action will skip the process collector on those agents and the corresponding cubes will render with no interior dots (cube body and hover tooltip remain functional).
+To suppress process-level visibility for specific agents (privacy-sensitive hosts, regulated workloads, etc.), set `process_enabled=false` on those agents via `echo.configure` — see [`docs/user-manual/agent-plugins.md`](agent-plugins.md) §Echo for the per-source enable/disable surface. The `echo.fleet_snapshot` action will skip the process collector on those agents and the corresponding cubes will render with no interior dots (cube body and hover tooltip remain functional).
 
 **Browser error handling.** When the JS renderer's fetch to `/api/v1/viz/fleet/topology` fails, the renderer surfaces a visible overlay (`#viz-error.shown`) on the canvas rather than leaving the scene blank. Any previously-rendered cubes are removed before the overlay is shown so the operator does not see "live data" cubes alongside a denial message.
 
@@ -9585,7 +9585,7 @@ Optional top-level key `offline_roster_degraded: true` is present only when the 
 |---|---|
 | 1 | Initial shape (PR 2–7) |
 | 2 | PR 8 — `dst_pid` (uint32) added to `ConnectionEdge`. Present only on `scope: local` edges with a resolved peer process on the same machine; omitted (not zero) on non-local edges. Unmatched `local` edges (no reciprocal half visible in the same snapshot) are dropped server-side before serialisation, so a `local` edge in the response always carries a non-zero `dst_pid`. Strict-validating consumers pinned to minor version 1 should relax their validator to `minimum: 1` rather than exact-match. |
-| 3 | PR 9 — `listeners[]` array added to each `MachineNode`. Each entry is a `ListenerSocket` (`proto`, `port`, optional `pid`, optional `process_name`). LISTEN-state rows continue to appear in `connections[]` during the deprecation window so consumers filtering `connections` by `state: LISTEN` are not broken; a future release will remove them from `connections[]` with a `Breaking` CHANGELOG entry. Strict consumers should migrate to `listeners[]` now. Ingestion path also flipped: agents push `tar.fleet_snapshot` JSON via `HeartbeatRequest.fleet_snapshot_json` every 30 s (PR 10), so cache-miss latency drops from ~800 ms (full agent dispatch) to ~2 ms (in-process map walk). The dispatch path remains as a cold-start fallback. |
+| 3 | PR 9 — `listeners[]` array added to each `MachineNode`. Each entry is a `ListenerSocket` (`proto`, `port`, optional `pid`, optional `process_name`). LISTEN-state rows continue to appear in `connections[]` during the deprecation window so consumers filtering `connections` by `state: LISTEN` are not broken; a future release will remove them from `connections[]` with a `Breaking` CHANGELOG entry. Strict consumers should migrate to `listeners[]` now. Ingestion path also flipped: agents push `echo.fleet_snapshot` JSON via `HeartbeatRequest.fleet_snapshot_json` every 30 s (PR 10), so cache-miss latency drops from ~800 ms (full agent dispatch) to ~2 ms (in-process map walk). The dispatch path remains as a cold-start fallback. |
 | 4 | PR 12 — `ListenerSocket` grows an optional `local_addr` field (the kernel-reported bind address: `0.0.0.0`, `::`, a NIC IP, `127.0.0.1`, etc., bounded server-side at 64 bytes per field). Omitted from the wire envelope when the agent did not populate it (older snapshots). The renderer reads this field and drops loopback-only listeners (`127.0.0.0/8`, `::1`, including bracketed and v4-mapped-in-v6 forms `[::ffff:127.x]`) from the cube-surface socket ring — those sockets are by definition not reachable from any other instance. `0.0.0.0` and `::` survive the filter; specific NIC IPs survive. Strict consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. |
 
 **Audit emissions**
@@ -9595,7 +9595,7 @@ Every request produces a `viz.fleet_topology` row (target_type `FleetTopology`, 
 **Metrics**
 
 - `yuzu_viz_topology_request_seconds` (histogram) — end-to-end request latency on the success path (auth + RBAC + store + serialisation + response).
-- `yuzu_viz_topology_fetch_duration_seconds` (histogram) — duration of the inner agent-dispatch path (`tar.fleet_snapshot` fan-out + response aggregation), measured only on cache-miss refills. Use to distinguish slow agent dispatch from slow auth / serialisation. Observed even on fetcher exception so a hung fetcher produces a visible upper-bound observation. (PR 6 / OBS-2.)
+- `yuzu_viz_topology_fetch_duration_seconds` (histogram) — duration of the inner agent-dispatch path (`echo.fleet_snapshot` fan-out + response aggregation), measured only on cache-miss refills. Use to distinguish slow agent dispatch from slow auth / serialisation. Observed even on fetcher exception so a hung fetcher produces a visible upper-bound observation. (PR 6 / OBS-2.)
 - `yuzu_viz_cache_hit_total` / `yuzu_viz_cache_miss_total` (counters).
 - `yuzu_viz_oversize_response_total` (counter) — 413 cap-check fires.
 - `yuzu_viz_agent_dispatch_timeout_total` (counter) — agents that didn't respond within the 5 s fetcher deadline.
@@ -9608,7 +9608,7 @@ Every request produces a `viz.fleet_topology` row (target_type `FleetTopology`, 
 - `yuzu_viz_pushed_cap_evictions_total` (gauge) — `pushed_` map entries evicted because the map hit the 100 000-agent hard cap. The victim is the least-recently-seen agent by *server* receipt time (not the agent-controlled `ts`); each eviction emits a `topology.push.evicted_for_cap` audit event.
 - `yuzu_viz_pushed_map_size` (gauge) — current `pushed_` map occupancy; the memory-pressure signal to alert on before evictions begin.
 
-**`fleet_snapshot.v1` (agent-emitted payload).** The `fleet_topology.v1` document above is the server-aggregated shape; the per-agent payload the agent pushes (via `HeartbeatRequest.fleet_snapshot_json`) or returns from a dispatched `tar.fleet_snapshot` is `fleet_snapshot.v1`. Its `schema_minor` is at **2** — the `1 → 2` bump added an optional `connections[].last_seen_seconds_ago` field, emitted only when non-zero, alongside the operator-tunable TAR plugin config key `fleet_snapshot_window_seconds` (default `3600`): connections seen within that window are merged into the snapshot even if not ESTABLISHED at the exact `/proc` sample instant. `fleet_snapshot_window_seconds` is a TAR plugin config key set via `tar.configure`, not a server CLI flag.
+**`fleet_snapshot.v1` (agent-emitted payload).** The `fleet_topology.v1` document above is the server-aggregated shape; the per-agent payload the agent pushes (via `HeartbeatRequest.fleet_snapshot_json`) or returns from a dispatched `echo.fleet_snapshot` is `fleet_snapshot.v1`. Its `schema_minor` is at **2** — the `1 → 2` bump added an optional `connections[].last_seen_seconds_ago` field, emitted only when non-zero, alongside the operator-tunable Echo plugin config key `fleet_snapshot_window_seconds` (default `3600`): connections seen within that window are merged into the snapshot even if not ESTABLISHED at the exact `/proc` sample instant. `fleet_snapshot_window_seconds` is an Echo plugin config key set via `echo.configure`, not a server CLI flag.
 
 **Example**
 
@@ -9682,7 +9682,7 @@ the JSON route above.
 #### `GET /viz/host/<agent_id>`
 
 Browser-facing per-host drill-down page (the 2D Cytoscape IPC graph above
-the TAR process tree), opened by double-clicking a cube in `/viz/fleet`.
+the Echo process tree), opened by double-clicking a cube in `/viz/fleet`.
 Auth-gated only (`require_auth`); redirects to `/home` on no session.
 The `agent_id` path segment is allow-listed to `[A-Za-z0-9._-]` — any
 other character returns `400` — before it is templated into the page
@@ -11242,6 +11242,39 @@ Render the Account panel for one active account.
 - **Query:** `username` — URL-encoded (an SSO principal such as `oidc:https://idp/x#sub` must encode `#` as `%23`). Empty or absent returns the "select a user" placeholder.
 - **Permission, statuses, headers:** as for the list. An unknown name is a 200 "No such user" panel, distinct from the red unreadable-store box.
 
+### Estate — Groups and enrolment
+
+These endpoints back the management-group panels of the **Estate → Groups and enrolment** page (`/groups`). They return HTMX fragments, not the JSON envelope. All three are read-only: the page offers no control that creates, changes or deletes a group (that stays in Settings). A malformed `id` is a `400` with a one-line plain-text body, answered before any permission check and before any store read. None of them writes a success audit row (the REST twins write none). A refused request writes the gate's ordinary denial audit row (`auth.permission_required` for the list and detail, `auth.fleet_read_required` for the members), as the REST twins do; opening `/groups` without `ManagementGroup:Read` therefore leaves one row, for the list panel, because the detail and members panels load only after a group is selected. Every response, including a refusal and the `400`, sends `Cache-Control: no-store`. Each read materialises its result as the REST twin does (the whole group table, one group's members), bounded by the store's read timeout; the display caps below only bound the HTML.
+
+**`GET /fragments/groups/list`**
+
+Render the Management groups panel: the group tree (name, type, member count).
+
+- **Permission:** `ManagementGroup:Read`, the same securable and permission check as `GET /api/v1/management-groups`; unlike that route, a failed read is reported, not rendered as an empty list. The per-group member counts have no field on `GET /api/v1/management-groups`; a machine derives them from each group's member list.
+- **Response (200):** HTML fragment. At most 500 rows are drawn; a note states the true count when more exist, and a group beyond the 500th row cannot be selected from the page. A groups read or a member-count read that does not answer is a red "could not be read" box with a Retry button and **no table**, still with status 200: it is never an empty tree and never a column of zero counts. A group whose parent is not in the list, or that sits in a cycle or beyond the display depth, is drawn as a top-level row rather than dropped. The group list and the member counts are two separate reads, so a group or member change between them can show an out-of-date count (a group deleted in between shows 0) until the panel is reloaded.
+- **Response (401 / 403):** Not signed in / the caller lacks the permission. On a 403 the panel shows the heading "Not available to your account" above the sentence "Your account cannot read management groups."
+- **Headers:** `Cache-Control: no-store`.
+
+**`GET /fragments/groups/detail?id=<group id>`**
+
+Render the selected group: name, type, parent (shown by its id when its name cannot be read), description, the stored rule of a rule-based group, who created it and when. A rule-based group's (type `dynamic`) rule is shown as stored, with a note that its membership is not kept up to date from the rule. The panel also carries the loader for the members panel.
+
+- **Query:** `id` — 1 to 64 of `a-f` and `0-9`. Empty or absent returns the "select a group" placeholder (still permission-checked).
+- **Permission:** `ManagementGroup:Read`, as for the list.
+- **Response (200):** HTML fragment: the detail, "No such group" (the store answered and holds no such id), or the red unreadable box with a Retry button. The three are never confused.
+- **Response (400 / 401 / 403):** malformed `id` / not signed in / the caller lacks the permission. On a 403 the panel shows the heading "Not available to your account" above the sentence "Your account cannot read management groups."
+- **Headers:** `Cache-Control: no-store`.
+
+**`GET /fragments/groups/members?id=<group id>`**
+
+Render one group's members (agent id, source, when added).
+
+- **Query:** `id` — required, 1 to 64 of `a-f` and `0-9`; empty or absent is a `400` (unlike the detail, which treats an empty `id` as the placeholder).
+- **Permission:** `ManagementGroup:Read` through the fleet-read gate (ADR-0017) as the **only** gate. A caller whose visibility is narrowed to some management groups sees only the members inside that visibility. Rows outside it are omitted and **no count or other figure derived from them is returned**: the panel states "Only members within your scope are shown." and its heading counts only the rows the caller may see. A service-scoped API token (RBAC on) whose ITServiceOwner ceiling holds `ManagementGroup:Read` passes this gate and sees the members within its service scope; the list and detail refuse such a token with `403`. The REST and MCP twin (`GET /api/v1/management-groups/{id}`, `get_management_group`) returns the whole member list, not narrowed, to any caller passing `ManagementGroup:Read`; narrowing it is a follow-up.
+- **Response (200):** HTML fragment, at most 200 rows with a note stating how many the caller can see. A group with no members says so; for a rule-based group the text says membership is not kept up to date from its rule. A members read that does not answer is a red unreadable box with a Retry button and no count, still 200. An unknown group is "No such group".
+- **Response (400 / 401 / 403 / 503):** malformed or missing `id` / not signed in / lacks the permission / the authorization topology could not be read. On a 403 the panel shows the heading "Not available to your account" above the sentence "Your account cannot read the members of this group."
+- **Headers:** `Cache-Control: no-store`.
+
 ### Access — Tokens and principals
 
 These endpoints back the **Access → Tokens and principals** page (`/access/tokens`). They return HTMX fragments, not the JSON envelope. None of them changes anything: every change the page makes is a call to an existing REST v1 route (`/api/v1/tokens*`, `/api/v1/engine-principals*`), which keeps its own permission, step-up, validation and audit. The 200 fragments send `Cache-Control: no-store, private` and `Vary: Cookie`; the 403 and 500 responses send `no-store`. The fragments also decide which controls to draw, using quiet permission probes (a refused browser session writes no audit row); the server stays authoritative.
@@ -11376,7 +11409,7 @@ must be a JSON object; anything else is `400`.
 
 **Destructive-class capabilities require explicit, non-empty `agent_ids` — broadcast and `scope`
 fan-out are refused (#3685).** The command catalogue currently classifies 21 `plugin.action` pairs
-`Destructive` (e.g. `tar.purge_source`, `filesystem.delete_lines`, `registry.delete_key`); dispatching
+`Destructive` (e.g. `echo.purge_source`, `filesystem.delete_lines`, `registry.delete_key`); dispatching
 any of them with `agent_ids` omitted or empty, or with `scope` present at all — including
 `"__all__"` — is refused **before** the command reaches an agent. This is a narrower carve-out
 than the general targeting rule two paragraphs above: for an ordinary (non-Destructive) row,
@@ -11409,7 +11442,7 @@ sets `Sec-Audit-Failed: true` in that case), and omitted entirely when no audit 
 means no claim, not `false`.
 
 The elevated securable/operation this row's catalogue entry names (per-row, e.g.
-`Infrastructure:Delete` for `tar.purge_source`) is checked via `require_permission` **before**
+`Infrastructure:Delete` for `echo.purge_source`) is checked via `require_permission` **before**
 this refusal — a caller lacking the grant gets the ordinary `403` first, preserving the
 pre-#3685 403-before-400 ordering. A caller who *is* authorized but named explicit `agent_ids`
 is then confined to their currently visible agents (management-group scope); an id list that
@@ -12769,11 +12802,13 @@ data: {"execution_id":"exec-abc123","event_id":119,"timestamp_ms":...,"type":"ag
 
 ---
 
-### Dashboard TAR
+### Dashboard Echo
 
-#### `POST /api/dashboard/tar-execute`
+The Echo routes were named `tar` before 2026-10 (`/api/v1/tar/...`, `/api/dashboard/tar-execute`). There is no alias for the old paths; see the Echo section of [Upgrading](upgrading.md).
 
-Execute a TAR warehouse SQL query against targeted agents. Returns HTMX HTML fragments: a `thead` OOB swap with dynamic column headers and sets up an SSE stream for result rows.
+#### `POST /api/dashboard/echo-execute`
+
+Execute an Echo warehouse SQL query against targeted agents. Returns HTMX HTML fragments: a `thead` OOB swap with dynamic column headers and sets up an SSE stream for result rows.
 
 **Permission:** `Execution:Execute`. A browser (session-cookie) caller must also send a same-site `Origin` or `Referer` naming the console; one without either, or from another site, is answered `403` and audited as `csrf.denied` before anything is parsed or dispatched. Token callers are exempt. The same rule applies to `POST /api/dashboard/execute`.
 
@@ -12787,7 +12822,7 @@ Execute a TAR warehouse SQL query against targeted agents. Returns HTMX HTML fra
 **Example (curl):**
 
 ```bash
-curl -X POST https://yuzu.example.com/api/dashboard/tar-execute \
+curl -X POST https://yuzu.example.com/api/dashboard/echo-execute \
   -H "Cookie: yuzu_session=abc123" \
   -H "Origin: https://yuzu.example.com" \
   -d "sql=SELECT name, pid FROM \$Process_Live LIMIT 10" \
@@ -12795,22 +12830,22 @@ curl -X POST https://yuzu.example.com/api/dashboard/tar-execute \
 ```
 
 **Response:** HTMX HTML fragments. The response contains:
-1. A `<thead>` element with `hx-swap-oob="innerHTML:#tar-results-head"` containing dynamic column headers derived from the query result schema.
+1. A `<thead>` element with `hx-swap-oob="innerHTML:#echo-results-head"` containing dynamic column headers derived from the query result schema.
 2. An SSE stream setup that delivers result rows as `<tr>` fragments.
 
 **Safety controls:**
 - Server-side: validates SELECT-only queries and applies a keyword blocklist (no INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, DETACH, PRAGMA, VACUUM, REINDEX).
 - Agent-side: untrusted queries run on a dedicated **read-only** SQLite connection through a `sqlite3` authorizer that permits only `SELECT`/`READ` of registry-known warehouse tables (`$Process_Live`, `$TCP_Hourly`, …) and scalar/aggregate functions. Writes, `ATTACH`, `PRAGMA`, schema-table reads (`sqlite_master`), recursive CTEs, and multi-statement input are denied at prepare time — the read-only connection makes writes structurally impossible regardless of the query text. `$`-prefixed table names are translated only outside string literals and comments, so the executed query always matches the validated form. Queries exceeding 4KB are rejected. A blocked query returns `query rejected: operation or table not permitted`.
 
-#### `GET /tar`
+#### `GET /echo`
 
-Render the TAR dashboard page. Requires an authenticated session (302 redirect to `/home` otherwise). The page hosts the retention-paused source list, the capture sources frame and the process tree viewer (a per-host process tree reconstructed from the device's local TAR warehouse; see `docs/user-manual/tar.md`). The Ad-hoc TAR SQL form is no longer on this page: a short note links to the Result sets page, where **From TAR query** takes the same parent scope, SQL, name and include-empty fields.
+Render the Echo dashboard page. Requires an authenticated session (302 redirect to `/home` otherwise). The page hosts the retention-paused source list, the capture sources frame and the process tree viewer (a per-host process tree reconstructed from the device's local Echo warehouse; see `docs/user-manual/echo.md`). The Ad-hoc Echo SQL form is no longer on this page: a short note links to the Result sets page, where **From Echo query** takes the same parent scope, SQL, name and include-empty fields.
 
 **Permission:** Session-only (the page itself; embedded fragment endpoints carry their own permission gates — see below).
 
-#### `GET /fragments/tar/retention-paused`
+#### `GET /fragments/echo/retention-paused`
 
-Render an HTML table fragment of the calling operator's most-recent TAR retention scan. Empty-state placeholders distinguish "no scan yet" from "scan returned no paused sources." **Scope caveat (ADR-0017):** this list gates on the *global* `Infrastructure:Read` permission — management-group confinement of this list/fan-out view is **not yet effective** (a confined operator is denied at the global gate rather than shown a narrowed list); when RBAC is disabled the list is the full enrolled fleet. Per-device confinement remains genuine only on the per-device `reenable` endpoint below.
+Render an HTML table fragment of the calling operator's most-recent Echo retention scan. Empty-state placeholders distinguish "no scan yet" from "scan returned no paused sources." **Scope caveat (ADR-0017):** this list gates on the *global* `Infrastructure:Read` permission — management-group confinement of this list/fan-out view is **not yet effective** (a confined operator is denied at the global gate rather than shown a narrowed list); when RBAC is disabled the list is the full enrolled fleet. Per-device confinement remains genuine only on the per-device `reenable` endpoint below.
 
 **Permission:** `Infrastructure:Read`.
 
@@ -12818,9 +12853,9 @@ Render an HTML table fragment of the calling operator's most-recent TAR retentio
 
 **Response:** HTML fragment.
 
-#### `POST /fragments/tar/retention-paused/scan`
+#### `POST /fragments/echo/retention-paused/scan`
 
-Dispatch a `tar.status` command to the operator's visible-agent set and record the new command_id in the per-username scan slot. The next `GET /fragments/tar/retention-paused` picks up the responses.
+Dispatch an `echo.status` command to the operator's visible-agent set and record the new command_id in the per-username scan slot. The next `GET /fragments/echo/retention-paused` picks up the responses.
 
 **Permission:** `Execution:Execute`. Reading the resulting list still requires only `Infrastructure:Read`, but dispatching a command to the fleet is an Execute action.
 
@@ -12828,11 +12863,11 @@ Dispatch a `tar.status` command to the operator's visible-agent set and record t
 
 **Response:** HTML fragment showing the dispatched-agent count or an empty-state placeholder.
 
-**Audit:** Emits `tar.status.scan` with detail `dispatched to <N> agent(s) in scope`.
+**Audit:** Emits `echo.status.scan` with detail `dispatched to <N> agent(s) in scope`.
 
-#### `POST /fragments/tar/retention-paused/reenable`
+#### `POST /fragments/echo/retention-paused/reenable`
 
-Dispatch a single-device `tar.configure` with `<source>_enabled=true`. Per-source independence is preserved — re-enabling `process` does not affect `tcp` / `service` / `user`.
+Dispatch a single-device `echo.configure` with `<source>_enabled=true`. Per-source independence is preserved — re-enabling `process` does not affect `tcp` / `service` / `user`.
 
 **Permission:** `Execution:Execute`. Per-device RBAC visibility is verified before dispatch; out-of-scope `device_id` values collapse to the same 404 response as not-connected agents (no enumeration oracle).
 
@@ -12848,11 +12883,11 @@ Dispatch a single-device `tar.configure` with `<source>_enabled=true`. Per-sourc
 - 400 with explanatory body for missing/invalid params.
 - 404 with body `Agent not reachable.` for both out-of-scope `device_id` and not-connected agent. Audit detail records the real reason (`scope_violation` vs `agent_not_connected`) server-side.
 
-**Audit:** Emits `tar.source.reenable` with `result=success` and `detail` carrying `device=<id> source=<src>` on success, or `result=failure` with the real rejection reason on rejected attempts.
+**Audit:** Emits `echo.source.reenable` with `result=success` and `detail` carrying `device=<id> source=<src>` on success, or `result=failure` with the real rejection reason on rejected attempts.
 
-#### `POST /fragments/tar/retention-paused/purge`
+#### `POST /fragments/echo/retention-paused/purge`
 
-Dispatch a single-device `tar.purge_source` that **permanently drops every warehouse row** for a source (`<source>_{live,hourly,daily,monthly}`) while leaving the collector **paused** — the "we have what we need; drop the rows but keep collection off" case (Phase 15.A). This is a **destructive, irreversible** operation.
+Dispatch a single-device `echo.purge_source` that **permanently drops every warehouse row** for a source (`<source>_{live,hourly,daily,monthly}`) while leaving the collector **paused** — the "we have what we need; drop the rows but keep collection off" case (Phase 15.A). This is a **destructive, irreversible** operation.
 
 **Permission:** `Infrastructure:Delete` (a higher tier than re-enable's `Execution:Execute`). Per-device RBAC visibility is verified before dispatch; out-of-scope `device_id` values collapse to the same 404 response as not-connected agents (no enumeration oracle).
 
@@ -12873,13 +12908,13 @@ Dispatch a single-device `tar.purge_source` that **permanently drops every wareh
 - 404 with body `Agent not reachable.` for both out-of-scope `device_id` and not-connected agent. Audit detail records the real reason (`scope_violation` vs `agent_not_connected`) server-side.
 - 503 if command dispatch is unavailable.
 
-**Audit:** Emits `tar.source.purge` with `result=success` and `detail` carrying `device=<id> source=<src>` on success (`rbac_denied` on the permission gate; `result=failure` with `scope_violation`/`agent_not_connected` on rejected attempts). Dispatch is fire-and-forget: `rows_deleted` is computed agent-side and appears in the command's **response record** (keyed by `command_id`), not in this dispatch audit row.
+**Audit:** Emits `echo.source.purge` with `result=success` and `detail` carrying `device=<id> source=<src>` on success (`rbac_denied` on the permission gate; `result=failure` with `scope_violation`/`agent_not_connected` on rejected attempts). Dispatch is fire-and-forget: `rows_deleted` is computed agent-side and appears in the command's **response record** (keyed by `command_id`), not in this dispatch audit row.
 
-**Metric:** `yuzu_tar_source_purge_total{result}` (counter) — counts dispatch outcomes.
+**Metric:** `yuzu_echo_source_purge_total{result}` (counter) — counts dispatch outcomes.
 
-**Agent version:** requires an agent that implements the `tar.purge_source` action (v0.14.0+). An older agent returns `error|unknown action: purge_source` in its response record (no crash); because dispatch is fire-and-forget the dashboard still shows "Purge dispatched" — verify the outcome via **Scan**.
+**Agent version:** requires an agent that implements the `echo.purge_source` action (v0.14.0+). An older agent returns `error|unknown action: purge_source` in its response record (no crash); because dispatch is fire-and-forget the dashboard still shows "Purge dispatched" — verify the outcome via **Scan**.
 
-#### `POST /api/v1/tar/retention-paused/purge`
+#### `POST /api/v1/echo/retention-paused/purge`
 
 The **agentic-first (A1) structured surface** for the same destructive purge — for automation / MCP workers / scripted callers that need a JSON contract and a `command_id` rather than the HTML fragment above. Same effect: permanently drop a paused source's warehouse rows on one device, leaving the collector paused. **Irreversible.**
 
@@ -12899,13 +12934,13 @@ The **agentic-first (A1) structured surface** for the same destructive purge —
 - **404** — dispatch reached zero agents (device offline).
 - **503** — command dispatch unavailable, or the audit row could not be persisted (`Sec-Audit-Failed` header; the purge is **not** dispatched without durable evidence).
 
-**Audit:** `tar.source.purge` `result=requested` is written **before** dispatch (fail-closed). **Metric:** `yuzu_tar_source_purge_total{result}`. **Agent version:** same `tar.purge_source` (v0.14.0+) requirement as the fragment.
+**Audit:** `echo.source.purge` `result=requested` is written **before** dispatch (fail-closed). **Metric:** `yuzu_echo_source_purge_total{result}`. **Agent version:** same `echo.purge_source` (v0.14.0+) requirement as the fragment.
 
-#### `GET /api/v1/tar/process-tree`
+#### `GET /api/v1/echo/process-tree`
 
-**API-parity read twin (#4027).** The **agentic-first (A1) structured surface** for the process-tree viewer's device picker — JSON twin of the operator-scoped device list `GET /fragments/tar/process-tree` renders into its host-picker `<select>`.
+**API-parity read twin (#4027).** The **agentic-first (A1) structured surface** for the process-tree viewer's device picker — JSON twin of the operator-scoped device list `GET /fragments/echo/process-tree` renders into its host-picker `<select>`.
 
-**Permission:** `Infrastructure:Read`. A service-scoped API token is denied outright (403, `tar.device_picker.view` denied) — the fleet-wide device-enumeration guard shared with `GET /api/v1/tar/capture-sources` below, since neither route names a single `agent_id` to confine a service-scoped token's own tag against.
+**Permission:** `Infrastructure:Read`. A service-scoped API token is denied outright (403, `echo.device_picker.view` denied) — the fleet-wide device-enumeration guard shared with `GET /api/v1/echo/capture-sources` below, since neither route names a single `agent_id` to confine a service-scoped token's own tag against.
 
 **Request:** no parameters.
 
@@ -12913,59 +12948,59 @@ The **agentic-first (A1) structured surface** for the same destructive purge —
 
 **Audit:** none on success — a device identity/online list, not per-device behavioral content (matches the fragment's own today-unaudited posture).
 
-#### `GET /api/v1/tar/capture-sources`
+#### `GET /api/v1/echo/capture-sources`
 
-**API-parity read twin (#4027).** Same shape and gates as `GET /api/v1/tar/process-tree` above — JSON twin of the operator-scoped device list `GET /fragments/tar/capture-sources` renders into its host picker (ADR-0015).
+**API-parity read twin (#4027).** Same shape and gates as `GET /api/v1/echo/process-tree` above — JSON twin of the operator-scoped device list `GET /fragments/echo/capture-sources` renders into its host picker (ADR-0015).
 
 **Permission:** `Infrastructure:Read`. Same service-scoped-token 403 as the process-tree twin.
 
 **Response:** `{"data":{"devices":[{"agent_id","hostname","os","arch","agent_version","online"}]},"meta":{"api_version":"v1"}}`.
 
-#### `GET /api/v1/tar/retention-paused`
+#### `GET /api/v1/echo/retention-paused`
 
-**API-parity read twin (#4027).** JSON twin of `GET /fragments/tar/retention-paused`: the **calling operator's** most recent `tar.status` scan (per-username state), filtered to their visible agents, one row per (agent, paused source).
+**API-parity read twin (#4027).** JSON twin of `GET /fragments/echo/retention-paused`: the **calling operator's** most recent `echo.status` scan (per-username state), filtered to their visible agents, one row per (agent, paused source).
 
 **Permission:** `Infrastructure:Read`.
 
 **Request:** no parameters.
 
-**Response:** `{"data":{"scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","result_truncated_by_cap","rows":[{"agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"}]},"meta":{"api_version":"v1"}}`. `result_truncated_by_cap` (#4644) is `true` when the scan's response read hit the 10,000-row or 50 MiB payload cap, so `rows` and the counters are partial: dropped responses read as agents that never answered, i.e. as "collecting normally". It is distinct from `store_degraded` (the read failed outright), but a cut scan ALSO reports `store_degraded: true` so a client that predates `result_truncated_by_cap` still sees an incomplete result; test `result_truncated_by_cap` first to tell a cut from a failed read. A client that retries on `store_degraded` should not retry a cut scan: the read is capped the same way each time, so only a narrower scan (a smaller management group) changes the result, whereas a failed read may succeed on retry. `scan_id` is `""` when the operator has not dispatched a scan yet — `POST /fragments/tar/retention-paused/scan` is dashboard-only today (a mutating dispatch route, out of scope for #4027).
+**Response:** `{"data":{"scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","result_truncated_by_cap","rows":[{"agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"}]},"meta":{"api_version":"v1"}}`. `result_truncated_by_cap` (#4644) is `true` when the scan's response read hit the 10,000-row or 50 MiB payload cap, so `rows` and the counters are partial: dropped responses read as agents that never answered, i.e. as "collecting normally". It is distinct from `store_degraded` (the read failed outright), but a cut scan ALSO reports `store_degraded: true` so a client that predates `result_truncated_by_cap` still sees an incomplete result; test `result_truncated_by_cap` first to tell a cut from a failed read. A client that retries on `store_degraded` should not retry a cut scan: the read is capped the same way each time, so only a narrower scan (a smaller management group) changes the result, whereas a failed read may succeed on retry. `scan_id` is `""` when the operator has not dispatched a scan yet — `POST /fragments/echo/retention-paused/scan` is dashboard-only today (a mutating dispatch route, out of scope for #4027).
 
 **Headers:** `Cache-Control: no-store, private` + `Vary: Cookie` — per-operator-scoped data, same UP-11 posture as the fragment.
 
 **Audit:** none on success — scan/config metadata, not per-device behavioral content (matches the fragment's own today-unaudited posture).
 
-**Not twinned (#4027 exception, recorded in `scripts/ci/api-parity/tar.json`):** `GET /fragments/tar/process-tree/result` and `GET /fragments/tar/process-tree/detail` are deliberately not given REST/MCP twins by #4027 — deferred as scope, not impossibility. `/detail`'s cache `token` is a CSPRNG value minted and principal-bound only inside the `/result` handler itself; no other path mints one, so a `/detail` twin genuinely has no usable input today. `/result`'s `pcmd`/`tcmd` command-id pair is an ordinary `tar sql` dispatch result (`Infrastructure:Read`, no execute gate) and could in principle be obtained by an operator through the already-twinned generic dispatch surface (`execute_instruction` / `POST /api/command`) by reproducing the two canned `$Process_Live`/`$TCP_Live` queries verbatim — but that is not a dedicated API path, and a real `/result` twin would still need a new async "not ready yet" polling contract (REST/MCP have no htmx auto-reissue equivalent). Both routes are otherwise reachable today only via the dashboard-only `GET /fragments/tar/process-tree/run` route, itself excluded (a dispatch-shaped GET batched with a later dispatch-twin effort, #3994). Revisit once that later batch ships `/run` (and `/result`) twins that mint these artifacts directly over the API.
+**Not twinned (#4027 exception, recorded in `scripts/ci/api-parity/echo.json`):** `GET /fragments/echo/process-tree/result` and `GET /fragments/echo/process-tree/detail` are deliberately not given REST/MCP twins by #4027 — deferred as scope, not impossibility. `/detail`'s cache `token` is a CSPRNG value minted and principal-bound only inside the `/result` handler itself; no other path mints one, so a `/detail` twin genuinely has no usable input today. `/result`'s `pcmd`/`tcmd` command-id pair is an ordinary `echo sql` dispatch result (`Infrastructure:Read`, no execute gate) and could in principle be obtained by an operator through the already-twinned generic dispatch surface (`execute_instruction` / `POST /api/command`) by reproducing the two canned `$Process_Live`/`$TCP_Live` queries verbatim — but that is not a dedicated API path, and a real `/result` twin would still need a new async "not ready yet" polling contract (REST/MCP have no htmx auto-reissue equivalent). Both routes are otherwise reachable today only via the dashboard-only `GET /fragments/echo/process-tree/run` route, itself excluded (a dispatch-shaped GET batched with a later dispatch-twin effort, #3994). Revisit once that later batch ships `/run` (and `/result`) twins that mint these artifacts directly over the API.
 
-#### `GET /fragments/tar/capture-sources`
+#### `GET /fragments/echo/capture-sources`
 
-Render the **Capture sources** frame body for `/tar` (ADR-0015): an operator-scoped device picker plus a target the per-source toggle table loads into on host change.
+Render the **Capture sources** frame body for `/echo` (ADR-0015): an operator-scoped device picker plus a target the per-source toggle table loads into on host change.
 
 **Permission:** `Infrastructure:Read`.
 
-#### `GET /fragments/tar/capture-sources/load`
+#### `GET /fragments/echo/capture-sources/load`
 
-Self-re-issuing poll that dispatches `tar.status` + `tar.compatibility` to one selected device and renders the per-source toggle table (enable state, live-row count, per-OS support, category). First call dispatches and returns a polling fragment carrying the two command IDs; subsequent calls (`scmd`/`ccmd`/`n` params) poll until both complete.
+Self-re-issuing poll that dispatches `echo.status` + `echo.compatibility` to one selected device and renders the per-source toggle table (enable state, live-row count, per-OS support, category). First call dispatches and returns a polling fragment carrying the two command IDs; subsequent calls (`scmd`/`ccmd`/`n` params) poll until both complete.
 
-**Permission:** `Infrastructure:Read` (scoped to the device) + `Execution:Execute` (the read dispatches a live query). **Audit:** `tar.sources.read` at dispatch.
+**Permission:** `Infrastructure:Read` (scoped to the device) + `Execution:Execute` (the read dispatches a live query). **Audit:** `echo.sources.read` at dispatch.
 
 **Query params:** `device` (agent ID); `scmd`/`ccmd`/`n` (poll continuation, server-supplied).
 
-#### `POST /fragments/tar/capture-sources/push`
+#### `POST /fragments/echo/capture-sources/push`
 
-Apply staged capture-source enable/disable changes. The dashboard stages toggles client-side; Push dispatches one `tar.configure <source>_enabled=<bool>` per changed source (the accidental-enable guardrail — nothing dispatches until Push).
+Apply staged capture-source enable/disable changes. The dashboard stages toggles client-side; Push dispatches one `echo.configure <source>_enabled=<bool>` per changed source (the accidental-enable guardrail — nothing dispatches until Push).
 
 **Permission:** `Infrastructure:Read` (scoped) + `Execution:Execute`. Source names are validated against a fixed allowlist; values constrained to `on`/`off`.
 
 **Request body (form-encoded):** `device` (agent ID); `changes` (comma-separated `source=on|off`, e.g. `arp=on,dns=on`).
 
-**Audit:** `tar.sources.configure` — **one row per changed source**, `detail` = `<source>_enabled=<bool> command_id=<id>`.
+**Audit:** `echo.sources.configure` — **one row per changed source**, `detail` = `<source>_enabled=<bool> command_id=<id>`.
 
-#### `GET /fragments/tar/process-tree/device-net`
+#### `GET /fragments/echo/process-tree/device-net`
 
-Self-re-issuing poll that dispatches read-only `tar.sql` over `$DNS_Live` + `$ARP_Live` to the selected host and renders the device-level **DNS-cache** and **ARP-table** panels embedded in the process-tree pane (ADR-0015). **Device-level, not per-process** (the DNS cache carries no pid).
+Self-re-issuing poll that dispatches read-only `echo.sql` over `$DNS_Live` + `$ARP_Live` to the selected host and renders the device-level **DNS-cache** and **ARP-table** panels embedded in the process-tree pane (ADR-0015). **Device-level, not per-process** (the DNS cache carries no pid).
 
-**Permission:** `Infrastructure:Read` (scoped) + `Execution:Execute`. **Audit:** `tar.dns.read` **and** `tar.arp.read` (distinct verbs — DNS is usage-class PII, separately countable) at dispatch.
+**Permission:** `Infrastructure:Read` (scoped) + `Execution:Execute`. **Audit:** `echo.dns.read` **and** `echo.arp.read` (distinct verbs — DNS is usage-class PII, separately countable) at dispatch.
 
 **Query params:** `device`; `dcmd`/`acmd`/`n` (poll continuation, server-supplied).
 

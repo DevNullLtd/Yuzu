@@ -336,20 +336,37 @@ ManagementGroupStore::find_group_by_name(const std::string& name) const {
 }
 
 std::vector<ManagementGroup> ManagementGroupStore::list_groups() const {
-    std::vector<ManagementGroup> result;
-    if (!open_)
-        return result;
+    return list_groups_checked().value_or(std::vector<ManagementGroup>{});
+}
+
+std::optional<std::vector<ManagementGroup>> ManagementGroupStore::list_groups_checked() const {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonStoreClosed, sampler))
+            spdlog::warn("ManagementGroupStore::list_groups_checked: store not open");
+        return std::nullopt;
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
-        return result;
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn("ManagementGroupStore::list_groups_checked: pool acquire timed out");
+        return std::nullopt;
+    }
     pg::PgResult r = pg::exec_params(
         lease.get(),
         (std::string("SELECT ") + kGroupCols +
          " FROM management_group_store.management_groups ORDER BY name")
             .c_str(),
         std::vector<std::string>{});
-    if (r.status() != PGRES_TUPLES_OK)
-        return result;
+    if (r.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("ManagementGroupStore::list_groups_checked: query failed: {}",
+                         PQerrorMessage(lease.get()));
+        return std::nullopt;
+    }
+    std::vector<ManagementGroup> result;
     for (int i = 0; i < PQntuples(r.get()); ++i)
         result.push_back(read_group(r.get(), i));
     return result;
@@ -986,6 +1003,41 @@ size_t ManagementGroupStore::count_members(const std::string& group_id) const {
     if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) == 0)
         return 0;
     return static_cast<size_t>(to_i64(PQgetvalue(r.get(), 0, 0)));
+}
+
+std::optional<std::unordered_map<std::string, std::size_t>>
+ManagementGroupStore::count_members_by_group_checked() const {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonStoreClosed, sampler))
+            spdlog::warn("ManagementGroupStore::count_members_by_group_checked: store not open");
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn(
+                "ManagementGroupStore::count_members_by_group_checked: pool acquire timed out");
+        return std::nullopt;
+    }
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT group_id, COUNT(*) FROM management_group_store.management_group_members "
+        "GROUP BY group_id",
+        std::vector<std::string>{});
+    if (r.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("ManagementGroupStore::count_members_by_group_checked: query failed: {}",
+                         PQerrorMessage(lease.get()));
+        return std::nullopt;
+    }
+    std::unordered_map<std::string, std::size_t> result;
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        result.emplace(text_col(r.get(), i, 0),
+                       static_cast<std::size_t>(to_i64(PQgetvalue(r.get(), i, 1))));
+    return result;
 }
 
 } // namespace yuzu::server
