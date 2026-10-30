@@ -108,6 +108,7 @@ ModuleSignVerdict SigningCache::get(const std::string& full_path, std::int64_t m
 #include <atomic>
 #include <cstring> // std::memset (stale-session props reset)
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -306,6 +307,12 @@ private:
     HCATINFO info_;
 };
 
+// A second owner of either handle would release it twice.
+static_assert(!std::is_copy_constructible_v<CatAdminGuard> &&
+              !std::is_move_constructible_v<CatAdminGuard>);
+static_assert(!std::is_copy_constructible_v<CatInfoGuard> &&
+              !std::is_move_constructible_v<CatInfoGuard>);
+
 struct CatalogResult {
     CatalogLookup lookup{CatalogLookup::kError};
     std::string signer;
@@ -341,6 +348,9 @@ CatalogResult catalog_lookup_with(const wchar_t* algorithm, HANDLE image,
     if (hash.empty())
         return out;
 
+    // The API reports "no catalog lists this hash" only through GetLastError(); clear it so a
+    // stale ERROR_NOT_FOUND from an earlier call can never be read as this call's answer.
+    SetLastError(0);
     HCATINFO raw_info = CryptCATAdminEnumCatalogFromHash(
         admin.get(), hash.data(), static_cast<DWORD>(hash.size()), 0, nullptr);
     if (raw_info == nullptr) {
@@ -363,14 +373,13 @@ CatalogResult catalog_lookup_with(const wchar_t* algorithm, HANDLE image,
         tag.push_back(kHex[b >> 4]);
         tag.push_back(kHex[b & 0x0F]);
     }
-    std::wstring member_path = image_path; // WINTRUST_CATALOG_INFO takes non-const strings
 
     GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
     WINTRUST_CATALOG_INFO wci{};
     wci.cbStruct = sizeof(wci);
     wci.pcwszCatalogFilePath = catalog.wszCatalogFile;
-    wci.pcwszMemberTag = tag.data();
-    wci.pcwszMemberFilePath = member_path.data();
+    wci.pcwszMemberTag = tag.c_str();
+    wci.pcwszMemberFilePath = image_path.c_str();
     wci.hMemberFile = image;
     wci.pbCalculatedFileHash = hash.data();
     wci.cbCalculatedFileHash = static_cast<DWORD>(hash.size());

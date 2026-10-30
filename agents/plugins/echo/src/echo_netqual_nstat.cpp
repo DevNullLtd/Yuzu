@@ -8,7 +8,8 @@
 
 #include "echo_netqual_nstat.hpp"
 
-#include "echo_netqual.hpp" // nq_delta_clamped
+#include "echo_collectors.hpp" // tcp_state_is_closing
+#include "echo_netqual.hpp"   // nq_delta_clamped
 
 #include <macos_socket_walk.hpp> // socket_walk_tcp_state: pure TCPS_* -> name, shared with the libproc walk
 
@@ -318,8 +319,13 @@ NetworkEvent network_event_from_nstat_flow(const NstatFlowEvent& e, std::int64_t
     ev.local_port = e.local_port;
     ev.remote_addr = e.remote_addr;
     ev.remote_port = e.remote_port;
-    ev.state = e.is_open ? (e.state.empty() ? std::string{"ESTABLISHED"} : e.state)
-                         : std::string{"CLOSED"};
+    // An open event keeps the descriptor's state only when the socket is already ending
+    // (TIME_WAIT, CLOSE_WAIT, ...): that is what the closing-state rules and the hourly
+    // de-duplication key on. Every other state a live flow can report (SYN_SENT, SYN_RCVD,
+    // LISTEN, an unresolved one) stays the ESTABLISHED label this stream always stored, because
+    // the fleet-snapshot reader keeps only ESTABLISHED rows and nstat never upgrades a row.
+    ev.state = !e.is_open ? std::string{"CLOSED"}
+                          : (tcp_state_is_closing(e.state) ? e.state : std::string{"ESTABLISHED"});
     ev.pid = e.pid;
     ev.process_name = e.process_name;
     return ev;

@@ -417,8 +417,8 @@ TEST_CASE("nstat_decode_tcp_src_desc decodes the descriptor's TCP state into the
     CHECK(nstat_build_open_event(1'700'000'000, decode(4)).state == "ESTABLISHED");
 }
 
-TEST_CASE("network_event_from_nstat_flow stores the descriptor state, a default for an unresolved "
-          "one, and CLOSED for a close",
+TEST_CASE("network_event_from_nstat_flow keeps an ending descriptor state and labels every other "
+          "open state ESTABLISHED",
           "[echo][netqual][nstat]") {
     NstatFlowEvent open;
     open.ts_unix = 1'700'000'123;
@@ -450,6 +450,15 @@ TEST_CASE("network_event_from_nstat_flow stores the descriptor state, a default 
     // A descriptor that never resolved a state falls back to ESTABLISHED.
     open.state.clear();
     CHECK(network_event_from_nstat_flow(open, 42).state == "ESTABLISHED");
+
+    // Only an ending state is kept: a live flow in any other state keeps the ESTABLISHED label
+    // the fleet-snapshot reader (which keeps only ESTABLISHED rows) expects.
+    open.state = "SYN_SENT";
+    CHECK(network_event_from_nstat_flow(open, 42).state == "ESTABLISHED");
+    open.state = "LISTEN";
+    CHECK(network_event_from_nstat_flow(open, 42).state == "ESTABLISHED");
+    open.state = "CLOSE_WAIT";
+    CHECK(network_event_from_nstat_flow(open, 42).state == "CLOSE_WAIT");
 
     // A close event is stored CLOSED with the disconnected action, whatever it carried.
     NstatFlowEvent close = open;

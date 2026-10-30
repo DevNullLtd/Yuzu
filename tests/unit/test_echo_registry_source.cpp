@@ -2641,11 +2641,25 @@ TEST_CASE("registry live: set, change and delete through a pre-opened handle are
     DWORD one = 1, two = 2;
     run.transition([&] { RegSetValueExW(key.h, L"LiveVal", 0, REG_DWORD, reinterpret_cast<BYTE*>(&one), 4); },
                    mine("LiveVal", RegistryEtwOp::Set));
-    run.transition([&] { RegSetValueExW(key.h, L"LiveVal", 0, REG_DWORD, reinterpret_cast<BYTE*>(&two), 4); },
-                   mine("LiveVal", RegistryEtwOp::Set));
+    // The key's own LastWriteTime right after the second write: the row's time must be this, not
+    // the moment the reader happened to look. (No other writer touches this salted key.)
+    std::int64_t changed_written_unix = 0;
+    run.transition(
+        [&] {
+            RegSetValueExW(key.h, L"LiveVal", 0, REG_DWORD, reinterpret_cast<BYTE*>(&two), 4);
+            FILETIME ft{};
+            if (RegQueryInfoKeyW(key.h, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                 nullptr, nullptr, nullptr, nullptr, &ft) == ERROR_SUCCESS) {
+                const auto ft100ns = (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) |
+                                     ft.dwLowDateTime;
+                changed_written_unix =
+                    static_cast<std::int64_t>((ft100ns - 116444736000000000ULL) / 10000000ULL);
+            }
+        },
+        mine("LiveVal", RegistryEtwOp::Set));
     run.transition([&] { RegDeleteValueW(key.h, L"LiveVal"); }, mine("LiveVal", RegistryEtwOp::DeleteValue));
 
-    const auto rows = q(run.t.db, "SELECT action, data, prev_data, actor_pid, actor_image, detail, source "
+    const auto rows = q(run.t.db, "SELECT action, data, prev_data, actor_pid, actor_image, detail, source, ts "
                                   "FROM registry_live WHERE value_name = 'LiveVal' ORDER BY id");
     REQUIRE(rows.rows.size() == 3);
     CHECK(rows.rows[0][0] == "added");
@@ -2653,6 +2667,8 @@ TEST_CASE("registry live: set, change and delete through a pre-opened handle are
     CHECK(rows.rows[1][0] == "changed");
     CHECK(rows.rows[1][1] == "2");
     CHECK(rows.rows[1][2].empty()); // prev_data is not stored
+    REQUIRE(changed_written_unix > 0);
+    CHECK(std::stoll(rows.rows[1][7]) == changed_written_unix); // row time = the key's LastWriteTime
     CHECK(rows.rows[2][0] == "removed");
     CHECK(rows.rows[2][2].empty());
     const auto me = std::to_string(::GetCurrentProcessId());
@@ -2663,6 +2679,9 @@ TEST_CASE("registry live: set, change and delete through a pre-opened handle are
         CHECK(r[6] == "notify"); // the read was triggered by the key watch
     }
     CHECK(std::stoll(run.t.db.get_config("registry_attr_attributed", "0")) >= 3);
+    // The bam\State subtree is excluded at read and diff: no row, whatever else is watched.
+    CHECK(q(run.t.db, "SELECT COUNT(*) FROM registry_live WHERE lower(key_path) LIKE '%bam\\state%'")
+              .rows[0][0] == "0");
 }
 
 TEST_CASE("registry live: with the ETW leg disabled the same transitions land as attr:off",

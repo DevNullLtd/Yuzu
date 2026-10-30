@@ -806,15 +806,14 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // table is created, and the WAL switch writes page 1 of an empty file. On a database that
     // already has tables this is a no-op until a VACUUM converts it (vacuum_to_incremental).
     // Best effort -- the byte budget works without it, only the file shrinks more slowly.
-    char* err_msg = nullptr;
-    rc = sqlite3_exec(raw_db, "PRAGMA auto_vacuum=INCREMENTAL", nullptr, nullptr, &err_msg);
+    SqliteErrMsg pragma_err;
+    rc = sqlite3_exec(raw_db, "PRAGMA auto_vacuum=INCREMENTAL", nullptr, nullptr,
+                      pragma_err.addr());
     if (rc != SQLITE_OK)
-        spdlog::warn("EchoDatabase: PRAGMA auto_vacuum=INCREMENTAL failed: {}",
-                     err_msg ? err_msg : "unknown");
-    sqlite3_free(err_msg);
+        spdlog::warn("EchoDatabase: PRAGMA auto_vacuum=INCREMENTAL failed: {}", pragma_err.text());
 
     // WAL mode for concurrent read performance -- required for correctness
-    err_msg = nullptr;
+    char* err_msg = nullptr;
     rc = sqlite3_exec(raw_db, "PRAGMA journal_mode=WAL", nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
         std::string err = err_msg ? err_msg : "unknown";
@@ -841,14 +840,11 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // Cap the WAL file left behind after a checkpoint resets it. Without a limit a one-off
     // burst (a backlog drain, a large eviction) leaves the -wal file at its high-water mark
     // forever. Only bites when a checkpoint resets the WAL; a pinned reader defers it.
-    err_msg = nullptr;
     rc = sqlite3_exec(raw_db,
                       std::format("PRAGMA journal_size_limit={}", kEchoWalAllowanceBytes).c_str(),
-                      nullptr, nullptr, &err_msg);
+                      nullptr, nullptr, pragma_err.addr());
     if (rc != SQLITE_OK)
-        spdlog::warn("EchoDatabase: PRAGMA journal_size_limit failed: {}",
-                     err_msg ? err_msg : "unknown");
-    sqlite3_free(err_msg);
+        spdlog::warn("EchoDatabase: PRAGMA journal_size_limit failed: {}", pragma_err.text());
 
     // Schema v9: the base tables were renamed tar_* -> echo_*. This must run BEFORE the base
     // schema below, which would otherwise create empty echo_* tables beside the populated tar_*
@@ -3620,6 +3616,7 @@ StorageBytes EchoDatabase::storage_bytes_locked() {
             out.freelist_count = sqlite3_column_int64(stmt.get(), 1);
             out.page_size = sqlite3_column_int64(stmt.get(), 2);
             out.auto_vacuum = sqlite3_column_int64(stmt.get(), 3);
+            out.ok = true;
         }
     }
 

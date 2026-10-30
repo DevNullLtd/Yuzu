@@ -8,6 +8,11 @@
  * default) and cleared when the hour changes, so a restart or an overflow costs at most
  * one extra row per key, never a missed first sighting.
  *
+ * The hour follows the timestamps in BOTH directions: any change of hour clears the set. A
+ * single timestamp far in the future therefore costs one repeated row per key when the clock
+ * comes back, instead of pinning the set at the future hour and silently dropping every real
+ * row after it.
+ *
  * Pure and copyable on purpose. Callers filter against a COPY and assign it back only
  * after the rows are committed, so a rolled-back tick re-derives the same rows instead
  * of finding its keys already consumed.
@@ -28,13 +33,13 @@ public:
     explicit HourlySeenSet(std::size_t cap = kDefaultCap) : cap_(cap) {}
 
     /// True when `key` has not been seen in the hour containing `ts_unix` (and records it);
-    /// false when it was. A strictly later hour clears the set first. A timestamp from an
-    /// earlier hour is checked against the current set and never moves the hour backwards.
-    /// Admitting a NEW key into a full set clears the set and counts one overflow, so the
-    /// worst case is a repeated row, never a lost first row.
+    /// false when it was. A different hour, earlier or later, clears the set first and becomes
+    /// the current hour, so a timestamp that straddles an hour boundary (or one outlier) costs
+    /// a repeated row, never a lost first row. Admitting a NEW key into a full set clears the
+    /// set and counts one overflow, with the same worst case.
     [[nodiscard]] bool first_this_hour(int64_t ts_unix, std::string key) {
         const int64_t hour = hour_of(ts_unix);
-        if (hour > hour_) {
+        if (hour != hour_) {
             keys_.clear();
             hour_ = hour;
         }

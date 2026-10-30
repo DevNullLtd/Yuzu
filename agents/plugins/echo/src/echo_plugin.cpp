@@ -1133,7 +1133,14 @@ public:
             for (auto& src : cursor_sources_)
                 src->stop();
         }
-        db_.reset();
+        {
+            // A pool command (a manual `rollup`, or a `status` released from a VACUUM wait) can
+            // still be inside enforce_budget. Wait for that pass to finish rather than reset the
+            // database under it. collect_mu_ is already released, so the lock order
+            // rollup_mu_ -> collect_mu_ -> mu_ holds.
+            std::lock_guard rollup_lock(rollup_mu_);
+            db_.reset();
+        }
         spdlog::info("Echo plugin shut down");
     }
 
@@ -1163,11 +1170,15 @@ public:
     }
 
     int fail_internal(yuzu::CommandContext& ctx, const char* what) noexcept {
+        // Roll back FIRST (it is noexcept): the logger and the output sink can throw, and a
+        // swallowed throw must not leave the unwound transaction open on the shared connection.
+        if (db_)
+            db_->rollback_open_transaction();
         try {
+            // what() stays in the log only; the wire line is a fixed token because the text can
+            // carry paths and JSON fragments.
             spdlog::error("ECHO: action aborted by an exception: {}", what);
-            if (db_)
-                db_->rollback_open_transaction();
-            ctx.write_output(std::format("error|internal: {}", what));
+            ctx.write_output("error|internal");
         } catch (...) {
             // Containment of the containment: nothing may escape the catch handler.
         }
@@ -1226,11 +1237,21 @@ public:
 
     // ── pid -> name map (pid_name_) ───────────────────────────────────────────
     // Callers hold collect_mu_ (init runs before any trigger can fire).
-    void note_pid_start(std::uint32_t pid, const std::string& name) {
+    // `ts` (the event or tick time, epoch seconds) only ages out exited pids at the cap.
+    void note_pid_start(std::uint32_t pid, const std::string& name, std::int64_t ts) {
         if (pid == 0 || name.empty())
             return;
-        if (pid_name_.size() >= kPidNameCap && !pid_name_.contains(pid))
-            pid_name_.clear(); // wholesale flush, as the ETW consumer's cache does
+        if (pid_name_.size() >= kPidNameCap && !pid_name_.contains(pid)) {
+            // The stream leg never erases a stopped pid, so a busy host fills the map with dead
+            // ones. Entries past their grace window already resolve to "" and cost nothing to
+            // drop; flush wholesale (which forgets running pids too) only if that left no room.
+            std::erase_if(pid_name_, [ts](const auto& kv) {
+                return kv.second.exited_at != 0 &&
+                       ts - kv.second.exited_at > yuzu::echo::kPidNameGraceSec;
+            });
+            if (pid_name_.size() >= kPidNameCap)
+                pid_name_.clear(); // wholesale flush, as the ETW consumer's cache does
+        }
         pid_name_[pid] = yuzu::echo::PidName{name, 0};
     }
     // A stop never erases: loads and sockets of a just-exited process still resolve inside
@@ -1238,7 +1259,7 @@ public:
     void note_pid_names(const std::vector<yuzu::echo::ProcEvent>& evs) {
         for (const auto& e : evs) {
             if (e.is_start) {
-                note_pid_start(e.pid, e.image_name);
+                note_pid_start(e.pid, e.image_name, e.ts_unix);
             } else if (auto it = pid_name_.find(e.pid); it != pid_name_.end()) {
                 it->second.exited_at = e.ts_unix;
             }
@@ -1250,7 +1271,7 @@ public:
     // observed again after a stamp is reset to running by note_pid_start.
     void note_pid_names(const std::vector<yuzu::agent::ProcessInfo>& procs, std::int64_t ts) {
         for (const auto& p : procs)
-            note_pid_start(p.pid, p.name);
+            note_pid_start(p.pid, p.name, ts);
         yuzu::echo::note_pid_exits(pid_name_, procs, ts);
     }
 
@@ -1463,12 +1484,13 @@ private:
     yuzu::echo::HourlySeenSet module_seen_;
     std::atomic<std::uint64_t> tcp_closing_overflows_{0};
     std::atomic<std::uint64_t> module_overflows_{0};
-    // Bytes data + WAL sat above the budget when the last maintenance pass (or catch-up slice)
-    // finished its hygiene; 0 within budget. Written under rollup_mu_, read lock-free by status.
-    std::atomic<std::int64_t> budget_over_{0};
     // Set when a pass ran out of time with evictable rows left and data still over target:
     // each fast tick then runs one more bounded slice (do_collect_fast) until it clears.
     std::atomic<bool> budget_catch_up_{false};
+    // The conversion-VACUUM deferral time when the persisted marker could not be written: it
+    // keeps the retry at most daily for this process. 0 = none. Written under rollup_mu_, read
+    // lock-free by status.
+    std::atomic<std::int64_t> vacuum_marker_fallback_{0};
 
     // Cursor-model sources (echo_cursor.hpp: power, removable — wave 2). Built
     // once in init() from make_cursor_sources() (empty this wave); NOT a
@@ -3022,13 +3044,26 @@ private:
         ctx.write_output(std::format("db_size_bytes|{}", s.db_size_bytes));
         ctx.write_output(std::format("retention_days|{}", s.retention_days));
         // Byte budget (db_budget_bytes): db_size_bytes above is used pages + WAL, the figure the
-        // budget is enforced against. budget_over_bytes is how far data + WAL sat above it when
-        // the last maintenance pass finished its hygiene; it can be non-zero while an echo.sql
-        // read pins the WAL (the budget is hard for data pages, soft for the WAL).
+        // budget is enforced against. budget_over_bytes is how far data + WAL sit above it right
+        // now (measured here, not cached, so it is true before the first pass too); it can be
+        // non-zero while an echo.sql read pins the WAL (the budget is hard for data pages, soft
+        // for the WAL). Either figure is `unknown` when its input could not be read: an
+        // unreadable setting or size is not "within budget".
         {
-            ctx.write_output(std::format("db_budget_bytes|{}", configured_budget_bytes()));
-            ctx.write_output(std::format("budget_over_bytes|{}",
-                                         budget_over_.load(std::memory_order_relaxed)));
+            const auto budget = yuzu::echo::budget_from_config(
+                db_->try_get_config(std::string{yuzu::echo::kDbBudgetKey}));
+            const auto sb = db_->storage_bytes();
+            if (budget)
+                ctx.write_output(std::format("db_budget_bytes|{}", *budget));
+            else
+                ctx.write_output("db_budget_bytes|unknown");
+            if (budget && sb.ok) {
+                ctx.write_output(std::format(
+                    "budget_over_bytes|{}",
+                    yuzu::echo::budget_over_bytes(sb.data_bytes(), sb.wal_bytes, *budget)));
+            } else {
+                ctx.write_output("budget_over_bytes|unknown");
+            }
             ctx.write_output(std::format(
                 "budget_evicted_raw_rows_total|{}",
                 db_->get_config(std::string{yuzu::echo::kBudgetEvictedRawKey}, "0")));
@@ -3038,12 +3073,10 @@ private:
             // incremental: auto_vacuum is on. deferred: a conversion VACUUM was wanted but the
             // volume lacked the free space (or it failed); retried at most daily. none: a file
             // created before auto_vacuum existed that has not needed the conversion yet.
-            const bool deferred =
-                db_->get_config(std::string{yuzu::echo::kAutoVacuumDeferredKey}, "0") != "0";
-            ctx.write_output(std::format(
-                "db_auto_vacuum|{}", db_->storage_bytes().auto_vacuum == 2
-                                         ? "incremental"
-                                         : (deferred ? "deferred" : "none")));
+            const bool deferred = deferred_marker() > 0;
+            ctx.write_output(std::format("db_auto_vacuum|{}",
+                                         sb.auto_vacuum == 2 ? "incremental"
+                                                             : (deferred ? "deferred" : "none")));
             ctx.write_output(std::format("module_dedup_overflow_total|{}",
                                          module_overflows_.load(std::memory_order_relaxed)));
             ctx.write_output(std::format("tcp_closing_dedup_overflow_total|{}",
@@ -4105,20 +4138,21 @@ private:
         }
 
         // ── Phase 2: persist (every parameter above is already validated) ────
-        if (days > 0) {
-            db_->set_config("retention_days", std::string{retention});
-            ctx.write_output(std::format("config|retention_days|{}", retention));
-            changed = true;
-        }
         if (budget_bytes) {
-            // Checked: this control gates deletes, so a value that did not persist must not be
-            // reported as applied.
+            // The only checked write, so it goes FIRST: this control gates deletes, a value that
+            // did not persist must not be reported as applied, and its failure must leave nothing
+            // else half-applied (retention_days below is unchecked and cannot fail the call).
             if (!db_->set_config(std::string{yuzu::echo::kDbBudgetKey},
                                  std::to_string(*budget_bytes))) {
                 ctx.write_output("error|db_budget_bytes could not be saved");
                 return 1;
             }
             ctx.write_output(std::format("config|db_budget_bytes|{}", *budget_bytes));
+            changed = true;
+        }
+        if (days > 0) {
+            db_->set_config("retention_days", std::string{retention});
+            ctx.write_output(std::format("config|retention_days|{}", retention));
             changed = true;
         }
         if (fast_secs > 0) {
@@ -4425,34 +4459,65 @@ private:
         // retention so each tier consumes the tier below it before retention can
         // delete from it.
         int total = yuzu::echo::run_aggregation(*db_, ts);
+
+        // Retention's clock guard has a verdict on `ts`: a fresh decline (a big wall-clock step,
+        // an implausible or ahead-of-clock anchor) or a failed read means this pass's clock
+        // cannot be trusted to delete anything. Every budget floor derives from the same `ts`
+        // and aggregation has just stamped its marks with it, so a clock the guard refused must
+        // not drive eviction either. Same semantics as retention: a FRESH anomaly declines the
+        // pass; a suppressed repeat is paced and drains on a later pass.
+        const auto guard_events = [this] {
+            const auto c = yuzu::echo::retention_guard_counters(retention_guard_);
+            std::int64_t n = 0;
+            for (const auto& kv : c.declines)
+                n += kv.second;
+            for (const auto& kv : c.failures)
+                n += kv.second;
+            return n;
+        };
+        const std::int64_t guard_before = guard_events();
         yuzu::echo::run_retention(*db_, ts, retention_guard_);
-        // Then the byte budget, the one-off VACUUM gate and file hygiene: eviction takes only
-        // rows aggregation has already summarised, so it must follow it.
-        enforce_budget(ts, /*maintenance_pass=*/true);
+        if (guard_events() > guard_before) {
+            {
+                // Surfaced as `retention_guard|__budget__|N` on the existing status contract.
+                std::lock_guard guard_lock(retention_guard_.mu);
+                ++retention_guard_.declines["__budget__"];
+            }
+            // A catch-up slice armed by an earlier pass must not run on this clock either.
+            budget_catch_up_.store(false, std::memory_order_relaxed);
+            spdlog::warn("ECHO: byte budget pass skipped: the retention clock guard refused this "
+                         "pass's clock reading");
+        } else {
+            // Then the byte budget, the one-off VACUUM gate and file hygiene: eviction takes only
+            // rows aggregation has already summarised, so it must follow it.
+            enforce_budget(ts, /*maintenance_pass=*/true);
+        }
         ctx.write_output(std::format("echo|rollup|{}|rows_aggregated", total));
         return 0;
     }
 
     // ── byte budget: eviction, VACUUM gate, file hygiene ─────────────────────
 
-    // The configured db_budget_bytes; an unset, unparseable or below-minimum stored value (a
-    // row edited outside the plugin) falls back to the default rather than to "no budget".
-    int64_t configured_budget_bytes() {
-        return yuzu::echo::parse_budget_bytes(
-                   db_->get_config(std::string{yuzu::echo::kDbBudgetKey}, ""))
-            .value_or(yuzu::echo::kEchoDbBudgetBytesDefault);
-    }
-
     // One bounded eviction pass plus the post-pass hygiene. Runs in the 15-minute maintenance
     // pass (`maintenance_pass`, which also gates the one-off conversion VACUUM) and as the
     // catch-up slice of a fast tick. The caller holds rollup_mu_.
     void enforce_budget(std::int64_t now_ts, bool maintenance_pass) {
-        const std::int64_t budget = configured_budget_bytes();
+        // Tri-state: an unreadable budget is NOT the default. Falling back to 250 MiB would
+        // delete down to a smaller target than the operator configured.
+        const auto configured = yuzu::echo::budget_from_config(
+            db_->try_get_config(std::string{yuzu::echo::kDbBudgetKey}));
+        if (!configured) {
+            budget_catch_up_.store(false, std::memory_order_relaxed);
+            spdlog::warn("ECHO: db_budget_bytes could not be read; the byte budget pass was "
+                         "skipped and is retried at the next pass");
+            return;
+        }
+        const std::int64_t budget = *configured;
         const std::int64_t target = budget - yuzu::echo::kEchoWalAllowanceBytes;
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::milliseconds(yuzu::echo::kBudgetPassDeadlineMs);
-        const auto res = yuzu::echo::run_budget(
-            *db_, now_ts, target, [&] { return std::chrono::steady_clock::now() < deadline; });
+        const auto time_left = [&] { return std::chrono::steady_clock::now() < deadline; };
+        const auto res = yuzu::echo::run_budget(*db_, now_ts, target, time_left);
 
         // Another slice on the next fast tick only when this one ran out of time with rows left
         // to evict. A failed pass is retried by the next maintenance pass, not hammered.
@@ -4468,45 +4533,73 @@ private:
         if (maintenance_pass && res.exhausted) {
             spdlog::warn("ECHO: echo.db data ({} bytes) is above its {} byte target and nothing "
                          "more is eligible to evict (newest 24 h of raw capture rows, hourly "
-                         "rows under 48 h, daily and monthly rows, paused sources and sources "
-                         "without a summary tier are never evicted)",
+                         "rows under 48 h (5 d for procperf), daily and monthly rows, paused "
+                         "sources and sources without a summary tier are never evicted)",
                          res.data_bytes_after, target);
         }
 
         if (maintenance_pass)
-            maybe_vacuum_to_incremental(now_ts, target);
+            maybe_vacuum_to_incremental(now_ts, target, res.exhausted);
 
-        // Hygiene: hand a bounded number of free pages back to the OS, then checkpoint. TRUNCATE
-        // (reclaims the WAL file) when rows were evicted or the WAL outgrew its allowance --
-        // the recovery from a pinned reader, retried every pass and slice; PASSIVE otherwise.
-        // The checkpoint never waits: a busy result means a reader pins the WAL and is retried.
-        db_->incremental_vacuum(256);
-        const bool truncate = evicted > 0 || db_->storage_bytes().wal_bytes >
-                                                 yuzu::echo::kEchoWalAllowanceBytes;
+        // Hygiene: hand free pages back to the OS while the pass deadline allows (at least one
+        // call, as before; only an incremental-auto_vacuum file has any to hand back, and the
+        // guard stops the loop burning the deadline on a file where the call is a no-op), then
+        // checkpoint. TRUNCATE (reclaims the WAL file) when rows were evicted or the WAL outgrew
+        // its allowance -- the recovery from a pinned reader, retried every pass and slice;
+        // PASSIVE otherwise. The checkpoint never waits: a busy result means a reader pins the
+        // WAL and is retried.
+        const auto has_free_pages = [this] {
+            const auto sb = db_->storage_bytes();
+            return sb.ok && sb.auto_vacuum == 2 && sb.freelist_count > 0;
+        };
+        do {
+            db_->incremental_vacuum(256);
+        } while (time_left() && has_free_pages());
+        const auto wal = db_->storage_bytes();
+        const bool truncate = evicted > 0 || (wal.ok && wal.wal_bytes >
+                                                            yuzu::echo::kEchoWalAllowanceBytes);
         if (db_->checkpoint(truncate ? yuzu::echo::CheckpointMode::kTruncate
                                      : yuzu::echo::CheckpointMode::kPassive) ==
             yuzu::echo::CheckpointResult::kBusy) {
             spdlog::debug("ECHO: WAL checkpoint busy (a reader pins the WAL); retrying next pass");
         }
+    }
 
-        // Measured last, after hygiene, so it describes the state the operator sees.
-        const auto sb = db_->storage_bytes();
-        budget_over_.store(yuzu::echo::budget_over_bytes(sb.data_bytes(), sb.wal_bytes, budget),
-                           std::memory_order_relaxed);
+    // The conversion-deferral time: the persisted marker (0 when absent, unreadable or not a
+    // whole non-negative number), else the in-memory copy kept when the marker write failed.
+    // The one reader behind both the VACUUM decision and the status line.
+    std::int64_t deferred_marker() {
+        const auto text = db_->get_config(std::string{yuzu::echo::kAutoVacuumDeferredKey}, "0");
+        std::int64_t at = 0;
+        const auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), at);
+        if (ec != std::errc{} || p != text.data() + text.size() || at < 0)
+            at = 0;
+        return at > 0 ? at : vacuum_marker_fallback_.load(std::memory_order_relaxed);
+    }
+
+    // Persist the deferral time. A write that fails keeps an in-memory copy so a database that
+    // cannot store the marker still retries at most daily within this process.
+    void set_deferred_marker(std::int64_t value) {
+        const bool stored = db_->set_config(std::string{yuzu::echo::kAutoVacuumDeferredKey},
+                                            std::to_string(value));
+        vacuum_marker_fallback_.store(stored ? 0 : value, std::memory_order_relaxed);
     }
 
     // The one-off conversion of a pre-existing database to incremental auto_vacuum. Never at
-    // boot; only here, once eviction has brought data under target and the file holds many
-    // free pages. Too little free disk (or a failed VACUUM) records the time and retries at
-    // most daily; status shows db_auto_vacuum|deferred until a conversion succeeds (the marker
-    // is not cleared when a later pass finds the freelist too small to warrant one).
-    void maybe_vacuum_to_incremental(std::int64_t now_ts, std::int64_t target) {
+    // boot; only here, once eviction has brought data under target (or has nothing left to
+    // evict) and the file holds many free pages. Too little free disk (or a failed VACUUM)
+    // records the time and retries at most daily; status shows db_auto_vacuum|deferred until a
+    // conversion succeeds (the marker is not cleared when a later pass finds the freelist too
+    // small to warrant one). The VACUUM runs on the single interval-trigger thread with the
+    // database lock held, so it stalls the agent's triggers for its duration; it is bounded by
+    // the operator's budget (it runs only when the used data is under it and copies used pages
+    // only) and happens once per database.
+    void maybe_vacuum_to_incremental(std::int64_t now_ts, std::int64_t target,
+                                     bool eviction_exhausted) {
         const auto sb = db_->storage_bytes();
-        std::int64_t deferred_at = 0;
-        {
-            const auto text = db_->get_config(std::string{yuzu::echo::kAutoVacuumDeferredKey}, "0");
-            std::from_chars(text.data(), text.data() + text.size(), deferred_at);
-        }
+        if (!sb.ok)
+            return; // cannot size the decision; the next pass retries
+        const std::int64_t deferred_at = deferred_marker();
         // An unreadable volume counts as no free space: defer rather than risk a full disk.
         std::error_code ec;
         const auto space = std::filesystem::space(db_path_.parent_path(), ec);
@@ -4515,28 +4608,42 @@ private:
                : static_cast<std::int64_t>(std::min<std::uintmax_t>(
                      space.available, static_cast<std::uintmax_t>(INT64_MAX)));
 
-        const std::string_view deferred_key = yuzu::echo::kAutoVacuumDeferredKey;
         switch (yuzu::echo::vacuum_decision(sb.auto_vacuum, sb.data_bytes(), target,
                                             sb.freelist_bytes(), sb.file_bytes(), free_disk,
-                                            deferred_at, now_ts)) {
+                                            deferred_at, now_ts, eviction_exhausted)) {
         case yuzu::echo::VacuumAction::kSkip:
             break;
         case yuzu::echo::VacuumAction::kDefer:
             spdlog::warn("ECHO: not converting echo.db to incremental auto_vacuum yet: {} bytes "
                          "free on its volume, {} needed; retrying within a day",
                          free_disk, 2 * sb.data_bytes());
-            db_->set_config(std::string{deferred_key}, std::to_string(now_ts));
+            set_deferred_marker(now_ts);
             break;
-        case yuzu::echo::VacuumAction::kRun:
+        case yuzu::echo::VacuumAction::kRun: {
             spdlog::info("ECHO: converting echo.db to incremental auto_vacuum (one-off VACUUM; "
                          "collectors pause while it runs)");
-            if (db_->vacuum_to_incremental()) {
-                db_->set_config(std::string{deferred_key}, "0");
+            // The attempt is recorded BEFORE the VACUUM and cleared on success, so a crash or a
+            // watchdog kill mid-VACUUM bounds the repeat to daily instead of every boot.
+            set_deferred_marker(now_ts);
+            const auto started = std::chrono::steady_clock::now();
+            const bool converted = db_->vacuum_to_incremental();
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - started)
+                                .count();
+            const auto after = db_->storage_bytes();
+            if (converted) {
+                set_deferred_marker(0);
+                spdlog::info("ECHO: auto_vacuum conversion finished in {} ms (used {} -> {} "
+                             "bytes, file {} -> {} bytes)",
+                             ms, sb.data_bytes(), after.data_bytes(), sb.file_bytes(),
+                             after.file_bytes());
             } else {
-                spdlog::warn("ECHO: the auto_vacuum conversion VACUUM failed; retrying within a day");
-                db_->set_config(std::string{deferred_key}, std::to_string(now_ts));
+                spdlog::warn("ECHO: the auto_vacuum conversion VACUUM failed after {} ms; "
+                             "retrying within a day",
+                             ms);
             }
             break;
+        }
         }
     }
 

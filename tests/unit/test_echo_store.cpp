@@ -5,6 +5,7 @@
  * stats, config get/set, state get/set.
  */
 
+#include "echo_aggregator.hpp" // run_budget: the failed-measurement case
 #include "echo_db.hpp"
 #include "echo_netqual.hpp"
 #include "echo_netqual_boot.hpp"
@@ -3755,10 +3756,13 @@ TEST_CASE("EchoDatabase: db_size_bytes is used pages plus the WAL, not the file 
           "[echo][store][budget]") {
     auto t = make_test_db();
     insert_tcp_rows(t.db, 3000, 1000);
-    REQUIRE(t.db.execute_sql("DELETE FROM tcp_live WHERE id % 2 = 0")); // free pages
+    // A contiguous range empties whole pages (every-other-row deletes may free none), and the
+    // case is only meaningful with a non-empty freelist: used pages differ from the file then.
+    REQUIRE(t.db.execute_sql("DELETE FROM tcp_live WHERE id <= 2000"));
 
     const int64_t page_count = pragma_int(t.db, "page_count");
     const int64_t freelist = pragma_int(t.db, "freelist_count");
+    REQUIRE(freelist > 0);
     const int64_t page_size = pragma_int(t.db, "page_size");
     std::error_code ec;
     const auto wal = fs::file_size(fs::path{t.path.string() + "-wal"}, ec);
@@ -3772,6 +3776,63 @@ TEST_CASE("EchoDatabase: db_size_bytes is used pages plus the WAL, not the file 
     CHECK(t.db.stats().db_size_bytes == (page_count - freelist) * page_size + wal_bytes);
     CHECK(sb.data_bytes() == (page_count - freelist) * page_size);
     CHECK(sb.file_bytes() == page_count * page_size);
+}
+
+namespace {
+
+// Denies the pragma reads behind storage_bytes() while `deny` is set (an authorizer is how a
+// failing measurement is injected without a production hook).
+struct PragmaDenier {
+    bool deny{false};
+};
+
+int deny_pragma_reads(void* user, int action, const char* arg1, const char*, const char*,
+                      const char*) {
+    if (!static_cast<const PragmaDenier*>(user)->deny)
+        return SQLITE_OK;
+    if (action == SQLITE_PRAGMA)
+        return SQLITE_DENY;
+    if (action == SQLITE_READ && arg1 != nullptr && std::string_view{arg1}.starts_with("pragma_"))
+        return SQLITE_DENY;
+    return SQLITE_OK;
+}
+
+} // namespace
+
+TEST_CASE("EchoDatabase: a failed size measurement is reported as failed, never as an empty database",
+          "[echo][store][budget][chaos]") {
+    PragmaDenier denier; // outlives the database that holds a pointer to it
+    auto t = make_test_db();
+    insert_tcp_rows(t.db, 200, 1000);
+    REQUIRE(t.db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
+        sqlite3_set_authorizer(h.raw(), deny_pragma_reads, &denier);
+        return {};
+    }));
+
+    // Positive control: with the injector off the measurement is real.
+    const auto healthy = t.db.storage_bytes();
+    REQUIRE(healthy.ok);
+    CHECK(healthy.page_count > 0);
+    CHECK(healthy.page_size > 0);
+
+    denier.deny = true;
+    const auto failed = t.db.storage_bytes();
+    CHECK_FALSE(failed.ok);
+    CHECK(failed.data_bytes() == 0); // all zero: the reason callers must look at `ok`
+    // The eviction pass treats it as a failure, not as "within budget" (and so does not evict).
+    const auto res = yuzu::echo::run_budget(t.db, 1'700'000'000, /*target_bytes=*/0, [] { return true; });
+    CHECK(res.failed);
+    CHECK_FALSE(res.exhausted);
+    CHECK(res.evicted_raw == 0);
+    CHECK(res.evicted_hourly == 0);
+    denier.deny = false;
+    CHECK(t.db.storage_bytes().ok);
+    CHECK(count_table_rows(t.db, "tcp_live") == 200);
+
+    // A closed store is the same shape.
+    EchoDatabase moved = std::move(t.db);
+    CHECK_FALSE(t.db.storage_bytes().ok);
+    t.db = std::move(moved); // hand it back so the fixture's destructor sees a live handle
 }
 
 TEST_CASE("EchoDatabase: set_state with identical JSON is a no-op, a change rewrites",
@@ -3917,6 +3978,78 @@ TEST_CASE("EchoDatabase: set_config and set_state refuse to join a transaction l
     CHECK(t.db.set_state("yuzu_test_collector", "{\"after\":1}"));
     CHECK(t.db.get_config("yuzu_test_key", "") == "after");
     CHECK(t.db.get_state("yuzu_test_collector") == "{\"after\":1}");
+}
+
+TEST_CASE("EchoDatabase: an interrupted conversion VACUUM leaves the file intact and a retry works",
+          "[echo][store][budget][chaos]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_av_interrupt_"};
+    {
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open(tmp.path.string().c_str(), &owner.db) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(owner.db,
+                             "PRAGMA auto_vacuum=0; CREATE TABLE yuzu_test_pad(x BLOB);"
+                             "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1500) "
+                             "INSERT INTO yuzu_test_pad SELECT zeroblob(4000) FROM n;"
+                             "DELETE FROM yuzu_test_pad WHERE rowid % 4 != 0;",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+
+    // A progress handler installed through the transaction handle's raw connection (it outlives
+    // the transaction). It counts every callback and, once armed, interrupts the statement that
+    // makes callback number `interrupt_after + 1`.
+    struct Interrupter {
+        bool armed{false};
+        int calls{0};
+        int interrupt_after{0};
+    } interrupter;
+    REQUIRE(db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
+        sqlite3_progress_handler(
+            h.raw(), 1,
+            [](void* p) -> int {
+                auto* i = static_cast<Interrupter*>(p);
+                ++i->calls;
+                return (i->armed && i->calls > i->interrupt_after) ? 1 : 0;
+            },
+            &interrupter);
+        return {};
+    }));
+
+    const auto before = db.storage_bytes();
+    REQUIRE(before.ok);
+    REQUIRE(before.auto_vacuum == 0);
+    REQUIRE(before.freelist_count > 0);
+
+    // vacuum_to_incremental() runs `PRAGMA auto_vacuum=INCREMENTAL` and then VACUUM. Measure how
+    // many callbacks the PRAGMA alone makes, so the interrupt lands inside the VACUUM and not in
+    // the PRAGMA that precedes it (an interrupted PRAGMA would prove nothing about the VACUUM).
+    interrupter.calls = 0;
+    REQUIRE(db.execute_sql("PRAGMA auto_vacuum=INCREMENTAL"));
+    const int pragma_calls = interrupter.calls;
+
+    interrupter.calls = 0;
+    interrupter.interrupt_after = pragma_calls;
+    interrupter.armed = true;
+    CHECK_FALSE(db.vacuum_to_incremental());
+    interrupter.armed = false;
+    CHECK(interrupter.calls > pragma_calls); // the injector fired inside the VACUUM
+
+    // Nothing half-converted: still the original file, still sound.
+    const auto after = db.storage_bytes();
+    CHECK(after.auto_vacuum == 0);
+    CHECK(after.page_count == before.page_count);
+    CHECK(after.freelist_count == before.freelist_count);
+    auto integrity = db.execute_query("PRAGMA integrity_check", 5);
+    REQUIRE(integrity.has_value());
+    REQUIRE(integrity->rows.size() == 1);
+    CHECK(integrity->rows[0][0] == "ok");
+    CHECK(db.get_config("retention_days", "") == "7");
+
+    // And the interruption is not sticky: the next attempt converts.
+    REQUIRE(db.vacuum_to_incremental());
+    CHECK(db.storage_bytes().auto_vacuum == 2);
 }
 
 TEST_CASE("EchoDatabase: a pre-auto_vacuum database converts with one VACUUM",

@@ -237,6 +237,7 @@ struct TcpDescriptor {
     std::uint8_t reserved[3]{};
 };
 static_assert(sizeof(TcpDescriptor) == 336);
+static_assert(offsetof(TcpDescriptor, state) == 76); // read by nstat_decode_tcp_src_desc
 static_assert(offsetof(TcpDescriptor, pid) == 116);
 static_assert(offsetof(TcpDescriptor, epid) == 120);
 static_assert(offsetof(TcpDescriptor, local) == 124);

@@ -923,16 +923,16 @@ TEST_CASE("Echo tcp events: 20,001 distinct closing remotes in an hour overflow 
     CHECK(ev.size() == 20'001); // every first sighting is still a row; the clear only costs repeats
 }
 
-TEST_CASE("Echo HourlySeenSet: hour boundary clears, an earlier ts never rewinds",
+TEST_CASE("Echo HourlySeenSet: any change of hour clears the set",
           "[echo][diff][dedup]") {
     HourlySeenSet seen;
     constexpr std::int64_t kHour = 1'699'999'200;
     CHECK(seen.first_this_hour(kHour + 10, "k"));
     CHECK_FALSE(seen.first_this_hour(kHour + 3599, "k"));
-    CHECK(seen.first_this_hour(kHour + 3600, "k"));      // strictly later hour: cleared
-    CHECK_FALSE(seen.first_this_hour(kHour + 10, "k"));  // earlier ts: checked against the set
-    CHECK(seen.first_this_hour(kHour + 10, "other"));    // ... and never moves the hour back
-    CHECK_FALSE(seen.first_this_hour(kHour + 3700, "other"));
+    CHECK(seen.first_this_hour(kHour + 3600, "k"));       // a later hour: cleared
+    CHECK_FALSE(seen.first_this_hour(kHour + 3700, "k")); // same (later) hour: remembered
+    CHECK(seen.first_this_hour(kHour + 10, "k"));         // an earlier hour: cleared too
+    CHECK_FALSE(seen.first_this_hour(kHour + 20, "k"));
     // A negative (dead-RTC) stamp lands in a stable hour rather than rounding toward zero.
     HourlySeenSet neg;
     CHECK(neg.first_this_hour(-1, "k"));
@@ -943,6 +943,28 @@ TEST_CASE("Echo HourlySeenSet: hour boundary clears, an earlier ts never rewinds
     CHECK(small.first_this_hour(0, "c")); // full: cleared, one overflow
     CHECK(small.overflows() == 1);
     CHECK_FALSE(small.first_this_hour(0, "c"));
+}
+
+TEST_CASE("Echo HourlySeenSet: one future-dated tick does not silence the real hours after it",
+          "[echo][diff][dedup][chaos]") {
+    // A clock excursion that stamps one event a year ahead must cost at most one repeated row
+    // per key when real timestamps resume. Pinned at the future hour, the set used to answer
+    // "seen" for every later real hour until it overflowed: silent loss of first sightings.
+    constexpr std::int64_t kReal = 1'699'999'200;
+    constexpr std::int64_t kYear = 365 * 86400;
+    HourlySeenSet seen;
+    CHECK(seen.first_this_hour(kReal + kYear, "a"));
+    CHECK(seen.first_this_hour(kReal, "k"));            // the real hour is not pinned out
+    CHECK_FALSE(seen.first_this_hour(kReal + 60, "k")); // ... and dedups again within it
+    CHECK(seen.first_this_hour(kReal + 7200, "k"));     // the next real hour re-admits
+
+    // Same excursion through the tcp rule: a closing socket stamped in the future, then real time.
+    HourlySeenSet tcp_seen;
+    const auto tw = tcp_conn(40000, "203.0.113.10", 443, "TIME_WAIT", 7, "curl");
+    CHECK(net_events({}, {tw}, kReal + kYear, tcp_seen).size() == 1);
+    const auto tw2 = tcp_conn(40001, "203.0.113.11", 443, "TIME_WAIT", 7, "curl");
+    CHECK(net_events({}, {tw2}, kReal, tcp_seen).size() == 1);
+    CHECK(net_events({}, {tw2}, kReal + 7200, tcp_seen).size() == 1);
 }
 
 TEST_CASE("Echo fill_process_names: fills empty names by pid, keeps a name, ignores pid 0",

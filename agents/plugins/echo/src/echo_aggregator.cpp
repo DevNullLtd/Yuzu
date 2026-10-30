@@ -458,16 +458,14 @@ namespace audit_retention = yuzu::server::audit_retention;
 // warehouse table can collide with.
 constexpr std::string_view kClockStateFailureKey = "__clock_state__";
 
-// UPPER bound only, same role as the audit sibling's `kMaxPlausibleNow`
-// (audit_store.cpp) -- a NEGATIVE reading is the legitimate dead-CMOS case this
-// whole guard exists for and must never be rejected on sign alone. Guards two
-// things: `horizon = now_epoch + kEchoRetentionFutureSlackSec` below, one
-// addition away from signed overflow with no clamp at all; and the durable
-// anchor write a few lines down, which -- unlike the arithmetic -- is not a UB
-// concern but a PERSISTENCE one: an implausible `now_epoch` persisted as
-// `kRetentionLastPassKey` poisons every future pass's elapsed-time check, not
-// just this one.
-constexpr int64_t kEchoMaxPlausibleNow = std::numeric_limits<int64_t>::max() / 4;
+// kEchoMaxPlausibleNow (echo_aggregator.hpp): UPPER bound only, same role as the audit
+// sibling's `kMaxPlausibleNow` (audit_store.cpp) -- a NEGATIVE reading is the legitimate
+// dead-CMOS case this whole guard exists for and must never be rejected on sign alone. Guards
+// two things: `horizon = now_epoch + kEchoRetentionFutureSlackSec` below, one addition away
+// from signed overflow with no clamp at all; and the durable anchor write a few lines down,
+// which -- unlike the arithmetic -- is not a UB concern but a PERSISTENCE one: an implausible
+// `now_epoch` persisted as `kRetentionLastPassKey` poisons every future pass's elapsed-time
+// check, not just this one.
 
 // Reported when `now_epoch` itself is implausible, BEFORE anything about the
 // stored anchor is examined. Deliberately a distinct sentinel from
@@ -929,7 +927,7 @@ struct BudgetCandidate {
     std::string ts_col;
     int64_t cutoff{0};       // rows with ts_col < cutoff are eligible
     std::string extra;       // " AND id <= N" for process_live, else empty
-    bool exhausted{false};   // a batch deleted nothing (or the table is empty)
+    bool exhausted{false};   // a batch deleted nothing, the table is empty, or it failed
 };
 
 int64_t parse_i64_or(const std::string& text, int64_t fallback) {
@@ -941,30 +939,55 @@ int64_t parse_i64_or(const std::string& text, int64_t fallback) {
     return fallback;
 }
 
+// Structural raw-tier eligibility, registry only: the first non-live granularity that has a
+// rollup (the tier whose mark bounds what is provably summarised), or empty when the source's
+// raw rows are the record and must never be evicted. usage_* is the usage fold's own state;
+// netconn, power, removable, registry and netqual have no summary tier. This is the one
+// definition behind both budget_raw_eligible_sources() and raw_budget_candidates().
+std::string_view raw_budget_rollup_tier(const CaptureSourceDef& src) {
+    if (src.name == "usage")
+        return {};
+    bool has_live = false;
+    std::string_view first_rollup_tier;
+    for (const auto& g : src.granularities) {
+        if (g.suffix == "live") {
+            has_live = true;
+        } else if (first_rollup_tier.empty() && !rollup_sql(src.name, g.suffix).empty()) {
+            first_rollup_tier = g.suffix;
+        }
+    }
+    return has_live ? first_rollup_tier : std::string_view{};
+}
+
+// Structural hourly-tier eligibility: any non-usage source with an hourly summary table.
+bool has_hourly_budget_tier(const CaptureSourceDef& src) {
+    if (src.name == "usage")
+        return false;
+    return std::any_of(src.granularities.begin(), src.granularities.end(),
+                       [](const auto& g) { return g.suffix == "hourly"; });
+}
+
 // Raw tier: each enabled source's raw capture table whose rows have already been summarised.
 std::vector<BudgetCandidate> raw_budget_candidates(EchoDatabase& db, int64_t now_epoch) {
     std::vector<BudgetCandidate> out;
     for (const auto& src : capture_sources()) {
-        // usage_* tables are the usage fold's own state, never evicted. A paused or errored
-        // source (or an unreadable flag) is exempt: its rows are preserved for forensics.
-        if (src.name == "usage" || !source_enabled(db, src.name))
-            continue;
-        bool has_live = false;
-        std::string_view first_rollup_tier;
-        for (const auto& g : src.granularities) {
-            if (g.suffix == "live") {
-                has_live = true;
-            } else if (first_rollup_tier.empty() && !rollup_sql(src.name, g.suffix).empty()) {
-                first_rollup_tier = g.suffix;
-            }
-        }
-        // No summary tier means the raw rows ARE the record (netconn, power, removable, registry,
-        // netqual): never evicted.
-        if (!has_live || first_rollup_tier.empty())
+        const std::string_view tier = raw_budget_rollup_tier(src);
+        // A paused or errored source (or an unreadable flag) is exempt: its rows are preserved
+        // for forensics.
+        if (tier.empty() || !source_enabled(db, src.name))
             continue;
 
         const int64_t mark = parse_i64_or(
-            db.get_config(std::format("rollup_{}_{}_at", src.name, first_rollup_tier), "0"), 0);
+            db.get_config(std::format("rollup_{}_{}_at", src.name, tier), "0"), 0);
+        // A mark ahead of the clock was written during a forward excursion (or is corrupt): it
+        // proves nothing about what was summarised, and min(mark, now - floor) would otherwise
+        // widen eviction to the whole 24 h floor. Skip the source until the mark is sane again.
+        if (mark > now_epoch) {
+            spdlog::warn("Echo budget: rollup mark of {} ({}) is ahead of the clock ({}); its raw "
+                         "rows are not evicted",
+                         src.name, mark, now_epoch);
+            continue;
+        }
         BudgetCandidate c;
         c.table = std::format("{}_live", src.name);
         c.ts_col = std::string{ts_column_for_suffix("live")};
@@ -984,26 +1007,40 @@ std::vector<BudgetCandidate> raw_budget_candidates(EchoDatabase& db, int64_t now
     return out;
 }
 
-// Hourly tier: summarised rows past the 48 h floor, only once the raw tier is spent.
+// Hourly tier: summarised rows past the 48 h floor (5 d for procperf), only once the raw tier
+// is spent.
 std::vector<BudgetCandidate> hourly_budget_candidates(EchoDatabase& db, int64_t now_epoch) {
     std::vector<BudgetCandidate> out;
     for (const auto& src : capture_sources()) {
-        if (src.name == "usage" || !source_enabled(db, src.name))
+        if (!has_hourly_budget_tier(src) || !source_enabled(db, src.name))
             continue;
-        for (const auto& g : src.granularities) {
-            if (g.suffix != "hourly")
-                continue;
-            BudgetCandidate c;
-            c.table = std::format("{}_hourly", src.name);
-            c.ts_col = std::string{ts_column_for_suffix("hourly")};
-            c.cutoff = now_epoch - kBudgetHourlyFloorSec;
-            out.push_back(std::move(c));
-        }
+        BudgetCandidate c;
+        c.table = std::format("{}_hourly", src.name);
+        c.ts_col = std::string{ts_column_for_suffix("hourly")};
+        c.cutoff = now_epoch - (src.name == "procperf" ? kBudgetProcPerfHourlyFloorSec
+                                                       : kBudgetHourlyFloorSec);
+        out.push_back(std::move(c));
     }
     return out;
 }
 
 }  // namespace
+
+std::vector<std::string> budget_raw_eligible_sources() {
+    std::vector<std::string> out;
+    for (const auto& src : capture_sources())
+        if (!raw_budget_rollup_tier(src).empty())
+            out.emplace_back(src.name);
+    return out;
+}
+
+std::vector<std::string> budget_hourly_eligible_sources() {
+    std::vector<std::string> out;
+    for (const auto& src : capture_sources())
+        if (has_hourly_budget_tier(src))
+            out.emplace_back(src.name);
+    return out;
+}
 
 std::string budget_rank_probe_sql(std::string_view table) {
     // COALESCE so an empty table ranks 0 instead of NULL.
@@ -1014,16 +1051,38 @@ std::string budget_rank_probe_sql(std::string_view table) {
 BudgetPassResult run_budget(EchoDatabase& db, int64_t now_epoch, int64_t target_bytes,
                             const std::function<bool()>& time_left) {
     BudgetPassResult res;
-    res.data_bytes_after = db.storage_bytes().data_bytes();
+    const auto fail = [&](const std::string& why) {
+        res.failed = true;
+        spdlog::warn("Echo budget: {}", why);
+    };
+
+    // A failed measurement is all zeros, which reads as "within budget": say it failed instead.
+    auto sb = db.storage_bytes();
+    if (!sb.ok) {
+        fail("eviction pass skipped: the database size could not be read");
+        return res;
+    }
+    res.data_bytes_after = sb.data_bytes();
     if (res.data_bytes_after <= target_bytes)
         return res;
+
+    // Every floor below derives from `now_epoch`; a reading this far ahead cannot be trusted to
+    // delete anything (run_retention refuses the same value for the same reason).
+    if (now_epoch > kEchoMaxPlausibleNow) {
+        fail(std::format("eviction pass skipped: the clock reading ({}) is not plausible; nothing "
+                         "evicted",
+                         now_epoch));
+        return res;
+    }
 
     std::vector<BudgetCandidate> raw = raw_budget_candidates(db, now_epoch);
     std::vector<BudgetCandidate> hourly = hourly_budget_candidates(db, now_epoch);
 
-    const auto fail = [&](const std::string& why) {
-        res.failed = true;
-        spdlog::warn("Echo budget: eviction pass stopped: {}", why);
+    // A table whose probe or delete fails is skipped for the rest of this pass; the others
+    // carry on. The next maintenance pass retries it.
+    const auto drop = [&](BudgetCandidate& c, const std::string& why) {
+        c.exhausted = true;
+        fail(std::format("eviction on {} skipped for this pass: {}", c.table, why));
     };
 
     while (res.data_bytes_after > target_bytes) {
@@ -1043,9 +1102,9 @@ BudgetPassResult run_budget(EchoDatabase& db, int64_t now_epoch, int64_t target_
                 continue;
             auto probe = db.execute_query(budget_rank_probe_sql(c.table), /*max_rows=*/1);
             if (!probe.has_value() || probe->rows.empty() || probe->rows[0].empty()) {
-                fail(std::format("size probe on {} failed: {}", c.table,
-                                 probe.has_value() ? "no result" : probe.error()));
-                return res;
+                drop(c, std::format("size probe failed: {}",
+                                    probe.has_value() ? "no result" : probe.error()));
+                continue;
             }
             const int64_t span = parse_i64_or(probe->rows[0][0], 0);
             if (span <= 0) {
@@ -1060,7 +1119,9 @@ BudgetPassResult run_budget(EchoDatabase& db, int64_t now_epoch, int64_t target_
         if (!best) {
             if (in_raw)
                 continue; // raw tier just emptied out; the next turn moves to hourly
-            res.exhausted = true;
+            // Nothing left to take -- unless a table was skipped on an error, in which case it
+            // may still hold eligible rows and "exhausted" would be untrue.
+            res.exhausted = !res.failed;
             break;
         }
 
@@ -1079,8 +1140,8 @@ BudgetPassResult run_budget(EchoDatabase& db, int64_t now_epoch, int64_t target_
         const auto deleted = db.delete_counted(
             sql, in_raw ? kBudgetEvictedRawKey : kBudgetEvictedHourlyKey);
         if (!deleted.has_value()) {
-            fail(std::format("delete on {} failed: {}", best->table, deleted.error()));
-            return res;
+            drop(*best, std::format("delete failed: {}", deleted.error()));
+            continue;
         }
         if (*deleted == 0) {
             best->exhausted = true; // nothing eligible left in this table
@@ -1089,21 +1150,42 @@ BudgetPassResult run_budget(EchoDatabase& db, int64_t now_epoch, int64_t target_
         } else {
             res.evicted_hourly += *deleted;
         }
-        res.data_bytes_after = db.storage_bytes().data_bytes();
+
+        sb = db.storage_bytes();
+        if (!sb.ok) {
+            fail("eviction pass stopped: the database size could not be read");
+            return res;
+        }
+        res.data_bytes_after = sb.data_bytes();
+        // A reader pinning the WAL (an echo.sql query) stops the log being recycled: another
+        // batch would only grow it. Stop here -- not exhausted, no catch-up armed -- and let the
+        // post-pass checkpoint and the next maintenance pass pick it up once the reader ends.
+        if (sb.wal_bytes > kEchoWalAllowanceBytes && res.data_bytes_after > target_bytes) {
+            spdlog::debug("Echo budget: eviction paused, the WAL ({} bytes) is above its allowance "
+                          "(a reader pins it)",
+                          sb.wal_bytes);
+            break;
+        }
     }
     return res;
 }
 
 VacuumAction vacuum_decision(int64_t auto_vacuum, int64_t data_bytes, int64_t target_bytes,
                              int64_t freelist_bytes, int64_t file_bytes, int64_t free_disk_bytes,
-                             int64_t deferred_at, int64_t now) noexcept {
+                             int64_t deferred_at, int64_t now, bool eviction_exhausted) noexcept {
     constexpr int64_t kMinFreelistBytes = 32 * 1024 * 1024;
     constexpr int64_t kRetryAfterSec = 86400;
-    if (auto_vacuum == 2 || data_bytes > target_bytes)
+    if (auto_vacuum == 2)
+        return VacuumAction::kSkip;
+    // Wait for eviction to shrink the data, but not forever: once it has nothing left to take the
+    // data will not drop further, and the conversion is what returns the freelist to the OS.
+    if (data_bytes > target_bytes && !eviction_exhausted)
         return VacuumAction::kSkip;
     if (freelist_bytes < std::max(kMinFreelistBytes, file_bytes / 4))
         return VacuumAction::kSkip;
-    if (deferred_at > 0 && now - deferred_at < kRetryAfterSec)
+    // A marker ahead of `now` is stale (written during a forward clock excursion): treating its
+    // negative age as "recent" would hold the conversion off until the clock catches up.
+    if (deferred_at > 0 && deferred_at <= now && now - deferred_at < kRetryAfterSec)
         return VacuumAction::kSkip;
     // VACUUM in WAL mode builds a copy and then writes the whole file back through the WAL.
     if (free_disk_bytes < 2 * data_bytes)
@@ -1117,6 +1199,15 @@ std::optional<int64_t> parse_budget_bytes(std::string_view text) {
     if (ec != std::errc{} || p != text.data() + text.size() || v < kEchoDbBudgetBytesMin)
         return std::nullopt;
     return v;
+}
+
+std::optional<int64_t>
+budget_from_config(const std::expected<std::optional<std::string>, std::string>& stored) {
+    if (!stored.has_value())
+        return std::nullopt; // the read failed: unknown, not "the default"
+    if (!stored->has_value())
+        return kEchoDbBudgetBytesDefault;
+    return parse_budget_bytes(**stored).value_or(kEchoDbBudgetBytesDefault);
 }
 
 } // namespace yuzu::echo

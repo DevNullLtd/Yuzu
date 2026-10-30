@@ -550,6 +550,9 @@ TEST_CASE("echo plugin: db_budget_bytes validates, persists and shows in status 
                                              &*kv);
     REQUIRE(desc->init(ctx.get()) == 0);
     yuzu::agent::LocalDispatcher d;
+    // Scope-exit: the loaded plugin is a process singleton, so a failed REQUIRE below must not
+    // leave it initialised over a directory the guard is about to remove.
+    const yuzu::test::ScopeExit shutdown_on_exit{[&] { desc->shutdown(ctx.get()); }};
 
     const auto status_value = [&](const std::string& key) {
         return plugin_status_value(d, desc, key);
@@ -602,8 +605,6 @@ TEST_CASE("echo plugin: db_budget_bytes validates, persists and shows in status 
         CHECK(status_value("budget_over_bytes") == std::optional<std::string>{"0"});
         CHECK(status_value("budget_evicted_raw_rows_total") == std::optional<std::string>{"0"});
     }
-
-    desc->shutdown(ctx.get());
 }
 
 
@@ -614,11 +615,14 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
     // gate and the post-pass hygiene that do_rollup runs), which the run_budget cases cannot
     // reach. The loaded plugin is driven through the frozen C ABI, so a test has no seam to shrink
     // the thresholds: this uses the production constants (a 32 MiB budget leaves a 16 MiB data
-    // target; the conversion wants a 32 MiB freelist) and pays for it in disk, about 70 MiB in the
-    // temp directory. No clock or timing assertion, no process. Measured at 0.17 s with
-    // `yuzu_agent_tests --durations=yes` on an Apple M4 (the writes are page-sized zeroblobs on one
-    // WAL connection); even at the 3-6x I/O amplification the shared CI runners show under load
-    // that is about a second.
+    // target; the conversion wants a 32 MiB freelist) and pays for it in disk, about 55 MiB in the
+    // temp directory. The data is sized past the 32 MiB budget itself (not only its 16 MiB data
+    // target) so that `budget_over_bytes` is non-zero before any pass has run. No clock or timing
+    // assertion, no process. Measured at 0.54 s with `yuzu_agent_tests --durations=yes` on an
+    // Apple M4 (the writes are page-sized zeroblobs on one WAL connection, and two passes run:
+    // one that can evict nothing, then the evicting one that also runs the conversion VACUUM); at
+    // the 3-6x I/O amplification the shared CI runners show under load that is two to three
+    // seconds.
     constexpr std::int64_t kMiB = 1024 * 1024;
     constexpr std::int64_t kMinBudget = 32 * kMiB;
 
@@ -642,29 +646,36 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
     REQUIRE(kv.has_value());
     const auto db_path = dir_guard.path / "echo.db";
 
-    // A database as an older build left it: auto_vacuum none, and 48 MiB of pages the plugin will
-    // find free once the pad rows are deleted below.
+    // A database as an older build left it: auto_vacuum none, and 16 MiB of pages the plugin will
+    // find free once the pad rows are deleted below (the evicted rows add to them).
     (void)raw_sql(db_path,
                   "PRAGMA auto_vacuum=0; CREATE TABLE yuzu_test_pad(x BLOB);"
-                  "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 48) "
+                  "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 16) "
                   "INSERT INTO yuzu_test_pad SELECT zeroblob(1048576) FROM n;");
 
     yuzu::agent::StandalonePluginContext ctx("echo", {{"agent.data_dir", dir_guard.path.string()}},
                                              &*kv);
     REQUIRE(desc->init(ctx.get()) == 0);
     yuzu::agent::LocalDispatcher d;
+    const yuzu::test::ScopeExit shutdown_on_exit{[&] { desc->shutdown(ctx.get()); }};
 
-    // Twenty ~1 MiB raw tcp rows, 25 to 44 hours old, all below the rollup mark (set to now, so
-    // the preservation contract admits them whatever the clock clamp does): 20 MiB of data, over
-    // the 16 MiB target. Then free the pad, so the file is mostly free pages.
+    // Thirty-four ~1 MiB raw tcp rows, 25 to 58 hours old, all below the rollup mark (set to now,
+    // so the preservation contract admits them whatever the clock clamp does): 34 MiB of data,
+    // over the 32 MiB budget and the 16 MiB target. Plus one small row 23 hours old, which the
+    // 24 h floor must keep whatever the mark says. Then free the pad, so the file is mostly
+    // free pages.
     const auto now = static_cast<std::int64_t>(std::time(nullptr));
     (void)raw_sql(
         db_path,
-        std::format("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 19) "
+        std::format("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 33) "
                     "INSERT INTO tcp_live (ts,snapshot_id,action,proto,local_addr,local_port,"
                     "remote_addr,remote_host,remote_port,state,pid,process_name) "
                     "SELECT {0} - 25 * 3600 - i * 3600, 1, 'connected', 'tcp', '10.0.0.1', i, "
                     "'203.0.113.1', hex(zeroblob(524288)), 443, 'ESTABLISHED', 1, 'curl' FROM n;"
+                    "INSERT INTO tcp_live (ts,snapshot_id,action,proto,local_addr,local_port,"
+                    "remote_addr,remote_host,remote_port,state,pid,process_name) "
+                    "VALUES ({0} - 23 * 3600, 1, 'connected', 'tcp', '10.0.0.1', 99, "
+                    "'203.0.113.2', '', 443, 'ESTABLISHED', 1, 'curl');"
                     "INSERT INTO echo_config (key, value) VALUES ('rollup_tcp_hourly_at', '{0}') "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value;"
                     "DELETE FROM yuzu_test_pad;",
@@ -681,18 +692,43 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
     CHECK(plugin_status_value(d, desc, "budget_evicted_raw_rows_total") ==
           std::optional<std::string>{"0"});
     CHECK(plugin_status_value(d, desc, "db_auto_vacuum") == std::optional<std::string>{"none"});
+    // The overage is measured when asked, not cached from a pass: this database is over its
+    // budget before any pass has ever run (a gauge that starts at 0 would hide it).
+    const auto over_before = plugin_status_value(d, desc, "budget_over_bytes");
+    REQUIRE(over_before.has_value());
+    CHECK(std::stoll(*over_before) > 0);
+
+    // A pass that can take nothing still reports the overage and evicts nothing: pause tcp (the
+    // exemption keeps its rows), so the only over-budget data is exempt.
+    const YuzuParam pause_tcp[] = {{"tcp_enabled", "false"}};
+    REQUIRE(d.run(desc, "configure", pause_tcp).rc == 0);
+    REQUIRE(d.run(desc, "rollup").rc == 0);
+    CHECK(plugin_status_value(d, desc, "budget_evicted_raw_rows_total") ==
+          std::optional<std::string>{"0"});
+    const auto over_paused = plugin_status_value(d, desc, "budget_over_bytes");
+    REQUIRE(over_paused.has_value());
+    CHECK(std::stoll(*over_paused) > 0);
+    const YuzuParam resume_tcp[] = {{"tcp_enabled", "true"}};
+    REQUIRE(d.run(desc, "configure", resume_tcp).rc == 0);
 
     const auto pass = d.run(desc, "rollup");
     REQUIRE(pass.rc == 0);
 
+    // The evicting pass ends with a TRUNCATE checkpoint, so the WAL file is empty (or gone); a
+    // PASSIVE one would leave the pass's own writes in it.
+    std::error_code wal_ec;
+    const auto wal_size = fs::file_size(fs::path{db_path.string() + "-wal"}, wal_ec);
+    CHECK((wal_ec || wal_size == 0));
+
     // Eviction ran on the public path and took the raw rows (enforce_budget in do_rollup).
     CHECK(plugin_status_value(d, desc, "budget_evicted_raw_rows_total") ==
-          std::optional<std::string>{"20"});
+          std::optional<std::string>{"34"});
     CHECK(plugin_status_value(d, desc, "budget_evicted_hourly_rows_total") ==
           std::optional<std::string>{"0"});
+    // Only the 23 h row is left: the 24 h floor holds against a mark of "now".
     const auto left = raw_sql(db_path, "SELECT count(*) FROM tcp_live");
     REQUIRE(left.size() == 1);
-    CHECK(left[0][0] == "0");
+    CHECK(left[0][0] == "1");
 
     // The measured size dropped to within the budget and the overage is published as zero.
     const auto size_after = plugin_status_value(d, desc, "db_size_bytes");
@@ -708,8 +744,6 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
         raw_sql(db_path, "SELECT value FROM echo_config WHERE key = 'auto_vacuum_deferred_at'");
     REQUIRE(deferred.size() == 1);
     CHECK(deferred[0][0] == "0");
-
-    desc->shutdown(ctx.get());
 }
 
 namespace {

@@ -474,6 +474,11 @@ struct StorageBytes {
     int64_t page_size{0};
     int64_t wal_bytes{0};   ///< -wal file size; 0 when absent or unreadable
     int64_t auto_vacuum{0}; ///< 0 = none, 1 = full, 2 = incremental
+    /// The page-count read succeeded. False for a closed store or a failed pragma read: the
+    /// figures above are then all zero, which must never be read as "an empty database"
+    /// (a failed measurement that reads as within-budget stops eviction and publishes a 0
+    /// overage). Callers branch on this before using the sizes.
+    bool ok{false};
 
     /// Used pages in bytes (free pages are reusable and not counted).
     [[nodiscard]] int64_t data_bytes() const noexcept {
@@ -527,7 +532,7 @@ public:
     // ── Storage budget primitives (echo_aggregator.cpp run_budget) ───────────
 
     /// Page counts, page size, WAL file size and auto_vacuum mode, read under the lock.
-    /// All zero when the store is closed.
+    /// All zero and `ok == false` when the store is closed or the pragma read failed.
     [[nodiscard]] StorageBytes storage_bytes();
 
     /**

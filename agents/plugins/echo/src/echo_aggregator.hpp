@@ -15,7 +15,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <functional>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -126,6 +128,12 @@ inline constexpr int64_t kMaxEchoDeletesPerTablePerPass = 5000;
 // It leaves a deliberate dead band: a forward error smaller than 30 days does not
 // fire on a table whose own window is shorter. The per-pass cap still bounds it.
 inline constexpr int64_t kEchoMinBigStepSec = 30 * 86400;
+
+/// UPPER bound only on a plausible caller clock (a negative reading is the legitimate dead-CMOS
+/// case). Shared by run_retention (which refuses to persist a larger one as its anchor) and
+/// run_budget (whose floors are all derived from `now`): a reading above it is never trusted
+/// to delete anything.
+inline constexpr int64_t kEchoMaxPlausibleNow = std::numeric_limits<int64_t>::max() / 4;
 
 /**
  * Per-table clock-guard state for time-based retention. Owned by the plugin and
@@ -365,6 +373,11 @@ inline constexpr int64_t kBudgetBatchRows = 1000;
 inline constexpr int64_t kBudgetRawFloorSec = 86400;
 /// Hourly rows newer than this are never evicted. Daily and monthly rows are never evicted.
 inline constexpr int64_t kBudgetHourlyFloorSec = 172800;
+/// The same floor for procperf_hourly, which the daily app-perf sync re-reads for the last two
+/// completed UTC days plus today (sync_source_app_perf.cpp) and the server overwrites those
+/// days from whatever it receives: evicting an hour the sync will still re-send would shrink an
+/// already-correct daily aggregate. 5 d = 2 completed days + today + slack.
+inline constexpr int64_t kBudgetProcPerfHourlyFloorSec = 432000;
 /// Steady-state wall-clock budget for one eviction pass, checked between batches.
 inline constexpr int64_t kBudgetPassDeadlineMs = 2000;
 
@@ -383,7 +396,11 @@ struct BudgetPassResult {
     bool exhausted{false};
     /// The pass ran out of time with eligible rows left.
     bool deadline_hit{false};
-    /// A probe or delete failed; the pass stopped (the cause is logged). Not retried in-pass.
+    /// Something stopped or skipped part of the pass (the cause is logged): the storage size
+    /// was unreadable, the clock reading was implausible, or a probe/delete on one table
+    /// failed -- that table is skipped for the rest of the pass and the others carry on. Never
+    /// retried in-pass; never combined with `exhausted` (a failed table may still hold
+    /// eligible rows).
     bool failed{false};
 };
 
@@ -391,7 +408,8 @@ struct BudgetPassResult {
  * Evict warehouse rows until used data pages are at or under `target_bytes`.
  *
  * Order (Alex, 2026-10-30): raw capture rows first, from the table holding the most rows,
- * oldest first; only once no raw row is eligible, hourly rows, never newer than 48 h. Daily,
+ * oldest first; only once no raw row is eligible, hourly rows, never newer than 48 h (5 d for
+ * procperf_hourly, kBudgetProcPerfHourlyFloorSec). Daily,
  * monthly, `usage_*`, netqual and the sources with no summary tier (netconn, power,
  * removable, registry) are never touched. Paused and errored sources are exempt.
  *
@@ -403,6 +421,13 @@ struct BudgetPassResult {
  *
  * Each batch (kBudgetBatchRows) is one transaction that also bumps the persisted eviction
  * counter, so a crash never loses a count. `time_left` is consulted before every batch.
+ *
+ * Trust in the inputs: an unreadable storage size and an implausible clock (above
+ * kEchoMaxPlausibleNow; every floor derives from `now_epoch`) both fail the pass with nothing
+ * evicted; a rollup mark ahead of `now_epoch` proves nothing about what was summarised, so
+ * that source's raw rows are skipped. The pass also stops, without arming a catch-up, when a
+ * batch leaves the WAL above kEchoWalAllowanceBytes -- a reader is pinning it and further
+ * batches could not be recycled -- and the next maintenance pass retries.
  */
 [[nodiscard]] BudgetPassResult run_budget(EchoDatabase& db, int64_t now_epoch,
                                           int64_t target_bytes,
@@ -412,6 +437,14 @@ struct BudgetPassResult {
 /// O(log n) b-tree edge lookup; the combined MAX-MIN aggregate scans). Exposed for the
 /// query-plan test.
 [[nodiscard]] std::string budget_rank_probe_sql(std::string_view table);
+
+/// Sources whose raw `<src>_live` rows the budget may ever evict / whose `<src>_hourly` rows it
+/// may ever evict, derived from the schema registry (structure only: the rollup marks, the
+/// enabled flag and the floors decide eligibility at run time). A new capture source joins
+/// these sets automatically, so the unit test pins them to literal lists: adding one must be a
+/// deliberate decision about whether its rows are a record or a summary.
+[[nodiscard]] std::vector<std::string> budget_raw_eligible_sources();
+[[nodiscard]] std::vector<std::string> budget_hourly_eligible_sources();
 
 /// Bytes data + WAL sit above the budget; 0 within it. Depends only on the measured sizes,
 /// never on how the last eviction pass ended.
@@ -423,16 +456,27 @@ struct BudgetPassResult {
 enum class VacuumAction { kSkip, kRun, kDefer };
 
 /// Gate for the one-off conversion VACUUM (auto_vacuum -> incremental). Run only when the file is
-/// not already incremental, eviction has brought data under target, the freelist is large
-/// (at least 32 MiB and a quarter of the file), the volume has twice the used size free, and
-/// no deferral was recorded in the last 24 h. Too little free disk is kDefer (the caller
-/// records the time and reports `deferred`); every other unmet condition is kSkip.
+/// not already incremental, eviction has brought data under target (or has nothing left to
+/// evict -- `eviction_exhausted`, otherwise a database whose remainder is exempt would wait
+/// for a shrink that can never come), the freelist is large (at least 32 MiB and a quarter of
+/// the file), the volume has twice the used size free, and no deferral was recorded in the
+/// last 24 h. A marker ahead of `now` (written during a forward clock excursion) is stale,
+/// never a reason to wait. Too little free disk is kDefer (the caller records the time and
+/// reports `deferred`); every other unmet condition is kSkip.
 [[nodiscard]] VacuumAction vacuum_decision(int64_t auto_vacuum, int64_t data_bytes,
                                            int64_t target_bytes, int64_t freelist_bytes,
                                            int64_t file_bytes, int64_t free_disk_bytes,
-                                           int64_t deferred_at, int64_t now) noexcept;
+                                           int64_t deferred_at, int64_t now,
+                                           bool eviction_exhausted) noexcept;
 
 /// Parse a `db_budget_bytes` value: decimal digits only, fits int64, >= kEchoDbBudgetBytesMin.
 [[nodiscard]] std::optional<int64_t> parse_budget_bytes(std::string_view text);
+
+/// The effective budget from a tri-state config read. A failed read is nullopt ("unreadable"):
+/// the caller must not substitute the default, because a raised budget silently reverting to
+/// 250 MiB would delete down to the smaller target. An absent, unparseable or below-minimum
+/// stored value (a row edited outside the plugin) is the default; a valid one is itself.
+[[nodiscard]] std::optional<int64_t>
+budget_from_config(const std::expected<std::optional<std::string>, std::string>& stored);
 
 } // namespace yuzu::echo
