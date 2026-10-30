@@ -363,6 +363,7 @@ const char* const kSettingsPageTemplate =
           Generate tokens for programmatic REST API access.
           Pass via <code>Authorization: Bearer &lt;token&gt;</code> or
           <code>X-Yuzu-Token</code> header.
+          A token with no MCP tier (the <em>none</em> choice) cannot be used for MCP; choose a tier.
           The raw token is shown <strong>once</strong> — copy it before closing.
         </p>
         <div id="api-token-section"

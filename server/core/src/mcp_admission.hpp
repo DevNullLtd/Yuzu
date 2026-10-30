@@ -41,7 +41,17 @@
 ///   `reason=tier_required auth_source=<bounded> cid=<cid>`, set-and-proceed (a failed
 ///   audit write never changes the refusal).
 ///   Counter: `yuzu_mcp_admission_refused_total{reason="tier_required"}`.
+///
+/// Audit-row budget (the refusal and the counter are NEVER sampled; only the row is):
+/// a tierless client looping on /mcp/v1/ would otherwise write one synchronous audit row
+/// per refusal on an httplib worker. Rows go through the shared `DenialAuditBudget`
+/// (bounded_audit_budget.hpp; the gateway peer guard is the precedent): keyed
+/// `tier_required|<bounded auth_source>|<principal>`, so one principal's flood spends only
+/// its own rows and cannot starve another principal's evidence row, and the FIRST refusal
+/// of every key always writes its row. The counter stays complete, so suppressed rows are
+/// still visible as a number, and the window-opening call logs one aggregate count line.
 
+#include "bounded_audit_budget.hpp" // DenialAuditBudget, the default limits
 #include "mcp_jsonrpc.hpp"      // error_response_null_a4, kPermissionDenied
 #include "rest_a4_envelope.hpp" // detail::make_correlation_id
 #include "rest_audit.hpp"       // detail::try_persist_audit
@@ -50,7 +60,11 @@
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
+#include <spdlog/spdlog.h>
+
+#include <cstddef>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -70,9 +84,9 @@ inline constexpr std::string_view kTierRequiredReason = "tier_required";
 inline constexpr std::string_view kTierRequiredMessage =
     "/mcp/v1/ requires an MCP-tier bearer token";
 inline constexpr std::string_view kTierRequiredRemediation =
-    "mint an API token with mcp_tier readonly, operator or supervised (POST /api/v1/tokens "
-    "with expires_at, or Settings > API tokens) and send it as Authorization: Bearer; do not "
-    "send a session cookie with it";
+    "mint an API token with mcp_tier readonly, operator or supervised and an expires_at at "
+    "most 90 days out (POST /api/v1/tokens, or Settings > API tokens), then send it as "
+    "Authorization: Bearer; do not send a session cookie with it";
 inline constexpr std::string_view kAdmissionRefusedMetric = "yuzu_mcp_admission_refused_total";
 inline constexpr std::string_view kSessionRejectAction = "mcp.session.reject";
 
@@ -85,6 +99,8 @@ inline constexpr std::string_view kSessionRejectAction = "mcp.session.reject";
 
 /// `Session::auth_source` is a closed server-side set, but it reaches an audit
 /// detail, so bound it anyway: anything outside the known values reads "other".
+/// The sibling list is `step_up_source_label` (step_up_gate.cpp); test_mcp_admission.cpp
+/// locks the two together, so extend them as a pair.
 [[nodiscard]] inline std::string_view bounded_auth_source(std::string_view source) noexcept {
     for (const std::string_view known :
          {"local", "oidc", "saml", "api_token", "mcp_token", "engine_token"}) {
@@ -103,29 +119,64 @@ inline void write_tier_required(httplib::Response& res, const std::string& cid) 
                     "application/json");
 }
 
+/// Longest principal (session username) bytes kept in the audit-budget key. With the
+/// `tier_required|<source>|` prefix (at most 27 bytes) the whole key stays inside the budget's
+/// own 96-byte bound, so the principal is never cut by the budget's truncation.
+inline constexpr std::size_t kAdmissionBudgetPrincipalBytes = 64;
+
+/// The audit-budget key for a refusal: `tier_required|<bounded auth_source>|<principal>`.
+/// Built only from a closed reason, a closed source label and the principal's own username,
+/// and used only as a map key: it is never logged, audited or put on the wire.
+[[nodiscard]] inline std::string admission_budget_key(const auth::Session& session) {
+    std::string key{kTierRequiredReason};
+    key += '|';
+    key += bounded_auth_source(session.auth_source);
+    key += '|';
+    key += std::string_view{session.username}.substr(0, kAdmissionBudgetPrincipalBytes);
+    return key;
+}
+
 /// Admission decision for an authenticated /mcp/v1/ request. Returns true when the
 /// request may proceed; on false the refusal (audit row, counter, response) has
 /// already been performed and the caller must return without touching `res` again.
-/// An admitted request writes nothing: no audit row, no counter, no response.
+/// An admitted request writes nothing: no audit row, no counter, no response, and it never
+/// touches `budget`.
+///
+/// A refusal is unconditional and ALWAYS counted (the counter is unsampled). The audit row
+/// is the only effect the budget bounds: it is written only when `budget.try_admit(key)`
+/// admits, where the key separates principals, so one looping client cannot spend another's
+/// evidence row and cannot turn its own refusals into unbounded synchronous audit-store
+/// writes on an httplib worker. The call that opens a new budget window logs one aggregate
+/// line with how many rows the closed window suppressed (a count only, no caller content).
 ///
 /// `audit_fn` is the server's `audit_log` hook (bool(req, action, result, target_type,
 /// target_id, detail)); a null function or a failed write is NOT a reason to admit.
 /// `metrics` may be null (a test or an embedder without a registry).
 [[nodiscard]] inline bool admit(const auth::Session& session, const httplib::Request& req,
                                 httplib::Response& res, const AdmissionAuditFn& audit_fn,
-                                yuzu::MetricsRegistry* metrics) {
+                                yuzu::MetricsRegistry* metrics, DenialAuditBudget& budget) {
     if (!requires_tiered_credential(session))
         return true;
 
     const auto cid = yuzu::server::detail::make_correlation_id();
-    std::string detail = "reason=";
-    detail += kTierRequiredReason;
-    detail += " auth_source=";
-    detail += bounded_auth_source(session.auth_source);
-    detail += " cid=";
-    detail += cid;
-    (void)yuzu::server::detail::try_persist_audit(audit_fn, req, std::string{kSessionRejectAction},
-                                                  "failure", "McpSession", std::string{}, detail);
+    const auto row = budget.try_admit(admission_budget_key(session),
+                                      std::string{kTierRequiredReason} + "|*");
+    if (row.closed_window_suppressed > 0) {
+        spdlog::warn("mcp admission: {} tier_required audit rows suppressed in the last window "
+                     "(yuzu_mcp_admission_refused_total is complete)",
+                     row.closed_window_suppressed);
+    }
+    if (row.admitted) {
+        std::string detail = "reason=";
+        detail += kTierRequiredReason;
+        detail += " auth_source=";
+        detail += bounded_auth_source(session.auth_source);
+        detail += " cid=";
+        detail += cid;
+        (void)yuzu::server::detail::try_persist_audit(
+            audit_fn, req, std::string{kSessionRejectAction}, "failure", "McpSession",
+            std::string{}, detail);
+    }
     if (metrics != nullptr) {
         metrics
             ->counter(std::string{kAdmissionRefusedMetric},
@@ -149,16 +200,25 @@ using AdmissionAuthFn =
 /// `register_routes`' auth hook, so all three verbs share this one gate; a harness that
 /// passes a bare resolver lacks the rule. `audit` and `metrics` are captured once at
 /// registration and must outlive the registered routes.
-[[nodiscard]] inline AdmissionAuthFn make_admission_auth_fn(AdmissionAuthFn require_auth,
-                                                            AdmissionAuditFn audit,
-                                                            yuzu::MetricsRegistry* metrics) {
-    return [require_auth = std::move(require_auth), audit = std::move(audit),
-            metrics](const httplib::Request& req,
-                     httplib::Response& res) -> std::optional<auth::Session> {
+///
+/// The factory owns the audit-row budget (one per registration, shared by the three verbs,
+/// held by the returned callable; the budget is thread-safe). It uses the primitive's default
+/// limits, the same as the gateway peer guard: at most `kDefaultAuditMaxRows` (10) rows per
+/// key per `kDefaultAuditWindowMs` (10 s) window, at most `kDefaultAuditMaxKeys` (64) live
+/// keys, overflow keys sharing `tier_required|*`. `now_ms` is the budget's clock, injectable
+/// so tests need no sleeps; null selects steady_clock.
+[[nodiscard]] inline AdmissionAuthFn
+make_admission_auth_fn(AdmissionAuthFn require_auth, AdmissionAuditFn audit,
+                       yuzu::MetricsRegistry* metrics, DenialAuditBudget::NowMsFn now_ms = {}) {
+    auto budget = std::make_shared<DenialAuditBudget>(
+        kDefaultAuditMaxRows, kDefaultAuditWindowMs, std::move(now_ms), kDefaultAuditMaxKeys);
+    return [require_auth = std::move(require_auth), audit = std::move(audit), metrics,
+            budget = std::move(budget)](const httplib::Request& req,
+                                        httplib::Response& res) -> std::optional<auth::Session> {
         auto session = require_auth(req, res);
         if (!session)
             return std::nullopt;
-        if (!admit(*session, req, res, audit, metrics))
+        if (!admit(*session, req, res, audit, metrics, *budget))
             return std::nullopt;
         return session;
     };

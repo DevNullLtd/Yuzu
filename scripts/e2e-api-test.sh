@@ -1435,7 +1435,7 @@ assert_eq "MCP cookie-session refusal carries JSON-RPC code -32003" "-32003" "$M
 # MCP call must not (a live cookie wins session resolution over a bearer token).
 MCP_CTL_LABEL="e2e-api-mcp-readonly-$(date +%s)"
 http_post "$SERVER_URL/api/v1/tokens" \
-    "{\"name\":\"$MCP_CTL_LABEL\",\"mcp_tier\":\"readonly\",\"expires_at\":$(( $(date +%s) + 3600 ))}"
+    "{\"name\":\"$MCP_CTL_LABEL\",\"mcp_tier\":\"readonly\",\"expires_at\":$(( $(date +%s) + 86400 ))}"
 assert_eq "POST /api/v1/tokens (mcp_tier readonly) returns 201" "201" "$HTTP_STATUS"
 MCP_CTL_TOKEN=$(extract_json_field "token" "$HTTP_BODY")
 if [[ -n "$MCP_CTL_TOKEN" ]]; then

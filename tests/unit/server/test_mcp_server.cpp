@@ -43736,7 +43736,8 @@ TEST_CASE("MCP runtime config: a secret value reaches neither the response nor a
     RuntimeConfigPgWired w{db.dsn()};
     McpTestServer ts;
     ts.runtime_config_for_test = w.backing();
-    ts.start(); // an untiered administrator token: admitted for oidc_* as on REST
+    ts.start(); // handler-level: an untiered administrator is admitted for oidc_* here, a state
+                // /mcp/v1/ admission (#4309) can no longer reach in production
     auto body = set_runtime_config_call(ts, "oidc_client_secret", "s3cret-via-mcp");
     INFO(body.dump());
     REQUIRE_FALSE(body.contains("error"));

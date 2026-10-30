@@ -249,7 +249,7 @@ the documented case; see `docs/user-manual/upgrading.md`). Breaking for
 service-scoped tokens only; human sessions, engine principals and MCP tiers are
 unchanged. Evidence for this entry is the governance ledger for #3526.
 
-**Addendum: the MCP stream endpoint and MCP sessions, authorisation gap narrowed; residual tracked under #4309 (CC6.1/CC6.3/CC7.2, #4754, 2026-10-29).**
+**Addendum: the MCP stream endpoint and MCP sessions, authorisation gap closed (the replay residual by #4309, the stream and session binding by #4754) (CC6.1/CC6.3/CC7.2, 2026-10-29).**
 Before this change `GET /mcp/v1/` (the session's SSE channel, which replays a
 bounded per-session ring of frames) required authentication only, and a session id
 was bound to the username alone. Two reaches existed. A service-scoped API token
@@ -282,7 +282,14 @@ every credential with no MCP tier (`403`, `-32003`, audited `mcp.session.reject`
 `reason=tier_required`), which includes the only credential kind that can be
 elevated, so a cookie session can no longer hold an `/mcp/v1/` session; for a
 period before that change the residual stood as described. The session id should
-still be protected like a credential. Stream liveness is principal-level: the class is checked when the stream attaches and is not re-derived from the live credential afterwards (the per-tick credential recheck compares the principal only, and the per-tick session check compares the class captured at attach).
+still be protected like a credential.
+**Audit-period disclosure (#4309).** Before this change a human principal with an
+empty MCP tier (a cookie session or an API token minted without `mcp_tier`) could
+call the MCP tool surface without the tier ceiling or the supervised-tier approval
+gate; RBAC still applied to every call. The fix is not retroactive: for any audit
+period before it shipped, MCP calls made by a tierless principal were not subject
+to the tier or approval controls.
+Stream liveness is principal-level: the class is checked when the stream attaches and is not re-derived from the live credential afterwards (the per-tick credential recheck compares the principal only, and the per-tick session check compares the class captured at attach).
 Further residuals: a class switch strands the old-class sessions against the
 per-principal cap (fixed at 8, no flag) for up to the 30-minute idle TTL (longer while
 a stream stays attached, because the stream's per-tick liveness check keeps the

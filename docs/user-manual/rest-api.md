@@ -13109,7 +13109,8 @@ principal only, and the per-tick session check compares the class captured at at
 | `404` | Session unknown, expired, another principal's, another credential class's, **or** the `Last-Event-ID` cursor is outside the replay window (`-32007`) — re-initialize with the credential you will use |
 | `403` | `Origin` not in `--mcp-allowed-origin` (`-32008`) |
 | `403` | Service-scoped API token (`-32003`; no `permission` field, because no permission grant would admit the caller; use a token without `scope_service`). Checked after the kill switches, `Origin`, protocol version and authentication, and before the session header, `Accept` and the stream lease, so it answers even when `Mcp-Session-Id` is absent. Audited `mcp.session.reject` `reason=service_scoped` |
-| `405` | Streaming disabled (`--mcp-no-streaming`) |
+| `403` | Credential with no MCP tier, such as a session cookie or an API token minted without `mcp_tier` (`-32003`, message `/mcp/v1/ requires an MCP-tier bearer token`, `null` id, no `permission` field; mint a tiered token and send it as `Authorization: Bearer` without a cookie). Checked after the kill switches, `Origin`, protocol version and authentication, and before the service-scope deny, the session header and `Accept`, so it answers even when `Mcp-Session-Id` is absent and takes precedence over the `404` session paths; an unauthenticated request stays `401`. Audited `mcp.session.reject` `reason=tier_required`, counted on `yuzu_mcp_admission_refused_total` |
+| `405` | Streaming disabled (`--mcp-no-streaming`); answered before authentication, so it precedes every `403` above |
 | `406` | `Accept` did not include `text/event-stream` (`-32011`) |
 | `429` | Concurrent-stream cap, or a superseded stream on this session is still closing (`-32012`; honour `retry_after_ms`) |
 
@@ -13129,13 +13130,13 @@ name the reason in that same A4 shape.
 
 Ends the session named by `Mcp-Session-Id` (and closes its stream). `200` on success;
 `404` if the session is unknown, expired, already ended, or belongs to another principal or another credential class (call `initialize` to start a new session; the original session is not terminated by a class mismatch); `400` if the header is
-absent.
+absent. A credential with no MCP tier (a session cookie, or an API token minted without `mcp_tier`) is refused `403` (`-32003`, `reason=tier_required`) after authentication and before the session header is read, so it takes precedence over the `400` and `404` above; an unauthenticated request stays `401`, and `405` (streaming disabled) is answered first.
 
 #### `POST /mcp/v1/`
 
 JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 
-**Permission:** Bearer token with `mcp_tier` set (readonly, operator, or supervised). The tier determines which tools are accessible, enforced before RBAC.
+**Permission:** Bearer token with `mcp_tier` set (readonly, operator, or supervised). The tier determines which tools are accessible, enforced before RBAC. A credential with no MCP tier (a session cookie, or an API token minted without `mcp_tier`) is refused `403` (`-32003`, `null` id, message `/mcp/v1/ requires an MCP-tier bearer token`, audited `reason=tier_required`) after authentication and before the JSON-RPC body or the `Mcp-Session-Id` header is read, so it takes precedence over a parse error and over the `404` session paths; an unauthenticated request stays `401`. Do not send a session cookie with the token: a live cookie is resolved first and the request is refused.
 
 **Request body (tool call):**
 

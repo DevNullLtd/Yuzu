@@ -13,6 +13,13 @@
 // expires_at). The server refuses a session cookie, and an API token minted
 // without mcp_tier, at /mcp/v1/ with HTTP 403 and JSON-RPC code -32003, so this
 // adapter has no cookie mode. The adapter sends only the Authorization header.
+//
+// Refusals: any HTTP status >= 400 writes one line to stderr (status, request
+// method, JSON-RPC error code and message, remediation when present; never the
+// token). The server's refusal for a missing MCP tier carries `id: null`, so the
+// adapter re-addresses a JSON-RPC error with a null id to the in-flight request's
+// id before writing it to stdout; otherwise a stdio client that matches replies on
+// id would wait for its timeout. Notifications (no id) are not re-addressed.
 
 const http = require('http');
 const https = require('https');
@@ -29,6 +36,28 @@ if (process.env.YUZU_MCP_COOKIE) {
 
 const url = new URL(MCP_URL);
 const transport = url.protocol === 'https:' ? https : http;
+
+function clip(value, max) {
+  const s = String(value);
+  return s.length > max ? `${s.slice(0, max)}...` : s;
+}
+
+// One stderr line for any HTTP status >= 400: the status, the request method, and
+// the JSON-RPC error code, message and remediation when the body carries them.
+// Never prints the token (it is only ever sent in the Authorization header).
+function logHttpError(status, request, body, rawBody) {
+  const method = request && request.method ? request.method : '?';
+  const err = body && typeof body === 'object' ? body.error : undefined;
+  let detail;
+  if (err && typeof err === 'object') {
+    detail = `JSON-RPC error ${err.code}: ${clip(err.message, 200)}`;
+    const remediation = err.data && err.data.remediation;
+    if (remediation) detail += ` (remediation: ${clip(remediation, 300)})`;
+  } else {
+    detail = `body: ${clip(rawBody, 200)}`;
+  }
+  process.stderr.write(`[mcp-adapter] HTTP ${status} for ${method}: ${detail}\n`);
+}
 
 function forward(jsonRpcRequest) {
   return new Promise((resolve, reject) => {
@@ -51,11 +80,16 @@ function forward(jsonRpcRequest) {
       let data = '';
       res.on('data', (chunk) => { data += chunk; });
       res.on('end', () => {
+        let parsedBody;
         try {
-          resolve(JSON.parse(data));
+          parsedBody = JSON.parse(data);
         } catch {
+          if (res.statusCode >= 400) logHttpError(res.statusCode, jsonRpcRequest, undefined, data);
           reject(new Error(`Invalid JSON from server: ${data.slice(0, 200)}`));
+          return;
         }
+        if (res.statusCode >= 400) logHttpError(res.statusCode, jsonRpcRequest, parsedBody, data);
+        resolve(parsedBody);
       });
     });
 
@@ -86,6 +120,16 @@ process.stdin.on('data', (chunk) => {
 
     forward(parsed)
       .then((response) => {
+        // The server's pre-parse refusals (e.g. the 403 for a credential without an
+        // MCP tier) are JSON-RPC errors with `id: null`, because they are decided
+        // before the body is read. A stdio client matches replies on request id and
+        // would wait for its timeout, so answer the in-flight request's id instead.
+        // Notifications (no id) are left as the server sent them.
+        if (response && typeof response === 'object' && response.error &&
+            typeof response.error === 'object' && response.id === null &&
+            parsed.id !== undefined && parsed.id !== null) {
+          response = { ...response, id: parsed.id };
+        }
         process.stdout.write(JSON.stringify(response) + '\n');
       })
       .catch((err) => {

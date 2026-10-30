@@ -363,9 +363,11 @@ protocol-version check still answer first where they apply. The refusal is
 audited as `mcp.session.reject` with `reason=tier_required` and counted on
 `yuzu_mcp_admission_refused_total{reason="tier_required"}`. The `403` body has no
 `permission` field and carries a remediation hint: mint an API token with
-`mcp_tier` `readonly`, `operator` or `supervised` (`POST /api/v1/tokens` with
-`expires_at`, or Settings > API tokens) and send it as `Authorization: Bearer`,
-without a session cookie. There is no flag that turns this check off. The
+`mcp_tier` `readonly`, `operator` or `supervised` and an `expires_at` at most 90
+days out (`POST /api/v1/tokens`, or Settings > API tokens), then send it as
+`Authorization: Bearer`, without a session cookie. The `403` and the
+counter are never limited; the audit row is budgeted (see the note on audit rows
+in [Troubleshooting](#-32003-permission-denied-rbac)). There is no flag that turns this check off. The
 per-tool tier-less guards listed under [Available Tools](#available-tools) remain
 as defence in depth; a tier-less caller no longer reaches them.
 
@@ -1721,11 +1723,21 @@ HTTP `403` with the message `/mcp/v1/ requires an MCP-tier bearer token`, an
 `id` of `null`, and no `permission` field. It is audited as `mcp.session.reject`
 with `reason=tier_required` and counted on
 `yuzu_mcp_admission_refused_total{reason="tier_required"}`. **Fix**: mint an API
-token with `mcp_tier` `readonly`, `operator` or `supervised` (`POST /api/v1/tokens`
-with `expires_at`, or Settings > API tokens) and send it as
-`Authorization: Bearer`. Send no session cookie with it: the server resolves a
-live cookie first, so the request is classed as the cookie and refused even
-though it also carries a valid token.
+token with `mcp_tier` `readonly`, `operator` or `supervised` and an `expires_at`
+at most 90 days out (`POST /api/v1/tokens`, or Settings > API tokens), then send
+it as `Authorization: Bearer`. Send no session cookie with it: the server
+resolves a live cookie first, so the request is classed as the cookie and
+refused even though it also carries a valid token.
+
+Every refusal is answered and counted, but the audit row is budgeted per key
+`tier_required|<auth_source>|<principal>`: at most 10 rows per key per 10-second
+window (up to twice that across a window boundary), at most 64 distinct keys per
+window with the rest sharing one overflow bucket (also 10 rows per window), and
+the first refusal of each key in a window always writes its row. One budget serves
+`GET`, `POST` and `DELETE`. Rows can therefore be suppressed under a flood while
+the counter still counts every refusal; a window that suppressed rows ends with one
+aggregate warning in the server log carrying the suppressed count. Read the
+counter, not the row count, for how many requests were turned away.
 
 The last two ticket-recall causes (a ticket minted through a different Yuzu
 surface, or presented by a principal other than its submitter) are deliberately
