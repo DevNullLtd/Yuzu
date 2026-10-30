@@ -265,13 +265,50 @@ Each wave ends with the owner's guidance before the next starts. Waves 1 to 6 ar
 | Wave | Content | Done when |
 |---|---|---|
 | 0 | This ADR and ADR-2002 section 7h ratified; the conflicts above decided; ADR-0073 to PR (done, PR #6704). A survey of what comparable open-source projects and commercial endpoint platforms do (done 2026-10-29; the open-source half is recorded below). The memory-measures PR (split from the kTLS branch). The gateway performance-harness PR (#6710). A fuzz harness and an ASan run for the trim NIF (D8). The common memory baseline (D14), on both rigs. | Owner sign-off. |
-| 1 | The CA: SPIFFE-form identities; 24-hour agent and 7-day gateway and server certificates with renewal; importing a customer intermediate; the CRL served to gateways. Gateway and server move from pins to CA trust plus identity plus revocation, in both directions. Measured: the CA's signing rate, and the Register rate against the real server with one-way TLS, Postgres pool 16 and 64. | Both directions refuse a revoked, expired, wrong-role or wrong-CA peer, proven by test. The measured rates are recorded; if they fall well short of about 1,700 per second, D14's 60-second target is revised or the bottleneck found before wave 2. |
-| 2 | The agent edge: the enrollment port (token, or a machine certificate through CNG, Keychain or file); the strict main port; certificate and CRL checks in kTLS; D5's per-session agent signature checked by the server, server-signed commands and agent-signed results. CI fuzzing, ASan, and the shared accept/refuse suite. Measured: the Register rate with mutual TLS and the per-session signature, and a mass re-enrollment after a simulated outage. | The shared suite passes on both TLS paths; 100 real Windows agents (rig100) enroll and connect with mutual TLS. |
+| 1 | The CA: SPIFFE-form identities; 24-hour agent and 7-day gateway and server certificates with renewal; importing a customer intermediate; the CRL served to gateways. Gateway and server move from pins to CA trust plus identity plus revocation, in both directions. Measured: the CA's signing rate, and the Register rate against the real server with one-way TLS, Postgres pool 16 and 64. | Both directions refuse a revoked, expired, wrong-role or wrong-CA peer, proven by test. The measured rates are recorded; if they fall well short of about 1,700 per second, D14's 60-second target is revised or the bottleneck found before wave 2. Chaos: a gateway partitioned until its CRL is stale heals, clock skew, and leaf expiry. |
+| 2 | The agent edge: the enrollment port (token, or a machine certificate through CNG, Keychain or file); the strict main port; certificate and CRL checks in kTLS; D5's per-session agent signature checked by the server, server-signed commands and agent-signed results. CI fuzzing, ASan, and the shared accept/refuse suite. Measured: the Register rate with mutual TLS and the per-session signature, and a mass re-enrollment after a simulated outage. | The shared suite passes on both TLS paths; 100 real Windows agents (rig100) enroll and connect with mutual TLS. Chaos: a mass re-enrollment under a flood on the enrollment port, and a replayed signed command. |
 | 3 | The server, before agents move: an agent seen on two gateways at once must not lose its route (RR7: about 50 of 5,000 lost in 8 of 8 forced-move runs); response storage must not drop under pool pressure; the in-memory registry must not lag the Postgres routes after a restart. Accepted by Nathan on 2026-10-28 from the BigColin review. | The RR7 forced-move, pool-pressure and post-restart cells pass with no loss, on BigColin's rig and ours. |
-| 4 | Topology: DNS discovery; the server-pushed gateway list, server-signed, and the server-signed drain suggestion (D5); latency weighting; gateway drain (GOAWAY batches, enrollment port closed at the start); Erlang clustering on or off by deployment, over TLS distribution with CA-issued certificates, with a `cluster_id` mismatch check at join (misconfiguration only); forwarding results for commands another gateway dispatched, and the re-drive of an operator command whose result was lost (D11). | A drain moves every agent to other gateways within the window, with no lost command result. |
-| 5 | Several servers: consistent hashing of agents to servers; the agent-to-gateway table; results through a different gateway; server drain; the ADR-2002 leader election wired in. | Two or more servers serve one fleet; one is killed and one is drained without losing an acknowledged result. |
-| 6 | Postgres: on the existing Patroni rig (`deploy/docker/docker-compose.ha-postgres.yml`), reconcile D13 with ADR-2002 section 11 (conflict 8); failover tests. | Failover meets RPO zero and under 60 seconds of write downtime, under load. |
+| 4 | Topology: DNS discovery; the server-pushed gateway list, server-signed, and the server-signed drain suggestion (D5); latency weighting; gateway drain (GOAWAY batches, enrollment port closed at the start); Erlang clustering on or off by deployment, over TLS distribution with CA-issued certificates, with a `cluster_id` mismatch check at join (misconfiguration only); forwarding results for commands another gateway dispatched, and the re-drive of an operator command whose result was lost (D11). | A drain moves every agent to other gateways within the window, with no lost command result. Chaos: results arrive exactly once through a drained or killed gateway. |
+| 5 | Several servers: consistent hashing of agents to servers; the agent-to-gateway table; results through a different gateway; server drain; the ADR-2002 leader election wired in. | Two or more servers serve one fleet; one is killed and one is drained without losing an acknowledged result. Chaos: results arrive exactly once through a drained or killed gateway. |
+| 6 | Postgres: on the existing Patroni rig (`deploy/docker/docker-compose.ha-postgres.yml`), reconcile D13 with ADR-2002 section 11 (conflict 8); failover tests. | Failover meets RPO zero and under 60 seconds of write downtime, under load. Chaos: the synchronous standby is lost for more than 15 minutes, and no asynchronous standby is promoted. |
 | 7 | The 100,000-agent run: the gateway on an 8-core, 16 GB allocation, load from Ngai-Syoon and the other test machines. | The D14 budget is met, or the gap is measured and explained. |
+
+## Obligations the waves carry
+
+Each line is something the named wave must state, decide or test. None is decided here.
+
+**Wave 0**
+- A committed script defines the D14 measurement method.
+
+**Wave 1**
+- The renewal port and the credential a renewal presents.
+- Renewal of gateway and server leaves, with credential hot reload on both.
+- Renewal jitter, so renewals do not bunch.
+- What an agent whose certificate lapsed, and that has no machine certificate, uses to return.
+- The clock-skew tolerance on every certificate and CRL check.
+- How the trust-domain UUID is stored, backed up, and shared between servers.
+- How a gateway's CRL pull is authenticated.
+- The enterprise prerequisites for importing a customer intermediate.
+
+**Wave 2**
+- The enrollment sequence: the CSR; which trust anchors admit a machine certificate; the challenge, single-use and with an expiry; and how an unenrolled agent trusts the gateway.
+- How agents find an open enrollment port.
+- The gateway closes an agent's connection when the server ends a revoked session.
+- `forwarded_for` cannot work on a strict main port, and PROXY protocol must be parsed before the kTLS handshake.
+- The privacy classification of `agent_id`, as an input to the TLS version choice (D8).
+- The signed-result evidence window: the shorter of response retention and `ca_issued` retention.
+
+**Wave 4**
+- Refusing to drain the last gateway.
+- Operator surfaces for gateway drain and server drain: REST and MCP, with a dashboard twin, a securable, a step-up row and audit, plus read access to the gateway list (ADR-1005).
+
+**Wave 5**
+- The source of ring membership and its hysteresis.
+- Re-attestation when an agent's owning server changes.
+
+**Observability and readiness (waves 1 to 5, each for what it adds)**
+- Metrics for CRL age, fail-closed state, refusals by reason, CA signing rate, enrollment-port saturation, certificate-expiry horizons, drain progress and ring membership. Gateway and server certificate expiry pages; agent certificate expiry is a dashboard.
+- Readiness: a fail-closed or draining gateway is not ready for new agents but stays live.
 
 ## Survey of comparable projects (2026-10-29)
 
@@ -304,7 +341,7 @@ Wave 0 compared this design with open-source systems that answer the same questi
 - Wave 2 ships with an upgrade section in `docs/user-manual/upgrading.md` (the new enrollment port and its firewall rule; the upgrade order server, then gateway, then agents; re-enrollment and its prerequisites; roll-forward), a changelog fragment marked Breaking, and an update to `docs/user-manual/gateway.md`'s "Moving the agent edge to mutual TLS".
 - The CA signs far more often: each agent renews every 12 hours instead of about every eight months. At 1.2 million agents that is about 28 signatures per second, around the clock, before any mass re-enrollment. Its signing path, its `ca_issued` table and its CRL size must be measured before wave 2, not after.
 - The gateway gains C code that faces the internet. The fuzzing, ASan and advisory-tracking requirements in D8 are permanent.
-- `docs/pki-architecture.md`, `docs/user-manual/gateway.md`, the reference composes, the compose wizard and the agent installer all change with waves 1, 2 and 4.
+- `docs/pki-architecture.md`, `docs/user-manual/gateway.md`, the reference composes and other compose files, the compose wizard, the agent and gateway installers, the gateway `sys.config` files and the environment examples all change with waves 1, 2, 4, 5 and 6.
 
 ## Open questions
 
@@ -320,3 +357,5 @@ Resolved in wave 0 (2026-10-29): the SPIFFE trust domain (D3), D5's scope, and w
 - **For wave 2:** how an agent learns that a server's signing key is revoked (D5).
 - **For wave 5:** how the server that owns an agent's stream learns of a revocation made on another server (D7, D12).
 - **Not yet named:** which wave removes the #4669 cluster-affinity admission check (conflict 1).
+- **For wave 4:** whether a fail-closed gateway gets weight zero in the gateway list (D7, D9).
+- **No wave named yet:** #5578's R-6, per-gateway `agent_id` scoping.
