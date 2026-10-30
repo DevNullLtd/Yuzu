@@ -1111,9 +1111,14 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
 - **Rate limits** (per replica, applied by the issuer). A mark over the rate stays in the set for a
   later pass and is counted `deferred`; nothing is dropped permanently, because divergence persists
   until fixed.
-  - **Figures are per replica.** Issuing takes N / rate seconds, where N is the number of agents
-    whose heartbeats reach that replica. Every figure here is for N = 100,000 on one replica. Both
-    defaults are unmeasured (see the combined Postgres rate above).
+  - **Figures are per replica.** Issuing takes N / r seconds, where N is the number of agents
+    whose heartbeats reach that replica and r is min(configured rate, 1 / record-write latency): the
+    issuer is one thread, and each issuance makes one synchronous `record_command_dispatch` write
+    (a lease and one autocommit insert), so at 0.5-2 ms per write it may not reach the 2,200/s the
+    two defaults add up to. The figures below assume the configured rate is reached; slice 10
+    measures the issuer's real throughput, and if it falls short the convergence times grow in
+    proportion. Every figure here is for N = 100,000 on one replica. Both defaults are unmeasured
+    (see the combined Postgres rate above).
   - `tags`: `--tag-resync-rate`, default 2000/s, at most one per agent per 60 s. A full set is about
     4 KB. Issuing takes about 50 s for N = 100,000, but tags converge in about **two minutes**: the
     first heartbeat after a restart (up to 36 s) marks the agent, issuing drains over about 50 s,
