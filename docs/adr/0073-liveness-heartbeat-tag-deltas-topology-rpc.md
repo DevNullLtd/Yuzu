@@ -1841,8 +1841,11 @@ It should say:
 - the new store: the first server start creates the `agent_registration_store` schema (D14), so the
   server's database role needs the same DDL rights every other store's first start needs. Without
   them the store's construction fails and the server refuses to start (ADR-0007/0012), as for any
-  store. A database restored from before this release has no rows in it: every reattach answers
-  `NO_RECORD` and each agent registers once more, as after a lost write;
+  store. Where the release's deployment contract permits restoring a database taken before this
+  release, that database has no rows in this store: every reattach answers `NO_RECORD` and each
+  agent registers once more, as after a lost write. Under a hard-cutover contract (the one
+  `docs/user-manual/upgrading.md` states today) no earlier-build database or backup is supported
+  at all; a fresh deployment starts with every agent registering fresh;
 - rollback, if the release's deployment contract permits one: the reverse order, agents, then
   gateways, then server. A new gateway must never front an old server (it cannot reattach). Status
   tags and topology are dark for each agent whose version does not match the server's until the
