@@ -1484,7 +1484,7 @@ message ReattachResponse {
   bool accepted = 1;
   string session_id = 2;          // the adopted session
   ReattachRefusal refusal = 3;    // NO_RECORD | NOT_ENROLLED | SUPERSEDED | MALFORMED_SESSION | DEGRADED | RATE_LIMITED
-  uint32 retry_after_ms = 4;      // set with RATE_LIMITED and DEGRADED
+  uint32 retry_after_ms = 4;      // set with RATE_LIMITED (>= 1000) and DEGRADED (5000); never 0
 }
 ```
 
@@ -1526,7 +1526,9 @@ message ReattachResponse {
      the next token (about 0.5 ms at 2000/s) is not used, because it would send every over-rate
      gateway back in a tight, aligned loop that loads the same gRPC handlers `BatchHeartbeat`
      needs. The gateway waits a full-jittered delay in [0, `retry_after_ms`] before it requeues the
-     session (D9). The bucket is one per replica, shared by every gateway, with no per-gateway
+     session (D9). A `DEGRADED` answer carries a fixed 5,000 ms, so a degraded pool is not retried
+     in a tight loop either, and the gateway treats a 0 from any server as the 1,000 ms floor. The
+     bucket is one per replica, shared by every gateway, with no per-gateway
      share: during a storm one gateway's replay can hold another gateway's agents in
      `RATE_LIMITED`, with their streams up but no session installed, so no command, containment
      included, routes to them until a later attempt is admitted. The delay is bounded by the
@@ -2311,7 +2313,8 @@ of every ~30 s. The content is unchanged.
     that N;
   - **S2, S1 with Postgres degraded** (300 ms added latency, pool saturated; slice 6): heartbeat
     ingestion is unaffected, resyncs are `deferred` and drain once the pool recovers, and a reattach
-    whose read fails answers `DEGRADED` without closing a stream;
+    whose read fails answers `DEGRADED` without closing a stream; `DEGRADED` reattach attempts per
+    second stay at or below the held session count divided by 5 s;
   - **S3, two replicas behind per-RPC balancing** (slices 4 and 6): asserts the connection-affinity
     precondition (*Server stores*) by showing the documented symptom, a `diverged` plus `no_base`
     share near 100 %, and that connection-level balancing converges;
