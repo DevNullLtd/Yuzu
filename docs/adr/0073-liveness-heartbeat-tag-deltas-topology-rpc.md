@@ -1108,8 +1108,10 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     - a 10 s deadline and no retries: the agent's next diverged heartbeat re-marks it;
     - no re-issue to an agent while an earlier forward for it is in flight; a mark above the
       in-flight bound stays `deferred`;
-    - `forward_gateway_pending` and #3279 are unchanged for every other command. That is a `DispatchCaller` construction, of the
-    existing system kind; it threads no operator authority and adds no `approval_provenance`
+    - `forward_gateway_pending` and #3279 are unchanged for every other command.
+
+    The `build_classified_command` call is a `DispatchCaller` construction, of the existing system
+    kind; it threads no operator authority and adds no `approval_provenance`
     stamping site. It is not a fleet dispatch. `SystemReservedPush` gains two enumerators, one per
     action (`resync_tags` labelled `__resync__.tags`, `resync_topology` labelled
     `__resync__.topology`), because each enumerator maps to one `plugin.action` capability label
