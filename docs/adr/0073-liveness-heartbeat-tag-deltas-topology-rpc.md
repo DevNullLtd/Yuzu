@@ -1816,8 +1816,9 @@ It should say:
 - after a server restart, for 100,000 agents on a replica: each agent's state-derived gauges return
   about two minutes after it reattaches, the last agent's about 3 to 6 minutes after the restart,
   and topology about 8 minutes after the reattach wave (D13);
-- the new flags: `--topology-interval`, `--no-topology`, `--tag-resync-rate`,
-  `--topology-resync-rate`, `--reattach-rate`;
+- the new flags and the gateway key, with defaults, ranges and environment names (*Configuration*):
+  `--topology-interval`, `--no-topology`, `--tag-resync-rate`, `--topology-resync-rate`,
+  `--reattach-rate`, `upstream_topology_concurrency`;
 - `yuzu.uptime_s` is replaced by `yuzu.started_at`;
 - the gateway management RPCs `ListAgents`, `GetAgent` and `QueryInventory` stay in the proto,
   deprecated, but the gateway answers them `UNIMPLEMENTED`; use the server's REST or MCP agent views;
@@ -1825,10 +1826,15 @@ It should say:
   the new gateway cannot replay to an old server.
 
 The *Version Compatibility* table's row states minimum agent and gateway versions equal to this
-release. Changelog: one fragment, `changelog.d/<PR#>-liveness-heartbeat.changed.md`, with the bold
-lead "**Breaking: liveness-only heartbeat**". It names the deprecated, no-longer-populated fields,
-the new RPCs, the tag-delta semantics and the upgrade-together requirement. `CHANGELOG.md` is not
-edited.
+release. Changelog: every implementing PR adds its own fragment, `changelog.d/<PR#>-<slug>.<section>.md`,
+as `changelog.d/README.md` requires, in the section that fits what that PR does (`added`,
+`changed`, `deprecated`, `removed`, `fixed` or `security`; there is no breaking section). The
+breaking wire change (slice 3) goes under `changed` with the bold lead "**Breaking: liveness-only
+heartbeat**", naming the deprecated, no-longer-populated fields, the new RPCs, the tag-delta
+semantics and the upgrade-together requirement. Deprecations (heartbeat fields 3 and 4, the three
+management RPCs) go under `deprecated`; removals (the dispatch fetcher, `yuzu.uptime_s`, the
+retired metrics and drop reasons) under `removed`; new flags, RPCs and metrics under `added`.
+`CHANGELOG.md` is not edited.
 
 ### Configuration
 
@@ -2031,10 +2037,16 @@ per replica, for N agents whose heartbeats reach it (estimates, unmeasured; slic
 - **Heartbeat state content and the topology body are unsigned** under ADR-0074 D5's decided
   scope. D16 states what a compromised gateway can do with that; it is not covered by ADR-0074's
   liveness-only acceptance (open point 12).
-- **Quarantine containment is unchanged:**
+- **Quarantine containment is unchanged in its rules, but its exempt channels change:**
   - a reattach installs a session exactly as a replay-adopt does, so the heartbeat-driven
     reconnect reconciler (#3425) applies;
-  - no quarantine-store read is added to the reattach path, matching the rule for `Register`.
+  - no quarantine-store read is added to the reattach path, matching the rule for `Register`;
+  - `__resync__` is a `SystemReservedPush` (`dispatch_confined_arms.hpp`), so, like `__sync__.now`,
+    it reaches a contained device. It only arms a full-tag heartbeat or a topology report; no code
+    runs. It is counted on `yuzu_server_system_reserved_push_total` under its own capability label,
+    and not audited, as the other pushes are. The `echo.fleet_snapshot` push is no longer sent
+    (D10). `docs/user-manual/security-hardening.md`'s list of channels that reach a contained
+    device changes with it.
 
 ### Privacy
 
@@ -2218,9 +2230,36 @@ of every ~30 s. The content is unchanged.
   `heartbeat_batch_interval_ms` must stay well below the heartbeat interval (D4); registration replay
   becomes reattach; the live management RPCs are `SendCommand` and `WatchEvents`, the other three
   deprecated and `UNIMPLEMENTED`.
-- `docs/user-manual/metrics.md`.
+- `docs/user-manual/metrics.md`: every new family and its closed label set (D13); the retired
+  `yuzu_viz_topology_fetch_duration_seconds` and `yuzu_viz_agent_dispatch_timeout_total` rows and
+  their example alerts removed; the new meaning of the kept cache and refill families and of
+  `yuzu_viz_topology_request_seconds` (no 5 s fetcher deadline); the three runbook sections the
+  alerts link to (D13); the peer-guard `rpc` set grown to seven (`proxy_topology`,
+  `proxy_reattach`) and the denied-series count from 40 to 56.
 - `docs/observability-conventions.md`: the heartbeat-buffer drop reasons (about l.109), plus the new
-  families.
+  families, and the peer-guard RPC inventory (five to seven RPCs, 40 to 56 series).
+- `docs/user-manual/server-admin.md`: the three server flags (`--tag-resync-rate`,
+  `--topology-resync-rate`, `--reattach-rate`) with their defaults, ranges, environment names and
+  per-replica scope (*Configuration*); and "Gateway upstream peer authorization", whose list of
+  "the five gateway-upstream RPCs" becomes seven.
+- `docs/user-manual/device-management.md` "Agent CLI Flags": `--topology-interval` and
+  `--no-topology` with their environment names (*Configuration*).
+- `docs/executions-history-ladder.md` "Non-tracked correlation-id prefixes": the `__resync__-`
+  prefix, skipped by `notify_exec_tracker` like `polchk-` and `preflight-` (D8).
+- `docs/user-manual/security-hardening.md`: "Command Replay Protection" (`__resync__` is a second
+  dedup-claimed reserved name); the quarantine section's server-internal pushes that reach a
+  contained device (`__resync__` added, `echo.fleet_snapshot` no longer sent; *Security*).
+- The Echo plugin: `agents/plugins/echo/README.md` and `docs/echo-dashboard.md` (the
+  `fleet_snapshot` action is run by the agent's pump and is no longer dispatched by the server;
+  `content_digest` and `schema_minor` 3); the `fleet_snapshot` description in
+  `content/definitions/echo.yaml`, which says "the server pulls on demand" and is false after D10;
+  and `content/plugin-docs/echo.json`, regenerated from those (never hand-edited, per
+  `docs/plugin-readme-standard.md`). `docs/echo-implementer.md` is checked and changed only if it
+  describes the snapshot path.
+- The shipped gateway configuration: the `notify_pending_max` comment in
+  `gateway/config/sys.config.prod` and `deploy/docker/reference-gateway-sys.config` says "a full
+  registration replay then makes those agents re-send it", which becomes a reattach; and the new
+  `upstream_topology_concurrency` key (*Configuration*).
 - `docs/user-manual/rest-api.md` and `docs/user-manual/mcp.md`: `stale_reason` and freshness, `ts`
   as the body's build time, `fresh` as a render-cache rebuild that never contacts an agent, and the
   host call's not-found meaning.
@@ -2242,7 +2281,6 @@ of every ~30 s. The content is unchanged.
   `viz.fleet_topology.invalidate` row, which today says the request forced a cache invalidation
   and now records a rebuild from stored bodies with no agent contacted; `topology.push.rejected`'s
   `reason` detail (`ip_conflict`, `reclaim_conflict`) and the paths that write each topology verb.
-- The agent CLI reference.
 - The ADR-2002 incident paragraph: a pointer to this ADR.
 
 The same changes fix known truth-drift:
