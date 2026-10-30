@@ -287,5 +287,4 @@ permissions|linux|-|full_disk_access|unsupported|-|-|-
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp`
 - Tests: `tests/unit/test_privacy_permissions_local_dispatcher.cpp` · `tests/unit/test_privacy_permissions_macos_internals.cpp` · `tests/unit/test_privacy_permissions_parsers.cpp` · `tests/unit/test_privacy_permissions_win_internals.cpp` · `tests/unit/test_privacy_permissions_win_walk.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-09-29-privacy_permissions-macos-leg.added.md` · `changelog.d/2026-09-30-privacy_permissions-windows-leg.added.md` · `changelog.d/5293-privacy_permissions-windows-hardenings.changed.md`
 <!-- END GENERATED -->
