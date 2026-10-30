@@ -825,6 +825,9 @@ Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
 **Server:**
 - `yuzu_server_heartbeat_tags_total{via,outcome}`, with `synced|full|diverged|no_base|rejected`;
 - `yuzu_server_tag_resync_total{outcome}`, with `sent|deferred|send_failed`;
+- `yuzu_server_agent_reattach_total{outcome}`, with
+  `accepted|no_record|not_enrolled|superseded|malformed_session|degraded|rate_limited` (D14);
+- `yuzu_server_agent_registration_store_failed_total{op}` (D14);
 - `yuzu_viz_topology_pushed_total{via,reason}` (gains `reason`);
 - `yuzu_viz_topology_push_parse_errors_total{via}` (unchanged);
 - `yuzu_viz_topology_digest_total{via,outcome}`, with `match|mismatch|no_slot|absent`;
@@ -945,6 +948,13 @@ message ReattachResponse {
   The CONNECTED re-announce then sets `gateway_node`, wire capabilities, `stream_home_id` and
   `cluster_id`, as today. Status tags and topology are **not** in the record. The next heartbeat is `no_base`, and
   `__resync__.tags`, then `__resync__.topology`, converge them (D3, D8).
+- **Reattach is a continuation, not a registration.** A successful reattach fires no
+  `agent.registered` webhook or offload event and writes no registration audit row, because the
+  agent did not enrol or register again. Every outcome is counted on
+  `yuzu_server_agent_reattach_total{outcome}` (D13). The refusals that say something about the
+  caller, `NOT_ENROLLED`, `SUPERSEDED` and `MALFORMED_SESSION`, also write an `agent.reattach`
+  audit row with `result=refused` and the refusal. `NO_RECORD`, `DEGRADED` and `RATE_LIMITED` are
+  counted only, so a store outage or a restart storm cannot flood the audit log.
 - **Every outcome, in one table.** The adopt decision is shared (step 5), so ProxyRegister and
   ProxyReattach answer from the same outcome. ProxyReattach always answers `OK` with a
   `ReattachResponse`; its refusals are values, never gRPC error statuses, so the gateway's breaker
@@ -1362,7 +1372,9 @@ of every ~30 s. The content is unchanged.
   backup) answers `NO_RECORD`; a body and metadata session-id mismatch answers `MALFORMED_SESSION`;
   a stored `service` scopable tag is dropped on install; a stored `tar` plugin sets
   `legacy_echo_wire_name` as at registration;
-  a refusal before the adopt step leaves the route directory untouched;
+  a refusal before the adopt step leaves the route directory untouched; a successful reattach
+  fires no `agent.registered` event; each outcome moves `yuzu_server_agent_reattach_total`, and
+  the three caller-attributable refusals write an `agent.reattach` audit row;
 - `AgentRegistrationStore` under the ADR-0012 test conventions (`YUZU_REQUIRE_PG_DB`): upsert, plugin
   interning, the decommission cascade (including the `kCascadeStoreCount` bump), DB-authored
   timestamps;
@@ -1474,6 +1486,7 @@ of every ~30 s. The content is unchanged.
 - The decommission blast-radius lists: `sle_routes.hpp`/`.cpp`, `rest_api_v1.cpp`'s delete block,
   ADR-0024 Decisions 9 and 11, and `docs/user-manual/rest-api.md` (the cascade header's step (d)).
 - `docs/auth-architecture.md`: the gateway no longer holds enrollment tokens; reattach authority.
+- `docs/user-manual/audit-log.md`: the `agent.reattach` refusal row.
 - The agent CLI reference.
 - The ADR-2002 incident paragraph: a pointer to this ADR.
 
