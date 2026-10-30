@@ -1533,7 +1533,8 @@ message ReattachResponse {
   has no agent step: it carries ids only and is invisible to the agent. It therefore cannot carry
   the D5 per-session proof, which is the agent signing a server challenge at session start. Until
   the owner resolves this (open point 13), a reattached session, and the route its CONNECTED
-  re-announce writes, carry the route-claim risk stated in ADR-0074 Conflict 1: a compromised
+  re-announce writes, carry the route-claim risk stated in ADR-0074 Conflict 1, which ADR-0074
+  lists for explicit acceptance at its sign-off and which holds only until its wave 2 (D5): a compromised
   gateway with a valid certificate can reattach any enrolled agent whose route row is not held by
   a different live session, and claim that route.
 
@@ -2331,9 +2332,12 @@ per-agent bytes on the agent, at no fleet count.
   slice 7b. Whether any of them may merge before acceptance is the owner's call (open point 17);
   none has a tracking epic yet, and the implementing PRs open one.
 - **Slice 7b against ADR-0074 wave 2.** If 7b lands before wave 2, reattach carries today's replay
-  authority (D14, *Authority is unchanged*). If wave 2 lands first, open point 13 must be decided
-  before 7b: wave 2 gates the route write on a verified per-session agent signature, which
-  reattach cannot carry as designed.
+  authority (D14, *Authority is unchanged*). Either way, open point 13 must be decided before
+  ADR-0074 wave 2 lands: wave 2 gates the route write on a verified per-session agent signature
+  (its exit criterion: a CONNECTED notification without one changes no route), which reattach
+  cannot carry as designed. If 7b is already on `dev` when wave 2 lands, every reattached agent
+  would otherwise be left with no route after a server restart until it reconnects; if wave 2
+  lands first, 7b waits for the decision.
 
 **No release or pilot build between slice 3 and slice 10.** From slice 3, status tags and topology
 are inert on `dev` (tags until slices 4-6, topology until slice 9), so a build cut in that range has
