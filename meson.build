@@ -393,8 +393,8 @@ if host_os == 'darwin'
   # `usr/lib/libEndpointSecurity.tbd` + `usr/include/EndpointSecurity/` in BOTH
   # the Command Line Tools SDK and the full Xcode SDK, so it is probed as a
   # library plus its header (an `appleframeworks` probe can never find it).
-  # This is the SINGLE probe site for every ES consumer in the tree: TAR's
-  # process stream (tar_proc_es.cpp), agent-core's pure ES helpers
+  # This is the SINGLE probe site for every ES consumer in the tree: Echo's
+  # process stream (echo_proc_es.cpp), agent-core's pure ES helpers
   # (es_client.hpp) and the test executables all consume
   # endpoint_security_dep/_deps/_args instead of probing independently.
   # Found: the real ES client compiles (-DYUZU_HAVE_ENDPOINT_SECURITY -fblocks;
@@ -404,7 +404,7 @@ if host_os == 'darwin'
   # Compiling and linking need no entitlement. RUNNING a client needs the
   # com.apple.developer.endpoint-security.client entitlement, root and Full
   # Disk Access: unentitled (every CI leg), es_new_client fails and each
-  # consumer falls back cleanly (TAR to the sysctl poll). See
+  # consumer falls back cleanly (Echo to the sysctl poll). See
   # docs/darwin-compat.md's EndpointSecurity pitfalls-table row.
   endpoint_security_dep = cxx.find_library('EndpointSecurity', required: false)
   endpoint_security_deps = []
@@ -548,7 +548,7 @@ if build_agent
   subdir('agents/plugins/registry')
   subdir('agents/plugins/rdp_control')
   subdir('agents/plugins/wmi')
-  subdir('agents/plugins/tar')
+  subdir('agents/plugins/echo')
   subdir('agents/plugins/wifi')
   subdir('agents/plugins/wol')
   subdir('agents/plugins/discovery')

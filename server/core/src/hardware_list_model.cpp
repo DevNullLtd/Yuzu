@@ -3,6 +3,8 @@
 
 #include "hardware_list_model.hpp"
 
+#include "tag_store.hpp" // TagStore::validate_key - the .cpp only; the header stays store-free (#6558)
+
 #include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
 
 #include <algorithm>

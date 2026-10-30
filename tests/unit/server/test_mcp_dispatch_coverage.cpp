@@ -302,9 +302,10 @@ std::vector<std::string> declared_record_names(const std::string& code, const st
 // Exact counts of the registry source files a healthy scan reads. Equality, not a floor: a
 // domain file that drops out of the glob (renamed away from the prefix) would otherwise leave
 // its records and includes unchecked while the scan still passes on the remaining files. Bump
-// kRegistryDomainFiles together with MIN_REGISTRY_FILES in scripts/ci/check-api-parity.py when
-// a mcp_tools_<domain>.cpp is added; bump kToolHeaderFiles when an mcp_tool*.hpp is added.
-constexpr std::size_t kRegistryDomainFiles = 3;
+// kRegistryDomainFiles together with MIN_REGISTRY_FILES in scripts/ci/check-api-parity.py (and the
+// seam-closure lane pins in scripts/ci/check-seam-closure.py) when a mcp_tools_<domain>.cpp is
+// added; bump kToolHeaderFiles when an mcp_tool*.hpp is added.
+constexpr std::size_t kRegistryDomainFiles = 4;
 constexpr std::size_t kToolHeaderFiles = 3;
 
 } // namespace
@@ -425,7 +426,9 @@ TEST_CASE("MCP dispatch coverage: every mcp_tools_*.cpp record is registered and
     }
     INFO("mcp_tools_*.cpp files scanned: " << files << " (expected " << kRegistryDomainFiles
                                            << "); bump kRegistryDomainFiles with the new file, together with "
-                                              "MIN_REGISTRY_FILES in scripts/ci/check-api-parity.py");
+                                              "MIN_REGISTRY_FILES in scripts/ci/check-api-parity.py and the "
+                                              "seam-closure lane pins (MCP_REGISTRY_EXPECTED_TU_COUNT in "
+                                              "scripts/ci/check-seam-closure.py)");
     CHECK(files == kRegistryDomainFiles);
 
     // Set equality in both directions, and no name declared twice across files.
@@ -503,13 +506,15 @@ std::vector<std::string> forbidden_includes_in(const std::string& source) {
 // The files the include denylist polices: every registry domain file (mcp_tools_*.cpp) and
 // every registry seam / shared-helper header (mcp_tool*.hpp: mcp_tool_registry.hpp,
 // mcp_tool_deps.hpp, mcp_tool_helpers.hpp). The headers matter because a shared helper
-// header is included by every domain file, so a store header reached through one of them
-// would reach all of them, and the .cpp scan alone would never see it. Each header is
+// header may be included by any domain file, so a store header reached through one of them
+// would reach every domain file that includes it, and the .cpp scan alone would never see it. Each header is
 // held to the same denylist as the .cpp files: mcp_tool_deps.hpp deliberately names
-// domain MODEL headers (hardware_list_model.hpp, inventory_routes.hpp,
+// domain MODEL headers (hardware_list_model.hpp, inventory_types.hpp,
 // quarantine_visible.hpp) for the provider closure types, but none of them is a store,
 // agent-registry, server or auth header, so it passes unchanged and the denylist is not
-// weakened for it.
+// weakened for it. This test polices DIRECT includes only; the TRANSITIVE closure (a store
+// reached through one of those model headers) is held store-free by scripts/ci/
+// check-seam-closure.py's MCP registry lane (#6558), which globs these same files.
 struct ToolScanFiles {
     std::vector<fs::path> cpp;
     std::vector<fs::path> hpp;

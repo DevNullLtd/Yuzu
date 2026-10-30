@@ -58,7 +58,7 @@ tus=(
     agents/plugins/peripherals/src/peripherals_win.cpp
     agents/plugins/browser_policy/src/browser_policy_win.cpp
     agents/plugins/pkg_inventory/src/pkg_inventory_win.cpp
-    agents/plugins/tar/src/tar_removable_collector.cpp
+    agents/plugins/echo/src/echo_removable_collector.cpp
     agents/plugins/execution_artifacts/src/execution_artifacts_win.cpp
     agents/plugins/update_source_trust/src/update_source_trust_win.cpp
     agents/plugins/mgmt_posture/src/mgmt_posture_win.cpp
@@ -78,11 +78,11 @@ tus=(
     agents/plugins/system_hardening/src/system_hardening_win.cpp
     agents/plugins/privacy_permissions/src/privacy_permissions_win.cpp
     agents/plugins/privacy_permissions/src/privacy_permissions_plugin.cpp
-     agents/plugins/license_scan/src/licensing_win.cpp agents/plugins/registry/src/registry_plugin.cpp agents/plugins/registry/src/registry_win.cpp agents/plugins/installed_apps/src/installed_apps_plugin.cpp agents/plugins/tar/src/tar_mapdrive_collector.cpp agents/plugins/users/src/users_plugin.cpp
+     agents/plugins/license_scan/src/licensing_win.cpp agents/plugins/registry/src/registry_plugin.cpp agents/plugins/registry/src/registry_win.cpp agents/plugins/installed_apps/src/installed_apps_plugin.cpp agents/plugins/echo/src/echo_mapdrive_collector.cpp agents/plugins/users/src/users_plugin.cpp
 )
 [ "$#" -gt 0 ] && tus+=("$@")
 
-# tar_removable_collector.cpp pulls in tar_removable_parsers.hpp, which uses
+# echo_removable_collector.cpp pulls in echo_removable_parsers.hpp, which uses
 # nlohmann::json for real (encode/decode of the whole cursor structure, not a
 # handful of calls a small stub could faithfully cover the way the spdlog
 # stub above does) — so unlike every TU above, this one needs the real

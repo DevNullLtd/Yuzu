@@ -31,17 +31,17 @@ Two existing constraints shape the design:
 - **Thin central (ADR-0004).** Most device data stays on the per-agent edge
   warehouse; central Postgres holds only what fleet-wide queries need.
 
-### Why not "TAR first"
+### Why not "Echo first"
 
-The initial instinct was to land this in the agent's local **TAR** edge
-warehouse and pull it centrally. Rejected: TAR is **pull-only by design** and
+The initial instinct was to land this in the agent's local **Echo** edge
+warehouse and pull it centrally. Rejected: Echo is **pull-only by design** and
 **event-shaped** (it records *change events*, e.g. PR #1620's `$Software`
-source records install/uninstall/upgrade deltas). TAR answers *"what changed,
+source records install/uninstall/upgrade deltas). Echo answers *"what changed,
 when"* on the edge. Our goal is *"what is installed now, daily, in central
-Postgres."* Routing a full daily snapshot through TAR would require building a
-new push/export transport that contradicts TAR's no-push philosophy, and TAR's
+Postgres."* Routing a full daily snapshot through Echo would require building a
+new push/export transport that contradicts Echo's no-push philosophy, and Echo's
 delta shape does not match a full-snapshot need. The two are **complementary,
-not substitutes**: this framework owns *current state, central*; TAR owns
+not substitutes**: this framework owns *current state, central*; Echo owns
 *change history, edge*. PR #1620 is out of scope here and lives or dies on its
 own merits.
 
@@ -56,7 +56,7 @@ is **source #1**; the seam is built right so further sources (and a future
 ### 1. Vehicle — direct push over `ReportInventory`
 Reuse the dormant `AgentService.ReportInventory(InventoryReport) → InventoryAck`
 RPC. `InventoryReport.plugin_data` is already a generic `map<string,bytes>`
-envelope (key = data-type, value = opaque blob). No TAR involvement.
+envelope (key = data-type, value = opaque blob). No Echo involvement.
 
 ### 2. Generic per-source framework (agent)
 A small, source-agnostic seam:
@@ -74,7 +74,7 @@ A small, source-agnostic seam:
 - Persist `last_sync_ts` + `last_hash` per source in the agent **`KvStore`**
   (`agents/core/src/kv_store.cpp`, `kv_store.db`), namespace `__sync__` — the
   same agent-core state store Guardian uses (namespace `__guardian__`).
-  Explicitly **not** TAR: TAR is a *plugin-owned, append-only* capture
+  Explicitly **not** Echo: Echo is a *plugin-owned, append-only* capture
   warehouse; this is *mutable agent-core* KV state, and core must not depend on
   a plugin's DB being loaded/healthy.
 - **Startup policy:** first-run or overdue (gone past one interval while
@@ -161,7 +161,7 @@ Therefore we **coexist, not replace**:
   future high-query sources get their own typed table in this store. Built per
   the `OfflineEndpointStore` template + ADR-0012 + the postgres-store-playbook:
   - **Current-state only** (replace on change). No history in central PG —
-    change-history stays an edge/TAR concern (ADR-0004 boundary).
+    change-history stays an edge/Echo concern (ADR-0004 boundary).
   - **Normalized relational rows**, **no JSONB/GIN** — honors the
     "migrate off Postgres easily" constraint. Generic parent
     `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` +
@@ -253,14 +253,14 @@ Therefore we **coexist, not replace**:
 
 ## Alternatives considered
 
-- **TAR-first + central pull** — rejected (pull-only, event-shaped; see Context).
+- **Echo-first + central pull** — rejected (pull-only, event-shaped; see Context).
 - **JSONB blob + GIN index** — rejected (Postgres lock-in; clunky range
   filters; conflicts with the migrate-off-PG constraint).
 - **Always send the full list** — rejected (abandons network-kindness).
 - **Server-dispatched daily schedule** — rejected (daily fleet fan-out; the
   agent-push model matches the RPC's purpose and self-staggers).
 - **Full version history in central PG** — rejected for v1 (fattest; contradicts
-  thin-central; history is TAR's edge concern).
+  thin-central; history is Echo's edge concern).
 
 ## Relationship to other ADRs
 - **ADR-0004** (edge warehouses / thin central) — this framework's
@@ -268,7 +268,7 @@ Therefore we **coexist, not replace**:
 - **ADR-0006/0008** (Postgres substrate) — `InventoryStore` is born-on-PG.
 - **ADR-0012** (server Postgres store contract) — `InventoryStore` follows it;
   recorded as a prioritized net-new store in `docs/postgres-migration-ladder.md`.
-- **PR #1620 / `$Software` TAR source** — complementary edge change-history,
+- **PR #1620 / `$Software` Echo source** — complementary edge change-history,
   not a substitute for this framework.
 
 ## Updates
@@ -537,8 +537,8 @@ header banner in `agents/plugins/app_usage/src/app_usage_parsers.hpp` are the
 per-file contracts; this entry is the routed-concerns.md pointer's full text
 (kept here, not duplicated inline in that file, to stay under its per-file
 character budget — see `docs/instruction-file-standard.md`'s placement
-ladder). The plugin reads TAR's `usage` fold read-only (`PRAGMA query_only`,
-`SQLITE_OPEN_READONLY`) — it never writes `tar.db`. Four clauses, all
+ladder). The plugin reads Echo's `usage` fold read-only (`PRAGMA query_only`,
+`SQLITE_OPEN_READONLY`) — it never writes `echo.db`. Four clauses, all
 CATASTROPHIC-IF-VIOLATED:
 
 1. **No pid, command line or user name is ever emitted.** `usage_daily_user`
@@ -551,9 +551,9 @@ CATASTROPHIC-IF-VIOLATED:
    the producer's backslash-pipe escape sequence — changing one side without
    the other silently corrupts or drops rows whose executable name contains a
    delimiter character.
-3. **A `tar_config` read failure must map to `Errored`, never `Enabled`.**
+3. **An `echo_config` read failure must map to `Errored`, never `Enabled`.**
    `source_state_from_config`'s tri-state (Enabled/Disabled/Errored) mirrors
-   TAR's own `canonical_source_enabled` #560 fix; defaulting a read failure to
+   Echo's own `canonical_source_enabled` #560 fix; defaulting a read failure to
    `Enabled` is the opposite of fail-closed.
 4. **Never send an empty blob for a constrained capture.** Skip the sync cycle
    instead — an empty blob reads server-side as "genuinely zero usage" on a

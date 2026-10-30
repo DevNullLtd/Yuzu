@@ -2615,7 +2615,7 @@ tests:
   # There is no rule for yuzu_server_system_reserved_push_total. That was
   # tried and withdrawn: `send_to` returns false whenever an agent's stream is
   # null, which is what an ordinary suspended laptop looks like, and
-  # tar.fleet_snapshot fans out over the whole fleet on every viz fetch. A
+  # echo.fleet_snapshot fans out over the whole fleet on every viz fetch. A
   # `> 0` rule on that family is permanently firing on any real fleet, and a
   # permanently-firing rule gets silenced — taking the genuine
   # "__guard__.push_rules never landed" signal with it. Same self-defeating
@@ -3140,6 +3140,48 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuInventoryGenericBlobRejectedDepth", alertstate="firing", severity="warning"}'
             value: 1
+
+  # ── YuzuCertInventoryReportsRejected ─────────────────────────────────────
+  # CASE - ONE device refused ONCE fires (increase over a day, no hold), carrying its reason.
+  - interval: 1m
+    name: cert inventory rejected - a single refusal fires, with its reason label
+    input_series:
+      - series: 'yuzu_server_cert_inventory_ingest_total{job="yuzu",instance="s1",result="rejected",reason="unknown_version"}'
+        values: "0x10 1x60"
+      - series: 'yuzu_server_cert_inventory_ingest_total{job="yuzu",instance="s1",result="stored",reason="none"}'
+        values: "0+5x70"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCertInventoryReportsRejected", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCertInventoryReportsRejected", alertstate="firing", severity="warning", result="rejected", reason="unknown_version"}'
+            value: 1
+
+  # CASE - a budget_exceeded freeze fires through the second arm.
+  - interval: 1m
+    name: cert inventory rejected - budget_exceeded fires too
+    input_series:
+      - series: 'yuzu_server_cert_inventory_ingest_total{job="yuzu",instance="s1",result="error",reason="budget_exceeded"}'
+        values: "0x10 1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCertInventoryReportsRejected", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCertInventoryReportsRejected", alertstate="firing", severity="warning", result="error", reason="budget_exceeded"}'
+            value: 1
+
+  # CASE - a flat zero series, and an unrelated store_error, stay quiet.
+  - interval: 1m
+    name: cert inventory rejected - flat rejected and plain store errors stay quiet
+    input_series:
+      - series: 'yuzu_server_cert_inventory_ingest_total{job="yuzu",instance="s1",result="rejected",reason="bad_header"}'
+        values: "0x70"
+      - series: 'yuzu_server_cert_inventory_ingest_total{job="yuzu",instance="s1",result="error",reason="store_error"}'
+        values: "0+1x70"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCertInventoryReportsRejected", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples: []
 
   # CASE - a flat/absent counter stays quiet: RED against dropping the `> 0`
   # (an `>= 0` form would spuriously fire the instant this series is scraped
@@ -4836,6 +4878,78 @@ tests:
         eval_time: 8m
         exp_samples: []
 
+  # CASE D2 -- the #6016 identity reasons each fire YuzuGatewayMgmtAuthRejected at
+  # once (a server key renewal that keeps the identity produces none of them, so
+  # there is nothing to suppress), and never the pin_mismatch rule.
+  - interval: 1m
+    name: gateway mgmt rejection - the server identity reasons fire promptly
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="no_uri_san"}'
+        values: "0x5 1x30"
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="identity_mismatch"}'
+        values: "0x5 1x30"
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="identity_unresolved"}'
+        values: "0x5 1x30"
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="revoked"}'
+        values: "0x5 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected", alertstate="firing", instance="g1", job="yuzu-gateway", reason="identity_mismatch", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected", alertstate="firing", instance="g1", job="yuzu-gateway", reason="identity_unresolved", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected", alertstate="firing", instance="g1", job="yuzu-gateway", reason="no_uri_san", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected", alertstate="firing", instance="g1", job="yuzu-gateway", reason="revoked", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 8m
+        exp_samples: []
+
+  # -- The built-in server certificate lacks the server identity URI (#6016) -----
+  #
+  # Gauge 0 = the in-place re-issue was skipped or failed. Pending for 15m so a
+  # rolling restart does not warn, then firing; 1 never fires; ABSENT (the
+  # installation does not use the built-in certificates) never fires.
+  - interval: 1m
+    name: server identity URI absent - fires after 15m at 0
+    input_series:
+      - series: 'yuzu_server_identity_uri_present{job="yuzu-server",instance="s1"}'
+        values: "1x5 0x40"
+      - series: 'yuzu_server_identity_uri_present{job="yuzu-server",instance="s2"}'
+        values: "1x45"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuServerIdentityUriAbsent", alertstate="firing"}'
+        eval_time: 19m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuServerIdentityUriAbsent", alertstate="firing"}'
+        eval_time: 21m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuServerIdentityUriAbsent", alertstate="firing", instance="s1", job="yuzu-server", severity="warning"}'
+            value: 1
+  - interval: 1m
+    name: server identity URI absent - recovers, and an absent gauge never fires
+    input_series:
+      - series: 'yuzu_server_identity_uri_present{job="yuzu-server",instance="s1"}'
+        values: "0x20 1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuServerIdentityUriAbsent", alertstate="firing"}'
+        eval_time: 18m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuServerIdentityUriAbsent", alertstate="firing", instance="s1", job="yuzu-server", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuServerIdentityUriAbsent", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuServerIdentityUriAbsent", instance="s9"}'
+        eval_time: 25m
+        exp_samples: []
+
   # -- Gateway pin file and certificate files unreadable --------------------
   #
   # A pin file whose latest read failed keeps its last key (commands still
@@ -6044,10 +6158,10 @@ tests:
 
   # YuzuExecCorrelationReapSaturated. ONE run, seven instances, because the rule needs a 24 hour `for:`
   # and promtool evaluates every rule in the file each minute of simulated time (a case costs about
-  # 0.17 s per simulated hour, and the whole file runs under a 120 s harness timeout). Hourly passes
-  # are modelled as a step of the counter every 12 samples at a 5m input interval; instance =
-  # case. The window is 6h, so it holds 5 or 6 passes depending on phase, and the threshold is
-  # 200,000 (four caps).
+  # 0.17 s per simulated hour, and each parallel shard of the file runs under a 120 s harness
+  # timeout). Hourly passes are modelled as a step of the counter every 12 samples at a 5m
+  # input interval; instance = case. The window is 6h, so it holds 5 or 6 passes depending on
+  # phase, and the threshold is 200,000 (four caps).
   #   s1 CASE A  sustained saturation (50,000 every hour from hour 1): the window first holds 4
   #              passes at hour 4, so `for: 24h` fires at hour 28. Not true at 3h (3 passes),
   #              pending at 5h and 27h (true, not vacuous), firing at exactly 28h. RED if `for:` is

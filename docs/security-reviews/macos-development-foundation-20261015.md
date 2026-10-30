@@ -114,7 +114,7 @@ the next boot, as documented. Neither round ran in the VM.
   the round reports.
 - **Updater:** `[updater]` passes at 41 cases. The new rollback-guard tests fail with the guard
   removed.
-- **Meson `--suite agent --suite tar --suite docs`:** 0 failures, except two pre-existing timing
+- **Meson `--suite agent --suite echo --suite docs`:** 0 failures, except two pre-existing timing
   flakes seen under host load. Both are green on re-run, and this PR touches neither:
   - `test_guardian_outbox_drain_worker.cpp:1836` (#5791);
   - `test_bounded_wait.cpp:289` (#5901).

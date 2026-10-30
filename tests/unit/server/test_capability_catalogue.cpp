@@ -404,9 +404,10 @@ TEST_CASE("capability catalogue: mgmt_posture.posture pins its exact classificat
     CHECK(row.execute_gate == ExecuteGate::None);
 }
 
-/// Exact-row pin for `shares.list`. A read-only listing of what the host is configured to
-/// serve under `Infrastructure`:Read with no execute gate. Pinning it directly means a silent
-/// drift to a mutating class, a different securable, or a gate on a facts-only read fails here.
+/// Exact-row pin for `shares.list`. A read-only listing of the shares the host serves (as
+/// configured on Linux, live Server-service state on Windows) under `Infrastructure`:Read with
+/// no execute gate. Pinning it directly means a silent drift to a mutating class, a different
+/// securable, or a gate on a facts-only read fails here.
 TEST_CASE("capability catalogue: shares.list pins its exact classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_shares();

@@ -8,8 +8,8 @@
  * SeBackupPrivilege/SeRestorePrivilege on the PROCESS token before an offline
  * RegLoadKeyW mount and restores the token's prior attributes on the way out.
  * Every plugin that calls with_user_hive() loads this ladder into the SAME agent process
- * (autoruns, registry, installed_apps, license_scan, tar, privacy_permissions at the time of
- * writing), and tar's collectors run on a background thread, so two overlapping offline-mount attempts race the
+ * (autoruns, registry, installed_apps, license_scan, echo, privacy_permissions at the time of
+ * writing), and echo's collectors run on a background thread, so two overlapping offline-mount attempts race the
  * shared process token: A enables it, B enables it (recording A's now-enabled
  * state as "previous"), A's scope exits and restores to B's recorded
  * "previous" -- silently disabling it out from under B, mid-mount.

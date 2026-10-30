@@ -422,7 +422,7 @@ Standing rules:
   `yuzu_viz_topology_pushed_total{via=...}` is the canonical
   per-push metric.
 - **Capture-mode CommandContextImpl on the agent.** Agent's
-  snapshot pump invokes `tar.fleet_snapshot` locally with a
+  snapshot pump invokes `echo.fleet_snapshot` locally with a
   `capture` pointer that diverts plugin output into a stack-local
   string. Capture buffer caps at 2 MiB (UP-9); truncated payloads
   are dropped on the floor (seq does NOT advance) so the next pump

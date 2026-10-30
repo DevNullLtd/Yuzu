@@ -70,14 +70,14 @@ def main() -> int:
         (builddir / "meson-logs").mkdir(parents=True)
         (builddir / "meson-info" / "intro-tests.json").write_text(
             json.dumps([
-                {"name": "tar unit tests", "timeout": 90},
+                {"name": "echo unit tests", "timeout": 90},
                 {"name": "server unit tests", "timeout": 600},
             ]),
             encoding="utf-8",
         )
         (builddir / "meson-logs" / "testlog.junit.xml").write_text(
             "<testsuites><testsuite>"
-            '<testcase name="tar - yuzu:tar unit tests" time="14.5"/>'
+            '<testcase name="echo - yuzu:echo unit tests" time="14.5"/>'
             '<testcase name="server - yuzu:server unit tests" time="602.1">'
             '<failure message="TIMEOUT">process killed at timeout</failure>'
             "</testcase></testsuite></testsuites>",
@@ -124,8 +124,8 @@ def main() -> int:
         check(job == (1, "linux", "yuzu-bigtam-linux-2", "failure"),
               f"wrong job row: {job}", failures)
         check(suites == [
+            ("echo unit tests", "success", 14.5, 90.0),
             ("server unit tests", "timeout", 602.1, 600.0),
-            ("tar unit tests", "success", 14.5, 90.0),
         ], f"wrong suite rows: {suites}", failures)
         check(flakes == [("Known Flake", 1)], f"wrong flake rows: {flakes}", failures)
 
@@ -159,7 +159,7 @@ def main() -> int:
         check(
             suite_query.returncode == 0
             and "server unit tests" in suite_query.stdout
-            and "tar unit tests" in suite_query.stdout,
+            and "echo unit tests" in suite_query.stdout,
             f"suite stats query failed: {suite_query.stderr or suite_query.stdout}",
             failures,
         )

@@ -234,8 +234,11 @@ FRAGMENT_FILES = [
 # 235, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a baseline.
 # registry 2.1.0: +3 (set_user_value Mutating, delete_user_value Destructive, apply Destructive; all
 # Infrastructure, gate AdminOrApproval) on top of that 235 = 238, re-derived the same way.
-# middleware (ibm_mq, +1, ReadOnly, Inventory:Read, gate None) on top of that 238 = 239, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
-EXPECTED_TOTAL_ROWS = 239
+# middleware (ibm_mq, +1, ReadOnly, Inventory:Read, gate None) on top of H.2's 244 = 245, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
+# H.2 hardware scaffold: +4 hardware (chassis/baseboard/swap/machine_id) +2 disk_actions
+# (partitions/topology), all ReadOnly, Inventory:Read, gate None, on top of 238 = 244, re-derived by
+# running this test (parse_fragment_gate_rows over FRAGMENT_FILES), not by adding to a baseline.
+EXPECTED_TOTAL_ROWS = 245
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
@@ -1037,10 +1040,10 @@ class TestFailureModesOnSyntheticData(unittest.TestCase):
         self.assertFalse(unexempt_missing)
 
     def test_strictest_wins_across_multiple_definitions(self) -> None:
-        pair_modes = {("tar", "sql"): ["auto", "auto", "role-gated", "auto"]}
-        fragment_rows = [("tar", "sql", "None")]
+        pair_modes = {("echo", "sql"): ["auto", "auto", "role-gated", "auto"]}
+        fragment_rows = [("echo", "sql", "None")]
         mismatches, unexempt_missing = diff_gates(pair_modes, fragment_rows)
-        self.assertEqual(mismatches, {("tar", "sql"): ("None", "AdminOrApproval")})
+        self.assertEqual(mismatches, {("echo", "sql"): ("None", "AdminOrApproval")})
 
     def test_gate_problems_reports_an_unparseable_document_alongside_gate_gaps(self) -> None:
         skipped = [("content/definitions/tab.yaml", 2, "while scanning for the next token")]

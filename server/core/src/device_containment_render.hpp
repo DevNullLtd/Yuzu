@@ -8,7 +8,7 @@
 /// copy never claims more than the record proves (record != applied != confirmed, and a
 /// released record says nothing about the device's firewall).
 
-#include "quarantine_store.hpp"
+#include "quarantine_types.hpp"
 
 #include <cstdint>
 #include <optional>

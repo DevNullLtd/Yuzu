@@ -7,7 +7,7 @@ sources: the per-plugin-group fragment headers listed in
 FRAGMENT_FILES below (each owned by a different package) plus the
 core-owned `capability_decls/core_dispatch_capabilities.hpp` (the four
 system-initiated dispatches a plugin never receives from a caller —
-`tar.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync`, `__sync__.now`). Nobody
+`echo.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync`, `__sync__.now`). Nobody
 mechanically checks that these sources, taken together, actually
 match what the plugins declare via their `actions()` override. This script
 is that check.
@@ -375,15 +375,15 @@ class TestFailureModesOnSyntheticData(unittest.TestCase):
         self.assertFalse(duplicates)
 
     def test_core_row_duplicated_by_a_fragment_is_a_duplicate(self) -> None:
-        actions_by_plugin = {"tar": {"fleet_snapshot"}}
-        fragment_rows_by_file = {"frag_x.hpp": [("tar", "fleet_snapshot")]}
-        core_rows = [("tar", "fleet_snapshot")]
+        actions_by_plugin = {"echo": {"fleet_snapshot"}}
+        fragment_rows_by_file = {"frag_x.hpp": [("echo", "fleet_snapshot")]}
+        core_rows = [("echo", "fleet_snapshot")]
         missing, bogus, duplicates = diff_catalogue(
             actions_by_plugin, fragment_rows_by_file, core_rows
         )
         self.assertFalse(missing)
         self.assertFalse(bogus)
-        self.assertEqual(duplicates, {("tar", "fleet_snapshot"): ["frag_x.hpp", "core"]})
+        self.assertEqual(duplicates, {("echo", "fleet_snapshot"): ["frag_x.hpp", "core"]})
 
 
 if __name__ == "__main__":

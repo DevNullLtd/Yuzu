@@ -135,7 +135,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Cross-fragment capability-catalogue drift gate (PR1.9).** Two new hermetic tests keep the five per-plugin-group `capability_decls/plugin_action_catalogue_*.hpp` fragments plus `core_dispatch_capabilities.hpp` honest as a whole, since no single fragment's author can see the other five. `tests/test_capability_catalogue_complete.py` (`python3 tests/test_capability_catalogue_complete.py`) parses every plugin's `actions()` override and cross-references it against all six catalogue sources, naming the exact `plugin.action` when a plugin declares an action with no catalogue row, a fragment declares a row no plugin actually has, or the same `plugin.action` is declared by more than one source. `tests/unit/server/test_capability_catalogue.cpp` (`[server][dispatch][capability]`) composes a `CommandCapabilityRegistry` over all six sources and asserts the catalogue-wide invariants: every row's `risk_tier` is at or above its operation's floor, every `securable`/`operation` is one `rbac_store.cpp` actually seeds, every `Destructive` row is `Irreversible`, `system_reserved` is true only for `core_dispatch_capabilities.hpp` rows, `classify()` resolves every declared pair, and a locally-constructed duplicate span makes the registry report `Ambiguous`.
 
-- **Command capability classification core (PR1.9a).** New header-only `server/core/src/command_capability.hpp` / `command_capability_parsers.hpp` define the `plugin.action` classification vocabulary (`DispatchClass`, `Mutability`) and a `CommandCapabilityRegistry` that composes several independently-authored capability fragments and classifies a dispatch case-insensitively — an unknown `plugin.action` is always `Unclassified`, never a permissive default, and the same `plugin.action` declared by two fragments is `Ambiguous`, never first-wins. Also ships the frozen `v1|<class>|<mutability>|<plan_hash_hex>` dispatch-tag wire grammar (encode/decode) and an order-invariant `compute_plan_hash`. `capability_decls/core_dispatch_capabilities.hpp` declares the three system-initiated dispatches (`tar.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync`). Not yet wired into a live dispatch path — a future PR consumes this registry from the dispatch chokepoint. `authz_model.hpp` additionally gains three new `CapabilitySeed` rows (`PluginConfig`, `PluginSecret`, `UploadGrant`), reusing only existing `Operation` enumerators. `RbacStore::seed_defaults()` seeds the same three securables into `rbac.db` — Administrator gets full CRUD via the existing loop, PlatformEngineer gets Read/Write/Delete on all three, and Operator gets Read on `PluginConfig`/`UploadGrant` only, never `PluginSecret` — closing the gap (peer finding PLAN-001) where a securable absent from the live seed cannot receive a default grant, denying even an Administrator on a fresh RBAC-enabled install.
+- **Command capability classification core (PR1.9a).** New header-only `server/core/src/command_capability.hpp` / `command_capability_parsers.hpp` define the `plugin.action` classification vocabulary (`DispatchClass`, `Mutability`) and a `CommandCapabilityRegistry` that composes several independently-authored capability fragments and classifies a dispatch case-insensitively — an unknown `plugin.action` is always `Unclassified`, never a permissive default, and the same `plugin.action` declared by two fragments is `Ambiguous`, never first-wins. Also ships the frozen `v1|<class>|<mutability>|<plan_hash_hex>` dispatch-tag wire grammar (encode/decode) and an order-invariant `compute_plan_hash`. `capability_decls/core_dispatch_capabilities.hpp` declares the three system-initiated dispatches (`echo.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync`). Not yet wired into a live dispatch path — a future PR consumes this registry from the dispatch chokepoint. `authz_model.hpp` additionally gains three new `CapabilitySeed` rows (`PluginConfig`, `PluginSecret`, `UploadGrant`), reusing only existing `Operation` enumerators. `RbacStore::seed_defaults()` seeds the same three securables into `rbac.db` — Administrator gets full CRUD via the existing loop, PlatformEngineer gets Read/Write/Delete on all three, and Operator gets Read on `PluginConfig`/`UploadGrant` only, never `PluginSecret` — closing the gap (peer finding PLAN-001) where a securable absent from the live seed cannot receive a default grant, denying even an Administrator on a fresh RBAC-enabled install.
 
 - **Dispatch classification tag on the wire, with a gateway wire-capability handshake (CC-03).** `CommandRequest` now carries `dispatch_tag` (field 9), the opaque `v1|<class>|<mutability>|<plan_hash_hex>` token the dispatch chokepoint uses to classify a command as read-only, mutating, or destructive. The field is mirrored into both of the Erlang gateway's vendored `agent.proto` copies and forwarded untouched on the command-fanout path, the same way the existing Guardian `payload` field is. Because gpb silently drops any field a gateway build's vendored proto doesn't declare, the gateway now advertises the literal `command_dispatch_tag_v1` in `StreamStatusNotification.wire_capabilities` (a new field on the same connect-time message the gateway already sends) so the server can tell a gateway that would strip the tag apart from one that carries it end to end.
 
@@ -144,15 +144,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **macOS crash reports now carry the application version.** `.ips` crash and hang reports route the app's `CFBundleShortVersionString` (from the report header `app_version`, falling back to the body `bundleInfo`) through the shared `canon_version` normaliser into the DEX signal's version field, so macOS crashes join the per-`(app, version)` reliability identity the same way Windows crashes do. Unversioned binaries (unsigned CLI tools) report an empty version, exactly as store/packaged apps already do on Windows.
 - **macOS DEX unified-log collector now observes Fault-level events (#1372).** The `log` predicate that pre-filters the firehose inside `logd` now requests `messageType == "fault"` alongside `error`, so Fault-level signals — notably `com.apple.apfs` filesystem corruption — reach the parser instead of being silently dropped before the agent ever sees them.
 
-- **tar.db corruption is now newly detected fleet-wide** (#1567; see
-  `docs/user-manual/tar.md` "Fleet visibility" for known limitations —
+- **echo.db corruption is now newly detected fleet-wide** (#1567; see
+  `docs/user-manual/echo.md` "Fleet visibility" for known limitations —
   audit-row latency during a mass event, and no backfill for a device
-  quarantined before this shipped). `tar.status` gains a
-  `db_health|<ok|quarantined>|<epoch>` row; the tar plugin publishes
+  quarantined before this shipped). `echo.status` gains a
+  `db_health|<ok|quarantined>|<epoch>` row; the echo plugin publishes
   `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, which a new
-  generic plugin heartbeat-tag bridge forwards as `yuzu.plugin.tar.*` tags. The
-  server exposes `yuzu_fleet_tar_db_corruption_agents` and
-  `yuzu_fleet_plugin_init_failed{plugin}`, writes a `tar.db.corruption_quarantined`
+  generic plugin heartbeat-tag bridge forwards as `yuzu.plugin.echo.*` tags. The
+  server exposes `yuzu_fleet_echo_db_corruption_agents` and
+  `yuzu_fleet_plugin_init_failed{plugin}`, writes an `echo.db.corruption_quarantined`
   audit row per (agent, quarantine identity), deduplicated against the audit store
   and rate-limited per agent per server process, and a new `yuzu.plugins_failed`
   heartbeat tag distinguishes a plugin that failed init from one that is not
@@ -160,8 +160,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Per-OS DEX health score under the catalogue OS filter (#1746).** Selecting a single-OS chip (Windows / Linux / macOS) on the `/dex` signal catalogue now scores each family against that platform's online agents and its own signals, instead of always showing a Windows-denominated number under any OS heading. A macOS- or Linux-only fleet now shows a real per-family score rather than a misleading Windows-derived one; the all-connected view is unchanged.
 
-- **TAR perf status tokens and per-source health** (#1846). New `counters_unavailable`
-  collect token for a supported platform whose counter reads failed. `tar.status` gains
+- **Echo perf status tokens and per-source health** (#1846). New `counters_unavailable`
+  collect token for a supported platform whose counter reads failed. `echo.status` gains
   `<source>_last_status`, `<source>_consecutive_failures` and `<source>_last_status_at`
   per source, plus `procperf_procs_seen` and `perf_capture_method`.
 
@@ -400,9 +400,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   / `yuzu_fleet_guardian_io_arm_disarm_rejected_ceiling`. Dormant while `prefer_spark`
   is off (every released agent today).
 
-- **New read-only `app_usage` agent plugin — `summary`, `last_used`, `foreground`.** Machine-scope application-usage evidence derived from TAR's default-on `usage` fold (`usage_daily`/`usage_daily_user`/`usage_live` inside `tar.db`, read-only, `PRAGMA query_only`): `summary` returns one row per executable over a window (`days` 1-365, `top` 1-500, `by` run_time|run_count) — run count, total run seconds, first/last seen, a distinct-user COUNT (never a user name), superseded/expired runs — preceded by a `meta|` row carrying the fold's own health counters; `last_used` returns per-executable first/last-seen within TAR's retained usage window (31 days by default) plus a trailing-30-day window, optionally narrowed by `exe`. Executable names are pipe-escaped on the wire. No pid, command line or user name is ever emitted (a negative test pins this). `foreground` (per-session focus time) is always `constrained` on every OS — session attribution is the user-context-bridge programme's, not this plugin's. A disabled `usage` source, an older TAR schema, or an unreadable or corrupted `tar.db` report `constrained|<reason>`, never an empty result; a stalled TAR usage/process collector additionally gates `last_used` the same way (`summary` instead flags it via its `meta|` row's `feeder_enabled` field). `last_used`'s unfiltered form is capped at 5000 executables, reporting a trailing `constrained|last_used_truncated` row past the cap; `summary`'s distinct-user counts are bounded separately, to exactly the (up to 500) exe_keys already selected into its own ranked result set. Windows, Linux and macOS (macOS constrained: inherits the process source's ES-or-poll granularity). `Forensics` securable, `AdminOrApproval`, single-target, audited. A new ADR-0016 `app_usage` daily-sync source ships the `last_used` projection to the server once a day (skipping, never sending an empty blob, when the source is constrained); it is registered as a typed source so a gateway-proxied report is never stored in the generic inventory.
+- **New read-only `app_usage` agent plugin — `summary`, `last_used`, `foreground`.** Machine-scope application-usage evidence derived from Echo's default-on `usage` fold (`usage_daily`/`usage_daily_user`/`usage_live` inside `echo.db`, read-only, `PRAGMA query_only`): `summary` returns one row per executable over a window (`days` 1-365, `top` 1-500, `by` run_time|run_count) — run count, total run seconds, first/last seen, a distinct-user COUNT (never a user name), superseded/expired runs — preceded by a `meta|` row carrying the fold's own health counters; `last_used` returns per-executable first/last-seen within Echo's retained usage window (31 days by default) plus a trailing-30-day window, optionally narrowed by `exe`. Executable names are pipe-escaped on the wire. No pid, command line or user name is ever emitted (a negative test pins this). `foreground` (per-session focus time) is always `constrained` on every OS — session attribution is the user-context-bridge programme's, not this plugin's. A disabled `usage` source, an older Echo schema, or an unreadable or corrupted `echo.db` report `constrained|<reason>`, never an empty result; a stalled Echo usage/process collector additionally gates `last_used` the same way (`summary` instead flags it via its `meta|` row's `feeder_enabled` field). `last_used`'s unfiltered form is capped at 5000 executables, reporting a trailing `constrained|last_used_truncated` row past the cap; `summary`'s distinct-user counts are bounded separately, to exactly the (up to 500) exe_keys already selected into its own ranked result set. Windows, Linux and macOS (macOS constrained: inherits the process source's ES-or-poll granularity). `Forensics` securable, `AdminOrApproval`, single-target, audited. A new ADR-0016 `app_usage` daily-sync source ships the `last_used` projection to the server once a day (skipping, never sending an empty blob, when the source is constrained); it is registered as a typed source so a gateway-proxied report is never stored in the generic inventory.
 
-- **App-usage read surface (server).** New `GET /api/v1/forensics/agents/{agent_id}/app-usage` and its MCP twin `get_agent_app_usage` return one device's per-executable usage projection — `exe_key`, `first_seen`/`last_seen` within TAR's retained usage window (31 days by default), and a trailing-30-day `run_count_30d`/`total_seconds_30d` — ingested from the agent's daily sync (`app_usage` source, ADR-0016; hash-skip over the raw received blob bytes, `software_licensing` precedent) once the agent-side producer ships. **Server half only in this change** — the agent-side `app_usage` `SyncSource` lands in a follow-up PR; until then both surfaces answer an honest empty projection (`{"apps": [], "collected_at": 0}`) for every agent, the same DORMANT-until-producer posture this repo already uses for `VulnFindingStore` (`docs/postgres-migration-ladder.md`). No user names, pids or command lines: the store carries none. Both surfaces require `Forensics:Read` scoped to the device (tier + management group, ancestor-aware) — and, on an installation with RBAC off, an Administrator session (`Forensics:Read` joins the topology floor, matching the securable's documented Administrator-only posture) — emit a per-open `app_usage.agent.view` audit and FAIL CLOSED (503, `Sec-Audit-Failed: true`) when that audit cannot persist; a store degrade is 503, never an empty 200. The new `app_usage_store` Postgres schema joins the decommission cascade (`DELETE /api/v1/sle/agents/{id}`, now six stores) and the `yuzu_inventory_stale_agents{source="app_usage"}` freshness gauge; an ingest failure nacks the source so the agent resends in full next cycle, and typed-source rows are purged from the generic inventory store at boot.
+- **App-usage read surface (server).** New `GET /api/v1/forensics/agents/{agent_id}/app-usage` and its MCP twin `get_agent_app_usage` return one device's per-executable usage projection — `exe_key`, `first_seen`/`last_seen` within Echo's retained usage window (31 days by default), and a trailing-30-day `run_count_30d`/`total_seconds_30d` — ingested from the agent's daily sync (`app_usage` source, ADR-0016; hash-skip over the raw received blob bytes, `software_licensing` precedent) once the agent-side producer ships. **Server half only in this change** — the agent-side `app_usage` `SyncSource` lands in a follow-up PR; until then both surfaces answer an honest empty projection (`{"apps": [], "collected_at": 0}`) for every agent, the same DORMANT-until-producer posture this repo already uses for `VulnFindingStore` (`docs/postgres-migration-ladder.md`). No user names, pids or command lines: the store carries none. Both surfaces require `Forensics:Read` scoped to the device (tier + management group, ancestor-aware) — and, on an installation with RBAC off, an Administrator session (`Forensics:Read` joins the topology floor, matching the securable's documented Administrator-only posture) — emit a per-open `app_usage.agent.view` audit and FAIL CLOSED (503, `Sec-Audit-Failed: true`) when that audit cannot persist; a store degrade is 503, never an empty 200. The new `app_usage_store` Postgres schema joins the decommission cascade (`DELETE /api/v1/sle/agents/{id}`, now six stores) and the `yuzu_inventory_stale_agents{source="app_usage"}` freshness gauge; an ingest failure nacks the source so the agent resends in full next cycle, and typed-source rows are purged from the generic inventory store at boot.
 
 - **New read-only `execution_artifacts` agent plugin — `shimcache`, `amcache`, `prefetch` (Windows only).** Reads the three execution-evidence artefacts every Windows IR playbook pulls first: the AppCompatCache (ShimCache) registry blob (Windows 10/11 `10ts` layout, path + last-modified per entry), `Amcache.hve` `InventoryApplicationFile` (path, SHA-1, size, link date, publisher, binary type — the live hive is copied then loaded privately via `RegLoadAppKeyW`, serialised by the shared offline-hive lock), and `C:\Windows\Prefetch\*.pf` (MAM/XPRESS-Huffman decompressed in-process via ntdll `RtlDecompressBufferEx`; header versions 23/26/30/31, exe name, hash, run count, last eight run times). Paths and hashes only — never file contents. Linux and macOS report `unsupported|windows_only_artefact`. Every action is on the `Forensics` securable, `AdminOrApproval`, single-target (a fleet or scoped target is refused), audited, and the plugin ships **default-off** via the server-side plugin-config kill switch (seeded at boot, never clobbering an operator's own decision) — enable with `PUT /api/v1/plugin-config/execution_artifacts/kill-switch`. A truncated, malformed, unknown-version or over-cap artefact is reported `constrained` with a named reason, never an empty success and never an exception across the plugin ABI.
 
@@ -592,7 +592,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only the MFA-step-up gap every other unmigrated approval-gated tool shares) and
   every other approval-gated MCP tool not yet migrated.
 
-- **Result-set (scope-walking) MCP twins — the full 12-operation REST v1 lifecycle is now reachable via MCP** (`list_result_sets`, `create_result_set`, `create_result_set_from_inventory_query`, `create_result_set_from_tar_query`, `create_result_set_from_instruction_result`, `reevaluate_result_set`, `get_result_set`, `get_result_set_members`, `get_result_set_lineage`, `pin_result_set`, `unpin_result_set`, `delete_result_set`). The three async dispatch producers (`create_result_set_from_tar_query`/`from_instruction_result`/`reevaluate_result_set`) reuse the exact same `Execution:Execute` gate plus the caller's derived per-device visible set (#1788) that the REST twins use — a service-scoped API token is confined identically on both surfaces. The other nine are owner-scoped (session-authenticated; a service-scoped token is denied outright, matching REST's `deny_fleet_wide_service_scoped` gate) or, for `create_result_set_from_inventory_query`, gated on a real `Inventory:Read` check. A new "Result sets" tool family is added to the MCP `initialize.instructions` handshake.
+- **Result-set (scope-walking) MCP twins — the full 12-operation REST v1 lifecycle is now reachable via MCP** (`list_result_sets`, `create_result_set`, `create_result_set_from_inventory_query`, `create_result_set_from_echo_query`, `create_result_set_from_instruction_result`, `reevaluate_result_set`, `get_result_set`, `get_result_set_members`, `get_result_set_lineage`, `pin_result_set`, `unpin_result_set`, `delete_result_set`). The three async dispatch producers (`create_result_set_from_echo_query`/`from_instruction_result`/`reevaluate_result_set`) reuse the exact same `Execution:Execute` gate plus the caller's derived per-device visible set (#1788) that the REST twins use — a service-scoped API token is confined identically on both surfaces. The other nine are owner-scoped (session-authenticated; a service-scoped token is denied outright, matching REST's `deny_fleet_wide_service_scoped` gate) or, for `create_result_set_from_inventory_query`, gated on a real `Inventory:Read` check. A new "Result sets" tool family is added to the MCP `initialize.instructions` handshake.
 - **`POST /api/v1/scope/validate` and `POST /api/v1/scope/preview`** — versioned REST v1 twins of the `validate_scope`/`preview_scope_targets` MCP tools (the former also twins the legacy unversioned `POST /api/scope/validate`), sharing the exact same underlying scope-validation/preview logic as their MCP counterparts so the two transports cannot diverge.
 
 - **MCP twins for fleet visualization and execution/fleet statistics.** `get_fleet_topology` and
@@ -717,7 +717,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/user-manual/rest-api.md` "Engine Principals" and `docs/user-manual/mcp.md` for the
   full contract.
 
-- **ABI4 capability declarations + capability-catalogue rows, group A (PR1.10 group A / PR1.9 data A, #2204).** `filesystem` (16 actions), `tar` (14), `registry` (9), `license_scan` (2) and `vuln_scan` (5) — 46 actions total — now declare per-action, per-OS `YuzuActionDescriptor` legs on `yuzu::Plugin` (`action_descriptors()`/`action_descriptor_count()`), each leg naming the real acquisition rung (ADR-3002) and mechanism read directly off the implementation's `#ifdef` structure, not an aspiration. New `server/core/src/capability_decls/plugin_action_catalogue_a.hpp` classifies 45 of those 46 `plugin.action` pairs into the `CommandCapabilityRegistry` vocabulary (`DispatchClass`/`Mutability`/securable/operation/risk tier) — `tar.fleet_snapshot` is intentionally left to the already-landed `core_dispatch_capabilities.hpp`, which classifies it as a system-reserved dispatch; declaring it again here would make that `plugin.action` pair `Ambiguous`.
+- **ABI4 capability declarations + capability-catalogue rows, group A (PR1.10 group A / PR1.9 data A, #2204).** `filesystem` (16 actions), `echo` (14), `registry` (9), `license_scan` (2) and `vuln_scan` (5) — 46 actions total — now declare per-action, per-OS `YuzuActionDescriptor` legs on `yuzu::Plugin` (`action_descriptors()`/`action_descriptor_count()`), each leg naming the real acquisition rung (ADR-3002) and mechanism read directly off the implementation's `#ifdef` structure, not an aspiration. New `server/core/src/capability_decls/plugin_action_catalogue_a.hpp` classifies 45 of those 46 `plugin.action` pairs into the `CommandCapabilityRegistry` vocabulary (`DispatchClass`/`Mutability`/securable/operation/risk tier) — `echo.fleet_snapshot` is intentionally left to the already-landed `core_dispatch_capabilities.hpp`, which classifies it as a system-reserved dispatch; declaring it again here would make that `plugin.action` pair `Ambiguous`.
 
 - **ABI4 capability declarations + capability-catalogue rows for the 14 inventory/system plugins (PR1.10 group B / PR1.9 data B, #2204).** `hardware`, `users`, `status`, `os_info`, `storage`, `installed_apps`, `processes`, `procfetch`, `disk_space`, `device_identity`, `agent_logging`, `diagnostics`, `example`, and `chargen` each now override `action_descriptors()`/`action_descriptor_count()` with a per-action, per-OS `YuzuActionDescriptor` array declaring what the shipped code does today — including the ADR-3002 acquisition rung per leg (native OS call, argv runner, or governed/ungoverned shell) so `capmatrix-gen` can render real data for this group instead of "undeclared". New `server/core/src/capability_decls/plugin_action_catalogue_b.hpp` classifies all 55 actions for the future `CommandCapabilityRegistry`: overwhelmingly `ReadOnly`/`None` on the `Inventory` securable, with `UserManagement` for the `users` plugin, `Security` for the two actions that enumerate TLS certificate/key file paths, and `Infrastructure`/`Execution` for `storage`'s KV mutations and `chargen`'s start/stop. No behavior change — declaration and classification only.
 
@@ -726,7 +726,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ABI4 capability declarations + capability-catalogue rows for the 15 endpoint-management plugins (group D, #2204).** `tags`, `asset_tags`, `interaction`, `windows_updates`, `services`, `script_exec`, `software_actions`, `msi_packages`, `sccm`, `wmi`, `event_logs`, `antivirus`, `bitlocker`, `ioc`, and `agent_actions` each now declare a per-action, per-OS `YuzuActionDescriptor` array (42 actions total) reflecting what the shipped implementation actually does today — never a fabricated claim. Highlights: `windows_updates` and `bitlocker` turn out to have genuine, working Linux/macOS legs despite their names (only `wmi` and `sccm` are truly Windows-only); `event_logs`' macOS `log show` leg is the only rung-2 (argv-runner) leg in the group, everything else that shells out does so at rung 3 (`/bin/sh -c` or a directly-spawned interpreter such as `osascript`/`powershell`/`bash`); `interaction`'s four osascript-backed dialog actions are `CONSTRAINED` on macOS (no reachable GUI session under the root LaunchDaemon); `windows_updates.pending_reboot` is `CONSTRAINED` on macOS (`softwareupdate -l` is an unbounded network call). Combined with groups A/B/C and `content_dist`, all 49 shipped plugins are now ABI4-declared. New `server/core/src/capability_decls/plugin_action_catalogue_d.hpp` classifies the 41 operator-dispatchable actions from this group (`asset_tags.sync` is excluded — it is `system_reserved` and already carried by `core_dispatch_capabilities.hpp`) against `rbac_store.cpp`'s seeded securables/operations. `script_exec`'s three actions (admin-only arbitrary command/script execution) classify `Execute`/`Destructive`/`Irreversible` at the top risk tier; `bitlocker.state`, `msi_packages.list`/`product_codes`, `software_actions.list_upgradable`/`installed_count`, and `agent_actions.info` classify `ReadOnly` — each is a pure status/inventory query with no install, encrypt, or write action in the plugin at all.
 
 - **SDK descriptor seam unblocks ABI4 capability declarations for every C++ plugin, and `capmatrix-gen` gets a completeness check (#2204).** `YUZU_PLUGIN_EXPORT` (`sdk/include/yuzu/plugin.hpp`) previously built every plugin's descriptor without `action_descriptors`/`action_descriptor_count`, so no plugin written through the `yuzu::Plugin` C++ wrapper — all 49 shipped plugins — could ever declare an ABI4 capability leg, regardless of what it implemented. `yuzu::Plugin` now exposes two non-pure virtuals with an honest "undeclared" default (`nullptr`/`0`), wired straight into the generated descriptor; a plugin overrides both to declare capabilities, and every existing plugin is unaffected. `capmatrix-gen` now hard-errors, naming both sides, when a declared plugin's `actions()` list and its `action_descriptors` array disagree — the self-check the five upcoming per-plugin declaration passes depend on. Also fixed: `sdk/include/yuzu/plugin.h`'s `rung` doc comment had the acquisition-ladder order (docs/adr/3002-acquisition-ladder.md) inverted — it now correctly states rung 1 = native OS interface (best), 2 = argv runner, 3 = governed shell (worst), and that rung describes *how* a leg acquires its capability, never how mature the implementation is; a matching legend was added to `docs/os-capability-matrix.md`. Comment-only — no ABI, struct, or field change.
-- **`capmatrix-gen` gains an opt-in `--registries` mode for the non-plugin capability registries.** Guardian's registry/service-guard hive and state lists, TAR's capture-source registry, Spark's per-OS mechanism factories, and DEX's `dex_obs_platforms()` coverage map are now each mirrored into a small checked-in table under `docs/capability-registries/`, readable by `capmatrix-gen` via `--registries <dir>` without linking `agent_core`/`server_core` into the plugin-dlopening host tool. Each table is cross-checked against its live C++ source by a dedicated suite test that fails the moment the two disagree. Existing invocations (the CI drift gate, the shell-test fixtures) are unaffected — the new flag is never passed by either.
+- **`capmatrix-gen` gains an opt-in `--registries` mode for the non-plugin capability registries.** Guardian's registry/service-guard hive and state lists, Echo's capture-source registry, Spark's per-OS mechanism factories, and DEX's `dex_obs_platforms()` coverage map are now each mirrored into a small checked-in table under `docs/capability-registries/`, readable by `capmatrix-gen` via `--registries <dir>` without linking `agent_core`/`server_core` into the plugin-dlopening host tool. Each table is cross-checked against its live C++ source by a dedicated suite test that fails the moment the two disagree. Existing invocations (the CI drift gate, the shell-test fixtures) are unaffected — the new flag is never passed by either.
 
 - **Wake-on-LAN `check` reachability on macOS** — the `check` action now performs a working reachability probe on macOS, bringing it to parity with Linux and Windows. It uses `ping -t <sec>` (the BSD/macOS whole-run deadline) so a live host is correctly reported as `reachable`. The probe previously used `-W`, which BSD/macOS interpret as milliseconds rather than seconds, so its effective 2 ms timeout reported essentially every host as `unreachable`. Linux and Windows behaviour is unchanged.
 
@@ -756,7 +756,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test — verified green across repeated isolated runs plus the full agent
   suite, and under TSan looped 20x clean.
 
-- **macOS TAR gains per-connection network quality and event-driven TCP lifecycle.** A new `NstatClient` reads the private `com.apple.network.statistics` kernel control (no framework, no Apple entitlement) to fill the previous macOS `netqual` stub and to drive sub-second TCP connect/close events, with the `proc_pidfdinfo` poll retained as fallback. System-wide capture requires a root agent; a non-root agent honestly reports `capture_method=none` rather than a partial sample.
+- **macOS Echo gains per-connection network quality and event-driven TCP lifecycle.** A new `NstatClient` reads the private `com.apple.network.statistics` kernel control (no framework, no Apple entitlement) to fill the previous macOS `netqual` stub and to drive sub-second TCP connect/close events, with the `proc_pidfdinfo` poll retained as fallback. System-wide capture requires a root agent; a non-root agent honestly reports `capture_method=none` rather than a partial sample.
 
 - **macOS parity for a batch of agent plugins.** macOS endpoints now report: installed packages via `pkgutil` receipts (`msi_packages`, matching the Windows MSI inventory); real network-adapter link speed (`network_config`, via `SIOCGIFMEDIA`) and honest ARP availability; service startup type via `launchctl` (`services`); last-logon time plus a `console_state` GUI-login flag (`users`); FileVault (APFS) disk-encryption status (`bitlocker`, alongside Windows BitLocker and Linux LUKS); and a dynamically-resolved agent executable path (`agent_logging`, via `_NSGetExecutablePath`).
 - **Honest "unsupported" responses for Windows-only surfaces on macOS.** `registry`, `sccm`, `rdp_control`, `interaction`, and the agent certificate store now return a structured, honest "not supported on this OS" result on macOS instead of an empty, unknown-action, or fabricated-success response — and a state-changing or unknown action that does nothing now reports terminal FAILURE rather than SUCCESS.
@@ -1106,7 +1106,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parity gap, and a deliberate stopgap for ADR-0032 interlock (j) / #2678's
   future generated-capability-projection diff harness.
 
-- **OpenAPI spec backfills 39 previously-undocumented `/api/v1/*` routes** (#3992, API-parity F2): device tokens, inventory evaluation, the agent plugin-policy distribution endpoint, TAR retention-paused purge, fleet topology / 3D visualization, session revocation, the SSO query-form of JIT-elevation eligibility, execution and fleet statistics, the full result-set (scope-walking) lifecycle, software deployment, and license management. Routes gated behind an unwired store (device tokens, software deployment, license — all three deliberately shelved today) say so in their `description`. `docs/user-manual/rest-api.md` gains a new "Result Sets" section for the eight lifecycle routes it was missing. Establishes the zero baseline F1's `check-api-parity.py` ratchet needs.
+- **OpenAPI spec backfills 39 previously-undocumented `/api/v1/*` routes** (#3992, API-parity F2): device tokens, inventory evaluation, the agent plugin-policy distribution endpoint, Echo retention-paused purge, fleet topology / 3D visualization, session revocation, the SSO query-form of JIT-elevation eligibility, execution and fleet statistics, the full result-set (scope-walking) lifecycle, software deployment, and license management. Routes gated behind an unwired store (device tokens, software deployment, license — all three deliberately shelved today) say so in their `description`. `docs/user-manual/rest-api.md` gains a new "Result Sets" section for the eight lifecycle routes it was missing. Establishes the zero baseline F1's `check-api-parity.py` ratchet needs.
 
 - **REST + MCP twin recipe.** `docs/api-twin-recipe.md` documents the pattern the ~36-PR
   api-parity programme (#2146) follows to add a REST v1 route + MCP tool twin for an existing
@@ -1119,7 +1119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **High availability (WS-3, ADR-2002 §6):** added the durable transactional command outbox (`command_outbox_store`) behind leader-driven background dispatch — the second half of stopping a second server replica from double-dispatching. A background producer commits a `pending` command occurrence via the outbox's claim-before-side-effect API — either in the same transaction as its own state change, or (as the first consumer, the scheduler, does) autocommitted and made idempotent by the occurrence's unique key; a leader-gated delivery loop drives it to `sent`; a crash between commit and the wire send re-drives from `pending`, and the agent deduplicates on the command id (WS-0), so delivery is effectively-once, never doubled. Each occurrence carries a unique key, so two racing leaders computing the same occurrence produce one row, not two; every state change also carries the leader's fenced epoch, so a paused ex-leader's write is rejected. This slice ships the outbox primitive and converts the scheduled-fire path onto it (see the Changed entry).
 
-- **REST v1 + MCP read twins for three TAR dashboard fragments** (#4027, API-parity programme Batch A): `GET /api/v1/tar/process-tree` and `GET /api/v1/tar/capture-sources` (operator-scoped device pickers) and `GET /api/v1/tar/retention-paused` (the calling operator's most recent retention-paused source scan). MCP twins `list_tar_process_tree_devices`, `list_tar_capture_sources_devices`, and `list_tar_retention_paused` share the exact same pure JSON builders as their REST siblings. TAR had zero MCP presence before this change. `GET /fragments/tar/process-tree/result` and `.../detail` are deliberately not twinned, deferred as scope rather than impossibility — `/detail`'s cache token is minted only inside `/result` itself, and `/result`'s pcmd/tcmd pair, while technically reachable via the already-twinned generic dispatch surface, has no dedicated API path and would need a new async polling contract; recorded as `exception:` rows in `scripts/ci/api-parity/tar.json` rather than left silently `planned`.
+- **REST v1 + MCP read twins for three Echo dashboard fragments** (#4027, API-parity programme Batch A): `GET /api/v1/echo/process-tree` and `GET /api/v1/echo/capture-sources` (operator-scoped device pickers) and `GET /api/v1/echo/retention-paused` (the calling operator's most recent retention-paused source scan). MCP twins `list_echo_process_tree_devices`, `list_echo_capture_sources_devices`, and `list_echo_retention_paused` share the exact same pure JSON builders as their REST siblings. Echo had zero MCP presence before this change. `GET /fragments/echo/process-tree/result` and `.../detail` are deliberately not twinned, deferred as scope rather than impossibility — `/detail`'s cache token is minted only inside `/result` itself, and `/result`'s pcmd/tcmd pair, while technically reachable via the already-twinned generic dispatch surface, has no dedicated API path and would need a new async polling contract; recorded as `exception:` rows in `scripts/ci/api-parity/echo.json` rather than left silently `planned`.
 
 - **REST v1 read-twins for the Settings dashboard (api-parity programme #2146).** The eight
   `/fragments/settings/*` sub-areas previously reachable only through the dashboard — TLS, HTTPS,
@@ -1291,7 +1291,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wiring, and the accompanying flip from today's fail-open write posture to fail-closed, is a later
   WS-4 slice.
 
-- **New TAR `usage` capture source — derived per-executable app-usage aggregate, enabled by default.** `usage` (backed by `$Usage_Live` / `$Usage_Daily`) is a derived fold over the existing `process` source: it pairs `started`/`stopped` process events into per-executable runs on the fast tick, with no collector or rollup SQL of its own (`run_usage_fold`, see `docs/tar-implementer.md` §8). **Ships on by default** (`usage_enabled=true`), joining `power` and `removable` as the third works-council-class source to diverge from the opt-in posture every TAR source added since 1.5 otherwise follows. The fold's boundary is strictly **forward-only**: coverage begins once the source reaches `Active` state after enablement or upgrade, and process history from before that point is never retroactively folded. `usage_live` persists the owning `pid`/`user` for each open run — queryable via `tar.sql` at `Infrastructure:Read` today, ahead of the dedicated Forensics-gated reader this PR's `Forensics` securable is built for (tracked: #4260). `usage_daily_user` persists a raw username per (day, executable) but is not in `tar.sql`'s queryable-table allowlist. `usage_daily` itself carries only a per-day `distinct_users` count, never a name. Set `usage_enabled=false` to opt out; existing `usage_daily`/`usage_live` rows stay queryable until they age out under their own retention windows.
+- **New Echo `usage` capture source — derived per-executable app-usage aggregate, enabled by default.** `usage` (backed by `$Usage_Live` / `$Usage_Daily`) is a derived fold over the existing `process` source: it pairs `started`/`stopped` process events into per-executable runs on the fast tick, with no collector or rollup SQL of its own (`run_usage_fold`, see `docs/echo-implementer.md` §8). **Ships on by default** (`usage_enabled=true`), joining `power` and `removable` as the third works-council-class source to diverge from the opt-in posture every Echo source added since 1.5 otherwise follows. The fold's boundary is strictly **forward-only**: coverage begins once the source reaches `Active` state after enablement or upgrade, and process history from before that point is never retroactively folded. `usage_live` persists the owning `pid`/`user` for each open run — queryable via `echo.sql` at `Infrastructure:Read` today, ahead of the dedicated Forensics-gated reader this PR's `Forensics` securable is built for (tracked: #4260). `usage_daily_user` persists a raw username per (day, executable) but is not in `echo.sql`'s queryable-table allowlist. `usage_daily` itself carries only a per-day `distinct_users` count, never a name. Set `usage_enabled=false` to opt out; existing `usage_daily`/`usage_live` rows stay queryable until they age out under their own retention windows.
 
 - **Registry-key and file Spark watches now report an establishment signal (#4340).** The Windows
   agent's Registry and File Spark mechanisms (Spark is the agent's event-driven change detection)
@@ -1366,21 +1366,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ITServiceOwner` and any custom/unknown role are rejected uniformly (no role-catalog
   oracle); pre-provisioning a role ahead of a user's first login is allowed.
 
-- The tar ARP capture source now works on Linux (`/proc/net/arp`, static/dynamic/incomplete entry types) and macOS (routing-socket sysctl via the shared `route_sysctl_arp` helper; entry type constrained to `unknown`), joining the existing Windows leg.
+- The echo ARP capture source now works on Linux (`/proc/net/arp`, static/dynamic/incomplete entry types) and macOS (routing-socket sysctl via the shared `route_sysctl_arp` helper; entry type constrained to `unknown`), joining the existing Windows leg.
 
-- The tar mapped-drive capture source gains a macOS leg: outbound NFS/SMB/AFP/WebDAV mounts observed live via native `getfsstat` (no subprocess); inbound sessions and history remain out of scope unprivileged and report empty.
+- The echo mapped-drive capture source gains a macOS leg: outbound NFS/SMB/AFP/WebDAV mounts observed live via native `getfsstat` (no subprocess); inbound sessions and history remain out of scope unprivileged and report empty.
 
 - privacy_permissions plugin: per-app sensitive-permission grant visibility (camera, microphone, location, full-disk-access equivalents), read-only and off until an operator enables it with `PUT /api/v1/plugin-config/privacy_permissions/kill-switch {"enabled":true}` (`PluginConfig:Write`). Dispatch needs `Forensics:Read` with `AdminOrApproval` and names exactly one device. Linux reads only the agent's own session (xdg-desktop-portal), normally `unavailable` under the shipped service. macOS and Windows are planned and follow as their own PR — until then both report a whole-source `unsupported`/`UNAVAILABLE` row rather than an empty success.
 
 - New `power_health` plugin: `battery`, `thermal`, and `power_plan` inventory reads, plus a gated `set_power_plan` action to switch the active Windows power scheme (PowrProf; no WMI, `powercfg`, or COM). Battery uses `GetSystemPowerStatus`/`CallNtPowerInformation` on Windows and `IOPSCopyPowerSourcesInfo` on macOS; the no-system-battery desktop path is verified live, and the Windows battery-present path is verified on real hardware (macOS battery-present remains fixture-only) (see `docs/user-manual/power-health.md`). A present battery resting on AC — neither charging nor discharging, held below 100% by a firmware charge threshold, which is the ordinary state of a docked laptop — reports `not_charging`; it is a state the OS reported, and is deliberately distinct from `unknown`, which means the read failed or the OS declined to answer. Thermal reports per-zone Celsius on Windows/Linux — or an explicit success line when zero thermal-zone instances are exposed, the measured normal case on desktop hardware, never an error — and macOS's 4-level thermal-pressure state on macOS. `set_power_plan` is Destructive/Reversible, gated Admin-or-approval, and fully specifies its failure semantics (exact-one-match scheme resolution, prior-state read before mutation, post-set read-back verification).
 
-- **TAR gains a cursor-model capture seam for OS-logged transition sources, plus the frozen schemas and default-ON configuration for its first two sources, `power` and `removable`. No collector for either ships in this change — the tables are queryable and empty until the collectors land in the two following changes.** Unlike TAR's existing snapshot-diff sources (service, mapdrive, arp, ...) which re-enumerate a full table every tick, a cursor-model source tracks a durable log position (a versioned cursor persisted in a new `tar_cursor` table) across restarts, so it never replays from the beginning: a lost or invalid cursor — including a wrapped OS event log, a real, measured condition — re-baselines forward from the current log position and records a `capture_gap` event rather than silently losing or duplicating history. Replay safety comes from a `record_key` UNIQUE index (`INSERT OR IGNORE`), never cursor arithmetic. **`power` and `removable` are the first WORKS-COUNCIL-CLASS capture sources to ship enabled.** They are not the product's first default-on sources — `process`, `tcp`, `service`, `user` and `perf` have always been on as machine-scope operational telemetry — but of the eight sources added since 1.5 under the works-council opt-in posture (`procperf`, `netqual`, `module`, `software`, `arp`, `dns`, `netconn`, `mapdrive`) every one defaults off, and these two are the first of that class to diverge. The divergence is deliberate and disclosed, not an oversight. **Action for upgrading operators:** both are enabled by the upgrade itself, without anyone opting in, so the moment to set `<source>_lookback_seconds=0` on hosts where a retrospective read of OS-retained history is not lawful is NOW — before the collectors land in the two following changes and the first backfill runs. Each ships an operator-configurable `<source>_lookback_seconds` (default 7 days, `0` = forward-only) so historical backfill can be suppressed independently of disabling the source outright. `ProcessInfo` (agents/core `process_enum`) gains a canonical `exec_path` field (Linux `/proc/<pid>/exe`, Windows `QueryFullProcessImageNameW`, macOS `proc_pidpath`) so a future `exec_from_removable` event can be correlated to the process that triggered it. This wave lands the seam, schema, and lifecycle contract only — no collector reads a real OS log or subscription yet; the `power`/`removable` sources report zero events until the wave-2 collectors land.
+- **Echo gains a cursor-model capture seam for OS-logged transition sources, plus the frozen schemas and default-ON configuration for its first two sources, `power` and `removable`. No collector for either ships in this change — the tables are queryable and empty until the collectors land in the two following changes.** Unlike Echo's existing snapshot-diff sources (service, mapdrive, arp, ...) which re-enumerate a full table every tick, a cursor-model source tracks a durable log position (a versioned cursor persisted in a new `echo_cursor` table) across restarts, so it never replays from the beginning: a lost or invalid cursor — including a wrapped OS event log, a real, measured condition — re-baselines forward from the current log position and records a `capture_gap` event rather than silently losing or duplicating history. Replay safety comes from a `record_key` UNIQUE index (`INSERT OR IGNORE`), never cursor arithmetic. **`power` and `removable` are the first WORKS-COUNCIL-CLASS capture sources to ship enabled.** They are not the product's first default-on sources — `process`, `tcp`, `service`, `user` and `perf` have always been on as machine-scope operational telemetry — but of the eight sources added since 1.5 under the works-council opt-in posture (`procperf`, `netqual`, `module`, `software`, `arp`, `dns`, `netconn`, `mapdrive`) every one defaults off, and these two are the first of that class to diverge. The divergence is deliberate and disclosed, not an oversight. **Action for upgrading operators:** both are enabled by the upgrade itself, without anyone opting in, so the moment to set `<source>_lookback_seconds=0` on hosts where a retrospective read of OS-retained history is not lawful is NOW — before the collectors land in the two following changes and the first backfill runs. Each ships an operator-configurable `<source>_lookback_seconds` (default 7 days, `0` = forward-only) so historical backfill can be suppressed independently of disabling the source outright. `ProcessInfo` (agents/core `process_enum`) gains a canonical `exec_path` field (Linux `/proc/<pid>/exe`, Windows `QueryFullProcessImageNameW`, macOS `proc_pidpath`) so a future `exec_from_removable` event can be correlated to the process that triggered it. This wave lands the seam, schema, and lifecycle contract only — no collector reads a real OS log or subscription yet; the `power`/`removable` sources report zero events until the wave-2 collectors land.
 
-- **New TAR `power` capture source — sleep/wake and AC-source transitions, enabled by default.** Unlike every other opt-in TAR source, `power` ships **on by default** (`power_enabled=true`) — see `docs/user-manual/tar-power.md` for why. macOS is the flagship leg: `pmset -g log` is read through the bounded subprocess runner and replayed via an exact-tail cursor (position identified by timestamp + a CRC of the exact log line + its occurrence within that second, not timestamp alone — a live capture showed two distinct log lines in the same second, which a timestamp-only cursor cannot tell apart) so a first enable can backfill up to `power_lookback_seconds` (default 7 days, 0 = forward-only) of OS-retained history. Windows and Linux have no OS history API for this data, so both are live-subscription-only (Windows: `PowerRegisterSuspendResumeNotification` + `PowerSettingRegisterNotification`; Linux: systemd-logind's `PrepareForSleep` sd-bus signal, gated on the optional `libsystemd` dependency, plus a polled `/sys/class/power_supply` AC read) — recording starts from the moment the source is enabled, with a paused window reported as an explicit, gap-visible `capture_gap` event rather than silently dropped. AC-source changes are edge-triggered (recorded only when the reading actually changes from the last known state) on every platform, never a repeated status report.
+- **New Echo `power` capture source — sleep/wake and AC-source transitions, enabled by default.** Unlike every other opt-in Echo source, `power` ships **on by default** (`power_enabled=true`) — see `docs/user-manual/echo-power.md` for why. macOS is the flagship leg: `pmset -g log` is read through the bounded subprocess runner and replayed via an exact-tail cursor (position identified by timestamp + a CRC of the exact log line + its occurrence within that second, not timestamp alone — a live capture showed two distinct log lines in the same second, which a timestamp-only cursor cannot tell apart) so a first enable can backfill up to `power_lookback_seconds` (default 7 days, 0 = forward-only) of OS-retained history. Windows and Linux have no OS history API for this data, so both are live-subscription-only (Windows: `PowerRegisterSuspendResumeNotification` + `PowerSettingRegisterNotification`; Linux: systemd-logind's `PrepareForSleep` sd-bus signal, gated on the optional `libsystemd` dependency, plus a polled `/sys/class/power_supply` AC read) — recording starts from the moment the source is enabled, with a paused window reported as an explicit, gap-visible `capture_gap` event rather than silently dropped. AC-source changes are edge-triggered (recorded only when the reading actually changes from the last known state) on every platform, never a repeated status report.
 
-- **TAR removable-media capture (`removable` source): hybrid snapshot + Windows
+- **Echo removable-media capture (`removable` source): hybrid snapshot + Windows
   event-log backfill, exec-from-removable correlation, stable device identity.**
-  New TAR cursor-model capture source recording removable-storage attach/detach
+  New Echo cursor-model capture source recording removable-storage attach/detach
   activity and processes executing from a currently attached removable volume.
   Windows backfills from three MEASURED-live channels
   (`Microsoft-Windows-Partition/Diagnostic` as identity authority,
@@ -1401,9 +1401,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   way, rather than collapsing them onto one identity.
   `exec_from_removable` is built from each process's canonical executable path
   only, never its command line, and is correlated against a device's own
-  attach session on every platform. **Unlike every other TAR capture source
+  attach session on every platform. **Unlike every other Echo capture source
   added since 1.5, this one ships default-on** rather than opt-in; see
-  `docs/user-manual/tar-removable.md` for the config key to disable it and the
+  `docs/user-manual/echo-removable.md` for the config key to disable it and the
   full per-OS mechanism writeup. The device-present path has been verified on
   real Windows hardware.
 
@@ -1505,7 +1505,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   captured in the agent-side execution log for now — carrying them on the wire is a later
   change). A new `tools/capmatrix-gen` host tool plus a
   CI drift gate (ratchet mode) keep `docs/os-capability-matrix.md`'s generated section honest
-  against what actually built. The TAR plugin's `OsSupportStatus` is now pinned 1:1 to the new
+  against what actually built. The Echo plugin's `OsSupportStatus` is now pinned 1:1 to the new
   descriptor enum as the single source of truth for its `compatibility` action.
 
 - **Subprocess runner reaches the ADR-3002 runner-side contract, plus a best-practice hardening sweep.** `run_bounded_subprocess` now reports an explicit `TerminationReason` (`exited`/`signaled`/`deadline`/`cancelled`/`line_limit`/`spawn_error`) on its `SubprocessResult` instead of the previous fabricated `exit_code = 0` "success" sentinel for a deliberate `stop_after_max_lines` kill. (Propagating that reason onward to `CommandResponse`/the wire — ADR-3002's "the reason must also survive to the wire" — lands with the first caller that reads and forwards it via the plugin→host result seam, e.g. `script_exec`/`content_dist` at their ladder migration. Existing callers of `run_bounded_subprocess` — `services_plugin.cpp`/`certificates_plugin.cpp`, both pre-dating this range — already receive the field on `SubprocessResult` simply by calling the now-enriched function; none of them reads or forwards it onward in this change.) The runner also supports a per-invocation `CancellationToken` alongside the existing process-wide cancel; rejects a relative `argv[0]` or an embedded NUL at runtime in every build type (previously assert-only); makes the output byte cap caller-configurable up to 16 MiB; and adds a caller-configurable soft-terminate grace, a streaming `on_line` callback, and a `probe_tool_path` "first existing absolute path wins" helper. The Windows backend is now a real Job-Object implementation (suspended-create → assign-Job → resume, `STARTUPINFOEXW`/`PROC_THREAD_ATTRIBUTE_HANDLE_LIST` handle allow-list, Colascione command-line quoting, `.bat`/`.cmd`/`.com` `argv[0]` ban), replacing the previous stub.
@@ -1615,7 +1615,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OTA update registry (`UpdateRegistry`) moved from SQLite to the shared PostgreSQL substrate (ADR-0061).** Fresh-start cutover with no data migration — existing OTA package metadata does not carry over on upgrade (binaries already on disk under `update_dir` are untouched; only the catalog row is lost). Construction is now fail-closed when `--ota-enabled` is set (a reachable database whose schema fails to migrate/open now refuses server startup instead of silently serving with OTA dead), and `UpdateRegistry` is now included in both `/readyz` and `/healthz`. See "OTA package catalog resets on Postgres cutover" in `docs/user-manual/upgrading.md`.
 
 - **Breaking — the dashboard execute routes now refuse a supplied-but-empty `scope`.**
-  `POST /api/dashboard/execute` and `POST /api/dashboard/tar-execute` previously could not tell an
+  `POST /api/dashboard/execute` and `POST /api/dashboard/echo-execute` previously could not tell an
   OMITTED `scope` from one supplied as empty (`scope=`): the form helper returned `""` for both, so
   a request that named NOBODY silently became a broadcast to every device the caller could reach.
   That is the form-encoded twin of the `extract_json_string_array` erasure #2500 closed on the JSON
@@ -1999,7 +1999,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as fresh content — closes a gap where a redeployed or newly-joined replica's own (stale) legacy
   `product-packs.db` could silently resurrect a pack that was legitimately uninstalled elsewhere.
 
-- **`os_info`, `processes`, `network_diag`, and `ioc` no longer shell out on macOS.** All four plugins reach ADR-3002 rung 1 (native OS interface, zero spawned processes): `os_info`'s `os_name`/`os_version`/`os_build` read `SystemVersion.plist` directly (falling back to `sysctlbyname(kern.osproductversion/kern.osversion)`, then a literal) instead of parsing `sw_vers` output; `processes` enumerates via the existing `sysctl KERN_PROC_ALL`-backed `enumerate_processes()` instead of parsing `ps`; `network_diag` and `ioc` walk `libproc`'s per-process socket-fd tables (a new shared `agents/shared/macos_socket_walk.hpp`) instead of parsing `lsof` output. Output shape is preserved where a prior contract existed (network_diag's listening/connections tables, including the `0.0.0.0`/`::` → `*` wildcard mapping and the pipe-delimited row format), with two disclosed differences from the old `lsof`-parsing path: `ioc`'s UDP rows now report an empty state rather than the old parser's fabricated `"LISTEN"` (an honest correction), and the shared walk's dedup (inherited from `netstat_plugin.cpp`'s existing convention, keyed on protocol/address/port only) means a socket shared or independently bound by more than one process — `SO_REUSEPORT`, a prefork listener — now surfaces under one arbitrarily-chosen owning PID in `network_diag`'s output rather than one row per owning process; the connection/port itself is still reported either way. `docs/os-capability-matrix.md` and `scripts/ci/check-plugin-spawn-lexical.sh`'s grandfathered list are updated to match. `netstat`/`sockwho`'s own inline copies of the socket walk, and `tar_network_collector`'s copy, are intentionally left as-is pending follow-up work.
+- **`os_info`, `processes`, `network_diag`, and `ioc` no longer shell out on macOS.** All four plugins reach ADR-3002 rung 1 (native OS interface, zero spawned processes): `os_info`'s `os_name`/`os_version`/`os_build` read `SystemVersion.plist` directly (falling back to `sysctlbyname(kern.osproductversion/kern.osversion)`, then a literal) instead of parsing `sw_vers` output; `processes` enumerates via the existing `sysctl KERN_PROC_ALL`-backed `enumerate_processes()` instead of parsing `ps`; `network_diag` and `ioc` walk `libproc`'s per-process socket-fd tables (a new shared `agents/shared/macos_socket_walk.hpp`) instead of parsing `lsof` output. Output shape is preserved where a prior contract existed (network_diag's listening/connections tables, including the `0.0.0.0`/`::` → `*` wildcard mapping and the pipe-delimited row format), with two disclosed differences from the old `lsof`-parsing path: `ioc`'s UDP rows now report an empty state rather than the old parser's fabricated `"LISTEN"` (an honest correction), and the shared walk's dedup (inherited from `netstat_plugin.cpp`'s existing convention, keyed on protocol/address/port only) means a socket shared or independently bound by more than one process — `SO_REUSEPORT`, a prefork listener — now surfaces under one arbitrarily-chosen owning PID in `network_diag`'s output rather than one row per owning process; the connection/port itself is still reported either way. `docs/os-capability-matrix.md` and `scripts/ci/check-plugin-spawn-lexical.sh`'s grandfathered list are updated to match. `netstat`/`sockwho`'s own inline copies of the socket walk, and `echo_network_collector`'s copy, are intentionally left as-is pending follow-up work.
 
 - **`PolicyStore` migrated to PostgreSQL (ADR-0056).** Compliance-policy storage
   (fragments, policies, inputs, triggers, group bindings, per-agent status) now
@@ -2111,12 +2111,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Server test suite sharded into `[pg]` / `~[pg]` meson entries (#2092).** Two entries over the same binary — `server unit tests` (`~[pg]`) and `server pg unit tests` (`[pg]`) — run in parallel with a 600s budget each (was one 900s entry); `flake-retry.py` now *replaces* a shard's positional tag filter with the case name when isolating a retry (Catch2 ORs positional specs — appending would re-run the whole shard), and its pure-logic selftest is wired into the `docs` meson suite. Nightly and on-demand sanitizer/coverage legs (`nightly.yml`, `sanitizer-tests.yml`) get `--timeout-multiplier 2` to compensate for instrumentation on the tighter per-shard budgets.
 
-- **`TarDatabase::open()` creates its schema in one transaction instead of ~75.** SQLite gives every
+- **`EchoDatabase::open()` creates its schema in one transaction instead of ~75.** SQLite gives every
   bare statement its own implicit transaction, and WAL defaults to `synchronous=FULL`, so handing
   `sqlite3_exec` the schema batch cost roughly 75 separate commits each with its own fsync. Measured
   on the Windows CI runner (91 iterations, best of 3): **72.4 ms per open against 11.0 ms** for the
   identical DDL wrapped in a single transaction. Every agent paid this at boot on every endpoint,
-  and the `tar` unit suite paid it ~95 times — which is what pushed that suite into its 90 s meson
+  and the `echo` unit suite paid it ~95 times — which is what pushed that suite into its 90 s meson
   budget on 48 of 437 Windows CI runs. The wrapper is also an atomicity fix: a batch that fails
   partway through now rolls back instead of leaving a half-built schema for the next open to
   inherit. (#2093)
@@ -2186,7 +2186,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking — `file-hash-equals` rules now enforce a hard 1 GiB ceiling on `max_bytes`.** Previously unbounded on both the agent's spark and legacy arm paths. A `max_bytes` above the ceiling, in either JSON wire form, is now rejected at authoring time (400). **If you have a pre-existing rule authored with `max_bytes` above 1 GiB watching a file at or above that size** (this check cannot retroactively reject an already-stored rule), that file now reports `<oversize>` instead of being hashed after upgrading — list your rules via `GET /api/v1/guaranteed-state/rules`, look for any `file-hash-equals` rule with `max_bytes` over 1073741824 (the route returns every rule; there is no server-side filter), and re-author within the ceiling if the larger cap was intentional (#2233).
 
-- **`docs/os-capability-matrix.md` restructured into sections and re-verified against code.** The single matrix now groups rows under divider sections — agent core, Guardian guards, Spark mechanisms, DEX, TAR capture sources, inventory/daily-sync, live snapshot, security posture & file/certificate surfaces, network quality, and all 49 agent plugins (one row each) — and the superseded pre-restructure table has been removed. Re-verification corrected drift: all 13 TAR sources listed (the four-valued `OsSupportStatus` incl. `kSupportedConstrained` now in the legend), the file guard marked observe-only on every platform, and the Spark consumer status updated to rung 7.7a. The matrix reflects the macOS-parity work landing in the same PR: `msi_packages` gains macOS support, macOS network-quality throughput, TAR tcp/netqual via `nstat`, DEX crash/hang app version, filesystem signing/version-info and certificate keychain rows, new **Antivirus posture** / **Firewall posture** / **Wi-Fi current connection** rows, and honest-sentinel corrections across `interaction`, `wol`, `flush_dns`, `registry`/`sccm`/`rdp_control` and the DNS-cache reads. Plugin tally re-derived: 42 cross-platform / 4 Windows-only / 2 uneven / 1 macOS-constrained.
+- **`docs/os-capability-matrix.md` restructured into sections and re-verified against code.** The single matrix now groups rows under divider sections — agent core, Guardian guards, Spark mechanisms, DEX, Echo capture sources, inventory/daily-sync, live snapshot, security posture & file/certificate surfaces, network quality, and all 49 agent plugins (one row each) — and the superseded pre-restructure table has been removed. Re-verification corrected drift: all 13 Echo sources listed (the four-valued `OsSupportStatus` incl. `kSupportedConstrained` now in the legend), the file guard marked observe-only on every platform, and the Spark consumer status updated to rung 7.7a. The matrix reflects the macOS-parity work landing in the same PR: `msi_packages` gains macOS support, macOS network-quality throughput, Echo tcp/netqual via `nstat`, DEX crash/hang app version, filesystem signing/version-info and certificate keychain rows, new **Antivirus posture** / **Firewall posture** / **Wi-Fi current connection** rows, and honest-sentinel corrections across `interaction`, `wol`, `flush_dns`, `registry`/`sccm`/`rdp_control` and the DNS-cache reads. Plugin tally re-derived: 42 cross-platform / 4 Windows-only / 2 uneven / 1 macOS-constrained.
 
 - **Cross-platform result-schema touch-ups from the macOS parity work.** The `msi_packages` `product_codes` result column type widened from `guid` to `string` (macOS `pkgutil` identifiers are reverse-domain strings, not GUIDs; Windows values are unchanged), and the `services` list gained a documented per-platform meaning for its second column (display name on Windows/Linux, launchd PID on macOS). On macOS, a `services set_start_mode` request for `manual` now returns an error rather than silently aliasing to `disabled` (launchd start-mode is binary enable/disable — there is no honest "manual" state to set), so any policy that references a macOS `manual` start mode should switch to `automatic`/`disabled`. Consumers that key on these result columns should treat the `product_codes` type as a string. Note: because bundled instruction definitions are seeded on a server's first boot, these definition changes reach fresh installs immediately and existing servers on the next re-seed (tracked in #2275).
 
@@ -2376,8 +2376,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`GuaranteedStateStore` migrated to PostgreSQL (ADR-0038).** Guardian rules, events, DEX observations, agent-rule status, and policy generation now live in Postgres (schema `guaranteed_state_store`), backfilled from the legacy `guaranteed-state.db` on first boot. Operator-visible change: `POST /api/v1/guaranteed-state/push` (and the heartbeat reconcile) now **aborts with `503`** if the rule store is degraded or unreachable, instead of silently fanning out an empty rule set to every in-scope agent. The retention reaper adopts the clock-guarded shape (#2496/#2579): a pass with no usable clock anchor and rows already expired declines once rather than deleting, counted at `yuzu_server_guardian_reap_passes_total{result="declined_no_anchor"}`. The reaper's "implausibly ahead" probe horizon is derived from the configured `guardian_event_retention_days` rather than a fixed bound, so a long-retention deployment's own honest live rows are never misclassified as implausible. The reap verdict now reads PostgreSQL's own clock rather than each replica's process clock (matching `AuditStore`'s `#2360/1d` fix) — under the prior process-clock read, a replica whose own clock ran even moderately fast could sweep a row still live by every other clock, with no anomaly recorded (#2663, found in review by fjarvis). First-boot migration from the legacy `guaranteed-state.db` now copies event and DEX-observation rows unconditionally, including already-TTL-expired ones — previously an expired row was silently excluded at migration time by an unguarded process-clock comparison with no anchor, sanitiser, or cap; it is now the same guarded reaper above, not migration, that decides expiry (#2663, security-guardian review).
 
-- The server **response store** (agentic command/instruction results powering the executions drawer and the `/tar` dashboard) now runs on PostgreSQL (schema `response_store`) instead of a per-server SQLite `responses.db`, continuing the ADR-0006 server-substrate migration (ADR-0039). The executions drawer and TAR result views are now fleet-consistent across server replicas. Ingest is fail-soft (a dropped result is re-derivable telemetry, counted on `yuzu_server_response_ingest_dropped_total`), reads distinguish a genuine "no responses" from a store/pool degrade (`yuzu_server_response_read_degrade_total`), and TTL retention (90-day default) runs a clock-guarded reap (`yuzu_server_response_reap_passes_total`) that reads PostgreSQL's own clock for every decision, not a replica's process clock, and declines once on a fresh database with no usable prior reading rather than deleting immediately. **Pre-cutover response history is not migrated** — it resets on first boot against PostgreSQL and self-refills as new commands run (see the upgrading guide). Plugin-reported typed result status (`plugin_result_status`, mirroring `agent.proto CommandResponse.plugin_result_status`) now round-trips through the store, matching the legacy SQLite store's ABI4 CC-07 column.
-- A single response's stored output/error text is capped at 2 MiB (matching the agent's own per-dispatch capture cap) and its facet cardinality at 5,000 distinct values, so one oversized or high-cardinality plugin result can no longer pressure the shared connection pool that authentication reads also share. A store/pool read degrade is now surfaced honestly everywhere it reaches an operator instead of silently reading as "no results": the dashboard results table, the group-creation count and write gate, the TAR retention-paused list, and a running `/auto` Pre-flight run all show a "temporarily unavailable, retrying" state rather than a false empty or zero. Pre-flight in particular no longer lets a transient read failure downgrade an already-resolved device's Pass/Fail verdict to Incomplete or complete a run on incomplete data — a degraded tick is skipped and retried, never persisted over a good result.
+- The server **response store** (agentic command/instruction results powering the executions drawer and the `/echo` dashboard) now runs on PostgreSQL (schema `response_store`) instead of a per-server SQLite `responses.db`, continuing the ADR-0006 server-substrate migration (ADR-0039). The executions drawer and Echo result views are now fleet-consistent across server replicas. Ingest is fail-soft (a dropped result is re-derivable telemetry, counted on `yuzu_server_response_ingest_dropped_total`), reads distinguish a genuine "no responses" from a store/pool degrade (`yuzu_server_response_read_degrade_total`), and TTL retention (90-day default) runs a clock-guarded reap (`yuzu_server_response_reap_passes_total`) that reads PostgreSQL's own clock for every decision, not a replica's process clock, and declines once on a fresh database with no usable prior reading rather than deleting immediately. **Pre-cutover response history is not migrated** — it resets on first boot against PostgreSQL and self-refills as new commands run (see the upgrading guide). Plugin-reported typed result status (`plugin_result_status`, mirroring `agent.proto CommandResponse.plugin_result_status`) now round-trips through the store, matching the legacy SQLite store's ABI4 CC-07 column.
+- A single response's stored output/error text is capped at 2 MiB (matching the agent's own per-dispatch capture cap) and its facet cardinality at 5,000 distinct values, so one oversized or high-cardinality plugin result can no longer pressure the shared connection pool that authentication reads also share. A store/pool read degrade is now surfaced honestly everywhere it reaches an operator instead of silently reading as "no results": the dashboard results table, the group-creation count and write gate, the Echo retention-paused list, and a running `/auto` Pre-flight run all show a "temporarily unavailable, retrying" state rather than a false empty or zero. Pre-flight in particular no longer lets a transient read failure downgrade an already-resolved device's Pass/Fail verdict to Incomplete or complete a run on incomplete data — a degraded tick is skipped and retried, never persisted over a good result.
 - A response whose `instruction_id`/`execution_id`/`plugin`/`agent_id` contains an embedded NUL byte is now rejected outright at ingest (counted, never stored) instead of being silently truncated at the NUL — closes a truncation-based identity-collision path where a malicious or misbehaving agent could otherwise have a response land, truncated, under a different (shorter) real device or instruction id. The TTL reap's per-pass cascade delete is now explicitly bounded (pre-drains `response_facets` in small batches before each parent-row chunk) instead of relying on an unbounded implicit foreign-key cascade, closing a self-sustaining retention wedge under high facet-cardinality backlogs. New/corrected Prometheus alerts: `YuzuResponseReapNotRunning`'s liveness check no longer pages permanently on a healthy install; `YuzuResponseReapFailing`, `YuzuResponseReapMetricMissing`, and `YuzuResponseReapAnchorNotSurviving` cover conditions the prior alert set couldn't detect; `YuzuResponseIngestDrops` no longer pages store-health on-call for an agent's own malformed input.
 
 - **BREAKING: the server audit store now requires PostgreSQL, with no SQLite fallback, and boot can refuse on a stuck migration.** The **audit store** — the SOC 2 evidence chain (operator actions, agent enrolment, background execution, and all behavioural-PII access) — now runs on PostgreSQL (schema `audit_store`) instead of a per-server SQLite `audit.db` (ADR-0040, continuing ADR-0006). This is an operational-requirements break, not a data-loss one: **audit history is preserved** across the cutover by a one-time streamed, resumable, fail-closed backfill on first boot; the legacy `audit.db` (with any `-wal`/`-shm` sidecars) is moved aside (not deleted) once verified. But an incomplete or unverifiable migration now means the server (or a break-glass one-shot) **refuses to start rather than serve with unproven evidence** — budget for that possibility on the upgrade, not just for a longer first boot. The backfill runs only against an empty audit schema or its own interrupted copy — if PostgreSQL already holds audit rows that are not a partial copy of *this* `audit.db` (a DSN aimed at another deployment, or a restore that brought back the events without the completion marker), the server refuses to start rather than resume past them and report a complete migration; the upgrading guide has the remediation. **Holder-side verification (round 3):** a host that boots and finds the completion marker already set by some OTHER process — a fileless replica that started first, or an unrelated backfill — no longer trusts that marker if it still holds its own legacy `audit.db`. It re-verifies its own file's content by fingerprint and refuses to serve on a mismatch, rather than silently reporting success over a trail that was never actually read. This closes the gap in the multi-replica boot-order guidance below: getting the boot order right still avoids the refusal, but getting it wrong no longer means silent, undetected evidence loss — see `docs/ops-runbooks/audit-store-backfill-recovery.md` for the recovery procedure if a host refuses. Credentials captured in pre-upgrade `config.update` audit rows are redacted both on read and during the backfill copy, so the PostgreSQL substrate never receives the plaintext (the unredacted original stays in the moved-aside legacy file; operators who set an OIDC client secret before the writer fix should still rotate it). Writes remain fail-hard (a persistence failure returns an error, never a silent drop) and reads degrade-and-deny (`503`) rather than ever returning a false-empty result — including on the LIVE write path now, not just during backfill: `result`/`principal_class` are sanitized like every other text column before every write, closing a gap where an embedded NUL silently truncated a value (e.g. `"success"` stored as `"suc"`) or invalid UTF-8 failed the insert outright on what is supposed to be a fail-hard path. Retention is now a fleet-consistent single-sweeper advisory-lease clock guard whose decisions read PostgreSQL's own clock (not any one replica's process clock, closing a class of cross-replica clock-divergence bug), and #2579's missing-anchor decline carries across as durable, fleet-shared state — a first pass with no usable stored clock reading and rows already expired declines once, anchors, and proceeds on the next pass, counted on `yuzu_server_audit_retention_bootstrap_declines_total` rather than the clock-anomaly series. Two new metrics — `yuzu_server_audit_read_degrade_total` and `yuzu_server_audit_backfill_total` — are exported. On a large `audit.db`, first boot takes longer while the backfill streams; widen the startup/health probe budget accordingly (see the upgrading guide). The final completeness check that runs once streaming finishes (a full-table scan proving nothing was lost or duplicated) now gets its own explicit 60-second execution deadline rather than silently inheriting the connection pool's ordinary 30-second per-statement default, so it is not truncated on a trail large enough to make that scan itself slow; see `docs/ops-runbooks/audit-store-backfill-recovery.md` if it still is. The one-shot break-glass CLI paths (`--mfa-reset`, `--break-glass-arm`) complete the same backfill before writing their audit record, so on an upgraded host the first one-shot migrates the legacy trail (and moves `audit.db` aside) exactly as first boot would; if that backfill cannot complete, the one-shot refuses rather than writing an audit row that would then block every later boot. A mandatory backfill that does not complete now also **blocks audit writes** until one does, so a server that refuses to start cannot leave native rows ahead of the completion marker and wedge every later boot; and a host with no legacy `audit.db` will no longer declare the migration complete on behalf of the host that has one — in a multi-replica upgrade, start the replica holding `audit.db` first (the server logs a warning whenever it marks a backfill complete without a source). Retention paces at two different cadences depending on whether a backlog is forming — it no longer waits a full interval after a pass that hit its per-pass delete cap with a backlog still outstanding, re-arming in 5 seconds instead — so a large one-off backlog drains far faster than the old hourly-only cadence implied; see `docs/user-manual/audit-log.md` § Capacity for both figures. `GET /api/audit` and `GET /api/v1/audit` now answer **400** for `limit` below 1 (previously it reached PostgreSQL, errored, and was reported as an audit-store outage), and a `total` that could not be counted is reported as `null` rather than as the page size. The MCP `query_audit_log` tool had the same class of bug on the same input: a non-positive `limit` previously reached `AuditStore::query` unclamped and came back as an empty page rather than an error — indistinguishable from "no matching events" for the one query this store's ADR promises never reads false-empty. `limit` is now clamped to `[1, 500]` before the query runs, the same idiom `query_responses` already used.
@@ -2392,7 +2392,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The server **management-group store** (the confinement hierarchy — group definitions, the parent/child tree, membership, and group→role assignments that scope what each operator can see) now runs on PostgreSQL (schema `management_group_store`) instead of a per-server SQLite `management-groups.db` (ADR-0042, continuing ADR-0006). **Confinement config is preserved** across the cutover by a one-time, fail-closed, resumable backfill on first boot; the legacy file is moved aside once verified, and an over-deep or cyclic legacy tree is refused (fail-closed) rather than migrated into a mis-confining state. **Confinement reads now fail closed** — a degraded/unreachable store denies (the operator sees nothing) rather than silently under-restricting (which could over-disclose across management groups). New metrics `yuzu_server_mgmt_group_read_degrade_total` and `yuzu_server_mgmt_group_backfill_total` are exported. On a large management-group tree, first boot takes longer while the backfill streams; widen the startup/health-probe budget (see the upgrading guide).
 
-- **One implementation of per-user registry access.** `installed_apps`, `license_scan` and `tar` each carried their own copy of the profile-enumeration and hive-mounting logic; all three now use the shared one. Consequences visible to operators: `installed_apps.list_per_user` reports an unresolvable profile name as `-` instead of substituting the user's SID; it now surfaces the hive-unload failures and missing-privilege conditions it previously discarded; its ProfileList-open failure is now reported as `error|profile_list_unreadable` (previously `error|failed to open ProfileList registry key`) — any saved alert or automation matching the old literal should be updated. `license_scan` and `tar`'s profile walks, previously unbounded, are now capped at 512 profiles like `registry.list_profiles` always was, reported honestly as `profile_list_truncated`/a logged warning rather than silently returning a short list — on a multi-session host (RDS/VDI) with more local profiles than that, per-user data for profiles past the cap is not collected.
+- **One implementation of per-user registry access.** `installed_apps`, `license_scan` and `echo` each carried their own copy of the profile-enumeration and hive-mounting logic; all three now use the shared one. Consequences visible to operators: `installed_apps.list_per_user` reports an unresolvable profile name as `-` instead of substituting the user's SID; it now surfaces the hive-unload failures and missing-privilege conditions it previously discarded; its ProfileList-open failure is now reported as `error|profile_list_unreadable` (previously `error|failed to open ProfileList registry key`) — any saved alert or automation matching the old literal should be updated. `license_scan` and `echo`'s profile walks, previously unbounded, are now capped at 512 profiles like `registry.list_profiles` always was, reported honestly as `profile_list_truncated`/a logged warning rather than silently returning a short list — on a multi-session host (RDS/VDI) with more local profiles than that, per-user data for profiles past the cap is not collected.
 
 - **`yuzu_server_audit_retention_last_pass_unixtime` now survives a server restart,
   including the first PostgreSQL boot.** `AuditStore` seeds the gauge from the durable
@@ -2650,7 +2650,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Device DEX/Guardian lenses and the `/dex` app-perf dashboard now read through the `DexApi`/`DexPerfApi`/`GuardianApi` seams instead of the store directly** (closing #4576 and #4483, the device-lens deferrals, and #4626's dashboard deferral). Small, disclosed rendering changes: a device with zero reported guards now shows "No guards evaluated" even if the fleet-wide rule catalogue is itself degraded (previously it showed a generic degraded state); the F2b trend/app-list and per-device app-perf placeholders are now one consistent message, "App performance data unavailable (not configured or degraded) — retry shortly." (the fleet-now Performance tab and the version-devices drill keep their own unchanged wording); the per-device DEX signal-history percentile strips now render "no comparison data" when no fleet perf function is wired, where that section used to be omitted (production always wires one, so no visible change there); the per-device app-performance drill now records its `dex.device.app_perf.view` access-audit row before checking whether the app-perf read surface is configured, so an unconfigured/degraded read can produce an audit row with no data shown (over-audits, never under-audits). Internally, `AppPerfProviders` is retired, the now-dead `DexRoutes::PerfFn` parameter is removed, and `device_lens_routes.cpp`/`dex_perf_ui.cpp`/`dex_app_perf_ui.{hpp,cpp}` are enrolled in `check-seam-closure.py`'s seam enforcement.
 
-- **Breaking — a result-set `parent_id` alias longer than 64 bytes is no longer accepted on `from-tar-query`/`from-instruction-result` (REST) and their MCP twins (#4734).** `parent_id` accepts either a canonical `rs_...` id or a per-operator alias (the set's own `name`, valid up to 256 bytes). The new 64-byte `kResultSetParentIdMaxLen` bound (closing an unbounded-copy gap into the persisted `scope_input_id` lineage marker) is checked before alias resolution is attempted, so a real, previously-working alias between 65 and 256 bytes now returns `400` ("parent_id must be at most 64 bytes") instead of resolving. This restriction already existed on MCP's equivalent producer tools; this change brings REST to parity rather than introducing a new limit. Any automation referencing a long-named result set as a dispatch parent should use the set's canonical `rs_...` id instead (`GET /api/v1/result-sets` lists both).
+- **Breaking — a result-set `parent_id` alias longer than 64 bytes is no longer accepted on `from-echo-query`/`from-instruction-result` (REST) and their MCP twins (#4734).** `parent_id` accepts either a canonical `rs_...` id or a per-operator alias (the set's own `name`, valid up to 256 bytes). The new 64-byte `kResultSetParentIdMaxLen` bound (closing an unbounded-copy gap into the persisted `scope_input_id` lineage marker) is checked before alias resolution is attempted, so a real, previously-working alias between 65 and 256 bytes now returns `400` ("parent_id must be at most 64 bytes") instead of resolving. This restriction already existed on MCP's equivalent producer tools; this change brings REST to parity rather than introducing a new limit. Any automation referencing a long-named result set as a dispatch parent should use the set's canonical `rs_...` id instead (`GET /api/v1/result-sets` lists both).
 
 - **HA WS-8 (#4943, #4944): the two whole-tier `/readyz` eviction shapes are decided.** The shipped `yuzu-postgres` images (single-node and the HA Patroni profile) now set `reserved_connections` (default 40, env `YUZU_PG_RESERVED_CONNECTIONS`, PostgreSQL 16+) and grant `pg_use_reserved_connections` to the app role at first boot, so a backup job or ad-hoc session can never take the slot a server's `/readyz` probe needs to reconnect; the probe stays pool-faithful (no probe-only privilege, no 53300 special case), `max_connections` sizing is stated as a formula (`N × (pool_size + 2) + …`), and existing databases apply the setting + grant by hand (see `upgrading.md`). Both images now refuse to boot if `YUZU_PG_RESERVED_CONNECTIONS` is set high enough to starve every other client — the shipped default (40) never triggers this. Overload keeps no server-side hysteresis by decision — the load balancer's thresholds (recommended `5 s / unhealthy 2 / healthy 3`) are the damping, and sustained overload reding every replica is documented as truthful. WS-9 rig `scripts/ha/ha-readyz-scenarios.sh` gains scenarios L (CPU-starved primary), M (3 s stall stays green) and N (max_connections exhaustion with and without the reserve). ADR-2002 §12 records both decisions.
 
@@ -2662,7 +2662,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `script_exec` now executes commands and scripts through the shared bounded subprocess runner with per-line incremental output streaming preserved (16 MiB streamed-output cap retained), replacing its private `CreateProcessA`/`fork`+`execvpe` paths; timeout and output-cap behaviour come from the runner contract (deadline unchanged: still caller-configurable via the `timeout` parameter, 1-3600s), and the plugin's grandfathered raw-spawn lexical-gate entry is removed. A timed-out or cancelled command now gets a 10s soft-terminate grace (`SIGTERM`/`CTRL_BREAK` before the hard kill, POSIX-effective only — see `SubprocessOptions::soft_terminate_grace`) instead of an immediate hard kill with no chance to unwind. Environment behaviour is unchanged on both platforms: POSIX children continue to receive the same curated `PATH`/`HOME`/`USER`/`LANG`/`LC_ALL`/`TERM`/`TZ` allow-list, and Windows children continue to inherit the full parent environment. Terminal command results now report a typed retry-grade status (deadline/cancelled/signaled/spawn-error) through the ABI4 result-status seam instead of a generic failure. A relative `command` (e.g. `./helper`) or a relative/empty `PATH` entry now resolves against a fixed safe working directory (`/` on POSIX, `C:\Windows\System32` on Windows) instead of the agent daemon's own real working directory, which the deleted spawn paths implicitly used — a deliberate hardening (ADR-3002 A6: never resolve against a potentially attacker-influenced daemon cwd); an instruction that relied on the old daemon-cwd-relative resolution should switch to an absolute `command` path. First unit tests for `script_exec` land alongside.
 
-- The tar service and mapped-drive collectors now invoke `systemctl`, `launchctl`, `wevtutil`, `smbstatus`, and `journalctl` as absolute-path argv through the shared bounded subprocess runner (hard deadlines, capped output, stderr discarded) instead of `popen`/`_popen` shell strings; both files' grandfathered raw-spawn lexical-gate entries are removed.
+- The echo service and mapped-drive collectors now invoke `systemctl`, `launchctl`, `wevtutil`, `smbstatus`, and `journalctl` as absolute-path argv through the shared bounded subprocess runner (hard deadlines, capped output, stderr discarded) instead of `popen`/`_popen` shell strings; both files' grandfathered raw-spawn lexical-gate entries are removed.
 
 - **Repository moved to the `DevNullLtd` organisation.** `Tr3kkR/Yuzu` is now
   `DevNullLtd/Yuzu`; GitHub redirects the old paths, so existing clones, links
@@ -2847,12 +2847,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Suppresses libpq's connect-time `static_std_strings`/`static_client_encoding` write-write race under TSan (#1611).** Nightly TSan: suppress libpq's documented single-connection `static_std_strings`/`static_client_encoding` connect-time write-write race (`pqSaveParameterStatus`), anchored to the two globals and guarded by a tripwire that fails if any first-party code starts calling the conn-less `PQescapeString`/`PQescapeBytea` readers. Also fixes an independent, pre-existing TSan race in `test_pg_pool.cpp`'s optional-teardown, unmasked once the libpq race stops halting execution first.
 
-- **TAR snapshot-diff collectors commit events and baseline atomically** (#1654).
+- **Echo snapshot-diff collectors commit events and baseline atomically** (#1654).
   Events and the baseline now land in one transaction, so a failed baseline save can
   no longer cause a double-emit on the next tick. The existing
   `error|<source> insert failed` line covers a rolled-back batch; a new
   `error|<source> state_save_failed` line covers a failed baseline-only save (the
-  software cold-start seed reports `tar|collect_software|0|state_save_failed` on its
+  software cold-start seed reports `echo|collect_software|0|state_save_failed` on its
   own line). The
   per-source enable/disable transition is all-or-nothing.
 
@@ -2898,7 +2898,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Linux CI's `Test` step gains a box-wide cross-job concurrency gate, addressing a residual risk #3443 left open.** `--num-processes 2` (merged 2026-08-23) fixed within-job pg-shard fan-out but left cross-job contention unmeasured — confirmed real within a day: a single push to `dev` launches its own 4-way Linux matrix simultaneously, saturating all 4 Big Tam runners by itself, and a concurrently-queued PR's Linux job was observed waiting 35 minutes for a free runner while shard E timed out again. The Linux `Test` step now wraps in `scripts/ci/with-test-slot.sh 2`, the same box-wide slot gate Wee Tam already used, with three Linux-specific settings (`YUZU_TEST_SLOT_DIR` pointed at a genuinely box-wide path, since Big Tam's `RUNNER_TOOL_CACHE` is per-agent; `YUZU_TEST_SLOT_NAME` for a distinct log namespace; `YUZU_TEST_SLOT_TIMEOUT_MIN=30` to reduce, not guarantee away, the chance of a starved job hitting an ambiguous job-level timeout kill instead of the script's own attributable error). `nightly.yml`/`sanitizer-tests.yml` still carry neither fix — remains tracked on #3443.
 
-- **Linux CI's `Test` step isolates the 8 server pg shards from the ~24 cheap tests (5 suites) sharing their concurrency pool.** A live run of the cross-job slot gate (#3582, same day) showed shards E and G TIMEOUT at 600.51s/600.54s (SIGKILL'd) despite acquiring the cross-job slot in 0s — zero cross-job contention. The Test step now runs 3 `flake-retry.py` invocations, cheap-first (fail-fast via `bash -e`): 21 tests across 5 cheap suites (`agent`/`docs`/`proto`/`tar`/`gateway`) run uncapped first, then 3 non-pg server tests, then the 8 pg shards run last, isolated by exact name into their own `with-test-slot.sh`-gated call at the same `--num-processes 2` as before. Root cause, corrected after a same-day governance re-review: back-computed start times show E's actual co-runners were pg shards D then G, not a cheap test — plain 2-wide FIFO pairing some heavy shards together, not cross-suite interference. (An earlier draft of this fix also bumped the isolated pool to `--num-processes 3`; reverted without a real run confirming it helped, since 3-wide FIFO predicts three of the heaviest shards — D, E, G — running concurrently, plausibly worse than today's pairing.) The cross-job slot count itself is unchanged at 2 (a different, already-fixed axis — #3443 AC4).
+- **Linux CI's `Test` step isolates the 8 server pg shards from the ~24 cheap tests (5 suites) sharing their concurrency pool.** A live run of the cross-job slot gate (#3582, same day) showed shards E and G TIMEOUT at 600.51s/600.54s (SIGKILL'd) despite acquiring the cross-job slot in 0s — zero cross-job contention. The Test step now runs 3 `flake-retry.py` invocations, cheap-first (fail-fast via `bash -e`): 21 tests across 5 cheap suites (`agent`/`docs`/`proto`/`echo`/`gateway`) run uncapped first, then 3 non-pg server tests, then the 8 pg shards run last, isolated by exact name into their own `with-test-slot.sh`-gated call at the same `--num-processes 2` as before. Root cause, corrected after a same-day governance re-review: back-computed start times show E's actual co-runners were pg shards D then G, not a cheap test — plain 2-wide FIFO pairing some heavy shards together, not cross-suite interference. (An earlier draft of this fix also bumped the isolated pool to `--num-processes 3`; reverted without a real run confirming it helped, since 3-wide FIFO predicts three of the heaviest shards — D, E, G — running concurrently, plausibly worse than today's pairing.) The cross-job slot count itself is unchanged at 2 (a different, already-fixed axis — #3443 AC4).
 
 - **Linux CI: a `dev`/`main` push's own build/test matrix no longer claims all 4 Big Tam runners at once, starving a concurrently-queued PR's Linux job.** Big Tam runs exactly 4 self-hosted `yuzu-bigtam-linux` runner agents; a push triggers the full 2x2 (gcc-15/clang-21 x debug/release) Linux matrix, which could previously occupy all 4 simultaneously and leave a PR's own single Linux leg queued with no free runner (a prior instance was directly observed waiting 35 minutes). `ci.yml`'s Linux job now caps at `max-parallel: 3`, leaving one runner unclaimed by this matrix — a no-op on `pull_request` events, which already run a single gcc-15/debug leg. This is a mitigation, not a guarantee: the freed runner isn't reserved for the queued PR job specifically, and a same-push `proto-compat` job (which targets the same runner pool), a stacked nightly run, or another concurrent PR/push can still claim it first; tracked at issue #3443.
 
@@ -3241,7 +3241,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`certificates` on macOS no longer reports a keychain it could not read as empty, and re-checks the console user before reading their login keychain.** An empty `SecItemCopyMatching` answer is accepted as `zero certificates` only when the keychain's read-permission status bit is set; otherwise the row is `not_available|<keychain> not readable (no read permission)` and the result is CONSTRAINED/PARTIAL. Immediately before the login-keychain `launchctl asuser`/`sudo -u` spawn the plugin re-reads `/dev/console`'s owner in-process and, if the uid no longer matches the resolved console user (a fast-user switch mid-action), emits `not_available|console user changed` and does not spawn; the window shrinks from tens of seconds to microseconds but is not eliminated. Subprocess failures now name their termination reason (`killed at deadline`, `output truncated (line limit)`, `killed by signal`, `spawn failed`, `exit <n>`) in both the agent log and the `not_available` row (#2318).
 
-- **Removed every scanf-family call from agent and server code (#2332 follow-up).** glibc 2.38 redirects `fscanf`/`sscanf` to versioned `__isoc23_*` symbols, so Linux binaries built on a new-glibc toolchain refuse to load on RHEL-era glibc; this removes the scanf-family dependency at source level (other new-glibc symbol requirements of the release build remain separate work). All 8 call sites (the `fs.nr_open` fd-ceiling read, `/proc/net/dev` throughput counters, the mapdrive flexible-timestamp and Security-log event/logon-type parsers, and the TAR tree timestamp query param) now use `std::strtol`-family parsing with end-pointer checks (`std::fgets` replacing the one `fscanf` stream read), behaviour-identical including scanf's width caps and whitespace handling — except that out-of-`int`-range timestamp fields, formerly undefined behaviour, now reject cleanly; the two previously-unchecked `sscanf` calls in the Security-log parser now check their parse explicitly.
+- **Removed every scanf-family call from agent and server code (#2332 follow-up).** glibc 2.38 redirects `fscanf`/`sscanf` to versioned `__isoc23_*` symbols, so Linux binaries built on a new-glibc toolchain refuse to load on RHEL-era glibc; this removes the scanf-family dependency at source level (other new-glibc symbol requirements of the release build remain separate work). All 8 call sites (the `fs.nr_open` fd-ceiling read, `/proc/net/dev` throughput counters, the mapdrive flexible-timestamp and Security-log event/logon-type parsers, and the Echo tree timestamp query param) now use `std::strtol`-family parsing with end-pointer checks (`std::fgets` replacing the one `fscanf` stream read), behaviour-identical including scanf's width caps and whitespace handling — except that out-of-`int`-range timestamp fields, formerly undefined behaviour, now reject cleanly; the two previously-unchecked `sscanf` calls in the Security-log parser now check their parse explicitly.
 
 - **Guardian's durable audit journal no longer loses records to a wall-clock anomaly or to its
   own size accounting.** (Dormant with the rest of the Guardian journal machinery until the
@@ -3344,7 +3344,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   taking the audit trail offline, and is logged as an error (there is no health
   metric for it - see #2526).
 
-- TAR time-based retention no longer trusts the endpoint clock. A rollup tick issued
+- Echo time-based retention no longer trusts the endpoint clock. A rollup tick issued
   an unbounded `DELETE FROM <table> WHERE <ts_col> < <cutoff>` per warehouse table,
   with the cutoff derived from the endpoint's own wall clock -- the clock in a fleet
   most likely to be wrong (dead CMOS battery, long suspend, cloned VM, boot before
@@ -3358,7 +3358,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   elapsed-time check cannot run without one - the first pass after an agent
   upgrade or a restore. That fourth trigger deliberately does not latch, so a
   real anomaly on the very next pass is still declined. That reading is persisted in
-  `tar_config` and sanitised, so it still fires after an agent restart and cannot be
+  `echo_config` and sanitised, so it still fires after an agent restart and cannot be
   disabled by a poisoned value. Every accepted delete is capped at 5,000 rows per
   table per pass, oldest first. A deliberate dead band remains: a forward error under
   30 days is caught only by the outcome test, which any row written after the jump
@@ -3370,26 +3370,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every collector on the endpoint; a big excess now drains over a few ticks instead.
   The retention transaction stops at the first failed statement and rolls back rather
   than letting later deletes escape as autocommits after SQLite has already aborted it.
-  If the rollback itself fails with the transaction still open, the TAR database is
+  If the rollback itself fails with the transaction still open, the Echo database is
   CLOSED: every subsequent write would be reported durable and then lost, so all of
-  them fail closed instead, and `tar status` reports `storage_state|offline` until the
+  them fail closed instead, and `echo status` reports `storage_state|offline` until the
   agent restarts. The existing paused/errored source gate
   still runs first, so a source paused for forensics neither deletes nor reports an
   anomaly. Because the agent has no `/metrics` endpoint, the counters are surfaced
-  through the `tar status` action as `retention_guard_declines_total` and
+  through the `echo status` action as `retention_guard_declines_total` and
   `retention_guard_failures_total`, plus per-table `retention_guard|<table>|<n>` and
   `retention_guard_failed|<table>|<n>` lines (probe and delete failures merged); the
   two totals must be read together, since a table whose probes or deletes fail every
   pass has silently stopped being retained.
 
 - **Behaviour change:** a retention transaction whose rollback fails while the
-  transaction is still open now takes TAR storage **offline on that endpoint until the
-  agent restarts**. Collection, retention and `tar configure` all stop; historical rows
-  stay readable through the separate read-only connection (`tar sql`), and `tar status`
+  transaction is still open now takes Echo storage **offline on that endpoint until the
+  agent restarts**. Collection, retention and `echo configure` all stop; historical rows
+  stay readable through the separate read-only connection (`echo sql`), and `echo status`
   replies with a single `error|...` line followed by `storage_state|offline` -- no
-  `record_count`, no `config|` lines. Anything keyed off `record_count` in a `tar status`
+  `record_count`, no `config|` lines. Anything keyed off `record_count` in an `echo status`
   reply sees an absent field rather than a zero. That error line only promises the
-  `tar sql` read path when the read-only connection actually opened; on an endpoint
+  `echo sql` read path when the read-only connection actually opened; on an endpoint
   where it did not, it says so rather than sending the operator to a dead end. The
   dashboard's capture-sources frame now surfaces the line verbatim instead of a generic
   "the device failed the status query". There is no automatic recovery today.
@@ -3555,9 +3555,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was tracked with a single `bool` latch, which cannot carry anomaly
   identity: a DIFFERENT anomaly arriving while the latch was still set from a
   previous decline was neither declined nor counted, and the pass deleted the
-  journal silently (measured, #2573, the same defect class as TAR's earlier
+  journal silently (measured, #2573, the same defect class as Echo's earlier
   fix). The guard now dedups on the whole fact set (shared with the audit
-  store's and TAR's clock guards), so a distinct anomaly reports again
+  store's and Echo's clock guards), so a distinct anomaly reports again
   instead of deleting, while an identical repeat still drains at the same
   paced rate as before. Two accepted behavior changes: (1) an idle journal
   (no batch actually past its retention window) that observes a large
@@ -3570,7 +3570,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   self-resolves on the next pass) — always the safe direction (an extra
   paced pass of delay, never an extra deletion).
 
-- **TAR's retention clock guard no longer swallows a distinct clock anomaly
+- **Echo's retention clock guard no longer swallows a distinct clock anomaly
   under a still-active one.** The per-table decline was tracked with a single
   `bool` latch, which cannot carry anomaly identity: a DIFFERENT anomaly
   arriving while the latch was still set from a previous decline was neither
@@ -3579,14 +3579,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   store's clock guard), so a distinct anomaly reports again instead of
   deleting, while an identical repeat still drains at the same paced rate as
   before.
-- **TAR's retention pass now refuses an implausible caller-supplied clock
+- **Echo's retention pass now refuses an implausible caller-supplied clock
   reading outright.** `run_retention`'s `now_epoch` had no upper bound, unlike
   the audit store's `kMaxPlausibleNow`, and — worse than the unguarded
   arithmetic this allowed — an implausible reading was persisted as the
   durable comparison point unconditionally, poisoning every later pass's
   elapsed-time check. The whole pass now declines before anything is
   persisted when the reading is implausible, reported as
-  `retention_guard_failed|__implausible_now__|<n>` in `tar status`.
+  `retention_guard_failed|__implausible_now__|<n>` in `echo status`.
 
 - The `/test` Phase 2 upgrade gate asserted the opposite of ADR-0030 for API tokens. ADR-0030 makes the `ApiTokenStore` SQLite-to-Postgres move a fresh-start cutover with no backfill, so every bearer token minted before the upgrade is invalidated by design — but `test-fixtures-verify.sh` required those tokens to still be listable afterwards, so the gate would have gone red on a correct upgrade and green on a failed one. The assertion is now chosen per upgrade edge from whether the edge actually crosses the cutover, and the check states in-file what its evidence does and does not cover: an empty owner-scoped list proves the rows are invisible to their owner, not that the bearer secrets were invalidated. Two ways the gate could still report green without evidence are closed: an unarmed API-token fixture on a cutover edge is now a failure ("invalidation unproven") rather than a silent skip, and the token-list readability check no longer rejects any response body containing the literal `"error"`, which had made a token legitimately named `error` look like a broken endpoint. The count helper is extracted to `scripts/test/api_token_count.py` with a table test, so its unreadable-body sentinel — which must never collapse to zero now that zero is the pass condition — is covered directly instead of only through a Docker upgrade run
 
@@ -3651,7 +3651,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Per-user registry reads report what actually happened.** `registry.get_user_value` now distinguishes a key it was denied access to from one that does not exist, decodes `REG_MULTI_SZ` and `REG_LINK` values instead of returning them as hex blobs, and names `REG_NONE`/`REG_LINK`/`REG_DWORD_BIG_ENDIAN` rather than reporting every one of them as `REG_UNKNOWN`. `registry.list_profiles` no longer silently drops a user's profile path when it is longer than the old fixed read buffer, and says so when a path exists but cannot be read. A failed hive unload now names the mount that actually needs clearing, so the remediation command in the message works. `docs/user-manual/agent-plugins.md` gains the full error/warning taxonomy and an explanation of the `hive_state` values.
 
-- **Per-user registry reads from a logged-out profile now actually work.** The offline-hive fallback (`registry.get_user_value`, and — as of this change — `installed_apps.list_per_user`, `license_scan`, and `tar`'s outbound mapdrive history) enables `SeBackupPrivilege`/`SeRestorePrivilege` before mounting a logged-out user's `NTUSER.DAT`. The call that enables them was missing a required argument, so it failed silently on every attempt since it first shipped — the offline path has never actually enabled the privilege, and every read against a logged-out profile has been reporting `privilege_missing` regardless of the account's real permissions. Fixed; verified against a live token that the call now succeeds where it previously failed.
+- **Per-user registry reads from a logged-out profile now actually work.** The offline-hive fallback (`registry.get_user_value`, and — as of this change — `installed_apps.list_per_user`, `license_scan`, and `echo`'s outbound mapdrive history) enables `SeBackupPrivilege`/`SeRestorePrivilege` before mounting a logged-out user's `NTUSER.DAT`. The call that enables them was missing a required argument, so it failed silently on every attempt since it first shipped — the offline path has never actually enabled the privilege, and every read against a logged-out profile has been reporting `privilege_missing` regardless of the account's real permissions. Fixed; verified against a live token that the call now succeeds where it previously failed.
 
 - MCP streamed POST: progress and final frames now carry their replay-ring event
   id as the SSE `id:` line (#2785). A client that only ever saw the POST
@@ -3802,7 +3802,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reaches a result envelope, and the already-quarantined business-error case now asserts
   the stored-intent retry re-dispatch instead of a terminal `400`.
 
-- **The A4 `.permission` hint on a service-scoped-token confinement denial no longer names a grant the caller typically already holds.** On a `deny_service_scoped_*`/inline confinement deny, the 403 body's `.permission` field used to name a `"SecurableType:Operation"` pair as if it were the missing grant — but a confinement deny fires regardless of what the caller holds (`kServiceScopeGlobalSafe` is compile-time-empty), so the hint was unactionable at best and, for an agentic caller parsing it to self-correct, actively misleading. Fixed at the last 14 sites of this shape across 7 files: `schedule_routes.{hpp,cpp}`'s `deny_service_scoped_schedule` helper and its 4 call sites (`server.cpp` hosts 3 of the 4), `preflight_routes.{hpp,cpp}`'s `deny_service_scoped_` helper (3 call sites) plus a separate inline deny on `POST /fragments/auto/run`, and inline checks in `network_routes.cpp`, `inventory_routes.cpp` (x2), `device_routes.cpp`, and `tar_tree_routes.cpp` (x2) — the tracked remainder of the 9 sibling sites #3289/#3278 already closed. `.permission` is now omitted from the body entirely at these sites, matching the fix already shipped elsewhere. As a side effect of the same migration, all 14 sites now echo their `correlation_id` on the `X-Correlation-Id` response header: 10 of the 14 were previously body-only (the header was never set at all); the remaining 4 (the schedule helper's call sites) already set the header, but unconditionally, so a second denial-path call could add a second `X-Correlation-Id` entry rather than reusing one an earlier gate had already minted — the helper now reuses instead. No change to the 403 boundary itself — every site still denies the same requests it did before. See #3167 for the tracked issue and `.claude/routed-concerns-access-control.md`'s "Service-scoped API token confinement" row for the full invariant.
+- **The A4 `.permission` hint on a service-scoped-token confinement denial no longer names a grant the caller typically already holds.** On a `deny_service_scoped_*`/inline confinement deny, the 403 body's `.permission` field used to name a `"SecurableType:Operation"` pair as if it were the missing grant — but a confinement deny fires regardless of what the caller holds (`kServiceScopeGlobalSafe` is compile-time-empty), so the hint was unactionable at best and, for an agentic caller parsing it to self-correct, actively misleading. Fixed at the last 14 sites of this shape across 7 files: `schedule_routes.{hpp,cpp}`'s `deny_service_scoped_schedule` helper and its 4 call sites (`server.cpp` hosts 3 of the 4), `preflight_routes.{hpp,cpp}`'s `deny_service_scoped_` helper (3 call sites) plus a separate inline deny on `POST /fragments/auto/run`, and inline checks in `network_routes.cpp`, `inventory_routes.cpp` (x2), `device_routes.cpp`, and `echo_tree_routes.cpp` (x2) — the tracked remainder of the 9 sibling sites #3289/#3278 already closed. `.permission` is now omitted from the body entirely at these sites, matching the fix already shipped elsewhere. As a side effect of the same migration, all 14 sites now echo their `correlation_id` on the `X-Correlation-Id` response header: 10 of the 14 were previously body-only (the header was never set at all); the remaining 4 (the schedule helper's call sites) already set the header, but unconditionally, so a second denial-path call could add a second `X-Correlation-Id` entry rather than reusing one an earlier gate had already minted — the helper now reuses instead. No change to the 403 boundary itself — every site still denies the same requests it did before. See #3167 for the tracked issue and `.claude/routed-concerns-access-control.md`'s "Service-scoped API token confinement" row for the full invariant.
 
 - **`ManagementGroupStore`'s mandatory legacy backfill now reads all three tables (groups/members/roles) in one snapshot transaction** (#3210), closing a torn-read race with a concurrent legacy-file writer during migration. Previously this could cause a nondeterministic fail-closed backfill refusal (boot blocked, retry required); it now succeeds deterministically.
 
@@ -4325,7 +4325,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - macOS: a zero-line `launchctl list` capture (an exit-0 subprocess result with no
   output at all, distinct from a genuine "no services" answer, which always includes
   at least the header row) is now treated as a corrupted/truncated capture rather than
-  a valid empty snapshot. TAR's service source refuses the diff and retains the
+  a valid empty snapshot. Echo's service source refuses the diff and retains the
   previous baseline instead of reading it as "every previously-known service just
   disappeared" — which previously would have stormed every service back as freshly
   `added` on the next real capture.
@@ -4334,7 +4334,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `list` and `running` actions on macOS previously decoded `launchctl list` output with a private
   parser that skipped the first line without checking it was the header and treated no output at all
   as an empty but successful result. A truncated or corrupted capture was therefore returned as a
-  clean, complete listing of zero services. The plugin now uses the same validated parser as TAR, and
+  clean, complete listing of zero services. The plugin now uses the same validated parser as Echo, and
   a malformed capture returns `CONSTRAINED` / `PARTIAL` with the provenance
   `services:malformed_launchctl_capture`, so a caller can tell a failed read from a host with nothing
   running.
@@ -4480,7 +4480,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time from a genuinely parentless original once its parent was deleted, silently broadcasting
   to `__all__` on the same target-erasure shape as #2500/#4306. Both routes now persist
   `scope_input_id` into the stored `source_payload` whenever `parent_id` is supplied, mirroring
-  the two dedicated `from-tar-query`/`from-instruction-result` producers' existing behaviour.
+  the two dedicated `from-echo-query`/`from-instruction-result` producers' existing behaviour.
 
 - **The #4306 re-eval target-erasure fix now also covers `from-inventory-query`.** `POST
   /api/v1/result-sets/from-inventory-query` and MCP `create_result_set_from_inventory_query`
@@ -4562,7 +4562,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking — `GET /api/v1/result-sets` can now answer `503`; the async result-set producers' post-dispatch store-fault status changed from `400` to `500` (#4306).**
   `GET /api/v1/result-sets` previously always answered `200`, even with an empty `result_sets`
   array on a degraded backend; it can now answer `503 RESULT_SET_STORE_UNAVAILABLE` on a genuine
-  store read failure. Separately, the three async result-set producers (`from-tar-query`,
+  store read failure. Separately, the three async result-set producers (`from-echo-query`,
   `from-instruction-result`, `re-eval`) previously mapped a post-dispatch store fault to `400`;
   that is now `500 RESULT_SET_STORE_FAULT_AFTER_DISPATCH` (a server fault, not a client error,
   once a real command has already dispatched). Any caller treating the list route as
@@ -4572,7 +4572,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ResultSetStore::count_for_owner` returned `0` on a genuine Postgres failure —
   indistinguishable from a genuinely-empty owner — so a degraded read at the
   PRE-DISPATCH per-owner quota check on the three async result-set producers
-  (`from-tar-query`, `from-instruction-result`, `re-eval`) let an over-quota
+  (`from-echo-query`, `from-instruction-result`, `re-eval`) let an over-quota
   owner's dispatch fire for real before the authoritative in-transaction
   recheck (which runs *after* dispatch) ever got a chance to refuse it.
   Separately, `members`/`list_by_owner`/`lineage` returned an empty/truncated
@@ -4622,7 +4622,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verbatim; the MCP result-set tools already bounded `parent_id` before that
   copy, but four REST routes did not: the generic `POST /api/v1/result-sets`
   route, `from-inventory-query`, and the shared dispatch engine behind
-  `from-tar-query`/`from-instruction-result` all now reject an
+  `from-echo-query`/`from-instruction-result` all now reject an
   oversized `parent_id` with `400` before any lookup, dispatch, or store
   write, matching the MCP tools' existing `kResultSetParentIdMaxLen` bound.
 
@@ -4766,12 +4766,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The dispatch chokepoint (PR1.9c): a `CommandRequest` can no longer reach an agent without
   BOTH a classification decision and an authorization decision.** Every direct
-  `detail::pb::CommandRequest` construction site in `server.cpp` — the TAR viz fleet-snapshot
+  `detail::pb::CommandRequest` construction site in `server.cpp` — the Echo viz fleet-snapshot
   fetcher, both Guardian rule-push paths, the asset-tag sync push, the `/api/command` handler, and
   the legacy `/api/chargen/*` + `/api/procfetch/fetch` sink — now routes through one private
   builder, `ServerImpl::build_classified_command`, which classifies the `plugin.action` pair via
   the `CommandCapabilityRegistry` composed over the full six-fragment catalogue (core +
-  filesystem/tar/registry/inventory/network/endpoint/content-distribution plugins), rejects an
+  filesystem/echo/registry/inventory/network/endpoint/content-distribution plugins), rejects an
   unclassified or ambiguous pair with a distinct counted reason, and enforces the resolved
   securable/operation against the caller's principal via `RbacStore::check_permission` before a
   command is ever built. An empty principal on a non-system caller is refused outright (no
@@ -4779,7 +4779,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatches) is dispatchable only under an explicit system caller, never a caller-attributable
   RBAC decision, and is refused to every operator regardless of what RBAC would otherwise grant
   them. `/api/command`'s destructive-action gate (previously a single hardcoded
-  `tar.purge_source` row) now sources its elevated securable/scope-confinement treatment from the
+  `echo.purge_source` row) now sources its elevated securable/scope-confinement treatment from the
   same registry, so it applies automatically to every action the catalogue classifies
   `Destructive`, not just the one it used to.
 - **Provenance, not syntax: `AgentRegistry::send_to`/`send_to_all` accept only a
@@ -4821,7 +4821,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the REST route that describes it as a reliable emergency stop arrives in the same PR as its
   wiring.
 - **The wire carries canonical plugin/action names.** Classification is case-insensitive but the
-  agent matches plugin names case-sensitively, so a caller using `plugin="TAR"` was authorized and
+  agent matches plugin names case-sensitively, so a caller using `plugin="Echo"` was authorized and
   then rejected by the agent. The command is now built from the values classification resolved.
 
 - **Security — raw dispatch (`POST /api/command`, MCP `execute_instruction`/`execute_bundle`/`quarantine_device`,
@@ -4904,7 +4904,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Dashboard results, the workflow executions drawer, and MCP `get_agent_details` now confine reads to the caller's management-group/service-scope, closing an ADR-0017 "World A" gap.** `/fragments/results`, the executions-drawer detail route (its responses section AND its per-agent status grid/table), and `get_agent_details` previously gated on a flat permission check with no per-agent filter — any operator holding `Response:Read`/`Execution:Read`/`Infrastructure:Read` could see response data, agent statuses, or agent existence/hostname/OS for agents outside their assigned management group. All three now gate on `require_fleet_read`, the same admit-then-filter primitive used by `GET /api/v1/inventory/software` and MCP `query_installed_software` (#3290): a management-group-confined or correctly-confined service-scoped caller gets a real, filtered result instead of an unfiltered fleet-wide read (dashboard/workflow) or a blanket denial (MCP `get_agent_details`, whose service-scoped callers were previously refused outright rather than shown anything); `get_agent_details` on an out-of-scope agent now returns the same "not found" response as a genuinely nonexistent agent, so the tool no longer discloses whether an out-of-scope agent exists — and the audit log's `detail` string for that denial is unified across both sub-cases too (a distinguishing detail string would let a caller holding `AuditLog:Read` recover the same distinction via `query_audit_log`, reopening the oracle the response-body fix closes), a deliberate tradeoff that also removes the ability to distinguish the two cases from durable audit records. (#1712, #1700, #3564; a sibling gap in the dashboard's results-facet sidecar routes, not fixed here, is tracked as #3489, and a similar gap in `GET /api/v1/execution-statistics/agents` + the workflow executions list fragment is tracked as #3526)
 
-- **`POST /api/dashboard/group-from-results` now rejects cross-origin and header-less requests (#1712).** This route materialises management-group membership from a filtered results view but, unlike the sibling TAR capture-source mutations in the same file, had no CSRF origin check — a pre-existing gap, unrelated to the management-group confinement work landing alongside it, discovered during review. `SameSite=Lax` session cookies do not stop a same-site sibling origin from submitting a cross-origin form POST, so a compromised or malicious subdomain of the same site could have created and populated a management group using the victim's session. The route now applies the same `origin_is_same_site` gate the TAR re-enable/purge fragments already use: a request with a cross-origin `Origin`, or with neither `Origin` nor `Referer` present, is refused with `403` and an audited `csrf_cross_origin` denial before any read or write. Same-site requests are unaffected.
+- **`POST /api/dashboard/group-from-results` now rejects cross-origin and header-less requests (#1712).** This route materialises management-group membership from a filtered results view but, unlike the sibling Echo capture-source mutations in the same file, had no CSRF origin check — a pre-existing gap, unrelated to the management-group confinement work landing alongside it, discovered during review. `SameSite=Lax` session cookies do not stop a same-site sibling origin from submitting a cross-origin form POST, so a compromised or malicious subdomain of the same site could have created and populated a management group using the victim's session. The route now applies the same `origin_is_same_site` gate the Echo re-enable/purge fragments already use: a request with a cross-origin `Origin`, or with neither `Origin` nor `Referer` present, is refused with `403` and an audited `csrf_cross_origin` denial before any read or write. Same-site requests are unaffected.
 
 - **Closed a fail-open in the permission gate on a corrupt RBAC store.** `require_permission` and
   `require_scoped_permission` now gate on `rbac_enforcement_in_effect()` rather than the raw
@@ -4939,9 +4939,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   omitted target, and a targeting argument supplied but resolving to nothing is still refused as a
   400 before any arm runs. Beyond the `/api/command` surface #1788 names, the same confinement now
   covers every OPERATOR dispatch surface: MCP `execute_instruction` and `execute_bundle`, REST
-  `POST /api/v1/bundles`, the dashboard execute and TAR `purge_source` routes, the per-device
+  `POST /api/v1/bundles`, the dashboard execute and Echo `purge_source` routes, the per-device
   DEX live query, the three async result-set producers
-  (`POST /api/v1/result-sets/from-tar-query`, `/from-instruction-result` and `/{id}/re-eval` —
+  (`POST /api/v1/result-sets/from-echo-query`, `/from-instruction-result` and `/{id}/re-eval` —
   which admit on a bare global `Execution:Execute` gate and then reach the fleet by scope or
   `__all__` broadcast, so a service-scoped token previously dispatched fleet-wide through them),
   and `POST /api/instructions/{id}/execute` + `POST /api/workflows/{id}/execute`, and the legacy
@@ -5058,7 +5058,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   js-yaml's quadratic-CPU `!!omap` resolution (CVE-2026-59870 / GHSA-5p4m-2wfm-xmqj)
   within already-declared ranges — no `overrides`, `package.json` unchanged.
 
-- **TAR `usage` tables are no longer reachable through generic `tar.sql`** (#4260). `usage_live`, `usage_daily` and `usage_daily_user` are excluded from the `tar.sql` queryable-table allowlist (`is_queryable_table`, enforced by the read-only connection's SQLite authorizer — direct names, `$Usage_*` placeholders, aliases, joins and subqueries all denied), so per-executable run history is readable only through the Forensics-gated, single-target `app_usage` reads, matching what `docs/authz-model.md` already claimed. Collection controls (`usage_enabled`) and `tar.status` health counters are unaffected.
+- **Echo `usage` tables are no longer reachable through generic `echo.sql`** (#4260). `usage_live`, `usage_daily` and `usage_daily_user` are excluded from the `echo.sql` queryable-table allowlist (`is_queryable_table`, enforced by the read-only connection's SQLite authorizer — direct names, `$Usage_*` placeholders, aliases, joins and subqueries all denied), so per-executable run history is readable only through the Forensics-gated, single-target `app_usage` reads, matching what `docs/authz-model.md` already claimed. Collection controls (`usage_enabled`) and `echo.status` health counters are unaffected.
 
 - **Execution-detail reads no longer produce a false 404 or a false denial-audit row during a
   transient backend degrade.** `GET /fragments/executions/{id}/detail`, `GET
@@ -5235,7 +5235,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - MCP: tool arguments are now validated against the tool's published `inputSchema` inside the C8 approval gate, BEFORE an approval ticket is minted and before a recall consumes one (#2405) — a schema-invalid supervised call can no longer waste an admin's approval or burn its one-time ticket; it answers `-32602` with an A4 envelope (audit row and response share one correlation id) and increments the new `yuzu_mcp_tool_args_invalid_total{tool}` counter. Enforcement is a closed-subset schema compiler (`mcp_input_schema`): every served schema must compile at boot through the #2383 registration validator, an unsupported keyword or malformed operand is a boot failure, `integer` is strict (integral floats rejected), `maxLength` counts bytes, and violation paths never echo caller-supplied keys. Handler-side validation remains as defense in depth. Breaking for supervised-tier callers: `execute_instruction`/`execute_bundle` calls with non-string `params` values (previously silently stringified post-approval) are now rejected pre-mint, as are the published-but-previously-advisory bounds on that path (`execute_bundle` `steps` outside 1–32; `execute_instruction` over-10 000 `agent_ids`, or any `agent_ids`/`plugin`/`action`/`scope`/`params` value over its published length bound) and integral floats where a schema declares `integer` (previously ignored and silently defaulted) — operator and readonly callers of those tools are unchanged; see the server-admin Upgrade Notes.
 
-- **Every route (not just `/mcp/`) now enforces a per-class pre-auth request-body cap (#2407).** Previously, only the `/mcp/` ingress bounded request bodies ahead of authentication (4 MiB, #2437); every other route relied solely on httplib's server-wide 100 MiB default, letting an unauthenticated caller make the server buffer up to that much per connection. A single policy table (`body_cap_policy.hpp`) now maps `{method, path}` to a per-route-class cap, enforced at the same pre-routing chokepoint, which httplib invokes **before** it reads the body — so an over-cap request is refused without the payload ever being buffered, rather than being measured after the fact. Oversized bodies return `413`; a body the resolved class cannot size in advance (chunked, or missing `Content-Length`) returns `411` where the class opts into that (`/mcp/` only, today — every other class still admits an unmeasurable body up to httplib's backstop, since chunked requests are legal HTTP and this repo does not control every client). Rejections are counted per class via the new `yuzu_body_cap_rejected_total{path_class,reason}` metric. Deliberately **not** implemented as httplib's global `set_payload_max_length`, which is shared by every route on the listener and would also squeeze the ~70 MiB live-query bundle route and the multipart certificate-chain upload. Two entries were sized against the wrong unit as originally drafted and rejected legitimate traffic — the TAR dashboard SQL class (raw body vs. form-decoded field) and the TAR result-set SQL class (raw body vs. JSON-parsed field) — both now carry a reasoned margin instead of matching the handler's decoded-value check byte-for-byte. `PUT /api/v1/guaranteed-state/rules/{id}`, `POST /api/v1/ca/revoke`, and `POST /api/v1/secrets/kek/{rotate,rewrap}` also gained their own table entries so this table agrees with each route's own handler-level check rather than silently falling to the 4 MiB catch-all default. A route-inventory sweep then found six more mutating routes plausibly carrying large bodies that were falling to the 4 MiB catch-all by omission — `POST /api/instructions/import`, `POST /api/instructions/yaml`, `POST /api/instructions/validate-yaml`, `POST /fragments/instructions/yaml-preview`, `POST /api/export/json-to-csv`, `POST /api/nvd/match` — each gained its own reasoned entry (see the per-class table for the sizing rationale, including the same raw-vs-decoded margin fix applied to the three form-encoded instruction-YAML routes). A follow-up hardening pass (#2407 D1–D7) then closed several gaps in the initial cap: the previously separate `/mcp/`-only cap branch is folded into the same table-driven check (D1), so editing the `mcp` table row is no longer a silent no-op; `GET`/`HEAD` requests are no longer excluded (D2 — a GET declaring a `Content-Length` still buffers a body regardless of method); the four unauthenticated health-probe paths (`/livez`, `/readyz`, `/health`, `/api/health`) are now covered too, closing what had been the server's last unauthenticated 100 MiB buffer (D3); a non-`identity` `Content-Encoding` (a compressed body) is now refused outright with `415` on every class, unconditionally — httplib decompresses transparently and only bounds the decompressed size against its own 100 MiB global limit, so a sub-cap compressed body could otherwise expand to ~100 MiB before anything downstream saw it (D4); and the `scim` class's pre-routing rejection now publishes SCIM's own RFC 7644 §3.12 `application/scim+json` error shape instead of the generic envelope, matching the (now-superseded) handler-level check's wording (D7). See `docs/user-manual/rest-api.md` "Pre-Auth Request Body Caps" for the full per-class table.
+- **Every route (not just `/mcp/`) now enforces a per-class pre-auth request-body cap (#2407).** Previously, only the `/mcp/` ingress bounded request bodies ahead of authentication (4 MiB, #2437); every other route relied solely on httplib's server-wide 100 MiB default, letting an unauthenticated caller make the server buffer up to that much per connection. A single policy table (`body_cap_policy.hpp`) now maps `{method, path}` to a per-route-class cap, enforced at the same pre-routing chokepoint, which httplib invokes **before** it reads the body — so an over-cap request is refused without the payload ever being buffered, rather than being measured after the fact. Oversized bodies return `413`; a body the resolved class cannot size in advance (chunked, or missing `Content-Length`) returns `411` where the class opts into that (`/mcp/` only, today — every other class still admits an unmeasurable body up to httplib's backstop, since chunked requests are legal HTTP and this repo does not control every client). Rejections are counted per class via the new `yuzu_body_cap_rejected_total{path_class,reason}` metric. Deliberately **not** implemented as httplib's global `set_payload_max_length`, which is shared by every route on the listener and would also squeeze the ~70 MiB live-query bundle route and the multipart certificate-chain upload. Two entries were sized against the wrong unit as originally drafted and rejected legitimate traffic — the Echo dashboard SQL class (raw body vs. form-decoded field) and the Echo result-set SQL class (raw body vs. JSON-parsed field) — both now carry a reasoned margin instead of matching the handler's decoded-value check byte-for-byte. `PUT /api/v1/guaranteed-state/rules/{id}`, `POST /api/v1/ca/revoke`, and `POST /api/v1/secrets/kek/{rotate,rewrap}` also gained their own table entries so this table agrees with each route's own handler-level check rather than silently falling to the 4 MiB catch-all default. A route-inventory sweep then found six more mutating routes plausibly carrying large bodies that were falling to the 4 MiB catch-all by omission — `POST /api/instructions/import`, `POST /api/instructions/yaml`, `POST /api/instructions/validate-yaml`, `POST /fragments/instructions/yaml-preview`, `POST /api/export/json-to-csv`, `POST /api/nvd/match` — each gained its own reasoned entry (see the per-class table for the sizing rationale, including the same raw-vs-decoded margin fix applied to the three form-encoded instruction-YAML routes). A follow-up hardening pass (#2407 D1–D7) then closed several gaps in the initial cap: the previously separate `/mcp/`-only cap branch is folded into the same table-driven check (D1), so editing the `mcp` table row is no longer a silent no-op; `GET`/`HEAD` requests are no longer excluded (D2 — a GET declaring a `Content-Length` still buffers a body regardless of method); the four unauthenticated health-probe paths (`/livez`, `/readyz`, `/health`, `/api/health`) are now covered too, closing what had been the server's last unauthenticated 100 MiB buffer (D3); a non-`identity` `Content-Encoding` (a compressed body) is now refused outright with `415` on every class, unconditionally — httplib decompresses transparently and only bounds the decompressed size against its own 100 MiB global limit, so a sub-cap compressed body could otherwise expand to ~100 MiB before anything downstream saw it (D4); and the `scim` class's pre-routing rejection now publishes SCIM's own RFC 7644 §3.12 `application/scim+json` error shape instead of the generic envelope, matching the (now-superseded) handler-level check's wording (D7). See `docs/user-manual/rest-api.md` "Pre-Auth Request Body Caps" for the full per-class table.
 
 - MCP: `execute_instruction` now enforces its declared input bounds server-side on **every** tier, not only on the approval-gated one — the operator tier executes with no approval and was previously bounded by nothing. Denials are audited with a correlation id shared with the client's error envelope and counted by `yuzu_mcp_tool_args_too_large_total{tool,reason}`. The two bounds the published schema subset cannot express (`params` key count and key length) are checked before an approval ticket is minted or consumed, so violating one never costs a ticket. The published `params` value limit is **widened** from 8 KiB to 64 KiB to match `execute_bundle`'s: the smaller figure was never enforced on the operator tier, so tightening it would have broken content-carrying plugin actions (e.g. `filesystem` writes) that worked in practice (#2437).
 
@@ -5461,7 +5461,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-zero rate means a client believes it is targeting specific devices and is not.
 
 - **The result-set producers no longer dispatch or search unscoped when a supplied `parent_id`
-  names no parent set** — `from-tar-query`, `from-instruction-result`, `re-eval` (which share one
+  names no parent set** — `from-echo-query`, `from-instruction-result`, `re-eval` (which share one
   dispatch closure) and `from-inventory-query` (which has its own, and was missed by the first
   round of this fix — governance caught it). `parent_id` is the targeting argument on these
   routes — present and non-empty scopes the dispatch to that result set's current members,
@@ -5567,7 +5567,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The rotation sweep now carries the full clock-guarded-retention shape, not just its cap** (#2964). `ApiTokenStore::sweep_expired_rotations` auto-revokes rotation predecessors on a wall-clock cutoff, and shipped only part 5 of the routed seven-part contract — an unconditional per-tick cap — with no persisted clock anchor and no anomaly detection, so a forward NTP step could cut over every in-flight rotation across several ticks. It now reads a **Postgres-authoritative** clock, persists an anchor and its anomaly dedup state in a new `rotation_retention_meta` row (migration v4), sanitises that reading (ahead-of-now, negative or unparseable is an anomaly, never a quiet reset), and classifies each pass through the shared `audit_retention_rules.hpp` `Facts`/`classify` pair — deduplicating on the whole fact set rather than the classified enum, so a second, different anomaly underneath an already-reported one cannot be swallowed. The eligibility probe measures only the **eligible** set (pairs with a live, used successor), because UP-5 pairs are permanently un-revokable and must never influence what this sweep decides to touch; this store deliberately does **not** adopt the routed concern's would-wipe half — a drain queue reaches 100% expiry of its eligible population as a matter of routine course, unlike a long-lived time series where that can only mean the retention cutoff moved, so a would-wipe verdict here cannot distinguish its own true and false positives at any population size. A missing anchor **declines**, deliberately: both credentials then stay active, which is already the supported UP-5 state, whereas sweeping under a bad clock revokes a credential someone is using — the cost, stated rather than glossed, is that a used pair keeps its predecessor valid for one more 60-second tick. Because `ApiTokenStore` is Postgres and the guard is single-writer as specified, the anchor and dedup state are **shared rows** taken under a store-wide session advisory lock in its own key namespace (never `hashtext(principal_id)`), released through an exception-safe RAII guard; ordering is global sweep lock → per-principal lock → mutation, and the up-to-200 revocations remain **separate per-pair transactions** inside that lock rather than one long transaction, so cluster-wide election and cap accounting are enforced without 200 unrelated rotations sharing a commit fate. A replica that loses the election returns a typed `SkippedLock` and stays quiet. The two out-param bools are replaced by a typed outcome (`Failed`/`SkippedLock`/`Declined`/`Ok`), so a clock decline is no longer indistinguishable from "nothing expired" — it carries a reason, a `yuzu_rotation_sweep_declined_total` counter and an actionable log line.
 
-- **Rotation-sweep clock guard now has full documentation coverage, closing a Gate 6 enterprise-readiness BLOCKING/HIGH finding** (#2964). `yuzu_rotation_sweep_declined_total` and `yuzu_rotation_sweep_lock_skipped_total` now have `docs/user-manual/metrics.md` entries and an `docs/observability-conventions.md` family paragraph, matching the depth already shipped for `yuzu_rotation_sweep_capped_total`; a new `docs/ops-runbooks/rotation-sweep-clock-guard.md` runbook covers triage (mirroring `audit-store-clock-guard.md`'s posture of pointing at the code's own decision rule rather than restating it); `docs/prometheus/yuzu-alerts.yml` gains `YuzuRotationSweepNotRunning` (gauge-staleness liveness on `yuzu_rotation_sweep_last_pass_timestamp_seconds`, pre-seeded at boot so the series is present from t=0), `YuzuRotationSweepLockContentionUnexpected` (single-replica-scoped), `YuzuRotationSweepLostRevocations` and `YuzuRotationSweepDeclinedSustained` (all four rules have behaviour cases in `tests/prometheus/yuzu-alerts.test.yml`, not merely a parse-only `check rules` pass); `docs/user-manual/upgrading.md`'s "Retention clock guards" checklist and `docs/user-manual/server-admin.md`'s Upgrade Notes now cover this as a third clock-guarded store alongside `audit_store`/TAR, including the multi-replica advisory-lock caveat. **`yuzu_rotation_sweep_lock_skipped_total`'s operator-facing description is corrected**: a nonzero reading is NOT routine leader-election contention on a single-replica deployment (the default) — one dedicated sweep thread on a sequential 60-second loop cannot lose an election against itself, so it can only mean a second writer holding the same session lock. `docs/user-manual/engine-principals.md` and `docs/user-manual/authentication.md` now state the rotation SLA explicitly (one tick to revoke; one further declined tick, ~120s total, on the first occurrence of a clock anomaly) rather than describing only the happy path — and are corrected to no longer claim a *sustained, identically-repeating* clock anomaly is held safe forever: fact-set dedup drains it on the very next tick, same as a one-off.
+- **Rotation-sweep clock guard now has full documentation coverage, closing a Gate 6 enterprise-readiness BLOCKING/HIGH finding** (#2964). `yuzu_rotation_sweep_declined_total` and `yuzu_rotation_sweep_lock_skipped_total` now have `docs/user-manual/metrics.md` entries and an `docs/observability-conventions.md` family paragraph, matching the depth already shipped for `yuzu_rotation_sweep_capped_total`; a new `docs/ops-runbooks/rotation-sweep-clock-guard.md` runbook covers triage (mirroring `audit-store-clock-guard.md`'s posture of pointing at the code's own decision rule rather than restating it); `docs/prometheus/yuzu-alerts.yml` gains `YuzuRotationSweepNotRunning` (gauge-staleness liveness on `yuzu_rotation_sweep_last_pass_timestamp_seconds`, pre-seeded at boot so the series is present from t=0), `YuzuRotationSweepLockContentionUnexpected` (single-replica-scoped), `YuzuRotationSweepLostRevocations` and `YuzuRotationSweepDeclinedSustained` (all four rules have behaviour cases in `tests/prometheus/yuzu-alerts.test.yml`, not merely a parse-only `check rules` pass); `docs/user-manual/upgrading.md`'s "Retention clock guards" checklist and `docs/user-manual/server-admin.md`'s Upgrade Notes now cover this as a third clock-guarded store alongside `audit_store`/Echo, including the multi-replica advisory-lock caveat. **`yuzu_rotation_sweep_lock_skipped_total`'s operator-facing description is corrected**: a nonzero reading is NOT routine leader-election contention on a single-replica deployment (the default) — one dedicated sweep thread on a sequential 60-second loop cannot lose an election against itself, so it can only mean a second writer holding the same session lock. `docs/user-manual/engine-principals.md` and `docs/user-manual/authentication.md` now state the rotation SLA explicitly (one tick to revoke; one further declined tick, ~120s total, on the first occurrence of a clock anomaly) rather than describing only the happy path — and are corrected to no longer claim a *sustained, identically-repeating* clock anomaly is held safe forever: fact-set dedup drains it on the very next tick, same as a one-off.
 
 - **Three correctness fixes found in a third review round of the clock guard above** (#2964). The bootstrap-vs-clock-anomaly metric split now routes on the RAW `no_anchor` fact (`SweepResult::no_anchor`), not the classified `decline_anomaly` precedence winner — `classify`'s `BadState > Step > Wipe > NoAnchor` ordering meant a bootstrap tick that also observed another anomaly used to miscount to the clock-anomaly series, exactly the false "the clock moved" claim this split exists to avoid. `SweepResult::failed_pairs` now also counts a per-pair transaction whose COMMIT fails after its own work already succeeded (previously counted only an in-transaction failure, silently dropping a commit-failure pair from both `revoked` and `failed_pairs`). `pg::PgSessionAdvisoryLockGuard`'s destructor now genuinely recovers an unlock failure caused by an aborted transaction — ROLLBACK, then retry the same targeted unlock — before falling back to terminating its own backend as a last resort; the prior revision fell straight to `pg_terminate_backend`, which fails identically to the unlock it was meant to backstop in exactly that case. `pg::PgAdvisoryLockKey` now generates a lock's try-lock and unlock SQL from one shared key definition (`KekOpLockGuard` and the rotation sweep both adopt it), closing a class of bug where a hand-written unlock statement could reference a different key than its matching try-lock.
 
@@ -5582,14 +5582,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **SAML gains its own D2-style observability (ADR-2001 #3072, SOC 2 CC6.8) — the SAML analogue of OIDC's D2 detector, shaped for SAML's single-candidate-NameID model rather than a copy of OIDC's.** A new `saml_login_observations` table (`ScimStore` migration v5) records every SAML login's NameID observation — including an unstable-Format one — before the linkable-Format link-formation gate runs; `link_saml_login_to_scim` now returns a typed `SamlScimLinkOutcome` instead of `void`, and the new store-error-aware `find_unique_active_by_external_id_checked` lets `POST /saml/acs` distinguish "no active SCIM resource matches this NameID" from "the store could not answer" from "more than one resource matched" — three cases that used to collapse into one silent `nullopt`. Two new always-on, observe-and-proceed audit verbs surface those causes at login time (`auth.saml.link_unmatched`, `auth.saml.link_lookup_failed` — the SAML login still succeeds on every branch; these are not denials), each paired with its own counter (`yuzu_scim_saml_link_unmatched_total`, `yuzu_scim_saml_link_ambiguous_total`, `yuzu_scim_saml_link_lookup_failures_total`). A new deprovision-time tripwire, `maybe_flag_saml_d2_unlinked`, bumps `yuzu_scim_deprovision_saml_unlinked_total` when a deprovisioned resource's `externalId` has no formed SAML link but a matching login observation exists — querying `saml_links_for_scim_id` specifically so an OIDC link on the same `scim_id` can never mask a missing SAML one. Honest scope, stated explicitly rather than left implicit: the login-time signals catch stable-Format drift/ambiguity/store-error, the deprovision-time tripwire catches an unstable-Format NameID whose value matches; a stable-Format NameID that never matches any `externalId` at all is caught at login time, not deprovision time — true deprovision-time attribution of that specific case is deferred to issue #3098 rather than fabricated from a single-candidate join key. See `docs/auth-architecture.md` "SAML D2 observability (#3072)" for the full detector-shape rationale.
 
-- **Breaking - closes the instances fixed in this release (not the full known class - see below) where a service-scoped API token could read or mutate fleet-wide Guardian/DEX/network/inventory/TAR data or the Schedule API, instead of being confined to its own service's agents; several of these surfaces are now access-audited for the first time. Also fixes a request-parsing bug that let `{"enabled": false}` silently re-enable a schedule instead of disabling it.** A pre-existing gap let a service-scoped API token reach identity-linked, fleet-wide data (and, for Guardian Baselines and the Guaranteed State push endpoint, MUTATE what every agent enforces) - the confinement check that should have limited it to its own service's agents only ever checked the token's role, never its service scope, and several of the affected reads had no per-open audit trail at all. Three tracked issues (#3123 device-discovery, #3124 response/execution data, #3125 inventory data) document further confirmed instances not fixed here - check each issue's current body for today's list, as fixes continue to land against them independently of this changelog entry. This entry intentionally cites no tracked issue/advisory for the primary fix itself (`docs/api-versioning-policy.md`'s security-tightening carve-out normally requires one) - a deliberate, disclosed exception: the primary vulnerability is described neutrally here with no exploit walkthrough, per an explicit operator decision at this branch's start not to publish a public advisory for it. The narrower follow-up instances found during review (#3123-3125, #3143, #3145, #3146, #3155, #3165, #3166, #3167) ARE individually tracked as normal issues. Fixed across REST, the dashboard, and MCP:
+- **Breaking - closes the instances fixed in this release (not the full known class - see below) where a service-scoped API token could read or mutate fleet-wide Guardian/DEX/network/inventory/Echo data or the Schedule API, instead of being confined to its own service's agents; several of these surfaces are now access-audited for the first time. Also fixes a request-parsing bug that let `{"enabled": false}` silently re-enable a schedule instead of disabling it.** A pre-existing gap let a service-scoped API token reach identity-linked, fleet-wide data (and, for Guardian Baselines and the Guaranteed State push endpoint, MUTATE what every agent enforces) - the confinement check that should have limited it to its own service's agents only ever checked the token's role, never its service scope, and several of the affected reads had no per-open audit trail at all. Three tracked issues (#3123 device-discovery, #3124 response/execution data, #3125 inventory data) document further confirmed instances not fixed here - check each issue's current body for today's list, as fixes continue to land against them independently of this changelog entry. This entry intentionally cites no tracked issue/advisory for the primary fix itself (`docs/api-versioning-policy.md`'s security-tightening carve-out normally requires one) - a deliberate, disclosed exception: the primary vulnerability is described neutrally here with no exploit walkthrough, per an explicit operator decision at this branch's start not to publish a public advisory for it. The narrower follow-up instances found during review (#3123-3125, #3143, #3145, #3146, #3155, #3165, #3166, #3167) ARE individually tracked as normal issues. Fixed across REST, the dashboard, and MCP:
   - `GET /api/v1/guaranteed-state/events` — per-agent reads (`?agent_id=`) are now management-group-scoped; the fleet-wide (no `agent_id`) shape denies service-scoped tokens outright and is always audited (previously only audited when `agent_id` was present).
   - `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/perf/devices`, `GET /api/v1/network/devices` (REST) and their MCP twins `get_dex_signal_detail`, `list_dex_perf_devices`, `list_network_devices` now deny service-scoped tokens and are access-audited (`dex.signal.view` / `dex.perf.device.view` / `network.device.view`) — the latter two verbs previously had no audit coverage on any surface.
   - The Guardian dashboard's fleet status, guards list, event timeline, per-Guard drilldown, baselines list, and per-Baseline fragments now deny service-scoped tokens (previously readable via a bare role check); the per-Guard drilldown's opens are also now audited.
   - The dashboard-fragment twins `/fragments/dex/perf/devices` and `/fragments/network/devices` now deny service-scoped tokens and are access-audited to match their REST/MCP siblings.
   - `/fragments/dex/overview` and `/fragments/dex/app` (fleet top-devices / app-affected-devices lists) now deny service-scoped tokens; per-open audit coverage for these two is deferred as a tracked follow-up. `/fragments/dex/catalogue/signal` (a third `dex.signal.view` emitter alongside the REST and MCP surfaces above) now denies the same way and is already audited.
   - `POST /fragments/auto/run` (the `/auto` Pre-flight dispatch) now denies a service-scoped token before resolving its device cohort — unlike every other fix in this list this route MUTATES (creates a run and dispatches the configured checks), so the same gap here reached command dispatch, not just a read.
-  - `GET /fragments/devices/list` (`Infrastructure:Read`, the fleet device roster), `GET /fragments/inventory/devices` (`Inventory:Read`, the GDPR-personal-data device inventory roster — serial/system_uuid/primary_mac), and both TAR frame device pickers (`GET /fragments/tar/process-tree`, `GET /fragments/tar/capture-sources`) now deny service-scoped tokens the same way — the same confinement-gap class extends beyond `GuaranteedState:Read` into these two other securables.
+  - `GET /fragments/devices/list` (`Infrastructure:Read`, the fleet device roster), `GET /fragments/inventory/devices` (`Inventory:Read`, the GDPR-personal-data device inventory roster — serial/system_uuid/primary_mac), and both Echo frame device pickers (`GET /fragments/echo/process-tree`, `GET /fragments/echo/capture-sources`) now deny service-scoped tokens the same way — the same confinement-gap class extends beyond `GuaranteedState:Read` into these two other securables.
   - `GET /fragments/auto` (the `/auto` Pre-flight saved-runs rail), `GET /fragments/auto/result` (the run result poll), and `POST /fragments/auto/delete` (run delete) now deny service-scoped tokens too — a different shape of the same root cause: these three scope by `session->username` alone, and a service-scoped API token shares its creating principal's username (`ApiToken::principal_id`), so a token scoped to e.g. one IT service could otherwise read back, poll, or delete a fleet-wide pre-flight run that its own principal created interactively, disclosing devices outside the token's own service.
   - The same owner-scoping shape exists on the `/auto` Deploy stage: `GET /fragments/auto/deploy` (the deploy config form) and `POST /fragments/auto/deploy/delete` (deployment delete) now deny service-scoped tokens for the same reason as the pre-flight rail/result/delete fixes above. `GET /fragments/auto/deploy/result` (the deployment result poll) now denies too — it also re-invokes the deployment engine's mutating advance step on every call, so this additionally narrows how far an already-in-flight deployment can progress for a service-scoped caller.
   - `POST /api/schedules` (schedule create) and `POST /api/schedules/{id}/enable` now deny service-scoped tokens outright, even holding both `Schedule:Write` and `Execution:Execute` — a recurring schedule dispatches fleet-wide through `ScheduleRunner` with no per-fire confinement at all, so this gap was worse than every read/mutating-read fix above: unattended and requiring no pre-existing state to reach. The `enable` route's deny was originally scoped to `enabled=true` only (intending to leave `enabled=false`/disable reachable as an operator's kill switch), but **that intent does not currently hold**: `Schedule:Write` is checked unconditionally before `enabled` is even parsed, so a service-scoped token is denied on disable too — see #3378, found and documented (not fixed) during #3290 Phase 2. `DELETE /api/schedules/{id}` (schedule delete) is fixed the same way as the owner-scoping class above (`delete_schedule`/`set_enabled` are username-scoped, and a service token shares its creating principal's username). This is an interim deny — the durable fix (persist the minting token's scope on the schedule row, have `ScheduleRunner` derive its dispatch confinement from it) is tracked follow-up work.
@@ -5737,7 +5737,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`DeviceTokenStore` is not yet constructed in production) and close an activation gate ahead of
   a future wiring change.
 
-- **Dispatch to a plugin absent from every target's inventory is now withheld before send instead of reported as success, and a quarantine denial's `agents_reached:0` no longer collapses into the same undifferentiated result an offline device produces (#3511, #3424).** Before this fix, MCP `execute_instruction` dispatching a nonexistent or misspelled plugin returned a normal success envelope (`command_id`, `execution_id`, `agents_reached: 1`) byte-identical in shape to a real dispatch — the agent's own `"plugin not found: <name>"` failure was visible only on a later `query_responses` call the caller had to know to make. Separately, a quarantine denial (a permanent policy refusal) and the containment gate itself failing closed (a transient systemic degradation) both surfaced as the same `agents_reached:0`/`status:"no_agents_reached"` shape an offline/unreachable agent also produces — an agentic caller could not tell "retry later" from "do not retry" from "this will never work as written". Both close via the same mechanism: `dispatch_confined_arms` (the one per-arm target-intersection chokepoint shared by REST, MCP, the dashboard, workflows, and schedules, #1788) gained a plugin-presence filter — `plugin_absent(aid)`, checked immediately after the pre-existing quarantine check on every arm (Group/Scope/Ids/Broadcast), sourced from a new `AgentRegistry::ids_missing_plugin(plugin)` query (one locked registry pass per dispatch). An agent with an EMPTY reported plugin inventory is never flagged absent — fail-open, since absence of registration data is not evidence of absence of the plugin, so a freshly-registered or gateway-relayed agent is never wrongly withheld. A quarantined-and-plugin-absent agent is reported quarantined, the stronger and more actionable of the two facts. The richer per-arm result used to be collapsed to a bare `std::pair<std::string, int>` at the one seam every dispatch-closure typedef shares (`ServerImpl::dispatch_confined`) — the exact widening #3424 was previously deferred for as "a cross-cutting change to a core signature with several production call sites." That widening lands here: `ConfinedDispatchOutcome`, the shared return type for all 15 independently-declared `DispatchFn`/`CommandDispatchFn`/`ConcurrencyDispatchFn` typedefs across the codebase (13 files, two of which each declare two), now carries `command_id`/`sent`/`denied_quarantined`/`denied_quarantined_count`/`containment_unreadable`/`unknown_plugin`/`unknown_plugin_count`/`not_sent` — closing both issues' underlying signature gap in one widening rather than two. Every non-MCP/REST consumer (dashboard, dex/device, deployment, tar-tree, preflight, bundle orchestrator, workflow, schedule, policy evaluator, quarantine reconciler) was updated mechanically only — no messaging change, matching each issue's own acceptance criteria. MCP `execute_instruction`'s zero-agents-reached response now discriminates five statuses instead of one — `invalid_scope` (a caller error: the supplied scope expression itself failed to parse, checked FIRST, `retry_after_ms: null` — this field existed on `ConfinedDispatchOutcome` since #881 but no cascade had ever read it until this PR's own review round caught the gap), `quarantined` and `plugin_not_found` (both permanent, `retry_after_ms: null`), `containment_unreadable` and the `no_agents_reached` catch-all (both retryable, `retry_after_ms: 5000` — the catch-all mixes a possibly-permanent approval-denial race with a possibly-retryable offline device, so it cannot honestly claim `null`) — checked by priority (`> 0`, not `== every target`, so a mixed-cause dispatch is never miscategorized), with `agents_quarantined`/`agents_unknown_plugin` counts present on every zero-agents response regardless of which status matched. A withheld plugin-absence dispatch also now gets a durable `command.dispatch_withheld` audit row (one aggregate row per dispatch, mirroring the existing fail-closed quarantine shape) — it previously had only a counter and a log line, on the reasoning that an inventory fact has nothing for an auditor to review; that reasoning didn't survive review, since a command that was not delivered is exactly the evidence `docs/observability-conventions.md`'s audit-on-denial clause requires. `POST /api/command`, the legacy command-forwarding route, and `POST /api/instructions/{id}/execute` all gained the identical `reason: "plugin_not_found"` 503 branch alongside their pre-existing `containment_unreadable`/`quarantined` ones. A second review round found `invalid_scope` had shipped on the MCP twin only, leaving `POST /api/instructions/{id}/execute` (400) and the dashboard exec console silently falling into their generic retryable catch-all for the same permanent caller error — both fixed, and `/api/command`/the legacy forwarder confirmed by direct trace not to need it (the former already 400s via its own separate pre-existing scope-ladder check; the latter is Broadcast-only and never parses a scope). A third review round (consistency-auditor) then found the REST route's new 400 body was a bare `{"error":"..."}` string rather than matching this handler's own local `{"error":{"code","message","reason","retry_after_ms"},"meta"}` convention (its three 503 siblings immediately below already use it) — fixed to match, `retry_after_ms: null` included. The dashboard exec console (`POST /api/dashboard/execute`) now names FOUR causes (was three) in its zero-agents-reached HTML message, replacing an unconditional "No agents connected. Cannot dispatch command." that misdirected an operator toward a connectivity fix during a containment or quarantine event. `POST /api/command`'s success body also gained `withheld_unknown_plugin` alongside its pre-existing `withheld_quarantined`, so a MIXED partial dispatch (some reached, some plugin-absent) is no longer silently invisible in the response an operator or agentic caller actually reads — MCP `execute_instruction`'s success payload and the other two REST-family routes' success bodies do not yet carry the equivalent counts, tracked as a follow-up. `execute_bundle` is unaffected: its denial reasons are covered by the separate pre-dispatch dry-run mechanism it already has (#3893). `quarantine_device` remains subject to the plugin-presence filter (only the containment gate is exempt for the quarantine plugin's own actions) but cannot yet discriminate a plugin-absence withholding from an ordinary unreached target, since it reaches dispatch through a deliberately narrower return shape — tracked as a smaller follow-up. The `/auto` Deploy pipeline (`deployment_engine.cpp`'s stage/execute claim-and-dispatch loop) is also corrected across this PR's three review rounds: it previously settled a claimed device to permanent `failed` only when the WHOLE claimed batch reached zero agents, so a transient `containment_unreadable` was reported as an unrecoverable failure instead of retried, and — in a mixed batch where some devices were reached — a device withheld individually for plugin-absence never tripped that all-or-nothing check and stayed claimed forever, wedging `complete_deployment` indefinitely. Round 1 reverts a `containment_unreadable` batch's claim entirely (for the next tick's retry) and settles exactly the named quarantined/plugin-absent ids to `failed`, regardless of how many other devices in the same batch were reached. Round 2 (security-guardian) found the same wedge for the single most common real-world trigger: `outcome.not_sent` — an ordinary offline device — was read nowhere, so it stayed claimed forever too; it now reverts individually, per-id, same as the whole-batch case. Round 3 (Gate 4 happy-path, independently corroborated by unhappy-path) found a THIRD instance: a device the caller's own `Execution:Execute`-derived `exec_visible` set no longer admits — a dimension separate from the `Infrastructure:Read`-derived `authorized` set the cohort was frozen against — is dropped silently by the dispatch chokepoint's own arm walk before ever reaching `sent`/`not_sent`/either withheld list, reproducing the identical wedge under an entirely ordinary least-privilege RBAC layout. It now settles to a new terminal `skipped` step (mirroring the existing pre-claim `mark_skipped`/"out of scope at dispatch" treatment) rather than wedging or being misreported as failed.
+- **Dispatch to a plugin absent from every target's inventory is now withheld before send instead of reported as success, and a quarantine denial's `agents_reached:0` no longer collapses into the same undifferentiated result an offline device produces (#3511, #3424).** Before this fix, MCP `execute_instruction` dispatching a nonexistent or misspelled plugin returned a normal success envelope (`command_id`, `execution_id`, `agents_reached: 1`) byte-identical in shape to a real dispatch — the agent's own `"plugin not found: <name>"` failure was visible only on a later `query_responses` call the caller had to know to make. Separately, a quarantine denial (a permanent policy refusal) and the containment gate itself failing closed (a transient systemic degradation) both surfaced as the same `agents_reached:0`/`status:"no_agents_reached"` shape an offline/unreachable agent also produces — an agentic caller could not tell "retry later" from "do not retry" from "this will never work as written". Both close via the same mechanism: `dispatch_confined_arms` (the one per-arm target-intersection chokepoint shared by REST, MCP, the dashboard, workflows, and schedules, #1788) gained a plugin-presence filter — `plugin_absent(aid)`, checked immediately after the pre-existing quarantine check on every arm (Group/Scope/Ids/Broadcast), sourced from a new `AgentRegistry::ids_missing_plugin(plugin)` query (one locked registry pass per dispatch). An agent with an EMPTY reported plugin inventory is never flagged absent — fail-open, since absence of registration data is not evidence of absence of the plugin, so a freshly-registered or gateway-relayed agent is never wrongly withheld. A quarantined-and-plugin-absent agent is reported quarantined, the stronger and more actionable of the two facts. The richer per-arm result used to be collapsed to a bare `std::pair<std::string, int>` at the one seam every dispatch-closure typedef shares (`ServerImpl::dispatch_confined`) — the exact widening #3424 was previously deferred for as "a cross-cutting change to a core signature with several production call sites." That widening lands here: `ConfinedDispatchOutcome`, the shared return type for all 15 independently-declared `DispatchFn`/`CommandDispatchFn`/`ConcurrencyDispatchFn` typedefs across the codebase (13 files, two of which each declare two), now carries `command_id`/`sent`/`denied_quarantined`/`denied_quarantined_count`/`containment_unreadable`/`unknown_plugin`/`unknown_plugin_count`/`not_sent` — closing both issues' underlying signature gap in one widening rather than two. Every non-MCP/REST consumer (dashboard, dex/device, deployment, echo-tree, preflight, bundle orchestrator, workflow, schedule, policy evaluator, quarantine reconciler) was updated mechanically only — no messaging change, matching each issue's own acceptance criteria. MCP `execute_instruction`'s zero-agents-reached response now discriminates five statuses instead of one — `invalid_scope` (a caller error: the supplied scope expression itself failed to parse, checked FIRST, `retry_after_ms: null` — this field existed on `ConfinedDispatchOutcome` since #881 but no cascade had ever read it until this PR's own review round caught the gap), `quarantined` and `plugin_not_found` (both permanent, `retry_after_ms: null`), `containment_unreadable` and the `no_agents_reached` catch-all (both retryable, `retry_after_ms: 5000` — the catch-all mixes a possibly-permanent approval-denial race with a possibly-retryable offline device, so it cannot honestly claim `null`) — checked by priority (`> 0`, not `== every target`, so a mixed-cause dispatch is never miscategorized), with `agents_quarantined`/`agents_unknown_plugin` counts present on every zero-agents response regardless of which status matched. A withheld plugin-absence dispatch also now gets a durable `command.dispatch_withheld` audit row (one aggregate row per dispatch, mirroring the existing fail-closed quarantine shape) — it previously had only a counter and a log line, on the reasoning that an inventory fact has nothing for an auditor to review; that reasoning didn't survive review, since a command that was not delivered is exactly the evidence `docs/observability-conventions.md`'s audit-on-denial clause requires. `POST /api/command`, the legacy command-forwarding route, and `POST /api/instructions/{id}/execute` all gained the identical `reason: "plugin_not_found"` 503 branch alongside their pre-existing `containment_unreadable`/`quarantined` ones. A second review round found `invalid_scope` had shipped on the MCP twin only, leaving `POST /api/instructions/{id}/execute` (400) and the dashboard exec console silently falling into their generic retryable catch-all for the same permanent caller error — both fixed, and `/api/command`/the legacy forwarder confirmed by direct trace not to need it (the former already 400s via its own separate pre-existing scope-ladder check; the latter is Broadcast-only and never parses a scope). A third review round (consistency-auditor) then found the REST route's new 400 body was a bare `{"error":"..."}` string rather than matching this handler's own local `{"error":{"code","message","reason","retry_after_ms"},"meta"}` convention (its three 503 siblings immediately below already use it) — fixed to match, `retry_after_ms: null` included. The dashboard exec console (`POST /api/dashboard/execute`) now names FOUR causes (was three) in its zero-agents-reached HTML message, replacing an unconditional "No agents connected. Cannot dispatch command." that misdirected an operator toward a connectivity fix during a containment or quarantine event. `POST /api/command`'s success body also gained `withheld_unknown_plugin` alongside its pre-existing `withheld_quarantined`, so a MIXED partial dispatch (some reached, some plugin-absent) is no longer silently invisible in the response an operator or agentic caller actually reads — MCP `execute_instruction`'s success payload and the other two REST-family routes' success bodies do not yet carry the equivalent counts, tracked as a follow-up. `execute_bundle` is unaffected: its denial reasons are covered by the separate pre-dispatch dry-run mechanism it already has (#3893). `quarantine_device` remains subject to the plugin-presence filter (only the containment gate is exempt for the quarantine plugin's own actions) but cannot yet discriminate a plugin-absence withholding from an ordinary unreached target, since it reaches dispatch through a deliberately narrower return shape — tracked as a smaller follow-up. The `/auto` Deploy pipeline (`deployment_engine.cpp`'s stage/execute claim-and-dispatch loop) is also corrected across this PR's three review rounds: it previously settled a claimed device to permanent `failed` only when the WHOLE claimed batch reached zero agents, so a transient `containment_unreadable` was reported as an unrecoverable failure instead of retried, and — in a mixed batch where some devices were reached — a device withheld individually for plugin-absence never tripped that all-or-nothing check and stayed claimed forever, wedging `complete_deployment` indefinitely. Round 1 reverts a `containment_unreadable` batch's claim entirely (for the next tick's retry) and settles exactly the named quarantined/plugin-absent ids to `failed`, regardless of how many other devices in the same batch were reached. Round 2 (security-guardian) found the same wedge for the single most common real-world trigger: `outcome.not_sent` — an ordinary offline device — was read nowhere, so it stayed claimed forever too; it now reverts individually, per-id, same as the whole-batch case. Round 3 (Gate 4 happy-path, independently corroborated by unhappy-path) found a THIRD instance: a device the caller's own `Execution:Execute`-derived `exec_visible` set no longer admits — a dimension separate from the `Infrastructure:Read`-derived `authorized` set the cohort was frozen against — is dropped silently by the dispatch chokepoint's own arm walk before ever reaching `sent`/`not_sent`/either withheld list, reproducing the identical wedge under an entirely ordinary least-privilege RBAC layout. It now settles to a new terminal `skipped` step (mirroring the existing pre-claim `mark_skipped`/"out of scope at dispatch" treatment) rather than wedging or being misreported as failed.
 
 - **A device quarantined while offline now re-contains itself automatically on reconnect
   (#3425).** After #881/#3127, a device quarantined while off ended up contained at the
@@ -5803,7 +5803,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`firewall` plugin (Linux/nftables) hardens netlink dump handling against local spoofing and malformed replies.** Dump datagrams are now accepted only from the kernel (`recvmsg` source `nl_pid == 0`), with foreign datagrams discarded under a bounded budget before any content or truncation accounting; replies are matched to the exact expected message type, `nlmsgerr` and the completion `dump_done_errno` are decoded for the real kernel errno, and `MSG_TRUNC`/oversized replies degrade to an honest `unknown` rather than being trusted. Compile-time `static_assert`s pin the transcribed UAPI struct layouts and wire constants against the system headers.
 
 - **`/api/command`'s Destructive-class targeting gate is now a structurally-closed switch, and MCP `execute_instruction` gained the parity refusal it never had (#3685).** The REST gate previously collapsed "classified and not Destructive" and "failed to classify at all" into the same skipped branch — an inline `if (classified_for_gate && ...)` guard whose fail-open shape a classify-miss could reach silently. It now routes through `evaluate_destructive_targeting`/`confine_destructive_targets` (`dispatch_destructive_gate.hpp`), a pure function with an exhaustive `switch` over every verdict (`NotDestructive`/`Targeted`/`RefuseUntargeted`/`ClassifyMiss` — no default arm, so a new verdict fails to compile rather than falling through unnoticed); a classify miss is now an explicit, reviewed no-op arm that defers to the existing dispatch chokepoint's own unconditional denial, rather than an unexamined side effect of the old guard's shape. REST's externally observable behavior — the two refusal messages, the 403-before-400 elevation ordering, the fail-closed confinement to the caller's visible agents on a degraded management-group read — is unchanged.
-  MCP `execute_instruction` previously had no equivalent gate at all. **An authorized caller** — an ordinary grant on the row's resolved securable, no admin/approval required for most Destructive rows (e.g. `tar.purge_source` needs only `Infrastructure:Delete`) — dispatching a Destructive-class capability with scope or broadcast targeting **dispatched normally and succeeded fleet-wide**, with no denial and no refusal naming the reason. A caller who instead held no grant at all for the row's securable was refused by the pre-existing dispatch chokepoint, but that denial surfaced only as the ambiguous `sent=0`/`no_agents_reached` envelope an offline/unreachable agent also produces — never a discriminated refusal, and not the exposure that mattered here. It now refuses at two sites sharing the same pure function and byte-identical message as REST — the C8 pre-mint gate (before an approval ticket is created or consumed, for tiers that require approval) and the main-handler backstop (for operator tier, which skips C8 entirely, and as defense in depth for every other tier). The capability classifier is wired unconditionally at boot; if it is ever unwired, every `execute_instruction` call is refused with a distinguishable "classifier unavailable" denial rather than silently reaching dispatch unclassified — fail-closed, not fail-open. A classify-miss (`Unclassified`/`Ambiguous`) at the C8 pre-mint gate specifically is now also denied locally with no ticket minted — reusing the dispatch chokepoint's own `unclassified`/`ambiguous` denial reasons rather than a new taxonomy — closing a narrower gap where a supervised-tier classify-miss call could mint and wait on a human approval before the chokepoint denied it anyway on actual dispatch; REST and MCP's main-handler backstop are unaffected (a classify-miss there still defers to the chokepoint's own denial, which is not itself a ticket-economy concern).
+  MCP `execute_instruction` previously had no equivalent gate at all. **An authorized caller** — an ordinary grant on the row's resolved securable, no admin/approval required for most Destructive rows (e.g. `echo.purge_source` needs only `Infrastructure:Delete`) — dispatching a Destructive-class capability with scope or broadcast targeting **dispatched normally and succeeded fleet-wide**, with no denial and no refusal naming the reason. A caller who instead held no grant at all for the row's securable was refused by the pre-existing dispatch chokepoint, but that denial surfaced only as the ambiguous `sent=0`/`no_agents_reached` envelope an offline/unreachable agent also produces — never a discriminated refusal, and not the exposure that mattered here. It now refuses at two sites sharing the same pure function and byte-identical message as REST — the C8 pre-mint gate (before an approval ticket is created or consumed, for tiers that require approval) and the main-handler backstop (for operator tier, which skips C8 entirely, and as defense in depth for every other tier). The capability classifier is wired unconditionally at boot; if it is ever unwired, every `execute_instruction` call is refused with a distinguishable "classifier unavailable" denial rather than silently reaching dispatch unclassified — fail-closed, not fail-open. A classify-miss (`Unclassified`/`Ambiguous`) at the C8 pre-mint gate specifically is now also denied locally with no ticket minted — reusing the dispatch chokepoint's own `unclassified`/`ambiguous` denial reasons rather than a new taxonomy — closing a narrower gap where a supervised-tier classify-miss call could mint and wait on a human approval before the chokepoint denied it anyway on actual dispatch; REST and MCP's main-handler backstop are unaffected (a classify-miss there still defers to the chokepoint's own denial, which is not itself a ticket-economy concern).
   Both refusal strings (`destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are refused` on 400, `no reachable in-scope agent` on 404) are now named constants shared by both surfaces and pinned by tests, rather than duplicated inline literals. REST's 400 refusal and both MCP refusal sites are now counted on `yuzu_server_dispatch_target_rejected_total{route,reason="destructive_untargeted"}` (`route="command"`/`route="mcp"`), pre-seeded at boot; REST's Destructive 400 arm previously emitted no metric at all.
   Residual gap, not closed by this change: `POST /api/instructions/{id}/execute` and MCP `execute_bundle` still reach Destructive-classified rows with scope/broadcast targeting — tracked as a follow-up. (The dashboard execute surface was also on this list; it is closed by the entry below, in this same release.)
 
@@ -5904,7 +5904,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Postgres app-role provisioning no longer exposes the generated password via the process table or a startup-file echo.** `scripts/install-server-postgres.sh` (local provisioning) and the `yuzu-postgres` image's first-boot init script previously passed the app role's password to `psql` via `-v`, which is visible to any local user via `/proc/<pid>/cmdline` / `ps` for the life of the psql process. The password now reaches `psql` via stdin (a guarded `\set` on the native path; `\getenv` in the container image) and never appears in argv. Both scripts also now run with `-X`/`--no-psqlrc`, so a stray `.psqlrc` under the invoking OS user's home (an `ECHO all` setting, for example) can't echo the password to stdout during provisioning either (#3859).
 
-- The dashboard exec console (`POST /api/dashboard/execute`) now enforces the same Destructive-class targeting rule as `/api/command` and the MCP `execute_instruction` tool: a `plugin.action` classified `Destructive` must name an explicit, in-scope agent, and a fleet broadcast (`__all__`), a management-group scope, or an omitted target is refused rather than dispatched. Previously the console was the one operator-facing dispatch surface without that rule, so a caller holding `Execution:Execute` at the route plus the destructive action's declared securable at the dispatch chokepoint could fan `tar.purge_source`, `registry.delete_key`, `filesystem.delete_lines`, `tags.clear`, `storage.clear` and similar actions across the whole fleet from a single command line — including by simply omitting a target, which that surface treated as the whole fleet. Targets are additionally confined to the operator's visible agents, failing closed when that read is unavailable or degraded; with RBAC off this confinement is a no-op, since every enrolled agent belongs to the auto-created root group. Refusals are counted on `yuzu_server_dispatch_target_rejected_total{route="dashboard"}` and written to the audit log. `ReadOnly` and `Mutating` actions are unchanged, and scheduled or background dispatch of destructive actions by scope is deliberately unaffected.
+- The dashboard exec console (`POST /api/dashboard/execute`) now enforces the same Destructive-class targeting rule as `/api/command` and the MCP `execute_instruction` tool: a `plugin.action` classified `Destructive` must name an explicit, in-scope agent, and a fleet broadcast (`__all__`), a management-group scope, or an omitted target is refused rather than dispatched. Previously the console was the one operator-facing dispatch surface without that rule, so a caller holding `Execution:Execute` at the route plus the destructive action's declared securable at the dispatch chokepoint could fan `echo.purge_source`, `registry.delete_key`, `filesystem.delete_lines`, `tags.clear`, `storage.clear` and similar actions across the whole fleet from a single command line — including by simply omitting a target, which that surface treated as the whole fleet. Targets are additionally confined to the operator's visible agents, failing closed when that read is unavailable or degraded; with RBAC off this confinement is a no-op, since every enrolled agent belongs to the auto-created root group. Refusals are counted on `yuzu_server_dispatch_target_rejected_total{route="dashboard"}` and written to the audit log. `ReadOnly` and `Mutating` actions are unchanged, and scheduled or background dispatch of destructive actions by scope is deliberately unaffected.
 
 - The eight MCP engine-principal mutation tools (`create_engine_principal`,
   `revoke_engine_principal`, `transfer_engine_principal_owner`,
@@ -5968,17 +5968,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Compat story.** Seeded roles are unaffected: Administrator and ITServiceOwner could decommission before this change and still can — `seed_defaults()` runs on every `RbacStore` construction, so the upgrade grants both roles `Decommission:Delete` with no migration required. Operator-authored custom roles are **breaking by design**: a role that had assembled the three old per-store Delete grants specifically to reach this route is now refused (403 naming `Decommission:Delete`) until granted the new securable. The three old grants are **not revoked** and continue gating their own stores' other routes exactly as before.
 
 - **20 MCP tools' input schemas now bound every free-text field.** `create_management_group`, `update_management_group`, `add_management_group_member`, `get_management_group`, `list_management_group_roles`, `assign_management_group_role`, `check_permission`, `unlock_account` (#2146 Batch B4) and the 12 result-set tools (`list_result_sets` through `delete_result_set`, #2146 Batch B2) previously accepted unbounded strings on `name`/`description`/`scope_expression`/`username`/`principal_id`/id/cursor fields, which could be embedded verbatim into database rows and audit log entries. Every such field now carries a `maxLength` matching the tightest applicable convention already used elsewhere in the file (e.g. `unlock_account`'s `username` at 64 chars, matching `AuthDB::is_valid_username`'s real enforced limit exactly). `create_result_set_from_instruction_result`'s `params` values also gained the same 64 KiB `maxLength` `execute_instruction` already enforces for the equivalent field.
-- A schema `maxLength` alone is validated only on the approval-gated MCP path (`mcp_server.cpp`'s sole schema-`validate()` call site sits inside `requires_approval()`, which itself returns false for an empty `mcp_tier` - and `/mcp/v1/` accepts a plain RBAC session or a non-MCP-tiered API token the same way any REST route does). 19 of the 20 tools are affected: 11 are never approval-gated at any tier, 3 (`create_result_set_from_tar_query`, `create_result_set_from_instruction_result`, `reevaluate_result_set`) auto-approve at operator tier, and the remaining 5 (`create_management_group`, `update_management_group`, `add_management_group_member`, `assign_management_group_role`, `delete_result_set`) are gated whenever `mcp_tier` is non-empty but not for an empty one. `unlock_account` is the one tool that needed no further change: it already denies an empty `mcp_tier` outright, and its `username` bound is already enforced by `AuthDB::is_valid_username`. The other 19 (`create_management_group`, `update_management_group`, `add_management_group_member`, `get_management_group`, `list_management_group_roles`, `assign_management_group_role`, `check_permission`, `list_result_sets`, `create_result_set`, `create_result_set_from_inventory_query`, `create_result_set_from_tar_query`, `create_result_set_from_instruction_result`, `get_result_set`, `get_result_set_members`, `get_result_set_lineage`, `pin_result_set`, `unpin_result_set`, `reevaluate_result_set`, `delete_result_set`) now also carry an explicit handler-side length check on every affected field, mirroring the `#2437`/`execute_instruction` precedent (`yuzu_mcp_tool_args_too_large_total{tool,reason="arg_too_large"}`, an audited denial, and a `-32602` A4 error naming the bound). This IS a behavior change for a caller that was previously sending an argument over the new bound and getting it accepted: that request now gets a clean, documented rejection instead.
+- A schema `maxLength` alone is validated only on the approval-gated MCP path (`mcp_server.cpp`'s sole schema-`validate()` call site sits inside `requires_approval()`, which itself returns false for an empty `mcp_tier` - and `/mcp/v1/` accepts a plain RBAC session or a non-MCP-tiered API token the same way any REST route does). 19 of the 20 tools are affected: 11 are never approval-gated at any tier, 3 (`create_result_set_from_echo_query`, `create_result_set_from_instruction_result`, `reevaluate_result_set`) auto-approve at operator tier, and the remaining 5 (`create_management_group`, `update_management_group`, `add_management_group_member`, `assign_management_group_role`, `delete_result_set`) are gated whenever `mcp_tier` is non-empty but not for an empty one. `unlock_account` is the one tool that needed no further change: it already denies an empty `mcp_tier` outright, and its `username` bound is already enforced by `AuthDB::is_valid_username`. The other 19 (`create_management_group`, `update_management_group`, `add_management_group_member`, `get_management_group`, `list_management_group_roles`, `assign_management_group_role`, `check_permission`, `list_result_sets`, `create_result_set`, `create_result_set_from_inventory_query`, `create_result_set_from_echo_query`, `create_result_set_from_instruction_result`, `get_result_set`, `get_result_set_members`, `get_result_set_lineage`, `pin_result_set`, `unpin_result_set`, `reevaluate_result_set`, `delete_result_set`) now also carry an explicit handler-side length check on every affected field, mirroring the `#2437`/`execute_instruction` precedent (`yuzu_mcp_tool_args_too_large_total{tool,reason="arg_too_large"}`, an audited denial, and a `-32602` A4 error naming the bound). This IS a behavior change for a caller that was previously sending an argument over the new bound and getting it accepted: that request now gets a clean, documented rejection instead.
 - Governance review of the fix above found and closed a real bypass of it: `create_result_set` has no `source_kind` allowlist, so a caller could mint a row labeled `source_kind=instruction_result` with an oversized or over-keyed `params` object hand-crafted into `source_payload`, then call `reevaluate_result_set` to dispatch it - fleet-wide, if `parent_id` was omitted - without the new bound ever firing. `reevaluate_result_set`'s `kInstructionResult` branch now re-applies the same `params` count/key-length/value-length caps (and an `instruction_id` length cap) that `create_result_set_from_instruction_result` already enforces at creation time, before any dispatch.
 
-- **`POST /api/v1/result-sets/{id}/re-eval` now rechecks its `instruction_result` fields against the same bounds enforced at creation time.** The `kInstructionResult` branch had no equivalent of the `kTarQuery` branch's existing 100 KiB `sql` cap: a caller holding ordinary `Execution:Execute` could mint a `Materialized` row via the unvalidated `POST /api/v1/result-sets` (no `source_kind` allowlist there) labeled `source_kind=instruction_result` with an over-keyed or oversized `params` object hand-crafted into `source_payload`, then call `re-eval` to dispatch it, fleet-wide if `parent_id` was omitted, fully bypassing any size bound; an oversized `instruction_id` on the same crafted row would reach `instruction_store`'s lookup unbounded. `re-eval` now re-applies the same `instruction_id` (256 bytes), `params` count (32 keys), key-length (256 bytes), and value-length (64 KiB) caps the MCP tool `create_result_set_from_instruction_result` already enforces at creation time, checked before the instruction-store availability gate so a malformed/oversized field is refused regardless of backend state. This mirrors the identical fix already shipped on the MCP twin, `reevaluate_result_set` (#4394), though REST's rejection path has no audit row or metric to match MCP's `reject_field_too_large` (tracked as #4408). This IS a behavior change for a caller that was previously able to smuggle an over-keyed/oversized `params` object or an oversized `instruction_id` through this path: that request now gets a clean `400` instead.
+- **`POST /api/v1/result-sets/{id}/re-eval` now rechecks its `instruction_result` fields against the same bounds enforced at creation time.** The `kInstructionResult` branch had no equivalent of the `kEchoQuery` branch's existing 100 KiB `sql` cap: a caller holding ordinary `Execution:Execute` could mint a `Materialized` row via the unvalidated `POST /api/v1/result-sets` (no `source_kind` allowlist there) labeled `source_kind=instruction_result` with an over-keyed or oversized `params` object hand-crafted into `source_payload`, then call `re-eval` to dispatch it, fleet-wide if `parent_id` was omitted, fully bypassing any size bound; an oversized `instruction_id` on the same crafted row would reach `instruction_store`'s lookup unbounded. `re-eval` now re-applies the same `instruction_id` (256 bytes), `params` count (32 keys), key-length (256 bytes), and value-length (64 KiB) caps the MCP tool `create_result_set_from_instruction_result` already enforces at creation time, checked before the instruction-store availability gate so a malformed/oversized field is refused regardless of backend state. This mirrors the identical fix already shipped on the MCP twin, `reevaluate_result_set` (#4394), though REST's rejection path has no audit row or metric to match MCP's `reject_field_too_large` (tracked as #4408). This IS a behavior change for a caller that was previously able to smuggle an over-keyed/oversized `params` object or an oversized `instruction_id` through this path: that request now gets a clean `400` instead.
 - **`POST /api/v1/result-sets/from-instruction-result` (the creation route itself) gains the same four caps.** Found by this PR's own sibling-handler review: this route had no bound at all on `instruction_id`/`params`, so the direct one-step path (no smuggle-via-create-then-reeval needed) was open to any caller holding ordinary `Execution:Execute`, the more directly exploitable variant of the same gap `re-eval` closes above. That specific bound gap was untracked (a prior revision of this fragment wrongly cited #4406, which covers a distinct type-confusion defect on the two REST creation routes, not this missing bound); it is closed here rather than filed separately. This IS also a behavior change: a caller previously able to send an oversized `instruction_id` or an over-keyed/oversized `params` object directly to this route now gets a clean `400` instead.
-- **Fixes #4406.** Both `re-eval`'s `kTarQuery`/`kInstructionResult` branches AND the `from-tar-query`/`from-instruction-result` creation routes had the same type-confusion gap: `.value("sql", "")` / `.value("instruction_id", "")` threw `nlohmann::json::type_error` on a type-mismatched field (present but not a JSON string) rather than coercing it, an uncaught exception rather than a clean `400`. All four sites now guard with `is_string()` first and treat a type-mismatched field as absent, matching the existing empty-field error path and the MCP twins' existing behavior. Found while closing the bound gap above: `from-instruction-result`'s copy of this exact defect was the one #4406 had already documented; fixing it here fully closes that issue rather than leaving it half-open.
-- **Fixes an adversarial-review finding: `from-tar-query` and `from-instruction-result` also threw uncaught on a type-mismatched `name`.** Same #4406 mechanism as `sql`/`instruction_id` above, on the identical two routes, missed in the first pass at closing #4406: `body.value("name", "")` had no `is_string()` guard, so `{"sql":"x","name":123}` (or the `instruction_result` equivalent) threw `nlohmann::json::type_error` uncaught, an empty `500` rather than a clean `400`. Both routes now guard it the same way, matching the pre-existing `name` guard on `from-inventory-query`. At the time this bullet was first written, this did NOT also add a length bound on `name` - a PR reviewer caught that gap afterward; see the bullet below for the length-bound fix.
+- **Fixes #4406.** Both `re-eval`'s `kEchoQuery`/`kInstructionResult` branches AND the `from-echo-query`/`from-instruction-result` creation routes had the same type-confusion gap: `.value("sql", "")` / `.value("instruction_id", "")` threw `nlohmann::json::type_error` on a type-mismatched field (present but not a JSON string) rather than coercing it, an uncaught exception rather than a clean `400`. All four sites now guard with `is_string()` first and treat a type-mismatched field as absent, matching the existing empty-field error path and the MCP twins' existing behavior. Found while closing the bound gap above: `from-instruction-result`'s copy of this exact defect was the one #4406 had already documented; fixing it here fully closes that issue rather than leaving it half-open.
+- **Fixes an adversarial-review finding: `from-echo-query` and `from-instruction-result` also threw uncaught on a type-mismatched `name`.** Same #4406 mechanism as `sql`/`instruction_id` above, on the identical two routes, missed in the first pass at closing #4406: `body.value("name", "")` had no `is_string()` guard, so `{"sql":"x","name":123}` (or the `instruction_result` equivalent) threw `nlohmann::json::type_error` uncaught, an empty `500` rather than a clean `400`. Both routes now guard it the same way, matching the pre-existing `name` guard on `from-inventory-query`. At the time this bullet was first written, this did NOT also add a length bound on `name` - a PR reviewer caught that gap afterward; see the bullet below for the length-bound fix.
 - **Fixes a Gate 8 sibling-sweep finding: `POST /api/v1/result-sets` (the generic/synchronous create route, not one of the three async producers the original #4406 sweep covered) had the identical unguarded shape on both `name` and `source_kind`.** `{"name":123}` or `{"name":"x","source_kind":123}` threw the same uncaught `nlohmann::json::type_error`. Both fields now guard with `is_string()` first, same pattern as every other site in this file. Does not add a `source_kind` allowlist (see the "not fixed here" bullet below) - only rejects a non-string value outright.
-- **Fixes a PR review finding: `name` (and, on the generic create route, `source_kind`) now also carry a length bound matching MCP's caps.** The type-confusion fixes above closed the crash but never applied MCP's `kResultSetNameMaxLen`=256 / `kResultSetSourceKindMaxLen`=64 (`mcp_input_bounds.hpp`), which MCP's own twin tools already enforce - a caller could still submit an unbounded-length `name`/`source_kind` and have it persisted verbatim. Now enforced at all five sites: the generic create route (`name` and `source_kind`), `from-inventory-query`, `from-tar-query`, and `from-instruction-result` (`name` only - the latter three routes have no caller-supplied `source_kind`). This IS a behavior change: an over-256-byte `name` or over-64-byte `source_kind` now gets a clean `400` instead of being persisted unbounded.
+- **Fixes a PR review finding: `name` (and, on the generic create route, `source_kind`) now also carry a length bound matching MCP's caps.** The type-confusion fixes above closed the crash but never applied MCP's `kResultSetNameMaxLen`=256 / `kResultSetSourceKindMaxLen`=64 (`mcp_input_bounds.hpp`), which MCP's own twin tools already enforce - a caller could still submit an unbounded-length `name`/`source_kind` and have it persisted verbatim. Now enforced at all five sites: the generic create route (`name` and `source_kind`), `from-inventory-query`, `from-echo-query`, and `from-instruction-result` (`name` only - the latter three routes have no caller-supplied `source_kind`). This IS a behavior change: an over-256-byte `name` or over-64-byte `source_kind` now gets a clean `400` instead of being persisted unbounded.
 - **A present-but-non-object `params` on `from-instruction-result` (or a stored row `re-eval` re-checks) is now refused with `400`, not silently ignored.** Gate 4 unhappy-path finding: since the bound checks above are gated on `params.is_object()`, a string/array/number `params` value skipped them entirely, dispatched with an empty params map (silently discarding the caller's intent), and persisted the wrong-shaped value verbatim and unbounded into `source_payload` - re-parsed on every subsequent `re-eval` call. This IS a behavior change: such a request now gets a clean `400` (`'params' must be a JSON object`) instead of silently succeeding with different behavior than the caller likely intended.
-- **Not fixed here, tracked separately or not yet tracked:** `POST /api/v1/result-sets` still has no `source_kind` allowlist (a separate, larger, deferred design question with an adjacent note on #4353, but no dedicated issue of its own) and REST's `from-tar-query` create route still applies no per-field bound of its own beyond its pre-existing `sql` cap - neither has a tracking issue yet. Several other fields across the result-set create routes carry MCP-enforced caps REST still never checks, the identical missing-bound shape as `instruction_id`/`params` above and now also confirmed by a PR review pass: `parent_id` (64 bytes, generic/`from-inventory-query`/`from-tar-query`/`from-instruction-result`), `device_ids[]` items (256 bytes, generic route, persisted as members), `from-inventory-query`'s `conditions[].plugin`/`.field`/`.op`/`.value` (64/128/32/512 bytes, persisted via `source_payload`), and `from-instruction-result`'s `matcher.column`/`matcher.op`/`matcher.value` (128/32/512 bytes, applied server-side, not forwarded to agents). None closed here and none yet tracked. No overall byte-size bound exists on `source_payload` itself beyond the route-class-wide 4 MiB request-body cap (200 KiB on `from-tar-query`) - only the named fields above are individually bounded. The MCP twins of the two REST routes fixed above (`create_result_set_from_instruction_result`, `reevaluate_result_set`) still have the identical present-but-non-object-`params` gap this PR just closed on REST: both gate their bound checks on `params.is_object()` with no rejection for a non-object value, so they would silently proceed with an effectively-empty params set rather than refuse. Not fixed here (this PR only touches REST) and not yet tracked.
+- **Not fixed here, tracked separately or not yet tracked:** `POST /api/v1/result-sets` still has no `source_kind` allowlist (a separate, larger, deferred design question with an adjacent note on #4353, but no dedicated issue of its own) and REST's `from-echo-query` create route still applies no per-field bound of its own beyond its pre-existing `sql` cap - neither has a tracking issue yet. Several other fields across the result-set create routes carry MCP-enforced caps REST still never checks, the identical missing-bound shape as `instruction_id`/`params` above and now also confirmed by a PR review pass: `parent_id` (64 bytes, generic/`from-inventory-query`/`from-echo-query`/`from-instruction-result`), `device_ids[]` items (256 bytes, generic route, persisted as members), `from-inventory-query`'s `conditions[].plugin`/`.field`/`.op`/`.value` (64/128/32/512 bytes, persisted via `source_payload`), and `from-instruction-result`'s `matcher.column`/`matcher.op`/`matcher.value` (128/32/512 bytes, applied server-side, not forwarded to agents). None closed here and none yet tracked. No overall byte-size bound exists on `source_payload` itself beyond the route-class-wide 4 MiB request-body cap (200 KiB on `from-echo-query`) - only the named fields above are individually bounded. The MCP twins of the two REST routes fixed above (`create_result_set_from_instruction_result`, `reevaluate_result_set`) still have the identical present-but-non-object-`params` gap this PR just closed on REST: both gate their bound checks on `params.is_object()` with no rejection for a non-object value, so they would silently proceed with an effectively-empty params set rather than refuse. Not fixed here (this PR only touches REST) and not yet tracked.
 
 - **`firewall` plugin (Linux, ufw/iptables) no longer reports a confident `active`/`inactive` verdict off a timed-out or output-capped read.** Previously a `state|` row was derived from `ufw status numbered`/`iptables -S` output as soon as the subprocess exited 0, even if the read had timed out or been truncated before finishing — a partial capture could parse as a real (and possibly wrong) enabled/disabled state. `state|` is now gated on the same completeness check (`tool_ran && exit_code==0 && !timed_out && !output_truncated`) `ruleset|<n>` already used, degrading to an honest `state|unknown` on an incomplete read rather than a parsed verdict off partial data.
 
@@ -6239,7 +6239,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejections are metric-only with no audit row (a high-frequency operational
   event, not a lifecycle action). See `docs/user-manual/server-admin.md`.
 
-- **Fixed a full-process-crash (SIGSEGV) reachable by any authenticated caller via unbounded JSON nesting on result-set routes.** `nlohmann::json::dump()` is unboundedly recursive; the `#2437` depth guard added for the `/mcp/` transport did not cover REST's result-set surface or either transport's re-evaluation of a previously-stored result set. `POST /api/v1/result-sets`, `/from-tar-query`, `/from-instruction-result`, and `/from-inventory-query` now reject a caller-supplied body that nests deeper than the shared `kMcpMaxJsonDepth` (32) limit before it is ever parsed or dumped. Both REST's `POST /api/v1/result-sets/{id}/re-eval` and MCP's `reevaluate_result_set` now apply the same check to the STORED `source_payload` before re-reading it, since a row poisoned via any write path (including one predating this fix) could otherwise be re-dumped and crash the process on a later read. `ResultSetStore::mark_failed`, which has no HTTP request/response of its own to hand an error to (today it has no production caller at all, only unit tests - a store method that closes the gap ahead of a future caller), now heals a poisoned row instead of re-dumping it: it discards the oversized original and writes a small, fixed, safe replacement payload so the row still transitions to `failed`.
+- **Fixed a full-process-crash (SIGSEGV) reachable by any authenticated caller via unbounded JSON nesting on result-set routes.** `nlohmann::json::dump()` is unboundedly recursive; the `#2437` depth guard added for the `/mcp/` transport did not cover REST's result-set surface or either transport's re-evaluation of a previously-stored result set. `POST /api/v1/result-sets`, `/from-echo-query`, `/from-instruction-result`, and `/from-inventory-query` now reject a caller-supplied body that nests deeper than the shared `kMcpMaxJsonDepth` (32) limit before it is ever parsed or dumped. Both REST's `POST /api/v1/result-sets/{id}/re-eval` and MCP's `reevaluate_result_set` now apply the same check to the STORED `source_payload` before re-reading it, since a row poisoned via any write path (including one predating this fix) could otherwise be re-dumped and crash the process on a later read. `ResultSetStore::mark_failed`, which has no HTTP request/response of its own to hand an error to (today it has no production caller at all, only unit tests - a store method that closes the gap ahead of a future caller), now heals a poisoned row instead of re-dumping it: it discards the oversized original and writes a small, fixed, safe replacement payload so the row still transitions to `failed`.
 - **Closed the same `#2437`-class crash on 6 more routes.** `POST /api/v1/bundles`, `POST /api/command`, `POST /api/instructions/{id}/execute`, `POST /api/schedules`, `PUT /api/config/{key}`, and `PUT /api/agents/{id}/properties/{key}` each had at least one caller-influenced JSON value reaching `nlohmann::json::dump()` (directly, or via a non-string-value coercion) with no preceding depth check. Each now rejects a request body nesting deeper than `kMcpMaxJsonDepth` (32) before any parse, matching the ordering and shared constant of the fixes above. `POST /api/v1/bundles` gained a second, independent guard inside `validate_bundle_steps` itself (`bundle_service.cpp`), since that function has no HTTP request/response of its own and is a free function any other caller can reach directly.
 - **Fixed a `#2437`-class SIGSEGV in the Guardian push/reconcile path with no operator action required to trigger it.** `build_agent_push` (`guardian_push_builder.cpp`) reads each Guardian rule's stored `spec_json` back out of the database on every agent heartbeat reconcile and every baseline deploy/toggle push fan-out, and marshals it via `fill_block()`, which calls `nlohmann::json::dump()` on any non-string `params` value for every rule in the batch. A rule whose stored `spec_json` nests deeper than `kMcpMaxJsonDepth` (32) is now excluded from the push (logged by rule id, not silently dropped) before any parsing or Guardian decision logic touches it, rather than reaching `fill_block()`'s `dump()`. Because the affected row persists in the database, an unguarded crash here would recur on every restart as soon as a matching agent's next heartbeat arrived; the other rules in the same push batch are unaffected by the exclusion. A rule this happens to now increments `yuzu_guardian_push_rule_excluded_total{reason="depth_exceeded"}` (rate-limited log line) so the exclusion has a fleet-wide signal beyond that one rule's own detail page.
 - **Fixed a `#2437`-class SIGSEGV in the command outbox delivery worker.** `CommandOutboxDelivery::deliver()` decodes a stored occurrence's `parameters` via `decode_payload()`, which calls `nlohmann::json::dump()` on any non-string value. A stored occurrence whose `parameters` nests deeper than `kMcpMaxJsonDepth` (32) is now caught before that decode step and routed through this worker's existing permanent-failure path (the same `mark_failed`/`mark_cancelled`/audit sequence already used for a malformed payload, distinguished only by a separate reason string so the two causes remain distinguishable in the audit trail) rather than reaching `decode_payload()`'s `dump()`. Other pending occurrences in the same tick are unaffected. The pre-existing `yuzu_server_command_outbox_deliver_decode_failed_total` counter fires for both this new cause and the existing decode-failure one unchanged; a new labeled companion, `yuzu_server_command_outbox_deliver_decode_failed_cause_total{cause}`, distinguishes the two so an operator diagnosing via the metric does not conflate them (`docs/user-manual/metrics.md`).
@@ -6453,20 +6453,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Deferred: a REST audited-fail-closed per-machine drill, per-version crashes/hangs (the
   central crash-store join), live measure-right-after-deploy (fan-out procperf), and the
   deploy→verify cohort auto-fill.
-- **TAR retention-paused source purge (Phase 15.A).** The `/tar` retention-paused frame gains a
+- **Echo retention-paused source purge (Phase 15.A).** The `/echo` retention-paused frame gains a
   **Purge data** action: for a source an operator deliberately paused (to preserve forensic data),
   permanently drop its accumulated warehouse rows (`<source>_{live,hourly,daily,monthly}`) **without**
-  re-enabling collection. New agent action `tar.purge_source` (refuses unless the source is paused —
+  re-enabling collection. New agent action `echo.purge_source` (refuses unless the source is paused —
   the authoritative TOCTOU guard, held atomically with the delete under the collector lock), dashboard
-  fragment `POST /fragments/tar/retention-paused/purge` and an agentic-first REST endpoint
-  `POST /api/v1/tar/retention-paused/purge` — both gated on `Infrastructure:Delete` (per-device scoped),
+  fragment `POST /fragments/echo/retention-paused/purge` and an agentic-first REST endpoint
+  `POST /api/v1/echo/retention-paused/purge` — both gated on `Infrastructure:Delete` (per-device scoped),
   a typed-hostname confirmation (native `prompt()`, CSP-safe) + CSRF same-site gate on the fragment,
-  audit verb `tar.source.purge`, and metric `yuzu_tar_source_purge_total{result}`. The generic
-  `POST /api/command` path also elevates `tar.purge_source` to `Infrastructure:Delete` + visible-agent
+  audit verb `echo.source.purge`, and metric `yuzu_echo_source_purge_total{result}`. The generic
+  `POST /api/command` path also elevates `echo.purge_source` to `Infrastructure:Delete` + visible-agent
   confinement so it can't be a weaker route. The purge also forces a `wal_checkpoint(TRUNCATE)` so the
   erasure is complete on disk (no WAL residue) and disk is reclaimed at return. Completes 15.A. See
-  `docs/tar-dashboard.md` §3.4.
-  **Upgrade note:** the `tar.purge_source` action requires an agent at this release or later; an older
+  `docs/echo-dashboard.md` §3.4.
+  **Upgrade note:** the `echo.purge_source` action requires an agent at this release or later; an older
   agent returns `error|unknown action: purge_source` (it does not crash), but because dispatch is
   fire-and-forget the dashboard still shows "Purge dispatched" — verify the outcome with a fresh Scan.
 
@@ -6681,16 +6681,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hiccup as "installed nowhere". An ingest report carrying an implausibly large source map is rejected
   wholesale, and concurrent-replace serialization uses a 64-bit advisory-lock key.
 
-- **TAR — software install/uninstall capture source (`$Software`).** A new TAR
+- **Echo — software install/uninstall capture source (`$Software`).** A new Echo
   warehouse source records application **installed / removed / upgraded** events over
   time by diffing the installed-software inventory on a dedicated hourly trigger
-  (`tar.software`; tune the cadence via `software_interval`, `0`–86400 s). On Windows it
+  (`echo.software`; tune the cadence via `software_interval`, `0`–86400 s). On Windows it
   captures **machine-scope only** (HKLM Uninstall 64-bit + WOW6432Node) installs — no
   per-user enumeration, no Windows profile names, and **no user identity / no PII**.
   Tiers: `$Software_Live` (5000 rows) →
   `$Software_Daily` (31 d) → `$Software_Monthly` (12 mo), with per-`name`
   install/remove/upgrade counts. **The source is off by default** (opt-in) — an operator
-  enables it per host with `tar.configure software_enabled=true`. Even though the
+  enables it per host with `echo.configure software_enabled=true`. Even though the
   machine-scope data carries no user identity (device asset-management /
   vulnerability-relevance data, like Services and User sessions), a brand-new capture
   source ships disabled out of caution so a host only collects it once the operator has
@@ -6698,8 +6698,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   install/remove storm. Names, versions, and publisher only
   — no command lines or usage data. The first
   scan on a host **seeds the baseline silently** so an `installed` event always means
-  "installed now". `tar.status` reports a `software_last_run_ts` heartbeat. **On upgrade,
-  `tar.status` gains a `software_*` block plus the `software_interval_seconds` /
+  "installed now". `echo.status` reports a `software_last_run_ts` heartbeat. **On upgrade,
+  `echo.status` gains a `software_*` block plus the `software_interval_seconds` /
   `software_last_run_ts` lines
   — update any field-count parsing.** Linux (dpkg/rpm) and macOS (pkgutil) collectors are a fast-follow — the
   `$Software_*` tables are queryable but empty there until then. Disabling the source
@@ -6709,12 +6709,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window or leave a stale baseline (no ghost install/remove/upgrade events on re-enable;
   same #538 contract as the other snapshot-diff sources). `SystemComponent` entries are
   read as `REG_DWORD` (their canonical type) so system components/patches are correctly
-  excluded, and `software` rows are reachable from the legacy `tar.query`/`tar.export`
-  typed paths as well as `tar.sql`. Enumeration is bounded by a per-cycle entry cap
+  excluded, and `software` rows are reachable from the legacy `echo.query`/`echo.export`
+  typed paths as well as `echo.sql`. Enumeration is bounded by a per-cycle entry cap
   (`kSoftwareEntryCap`, warns once on truncation) so a bloated/corrupt registry cannot grow
   the tick unbounded, and same-name dedup compares versions **numerically** (so `10.0`
-  outranks `9.0` — a lexicographic compare previously suppressed real upgrades). `tar.snapshot`
-  now collects the source too. See `docs/user-manual/tar.md` and the data-handling
+  outranks `9.0` — a lexicographic compare previously suppressed real upgrades). `echo.snapshot`
+  now collects the source too. See `docs/user-manual/echo.md` and the data-handling
   classification in `docs/enterprise-readiness-soc2-first-customer.md`.
 - **DEX: wave-4 reliability signals — power, driver, and service health (Windows).**
   Seven new signal types (Windows event catalogue 103→110, server display catalogue
@@ -6800,7 +6800,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SQLITE_MAX_VARIABLE_NUMBER` still resolves every name. A `YuzuAuditPersistFailures`
   Prometheus alert (`docs/prometheus/yuzu-alerts.yml`) now fires when behavioural-data
   routes 503 fleet-wide on an audit-store outage.
-- **TAR-styled live device snapshot ("Get live info", expanded).** The per-device
+- **Echo-styled live device snapshot ("Get live info", expanded).** The per-device
   page's **Get live info** button now returns a full live system snapshot — a KPI strip
   (uptime, process / service / connection / user counts) over a grid of collapsible,
   uniformly-sized, scrollable cards with an **Expand all / Collapse all** control and a
@@ -6809,8 +6809,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child tree with the SHA-256 of each on-disk image and live network connections joined
   by PID, suspicious parent→child spawns flagged), **Services**, **Adapters & IP**,
   **ARP** (Windows), **DNS cache** (Windows), **Listening ports**, **Active connections**,
-  **Logged-in users**, and a read-only **Capture sources** view (which TAR warehouse
-  sources are capturing locally; configuration stays on the TAR page). Two new agent
+  **Logged-in users**, and a read-only **Capture sources** view (which Echo warehouse
+  sources are capturing locally; configuration stays on the Echo page). Two new agent
   actions: `processes/list_tree` (adds parent PID for tree reconstruction) and
   `network_config/arp` (Windows `GetIpNetTable2`) — these ship with agents built from
   this release onward; an older agent renders an empty Processes-tree / ARP card (it
@@ -6823,17 +6823,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   REST/scripted callers; the dashboard now dispatches `kind=process_tree`. REST/scripted
   callers reach `kind=uptime|processes` only — the 9-card grid is dashboard-only pending
   the A1 JSON backfill (#1649). See `docs/user-manual/device-management.md`.
-- **ARP + DNS capture sources (TAR, ADR-0015) — Windows.** Two new **opt-in**
-  (`default_enabled=false`) TAR capture sources: `arp` (host ARP / neighbour table
+- **ARP + DNS capture sources (Echo, ADR-0015) — Windows.** Two new **opt-in**
+  (`default_enabled=false`) Echo capture sources: `arp` (host ARP / neighbour table
   via `GetIpNetTable2` → `$ARP_Live`/`$ARP_Hourly`) and `dns` (device DNS
   resolver-cache state via `DnsGetCacheDataTable` → `$DNS_Live`/`$DNS_Hourly` —
   device-level, **no per-process attribution**; DNS is usage-class PII, enabling is
-  audited). Queryable via `tar.sql`, the `query`/`export` actions (`type: arp|dns`),
-  and the `crossplatform.tar.recent_arp`/`recent_dns` canned instructions; toggled
-  via `crossplatform.tar.configure` (`arp_enabled`/`dns_enabled`) or the new **/tar
+  audited). Queryable via `echo.sql`, the `query`/`export` actions (`type: arp|dns`),
+  and the `crossplatform.echo.recent_arp`/`recent_dns` canned instructions; toggled
+  via `crossplatform.echo.configure` (`arp_enabled`/`dns_enabled`) or the new **/echo
   "Capture sources" frame** (staged-then-push guardrail + category filter). The
   process-tree pane gains device-level **DNS-cache + ARP-table panels**
-  (audit verbs `tar.dns.read`/`tar.arp.read`). Linux/macOS collectors are planned
+  (audit verbs `echo.dns.read`/`echo.arp.read`). Linux/macOS collectors are planned
   (schema registered, queryable-empty) and recorded per-OS in
   `docs/os-capability-matrix.md`. The Windows agent links `dnsapi`; the resolver-cache
   read combines `DNS_QUERY_NO_WIRE_QUERY` with the additional cache-read flag required
@@ -6990,7 +6990,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface). v1 bundle state is per-surface and in-memory; a
   durable Postgres manifest for HA + cross-surface collation is a committed
   follow-up (ADR-0011).
-- **`$Module` Windows image-load collector (TAR, M2).** The `$Module` source now
+- **`$Module` Windows image-load collector (Echo, M2).** The `$Module` source now
   populates on Windows: a dedicated ETW session on Microsoft-Windows-Kernel-Process
   (IMAGE keyword, image load/unload) captures DLL / driver image loads, with the
   code-signing verdict resolved at drain (WinVerifyTrust + publisher extraction,
@@ -7001,24 +7001,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   network I/O), so a revoked driver may read as `signed`; authoritative
   revoked/blocked detection is the M3 CodeIntegrity overlay. A minimal edge
   risk-filter keeps every unsigned / invalid / revoked / kernel / blocked load at
-  full fidelity and dedups + caps normally-signed loads per drain. `tar.status` reports
+  full fidelity and dedups + caps normally-signed loads per drain. `echo.status` reports
   `module_capture_method` + `module_stream_dropped`. macOS (Endpoint Security) and
   Linux (auditd kernel modules) collectors follow in M4/M5/M6. See
-  `docs/tar-module-loads.md`.
-- **`$Module` image-load warehouse source — schema foundation (TAR, M1).**
+  `docs/echo-module-loads.md`.
+- **`$Module` image-load warehouse source — schema foundation (Echo, M1).**
   Registers four queryable tables (`$Module_Live`, `$Module_Hourly`,
-  `$Module_Daily`, `$Module_Monthly`) in the TAR warehouse: process/driver
+  `$Module_Daily`, `$Module_Monthly`) in the Echo warehouse: process/driver
   image-load activity (module name + directory + code-signing verdict) — the
   DLL-search-order-hijack / injection / BYOVD forensic surface that `$Process`
-  cannot answer. **Queryable via `tar.sql` now, empty until a collector lands**
+  cannot answer. **Queryable via `echo.sql` now, empty until a collector lands**
   (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd kernel-module);
   opt-in (`module_enabled`, default off). The process-stream ring is promoted to
   a reusable `EventRing<T>` template (no behaviour change for the `process`
   source), and `run_aggregation` is now data-driven over the capture-source
   registry so a newly-registered source's rollups can no longer be silently
-  omitted. Design + PR ladder: `docs/tar-module-loads.md`.
-- **Gap-free process start/stop capture via Endpoint Security on macOS (TAR).**
-  The TAR `process` source on macOS now feeds from the Endpoint Security
+  omitted. Design + PR ladder: `docs/echo-module-loads.md`.
+- **Gap-free process start/stop capture via Endpoint Security on macOS (Echo).**
+  The Echo `process` source on macOS now feeds from the Endpoint Security
   `NOTIFY_EXEC`/`NOTIFY_EXIT` stream (was a 60-second `KERN_PROC_ALL` sysctl
   poll), reaching Windows-ETW parity: short-lived processes the poll missed are
   captured, with accurate timestamps, ppid, image name, and owning user from the
@@ -7029,7 +7029,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **self-heals** to the poll if the ES client goes silent for an extended period
   (a NOTIFY-only client has no liveness API — the idle threshold is deliberately
   long to avoid abandoning a healthy stream on a quiet host). The active path is
-  reported by `tar.status` as `process_capture_method` (`endpoint_security` or
+  reported by `echo.status` as `process_capture_method` (`endpoint_security` or
   `polling`), alongside two drop counters — `process_stream_dropped` (userspace
   ring overflow) and `process_stream_kernel_dropped` (Endpoint Security `seq_num`
   gaps). The ES handler is `noexcept` and drops malformed / zero-pid / zero-ts
@@ -7038,12 +7038,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   AutoLogger-equivalent backfill. **Fork gap:** the stream subscribes
   `NOTIFY_EXEC`/`NOTIFY_EXIT` only, so a fork-without-exec child is invisible until
   it exits (`NOTIFY_FORK` capture deferred, #1455). Both collectors now share a
-  cross-platform `ProcStreamCollector` interface. See `docs/user-manual/tar.md` and
+  cross-platform `ProcStreamCollector` interface. See `docs/user-manual/echo.md` and
   `docs/darwin-compat.md`. **Not yet active in shipped builds:** the Apple
   entitlement and the codesign/notarization release pipeline are pending
   (#1455), so current macOS agents transparently use the **sysctl poll** until
   that lands — confirm the live path per device via `process_capture_method` in
-  `tar.status` (`endpoint_security` = streaming, `polling` = fallback).
+  `echo.status` (`endpoint_security` = streaming, `polling` = fallback).
 
 - **Linux server DEX: `os.uptime_report` (uptime/reboot heartbeat).** The Linux DEX
   collector now emits the hourly `os.uptime_report` scalar (uptime seconds, from
@@ -7091,7 +7091,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   macOS, each row citing its in-code source of truth — so a platform gap (such as
   the previously Linux-only network collector) is visible in one place. Flags the
   durable follow-up: generate the matrix from the existing machine-readable per-OS
-  metadata (`tar_schema_registry` `OsSupportStatus`, guard support arrays, the DEX
+  metadata (`echo_schema_registry` `OsSupportStatus`, guard support arrays, the DEX
   signal catalogue) rather than hand-maintaining it.
 
 - **Cohort-vs-cohort performance comparison on `/dex` (F2c).** The Performance
@@ -7132,7 +7132,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `yuzu_fleet_net_{reporting,retrans_reporting,rtt_ms,retrans_pct,throughput_bps}`
   (`yuzu_fleet_net_retrans_reporting` is the retransmit-rate denominator;
   `yuzu_fleet_net_degraded` is dormant/absent until the classification lands).
-  An opt-in per-connection warehouse tier (`netqual_enabled` TAR config →
+  An opt-in per-connection warehouse tier (`netqual_enabled` Echo config →
   on-device `$NetQual_Live`, bucket-only destination class, top-N capped, Linux)
   ships as the foundation for the deferred per-destination drill; it has no
   dashboard consumer in v1. Page permission: `GuaranteedState:Read`. See
@@ -7160,7 +7160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator action (EU works-council co-determination triggers on the *capability* to
   observe); `--dex-disable` suppresses it fleet-wide.
 
-- **Gap-free process start/stop capture via ETW on Windows (TAR).** The TAR
+- **Gap-free process start/stop capture via ETW on Windows (Echo).** The Echo
   `process` source now feeds from a real-time `Microsoft-Windows-Kernel-Process`
   ETW session instead of the 60 s snapshot-diff poll, so short-lived processes
   (which the poll misses entirely) are captured — with exact timestamps and exit
@@ -7189,7 +7189,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Boot process-capture AutoLogger wired into the Windows installer (#1425).**
   The production InnoSetup installer (`deploy/packaging/windows/yuzu-agent.iss`)
   now configures the `YuzuProcBoot` boot AutoLogger at install time — scoped to
-  the `advanced` plugin component that ships `tar.dll` — and tears it down on
+  the `advanced` plugin component that ships `echo.dll` — and tears it down on
   uninstall: it removes the boot config, **stops the running trace session**, and
   deletes `procboot.etl`. Stopping the session is load-bearing: `Remove-AutologgerConfig`
   removes only the boot-start config and leaves a session started by an earlier
@@ -7327,23 +7327,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `yuzu_server_dex_alert_*` metrics (fired / delivery_failed / suppressed /
   dropped / cooldowns_evicted / routed_types). The agent-side A3 breach
   thresholds (90 % CPU / 10 min etc.) remain fixed in this release.
-- **DEX: per-application resource sampling (TAR `procperf` warehouse tier).**
+- **DEX: per-application resource sampling (Echo `procperf` warehouse tier).**
   Each Windows agent now records, on the same 30 s perf tick, the **top 10
   applications by CPU and the top 10 by working set** (union, ≤ 20 rows/tick)
-  into the on-device TAR edge warehouse — `$ProcPerf_Live` (7-day window) and
+  into the on-device Echo edge warehouse — `$ProcPerf_Live` (7-day window) and
   `$ProcPerf_Hourly` (31-day per-app avg/max rollup). One
   `NtQuerySystemInformation` snapshot per tick: no PDH, no WMI, no per-process
   handles. Samples are aggregated per image name (12 chrome.exe processes =
   one row, `instances=12`); `cpu_pct` is the app's share of total machine
   capacity, matching Task Manager. Privacy: **image names only — never
-  command lines**; TAR redaction patterns apply to the name. **Off by default**
+  command lines**; Echo redaction patterns apply to the name. **Off by default**
   (`procperf_enabled=false`) — per-application data is usage-class telemetry
   subject to works-council/DPA review, distinct from device-level perf (which
   carries no per-app identity and stays on); set `procperf_enabled=true` to opt
-  in, independent of the device-level sampler. Queryable via `tar.sql`.
-- **TAR: warehouse tables are now ensured on every database open.** Fixes an
+  in, independent of the device-level sampler. Queryable via `echo.sql`.
+- **ECHO: warehouse tables are now ensured on every database open.** Fixes an
   upgrade bug where tables introduced by a newer release (the perf tier, and
-  now procperf) were never created on a pre-existing `tar.db` — the schema DDL
+  now procperf) were never created on a pre-existing `echo.db` — the schema DDL
   only ran on first-time migration, so upgraded agents failed those inserts
   until the database was deleted. The DDL is idempotent (`IF NOT EXISTS`) and
   now runs on each open.
@@ -7358,7 +7358,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values from a rogue agent are rejected and percentages clamp at 100.
   (2) The `/dex` per-device drill-down gains a **device performance panel**:
   CPU / memory / disk-latency sparklines over the device's hourly warehouse
-  rollups, fetched by a live read-only `$Perf_Hourly` TAR query dispatched to
+  rollups, fetched by a live read-only `$Perf_Hourly` Echo query dispatched to
   the device when you **click Load performance** (click-to-load — viewing a
   device page alone never dispatches a command; raw samples stay on-device —
   the federated model). Server-rendered SVG, no JS. Needs the device online
@@ -7379,7 +7379,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface (SSE, webhooks, blast-radius detection) and land in a new
   **"Performance"** family on the `/dex` Catalogue and Health views (display
   catalogue now 107 entries). Thresholds are fixed in this release
-  (operator-configurable thresholds are the F1 follow-up). The TAR perf
+  (operator-configurable thresholds are the F1 follow-up). The Echo perf
   warehouse remains the historical record of the same counters; this is the
   alerting leg.
 - **RDP control plugin (`rdp_control`).** New Windows-only agent plugin with
@@ -7408,7 +7408,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "PostgreSQL Substrate" section) and `upgrading.md`, including the ADR-0010
   **restore-pairing invariant** (database and `KeyProvider` keys-dir backups
   restore *together*; runbook tracked in #1341) and an explicit warning never
-  to `tar` a live `postgres-data` volume; (3) the native UAT rig
+  to `echo` a live `postgres-data` volume; (3) the native UAT rig
   (`scripts/start-UAT.sh`) now stands up a `yuzu-postgres:local` sidecar
   container on loopback `:15433` with per-run random, distinct
   superuser/app-role credentials, exports `YUZU_POSTGRES_DSN` to the server,
@@ -7418,17 +7418,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rises 30s → 60s (the fleet-health gauge needs a first heartbeat + a
   recompute window — measured ~37s; the stack was healthy, the poll was
   just too tight).
-- **DEX: continuous device performance sampling (TAR `perf` warehouse tier).**
+- **DEX: continuous device performance sampling (Echo `perf` warehouse tier).**
   Every Windows agent now samples CPU busy %, memory used % + commit-charge %,
   per-IO disk service time (µs) + read/write throughput, and non-loopback
-  network rx/tx throughput every 30 s into the on-device TAR edge warehouse
+  network rx/tx throughput every 30 s into the on-device Echo edge warehouse
   (`$Perf_Live`, 7-day window; `$Perf_Hourly` avg/max rollup, 31-day) — raw
   samples never cross the wire (ADR-0004 federated model). Raw kernel counters
   only (`GetSystemTimes`, `GlobalMemoryStatusEx`/`GetPerformanceInfo`,
   `IOCTL_DISK_PERFORMANCE`, `GetIfTable2`); no PDH, no WMI, no shell-out. New
-  `tar collect_perf` action and `configure` keys **`perf_enabled`** (default
+  `echo collect_perf` action and `configure` keys **`perf_enabled`** (default
   `true`) and **`perf_interval_seconds`** (default 30; `0` disables the trigger
-  entirely). Queryable via `tar.sql`. Linux (`/proc`) and macOS
+  entirely). Queryable via `echo.sql`. Linux (`/proc`) and macOS
   (`host_statistics`) collectors are planned. Threshold-breach alerting shipped
   alongside (see "sustained performance-breach alerts" above); fleet rollup
   (A4) is a follow-on slice — today's data is collection + raw-SQL query +
@@ -8014,13 +8014,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`result_sets_ui.{hpp,cpp}`): sidebar of active sets, lineage breadcrumb, copyable
   `from_result_set:` scope token, CSV-import create, pin/unpin/delete — HTMX,
   server-rendered, dark-theme; nav link added across all dashboard pages. The two async
-  producers (from-tar-query / from-instruction-result), the YAML `fromResultSet:` DSL
+  producers (from-echo-query / from-instruction-result), the YAML `fromResultSet:` DSL
   surface, and re-eval land in follow-up PRs. Design: `docs/scope-walking-design.md`.
 
-- **Scope walking — async result-set producers + TAR SQL frame (PR-D).** The two
+- **Scope walking — async result-set producers + Echo SQL frame (PR-D).** The two
   asynchronous producers now create result sets by dispatching a command and
   materialising membership once the producing execution reaches a terminal state:
-  `POST /api/v1/result-sets/from-tar-query` (dispatches operator SQL to the tar
+  `POST /api/v1/result-sets/from-echo-query` (dispatches operator SQL to the echo
   plugin in the parent set's scope — or `__all__` — and includes every agent that
   returned ≥1 row, or all responders with `include_empty=true`) and
   `POST /api/v1/result-sets/from-instruction-result` (runs an InstructionDefinition
@@ -8028,13 +8028,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matcher — the Chrome-IR hash-check step). Both follow the
   create-execution-**before**-dispatch ordering (UP2-4) and return `202` with a
   `pending` row carrying `source_execution_id`; the server maintenance thread applies
-  the matcher (new `result_set_matcher.{hpp,cpp}` — `tar_rows_ge` / `any_response` /
-  column-op over both the tar pipe shape and JSON array-of-objects) and flips the row
+  the matcher (new `result_set_matcher.{hpp,cpp}` — `echo_rows_ge` / `any_response` /
+  column-op over both the echo pipe shape and JSON array-of-objects) and flips the row
   to `materialized`. `POST /api/v1/result-sets/{id}/re-eval` re-runs an async set's
   source query as a **sibling** (shares the original's parent). Parent references
   accept a per-operator **alias** as well as the canonical `rs_` id (resolved at the
   dispatch layer where the owner is known). New `yuzu_result_sets_total{result="pending"}`
-  metric path. The TAR dashboard's "Ad-hoc TAR SQL" frame (`tar_page_ui.cpp`) is now
+  metric path. The Echo dashboard's "Ad-hoc Echo SQL" frame (`echo_page_ui.cpp`) is now
   live: a reusable **scope chip** (your result sets + `__all__`), a SQL editor, and a
   one-click "Run & create result set" that dispatches, polls the pending set, and
   surfaces the materialised device count + copyable `from_result_set:` token — HTMX,
@@ -8185,7 +8185,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixed for `--saml-admin-group`), and the OIDC admin audit detail now names the granting group
   (`admin_group=<value>`), mirroring the SAML audit detail.
 
-- **TAR `perf` + `procperf` collectors on Linux (procfs).** The device
+- **Echo `perf` + `procperf` collectors on Linux (procfs).** The device
   performance sampler and the per-application top-N sampler — Windows-only
   until now — are implemented on Linux: `perf` reads `/proc/stat`,
   `/proc/meminfo` (`MemAvailable`; `commit_pct` reads 0 under
@@ -8209,19 +8209,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (so `*evil|app*` redacts a process that named itself `evil|app`), and comm
   bytes are scrubbed to valid UTF-8. macOS remains planned for both sources.
 
-- **TAR netqual on Windows + retrospective network quality (ADR-0020).** The
+- **Echo netqual on Windows + retrospective network quality (ADR-0020).** The
   per-connection TCP-quality source (`netqual`, opt-in) now collects on Windows
   via TCP ESTATS — smoothed RTT/jitter, per-tick loss, retrans/segs context per
   ESTABLISHED connection, privacy-bucketed as before (`kSupportedConstrained`:
-  needs an elevated agent; non-elevated records nothing and `tar.status` reports
+  needs an elevated agent; non-elevated records nothing and `echo.status` reports
   the new `netqual_capture_method` key as `none`). Two retrospective layers
-  answer "what was network quality like before TAR was running": a per-boot
+  answer "what was network quality like before Echo was running": a per-boot
   baseline (`$NetQual_Boot`, since-boot TCP retransmit + interface-error totals
   captured once at agent start, no elevation) and a new opt-in **`netconn`**
   source (`$NetConn_Live`, `netconn_enabled`) that backfills OS-retained
   connectivity history — network connect/disconnect, NCSI internet-capability
   changes, Wi-Fi connect/fail/disconnect with reason codes — reaching
-  days-to-weeks before TAR (or the agent) existed on the box. netconn stores
+  days-to-weeks before Echo (or the agent) existed on the box. netconn stores
   closed enum tokens and numeric reason codes only: no SSID, BSSID, profile
   name, interface GUID, or MAC is ever extracted (fixture-pinned allow-list
   parser). The retrospective reach is operator-configurable via
@@ -8230,8 +8230,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collection is not permitted — see ADR-0020). Linux/macOS netconn and the
   macOS netqual collector remain planned (schema registered, queryable-empty).
 
-- **Mapped-drive TAR capture source (`mapdrive`, capability-map §3.8).** New opt-in
-  (default-off) TAR capture source recording network-share mappings in **both**
+- **Mapped-drive Echo capture source (`mapdrive`, capability-map §3.8).** New opt-in
+  (default-off) Echo capture source recording network-share mappings in **both**
   directions — outbound (drives this host maps to remote shares) and inbound (remote
   hosts mapping this host's shares, the lateral-movement signal) — distinguished by a
   `direction` column and queryable via `$MapDrive_Live`/`$MapDrive_Hourly`. Beyond the
@@ -8243,8 +8243,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inbound needs local-admin/Server-Operator) and `/proc/mounts` + `smbstatus` (Linux,
   inbound needs Samba); macOS is planned. Rows carry usernames and remote share paths
   (identity/usage-class telemetry — enabling is audited). Enable with
-  `tar.configure {"mapdrive_enabled":"true"}`; the historical backfill materializes on
-  the first agent restart after enabling. See `docs/user-manual/tar.md`.
+  `echo.configure {"mapdrive_enabled":"true"}`; the historical backfill materializes on
+  the first agent restart after enabling. See `docs/user-manual/echo.md`.
 
 - **SCIM 2.0 user provisioning (`/scim/v2/*`, SOC 2 CC6.2/CC6.8).** An
   enterprise IdP (Okta/Entra/OneLogin) can now auto-provision and
@@ -8272,15 +8272,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   switch to a `<=` comparison. A session already at/past its own absolute lifetime is now rejected
   `401` rather than granted a zero-length window (governance hardening round, UP-1/UP-4).
 
-- **TAR `tar.configure` now advertises every per-source enable toggle and the software
+- **Echo `echo.configure` now advertises every per-source enable toggle and the software
   tuning params in its discovery schema.** `perf_enabled`, `procperf_enabled`,
   `netqual_enabled`, `module_enabled`, and `software_enabled` (plus `software_interval`)
   were already accepted by the agent but missing from the
-  build-embedded `crossplatform.tar.configure` definition, so an agentic worker could not
+  build-embedded `crossplatform.echo.configure` definition, so an agentic worker could not
   discover or tune them (notably the enable toggle for the opt-in, off-by-default
   `software` source). No runtime behaviour change — the params were always honoured; they
   are now discoverable. (Docs note that `perf_interval_seconds`, by contrast, is read at
-  trigger registration and is not a `tar.configure` param — use `perf_enabled` to stop
+  trigger registration and is not an `echo.configure` param — use `perf_enabled` to stop
   perf collection at runtime.)
 - **`win_str.hpp` relocated to `agents/shared/` + the #1681 de-dup sweep completed.** The shared
   Windows wide<->UTF-8 helper moved from `agents/plugins/shared/` to a new `agents/shared/` sibling
@@ -8288,7 +8288,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent-core files (`process_enum`, `dex_observer`, `guard_registry`, `guard_service`,
   `trigger_engine`; `guard_file`'s dead copy removed) and the remaining plugins (`processes`,
   `device_identity`, `filesystem`, `hardware`, `ioc`, `content_dist`, `disk_space`,
-  `tar_dns_collector`, `tar_proc_etw`, `tar_proc_perf`, `tar_arp_collector`) now delegate to
+  `echo_dns_collector`, `echo_proc_etw`, `echo_proc_perf`, `echo_arp_collector`) now delegate to
   `yuzu::win::{to_wide,from_wide,reg_sz_to_utf8}`. `temp_file` (caller-buffer contract) and
   `installed_apps` (interior-NUL semantic divergence) deliberately retain their own copies.
   Behaviour-preserving; no user-facing change.
@@ -8334,14 +8334,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/install-server-postgres.sh`) and set `YUZU_POSTGRES_DSN` before upgrading. See
   `docs/user-manual/server-admin.md` → "PostgreSQL substrate".
 
-- **TAR `process_etw_dropped` status key renamed to `process_stream_dropped`; new
+- **Echo `process_etw_dropped` status key renamed to `process_stream_dropped`; new
   `process_stream_kernel_dropped` added.** The Windows-specific
   `process_etw_dropped` is now the cross-platform `process_stream_dropped`, and its
   meaning is pinned to **userspace ring overflow** (the drain tick fell behind) on
   both platforms. A new `process_stream_kernel_dropped` key reports
   **kernel/provider-side** drops separately — Endpoint Security `seq_num` gaps on
   macOS; 0 on Windows ETW, which exposes no per-message sequence here. Any
-  Prometheus scrape rule, SIEM parser, or `tar.sql` query that referenced
+  Prometheus scrape rule, SIEM parser, or `echo.sql` query that referenced
   `process_etw_dropped` will find no value after upgrade — update it to
   `process_stream_dropped`.
 - **Compose Wizard (`tools/compose-wizard/`) now provisions the PostgreSQL
@@ -8542,7 +8542,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change — Catalogue display only; the drift-net test now pins the map to the emitted set on both
   platforms.
 - **Doc honesty: retract over-claimed management-group list-view confinement (ADR-0017 / #1716).**
-  `GET /api/v1/inventory/software`, MCP `query_installed_software`, and the TAR retention-paused
+  `GET /api/v1/inventory/software`, MCP `query_installed_software`, and the Echo retention-paused
   list carry a per-agent management-group drop filter that is **not yet effective** under the
   *global* `Inventory:Read` / `Infrastructure:Read` gate (a confined operator is denied at the gate;
   a global operator's filter is a no-op). Docs, the SOC 2 / CAIQ CC6.1 evidence, the capability map,
@@ -8576,13 +8576,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Windows-only header `agents/shared/win_str.hpp` (`namespace yuzu::win`, header-only so each
   plugin still compiles its own copy and build isolation is preserved). The plugins that carried a
   **named** wide<->UTF-8 helper are migrated to it: the four siblings above, plus a **de-dup migration**
-  of `registry`, `wmi`, `services`, `interaction`, `tar_module_etw` (the trio / mixed local copies) and
-  `network_config`, `procfetch`, `sockwho`, `users`, `wifi`, `tar_service_collector`, `tar_user_collector`
+  of `registry`, `wmi`, `services`, `interaction`, `echo_module_etw` (the trio / mixed local copies) and
+  `network_config`, `procfetch`, `sockwho`, `users`, `wifi`, `echo_service_collector`, `echo_user_collector`
   (the `process_enum`-style `wide_to_utf8`). Most switch via a `using` declaration (the local name
-  coincided); `wmi` (`from_bstr`) and `tar_module_etw` (`std::string`/`std::wstring` signatures) keep thin
+  coincided); `wmi` (`from_bstr`) and `echo_module_etw` (`std::string`/`std::wstring` signatures) keep thin
   delegating shims. This is a **partial** consolidation — **not** every conversion site: other plugins
   (`processes`, `device_identity`, `filesystem`, `hardware`, `ioc`, `content_dist`, and the
-  `tar_dns_collector`/`tar_proc_etw`/`tar_proc_perf`/`tar_arp_collector` siblings) and several agent-**core**
+  `echo_dns_collector`/`echo_proc_etw`/`echo_proc_perf`/`echo_arp_collector` siblings) and several agent-**core**
   files (`process_enum`, `dex_observer`, `guard_file`, `guard_registry`, `guard_service`, `temp_file`,
   `trigger_engine`) still carry their own named or inline conversions; a comprehensive sweep is a tracked
   follow-up, and `installed_apps` keeps its copy (its #1662 fix is already on `dev`). `reg_sz_to_utf8` stops at the
@@ -8637,7 +8637,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Filtering Engine the firewall sits on, stopping it tears down the firewall while `mpssvc`
   looks protected) — are now rejected by `dangerous_enforce_service_stop`. (#1285)
 
-- **TAR configure-time validation is now OS-aware and bounded (#540, #541, #544).**
+- **Echo configure-time validation is now OS-aware and bounded (#540, #541, #544).**
   (a) `network_capture_method` was validated against the OS-blind union of every
   platform's capture methods, so a Linux agent would accept and store the
   Windows-only `iphlpapi` (and surface it in `status`) while the collector kept
@@ -8653,7 +8653,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value every fast cycle, so a sub-floor value persisted before the floor existed
   (a no-tamper upgrade) or written out of band would otherwise reach the redaction
   scan and suppress events. The loaders skip non-string elements instead of
-  discarding the whole set, the build-embedded `content/definitions/tar.yaml`
+  discarding the whole set, the build-embedded `content/definitions/echo.yaml`
   discovery metadata is synced (substring not glob, OS-aware method rejection,
   the 256/256/3 limits), and the stale "glob" comments are corrected to
   "case-insensitive substring" (#541). (c) The schema-registry `kPlanned` accept-list test could
@@ -8669,20 +8669,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ensure_redaction_defaults` helper, so an operator can ADD redaction patterns but
   can never DISABLE the baseline protection on any path. The load-path JSON parse
   also gains a 128 KiB pre-parse byte cap (a multi-MB tampered/legacy value is no
-  longer fully parsed + copied every fast cycle), and the `tar.yaml` discovery
+  longer fully parsed + copied every fast cycle), and the `echo.yaml` discovery
   metadata for `network_capture_method` no longer advertises the process-source
   `etw`/`endpoint_security` methods the OS-aware validator rejects (A1 parity).
-- **TAR source enable/disable is now corruption-resilient and reports a strict
+- **Echo source enable/disable is now corruption-resilient and reports a strict
   state (#559, #560).** Two agent-side defects in the per-source lifecycle: (a) a
-  corrupt `tar.db` was opened and trusted, and since `get_config` returns the
+  corrupt `echo.db` was opened and trusted, and since `get_config` returns the
   caller default on a read failure, every `<source>_enabled` key read as its
   default — silently re-enabling sources an operator had paused for forensic
   preservation and defeating the #539 retention guard with no telemetry (#559);
-  (b) `tar.status` echoed the raw stored enable value, so a garbage value
+  (b) `echo.status` echoed the raw stored enable value, so a garbage value
   (corruption, tampering, a downgrade/upgrade) was passed through instead of
   flagged, and the collect-time `!= "false"` gate treated any non-`false` value
-  as enabled (#560). Fixes: `TarDatabase::open` runs `PRAGMA integrity_check` and
-  quarantines a corrupt DB aside (`tar.db.corrupt-<epoch>`, with its `-wal`/`-shm`
+  as enabled (#560). Fixes: `EchoDatabase::open` runs `PRAGMA integrity_check` and
+  quarantines a corrupt DB aside (`echo.db.corrupt-<epoch>`, with its `-wal`/`-shm`
   sidecars) before re-initialising a fresh one — failing **closed** if the corrupt
   file cannot be moved aside rather than re-opening and trusting it; `status` now
   emits a strict tri-state (`true`/`false`/`errored`); and the collect-time gate
@@ -8692,8 +8692,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Recovering such a source via `configure <source>_enabled=true` now also clears
   its `paused_at`: the enable/disable transition canonicalises the previous value
   before both legs, so an `errored`→`true` recovery no longer leaves a stale
-  `paused_at` that made `tar.status` report a now-collecting source as paused.
-- **TAR `status` no longer misrepresents the active network capture mechanism (#1528).**
+  `paused_at` that made `echo.status` report a now-collecting source as paused.
+- **Echo `status` no longer misrepresents the active network capture mechanism (#1528).**
   `network_capture_method` accepts and stores a pre-staged `kPlanned` method (e.g. `etw`
   on Windows, `endpoint_security` on macOS), but `collect_fast` always polls via
   `enumerate_connections()` regardless — so `status` could tell an IR analyst the agent
@@ -8703,11 +8703,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single `effective_network_capture_method()` helper in the schema registry that is the
   obvious place to wire the runtime check when a kernel-event collector lands. The
   pre-staging affordance is preserved (the configured value is still stored and reported).
-  (`agents/plugins/tar/src/tar_schema_registry.{hpp,cpp}`,
-  `agents/plugins/tar/src/tar_plugin.cpp`, `docs/user-manual/tar.md`,
-  `content/definitions/tar.yaml`, `docs/yaml-dsl-spec.md`)
-- **TAR: disabling a collector no longer races an in-flight collection cycle (#538).**
-  `tar.configure <source>_enabled=false` wrote the disable flag without serialising
+  (`agents/plugins/echo/src/echo_schema_registry.{hpp,cpp}`,
+  `agents/plugins/echo/src/echo_plugin.cpp`, `docs/user-manual/echo.md`,
+  `content/definitions/echo.yaml`, `docs/yaml-dsl-spec.md`)
+- **ECHO: disabling a collector no longer races an in-flight collection cycle (#538).**
+  `echo.configure <source>_enabled=false` wrote the disable flag without serialising
   against the collectors, so a `collect_fast`/`collect_slow` cycle already past its
   per-source enable check could commit one extra snapshot **after** the operator's
   "stop" — and the saved baseline was the racy snapshot. On re-enable the next cycle
@@ -8732,21 +8732,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commits no post-disable row, and a re-enable re-baselines instead of emitting a
   first row whose rate-average covers the entire paused window (a privacy concern on
   the opt-in, default-off `procperf` per-application source).
-- **TAR `tar.status` no longer misreports opt-in capture sources as enabled.**
+- **Echo `echo.status` no longer misreports opt-in capture sources as enabled.**
   The high-volume usage-class sources (`module`, `procperf`, `netqual`) are
   opt-in and ship disabled, but a fresh agent reported `<source>_enabled=true`
-  on `tar.status` because every source defaulted its enabled flag to `true`.
+  on `echo.status` because every source defaulted its enabled flag to `true`.
   They now carry an explicit `CaptureSourceDef::default_enabled=false`, threaded
   through `source_enabled()`, `do_status()`, retention, and the `paused_at`
   transition from a single source of truth — so status, retention, and the
   retention-paused list all agree the source starts disabled (and the first
   `<source>_enabled=false` no longer writes a spurious `paused_at`). On upgrade,
   an agent that never set these keys now reports `<source>_enabled|false` on
-  `tar.status` where it previously reported `true`; **no data collection
+  `echo.status` where it previously reported `true`; **no data collection
   changes** (collection was already gated off), so this only affects automation
-  that parses `tar.status` to inventory active sources.
-- **TAR retention-paused dashboard: correct rendering + DoS-resistant (#558, #560, #561).**
-  The `/tar` retention-paused list had three defects: (a) a source whose
+  that parses `echo.status` to inventory active sources.
+- **Echo retention-paused dashboard: correct rendering + DoS-resistant (#558, #560, #561).**
+  The `/echo` retention-paused list had three defects: (a) a source whose
   `<source>_enabled` held a non-`"false"` value (`errored` from a corrupt/tampered
   agent DB, or any garbage) was **silently omitted** from the list — showing clean
   state for an actually-paused source; it now renders with a value-error badge
@@ -9169,12 +9169,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Behavioural dispatch-audit sites routed through the shared chokepoint for catch-arm parity
   (#1647 follow-up).** The remaining per-device/per-signal routes that still called the `AuditFn`
   raw — `device.live.*` (`/fragments/device/live/run`), `dex.device.perf.query` /
-  `dex.device.procperf.query`, and the `tar_tree_routes` dispatch/read sites
-  (`tar.process_tree.{read,detail}`, `tar.dns.read`, `tar.arp.read`, `tar.sources.{read,configure}`)
+  `dex.device.procperf.query`, and the `echo_tree_routes` dispatch/read sites
+  (`echo.process_tree.{read,detail}`, `echo.dns.read`, `echo.arp.read`, `echo.sources.{read,configure}`)
   — now go through `detail::emit_behavioral_audit` in `server/core/src/rest_audit.hpp`. A throwing
   `audit_fn` (`bad_alloc`-class) is caught and logged instead of escaping the handler (httplib would
   have turned it into a `500`). Each route keeps its existing **dispatch/set-and-proceed** posture
-  (no read-PII route became a `503`). The `tar_tree_routes` sites previously **discarded** the audit
+  (no read-PII route became a `503`). The `echo_tree_routes` sites previously **discarded** the audit
   bool and set no header; they now surface `Sec-Audit-Failed: true` on a dropped/throwing audit row,
   matching the migrated sibling routes. No audit verbs changed.
 
@@ -9490,11 +9490,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was plaintext + unauthenticated). To run the old insecure posture, pass
   `--no-tls --no-https` explicitly. See `docs/pki-architecture.md`
   "Secure-by-default deployment".
-- **Windows TAR process events no longer carry a command line (`cmdline` is
+- **Windows Echo process events no longer carry a command line (`cmdline` is
   empty).** With the Windows `process` source moving from the snapshot-diff poll
   to the ETW Kernel-Process feeder (see Added), process rows on Windows are
   names-only — the ETW start event carries no command line. Any dashboard, SIEM
-  export, `tar.sql` query, or Guardian rule that read `cmdline` from
+  export, `echo.sql` query, or Guardian rule that read `cmdline` from
   `$Process_*` on Windows now sees an empty string. **macOS process rows are now
   names-only too — on BOTH the Endpoint Security stream and the sysctl poll** (see
   Added): the stream carries no command line, and the poll fallback (a Command Line
@@ -9508,7 +9508,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   redact). The boot-window AutoLogger backfill is configured by the production
   InnoSetup installer (scoped to the `advanced` component) and by the developer
   install script (`install-agent-user.ps1`); it takes effect on the next reboot
-  after install. See `docs/user-manual/tar.md`
+  after install. See `docs/user-manual/echo.md`
   "Upgrade note (Windows process capture → ETW)".
 - **The server now generates per-install default TLS certificates on first
   boot instead of refusing to start without operator-provided certs.** A fresh
@@ -9649,13 +9649,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Scope walking PR-D.** `tests/unit/server/test_result_set_matcher.cpp` — 11 cases
   for the async membership matcher (pure `(matcher, status, output)` function):
   non-success never qualifies, empty/blank → SUCCESS default, `any_response`,
-  `tar_rows_ge` thresholds + tar `error|` → 0 rows, `tar_row_count` trailer +
+  `echo_rows_ge` thresholds + echo `error|` → 0 rows, `echo_row_count` trailer +
   line-count fallback, unknown-kind conservative exclude, column ops
-  (`eq`/`in`/`contains`/`exists`) over both the tar pipe shape and the JSON
+  (`eq`/`in`/`contains`/`exists`) over both the echo pipe shape and the JSON
   array-of-objects fallback, and the malformed-matcher fallbacks.
   `tests/unit/server/test_rest_result_sets_async.cpp` — 14 HTTP-level cases (real
   `ResultSetStore` + `ExecutionTracker`, fake recording dispatch closure):
-  from-tar-query 202/pending shape + create-before-dispatch ordering, `__all__` vs
+  from-echo-query 202/pending shape + create-before-dispatch ordering, `__all__` vs
   `from_result_set:<parent>` scope, **alias pre-resolution** to canonical id,
   unknown-alias 404, `include_empty` → `any_response` matcher, missing-sql 400,
   zero-agents 503 (execution cancelled, no pending row), dispatch-throw 500,
@@ -9796,10 +9796,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **TAR warehouse SQL — read-only sandbox + authorizer for operator queries (#760, #631).**
-  The agent's `tar.sql` executor no longer relies solely on a keyword blocklist
+- **Echo warehouse SQL — read-only sandbox + authorizer for operator queries (#760, #631).**
+  The agent's `echo.sql` executor no longer relies solely on a keyword blocklist
   over a read-write SQLite handle. Untrusted operator SQL now runs on a dedicated
-  **read-only** connection through a new `TarDatabase::execute_user_query`, guarded
+  **read-only** connection through a new `EchoDatabase::execute_user_query`, guarded
   by a SQLite **authorizer** that permits only `SELECT`/`READ` of registry-known
   warehouse tables (plus scalar/aggregate functions) and denies writes, `ATTACH`,
   `PRAGMA`, schema-table reads, and trailing statements at prepare time — so a
@@ -9811,7 +9811,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   New unit coverage drives the authorizer, the read-only handle, and the
   literal-translation fix directly. Operators who used `PRAGMA` or `sqlite_master`
   for schema discovery should switch to the `$`-prefixed warehouse table names
-  (see `docs/user-manual/tar.md`). Hardens SOC 2 CC6.1 / CC8.1.
+  (see `docs/user-manual/echo.md`). Hardens SOC 2 CC6.1 / CC8.1.
 
 - **Gateway — refuse to boot with the default Erlang distribution cookie (#659).**
   `gateway/config/vm.args` is now `vm.args.src`, supplying the cookie from the
@@ -10136,7 +10136,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Per-host IPC-graph drill-down (`/viz/host/<agent_id>`).** Double-clicking
   a cube in `/viz/fleet` opens a new tab with a 2D bipartite IPC graph
-  (processes + sockets, Cytoscape `cose` layout) above the existing TAR
+  (processes + sockets, Cytoscape `cose` layout) above the existing Echo
   process tree, with cross-pane select-to-highlight and a resizable
   splitter. New REST routes `GET /api/v1/viz/host/<agent_id>/topology`
   and `GET /fragments/viz/host/<agent_id>/topology` return a
@@ -10145,7 +10145,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kill switch. The `/viz/host/<id>` page route is auth-gated and
   allow-lists the `agent_id` (`[A-Za-z0-9._-]`) before templating.
   Vendored Cytoscape.js 3.33.3 (MIT).
-- **`tar.fleet_snapshot` connection window.** `fleet_snapshot` now merges
+- **`echo.fleet_snapshot` connection window.** `fleet_snapshot` now merges
   connections seen recently from the `tcp_live` warehouse, not only those
   ESTABLISHED at the exact `/proc` sample instant, so short-lived flows
   reach the viz. New operator-tunable `fleet_snapshot_window_seconds`
@@ -10269,7 +10269,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Agent interval triggers now fire.** `yuzu_register_trigger` /
   `yuzu_unregister_trigger` were no-op stubs — no `TriggerEngine` was
   instantiated, so `collect_fast` / `collect_slow` / `rollup` never ran
-  for any plugin. The TAR warehouse `*_live` tables sat permanently empty
+  for any plugin. The Echo warehouse `*_live` tables sat permanently empty
   in the field. The agent now owns a `TriggerEngine`, wires it into the
   plugin context before plugin init, and starts it after plugins load.
   See the upgrade note below.
@@ -10286,8 +10286,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Mixed-fleet split-brain in `/viz/fleet` (governance Gate 7 UP-9).**
   Once any agent pushed a snapshot, the topology was built solely from
   the pushed map and the dispatch fallback was skipped — so any
-  registered agent that had *not* pushed (a pre-`tar.fleet_snapshot`
-  build mid rolling-upgrade, the TAR plugin disabled, a pump wedged on
+  registered agent that had *not* pushed (a pre-`echo.fleet_snapshot`
+  build mid rolling-upgrade, the Echo plugin disabled, a pump wedged on
   its first cycle) silently vanished from the visualization. The store
   now emits a `stale=true` placeholder cube for every
   registered-but-unpushed agent.
@@ -10422,7 +10422,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Interval triggers were previously non-functional.** After upgrading
   the agent daemon, registered interval triggers begin firing for the
-  first time. Operators should expect the TAR `*_live` warehouse tables
+  first time. Operators should expect the Echo `*_live` warehouse tables
   to start populating (on the first `collect_fast` cycle, default 60 s)
   and may see a small increase in per-agent CPU/IO. Any plugin that
   registered an interval trigger expecting the old no-op behaviour will
@@ -10432,7 +10432,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `code_change/3`); the documented gateway deploy path — container
   replacement — is unaffected.
 - **Rolling agent upgrades and `/viz/fleet`.** During a rolling agent
-  upgrade, agents on a build older than the `tar.fleet_snapshot` action
+  upgrade, agents on a build older than the `echo.fleet_snapshot` action
   (the push-ingestion source) appear in `/viz/fleet` as dimmed `stale`
   cubes until their agent is upgraded — they have no topology to push
   yet. This is expected, not a regression; the cubes populate fully once
@@ -10459,7 +10459,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ending in a small ring marker; hover reveals the off-cluster
   `ip:port`. Hover order is sockets → processes → edges → cubes.
 - **Push-based fleet topology ingestion (PR 10).** Agents now push
-  their `tar.fleet_snapshot.v1` JSON every ~30 s via a new
+  their `echo.fleet_snapshot.v1` JSON every ~30 s via a new
   `HeartbeatRequest.fleet_snapshot_json` proto field (field 4,
   additive). Server-side `FleetTopologyStore::push_snapshot` ingests
   into a per-agent `pushed_` map keyed by session-authenticated
@@ -10565,7 +10565,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`/viz/fleet` interior process nodes coloured by category (PR 7 of the
   11-PR `/viz/fleet` 3D fleet network-topology ladder).** Each fleet machine
   cube now contains one `SphereGeometry` dot per process reported by
-  `tar.fleet_snapshot`, coloured from a fixed six-colour palette:
+  `echo.fleet_snapshot`, coloured from a fixed six-colour palette:
   system `#6e7681`, browser `#58a6ff`, database `#d29922`, web `#56d364`,
   runtime `#bc8cff`, other `#8b949e`. Categories are computed server-side
   by `classify(process_name, user)` in `process_category.hpp`; the renderer
@@ -10594,7 +10594,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grid (FNV-1a 32-bit hash of `agent_id` for stable cross-reload layout).
   Per-OS palette: Linux `#f0c674`, macOS `#a0a0a0`, Windows `#5294e2`,
   default `#666666`. Live agents render at opacity `0.18`; stale agents
-  (no `tar.fleet_snapshot` response within the 5 s deadline) drop to
+  (no `echo.fleet_snapshot` response within the 5 s deadline) drop to
   `0.08` so they remain visible without competing for visual attention.
   Hostname `Sprite` labels appear above each cube and always face the
   camera (truncated at 24 chars; full hostname visible in tooltip).
@@ -10604,13 +10604,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by coercing through `Number(...) | 0` and validates `Array.isArray` on
   the topology payload before iteration.
 - **`yuzu_viz_topology_fetch_duration_seconds` Prometheus histogram (PR 6 / OBS-2).**
-  Times the inner agent-dispatch path (`tar.fleet_snapshot` fan-out +
+  Times the inner agent-dispatch path (`echo.fleet_snapshot` fan-out +
   aggregation) on cache-miss refills only, distinguishing "agent dispatch
   is slow" from "the rest of the request is slow" (the existing
   `yuzu_viz_topology_request_seconds` covers the full HTTP path). Wired
   via a new opt-in `FleetTopologyStore::set_fetch_duration_observer()`
   setter and a recommended `VizFleetSlowAgentDispatch` alert at p99 > 5 s
-  (the `tar.fleet_snapshot` deadline).
+  (the `echo.fleet_snapshot` deadline).
 
 ### Changed
 
@@ -10689,7 +10689,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`/viz/fleet` page scaffold + WASD/orbit/zoom camera controls (PR 5
   of the 11-PR `/viz/fleet` 3D fleet network-topology ladder).** New
-  page route `GET /viz/fleet` (auth-gated, same posture as `/tar`) that
+  page route `GET /viz/fleet` (auth-gated, same posture as `/echo`) that
   serves an HTMX-style page shell with a persistent `<div id="viz-root"
   data-yuzu-viz-url="/api/v1/viz/fleet/topology">` containing
   `<canvas id="viz-canvas">` and a swappable `<div id="viz-overlay-panel">`
@@ -10710,7 +10710,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sync without a window-resize listener. Empty `tick()` placeholder for
   PR 6+ to fill in topology rendering. The Fleet Viz nav link is added
   to all sibling page shells (dashboard / instructions / compliance /
-  TAR / settings / help) so navigation is consistent. (#viz-engine
+  Echo / settings / help) so navigation is consistent. (#viz-engine
   ladder PR 5.)
 
 - **Vendored Three.js r168 + OrbitControls (PR 4 of the 11-PR
@@ -10783,10 +10783,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   effect (gov R3 F-1). `FleetTopologyStore` is now in the `/readyz`
   store conjunction so a construction-failed store surfaces as
   503-not-ready rather than a silent viz outage (gov R3 HC-1). The store's
-  PR-2 fetcher seam is wired: on cache miss, dispatches `tar.fleet_snapshot`
+  PR-2 fetcher seam is wired: on cache miss, dispatches `echo.fleet_snapshot`
   to every connected agent via `AgentRegistry::send_to`, drains
   `forward_gateway_pending()` for gateway-proxied agents, polls the
-  response store for matches keyed on a synthesised `tar-<hex>` command_id
+  response store for matches keyed on a synthesised `echo-<hex>` command_id
   until the 5 s deadline, and returns whatever arrived; missing agents
   come back as `stale=true` rows so the renderer dims rather than
   disappears them. The fetcher dispatch intentionally opts out of the
@@ -10796,8 +10796,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--build-arg TRIPLET=x64-linux` ahead of arm64 publishing (QE-R2-02).
   (#viz-engine ladder PR 3.)
 
-- **`tar.fleet_snapshot` action + server-side `FleetTopologyStore` (PRs 1+2
-  of the 11-PR `/viz/fleet` 3D fleet network-topology ladder).** New TAR
+- **`echo.fleet_snapshot` action + server-side `FleetTopologyStore` (PRs 1+2
+  of the 11-PR `/viz/fleet` 3D fleet network-topology ladder).** New Echo
   plugin action enumerates running processes, open network connections,
   and host-bound IPs and emits a single `fleet_snapshot.v1` JSON document
   on demand. Cmdlines are redacted using the union of operator config and
@@ -12947,24 +12947,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs miss CI-yaml drift like the gcc-13 / gcc13 cache split that
   thrashed the GHA cache for weeks before /test surfaced it.
 
-- **TAR dashboard hardening round 4 — Gate 5/6 BLOCKING (issue #547).**
+- **Echo dashboard hardening round 4 — Gate 5/6 BLOCKING (issue #547).**
   Folds the BLOCKING items Gates 5 + 6 (compliance / sre / enterprise-
   readiness / chaos) caught after the first three hardening rounds:
   - **compliance F1 (RBAC denied audit gap)** — both new POST handlers
-    (`/fragments/tar/retention-paused/scan` and `.../reenable`) now emit
+    (`/fragments/echo/retention-paused/scan` and `.../reenable`) now emit
     `result=denied` audit rows when `perm_fn_` rejects the request. The
     audit catalog (`docs/user-manual/audit-log.md`) documented the
     `denied` rows but the code did not deliver them, contradicting the
     SOC 2 CC6.1 / CC7.2 control claim. Two `audit_fn_` calls plus the
     sibling `denied` counter increments close the gap.
   - **sre OBS-1 (Prometheus metrics)** — the design doc spec'd 5
-    metrics; PR-A in scope is 4: `yuzu_tar_dashboard_view_total`
+    metrics; PR-A in scope is 4: `yuzu_echo_dashboard_view_total`
     (counter, labels: `frame`, `result`),
-    `yuzu_tar_retention_paused_devices` (gauge, labels: `source`),
-    `yuzu_tar_scan_dispatched_total` (counter, labels: `result` —
+    `yuzu_echo_retention_paused_devices` (gauge, labels: `source`),
+    `yuzu_echo_scan_dispatched_total` (counter, labels: `result` —
     `success` / `rate_limited` / `no_visible_agents` /
     `no_connected_agents` / `denied`), and
-    `yuzu_tar_source_reenable_total` (counter, labels: `result` —
+    `yuzu_echo_source_reenable_total` (counter, labels: `result` —
     `success` / `scope_violation` / `agent_not_connected` / `denied` /
     `invalid_input`). Plumbed `MetricsRegistry*` through
     `DashboardRoutes::register_routes` (new optional parameter,
@@ -12980,21 +12980,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     return HTTP 429 with `Retry-After`, an HTML fragment showing the
     remaining wait, and a `denied` audit row carrying
     `rate_limited cooldown=Ns`. Without this, a compromised session
-    could spam Scan in a loop and storm the fleet with `tar.status`
+    could spam Scan in a loop and storm the fleet with `echo.status`
     RPCs at the operator's `Execution:Execute` permission tier.
   - **enterprise SHOULD-1 (mixed-version upgrade caveat)** —
-    `docs/user-manual/server-admin.md` gains a "v0.12.0 — TAR dashboard
+    `docs/user-manual/server-admin.md` gains a "v0.12.0 — Echo dashboard
     page + mixed-version agent caveats" subsection covering the
     em-dash rendering for pre-PR-A agents, the per-operator scan-state
     persistence model, and the new audit-action surface. Without this,
     operators upgrading the server before the agent fleet would see
     `—` columns and have no documented explanation.
-  - **enterprise SHOULD-2 (TAR nav-link conditional rendering)**
+  - **enterprise SHOULD-2 (Echo nav-link conditional rendering)**
     deferred to follow-up — requires a JS-time permission lookup that
     is more architectural than a one-line CSS hide. The current
     behaviour (click → 401/redirect) is not a security issue.
 
-- **TAR dashboard hardening round 3 — Gate 4 + Gate 3 follow-up
+- **Echo dashboard hardening round 3 — Gate 4 + Gate 3 follow-up
   (issue #547).** Folds the BLOCKING items Gate 4 caught after the
   first two hardening rounds, plus the QE BLOCKING test gap on
   `json_escape`:
@@ -13008,9 +13008,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     sec-M3 depends on. Without this test, a future refactor that
     drops a case from json_escape would silently re-open sec-M3.
   - **consistency-auditor BLOCKING-8** — `docs/capability-map.md`
-    §28.4 still said `/dashboard/tar`. Fixed to `/tar` matching
+    §28.4 still said `/dashboard/echo`. Fixed to `/echo` matching
     the implementation and the rest of the docs.
-  - **consistency-auditor BLOCKING-9** — `docs/tar-dashboard.md`
+  - **consistency-auditor BLOCKING-9** — `docs/echo-dashboard.md`
     §3.5 and §6 (permissions matrix) still said
     `Infrastructure:Update` for Re-enable. Updated to
     `Execution:Execute` matching the round-1 perm-tier fix and
@@ -13027,75 +13027,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     success-level toast saying "dispatched to 0 agent(s)" when
     no agents in scope are connected. The zero-reach case now
     fires a warning-level toast that matches the empty-state body.
-  - **unhappy-path UP-11** — three TAR fragment endpoints now
+  - **unhappy-path UP-11** — three Echo fragment endpoints now
     emit `Cache-Control: no-store, private` and `Vary: Cookie`.
     Without these, a corporate proxy honouring default `text/html`
     caching could re-replay one operator's filtered, visibility-
     scoped scan results to a different operator on the shared URL,
     defeating the round-1 sec-H2 fix.
 
-- **TAR dashboard hardening round 2 — docs from Gate 2 governance
+- **Echo dashboard hardening round 2 — docs from Gate 2 governance
   (issue #547).** Folds the four BLOCKING + four SHOULD-FIX docs
   findings the docs-writer caught:
-  - **doc-B1** — `docs/user-manual/tar.md` gains a new "TAR
-    dashboard page" section after "Checking TAR status," covering
+  - **doc-B1** — `docs/user-manual/echo.md` gains a new "Echo
+    dashboard page" section after "Checking Echo status," covering
     the page URL, the retention-paused list workflow, columns,
     permissions (`Infrastructure:Read` to view, `Execution:Execute`
     to scan or re-enable — reflects the round-1 perm tier fix), the
     in-memory per-username scan-state caveat, and the audit-action
-    surface. Also extends the `tar.status` example output block
+    surface. Also extends the `echo.status` example output block
     with the four new per-source `enabled` / `paused_at` /
     `live_rows` / `oldest_ts` lines so operators reading the manual
     know what to expect.
-  - **doc-B2** — URL drift fixed across `docs/tar-dashboard.md`,
-    `CLAUDE.md`, and `docs/roadmap.md`. The page is at `/tar` (the
-    implementation), not `/dashboard/tar` (the prior design-doc
+  - **doc-B2** — URL drift fixed across `docs/echo-dashboard.md`,
+    `CLAUDE.md`, and `docs/roadmap.md`. The page is at `/echo` (the
+    implementation), not `/dashboard/echo` (the prior design-doc
     text). The CLAUDE.md routed-concerns trigger pattern updates to
-    `/tar` and `/fragments/tar/...`.
-  - **doc-B3** — `docs/tar-dashboard.md` §3.1 no longer claims
+    `/echo` and `/fragments/echo/...`.
+  - **doc-B3** — `docs/echo-dashboard.md` §3.1 no longer claims
     background refresh every 60s. Replaced with the actual
     behaviour (manual Refresh button) and a forward-pointer to
     Phase 15.G operational hardening.
   - **doc-B4** — `docs/user-manual/audit-log.md` "Logged actions"
-    table gains entries for `tar.status.scan` and
-    `tar.source.reenable`, including the `result=failure` /
+    table gains entries for `echo.status.scan` and
+    `echo.source.reenable`, including the `result=failure` /
     `detail=scope_violation|agent_not_connected` distinction the
     handler emits server-side even when the HTTP response body is
     identical (404 with body `Agent not reachable.`) for both
     cases — so SIEM rules can distinguish forged-form attempts
     from transient connectivity issues.
-  - **doc-S1** — `docs/user-manual/rest-api.md` "Dashboard TAR"
-    section gains entries for `GET /tar`, `GET
-    /fragments/tar/retention-paused`, `POST .../scan`, and `POST
+  - **doc-S1** — `docs/user-manual/rest-api.md` "Dashboard Echo"
+    section gains entries for `GET /echo`, `GET
+    /fragments/echo/retention-paused`, `POST .../scan`, and `POST
     .../reenable` with method, path, permission, request schema,
     response codes, and the audit-action emitted.
-  - **doc-S2** — `docs/tar-dashboard.md` §7 audit-action list
-    corrected: `tar.retention_paused.list` (never implemented) →
-    `tar.status.scan` (the actual emission). Forward-pointer added
-    to `tar.source.purge` etc. as the Phase 15.A.next deliverables.
+  - **doc-S2** — `docs/echo-dashboard.md` §7 audit-action list
+    corrected: `echo.retention_paused.list` (never implemented) →
+    `echo.status.scan` (the actual emission). Forward-pointer added
+    to `echo.source.purge` etc. as the Phase 15.A.next deliverables.
   - **doc-S3** — `docs/roadmap.md` Phase 15 issue index row for
     #547 now reflects PR-A.A delivery — "In progress —
     PR-A.A shipped (paused_at + status extension + dashboard page +
     Scan + Re-enable; purge action + persistence pending)" rather
     than the bare "In progress" of the prior doc commit.
-  - **doc-S4** — `docs/tar-dashboard.md` PR ladder row for PR-A
+  - **doc-S4** — `docs/echo-dashboard.md` PR ladder row for PR-A
     flips from "In flight — current session" to "Shipped PR-A.A"
     so future readers do not treat the deferred purge action as an
     accidental omission.
-- **TAR dashboard hardening round 1 — Gate 2 governance findings
+- **Echo dashboard hardening round 1 — Gate 2 governance findings
   (issue #547).** The PR-A.A initial commit shipped on
   `Infrastructure:Read` for the Scan dispatch and a single shared
-  `latest_tar_scan_id_` server slot. Governance Gate 2 caught two
+  `latest_echo_scan_id_` server slot. Governance Gate 2 caught two
   HIGH and three MEDIUM findings before merge and this round folds
   the fixes:
   - **sec-H1 (perm tier mismatch).** `POST .../scan` and
     `POST .../reenable` now require `Execution:Execute` (matched to
-    sibling dispatch handlers `run-instruction` / `tar-execute`).
+    sibling dispatch handlers `run-instruction` / `echo-execute`).
     Reading the rendered list still requires `Infrastructure:Read`.
   - **sec-H2 (cross-operator data leak).** Scan state is now
-    per-username (`tar_scans_by_user_` map keyed by session
+    per-username (`echo_scans_by_user_` map keyed by session
     username, bounded LRU at 256 entries). Operator B opening
-    `/tar` no longer sees operator A's scan results, and the
+    `/echo` no longer sees operator A's scan results, and the
     rendered table is **filtered by the operator's visible-agent
     set** (`ManagementGroupStore::get_visible_agents`) so even
     cached responses from agents outside the operator's RBAC scope
@@ -13124,17 +13124,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     that were filtered out, so the operator understands the
     visibility-bounded view they are seeing.
 
-- **TAR dashboard page + retention-paused source list (PR-A,
-  issue #547).** New `/tar` page off the main dashboard
-  nav, served as `kTarPageHtml` from a dedicated translation unit
-  (`server/core/src/tar_page_ui.cpp`). The page is the operator's
-  destination for *doing TAR* — first frame is the retention-paused
+- **Echo dashboard page + retention-paused source list (PR-A,
+  issue #547).** New `/echo` page off the main dashboard
+  nav, served as `kEchoPageHtml` from a dedicated translation unit
+  (`server/core/src/echo_page_ui.cpp`). The page is the operator's
+  destination for *doing Echo* — first frame is the retention-paused
   source list, with placeholder slots for the scope-walking-aware
   SQL frame (Phase 15.D / issue #550) and the process tree viewer
   (Phase 15.H / issue #554) that drop in as those PRs land.
   Three new HTMX fragment endpoints:
-  - `GET /fragments/tar/retention-paused` queries the response store
-    for the most recent operator-triggered `tar.status` scan, parses
+  - `GET /fragments/echo/retention-paused` queries the response store
+    for the most recent operator-triggered `echo.status` scan, parses
     each agent's `<source>_enabled=false` rows along with the
     matching `paused_at` / `live_rows` / `oldest_ts` companions, and
     renders a sortable table with one row per (agent × paused
@@ -13142,31 +13142,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     accumulating non-aging data the longest float to the top. Honest
     scan-provenance header showing dispatched-to count,
     responded-so-far count, and the "all-collecting-normally" count.
-  - `POST /fragments/tar/retention-paused/scan` dispatches a fresh
-    `tar.status` to all connected agents, records the resulting
-    command_id in an in-memory `latest_tar_scan_id_` (per-server-
+  - `POST /fragments/echo/retention-paused/scan` dispatches a fresh
+    `echo.status` to all connected agents, records the resulting
+    command_id in an in-memory `latest_echo_scan_id_` (per-server-
     instance for now; persistence + multi-server coordination land
     in Phase 15.G operational hardening). Audit row written:
-    `action=tar.status.scan` with the dispatched-agent count.
-  - `POST /fragments/tar/retention-paused/reenable` takes
+    `action=echo.status.scan` with the dispatched-agent count.
+  - `POST /fragments/echo/retention-paused/reenable` takes
     `device_id` + `source` form params, validates `source` against
     the canonical four (`process` / `tcp` / `service` / `user`)
     rejecting forged form submissions with `400 Unknown source`,
     requires `Infrastructure:Update` per device (re-enable is more
     consequential than view), then dispatches a single-device
-    `tar.configure` with `<source>_enabled=true`. The row drops
+    `echo.configure` with `<source>_enabled=true`. The row drops
     optimistically via HTMX `hx-swap=delete`; the next operator-
     triggered Refresh reconciles against a fresh scan. Audit row:
-    `action=tar.source.reenable` with `device_id` and `source` in
+    `action=echo.source.reenable` with `device_id` and `source` in
     the detail. Per-source independence preserved (the #539
     invariant) — re-enabling one source does not touch the others.
 
-  The page also gains a "TAR" entry in the main dashboard nav,
+  The page also gains an "Echo" entry in the main dashboard nav,
   added consistently across `dashboard_ui.cpp`, `help_ui.cpp`,
   `instruction_ui.cpp`, `settings_ui.cpp`, and `compliance_ui.cpp`
   so the link is reachable from every existing page.
 
-- **TAR `tar.status` now emits per-source `paused_at`, `live_rows`,
+- **Echo `echo.status` now emits per-source `paused_at`, `live_rows`,
   `oldest_ts` (PR-A foundation, issue #547).** The `configure` action's
   per-source enable/disable surface gained a transition timestamp:
   flipping `<source>_enabled` from `true` → `false` records the
@@ -13175,41 +13175,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key would be ambiguous with "never paused"). Idempotent re-sets do
   not advance the timestamp, so the dashboard's "paused since" column
   reflects the actual operator action rather than the most recent
-  configure round-trip. `tar.status` now also emits one `live_rows`
+  configure round-trip. `echo.status` now also emits one `live_rows`
   and one `oldest_ts` line per source — the rendering data the
   retention-paused dashboard list (PR-A) needs without a second
   round-trip. The transition logic is extracted to a free function
-  `yuzu::tar::apply_source_enabled_transition()` in
-  `tar_aggregator.{hpp,cpp}` so the plugin and the regression tests
+  `yuzu::echo::apply_source_enabled_transition()` in
+  `echo_aggregator.{hpp,cpp}` so the plugin and the regression tests
   share one source of truth. Backwards-compatible: agents pre-PR-A
   simply do not emit the new lines, and the dashboard renders `—` for
   the missing fields.
 
-- **TAR query examples, test coverage, and implementer documentation
+- **Echo query examples, test coverage, and implementer documentation
   (issue #60).** Two new pre-built `InstructionDefinition`s shipped
-  in `content/definitions/tar_warehouse.yaml` directly answering the
+  in `content/definitions/echo_warehouse.yaml` directly answering the
   examples called out in the issue body:
-  `crossplatform.tar.daily_process_summary` (live-to-aggregate rollup
+  `crossplatform.echo.daily_process_summary` (live-to-aggregate rollup
   reading from `$Process_Daily` with `datetime(day_ts, 'unixepoch')`
-  for human-readable dates), and `crossplatform.tar.recent_processes_iso`
+  for human-readable dates), and `crossplatform.echo.recent_processes_iso`
   (the canonical pattern for the SQLite-equivalent of competing
   platforms' `EPOCHTOJSON(TS)` helper). Both carry per-parameter
   `description` fields so the dashboard and REST API surface them
   without docs-side cross-references. (The originally-shipped
-  `crossplatform.tar.process_by_exact_name` was removed during
+  `crossplatform.echo.process_by_exact_name` was removed during
   governance — it relied on `${process_name}` interpolation in the
   hidden default SQL, but the server has no parameter-interpolation
   pass for `parameters.<key>.default`. Re-add once that surface lands.)
-- **`tar.compatibility` InstructionDefinition + DSL spec registration
+- **`echo.compatibility` InstructionDefinition + DSL spec registration
   (governance docs Finding 4 + plugin Finding 5).** The action shipped
   in the plugin (issue #59) but had no corresponding YAML
-  `InstructionDefinition` in `content/definitions/tar.yaml` and no row
+  `InstructionDefinition` in `content/definitions/echo.yaml` and no row
   in `docs/yaml-dsl-spec.md` §14.15 — meaning operators could not
   invoke it from the dashboard or via the standard
   `/api/v1/instructions/execute` flow without hand-crafting a
   `CommandRequest`. Both gaps are closed; `minAgentVersion: "0.12.0"`
   is set since the action does not exist on prior agents.
-- **`tar.configure` InstructionDefinition now declares the six new
+- **`echo.configure` InstructionDefinition now declares the six new
   parameters introduced by issue #59** (governance plugin Finding 2):
   `process_enabled` / `tcp_enabled` / `service_enabled` /
   `user_enabled` (boolean-as-string with `^(true|false)$` regex
@@ -13217,7 +13217,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `process_stabilization_exclusions` — all four with descriptions and
   agent-version notes so the dashboard form widget and the OpenAPI
   spec render the new surface correctly.
-- **TAR OS compatibility metadata + capture configuration surface
+- **Echo OS compatibility metadata + capture configuration surface
   (issue #59).** The schema registry's `CaptureSourceDef` now carries a
   per-OS `os_support` vector (`OsSupportStatus` × `capture_method` ×
   `notes`) describing how each of the four capture sources (process,
@@ -13226,11 +13226,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtimes, `systemctl`'s `unknown` startup_type, container `/var/run/utmp`
   absence, `lsof` cost, etc.) and `kPlanned` rows for the ETW and
   Endpoint Security collectors that have not landed yet
-  (`agents/plugins/tar/src/tar_schema_registry.{hpp,cpp}`). Operators
+  (`agents/plugins/echo/src/echo_schema_registry.{hpp,cpp}`). Operators
   can read the live matrix at runtime via the new `compatibility`
   action, which emits one `header|...` + N `row|source|os|status|method|notes`
   lines that the dashboard can render directly.
-- **TAR per-source enable/disable + stabilization exclusions + network
+- **Echo per-source enable/disable + stabilization exclusions + network
   capture-method surface (issue #59).** The `configure` action gained
   four new validated parameters: `process_enabled` /
   `tcp_enabled` / `service_enabled` / `user_enabled` (default `true`,
@@ -13243,10 +13243,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   glob patterns; matching processes are dropped before the diff so
   noisy short-lived helpers don't dwarf real activity, with the
   forensic-completeness trade-off documented in
-  `docs/user-manual/tar.md`). `do_status` now also surfaces the
+  `docs/user-manual/echo.md`). `do_status` now also surfaces the
   `<source>_enabled` and `network_capture_method` config rows so
   operators can see effective state without reading the DB
-  (`agents/plugins/tar/src/tar_plugin.cpp`).
+  (`agents/plugins/echo/src/echo_plugin.cpp`).
 
 ### Breaking
 
@@ -13272,20 +13272,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `--management-*` overrides at all (the management listener
   reuses the agent listener credentials by default) and are
   unaffected.
-- **`crossplatform.tar.process_by_exact_name` removed from
-  `content/definitions/tar_warehouse.yaml` (governance plugin H-1 /
+- **`crossplatform.echo.process_by_exact_name` removed from
+  `content/definitions/echo_warehouse.yaml` (governance plugin H-1 /
   enterprise-readiness Finding 9).** The instruction shipped briefly
   with `${process_name}` interpolation in its hidden default SQL,
   but the server has no `${param}` interpolation pass for
   `parameters.<key>.default` — the literal `${process_name}` would
   hit SQLite verbatim and match zero rows. Operators who imported
   the InstructionDefinition during the brief window it was on
-  `dev` should expect the ID `crossplatform.tar.process_by_exact_name`
+  `dev` should expect the ID `crossplatform.echo.process_by_exact_name`
   to be missing on upgrade. Re-add once server-side parameter
   interpolation lands.
-- **`tar_warehouse.yaml` `minAgentVersion` bumped to `"0.10.0"` for
-  every `tar.sql`-based InstructionDefinition (governance H-2).**
-  Previously claimed `"0.7.0"` against agents on which `tar.sql` did
+- **`echo_warehouse.yaml` `minAgentVersion` bumped to `"0.10.0"` for
+  every `echo.sql`-based InstructionDefinition (governance H-2).**
+  Previously claimed `"0.7.0"` against agents on which `echo.sql` did
   not exist. Server-side compatibility checks will now skip these
   instructions on agents older than v0.10.0 instead of dispatching
   and getting `unknown action: sql` per device.
@@ -13317,7 +13317,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relinking the static archive. The ASan path can now exercise the
   agent test surface end-to-end. (`proto/meson.build`,
   `tests/meson.build`)
-- **TAR `network_capture_method=polling` (the documented default) is
+- **Echo `network_capture_method=polling` (the documented default) is
   no longer rejected by the configure surface (governance C-1 / QA
   Finding 2).** Both `do_status` reported `polling` as the default and
   `do_configure` validated against `accepted_capture_methods("tcp")`
@@ -13328,39 +13328,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   broken. `do_configure` now special-cases `polling` and accepts it
   unconditionally; the rejection error message also lists `polling`
   alongside the registry-derived methods so the operator sees the
-  full accept-set. (`agents/plugins/tar/src/tar_plugin.cpp`)
-- **TAR macOS TCP `capture_method` metadata corrected
-  (governance C-1 consistency).** `tar_schema_registry.cpp` declared
+  full accept-set. (`agents/plugins/echo/src/echo_plugin.cpp`)
+- **Echo macOS TCP `capture_method` metadata corrected
+  (governance C-1 consistency).** `echo_schema_registry.cpp` declared
   the macOS TCP collector as `capture_method = "lsof"` with notes
   describing `lsof -nP -iTCP -iUDP`. The actual implementation in
-  `tar_network_collector.cpp` uses `proc_listallpids` +
+  `echo_network_collector.cpp` uses `proc_listallpids` +
   `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` via `libproc` — `lsof`
-  appears nowhere in the collector. The new `tar.compatibility`
+  appears nowhere in the collector. The new `echo.compatibility`
   diagnostic action (issue #59) was therefore shipping factually
   wrong information to operators on the most operator-facing
-  surface in this batch. Updated the registry, `docs/user-manual/tar.md`
-  OS compatibility matrix, and `docs/tar-implementer.md` to all
+  surface in this batch. Updated the registry, `docs/user-manual/echo.md`
+  OS compatibility matrix, and `docs/echo-implementer.md` to all
   reflect `proc_pidfdinfo` / libproc with the inherent TOCTOU caveat.
-- **TAR Windows User collector capture-method note corrected
+- **Echo Windows User collector capture-method note corrected
   (governance H-1 consistency).** `os_support` notes claimed
-  `WTSEnumerateSessionsEx`, but `tar_user_collector.cpp` uses the
+  `WTSEnumerateSessionsEx`, but `echo_user_collector.cpp` uses the
   legacy `WTSEnumerateSessionsW`. Note now reflects the actual symbol
   and adds a forward-pointer to the recommended successor.
-- **`tar_warehouse.yaml` `minAgentVersion` bumped from `"0.7.0"` to
+- **`echo_warehouse.yaml` `minAgentVersion` bumped from `"0.7.0"` to
   `"0.10.0"` across all 13 entries (governance H-2 consistency).**
-  All entries use `tar.sql`, which first shipped in v0.10.0. The
+  All entries use `echo.sql`, which first shipped in v0.10.0. The
   previous claim caused server-side compatibility checks to schedule
   these instructions against v0.7.x–v0.9.x agents that would then
   reject them with `unknown action: sql`.
-- **TAR retention no longer deletes data after a source is disabled
+- **Echo retention no longer deletes data after a source is disabled
   (issue #539, P1, forensic-completeness regression).** The
-  `configure` action and `docs/user-manual/tar.md` both promise that
+  `configure` action and `docs/user-manual/echo.md` both promise that
   setting `<source>_enabled=false` "leaves existing rows queryable,"
-  but `run_retention()` in `tar_aggregator.cpp` was iterating
+  but `run_retention()` in `echo_aggregator.cpp` was iterating
   `capture_sources()` unconditionally — so the rollup trigger
   continued draining hourly within 24h, daily within 31d, and monthly
   within ~365d after disable, breaking the forensic-preservation use
-  case that TAR's headline pitch is built around. The retention loop
+  case that Echo's headline pitch is built around. The retention loop
   now consults `<source>_enabled` and skips disabled sources entirely;
   re-enabling the source resumes time-based retention on the next
   rollup tick. Per-source independence is preserved: disabling
@@ -13411,8 +13411,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Recommended execution order extends through Phase 16; total issue
     count updated to 126.
 - **`docs/capability-map.md`: Phase 15 capabilities added (the WHAT).**
-  Section 28 (Response Visualization) gained 28.4 TAR Dashboard Page,
-  28.5 TAR Process Tree Viewer, 28.6 Retention Awareness Surface. New
+  Section 28 (Response Visualization) gained 28.4 Echo Dashboard Page,
+  28.5 Echo Process Tree Viewer, 28.6 Retention Awareness Surface. New
   Section 30 (Scope Walking & Result Sets) covers 30.1 Result Set
   Persistence and Lineage, 30.2 Composable Scope from Previous Query,
   30.3 YAML DSL `fromResultSet:` Surface, 30.4 Result Set Operational
@@ -13422,9 +13422,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   will do; the roadmap's Phase 15 PR ladder describes how we will get
   there. Phase 15 issues filed on GitHub as #547 (15.A) through #554
   (15.H); the roadmap's "TBD" entries replaced with the issue links.
-- **New `docs/tar-dashboard.md` + `docs/scope-walking-design.md`
+- **New `docs/echo-dashboard.md` + `docs/scope-walking-design.md`
   (Phase 15 design — see `docs/roadmap.md` Phase 15 PR ladder).** Two
-  rigorous design documents covering (a) a dedicated TAR dashboard
+  rigorous design documents covering (a) a dedicated Echo dashboard
   page with three frames — retention-paused source list, scope-walking-
   aware ad-hoc SQL, and process tree viewer reconstructed from
   `process_live` seed + events — and (b) the cross-cutting
@@ -13442,11 +13442,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forensic reconstruction shows the full reasoning chain.
   `CLAUDE.md` routed-concerns table gains pointers to both docs;
   `docs/roadmap.md` gains Phase 15 (8 issues, 15.A–15.H) with the
-  PR ladder explicit. PR-A (TAR page shell + retention-paused list)
+  PR ladder explicit. PR-An (Echo page shell + retention-paused list)
   is the first slice and is in progress.
-- **New `docs/tar-implementer.md` (issue #60).** The implementer-facing
-  companion to `docs/user-manual/tar.md`, covering: TAR as a
-  forensics + inventory capability (and what TAR is *not*); the
+- **New `docs/echo-implementer.md` (issue #60).** The implementer-facing
+  companion to `docs/user-manual/echo.md`, covering: Echo as a
+  forensics + inventory capability (and what Echo is *not*); the
   collect_fast / collect_slow / rollup data flow; the on-disk format
   (plain SQLite WAL today, with explicit honest notes that
   encryption-at-rest via SQLCipher and page-level compression are
@@ -13457,9 +13457,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   measured on a 5950X (worst-case per-collect timings, default-retention
   disk usage); and a routine-debugging entry-point table. The doc
   closes the issue's "supportable without the original upstream page"
-  acceptance criterion. `docs/user-manual/tar.md` gained a top-of-page
+  acceptance criterion. `docs/user-manual/echo.md` gained a top-of-page
   pointer to it for engineers.
-- **`docs/user-manual/tar.md`** gained an "OS compatibility matrix"
+- **`docs/user-manual/echo.md`** gained an "OS compatibility matrix"
   section (per-OS capture method + constraints for each source, status
   legend) and a configuration table extended with the seven new
   `configure` parameters introduced by issue #59. Includes a worked
@@ -13541,7 +13541,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
-- **`tests/unit/test_tar_warehouse.cpp`** — new Catch2 suite for issue
+- **`tests/unit/test_echo_warehouse.cpp`** — new Catch2 suite for issue
   #60 (15 cases / 284 assertions). Pins: every source/granularity has
   a `CREATE TABLE` and a timestamp index in `generate_warehouse_ddl()`;
   `columns_for_table` returns `id` + every declared column for every
@@ -13556,7 +13556,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that granularity (independence invariant); and post-restart TCP
   diff-with-empty-previous yields all-`connected` events (the
   documented forensic-completeness double-capture caveat).
-- **`tests/unit/test_tar_schema_registry.cpp`** — new Catch2 suite for
+- **`tests/unit/test_echo_schema_registry.cpp`** — new Catch2 suite for
   issue #59 (6 cases / 44 assertions). Pins: every source declares
   windows + linux + macos rows; every non-`kUnsupported` row has a
   non-empty `capture_method` + `notes`; `accepted_capture_methods` is
@@ -13572,7 +13572,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the only authorizing value `"1"`. The exact-match policy is the
   point — any future "be permissive" change to the gate would have to
   delete a test case and survive review.
-- **`tests/unit/test_tar_aggregator.cpp`** — extended with 4 PR-A
+- **`tests/unit/test_echo_aggregator.cpp`** — extended with 4 PR-A
   cases (issue #547) pinning the
   `apply_source_enabled_transition()` helper and the
   `<source>_paused_at` semantics: enabled→disabled writes the
@@ -13583,7 +13583,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `service` / `user` paused_at). The four cases sit alongside the
   existing #539 retention-guard suite — same fixture pattern, same
   `yuzu::test::TempDbFile` shared helper.
-- **`tests/unit/test_tar_aggregator.cpp`** — original 4-case Catch2
+- **`tests/unit/test_echo_aggregator.cpp`** — original 4-case Catch2
   suite pinning the issue #539 retention guard. Reproduces the chaos-injector
   CHAOS-2 scenario (48 hourly rows seeded across a 48h window centred
   on the test's `now`, disable the source, run retention) and asserts
@@ -13592,12 +13592,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disabling one source does not pause retention on the others — so a
   future refactor cannot turn the per-source guard into a global
   switch without deleting a named test case. Adds
-  `agents/plugins/tar/src/tar_aggregator.cpp` to the TAR test
+  `agents/plugins/echo/src/echo_aggregator.cpp` to the Echo test
   executable's source list (the existing tests are schema-registry-only
   and did not exercise the rollup engine). Tests use
   `yuzu::test::TempDbFile` per the shared-helper convention in
   `tests/unit/test_helpers.hpp`.
-- **`tests/unit/test_tar_schema_registry.cpp`** — orphaned `lsof`
+- **`tests/unit/test_echo_schema_registry.cpp`** — orphaned `lsof`
   assertion fixed. The test on line 73 still expected the macOS TCP
   capture-method accept-list to contain `"lsof"`, but commit
   `5a41db5` corrected the registry to `"proc_pidfdinfo"` (matching
@@ -13661,7 +13661,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     sibling test files still managing their own RAII. Those four were
     already remediated in prior commits; the Gate 4 consistency audit
     caught the misattribution. The accurate 6-file list is now carried
-    in the TempDbFile entry below (`test_tar_store.cpp`,
+    in the TempDbFile entry below (`test_echo_store.cpp`,
     `test_api_token_store.cpp`, `test_management_group_store.cpp`,
     `test_settings_routes_users.cpp`, `test_guaranteed_state_store.cpp`,
     `test_plugin_loader.cpp`).
@@ -13708,7 +13708,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`yuzu_test_guardian_SHULGI$`, `yuzu_test_kv_SHULGI$`,
   `yuzu_test_reserved_plugin_<random>`, `yuzu_trigger_test`). Three
   test binaries (`yuzu_agent_tests.exe`, `yuzu_server_tests.exe`,
-  `yuzu_tar_tests.exe`) and two release binaries (`yuzu-agent.exe`,
+  `yuzu_echo_tests.exe`) and two release binaries (`yuzu-agent.exe`,
   `yuzu-server.exe`) are added to `ExclusionProcess` — Defender has
   been observed retaining handles on freshly-written `.obj` / `.pdb`
   siblings after these processes exit, contributing to the EBUSY
@@ -13841,7 +13841,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry the flake-#473 salt pattern (`std::hash<std::thread::id>` +
   `steady_clock::now()`, or a fresh `random_device` per construction)
   instead of the shared `yuzu::test::TempDbFile` helper:
-  `tests/unit/test_tar_store.cpp`,
+  `tests/unit/test_echo_store.cpp`,
   `tests/unit/server/test_api_token_store.cpp`,
   `tests/unit/server/test_management_group_store.cpp`,
   `tests/unit/server/test_settings_routes_users.cpp`,
@@ -15949,7 +15949,7 @@ the full set of changes between rc2 and final._
     `warning_level=3`. Compile logs dropped by dozens of lines per
     incremental build without a wrapper script in the way.
   - **Short test suite names.** `tests/meson.build` now attaches
-    `suite: 'agent' | 'server' | 'tar'` to each `test()` call, so
+    `suite: 'agent' | 'server' | 'echo'` to each `test()` call, so
     `meson test -C build-linux --suite server` works directly — no
     more guessing `"yuzu:server unit tests"` or `"unit tests"`.
   - **Stable top-level test binary paths.** New
@@ -16319,7 +16319,7 @@ development independently from the primary software changelog.
   - If neither `scope` nor `agent_ids` is provided, defaults to all agents (documented in tool description as a warning).
 
 #### Testing
-- **Puppeteer E2E test expanded** (`Synthetic-UAT-Puppeteer.js`) — 70 → 115 non-destructive commands. Cross-platform path support via `YUZU_AGENT_OS` env var. Added: `network_config dns_cache`, `network_actions ping/flush_dns`, `users group_members`, `filesystem search/search_dir/create_temp/create_temp_dir`, `vuln_scan cve_scan/config_scan/inventory`, `storage set/get/list`, `tags set/get/get_all/check/count`, `agent_actions set_log_level`, TAR extended, `chargen start/stop`, `wol check`, registry read-only (Windows), `windows_updates` extended.
+- **Puppeteer E2E test expanded** (`Synthetic-UAT-Puppeteer.js`) — 70 → 115 non-destructive commands. Cross-platform path support via `YUZU_AGENT_OS` env var. Added: `network_config dns_cache`, `network_actions ping/flush_dns`, `users group_members`, `filesystem search/search_dir/create_temp/create_temp_dir`, `vuln_scan cve_scan/config_scan/inventory`, `storage set/get/list`, `tags set/get/get_all/check/count`, `agent_actions set_log_level`, Echo extended, `chargen start/stop`, `wol check`, registry read-only (Windows), `windows_updates` extended.
 - **REST API command test expanded** (`scripts/uat-command-test.sh`) — 145 → 151 dispatches. Added: `agent_actions set_log_level`, `network_actions flush_dns`, `filesystem create_temp/create_temp_dir`, `interaction notify`. Removed destructive `status switch`.
 - **MCP Haiku subagent test framework** — stdio-to-HTTP MCP adapter (`scripts/mcp-http-adapter.js`), Claude Code agent definition (`.claude/agents/mcp-uat-tester.md`), and test harness (`scripts/e2e-mcp-haiku-test.sh`) that invokes Haiku to exercise all MCP tools end-to-end.
 - **15 `execute_instruction` unit tests** (`tests/unit/server/test_mcp_server.cpp`) — happy dispatch, null dispatch_fn, missing params, zero agents, default scope, explicit agent_ids, params forwarding, non-string params, read_only_mode, readonly/operator/supervised tier enforcement, audit trail on success and failure.
@@ -16352,7 +16352,7 @@ development independently from the primary software changelog.
 #### Testing
 - **Comprehensive MCP protocol test suite** (`scripts/e2e-mcp-test.sh`, 140 tests) — exercises all 22 read-only tools, 3 resources, 4 prompts, JSON-RPC protocol methods (initialize, ping, notifications), parameter validation, authentication enforcement, audit trail verification, Phase 2 write tool guards, response format validation, and sequential call state isolation.
 - **Expanded REST API E2E test suite** (`scripts/e2e-api-test.sh`, 153 tests) — 26 new sections covering execution statistics, help system, webhook/policy/workflow/instruction-set CRUD, YAML validation, approvals, execution lifecycle with response polling, notifications, agent properties, runtime config, analytics, NVD, inventory queries, directory/discovery, scope engine, 17 settings fragments, 5 dashboard fragments, SSE stream connectivity, static asset delivery, security header verification, MCP endpoint reachability, topology, statistics, license, software deployment, and patch management.
-- **Expanded plugin command test** (`scripts/uat-command-test.sh`, ~115 commands across 36 groups) — 12 new plugin groups: example plugin (ping/echo), asset tags, network actions, storage KV CRUD, tags CRUD, TAR extended (sql/configure), vulnerability scanning extended (scan/cve_scan/config_scan), Wake-on-LAN check, chargen traffic generation, HTTP client extended, certificates, and Windows update patch connectivity. Filesystem and IOC tests auto-detect Linux vs Windows and use appropriate paths.
+- **Expanded plugin command test** (`scripts/uat-command-test.sh`, ~115 commands across 36 groups) — 12 new plugin groups: example plugin (ping/echo), asset tags, network actions, storage KV CRUD, tags CRUD, Echo extended (sql/configure), vulnerability scanning extended (scan/cve_scan/config_scan), Wake-on-LAN check, chargen traffic generation, HTTP client extended, certificates, and Windows update patch connectivity. Filesystem and IOC tests auto-detect Linux vs Windows and use appropriate paths.
 
 #### Infrastructure
 - **Docker Compose local UAT stack** (`docker-compose.local.yml`, gitignored) — uses locally-built images (`yuzu-server:local`, `yuzu-gateway:local`) with full observability (Prometheus, Grafana, ClickHouse). Dashboards provisioned via Docker configs. Separate from `docker-compose.uat.yml` which references ghcr.io images for remote testers.
@@ -16421,7 +16421,7 @@ development independently from the primary software changelog.
 
 #### Server
 - ClickHouse analytics event drain with CLI configuration parameters
-- TAR data warehouse: typed SQLite tables, SQL query engine, rollup aggregation
+- Echo data warehouse: typed SQLite tables, SQL query engine, rollup aggregation
 - Instruction execute API endpoint for programmatic command dispatch
 - Rich Grafana dashboard templates for fleet analytics and observability
 - Ctrl+K command palette enabled on all dashboard pages
@@ -16735,7 +16735,7 @@ development independently from the primary software changelog.
 - HTTP client plugin (cpp-httplib, no shell) with SSRF protection
 - Content staging and execution (CreateProcessW/fork+execvp, no system())
 - Desktop user interaction: notifications, questions, surveys, DND mode (Windows)
-- Timeline Activity Record (TAR): persistent process tree, network, service, user session tracking
+- Echo: persistent process tree, network, service, user session tracking
 - OTA auto-update with hash verification and rollback
 - Bounded thread pool (4-32 workers, 1000 max queue) with output buffering
 - Windows certificate store integration (CryptoAPI/CNG)
@@ -16761,8 +16761,8 @@ development independently from the primary software changelog.
 - Eliminated 4 CRITICAL command injection vulnerabilities (replaced system()/popen() with safe alternatives)
 - mTLS for agent-server gRPC with certificate chain validation
 - PBKDF2 password hashing for local authentication
-- Command-line redaction in TAR (configurable patterns)
+- Command-line redaction in Echo (configurable patterns)
 - SSRF protection with private IP range blocking
 - Input validation on all REST API endpoints
 - Registry sensitive path audit logging
-- PRAGMA secure_delete on TAR database
+- PRAGMA secure_delete on Echo database

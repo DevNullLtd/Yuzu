@@ -142,7 +142,7 @@ CommandDedupStore::open(const std::filesystem::path& db_path) {
     // so this column must NEVER become a wall-clock retention cutoff (that would
     // reintroduce the clock-guarded-retention hazard on a user-controlled clock).
     // A `meta` table carries schema_version for a future migration ladder (the
-    // agent has no shared MigrationRunner; this mirrors tar_db's config-row
+    // agent has no shared MigrationRunner; this mirrors echo_db's config-row
     // precedent).
     const char* create_sql = R"(
         CREATE TABLE IF NOT EXISTS command_outcomes (

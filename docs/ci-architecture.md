@@ -839,10 +839,12 @@ the gateway source and rerunning the suite).
 
 The same run covers the **management hop**, server to gateway (`:50063`, the privileged command
 plane; the symptom of #5175 was every `SendCommand` reaching the server as `Socket closed`). The
-gateway's management listener runs in the production posture: strict mutual TLS
+gateway's management listener runs in the production posture except for the mode: strict mutual TLS
 (`verify_peer` + `fail_if_no_peer_cert`), `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1`, and
 `mgmt_peer_pins = [{cert_file, <server default-server.pem>}]` (the shipped form: the gateway pins that
-leaf's SPKI and requires `serverAuth`); the server is pointed at it with `--gateway-command-addr` and
+leaf's SPKI and requires `serverAuth`), plus `mgmt_peer_auth_mode = identity_or_pin`. The rig opts in to
+that mode (#6016); the shipped configs stay on `pin`, so the shipped `pin` configuration (resolved and judged by the real boot-guard functions) is covered by
+the eunit module `yuzu_gw_config_posture_tests`, not exercised on the real stack; the server is pointed at it with `--gateway-command-addr` and
 presents its own default leaf. Three layers check it. (1) The script dispatches `os_info.os_name` to
 the real agent through the server's REST API (admin login, `POST /api/command`, poll
 `/api/responses/{id}`): one round trip, then 300 commands, 16 at a time, whose streams all share the
@@ -850,7 +852,7 @@ server's single management connection; every one must return the agent's SUCCESS
 `yuzu_server_gateway_forward_total` must count all 301 as `ok` and none under any failure status (the
 REST per-IP limit is raised for this server with `--rate-limit 10000`; at the default 100 requests/s the
 limiter answers 429 for most of the burst and the commands never overlap). (2)
-`yuzu_gw_real_mgmt_SUITE` dials the listener itself: the pinned leaf is served; the gateway's own
+`yuzu_gw_real_mgmt_SUITE` dials the listener itself: the pinned leaf is served, and the server identity cases (#6016, in the `identity_or_pin` mode the script configures) are covered too: the real server leaf is admitted by identity, a renewed-key leaf and a same-key re-issue carrying the identity are served, and a leaf carrying another install's identity is refused; the gateway's own
 leaf and an enrolled agent's leaf, both valid certificates of the same CA, get `UNAUTHENTICATED` and
 move `yuzu_gw_mgmt_auth_rejected_total` by `pin_mismatch` and `missing_server_auth_eku`; a peer with
 no certificate gets no call; a command to the real agent returns its SUCCESS with output; 300
@@ -1020,10 +1022,10 @@ telemetry start step exports the same values for already-running listeners.
 Wee Tam's 4 runners are CCD-pinned, but affinity partitions only **cores** — not
 DRAM bandwidth, the disk, or the Defender minifilter. So when several Windows jobs
 run their **test** phase at the same time, the heavy unit-test suites
-(`server ~[pg]`/`[pg]`, `agent`, `tar`) slow roughly linearly and hit their meson
+(`server ~[pg]`/`[pg]`, `agent`, `echo`) slow roughly linearly and hit their meson
 timeouts: per-runner telemetry (`ci_test_suites`) measured `server ~[pg]` at
 c0≈289 s → c2≈467 s → c4≈603 s — a **guaranteed** timeout once ≥4 test phases
-overlap, and a 22–25 % timeout rate on the `server ~[pg]`/`tar` suites overall.
+overlap, and a 22–25 % timeout rate on the `server ~[pg]`/`echo` suites overall.
 `fork()`/VFS/page-cache and no AV minifilter keep Big Tam's (Linux) per-op cost
 lower than Wee Tam's — but a prior revision of this section claimed Big Tam
 "scales flat" and needed no gate at all, which was never actually true; see
@@ -1256,7 +1258,7 @@ within-job `--num-processes` pool was shared by ALL ~32 registered tests, not
 just the 8 pg shards: the Linux Test step ran one `meson test` invocation with
 no `--suite`/name filter at all. Fix: split the Test step into 3
 `flake-retry.py` invocations, cheap-first (fail-fast via `bash -e`) — 21 tests
-across 5 cheap suites (`agent`/`docs`/`proto`/`tar`/`gateway`) run first, then
+across 5 cheap suites (`agent`/`docs`/`proto`/`echo`/`gateway`) run first, then
 the 3 non-pg server tests, both uncapped (neither touches Postgres) — status as
 of that day; see "Within-job cap extended to the non-pg step" at the end of
 this section for what changed; the 8 pg
@@ -1538,7 +1540,7 @@ shard by under the 25% bar (a re-cut must cut the longest shard by more than a q
 and C 110.5 s (-15%), and moving `[pg][auth_db]` from pg M to B gives B 205.4 s
 and M 319.0 s (-17%). The pre-move shards were not re-run on Windows, so the
 pg move's own Windows effect is not measured; re-cut from the per-case
-durations the CI job summary now carries. The tar writer and drain spin bounds were not
+durations the CI job summary now carries. The echo writer and drain spin bounds were not
 measured on Windows either, and nothing here claims it.
 
 **Drift risk — automated (#3443 Phase 1, 2026-08-26):** this used to hardcode
@@ -1908,7 +1910,7 @@ triggers. A `priority:` on `gateway eunit` is a separate, later axis (Push 2b be
   the `Ok:`, `Fail:` and `Skipped:` lines: Ok 100, Fail 0, Skipped 5 for the first
   invocation and Ok 8 for the second.
 - Timeouts are not in the log: read `timeout:` in `tests/meson.build`. The ones
-  that matter: agent shards 240 s, `blocked log sink SIGTERM harness` 300 s, tar
+  that matter: agent shards 240 s, `blocked log sink SIGTERM harness` 300 s, echo
   90 s, `gateway eunit` and `gateway ct` 600 s.
 - Not usable: the step summaries are not exposed by the jobs API, the meson-logs
   artifact uploads only on failure, and the runner telemetry database does not
@@ -1926,7 +1928,7 @@ applied to this step: (a) the `Test (non-pg suites)` median improves by 10% or
 more (about 40 s); (b) no entry of 5 s or more at np=2 takes more than 1.5x the
 mean of its two np=2 times (shorter entries have no stable ratio); (c) no entry
 reaches 80% of its own meson timeout (480 s for `gateway eunit` and `gateway ct`,
-240 s for the harness, 192 s for an agent shard, 72 s for tar); and the entry
+240 s for the harness, 192 s for an agent shard, 72 s for echo); and the entry
 count (105) and skip count (5) are unchanged. Revert at once on any of: a spark or
 guardian case failing (a `spin_until` that never resolves, an
 `ArmOutcomeKind`/`ReceiptStatus` mismatch), even if a manual re-run is green

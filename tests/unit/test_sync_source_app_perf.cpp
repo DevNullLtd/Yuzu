@@ -1,5 +1,5 @@
 // app_perf daily-sync source (DEX app-perf-over-time B1) — pure agent-side
-// helpers: the rollup query shape, the TAR `sql`-action output parse, version
+// helpers: the rollup query shape, the Echo `sql`-action output parse, version
 // canon + sample-weighted merge, and the wire-blob render.
 
 #include <catch2/catch_test_macros.hpp>
@@ -19,18 +19,18 @@ using yuzu::agent::render_app_perf_blob;
 
 TEST_CASE("build_app_perf_query targets $ProcPerf_Hourly over the window", "[app_perf][agent]") {
     const std::string q = build_app_perf_query(86400, 259200); // [day1, day3)
-    CHECK(q.rfind("SELECT", 0) == 0); // tar sql validator: must start with SELECT
+    CHECK(q.rfind("SELECT", 0) == 0); // echo sql validator: must start with SELECT
     CHECK(q.find("$ProcPerf_Hourly") != std::string::npos);
     CHECK(q.find("hour_ts >= 86400") != std::string::npos);
     CHECK(q.find("hour_ts < 259200") != std::string::npos);
     CHECK(q.find("GROUP BY name, version") != std::string::npos);
-    CHECK(q.size() < 4096); // tar sql 4KB limit
+    CHECK(q.size() < 4096); // echo sql 4KB limit
 }
 
 TEST_CASE("build_app_perf_query excludes kernel-thread / Windows System rows",
           "[app_perf][agent]") {
     // Kernel threads (Linux PF_KTHREAD) and the Windows System process (pid 4)
-    // are recorded unfiltered into procperf_live/_hourly (the live TAR tier
+    // are recorded unfiltered into procperf_live/_hourly (the live Echo tier
     // keeps them by design); this daily rollup is the one place that excludes
     // them from the app-perf-over-time history sent to the server.
     const std::string q = build_app_perf_query(86400, 259200);

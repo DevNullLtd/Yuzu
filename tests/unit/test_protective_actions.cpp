@@ -37,16 +37,16 @@ TEST_CASE("is_protective_action: quarantine control set plus __guard__.push_rule
     CHECK_FALSE(is_protective_action("__guard__", "get_status"));
     CHECK_FALSE(is_protective_action("__guard__", "reconcile"));
     CHECK_FALSE(is_protective_action("__sync__", "now"));
-    CHECK_FALSE(is_protective_action("tar", "fleet_snapshot"));
+    CHECK_FALSE(is_protective_action("echo", "fleet_snapshot"));
     CHECK_FALSE(is_protective_action("asset_tags", "sync"));
-    CHECK_FALSE(is_protective_action("tar", "sql"));
+    CHECK_FALSE(is_protective_action("echo", "sql"));
     CHECK_FALSE(is_protective_action("", ""));
 }
 
 TEST_CASE("is_protective_action: exactly five pairs across the cross product",
           "[protective][security]") {
     int protective = 0;
-    for (const auto plugin : {"quarantine", "__guard__", "tar"}) {
+    for (const auto plugin : {"quarantine", "__guard__", "echo"}) {
         for (const auto action :
              {"quarantine", "unquarantine", "status", "whitelist", "push_rules", "sql"}) {
             if (is_protective_action(plugin, action))
@@ -59,7 +59,7 @@ TEST_CASE("is_protective_action: exactly five pairs across the cross product",
 TEST_CASE("plugin_owns_protective_actions: true exactly for plugins with a protective action",
           "[protective][security]") {
     // The tie between the two lists: fails if either drifts.
-    for (const auto plugin : {"quarantine", "Quarantine", "__guard__", "tar", "firewall", ""}) {
+    for (const auto plugin : {"quarantine", "Quarantine", "__guard__", "echo", "firewall", ""}) {
         bool any = false;
         for (const auto action :
              {"quarantine", "unquarantine", "status", "whitelist", "push_rules", "sql", ""})
