@@ -1187,7 +1187,23 @@ CREATE INDEX idx_gse_rule_time     ON guaranteed_state_events(rule_id, timestamp
 CREATE INDEX idx_gse_agent_time    ON guaranteed_state_events(agent_id, timestamp DESC);
 CREATE INDEX idx_gse_severity_time ON guaranteed_state_events(severity, timestamp DESC);
 CREATE INDEX idx_gse_time          ON guaranteed_state_events(timestamp DESC);
+
+-- Server compliance census, one row per (agent, rule). The foreign key (schema v3,
+-- #5674) makes a rule delete remove its census rows in the same statement, and makes
+-- the database refuse a census write for a rule that no longer exists (SQLSTATE 23503).
+CREATE TABLE guardian_agent_rule_status (
+    agent_id TEXT NOT NULL,
+    rule_id TEXT NOT NULL REFERENCES guaranteed_state_rules(rule_id) ON DELETE CASCADE,
+    state TEXT NOT NULL, updated_at TEXT NOT NULL,
+    PRIMARY KEY (agent_id, rule_id)
+);
 ```
+
+The census row is written in the same transaction as the event that causes it, under its own
+savepoint (`census_upsert`). A refused write (rule deleted) or a failed write rolls back to that
+savepoint and the event is kept; a failed write other than the foreign-key refusal is counted on
+`yuzu_server_guardian_census_proj_failures_total`. Redelivery of an event that is already stored
+returns before the census write and does not repair the census.
 
 ### 9.2 REST API endpoints
 
