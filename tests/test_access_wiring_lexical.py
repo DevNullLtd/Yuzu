@@ -39,6 +39,16 @@ Groups page (register_groups_routes block):
      else installs GET /groups or /static/yuzu-groups.js, and test_groups_page.cpp drives the
      registrar directly, so a deleted call would leave every unit test green.
 
+Engine Principals panel difference list (#5882; a doc-and-comment pin, not server.cpp wiring):
+
+  9. docs/user-manual/upgrading.md "Where the panel and the route differ" is the ONE canonical list.
+     It must be numbered 1..N without a gap, and the same count (as a word: SEVEN, seven) must be
+     stated by the handler comment in settings_routes.cpp, the comment in settings_routes.hpp and
+     the header of test_settings_engine_panel_authz.cpp; the handler comment must also number its
+     own items 1..N. The count and the numbering are cited by number from code, tests and four
+     manual pages, so a list that gains or loses an item without those following is a silent
+     drift (G8-32).
+
 `//` comments are stripped and whitespace collapsed before matching. Lexical only: it cannot see
 a relocation that keeps the tokens (review-enforced). The self-test applies in-memory mutations
 and fails loudly if a pattern goes stale.
@@ -52,6 +62,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SERVER_CPP = ROOT / "server" / "core" / "src" / "server.cpp"
+SETTINGS_CPP = ROOT / "server" / "core" / "src" / "settings_routes.cpp"
+SETTINGS_HPP = ROOT / "server" / "core" / "src" / "settings_routes.hpp"
+UPGRADING_MD = ROOT / "docs" / "user-manual" / "upgrading.md"
+PANEL_TEST = ROOT / "tests" / "unit" / "server" / "test_settings_engine_panel_authz.cpp"
 TAG = "test_access_wiring_lexical"
 HINT = (" (this gate pins the Access Users production wiring; if server.cpp was legitimately"
         " restructured, update tests/test_access_wiring_lexical.py)")
@@ -215,6 +229,70 @@ MUTATIONS = [
 ]
 
 
+# ── The Engine Principals panel's difference list (item 9) ────────────────────────────────────
+NUMBER_WORDS = {w: n for n, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve".split())}
+LIST_ANCHOR = "**Where the panel and the route differ, deliberately.**"
+
+
+def canonical_numbers(md):
+    """The item numbers of the canonical list, in order, or None when the anchor is missing.
+    The list is the run of top-level `N. ` lines between the anchor and the next bold paragraph;
+    indented sub-bullets and continuation lines are not items."""
+    lines = md.splitlines()
+    at = next((i for i, l in enumerate(lines) if l.startswith(LIST_ANCHOR)), None)
+    if at is None:
+        return None
+    out = []
+    for l in lines[at + 1:]:
+        if l.startswith("**"):
+            break
+        m = re.match(r"(\d+)\. ", l)
+        if m:
+            out.append(int(m.group(1)))
+    return out
+
+
+def count_word(text, pattern):
+    """The count a comment states, from the first match of `pattern` (group 1 is a number word),
+    or None when it is absent or not a number word."""
+    m = re.search(pattern, text)
+    return NUMBER_WORDS.get(m.group(1).lower()) if m else None
+
+
+def handler_comment_numbers(cpp):
+    """The `//  N.` item numbers of the settings handler's difference comment, in order."""
+    start = cpp.find("There are ")
+    end = cpp.find('sink.Get("/fragments/settings/engine-principals"', start)
+    if start < 0 or end < 0:
+        return None
+    return [int(m.group(1)) for m in re.finditer(r"^\s*//\s{1,3}(\d+)\. ", cpp[start:end], re.M)]
+
+
+def difference_list_problems(md, cpp, hpp, test_src):
+    nums = canonical_numbers(md)
+    if nums is None:
+        return ["upgrading.md no longer has the 'Where the panel and the route differ, deliberately.' list"]
+    n = len(nums)
+    out = []
+    if n == 0 or nums != list(range(1, n + 1)):
+        out.append(f"upgrading.md's difference list is not numbered 1..N without a gap (found {nums})")
+    for name, text, pattern in (
+        ("settings_routes.cpp handler comment", cpp, r"There are ([A-Za-z]+), listed once"),
+        ("settings_routes.hpp comment", hpp, r"its ([A-Za-z]+) differences"),
+        ("test_settings_engine_panel_authz.cpp header", test_src, r"They are ([A-Za-z]+), numbered here"),
+    ):
+        stated = count_word(text, pattern)
+        if stated is None:
+            out.append(f"{name} no longer states the difference count as a number word")
+        elif stated != n:
+            out.append(f"{name} says {stated} differences but upgrading.md lists {n}")
+    hn = handler_comment_numbers(cpp)
+    if hn is None or hn != list(range(1, n + 1)):
+        out.append(f"settings_routes.cpp handler comment does not number its items 1..{n} (found {hn})")
+    return out
+
+
 class AccessWiring(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -234,6 +312,66 @@ class AccessWiring(unittest.TestCase):
                 p = problems(mutated)
                 self.assertTrue(p, "mutation was NOT detected by the gate")
                 self.assertIn(expected, p[0])
+
+
+class DifferenceListCount(unittest.TestCase):
+    """Item 9: the canonical list's count and numbering match every place that states them."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.md = UPGRADING_MD.read_text(encoding="utf-8")
+        cls.cpp = SETTINGS_CPP.read_text(encoding="utf-8")
+        cls.hpp = SETTINGS_HPP.read_text(encoding="utf-8")
+        cls.test_src = PANEL_TEST.read_text(encoding="utf-8")
+
+    def test_counts_agree(self):
+        p = difference_list_problems(self.md, self.cpp, self.hpp, self.test_src)
+        for m in p:
+            print(f"\n::error::{TAG}: {m} (update the list in docs/user-manual/upgrading.md and the"
+                  " count in the three places that state it)", file=sys.stderr)
+        self.assertEqual(p, [])
+        # Not vacuous: the list has items and the real sources state a count.
+        self.assertGreaterEqual(len(canonical_numbers(self.md)), 1)
+
+    def test_mutations_are_caught(self):
+        def drop_item_7(md):
+            return re.sub(r"^7\. .*\n", "", md, count=1, flags=re.M)
+
+        def add_item_8(md):
+            return re.sub(r"(^7\. .*\n)", r"\g<1>" + "8. A new difference.\n", md, count=1, flags=re.M)
+
+        def gap(md):
+            return re.sub(r"^5\. ", "6. ", md, count=1, flags=re.M)
+
+        def lose_item_3(cpp):
+            at = cpp.index("There are ")  # the item numbers are matched only after this marker
+            head, tail = cpp[:at], cpp[at:]
+            return head + re.sub(r"^\s*//\s{1,3}3\. ", "    //     x ", tail, count=1, flags=re.M)
+
+        cases = [
+            ("drop item 7 of the canonical list", (drop_item_7(self.md), self.cpp, self.hpp, self.test_src),
+             "says 7 differences but upgrading.md lists 6"),
+            ("add an item 8 to the canonical list", (add_item_8(self.md), self.cpp, self.hpp, self.test_src),
+             "says 7 differences but upgrading.md lists 8"),
+            ("renumber so the list has a gap", (gap(self.md), self.cpp, self.hpp, self.test_src),
+             "not numbered 1..N"),
+            ("handler comment says SIX", (self.md, self.cpp.replace("There are SEVEN,", "There are SIX,", 1),
+                                          self.hpp, self.test_src), "handler comment says 6"),
+            ("hpp comment says six", (self.md, self.cpp, self.hpp.replace("its seven differences", "its six differences", 1),
+                                      self.test_src), "settings_routes.hpp comment says 6"),
+            ("test header says EIGHT", (self.md, self.cpp, self.hpp,
+                                        self.test_src.replace("They are SEVEN,", "They are EIGHT,", 1)),
+             "header says 8"),
+            ("handler comment loses item 3", (self.md, lose_item_3(self.cpp), self.hpp, self.test_src),
+             "does not number its items"),
+            ("anchor renamed", (self.md.replace("Where the panel and the route differ, deliberately.", "Differences.", 1),
+                                self.cpp, self.hpp, self.test_src), "no longer has"),
+        ]
+        for name, args, expected in cases:
+            with self.subTest(mutation=name):
+                p = difference_list_problems(*args)
+                self.assertTrue(p, "mutation was NOT detected by the gate")
+                self.assertTrue(any(expected in m for m in p), f"{expected!r} not in {p}")
 
 
 if __name__ == "__main__":
