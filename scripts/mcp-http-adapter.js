@@ -8,12 +8,11 @@
 // Usage:
 //   YUZU_MCP_URL=http://localhost:8080/mcp/v1/ YUZU_MCP_TOKEN=<token> node scripts/mcp-http-adapter.js
 //
-// Or with session cookie auth:
-//   YUZU_MCP_COOKIE="yuzu_session=<cookie>" node scripts/mcp-http-adapter.js
-//
-// When YUZU_MCP_COOKIE is set, every request carries a Referer naming the
-// server's own origin, so cookie-session writes are same-site. Token-only use
-// sends no Referer.
+// Authentication is a bearer token that carries an MCP tier (readonly, operator
+// or supervised): mint one with POST /api/v1/tokens (set mcp_tier and
+// expires_at). The server refuses a session cookie, and an API token minted
+// without mcp_tier, at /mcp/v1/ with HTTP 403 and JSON-RPC code -32003, so this
+// adapter has no cookie mode. The adapter sends only the Authorization header.
 
 const http = require('http');
 const https = require('https');
@@ -21,7 +20,12 @@ const { URL } = require('url');
 
 const MCP_URL = process.env.YUZU_MCP_URL || 'http://localhost:8080/mcp/v1/';
 const MCP_TOKEN = process.env.YUZU_MCP_TOKEN || '';
-const MCP_COOKIE = process.env.YUZU_MCP_COOKIE || '';
+
+if (process.env.YUZU_MCP_COOKIE) {
+  process.stderr.write(
+    '[mcp-adapter] YUZU_MCP_COOKIE is ignored: /mcp/v1/ refuses session cookies. ' +
+    'Set YUZU_MCP_TOKEN to an API token minted with an mcp_tier.\n');
+}
 
 const url = new URL(MCP_URL);
 const transport = url.protocol === 'https:' ? https : http;
@@ -34,10 +38,6 @@ function forward(jsonRpcRequest) {
       'Content-Length': Buffer.byteLength(body),
     };
     if (MCP_TOKEN) headers['Authorization'] = `Bearer ${MCP_TOKEN}`;
-    if (MCP_COOKIE) {
-      headers['Cookie'] = MCP_COOKIE;
-      headers['Referer'] = `${url.origin}/`;
-    }
 
     const opts = {
       hostname: url.hostname,
