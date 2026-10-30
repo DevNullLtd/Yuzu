@@ -252,24 +252,52 @@ std::size_t find_live_call(const std::string& src, const std::string& call) {
 }
 } // namespace
 
-// #4309: /mcp/v1/ admission. admit() (mcp_admission.hpp) is unit-tested on its own, but nothing
-// else exercises ServerImpl, so deleting or commenting out the call in the MCP auth lambda would
-// leave every admit() case green while the real server serves tierless cookie sessions on all
-// three verbs. The live call must sit in the lines following the register_routes literal (the
-// auth lambda is its first argument); a commented-out call does not begin its line, so it fails.
-TEST_CASE("mcp route registration: wiring -- the MCP auth lambda calls admit() after "
-          "register_routes(",
+// #4309: /mcp/v1/ admission. The admission BEHAVIOUR (all three verbs, through the real routes)
+// is driven in test_mcp_admission.cpp via mcp::make_admission_auth_fn, but nothing else exercises
+// ServerImpl, so this source check pins that server.cpp builds register_routes' auth hook with
+// that factory: the live factory call is the first argument (only `*web_server_,` and comment
+// lines may sit between the literal and it, so an `#if` guard shows up as extra code), the
+// inline mcp::admit( of the earlier shape is gone so the gate has exactly one place, and there
+// is exactly one factory call. A commented-out call does not begin its line, so it fails.
+TEST_CASE("mcp route registration: wiring -- server.cpp builds the MCP auth hook with "
+          "make_admission_auth_fn as register_routes' first argument",
           "[server][routes][mcp][authz][4309]") {
     std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
     REQUIRE(in.is_open());
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-    const auto reg = find_live_call(src, "mcp_server_->register_routes(");
+    const std::string reg_literal = "mcp_server_->register_routes(";
+    const auto reg = find_live_call(src, reg_literal);
     REQUIRE(reg != std::string::npos);
-    // The auth lambda is the first argument, so the call is within a short window of the literal.
-    const auto window = src.substr(reg, 2500);
-    CHECK(find_live_call(window, "if (!mcp::admit(") != std::string::npos);
-    // The lambda must hand admit() the session require_auth resolved, not skip the resolution.
-    CHECK(find_live_call(window, "auto sess = require_auth(req, res);") != std::string::npos);
+    const auto after_reg = reg + reg_literal.size();
+    const auto factory = find_live_call(src.substr(after_reg), "mcp::make_admission_auth_fn(");
+    REQUIRE(factory != std::string::npos);
+    // Everything between the literal and the factory call, comment lines dropped.
+    const std::string between = src.substr(after_reg, factory);
+    std::string code;
+    for (std::size_t pos = 0; pos < between.size();) {
+        auto eol = between.find('\n', pos);
+        if (eol == std::string::npos)
+            eol = between.size();
+        const auto line = between.substr(pos, eol - pos);
+        const auto first = line.find_first_not_of(" \t");
+        if (first != std::string::npos && line.compare(first, 2, "//") != 0)
+            code += line.substr(first);
+        pos = eol + 1;
+    }
+    CHECK(code == "*web_server_,");
+    // One place, not two: the inline admit() of the earlier shape must be gone.
+    CHECK(find_live_call(src, "if (!mcp::admit(") == std::string::npos);
+    CHECK(find_live_call(src, "mcp::admit(") == std::string::npos);
+    // Exactly one live factory call site in server.cpp.
+    std::size_t live_count = 0;
+    for (auto at = src.find("mcp::make_admission_auth_fn("); at != std::string::npos;
+         at = src.find("mcp::make_admission_auth_fn(", at + 1)) {
+        const auto bol = src.rfind('\n', at);
+        const auto from = bol == std::string::npos ? 0 : bol + 1;
+        if (src.find_first_not_of(" \t", from) == at)
+            ++live_count;
+    }
+    CHECK(live_count == 1);
 }
 
 TEST_CASE("mcp route registration: wiring -- server.cpp wires the software sync runner before "

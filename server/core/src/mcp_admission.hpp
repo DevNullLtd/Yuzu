@@ -15,16 +15,22 @@
 /// tier at mint (`validate_engine_mint`), so a tierless engine credential is an
 /// unreachable corrupt row and refusing it is fail-closed, not a regression.
 ///
-/// Placement: `admit()` runs inside the MCP auth lambda that server.cpp hands to
-/// `McpServer::register_routes`, which fans out to all three verbs, so `McpServer`
+/// Placement: `admit()` runs inside the auth hook that server.cpp builds with
+/// `make_admission_auth_fn()` and hands to `McpServer::register_routes`, which fans
+/// out to all three verbs, so `McpServer`
 /// and its unit fixture stay untouched. The per-tool `mcp_tier.empty()` guards in
 /// mcp_server.cpp and the empty-tier branches in mcp_policy.hpp remain as defence
 /// in depth.
 ///
-/// ONE entry point: `admit()` performs the refusal (audit row + counter + A4
-/// response) and returns whether the request is admitted. Do not split the three
-/// effects across call sites; the wiring tripwire in test_mcp_route_registration.cpp
-/// pins the live `admit(` call in server.cpp.
+/// `admit()` performs the refusal (audit row + counter + A4 response) and returns
+/// whether the request is admitted; do not split the three effects across call sites.
+/// `make_admission_auth_fn()` is the ONE place production composes it with the session
+/// resolver; server.cpp passes its result to `register_routes`. test_mcp_admission.cpp
+/// drives the real routes through that factory on all three verbs, and a source check in
+/// test_mcp_route_registration.cpp pins that server.cpp builds its auth hook with it.
+///
+/// A non-empty tier is NOT validated here: an unknown tier ("bogus") is admitted and
+/// the downstream `tier_allows` gate decides what it may do.
 ///
 /// Wire contract (frozen; docs, scripts and tests quote these strings verbatim):
 ///   HTTP 403, JSON-RPC code kPermissionDenied (-32003), id null, A4 error.data with
@@ -45,8 +51,10 @@
 #include <yuzu/server/auth.hpp>
 
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace yuzu::server::mcp {
 
@@ -126,6 +134,34 @@ inline void write_tier_required(httplib::Response& res, const std::string& cid) 
     }
     write_tier_required(res, cid);
     return false;
+}
+
+/// Same shape as `McpServer::AuthFn` (spelled out so this header does not depend on
+/// mcp_server.hpp).
+using AdmissionAuthFn =
+    std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
+
+/// The PRODUCTION auth hook for /mcp/v1/: wraps the server's session resolver with
+/// admission. The returned callable resolves the session via `require_auth` (which has
+/// already written its own 401 on failure), then runs `admit()` against the SAME request,
+/// response and resolved session; a refusal yields nullopt (the 403 is already written),
+/// an admitted request yields the session. server.cpp passes the result as
+/// `register_routes`' auth hook, so all three verbs share this one gate; a harness that
+/// passes a bare resolver lacks the rule. `audit` and `metrics` are captured once at
+/// registration and must outlive the registered routes.
+[[nodiscard]] inline AdmissionAuthFn make_admission_auth_fn(AdmissionAuthFn require_auth,
+                                                            AdmissionAuditFn audit,
+                                                            yuzu::MetricsRegistry* metrics) {
+    return [require_auth = std::move(require_auth), audit = std::move(audit),
+            metrics](const httplib::Request& req,
+                     httplib::Response& res) -> std::optional<auth::Session> {
+        auto session = require_auth(req, res);
+        if (!session)
+            return std::nullopt;
+        if (!admit(*session, req, res, audit, metrics))
+            return std::nullopt;
+        return session;
+    };
 }
 
 } // namespace yuzu::server::mcp

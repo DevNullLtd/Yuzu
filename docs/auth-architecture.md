@@ -883,9 +883,9 @@ by each handler.
   plus a separate list of tools added after it (today two), legal only for a tool
   whose REST twin is `kRequired`, which a compile-time check ties to the REST
   table. Every pending tool with a `kRequired` twin is pending because no MCP
-  consumer enforces `kRequired` yet. PR 2 promotes pending rows; an MCP `kRequired` row will need a
-  design for the approval primitive first, because `decide_step_up` passes
-  an `mcp_token` caller unconditionally.
+  consumer enforces `kRequired` yet. PR 2 promotes pending rows; how it resolves the MCP rows
+  (no MCP `kRequired` row, because `decide_step_up` passes an `mcp_token`
+  caller unconditionally) is the decision recorded in the next bullet.
 - **Decision for the MCP arm (#6306, recorded 2026-10-29 for #6305 PR 2; a
   decision record, no code change).** The MCP arm of this chokepoint is not
   MFA step-up. An MCP caller presents a bearer credential with no browser

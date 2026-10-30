@@ -45,7 +45,34 @@ COOKIE_JAR=$(mktemp /tmp/yuzu-e2e-cookies.XXXXXX)
 RESP_BODY=$(mktemp /tmp/yuzu-e2e-body.XXXXXX)
 RESP_HEADERS=$(mktemp /tmp/yuzu-e2e-headers.XXXXXX)
 
+# Name of the section-34 MCP control token ("" until it is minted). The exit trap
+# revokes any live token carrying this name, so the control token is revoked even
+# when its id was never captured (the create reply has no token_id) or the run
+# aborts before the in-line revoke.
+MCP_CTL_LABEL=""
+
 cleanup() {
+    if [[ -n "$MCP_CTL_LABEL" ]]; then
+        local listed tid code
+        listed=$(curl -s -m 10 -b "$COOKIE_JAR" "${SERVER_URL}/api/v1/tokens" 2>/dev/null \
+            | python3 -c '
+import json, sys
+try:
+    for t in json.load(sys.stdin).get("data", []):
+        if t.get("name") == sys.argv[1] and not t.get("revoked"):
+            print(t["token_id"])
+except Exception:
+    pass
+' "$MCP_CTL_LABEL" 2>/dev/null) || listed=""
+        for tid in $listed; do
+            code=$(curl -s -m 10 -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+                -H "Origin: ${SITE_ORIGIN:-$SERVER_URL}" \
+                -X DELETE "${SERVER_URL}/api/v1/tokens/${tid}" 2>/dev/null) || code="000"
+            if [[ "$code" != "200" ]]; then
+                echo "WARNING: could not revoke e2e MCP control token id=${tid} (HTTP ${code}); revoke it by hand" >&2
+            fi
+        done
+    fi
     rm -f "$COOKIE_JAR" "$RESP_BODY" "$RESP_HEADERS"
 }
 trap cleanup EXIT

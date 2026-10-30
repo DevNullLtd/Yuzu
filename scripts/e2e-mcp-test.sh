@@ -55,18 +55,49 @@ COOKIE_JAR=$(mktemp /tmp/yuzu-mcp-cookies.XXXXXX)
 RESP_BODY=$(mktemp /tmp/yuzu-mcp-body.XXXXXX)
 
 # Tokens minted by this run (ids), revoked on exit. MCP_TOKEN is the supervised
-# bearer token every MCP call uses.
+# bearer token every MCP call uses. Every token this run mints is named
+# "${TOKEN_NAME_PREFIX}<suffix>", so the exit trap can also revoke by name when an
+# id was never captured (the create reply carries no token_id). The trailing "-"
+# keeps the prefix from matching another run's pid, e.g. e2e-mcp-12- vs e2e-mcp-123-.
+TOKEN_NAME_PREFIX="e2e-mcp-$$-"
 MINTED_TOKEN_IDS=()
 MCP_TOKEN=""
 
+# _revoke_token_id ID: DELETE over the cookie session (a cookie-session write, so
+# it carries the same-site Referer). A status other than 200 prints one stderr
+# WARNING naming the id (a short display id, never the secret). Never fails.
+_revoke_token_id() {
+    local code
+    code=$(curl -s -m 10 -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+        -H "Referer: $MCP_REFERER" \
+        -X DELETE "${API_TOKENS_URL}/$1" 2>/dev/null) || code="000"
+    if [[ "$code" != "200" ]]; then
+        echo "WARNING: could not revoke e2e token id=$1 (HTTP $code); revoke it by hand" >&2
+    fi
+    return 0
+}
+
 cleanup() {
-    # Revoke over the cookie session (a cookie-session write: same-site Referer).
     # Best effort; the exit status of the script must not depend on it.
     local tid
     for tid in ${MINTED_TOKEN_IDS[@]+"${MINTED_TOKEN_IDS[@]}"}; do
-        curl -s -m 10 -o /dev/null -b "$COOKIE_JAR" \
-            -H "Referer: $MCP_REFERER" \
-            -X DELETE "${API_TOKENS_URL}/${tid}" 2>/dev/null || true
+        _revoke_token_id "$tid"
+    done
+    # Then by name prefix: covers a token whose id lookup came back empty. A list
+    # that fails (server down, session gone) yields no ids and is tolerated.
+    local listed
+    listed=$(curl -s -m 10 -b "$COOKIE_JAR" "$API_TOKENS_URL" 2>/dev/null \
+        | python3 -c '
+import json, sys
+try:
+    for t in json.load(sys.stdin).get("data", []):
+        if t.get("name", "").startswith(sys.argv[1]) and not t.get("revoked"):
+            print(t["token_id"])
+except Exception:
+    pass
+' "$TOKEN_NAME_PREFIX" 2>/dev/null) || listed=""
+    for tid in $listed; do
+        _revoke_token_id "$tid"
     done
     rm -f "$COOKIE_JAR" "$RESP_BODY"
 }
@@ -257,20 +288,22 @@ log "Authenticated as $ADMIN_USER"
 # Mints an API token over the cookie session and sets MINT_STATUS, MINTED_RAW
 # and MINTED_ID. This is a cookie-session write, so it carries the same-site
 # Referer. The create reply holds the raw secret but no token_id, so the id is
-# found by listing the caller's tokens by name. A tiered token needs a future
-# expires_at (at most 90 days out); an untiered token is minted non-expiring.
-# Every minted id is revoked by the EXIT trap.
+# found by listing the caller's tokens by name. Every token gets a 24h expires_at
+# (a tiered token requires one, at most 90 days out; an untiered token accepts
+# one), so a token that outlives a crashed run still dies on its own. Every
+# minted id is revoked by the EXIT trap, which also sweeps by TOKEN_NAME_PREFIX.
 MINT_STATUS=""
 MINTED_RAW=""
 MINTED_ID=""
 mint_api_token() {
     local name="$1" tier="${2:-}"
-    local payload
+    local payload expires_at
+    expires_at=$(( $(date +%s) + 86400 ))
     if [[ -n "$tier" ]]; then
         payload=$(printf '{"name":"%s","mcp_tier":"%s","expires_at":%d}' \
-            "$name" "$tier" "$(( $(date +%s) + 86400 ))")
+            "$name" "$tier" "$expires_at")
     else
-        payload=$(printf '{"name":"%s"}' "$name")
+        payload=$(printf '{"name":"%s","expires_at":%d}' "$name" "$expires_at")
     fi
 
     MINTED_RAW=""
@@ -310,7 +343,7 @@ except Exception:
 # Every MCP call below sends this supervised token and no cookie. Supervised is
 # required: section 12c asserts the approver_assurance_required: prefix, which an
 # operator-tier token never reaches (Approval:Approve fails tier_allows first).
-mint_api_token "e2e-mcp-$$" "supervised"
+mint_api_token "${TOKEN_NAME_PREFIX}supervised" "supervised"
 if [[ "$MINT_STATUS" != "201" || -z "$MINTED_RAW" || -z "$MINTED_ID" ]]; then
     echo "FATAL: could not mint a supervised MCP token (HTTP $MINT_STATUS, token_id='$MINTED_ID')"
     exit 1
@@ -870,13 +903,30 @@ assert_eq "cookie session refusal carries JSON-RPC code -32003" "-32003" "$(erro
 assert_contains "cookie session refusal names the tier requirement" \
     "/mcp/v1/ requires an MCP-tier bearer token" "$MCP_BODY"
 
+# 10b.1b The precedence trap: a valid session cookie sent TOGETHER with the valid
+# supervised Bearer token is still refused. Session resolution reads a live cookie
+# before the Authorization header, so the request is classed as the cookie session
+# (no MCP tier) and the token is never consulted. This pins that documented
+# precedence, which is why every other MCP call in this script sends no cookie.
+MCP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
+    -b "$COOKIE_JAR" \
+    -H "Referer: $MCP_REFERER" \
+    -H "Authorization: Bearer $MCP_TOKEN" \
+    -X POST -H "Content-Type: application/json" \
+    -d '{"jsonrpc":"2.0","method":"ping","id":1}' \
+    "$MCP_URL" 2>/dev/null) || MCP_STATUS="000"
+MCP_BODY=$(cat "$RESP_BODY" 2>/dev/null || echo "")
+assert_eq "cookie + valid supervised Bearer POST ping → 403 (cookie wins)" "403" "$MCP_STATUS"
+assert_eq "cookie + Bearer refusal carries JSON-RPC code -32003" "-32003" "$(error_code)"
+
 # 10b.2 An API token minted WITHOUT mcp_tier is refused the same way.
-mint_api_token "e2e-mcp-tierless-$$"
-TESTS=$((TESTS + 1))
+mint_api_token "${TOKEN_NAME_PREFIX}tierless"
+TIERLESS_TOKEN=""
 if [[ "$MINT_STATUS" == "201" && -n "$MINTED_RAW" ]]; then
+    TIERLESS_TOKEN="$MINTED_RAW"
     pass "tierless API token minted (HTTP 201)"
     TIERLESS_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
-        -H "Authorization: Bearer $MINTED_RAW" \
+        -H "Authorization: Bearer $TIERLESS_TOKEN" \
         -X POST -H "Content-Type: application/json" \
         -d '{"jsonrpc":"2.0","method":"ping","id":1}' \
         "$MCP_URL" 2>/dev/null) || TIERLESS_STATUS="000"
@@ -885,6 +935,36 @@ if [[ "$MINT_STATUS" == "201" && -n "$MINTED_RAW" ]]; then
     assert_eq "tierless API token refusal carries JSON-RPC code -32003" "-32003" "$(error_code)"
 else
     fail "tierless API token could not be minted (HTTP $MINT_STATUS)"
+fi
+# The token's id is needed to revoke it. An empty lookup is a failure; the exit
+# trap still revokes it by name prefix.
+if [[ -n "$MINTED_ID" ]]; then
+    pass "tierless API token id located for revocation"
+else
+    fail "tierless API token id could not be located (the exit trap revokes by name prefix)"
+fi
+
+# 10b.2b GET and DELETE are refused the same way, before any session-id check.
+# Both answer 405 under --mcp-no-streaming, so first probe for streaming with the
+# supervised token and no session id: streaming on answers 400 (session id
+# required), streaming off 405. Anything else, or no tierless token, skips.
+if [[ -n "$TIERLESS_TOKEN" ]]; then
+    STREAM_PROBE=$(curl -s -m 10 -o /dev/null -w "%{http_code}" \
+        -H "Authorization: Bearer $MCP_TOKEN" \
+        "$MCP_URL" 2>/dev/null) || STREAM_PROBE="000"
+    if [[ "$STREAM_PROBE" == "400" ]]; then
+        for verb in GET DELETE; do
+            VERB_STATUS=$(curl -s -m 10 -o "$RESP_BODY" -w "%{http_code}" \
+                -H "Authorization: Bearer $TIERLESS_TOKEN" \
+                -X "$verb" "$MCP_URL" 2>/dev/null) || VERB_STATUS="000"
+            MCP_BODY=$(cat "$RESP_BODY" 2>/dev/null || echo "")
+            assert_eq "tierless API token $verb (no session id) → 403" "403" "$VERB_STATUS"
+            assert_eq "tierless API token $verb refusal carries JSON-RPC code -32003" \
+                "-32003" "$(error_code)"
+        done
+    else
+        log "  (skipping GET/DELETE tierless checks: streaming probe returned $STREAM_PROBE, not 400; --mcp-no-streaming?)"
+    fi
 fi
 
 # 10b.3 Control: the supervised token (Bearer only, no cookie) is admitted.

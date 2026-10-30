@@ -51,14 +51,46 @@ done
 SESSION_COOKIE=""
 MCP_TOKEN=""
 MCP_TOKEN_ID=""
+# The token is named "${MCP_TOKEN_NAME_PREFIX}token". The exit trap revokes by id
+# and, as a fallback, every live token whose name starts with the prefix (the
+# create reply has no token_id, so the id lookup can come back empty). The
+# trailing "-" keeps the prefix from matching another run's pid.
+MCP_TOKEN_NAME_PREFIX="e2e-mcp-haiku-$$-"
 SITE_REFERER="$(sed -E 's,^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#@]*@)?([^/?#]*).*,\1\3,' <<< "$SERVER_URL")/"
 
+# _revoke_token_id ID: cookie-session write, so it carries the same-site Referer.
+# A status other than 200 prints one stderr WARNING naming the id (a short display
+# id, never the secret). Never fails.
+_revoke_token_id() {
+    local code
+    code=$(curl -s -m 10 -o /dev/null -w "%{http_code}" -b "yuzu_session=$SESSION_COOKIE" \
+        -H "Referer: $SITE_REFERER" \
+        -X DELETE "$SERVER_URL/api/v1/tokens/$1" 2>/dev/null) || code="000"
+    if [ "$code" != "200" ]; then
+        echo "WARNING: could not revoke MCP token id=$1 (HTTP $code); revoke it by hand" >&2
+    fi
+    return 0
+}
+
 cleanup() {
-    if [ -n "$MCP_TOKEN_ID" ] && [ -n "$SESSION_COOKIE" ]; then
-        # Cookie-session write: carries the same-site Referer. Best effort.
-        curl -s -m 10 -o /dev/null -b "yuzu_session=$SESSION_COOKIE" \
-            -H "Referer: $SITE_REFERER" \
-            -X DELETE "$SERVER_URL/api/v1/tokens/$MCP_TOKEN_ID" >/dev/null 2>&1 || true
+    if [ -n "$SESSION_COOKIE" ]; then
+        local tid listed
+        if [ -n "$MCP_TOKEN_ID" ]; then
+            _revoke_token_id "$MCP_TOKEN_ID"
+        fi
+        listed=$(curl -s -m 10 -b "yuzu_session=$SESSION_COOKIE" "$SERVER_URL/api/v1/tokens" 2>/dev/null \
+            | python3 -c '
+import json, sys
+try:
+    for t in json.load(sys.stdin).get("data", []):
+        if t.get("name", "").startswith(sys.argv[1]) and not t.get("revoked"):
+            print(t["token_id"])
+except Exception:
+    pass
+' "$MCP_TOKEN_NAME_PREFIX" 2>/dev/null) || listed=""
+        for tid in $listed; do
+            _revoke_token_id "$tid"
+        done
     fi
     if $DO_TEARDOWN; then
         echo -e "\n${CYAN}Tearing down UAT stack...${NC}"
@@ -134,7 +166,7 @@ echo -e "${GREEN}${AGENT_COUNT} agent(s) connected${NC}"
 # where Execution:Execute is auto-approved. YUZU_MCP_TIER=supervised exercises the
 # approval-ticket path instead (the agent's Phase 3 will then stop at tickets).
 MCP_TIER="${YUZU_MCP_TIER:-operator}"
-MCP_TOKEN_NAME="e2e-mcp-haiku-$$"
+MCP_TOKEN_NAME="${MCP_TOKEN_NAME_PREFIX}token"
 MINT_BODY=$(mktemp /tmp/yuzu-mcp-haiku-mint.XXXXXX)
 MINT_STATUS=$(curl -s -m 10 -o "$MINT_BODY" -w "%{http_code}" \
     -b "yuzu_session=$SESSION_COOKIE" \
@@ -168,6 +200,10 @@ if [ "$MINT_STATUS" != "201" ] || [ -z "$MCP_TOKEN" ]; then
     exit 1
 fi
 echo -e "${GREEN}Minted ${MCP_TIER} MCP token${NC}"
+if [ -z "$MCP_TOKEN_ID" ]; then
+    echo -e "${YELLOW}WARNING: minted token '${MCP_TOKEN_NAME}' but could not look up its id." \
+            "It will be revoked by name prefix on exit; if that fails, revoke it by hand.${NC}" >&2
+fi
 
 # ── Run the Haiku agent ──────────────────────────────────────────────────
 

@@ -1819,7 +1819,7 @@ if build_server
       'unit/server/test_dashboard_destructive_gate.cpp', # PR6.0b: the same gate wired into POST /api/dashboard/execute
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_route_registration.cpp', # #2542 PR-6: McpServer register_routes(HttpRouteSink&, ...) seam — registration shape + kill-switch-before-auth ordering + server.cpp wiring tripwire
-      'unit/server/test_mcp_admission.cpp', # #4309: /mcp/v1/ refuses an empty-tier credential — predicate matrix + admit() effects (audit/counter/envelope)
+      'unit/server/test_mcp_admission.cpp', # #4309: /mcp/v1/ refuses an empty-tier credential - predicate matrix, admit() effects, and the real routes behind make_admission_auth_fn on all three verbs
       'unit/server/test_mcp_server.cpp',
       'unit/server/test_mcp_session.cpp',
       'unit/server/test_mcp_stream.cpp',

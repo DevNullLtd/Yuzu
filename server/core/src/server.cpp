@@ -22412,24 +22412,19 @@ private:
             mcp_server_->register_routes(
                 *web_server_,
                 // #4309: credential-class admission. Every MCP verb resolves its
-                // session here, so refusing an empty tier in this lambda covers GET,
-                // POST and DELETE before any JSON-RPC parse. admit() performs the
-                // refusal (audit + counter + 403) itself; see mcp_admission.hpp.
-                [this](const httplib::Request& req, httplib::Response& res)
-                    -> std::optional<auth::Session> {
-                    auto sess = require_auth(req, res);
-                    if (!sess)
-                        return std::nullopt;
-                    const auto mcp_admission_audit =
-                        [this](const httplib::Request& r, const std::string& action,
-                               const std::string& result, const std::string& target_type,
-                               const std::string& target_id, const std::string& detail) -> bool {
-                        return audit_log(r, action, result, target_type, target_id, detail);
-                    };
-                    if (!mcp::admit(*sess, req, res, mcp_admission_audit, &metrics_))
-                        return std::nullopt;
-                    return sess;
-                },
+                // session through this one hook, so refusing an empty tier here covers
+                // GET, POST and DELETE before any JSON-RPC parse. The factory resolves
+                // the session, then runs admit() (audit + counter + 403) on the same
+                // request; see mcp_admission.hpp. This is the only call site.
+                mcp::make_admission_auth_fn(
+                    [this](const httplib::Request& req, httplib::Response& res)
+                        -> std::optional<auth::Session> { return require_auth(req, res); },
+                    [this](const httplib::Request& req, const std::string& action,
+                           const std::string& result, const std::string& target_type,
+                           const std::string& target_id, const std::string& detail) -> bool {
+                        return audit_log(req, action, result, target_type, target_id, detail);
+                    },
+                    &metrics_),
                 [this](const httplib::Request& req, httplib::Response& res, const std::string& type,
                        const std::string& op) -> bool {
                     return require_permission(req, res, type, op);
