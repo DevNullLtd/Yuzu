@@ -928,7 +928,17 @@ message ReattachResponse {
      CAS, `server/core/src/gateway_route_store.hpp` and its FORWARD NOTE), extracted into one shared
      function and called from both RPCs. Never a second copy. Whatever ADR-0074 decides about
      cluster affinity (its Conflict 1) therefore applies to both RPCs at once;
-  6. install the `AgentSession` from the record, the adopted session id and `observed_peer`.
+  6. install the `AgentSession` through `AgentRegistry::register_agent`, from an `AgentInfo`
+     rebuilt from the record, with the adopted session id and `observed_peer`. Because the install
+     runs the same code as a Register:
+     - `plugin_names`, `plugin_meta` and `legacy_echo_wire_name` are derived from the stored
+       PluginInfo list exactly as at registration, including the pre-rename `tar` to `echo`
+       normalisation (`agent_registry.cpp`);
+     - the stored scopable tags go through the same ingest validation, including dropping a
+       self-reported `service` key (#3295), and are treated as a fresh Register treats them.
+       `TagStore` stays the authority wherever it has a row for the agent; the record's copy is only
+       the in-memory fallback a gateway-proxied session already has. Reattach never writes to
+       `TagStore`, so it never re-creates a tag an operator removed there.
 
   The CONNECTED re-announce then sets `gateway_node`, wire capabilities, `stream_home_id` and
   `cluster_id`, as today. Status tags and topology are **not** in the record. The next heartbeat is `no_base`, and
@@ -967,7 +977,8 @@ message ReattachResponse {
 - **Table `registrations`:**
   - columns: `agent_id TEXT PRIMARY KEY`, `session_id TEXT NOT NULL` (the session of the
     registration that wrote the row), `hostname`, `os`, `arch`, `agent_version`,
-    `scopable_tags JSONB`, `plugin_set_hash TEXT NOT NULL`, `registered_at BIGINT NOT NULL`;
+    `scopable_tags JSONB` (as the agent sent them; filtered again on every install, step 6),
+    `plugin_set_hash TEXT NOT NULL`, `registered_at BIGINT NOT NULL`;
   - `registered_at` is authored by Postgres `now()` in SQL, never the replica's clock (the ADR-2002
     #3715 DB-clock rule);
   - no secret is stored: no enrollment token, CSR, certificate or attestation;
@@ -976,7 +987,9 @@ message ReattachResponse {
     affinity D16 says reattach does not add.
 - **Table `plugin_sets`:**
   - columns: `plugin_set_hash TEXT PRIMARY KEY`, `plugins JSONB NOT NULL`;
-  - the PluginInfo list is interned by a SHA-256 over its canonical encoding;
+  - the PluginInfo list is stored as the agent sent it, before any server-side normalisation, so
+    that reattach derives the session's plugin facts through the same code as Register (step 6);
+  - the list is interned by a SHA-256 over its canonical encoding;
   - PluginInfo is compiled into the agent, so a fleet has one row per (version, OS, build), not one
     per agent. Replicas cache rows by hash in memory; the table is immutable per hash.
 - **Writes.** One upsert of the agent's row, plus an insert-if-absent of its plugin set, in one
@@ -1310,6 +1323,8 @@ of every ~30 s. The content is unchanged.
   fail-closed on a degraded record read; never installs from partial facts; the rate limit;
   a record written by a different session (a failed upsert, a cross-replica race, a restored
   backup) answers `NO_RECORD`; a body and metadata session-id mismatch answers `MALFORMED_SESSION`;
+  a stored `service` scopable tag is dropped on install; a stored `tar` plugin sets
+  `legacy_echo_wire_name` as at registration;
   a refusal before the adopt step leaves the route directory untouched;
 - `AgentRegistrationStore` under the ADR-0012 test conventions (`YUZU_REQUIRE_PG_DB`): upsert, plugin
   interning, the decommission cascade, DB-authored timestamps;
