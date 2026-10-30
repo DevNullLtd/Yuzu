@@ -64,11 +64,11 @@ StateDirectory=yuzu-agent
 NoNewPrivileges=true
 # CAP_DAC_READ_SEARCH lets the agent read root-only files, chiefly the 0400 DMI
 # serial and UUID under /sys/class/dmi/id. It is granted as an ambient capability and
-# the bounding set is exactly this one capability, so nothing else can be gained.
+# the bounding set is exactly this one capability, so no other capability can be gained.
 # Every plugin runs in the agent process, so every plugin can now read ANY file on the
 # host. The capability grants no permission to write file contents and no other
 # capability bit; it also authorizes open_by_handle_at(2) and linkat(2) with
-# AT_EMPTY_PATH, which neither the agent nor its plugins call. The agent clears its
+# AT_EMPTY_PATH, which neither the agent nor its bundled plugins call. The agent clears its
 # inheritable and ambient sets at start, so an ordinary exec'd child (a script,
 # dmidecode) has no capabilities after execve.
 # To opt out, see docs/user-manual/upgrading.md.
