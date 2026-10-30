@@ -114,8 +114,29 @@ following stop:
 
 It still counts as connected and still receives commands.
 
+The consequences are not confined to one maintenance window. They last for the whole agent
+rollout, which on a large fleet is days or weeks, not the hour in which the server and gateways
+move:
+- **Alerts on those agents go silent rather than fire.** The fleet gauges are absent-not-zero, so an
+  un-upgraded agent simply drops out of every `yuzu_fleet_*` series and out of every alert computed
+  from them. A Guardian, Spark, dedup, OTA or network condition on such an agent raises nothing.
+- **Guardian generation re-push to those agents stops.** The reconcile reads
+  `yuzu.guardian_generation` from the agent's state tags (D3), and an un-upgraded agent has none, so a
+  policy change made during the rollout is never re-pushed to an agent that missed it.
+- Even `yuzu_fleet_agents_by_version` omits them, because it is built from the `yuzu.agent_version`
+  tag. The un-upgraded agents are counted by a gauge of their own (D13) and listed by the
+  registration-time version that MCP `list_agents` reports.
+
+The recommended practice, stated in `docs/user-manual/upgrading.md` (*Upgrade*): roll agents out in
+short stages right after the server and gateways, and pause Guardian policy changes until the last
+stage is done.
+
 An upgraded agent behind an old server or gateway has its tags and topology ignored the same way.
-Command dispatch, responses, inventory and liveness are unaffected in either direction.
+Between an agent and the server, command dispatch, responses, inventory and liveness are unaffected
+in either direction. Between a gateway and the server they are not: a new gateway in front of an old
+server cannot reattach its agents after a server restart (the old server has no `ProxyReattach`),
+so those agents have no installed session there until they reconnect. The upgrade order (server,
+then gateways) never creates that pairing, and a rollback must not either (*Upgrade*).
 
 ## Context
 
@@ -1178,6 +1199,12 @@ Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
 - `yuzu_server_tag_resync_total{outcome}`, with `sent|deferred|send_failed`;
 - gauge `yuzu_server_resync_pending{action}`, with `tags|topology`: the size of the pending set
   (D8);
+- gauge `yuzu_server_agents_tags_absent`: the agents with a live session on this replica whose
+  latest heartbeat was `absent` (an agent older than this release, D3 step 1), recomputed on the
+  fleet-gauge timer. It is server-owned and published at 0, like the journal meta-signals in
+  `docs/observability-conventions.md`, so 0 means the rollout is complete on this replica. It is
+  the only fleet-wide count of un-upgraded agents: `yuzu_fleet_agents_by_version` is built from
+  status tags and omits them;
 - `yuzu_server_agent_reattach_total{outcome}`, with
   `accepted|no_record|not_enrolled|superseded|malformed_session|degraded|rate_limited` (D14);
 - `yuzu_server_agent_registration_store_failed_total{op}` (D14);
@@ -1210,6 +1237,8 @@ Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
   canonical-form or agent delta defect rather than a fleet event. Its runbook also names the
   per-RPC-balancing symptom (*Server stores*): a `diverged` plus `no_base` share near 100 %.
 - `YuzuVizTopologyResyncBacklog`: `deferred` stays above 0 for 30 min.
+- `YuzuAgentsTagsAbsent`: `yuzu_server_agents_tags_absent` stays above 0 for 24 h. It bounds the
+  window in which un-upgraded agents are invisible to the health and posture gauges (*Upgrade*).
 
 **Fleet-gauge semantics.** `yuzu_fleet_*` are rebuilt from the merged views. While an agent is
 `no_base` (after a server restart, until its full set lands), its state-derived gauges are absent,
@@ -1629,12 +1658,32 @@ lands. The two are kept consistent as follows.
 `docs/user-manual/upgrading.md` gains: "⚠️ Breaking: the heartbeat carries status-tag changes and a
 topology digest; fleet topology moved to its own RPC; upgrade server, gateways and agents together".
 It should say:
-- the order: server, then gateways, then agents, in one maintenance window;
+- the order: server, then gateways, then agents. The server and gateways move in one maintenance
+  window; the agents follow in short stages, and Guardian policy changes are paused until the last
+  stage is done;
 - un-upgraded agents keep connecting and executing commands, but contribute **no** status tags and no
   topology until upgraded (absent from fleet gauges, DEX performance, `/network`, Spark and Guardian
-  health, and `/viz`). Operators see their heartbeats counted `absent` on
-  `yuzu_server_heartbeat_tags_total`; they are sent no `__resync__` and do not move the divergence
-  alert;
+  health, and `/viz`). This lasts for the whole agent rollout, not one window. Alerts computed from
+  the fleet gauges go silent for those agents rather than fire, and the Guardian generation re-push
+  does not reach them. Their heartbeats are counted `absent` on `yuzu_server_heartbeat_tags_total`;
+  they are sent no `__resync__` and do not move the divergence alert;
+- how to verify the rollout and find stragglers: `yuzu_server_agents_tags_absent` (D13) falls to 0
+  when the last agent is upgraded, and `YuzuAgentsTagsAbsent` raises a ticket while it stays above 0;
+  the rate of `yuzu_server_heartbeat_tags_total{outcome="absent"}` falls with it; MCP `list_agents`
+  lists each connected agent with the version it registered with, which is the straggler list.
+  `yuzu_fleet_agents_by_version` cannot list them, because it is built from status tags;
+- the new store: the first server start creates the `agent_registration_store` schema (D14), so the
+  server's database role needs the same DDL rights every other store's first start needs. Without
+  them the store's construction fails and the server refuses to start (ADR-0007/0012), as for any
+  store. A database restored from before this release has no rows in it: every reattach answers
+  `NO_RECORD` and each agent registers once more, as after a lost write;
+- rollback, if the release's deployment contract permits one: the reverse order, agents, then
+  gateways, then server. A new gateway must never front an old server (it cannot reattach). Status
+  tags and topology are dark for each agent whose version does not match the server's until the
+  rollback completes, exactly as during the upgrade. The new schema is left in place and unread. A
+  release that ships under a hard-cutover deployment contract (the one `upgrading.md` states for the
+  Forensics tier) has no in-place upgrade and no return to an earlier build: it is deployed fresh,
+  every agent registers fresh, and recovery is rolling forward;
 - after a server restart, state-derived gauges converge in about two minutes per 100,000 agents on a
   replica, after those agents reattach, and topology over several minutes;
 - the new flags: `--topology-interval`, `--no-topology`, `--tag-resync-rate`,
@@ -2076,8 +2125,8 @@ release and merge to `dev` inside one release window. ADR-0074 gates its own wav
      `--no-topology`.
 10. **Surfaces and docs.**
     - MCP and REST `stale_reason` and descriptions.
-    - Both alert rules (`YuzuHeartbeatTagDivergenceSustained` and `YuzuVizTopologyResyncBacklog`);
-      this is the only slice that adds them.
+    - The alert rules (`YuzuHeartbeatTagDivergenceSustained`, `YuzuVizTopologyResyncBacklog` and
+      `YuzuAgentsTagsAbsent`); this is the only slice that adds them.
     - Every doc listed above, the upgrading.md section and the changelog fragment.
     - The harness and rig rerun recorded as the measured outcome, using ADR-0074 D14's method.
 
