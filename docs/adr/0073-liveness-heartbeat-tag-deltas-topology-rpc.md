@@ -454,7 +454,11 @@ shared by direct `Heartbeat` and gateway `BatchHeartbeat`):
 
 1. **Absent payload.** An empty `status_tags_pb` comes from an agent older than this ADR: an
    upgraded agent always sends a `state_digest`, so its payload is never empty. The server applies
-   nothing, requests no resync and counts `absent`. `absent` heartbeats are excluded from the
+   nothing from it, requests no resync and counts `absent`, and it withholds any state map the
+   entry still holds, as for an agent rejected three times (below): an older binary that
+   connects under an `agent_id` whose entry holds a newer process's verified map (a rollback or a
+   reinstalled older package within the 90 s prune) must not have that map served as current,
+   and its absent heartbeats keep refreshing the entry, so the prune would never remove it. `absent` heartbeats are excluded from the
    divergence alert (D13). They are what an un-upgraded agent produces during the upgrade window
    (*Upgrade consequence* above).
 2. **Decode and caps.** Decodes `status_tags_pb` and checks it against the tag caps: at most 512 keys, 64 KiB per key or
@@ -528,8 +532,10 @@ over the agent's current merged state.
 
 **At registration.** Direct `Register` and `ProxyRegister` pass `RegisterRequest.status_tags_pb` to
 the same function, as a `full` payload, on the replica that handles the registration. The caps, the
-class check and the digest check all apply. An empty field is `absent`. A rejected Register payload
-installs no state map, so the agent's first heartbeat is `no_base` and requests a resync.
+class check and the digest check all apply. Every Register, whatever its tag outcome, first drops
+the agent's existing state map and digest on this replica, so a state map never outlives the
+process that sent it. An empty field is then `absent`. A rejected Register payload installs no
+state map, so the agent's first heartbeat is `no_base` and requests a resync.
 Registration itself never fails because of the tags.
 
 **Locking.** `AgentHealthStore::apply` holds the store's `mu_` only to read, copy and commit:
