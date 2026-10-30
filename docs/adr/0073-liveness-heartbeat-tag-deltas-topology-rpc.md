@@ -834,8 +834,10 @@ When several conditions hold, the first in this order wins:
       `kPushedMapHardCap`, and nothing counts them: the queue is in memory. A clean `stop()`
       never does. This is the cost of keeping the write off the heartbeat path; the conflict
       itself is still counted on `yuzu_viz_topology_reclaim_total{outcome="conflict"}`, which
-      survives in Prometheus, so a gap between conflicts and written rows is visible. The anti-spoof evidence chain therefore records a refused re-claim exactly as
-    it records a refused push.
+      survives in Prometheus, so a gap between conflicts and written rows is visible.
+
+    The anti-spoof evidence chain therefore records a refused re-claim as it records a refused
+    push, except for the queued-row loss cases above.
 
   A gateway restart thus costs zero bodies for agents back within five minutes. Eviction is lazy (in
   `confirm` and `build_snapshot`), so no background loop is added.
