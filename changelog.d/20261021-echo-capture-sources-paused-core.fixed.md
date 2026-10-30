@@ -1,1 +1,0 @@
-- **Echo capture-sources frame shows a paused core source as paused.** A core source (process, tcp, service, user, perf) disabled via `configure` previously rendered as a checked, locked "always on" row; it now renders a locked, unchecked box reading "paused". Enabled core sources render exactly as before.

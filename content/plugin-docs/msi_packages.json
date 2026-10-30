@@ -571,9 +571,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
     ],
-    "changelog": [
-      "changelog.d/2026-10-17-msi_packages-list-inventory.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/msi_packages.yaml"
     ],

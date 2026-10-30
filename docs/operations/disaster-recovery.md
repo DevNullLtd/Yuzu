@@ -12,11 +12,17 @@
 > (HA WS-6 6.2, `auth.enrollment_tokens` / `auth.pending_agents`) — back them
 > up via the same `pg_dump`/`pg_restore` procedure as the rest of the `auth`
 > schema, not as local files. `enrollment-tokens.cfg`/`pending-agents.cfg` are
-> no longer written by a 6.2+ server; a pre-6.2 backup restored onto a fresh
-> Postgres is imported exactly once, at the first 6.2 boot (the marker+
-> fingerprint mechanics that make a restored OLD backup with different content
-> REFUSED rather than silently merged are in
+> no longer written by the 0.15.0 server; a copy found at any boot where the database holds no import record for it (a fresh database never does) is imported
+> exactly once as live credentials, without any check of where it came from (the
+> marker+fingerprint mechanics that refuse a later file with different content
+> are in
 > `docs/adr/2002-high-availability-architecture.md` §8).
+>
+> 0.15.0 supports initial deployment into a fresh database only: restore a backup
+> taken from a 0.15.0 deployment, not one written by an earlier build, and start
+> with no leftover `enrollment-tokens.cfg` or `pending-agents.cfg` in `--data-dir` or the
+> directory holding `yuzu-server.cfg` (the server imports them without checking where
+> they came from).
 
 > Shipped InstructionDefinitions live inside the `yuzu-server` binary
 > (embedded at build time by `server/core/scripts/embed_content.py`)
@@ -37,7 +43,7 @@
 
 ### Pre-Upgrade Backup
 
-Always back up before upgrading:
+Back up a 0.15.0 deployment before changing it (0.15.0 itself has no supported upgrade from an earlier build):
 ```bash
 yuzu-backup.sh --output /backup/yuzu-pre-upgrade-$(date +%Y%m%d)
 ```
@@ -58,6 +64,8 @@ The script:
 3. Generates a SHA256 manifest for integrity verification
 
 ## Restore Procedure
+
+Use only a backup taken from this 0.15.0 deployment; restore the Postgres dump and the keys directory together (see Key management in [Server Administration](../user-manual/server-admin.md)).
 
 ```bash
 # 1. Stop the server

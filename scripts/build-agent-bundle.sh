@@ -38,7 +38,7 @@ STAGING="deploy/docker/.agent-bundle-build"   # build context (gitignored)
 BUNDLE_ROOT="$STAGING/yuzu-agents"            # becomes /opt/yuzu-agents
 
 # ── Defaults / config ─────────────────────────────────────────────────────
-VERSION="${YUZU_VERSION:-0.12.0}"
+VERSION="${YUZU_VERSION:-0.15.0}"
 IMAGE_NAME="yuzu-agent-bundle-chisel"
 PUSH=0; MULTIARCH=0; RUN_TEST=1; KEEP_STAGING=0
 
