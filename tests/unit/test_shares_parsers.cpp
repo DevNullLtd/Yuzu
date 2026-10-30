@@ -1113,9 +1113,8 @@ TEST_CASE("shares bsd exports: one row per path and per line", "[shares]") {
 }
 
 TEST_CASE("shares bsd exports: one line of many distinct paths stays bounded", "[shares]") {
-    // 10 x kMaxShareRows distinct paths on ONE line. The duplicate scan must stop growing with
-    // the line (a 256 KiB line of distinct paths otherwise costs seconds), while the row budget
-    // still truncates the listing exactly as before.
+    // 10 x kMaxShareRows distinct paths on ONE line. Past kMaxShareRows distinct paths the
+    // duplicate scan stops growing, and the row budget still truncates the listing.
     std::string line;
     for (std::size_t i = 0; i < 10 * kMaxShareRows; ++i)
         line += "/p" + std::to_string(i) + " ";

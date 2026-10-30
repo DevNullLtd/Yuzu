@@ -59,7 +59,9 @@ metadata:
     Control Assistance Operators). On macOS, the share points recorded by the
     sharing tool (/usr/sbin/sharing -l -f json, bounded runner) as SMB shares, and
     /etc/exports as written (Apple's mountd grammar, emulated best-effort: checks that need the
-    host are not modelled) as NFS exports, not live smbd/nfsd state; a record
+    host are not modelled, so an export may be shown that mountd would drop, or omitted that it
+    would keep, and a uid-0 account not named root is not flagged no_root_squash) as NFS
+    exports, not live smbd/nfsd state; a record
     with SMB sharing off is flagged unavailable, SMB encryption required is flagged sealed,
     and a tool that fails or answers unrecognisably is constrained with a named token. A
     refused or failed read is permission_denied or constrained with a reason token,
@@ -114,7 +116,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_3
         type: string
-        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:shares:exports:permission_denied, linux:shares:smb_conf:registry_backend, windows:shares:netshareenum:server_not_started, macos:shares:sharing:exit_nonzero, macos:shares:exports:symlink_refused. source: the number of shares read from it, "-" unless it was read. share: the exported path ("-" when none is set).'
+        description: 'status: reason token(s) for a non-supported read, "-" when complete (every source read); tokens look like linux:shares:exports:permission_denied, linux:shares:smb_conf:registry_backend, windows:shares:netshareenum:server_not_started, macos:shares:sharing:exit_nonzero, macos:shares:exports:symlink_refused. source: the number of shares read from it, "-" unless it was read. share: the exported path ("-" when none is set).'
         example: '-'
         platforms: [windows, linux, darwin]
       - name: field_4

@@ -626,8 +626,6 @@ inline Listing list_macos(const MacFs& fs) {
     static const std::vector<std::string> kArgv{"/usr/sbin/sharing", "-l", "-f", "json"};
     yuzu::agent::SubprocessOptions opts;
     opts.deadline = std::chrono::milliseconds{5000};
-    // max_lines never stops the run early (stop_after_max_lines stays false), so `line_limit`
-    // cannot occur; classify_runner_failure below still maps it, keeping the shared mapping total.
     opts.max_lines = 1;
     opts.merge_stderr = false;
     opts.output_cap_bytes = 2 * kMaxShareBytes;

@@ -6,7 +6,7 @@
 // portable so the unit tests run on every host; no file I/O, no subprocess, no OS header.
 //
 //   parse_exports       Linux exports(5) grammar (/etc/exports, /etc/exports.d/*.exports)
-//   parse_bsd_exports   macOS exports(5) grammar as Apple's mountd reads /etc/exports
+//   parse_bsd_exports   macOS exports(5) grammar modelled on Apple's mountd
 //   parse_smb_conf      Samba smb.conf: share sections, synonyms, `copy =` and [global]
 //                       inheritance, plus detection of the parts this plugin does not read
 //   parse_sharing_json  macOS `sharing -l -f json` share points (SMB)
@@ -944,9 +944,7 @@ inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
             auto p = bsd_clean_path(f);
             if (p.size() > kBsdNameLen)
                 return false; // get_exportlist: "pathname too long", the whole entry is dropped
-            // kMaxShareRows + 1 distinct paths already overflow the row budget (truncation is
-            // signalled), so keeping more changes nothing; the size guard stops the duplicate
-            // scan going quadratic on one very long line.
+            // >kMaxShareRows paths already truncate; this stops the duplicate scan going quadratic.
             if (e.paths.size() <= kMaxShareRows && std::ranges::find(e.paths, p) == e.paths.end())
                 e.paths.push_back(std::move(p));
         } else {
@@ -976,17 +974,17 @@ inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
 } // namespace detail
 
 /// macOS exports(5), modelled on Apple's mountd (best-effort: the rejections that need a host
-/// lookup are not modelled): `<path>... [-opts] [hosts | -network net [-mask mask]]`. Entries are joined as get_export_entry joins them (trailing
-/// spaces, tabs and backslashes stripped, and NOT a CR, which stays in the last field; a
-/// stripped backslash appends the next physical line directly; a continuation still open at
-/// end of file loses its entry), a field starting `#` makes the entry a comment, and fields
-/// are bounded by nextfield (single or double quotes, backslash escapes). One share per
-/// distinct path; hosts and netgroups are counted, never emitted. Access is `ro` for `-ro` /
-/// `-o`, else `rw`; `-offline` flags the share `unavailable`; `no_root_squash` follows the
-/// LAST `-maproot` / `-mapall` / `-root` / `-r` credential and is raised when its user is
-/// root (see detail::is_root_user). Anonymous is Apple's world test (see
-/// detail::bsd_net_is_world). A line Apple rejects yields no row and no token, as the Linux
-/// parser skips a malformed line.
+/// lookup are not modelled): `<path>... [-opts] [hosts | -network net [-mask mask]]`. Entries
+/// are joined as get_export_entry joins them (trailing spaces, tabs and backslashes stripped,
+/// and NOT a CR, which stays in the last field; a stripped backslash appends the next physical
+/// line directly; a continuation still open at end of file loses its entry), a field starting
+/// `#` makes the entry a comment, and fields are bounded by nextfield (single or double quotes,
+/// backslash escapes). One share per distinct path; hosts and netgroups are counted, never
+/// emitted. Access is `ro` for `-ro` / `-o`, else `rw`; `-offline` flags the share
+/// `unavailable`; `no_root_squash` follows the LAST `-maproot` / `-mapall` / `-root` / `-r`
+/// credential and is raised when its user is root (see detail::is_root_user). Anonymous is
+/// Apple's world test (see detail::bsd_net_is_world). A line Apple rejects yields no row and no
+/// token, as the Linux parser skips a malformed line.
 inline void parse_bsd_exports(std::string_view text, std::string_view source,
                               yuzu::shared::RowByteBudget& budget, ExportsParse& out) {
     std::string entry;
