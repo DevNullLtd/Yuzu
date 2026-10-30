@@ -31,14 +31,14 @@ namespace pb = ::yuzu::agent::v1;
 
 constexpr const char* kSourceDeviceCi = "device_ci";
 
-// Caps. The field cap MUST match the agent source (sync_source_device_ci.cpp),
-// comment-coordinated. The blob ceiling is kDeviceCiMaxBlobBytes (device_ci_kinds.hpp): 96 KiB,
+// Caps. The field cap is kDeviceCiMaxFieldLen (device_ci_kinds.hpp); the agent source
+// (sync_source_device_ci.cpp) holds an equal constant, pinned by the dirty-input cross-pin test.
+// The blob ceiling is kDeviceCiMaxBlobBytes (device_ci_kinds.hpp): 96 KiB,
 // derived from the section registry (a p99 large host is about 25 KiB; every kind at its row
 // cap with a p99.9-wide row is about 75 KiB) and proved against it by a static_assert there. It
 // must stay >= the agent's (sync_source_device_ci.hpp), equal by contract. A conforming sender
 // trims its own rows to fit (ADR-0016 update "device_ci blob v2"), so a blob over the ceiling is
 // a non-conforming sender: dropped and nacked below, never parsed.
-constexpr std::size_t kMaxFieldLen = 1024;
 // The number of positional fields in the canonical record (see DeviceCiRecord /
 // the agent's CiRecord). Extra fields in a (forward-version) blob are ignored;
 // missing trailing fields stay empty.
@@ -59,8 +59,8 @@ constexpr int kMaxSources = 64;
 // (U+FFFD is 3 bytes; clamping first would budget differently on each side).
 std::string clamp_field(std::string_view raw) {
     std::string f = sanitize_utf8_strict(raw);
-    if (f.size() > kMaxFieldLen) {
-        std::size_t end = kMaxFieldLen;
+    if (f.size() > kDeviceCiMaxFieldLen) {
+        std::size_t end = kDeviceCiMaxFieldLen;
         while (end > 0 && (static_cast<unsigned char>(f[end]) & 0xC0) == 0x80)
             --end;
         f.resize(end);
@@ -147,6 +147,8 @@ DeviceCiRecord parse_v2(const std::string& blob) {
     else
         spdlog::warn("device_ci: sha256 of a v2 blob failed — record will be nacked");
 
+    bool extra_scalar{false}; // the scalar record carried fields past its last position (see below)
+
     std::string_view rest(blob.data() + 1, blob.size() - 1);
     const auto next_record = [&rest]() -> std::optional<std::string_view> {
         if (rest.empty())
@@ -164,7 +166,9 @@ DeviceCiRecord parse_v2(const std::string& blob) {
         std::string_view r0;
         if (auto r = next_record())
             r0 = *r;
-        auto f = split_fields(r0, kDeviceCiScalarFields);
+        // One sentinel field past the last position makes an over-wide record visible.
+        auto f = split_fields(r0, kDeviceCiScalarFields + 1);
+        extra_scalar = f.size() > kDeviceCiScalarFields;
         f.resize(kDeviceCiScalarFields);
         assign_base_fields(rec, f.data());
         rec.chassis_type = std::move(f[22]);
@@ -193,9 +197,11 @@ DeviceCiRecord parse_v2(const std::string& blob) {
         max_rec_fields = std::max(max_rec_fields, static_cast<std::size_t>(d.n_fields) + 2);
 
     // What this parse ignores, kept so ONE debug line per blob makes version skew diagnosable
-    // (a newer agent's kind, an extra column). Bounded: a hostile blob cannot grow the line.
+    // (a newer agent's kind, an extra column or field). Bounded: a hostile blob cannot grow the
+    // line.
     std::vector<std::string> dropped; // distinct unregistered section / kind tokens
-    std::bitset<kDeviceCiSectionCount> extra_cols; // kinds whose rows carried extra columns
+    std::bitset<kDeviceCiSectionCount> extra_status; // sections whose status record had extras
+    std::bitset<kDeviceCiSectionCount> extra_cols;   // kinds whose rows carried extra columns
     const auto note_dropped = [&dropped](const std::string& token) {
         if (dropped.size() < kMaxLoggedDropped &&
             std::ranges::find(dropped, token) == dropped.end())
@@ -227,6 +233,8 @@ DeviceCiRecord parse_v2(const std::string& blob) {
             }
             auto& a = acc[*i];
             a.seen = true;
+            if (f.size() > 4) // "status" section level reason, plus a sentinel
+                extra_status.set(*i);
             a.sec.level = f.size() > 2 ? std::move(f[2]) : std::string{};
             a.sec.reason = f.size() > 3 ? std::move(f[3]) : std::string{};
             continue;
@@ -267,14 +275,22 @@ DeviceCiRecord parse_v2(const std::string& blob) {
         rec.sections.push_back(std::move(a.sec));
     }
 
-    if (!dropped.empty() || extra_cols.any()) {
+    if (!dropped.empty() || extra_scalar || extra_status.any() || extra_cols.any()) {
         std::string tokens;
         for (const auto& t : dropped)
             tokens += (tokens.empty() ? "'" : ", '") + ::yuzu::log_key_token(t) + "'";
         std::string kinds;
-        for (std::size_t i = 0; i < kDeviceCiSectionCount; ++i)
+        const auto add_kind = [&kinds](const std::string& name) {
+            kinds += (kinds.empty() ? "" : ", ") + name;
+        };
+        if (extra_scalar)
+            add_kind("scalar");
+        for (std::size_t i = 0; i < kDeviceCiSectionCount; ++i) {
+            if (extra_status.test(i))
+                add_kind(std::string("status:") + kDeviceCiSections[i].section);
             if (extra_cols.test(i))
-                kinds += (kinds.empty() ? "" : ", ") + std::string(kDeviceCiSections[i].section);
+                add_kind(kDeviceCiSections[i].section);
+        }
         spdlog::debug("device_ci: v2 blob ignored unregistered tokens [{}] and extra columns on "
                       "kinds [{}]",
                       tokens, kinds);

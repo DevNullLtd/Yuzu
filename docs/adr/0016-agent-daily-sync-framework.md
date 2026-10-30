@@ -563,7 +563,7 @@ and 0x1E-terminated. A blob whose first byte is not `0x02` parses exactly as bef
 |---|---|
 | `scalar_record` | positions 0-21 = the frozen v1 fields (unchanged order); positions 22-32 appended: `chassis_type`, `chassis_serial`, `chassis_asset_tag`, `chassis_source`, `board_vendor`, `board_product`, `board_serial`, `board_source`, `machine_id_hash`, `machine_id_algorithm`, `machine_id_source`. Missing trailing positions stay blank; extras are ignored. |
 | status record | `status` 1F `<section>` 1F `<level>` 1F `<reason>` — one per registered section, including the three status-only ones (`chassis`, `baseboard`, `machine_id`, whose values are the appended scalars). Last wins. An unregistered section is ignored. |
-| list row | `<kind>` 1F `<c1>` ... `<cn>` — columns per kind below. A short row is padded blank, extra fields are ignored, an unknown kind is ignored. Each blob's ignored tokens (unknown kinds and sections, kinds that carried extra columns) are named in one debug log line, so version skew is diagnosable. |
+| list row | `<kind>` 1F `<c1>` ... `<cn>` — columns per kind below. A short row is padded blank, extra fields are ignored, an unknown kind is ignored. Each blob's ignored tokens (unknown kinds and sections, the scalar record, status records or kinds that carried extra fields) are named in one debug log line, so version skew is diagnosable. |
 | blob ceiling | 96 KiB (98,304 bytes) total, on the server and, equal by contract, on the agent (`kDeviceCiMaxBlobBytes` in `device_ci_kinds.hpp` and in `sync_source_device_ci.hpp`; the two binaries share no header, so each side's test pins its own constant to the literal 98304). The v1 agent's cap moves from 64 KiB to 96 KiB with it; that is behaviour-neutral, as its record is about 1 KiB. Derived from the section registry below, not from a transport limit: a p99 large host is about 25 KiB, and every kind at its row cap with a p99.9-wide row sums to about 75 KiB (table below). A conforming sender never reaches the ceiling (see "A host over the caps"). Every field is clamped to 1,024 bytes. |
 
 Section registry (one declaration, `server/core/src/device_ci_kinds.hpp`, shared by the
@@ -589,7 +589,13 @@ ceiling bounds the blob.
 A `static_assert` in `device_ci_kinds.hpp` holds that total to at most 80% of the ceiling, so
 changing a cap or a budget fails the build until the ceiling is reconsidered on both the server
 and the agent. A second `static_assert` keeps every row budget between the shortest possible row
-and the clamp-bound row.
+and the clamp-bound row, and at or above the measured width recorded beside it (`row_floor`), so
+a budget cannot be cut below a width actually observed to dodge the 80% line.
+
+The `partition` and `topology` budgets are assumed widths: no captures exist yet, so they are
+re-measured when the storage legs land (`swap` has no capture either, its legs being planned, and
+its floor is its shortest possible row). `topology`'s cap is 96, not the 192 starting target,
+because 192 x 144 B would put the registry-derived total past the 80% line.
 
 **A host over the caps (sender contract).** No agent v2 writer exists in this change; this is
 the contract it is built to. The sender keeps the first N rows of each kind (N = the kind's row

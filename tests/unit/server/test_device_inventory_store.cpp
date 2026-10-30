@@ -258,22 +258,30 @@ void exec_stmt(PgPool& pool, const std::string& sql) {
 constexpr std::size_t kBlobCap = 98304;
 
 // The registry, restated as an independent literal table: per list kind the row cap, the wire
-// width (columns per row) and the declared row budget (p99.9 row width in wire bytes). Also
-// never read from the registry: if a cap, a width or a budget drifts, this table disagrees.
+// width (columns per row), the declared row budget (p99.9 row width in wire bytes) and the
+// measured row floor (cpu, dimm, disk, volume from captures; partition and topology ASSUMED, swap
+// its shortest row, none captured). Also never read from the registry: if a cap, a width, a
+// budget or a floor drifts, this table disagrees.
 struct KindExpect {
     const char* kind;
     int cap;
     int width;
     int budget;
+    int floor;
 };
-constexpr KindExpect kKindExpect[] = {{"cpu", 32, 7, 96},       {"dimm", 64, 7, 96},
-                                      {"disk", 128, 5, 64},     {"swap", 16, 3, 56},
-                                      {"volume", 128, 6, 144},  {"partition", 192, 6, 120},
-                                      {"topology", 96, 5, 144}};
+constexpr KindExpect kKindExpect[] = {{"cpu", 32, 7, 96, 54},       {"dimm", 64, 7, 96, 75},
+                                      {"disk", 128, 5, 64, 36},     {"swap", 16, 3, 56, 8},
+                                      {"volume", 128, 6, 144, 61},  {"partition", 192, 6, 120, 95},
+                                      {"topology", 96, 5, 144, 110}};
 // The declared scalar record + status records budget, and the registry-derived total:
 // sum(cap x budget) = 73,600, plus 3,072 = 76,672 (78.0% of the ceiling; the build holds <= 80%).
 constexpr std::size_t kScalarStatusBudget = 3072;
 constexpr std::size_t kRegistryTotal = 76672;
+// The clamp-bound worst case of the part a sender never trims: the version byte, a scalar record
+// of 33 fields at the 1,024-byte field clamp (33 x 1024 + 32 separators + 1E), and one status
+// record per section at the clamp (10 x ("status" 1F section 1F 1024 1F 1024 1E) + the 64 bytes
+// of section names): 1 + 33,825 + 20,644 = 54,470, comfortably under the ceiling.
+constexpr std::size_t kUntrimmedWorstCase = 54470;
 
 // Comma-separated registry column list -> names.
 std::vector<std::string> column_names(const char* columns) {
@@ -668,6 +676,7 @@ TEST_CASE("v2 registry budgets and the blob ceiling agree with the independent l
         CHECK(d.row_cap == e.cap);
         CHECK(d.n_fields == e.width);
         CHECK(d.row_budget == e.budget);
+        CHECK(d.row_floor == e.floor);
         rows_sum += static_cast<std::size_t>(e.cap) * static_cast<std::size_t>(e.budget);
     }
     // Every registered list kind is in the table (a new kind must be added to it).
@@ -679,6 +688,10 @@ TEST_CASE("v2 registry budgets and the blob ceiling agree with the independent l
     CHECK(rows_sum == 73600);
     CHECK(rows_sum + kScalarStatusBudget == kRegistryTotal);
     CHECK(yuzu::server::device_ci_registry_budget() == kRegistryTotal);
+    // The clamp-bound worst case of the never-trimmed records, against independent literals.
+    CHECK(yuzu::server::kDeviceCiMaxFieldLen == 1024u);
+    CHECK(yuzu::server::device_ci_untrimmed_worst_case() == kUntrimmedWorstCase);
+    CHECK(kUntrimmedWorstCase < kBlobCap);
     // Real headroom: the declared worst plausible blob stays within 80% of the ceiling.
     CHECK(kRegistryTotal * 5 <= kBlobCap * 4);
 }
@@ -895,6 +908,59 @@ TEST_CASE("v2 parse names what it ignored in ONE debug line per blob, bounded an
         CHECK(c->rows.size() == 1);
         CHECK(c->rows[0].size() == 7);
     }
+    SECTION("extra fields on the scalar record alone are named, values unchanged") {
+        auto scalars = v2_scalars();
+        scalars.emplace_back("extra1");
+        scalars.emplace_back("extra2");
+        yuzu::test::LogCapture cap(spdlog::level::debug);
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(scalars, v2_records()));
+        cap.stop();
+        const std::string logs = cap.text();
+        CHECK(count_of(logs, kLine) == 1);
+        CHECK(logs.find("unregistered tokens [] and extra columns on kinds [scalar]") !=
+              std::string::npos);
+        CHECK(r.machine_id_source == "etc_machine_id"); // position 32 is the last one kept
+        CHECK(r.arch == "x86_64");
+        REQUIRE(r.sections.size() == 10);
+        CHECK(find_section(r, "chassis")->level == "ok");
+    }
+    SECTION("extra fields on a status record alone are named, values unchanged") {
+        auto recs = v2_records();
+        recs[3] = {"status", "cpu", "constrained", "kept:3", "extra", "more"};
+        yuzu::test::LogCapture cap(spdlog::level::debug);
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        cap.stop();
+        const std::string logs = cap.text();
+        CHECK(count_of(logs, kLine) == 1);
+        CHECK(logs.find("unregistered tokens [] and extra columns on kinds [status:cpu]") !=
+              std::string::npos);
+        const auto* c = find_section(r, "cpu");
+        REQUIRE(c != nullptr);
+        CHECK(c->level == "constrained");
+        CHECK(c->reason == "kept:3");
+        CHECK(r.machine_id_source == "etc_machine_id");
+    }
+    SECTION("scalar, status and row overflow together make ONE line, in registry order") {
+        auto scalars = v2_scalars();
+        scalars.emplace_back("extra");
+        auto recs = v2_records();
+        recs[3] = {"status", "cpu", "ok", "", "extra"};
+        recs.push_back({"status", "nosuchsection", "ok", "", "extra"}); // ignored, not overflow
+        recs[4].push_back("extra");                                     // the cpu row
+        yuzu::test::LogCapture cap(spdlog::level::debug);
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(scalars, recs));
+        cap.stop();
+        const std::string logs = cap.text();
+        CHECK(count_of(logs, kLine) == 1);
+        CHECK(logs.find("'nosuchsection'") != std::string::npos);
+        CHECK(logs.find("extra columns on kinds [scalar, status:cpu, cpu]") != std::string::npos);
+        const auto* c = find_section(r, "cpu");
+        REQUIRE(c != nullptr);
+        CHECK(c->level == "ok");
+        REQUIRE(c->rows.size() == 1);
+        CHECK(c->rows[0].size() == 7);
+        CHECK(r.machine_id_source == "etc_machine_id");
+    }
     SECTION("a conforming blob logs nothing") {
         yuzu::test::LogCapture cap(spdlog::level::debug);
         parse_device_ci_blob(fixture_blob_v2());
@@ -928,6 +994,8 @@ TEST_CASE("device_ci section registry self-check", "[device_ci][v2]") {
             ++status_only;
             CHECK(d.n_fields == 0);
             CHECK(d.row_cap == 0);
+            CHECK(d.row_budget == 0);
+            CHECK(d.row_floor == 0);
             continue;
         }
         int names = 1;
