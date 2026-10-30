@@ -371,7 +371,7 @@ A key cannot appear in both `upsert` and `removed`; the server rejects such a pa
 
 **Base and acknowledgement.**
 - The agent's base is the state set as of its last **acknowledged** heartbeat, or the Register's
-  full set right after (re)registration.
+  full set right after (re)registration. The heartbeat thread owns it (D8).
 - "Acknowledged" means the RPC returned OK. That comes from the gateway (which answers locally) or
   from the server.
 - A failed or timed-out heartbeat does not advance the base, so its changes repeat in the next
@@ -518,7 +518,8 @@ outside this rule; this ADR adds none of it.
   - **The cost of keep-newest:**
     - any state change carried only in a dropped older heartbeat is missing at the server;
     - the next delta then fails the digest check (D3), and the server re-requests the full set with
-      `__resync__.tags`.
+      `__resync__.tags`. The agent answers with full heartbeats until two are acknowledged (D8), so
+      one more coalescing during the resync does not lose the full set.
     - Coalescing happens only when a session sends two beats before a flush. In steady state that is
       rare, because flushes run far more often than every 30 s.
     - It is routine during an **upstream outage**. After an outage, every agent whose state tags
@@ -774,14 +775,31 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
 **Mechanism.**
 - **Reserved name `__resync__`**, actions `tags` and `topology` (parameter `window_s`, default 60).
   It is handled in the agent's Subscribe command loop alongside `__sync__` (`agent.cpp`, the
-  reserved-name dispatch at about l.3447-3497). The decision logic is a pure, unit-tested function,
+  reserved-name dispatch from about l.3430, with `__sync__` at about l.3483-3531). The decision logic is a pure, unit-tested function,
   like `agents/core/src/sync_now_decision.hpp`.
 - **Dedup.** The command is **dedup-claimed**; only `__guard__` bypasses the claim (ADR-2002 WS-0).
   `record_command_terminal` runs **before** the stream write.
+- **Agent handler.** It runs inline on the Subscribe reader thread, as `__sync__`'s does. It only
+  arms a request and wakes the thread that acts on it, records the terminal, and writes the
+  response. It never sends tags or a body itself.
+  - `tags` sets a member atomic that the heartbeat thread reads. SUCCESS means armed.
+  - `topology` arms the topology sender and wakes it. SUCCESS means armed. With no running topology
+    sender (`--no-topology`, or none yet on this connection) the answer is a FAILURE terminal.
+  - An unknown action is a FAILURE terminal.
 - **Agent response.**
-  - `tags`: the next heartbeat carries `full = true`. There is no extra RPC, because the heartbeat
-    is already jittered.
+  - `tags`: the heartbeat thread sends `full = true` on **every** heartbeat until two full
+    heartbeats have been acknowledged after the request. There is no extra RPC, because the
+    heartbeat is already jittered. Keep-newest coalescing (D4) can replace one full heartbeat with a
+    newer one before a flush; repeating the full set means a single coalescing cannot lose it, and
+    the gateway stays opaque. It is not a guarantee under a sustained upstream outage: a full set
+    that is still lost leaves the agent `no_base` or `diverged`, and the server asks again after the
+    per-agent interval.
   - `topology`: the topology sender sends `RESYNC` after a uniform delay in `[0, window_s]` (D7).
+- **Ownership on the agent.** The delta base (the last acknowledged state set and its digest) is
+  owned by the heartbeat thread: only it reads or writes the base. The `tags` request atomic is set
+  by the reader thread and cleared by the heartbeat thread, only after the second acknowledged full
+  heartbeat. A new connection resets the base to the Register's full set (D2) and clears the
+  request.
 - **Reserved name on the agent.** `__resync__` is added to `kReservedPluginNames`
   (`agents/core/include/yuzu/agent/plugin_loader.hpp`, #822), so no plugin can claim the name.
 - **Server.**
@@ -1501,7 +1519,11 @@ of every ~30 s. The content is unchanged.
 - delta computation, including removals, base-only-on-ack, and full-on-Register and full-on-resync;
 - the tag caps applied before the diff and the digest: an oversize or invalid-UTF-8 key is dropped
   and counted, the digest covers only what is sent, and a capped set passes the server's checks;
-- the `__resync__` decision function, dedup claim, and terminal recorded before the write;
+- the `__resync__` decision function, dedup claim, and terminal recorded before the write; the
+  handler only arms and wakes (SUCCESS means armed), and answers FAILURE with no topology sender or
+  an unknown action;
+- after `__resync__.tags`, every heartbeat is full until two full heartbeats are acknowledged, and a
+  coalesced first full heartbeat does not end the repetition;
 - the topology send rules, with an injected RNG for jitter bounds, never timing.
 
 **Server:**
