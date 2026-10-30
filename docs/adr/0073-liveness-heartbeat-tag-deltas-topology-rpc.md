@@ -822,7 +822,13 @@ When several conditions hold, the first in this order wins:
     heartbeat path either: it queues it for the resync issuer's thread (D8), which writes it
     before its next pass, so several conflicts in one `BatchHeartbeat` under a degraded pool
     cannot push the batch past the gateway's 5 s call timeout. The queued row's lifecycle:
-    - a failed write keeps the row queued for the next pass and is counted
+    - the queue is owned by the issuer and guarded by its own mutex, never `pushed_mu_`: the
+      caller pushes the row after `pushed_mu_` is released, and the issuer swaps the whole queue
+      out under the queue's mutex and writes the rows after releasing it, so no `log()` call runs
+      while either mutex is held;
+    - a failed write keeps the row, and every row after it, queued for the next pass: the pass
+      stops at the first failed write rather than trying the rest against a degraded store, puts
+      the unwritten rows back at the head of the queue, and counts each
       (`yuzu_viz_topology_reclaim_audit_total{result="deferred"}`, D13);
     - the queue is capped at `kPushedMapHardCap` rows (a retained slot conflicts at most once per
       reconnect, but a flapping agent through a degraded pool can conflict on each reconnect); an
@@ -830,7 +836,8 @@ When several conditions hold, the first in this order wins:
     - on stop the issuer drains the queue before it exits; it starts no drain write after 5 s,
       and each drain write runs under `SET LOCAL statement_timeout` of 1 s, so a lease-held write
       cannot run on to the pool's 10 s `lock_timeout` or 30 s `statement_timeout` and the drain
-      ends within about 6 s, so a stop does not lose a row while the audit
+      ends within about 10 s (no write starts after 5 s, and the last one can still wait out
+      `AuditStore::log`'s 4 s write lease and run its 1 s statement), so a stop does not lose a row while the audit
       store is healthy and the queue is short; a row it cannot write, or has not reached when the
       deadline passes, is logged at WARN with the total and the first and last conflict. Its
       `dropped` count is best-effort, because the process is exiting and is normally not scraped
@@ -1204,8 +1211,13 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     under that mutex before the context is destroyed. The stop sweep sets the flag and calls
     `TryCancel` only while holding that mutex, so it never cancels a context that has finished or
     been destroyed, and a forwarder starting during the stop never begins an uncancelled RPC. The
-    slice-6 shutdown test races a stop against forward completion under TSan. Shutdown latency is bounded by one in-flight lease budget plus the pool's
-    `statement_timeout`, plus the re-claim audit drain's bound of about 6 s (D6); the forwarders' 10 s
+    slice-6 shutdown test races a stop against forward completion under TSan. Shutdown latency is bounded by the longest in-flight Postgres call plus the re-claim
+    audit drain (D6). The longest in-flight call is not the 250 ms record lease: a pass can be
+    inside the kill-switch read (`get_kill_switch`'s 1.5 s read lease) or a re-claim audit write
+    (`AuditStore::log`'s 4 s write lease), each plus the statement it runs, which the drain's
+    `SET LOCAL statement_timeout` of 1 s bounds; the drain itself starts no write after 5 s, so it
+    can overrun that by one write (one 4 s lease plus 1 s). The worst case is therefore about
+    4 + 1 + 5 + 4 + 1 = 15 s, and slice 8 measures it; the forwarders' 10 s
     deadline does not add to it because they are cancelled first. The slice-6 shutdown test also
     stops during an in-flight forward; slice 8, which adds the re-claim audit queue, adds a stop
     during the audit drain. The pass swaps the pending set out under the set's mutex and never holds
