@@ -887,7 +887,8 @@ message ReattachRequest {
 message ReattachResponse {
   bool accepted = 1;
   string session_id = 2;          // the adopted session
-  ReattachRefusal refusal = 3;    // NO_RECORD | NOT_ENROLLED | SUPERSEDED | MALFORMED_SESSION | DEGRADED
+  ReattachRefusal refusal = 3;    // NO_RECORD | NOT_ENROLLED | SUPERSEDED | MALFORMED_SESSION | DEGRADED | RATE_LIMITED
+  uint32 retry_after_ms = 4;      // set with RATE_LIMITED and DEGRADED
 }
 ```
 
@@ -929,7 +930,8 @@ message ReattachResponse {
      function and called from both RPCs. Never a second copy. Whatever ADR-0074 decides about
      cluster affinity (its Conflict 1) therefore applies to both RPCs at once;
   6. install the `AgentSession` through `AgentRegistry::register_agent`, from an `AgentInfo`
-     rebuilt from the record, with the adopted session id and `observed_peer`. Because the install
+     rebuilt from the record, then map the adopted session id and `observed_peer` as
+     ProxyRegister's adopt path does. Because the install
      runs the same code as a Register:
      - `plugin_names`, `plugin_meta` and `legacy_echo_wire_name` are derived from the stored
        PluginInfo list exactly as at registration, including the pre-rename `tar` to `echo`
@@ -943,6 +945,24 @@ message ReattachResponse {
   The CONNECTED re-announce then sets `gateway_node`, wire capabilities, `stream_home_id` and
   `cluster_id`, as today. Status tags and topology are **not** in the record. The next heartbeat is `no_base`, and
   `__resync__.tags`, then `__resync__.topology`, converge them (D3, D8).
+- **Every outcome, in one table.** The adopt decision is shared (step 5), so ProxyRegister and
+  ProxyReattach answer from the same outcome. ProxyReattach always answers `OK` with a
+  `ReattachResponse`; its refusals are values, never gRPC error statuses, so the gateway's breaker
+  (`yuzu_gw_upstream:record_result/2`) sees an answer it can classify.
+
+  | Outcome | ProxyRegister answers (today) | ProxyReattach refusal | Gateway action | Breaker |
+  |---|---|---|---|---|
+  | adopted | `OK`, adopted session | none (`accepted = true`) | re-announce CONNECTED (`yuzu_gw_agent:reannounce/2`) | success |
+  | no record, or a record from another session (step 4) | not applicable | `NO_RECORD` | disconnect the agent's stream | success |
+  | not `approved` (step 3) | rejected enrollment (`accepted = false`) | `NOT_ENROLLED` | disconnect the agent's stream | success |
+  | superseded by a different live session, or held by another agent | `FAILED_PRECONDITION` | `SUPERSEDED` | disconnect the agent's stream | success |
+  | presented id malformed, or body and metadata differ | `FAILED_PRECONDITION` | `MALFORMED_SESSION` | disconnect the agent's stream | neutral |
+  | enrollment, record or directory read degraded | `UNAVAILABLE` | `DEGRADED` | **keep the stream**; leave the session to the next targeted replay, after `retry_after_ms` | neutral |
+  | over `--reattach-rate` | not applicable | `RATE_LIMITED` | keep the stream; requeue the session after `retry_after_ms` | neutral |
+
+  `DEGRADED` must never disconnect: a Postgres outage would otherwise tear down every agent the
+  gateway holds. `SUPERSEDED` stays a breaker success, as `FAILED_PRECONDITION` is on replay today,
+  so a run of stale replays after a reconnect storm cannot trip the breaker.
 - **Fallback is re-registration by the agent, not `__resync__`.** On `NO_RECORD` or `NOT_ENROLLED`,
   the gateway does what it already does for a replay answered `accepted = false`
   (`yuzu_gw_upstream:replay_send/4`, about l.1964-1976): it disconnects the agent's stream. The agent
@@ -1026,8 +1046,10 @@ message ReattachResponse {
 **Storm behaviour after a server restart at 100k agents.**
 1. **The gateway replays sessions as ids.** Pacing is the existing replay start jitter and permit
    concurrency. The server adds a per-replica token bucket, `--reattach-rate`, default 2000/s.
-   Over-rate calls answer `RESOURCE_EXHAUSTED` with a retry hint, and the gateway's replay worker
-   waits and asks again, as it already does for `too_many_streams`. Each reattach costs one lock,
+   An over-rate call answers `OK` with refusal `RATE_LIMITED` and `retry_after_ms`, and the
+   gateway requeues the session after that delay without touching the breaker. It is not answered
+   `RESOURCE_EXHAUSTED`: the gateway counts that status as a breaker failure today
+   (`yuzu_gw_upstream:record_result/2`), so a reattach storm would open the breaker. Each reattach costs one lock,
    one enrollment-status read, one route CAS and one primary-key read, with the plugin set usually
    cached. That is lighter than today's ProxyRegister replay, which carries a 9 KB, 69-plugin
    request. 100k agents reattach in about 50 s.
@@ -1347,7 +1369,9 @@ of every ~30 s. The content is unchanged.
 - no RegisterRequest is retained (registry row, owner-sessions row, owner state). A size test on the
   per-agent rows is part of the harness;
 - replay sends `ProxyReattach` with exactly the three fields;
-- `NO_RECORD` and `NOT_ENROLLED` close the agent's stream;
+- every row of D14's outcome table: `NO_RECORD`, `NOT_ENROLLED`, `SUPERSEDED` and
+  `MALFORMED_SESSION` close the agent's stream; `DEGRADED` and `RATE_LIMITED` keep it and requeue
+  after `retry_after_ms`; each is classified for the breaker as the table says;
 - owner restart restores from ids;
 - the management service serves only `SendCommand` and `WatchEvents` (the three deprecated RPCs
   answer UNIMPLEMENTED);
