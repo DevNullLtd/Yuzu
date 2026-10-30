@@ -45,9 +45,11 @@ Engine Principals panel difference list (#5882; a doc-and-comment pin, not serve
      It must be numbered 1..N without a gap, and the same count (as a word: SEVEN, seven) must be
      stated by the handler comment in settings_routes.cpp, the comment in settings_routes.hpp and
      the header of test_settings_engine_panel_authz.cpp; the handler comment must also number its
-     own items 1..N. The count and the numbering are cited by number from code, tests and four
-     manual pages, so a list that gains or loses an item without those following is a silent
-     drift (G8-32).
+     own items 1..N. The count is stated as a word in those three places, and one item is cited by
+     number (`(difference 7)` in settings_routes.cpp); no manual page cites the count or a number.
+     A list that gains or loses an item without those following is a silent drift (G8-32). Not
+     gated: the count also appears in docs/test-coverage.md and the handler comment's "pins 1 to 3,
+     6 and 7" claim, which this test does not read.
 
 `//` comments are stripped and whitespace collapsed before matching. Lexical only: it cannot see
 a relocation that keeps the tokens (review-enforced). The self-test applies in-memory mutations
@@ -334,14 +336,21 @@ class DifferenceListCount(unittest.TestCase):
         self.assertGreaterEqual(len(canonical_numbers(self.md)), 1)
 
     def test_mutations_are_caught(self):
+        # upgrading.md is newest-first: an unrelated entry above the canonical list may carry its
+        # own numbered list, so mutate only the slice that starts at the list's anchor.
+        def in_list(md, mutate):
+            at = md.index(LIST_ANCHOR)
+            return md[:at] + mutate(md[at:])
+
         def drop_item_7(md):
-            return re.sub(r"^7\. .*\n", "", md, count=1, flags=re.M)
+            return in_list(md, lambda t: re.sub(r"^7\. .*\n", "", t, count=1, flags=re.M))
 
         def add_item_8(md):
-            return re.sub(r"(^7\. .*\n)", r"\g<1>" + "8. A new difference.\n", md, count=1, flags=re.M)
+            return in_list(md, lambda t: re.sub(r"(^7\. .*\n)", r"\g<1>" + "8. A new difference.\n",
+                                                t, count=1, flags=re.M))
 
         def gap(md):
-            return re.sub(r"^5\. ", "6. ", md, count=1, flags=re.M)
+            return in_list(md, lambda t: re.sub(r"^5\. ", "6. ", t, count=1, flags=re.M))
 
         def lose_item_3(cpp):
             at = cpp.index("There are ")  # the item numbers are matched only after this marker

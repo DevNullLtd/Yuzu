@@ -18,9 +18,11 @@
  *      `classify`), so a refusal from the wrong gate fails the persona. The hint must equal that
  *      classification, and must not have written an audit row (every route, the MCP twins
  *      included, is checked against an `AuditWatch` that is shown to see a write). A persona the
- *      hint calls kMay must also get the exact success status its route answers (`admitted_status`
- *      at each call site), so a 400 or a 409 from a gate the hint does not model cannot pass for
- *      "authority admitted".
+ *      hint calls kMay must also get the exact status its route answers (`admitted_status` at each
+ *      call site): 201 for assign, 200 for unassign and for PUT enforcement, and 409 for the PUT
+ *      destination-guard persona (P4: admitted by both gates, then refused by the
+ *      destination guard, a deterministic refusal that is characterised, not a transition). So a
+ *      400 or a 409 from a gate the hint does not model cannot pass for "authority admitted".
  *   2. The fold itself: structural denies need no store, a null or degraded store is
  *      kUnconfirmed, `RbacAdminSurface` has no default argument.
  *
@@ -529,6 +531,16 @@ TEST_CASE("rbac_admin_hint == PUT enforcement: engine session (P11)",
 // gate wording (kMayNot / kUnconfirmed).
 
 namespace {
+/// Whether the target holds no grant, read through the CHECKED variant: `get_principal_roles`
+/// answers an empty list on a failed read, which would let a "no grant happened" probe pass
+/// vacuously. A failed read fails the test here instead.
+bool target_roles_empty(RbacRoleHarness& h) {
+    const auto roles = h.rbac->get_principal_roles_checked("user", "hint-target");
+    INFO("get_principal_roles_checked: " << (roles ? "ok" : roles.error()));
+    REQUIRE(roles.has_value());
+    return roles->empty();
+}
+
 /// The kMcp hint for the harness's MCP session, the silence check around it, and the real tool's
 /// classified answer (ticket-then-recall through the harness). Returns what the tool answered so
 /// the caller can check the side effect that tool owns.
@@ -558,8 +570,7 @@ void check_mcp_assign(RbacRoleHarness& h, RbacAdminHint expected) {
         h, expected, "assign_rbac_role",
         {{"principal_type", "user"}, {"principal_id", "hint-target"}, {"role", "Viewer"}});
     // The side effect agrees: only an admitted caller's assignment happened.
-    CHECK(h.rbac->get_principal_roles("user", "hint-target").empty() ==
-          (answered != RbacAdminHint::kMay));
+    CHECK(target_roles_empty(h) == (answered != RbacAdminHint::kMay));
 }
 
 /// The target holds the grant first, so an admitted request removes it (a request that clears
@@ -568,8 +579,7 @@ void check_mcp_unassign(RbacRoleHarness& h, RbacAdminHint expected) {
     REQUIRE(h.rbac->assign_role({"user", "hint-target", "Viewer"}).has_value());
     const auto answered = check_mcp_tool(h, expected, "unassign_rbac_role",
                                          {{"principal_id", "hint-target"}, {"role", "Viewer"}});
-    CHECK(h.rbac->get_principal_roles("user", "hint-target").empty() ==
-          (answered == RbacAdminHint::kMay));
+    CHECK(target_roles_empty(h) == (answered == RbacAdminHint::kMay));
 }
 
 /// `target` is the opposite of the current state, so the idempotent no-op never hides the gates.
@@ -655,6 +665,20 @@ TEST_CASE(
     h.rbac->set_rbac_enabled(true);
     make_user(h, h.session_user, auth::Role::admin);
     check_mcp_enforcement(h, RbacAdminHint::kMayNot, /*target=*/false);
+}
+
+// The ON -> OFF kMay twin of REST P3: a base admin WITH the grant really transitions. The REST P4
+// persona (base USER with the grant) has no MCP twin on purpose: its destination guard refuses
+// with a 409 whatever the caller, so the state never moves, and `check_mcp_enforcement` asserts
+// that an admitted caller's state moves to `target`.
+TEST_CASE("rbac_admin_hint (kMcp) == MCP set_rbac_enforcement: base admin with the grant, RBAC on "
+          "-> off",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.rbac->set_rbac_enabled(true);
+    make_user(h, h.session_user, auth::Role::admin);
+    REQUIRE(h.rbac->assign_role({"user", h.session_user, "Administrator"}).has_value());
+    check_mcp_enforcement(h, RbacAdminHint::kMay, /*target=*/false);
 }
 
 TEST_CASE(
