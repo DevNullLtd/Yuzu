@@ -2589,7 +2589,8 @@ Proposed targets for the team to ratify:
 > decided asynchronous default (the update at the end of §11), a failover can lose writes the old
 > primary acknowledged but had not yet sent to the promoted standby. That loss is an accepted risk
 > (ADR-0074, Accepted risks), and each store must meet the requirement ADR-0074 D13 sets for it. This
-> decision does not change the RTO targets above.
+> decision does not change the RTO targets above. Asynchronous replication is now the default, not an
+> opt-out, and no bound is set on its loss window (ADR-0074 D13).
 
 ### 14. Testing — failover harness (Q12)
 A **failover test harness** stands up the Patroni+etcd+HAProxy stack and **injects a primary kill
@@ -2599,6 +2600,10 @@ effectively-once at the receiver** (§5/§6); NOTIFY listeners **cursor-poll for
 committed events (§5); in-flight commands re-drive (§7); **directory re-home races do not lose or
 duplicate** (§7). It must also cover **standby loss** (quorum-degrade behavior, §11). Owned by
 `build-ci` + `release-deploy`; scenarios by `chaos-injector`.
+
+> **Update (2026-10-30, ADR-0074 conflict 8).** The standby-loss scenario above applies to the optional
+> synchronous profiles. Under the decided asynchronous default, the harness also runs a failover that
+> loses acknowledged writes, against the per-store requirements in ADR-0074 D13.
 
 ## Decomposition into child workstreams
 
