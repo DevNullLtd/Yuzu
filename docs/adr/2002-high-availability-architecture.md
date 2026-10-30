@@ -334,7 +334,11 @@ cluster unit; intra-zone scale is more nodes.
   `ProxyRegister` with **conditional (CAS) register/deregister** keyed on `connection_epoch` — a
   delayed replay from an *older* connection **cannot overwrite** a newer re-home (the bug an
   unconditional self-healing write would create). A lease that expires without renewal marks the
-  route stale.
+  route stale. Upgrade window (Echo rename; removed with the other legacy-name shims): the directory row also
+  carries a `legacy_echo_wire_name` flag, set at `ProxyRegister` from the agent's reported plugin
+  inventory, so a replica that holds no session for an agent can still address it by the
+  pre-rename plugin name `tar` until the agent upgrades. The column stays after the write and read
+  are removed.
 - **Net-new intra-cluster routing (corrected claim).** Today `yuzu_gw_router:send_command` resolves an
   agent via node-local ETS (`yuzu_gw_registry.erl:90`) and returns `not_connected` on a miss — a
   targeted command landing on the wrong node of the right cluster fails even though a sibling holds
@@ -1443,7 +1447,7 @@ one core replica a server-only restart now recovers through the replay described
   registry-unavailable abort, an `accepted=false` answer and a failing server feeding the breaker during a
   drip (the same list as "Observed on a rig" in the gateway manual).
 - **Observed: a stuck heartbeat batch, and the buffer change that closes it (post-change rig run
-  observed).** OBSERVED on a rig with an agent that had the TAR plugin, before this change: such an
+  observed).** OBSERVED on a rig with an agent that had the Echo plugin, before this change: such an
   agent's heartbeat can carry a `fleet_snapshot_json` of 200 to 800 KB (a busy rig host), and the gateway
   heartbeat buffer retained heartbeats on a failed flush capped by count only (10000). In an unplanned
   15.6 minute server outage and in a 300 s outage (run E2a) the retained batch exceeded the server's gRPC
@@ -1451,7 +1455,7 @@ one core replica a server-only restart now recovers through the replay described
   `Received message larger than max` and none ever drained, so there was no verdict and no replay until the
   gateway was restarted (in E2a `agents.online` stayed 0 for the whole observation and the route row was
   tombstoned). This is existing buffer behaviour, not introduced by the replay, and it disabled the recovery
-  this section describes; the earlier rig runs used an agent without the TAR plugin and did not meet it.
+  this section describes; the earlier rig runs used an agent without the Echo plugin and did not meet it.
   The change: the buffer keeps one entry per session (a newer heartbeat replaces the fields of the older
   one, except that the newest non-empty `fleet_snapshot_json` is kept, because the agent sends a snapshot
   only when it has a new one); a flush is split into chunks of at most about 3 MiB (estimated), oldest

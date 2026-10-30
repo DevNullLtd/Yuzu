@@ -1,8 +1,9 @@
 #pragma once
 
 // shares_parsers.hpp -- pure parsers and row formatters for the shares plugin: what this
-// host CONFIGURES to serve over SMB/NFS. Header-only and portable so the unit tests run on
-// every host; no file I/O, no subprocess, no OS header.
+// host CONFIGURES to serve over SMB/NFS (the Windows leg reports LIVE shares through
+// shares_legs.hpp's list_windows and shares only the row formatters). Header-only and
+// portable so the unit tests run on every host; no file I/O, no subprocess, no OS header.
 //
 //   parse_exports       Linux exports(5) grammar (/etc/exports, /etc/exports.d/*.exports)
 //   parse_smb_conf      Samba smb.conf: share sections, synonyms, `copy =` and [global]
@@ -49,7 +50,10 @@ struct Share {
     std::string path;
     Access access = Access::unknown;
     std::optional<bool> anonymous;
-    std::vector<std::string> flags; ///< closed vocabulary: hidden, unavailable, special, no_root_squash, clients_<n>
+    /// closed vocabulary: hidden, unavailable, special, no_root_squash, clients_<n>, and the
+    /// Windows share kind (exactly one per row): disk, print, device, ipc, other; temporary.
+    /// Windows `hidden` is a non-special share whose name ends in `$`
+    std::vector<std::string> flags;
     std::string source;
 };
 
@@ -89,8 +93,10 @@ inline bool is_ws(char c) { return c == ' ' || c == '\t' || c == '\v' || c == '\
 
 inline std::string lower(std::string_view s) {
     std::string out(s);
-    std::ranges::transform(out, out.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    // ASCII only, whatever the process locale (std::tolower follows setlocale).
+    std::ranges::transform(out, out.begin(), [](unsigned char c) {
+        return static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c);
+    });
     return out;
 }
 
@@ -483,7 +489,8 @@ inline void smb_canon(std::string& key, std::string& value) {
     std::string k;
     for (const char c : key)
         if (!is_ws(c))
-            k += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            k += c;
+    k = lower(k);
     if (k == "writable" || k == "writeable" || k == "writeok") {
         k = "readonly";
         if (const auto b = parse_bool(value))
@@ -706,7 +713,9 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
 
 /// One free wire field: "-" when empty, else scrubbed of NUL and anything outside strictly
 /// well-formed UTF-8 (scrub_wire_bytes; NEVER sanitize_utf8, which passes overlong,
-/// surrogate and out-of-range sequences, #4864) then pipe/backslash/CRLF-escaped.
+/// surrogate and out-of-range sequences, #4864) then passed through safe_output_field: a
+/// backslash is folded to '/' (so a Windows path reads C:/Users), CR/LF fold to spaces and a
+/// pipe is escaped.
 [[nodiscard]] inline std::string wire_field(std::string_view v) {
     if (v.empty())
         return "-";
@@ -740,7 +749,7 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
     return r;
 }
 
-/// `source|<exports|exports_d|smb_conf>|<state>|<share count or ->`
+/// `source|<exports|exports_d|smb_conf|netshareenum>|<state>|<share count or ->`
 [[nodiscard]] inline std::string source_row(std::string_view kind, SourceState state,
                                             std::optional<std::size_t> count = std::nullopt) {
     std::string r = "source|";

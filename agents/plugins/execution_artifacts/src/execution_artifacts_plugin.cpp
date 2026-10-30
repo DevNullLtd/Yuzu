@@ -145,7 +145,7 @@ public:
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
         // Copied into a std::string immediately -- ctx.get_config returns a
         // string_view over the C ABI's own buffer, not guaranteed to
-        // outlive this call (tar_plugin.cpp:569's same precedent).
+        // outlive this call (echo_plugin.cpp:569's same precedent).
         data_dir_ = std::string{ctx.get_config("agent.data_dir")};
 #ifdef _WIN32
         // A1 (#4390): reclaim any stale scratch directory a crashed/killed
@@ -274,7 +274,7 @@ private:
     }
 #endif
 
-    // Captured at init() (tar_plugin.cpp:565-581's precedent); only the
+    // Captured at init() (echo_plugin.cpp:565-581's precedent); only the
     // amcache leg consumes it (execution_artifacts_win.cpp's collect_amcache,
     // as the parent directory for its per-dispatch random scratch
     // directory), empty when agent.data_dir is unset -- collect_amcache

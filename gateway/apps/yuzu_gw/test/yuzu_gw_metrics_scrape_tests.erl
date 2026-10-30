@@ -39,7 +39,7 @@
                 yuzu_gw_router, yuzu_gw_upstream_regulator, yuzu_gw_upstream,
                 yuzu_gw_upstream_pressure, yuzu_gw_gauge, yuzu_gw_health,
                 yuzu_gw_cluster_discovery, yuzu_gw_memory_shedder,
-                yuzu_gw_mgmt_pins, yuzu_gw_sup]).
+                yuzu_gw_mem_reclaim, yuzu_gw_mgmt_pins, yuzu_gw_sup]).
 
 %%%===================================================================
 %%% docs and alerts: no application needed

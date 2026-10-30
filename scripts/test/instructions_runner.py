@@ -2042,7 +2042,7 @@ Side effects (NOT exhaustive: every destructive/forensic row in the risk table a
 undoes none of them):
   device.tags.clear              removes the target's tags
   agent.storage.clear            removes every key in the target's agent storage
-  crossplatform.tar.rollup       permanently deletes TAR rows past retention; not recoverable; no
+  crossplatform.echo.rollup       permanently deletes Echo rows past retention; not recoverable; no
                                  approval gate
   security.certificates.delete   deletes a certificate from the target's store
   agent.content_dist.stage / execute_staged / cleanup / upload_file

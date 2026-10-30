@@ -147,10 +147,10 @@
   "id": "net-13",
   "tier": "D",
   "source": "docs/user-manual/network.md",
-  "claim": "Per-connection netqual TAR tier is opt-in (netqual_enabled=true), off by default, stores only coarse destination class (loopback/private/public \u2014 raw address dropped at edge), on-device only, Linux-only in this version.",
+  "claim": "Per-connection netqual Echo tier is opt-in (netqual_enabled=true), off by default, stores only coarse destination class (loopback/private/public \u2014 raw address dropped at edge), on-device only, Linux-only in this version.",
   "verdict": "CONFIRMED",
   "drift_direction": "none",
-  "evidence": "agents/plugins/tar/src/tar_plugin.cpp:677 \u2014 `db_->get_config(\"netqual_enabled\", \"false\") == \"true\"` gates collection. tar_netqual.hpp:116\u2013150 \u2014 select_netqual_rows buckets via remote_bucket() and never stores raw address. tar_network_collector.cpp:670\u2013672 \u2014 macOS collect_tcp_quality returns {}; lines 858\u2013860 \u2014 Windows returns {}; only Linux block at line 515 has real implementation.",
+  "evidence": "agents/plugins/echo/src/echo_plugin.cpp:677 \u2014 `db_->get_config(\"netqual_enabled\", \"false\") == \"true\"` gates collection. echo_netqual.hpp:116\u2013150 \u2014 select_netqual_rows buckets via remote_bucket() and never stores raw address. echo_network_collector.cpp:670\u2013672 \u2014 macOS collect_tcp_quality returns {}; lines 858\u2013860 \u2014 Windows returns {}; only Linux block at line 515 has real implementation.",
   "verification": "static",
   "needs_uat": false,
   "recommended_record_update": "none"
@@ -159,10 +159,10 @@
   "id": "net-14",
   "tier": "D",
   "source": "docs/user-manual/network.md",
-  "claim": "netqual per-connection tier has no dashboard consumer yet \u2014 it is the foundation for the deferred per-destination drill; queryable via Execute-gated TAR SQL as $NetQual_Live.",
+  "claim": "netqual per-connection tier has no dashboard consumer yet \u2014 it is the foundation for the deferred per-destination drill; queryable via Execute-gated Echo SQL as $NetQual_Live.",
   "verdict": "CONFIRMED",
   "drift_direction": "none",
-  "evidence": "agents/plugins/tar/src/tar_schema_registry.cpp:408\u2013409 \u2014 source name='netqual', dollar_name='NetQual'; suffix='live' at 426. The dollar_name_map() at 453\u2013470 constructs $NetQual_Live \u2192 netqual_live. No server-side consumer of NetQual_Live data found in server/core/src/. server/core/src/server.cpp:8210 explicitly notes app_unstable stays false 'wired with the per-connection collector slice' \u2014 the per-connection data does not feed the dashboard yet.",
+  "evidence": "agents/plugins/echo/src/echo_schema_registry.cpp:408\u2013409 \u2014 source name='netqual', dollar_name='NetQual'; suffix='live' at 426. The dollar_name_map() at 453\u2013470 constructs $NetQual_Live \u2192 netqual_live. No server-side consumer of NetQual_Live data found in server/core/src/. server/core/src/server.cpp:8210 explicitly notes app_unstable stays false 'wired with the per-connection collector slice' \u2014 the per-connection data does not feed the dashboard yet.",
   "verification": "static",
   "needs_uat": false,
   "recommended_record_update": "none"
@@ -291,7 +291,7 @@
   "verification": "static",
   "needs_uat": false,
   "severity": "HIGH",
-  "note": "[drift upheld] Drift independently confirmed. capability-map.md:1163-1171 (\u00a731.2 \"Event Guards \u2014 Kernel-Event-Driven Enforcement (Windows)\") is marked :x: \"Not implemented (PRs 3, 5, 6, 7, 10)\" and lists four primitives. Three are in fact shipped and wired into the production agent: (1) Registry Guard \u2014 RegistryGuard using RegNotifyChangeKeyValue + WaitForMultipleObjects (agents/core/src/guard_registry.cpp:456,468,522) with enforce-mode key recreate/write-back (RegCreateKeyExW, line 319), wired in guardian_engine.cpp:660-709; (2) SCM Guard \u2014 ServiceGuard using NotifyServiceStatusChangeW + OpenSCManagerW/OpenServiceW (guard_service.cpp:347-449), wired in guardian_engine.cpp:598-658, git commit e841be56 \"real-time Windows service run-state enforcement (PR5)\"; (3) File Guard \u2014 FileGuard using ReadDirectoryChangesW + FindFirstChangeNotificationW (guard_file.cpp:176,309), wired in guardian_engine.cpp:516-596. All four guard sources are in agents/core/meson.build:41 and compiled into the agent. Only WFP Guard and ETW Guard remain genuinely absent (no guard_wfp*/guard_etw* sources exist outside unrelated TAR/network code). The section should therefore be :large_orange_diamond: Partial (3 of 4 named primitives shipped), not :x:. (Note: the drift direction is code-ahead-of-doc \u2014 the doc under-states shipped work \u2014 not the auditor's stated \"doc-ahead-of-code\"; but the drift itself is real and material.) I could not find any code or doc text that satisfies the :x: Not-implemented claim, so the finding stands.",
+  "note": "[drift upheld] Drift independently confirmed. capability-map.md:1163-1171 (\u00a731.2 \"Event Guards \u2014 Kernel-Event-Driven Enforcement (Windows)\") is marked :x: \"Not implemented (PRs 3, 5, 6, 7, 10)\" and lists four primitives. Three are in fact shipped and wired into the production agent: (1) Registry Guard \u2014 RegistryGuard using RegNotifyChangeKeyValue + WaitForMultipleObjects (agents/core/src/guard_registry.cpp:456,468,522) with enforce-mode key recreate/write-back (RegCreateKeyExW, line 319), wired in guardian_engine.cpp:660-709; (2) SCM Guard \u2014 ServiceGuard using NotifyServiceStatusChangeW + OpenSCManagerW/OpenServiceW (guard_service.cpp:347-449), wired in guardian_engine.cpp:598-658, git commit e841be56 \"real-time Windows service run-state enforcement (PR5)\"; (3) File Guard \u2014 FileGuard using ReadDirectoryChangesW + FindFirstChangeNotificationW (guard_file.cpp:176,309), wired in guardian_engine.cpp:516-596. All four guard sources are in agents/core/meson.build:41 and compiled into the agent. Only WFP Guard and ETW Guard remain genuinely absent (no guard_wfp*/guard_etw* sources exist outside unrelated Echo/network code). The section should therefore be :large_orange_diamond: Partial (3 of 4 named primitives shipped), not :x:. (Note: the drift direction is code-ahead-of-doc \u2014 the doc under-states shipped work \u2014 not the auditor's stated \"doc-ahead-of-code\"; but the drift itself is real and material.) I could not find any code or doc text that satisfies the :x: Not-implemented claim, so the finding stands.",
   "recommended_record_update": "none"
  },
  {
@@ -315,7 +315,7 @@
   "claim": "All four Scope Walking and Result Set capabilities (\u00a730.1-\u00a730.4) are :x: Not implemented.",
   "verdict": "DRIFTED",
   "drift_direction": "doc-ahead-of-code",
-  "evidence": "result_set_store.cpp (857 lines) implements ResultSetStore with create_pending (line 373), list_by_owner (line 381), lineage (line 466), pin/unpin (lines 634/662), GC sweep, per-owner quotas. rest_api_v1.cpp has 10+ /api/v1/result-sets routes (GET, POST, from-inventory-query, from-tar-query, from-instruction-result, re-eval, members, lineage, pin, unpin, delete \u2014 lines 3135-3570). scope_engine.cpp:420-434 implements from_result_set: short-circuit kind. result_sets_ui.cpp (render_result_sets_sidebar, render_result_set_detail, from_result_set token display). result_set_matcher.cpp exists. CHANGELOG (~line 1194-1234) confirms these shipped. \u00a730.1, \u00a730.2, and \u00a730.3 should be DONE; \u00a730.4 operational hardening is PARTIAL (metrics present, full GC/re-eval in code).",
+  "evidence": "result_set_store.cpp (857 lines) implements ResultSetStore with create_pending (line 373), list_by_owner (line 381), lineage (line 466), pin/unpin (lines 634/662), GC sweep, per-owner quotas. rest_api_v1.cpp has 10+ /api/v1/result-sets routes (GET, POST, from-inventory-query, from-echo-query, from-instruction-result, re-eval, members, lineage, pin, unpin, delete \u2014 lines 3135-3570). scope_engine.cpp:420-434 implements from_result_set: short-circuit kind. result_sets_ui.cpp (render_result_sets_sidebar, render_result_set_detail, from_result_set token display). result_set_matcher.cpp exists. CHANGELOG (~line 1194-1234) confirms these shipped. \u00a730.1, \u00a730.2, and \u00a730.3 should be DONE; \u00a730.4 operational hardening is PARTIAL (metrics present, full GC/re-eval in code).",
   "verification": "static",
   "needs_uat": false,
   "severity": "MEDIUM",
@@ -326,14 +326,14 @@
   "id": "asp-06",
   "tier": "B",
   "source": "docs/roadmap.md:157 (Phase 15 current status table)",
-  "claim": "Phase 15: TAR Dashboard and Scope Walking \u2014 0 done, 8 open, 0% progress.",
+  "claim": "Phase 15: Echo Dashboard and Scope Walking \u2014 0 done, 8 open, 0% progress.",
   "verdict": "DRIFTED",
   "drift_direction": "doc-ahead-of-code",
   "evidence": "Issues 15.B (result-set store + REST API) and 15.C (scope-engine from_result_set + dashboard) are shipped in code per result_set_store.cpp, rest_api_v1.cpp scope-walking routes, scope_engine.cpp, and result_sets_ui.cpp. Issue 15.G (operational hardening) is PARTIAL (prometheus metrics yuzu_result_sets_total etc in rest_api_v1.cpp:3122, pin/quota enforcement present). CHANGELOG lines 1194-1234 confirm the shipping. The Phase 15 table should show at minimum 2/8 done (15.B and 15.C), with 15.G as partial.",
   "verification": "static",
   "needs_uat": false,
   "severity": "LOW",
-  "note": "[drift upheld] I independently confirmed the drift. The roadmap Phase 15 status table (docs/roadmap.md:157) reads \"0 done, 8 open, 0% progress\" and the per-issue detail rows mark 15.B (line 1496), 15.C (line 1503) and 15.G (line 1535) all as \"Open\", but the code for these is fully shipped. (1) Issue 15.B \u2014 result-set store + REST: server/core/src/result_set_store.cpp is a real 857-line store (schema, lineage, TTL, pin, gc_sweep), and the complete REST surface exists in server/core/src/rest_api_v1.cpp: GET /api/v1/result-sets (3136), POST create (3162), from-inventory-query (3227), from-tar-query (3336), from-instruction-result (3377), GET /{id} (3488), /{id}/members (3501), /{id}/lineage (3532), /{id}/pin (3555), /{id}/unpin (3576), /{id}/re-eval (3428), DELETE /{id} (3596). (2) Issue 15.C \u2014 scope engine from_result_set: server/core/src/scope_engine.cpp:425 parses the from_result_set:<id-or-alias> short-circuit kind, and server/core/src/result_sets_ui.cpp renders the sidebar (render_result_sets_sidebar:46), lineage breadcrumb (line 90) and copyable from_result_set: scope token (line 116). (3) Issue 15.G \u2014 operational hardening is PARTIAL: gc_sweep wired in server/core/src/server.cpp:7881, per-owner quota/pin caps (kMaxPerOwner/kMaxPinsPerOwner in result_set_store.cpp), and Prometheus metrics yuzu_result_sets_total (rest_api_v1.cpp:3122), yuzu_result_sets_alive (server.cpp:7891), yuzu_result_set_quota_rejected (resolve_seconds histogram not found). Git history confirms shipping: commit 68427bba \"feat(scope-walking): result-set store, REST, from_result_set: scope kind, dashboard UI\" and 4f10a69b (PR 1202 review fixes). The table should show at minimum 2/8 done (15.B + 15.C) with 15.G partial. I could not refute the auditor.",
+  "note": "[drift upheld] I independently confirmed the drift. The roadmap Phase 15 status table (docs/roadmap.md:157) reads \"0 done, 8 open, 0% progress\" and the per-issue detail rows mark 15.B (line 1496), 15.C (line 1503) and 15.G (line 1535) all as \"Open\", but the code for these is fully shipped. (1) Issue 15.B \u2014 result-set store + REST: server/core/src/result_set_store.cpp is a real 857-line store (schema, lineage, TTL, pin, gc_sweep), and the complete REST surface exists in server/core/src/rest_api_v1.cpp: GET /api/v1/result-sets (3136), POST create (3162), from-inventory-query (3227), from-echo-query (3336), from-instruction-result (3377), GET /{id} (3488), /{id}/members (3501), /{id}/lineage (3532), /{id}/pin (3555), /{id}/unpin (3576), /{id}/re-eval (3428), DELETE /{id} (3596). (2) Issue 15.C \u2014 scope engine from_result_set: server/core/src/scope_engine.cpp:425 parses the from_result_set:<id-or-alias> short-circuit kind, and server/core/src/result_sets_ui.cpp renders the sidebar (render_result_sets_sidebar:46), lineage breadcrumb (line 90) and copyable from_result_set: scope token (line 116). (3) Issue 15.G \u2014 operational hardening is PARTIAL: gc_sweep wired in server/core/src/server.cpp:7881, per-owner quota/pin caps (kMaxPerOwner/kMaxPinsPerOwner in result_set_store.cpp), and Prometheus metrics yuzu_result_sets_total (rest_api_v1.cpp:3122), yuzu_result_sets_alive (server.cpp:7891), yuzu_result_set_quota_rejected (resolve_seconds histogram not found). Git history confirms shipping: commit 68427bba \"feat(scope-walking): result-set store, REST, from_result_set: scope kind, dashboard UI\" and 4f10a69b (PR 1202 review fixes). The table should show at minimum 2/8 done (15.B + 15.C) with 15.G partial. I could not refute the auditor.",
   "recommended_record_update": "none"
  },
  {
@@ -2395,7 +2395,7 @@
   "needs_uat": false,
   "recommended_record_update": "none",
   "severity": "NONE",
-  "note": "TAR perf sampler is a separate subsystem (perf_enabled) as the doc states."
+  "note": "Echo perf sampler is a separate subsystem (perf_enabled) as the doc states."
  },
  {
   "id": "dex-20",
@@ -2440,13 +2440,13 @@
   "note": "Per-volume / per-device latch; unreadable volumes skipped (never a signal) per cpp:124."
  },
  {
-  "id": "tar-01",
+  "id": "echo-01",
   "tier": "A",
-  "source": "CLAUDE.md routed-concern (TAR dashboard): untrusted tar.sql operator SQL must go through TarDatabase::execute_user_query (read-only connection + sqlite3 authorizer allowlisting registry warehouse tables), never the trusted execute_query (#760/#631)",
+  "source": "CLAUDE.md routed-concern (Echo dashboard): untrusted echo.sql operator SQL must go through EchoDatabase::execute_user_query (read-only connection + sqlite3 authorizer allowlisting registry warehouse tables), never the trusted execute_query (#760/#631)",
   "claim": "Untrusted operator SQL is executed on a dedicated read-only, authorizer-sandboxed SQLite connection that allowlists only registry-known warehouse tables; trusted internal SQL uses a separate path.",
   "verdict": "CONFIRMED",
   "drift_direction": "none",
-  "evidence": "agents/plugins/tar/src/tar_db.cpp:60-80 tar_query_authorizer (SELECT/FUNCTION/READ allow, default DENY; READ gated by is_queryable_table); cpp:279-289 ro connection opened SQLITE_OPEN_READONLY|FULLMUTEX, sqlite3_set_authorizer + DBCONFIG_ENABLE_LOAD_EXTENSION=0; tar_db.hpp:299-302 query_db_ field. is_queryable_table in tar_schema_registry.cpp:577-590 (table_ref_map keys + tar_state/tar_config; tar_events deliberately excluded).",
+  "evidence": "agents/plugins/echo/src/echo_db.cpp:60-80 echo_query_authorizer (SELECT/FUNCTION/READ allow, default DENY; READ gated by is_queryable_table); cpp:279-289 ro connection opened SQLITE_OPEN_READONLY|FULLMUTEX, sqlite3_set_authorizer + DBCONFIG_ENABLE_LOAD_EXTENSION=0; echo_db.hpp:299-302 query_db_ field. is_queryable_table in echo_schema_registry.cpp:577-590 (table_ref_map keys + echo_state/echo_config; tar_events deliberately excluded).",
   "verification": "static",
   "needs_uat": false,
   "recommended_record_update": "none",
@@ -2454,46 +2454,46 @@
   "note": "Defence-in-depth sandbox fully present and matches the invariant."
  },
  {
-  "id": "tar-02",
+  "id": "echo-02",
   "tier": "A",
-  "source": "docs/tar-dashboard.md \u00a76 + CLAUDE.md: tar.sql handler routes operator SQL to the user-query path",
-  "claim": "The tar.sql agent action validates then runs operator SQL via execute_user_query, while internal rollup/stats queries use execute_query.",
+  "source": "docs/echo-dashboard.md \u00a76 + CLAUDE.md: echo.sql handler routes operator SQL to the user-query path",
+  "claim": "The echo.sql agent action validates then runs operator SQL via execute_user_query, while internal rollup/stats queries use execute_query.",
   "verdict": "CONFIRMED",
   "drift_direction": "none",
-  "evidence": "agents/plugins/tar/src/tar_plugin.cpp:1498-1511 do_sql -> validate_and_translate_sql then db_->execute_user_query(*validated); internal callers at tar_plugin.cpp:891,903,1046,1135 use execute_query. Only the operator action reaches execute_user_query.",
+  "evidence": "agents/plugins/echo/src/echo_plugin.cpp:1498-1511 do_sql -> validate_and_translate_sql then db_->execute_user_query(*validated); internal callers at echo_plugin.cpp:891,903,1046,1135 use execute_query. Only the operator action reaches execute_user_query.",
   "verification": "static",
   "needs_uat": false,
   "recommended_record_update": "none",
   "severity": "NONE"
  },
  {
-  "id": "tar-03",
+  "id": "echo-03",
   "tier": "A",
   "source": "#631 (NUL-byte / trailing-statement divergence between validated and executed SQL)",
   "claim": "execute_user_query passes explicit byte length (not -1) so an embedded NUL is a tokenizer error, and rejects any trailing statement after the first.",
   "verdict": "CONFIRMED",
   "drift_direction": "none",
-  "evidence": "agents/plugins/tar/src/tar_db.cpp:1041-1042 sqlite3_prepare_v2 with static_cast<int>(sql.size()); cpp:1057-1062 trailing-SQL rejection ('only single-statement queries are allowed'); cpp:1046-1047 SQLITE_AUTH -> generic message (no table/column enumeration oracle).",
+  "evidence": "agents/plugins/echo/src/echo_db.cpp:1041-1042 sqlite3_prepare_v2 with static_cast<int>(sql.size()); cpp:1057-1062 trailing-SQL rejection ('only single-statement queries are allowed'); cpp:1046-1047 SQLITE_AUTH -> generic message (no table/column enumeration oracle).",
   "verification": "static",
   "needs_uat": false,
   "recommended_record_update": "none",
   "severity": "NONE"
  },
  {
-  "id": "tar-04",
+  "id": "echo-04",
   "tier": "A",
-  "source": "docs/tar-db.hpp contract / #760: execute_user_query fails closed if sandbox connection is unavailable",
+  "source": "docs/echo-db.hpp contract / #760: execute_user_query fails closed if sandbox connection is unavailable",
   "claim": "If the read-only sandbox connection cannot be opened, operator SQL is refused (fail closed) for the process lifetime.",
   "verdict": "CONFIRMED",
   "drift_direction": "none",
-  "evidence": "agents/plugins/tar/src/tar_db.cpp:290-296 logs and continues without query_db_ on open failure; cpp:1032-1033 execute_user_query returns std::unexpected('query engine unavailable') when query_db_ is null.",
+  "evidence": "agents/plugins/echo/src/echo_db.cpp:290-296 logs and continues without query_db_ on open failure; cpp:1032-1033 execute_user_query returns std::unexpected('query engine unavailable') when query_db_ is null.",
   "verification": "static",
   "needs_uat": false,
   "recommended_record_update": "none",
   "severity": "NONE"
  },
  {
-  "id": "tar-05",
+  "id": "echo-05",
   "tier": "A",
   "source": "docs/scope-walking-design.md \u00a73.1: server schema in result_set_store.cpp, new SQLite database result_sets.db",
   "claim": "The result-set store is a dedicated SQLite database named result_sets.db with result_sets + result_set_members tables and lineage parent_id edges.",
@@ -2506,7 +2506,7 @@
   "severity": "NONE"
  },
  {
-  "id": "tar-06",
+  "id": "echo-06",
   "tier": "A",
   "source": "docs/scope-walking-design.md \u00a74.1: new scope kind from_result_set:<id>",
   "claim": "The Scope Engine adds a from_result_set:<id-or-alias> short-circuit kind that resolves to materialised members and composes with attribute predicates via AND/OR/NOT.",
@@ -2519,7 +2519,7 @@
   "severity": "NONE"
  },
  {
-  "id": "tar-07",
+  "id": "echo-07",
   "tier": "A",
   "source": "docs/scope-walking-design.md \u00a74.1: resolving session must be the owner (owner-only initial release)",
   "claim": "from_result_set: resolution is owner-checked; a reference the resolver does not own no-matches rather than leaking another operator's set.",
@@ -2532,7 +2532,7 @@
   "severity": "NONE"
  },
  {
-  "id": "tar-08",
+  "id": "echo-08",
   "tier": "A",
   "source": "docs/scope-walking-design.md \u00a73.3: TTL/GC, pin-storm guard, per-operator quota",
   "claim": "Result sets carry default 1h TTL, 10000/operator hard cap, 50-pin cap, and a background GC sweep deleting unpinned expired rows.",
@@ -2545,10 +2545,10 @@
   "severity": "NONE"
  },
  {
-  "id": "tar-09",
+  "id": "echo-09",
   "tier": "C",
-  "source": "docs/scope-walking-design.md \u00a73.1 / hpp: async producers (TAR SQL, instruction-result) land pending and are materialised by the server maintenance thread once the execution is terminal",
-  "claim": "from-tar-query / from-instruction-result create a pending result set with a source_execution_id, materialised asynchronously by a maintenance thread.",
+  "source": "docs/scope-walking-design.md \u00a73.1 / hpp: async producers (Echo SQL, instruction-result) land pending and are materialised by the server maintenance thread once the execution is terminal",
+  "claim": "from-echo-query / from-instruction-result create a pending result set with a source_execution_id, materialised asynchronously by a maintenance thread.",
   "verdict": "CONFIRMED",
   "drift_direction": "none",
   "evidence": "result_set_store.hpp:126-129 create_pending; rest_api_v1.cpp:3013-3072 run_async create-before-dispatch engine; server.cpp:7815-7861 maintenance thread iterates list_pending() and calls materialize(p.id, members).",
@@ -2558,7 +2558,7 @@
   "severity": "NONE"
  },
  {
-  "id": "tar-10",
+  "id": "echo-10",
   "tier": "C",
   "source": "docs/scope-walking-design.md \u00a77 Status (PR-E): selector/fromResultSet parsing + lowering + rules 1-2 enforced + dispatch alias resolution + scope_resolution_failed audit shipped",
   "claim": "DSL fromResultSet:/selector: parses and lowers (platform->ostype, tags->EXISTS tag:), rules 1-2 enforced at create, rule 3 enforced at dispatch via instruction.scope_resolution_failed audit.",
@@ -2571,7 +2571,7 @@
   "severity": "NONE"
  },
  {
-  "id": "tar-11",
+  "id": "echo-11",
   "tier": "C",
   "source": "docs/scope-walking-design.md \u00a77/\u00a711 Status: Policy fromResultSet: deferred to PR-E2 (create_policy rejects it)",
   "claim": "Policy fromResultSet: is not yet supported; create_policy rejects both the scalar and block forms.",
@@ -2584,22 +2584,22 @@
   "severity": "NONE"
  },
  {
-  "id": "tar-12",
+  "id": "echo-12",
   "tier": "D",
-  "source": "docs/tar-dashboard.md \u00a72/\u00a79: /tar dashboard page (Infrastructure:Read) with retention-paused source list shipped (PR-A.A)",
-  "claim": "A dedicated /tar page exists requiring auth, hosting the retention-paused source list with Scan and Re-enable.",
+  "source": "docs/echo-dashboard.md \u00a72/\u00a79: /echo dashboard page (Infrastructure:Read) with retention-paused source list shipped (PR-A.A)",
+  "claim": "A dedicated /echo page exists requiring auth, hosting the retention-paused source list with Scan and Re-enable.",
   "verdict": "CONFIRMED",
   "drift_direction": "none",
-  "evidence": "server/core/src/server.cpp:5857-5864 GET /tar (require_auth, kTarPageHtml); dashboard_routes.cpp:892 GET /fragments/tar/retention-paused, :921 POST .../scan, :1095 POST .../reenable; page shell server/core/src/tar_page_ui.cpp; nav links in dashboard_ui.cpp:382 etc.",
+  "evidence": "server/core/src/server.cpp:5857-5864 GET /echo (require_auth, kEchoPageHtml); dashboard_routes.cpp:892 GET /fragments/echo/retention-paused, :921 POST .../scan, :1095 POST .../reenable; page shell server/core/src/echo_page_ui.cpp; nav links in dashboard_ui.cpp:382 etc.",
   "verification": "static",
   "needs_uat": false,
   "recommended_record_update": "none",
   "severity": "NONE"
  },
  {
-  "id": "tar-13",
+  "id": "echo-13",
   "tier": "D",
-  "source": "docs/tar-dashboard.md \u00a73.1: retention rows deduplicated to most-recent per agent by server-stamped received_at_ms (never agent-claimed timestamp); tri-state enabled value with value-error badge",
+  "source": "docs/echo-dashboard.md \u00a73.1: retention rows deduplicated to most-recent per agent by server-stamped received_at_ms (never agent-claimed timestamp); tri-state enabled value with value-error badge",
   "claim": "Responses are deduplicated by received_at_ms and a non-true/false enabled value surfaces a value-error badge rather than being dropped.",
   "verdict": "CONFIRMED",
   "drift_direction": "none",
@@ -2610,27 +2610,27 @@
   "severity": "NONE"
  },
  {
-  "id": "tar-14",
+  "id": "echo-14",
   "tier": "C",
-  "source": "docs/tar-dashboard.md \u00a79 + scope-walking-design.md \u00a711: PR-B (result-set store + REST), PR-C (scope chip/sidebar/breadcrumb), PR-D (TAR SQL frame scope-walking-aware) all marked 'Pending'",
+  "source": "docs/echo-dashboard.md \u00a79 + scope-walking-design.md \u00a711: PR-B (result-set store + REST), PR-C (scope chip/sidebar/breadcrumb), PR-D (Echo SQL frame scope-walking-aware) all marked 'Pending'",
   "claim": "PR-B, PR-C and PR-D are pending/not yet built.",
   "verdict": "DRIFTED",
   "drift_direction": "code-ahead-of-doc",
-  "evidence": "All shipped: result-set REST routes rest_api_v1.cpp:3135-3608 (PR-B); sidebar/detail/lineage/pin fragments server.cpp:5870-5945 + result_sets_ui.cpp (PR-C); TAR-page SQL frame is scope-walking-aware tar_page_ui.cpp:300-305 scope chip + :470 POST /api/v1/result-sets/from-tar-query + pollSet materialisation (PR-D). The doc status tables still say 'Pending'.",
+  "evidence": "All shipped: result-set REST routes rest_api_v1.cpp:3135-3608 (PR-B); sidebar/detail/lineage/pin fragments server.cpp:5870-5945 + result_sets_ui.cpp (PR-C); Echo-page SQL frame is scope-walking-aware echo_page_ui.cpp:300-305 scope chip + :470 POST /api/v1/result-sets/from-echo-query + pollSet materialisation (PR-D). The doc status tables still say 'Pending'.",
   "verification": "static",
   "needs_uat": false,
   "recommended_record_update": "CLAUDE.md edit",
   "severity": "LOW",
-  "note": "[drift upheld] Drift confirmed independently. docs/tar-dashboard.md \u00a79 lines 249-251 still mark PR-B/PR-C/PR-D as \"Pending\", but all three are shipped and committed in the live tree. PR-B: result_set_store.{cpp,hpp} exists and REST routes GET/POST /api/v1/result-sets, /from-inventory-query, /from-tar-query are wired (rest_api_v1.cpp:3135-3330). PR-C: result_sets_ui.cpp renders sidebar/detail/lineage(breadcrumb)/pin fragments wired in server.cpp:5869-6011 (result_set_store_->lineage at :5913). PR-D: tar_page_ui.cpp:300-478 has the scope chip (tar-sql-scope), POST /api/v1/result-sets/from-tar-query, and pollSet materialization polling \u2014 and commit e7b47ca3 is literally \"feat(scope-walking): ... TAR SQL frame (PR-D)\". The doc is also self-inconsistent: scope-walking-design.md \u00a711 line 336 already marks PR-E as \"Shipped\", which sequentially depends on PR-B/C/D, yet tar-dashboard.md \u00a79 still says those three are Pending. Direction is code-ahead-of-doc."
+  "note": "[drift upheld] Drift confirmed independently. docs/echo-dashboard.md \u00a79 lines 249-251 still mark PR-B/PR-C/PR-D as \"Pending\", but all three are shipped and committed in the live tree. PR-B: result_set_store.{cpp,hpp} exists and REST routes GET/POST /api/v1/result-sets, /from-inventory-query, /from-echo-query are wired (rest_api_v1.cpp:3135-3330). PR-C: result_sets_ui.cpp renders sidebar/detail/lineage(breadcrumb)/pin fragments wired in server.cpp:5869-6011 (result_set_store_->lineage at :5913). PR-D: echo_page_ui.cpp:300-478 has the scope chip (echo-sql-scope), POST /api/v1/result-sets/from-echo-query, and pollSet materialization polling \u2014 and commit e7b47ca3 is literally \"feat(scope-walking): ... Echo SQL frame (PR-D)\". The doc is also self-inconsistent: scope-walking-design.md \u00a711 line 336 already marks PR-E as \"Shipped\", which sequentially depends on PR-B/C/D, yet echo-dashboard.md \u00a79 still says those three are Pending. Direction is code-ahead-of-doc."
  },
  {
-  "id": "tar-15",
+  "id": "echo-15",
   "tier": "C",
-  "source": "docs/tar-dashboard.md \u00a79: PR-H process tree viewer 'Pending \u2014 waits on agent service-install hardening readiness'",
-  "claim": "The process-tree viewer (tar.process_tree action, /fragments/tar/process-tree and /api/v1/tar/process-tree/{id} routes) is not yet built.",
+  "source": "docs/echo-dashboard.md \u00a79: PR-H process tree viewer 'Pending \u2014 waits on agent service-install hardening readiness'",
+  "claim": "The process-tree viewer (echo.process_tree action, /fragments/echo/process-tree and /api/v1/echo/process-tree/{id} routes) is not yet built.",
   "verdict": "CONFIRMED",
   "drift_direction": "none",
-  "evidence": "No server route handler for process-tree: grep for 'process-tree' in server/core/src/*.cpp finds only HTML markup (tar_page_ui.cpp:322 frame, viz_host_page_ui.cpp:81 hx-get) but no Get/Post registration; no tar.process_tree/'seed' action in agents/plugins/tar/src/tar_plugin.cpp (process_live referenced only by existing collectors). Doc accurately marks it Pending.",
+  "evidence": "No server route handler for process-tree: grep for 'process-tree' in server/core/src/*.cpp finds only HTML markup (echo_page_ui.cpp:322 frame, viz_host_page_ui.cpp:81 hx-get) but no Get/Post registration; no echo.process_tree/'seed' action in agents/plugins/echo/src/echo_plugin.cpp (process_live referenced only by existing collectors). Doc accurately marks it Pending.",
   "verification": "static",
   "needs_uat": false,
   "recommended_record_update": "none",
@@ -2638,20 +2638,20 @@
   "note": "DEFERRED marker is honest; markup stub exists but the backend route/action does not. Not drift."
  },
  {
-  "id": "tar-16",
+  "id": "echo-16",
   "tier": "D",
-  "source": "docs/tar-dashboard.md \u00a73.4: Purge action (tar.purge_source) deferred",
-  "claim": "The Purge-data action (tar.purge_source agent action, Infrastructure:Delete, typed-confirm) is not yet implemented.",
+  "source": "docs/echo-dashboard.md \u00a73.4: Purge action (echo.purge_source) deferred",
+  "claim": "The Purge-data action (echo.purge_source agent action, Infrastructure:Delete, typed-confirm) is not yet implemented.",
   "verdict": "CONFIRMED",
   "drift_direction": "none",
-  "evidence": "absent: grep 'purge_source'/'tar.purge_source'/'do_purge' across server/core/src and agents/plugins/tar/src returns no implementation. Doc \u00a73.4 and \u00a79 mark it deferred \u2014 accurate.",
+  "evidence": "absent: grep 'purge_source'/'echo.purge_source'/'do_purge' across server/core/src and agents/plugins/echo/src returns no implementation. Doc \u00a73.4 and \u00a79 mark it deferred \u2014 accurate.",
   "verification": "static",
   "needs_uat": false,
   "recommended_record_update": "none",
   "severity": "NONE"
  },
  {
-  "id": "tar-17",
+  "id": "echo-17",
   "tier": "D",
   "source": "docs/asset-tagging-guide.md: four structured tag categories (role, environment, location, service); environment restricted to Dev/UAT/Production; other three free-form; max 448 bytes",
   "claim": "Exactly four structured categories exist with environment restricted to the three allowed values and a 448-byte value cap.",
@@ -2664,7 +2664,7 @@
   "severity": "NONE"
  },
  {
-  "id": "tar-18",
+  "id": "echo-18",
   "tier": "D",
   "source": "docs/asset-tagging-guide.md 'Automatic service management groups': setting a service tag auto-creates a dynamic 'Service: <value>' management group",
   "claim": "Setting the service tag auto-creates a dynamic management group named 'Service: <value>' scoped by tag:service == value.",
@@ -2677,7 +2677,7 @@
   "severity": "NONE"
  },
  {
-  "id": "tar-19",
+  "id": "echo-19",
   "tier": "D",
   "source": "docs/asset-tagging-guide.md 'IT Service Owner Role': ITServiceOwner has 10 securable types with 5 operations each (50 permissions total), listing Device, Tag, InstructionDefinition, InstructionSet, InstructionExecution, Response, Scope, Schedule, Approval, ManagementGroup",
   "claim": "ITServiceOwner is seeded with exactly the 10 listed securable types (50 permissions).",
@@ -2691,7 +2691,7 @@
   "note": "[drift upheld] Drift independently confirmed. server/core/src/rbac_store.cpp:402-417 seeds ITServiceOwner across 16 securable types (Infrastructure, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response, ManagementGroup, Policy, DeviceToken, SoftwareDeployment, License, FileRetrieval, GuaranteedState), each crossed with the 5-element crud_ops array {Read, Write, Execute, Delete, Approve} (rbac_store.cpp:167,421) = 80 permissions, plus an extra GuaranteedState:Push insert (rbac_store.cpp:435) = 81 total permissions. The doc (docs/asset-tagging-guide.md:296-300) claims exactly 10 securable types and 50 permissions, and its listed names diverge from the code: doc lists Device/Scope/InstructionExecution which do NOT exist in itso_types (code uses Infrastructure, Execution, has no Scope), and the doc entirely omits Policy, DeviceToken, SoftwareDeployment, License, FileRetrieval, GuaranteedState, AuditLog, and the GuaranteedState:Push grant. Both the count and the type names are wrong; code is ahead of doc."
  },
  {
-  "id": "tar-20",
+  "id": "echo-20",
   "tier": "D",
   "source": "docs/asset-tagging-guide.md 'Scope Expressions with Tags': tag:key == value equality and EXISTS tag:<name> presence; selector.tags block lowers to EXISTS tag:<name>",
   "claim": "The scope engine supports tag:<key> equality and EXISTS tag:<name> presence, and the YAML selector.tags block lowers each tag to a presence check.",
@@ -2704,20 +2704,20 @@
   "severity": "NONE"
  },
  {
-  "id": "tar-21",
+  "id": "echo-21",
   "tier": "A",
-  "source": "docs/scope-walking-design.md \u00a76: REST surface /api/v1/result-sets with from-inventory-query (sync), from-tar-query/from-instruction-result (async), /lineage, /pin, /unpin, /re-eval, members, DELETE",
+  "source": "docs/scope-walking-design.md \u00a76: REST surface /api/v1/result-sets with from-inventory-query (sync), from-echo-query/from-instruction-result (async), /lineage, /pin, /unpin, /re-eval, members, DELETE",
   "claim": "The full result-sets REST surface (list/get/create/from-*/lineage/members/pin/unpin/re-eval/delete) is wired.",
   "verdict": "CONFIRMED",
   "drift_direction": "none",
-  "evidence": "server/core/src/rest_api_v1.cpp:3136 GET list, :3162 POST create, :3227 from-inventory-query, :3336 from-tar-query, :3377 from-instruction-result, :3428 re-eval, :3488 GET {id}, :3501 members, :3532 lineage, :3555 pin, :3576 unpin, :3596 DELETE. Tests: test_rest_result_sets_async.cpp, test_result_set_store.cpp.",
+  "evidence": "server/core/src/rest_api_v1.cpp:3136 GET list, :3162 POST create, :3227 from-inventory-query, :3336 from-echo-query, :3377 from-instruction-result, :3428 re-eval, :3488 GET {id}, :3501 members, :3532 lineage, :3555 pin, :3576 unpin, :3596 DELETE. Tests: test_rest_result_sets_async.cpp, test_result_set_store.cpp.",
   "verification": "static",
   "needs_uat": false,
   "recommended_record_update": "none",
   "severity": "NONE"
  },
  {
-  "id": "tar-22",
+  "id": "echo-22",
   "tier": "D",
   "source": "docs/asset-tagging-guide.md REST reference: GET /api/v1/tag-categories (Tag:Read), GET /api/v1/tag-compliance (Tag:Read), PUT/DELETE /api/v1/tags",
   "claim": "The tag-categories and tag-compliance REST endpoints exist with the documented behaviour.",
@@ -2731,7 +2731,7 @@
   "note": "Endpoint set present; precise permission-string mapping (Tag:Read) not exhaustively traced but category/compliance surfaces are wired."
  },
  {
-  "id": "tar-23",
+  "id": "echo-23",
   "tier": "A",
   "source": "docs/scope-walking-design.md \u00a74.3: from_result_set: never errors on stale/offline members; design materialises members at create time (default)",
   "claim": "Membership is materialised at create time and resolution silently drops stale members rather than erroring.",
@@ -4080,11 +4080,11 @@
   "claim": "Flow telemetry is event-driven and edge-aggregated into a federated agent SQLite warehouse.",
   "verdict": "DRIFTED",
   "drift_direction": "doc-ahead-of-code",
-  "evidence": "Capture is still poll-based: design doc 4.1 table marks per-connection capture 'Have (observed); poll-based \u2014 misses short-lived flows' and 4.2 'Move to event capture' as Add. No eBPF/ETW-flow/NetworkExtension flow collector exists for the reachability graph (grep for the event-capture flow path returns DEX/TAR collectors, not a flow-summary edge warehouse). ADR is accepted; code unchanged from the poll PoC.",
+  "evidence": "Capture is still poll-based: design doc 4.1 table marks per-connection capture 'Have (observed); poll-based \u2014 misses short-lived flows' and 4.2 'Move to event capture' as Add. No eBPF/ETW-flow/NetworkExtension flow collector exists for the reachability graph (grep for the event-capture flow path returns DEX/Echo collectors, not a flow-summary edge warehouse). ADR is accepted; code unchanged from the poll PoC.",
   "verification": "static",
   "needs_uat": false,
   "recommended_record_update": "none",
-  "note": "[drift upheld] Independently confirmed: no event-driven flow capture exists for the reachability/vuln-scan graph; capture is still poll-based, matching the PoC the ADR set out to replace. Evidence in code: agents/plugins/tar/src/tar_network_collector.cpp uses GetExtendedTcpTable (lines 713/719/747/753), /proc/net/tcp + /proc/net/tcp6 (lines 356-357), and libproc (line 54), and explicitly returns empty for Windows quality with a note that Microsoft-Windows-TCPIP ETW is kPlanned (lines 858-860). The only ETW present is PROCESS capture (agents/plugins/tar/src/tar_proc_etw.hpp \u2014 Microsoft-Windows-Kernel-Process, not network flow). No eBPF/tracepoint flow collector (the only tcp_connect hits are the SQL helper TarDatabase::query_recent_tcp_connections, tar_db.cpp:661) and no NetworkExtension/.mm files exist. The graph is fed by fleet_snapshot.v1 built from the live /proc/net/tcp snapshot merged with the TAR warehouse (agents/plugins/tar/src/tar_fleet_snapshot.hpp:81-90) \u2014 a poll, not an event firehose, and no (src,dst,port,proto,first_seen,last_seen,count) flow-summary edge warehouse. ADR-0003 (docs/adr/0003-telemetry-capture-model.md, status: accepted) states the flow telemetry IS event-driven, edge-aggregated, and federated; the design doc's own \u00a74.1/\u00a74.2 honestly mark 'Event-driven flow capture' as Add. So the ADR is doc-ahead-of-code drift, as the auditor found.",
+  "note": "[drift upheld] Independently confirmed: no event-driven flow capture exists for the reachability/vuln-scan graph; capture is still poll-based, matching the PoC the ADR set out to replace. Evidence in code: agents/plugins/echo/src/echo_network_collector.cpp uses GetExtendedTcpTable (lines 713/719/747/753), /proc/net/tcp + /proc/net/tcp6 (lines 356-357), and libproc (line 54), and explicitly returns empty for Windows quality with a note that Microsoft-Windows-TCPIP ETW is kPlanned (lines 858-860). The only ETW present is PROCESS capture (agents/plugins/echo/src/echo_proc_etw.hpp \u2014 Microsoft-Windows-Kernel-Process, not network flow). No eBPF/tracepoint flow collector (the only tcp_connect hits are the SQL helper EchoDatabase::query_recent_tcp_connections, echo_db.cpp:661) and no NetworkExtension/.mm files exist. The graph is fed by fleet_snapshot.v1 built from the live /proc/net/tcp snapshot merged with the Echo warehouse (agents/plugins/echo/src/echo_fleet_snapshot.hpp:81-90) \u2014 a poll, not an event firehose, and no (src,dst,port,proto,first_seen,last_seen,count) flow-summary edge warehouse. ADR-0003 (docs/adr/0003-telemetry-capture-model.md, status: accepted) states the flow telemetry IS event-driven, edge-aggregated, and federated; the design doc's own \u00a74.1/\u00a74.2 honestly mark 'Event-driven flow capture' as Add. So the ADR is doc-ahead-of-code drift, as the auditor found.",
   "severity": "LOW"
  },
  {
@@ -4246,7 +4246,7 @@
   "verification": "static",
   "needs_uat": false,
   "recommended_record_update": "none",
-  "note": "[drift upheld] Confirmed the drift independently. The scope-walking / result-set primitive fully exists (server/core/src/result_set_store.{hpp,cpp}, scope_engine.cpp:425 implements the `from_result_set:` short-circuit, result_set_matcher.cpp, result_sets_ui.cpp). But the result-set source kinds are exactly four (result_set_store.hpp:43-46: inventory_query, tar_query, instruction_result, manual_curate) \u2014 there is no attack_path or chokepoint source kind. More fundamentally, the upstream graph layer that \u00a76 says \"produces host sets (hosts on a probable attack path to a jewel; the chokepoint hosts)\" does NOT exist: grep across server/ and agents/ finds zero reachability-graph code, no Dijkstra/Yen/min-cut/betweenness, and no crown_jewel/trust_zone/entry_point/traversability code (the only \"graph\" hit is the generic cytoscape.min.js; every \"chokepoint\" hit is an unrelated security/ingest chokepoint). The vuln_scan plugin is the PoC matcher only (scan/cve_scan/config_scan/summary/inventory) and is explicitly marked superseded by this design. The integration \u00a76 describes therefore cannot exist because its upstream (the scored graph) is unbuilt \u2014 exactly what the auditor concluded. The doc itself confirms this is aspirational: it is labeled \"North Star \u2014 for review\" with the graph layer scoped to Phases 7 (attack-path scoring) and 8 (chokepoints), and the capability map states \"until Phase 7, no attack-path claims.\"",
+  "note": "[drift upheld] Confirmed the drift independently. The scope-walking / result-set primitive fully exists (server/core/src/result_set_store.{hpp,cpp}, scope_engine.cpp:425 implements the `from_result_set:` short-circuit, result_set_matcher.cpp, result_sets_ui.cpp). But the result-set source kinds are exactly four (result_set_store.hpp:43-46: inventory_query, echo_query, instruction_result, manual_curate) \u2014 there is no attack_path or chokepoint source kind. More fundamentally, the upstream graph layer that \u00a76 says \"produces host sets (hosts on a probable attack path to a jewel; the chokepoint hosts)\" does NOT exist: grep across server/ and agents/ finds zero reachability-graph code, no Dijkstra/Yen/min-cut/betweenness, and no crown_jewel/trust_zone/entry_point/traversability code (the only \"graph\" hit is the generic cytoscape.min.js; every \"chokepoint\" hit is an unrelated security/ingest chokepoint). The vuln_scan plugin is the PoC matcher only (scan/cve_scan/config_scan/summary/inventory) and is explicitly marked superseded by this design. The integration \u00a76 describes therefore cannot exist because its upstream (the scored graph) is unbuilt \u2014 exactly what the auditor concluded. The doc itself confirms this is aspirational: it is labeled \"North Star \u2014 for review\" with the graph layer scoped to Phases 7 (attack-path scoring) and 8 (chokepoints), and the capability map states \"until Phase 7, no attack-path claims.\"",
   "severity": "LOW"
  },
  {
@@ -4700,11 +4700,11 @@
  {
   "id": "agent-07",
   "tier": "A",
-  "source": "docs/agent-privilege-model.md privilege matrix: tar.* cap_dac_read_search, wol.wake cap_net_raw, tar.process_tree cap_sys_ptrace on Linux agent binary via setcap",
+  "source": "docs/agent-privilege-model.md privilege matrix: echo.* cap_dac_read_search, wol.wake cap_net_raw, echo.process_tree cap_sys_ptrace on Linux agent binary via setcap",
   "claim": "Linux setcap applies cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace to the agent binary.",
   "verdict": "CONFIRMED",
   "drift_direction": "none",
-  "evidence": "install-agent-user.sh:581 `setcap 'cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace+eip'`. Note cap_net_admin is applied but is not itemized in any privilege-matrix row (only cap_net_raw for wol, cap_dac_read_search/cap_sys_ptrace for tar) \u2014 minor under-documentation, not contradiction.",
+  "evidence": "install-agent-user.sh:581 `setcap 'cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace+eip'`. Note cap_net_admin is applied but is not itemized in any privilege-matrix row (only cap_net_raw for wol, cap_dac_read_search/cap_sys_ptrace for echo) \u2014 minor under-documentation, not contradiction.",
   "verification": "static",
   "needs_uat": false,
   "severity": "NONE",
@@ -4770,15 +4770,15 @@
  {
   "id": "agent-12",
   "tier": "A",
-  "source": "docs/os-capability-matrix.md line 29: \"DEX \u2014 performance telemetry (CPU/mem/disk levels) | Windows \u2705 | Linux \u2705 | macOS \u26d4 | tar_perf.cpp (Win: GetSystemTimes...; Linux: /proc)\"",
-  "claim": "tar_perf.cpp is the source of truth for DEX perf telemetry and implements Linux (/proc) collection (Linux \u2705).",
+  "source": "docs/os-capability-matrix.md line 29: \"DEX \u2014 performance telemetry (CPU/mem/disk levels) | Windows \u2705 | Linux \u2705 | macOS \u26d4 | echo_perf.cpp (Win: GetSystemTimes...; Linux: /proc)\"",
+  "claim": "echo_perf.cpp is the source of truth for DEX perf telemetry and implements Linux (/proc) collection (Linux \u2705).",
   "verdict": "DRIFTED",
   "drift_direction": "contradiction",
-  "evidence": "tar_perf.cpp:190 `#else // !_WIN32 \u2014 Linux (/proc) and macOS (host_statistics) are kPlanned`; read_perf_counters() returns empty PerfCounters with valid=false on BOTH Linux and macOS (lines 194-198). The machine-readable source-of-truth tar_schema_registry.cpp:296 marks perf source `OsSupportStatus::kPlanned` for linux (and :298 macos), only :291 windows kSupported. The cited source-of-truth file does NOT deliver Linux perf.",
+  "evidence": "echo_perf.cpp:190 `#else // !_WIN32 \u2014 Linux (/proc) and macOS (host_statistics) are kPlanned`; read_perf_counters() returns empty PerfCounters with valid=false on BOTH Linux and macOS (lines 194-198). The machine-readable source-of-truth echo_schema_registry.cpp:296 marks perf source `OsSupportStatus::kPlanned` for linux (and :298 macos), only :291 windows kSupported. The cited source-of-truth file does NOT deliver Linux perf.",
   "verification": "static",
   "needs_uat": false,
   "severity": "MEDIUM",
-  "note": "[drift upheld] Confirmed drift. The matrix row docs/os-capability-matrix.md:29 (\"DEX \u2014 performance telemetry (CPU/mem/disk levels)\") cites `tar_perf.cpp` as its source of truth, marks Linux \u2705, and says \"Linux: /proc\". The cited file does NOT deliver this on Linux: agents/plugins/tar/src/tar_perf.cpp:190-198 \u2014 the non-Windows `read_perf_counters()` returns `PerfCounters` with valid=false and the inline comment \"collect_perf records nothing on this platform yet\". The file's own header agents/plugins/tar/src/tar_perf.hpp:18 states \"Linux (/proc) and macOS (host_statistics) are kPlanned in the registry.\" The machine-readable source of truth tar_schema_registry.cpp:296 marks the `perf` source OsSupportStatus::kPlanned for linux (only :291 windows kSupported), and tar_plugin.cpp:725 emits `unsupported_platform` when the read is invalid. The Linux /proc perf code that DOES exist (agents/core/src/dex_linux_collector.cpp poll_perf at :243 + dex_linux_proc.cpp parse_proc_stat/parse_commit_pct/parse_diskstats) belongs to a DIFFERENT capability \u2014 it produces sustained-breach DEX reliability SIGNALS (cpu_sustained/memory_pressure/disk_latency observations, the matrix's line-28 \"DEX \u2014 reliability signals\" row), not the continuous BRD-A1 device performance-level warehouse tier ($Perf_Live/$Perf_Hourly) that tar_perf.cpp owns and line 29 describes. So no source satisfies the \"Linux \u2705\" claim for the row as cited.",
+  "note": "[drift upheld] Confirmed drift. The matrix row docs/os-capability-matrix.md:29 (\"DEX \u2014 performance telemetry (CPU/mem/disk levels)\") cites `echo_perf.cpp` as its source of truth, marks Linux \u2705, and says \"Linux: /proc\". The cited file does NOT deliver this on Linux: agents/plugins/echo/src/echo_perf.cpp:190-198 \u2014 the non-Windows `read_perf_counters()` returns `PerfCounters` with valid=false and the inline comment \"collect_perf records nothing on this platform yet\". The file's own header agents/plugins/echo/src/echo_perf.hpp:18 states \"Linux (/proc) and macOS (host_statistics) are kPlanned in the registry.\" The machine-readable source of truth echo_schema_registry.cpp:296 marks the `perf` source OsSupportStatus::kPlanned for linux (only :291 windows kSupported), and echo_plugin.cpp:725 emits `unsupported_platform` when the read is invalid. The Linux /proc perf code that DOES exist (agents/core/src/dex_linux_collector.cpp poll_perf at :243 + dex_linux_proc.cpp parse_proc_stat/parse_commit_pct/parse_diskstats) belongs to a DIFFERENT capability \u2014 it produces sustained-breach DEX reliability SIGNALS (cpu_sustained/memory_pressure/disk_latency observations, the matrix's line-28 \"DEX \u2014 reliability signals\" row), not the continuous BRD-A1 device performance-level warehouse tier ($Perf_Live/$Perf_Hourly) that echo_perf.cpp owns and line 29 describes. So no source satisfies the \"Linux \u2705\" claim for the row as cited.",
   "recommended_record_update": "CLAUDE.md edit"
  },
  {
@@ -4788,11 +4788,11 @@
   "claim": "Linux DEX perf telemetry (CPU/mem levels) IS actually delivered to the server (Linux \u2705 is substantively true despite the wrong citation).",
   "verdict": "CONFIRMED",
   "drift_direction": "none",
-  "evidence": "agent.cpp:1602-1625 (Linux #ifdef block) reads /proc/stat \u2192 yuzu.perf_cpu_pct and /proc/meminfo \u2192 yuzu.perf_commit_pct heartbeat tags using lnx::parse_proc_stat/cpu_busy_pct/parse_commit_pct from dex_linux_proc.cpp (which parses /proc/stat, /proc/meminfo at lines 61-146). So the Linux \u2705 verdict in the matrix is correct; only the source-of-truth pointer (tar_perf.cpp) is misleading.",
+  "evidence": "agent.cpp:1602-1625 (Linux #ifdef block) reads /proc/stat \u2192 yuzu.perf_cpu_pct and /proc/meminfo \u2192 yuzu.perf_commit_pct heartbeat tags using lnx::parse_proc_stat/cpu_busy_pct/parse_commit_pct from dex_linux_proc.cpp (which parses /proc/stat, /proc/meminfo at lines 61-146). So the Linux \u2705 verdict in the matrix is correct; only the source-of-truth pointer (echo_perf.cpp) is misleading.",
   "verification": "static",
   "needs_uat": false,
   "severity": "NONE",
-  "note": "Linux perf telemetry real via dex_linux_proc + agent.cpp heartbeat tags, not tar_perf.cpp.",
+  "note": "Linux perf telemetry real via dex_linux_proc + agent.cpp heartbeat tags, not echo_perf.cpp.",
   "recommended_record_update": "none"
  },
  {

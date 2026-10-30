@@ -1,1 +1,0 @@
-- **The Software page no longer shows the standing "Scope (ADR-0017)" banner.** The notice above the table that said the fleet-wide counts need a global `Inventory:Read` grant is gone. The permission check, the audit and the notice a management-group-confined account gets are unchanged.

@@ -35,7 +35,7 @@
 ///    return `std::expected<std::vector<T>, std::string>`; `get_rule` keeps a
 ///    three-state `std::expected<std::optional<Row>, GuaranteedStateReadError>`
 ///    (found / genuinely-absent / degraded — mirrors
-///    `DeviceInventoryStore::CiReadError`). `agent_rule_statuses` /
+///    `CiReadError`, device_inventory_types.hpp). `agent_rule_statuses` /
 ///    `agent_rule_statuses_for_agent` / `errored_rule_count` (enforce-gate/
 ///    census/ADR-0017 list-read input) are the same
 ///    `std::expected<..., std::string>` shape. A degraded read

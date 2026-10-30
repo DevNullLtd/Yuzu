@@ -6,12 +6,14 @@
  *               Linux   /etc/exports, the /etc/exports.d snippets (*.exports) and
  *                       /etc/samba/smb.conf (bounded no-follow file reads);
  *               macOS   PLANNED (share points plus /etc/exports; not read yet);
- *               Windows PLANNED (NetShareEnum; not read yet).
+ *               Windows the LIVE shares of the Server service through NetShareEnum
+ *                       (level 2; level 1 names without paths when level 2 is refused).
  *
- * READ-ONLY and FACTS ONLY. Configured shares as written, not live nfsd/smbd state; ACLs,
- * `valid users` and NFS client host lists are never emitted (NFS clients are a count plus an
- * `anonymous` flag). A refused or failed read is reported as permission_denied/constrained
- * with a token, never as an empty result.
+ * READ-ONLY and FACTS ONLY. Linux reports configured shares as written, not live nfsd/smbd
+ * state; Windows reports what the Server service publishes now. ACLs, `valid users` and NFS
+ * client host lists are never emitted (NFS clients are a count plus an `anonymous` flag). A
+ * refused or failed read is reported as permission_denied/constrained with a token, and a
+ * stopped Windows Server service as unsupported, never as an empty result.
  *
  * This TU is portable except for its single dispatch #if, which selects the platform's leg
  * function and exception token (`kLeg`, `kLegExceptionToken`) and ends in an #error. All
@@ -41,13 +43,19 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_PLANNED, 2, "share-point listing plus /etc/exports (BSD syntax)",
          "not read yet: one unsupported status row, macos:planned"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "NetShareEnum level 2 (netapi32)",
-         "not read yet: one unsupported status row, windows:planned"},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "NetShareEnum level 2 (netapi32); level 1 (names, no paths) when level 2 is refused",
+         "live Server-service state, not the LanmanServer registry: a stopped Server service is "
+         "unavailable (windows:shares:netshareenum:server_not_started, or "
+         "windows:shares:netshareenum:server_unavailable when its RPC endpoint does not answer); "
+         "STYPE_SPECIAL shares (ADMIN$, C$, IPC$) are flagged special, never hidden, and any "
+         "other share whose name ends in $ is flagged hidden; access and anonymous are -, ACLs "
+         "and level 502 are never read"},
     },
 };
 
-// This build's leg and its exception token, defined together. The macOS and Windows legs are
-// the PLANNED placeholders.
+// This build's leg and its exception token, defined together. The macOS leg is the PLANNED
+// placeholder.
 #if defined(_WIN32)
 constexpr yuzu::shares::LegFn kLeg = &yuzu::shares::run_windows;
 constexpr const char* kLegExceptionToken = "windows:leg:exception";

@@ -266,7 +266,7 @@ for _rid, _anchor in ORDER_ANCHORS.items():
 COUNTED: list[tuple[str, str, int, str]] = [
     ("fixed-plugin-polls",
      r"(?P<k>ResponseTierFilter::for_fixed_plugin_poll\(" + _FP + r"\))", 3,
-     "the DEX, TAR and device fixed-plugin polls must each build their tier with the plugin set"),
+     "the DEX, Echo and device fixed-plugin polls must each build their tier with the plugin set"),
     # The two call anchors of ORDER_ANCHORS: a second occurrence would let the "before" ordering be
     # satisfied against the wrong site and weaken two rows silently.
     ("anchor-listener-start", r"(?P<k>agent_server_=builder\.BuildAndStart\(\);)", 1,

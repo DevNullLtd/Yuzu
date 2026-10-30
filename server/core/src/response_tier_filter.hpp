@@ -89,7 +89,7 @@ public:
 
     /// A server-internal consumer that is not an operator read surface: it reads back a command the
     /// server dispatched itself from a fixed, non-Forensics plugin set. The four live callers are
-    /// the tar fleet snapshot poll, the deployment collect, the pre-flight check collation and the
+    /// the echo fleet snapshot poll, the deployment collect, the pre-flight check collation and the
     /// quarantine containment reconciler; they are frozen by
     /// tests/test_response_store_read_tripwire.py. The policy evaluator, the bundle collate and the
     /// result-set materializer read through a real filter instead. Do not use this to silence a
@@ -100,7 +100,7 @@ public:
 
     /// A server-side poll that reads back the reply to a command the server dispatched itself from
     /// a FIXED set of plugins, none of them Forensics-tier (the device live snapshots, the DEX and
-    /// TAR result polls). Excludes the Forensics plugins outright (present-empty visibility), so
+    /// Echo result polls). Excludes the Forensics plugins outright (present-empty visibility), so
     /// the poll could never return a Forensics row even if the command id were tampered with. A
     /// null set (a surface that was never wired; impossible in production, boot refuses without
     /// one) is `refuse_unwired()`: the fixed plugin does not make an unwired poll safe to run

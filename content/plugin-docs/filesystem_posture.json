@@ -709,7 +709,7 @@
   "version": "1.0.0",
   "where_the_data_goes": [
     "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}` and aggregatable (`mounts` groups by `fstype`, `quotas` by `state`, `snapshots` by `kind`). The three definitions are gathered, with response TTLs of 60 s (`mounts`), 300 s (`quotas`) and 300 s (`snapshots`).",
-    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX (Digital Employee Experience) or metrics; nothing runs on a schedule unless an operator or schedule dispatches the instruction.",
+    "**Not consumed by** daily-sync inventory, the Echo warehouse, DEX (Digital Employee Experience) or metrics; nothing runs on a schedule unless an operator or schedule dispatches the instruction.",
     "**Sensitivity.** Rows carry filesystem and volume metadata only: mount points, device and volume paths (`/dev/vda1`, a Windows volume GUID), capacity figures, quota state and snapshot names or GUIDs. A mount point or volume path can embed text a person chose, such as an external drive's label under `/Volumes` or a user directory used as an automount target, but no hostname, MAC address or account name is emitted as its own column.",
     "**Siblings:** `crossplatform.storage.smart` and `crossplatform.storage.volumes` (`disk_actions`: physical drive health and the drive-to-volume join) and `crossplatform.storage.free` (`disk_space`).",
     "**MCP / REST.** Discover: `discover_plugins` (summary), `yuzu://plugin-docs` (this page as data), `discover_instructions` / `get_definition(\"crossplatform.storage.mounts\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."

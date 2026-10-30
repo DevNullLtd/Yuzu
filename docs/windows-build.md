@@ -15,6 +15,17 @@ The gateway's Erlang/OTP needs no activation step: Meson resolves the pinned rel
 
 **Python for build scripts:** every Meson target that runs a repo script uses the interpreter running Meson itself (`yuzu_python` in the root `meson.build`), i.e. the native `C:\Python314` of the runner contract. A bare `python3` under MSYS2 bash is MSYS2's `/usr/bin/python3`, which cannot open the `C:/` paths Meson passes and made every script test fail in ~0.04s.
 
+## Agent-only vcpkg install
+
+`vcpkg.json` defaults to the `server` and `tests` features (libpq, xmlsec, drogon, catch2), so a plain `vcpkg install --triplet x64-windows --x-manifest-root=.` is expected to be unchanged (checked with `--dry-run` on `arm64-osx` and `x64-linux` only). An agent-only Windows build opts out and skips them (`libpq` is a from-source PostgreSQL build, `drogon` pulls trantor and jsoncpp):
+
+```bash
+vcpkg install --triplet x64-windows --x-manifest-root=. --x-no-default-features
+vcpkg install --triplet x64-windows --x-manifest-root=. --x-no-default-features --x-feature=tests  # + -Dbuild_tests=true
+```
+
+Neither form touches `triplets/x64-windows.cmake` or the hand-wired grpc/protobuf/abseil branch (#375). `zlib` is declared in the base manifest because the `_libzlib` find_library in the root `meson.build` requires it. vcpkg reconciles `vcpkg_installed/x64-windows` on every install, so a runner should be able to alternate between the default and the opt-out form without a cache-key change (reproduced on `arm64-osx`, not on Windows; see `docs/build-guide.md` "Dependency features"). **Not exercised on Windows:** `x64-windows` could not be planned on the authoring host, and no CI leg uses `--x-no-default-features` on a Windows triplet; the default form will be exercised by `ci.yml`, `release.yml`, `nightly.yml` and `codeql.yml` once CI runs on this change.
+
 ## Toolchain paths
 
 All paths are configured by `setup_msvc_env.sh`. Do **not** use Clang (`C:\Program Files\LLVM\bin`) — must use cl.exe / MSVC.

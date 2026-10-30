@@ -213,18 +213,25 @@ struct Session {
     std::string token_scope_service;  // Non-empty = token scoped to this service
     std::string mcp_tier;             // "readonly", "operator", "supervised", or "" (not MCP)
     /// Discriminator for the session's principal class — "human" (default) or
-    /// "engine". In-memory only (no auth.db schema change: token sessions are
-    /// synthesized fresh per request, never persisted — see design doc §6).
-    /// Set by `synthesize_token_session` from the source `ApiToken::principal_kind`;
-    /// every other session-creation site leaves the "human" default. This is the
-    /// discriminator the Phase-4/5 self-target destruction guard (§9) keys on —
-    /// never infer principal kind from the shape of `username`.
+    /// "engine". Token sessions are synthesized fresh per request and never
+    /// persisted (design doc §6); `synthesize_token_session` sets this from the
+    /// source `ApiToken::principal_kind` and every other session-creation site
+    /// leaves the "human" default. The durable `sessions` row carries the column
+    /// (session_store.cpp), and a CHECK on it keeps the stored value inside
+    /// {human, engine} and consistent with `auth_source`. Do NOT branch on this
+    /// field to decide whether a session is an engine: use `is_engine()` below.
+    /// Never infer principal kind from the shape of `username`.
     std::string principal_kind{"human"};
 
     /// True iff this session authenticates as an ADR-0031 engine principal.
-    /// The canonical engine-session discriminator (mirrors the belts in
-    /// rest_api_v1.cpp deny_engine_session / mcp_server.cpp
-    /// deny_if_engine_session / principal_quota_gate.hpp apply_engine_quota_gate).
+    /// The canonical engine-session discriminator (#2343): every decision, gate
+    /// and audit-class site on a `Session` uses this, so a session classified as
+    /// an engine by either field is an engine everywhere. One helper takes bare
+    /// fields instead of a `Session` and copies this predicate by hand:
+    /// `principal_quota_gate.hpp`'s `apply_engine_quota_gate`, which must change
+    /// together with it. `same_site_write_policy.hpp` and `web_utils.hpp` also take
+    /// a bare `auth_source`, but they classify the transport (bearer token or
+    /// cookie), not engine-ness.
     [[nodiscard]] bool is_engine() const {
         return principal_kind == "engine" || auth_source == "engine_token";
     }

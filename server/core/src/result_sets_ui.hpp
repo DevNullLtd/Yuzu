@@ -32,7 +32,7 @@ std::string render_result_sets_sidebar(const std::vector<ResultSet>& sets,
 //
 // `reeval_allowed` is the route's verdict that the stored source still classifies as a
 // read-only, auto-approved dispatch; the Re-evaluate button also needs a source kind the
-// REST route supports (tar_query, instruction_result), checked here.
+// REST route supports (echo_query, instruction_result), checked here.
 struct DetailOptions {
     bool reeval_allowed{false}; // fail closed: a caller that forgets the verdict shows no button
 };

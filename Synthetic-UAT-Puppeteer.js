@@ -245,12 +245,12 @@ const COMMANDS = [
   // ─── Content Distribution (read-only) ───
   ['content_dist list_staged', 'List staged content', 'any'],
 
-  // ─── TAR (Timeline Activity Record) ───
-  ['tar status',       'TAR status',        'any'],
-  ['tar collect_fast', 'TAR collect fast',  'any'],
-  ['tar collect_slow', 'TAR collect slow',  'any'],
-  ['tar query',        'TAR query',         'any'],
-  ['tar snapshot',     'TAR snapshot',      'any'],
+  // ─── Echo ───
+  ['echo status',       'Echo status',        'any'],
+  ['echo collect_fast', 'Echo collect fast',  'any'],
+  ['echo collect_slow', 'Echo collect slow',  'any'],
+  ['echo query',        'Echo query',         'any'],
+  ['echo snapshot',     'Echo snapshot',      'any'],
 
   // ─── Chargen (safe mutating: start then stop) ───
   ['chargen chargen_start',  'Chargen start', 'any'],

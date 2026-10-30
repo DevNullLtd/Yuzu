@@ -45,7 +45,7 @@ namespace {
 
 constexpr const char* kPath = "/api/dashboard/execute";
 constexpr std::pair<const char*, const char*> kReadOnly{"os_info", "os_version"};
-constexpr std::pair<const char*, const char*> kDestructive{"tar", "purge_source"};
+constexpr std::pair<const char*, const char*> kDestructive{"echo", "purge_source"};
 
 struct DispatchCall {
     std::string plugin, action, scope_expr;

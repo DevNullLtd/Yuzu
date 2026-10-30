@@ -1834,28 +1834,28 @@ This section enumerates the stable builtin primitives that content authors targe
 | `discovery.ping_sweep` | `discovery` | Y | Y | Y | Verified |
 | `discovery.port_scan` | `discovery` | Y | Y | Y | Verified |
 
-### 14.15 Timeline Activity Record (TAR)
+### 14.15 Echo
 
 | Primitive | Backing Plugin | Win | Linux | macOS | Status |
 |---|---|:---:|:---:|:---:|---|
-| `tar.status` | `tar` | Y | Y | Y | Verified |
-| `tar.query` | `tar` | Y | Y | Y | Verified |
-| `tar.snapshot` | `tar` | Y | Y | Y | Verified |
-| `tar.export` | `tar` | Y | Y | Y | Verified |
-| `tar.configure` | `tar` | Y | Y | Y | Verified |
-| `tar.collect_fast` | `tar` | Y | Y | Y | Verified |
-| `tar.collect_slow` | `tar` | Y | Y | Y | Verified |
-| `tar.collect_perf` | `tar` | Y | Y | - | Verified |
-| `tar.sql` | `tar` | Y | Y | Y | Verified |
-| `tar.rollup` | `tar` | Y | Y | Y | Verified |
-| `tar.compatibility` | `tar` | Y | Y | Y | Verified |
-| `tar.fleet_snapshot` | `tar` | Y | Y | Y | Active |
+| `echo.status` | `echo` | Y | Y | Y | Verified |
+| `echo.query` | `echo` | Y | Y | Y | Verified |
+| `echo.snapshot` | `echo` | Y | Y | Y | Verified |
+| `echo.export` | `echo` | Y | Y | Y | Verified |
+| `echo.configure` | `echo` | Y | Y | Y | Verified |
+| `echo.collect_fast` | `echo` | Y | Y | Y | Verified |
+| `echo.collect_slow` | `echo` | Y | Y | Y | Verified |
+| `echo.collect_perf` | `echo` | Y | Y | - | Verified |
+| `echo.sql` | `echo` | Y | Y | Y | Verified |
+| `echo.rollup` | `echo` | Y | Y | Y | Verified |
+| `echo.compatibility` | `echo` | Y | Y | Y | Verified |
+| `echo.fleet_snapshot` | `echo` | Y | Y | Y | Active |
 
-**`tar.compatibility`** -- Emit the live OS compatibility matrix for every registered capture source (process, tcp, service, user, perf, procperf, netqual, module, software, arp, dns, netconn, mapdrive, power, removable, usage). Returns one `header|...` line followed by N `row|source|os|status|capture_method|notes` lines. Status values: `supported` | `constrained` | `planned` | `unsupported`. Read-only static metadata; safe to call at any frequency. Use to verify which sources are wired on the current agent OS before configuring `network_capture_method`; the mechanism actually in force is reported as `network_capture_method_effective` by the `status` action (always `polling` today).
+**`echo.compatibility`** -- Emit the live OS compatibility matrix for every registered capture source (process, tcp, service, user, perf, procperf, netqual, module, software, arp, dns, netconn, mapdrive, power, removable, usage). Returns one `header|...` line followed by N `row|source|os|status|capture_method|notes` lines. Status values: `supported` | `constrained` | `planned` | `unsupported`. Read-only static metadata; safe to call at any frequency. Use to verify which sources are wired on the current agent OS before configuring `network_capture_method`; the mechanism actually in force is reported as `network_capture_method_effective` by the `status` action (always `polling` today).
 
-**`tar.collect_perf`** -- Record one device performance sample (CPU/memory/disk/network) into `$Perf_Live`, and — when `procperf_enabled` is set (on by default) — one per-application top-N sample into `$ProcPerf_Live` on the same tick (output line `tar|collect_procperf|N|...`). Trigger-driven on the `perf_interval_seconds` cadence (default 30 s; Windows and Linux — macOS records nothing until its collector lands); a manual invocation forces one immediate sample. Note: a tick whose core counter read fails (e.g. a hardened container masking `/proc/stat` on Linux, or an NT-counter read failure on Windows) reports `counters_unavailable` on any OS the registry lists as supported for `perf`/`procperf`, and `unsupported_platform` only where no perf collector exists (macOS today) — so a supported platform whose reads are failing is distinguishable from an unsupported one. The per-source streak is in `tar.status` (`perf_last_status` / `perf_consecutive_failures`, and identically `procperf_last_status` / `procperf_consecutive_failures`). The first sample after agent start is a baseline (records no row). See [the TAR user manual](user-manual/tar.md) for the perf/procperf tiers and their `perf_enabled` / `procperf_enabled` / `perf_interval_seconds` configuration.
+**`echo.collect_perf`** -- Record one device performance sample (CPU/memory/disk/network) into `$Perf_Live`, and — when `procperf_enabled` is set (on by default) — one per-application top-N sample into `$ProcPerf_Live` on the same tick (output line `echo|collect_procperf|N|...`). Trigger-driven on the `perf_interval_seconds` cadence (default 30 s; Windows and Linux — macOS records nothing until its collector lands); a manual invocation forces one immediate sample. Note: a tick whose core counter read fails (e.g. a hardened container masking `/proc/stat` on Linux, or an NT-counter read failure on Windows) reports `counters_unavailable` on any OS the registry lists as supported for `perf`/`procperf`, and `unsupported_platform` only where no perf collector exists (macOS today) — so a supported platform whose reads are failing is distinguishable from an unsupported one. The per-source streak is in `echo.status` (`perf_last_status` / `perf_consecutive_failures`, and identically `procperf_last_status` / `procperf_consecutive_failures`). The first sample after agent start is a baseline (records no row). See [the Echo user manual](user-manual/echo.md) for the perf/procperf tiers and their `perf_enabled` / `procperf_enabled` / `perf_interval_seconds` configuration.
 
-**`tar.fleet_snapshot`** -- Enumerate running processes, open network connections, and host-bound IPs and emit a single `fleet_snapshot.v1` JSON document. Each list is capped at 4096 entries; truncation is flagged via `truncated_processes` / `truncated_connections`. Cmdlines are redacted per the active redaction patterns (defaults always apply). When the operator has paused the `process` or `tcp` source, the corresponding list is empty and `process_source_paused` / `tcp_source_paused` markers appear in the document. Consumed by the server-side `FleetTopologyStore` for the `/viz/fleet` 3D renderer (PR ladder 1-11). Dispatched on demand by the server at the topology cache TTL (default 60 s); not typically invoked manually.
+**`echo.fleet_snapshot`** -- Enumerate running processes, open network connections, and host-bound IPs and emit a single `fleet_snapshot.v1` JSON document. Each list is capped at 4096 entries; truncation is flagged via `truncated_processes` / `truncated_connections`. Cmdlines are redacted per the active redaction patterns (defaults always apply). When the operator has paused the `process` or `tcp` source, the corresponding list is empty and `process_source_paused` / `tcp_source_paused` markers appear in the document. Consumed by the server-side `FleetTopologyStore` for the `/viz/fleet` 3D renderer (PR ladder 1-11). Dispatched on demand by the server at the topology cache TTL (default 60 s); not typically invoked manually.
 
 ### 14.16 Test and Debug
 

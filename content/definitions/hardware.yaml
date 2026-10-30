@@ -226,6 +226,16 @@ spec:
         description: 'Reported/maximum clock speed in MHz; 0 when the OS exposes no frequency (e.g. Apple Silicon has no hw.cpufrequency). Values: integer, or 0 when unreadable.'
         example: "4200"
         platforms: [windows, linux, darwin]
+      - name: socket_designation
+        type: string
+        description: 'Socket label (e.g. "CPU 1"). Always "-" until a leg reads it. Values: "-".'
+        example: "-"
+        platforms: [windows, linux, darwin]
+      - name: stepping
+        type: string
+        description: 'CPU stepping. Always "-" until a leg reads it. Values: "-".'
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "List installed processors"
 
@@ -294,6 +304,21 @@ spec:
         type: int32
         description: 'Module speed in MHz; 0 on every aggregate-only row. Values: integer, or 0 on an aggregate-only row.'
         example: "3600"
+        platforms: [windows, linux]
+      - name: manufacturer
+        type: string
+        description: 'DIMM manufacturer. Always "-" until a leg reads it. Values: "-".'
+        example: "-"
+        platforms: [windows, linux]
+      - name: part_number
+        type: string
+        description: 'DIMM part number. Always "-" until a leg reads it. Values: "-".'
+        example: "-"
+        platforms: [windows, linux]
+      - name: serial
+        type: string
+        description: 'DIMM serial number. Always "-" in this release: a per-module serial is personal data, classified with the system serial, and is not read in this release. Values: "-".'
+        example: "-"
         platforms: [windows, linux]
 
   readablePayload: "List installed memory modules"
@@ -523,6 +548,302 @@ spec:
 
   gather:
     ttlSeconds: 86400
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [hardware]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.hardware.chassis
+  displayName: Chassis
+  version: 1.0.0
+  description: >
+    Reports the chassis type, serial number and asset tag. Not read yet on any OS:
+    every dispatch answers one unsupported status row (windows:planned,
+    linux:planned or macos:planned) until its leg lands.
+    macOS has no public source and will move to a typed unsupported. On-demand
+    only; it is not part of any daily sync.
+  tags: [hardware, inventory, chassis]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: hardware
+    action: chassis
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|chassis|<level>|<reason>   (always first; the only row until a leg lands)
+    # chassis|<type>|<serial>|<asset_tag>|<source>
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), chassis (one per record read).'
+        values: [status, chassis]
+        example: status
+        platforms: [windows, linux, darwin]
+      - name: type
+        type: string
+        description: 'Chassis type (SMBIOS type 3), or "-" when absent. Status rows: the action name.'
+        example: "Desktop"
+        platforms: [windows, linux, darwin]
+      - name: serial
+        type: string
+        description: 'Chassis serial number, or "-" when absent. Status rows: the level (unsupported).'
+        example: "-"
+        platforms: [windows, linux, darwin]
+      - name: asset_tag
+        type: string
+        description: 'Chassis asset tag, or "-" when absent. Status rows: the reason token (<os>:planned).'
+        example: "-"
+        platforms: [windows, linux, darwin]
+      - name: source
+        type: string
+        description: 'Where the value was read from, or "-" when absent. Absent on status rows.'
+        example: "/sys/class/dmi/id"
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "Chassis"
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [hardware]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.hardware.baseboard
+  displayName: Baseboard
+  version: 1.0.0
+  description: >
+    Reports the baseboard (motherboard) vendor, product and serial number. Not
+    read yet on any OS: every dispatch answers one unsupported status row
+    (windows:planned, linux:planned or macos:planned) until its leg lands.
+    macOS has no public source and will move to a typed unsupported. On-demand
+    only; it is not part of any daily sync.
+  tags: [hardware, inventory, baseboard]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: hardware
+    action: baseboard
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|baseboard|<level>|<reason>   (always first; the only row until a leg lands)
+    # baseboard|<vendor>|<product>|<serial>|<source>
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), baseboard (one per record read).'
+        values: [status, baseboard]
+        example: status
+        platforms: [windows, linux, darwin]
+      - name: vendor
+        type: string
+        description: 'Baseboard vendor, or "-" when absent. Status rows: the action name.'
+        example: "ASUSTeK COMPUTER INC."
+        platforms: [windows, linux, darwin]
+      - name: product
+        type: string
+        description: 'Baseboard product name, or "-" when absent. Status rows: the level (unsupported).'
+        example: "PRIME B450M-A"
+        platforms: [windows, linux, darwin]
+      - name: serial
+        type: string
+        description: 'Baseboard serial number, or "-" when absent. Status rows: the reason token (<os>:planned).'
+        example: "-"
+        platforms: [windows, linux, darwin]
+      - name: source
+        type: string
+        description: 'Where the value was read from, or "-" when absent. Absent on status rows.'
+        example: "/sys/class/dmi/id"
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "Baseboard"
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [hardware]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.hardware.swap
+  displayName: Swap and Page Files
+  version: 1.0.0
+  description: >
+    Reports swap devices and page files with total and used size in MB. Not read
+    yet on any OS: every dispatch answers one unsupported status row
+    (windows:planned, linux:planned or macos:planned) until its leg lands.
+    On-demand only; it is not part of any daily sync.
+  tags: [hardware, inventory, swap]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: hardware
+    action: swap
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|swap|<level>|<reason>   (always first; the only row until a leg lands)
+    # swap|<device>|<total_mb>|<used_mb>|<source>
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), swap (one per record read).'
+        values: [status, swap]
+        example: status
+        platforms: [windows, linux, darwin]
+      - name: device
+        type: string
+        description: 'Swap device or page-file path, or "-" when absent. Status rows: the action name.'
+        example: "/dev/sda3"
+        platforms: [windows, linux, darwin]
+      - name: total_mb
+        type: string
+        description: 'Total size in MB, or "-" when unread. Status rows: the level (unsupported).'
+        example: "8192"
+        platforms: [windows, linux, darwin]
+      - name: used_mb
+        type: string
+        description: 'Used size in MB, or "-" when unread. Status rows: the reason token (<os>:planned).'
+        example: "512"
+        platforms: [windows, linux, darwin]
+      - name: source
+        type: string
+        description: 'Where the value was read from, or "-" when absent. Absent on status rows.'
+        example: "/proc/swaps"
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "Swap and Page Files"
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [hardware]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.hardware.machine_id
+  displayName: Machine Identifier (Keyed Hash)
+  version: 1.0.0
+  description: >
+    Reports a keyed hash of the operating system machine identifier. The raw
+    identifier never leaves the host. Not read yet on any OS: every dispatch
+    answers one unsupported status row (windows:planned, linux:planned or
+    macos:planned) until its leg lands; macOS has no
+    source beyond the hardware UUID that device.hardware.system reports and
+    will move to a typed unsupported. On-demand only; it is not part of any
+    daily sync.
+  tags: [hardware, inventory, machine-id]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: hardware
+    action: machine_id
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|machine_id|<level>|<reason>   (always first; the only row until a leg lands)
+    # machine_id|<hash_hex>|<algorithm>|<source>
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), machine_id (one per record read).'
+        values: [status, machine_id]
+        example: status
+        platforms: [windows, linux, darwin]
+      - name: hash_hex
+        type: string
+        description: 'Keyed hash of the machine identifier, hex, or "-" when absent. Status rows: the action name.'
+        example: "-"
+        platforms: [windows, linux, darwin]
+      - name: algorithm
+        type: string
+        description: 'Name of the keyed hash used, or "-" when absent. Status rows: the level (unsupported).'
+        example: "-"
+        platforms: [windows, linux, darwin]
+      - name: source
+        type: string
+        description: 'Where the identifier was read from, or "-" when absent. Status rows: the reason token (<os>:planned).'
+        example: "/etc/machine-id"
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "Machine Identifier (Keyed Hash)"
 
   approval:
     mode: auto

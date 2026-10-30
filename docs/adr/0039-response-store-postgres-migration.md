@@ -13,7 +13,7 @@
 two tables: `responses` (per-agent result rows: status, output, error, plugin,
 `execution_id`, `ttl_expires_at`) and `response_facets` (denormalised column values powering
 the dashboard's facet filters). High-write (every command result from every agent), TTL'd
-(default 90-day retention via a background cleanup thread), a `/tar`- and executions-drawer
+(default 90-day retention via a background cleanup thread), a `/echo`- and executions-drawer
 read source. Read surface is compact: `query` / `query_by_execution` / `get_by_instruction`
 / `query_by_ids`, `aggregate` / `distinct_agent_ids` / `facet_values` / `facet_agent_ids` /
 `facet_response_ids`.
@@ -44,7 +44,7 @@ changing v1 in place would silently no-op on any database that already ran it.
 
 - **Response ingest (`store`): FAIL-SOFT** (ADR-0037 shape) — a dropped result row is
   re-derivable operational telemetry (the executions ladder tracks the command; the agent's
-  result is best-effort persisted for the drawer/TAR). Ingest must never block the gRPC
+  result is best-effort persisted for the drawer/Echo). Ingest must never block the gRPC
   thread. Drops counted (`yuzu_server_response_ingest_dropped_total{reason}`, kReason*
   constants). `store()` runs the full insert-plus-facet-batch body through
   `PgPool::with_txn_for` rather than a hand-rolled `PgTxn`/lease pair (Doomgoose finding #1) —
@@ -57,7 +57,7 @@ changing v1 in place would silently no-op on any database that already ran it.
   reads also share (Doomgoose finding #4).
 - **Reads (`query`/`query_by_execution`/`aggregate`/facets/…): degrade-distinguishable at
   the store seam** (`std::optional<vector>` nullopt-on-degrade + `yuzu_server_response_read_
-  degrade_total{reason}` + sampled logs). For the executions drawer / TAR dashboard / dashboard
+  degrade_total{reason}` + sampled logs). For the executions drawer / Echo dashboard / dashboard
   results table these feed a **display**, not an enforce/target/authz decision, so per the
   playbook's deny-or-benign carve-out those consumers may render degraded (503 on the REST
   twin, empty+degrade-banner on the dashboard) — but the seam MUST distinguish empty from
@@ -78,7 +78,7 @@ changing v1 in place would silently no-op on any database that already ran it.
 ### Backfill (ADR-0009) — SKIPPABLE
 
 Responses are TTL'd 90-day operational data, not authoritative config and not compliance
-evidence — losing pre-cutover responses degrades only historical drawer/TAR views, which
+evidence — losing pre-cutover responses degrades only historical drawer/Echo views, which
 self-refill as new commands run. So **no backfill** (the ADR-0009 skippable class, the
 `ResponseStore` precedent the ladder cites): the legacy `responses.db` is not read on upgrade;
 a one-time loud "response history reset on Postgres cutover" boot log. (Matches
@@ -257,7 +257,7 @@ should reach for one batch-under-one-savepoint, not a savepoint per row (subxid 
   skippable); a mandatory multi-GB backfill of a high-write table would add boot latency and
   OOM risk (cf. #2661) for data that self-refills.
 - **Catastrophic-read type-distinguishable everywhere**: unnecessary for the display consumers
-  (executions drawer / TAR / dashboard results) — the seam stays degrade-distinguishable but
+  (executions drawer / Echo / dashboard results) — the seam stays degrade-distinguishable but
   those consumers may render degraded (the ResultSetStore `list_by_owner` precedent). The
   `/auto` Pre-flight consumer is the exception (see the Posture correction above): its two
   callers check the seam's `degraded` signal explicitly and decline to persist rather than
@@ -267,7 +267,7 @@ should reach for one batch-under-one-savepoint, not a savepoint per row (subxid 
 
 - Response history is reset on the Postgres cutover (skippable backfill) — a CHANGELOG
   "Changed" note + `docs/user-manual` mention; operationally invisible after one command
-  cycle. Executions drawer / TAR read fleet-consistent across replicas afterward.
+  cycle. Executions drawer / Echo read fleet-consistent across replicas afterward.
 - Tests → `YUZU_REQUIRE_PG_DB_TPL` + a file-local `"responsestore"` `PgTestTemplate`;
   migration/fresh-DB tests keep plain `YUZU_REQUIRE_PG_DB`.
 - `plugin_result_status` (ABI3→4) round-trips through `ResponseStore` unchanged — a caller

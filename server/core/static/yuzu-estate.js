@@ -197,9 +197,9 @@
       return D.form({
         title: 'Remove stored data for ' + label + '?',
         body: [
-          'This erases the device from seven stores: inventory, installed software, device ' +
-            'configuration, application performance, detected licences, application usage and the ' +
-            'endpoint presence row. It cannot be undone.',
+          'This erases the device from eight stores: inventory, installed software, device ' +
+            'configuration, application performance, detected licences, application usage, the ' +
+            'endpoint presence row and fleet certificates. It cannot be undone.',
           'It does not unenrol the device; a connected agent will report again. Tags, custom ' +
             'properties, quarantine records and property schemas are not removed.'
         ],

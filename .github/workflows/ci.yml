@@ -1177,7 +1177,7 @@ jobs:
       - name: Test (non-pg suites)
         # Split into 2 invocations, cheap-first (fail-fast — bash -e aborts
         # the remaining lines on the first non-zero exit): the cheap suites
-        # (agent/docs/proto/tar/gateway/platform) run first, then the 6
+        # (agent/docs/proto/echo/gateway/platform) run first, then the 6
         # non-pg server entries by name (4 shards — #3443 Windows
         # restructuring added shard C, a later measured-by-time follow-up
         # added shard D, carved from B's [body_cap] tests — + the mcp bridge
@@ -1264,7 +1264,7 @@ jobs:
           # stale log). On a red run bash -e stops before the summary; use the
           # uploaded meson-logs artifact locally (#4884).
           rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 --suite agent --suite docs --suite proto --suite tar --suite gateway --suite platform
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 --suite agent --suite docs --suite proto --suite echo --suite gateway --suite platform
           python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux non-pg (cheap suites)"
           rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
           python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "guardian cache allocation-failure sweep" "server pg shard partition invariant" "dex link no presentation symbols"
@@ -1345,7 +1345,7 @@ jobs:
         #
         # HISTORICAL (pre-#3443-Phase-2) — describes what was then a single
         # step's internal 3-invocation split: 21 tests across 5 cheap suites
-        # (agent/docs/proto/tar/gateway) run first, then the 4 non-pg server
+        # (agent/docs/proto/echo/gateway) run first, then the 4 non-pg server
         # entries by name (corrected count — this paragraph originally said
         # "3", found stale by adversarial review), both UNCAPPED (no
         # --num-processes at all) since neither touches Postgres. Only the pg
@@ -2199,7 +2199,7 @@ jobs:
           # docs suite is OS-independent and runs on the Linux leg only; OS-contract
           # entries carry suite platform (tests/meson.build) and run on every leg, so
           # the selection swaps docs for platform and the guard excludes docs.
-          suites=(--suite agent --suite platform --suite proto --suite tar --suite gateway --suite server-nonpg --suite server-checks)
+          suites=(--suite agent --suite platform --suite proto --suite echo --suite gateway --suite server-nonpg --suite server-checks)
           python scripts/ci/assert-suite-cover.py --builddir build-windows-${{ matrix.build_type }} \
             "${suites[@]}" \
             --exclude-suite server-pg --exclude-suite server-pg-smoke --exclude-suite docs
@@ -2264,7 +2264,7 @@ jobs:
           suites=(--suite server-pg)
           python scripts/ci/assert-suite-cover.py --builddir build-windows-${{ matrix.build_type }} \
             "${suites[@]}" \
-            --exclude-suite agent --exclude-suite docs --exclude-suite proto --exclude-suite tar \
+            --exclude-suite agent --exclude-suite docs --exclude-suite proto --exclude-suite echo \
             --exclude-suite gateway --exclude-suite server-nonpg --exclude-suite server-checks \
             --exclude-suite server-pg-smoke --exclude-suite platform
           # Runs LAST (after the non-pg step above): flake-retry.py /

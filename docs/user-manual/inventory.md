@@ -510,7 +510,7 @@ place, **Hardware** and **Software**, each its own page:
 
 - **`/hardware`** — a ServiceNow-style Configuration-Item list and record; the successor
   to the old **Devices** tab, extended with a generic action runner. The list shows
-  hostname, **IP** (new — read live from the TAR fleet-snapshot cache, so it is honestly
+  hostname, **IP** (new — read live from the Echo fleet-snapshot cache, so it is honestly
   blank once a device goes offline rather than a stale last-known address), OS,
   online/offline/**stale** status, per-page **DEX score**, agent version, last-seen,
   **Tags** (new — click a chip to filter by that exact `key` or `key=value`, or type
@@ -942,6 +942,16 @@ ingest is failing. Four further series sharpen the picture:
   `YuzuGenericInventoryPersistenceDropped` warns only after a non-`stale` reason's rate
   remains non-zero for 15 minutes, avoiding alerts for a single self-healing report or
   expected clock-step stale suppression.
+- `yuzu_inventory_typed_purge_rows_total` (counter) — stray typed-source rows removed from the
+  generic store by the background boot purge. Present at 0 on every boot; it rises only after
+  an upgrade or rollback that left such rows. The pass runs once per boot and then stops, so a
+  flat counter after the first minutes is normal.
+- `yuzu_inventory_typed_purge_failures_total` (counter) — background purge passes that gave up after a failed
+  batch (closed store, pool timeout, SQL error, 20 s statement timeout) through its retries with backoff
+  at smaller batch sizes, or because typed rows stayed locked by another session across the retries
+  (that path retries without halving). The pass is not retried until the next boot; **a restart re-runs it**, which is the remediation once the database is healthy;
+  stray rows stay unreadable meanwhile. Any non-zero value after a boot is worth a look at the
+  Postgres pool, not a page. Readiness does not depend on the pass.
 - `yuzu_inventory_query_truncated_total` (counter) — generic-store reads that hit their
   row cap or 8 MiB aggregate payload cap. A non-zero rate on the result-set
   producer path pairs with 503s from
@@ -1108,8 +1118,8 @@ columns, fields, and audit/degrade posture.
 ## App usage inventory (`app_usage`)
 
 A further daily-sync source, **`app_usage`**, is live on the agent and server. It
-derives machine-scope executable usage evidence read-only from TAR's `usage` fold
-(`usage_daily`/`usage_daily_user`/`usage_live` inside `tar.db`) and persists it in
+derives machine-scope executable usage evidence read-only from Echo's `usage` fold
+(`usage_daily`/`usage_daily_user`/`usage_live` inside `echo.db`) and persists it in
 the typed Postgres schema **`app_usage_store`**: per-executable run counts, total
 seconds, first/last-seen, and a distinct-user count over a 30-day sliding window.
 
@@ -1140,6 +1150,87 @@ seconds, first/last-seen, and a distinct-user count over a 30-day sliding window
   syncing a partial result — build servers, CI runners and dev workstations with
   heavy toolchain churn are the plausible case. There is currently no
   operator-facing alert for this state.
+
+## Certificate inventory (`certificate_inventory`) - server side
+
+A further daily-sync source, **`certificate_inventory`**, is received by the server
+(ADR-0070 D12; the agent collector and the read surface ship in later changes, so on
+its own this change stores reports and exposes nothing). No agent sends
+`certificate_inventory` yet: an agent starts only once the server advertises that it
+accepts the source, which ships in a separate later change, so until then this store
+stays empty. It is persisted in the typed
+Postgres schema **`certificate_inventory_store`**: one row per (device, certificate) with its X.509
+facts, the places it was seen (store and path), and its SANs, EKUs and CRL distribution
+points. It never lands in the generic inventory store, on either path.
+
+- **Wire format.** A version-1 pipe-delimited blob (`ver|`, `store|`, `cert|`, `loc|`,
+  `san|`, `eku|`, `cdp|`, `der|`), every field framed with `\\`, `\|`, `\n` and `\r`
+  escapes so store ids, DNs and paths round-trip byte for byte. The agent writer
+  (`certificates_inventory_blob.hpp`) defines the record and its 33 `cert|` fields; the
+  server parser follows it, and the order is documented in the header of
+  `server/core/src/certificate_inventory_ingestion.hpp`. Digests are stored lower-case and
+  serial, subject key id and authority key id upper-case, so filters compare
+  case-insensitively. A DER that does not hash to its certificate's SHA-256 is dropped, the
+  certificate marked `der_hash_mismatch` and the report counted under that reason. A
+  field sent as `?` is unknown and stored NULL, which is not the same as an empty value.
+  The stored hash is the SHA-256 of the received bytes, never the agent's claim.
+- **Per-store rules.** Every store reports one status. `ok` replaces the store's rows
+  with exactly those reported. `absent` removes them. `constrained` upserts what was
+  reported and keeps the rest, because a partial read cannot prove a removal.
+  `unreadable` leaves the rows alone. A store the device used to report and omits is
+  marked `not_observed` from the first omission, with its rows kept. Each store has its
+  own `observed_at` (last report in which it read `ok` or `absent`) and `status_at`
+  (last report that carried it), both server receipt time.
+- **Hash-skip.** A report byte-identical to the last full one is answered by hash only.
+  The server advances `observed_at` for `ok`/`absent` stores only, and the location
+  `last_seen` only for the locations that last full report carried, so kept, unreported
+  locations still age. A cold cache or a changed hash is answered `need_full`.
+- **Refusals, never truncation.** A record over a cap (64 stores, 10,000 distinct
+  certificates, 2,000 certificates per store, 64 SANs of 256 bytes, 32 EKUs, 8 CRL
+  distribution points of 512 bytes, 1,024-byte DNs, 16 KiB DER and 1 MiB of DER per
+  blob, 3 MiB per blob) is refused, never truncated. A refused or malformed record makes
+  the store it belongs to read `constrained` (reason `row_cap` for a size cap,
+  `parse_error` for a defect), keeps that store's rows, and the blob is still
+  acknowledged. A record that cannot be tied to a store constrains the whole report.
+  Invalid UTF-8 is replaced with U+FFFD and the field is named in the certificate's
+  `constrained_fields` (a `?` for is_ca, path_len or self_signed is named
+  `unknown:<field>`). A DER that does not hash to its certificate is dropped and the
+  certificate marked `der_hash_mismatch`. No private key material is ever stored; the
+  optional public DER and key-association metadata are.
+- **A refused device freezes.** A whole blob that is over 3 MiB, has an unknown major
+  version, an unparseable header, more than 64 stores or 10,000 certificates, or arrives
+  with more than 64 sources is **rejected**: acknowledged without asking for a resend (the
+  same bytes would be refused again), nothing is written, and the device's stored
+  inventory stops changing. Its next daily cycle is cold (hash-only, then a full resend)
+  and is refused again, so this repeats once per interval until the agent is fixed. It is
+  visible only as `yuzu_server_cert_inventory_ingest_total{result="rejected",reason}` (the
+  `YuzuCertInventoryReportsRejected` alert) and a warn log naming the agent. To diagnose,
+  find the agent in the warn line `blob from agent=... refused`, then check its agent
+  version against the server's (unknown major version) and its store count. A
+  transaction that runs past its time budget (scaled with the report size) is rolled
+  back, counted as `error`/`budget_exceeded`, and is likewise acknowledged and retried
+  next interval. **A device whose report deterministically exceeds the budget is frozen
+  the same way** (never stored, retried once per interval) and is covered by the same
+  alert. An unexpected exception in the ingest seam is counted `error`/`exception`: a
+  full report is then asked to resend, a hash-only report is acknowledged and retries
+  next interval. At most four full-report ingests run at once; a fifth is deferred
+  (`deferred`/`agent_busy`).
+- **Busy device.** Reports for one device are serialised. A report that finds another
+  for the same device in flight is counted `deferred`/`agent_busy`; a full report is asked
+  to resend, and a hash-only report just retries next cycle. A hash-only claim must be
+  exactly 64 lowercase hex characters (an empty or malformed claim is answered with a
+  resend request, counted `need_full`/`bad_claim`). Consumers of a device's `status_at`
+  must tolerate one missed interval.
+- **Erasure.** Erasing a device (`DELETE /api/v1/sle/agents/{id}`) removes its
+  certificate rows in one transaction. Erasure does not unenrol the device, so a
+  still-running agent re-creates its rows on its next report.
+- **Observability.** `yuzu_server_cert_inventory_ingest_total{result,reason}` (see
+  [Metrics](metrics.md)). The store (`certificate_inventory_store`) is a `/readyz` and
+  `/healthz` component: the server refuses to start if its schema cannot be created,
+  and a store that failed to open would otherwise acknowledge the blob with no rows.
+- **Deploy order.** Upgrade servers before agents. `certificate_inventory` is in the
+  typed set from the typed-source read filter change, so even a gateway-proxied blob
+  reaching a server without this store is not stored in the generic store.
 
 ## See also
 

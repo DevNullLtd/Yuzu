@@ -11,6 +11,7 @@
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
 #include "app_usage_store.hpp"
+#include "certificate_inventory_store.hpp"
 #include "offline_endpoint_store.hpp"
 
 namespace yuzu::server {
@@ -82,6 +83,15 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
     targets_.push_back({"offline_endpoint",
                         stores.offline_endpoint
                             ? Fn([p = stores.offline_endpoint](std::string_view id) {
+                                  return p->delete_agent(id);
+                              })
+                            : nullptr});
+    // The eighth store (slice-2 PR 2a-2a): fleet certificate inventory. delete_agent erases every
+    // table's rows in one transaction (erase only: the decommission tombstone that stops a still-
+    // running agent repopulating them is PR 2a-2c, so until then its next report re-creates them).
+    targets_.push_back({"certificate_inventory",
+                        stores.certificate_inventory
+                            ? Fn([p = stores.certificate_inventory](std::string_view id) {
                                   return p->delete_agent(id);
                               })
                             : nullptr});

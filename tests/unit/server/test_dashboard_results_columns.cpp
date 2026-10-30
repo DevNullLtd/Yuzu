@@ -24,7 +24,7 @@
  * render_results and its inputs (instruction_store_, response_store_) are
  * private; the DashboardResultsColumnsTestAccess friend seam
  * (dashboard_routes.hpp) wires them without standing up an HTTP server, same
- * shape as test_dashboard_tar_retention.cpp's seam.
+ * shape as test_dashboard_echo_retention.cpp's seam.
  */
 
 #include "dashboard_routes.hpp"
@@ -562,7 +562,7 @@ TEST_CASE("render_filter_bar route: dispatched through TestRouteSink, the "
           const std::string&, const std::string&, const std::string&) {};
 
     // MEMBER ORDER IS LOAD-BEARING (mirrors FragmentHarness,
-    // test_dashboard_tar_fragments.cpp:106-180): `sink` declared LAST so it
+    // test_dashboard_echo_fragments.cpp:106-180): `sink` declared LAST so it
     // is destroyed FIRST, while `routes` -- whose `this` its handlers
     // captured -- is still alive.
     struct SinkHarness {

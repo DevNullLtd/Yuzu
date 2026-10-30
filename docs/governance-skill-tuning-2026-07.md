@@ -193,7 +193,7 @@ clock-guarded-retention row routes any retention/reaper/prune pass to
 `cpp-safety` + `sre` + `compliance-officer` — exactly the roster the kill shape cites.
 
 The description is, however, a precise account of `CLAUDE.md` **before 2026-07-11**, when
-the inline table's only retention mention was a TAR row about retention-*paused sources*:
+the inline table's only retention mention was an Echo row about retention-*paused sources*:
 
 | commit | date | change |
 |---|---|---|

@@ -1473,10 +1473,10 @@ TEST_CASE("ExecutionTracker: the dispatch record carries the plugin; the plugin 
     ExecutionTracker& tracker = *tracker_bundle;
 
     SECTION("round trip: plugin and execution id") {
-        REQUIRE(tracker.record_command_dispatch("tar-0001", "tar", "exec-1"));
-        const auto rec = tracker.lookup_command_record("tar-0001");
+        REQUIRE(tracker.record_command_dispatch("echo-0001", "echo", "exec-1"));
+        const auto rec = tracker.lookup_command_record("echo-0001");
         REQUIRE(rec.has_value());
-        CHECK(rec->plugin == "tar");
+        CHECK(rec->plugin == "echo");
         CHECK(rec->execution_id == "exec-1");
     }
     SECTION("an untracked dispatch records the plugin with an empty execution id") {

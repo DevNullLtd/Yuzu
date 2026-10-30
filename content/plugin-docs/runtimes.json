@@ -381,7 +381,7 @@
   "version": "1.0.0",
   "where_the_data_goes": [
     "**Instruction result.** Every row is server instruction-result data — the standard retention policy, served over REST `/api/responses`. Nothing here is a durable server-side table of its own.",
-    "**Not consumed by** daily-sync, TAR, DEX, or metrics — the plugin runs only on an explicit instruction dispatch and there is no agent daily-sync source for runtimes.",
+    "**Not consumed by** daily-sync, Echo, DEX, or metrics — the plugin runs only on an explicit instruction dispatch and there is no agent daily-sync source for runtimes.",
     "**Sensitivity.** Rows name installed runtimes with their exact version, install path and vendor, which is a patch-level and licensing-relevant software inventory for the device. The Linux leg reads only fixed machine-scope roots (`/usr`, `/opt`, `/var/opt/java`) and the mount table `/proc/self/mountinfo` (used only to decide what to skip, never emitted), so no user-profile root is walked; `install_path` and `vendor` echo directory and file text as found, so a name planted under those roots reaches a row after the UTF-8 and pipe scrub (`yuzu::util::sanitize_utf8` replaces invalid lead and continuation bytes but still passes overlong, surrogate and out-of-range sequences that protobuf rejects: #4864).",
     "**Siblings:** `crossplatform.runtimes.dotnet`, `crossplatform.runtimes.jvm`."
   ]

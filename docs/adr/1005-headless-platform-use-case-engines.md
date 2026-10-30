@@ -410,7 +410,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `/api/compliance*`) — marked **settings-plane exception** with a
        **2027-Q1** proposed re-home target (PO-adjustable; no committed
        date until an owning module is scoped). `/fragments/*` surfaces
-       (e.g. `/fragments/auto/*`, `/fragments/tar/*`,
+       (e.g. `/fragments/auto/*`, `/fragments/echo/*`,
        `/fragments/device/live/*`, `/fragments/executions`) remain under
        item 1 above; they carry no migration date — tracked separately.
 
@@ -443,7 +443,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      | POST | `/api/scope/validate` | `dashboard_api_routes.cpp` | settings-plane exception | 2027-Q1 |
      | POST | `/api/dashboard/execute` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
      | POST | `/api/dashboard/group-from-results` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
-     | POST | `/api/dashboard/tar-execute` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/dashboard/echo-execute` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
      | GET | `/api/deployment-jobs` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
      | POST | `/api/deployment-jobs` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
      | DELETE | `/api/deployment-jobs/([a-f0-9]+)` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
@@ -682,7 +682,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      has an open tracker that owns a date: the two NVD fragments
      (grandfathered surface #2, 2027-Q1 target, #4099 open); the
      self-service password change (a permanent exception, ADR 2026-10-04);
-     the two TAR process-tree fragments (waiting on a /run twin; #4027
+     the two Echo process-tree fragments (waiting on a /run twin; #4027
      closed, #3994 open design issue). The two dashboard api-tokens routes
      left this set when they were recorded as `twinned` (#6009). Plain growth
      of the set is machine-caught,
@@ -1062,6 +1062,25 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - **Revisit** when a minimum-version admission check exists, or when
        multi-replica operation leaves the unsupported state in the safe-to-scale
        gate, whichever comes first. No calendar date is set.
+   - **2026-10-28 - the Echo rename retires every TAR-named surface with no
+     deprecation window.** `docs/api-versioning-policy.md` treats an endpoint or
+     tool rename as a Breaking change that keeps the old name for a window; this
+     rename retires the old names outside that cycle, by the owner's ruling at the
+     rename's planning (2026-10-28): a hard cut, no aliases. Scope: the REST
+     routes `/api/v1/tar/...` and `/api/dashboard/tar-*`, the MCP tools
+     `*_tar_*`, the metrics `yuzu_tar_*`, the audit actions `tar.*` (no longer
+     written; old rows keep their spelling and the `echo.*` filters match both),
+     the instruction ids `crossplatform.tar.*`, the result-set matcher kind
+     `tar_rows_ge` and the agent plugin name `tar`. Replacement names substitute
+     `echo` for `tar` (`/api/v1/echo/...`, `*_echo_*`, `yuzu_echo_*`, `echo.*`,
+     `crossplatform.echo.*`, `echo_rows_ge`, plugin `echo`). The only retained
+     compatibility is the upgrade-window plugin-name shim (the server accepts an
+     agent that still reports `tar` and writes that name on the wire to it),
+     removed with the other legacy-name shims. Rationale: the feature is renamed
+     outright, so a retained alias would keep the old name alive in every
+     surface; the migration guide (`docs/user-manual/upgrading.md`) lists the
+     old and new names. The ledger records the retirement because the policy
+     requires it.
 
 ## Interim rules (until the named follow-ups ship)
 

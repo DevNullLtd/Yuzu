@@ -53,10 +53,13 @@
 /// legacy `inventory.db`: a leftover legacy file is never read and never scrubbed by this
 /// store — see `docs/user-manual/upgrading.md`'s InventoryStore section for the operator note.
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu {
@@ -100,7 +103,7 @@ struct InventoryQuery {
 /// `std::optional<InventoryRecord>`: a value == found, `std::nullopt` ==
 /// genuinely no row for this (agent_id, plugin). `std::unexpected(kDegraded)`
 /// == store/pool/query failure — the caller shows a degrade banner/503, never
-/// a 404 (mirrors `DeviceInventoryStore::CiReadError` exactly; out-params are
+/// a 404 (mirrors `CiReadError` (device_inventory_types.hpp) exactly; out-params are
 /// forbidden in new code, docs/cpp-conventions.md, hence `std::expected`
 /// rather than an enum + out-param).
 enum class InventoryReadError { kDegraded };
@@ -185,23 +188,56 @@ public:
     /// cannot report a false "erased".
     [[nodiscard]] bool delete_agent(const std::string& agent_id);
 
-    /// Delete every row for one plugin (source), across ALL agents. Mirrors
-    /// `delete_agent`'s lease/txn idiom exactly, keyed on `plugin` instead of
-    /// `agent_id`. Defence-in-depth (ADR-0016 §5) for the boot-time typed-
-    /// source purge (server.cpp): a typed source's rows never belong in this
-    /// generic store — the gateway skip (`is_typed_inventory_source`) and the
-    /// read filter on every read are the controls; this is hygiene that
-    /// reclaims rows a newer-agent/older-server window left here. Returns false on a
-    /// closed store, a lease/lock timeout, or a SQL failure (never throws) —
-    /// callers must not treat a false return as fatal (never set
-    /// `startup_failed_` on it).
-    [[nodiscard]] bool delete_source(std::string_view plugin_name);
+    /// How a `drain_typed_sources` pass ended.
+    enum class TypedPurgeStatus { kCompleted, kStopped, kFailed };
+    struct TypedPurgeResult {
+        TypedPurgeStatus status{TypedPurgeStatus::kCompleted};
+        std::int64_t rows{0}; ///< rows removed so far, whatever the status
+        std::string cause;    ///< set when status == kFailed
+    };
+    struct TypedPurgeOptions {
+        int batch_rows{5000};
+        int min_batch_rows{100};  ///< a failing batch halves down to this floor
+        int max_attempts{4};      ///< retries after a failed batch before giving up
+        std::chrono::milliseconds pause{100};   ///< between batches (interruptible)
+        std::chrono::milliseconds backoff{500}; ///< x failure count, interruptible
+        /// TEST ONLY: called with the batch size after the lease is held; true makes that
+        /// batch fail as a statement error would.
+        std::function<bool(int)> test_fail_batch;
+    };
+
+    /// Delete at most `max_rows` stray rows of `kTypedInventorySources` (across ALL
+    /// agents) in ONE bounded, time-limited statement. Returns the rows deleted (0 =
+    /// nothing left, or a non-positive bound), or `std::nullopt` on a closed store, a
+    /// lease timeout or a SQL failure (never throws). The typed list is bound
+    /// internally (the read filter's own), so no caller can name other sources.
+    [[nodiscard]] std::optional<std::int64_t> purge_typed_sources_batch(int max_rows);
+
+    /// The background pass (ADR-0070 D12 hygiene -- the read filter and the gateway
+    /// skip are the controls; this reclaims space): keyset batches in primary-key
+    /// order until none remain. A failed batch (or one that found every remaining
+    /// typed row locked by a peer, which is never reported as completion) is retried with backoff at half the
+    /// size (down to the floor) before the pass gives up; `should_stop` is polled
+    /// between batches and during every pause. Counts
+    /// `yuzu_inventory_typed_purge_rows_total` per batch and
+    /// `yuzu_inventory_typed_purge_failures_total` once when a pass fails.
+    [[nodiscard]] TypedPurgeResult
+    drain_typed_sources(const TypedPurgeOptions& opt, const std::function<bool()>& should_stop = {});
 
     /// Count inventory records, typed sources excluded. AUTHORITATIVE read: `std::nullopt` on a
     /// store/pool/query degrade, NEVER a silent zero.
     [[nodiscard]] std::optional<int64_t> count() const;
 
 private:
+    struct PurgeBatch {
+        std::int64_t deleted{0};
+        std::string last_agent, last_plugin; ///< last key deleted; empty when none
+        bool more_locked{false}; ///< typed rows remain after the cursor that this batch skipped
+    };
+    [[nodiscard]] std::optional<PurgeBatch>
+    purge_batch(int max_rows, const std::string& after_agent, const std::string& after_plugin,
+                const TypedPurgeOptions* hook, std::string* err);
+
     pg::PgPool& pool_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};

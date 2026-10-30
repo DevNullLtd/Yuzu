@@ -149,8 +149,9 @@ CiRecord build_device_ci_record(const CiPluginOutputs& out) {
     rec.os_build = scalar(out.os_build, "os_build");
     rec.arch = scalar(out.os_arch, "os_arch");
 
-    // processors: `cpu|<id>|<model>|<cores>|<threads>|<mhz>` — model from the first
-    // CPU, cores/threads summed across sockets.
+    // processors: `cpu|<id>|<model>|<cores>|<threads>|<mhz>[|<socket_designation>|<stepping>]`
+    // (trailing columns are placeholders and ignored here) — model from the first CPU,
+    // cores/threads summed across sockets.
     long long cores = 0;
     long long threads = 0;
     for (auto line : split_lines(out.processors)) {
@@ -165,7 +166,8 @@ CiRecord build_device_ci_record(const CiPluginOutputs& out) {
     rec.cpu_cores = std::to_string(cores);
     rec.cpu_threads = std::to_string(threads);
 
-    // memory: `dimm|<slot>|<size_mb>|<type>|<speed_mhz>` — sum size_mb → bytes.
+    // memory: `dimm|<slot>|<size_mb>|<type>|<speed_mhz>[|<manufacturer>|<part_number>|<serial>]`
+    // (trailing columns are placeholders and ignored here) — sum size_mb → bytes.
     long long total_mb = 0;
     for (auto line : split_lines(out.memory)) {
         auto t = split_pipe(line);

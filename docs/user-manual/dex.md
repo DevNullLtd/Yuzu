@@ -288,7 +288,7 @@ numbers match.
   management-group / service-scope visibility, unlike the unaudited aggregate
   trend above it. The daily rollup that feeds this trend **excludes kernel
   threads** (Linux `PF_KTHREAD`, e.g. `kworker/*`) — unlike the live,
-  per-device [procperf tier](tar.md) these devices still capture, where
+  per-device [procperf tier](echo.md) these devices still capture, where
   kernel threads remain visible (their zero working set keeps them out of the
   live working-set top-N, though a genuinely hot one can still surface in the
   CPU top-N as real signal; see the procperf row of the source-coverage
@@ -321,10 +321,10 @@ numbers match.
   signal type on one timeline, with friendly labels) plus a **device
   performance** panel: CPU, memory, and disk-latency sparklines built from the
   device's own hourly perf rollups. The panel is **click-to-load** and runs a
-  **live, read-only TAR query on the device** when you load it — the raw
+  **live, read-only Echo query on the device** when you load it — the raw
   samples stay in the on-device edge warehouse (federated model) until an
   operator asks, and merely viewing a device page never dispatches anything. It
-  therefore needs the device online, the TAR perf sampler enabled, and (beyond
+  therefore needs the device online, the Echo perf sampler enabled, and (beyond
   `GuaranteedState:Read`) the **`Execution:Execute`** permission — without it
   the panel shows a note instead. Each query is audit-logged
   (`dex.device.perf.query`).
@@ -667,9 +667,9 @@ DEX collection is a **deploy-time agent setting**. Start the agent with
 **`--dex-disable`** (or `YUZU_AGENT_DEX_DISABLE=1`) and that endpoint arms no
 observer and sends no DEX telemetry of any kind. **Note:** `--dex-disable` turns
 off the DEX event observer, the Windows state poll, and the heartbeat perf
-tags (the fleet rollup above), but the TAR performance
+tags (the fleet rollup above), but the Echo performance
 sampler is a separate subsystem — disable it with `perf_enabled=false` (see
-[TAR configuration](tar.md#configuration)). There is no server-side runtime
+[Echo configuration](echo.md#configuration)). There is no server-side runtime
 toggle today; per-category collection toggles and an individual-view kill switch
 are named roadmap items (see the enterprise-readiness plan).
 

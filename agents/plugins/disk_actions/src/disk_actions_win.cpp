@@ -88,6 +88,7 @@
 
 #include "disk_actions_legs.hpp"
 #include "disk_actions_parsers.hpp"
+#include <planned_leg.hpp>
 
 #include <array>
 #include <cstddef>
@@ -864,6 +865,17 @@ int emit_volumes(yuzu::CommandContext& ctx) {
         }
     }
     return 0;
+}
+
+// PLANNED (partitions/topology): one `status|<action>|unsupported|windows:planned` row until
+// H.5 (partitions; topology stays planned until a Windows source is ruled) lands. The shared
+// reporter owns the grammar (agents/shared/planned_leg.hpp).
+int emit_partitions(yuzu::CommandContext& ctx) {
+    return yuzu::shared::report_planned(ctx, "partitions");
+}
+
+int emit_topology(yuzu::CommandContext& ctx) {
+    return yuzu::shared::report_planned(ctx, "topology");
 }
 
 } // namespace yuzu::disk_actions
