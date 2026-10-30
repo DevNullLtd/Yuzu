@@ -1492,8 +1492,8 @@ count-valued histograms here are not latencies, so they declare their own:
 
 **Server:**
 - `yuzu_server_heartbeat_tags_total{via,outcome}`, with `via` `direct|gateway|register` and
-  `outcome` `synced|full|diverged|no_base|rejected|absent|unverifiable`, plus `bad_signature`
-  from ADR-0074 wave 2 (D3, D16);
+  `outcome` `synced|full|diverged|no_base|rejected|absent|unverifiable`, plus
+  `bad_signature|replayed|unverified_session` from ADR-0074 wave 2 (D3, D16);
 - `yuzu_server_tag_resync_total{outcome}`, with `sent|deferred|send_failed`;
 - gauge `yuzu_server_resync_pending{action}`, with `tags|topology`: the size of the pending set
   (D8);
@@ -1510,14 +1510,17 @@ count-valued histograms here are not latencies, so they declare their own:
 - `yuzu_viz_topology_pushed_total{via,reason}` (gains `reason`: `changed|refresh|startup|resync`);
 - `yuzu_viz_topology_push_parse_errors_total{via}` (unchanged);
 - `yuzu_viz_topology_report_rejected_total{via,reason}`, with
-  `parse|digest_mismatch|ip_conflict|oversize|unknown_session` (D7; `parse` also moves the parse
-  counter above);
+  `parse|digest_mismatch|ip_conflict|oversize|unknown_session`, plus
+  `bad_signature|replayed|unverified_session` from ADR-0074 wave 2 (D7, D16; `parse` also moves
+  the parse counter above);
+- `yuzu_server_reattach_challenge_total{outcome}`, with `verified|bad_signature|expired`, and the
+  gauge `yuzu_server_reattach_challenge_pending`, from ADR-0074 wave 2 (D14);
 - `yuzu_viz_topology_reclaim_total{outcome}`, with `reclaimed|conflict` (D6);
 - `yuzu_viz_topology_reclaim_audit_total{result}`, with `written|deferred|dropped` (D6: the queued
   `reclaim_conflict` audit row; a non-zero `dropped` is a lost evidence row);
 - `yuzu_viz_topology_reclaim_audit_queued`, a gauge (D6: the re-claim audit rows still queued);
 - `yuzu_viz_topology_digest_total{via,outcome}`, with `match|mismatch|no_slot|empty|disabled|absent`,
-  plus `bad_signature` from ADR-0074 wave 2 (D16;
+  plus `bad_signature|replayed|unverified_session` from ADR-0074 wave 2 (D16;
   `empty`: an empty digest; `disabled`: `DISABLED`; `absent`: no field);
 - `yuzu_viz_topology_resync_total{outcome}`, with `sent|deferred|send_failed`;
 - gauge `yuzu_viz_topology_slots{state}`, with `fresh`, `disconnected`, `agent_silent`,
@@ -1866,12 +1869,28 @@ message ReattachResponse {
   owner, 2026-10-30; lands in ADR-0074 wave 2).** Reattach itself carries ids only and has no
   agent step, so it cannot carry the D5 per-session proof. The requirement is:
   - after a reattach, the server sends a signed session-start challenge down the existing stream,
-    the same challenge D5 issues at the start of every session;
-  - until the agent's signature over that challenge verifies, the route is not published (the
-    CONNECTED re-announce changes no route row) and no command but the challenge is routed to the
-    agent, `__resync__` included; the issuer treats such a session as not yet installed (D8);
-  - a signature that fails to verify, or no answer within the challenge's expiry, tears the stream
-    down, and the agent registers again through the full path.
+    the same challenge D5 issues at the start of every session, single-use, with a fresh nonce and
+    an expiry (`--reattach-challenge-timeout`, default 30 s, unmeasured);
+  - steps 5 and 6 still run, so the server can send the challenge, but the session is installed
+    `challenge_pending` and its route row is written `challenge_pending`. Until the agent's
+    signature over the challenge verifies, the route-directory reader's `routable` predicate
+    refuses the row, so the CONNECTED re-announce publishes no route, and `send_to`, the one send
+    every dispatch surface reaches (operator dispatch through `dispatch_confined_arms`, the five
+    cascade sites, the schedule runner, the policy evaluator, the Guardian push and every
+    `SystemReservedPush`, `__resync__` included), refuses the session; the challenge push is the
+    one exempt send. The issuer treats such a session as not installed (D8);
+  - on verification the server clears `challenge_pending` on both, then runs the #3425
+    reconnect reconciler's containment re-application and marks a tags resync (D16): a
+    containment re-dispatch refused during the window is re-fired, never dropped;
+  - a signature that fails to verify, or no answer within the expiry, makes the server uninstall
+    the session and tombstone its route row itself (it does not rely on the gateway closing the
+    stream), and the agent registers again through the full path;
+  - every outcome is counted (`yuzu_server_reattach_challenge_total{outcome}`, with
+    `verified|bad_signature|expired`, and the gauge `yuzu_server_reattach_challenge_pending`), and
+    a failure writes an `agent.reattach.challenge` audit row through `audit_token`;
+  - tests assert the exact send set: a reattached, unverified session receives no operator,
+    scheduled, policy, Guardian or system-reserved command, and a quarantined device gets its
+    containment re-applied after verification.
   Until wave 2 lands, a reattached session, and the route its CONNECTED re-announce writes, carry
   the route-claim risk stated in ADR-0074 Conflict 1, which ADR-0074 lists for explicit
   acceptance at its sign-off and which holds only until its wave 2 (D5): a compromised gateway
@@ -2053,22 +2072,53 @@ lands. The two are kept consistent as follows.
 - **Signed state content (decided by the owner, 2026-10-30; lands in ADR-0074 wave 2).** The agent
   signs its state content with its D5 agent key, and the server rejects anything a gateway
   altered. The requirement:
-  - every `StatusTags` payload the agent sends is signed, a delta or a full set, on the heartbeat
-    and in Register, together with the heartbeat's `TopologyDigest`; and every `TopologyReport`
-    body is signed;
-  - each signature covers the bytes as the agent serialized them and binds the agent id, the
-    session id and a per-session sequence the server requires to increase, so a payload replayed
-    from another session, or an older one replayed in this session, is rejected; the gateway's
-    keep-newest coalescing (D4) only drops whole heartbeats, so it never breaks a signature;
-  - the server verifies against the certificate it issued that agent, before the D3 digest check
-    and before `push_snapshot`. A payload that fails is rejected whole and changes nothing: the
-    tag outcome and the digest outcome are `bad_signature`, a `TopologyReport` is refused with
-    `BAD_SIGNATURE` (D13), and the per-agent `rejected` backoff applies;
+  - every `StatusTags` payload the agent sends on a heartbeat (a delta or a full set) is signed
+    together with the heartbeat's `TopologyDigest`, and every `TopologyReport` body is signed;
+  - **placement.** The signed content travels as one agent-serialized `bytes` envelope per
+    message (for a heartbeat: the `StatusTags` bytes, the `TopologyDigest`, the binding fields
+    and the signature; for `ReportTopology`: the body, the binding fields and the signature) that
+    the gateway passes through unchanged. A signature over bytes a relay decodes and re-encodes
+    would not verify, which is why the envelope is opaque; coalescing is not the hazard, because
+    keep-newest (D4) only drops whole heartbeats. The envelope fields are additive (no
+    subtraction); the typed fields they supersede are deprecated and ignored from wave 2, and both
+    proto copies and the gateway's `*_pb.erl` carry the new fields;
+  - **binding.** Each signature binds the agent id, the session id, the nonce of the session's
+    most recently verified D5 challenge (its challenge epoch: at session start, or after a
+    reattach, D14), the payload kind, and a per-kind sequence (one for heartbeat state, one for
+    `TopologyReport`, since they travel on different paths) that the server requires to increase
+    within the epoch. Every send, a retry included, is re-signed with a fresh sequence. The floor
+    is held with the session on the replica that holds it; a restart, a prune or a replica change
+    loses it, but a new epoch is then required, so a payload signed under an earlier epoch is
+    refused whatever the floor;
+  - **until the challenge verifies, no state content is accepted.** A session with no verified
+    epoch on this replica (a fresh Register, or a reattach whose challenge is pending) applies no
+    `StatusTags` and no digest and pushes no body; they are counted `unverified_session`. After
+    verification the server marks a tags resync, and the first signed full set under the new
+    epoch becomes the base. `RegisterRequest.status_tags_pb` is therefore not trusted state from
+    wave 2: the agent has no session id when it builds Register (the server mints it), so that
+    payload cannot be bound, and it is ignored and counted `unverified_session`. This costs one
+    tags resync per registration, which the issuer's rate already budgets for a restart (D8);
+  - **order.** For a heartbeat: the raw size cap, then the signature, then decode and the D3 steps.
+    For `ReportTopology`: the 2 MiB cap, then session resolution, then the signature, then parse.
+    So bytes are authenticated before they are parsed, and an altered payload is counted
+    `bad_signature`, never `rejected` or `unverifiable`;
+  - **refusal.** From wave 2 a payload without a valid signature, a stripped one included, is
+    `bad_signature` (`BAD_SIGNATURE` for a `TopologyReport`), never `absent` and never accepted;
+    the clean break (ADR-0074) means every agent signs. It applies nothing; like any payload that
+    fails before D3 step 6 it clears the interval map (D3 step 4), and it counts toward the
+    per-agent `rejected` backoff and the three-rejects withholding. A payload whose sequence is
+    not above the floor is `replayed`, a separate outcome that counts toward neither, so an honest
+    reorder cannot back an agent off. The first `bad_signature` per session writes an
+    `agent.state.bad_signature` audit row through `audit_token`; later ones are counted only;
+  - **key.** The server verifies against the key of the certificate the session's challenge was
+    verified with. Revocation is checked at the challenge and by ADR-0074's revocation poll, not
+    per payload. A renewal mid-session re-binds at the next challenge; how and when a renewed
+    agent re-answers is ADR-0074 wave 2's to define;
   - the liveness fields (`session_id`, `sent_at`, the fact that a heartbeat arrived) stay unsigned,
     as ADR-0074 D5 decided.
-  The signature fields are additive proto fields (no subtraction), and the agent's signing cost and
-  the server's verification rate are measured in wave 2 alongside ADR-0074's result-signature
-  measure. Until wave 2 lands, the state content is unsigned and the gap below stands.
+  The agent's signing cost and the server's verification rate are measured in wave 2 at the
+  heartbeat rate (N / 30 s per replica, about 3,300 per second at N = 100,000), not only at
+  ADR-0074's result rate. Until wave 2 lands, the state content is unsigned and the gap below stands.
 - **What that leaves a compromised gateway until wave 2, stated plainly.** Until then, the tag
   delta and the topology digest ride the unsigned heartbeat, and the topology body rides an
   unsigned unary. They carry no integrity beyond the agent's TLS session to the gateway.
@@ -2517,7 +2567,9 @@ of every ~30 s. The content is unchanged.
   lands, then `awaiting_report` until its body lands; the schema enum matches the C++ enum;
 - a re-claim conflict queues `topology.push.rejected` with `reason=reclaim_conflict`, which the
   issuer writes; a failed write stays queued and is counted `deferred`; a stop drains the queue; re-claim and push share one claim function; a `PARSE`, `DIGEST_MISMATCH`, `OVERSIZE`
-  or `UNKNOWN_SESSION` rejection writes no audit row and moves the rejection counter;
+  or `UNKNOWN_SESSION` rejection writes no audit row and moves the rejection counter (from wave 2,
+  the first `BAD_SIGNATURE` per session is the exception: it writes `agent.state.bad_signature`,
+  D16);
 - an accepted report sets `confirmed_at` and claims its IPs; the owner-live test reads
   `confirmed_at`, so a quiet, confirmed owner keeps its IPs past 300 s without a new body;
 - at the cap, a `disconnected` slot is evicted before any connected one, and a quiet confirmed host
@@ -2677,7 +2729,13 @@ of every ~30 s. The content is unchanged.
   prefix, skipped by `notify_exec_tracker` like `polchk-` and `preflight-` (D8).
 - `docs/user-manual/security-hardening.md`: "Command Replay Protection" (`__resync__` is a second
   dedup-claimed reserved name); the quarantine section's server-internal pushes that reach a
-  contained device (`__resync__` added, `echo.fleet_snapshot` no longer sent; *Security*).
+  contained device (`__resync__` added, `echo.fleet_snapshot` no longer sent; *Security*); and
+  from slice 11, the signed state content and the post-reattach challenge (D14, D16).
+- From slice 11: `docs/user-manual/metrics.md` (the `bad_signature`, `replayed` and
+  `unverified_session` outcomes, the reattach-challenge counter and gauge);
+  `docs/user-manual/audit-log.md` (`agent.state.bad_signature`, `agent.reattach.challenge`);
+  `docs/fleet-viz-invariants.md` (`BAD_SIGNATURE`, and no body applied before the challenge
+  verifies); the gateway proto documentation (the additive envelope fields).
 - The Echo plugin: `agents/plugins/echo/README.md` and `docs/echo-dashboard.md` (the
   `fleet_snapshot` action is run by the agent's pump and is no longer dispatched by the server;
   `content_digest` and `schema_minor` 3); the `fleet_snapshot` description in
@@ -2860,18 +2918,27 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
       (D13) measured.
 11. **Signed state content and the reattach challenge (lands with ADR-0074 wave 2;** owner
     decisions of 2026-10-30, D14 and D16**).**
-    - Agent: signs every `StatusTags` payload (heartbeat and Register) with the `TopologyDigest`,
-      and every `TopologyReport`, binding agent id, session id and a per-session sequence; answers
-      a session-start challenge arriving mid-stream after a reattach.
-    - Server: verifies before the D3 digest check and before `push_snapshot`; the `bad_signature`
-      outcomes and `BAD_SIGNATURE`; the post-reattach challenge, with no route published and no
-      command but the challenge routed until it verifies, and teardown on failure or expiry.
-    - Proto: the additive signature and sequence fields.
-    - Tests: a gateway-altered delta, digest and topology body are each rejected and change
-      nothing; a replay from another session and an older in-session payload are rejected; a
-      reattached session gets no route and no `__resync__` before its challenge verifies, and is
-      torn down on a bad or missing answer. The signing and verification costs are measured on the
-      wave-2 rig.
+    - Agent: the signed envelopes for heartbeat state (with the `TopologyDigest`) and for
+      `TopologyReport`, bound to agent id, session id, challenge epoch, kind and a per-kind
+      sequence, re-signed on every send; answering a session-start challenge arriving mid-stream
+      after a reattach.
+    - Server: verification in the stated order (cap, signature, then parse); refusal of unsigned
+      payloads; no state applied before the challenge verifies, and the tags resync after it;
+      `RegisterRequest.status_tags_pb` ignored; the `bad_signature`, `replayed` and
+      `unverified_session` outcomes, `BAD_SIGNATURE`, and the `agent.state.bad_signature` audit
+      row; the post-reattach challenge, `challenge_pending` on the session and the route row,
+      the `send_to` and `routable` refusals, the reconciler re-application after verification, and
+      the server-side uninstall and tombstone on failure or expiry; the challenge counter, gauge
+      and audit verb; `--reattach-challenge-timeout`.
+    - Proto and gateway: the additive envelope fields in both proto copies and the gateway's
+      `*_pb.erl`, passed through unchanged.
+    - Tests: a gateway-altered, stripped or replayed payload is refused and changes nothing; a
+      pre-restart signed full set replayed after a restart and a reattach is refused (new epoch);
+      honest reordering across the two paths and a lost-ack retry are accepted; a signed payload
+      through a real gateway relay verifies; a reattached, unverified session receives no command
+      of any kind (exact send set) and no route, and is uninstalled and tombstoned on a bad or
+      missing answer; containment is re-applied after verification. Signing and verification
+      costs are measured on the wave-2 rig at the heartbeat rate.
 
 ## Open points for the owner
 
