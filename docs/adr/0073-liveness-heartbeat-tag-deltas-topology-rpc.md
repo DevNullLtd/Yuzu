@@ -1101,7 +1101,10 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
   - **The reply is dropped at ingest.** Like a solicited `__guard__` reply on the direct Subscribe
     loop (`agent_service_impl.cpp`, about l.1561-1569), a `__resync__` reply is dropped on both
     ingest paths before the provenance lookup: no `ResponseStore` row and no
-    `resolve_response_provenance` call. The acknowledgement that matters is the `full = true`
+    `resolve_response_provenance` call. The drop keys on the response's plugin field
+    (`resp.plugin() == "__resync__"`), as the `__guard__` drop does, never on a prefix of the
+    command id the agent echoes, which the Forensics tier forbids parsing at ingest; the call count
+    `tests/test_forensics_tier_wiring_lexical.py` pins is unchanged. The acknowledgement that matters is the `full = true`
     heartbeat or the topology report, not the reply.
   - Under ADR-0074 D5 every command is server-signed and every result agent-signed; `__resync__` is
     a command like any other and takes no exemption.
