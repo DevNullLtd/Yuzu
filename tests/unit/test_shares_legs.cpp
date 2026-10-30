@@ -793,6 +793,7 @@ TEST_CASE("shares macos: argv and bounds are pinned and the exports read comes f
     CHECK(f.opts.deadline == std::chrono::milliseconds{5000});
     CHECK_FALSE(f.opts.merge_stderr);
     CHECK(f.opts.max_lines == 1);
+    CHECK_FALSE(f.opts.stop_after_max_lines); // keeps max_lines from ever ending the run early
     CHECK(f.opts.output_cap_bytes == 2 * kMaxShareBytes);
     CHECK(f.reads == std::vector<std::string>{kExports}); // nothing else is read
     CHECK(f.order == std::vector<std::string>{"read", "run"});

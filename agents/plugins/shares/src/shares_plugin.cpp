@@ -46,12 +46,14 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "/usr/sbin/sharing -l -f json through the bounded runner (5 s deadline, no shell) plus a "
          "byte-capped no-follow read of /etc/exports (BSD exports(5) grammar as mountd parses it)",
          "share points as recorded, not live smbd state (a record with SMB sharing off is flagged "
-         "unavailable, SMB encryption required is flagged sealed; AFP is not reported); "
-         "/etc/exports as written, not live nfsd state, hosts counted never listed, an IPv6 "
+         "unavailable, SMB encryption required is flagged sealed; the tool never prints AFP or "
+         "FTP state, so a share point enabled only for those appears as an SMB row); "
+         "/etc/exports as written (mountd grammar emulated best-effort, host-dependent checks not "
+         "modelled, README caveat 5), not live nfsd state, hosts counted never listed, an IPv6 "
          "network with no or a zero mask is anonymous as the kernel treats it, an IPv4 network "
-         "never is (classful mask); a tool that cannot start, times out, exits nonzero or prints "
-         "anything but a JSON object or its no-records text fails the sharing source with a "
-         "named token"},
+         "never is (classful mask); a tool that cannot start, times out, exits nonzero (other "
+         "than printing its no-records text) or prints anything but a JSON object or its "
+         "no-records text fails the sharing source with a named token"},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "NetShareEnum level 2 (netapi32); level 1 (names, no paths) when level 2 is refused",

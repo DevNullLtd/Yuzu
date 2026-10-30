@@ -7,7 +7,7 @@
  * Holds (a) the per-OS entry-point declarations, (b) report_list, the SINGLE owner of the
  * `status|list|...` row (no leg and no parser writes one), pairing each status with its
  * result status/completeness, (c) execute_list, the plugin's whole execute() body
- * (dispatch + ABI containment), and (d) the OS-free DECISION logic, `list_linux` and
+ * (dispatch + ABI containment), and (d) the OS-free DECISION logic, `list_linux`,
  * `list_windows` and `list_macos`, over injected boundaries (file readers, an exports.d lister,
  * a directory probe; a NetShareEnum page source; a bounded subprocess runner) so the
  * refused-vs-absent and paging rules are unit-tested with canned results and no disk, uid or
@@ -600,8 +600,9 @@ struct MacFs {
 ///
 /// The `sharing` source is `failed` (with a `macos:shares:sharing:<reason>` token, the listing
 /// constrained, the exports rows kept) when the tool cannot start, is killed at its deadline or
-/// cancelled, dies by signal, is line-limited, has its output cut at the cap, exits nonzero
-/// (unless it printed its exact no-records text) or prints anything but a JSON object. Empty or
+/// cancelled, dies by signal, has its output cut at the cap, exits nonzero (unless it printed its
+/// exact no-records text) or prints anything but a JSON object. `line_limit` is also mapped, but
+/// only defensively: it needs `stop_after_max_lines`, which this leg never sets. Empty or
 /// whitespace-only output is `unrecognised_output` too: no capture shows what an empty host
 /// prints. A refused /etc/exports is permission_denied only when `sharing` was not read.
 inline Listing list_macos(const MacFs& fs) {
@@ -625,6 +626,8 @@ inline Listing list_macos(const MacFs& fs) {
     static const std::vector<std::string> kArgv{"/usr/sbin/sharing", "-l", "-f", "json"};
     yuzu::agent::SubprocessOptions opts;
     opts.deadline = std::chrono::milliseconds{5000};
+    // max_lines never stops the run early (stop_after_max_lines stays false), so `line_limit`
+    // cannot occur; classify_runner_failure below still maps it, keeping the shared mapping total.
     opts.max_lines = 1;
     opts.merge_stderr = false;
     opts.output_cap_bytes = 2 * kMaxShareBytes;

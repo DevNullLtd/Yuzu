@@ -944,7 +944,10 @@ inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
             auto p = bsd_clean_path(f);
             if (p.size() > kBsdNameLen)
                 return false; // get_exportlist: "pathname too long", the whole entry is dropped
-            if (std::ranges::find(e.paths, p) == e.paths.end())
+            // kMaxShareRows + 1 distinct paths already overflow the row budget (truncation is
+            // signalled), so keeping more changes nothing; the size guard stops the duplicate
+            // scan going quadratic on one very long line.
+            if (e.paths.size() <= kMaxShareRows && std::ranges::find(e.paths, p) == e.paths.end())
                 e.paths.push_back(std::move(p));
         } else {
             if (e.paths.empty())
@@ -972,8 +975,8 @@ inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
 
 } // namespace detail
 
-/// macOS exports(5) as Apple's mountd reads /etc/exports: `<path>... [-opts] [hosts |
-/// -network net [-mask mask]]`. Entries are joined as get_export_entry joins them (trailing
+/// macOS exports(5), modelled on Apple's mountd (best-effort: the rejections that need a host
+/// lookup are not modelled): `<path>... [-opts] [hosts | -network net [-mask mask]]`. Entries are joined as get_export_entry joins them (trailing
 /// spaces, tabs and backslashes stripped, and NOT a CR, which stays in the last field; a
 /// stripped backslash appends the next physical line directly; a continuation still open at
 /// end of file loses its entry), a field starting `#` makes the entry a comment, and fields

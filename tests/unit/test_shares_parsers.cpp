@@ -1112,6 +1112,22 @@ TEST_CASE("shares bsd exports: one row per path and per line", "[shares]") {
     CHECK(sigs(bsd("/a /a/ /b")) == Sigs{"/a rw anon clients_0", "/b rw anon clients_0"});
 }
 
+TEST_CASE("shares bsd exports: one line of many distinct paths stays bounded", "[shares]") {
+    // 10 x kMaxShareRows distinct paths on ONE line. The duplicate scan must stop growing with
+    // the line (a 256 KiB line of distinct paths otherwise costs seconds), while the row budget
+    // still truncates the listing exactly as before.
+    std::string line;
+    for (std::size_t i = 0; i < 10 * kMaxShareRows; ++i)
+        line += "/p" + std::to_string(i) + " ";
+    const auto p = bsd(line);
+    CHECK(p.shares.size() == kMaxShareRows);
+    CHECK(p.truncated);
+    // One path past the budget is kept so the overflow is seen; no more than that.
+    detail::BsdEntry e;
+    REQUIRE(detail::parse_bsd_entry(line, e));
+    CHECK(e.paths.size() == kMaxShareRows + 1);
+}
+
 TEST_CASE("shares bsd exports: lines Apple rejects yield no row and no token", "[shares]") {
     for (const char* line :
          {"-ro /srv", "friends /srv", "friends", "-ro", "/a -ro /b", "/a friends /b",

@@ -11,12 +11,14 @@
 ##            not read and are reported as constrained tokens.
 ##   macOS:   the share points `/usr/sbin/sharing -l -f json` records (a bounded argv leaf:
 ##            5 s deadline, no shell) plus a byte-capped no-follow read of /etc/exports in
-##            Apple's BSD grammar. Share points as recorded, not live smbd state; a record
-##            with SMB sharing off is flagged `unavailable`, SMB encryption required
-##            `sealed`; AFP is not reported. NFS exports as written, hosts counted never
-##            listed. A tool that cannot start, times out, exits nonzero or prints anything
-##            but a JSON object or its no-records text fails the `sharing` source with a
-##            named token, never an empty list.
+##            Apple's BSD grammar, emulated best-effort (checks that need the host are not
+##            modelled). Share points as recorded, not live smbd state; a record with SMB
+##            sharing off is flagged `unavailable`, SMB encryption required `sealed`; the
+##            tool never prints AFP or FTP state, so a share point enabled only for those
+##            appears as an SMB row. NFS exports as written, hosts counted never listed. A
+##            tool that cannot start, times out, exits nonzero (other than printing its
+##            no-records text) or prints anything but a JSON object or its no-records text
+##            fails the `sharing` source with a named token, never an empty list.
 ##   Windows: NetShareEnum level 2 (netapi32), the live shares of the Server service, read
 ##            in pages (64 KiB requested per call: a memory bound, not a time bound); level 1
 ##            (names, no paths) when level 2 is refused. The
@@ -56,13 +58,16 @@ metadata:
     exists only on a domain controller; Windows Server 2022 lists Administrators or Access
     Control Assistance Operators). On macOS, the share points recorded by the
     sharing tool (/usr/sbin/sharing -l -f json, bounded runner) as SMB shares, and
-    /etc/exports as written (BSD grammar) as NFS exports, not live smbd/nfsd state; a record
+    /etc/exports as written (Apple's mountd grammar, emulated best-effort: checks that need the
+    host are not modelled) as NFS exports, not live smbd/nfsd state; a record
     with SMB sharing off is flagged unavailable, SMB encryption required is flagged sealed,
     and a tool that fails or answers unrecognisably is constrained with a named token. A
     refused or failed read is permission_denied or constrained with a reason token,
     never an empty result; one source row per source says whether it was read. Share names and
-    paths can embed account names, so the result is sensitive. A leading status row states
-    whether the read was complete.
+    paths can embed account names (on macOS the default share point is named after the
+    account's full name and sits under /Users/<account>), so the result is sensitive. A
+    leading status row states whether every source was read, not whether every mountd
+    rejection was modelled.
   tags: [network, shares, smb, nfs, posture]
 
 spec:
@@ -119,7 +124,7 @@ spec:
         platforms: [linux, darwin]
       - name: field_5
         type: string
-        description: 'share: true when any client may use it (guest, `*`, a wildcard made only of `*`/`?`, a network with an all-zero mask, on macOS an export with no host and no network or an IPv6 network with no or a zero mask), false when not, "-" when unknown. For SMB this reflects `guest ok` as written; whether a client can actually connect as guest also depends on global authentication settings (`map to guest`, `security`). Windows rows carry `-`: share-level permissions are not read. Not used by the other kinds.'
+        description: 'share: true when any client may use it (guest, `*`, a wildcard made only of `*`/`?`, a network with an all-zero mask, on macOS an export with no host and no network or an IPv6 network with no or a zero mask), false when not, "-" when unknown. For SMB this reflects `guest ok` as written (Samba) or the guest-access setting of the share point (macOS); whether a client can actually connect as guest also depends on global authentication settings (`map to guest`, `security`). Windows rows carry `-`: share-level permissions are not read. Not used by the other kinds.'
         example: 'false'
         platforms: [linux, darwin]
       - name: field_6
