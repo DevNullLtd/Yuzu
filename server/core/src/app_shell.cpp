@@ -601,16 +601,18 @@ std::vector<std::string> breadcrumb_trail(const ShellCtx& ctx) {
 // Colour scheme (Settings > General > Appearance, localStorage 'yuzu-theme'). Runs first in the
 // chrome, right after <body> opens and before any content paints, so a saved scheme never
 // flashes slate. Exact-match whitelist; a blocked or absent store leaves slate (the :root).
-constexpr std::string_view kThemeBoot =
-    "<script>try{var t=localStorage.getItem('yuzu-theme');"
-    "if(/^(slate|navy|jade|light|light-baby|light-hot)$/.test(t))"
-    "document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>";
+constexpr std::string_view kThemeBootPre =
+    "<script>try{var t=localStorage.getItem('yuzu-theme');if(/";
+constexpr std::string_view kThemeBootPost =
+    "/.test(t))document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>";
 
 std::string render_shell(const ShellCtx& ctx) {
     std::string out;
     out.reserve(9000);
     out += kShellBegin;
-    out += kThemeBoot;
+    out += kThemeBootPre;
+    out += kThemeWhitelistRe;
+    out += kThemeBootPost;
     out += kShellCss;
     out += kBellCss;
     append_sidebar(out, ctx.active_key);
