@@ -738,10 +738,15 @@ When several conditions hold, the first in this order wins:
 - **Retain on disconnect** replaces evict-on-disconnect (`FleetTopologyStore::evict_pushed`). On
   stream close, IP claims are released **immediately** (UP-5 unchanged), but the body and digest are
   kept for 300 s, rendered `disconnected`. On the first confirming heartbeat after a reconnect, the
-  stored `local_ips` are re-claimed:
+  stored `local_ips` are re-claimed. The re-claim and `push_snapshot` call **one claim function**
+  (the IP scan, the owner-live test and the install), so the two can never judge a conflict
+  differently:
   - if they are free, the slot is live again with no body sent;
-  - if any IP is held by another live agent, the slot is dropped and topology is requested, so the
-    fresh body goes through first-claim-wins.
+  - if any IP is held by another live agent, the server first writes `topology.push.rejected`
+    (detail `reason=reclaim_conflict` with the claimant, the IP and the owner, each sanitised as
+    today), then drops the slot and requests topology, so the fresh body goes through
+    first-claim-wins. The anti-spoof evidence chain therefore records a refused re-claim exactly as
+    it records a refused push.
 
   A gateway restart thus costs zero bodies for agents back within five minutes. Eviction is lazy (in
   `confirm` and `build_snapshot`), so no background loop is added.
@@ -785,7 +790,25 @@ rpc ProxyTopology(yuzu.agent.v1.TopologyReport) returns (yuzu.agent.v1.TopologyA
   the id but has no installed session for the agent yet (its reattach has not landed) also refuses
   `UNKNOWN_SESSION`.
 - The 2 MiB and 4096-row caps are checked before parsing.
-- The `topology.push.first` and `topology.push.rejected` audit rows are unchanged.
+- **Audit.** The three verbs stay, and each is written by named paths only:
+  - `topology.push.first`: the first accepted report per agent per server process lifetime. A
+    re-claim of a retained slot is not a push and writes none.
+  - `topology.push.rejected` (`result=denied`): a report rejected `IP_CONFLICT` in `push_snapshot`
+    (detail `reason=ip_conflict`), and a heartbeat-driven re-claim conflict (D6,
+    `reason=reclaim_conflict`). The detail keeps today's `claimant`, `ip` and `owner`, each through
+    `sanitise_for_audit`.
+  - `topology.push.evicted_for_cap` (`result=warning`): a cap eviction when a new agent's slot is
+    installed (D6).
+  - **Rejections before the store write no row.** `PARSE`, `DIGEST_MISMATCH`, `OVERSIZE` and
+    `UNKNOWN_SESSION` are refused before `push_snapshot`, as a parse failure is today. They are
+    counted on `yuzu_viz_topology_report_rejected_total{via,reason}` (D13). They say nothing about
+    another agent's claim, which is what the audit chain records.
+  - **Volume.** An honest agent retries an `IP_CONFLICT` only after a full floor (below), and the
+    server's resync for it is suppressed meanwhile (D6), so it writes about one `rejected` row per
+    12-18 minutes at most. A re-claim conflict happens at most once per reconnect. A sender that
+    ignores the retry rule is bounded only by the gateway's permit pool and the server's handler
+    rate, as today. No per-agent audit rate limit is added; the code already records
+    threshold-based audit as a follow-up (`fleet_topology_store.cpp`).
 
 **Gateway:**
 - a `report_topology/2` handler in `yuzu_gw_agent_service.erl`, admitted like `report_inventory/2`
@@ -1097,6 +1120,10 @@ Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
 - `yuzu_server_agent_registration_store_failed_total{op}` (D14);
 - `yuzu_viz_topology_pushed_total{via,reason}` (gains `reason`);
 - `yuzu_viz_topology_push_parse_errors_total{via}` (unchanged);
+- `yuzu_viz_topology_report_rejected_total{via,reason}`, with
+  `parse|digest_mismatch|ip_conflict|oversize|unknown_session` (D7; `parse` also moves the parse
+  counter above);
+- `yuzu_viz_topology_reclaim_total{outcome}`, with `reclaimed|conflict` (D6);
 - `yuzu_viz_topology_digest_total{via,outcome}`, with `match|mismatch|no_slot|empty|disabled|absent`
   (`empty`: an empty digest; `disabled`: `DISABLED`; `absent`: no field);
 - `yuzu_viz_topology_resync_total{outcome}`, with `sent|deferred|send_failed`;
@@ -1753,6 +1780,9 @@ of every ~30 s. The content is unchanged.
   agent with a late report reads `body_pending`, not `agent_silent`; an offline host past 300 s
   reads `offline` and a `--no-topology` agent `not_reported`; every reporting agent after a restart
   reads `awaiting_report` until its body lands; the schema enum matches the C++ enum;
+- a re-claim conflict writes `topology.push.rejected` with `reason=reclaim_conflict` before the slot
+  is dropped; re-claim and push share one claim function; a `PARSE`, `DIGEST_MISMATCH`, `OVERSIZE`
+  or `UNKNOWN_SESSION` rejection writes no audit row and moves the rejection counter;
 - an accepted report sets `confirmed_at` and claims its IPs; the owner-live test reads
   `confirmed_at`, so a quiet, confirmed owner keeps its IPs past 300 s without a new body;
 - at the cap, a `disconnected` slot is evicted before any connected one, and a quiet confirmed host
@@ -1870,7 +1900,8 @@ of every ~30 s. The content is unchanged.
 - The decommission blast-radius lists: `sle_routes.hpp`/`.cpp`, `rest_api_v1.cpp`'s delete block,
   ADR-0024 Decisions 9 and 11, and `docs/user-manual/rest-api.md` (the cascade header's step (d)).
 - `docs/auth-architecture.md`: the gateway no longer holds enrollment tokens; reattach authority.
-- `docs/user-manual/audit-log.md`: the `agent.reattach` refusal row.
+- `docs/user-manual/audit-log.md`: the `agent.reattach` refusal row; `topology.push.rejected`'s
+  `reason` detail (`ip_conflict`, `reclaim_conflict`) and the paths that write each topology verb.
 - The agent CLI reference.
 - The ADR-2002 incident paragraph: a pointer to this ADR.
 
