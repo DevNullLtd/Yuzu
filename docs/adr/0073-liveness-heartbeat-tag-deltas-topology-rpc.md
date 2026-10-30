@@ -1083,8 +1083,21 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     refused centrally: `classify_and_authorize_dispatch` (`agent_registry.hpp`) denies any
     non-system caller a `system_reserved` row. No per-surface rule is added.
   - They are built with `build_classified_command(DispatchCaller{.system = true}, ...)` and sent
-    with `send_system_reserved` to the agent's own stream (plus `forward_gateway_pending` for a
-    gateway agent), as `__sync__.now` is. That is a `DispatchCaller` construction, of the
+    with `send_system_reserved` to the agent's own stream, as `__sync__.now` is. For a gateway
+    agent they do **not** go through `forward_gateway_pending`: that path starts one untracked,
+    detached thread per command, holds a `SendCommand` open for up to 300 s with three retries,
+    and is never joined at stop (#3279). At the issuer's rates, with the per-agent re-issue while
+    an agent stays diverged, a slow or blackholed gateway management plane would turn a resync
+    wave into unbounded thread growth, starve command and containment forwarding on the same path,
+    and make the issuer's bounded shutdown false. The issuer forwards gateway resyncs itself:
+    - per pass, one `SendCommand` per gateway cluster per action, carrying that pass's agents in
+      `SendCommandRequest`'s repeated `agent_ids` under one fresh command id (the agent's dedup is
+      per agent, so one id per pass suffices), from a bounded set of forwarder threads the issuer
+      owns and joins at stop (at most `upstream_topology_concurrency`-sized: 8);
+    - a 10 s deadline and no retries: the agent's next diverged heartbeat re-marks it;
+    - no re-issue to an agent while an earlier forward for it is in flight; a mark above the
+      in-flight bound stays `deferred`;
+    - `forward_gateway_pending` and #3279 are unchanged for every other command. That is a `DispatchCaller` construction, of the
     existing system kind; it threads no operator authority and adds no `approval_provenance`
     stamping site. It is not a fleet dispatch. `SystemReservedPush` gains two enumerators, one per
     action (`resync_tags` labelled `__resync__.tags`, `resync_topology` labelled
