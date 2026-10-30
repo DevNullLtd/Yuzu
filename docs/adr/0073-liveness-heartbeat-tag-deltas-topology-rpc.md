@@ -31,7 +31,9 @@
   - ADR-0034: held-open connection scaling.
   - ADR-0066: gRPC stays the transport.
 - **Depends on:** ADR-0074 (PR #6703) being ratified, for the budget (D14) and the signing scope (D5).
-  Every code reference below is cited at `origin/dev` `dfdffa4c0`, which includes PR #5695.
+  Every code reference below is cited at `origin/dev` `51f08447d`, which includes PR #5695 and the
+  TAR-to-Echo plugin rename. Line numbers ("about l.N") are approximate and drift; the file and
+  symbol names are authoritative.
 
 ## Decision
 
@@ -74,7 +76,7 @@
    The existing gateway tag checks move to the server, so the gateway does *less* than today.
 8. **Everything periodic is jittered and nothing is clock-aligned** (D9).
 9. **The fleet-wide pull paths go away** (D10):
-   - the server's legacy `tar.fleet_snapshot` dispatch fetcher;
+   - the server's legacy `echo.fleet_snapshot` dispatch fetcher;
    - the gateway heartbeat buffer's snapshot handling.
 10. **The topology pump stays an agent-core thread**, made tunable and disableable now. Converting
     it to an ADR-0021 Reflex is deferred (D11).
@@ -122,10 +124,10 @@ Command dispatch, responses, inventory and liveness are unaffected in either dir
 `HeartbeatRequest` (`proto/yuzu/agent/v1/agent.proto:138-161`) carries `session_id`, `sent_at`, a
 flat `status_tags` map, and `fleet_snapshot_json`. Both thread timings are fixed with no jitter:
 - the heartbeat sleeps `cfg_.heartbeat_interval` (default 30 s, `agents/core/include/yuzu/agent/agent.hpp:19`)
-  in its loop in `agents/core/src/agent.cpp` (about l.2514-2522);
-- the snapshot pump sleeps a fixed 30 s (`agent.cpp`, `snapshot_pump_thread_`, about l.1645-1685).
+  in its loop in `agents/core/src/agent.cpp` (about l.2550-2559);
+- the snapshot pump sleeps a fixed 30 s (`agent.cpp`, `snapshot_pump_thread_`, about l.1681-1717).
 
-**Topology body.** `fleet_snapshot_json` carries TAR's `fleet_snapshot.v1` document: every process
+**Topology body.** `fleet_snapshot_json` carries the Echo plugin's `fleet_snapshot.v1` document: every process
 (user and redacted cmdline), the live connections merged with the last hour's closed `tcp_live` rows,
 and the local IPs. Its embedded `ts` and per-connection `last_seen_seconds_ago` change every run. The
 pump bumps its sequence on every run and never compares content. So the 50-800 KB body rides nearly
@@ -137,7 +139,7 @@ Its sole consumer is `FleetTopologyStore`, which feeds:
 - the Hardware list's claimed-IPs column.
 
 **Status tags.** About 97 `yuzu.*` tags are rebuilt and sent whole every beat (`agent.cpp`, from
-`req.mutable_status_tags()` at about l.2547 to about l.3080):
+`req.mutable_status_tags()` at about l.2583 to about l.3117):
 
 | Family | Keys (approx.) | Producer | Server consumers |
 |---|---|---|---|
@@ -148,7 +150,7 @@ Its sole consumer is `FleetTopologyStore`, which feeds:
 | Guardian | about 65 `yuzu.guardian_*` (generation, backend, arm counts, journal counters and gauges, `*_age_seconds` / `*_stale_seconds` gauges) | `GuardianEngine` emitters, groups A-D2 | `server/core/src/guardian_*_fleet_tags.hpp` gauges. **`yuzu.guardian_generation` drives per-heartbeat re-push of lagging agents** (`server/core/src/heartbeat_ingestion.cpp`, about l.104-150). |
 | Spark | `yuzu.spark_running`, `_disabled`, `_mechs`, `_armed_faulted`, `_watch_faults`, `_queued_dropped`, `_consumer_errors`, plus per-mechanism keys | `SparkEngine` | `server/core/src/spark_fleet_tags.hpp` gauges. **Absence is a posture** (shutting down emits nothing). |
 | DEX observer | `yuzu.dex_observer_armed`, `yuzu.dex_observed` | DEX signal observer | fleet gauges via `recompute_metrics` |
-| Plugin facts | `yuzu.plugin.<p>.<k>` (bounded `heartbeat.*` KV facts) | plugins via KV | **`yuzu.plugin.tar.db_corruption_total` + `db_quarantine_last` drive the tar-corruption audit sink on every heartbeat** (`AgentHealthStore::upsert`, #1567) |
+| Plugin facts | `yuzu.plugin.<p>.<k>` (bounded `heartbeat.*` KV facts) | plugins via KV | **`yuzu.plugin.echo.db_corruption_total` + `db_quarantine_last` drive the Echo corruption audit sink on every heartbeat** (`AgentHealthStore::upsert`, #1567; `server/core/src/echo_corruption_audit.hpp`). `upsert` rewrites a pre-rename agent's `yuzu.plugin.tar.` prefix to `yuzu.plugin.echo.` at ingest (`agent_registry.cpp`, an upgrade-window shim). |
 | Daily-sync skips | `yuzu.sync.<source>.skip_streak`, `.last_skip` | `emit_sync_skip_tags` | fleet gauge, inventory runbook |
 | Perf (interval) | `yuzu.perf_cpu_pct`, `_commit_pct`, `_disk_lat_ms` | agent core, per-interval deltas | `yuzu_fleet_perf_*`, `/dex` performance (`server/core/src/dex_perf_rules.hpp`) |
 | Network quality (interval) | `yuzu.net_rtt_p50_ms`, `_retrans_pct`, `_throughput_bps`, pinned to `kNetTag*` by `static_assert` (`server/core/src/network_perf_rules.hpp`) | agent core, interval deltas over `steady_clock` baselines | `yuzu_fleet_net_*` (absent-not-zero), `/network` read model (`docs/user-manual/network.md`) |
@@ -258,7 +260,7 @@ measures and its kTLS work, which these changes make measurable.
 The accepted ADRs point the other way:
 - ADR-0016's Context objects to resending unchanged data every cycle ("be kind to the network at
   fleet scale").
-- ADR-0021 Decision 5 says "TAR snapshot pumps etc." become visible, tunable, disableable
+- ADR-0021 Decision 5 says built-in schedules ("Echo snapshot pumps etc.") become visible, tunable, disableable
   Reflexes.
 
 Commercial endpoint platforms follow the same pattern:
@@ -412,7 +414,7 @@ shared by direct `Heartbeat` and gateway `BatchHeartbeat`):
 2. **Decode and caps.** Decodes `status_tags_pb` and checks it against the tag caps: at most 512 keys, 64 KiB per key or
    value, 256 KiB in total, valid UTF-8. These caps are enforced at the gateway today
    (`yuzu_gw_heartbeat_buffer.erl`: `MAX_STATUS_TAGS`, `MAX_TAG_ITEM_BYTES`, `MAX_TAG_BYTES_TOTAL`
-   at l.117-130, and `screen/1` with the UTF-8 repair at about l.460-583). A payload that fails them
+   at l.117-130, and `screen/1` with the UTF-8 repair at about l.483-583). A payload that fails them
    is discarded and counted `rejected`, once: it is never also counted `diverged`. The agent is
    handled like a `diverged` one for the resync, subject to the backoff below. The agent applies
    the same caps before it digests (D1), so a rejection means an agent or encoding defect. Two
@@ -466,7 +468,12 @@ current indefinitely.
 
 **Per-heartbeat side effects read the merged view, never the wire:**
 - Guardian generation reconcile (`yuzu.guardian_generation`);
-- the tar-corruption audit sink (`yuzu.plugin.tar.db_corruption_*`).
+- the Echo corruption audit sink (`yuzu.plugin.echo.db_corruption_total` and `db_quarantine_last`).
+
+`upsert`'s ingest-time rewrite of the legacy `yuzu.plugin.tar.` prefix is not carried into `apply`.
+It has no work left: an agent from before the rename is older than this release, so its heartbeat
+is `absent` (step 1) and carries no tags. Rewriting a key after the agent digested it would also
+make every such delta fail the digest check.
 
 Both depend on firing on **every** heartbeat, not only on change. The reconcile re-pushes a still
 lagging agent; the corruption sink retries a candidate the gate skipped. So they run after step 6,
@@ -543,11 +550,11 @@ outside this rule; this ADR adds none of it.
   - the oversize drop, now judged on the **whole encoded heartbeat's** byte size only;
   - the non-transient rejection.
 - **What the gateway stops doing.** It no longer decodes, counts, size-checks or UTF-8-repairs
-  individual tags (`yuzu_gw_heartbeat_buffer.erl`, about l.460-583); that moves to the server (D3,
+  individual tags (`yuzu_gw_heartbeat_buffer.erl`, about l.483-583); that moves to the server (D3,
   step 2). The tag-strip path is removed. The `heartbeat_invalid` drop reason **stays**, for the
   drops that remain: a heartbeat whose session id cannot be keyed (admission already rejects such a
   session), and one the encoder raises on when a chunk is sent (`yuzu_gw_heartbeat_buffer.erl`,
-  `screen/1` at about l.460-489 and the flush's encoder-raise split at about l.782-789). Both
+  `screen/1` at about l.483-493 and the flush's encoder-raise split at about l.781-797). Both
   `status_tags_pb` and `TopologyDigest.digest` are `bytes`, so no field this ADR adds can make the
   encoder raise; a typed `string` digest would have, silently dropping every heartbeat of a session
   that sent a bad one. The gateway does **less** per
@@ -605,9 +612,8 @@ The owner's ruling described "one tiny digest tag". It is a typed field instead,
 - tags count against the tag caps;
 - a typed field is visible in the contract.
 
-**The topology digest is computed by TAR**, inside its `fleet_snapshot` builder (the plugin is now
-named `echo`: `agents/plugins/echo/src/echo_fleet_snapshot.{hpp,cpp}`, action
-`echo.fleet_snapshot`), and emitted as a top-level `content_digest` member. That is a
+**The topology digest is computed by the Echo plugin** (formerly TAR), inside its `fleet_snapshot`
+builder (`agents/plugins/echo/src/echo_fleet_snapshot.{hpp,cpp}`, action `echo.fleet_snapshot`), and emitted as a top-level `content_digest` member. That is a
 `schema_minor` bump from 2 to 3; the schema name `fleet_snapshot.v1` is unchanged, and the digest
 input includes the new `schema_minor`. Definition `v1`: SHA-256, first 16 bytes, `"v1:"` plus 32 hex
 characters, over a u32/i64 little-endian, length-prefixed encoding of:
@@ -628,7 +634,7 @@ connection row's `last_seen_seconds_ago`, which a live row omits. A test builds 
 exercise every such key (both sources paused, both truncation flags set, live and closed rows)
 and fails if any built document contains an unclassified key. **The server treats this digest as opaque.**
 It stores the value that arrived with the body, rejects a report whose `digest` disagrees with the
-body's `content_digest`, and never recomputes it. That keeps one implementation (TAR) and keeps JSON
+body's `content_digest`, and never recomputes it. That keeps one implementation (Echo) and keeps JSON
 canonicalisation out of the server.
 
 **Pump.** The pump stays a Run()-lifetime thread (`snapshot_pump_thread_` in `agent.cpp`). Each run:
@@ -762,7 +768,7 @@ When several conditions hold, the first in this order wins:
   `disconnected`. Today the next heartbeat's body repairs that; under D6 no body is due, so the
   damage would last until the next report.
 - **Connection ages.** Only **closed** rows are rebased: the rows that carry
-  `last_seen_seconds_ago`, which the builder sets only on rows from TAR's connection history. At
+  `last_seen_seconds_ago`, which the builder sets only on rows from Echo's connection history. At
   render time they show `last_seen_seconds_ago + (now - body_received_at)`, measured on
   `steady_clock`, and a closed row older than 3600 s is dropped. A **live** row carries no
   `last_seen_seconds_ago` and keeps age 0. Age 0 means "live when the body was built, and the
@@ -902,7 +908,7 @@ full floor.
 bound a defect that keeps the digest constant while rendered content changes: a misclassified field,
 or a lost ack. A visible mismatch is already caught within one heartbeat plus `kReportGrace`.
 Fifteen minutes:
-- keeps that blind window well inside TAR's one-hour connection history;
+- keeps that blind window well inside Echo's one-hour connection history;
 - is three times the IP-claim window;
 - is a minutes-scale refresh, consistent with how commercial endpoint platforms refresh host details.
 
@@ -972,7 +978,7 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
 **Mechanism.**
 - **Reserved name `__resync__`**, actions `tags` and `topology` (parameter `window_s`, default 60).
   It is handled in the agent's Subscribe command loop alongside `__sync__` (`agent.cpp`, the
-  reserved-name dispatch from about l.3430, with `__sync__` at about l.3483-3531). The decision logic is a pure, unit-tested function,
+  reserved-name dispatch from about l.3430, with `__sync__` at about l.3490-3531). The decision logic is a pure, unit-tested function,
   like `agents/core/src/sync_now_decision.hpp`.
 - **Dedup.** The command is **dedup-claimed**; only `__guard__` bypasses the claim (ADR-2002 WS-0).
   `record_command_terminal` runs **before** the stream write.
@@ -1080,7 +1086,7 @@ path and a command on the other.
 | Startup report | uniform 0-60 s |
 | Resync report | uniform `[0, window_s]` from `__resync__.topology`, default 60 s |
 | Server `kReportGrace` | 120 s |
-| Agent reconnect backoff | full jitter: uniform [0, min(2^n, 300) s]. Today it is exactly `min(2^n, 300)` (`agent.cpp`, `kMaxReconnectDelaySecs` and the backoff at about l.1689-1724), so every agent dropped by one gateway restart retries on the same schedule. |
+| Agent reconnect backoff | full jitter: uniform [0, min(2^n, 300) s]. Today it is exactly `min(2^n, 300)` (`agent.cpp`, `kMaxReconnectDelaySecs` and the backoff at about l.1725-1760), so every agent dropped by one gateway restart retries on the same schedule. |
 
 Every timer is re-drawn per cycle. None is derived from wall-clock boundaries. Server-originated
 work is rate-limited at the source (D8). Reviewers reject any new heartbeat or topology timer that
@@ -1100,15 +1106,15 @@ The owner ruled 2026-10-26: no live customers; aggressive changes for the better
   - no dual parsing and no agent fallback.
 - **Agent:**
   - the flat tag build becomes a state map plus an interval map, diffed against the base;
-  - the topology attach block (`agent.cpp`, about l.3083-3101) and `last_attached_seq` go;
+  - the topology attach block (`agent.cpp`, about l.3119-3137) and `last_attached_seq` go;
   - `yuzu.uptime_s` goes.
 - **Server:**
   - `AgentHealthStore::upsert(Map)` becomes `apply(agent_id, StatusTags) -> ApplyOutcome`, with
     separate interval and state maps;
   - the field-4 branch of `HeartbeatIngestion::ingest` (`heartbeat_ingestion.cpp`, about l.176-200)
     goes;
-  - the **legacy dispatch fetcher** (`server.cpp`, the `tar.fleet_snapshot` fan-out at about
-    l.5528-5700) goes, with the store's `Fetcher` seam and
+  - the **legacy dispatch fetcher** (`server.cpp`, the `echo.fleet_snapshot` fan-out at about
+    l.5542-5720) goes, with the store's `Fetcher` seam and
     `yuzu_viz_topology_fetch_duration_seconds`. Cold start becomes roster placeholders filled by
     resync, not a fleet-wide pull down the Subscribe streams;
   - the `echo.fleet_snapshot` row in `core_dispatch_capabilities.hpp` stays `system_reserved`
@@ -1116,7 +1122,7 @@ The owner ruled 2026-10-26: no live customers; aggressive changes for the better
 - **Gateway heartbeat buffer** (`yuzu_gw_heartbeat_buffer.erl`): these go:
   - newest-snapshot coalescing (header l.13-24, `coalesce/2` at about l.588), snapshot-first
     eviction and send-without-snapshot;
-  - per-tag counting, size checks and UTF-8 repair (about l.460-583; moved to the server, D3);
+  - per-tag counting, size checks and UTF-8 repair (about l.483-583; moved to the server, D3);
   - the `snapshot_oversize` and `snapshot_evicted` drop reasons (`drop_reason()` at l.169-170).
     `heartbeat_invalid` stays, for the unkeyable-session and encoder-raise drops (D4).
 
@@ -1492,7 +1498,7 @@ row, not a stored request, and re-registers through reattach, like any replay.
 - **Why.** They are the only readers of the gateway's hostname and plugin data
   (`yuzu_gw_mgmt_service.erl`: `list_agents/2`, `get_agent/2`, `query_inventory/2`). The server
   calls only `SendCommand` (`gateway_mgmt_stub_pool.hpp`); a search of `server/core/src` at
-  `dfdffa4c0` finds no call to the other three.
+  `51f08447d` finds no call to the other three.
 - **What stays.** `SendCommand` and `WatchEvents` stay live. The three retired RPCs and their
   request and response messages also stay in `proto/yuzu/server/v1/management.proto` (and the
   gateway's copy), marked `option deprecated = true;` with a comment naming ADR-0073 (D15: no proto
@@ -1937,8 +1943,8 @@ of every ~30 s. The content is unchanged.
   new `DispatchCaller{.system = true}` construction adds no `approval_provenance` stamping site.
 - **Prometheus metrics and alert rules** (`docs/observability-conventions.md`): `sre` and
   `architect`.
-- **TAR** (the `echo` plugin's `echo_fleet_snapshot`, schema minor 2 to 3): `architect`,
-  `plugin-developer`.
+- **Echo plugin** (formerly TAR; the TAR dashboard routed row; `echo_fleet_snapshot`, schema minor 2
+  to 3): `architect`, `plugin-developer`.
 - **Erlang gateway:** `gateway-erlang`, for the gpb regen, keep-newest opacity, moving the tag
   checks out, replay-as-reattach, the owner-restart path, and the management-RPC retirement.
 - **Server storage substrate (Postgres):** `architect` and `sre`, for the born-on-PG
@@ -1999,7 +2005,7 @@ The same changes fix known truth-drift:
 - the proto comment's "5-20 KB" and "once per two heartbeats" (`agent.proto:155-159`);
 - `fleet_topology_store.hpp:194` ("invalidates the cache");
 - `fleet-viz-invariants.md`'s "whose `ts`" and "5-20 KB struct";
-- the `server.cpp` "60 s cache" comment on `claimed_ips()` (about l.19169).
+- the `server.cpp` "60 s cache" comment on `claimed_ips()` (about l.19297).
 
 ## Implementation slices
 
@@ -2019,10 +2025,10 @@ release and merge to `dev` inside one release window. ADR-0074 gates its own wav
    - `yuzu_agent_heartbeat_bytes`, plus a would-be-delta histogram computed locally. That measures the
      tag saving before the wire changes.
    - An audit that no server heartbeat-age threshold sits under 1.2 × 30 s plus margin.
-2. **Shared pure headers and TAR digest.**
+2. **Shared pure headers and the Echo digest.**
    - `common/include/yuzu/status_tag_classes.hpp` and `status_tag_digest.hpp`, with completeness
      and canonical-form tests.
-   - TAR `content_digest` (`schema_minor` bump) and its classification list.
+   - Echo `content_digest` (`schema_minor` bump) and its classification list.
    - The pump records digest, `last_pump_at` and outcome.
 2b. **`AgentRegistrationStore`, written on every successful registration** (direct and gateway).
     It is additive and wire-compatible, so it can land early. Records accumulate before anything
