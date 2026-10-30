@@ -34,11 +34,11 @@ flowchart LR
 
 ### What you can decide with it
 
-| Question | Rows to use | Linux (unprivileged agent) | macOS (agent runs as root) | Windows |
+| Question | Rows to use | Linux (agent service account) | macOS (agent runs as root) | Windows |
 |---|---|---|---|---|
-| Is password, keyboard-interactive or GSSAPI login allowed, and may root log in? | `config` rows | Answered if `sshd_config` is readable; on RHEL-family hosts the file is 0600 root, so it reads `refused` | Answered | Nothing: `windows:planned` |
+| Is password, keyboard-interactive or GSSAPI login allowed, and may root log in? | `config` rows | Answered if `sshd_config` is readable; on RHEL-family hosts the file is 0600 root, so an agent without `CAP_DAC_READ_SEARCH` (the packaged unit grants it) reads it `refused` | Answered | Nothing: `windows:planned` |
 | Is the SSH service switched on? | `service` rows | `systemctl is-enabled` state of `ssh`/`sshd` services and sockets | launchd override only (`enabled` is not "running") | Nothing |
-| Which public keys can log in as which account? | `file` and `key` rows | Usually refused: other users' homes are 0700 or 0750, so `CONSTRAINED` with `homes:permission_denied` is the common result, never "no keys" | Expected to be answered for homes under `/Users` owned by uid 500 or above and `/var/root` when the agent runs as root (not measured: the capture is euid 501 and reads `homes:permission_denied`) | Nothing |
+| Which public keys can log in as which account? | `file` and `key` rows | Answered on the packaged unit, whose ambient `CAP_DAC_READ_SEARCH` opens other users' homes (0700 or 0750; not measured for this plugin). Without the capability (an operator opt-out, a dev install, or a manual launch) refused: `CONSTRAINED` with `homes:permission_denied`, never "no keys" | Expected to be answered for homes under `/Users` owned by uid 500 or above and `/var/root` when the agent runs as root (not measured: the capture is euid 501 and reads `homes:permission_denied`) | Nothing |
 | Are any keys restricted (forced command, source address)? | `key` flags and option names | As above | As above (not measured as root) | Nothing |
 | Is the same key trusted on several hosts? | `key` fingerprint | Join the fingerprint across hosts | Same | Nothing |
 | Who can log in right now, with what policy, and from which source? | none | Not answerable: no effective policy, no login history, no sessions | Not answerable | Not answerable |
@@ -93,7 +93,7 @@ Paths only root can change are read the way `sshd` reads them, so ordinary distr
 
 - **`list` / Windows** — not read yet: one unsupported status row, windows:planned
 - **`list` / macOS** — configured access as written, not sshd's effective policy; the launchd override is not 'running'; CA trust, key and principals commands, a principals file, hostbased auth and AuthenticationMethods are not read; the Remote Login access list (pam_sacl) is not read; key comments, option values and key-file paths are never emitted; only homes under /Users owned by uid 500 or above, and /var/root, are walked; a symlinked key file or .ssh is refused; network mounts are skipped
-- **`list` / Linux** — constrained: the agent runs unprivileged, so other users' homes (usually 0700) are refused, not empty, and the listing is constrained; configured access as written, not sshd's effective policy (Match is not evaluated); CA trust, key and principals commands, a principals file, hostbased auth and AuthenticationMethods are not read; key comments, option values and key-file paths are never emitted; only homes under /home and /root are walked; a symlinked key file or .ssh is refused; network mounts are skipped
+- **`list` / Linux** — constrained: an agent without CAP_DAC_READ_SEARCH cannot enter other users' homes (usually 0700), which are refused, not empty, and the listing is constrained; configured access as written, not sshd's effective policy (Match is not evaluated); CA trust, key and principals commands, a principals file, hostbased auth and AuthenticationMethods are not read; key comments, option values and key-file paths are never emitted; only homes under /home and /root are walked; a symlinked key file or .ssh is refused; network mounts are skipped
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites

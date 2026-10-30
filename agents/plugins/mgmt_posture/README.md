@@ -91,7 +91,7 @@ The macOS leg has exactly three outcomes, and only the last one carries data row
 
 - **`posture` / Windows** — not read yet: one unsupported status row, windows:planned
 - **`posture` / macOS** — MDM enrolment only; AD binding is device_identity.domain; Jamf not read
-- **`posture` / Linux** — configuration as written, not the live join state; sssd.conf is root 0600, so an unprivileged agent reports permission_denied (plane unknown), never not-joined; a privileged agent reads it in full
+- **`posture` / Linux** — configuration as written, not the live join state; sssd.conf is root 0600, so an agent without CAP_DAC_READ_SEARCH reports permission_denied (plane unknown), never not-joined; an agent with it (or root) reads it in full
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
