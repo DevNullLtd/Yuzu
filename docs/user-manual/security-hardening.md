@@ -437,11 +437,15 @@ Five classes that used to appear on this list no longer belong on it:
   is `SecretCodec`-encrypted as of the `RuntimeConfigStore` Postgres migration
   (ADR-0060) — same KEK-pairing backup rule as MFA secrets above: back the
   database and the `--ca-dir` keys directory up together.
-- **Session tokens** have no durable storage on any substrate. Sessions are
-  in-memory-authoritative (`AuthManager::sessions_`); the Postgres cutover
-  dropped the SQLite-era `sessions` table outright rather than migrating it, so
-  there is no session-token column to encrypt — or to leak in a dump. A restart
-  is itself a fleet-wide session revocation.
+- **Session tokens** are never stored. Operator sessions are durable rows in the
+  `session_store` Postgres schema (`SessionStore`, HA WS-1/1a), keyed by the
+  SHA-256 hash of the token, with `AuthManager::sessions_` as a generation-gated
+  validate cache, so there is no session-token column to encrypt — or to leak in
+  a dump. Sessions survive a server restart, so a restart is **not** a session
+  revocation: use `DELETE /api/v1/sessions?username=<name>` (force sign-out of
+  one operator) or `DELETE /api/v1/sessions/me` (sign out everywhere). The
+  all-operators emergency procedure is in
+  [Auth database recovery](../ops-runbooks/auth-db-recovery.md#sessions-are-durable).
 - **Offload-target credentials** (`offload_target_store.offload_targets.auth_credential`)
   are `SecretCodec`-encrypted as of 2026-08-25 (ADR-0059). Same backup-pairing
   requirement as MFA TOTP secrets above: a Postgres dump alone cannot recover a
