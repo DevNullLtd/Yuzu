@@ -2356,6 +2356,12 @@ of every ~30 s. The content is unchanged.
     at the D8 rates, and the gateway buffer stays inside its byte cap;
   - **S5, server wall-clock step of ±10 min** (slice 8): no `stale_reason`, IP claim or retention
     outcome changes (D6, `steady_clock`);
+  - **S1 with the gateway management port blackholed** (slice 6): the issuer's gateway forwarder
+    threads stay within their bound, command and containment forwarding are still served, and
+    marks above the in-flight bound are `deferred`;
+  - **S2 with re-claim conflicts** (slice 8): a gateway restart with IP churn among retained slots
+    under a degraded pool leaves `BatchHeartbeat` under its timeout, with the audit rows written
+    off the heartbeat path;
   - **S6, retain-on-disconnect IP conflict** (slice 8): a gateway restart during which another
     agent claims one of a retained slot's IPs writes `topology.push.rejected` with
     `reason=reclaim_conflict`, drops the slot and requests topology (D6).
