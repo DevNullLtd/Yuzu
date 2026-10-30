@@ -1446,7 +1446,15 @@ message ReattachResponse {
      RPC). The guard is the outer override, so it runs, and writes its own denial audit row,
      before the handler is entered;
   1. `onbehalf::enforce(context)`, as the handler's first statement and before any side effect, as
-     in every gateway-upstream handler;
+     in every gateway-upstream handler; then the `--reattach-rate` token bucket. An over-rate call
+     answers `RATE_LIMITED` here, before `registration_lock_for` and before any Postgres read, so
+     the bucket protects the pool it exists for. `retry_after_ms` is the time until the bucket next
+     holds a token. The bucket is one per replica, shared by every gateway, with no per-gateway
+     share: during a storm one gateway's replay can hold another gateway's agents in
+     `RATE_LIMITED`, with their streams up but no session installed, so no command, containment
+     included, routes to them until a later attempt is admitted. The delay is bounded by the
+     storm's length at `--reattach-rate`; whether to key the bucket per gateway peer is open
+     point 18;
   2. `registration_lock_for(agent_id)`;
   3. enrollment status read (the existing fast-path read, `get_pending_status`). Only
      `PendingStatus::approved` proceeds. `pending`, `denied` or no row answers `NOT_ENROLLED`. A
@@ -2489,3 +2497,9 @@ make a new choice.
     Postgres schema (`agent_registration_store`) that nothing reads until slice 7b and that
     accumulates rows from its first deployment. The alternative is to hold every slice until
     acceptance. The owner decides, and names the tracking epic.
+18. **Per-gateway fairness of the reattach rate limit** (D14 step 1). The `--reattach-rate` bucket
+    is per replica and shared by every gateway, so one gateway (a large honest replay, a buggy one,
+    or one holding a valid but compromised certificate) can delay session install, and with it
+    command and containment routing, for other gateways' agents for the length of a storm. The
+    alternative is a per-gateway-peer share keyed on the peer's SPKI or identity, as
+    `PrincipalQuota` keys the OTA bounds. The owner decides.
