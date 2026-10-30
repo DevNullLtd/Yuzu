@@ -1432,6 +1432,13 @@ on the sustained condition and staying quiet on the expected one.
   (breaking)*).
   Responder: list stragglers with MCP `list_agents` and upgrade them. Tests: quiet at 0; fires after
   24 h above 0.
+- `YuzuAgentRegistrationStoreWriteFailing` (ticket):
+  `increase(yuzu_server_agent_registration_store_failed_total{op="write"}[1h]) > 0`. Meaning: that
+  many agents have no current registration record, so the next server restart answers their
+  reattach `NO_RECORD` and forces them to reconnect and register in full; write losses cluster in
+  registration storms, so the next restart repeats the storm for them. Responder: check Postgres
+  pool saturation and the store's logs; the agents recover on their next registration. Tests:
+  quiet at 0; fires on one failed write.
 
 **Diagnosis.** The series above separate the three usual causes of divergence:
 
@@ -2586,7 +2593,8 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
 10. **Surfaces and docs.**
     - MCP and REST `stale_reason` and descriptions.
     - The alert rules (`YuzuHeartbeatTagDivergenceSustained`, `YuzuVizTopologyResyncBacklog` and
-      `YuzuAgentsTagsAbsent`); this is the only slice that adds them.
+      `YuzuAgentsTagsAbsent`, `YuzuAgentRegistrationStoreWriteFailing`); this is the only slice
+      that adds them.
     - Every doc listed above, the upgrading.md section and the changelog fragment.
     - The harness and rig rerun recorded as the measured outcome, using ADR-0074 D14's method.
     - The chaos scenarios S1-S6 (*Tests*) recorded with their results, and the two freshness SLIs
