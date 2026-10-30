@@ -1101,7 +1101,11 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     wave into unbounded thread growth, starve command and containment forwarding on the same path,
     and make the issuer's bounded shutdown false. The issuer forwards gateway resyncs itself:
     - per pass, one `SendCommand` per gateway cluster per action, carrying that pass's agents in
-      `SendCommandRequest`'s repeated `agent_ids` under one fresh command id (the agent's dedup is
+      `SendCommandRequest`'s repeated `agent_ids` under one fresh command id. An empty `agent_ids`
+      means broadcast to every online agent (`management.proto`), so the issuer never sends a
+      forward with an empty list: a cluster with no agents left after filtering is skipped for the
+      pass, enforced by a unit test on the pure batching function. A forward carries at most 2,000
+      agent ids, so one message stays well under the listener limit (the agent's dedup is
       per agent, so one id per pass suffices), from a bounded set of forwarder threads the issuer
       owns and joins at stop, at most 8 in flight per replica (a fixed bound, unmeasured; slice 10
       measures it);
