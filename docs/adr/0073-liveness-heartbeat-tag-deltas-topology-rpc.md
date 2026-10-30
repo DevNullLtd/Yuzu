@@ -1393,7 +1393,8 @@ lands. The two are kept consistent as follows.
     unary gets its own admission, cap and failure semantics.
 14. **Delta-aware gateway coalescing** (compose older and newer deltas in the buffer). Rejected by
     owner ruling (no parsing in the gateway). Keep-newest plus server-side digest repair costs one
-    resync per changed agent after an outage, and nothing in steady state.
+    resync per changed agent after an outage under 90 s (one per agent after a longer one, D4), and
+    nothing in steady state.
 15. **Typed `StatusTags` in the heartbeat.** Rejected for `bytes` (D2), so the gateway never decodes
     tags.
 16. **Keep the Register once at the gateway** (a registry row read by replay; about −29 KiB).
