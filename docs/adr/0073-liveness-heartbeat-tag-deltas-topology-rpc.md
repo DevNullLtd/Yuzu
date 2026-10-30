@@ -750,9 +750,19 @@ relayed by the gateway like any command (no new gateway state).
     `tags` per 60 s and one `topology` per 5 min, and only while the agent diverges;
   - one capability-catalogue row per action with an `ExecuteGate` (compile-time, once);
   - one `command_execution` record per dispatch, written by `build_classified_command` like every
-    other dispatch (a Postgres upsert on the issuing replica);
+    other dispatch: a Postgres upsert on the issuing replica, made by the resync issuer off the
+    heartbeat path (below). It is kept, because the Forensics provenance rule needs one record per
+    dispatch;
   - one id-prefix skip in `notify_exec_tracker`;
-  - a small `CommandResponse` relayed back up.
+  - a small `CommandResponse` relayed back up, and dropped at ingest (below): no `ResponseStore`
+    row and no provenance lookup.
+  - **Combined Postgres rate after a server restart.** A reattach costs about three Postgres
+    operations (enrollment read, route CAS, record read; D14) at up to `--reattach-rate`, and each
+    issued resync one record write at up to `--tag-resync-rate` plus `--topology-resync-rate`. At
+    the defaults, overlapping, that is up to about 8,000 operations per second per replica against
+    the default `--postgres-pool-size` of 16. It is unmeasured. It is to be measured against the
+    pool size alongside ADR-0074's wave-2 measurement of a mass re-enrollment after an outage,
+    before the defaults are relied on.
 - It is paid **only when divergence occurs**: after a server restart, replica change, upstream
   outage or real loss. It is zero in steady state.
 - Latency is one stream hop.
@@ -825,12 +835,33 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
   - `__resync__` is **not** in the protective set. A kill switch on it, or a degraded enablement
     store, refuses it at `build_classified_command`; that is counted `send_failed`, and divergence
     persists until the next permitted issuance.
-  - Issuance is per replica, from heartbeat ingestion, and is not leader-gated: the replica that
-    lacks the state is the one that must ask.
+  - **Ingestion only marks.** A heartbeat that requests a resync (D3, D6) adds the agent to a
+    per-replica pending set: one entry per agent and action, deduplicated, so the set is bounded by
+    the agents whose heartbeats reach this replica (gauge `yuzu_server_resync_pending{action}`).
+    Ingestion does no Postgres work and no send for it, so a resync adds nothing to a batch's
+    #5686 per-batch Postgres budget or to the gateway's 5 s BatchHeartbeat call timeout
+    (`yuzu_grpc_client`'s default, per the `yuzu_gw_heartbeat_buffer.erl` header). A slow pool
+    cannot push a batch past the timeout and make the gateway resend it.
+  - **A per-replica issuer drains the set** on its own thread, at the configured rate and per-agent
+    interval. It is not leader-gated: the replica that lacks the state is the one that must ask.
+    Each drain pass is one loop with one `DispatchRecordLatch` (`dispatch_record_policy.hpp`), so
+    each record write uses the 250 ms fan-out lease budget. At the first failed write the issuer
+    ends the pass, rather than sending the rest with skipped records, and leaves the remaining
+    marks in the set, counted `deferred`. A Postgres outage therefore delays resyncs and never
+    blocks heartbeat ingestion.
+  - **No installed session yet.** A mark for an agent this replica has no installed session for
+    (after a restart, until its reattach lands, D14) stays in the set, counted `deferred`, and is
+    tried on a later pass. Only a send attempted on an installed session is ever `send_failed`.
+  - **The reply is dropped at ingest.** Like a solicited `__guard__` reply on the direct Subscribe
+    loop (`agent_service_impl.cpp`, about l.1561-1569), a `__resync__` reply is dropped on both
+    ingest paths before the provenance lookup: no `ResponseStore` row and no
+    `resolve_response_provenance` call. The acknowledgement that matters is the `full = true`
+    heartbeat or the topology report, not the reply.
   - Under ADR-0074 D5 every command is server-signed and every result agent-signed; `__resync__` is
     a command like any other and takes no exemption.
-- **Rate limits** (per replica). A request over the rate is deferred to a later heartbeat and
-  counted; nothing is dropped permanently, because divergence persists until fixed.
+- **Rate limits** (per replica, applied by the issuer). A mark over the rate stays in the set for a
+  later pass and is counted `deferred`; nothing is dropped permanently, because divergence persists
+  until fixed.
   - `tags`: `--tag-resync-rate`, default 2000/s, at most one per agent per 60 s. A full set is about
     4 KB, so 100k agents resync in about 50 s.
   - `topology`: `--topology-resync-rate`, default 200/s, at most one per agent per 5 min. 100k agents
@@ -839,7 +870,7 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     for each consecutive `rejected` outcome, to a cap of 15 min. An accepted payload resets it. A
     `diverged` or `no_base` outcome keeps the 60 s interval.
 - **Loss.** A command that cannot be sent (no stream) is not retried by itself. The agent's next
-  diverged heartbeat re-triggers it after the per-agent interval. An agent whose stream is down
+  diverged heartbeat marks it again, and it is issued after the per-agent interval. An agent whose stream is down
   reconnects, and its Register carries the full set anyway.
 
 **Direct-connected agents use the same command.** There is one mechanism, not a response flag on one
@@ -1554,6 +1585,10 @@ of every ~30 s. The content is unchanged.
 - keep-newest loss producing `diverged` and then `__resync__.tags`;
 - the `__resync__-` exec-tracker skip, and fresh ids per issuance;
 - a kill-switched `__resync__` counted `send_failed`;
+- heartbeat ingestion only marks a resync: no Postgres call and no send on the BatchHeartbeat path;
+  the issuer ends a pass at the first failed record write and leaves the rest `deferred`; a mark for
+  an agent with no installed session stays `deferred`, never `send_failed`; a `__resync__` reply
+  writes no `ResponseStore` row and makes no provenance lookup;
 - the catalogue pair's system-only refusal at operator surfaces;
 - hooks firing on unchanged-tag heartbeats (generation reconcile, corruption sink);
 - interval replace semantics (a missing net tag disappears);
