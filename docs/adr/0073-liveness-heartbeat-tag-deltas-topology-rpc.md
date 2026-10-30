@@ -1160,10 +1160,25 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
       per agent, so one id per pass suffices), from a bounded set of forwarder threads the issuer
       owns and joins at stop, at most 8 in flight per replica (a fixed bound, unmeasured; slice 10
       measures it);
-    - a 10 s deadline and no retries: the agent's next diverged heartbeat re-marks it. The issuer
-      also sets `SendCommandRequest.timeout_seconds` to 10, because the gateway's router keeps a
-      forward's fan-out state for `timeout_seconds` (unset means its 300 s default) whatever the
-      caller's own deadline, so without it the server's bound would not bound the gateway;
+    - `SendCommandRequest.timeout_seconds` of 10 and no retries: the agent's next diverged
+      heartbeat re-marks it. The gateway's router keeps a forward's fan-out state for
+      `timeout_seconds` (unset means its 300 s default) whatever the caller's own deadline, so
+      without it the server's bound would not bound the gateway. The client deadline is 12 s,
+      a margin over `timeout_seconds`, so a forward with a silent target ends on the gateway's own
+      fan-out timeout (a clean end of the stream), not on `DEADLINE_EXCEEDED`;
+    - the forwarder reads the response stream to its end. It accepts a frame only if its
+      `agent_id` is in that forward's set; a frame for any other agent is refused as
+      `agent_mismatch` (the HA WS-4 forgery check, as `classify_gateway_forward_response` does
+      for one expected agent today, here against a set), counted once per forward rather than once
+      per frame. `not_connected` is counted per agent. The frames are `__resync__` replies, which
+      ingest drops (below), so the forwarder drops them itself and never calls
+      `process_gateway_response`. A unit test on this pure classifier covers a 2,000-id forward
+      with one silent target and one foreign frame;
+    - outcomes are per agent, never per forward: an agent the stream answered for, or that was
+      not reported `not_connected` before a clean end, is `sent`; `send_failed` is a transport
+      failure before delivery (an upstream error, or the 12 s deadline) for the agents of that
+      forward, or a `not_connected` agent. One slow agent therefore never turns the delivered
+      agents of its forward into `send_failed`;
     - no re-issue to an agent while an earlier forward for it is in flight; a mark above the
       in-flight bound stays `deferred`;
     - at most one forward in flight per (cluster, action): a cluster's marks stay `deferred` while
@@ -1239,7 +1254,7 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     (`AuditStore::log`'s 4 s write lease), each plus the statement it runs, which the drain's
     `SET LOCAL statement_timeout` of 1 s bounds; the drain itself starts no write after 5 s, so it
     can overrun that by one write (one 4 s lease plus 1 s). The worst case is therefore about
-    4 + 1 + 5 + 4 + 1 = 15 s, and slice 8 measures it; the forwarders' 10 s
+    4 + 1 + 5 + 4 + 1 = 15 s, and slice 8 measures it; the forwarders' 12 s
     deadline does not add to it because they are cancelled first. The slice-6 shutdown test also
     stops during an in-flight forward; slice 8, which adds the re-claim audit queue, adds a stop
     during the audit drain. The pass swaps the pending set out under the set's mutex and never holds
@@ -1526,8 +1541,8 @@ on the sustained condition and staying quiet on the expected one.
     rule; the runbook says so;
   - `increase(yuzu_viz_topology_resync_total{outcome="send_failed"}[30m]) > 0` or the same on
     `yuzu_server_tag_resync_total`: a send attempted on an installed session failed, so divergence
-    persists. The causes are a kill switch on `__resync__`, a failed gateway forward (its 10 s
-    deadline or an upstream error), a gateway without the dispatch-tag capability, or a stream
+    persists. The causes are a kill switch on `__resync__`, a failed gateway forward (its 12 s
+    deadline or an upstream error), an agent the gateway reported `not_connected`, a gateway without the dispatch-tag capability, or a stream
     that ended between the session check and the send (D8). A single transient failure therefore
     raises the ticket; the runbook separates the causes by the issuer's WARN log. A degraded
     enablement store shows as `deferred`, in the first branch.
