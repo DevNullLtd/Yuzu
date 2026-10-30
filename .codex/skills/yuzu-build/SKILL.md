@@ -22,7 +22,7 @@ description: Configure, compile, and test Yuzu with the repo's canonical Meson e
 ## Choose Tests
 
 - Read `tests/meson.build` to map the change to a suite.
-- Prefer targeted suites first: `agent`, `server`, `tar`, `proto`, and `docs`.
+- Prefer targeted suites first: `agent`, `server`, `echo`, `proto`, and `docs`.
 - Run `meson test -C <builddir> --suite <suite> --print-errorlogs`.
 - Expand to broader coverage only when the change crosses multiple areas or the targeted suite fails unexpectedly.
 

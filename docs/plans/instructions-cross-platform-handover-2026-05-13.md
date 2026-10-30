@@ -30,7 +30,7 @@ Files touched:
 | `content/definitions/discovery.yaml` | D | `type: query` → `question` for `device.discovery.scan_subnet` |
 | `content/definitions/deployment.yaml` | D | `type: query` → `question` for `server.deployment.list_jobs` |
 | `content/definitions/procfetch.yaml` | C | `platforms:` adds `darwin` |
-| `agents/plugins/tar/src/tar_plugin.cpp` | E | `tar.export` UNION ALL projects uniform `(source, ts, snapshot_id, action, summary)` |
+| `agents/plugins/echo/src/echo_plugin.cpp` | E | `echo.export` UNION ALL projects uniform `(source, ts, snapshot_id, action, summary)` |
 | `agents/plugins/agent_logging/src/agent_logging_plugin.cpp` | F | "no log file" → `status\|empty` rc=0 |
 | `agents/plugins/procfetch/src/procfetch_plugin.cpp` | C | macOS branch via `libproc` + OpenSSL EVP |
 | `agents/plugins/wifi/src/wifi_plugin.cpp` | C | macOS fallback to `system_profiler SPAirPortDataType` when `airport` is gone (Sonoma+) |

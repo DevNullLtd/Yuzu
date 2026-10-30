@@ -184,7 +184,7 @@ struct TempDbFile {
         std::filesystem::remove(path, ec);
         std::filesystem::remove(std::filesystem::path(path.string() + "-wal"), ec);
         std::filesystem::remove(std::filesystem::path(path.string() + "-shm"), ec);
-        // The Windows TarDatabase::open pre-creates an empty -journal beside the database.
+        // The Windows EchoDatabase::open pre-creates an empty -journal beside the database.
         std::filesystem::remove(std::filesystem::path(path.string() + "-journal"), ec);
     }
 
@@ -267,7 +267,7 @@ template <typename F> ScopeExit(F) -> ScopeExit<F>;
 /// ── Postgres test support (#1320 PR 1) ──────────────────────────────────
 ///
 /// Compiled only into suites that link libpq (the server suite defines
-/// YUZU_TEST_ENABLE_PG in tests/meson.build); the agent/tar suites include
+/// YUZU_TEST_ENABLE_PG in tests/meson.build); the agent/echo suites include
 /// this header without a libpq include path, so everything Postgres-shaped
 /// stays behind the guard.
 ///

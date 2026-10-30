@@ -145,7 +145,7 @@ rule push (`/api/v1/guaranteed-state/push`, Baseline deploy, and the reconcile r
 caller saw a normal `202 {"queued":true,"agents":0}` response and audit row — `agents=0` was technically
 present, but indistinguishable from any other ordinary zero-match case (no agents in scope, none online),
 so nothing identified a kill switch as the cause.
-`tar.fleet_snapshot` and `asset_tags.sync`, the other two `system_reserved` capabilities, were
+`echo.fleet_snapshot` and `asset_tags.sync`, the other two `system_reserved` capabilities, were
 unaffected (neither plugin name starts with `_`).
 
 The fix restores `action_allowed`'s documented default: with no kill-switch row for

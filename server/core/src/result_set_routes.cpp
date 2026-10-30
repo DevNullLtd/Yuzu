@@ -109,8 +109,8 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
         // re-evaluates keeps the auditing gate.
         if (!deps.probe_perm_fn || !deps.probe_perm_fn(req, "Execution", "Execute"))
             return false;
-        if (rs.source_kind == source_kind::kTarQuery)
-            return read_only_dispatch("tar", "sql");
+        if (rs.source_kind == source_kind::kEchoQuery)
+            return read_only_dispatch("echo", "sql");
         if (rs.source_kind != source_kind::kInstructionResult)
             return false;
         if (!deps.instruction_store || !deps.instruction_store->is_open())

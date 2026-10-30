@@ -33,7 +33,7 @@ constexpr Screen kPosture[] = {
      "M5 11h14v10H5z M8 11V7a4 4 0 018 0v4"},
     {"dex", "DEX", "/dex", "See crashes, slow starts and noisy apps as users feel them.",
      "M22 12h-4l-3 9L9 3l-3 9H2"},
-    {"tar", "TAR", "/tar", "A recorded history of what ran and connected on each device.",
+    {"echo", "Echo", "/echo", "A recorded history of what ran and connected on each device.",
      "M3 12a9 9 0 109-9 M3 4v5h5 M12 7v5l3 2"},
 };
 constexpr Screen kEstate[] = {

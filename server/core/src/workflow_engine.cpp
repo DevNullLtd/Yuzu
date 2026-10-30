@@ -88,6 +88,15 @@ const std::vector<pg::PgMigration>& migrations() {
          // execution_id-only equality lookup on its leading column; a dedicated index would be
          // pure redundant write/storage cost.
          "CREATE INDEX idx_workflows_deleted ON workflows(deleted_at) WHERE deleted_at = 0;"},
+        // v2 (Echo rename, upgrade window): workflow steps, their recorded results and the
+        // workflow source follow the renamed definition ids. Idempotent.
+        {2,
+         "UPDATE workflow_steps SET instruction_id = replace(instruction_id, "
+         "'crossplatform.tar.', 'crossplatform.echo.') WHERE instruction_id LIKE 'crossplatform.tar.%';"
+         "UPDATE workflow_step_results SET instruction_id = replace(instruction_id, "
+         "'crossplatform.tar.', 'crossplatform.echo.') WHERE instruction_id LIKE 'crossplatform.tar.%';"
+         "UPDATE workflows SET yaml_source = replace(yaml_source, "
+         "'crossplatform.tar.', 'crossplatform.echo.') WHERE yaml_source LIKE '%crossplatform.tar.%';"},
     };
     return kMigrations;
 }

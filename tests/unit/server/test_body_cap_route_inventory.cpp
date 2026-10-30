@@ -209,9 +209,9 @@ constexpr DefaultAllow kDefaultIsCorrectFor[] = {
     // dashboard_routes.cpp (5)
     {"POST", R"body_cap_path(/api/dashboard/group-from-results)body_cap_path", "HTMX dashboard fragment: small form/JSON body (ids, flags, retention-scan triggers)."},
     {"POST", R"body_cap_path(/api/dashboard/execute)body_cap_path", "HTMX dashboard fragment: small form/JSON body (ids, flags, retention-scan triggers)."},
-    {"POST", R"body_cap_path(/fragments/tar/retention-paused/scan)body_cap_path", "HTMX dashboard fragment: small form/JSON body (ids, flags, retention-scan triggers)."},
-    {"POST", R"body_cap_path(/fragments/tar/retention-paused/reenable)body_cap_path", "HTMX dashboard fragment: small form/JSON body (ids, flags, retention-scan triggers)."},
-    {"POST", R"body_cap_path(/fragments/tar/retention-paused/purge)body_cap_path", "HTMX dashboard fragment: small form/JSON body (ids, flags, retention-scan triggers)."},
+    {"POST", R"body_cap_path(/fragments/echo/retention-paused/scan)body_cap_path", "HTMX dashboard fragment: small form/JSON body (ids, flags, retention-scan triggers)."},
+    {"POST", R"body_cap_path(/fragments/echo/retention-paused/reenable)body_cap_path", "HTMX dashboard fragment: small form/JSON body (ids, flags, retention-scan triggers)."},
+    {"POST", R"body_cap_path(/fragments/echo/retention-paused/purge)body_cap_path", "HTMX dashboard fragment: small form/JSON body (ids, flags, retention-scan triggers)."},
 
     // deployment_routes.cpp (2)
     {"POST", R"body_cap_path(/fragments/auto/deploy/run)body_cap_path", "/auto Deploy trigger: small JSON body (run id / target selection) -- the installer itself travels via the content_dist plugin on the agent side, never through this route."},
@@ -253,7 +253,7 @@ constexpr DefaultAllow kDefaultIsCorrectFor[] = {
     {"POST", R"body_cap_path(/fragments/auto/run)body_cap_path", "/auto Pre-flight trigger: small JSON body (run id / cohort selection)."},
 
     // rest_api_v1.cpp (38)
-    {"POST", R"body_cap_path(/api/v1/tar/retention-paused/purge)body_cap_path", "REST management/config JSON body: ids, flags, small structured payloads (management groups, engine principals, tokens, tags, access reviews, inventory queries, result-set derivation, device tokens, software packages/deployments, license, guaranteed-state push, DEX live-snapshot trigger)."},
+    {"POST", R"body_cap_path(/api/v1/echo/retention-paused/purge)body_cap_path", "REST management/config JSON body: ids, flags, small structured payloads (management groups, engine principals, tokens, tags, access reviews, inventory queries, result-set derivation, device tokens, software packages/deployments, license, guaranteed-state push, DEX live-snapshot trigger)."},
     {"POST", R"body_cap_path(/api/v1/management-groups)body_cap_path", "REST management/config JSON body: ids, flags, small structured payloads (management groups, engine principals, tokens, tags, access reviews, inventory queries, result-set derivation, device tokens, software packages/deployments, license, guaranteed-state push, DEX live-snapshot trigger)."},
     {"PUT", R"body_cap_path(/api/v1/management-groups/([a-f0-9]+))body_cap_path", "REST management/config JSON body: ids, flags, small structured payloads (management groups, engine principals, tokens, tags, access reviews, inventory queries, result-set derivation, device tokens, software packages/deployments, license, guaranteed-state push, DEX live-snapshot trigger)."},
     {"POST", R"body_cap_path(/api/v1/management-groups/([a-f0-9]+)/members)body_cap_path", "REST management/config JSON body: ids, flags, small structured payloads (management groups, engine principals, tokens, tags, access reviews, inventory queries, result-set derivation, device tokens, software packages/deployments, license, guaranteed-state push, DEX live-snapshot trigger)."},
@@ -328,8 +328,8 @@ constexpr DefaultAllow kDefaultIsCorrectFor[] = {
     {"POST", R"body_cap_path(/api/settings/mfa/recovery-codes)body_cap_path", "Admin settings JSON/form body: config toggles, ids, small structured payloads."},
     {"POST", R"body_cap_path(/api/settings/mfa/disable)body_cap_path", "Admin settings JSON/form body: config toggles, ids, small structured payloads."},
 
-    // tar_tree_routes.cpp (1)
-    {"POST", R"body_cap_path(/fragments/tar/capture-sources/push)body_cap_path", "TAR capture-sources push: small JSON body."},
+    // echo_tree_routes.cpp (1)
+    {"POST", R"body_cap_path(/fragments/echo/capture-sources/push)body_cap_path", "Echo capture-sources push: small JSON body."},
 
     // webhook_routes.cpp (1)
     {"POST", R"body_cap_path(/api/webhooks)body_cap_path", "Webhook registration: small JSON body (URL + delivery config)."},

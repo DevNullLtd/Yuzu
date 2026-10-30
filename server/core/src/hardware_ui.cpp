@@ -356,7 +356,7 @@ std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q, bo
         const std::string ram = ci_ram_gb(d.ci_ram_bytes);
         return ram.empty() ? std::string("<span class=\"hw-grey\">&mdash;</span>") : ram;
     }();
-    // IP (round-3 item 10): the ONLY source is the live TAR fleet-snapshot cache —
+    // IP (round-3 item 10): the ONLY source is the live Echo fleet-snapshot cache —
     // online-only, honestly "—" once offline rather than a stale last-known value.
     const std::string ip_cell = d.ips.empty()
         ? "<span class=\"hw-grey\">&mdash;</span>"

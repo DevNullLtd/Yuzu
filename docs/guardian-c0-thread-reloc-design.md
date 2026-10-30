@@ -499,7 +499,7 @@ The Guardian lifecycle journal is not the only wall-clock expiry site in the cod
 not the only one with a guard: `server/core/src/app_perf_daily_store.cpp` already bounds an
 implausible future timestamp (`kFutureSlackDays`) and caps rows applied per pass
 (`kMaxRowsPerApply`). An earlier draft of this section claimed "the ONLY", which was simply
-wrong, and named `tar_aggregator`'s SQL in the wrong file.
+wrong, and named `echo_aggregator`'s SQL in the wrong file.
 
 What is accurate: most wall-clock expiry sites issue a single uncapped `DELETE ... WHERE
 expires_at < now`, with no anomaly detection and no per-pass bound. Those include
@@ -507,13 +507,13 @@ expires_at < now`, with no anomaly detection and no per-pass bound. Those includ
 `preflight_run_store.cpp`, `deployment_run_store.cpp`, `guaranteed_state_store.cpp`'s TTL over
 the server's copy of these same lifecycle events, `auth_db.cpp`'s expired-session sweep,
 `app_perf_daily_store.cpp` and `app_perf_fleet_store.cpp`'s own retention deletes, and
-agent-side retention driven from `agents/plugins/tar/src/tar_schema_registry.cpp`.
+agent-side retention driven from `agents/plugins/echo/src/echo_schema_registry.cpp`.
 
 The asymmetry is defensible for the server stores: they run on an NTP-managed host, they are
 backed up, and their clock is not one an endpoint controls. It is less comfortable for the
-agent-side TAR retention, which shares exactly the clock this guard exists for, and for
+agent-side Echo retention, which shares exactly the clock this guard exists for, and for
 `audit_store`, which holds SOC 2 evidence. Neither is in this change's scope. Follow-ups are filed for the two
-that matter: **#2360** (`audit_store`, the SOC 2 evidence trail) and **#2361** (agent-side TAR
+that matter: **#2360** (`audit_store`, the SOC 2 evidence trail) and **#2361** (agent-side Echo
 retention, which shares the endpoint clock this guard exists for). The remaining server-side
 sites are recorded in #2360 rather than filed individually, since they share one fix pattern and
 a lower stake.

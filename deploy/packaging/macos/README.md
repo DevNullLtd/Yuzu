@@ -86,7 +86,7 @@ newer binary compatible.
 
 The agent, core library, copied framework closure, and every external plugin
 must have the same complete Mach-O architecture slice set; the helper rejects a
-mixed closure. The required process collector is the exact output `tar.dylib`,
+mixed closure. The required process collector is the exact output `echo.dylib`,
 not a similarly named plugin.
 
 The bundle LaunchDaemon runs as root, retains external plugins, and always passes
@@ -206,7 +206,7 @@ signing does not installer-sign or notarize the `.pkg`.
 
 Do not install the root LaunchDaemon, grant Full Disk Access, or test live
 Endpoint Security without explicit test-rig authorization. A valid signature, a
-running process, or polling fallback does not prove live ES: `tar.status` must
+running process, or polling fallback does not prove live ES: `echo.status` must
 report `process_capture_method|endpoint_security`, followed by a unique observed
 exec and exit with checked drop counters. The active SDK must ship the Endpoint
 Security header and library stub; both the Command Line Tools and full Xcode
