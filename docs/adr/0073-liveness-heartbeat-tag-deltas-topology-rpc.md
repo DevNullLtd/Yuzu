@@ -1248,13 +1248,20 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     under that mutex before the context is destroyed. The stop sweep sets the flag and calls
     `TryCancel` only while holding that mutex, so it never cancels a context that has finished or
     been destroyed, and a forwarder starting during the stop never begins an uncancelled RPC. The
-    slice-6 shutdown test races a stop against forward completion under TSan. Shutdown latency is bounded by the longest in-flight Postgres call plus the re-claim
-    audit drain (D6). The longest in-flight call is not the 250 ms record lease: a pass can be
-    inside the kill-switch read (`get_kill_switch`'s 1.5 s read lease) or a re-claim audit write
-    (`AuditStore::log`'s 4 s write lease), each plus the statement it runs, which the drain's
-    `SET LOCAL statement_timeout` of 1 s bounds; the drain itself starts no write after 5 s, so it
-    can overrun that by one write (one 4 s lease plus 1 s). The worst case is therefore about
-    4 + 1 + 5 + 4 + 1 = 15 s, and slice 8 measures it; the forwarders' 12 s
+    slice-6 shutdown test races a stop against forward completion under TSan. Shutdown latency is
+    bounded by the longest in-flight Postgres call plus the re-claim audit drain (D6). The longest
+    in-flight call is not the 250 ms record lease: a pass can be inside the kill-switch read
+    (`get_kill_switch`'s 1.5 s read lease), the record insert, or a steady-state re-claim audit
+    write (a 4 s write lease), and outside the drain each runs its statement under the pool's
+    defaults, a 10 s `lock_timeout` and a 30 s `statement_timeout` (`pg_pool.hpp`; the
+    `record_command_dispatch` comment in `server.cpp` reports a lock-blocked upsert measured at
+    10.04 s). The drain's 1 s `SET LOCAL statement_timeout` bounds only the drain's own writes, and
+    it needs a transaction to bind to: `AuditStore::log` runs on an autocommit lease, so the
+    drain writes each row with `log_in_txn` inside an explicit transaction on the issuer's own
+    4 s lease. The drain starts no write after 5 s and can overrun that by one write (4 s lease
+    plus 1 s). The worst case is therefore about 4 + 30 + 5 + 4 + 1 = 44 s, about 45 s, inside the
+    server's 210 s stop budget (`TimeoutStopSec`, the compose `stop_grace_period`); slices 6 and 8
+    size their shutdown assertions on that figure and slice 8 measures it; the forwarders' 12 s
     deadline does not add to it because they are cancelled first. The slice-6 shutdown test also
     stops during an in-flight forward; slice 8, which adds the re-claim audit queue, adds a stop
     during the audit drain. The pass swaps the pending set out under the set's mutex and never holds
