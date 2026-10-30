@@ -165,7 +165,7 @@ The kTLS branch (`perf/gateway-idle-mem-ktls`, not on `dev`) currently refuses `
 ### D10. How gateways know about one another
 
 - **Inside a corporate network:** gateways may form an Erlang cluster (the existing `yuzu_gw_cluster_discovery` and per-agent `pg` lookup; there is no hash ring, #4556). The cluster's own connections run over TLS (`inet_tls_dist`) with CA-issued certificates. Membership in an Erlang cluster is full control of every member. D1.2's role check applies: distribution admits only gateway identities carrying the cluster's id, with chain and CRL checked. Under D3 agent leaves carry both `serverAuth` and `clientAuth` and chain to the same CA, so a chain-only check would admit an agent leaf to the cluster.
-- **New in wave 4:** TLS distribution with CA-issued certificates (today distribution is plaintext, and the cookie is its only authentication); distribution off unless configured (today cluster formation is tried by default); and a `cluster_id` mismatch check at join, which guards against misconfiguration only, because admission is the distribution certificate.
+- **New in wave 4:** TLS distribution with CA-issued certificates (today distribution is plaintext, and the cookie is its only authentication); distribution off by default on an internet-facing gateway (today cluster formation is tried by default everywhere); and a `cluster_id` mismatch check at join, which guards against misconfiguration only, because admission is the distribution certificate.
 - **Outside, including every internet-facing gateway:** gateways never talk to each other. They coordinate only through the server. Erlang clustering is off by default for an internet-facing gateway.
 - **Either way,** every gateway reports health, load and draining state to the server, because the server owns the gateway list agents receive (D9).
 
@@ -225,7 +225,7 @@ Several standing rules, and one earlier ADR, say the opposite of a decision abov
 
 1. **Cluster affinity against free gateway choice. Decided on 2026-10-29: affinity is dropped.** #4669 made an agent's home cluster sticky (`agent_routes.home_cluster_id`), so another cluster cannot claim and answer for it. D9 and D11 move agents between gateways freely, possibly across clusters. From wave 4 the choice of gateway is free, and affinity is no longer an admission rule, nor kept as a preference.
    - **The risk this carries, stated plainly:** until D5 lands in wave 2, a compromised gateway that holds a valid gateway certificate can claim any agent's route. D5's per-session signature and signed commands and results close it only if the route write (`agent_routes`, written today on the gateway's CONNECTED notification and asserted by the gateway) changes only after the server has verified that session's agent signature. Wave 2 makes it so. D5 does not stop a gateway that holds the agent from reading command payloads (a D5 non-goal).
-   - **Which wave removes the #4669 admission check is not yet named.** The drop is decided, gateway choice is free from wave 4, and the route-claim risk runs until D5 lands in wave 2.
+   - **The #4669 admission check is removed no later than wave 4.** Whether it goes earlier, before D5 lands in wave 2 (while the route-claim risk is open), is for the owner at sign-off.
 2. **D5's scope. Decided on 2026-10-29:** signed commands, signed results and a signed gateway list, on top of the per-session signature (see D5).
 3. **#5649. Still open: a proof obligation for wave 5.** D12 point 2 chooses stickiness on the gateway side (one owning server per agent). Wave 5 must show the reconcile correct when that owner changes (server loss or drain).
 4. **ADR-0073's budget text. Done:** ADR-0073 is in PR #6704 and was revised there to cite D14 instead of the 8 KiB goal, and to re-cite the gateway after the merge of PR #5695.
@@ -259,7 +259,7 @@ Three proposals change the plan. All three were accepted by Nathan on 2026-10-28
 
 ## Delivery plan
 
-Each wave ends with the owner's guidance before the next starts. Waves 1 to 6 are gated at 5,000 agents on both rigs (conflict 7); wave 7 at 100,000. Pull requests target `dev` and merge by the repository's usual rules.
+Each wave ends with the owner's guidance before the next starts. Waves 1 to 5 are gated at 5,000 agents on both rigs; wave 6 tests failover under a 5,000-agent load; wave 7 at 100,000 (conflict 7). Pull requests target `dev` and merge by the repository's usual rules.
 
 | Wave | Content | Done when |
 |---|---|---|
@@ -355,6 +355,6 @@ Resolved in wave 0 (2026-10-29): the SPIFFE trust domain (D3), D5's scope, and w
 - **For wave 1:** whether a default install gains an issuing intermediate under the Yuzu root, so a mass revocation is not a root rotation (D7).
 - **For wave 2:** how an agent learns that a server's signing key is revoked (D5).
 - **For wave 5:** how the server that owns an agent's stream learns of a revocation made on another server (D7, D12).
-- **Not yet named:** which wave removes the #4669 cluster-affinity admission check (conflict 1).
+- **For sign-off:** whether the #4669 cluster-affinity admission check is removed before wave 2, while the route-claim risk is open, or with wave 4 (conflict 1).
 - **For wave 4:** whether a fail-closed gateway gets weight zero in the gateway list (D7, D9).
 - **No wave named yet:** #5578's R-6, per-gateway `agent_id` scoping.
