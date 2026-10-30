@@ -823,13 +823,14 @@ When several conditions hold, the first in this order wins:
     as `push_snapshot` audits today, so no Postgres write is held under the fleet-wide mutex. The
     fresh body then goes through first-claim-wins. The caller does not write the row on the
     heartbeat path either: it queues it for the resync issuer's thread (D8), which writes it
-    before its next pass. Each steady-state drain pass is bounded: it writes at most 1 s of rows
+    before its next pass, so several conflicts in one `BatchHeartbeat` under a degraded pool
+    cannot push the batch past the gateway's 5 s call timeout. Each steady-state drain pass is bounded: it writes at most 1 s of rows
     (whatever has started by then finishes), checks the stop flag between writes and hands off to
     the stop-time drain below when it is set, and leaves the rest queued for the next pass, so a
     large backlog against a slow but healthy pool never holds up resync issuing for more than
     about a second per pass and a stop mid-drain stays inside the issuer's shutdown bound. The
-    queue's depth is a gauge (`yuzu_viz_topology_reclaim_audit_queued`, D13). So several conflicts in one `BatchHeartbeat` under a degraded pool
-    cannot push the batch past the gateway's 5 s call timeout. The queued row's lifecycle:
+    queue's depth is a gauge (`yuzu_viz_topology_reclaim_audit_queued`, D13). The queued row's
+    lifecycle:
     - the queue is owned by the issuer and guarded by its own mutex, never `pushed_mu_`: the
       caller pushes the row after `pushed_mu_` is released, and the issuer swaps the whole queue
       out under the queue's mutex and writes the rows after releasing it, so no `log()` call runs
@@ -845,7 +846,8 @@ When several conditions hold, the first in this order wins:
       and each drain write runs under `SET LOCAL statement_timeout` of 1 s, so a lease-held write
       cannot run on to the pool's 10 s `lock_timeout` or 30 s `statement_timeout` and the drain
       ends within about 10 s (no write starts after 5 s, and the last one can still wait out
-      `AuditStore::log`'s 4 s write lease and run its 1 s statement), so a stop does not lose a row while the audit
+      the issuer's own 4 s write lease and run its 1 s statement), so a stop does not lose a row
+      while the audit
       store is healthy and the queue is short; a row it cannot write, or has not reached when the
       deadline passes, is logged at WARN with the total and the first and last conflict. Its
       `dropped` count is best-effort, because the process is exiting and is normally not scraped
@@ -1271,8 +1273,9 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     `record_command_dispatch` comment in `server.cpp` reports a lock-blocked upsert measured at
     10.04 s). The drain's 1 s `SET LOCAL statement_timeout` bounds only the drain's own writes, and
     it needs a transaction to bind to: `AuditStore::log` runs on an autocommit lease, so the
-    drain writes each row with `log_in_txn` inside an explicit transaction on the issuer's own
-    4 s lease. The drain starts no write after 5 s and can overrun that by one write (4 s lease
+    drain writes each row in its own explicit transaction (`BEGIN`, `SET LOCAL`, `log_in_txn`,
+    `COMMIT`) on the issuer's own 4 s lease, so a timeout rolls back only that row, which stays
+    queued with every row after it. The drain starts no write after 5 s and can overrun that by one write (4 s lease
     plus 1 s). The worst case is therefore about 4 + 30 + 5 + 4 + 1 = 44 s, about 45 s, inside the
     server's 210 s stop budget (`TimeoutStopSec`, the compose `stop_grace_period`); slices 6 and 8
     size their shutdown assertions on that figure and slice 8 measures it; the forwarders' 12 s
