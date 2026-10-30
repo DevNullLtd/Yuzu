@@ -1029,11 +1029,26 @@ message ReattachResponse {
 - **Backup and restore.** The schema is in the standard Postgres backup scope, like every
   server store. After a restore, rows whose `session_id` no longer matches the session an agent
   presents answer `NO_RECORD`, and those agents re-register once.
-- **Lifecycle.**
-  - Rows are deleted by the agent decommission/deregistration cascade
-    (`server/core/src/agent_decommission.hpp`), which gains this store as a member.
+- **Lifecycle and retention.**
+  - A `registrations` row persists until the agent is decommissioned. There is no retention pass:
+    the table holds one row per agent that has registered, the same population and lifetime as the
+    agent's enrollment record, and a row is only useful while that agent may still reattach. A
+    device retired without a decommission keeps its row, as it keeps its enrollment record; the
+    decommission cascade is the erasure path. No clock-guarded-retention apparatus applies,
+    because nothing is deleted on a wall-clock cutoff.
+  - Rows are deleted by the agent decommission cascade (`server/core/src/agent_decommission.hpp`).
+    The header's four mandatory steps all apply: (a) append the store to
+    `AgentDecommissionStores`; (b) register it in `agent_decommission.cpp`'s registration list;
+    (c) bump `kCascadeStoreCount` in `tests/unit/server/test_agent_decommission.cpp`; (d) add it
+    to the blast-radius lists in `sle_routes.hpp`/`.cpp`, `rest_api_v1.cpp`'s delete block,
+    ADR-0024 Decisions 9 and 11, and `docs/user-manual/rest-api.md`.
+  - **Cascade against a concurrent registration.** The cascade's delete does not take
+    `registration_lock_for`. A registration that commits after the delete re-creates the row. That
+    is by design: an agent still connected after a decommission re-registers and is present
+    again, as it repopulates the cascade's other per-agent stores until a decommission tombstone
+    exists (`agent_decommission.cpp`). A reattach that reads after the delete answers `NO_RECORD`.
   - `plugin_sets` rows are never deleted. They are bounded by the number of distinct agent builds,
-    so no retention pass, and no clock-guarded-retention apparatus, applies.
+    so no retention pass applies to them either. They hold no per-agent data.
 - **HA.** The record is fleet-wide, so a reattach succeeds on **any** replica. Today a replay needs
   the stored request, so it can only come from the gateway that holds it. `OfflineEndpointStore`
   presence, `gateway_route_store` and `AgentRegistry` presence are unchanged. The registry's
@@ -1349,7 +1364,8 @@ of every ~30 s. The content is unchanged.
   `legacy_echo_wire_name` as at registration;
   a refusal before the adopt step leaves the route directory untouched;
 - `AgentRegistrationStore` under the ADR-0012 test conventions (`YUZU_REQUIRE_PG_DB`): upsert, plugin
-  interning, the decommission cascade, DB-authored timestamps;
+  interning, the decommission cascade (including the `kCascadeStoreCount` bump), DB-authored
+  timestamps;
 - the `apply` outcomes (synced, full, diverged, no_base, rejected), and the moved tag caps;
 - keep-newest loss producing `diverged` and then `__resync__.tags`;
 - the `__resync__-` exec-tracker skip, and fresh ids per issuance;
@@ -1451,6 +1467,12 @@ of every ~30 s. The content is unchanged.
   `ListAgents`, `GetAgent` and `QueryInventory` deprecated and `UNIMPLEMENTED` on the gateway
   management surface (slice 0b's own PR).
 - `docs/postgres-migration-ladder.md`: the `AgentRegistrationStore` row.
+- `docs/data-architecture.md` and the server-side PostgreSQL data-inventory table in
+  `docs/enterprise-readiness-soc2-first-customer.md`: the `agent_registration_store` schema, its
+  fields (hostname, os, arch, version, scopable tags, plugin set; no secret) and its retention
+  (until decommission).
+- The decommission blast-radius lists: `sle_routes.hpp`/`.cpp`, `rest_api_v1.cpp`'s delete block,
+  ADR-0024 Decisions 9 and 11, and `docs/user-manual/rest-api.md` (the cascade header's step (d)).
 - `docs/auth-architecture.md`: the gateway no longer holds enrollment tokens; reattach authority.
 - The agent CLI reference.
 - The ADR-2002 incident paragraph: a pointer to this ADR.
