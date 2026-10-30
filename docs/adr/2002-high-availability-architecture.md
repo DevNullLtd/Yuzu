@@ -145,6 +145,9 @@ server+everything model.
   guarantee is only **"effect-once, result-maybe-lost,"** which the ADR would then have to state. We do
   **not** promise exactly-once (a crash between claim commit and RPC send is unavoidable; durable
   receiver dedup **plus outcome-replay** is what closes it).
+  *Update (2026-10-30, ADR-0074 conflict 8): under the decided asynchronous default a failover can lose a
+  claim, and a reclaimed step is sent under a new command id that WS-0 dedup does not absorb; this holds
+  across a failover only once ADR-0074 D13's execute-once-claims requirement is met.*
 - **Events/SSE: at-least-once with gap detection.** Durable monotonic event IDs; consumers replay
   from a cursor / `Last-Event-ID`; NOTIFY is a latency hint only. A consumer may see a duplicate
   event and must tolerate it.
