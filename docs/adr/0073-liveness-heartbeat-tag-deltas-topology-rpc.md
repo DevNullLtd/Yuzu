@@ -1145,7 +1145,14 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     wave into unbounded thread growth, starve command and containment forwarding on the same path,
     and make the issuer's bounded shutdown false. The issuer forwards gateway resyncs itself:
     - per pass, one `SendCommand` per gateway cluster per action, carrying that pass's agents in
-      `SendCommandRequest`'s repeated `agent_ids` under one fresh command id. An empty `agent_ids`
+      `SendCommandRequest`'s repeated `agent_ids`. The message carries exactly one `command`
+      (one `CommandRequest`, `management.proto`), so the granularity is one command per forward:
+      the issuer builds it once per (cluster, action) forward with `build_classified_command`, as
+      `push_sync_now`'s fan-out does, and one fresh command id, one kill-switch read and one
+      `record_command_dispatch` record cover every agent in the forward. A direct-connected agent's
+      issuance builds its own command, with its own id and record. Today's
+      `forward_gateway_pending` sends one agent per `SendCommand`, so the multi-agent shape is new
+      here. An empty `agent_ids`
       means broadcast to every online agent (`management.proto`), so the issuer never sends a
       forward with an empty list: a cluster with no agents left after filtering is skipped for the
       pass, enforced by a unit test on the pure batching function. A forward carries at most 2,000
@@ -1198,7 +1205,8 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
   - **A per-replica issuer drains the set** on its own thread, at the configured rate and per-agent
     interval. It is not leader-gated: the replica that lacks the state is the one that must ask.
     Each drain pass is one loop with one `DispatchRecordLatch` (`dispatch_record_policy.hpp`), so
-    each record write uses the 250 ms fan-out lease budget. `build_classified_command` also reads
+    each record write (one per direct agent, one per gateway forward) uses the 250 ms fan-out lease
+    budget. `build_classified_command` also reads
     the kill-switch decision from `PluginConfigStore` on every call (a lease and a select, failing
     closed, never memoized: the emergency-stop contract), and the issuer does not change that, so
     each issuance costs that read as well as its record write. `kill_switch_decision` cannot tell
@@ -1258,18 +1266,22 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     `tests/test_forensics_tier_wiring_lexical.py` pins is unchanged. The acknowledgement that matters is the `full = true`
     heartbeat or the topology report, not the reply.
   - Under ADR-0074 D5 every command is server-signed and every result agent-signed; `__resync__` is
-    a command like any other and takes no exemption.
+    a command like any other and takes no exemption. D5 binds each command signature to its agent
+    id, so one signed `CommandRequest` cannot serve a multi-agent forward once D5 wave 2 lands: the
+    gateway forward must change shape before then, and this ADR does not choose how (open
+    point 20). Either change is additive (no proto subtraction).
 - **Rate limits** (per replica, applied by the issuer). A mark over the rate stays in the set for a
   later pass and is counted `deferred`; nothing is dropped permanently, because divergence persists
   until fixed.
   - **Figures are per replica.** Issuing takes N / r seconds, where N is the number of agents
     whose heartbeats reach that replica and r is min(configured rate, 1 / (kill-switch read +
-    record-write latency)): the issuer is one thread, and each issuance makes two synchronous
-    Postgres operations in `build_classified_command` (the kill-switch read, then the
+    record-write latency)) for direct agents: the issuer is one thread, and each issuance makes two
+    synchronous Postgres operations in `build_classified_command` (the kill-switch read, then the
     `record_command_dispatch` insert, each a lease and one statement). At 0.5-2 ms per operation
     that is about 250-1,000 issuances per second, below the 2,200/s the two defaults add up to at
     any latency in that range, so issuing tags for N = 100,000 takes about 100-400 s, not 50 s.
-    For gateway agents a second bound applies: one forward in flight per (cluster, action) that
+    For gateway agents those two operations are paid once per forward, not per agent, and the
+    bound that applies is the forward's: one forward in flight per (cluster, action) that
     lasts until its slowest target answers or its 10 s timeout, so one cluster issues at most
     2,000 agents per forward duration, about 200 agents/s when any target is silent (about 500 s
     for a single-cluster fleet of 100,000). The figures below are upper-rate figures that assume
@@ -2702,7 +2714,8 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
      OF THE BYPASS entries; the issuer's own gateway forwarder (the `send_system_reserved`
      variant that never uses `gw_pending_`, the pure batching function with its never-empty
      `agent_ids` and 2,000-id rules, at most 8 forwards in flight and one per (cluster, action),
-     `timeout_seconds` 10, `TryCancel` at stop) and its tests.
+     `timeout_seconds` 10, `TryCancel` at stop) and its tests. The multi-agent forward is a
+     prerequisite to reshape before ADR-0074 D5 wave 2 (open point 20).
 
    Covers both `tags` and `topology`; the `topology` action is inert until slice 8.
 7. **Gateway opacity.** Keep-newest whole-heartbeat coalescing; the per-tag checks and the
@@ -2808,3 +2821,11 @@ make a new choice.
     staged over more than a day is expected to trigger, so it fires on a planned state. The
     alternatives are to gate it on an `absent` rate that is not falling, to make its window a
     rollout-policy setting, or to keep it as an explicit reminder ticket. The owner decides.
+20. **The gateway resync forward under ADR-0074 D5 wave 2** (D8). The issuer sends one
+    `SendCommand` per (cluster, action) with up to 2,000 `agent_ids` and one command, which is the
+    only shape `SendCommandRequest` allows today and what keeps a cluster at about 200 agents/s
+    with a silent target. D5 binds each command signature to one agent id, so this cannot stay
+    once wave 2 lands. The alternatives are an additive per-agent `CommandRequest` field on
+    `SendCommandRequest` (a proto addition), or one forward per agent from the bounded forwarder
+    set (which, at 8 in flight and a 10 s deadline, drops a silent-target cluster's rate to well
+    under one agent per second). The owner decides, before wave 2.
