@@ -543,7 +543,13 @@ outside this rule; this ADR adds none of it.
   - the non-transient rejection.
 - **What the gateway stops doing.** It no longer decodes, counts, size-checks or UTF-8-repairs
   individual tags (`yuzu_gw_heartbeat_buffer.erl`, about l.460-583); that moves to the server (D3,
-  step 2). The `heartbeat_invalid` and tag-strip paths are removed. The gateway does **less** per
+  step 2). The tag-strip path is removed. The `heartbeat_invalid` drop reason **stays**, for the
+  drops that remain: a heartbeat whose session id cannot be keyed (admission already rejects such a
+  session), and one the encoder raises on when a chunk is sent (`yuzu_gw_heartbeat_buffer.erl`,
+  `screen/1` at about l.460-489 and the flush's encoder-raise split at about l.782-789). Both
+  `status_tags_pb` and `TopologyDigest.digest` are `bytes`, so no field this ADR adds can make the
+  encoder raise; a typed `string` digest would have, silently dropping every heartbeat of a session
+  that sent a bad one. The gateway does **less** per
   heartbeat than today.
 
 **Pre-existing gateway state.**
@@ -566,7 +572,7 @@ gateway memory only for that decode and forward.
 
 ```proto
 message TopologyDigest {
-  string digest = 1;                          // "v1:" + 32 lowercase hex; empty until the first good run
+  bytes digest = 1;                           // ASCII "v1:" + 32 lowercase hex; empty until the first good run
   yuzu.common.v1.Timestamp last_pump_at = 2;  // agent clock, last successful run; compared for CHANGE only
   TopologyPumpOutcome last_outcome = 3;       // OK | TRUNCATED | FAILED | DISABLED
 }
@@ -935,8 +941,8 @@ The owner ruled 2026-10-26: no live customers; aggressive changes for the better
   - newest-snapshot coalescing (header l.13-24, `coalesce/2` at about l.588), snapshot-first
     eviction and send-without-snapshot;
   - per-tag counting, size checks and UTF-8 repair (about l.460-583; moved to the server, D3);
-  - the `snapshot_oversize`, `snapshot_evicted` and `heartbeat_invalid` drop reasons (`drop_reason()`
-    at l.169-170).
+  - the `snapshot_oversize` and `snapshot_evicted` drop reasons (`drop_reason()` at l.169-170).
+    `heartbeat_invalid` stays, for the unkeyable-session and encoder-raise drops (D4).
 
   Keep-newest coalescing, chunking, the byte cap and the session cap stay, applied to opaque
   heartbeats.
@@ -1002,8 +1008,10 @@ Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
 - `yuzu_gw_heartbeat_coalesced_total` (unchanged; it counts keep-newest replacements, which now
   predict server-side `diverged` verdicts);
 - `rpc="ProxyTopology"` on the peer-guard metrics;
-- `snapshot_oversize`, `snapshot_evicted` and `heartbeat_invalid` are retired from
+- `snapshot_oversize` and `snapshot_evicted` are retired from
   `yuzu_gw_heartbeat_buffer_dropped_total{reason}`, and their documentation is removed.
+  `heartbeat_invalid` stays and now counts only unkeyable-session and encoder-raise drops; its
+  documentation is updated to say so.
 
 **Alerts** (`docs/prometheus/yuzu-alerts.yml`, ticket severity, never paging):
 - `YuzuHeartbeatTagDivergenceSustained`: the `diverged` share stays above 1 % of heartbeats for
@@ -1629,6 +1637,8 @@ of every ~30 s. The content is unchanged.
 **Gateway eunit:**
 - a heartbeat's `status_tags_pb` and `topology` pass through byte-identical;
 - keep-newest replaces the whole entry;
+- `heartbeat_invalid` still counts an unkeyable session id and an encoder-raise drop, and a
+  heartbeat with an arbitrary-byte `TopologyDigest.digest` encodes;
 - no gateway code path reads either field (a lexical test, like the existing peer-guard
   registration gate);
 - no RegisterRequest is retained (registry row, owner-sessions row, owner state, and the
@@ -1786,8 +1796,9 @@ release and merge to `dev` inside one release window. ADR-0074 gates its own wav
      minting, the exec-tracker skip, the catalogue pairs, and the operator-surface refusal.
 
    Covers both `tags` and `topology`; the `topology` action is inert until slice 8.
-7. **Gateway opacity.** Keep-newest whole-heartbeat coalescing; the per-tag checks and
-   `heartbeat_invalid` removed; pass-through and lexical eunit.
+7. **Gateway opacity.** Keep-newest whole-heartbeat coalescing; the per-tag checks and the
+   tag-strip path removed (`heartbeat_invalid` stays for the remaining drops); pass-through and
+   lexical eunit.
 7b. **Reattach, both ends.**
     - Server: `ProxyReattach` with the shared adopt function, its rate limit, and the peer-guard
       override.
