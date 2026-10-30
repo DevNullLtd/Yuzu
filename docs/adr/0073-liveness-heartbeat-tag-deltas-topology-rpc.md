@@ -1227,10 +1227,17 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
   later pass and is counted `deferred`; nothing is dropped permanently, because divergence persists
   until fixed.
   - **Figures are per replica.** Issuing takes N / r seconds, where N is the number of agents
-    whose heartbeats reach that replica and r is min(configured rate, 1 / record-write latency): the
-    issuer is one thread, and each issuance makes one synchronous `record_command_dispatch` write
-    (a lease and one autocommit insert), so at 0.5-2 ms per write it may not reach the 2,200/s the
-    two defaults add up to. The figures below assume the configured rate is reached; slice 10
+    whose heartbeats reach that replica and r is min(configured rate, 1 / (kill-switch read +
+    record-write latency)): the issuer is one thread, and each issuance makes two synchronous
+    Postgres operations in `build_classified_command` (the kill-switch read, then the
+    `record_command_dispatch` insert, each a lease and one statement). At 0.5-2 ms per operation
+    that is about 250-1,000 issuances per second, below the 2,200/s the two defaults add up to at
+    any latency in that range, so issuing tags for N = 100,000 takes about 100-400 s, not 50 s.
+    For gateway agents a second bound applies: one forward in flight per (cluster, action) that
+    lasts until its slowest target answers or its 10 s timeout, so one cluster issues at most
+    2,000 agents per forward duration, about 200 agents/s when any target is silent (about 500 s
+    for a single-cluster fleet of 100,000). The figures below are upper-rate figures that assume
+    the configured rate is reached; slice 10
     measures the issuer's real throughput, and if it falls short the convergence times grow in
     proportion. Every figure here is for N = 100,000 on one replica. Both defaults are unmeasured
     (see the combined Postgres rate above).
