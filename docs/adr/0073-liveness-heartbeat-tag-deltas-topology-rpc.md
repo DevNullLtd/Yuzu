@@ -1004,7 +1004,8 @@ relayed by the gateway like any command (no new gateway state).
   - **Combined Postgres rate after a server restart.** A reattach costs about four Postgres
     operations (enrollment read, route CAS, record read; D14; and the `announce_connected` route
     write of the CONNECTED re-announce that follows it) at up to `--reattach-rate`, and each
-    issued resync one record write at up to `--tag-resync-rate` plus `--topology-resync-rate`. At
+    issued resync one record write at up to `--tag-resync-rate` plus `--topology-resync-rate`
+    (plus one kill-switch read per issuer pass). At
     the defaults, overlapping, that is up to about 10,200 operations per second per replica against
     the default `--postgres-pool-size` of 16. Agents that re-register instead (`NO_RECORD`) add one
     registration-record transaction each (D14). It is unmeasured. It is to be measured against the
@@ -1105,9 +1106,13 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
   - **A per-replica issuer drains the set** on its own thread, at the configured rate and per-agent
     interval. It is not leader-gated: the replica that lacks the state is the one that must ask.
     Each drain pass is one loop with one `DispatchRecordLatch` (`dispatch_record_policy.hpp`), so
-    each record write uses the 250 ms fan-out lease budget. At the first failed write the issuer
-    ends the pass, rather than sending the rest with skipped records, and leaves the remaining
-    marks in the set, counted `deferred`. A Postgres outage therefore delays resyncs and never
+    each record write uses the 250 ms fan-out lease budget. `build_classified_command` also reads
+    the kill-switch decision from `PluginConfigStore` on every call (a lease and a select, failing
+    closed), so the issuer reads the `__resync__` decision once per pass instead: still
+    fail-closed, and one read per pass rather than one per issuance. At the first refusal from the
+    dispatch path (that read failing, or a record write failing) the issuer ends the pass, rather
+    than sending the rest with skipped records, and leaves the remaining marks in the set,
+    counted `deferred`; only a refusal by a kill switch that is actually set is `send_failed`. A Postgres outage therefore delays resyncs and never
     blocks heartbeat ingestion.
   - **The issuer's lifecycle.** The issuer is a `ServerImpl`-owned thread with a stop flag. Its
     rate and between-pass waits are condition-variable waits the stop flag wakes, so it never
