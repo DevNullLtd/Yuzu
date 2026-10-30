@@ -41,6 +41,7 @@
 #include "content_etag.hpp"
 #include "crypto_library_model.hpp"
 #include "device_token_store.hpp"
+#include "dex_read_model.hpp" // the scope tokens and the basis/coverage the builder can emit
 #include "license_store.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
@@ -621,6 +622,91 @@ TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query
             const std::string enabled_desc = enabled.value("description", "");
             CHECK(enabled_desc.find("no dispatch effect") != std::string::npos);
         }
+    }
+}
+
+TEST_CASE("openapi_spec_json(): /dex/apps documents the platform scope parameter and coverage",
+          "[openapi][dex]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/dex/apps"));
+    const auto& op = spec["paths"]["/dex/apps"]["get"];
+
+    REQUIRE(op.contains("parameters")); // const operator[] on a missing key asserts
+    const json* platform = nullptr;
+    for (const auto& p : op["parameters"])
+        if (p.value("name", "") == "platform")
+            platform = &p;
+    REQUIRE(platform != nullptr);
+    CHECK((*platform)["in"] == "query");
+    CHECK((*platform)["required"] == false);
+    CHECK((*platform)["schema"]["enum"] == json::array({"all", "windows", "macos", "linux"}));
+    CHECK((*platform)["schema"]["default"] == "all");
+
+    CHECK(op["responses"]["200"].value("description", "").find("crash_source_coverage") !=
+          std::string::npos);
+    CHECK(op["responses"]["400"].value("description", "").find("invalid platform") !=
+          std::string::npos);
+}
+
+TEST_CASE("openapi_spec_json(): DexAppsList covers every population basis and the coverage the "
+          "/dex/apps builder can emit",
+          "[openapi][dex]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["components"]["schemas"].contains("DexAppsList"));
+    const auto& list = spec["components"]["schemas"]["DexAppsList"];
+    // A lookup by JSON pointer that yields null for a missing node: a regression that deletes part
+    // of the schema fails an assertion here instead of aborting the whole test binary.
+    const auto at = [&list](const std::string& ptr) {
+        return list.value(json::json_pointer(ptr), json());
+    };
+    const auto contains = [](const json& array, const json& v) {
+        return std::find(array.begin(), array.end(), v) != array.end();
+    };
+
+    // The published population vocabulary is exactly the four values, and every `<scope>_online`
+    // the builder can publish is inside it.
+    const json basis_enum = at("/properties/population_basis/enum");
+    CHECK(basis_enum ==
+          json::array({"all_online", "windows_online", "macos_online", "linux_online"}));
+    for (const char* scope : {yuzu::server::kDexAppsScopeAll, yuzu::server::kDexAppsScopeWindows,
+                              yuzu::server::kDexAppsScopeMacos, yuzu::server::kDexAppsScopeLinux})
+        CHECK(contains(basis_enum, json(yuzu::server::dex_apps_population_basis(scope))));
+
+    // crash_source_coverage is always emitted, so it is a declared and required property, and its
+    // schema is a closed object: the three platform keys, each exactly complete|partial.
+    CHECK(contains(at("/required"), json("crash_source_coverage")));
+    const std::string cov = "/properties/crash_source_coverage";
+    const json coverage = at(cov);
+    REQUIRE(coverage.is_object());
+    CHECK(coverage.value("type", "") == "object");
+    CHECK(coverage.value("additionalProperties", true) == false); // absent must fail, not assert
+    CHECK(at(cov + "/properties").size() == 3);
+    for (const char* os : {"windows", "macos", "linux"})
+        CHECK(at(cov + "/properties/" + os + "/enum") == json::array({"complete", "partial"}));
+    // ... and it covers what the builder can publish under `all`.
+    for (const auto& [os, value] :
+         yuzu::server::dex_apps_crash_source_coverage(yuzu::server::kDexAppsScopeAll))
+        CHECK(contains(at(cov + "/properties/" + os + "/enum"), json(value)));
+
+    // The figures are no longer called Windows-only: each description the scope changed names the
+    // platform scope and none says Windows (the default scope is every platform).
+    const auto scoped = [&at](const std::string& node) {
+        const json d = at(node + "/description");
+        if (!d.is_string())
+            return false;
+        const auto text = d.get<std::string>();
+        return text.find("scope") != std::string::npos && text.find("Windows") == std::string::npos;
+    };
+    CHECK(scoped(""));
+    CHECK(scoped("/properties/population"));
+    CHECK(scoped("/properties/apps_total"));
+    CHECK(scoped("/properties/population_basis"));
+    const std::string app = "/properties/apps/items/properties/";
+    for (const char* key : {"crashes", "hangs", "distinct_devices"}) {
+        CHECK(scoped(app + key));
+        CHECK(scoped(app + "versions/items/properties/" + key));
     }
 }
 

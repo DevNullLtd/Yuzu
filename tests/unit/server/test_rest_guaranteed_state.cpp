@@ -2981,7 +2981,7 @@ TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
 
     // Additive per-application and per-version figures.
     CHECK(j["data"]["population"].is_number_integer());
-    CHECK(j["data"]["population_basis"] == "windows_online");
+    CHECK(j["data"]["population_basis"] == "all_online"); // the default scope
     CHECK(j["data"]["apps_total"] == 2);
     CHECK(j["data"]["apps_truncated"] == false);
     CHECK_FALSE(j["data"].contains("stat_failures"));
@@ -2991,6 +2991,9 @@ TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
         CHECK(first.contains(k));
     CHECK(first["profile"] == "default");
     CHECK(first["versions"].is_array());
+    CHECK(j["data"]["crash_source_coverage"].size() == 3);
+    for (const char* k : {"windows", "linux", "macos"})
+        CHECK(j["data"]["crash_source_coverage"].contains(k));
     CHECK(res->body.find("below_floor") == std::string::npos);
 
     // The policy every figure was scored under is named on the payload.
@@ -3013,7 +3016,7 @@ TEST_CASE("REST dex/apps: an intact empty store is a 200 with an empty list, not
     auto j = nlohmann::json::parse(res->body);
     REQUIRE(j["data"]["apps"].is_array());
     CHECK(j["data"]["apps"].empty());
-    CHECK(j["data"]["population_basis"] == "windows_online");
+    CHECK(j["data"]["population_basis"] == "all_online"); // the default scope
     CHECK(res->body.find("retry_after_ms") == std::string::npos);
 }
 
@@ -3078,6 +3081,73 @@ TEST_CASE("REST dex/apps: an off-enum window is a 400, never a silent default",
     auto res = h.sink.Get("/api/v1/dex/apps?window=bogus");
     REQUIRE(res);
     CHECK(res->status == 400);
+}
+
+TEST_CASE("REST dex/apps: an unknown platform is a 400 with no retry hint",
+          "[pg][rest][dex][apps]") {
+    RestGsHarness h;
+    // The token match is exact: an unshipped spelling, empty and any non-lowercase form all refuse.
+    for (const char* bad : {"darwin", "", "Windows", "ALL"}) {
+        CAPTURE(bad);
+        auto res = h.sink.Get(std::string{"/api/v1/dex/apps?platform="} + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["error"]["message"] == "invalid platform (expected all|windows|macos|linux)");
+        CHECK(j["error"]["retry_after_ms"].is_null());
+        CHECK(res->get_header_value("Retry-After").empty());
+    }
+}
+
+TEST_CASE("REST dex/apps: the platform scope selects the population and the coverage",
+          "[pg][rest][dex][apps]") {
+    RestGsHarness h;
+    h.dex_fleet_override_.connected_agents = {{"w1", "windows"}, {"w2", "windows"}, {"l1", "linux"},
+                                              {"m1", "macos"}};
+    h.dex_fleet_override_.total_online = 4;
+    // The same subject on two operating systems: one merged row under `all`, one row per scope otherwise.
+    h.seed_obs("b1", "w1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("b2", "l1", "process.crashed", "chrome.exe", "linux", "2026-06-10T10:00:00Z");
+    const auto get = [&](const char* q) {
+        auto res = h.sink.Get(q);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body)["data"];
+    };
+    const auto none = get("/api/v1/dex/apps?window=all");
+    CHECK(none["population_basis"] == "all_online");
+    CHECK(none["population"] == 4);
+    REQUIRE(none["apps"].size() == 1);
+    CHECK(none["apps"][0]["subject"] == "chrome.exe");
+    CHECK(none["apps"][0]["crashes"] == 2);
+    CHECK(none["apps"][0]["distinct_devices"] == 2);
+    // The per-version rows merge across operating systems the same way (one unversioned bucket).
+    REQUIRE(none["apps"][0]["versions"].size() == 1);
+    CHECK(none["apps"][0]["versions"][0]["version"] == "");
+    CHECK(none["apps"][0]["versions"][0]["crashes"] == 2);
+    CHECK(none["apps"][0]["versions"][0]["distinct_devices"] == 2);
+    const auto win = get("/api/v1/dex/apps?window=all&platform=windows");
+    CHECK(win["population_basis"] == "windows_online");
+    CHECK(win["population"] == 2);
+    REQUIRE(win["apps"].size() == 1);
+    CHECK(win["apps"][0]["crashes"] == 1);
+    CHECK(win["apps"][0]["distinct_devices"] == 1);
+    CHECK(win["crash_source_coverage"] == nlohmann::json{{"windows", "complete"}});
+    const auto lin = get("/api/v1/dex/apps?window=all&platform=linux");
+    CHECK(lin["population_basis"] == "linux_online");
+    CHECK(lin["population"] == 1);
+    REQUIRE(lin["apps"].size() == 1);
+    CHECK(lin["apps"][0]["crashes"] == 1);
+    CHECK(lin["apps"][0]["distinct_devices"] == 1);
+    CHECK(lin["crash_source_coverage"] == nlohmann::json{{"linux", "partial"}});
+    // The two published values the cases above do not send: an explicit `all` is the default, and
+    // `macos` selects the macOS population (one online device, no observation seeded for it).
+    CHECK(get("/api/v1/dex/apps?window=all&platform=all") == none);
+    const auto mac = get("/api/v1/dex/apps?window=all&platform=macos");
+    CHECK(mac["population_basis"] == "macos_online");
+    CHECK(mac["population"] == 1);
+    CHECK(mac["apps"].empty());
+    CHECK(mac["crash_source_coverage"] == nlohmann::json{{"macos", "partial"}});
 }
 
 TEST_CASE("REST dex/catalogue/group: family drill, unknown family -> 404, no audit",

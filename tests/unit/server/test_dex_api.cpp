@@ -27,6 +27,7 @@
 #include "runtime_config_store.hpp"    // the real policy store behind the production reader
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <libpq-fe.h>
 #include <yuzu/metrics.hpp>
@@ -134,6 +135,31 @@ TEST_CASE("DexApi: null store is the honest degrade, never a throw", "[pg][dex_a
     CHECK(api->device_score("a1", "7d").score == -1);
     CHECK(api->apps("7d").apps.empty());
     CHECK(api->apps("7d").degraded); // a null store is a degrade, never an empty healthy list
+}
+
+// An unknown platform scope is refused before any store, policy or fleet work, so no
+// Postgres is needed. The refusal warning is constant text (no token echo) and throttled:
+// the immediate repeat is demoted (RefusalLogThrottle's interval is 60 s).
+TEST_CASE("DexApi: apps with an unknown platform scope degrades invalid_scope and warns once",
+          "[dex][dex_api]") {
+    auto api = make_local_dex_api(/*store=*/nullptr, /*fleet_fn=*/{});
+    std::string log;
+    {
+        yuzu::test::LogCapture cap;
+        for (int i = 0; i < 2; ++i) {
+            const auto m = api->apps("7d", "darwin");
+            CHECK(m.degraded);
+            CHECK(m.degraded_reason == "invalid_scope");
+        }
+        cap.stop();
+        log = cap.text();
+    }
+    const std::string line = "DexApi::apps: platform scope refused (invalid_scope)";
+    std::size_t n = 0;
+    for (auto p = log.find(line); p != std::string::npos; p = log.find(line, p + 1))
+        ++n;
+    CHECK(n == 1);
+    CHECK(log.find("darwin") == std::string::npos);
 }
 
 // An unavailable policy answers before the fleet snapshot is taken (no wasted work). No
@@ -804,6 +830,39 @@ TEST_CASE("DexApi: apps windows scope is byte-identical to the one-argument read
           "windows_online");
     CHECK(nlohmann::json::parse(yuzu::server::dex_apps_json(api->apps("7d", "all")))["population_basis"] ==
           "all_online");
+    // The additive key: the windows read (both spellings) carries one key, all carries three.
+    const auto wj = nlohmann::json::parse(yuzu::server::dex_apps_json(windows));
+    CHECK(wj["crash_source_coverage"] == nlohmann::json{{"windows", "complete"}});
+    CHECK(nlohmann::json::parse(yuzu::server::dex_apps_json(implicit))["crash_source_coverage"] ==
+          wj["crash_source_coverage"]);
+    CHECK(nlohmann::json::parse(yuzu::server::dex_apps_json(api->apps("7d", "all")))["crash_source_coverage"] ==
+          nlohmann::json{{"windows", "complete"}, {"linux", "partial"}, {"macos", "partial"}});
+}
+
+// A Linux or macOS scope with signals but no connected device in it: the subject is
+// listed, nothing is shared or scored against a zero population.
+TEST_CASE("DexApi: apps on an empty Linux fleet and an empty macOS fleet", "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    seed_obs_v(store, "lxe1", "l9", "linux-only.bin", "process.crashed", "1.0", kTs, "linux");
+    seed_obs_v(store, "mce1", "m9", "macos-only.app", "process.crashed", "1.0", kTs, "macos");
+    auto api = make_local_dex_api(&store, fleet20); // Windows devices only
+    for (const auto& [scope, subject] :
+         {std::pair<const char*, const char*>{"linux", "linux-only.bin"}, {"macos", "macos-only.app"}}) {
+        const auto m = api->apps("7d", scope);
+        REQUIRE_FALSE(m.degraded);
+        CHECK(m.population == 0);
+        REQUIRE(m.apps.size() == 1);
+        CHECK(m.apps[0].subject == subject);
+        CHECK(m.apps[0].figures.distinct_devices_online == 0);
+        CHECK_FALSE(m.apps[0].figures.share_affected);
+        CHECK_FALSE(m.apps[0].figures.rate_per_1000);
+        CHECK(std::string(m.apps[0].figures.score.withheld) == "no_population");
+    }
+    CHECK(api->apps("7d", "windows").population == 20);
 }
 
 TEST_CASE("DexApi: apps with an invalid scope is degraded before policy or fleet",
@@ -915,7 +974,7 @@ TEST_CASE("DexApi: apps top-N membership is devices affected, not raw events",
     }
     CHECK(totals == 2);
     CHECK(widespread);
-    const auto m = yuzu::server::dex_apps_model_from_rows("7d", *rows, 20,
+    const auto m = yuzu::server::dex_apps_model_from_rows("7d", yuzu::server::kDexAppsScopeWindows, *rows, 20,
                                                           yuzu::server::DexPolicyInForce{});
     CHECK(m.apps_total == 4);
     CHECK(m.apps_truncated);
@@ -1034,7 +1093,7 @@ TEST_CASE("DexApi: apps store cuts rank by devices, then events, then byte-order
         for (int limit : {3, 2}) {
             const auto rows = store.dex_app_stability_checked(since, "windows", limit, 20, 5, {});
             REQUIRE(rows);
-            const auto m = yuzu::server::dex_apps_model_from_rows("7d", *rows, 20, policy);
+            const auto m = yuzu::server::dex_apps_model_from_rows("7d", yuzu::server::kDexAppsScopeWindows, *rows, 20, policy);
             CHECK(m.apps_total == 3);
             CHECK(m.apps_truncated == (limit == 2));
         }

@@ -35,6 +35,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -172,6 +173,17 @@ std::vector<std::string> dex_apps_online_ids(const DexFleet& fleet, std::string_
 /// The published `population_basis`: `<scope>_online` ("windows_online" for windows).
 std::string dex_apps_population_basis(std::string_view scope);
 
+/// The published `crash_source_coverage`: how complete the crash/hang sources are per
+/// platform in `scope` (a normalized token). windows = "complete"; linux and macos =
+/// "partial" (an empty list there is not proof of stability). `all` carries all three
+/// keys, a single scope its one key; the vector order is this helper's, and the JSON
+/// object is keyed by platform with no ordering promise.
+/// A fixed table of the shipped design, NOT live collector health: it mirrors the crash
+/// sources in docs/user-manual/dex-signal-catalog.md (Windows WER/event log; Linux
+/// `process.crashed` needs systemd-coredump as the active handler; macOS fidelity notes)
+/// and does not change when a collector is disabled or absent on a host.
+std::vector<std::pair<std::string, std::string>> dex_apps_crash_source_coverage(std::string_view scope);
+
 /// The score policy an Apps read scored under, and where it came from.
 /// `source` is "default" (nothing stored, or the stored document was refused and
 /// the shipped defaults are in force) or "custom". `revision` identifies the
@@ -221,7 +233,7 @@ struct DexAppsModel {
 /// kDexCohortFloor (one device, maintainer ruling 2026-10-14): every figure is
 /// published at any device count; an unknown or zero population withholds
 /// `no_population`.
-DexAppsModel dex_apps_model_from_rows(const std::string& window,
+DexAppsModel dex_apps_model_from_rows(const std::string& window, const std::string& platform_scope,
                                       const std::vector<DexAppStabilityRow>& rows,
                                       std::optional<int64_t> population,
                                       const DexPolicyInForce& policy);

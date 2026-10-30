@@ -10654,7 +10654,8 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
         const auto& out = t["outputSchema"];
         CHECK(out["required"] ==
               nlohmann::json::array({"window", "apps", "policy", "population", "population_basis",
-                                     "apps_total", "apps_truncated"}));
+                                     "crash_source_coverage", "apps_total", "apps_truncated"}));
+        CHECK(out["properties"].contains("crash_source_coverage"));
         const auto& policy = out["properties"]["policy"];
         CHECK(policy["required"] == nlohmann::json::array({"source", "revision", "fault", "tiers"}));
         CHECK(policy["properties"]["source"]["enum"] == nlohmann::json::array({"default", "custom"}));

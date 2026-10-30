@@ -12,7 +12,9 @@
 #include <cassert>
 #include <cctype>
 #include <cstdint>
+#include <initializer_list>
 #include <map>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -266,12 +268,13 @@ json policy_json(const DexPolicyInForce& p) {
 
 } // namespace
 
-DexAppsModel dex_apps_model_from_rows(const std::string& window,
+DexAppsModel dex_apps_model_from_rows(const std::string& window, const std::string& platform_scope,
                                       const std::vector<DexAppStabilityRow>& rows,
                                       std::optional<int64_t> population,
                                       const DexPolicyInForce& policy) {
     DexAppsModel m;
     m.window = window;
+    m.platform_scope = platform_scope;
     m.population = population;
     m.policy = policy;
     std::map<std::string, std::size_t> index; // subject -> position in m.apps
@@ -329,6 +332,9 @@ std::string dex_normalize_apps_scope(std::string_view scope) {
 
 std::vector<std::string> dex_apps_online_ids(const DexFleet& fleet, std::string_view scope) {
     std::vector<std::string> ids;
+    // Exact for `all`; a scoped read is a fraction of the fleet, so it grows to its own size.
+    if (scope == kDexAppsScopeAll)
+        ids.reserve(fleet.connected_agents.size());
     for (const auto& [id, os] : fleet.connected_agents)
         if (scope == kDexAppsScopeAll || os == scope)
             ids.push_back(id);
@@ -339,6 +345,16 @@ std::string dex_apps_population_basis(std::string_view scope) {
     return std::string{scope} + "_online";
 }
 
+std::vector<std::pair<std::string, std::string>> dex_apps_crash_source_coverage(std::string_view scope) {
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const auto& [os, coverage] : {std::pair{kDexAppsScopeWindows, "complete"},
+                                       std::pair{kDexAppsScopeLinux, "partial"},
+                                       std::pair{kDexAppsScopeMacos, "partial"}})
+        if (scope == kDexAppsScopeAll || scope == os)
+            out.emplace_back(os, coverage);
+    return out;
+}
+
 DexAppsModel build_dex_apps_model(GuaranteedStateStore* store, const std::string& window,
                                   const std::string& since, const std::string& platform_scope,
                                   const std::optional<std::vector<std::string>>& online_ids,
@@ -346,6 +362,12 @@ DexAppsModel build_dex_apps_model(GuaranteedStateStore* store, const std::string
     DexAppsModel m;
     m.window = window;
     m.platform_scope = platform_scope;
+    // An unrecognised or empty scope is refused first: never a default platform.
+    if (dex_normalize_apps_scope(platform_scope).empty()) {
+        m.degraded = true;
+        m.degraded_reason = "invalid_scope";
+        return m;
+    }
     // A score under an invalid policy is never published: the resolver requires
     // a policy that passed dex_score_policy_fault. The provider already serves
     // the shipped defaults for a refused stored document, so this is the
@@ -377,12 +399,10 @@ DexAppsModel build_dex_apps_model(GuaranteedStateStore* store, const std::string
         m.degraded = true;
         return m;
     }
-    auto out = dex_apps_model_from_rows(
-        window, *rows,
+    return dex_apps_model_from_rows(
+        window, platform_scope, *rows,
         online_ids ? std::optional<int64_t>{static_cast<int64_t>(online_ids->size())} : std::nullopt,
         policy);
-    out.platform_scope = platform_scope;
-    return out;
 }
 
 std::string dex_apps_json(const DexAppsModel& model) {
@@ -409,6 +429,10 @@ std::string dex_apps_json(const DexAppsModel& model) {
     out["apps_truncated"] = model.apps_truncated;
     out["population"] = model.population ? json(*model.population) : json(nullptr);
     out["population_basis"] = dex_apps_population_basis(model.platform_scope);
+    json coverage = json::object();
+    for (const auto& [os, c] : dex_apps_crash_source_coverage(model.platform_scope))
+        coverage[os] = c;
+    out["crash_source_coverage"] = std::move(coverage);
     out["policy"] = policy_json(model.policy);
     return out.dump();
 }

@@ -72,8 +72,9 @@ DexAppModel build_dex_app_model(GuaranteedStateStore* store, const std::string& 
                                 const std::string& window, const std::string& since,
                                 const std::set<std::string>* visible);
 
-/// Degrade contract: `policy.policy` failing `dex_score_policy_fault` (checked
-/// FIRST, warn-logged; `degraded_reason` = "score_policy_invalid"), a null
+/// Degrade contract: a `platform_scope` that is not a normalized token is refused
+/// FIRST (`degraded_reason` = "invalid_scope"); `policy.policy` failing `dex_score_policy_fault` (checked
+/// next, warn-logged; `degraded_reason` = "score_policy_invalid"), a null
 /// `store`, or a failed read all return `degraded = true` with no apps, never a
 /// score under an invalid policy and never an empty list.
 /// `platform_scope` is all|windows|macos|linux (a normalized token). `online_ids` is
