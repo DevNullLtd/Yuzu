@@ -59,8 +59,9 @@
    gateway as `GatewayUpstream.ProxyTopology`. It is sent when the topology digest changes, when a
    jittered 15-minute floor expires, at agent start, or on server request (D5-D7).
 5. **The server derives topology liveness from the heartbeat's digest**, not from body arrival. The
-   90 s stale rule and the 300 s IP-claim reclaim keep their meaning, keyed on server receipt of a
-   *confirming heartbeat* (D6).
+   90 s stale rule keeps its meaning, keyed on server receipt of any heartbeat carrying the digest,
+   and the 300 s IP-claim reclaim keeps its meaning, keyed on a *confirming heartbeat*, one whose
+   digest equals the stored body's (D6).
 6. **One resync mechanism serves both: a system-only reserved Subscribe command, `__resync__`**
    (actions `tags` and `topology`). It is rate-limited at the server, and the gateway relays it like
    any other command (D8).
@@ -1138,7 +1139,8 @@ is the Spark-to-Reaction shape. The later conversion replaces only the schedule.
 
 ### D12. Server-pull when `/viz` is viewed: deferred
 
-On-change push keeps a changed host's body within about 82 s (72 s pump plus 10 s send delay), and an
+On-change push keeps a changed host's body within about 82 s at the default 60 s interval (72 s pump
+plus 10 s send delay; one jittered interval plus 10 s in general), and an
 unchanged host's body is current by definition. Pull-on-view would add little.
 
 It would also make a `Response:Read` page view dispatch work to agents, a read causing execution that
@@ -1687,7 +1689,7 @@ plus churn. Tags fall from about 4 KB to a few hundred bytes per beat.
 - the 90 s prune is unchanged.
 
 **`FleetTopologyStore`** (`server/core/src/fleet_topology_store.{hpp,cpp}`):
-- the D6 slot fields;
+- the D6 slot fields, every duration on `steady_clock` (D6);
 - `push_snapshot(raw, digest, reason)`;
 - `confirm()`;
 - `mark_disconnected` replaces `evict_pushed`;
