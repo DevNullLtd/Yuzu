@@ -1096,9 +1096,10 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     caller with D10; it stays as a zero series (removing it is a subtraction from a closed label
     set operators may query), and its SCOPE OF THE BYPASS entry is marked as having no caller
     since this ADR.
-  - `__resync__` is **not** in the protective set. A whole-action kill switch on it, or a degraded
-    enablement store, refuses it at `build_classified_command`; that is counted `send_failed`, and
-    divergence persists until the next permitted issuance. A per-OS kill switch is not applied:
+  - `__resync__` is **not** in the protective set. A whole-action kill switch on it refuses it;
+    that is counted `send_failed`, and divergence persists until the next permitted issuance. A
+    degraded enablement store fails the issuer's once-per-pass kill-switch read, which ends the
+    pass with the marks counted `deferred` (below), never `send_failed`. A per-OS kill switch is not applied:
     `send_system_reserved` ignores the per-OS withhold `build_classified_command` returns, as it
     does for `__sync__.now` and every other system-reserved push (only `dispatch_confined` applies
     per-OS withholds).
@@ -1390,8 +1391,8 @@ on the sustained condition and staying quiet on the expected one.
     default, well inside 30 min. A replica whose N / rate exceeds 30 min raises the window in the
     rule; the runbook says so;
   - `increase(yuzu_viz_topology_resync_total{outcome="send_failed"}[30m]) > 0` or the same on
-    `yuzu_server_tag_resync_total`: a kill switch on `__resync__` or a degraded enablement store
-    (D8), so divergence persists.
+    `yuzu_server_tag_resync_total`: a kill switch on `__resync__` (D8), so divergence persists. A
+    degraded enablement store shows as `deferred`, in the first branch.
   - Responder: check Postgres pool saturation (`YuzuPgPoolSaturated`, the issuer defers at its
     first failed record write), the `__resync__` kill switch, and the issuing rate against N.
   - Tests: quiet during an 8-minute post-restart drain; fires when the set stays non-empty for
@@ -1411,8 +1412,8 @@ on the sustained condition and staying quiet on the expected one.
 | `rejected` rises | an agent encoding or cap defect (D3, step 2) | `yuzu_agent_status_tags_dropped_total` on the agents |
 | `unverifiable` rises | agents with a digest version the server does not implement (D3) | server and agent versions |
 | `diverged` plus `no_base` near 100 % | per-RPC balancing in front of the server (*Server stores*) | the load balancer |
-| `yuzu_server_resync_pending` high and `deferred` rising, `send_failed` at 0 | server overload: the issuer is deferring on Postgres or on the rate | `YuzuPgPoolSaturated`, `--tag-resync-rate`, `--topology-resync-rate` |
-| `send_failed` rising | the `__resync__` kill switch, or a degraded enablement store | plugin configuration |
+| `yuzu_server_resync_pending` high and `deferred` rising, `send_failed` at 0 | server overload: the issuer is deferring on Postgres (a record write or the enablement read failing) or on the rate | `YuzuPgPoolSaturated`, `--tag-resync-rate`, `--topology-resync-rate` |
+| `send_failed` rising | the `__resync__` kill switch | plugin configuration |
 
 **Freshness SLIs.** Two ratios measure what this ADR changes, per replica:
 - tag sync: the share of heartbeats counted `synced` or `full` among all but `absent` and
