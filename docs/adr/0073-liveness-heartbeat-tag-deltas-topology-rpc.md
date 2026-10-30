@@ -828,7 +828,12 @@ When several conditions hold, the first in this order wins:
       overflow drops the oldest row, counts it (`result="dropped"`) and logs it at WARN;
     - on stop the issuer drains the queue before it exits, each write bounded by one lease
       budget, so a stop does not lose a row while the audit store is healthy; a row it cannot
-      write then is counted `dropped` and logged. The anti-spoof evidence chain therefore records a refused re-claim exactly as
+      write then is counted `dropped` and logged;
+    - an unclean exit (OOM, `SIGKILL`, a crash) loses every row still queued, at most
+      `kPushedMapHardCap`, and nothing counts them: the queue is in memory. A clean `stop()`
+      never does. This is the cost of keeping the write off the heartbeat path; the conflict
+      itself is still counted on `yuzu_viz_topology_reclaim_total{outcome="conflict"}`, which
+      survives in Prometheus, so a gap between conflicts and written rows is visible. The anti-spoof evidence chain therefore records a refused re-claim exactly as
     it records a refused push.
 
   A gateway restart thus costs zero bodies for agents back within five minutes. Eviction is lazy (in
@@ -1454,6 +1459,12 @@ on the sustained condition and staying quiet on the expected one.
   (breaking)*).
   Responder: list stragglers with MCP `list_agents` and upgrade them. Tests: quiet at 0; fires after
   24 h above 0.
+- `YuzuVizTopologyReclaimAuditDropped` (ticket):
+  `increase(yuzu_viz_topology_reclaim_audit_total{result="dropped"}[1h]) > 0`. Meaning: that many
+  refused re-claims have no `topology.push.rejected` evidence row (D6). Responder: check the audit
+  store and Postgres pool; the conflicts are still counted on `yuzu_viz_topology_reclaim_total`
+  for the same window, and the evidence gap is recorded in the incident. Tests: quiet at 0; fires
+  on one dropped row.
 - `YuzuAgentRegistrationStoreWriteFailing` (ticket):
   `increase(yuzu_server_agent_registration_store_failed_total{op="write"}[1h]) > 0`. Meaning: that
   many agents have no current registration record, so the next server restart answers their
@@ -2625,7 +2636,8 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
 10. **Surfaces and docs.**
     - MCP and REST `stale_reason` and descriptions.
     - The alert rules (`YuzuHeartbeatTagDivergenceSustained`, `YuzuVizTopologyResyncBacklog` and
-      `YuzuAgentsTagsAbsent`, `YuzuAgentRegistrationStoreWriteFailing`); this is the only slice
+      `YuzuAgentsTagsAbsent`, `YuzuAgentRegistrationStoreWriteFailing`,
+      `YuzuVizTopologyReclaimAuditDropped`); this is the only slice
       that adds them.
     - Every doc listed above, the upgrading.md section and the changelog fragment.
     - The harness and rig rerun recorded as the measured outcome, using ADR-0074 D14's method.
