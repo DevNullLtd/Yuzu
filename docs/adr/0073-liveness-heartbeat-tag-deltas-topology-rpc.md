@@ -1133,9 +1133,15 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     `background_jobs.hpp` row (WS-10; a diff against that array, never a silent addition),
     `BackgroundJobClass::ReplicaSafe`, never leader-gated (above), and a
     `YUZU_ASSERT_BACKGROUND_JOB` site.
-  - **No installed session yet.** A mark for an agent this replica has no installed session for
-    (after a restart, until its reattach lands, D14) stays in the set, counted `deferred`, and is
-    tried on a later pass. Only a send attempted on an installed session is ever `send_failed`.
+  - **Marks leave the set.** A mark is removed when its resync is sent, when its condition no
+    longer holds at issue time (the full set or the body has landed), when the agent's session on
+    this replica ends (`mark_disconnected` on `removed_current_session`, D6), and when the issuer
+    finds no installed session for the agent: a mark for an agent this replica has no installed
+    session for (after a restart, until its reattach lands, D14) is dropped, not deferred, because
+    the agent's heartbeats re-mark it on every beat once its session is installed. So the set is
+    bounded by the agents with an installed session here, and an agent that leaves never holds the
+    backlog alert's first branch true. `deferred` is kept for the rate, the per-agent interval and
+    Postgres refusals only. Only a send attempted on an installed session is ever `send_failed`.
   - **The reply is dropped at ingest.** Like a solicited `__guard__` reply on the direct Subscribe
     loop (`agent_service_impl.cpp`, about l.1561-1569), a `__resync__` reply is dropped on both
     ingest paths before the provenance lookup: no `ResponseStore` row and no
@@ -2237,6 +2243,8 @@ of every ~30 s. The content is unchanged.
   cases;
 - on both the direct and the gateway path, a superseded session's late close does not mark the
   current session's slot `disconnected` or release its IP claims;
+- the resync pending set: a departed agent's mark leaves the set and does not hold
+  `YuzuVizTopologyResyncBacklog`'s first branch true; a mark whose condition cleared is not sent;
 - `stale_reason` precedence: each pair of simultaneous conditions renders the earlier value; a live
   agent with a late report reads `body_pending`, not `agent_silent`; an offline host past 300 s
   reads `offline` and a `--no-topology` agent `not_reported`; a slotted agent with a pending
