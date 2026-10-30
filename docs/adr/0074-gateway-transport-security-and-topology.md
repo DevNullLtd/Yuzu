@@ -296,6 +296,7 @@ Each line is something the named wave must state, decide or test. None is decide
 - `forwarded_for` cannot work on a strict main port, and PROXY protocol must be parsed before the kTLS handshake.
 - The privacy classification of `agent_id`, as an input to the TLS version choice (D8).
 - The signed-result evidence window: the shorter of response retention and `ca_issued` retention.
+- How agents already running behind a gateway get the wave-2 agent binary, and who confirms the pilot check before wave 2 merges.
 
 **Wave 4**
 - Refusing to drain the last gateway.
