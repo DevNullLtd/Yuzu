@@ -9,7 +9,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Result-set membership matcher (scope walking — design §3.2 / §6).
 //
-// Async result-set producers (`from-tar-query`, `from-instruction-result`)
+// Async result-set producers (`from-echo-query`, `from-instruction-result`)
 // dispatch a command and land a `pending` row carrying an opaque `matcher`
 // JSON. Once the producing execution reaches a terminal state, the server's
 // maintenance thread walks every responder and asks this predicate whether
@@ -23,7 +23,7 @@
 //
 //   ""  /  {}                       → default: SUCCESS responders only
 //   {"kind":"any_response"}         → every SUCCESS responder (include_empty)
-//   {"kind":"tar_rows_ge","n":N}    → SUCCESS AND the tar result carried ≥ N rows
+//   {"kind":"echo_rows_ge","n":N}    → SUCCESS AND the echo result carried ≥ N rows
 //                                     (N: JSON integer ≥ 1, default 1; a malformed N, or N < 1,
 //                                     matches nobody)
 //   a present `kind` that is not a string matches nobody (admission refuses it)
@@ -63,7 +63,7 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
 
 /// Admission check for a caller-supplied matcher (#4644): nullopt when acceptable, else the 400
 /// message. A present `kind` must be a string; on a kind-less matcher a present `column`, `op`
-/// or `value` must be a string and a present `value_set` an array. Only `tar_rows_ge` has a numeric field: its `n`
+/// or `value` must be a string and a present `value_set` an array. Only `echo_rows_ge` has a numeric field: its `n`
 /// (absent = 1) must be one JSON integer in 1..2147483647. `response_matches` independently fails
 /// CLOSED on a malformed `n` or `kind` already stored (including n < 1), so a bad value can never
 /// throw out of the maintenance tick nor admit every responder. A matcher that is present but not
@@ -90,11 +90,11 @@ std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher
 void bind_declared_columns(nlohmann::json& matcher, const std::string& result_schema_json,
                            const std::string& plugin);
 
-/// Count the rows in a tar `tar.sql` response `output`. The tar plugin emits
+/// Count the rows in an echo `echo.sql` response `output`. The echo plugin emits
 /// a `__schema__|col|col` header line, one `|`-joined line per row, then a
-/// `__total__|N` trailer (see agents/plugins/tar do_sql). Returns N from the
+/// `__total__|N` trailer (see agents/plugins/echo do_sql). Returns N from the
 /// trailer when present; otherwise counts data lines. An `error|...` output
-/// (the tar failure shape) returns 0. Exposed for direct testing.
-int tar_row_count(std::string_view output);
+/// (the echo failure shape) returns 0. Exposed for direct testing.
+int echo_row_count(std::string_view output);
 
 } // namespace yuzu::server::rs_matcher

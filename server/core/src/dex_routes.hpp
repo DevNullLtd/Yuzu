@@ -189,13 +189,13 @@ std::string render_dex_observation_fragment(const GuardianObservationRow& obs);
 std::string render_dex_apps_fragment(const GuaranteedStateStore* store, const std::string& since,
                                      int window_days);
 
-// ── A4: device perf sparklines (federated TAR query) ────────────────────────
+// ── A4: device perf sparklines (federated Echo query) ────────────────────────
 
 /// `DexAgentResponse` — hoisted to `dex_view_types.hpp` (store-free; see that
 /// header for the doc comment).
 
-/// One parsed hourly perf point out of the device's TAR edge warehouse
-/// (`$Perf_Hourly` — see agents/plugins/tar perf tier, BRD A1).
+/// One parsed hourly perf point out of the device's Echo edge warehouse
+/// (`$Perf_Hourly` — see agents/plugins/echo perf tier, BRD A1).
 struct DexPerfPoint {
     std::int64_t hour_ts{0};
     double cpu_avg{0.0};      ///< % busy, clamped 0..100
@@ -203,7 +203,7 @@ struct DexPerfPoint {
     double disk_lat_ms{0.0};  ///< worse of read/write avg per-IO service time
 };
 
-/// PURE: parse the `tar.sql` pipe-delimited output (`__schema__|col|…` header +
+/// PURE: parse the `echo.sql` pipe-delimited output (`__schema__|col|…` header +
 /// data rows) into perf points, chronologically sorted. Defensive against
 /// agent-controlled bytes: columns are located by NAME from the schema line,
 /// non-finite/negative numbers are rejected per-field, malformed rows are
@@ -224,7 +224,7 @@ std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points);
 // already included above), so every existing caller of THIS header is
 // unaffected.
 
-/// PURE: parse the canned per-app `tar.sql` output (same defensive contract as
+/// PURE: parse the canned per-app `echo.sql` output (same defensive contract as
 /// parse_dex_perf_output: columns by NAME from the `__schema__|…` line,
 /// non-finite/negative rejected per-field, malformed rows skipped, ≤100 rows,
 /// empty on `error|…`). cpu percentages clamp to 0..100 (a lie, not an
@@ -237,7 +237,7 @@ std::vector<DexProcPerfRow> parse_dex_procperf_output(const std::string& output)
 /// read-only query surface deliberately hides plugin config, so the server
 /// cannot distinguish "procperf disabled (the default)" from "enabled, no
 /// rollup yet" — the message says both honestly (the crisp distinction needs
-/// the tar-plugin source_state meta table, a filed follow-up).
+/// the echo-plugin source_state meta table, a filed follow-up).
 std::string render_dex_procperf_panel(const std::vector<DexProcPerfRow>& rows,
                                       const std::string& window);
 

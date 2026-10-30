@@ -4,7 +4,7 @@
 // fleet view); this TU renders /viz/host/<agent_id> (the per-host drill-down
 // page that the 3D cube's dblclick opens in a new tab).
 //
-// Two-pane page: the 2D IPC graph (Cytoscape) on top, the existing TAR
+// Two-pane page: the 2D IPC graph (Cytoscape) on top, the existing Echo
 // process-tree fragment on the bottom. The page reads the agent_id from
 // `data-agent-id` on the mount root; yuzu-viz-host.js (slice 2) fetches
 // /api/v1/viz/host/<agent_id>/topology and renders the bipartite graph.
@@ -44,7 +44,7 @@ const char* const kVizHostPageTemplate = R"HTM(<!DOCTYPE html>
   <style>
     body { display: flex; flex-direction: column; height: 100vh; margin: 0; }
     /* Page body: title block (.page-header from yuzu.css), toolbar, then the
-       graph and TAR panes. The long sentence needs more than the 70ch default. */
+       graph and Echo panes. The long sentence needs more than the 70ch default. */
     .vh-body {
       flex: 1;
       min-height: 0;
@@ -56,9 +56,9 @@ const char* const kVizHostPageTemplate = R"HTM(<!DOCTYPE html>
     .vh-body .subtitle { max-width: 100ch; }
     .vh-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
     /* Each pane is a bordered panel: a header row (.vh-hd) over a body
-       (#ipc-graph / #tar-tree) that carries the side and bottom borders.
+       (#ipc-graph / #echo-tree) that carries the side and bottom borders.
        The headers sit beside the panes, never inside them, because
-       Cytoscape owns #ipc-graph's children and htmx swaps #tar-tree's. */
+       Cytoscape owns #ipc-graph's children and htmx swaps #echo-tree's. */
     .vh-hd {
       display: flex;
       flex-wrap: wrap;
@@ -90,7 +90,7 @@ const char* const kVizHostPageTemplate = R"HTM(<!DOCTYPE html>
     .vh-sw.conn { width: 14px; height: 0; border-top: 2px solid var(--c2); }
     .vh-main { flex: 1; display: flex; flex-direction: column; min-height: 520px; }
     #viz-host-root { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-    #ipc-graph, #tar-tree {
+    #ipc-graph, #echo-tree {
       width: 100%;
       background: var(--surface);
       border: 1px solid var(--line);
@@ -98,7 +98,7 @@ const char* const kVizHostPageTemplate = R"HTM(<!DOCTYPE html>
       border-radius: 0 0 var(--rad-panel) var(--rad-panel);
     }
     #ipc-graph { flex: 0 0 60%; }
-    #tar-tree { flex: 1 1 40%; overflow: auto; padding: 16px; }
+    #echo-tree { flex: 1 1 40%; overflow: auto; padding: 16px; }
     .vh-error { padding: 16px; color: var(--ink2); }
     .vh-stale {
       padding: 8px 16px;
@@ -109,7 +109,7 @@ const char* const kVizHostPageTemplate = R"HTM(<!DOCTYPE html>
       border-width: 0 1px 1px;
     }
     /* Splitter — draggable horizontal divider between the IPC graph (top)
-       and TAR tree (bottom). Ratio persists in localStorage under
+       and Echo tree (bottom). Ratio persists in localStorage under
        yuzuVizHostSplitRatio so an operator's chosen layout sticks across
        page reloads. */
     #splitter { flex: 0 0 22px; position: relative; cursor: row-resize; }
@@ -126,7 +126,7 @@ const char* const kVizHostPageTemplate = R"HTM(<!DOCTYPE html>
       transition: background 0.12s;
     }
     #splitter:hover::after { background: var(--primary); }
-    .yuzu-tar-highlight {
+    .yuzu-echo-highlight {
       background: color-mix(in srgb, var(--hl) 14%, transparent);
       transition: background 0.12s;
     }
@@ -161,10 +161,10 @@ const char* const kVizHostPageTemplate = R"HTM(<!DOCTYPE html>
         <div id="splitter"></div>
         <div class="vh-hd">
           <h2>Process tree</h2>
-          <span class="vh-sub">From TAR, for this host</span>
+          <span class="vh-sub">From Echo, for this host</span>
         </div>
-        <div id="tar-tree"
-             hx-get="/fragments/tar/process-tree?device={{AGENT_ID}}"
+        <div id="echo-tree"
+             hx-get="/fragments/echo/process-tree?device={{AGENT_ID}}"
              hx-trigger="load"></div>
       </div>
     </div>
@@ -172,19 +172,19 @@ const char* const kVizHostPageTemplate = R"HTM(<!DOCTYPE html>
 
   <script>
     // Slice 4: receiver for the IPC graph's "yuzu:select-process" event.
-    // Find the TAR tree's <details data-pid="N"> matching the broadcasted
+    // Find the Echo tree's <details data-pid="N"> matching the broadcasted
     // pid, scroll into view, and add a transient highlight class. One-way
-    // (IPC graph → TAR tree). Reverse direction is post-v1.
+    // (IPC graph → Echo tree). Reverse direction is post-v1.
     document.body.addEventListener("yuzu:select-process", (evt) => {
       const pid = evt && evt.detail && evt.detail.pid;
       if (pid == null) return;
-      const tarTree = document.getElementById("tar-tree");
-      if (!tarTree) return;
-      const el = tarTree.querySelector('[data-pid="' + String(pid) + '"]');
+      const echoTree = document.getElementById("echo-tree");
+      if (!echoTree) return;
+      const el = echoTree.querySelector('[data-pid="' + String(pid) + '"]');
       if (!el) return;
       el.scrollIntoView({ block: "center" });
-      el.classList.add("yuzu-tar-highlight");
-      setTimeout(() => el.classList.remove("yuzu-tar-highlight"), 2000);
+      el.classList.add("yuzu-echo-highlight");
+      setTimeout(() => el.classList.remove("yuzu-echo-highlight"), 2000);
     });
 
     // Slice 4: resizable splitter. Drag the divider to change the
@@ -195,7 +195,7 @@ const char* const kVizHostPageTemplate = R"HTM(<!DOCTYPE html>
       const root = document.getElementById("viz-host-root");
       const splitter = document.getElementById("splitter");
       const top = document.getElementById("ipc-graph");
-      const bottom = document.getElementById("tar-tree");
+      const bottom = document.getElementById("echo-tree");
       if (!root || !splitter || !top || !bottom) return;
       const KEY = "yuzuVizHostSplitRatio";
       let ratio = parseFloat(localStorage.getItem(KEY));

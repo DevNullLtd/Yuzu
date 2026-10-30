@@ -739,10 +739,10 @@ Apply the cheapest filters first to minimize work at each stage:
 | Step | What | Why first | Cost |
 |---|---|---|---|
 | 1 | Scope to `ostype == "windows"` | Attribute check, instant | Free (scope engine) |
-| 2 | Query TAR for network events matching `example.com` | SQLite SELECT on agent-side TAR DB | Medium (per-agent DB query) |
+| 2 | Query Echo for network events matching `example.com` | SQLite SELECT on agent-side Echo DB | Medium (per-agent DB query) |
 | 3 | Run `os_info.os_version` on matching agents only | Only runs on the filtered set | Low (small target set) |
 
-The key insight: **use the TAR (Timeline Activity Record), not netstat.** `netstat` only shows *current* connections. The TAR continuously records network connection events (opened/closed) with timestamps, so it has 90 days of history. Each TAR network event stores both the IP and the DNS hostname (resolved at collection time):
+The key insight: **use the Echo, not netstat.** `netstat` only shows *current* connections. The Echo continuously records network connection events (opened/closed) with timestamps, so it has 90 days of history. Each Echo network event stores both the IP and the DNS hostname (resolved at collection time):
 
 ```json
 {"proto":"tcp", "local_addr":"10.0.1.5", "local_port":52341,
@@ -751,7 +751,7 @@ The key insight: **use the TAR (Timeline Activity Record), not netstat.** `netst
  "pid":1234, "process_name":"chrome.exe"}
 ```
 
-The `remote_host` field is resolved via reverse DNS at the moment the connection is first recorded by the TAR collector. This means hostname searches are just a string match against stored data — no DNS resolution at query time.
+The `remote_host` field is resolved via reverse DNS at the moment the connection is first recorded by the Echo collector. This means hostname searches are just a string match against stored data — no DNS resolution at query time.
 
 #### Complete Python Script
 
@@ -798,13 +798,13 @@ def get_responses(definition_id, exec_id=None, limit=1000):
         raise RuntimeError("response page is full: narrow the scope or filter, or fetch it in pages")
     return body
 
-# ── Step 1: Query TAR on Windows machines for network events ─────────────
+# ── Step 1: Query Echo on Windows machines for network events ─────────────
 # Scope to Windows first (cheapest filter — just an attribute check).
-# Then query the TAR for network events in the last 90 days.
+# Then query the Echo for network events in the last 90 days.
 since_epoch = int(time.time()) - (DAYS_BACK * 86400)
 
-print(f"Step 1: Querying TAR network events on all Windows machines (last {DAYS_BACK} days)...")
-exec1 = execute("crossplatform.tar.query",
+print(f"Step 1: Querying Echo network events on all Windows machines (last {DAYS_BACK} days)...")
+exec1 = execute("crossplatform.echo.query",
                 scope='ostype == "windows"',
                 params={
                     "from": str(since_epoch),
@@ -814,11 +814,11 @@ exec1 = execute("crossplatform.tar.query",
 summary1 = wait_for(exec1, timeout=600)
 print(f"  Received responses from {summary1['agents_responded']} agents")
 
-# ── Step 2: Filter TAR results for connections to our target hostname ────
-# TAR stores remote_host (DNS name resolved at collection time), so this
+# ── Step 2: Filter Echo results for connections to our target hostname ────
+# Echo stores remote_host (DNS name resolved at collection time), so this
 # is a simple string match — no DNS resolution needed at query time.
 print(f"Step 2: Filtering for connections to {TARGET_HOSTNAME}...")
-responses = get_responses("crossplatform.tar.query", exec1)
+responses = get_responses("crossplatform.echo.query", exec1)
 
 matching_agents = set()
 for row in responses:
@@ -868,27 +868,27 @@ All agents (e.g., 10,000)
     ▼ scope: ostype == "windows"    ← FREE (attribute check)
 Windows agents (e.g., 6,000)
     │
-    ▼ TAR query: network events     ← MEDIUM (SQLite SELECT per agent)
+    ▼ Echo query: network events     ← MEDIUM (SQLite SELECT per agent)
 Connected to example.com (e.g., 47)
     │
     ▼ os_info.os_version            ← CHEAP (47 agents, not 6,000)
 Final results (47 rows)
 ```
 
-If you reversed the order and ran `os_info` on all 10,000 agents first, you'd gather 10,000 OS version responses only to discard 9,953 of them. By filtering first with the TAR, you avoid dispatching unnecessary work to thousands of agents.
+If you reversed the order and ran `os_info` on all 10,000 agents first, you'd gather 10,000 OS version responses only to discard 9,953 of them. By filtering first with the Echo, you avoid dispatching unnecessary work to thousands of agents.
 
 #### Dashboard UI Walkthrough
 
 **Manual three-step approach:**
 
-1. **Step 1: Query TAR on Windows fleet**
-   - **Instructions > Definitions** > `crossplatform.tar.query`
+1. **Step 1: Query Echo on Windows fleet**
+   - **Instructions > Definitions** > `crossplatform.echo.query`
    - Scope: `ostype == "windows"`
    - Parameters: **Start Time** = epoch for 90 days ago (e.g., `1719500000`), **Event Type Filter** = `network`, **Result Limit** = `10000`
    - Click **Run**
 
-2. **Step 2: Review TAR results**
-   - **Instructions > Executions** > click the TAR query execution
+2. **Step 2: Review Echo results**
+   - **Instructions > Executions** > click the Echo query execution
    - In the results, look at the `detail_json` column for `remote_addr` values matching the target IP (e.g., `93.184.216.34` for example.com)
    - Note the agent IDs of matching machines
 

@@ -370,7 +370,7 @@
   "version": "1.0.0",
   "where_the_data_goes": [
     "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `sources` is also a gathered definition (`crossplatform.security.update_source_trust`, 300s TTL).",
-    "**Not consumed by** daily-sync, TAR, DEX, or metrics.",
+    "**Not consumed by** daily-sync, Echo, DEX, or metrics.",
     "**Sensitivity.** Rows name the repositories a device installs software from (URIs, key paths), which discloses part of its software supply chain. URL userinfo (`user:pass@`) is redacted in every URL-bearing field; a secret carried in a URL query string or path (a vendor entitlement token) cannot be recognised and is emitted as written, and so is any user name inside a configured path or URL (`file:///home/<user>/repo`, `signed-by=/home/<user>/key.gpg`, `~user`): the plugin adds none of its own. Key material is never emitted, only key file paths, formats and sizes. Rows stay in the ResponseStore for the response retention period (90 days by default) and are not purged individually, so treat a credential seen in a row as exposed and rotate it.",
     "**Siblings:** `windows_updates` (patch compliance and reachability of update sources, not their trust) and `installed_apps` (what is installed, not where it came from)."
   ]

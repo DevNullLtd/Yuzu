@@ -32,7 +32,7 @@ extern const char* const kInstructionPageHtml;
 extern const char* const kApprovalsPageHtml;
 extern const char* const kExecutionsPageHtml;
 extern const char* const kWorkflowsPageHtml;
-extern const char* const kTarPageHtml;
+extern const char* const kEchoPageHtml;
 extern const char* const kVizFleetPageHtml;
 extern const char* const kVizHostPageHtml;
 extern const char* const kComplianceHtml;
@@ -89,7 +89,7 @@ TEST_CASE("app shell: nav is exactly the pages that exist, in design order", "[n
         for (const auto& it : g.items)
             labels.push_back(it.label);
     CHECK(labels == std::vector<std::string_view>{"Console", "Instructions", "Result sets",
-                                                  "Compliance", "Guardian", "DEX", "TAR", "Crypto",
+                                                  "Compliance", "Guardian", "DEX", "Echo", "Crypto",
                                                   "Groups and enrolment", "Hardware", "Software",
                                                   "Fleet", "Users and roles", "Tokens and principals", "Audit and reviews",
                                                   "Settings"});
@@ -439,7 +439,7 @@ TEST_CASE("app shell: the bell is one hidden <details> before the account block"
 TEST_CASE("app shell: re-baking keeps exactly one bell, style and script", "[nav][shell][bell]") {
     const std::string page = "<body><!--yuzu:shell--><!--/yuzu:shell--></body>";
     const auto once = apply_shell(page, {.active_key = "dex"});
-    const auto twice = apply_shell(once, {.active_key = "tar"});
+    const auto twice = apply_shell(once, {.active_key = "echo"});
     CHECK(count_of(twice, "id=\"shell-bell\"") == 1);
     CHECK(count_of(twice, "(function(){\n  var POLL_MS=") == 1);
     CHECK(count_of(twice, "<style>") == 2);
@@ -567,11 +567,11 @@ TEST_CASE("apply_shell: a page without markers comes back unchanged", "[nav][she
 }
 
 TEST_CASE("bake: returns a stable, shell-bearing copy", "[nav][shell]") {
-    const char* a = bake("<!--yuzu:shell--><!--/yuzu:shell-->one", {.active_key = "tar"});
+    const char* a = bake("<!--yuzu:shell--><!--/yuzu:shell-->one", {.active_key = "echo"});
     const char* b = bake("<!--yuzu:shell--><!--/yuzu:shell-->two", {.active_key = "dex"});
     CHECK_THAT(std::string(a), ContainsSubstring("one"));
     CHECK_THAT(std::string(b), ContainsSubstring("two"));
-    CHECK(highlighted_hrefs(a) == std::vector<std::string>{"/tar"}); // a survives b's bake
+    CHECK(highlighted_hrefs(a) == std::vector<std::string>{"/echo"}); // a survives b's bake
 }
 
 // ── The page templates themselves ───────────────────────────────────────────
@@ -593,7 +593,7 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         {"compliance", kComplianceHtml, {"/compliance"}},
         {"guardian", kGuardianHtml, {"/guardian"}},
         {"guardian detail (shared shell default)", kGuardianDetailPageHtml, {"/guardian"}},
-        {"tar", kTarPageHtml, {"/tar"}},
+        {"echo", kEchoPageHtml, {"/echo"}},
         {"settings", kSettingsHtml, {"/settings"}},
         {"groups and enrolment", kGroupsHtml, {"/groups"}},
         // A sub-item: its own link is the current page and the parent is lit as the family.

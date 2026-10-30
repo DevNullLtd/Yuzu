@@ -1,0 +1,1 @@
+- **Echo retention tiers on Settings > Data and retention.** The data-retention panel now shows a read-only table of the Echo capture sources' retention tiers (exact, hourly, daily, monthly, boot) and a "Look again after" floor per source, read from the same model as `GET /api/v1/settings/data-retention`; agent defaults for this release, not per-device readings.
