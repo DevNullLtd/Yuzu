@@ -769,7 +769,9 @@ arrive before it. Waiting `kReportGrace` from the first sighting means a normal 
 once, not once as STARTUP and again as RESYNC.
 
 **After a rejected report.** A report the server rejects (`PARSE`, `DIGEST_MISMATCH`, `OVERSIZE`,
-`IP_CONFLICT`) installs no slot. While the heartbeat digest still equals the rejected report's
+`IP_CONFLICT`) installs no slot and leaves an existing slot as it was. The rejected report's digest
+and reason are recorded on the no-slot entry or, for an agent that holds a slot, on the slot, and
+the rule below applies to both. While the heartbeat digest still equals the rejected report's
 digest, the server issues no `__resync__.topology` for that agent: a resync would bring back the same
 body and the same rejection, every 5 minutes, defeating the agent's own back-off. The agent's retry
 rule covers it instead (D7: a full floor after `IP_CONFLICT`, exponential back-off otherwise). A new
@@ -786,8 +788,8 @@ When several conditions hold, the first in this order wins:
 | 2 | `disconnected` | slot retained after its stream closed | below |
 | 3 | `agent_silent` | connected slot, `now - last_heartbeat_at > 90 s` | Same 90 s as `kPushedStaleAfter`: two jittered heartbeats (at most 36 s each) plus gateway flush slack. Keyed on any heartbeat, so a live agent whose report is late reads `body_pending`, never `agent_silent`. |
 | 4 | `pump_stuck` | `now - pump_advanced_at > T`, or `last_outcome ∈ {TRUNCATED, FAILED}` and `now - outcome_since > T`, where `T = 3 × 1.2 × pump_interval_s + 90 s` | Three missed runs at the longest jittered sleep, plus the 90 s heartbeat window, because the server sees a run only on the next heartbeat after it. `pump_interval_s` is clamped to the 30-900 s flag range before use, and a value of 0 (`DISABLED`) never evaluates this row. At the 60 s default `T` is 306 s; at 900 s it is 3,330 s. The server never assumes the default. |
-| 5 | `body_pending` | `mismatch_since` older than `kReportGrace` | new |
-| 6 | `report_rejected` | connected, no slot, last report rejected, digest unchanged since | new; the reason is in the metric and, for `IP_CONFLICT`, the audit row (D7) |
+| 5 | `report_rejected` | connected, last report rejected, digest unchanged since: no slot, or a slot whose body differs from the rejected digest (so a slotted agent with a pending rejected digest reads this, not `body_pending`) | new; the reason is in the metric and, for `IP_CONFLICT`, the audit row (D7) |
+| 6 | `body_pending` | `mismatch_since` older than `kReportGrace` | new |
 | 7 | `awaiting_report` | connected, no slot, a non-empty digest seen: within `kReportGrace` of the first sighting, or a resync sent or `deferred` | new. After a server restart every reporting agent reads this until its body lands, which can take about 8 min per 100,000 agents (D8). |
 | 8 | `not_reported` | connected, no slot, and no non-empty digest: no field, an empty digest, `DISABLED`, or no heartbeat on this replica yet | today's roster placeholder |
 
