@@ -871,7 +871,7 @@ reader, not by habit:
 | `session_id` | heartbeat admission and binding (`yuzu_gw_heartbeat_admission`); sent on reattach for the route-directory CAS |
 | connection, stream and owner references | delivering commands down the agent's own Subscribe stream |
 | `stream_home_id`, owner key | already sent in the CONNECTED notification that follows a reattach (`yuzu_gw_upstream.erl`, `handle_cast({notify_stream_status, ...})` at about l.1442-1478), unchanged |
-| observed peer address | a transport fact only the gateway sees. It fills `RegisterRequest.gateway_observed_peer` today and is sent on reattach so the server's session keeps it. |
+| observed peer address | a transport fact only the gateway sees. It fills `RegisterRequest.gateway_observed_peer` today and is sent on reattach so the server's session keeps it. The gateway keeps the raw origin it decided (`origin_text/1` in `yuzu_gw_agent_service.erl`), empty when it has no observation. Today's `peer_addr` substitutes `<<"unknown">>` for empty; that display value is never what reattach sends. |
 | `connected_at` | management-plane liveness answers |
 
 It keeps **no** hostname, platform, version, plugin list, plugin names, scopable tags, status tags,
@@ -907,6 +907,11 @@ message ReattachResponse {
 
   Only the payload changes, from a stored request to two ids and a peer address. That removes the
   `local_error` encode-failure branch of `replay_send/4`.
+- **The observed peer on the server.** `observed_peer` is parsed with the same strict
+  `normalize_bare_ip` that ProxyRegister applies to `gateway_observed_peer`. Empty, or a value
+  that does not parse, means "not observed": the session's source IP and any reattach audit row
+  fall back to the gateway's own IP and record `origin_observed=false`, exactly as ProxyRegister's
+  audit attribution does today (`gateway_service_impl.cpp`).
 - **Which session id counts.** The body's `session_id` is the session presented. The gateway also
   sends it as `x-yuzu-session-id`, as replay does today. The server refuses `MALFORMED_SESSION`
   when the metadata value is present and differs from the body, or when the body's id is not a
@@ -1396,7 +1401,8 @@ of every ~30 s. The content is unchanged.
   registration gate);
 - no RegisterRequest is retained (registry row, owner-sessions row, owner state). A size test on the
   per-agent rows is part of the harness;
-- replay sends `ProxyReattach` with exactly the three fields;
+- replay sends `ProxyReattach` with exactly the three fields, and `observed_peer` is the raw
+  origin (empty when unobserved), never the `unknown` display substitute;
 - every row of D14's outcome table: `NO_RECORD`, `NOT_ENROLLED`, `SUPERSEDED` and
   `MALFORMED_SESSION` close the agent's stream; `DEGRADED` and `RATE_LIMITED` keep it and requeue
   after `retry_after_ms`; each is classified for the breaker as the table says;
