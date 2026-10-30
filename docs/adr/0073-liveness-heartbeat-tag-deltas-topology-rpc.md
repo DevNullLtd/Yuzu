@@ -85,7 +85,8 @@
       `AgentRegistrationStore`, written at every successful registration.
     - If that record is missing or unreadable, the gateway closes the agent's stream and the agent
       registers again on its own.
-    - Enrollment tokens no longer sit in gateway memory.
+    - Enrollment tokens are no longer retained in gateway memory. A Register's token still passes
+      through the gateway transiently, while the request is decoded and forwarded.
 13. **The agent's reconnect backoff gets full jitter** (D9). Today it is a pure power of two, which
     phase-aligns the fleet after a mass disconnect.
 14. **No proto subtraction; deprecate and ignore** (owner ruling 2026-10-26). A field, RPC or message
@@ -455,7 +456,8 @@ outside this rule; this ADR adds none of it.
   heartbeat than today.
 
 **Pre-existing gateway state.**
-- **Removed by this ADR:** the retained RegisterRequest, in all three copies (D14).
+- **Removed by this ADR:** the retained RegisterRequest, in all three session copies, and the
+  transient fourth copy in the pending Register-to-Subscribe row (D14).
 - **Kept, because it is the connection:**
   - the per-session `yuzu_gw_agent` process and its routing record (ids, connection, stream home,
     owner key, `connected_at`, observed peer);
@@ -464,7 +466,8 @@ outside this rule; this ADR adds none of it.
 - **Removed with the Register:** the plugin-name list (D14).
 
 A fresh Register is decoded **transiently** to forward it as `ProxyRegister`, and nothing from it
-is kept, so its `status_tags_pb` (field 8) never enters gateway state.
+is kept, so its `status_tags_pb` (field 8) never enters gateway state. Its enrollment token is in
+gateway memory only for that decode and forward.
 
 ### D5. Topology digest and pump
 
@@ -876,6 +879,12 @@ reader, not by habit:
 
 It keeps **no** hostname, platform, version, plugin list, plugin names, scopable tags, status tags,
 enrollment token, CSR, certificate or attestation.
+
+**The pending row.** Between Register and Subscribe, `yuzu_gw_agent_service:register_upstream/4`
+stores a `yuzu_gw_pending` row (`yuzu_gw_registry:store_pending/3`) that today holds the verbatim
+`register_req` and its `agent_info`: a fourth copy, with the token, for the pending TTL. Under this
+ADR that row keeps only `agent_id`, the observed origin, `conn_key` and `registered_at`, the
+connection facts the Subscribe match and the per-connection session cap need.
 
 **Replay becomes reattach.**
 
@@ -1334,8 +1343,10 @@ or a body asks for it, rate-limited. A shared store is neither needed nor decide
 
 ### Security
 
-- **Enrollment tokens leave gateway memory.** Today each connected agent's token is held twice in
-  ETS for the whole session, only for replay.
+- **Enrollment tokens are no longer retained by the gateway.** Today each connected agent's token
+  is held twice in ETS for the whole session, only for replay, and once more in the pending row
+  until Subscribe. A token still transits the gateway while a Register is decoded and forwarded;
+  the accurate claim is "not retained", not "never in gateway memory".
 - **Reattach is a new gateway-upstream RPC.** It gets a peer-guard override, an `rpc` label and a
   test row.
 - **Its authority is unchanged and cannot enrol** (D14). It rests on the gateway's peer
@@ -1399,7 +1410,8 @@ of every ~30 s. The content is unchanged.
 - keep-newest replaces the whole entry;
 - no gateway code path reads either field (a lexical test, like the existing peer-guard
   registration gate);
-- no RegisterRequest is retained (registry row, owner-sessions row, owner state). A size test on the
+- no RegisterRequest is retained (registry row, owner-sessions row, owner state, and the
+  `yuzu_gw_pending` row, which holds no `register_req` or `agent_info`). A size test on the
   per-agent rows is part of the harness;
 - replay sends `ProxyReattach` with exactly the three fields, and `observed_peer` is the raw
   origin (empty when unobserved), never the `unknown` display substitute;
