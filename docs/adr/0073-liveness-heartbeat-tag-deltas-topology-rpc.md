@@ -1599,7 +1599,9 @@ message ReattachResponse {
   server-minted session id (`is_server_minted_session_id`, the check ProxyRegister applies).
 - **Server** (`GatewayUpstreamServiceImpl::ProxyReattach`, `server/core/src/gateway_service_impl.cpp`):
   0. gateway peer authorization (`GatewayPeerGuardedService` override; D7's rule for a new upstream
-     RPC). The guard is the outer override, so it runs, and writes its own denial audit row,
+     RPC). The guard is the outer override, so it runs, and counts every denial and writes its
+     own denial audit row where its contract writes one (`gateway_peer_guard.hpp`: not for
+     `null_context`, `not_authenticated` or `no_cert`, and within the denial audit budget),
      before the handler is entered;
   1. `onbehalf::enforce(context)`, as the handler's first statement and before any side effect, as
      in every gateway-upstream handler; then the `--reattach-rate` token bucket. An over-rate call
