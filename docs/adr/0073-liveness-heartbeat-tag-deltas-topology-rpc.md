@@ -604,9 +604,11 @@ The owner's ruling described "one tiny digest tag". It is a typed field instead,
 - tags count against the tag caps;
 - a typed field is visible in the contract.
 
-**The topology digest is computed by TAR**, inside its `fleet_snapshot` builder
-(`agents/plugins/tar/src/tar_fleet_snapshot.{hpp,cpp}`), and emitted as a top-level `content_digest`
-member (a `schema_minor` bump). Definition `v1`: SHA-256, first 16 bytes, `"v1:"` plus 32 hex
+**The topology digest is computed by TAR**, inside its `fleet_snapshot` builder (the plugin is now
+named `echo`: `agents/plugins/echo/src/echo_fleet_snapshot.{hpp,cpp}`, action
+`echo.fleet_snapshot`), and emitted as a top-level `content_digest` member. That is a
+`schema_minor` bump from 2 to 3; the schema name `fleet_snapshot.v1` is unchanged, and the digest
+input includes the new `schema_minor`. Definition `v1`: SHA-256, first 16 bytes, `"v1:"` plus 32 hex
 characters, over a u32/i64 little-endian, length-prefixed encoding of:
 
 1. `schema`, `schema_minor`, `hostname`.
@@ -618,18 +620,31 @@ characters, over a u32/i64 little-endian, length-prefixed encoding of:
 
 **Excluded as volatile:** `ts`, and every row's `last_seen_seconds_ago`.
 
-The builder holds one static list classifying every emitted key as digested or volatile. A test
-fails if a built document contains an unclassified key. **The server treats this digest as opaque.**
+The builder holds one static list classifying every key it can emit, at the top level and in each
+row, as digested, volatile, or `content_digest` itself (the output, never an input). The list covers
+the keys emitted only on some runs: `process_source_paused`, `tcp_source_paused`, and a
+connection row's `last_seen_seconds_ago`, which a live row omits. A test builds documents that
+exercise every such key (both sources paused, both truncation flags set, live and closed rows)
+and fails if any built document contains an unclassified key. **The server treats this digest as opaque.**
 It stores the value that arrived with the body, rejects a report whose `digest` disagrees with the
 body's `content_digest`, and never recomputes it. That keeps one implementation (TAR) and keeps JSON
 canonicalisation out of the server.
 
 **Pump.** The pump stays a Run()-lifetime thread (`snapshot_pump_thread_` in `agent.cpp`). Each run:
-1. execute `tar.fleet_snapshot` via `LocalDispatcher`;
-2. keep the body, digest, `last_pump_at` and outcome;
+1. execute `echo.fleet_snapshot` via `LocalDispatcher`;
+2. publish the body, digest, `last_pump_at`, outcome and `pump_interval_s` as **one record**;
 3. sleep a jittered 60 s.
 
-Truncated runs (over 2 MiB) keep the previous body and record `TRUNCATED`.
+Truncated runs (over 2 MiB) keep the previous body and digest and record `TRUNCATED`; a failed run
+keeps them too and records `FAILED`.
+
+**One record, published and read whole.** The pump builds an immutable record and replaces the
+shared pointer to it under `snapshot_mu_` in one step. The heartbeat thread (for `TopologyDigest`)
+and the topology sender (for `ReportTopology`) each copy that pointer once under the same mutex
+and read every field from the copy. Neither reads the body and the digest in two steps, so a report
+can never pair one run's body with another run's digest, which the server would reject as
+`DIGEST_MISMATCH`. Today's pump publishes the body under `snapshot_mu_` and a sequence number as a
+separate atomic (`latest_snapshot_`, `latest_snapshot_seq_`); both go.
 
 ### D6. Server topology liveness from the digest
 
@@ -1629,7 +1644,9 @@ of every ~30 s. The content is unchanged.
   an unknown action;
 - after `__resync__.tags`, every heartbeat is full until two full heartbeats are acknowledged, and a
   coalesced first full heartbeat does not end the repetition;
-- the topology send rules, with an injected RNG for jitter bounds, never timing.
+- the topology send rules, with an injected RNG for jitter bounds, never timing;
+- the pump record is published and read whole: a reader racing a publish sees one run's body,
+  digest, `last_pump_at` and outcome, never a mix.
 
 **Server:**
 - `ReportTopology`, `ProxyTopology` and `ProxyReattach` each refuse an on-behalf-of request before
@@ -1730,7 +1747,8 @@ of every ~30 s. The content is unchanged.
   new `DispatchCaller{.system = true}` construction adds no `approval_provenance` stamping site.
 - **Prometheus metrics and alert rules** (`docs/observability-conventions.md`): `sre` and
   `architect`.
-- **TAR** (`tar_fleet_snapshot`, schema minor): `architect`, `plugin-developer`.
+- **TAR** (the `echo` plugin's `echo_fleet_snapshot`, schema minor 2 to 3): `architect`,
+  `plugin-developer`.
 - **Erlang gateway:** `gateway-erlang`, for the gpb regen, keep-newest opacity, moving the tag
   checks out, replay-as-reattach, the owner-restart path, and the management-RPC retirement.
 - **Server storage substrate (Postgres):** `architect` and `sre`, for the born-on-PG
