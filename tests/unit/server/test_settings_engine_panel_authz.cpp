@@ -758,6 +758,31 @@ TEST_CASE("engine panel authz: the panel's own belt 403s (engine session, MCP-ti
           std::vector<std::string>{"engine_principal.list/denied/mcp_session_denied"});
 }
 
+TEST_CASE("engine panel authz: the panel's roster 200 is Cache-Control: no-store, private with "
+          "Vary: Cookie, exactly as the Access principals list's",
+          "[pg][settings][engine_principal][authz][cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
+    Rig r{db_.dsn()};
+    const auto frag = r.cookie_get(kFragment, r.cookie("root", auth::Role::admin));
+    REQUIRE(frag);
+    REQUIRE(frag->status == 200);
+    CHECK_THAT(frag->body, ContainsSubstring(kSlug)); // the roster itself, not a note
+    CHECK(frag->get_header_value("Cache-Control") == "no-store, private");
+    CHECK(frag->get_header_value("Vary") == "Cookie");
+}
+
+TEST_CASE("engine panel authz: the in-page store-unavailable note (a 200) is no-store, private too",
+          "[pg][settings][engine_principal][authz][cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, engine_panel_tpl);
+    Rig r{db_.dsn(), /*wire_engine_store=*/false};
+    const auto frag = r.cookie_get(kFragment, r.cookie("root", auth::Role::admin));
+    REQUIRE(frag);
+    REQUIRE(frag->status == 200);
+    CHECK_THAT(frag->body, ContainsSubstring("Engine Principals store unavailable"));
+    CHECK(frag->get_header_value("Cache-Control") == "no-store, private");
+    CHECK(frag->get_header_value("Vary") == "Cookie");
+}
+
 // ---- revoke detail (sec-1) and the success audit row (sec-2): the CH-3 matrix ---------------
 
 namespace {

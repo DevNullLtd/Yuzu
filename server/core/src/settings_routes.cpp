@@ -3012,6 +3012,11 @@ void SettingsRoutes::register_routes(
                      return read_perm(req, audit_probe, "AuditLog", "Read");
                  };
                  std::optional<std::size_t> roster_count;
+                 // Principal and credential metadata: never cached, never shared, and a cache that
+                 // ignores `no-store` still keys on the cookie. As the Access tokens panel's 200
+                 // (access_tokens_routes.cpp respond_fragment).
+                 res.set_header("Cache-Control", "no-store, private");
+                 res.set_header("Vary", "Cookie");
                  res.set_content(render_engine_principals_fragment(may_read_audit, &roster_count),
                                  "text/html; charset=utf-8");
                  if (roster_count)
