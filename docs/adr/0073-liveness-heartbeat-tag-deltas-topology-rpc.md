@@ -845,8 +845,8 @@ When several conditions hold, the first in this order wins:
     - on stop the issuer drains the queue before it exits; it starts no drain write after 5 s,
       and each drain write runs under `SET LOCAL statement_timeout` of 1 s, so a lease-held write
       cannot run on to the pool's 10 s `lock_timeout` or 30 s `statement_timeout` and the drain
-      ends within about 10 s (no write starts after 5 s, and the last one can still wait out
-      the issuer's own 4 s write lease and run its 1 s statement), so a stop does not lose a row
+      ends within about 20 s (no write starts after 5 s, and the last one can still wait out its
+      4 s write lease, a 10 s connect, and run its 1 s statement), so a stop does not lose a row
       while the audit
       store is healthy and the queue is short; a row it cannot write, or has not reached when the
       deadline passes, is logged at WARN with the total and the first and last conflict. Its
@@ -1253,8 +1253,10 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     blocks heartbeat ingestion.
   - **The issuer's lifecycle.** The issuer is a `ServerImpl`-owned thread with a stop flag. Its
     rate and between-pass waits are condition-variable waits the stop flag wakes, so it never
-    sleeps through a stop. `stop()` and `~ServerImpl` stop and join it after the gRPC services
-    have stopped (so ingestion can no longer mark; a mark made after the stop is dropped) and
+    sleeps through a stop. `stop()` and `~ServerImpl` set its stop flag at the start of `stop()`,
+    as `auth_db_->request_stop()` is today, so its wind-down and stop-time drain run alongside the
+    existing roll-up joins rather than after them; a mark made after the flag is set is dropped.
+    They join it after the gRPC services have stopped (so ingestion can no longer mark) and
     before the registry, `plugin_config_store_`, the execution tracker, `audit_store_` (the
     re-claim audit drain), `gw_mgmt_pool_` (its own gateway forwarders) and the Postgres pool it
     calls. On stop it cancels its in-flight forwards (`ClientContext::TryCancel`) before joining
@@ -1273,12 +1275,23 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     `record_command_dispatch` comment in `server.cpp` reports a lock-blocked upsert measured at
     10.04 s). The drain's 1 s `SET LOCAL statement_timeout` bounds only the drain's own writes, and
     it needs a transaction to bind to: `AuditStore::log` runs on an autocommit lease, so the
-    drain writes each row in its own explicit transaction (`BEGIN`, `SET LOCAL`, `log_in_txn`,
-    `COMMIT`) on the issuer's own 4 s lease, so a timeout rolls back only that row, which stays
-    queued with every row after it. The drain starts no write after 5 s and can overrun that by one write (4 s lease
-    plus 1 s). The worst case is therefore about 4 + 30 + 5 + 4 + 1 = 44 s, about 45 s, inside the
-    server's 210 s stop budget (`TimeoutStopSec`, the compose `stop_grace_period`); slices 6 and 8
-    size their shutdown assertions on that figure and slice 8 measures it; the forwarders' 12 s
+    drain writes through a narrow `AuditStore` method that owns the lease (4 s), the transaction
+    and the timeout: one transaction per row through `PgPool::with_txn_for`, whose callback runs
+    `SET LOCAL statement_timeout = 1000` and then `log_in_txn` and returns false on failure, so
+    the pool rolls back only that row, which stays queued with every row after it; after each
+    committed row the method calls `count_committed`, as `log()` does. A lease that starts a
+    fresh connection inside its acquire deadline can add the pool's 10 s `connect_timeout_s`
+    (`try_acquire_for`'s documented worst case, which `kRegistryAuditRundownBound` in `server.cpp`
+    already counts for the same 4 s lease). The drain starts no write after 5 s and can overrun
+    that by one write (4 + 10 + 1 s). The issuer's own worst case is therefore about
+    (4 + 10 + 30) + 5 + (4 + 10 + 1) = 64 s from its stop flag. Because the flag is set at the
+    start of `stop()`, that runs alongside the sequential roll-up joins (up to 120 + 60 = 180 s,
+    which `yuzu-server.service` sizes the 210 s `TimeoutStopSec` and the compose
+    `stop_grace_period` for) and adds to the stacked shutdown only what is left of it when its
+    join is reached; it is not a new sequential stage after them. Slices 6 and 8 size their
+    shutdown assertions on the 64 s figure, slice 8 measures it, and slice 10 restates the
+    stacked shutdown figures in `docs/user-manual/upgrading.md`, `docs/user-manual/server-admin.md`
+    and the `yuzu-server.service` comment with the issuer included; the forwarders' 15 s
     deadline does not add to it because they are cancelled first. The slice-6 shutdown test also
     stops during an in-flight forward; slice 8, which adds the re-claim audit queue, adds a stop
     during the audit drain. The pass swaps the pending set out under the set's mutex and never holds
