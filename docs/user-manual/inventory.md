@@ -635,7 +635,8 @@ place, **Hardware** and **Software**, each its own page:
     as pills with a Clear all, the URL hash carries them (so a view can be bookmarked or shared), and the
     exact REST call the view corresponds to is shown with a copy button. The filter box on an
     expanded devices table filters only the rows already loaded; the catalogue search
-    and chips are server-side.
+    and chips are server-side. Rows and the **versions** and **devices** controls work from the
+    keyboard (Tab, then Enter or Space), and pressing an open control again closes its drill.
     The chip rows are built from the server's vocabulary tables, so **Found by** lists every
     collector source and each **Kind** and **Found by** chip's tooltip says what it covers.
   - **The table** lists titles most-installed first, 100 at a time with a keyset

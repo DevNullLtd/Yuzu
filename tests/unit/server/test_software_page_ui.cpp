@@ -936,10 +936,16 @@ TEST_CASE("software page: title rows and drill controls are keyboard-operable", 
     // new Load-more button, else the devices filter.
     REQUIRE(has(sc, "function swKey(e, el)"));
     REQUIRE(has(sc, "e.target.closest('button')"));
-    REQUIRE(has(sc, "el.click()"));
+    REQUIRE(has(sc, "e.preventDefault(); el.click();"));  // Space must not scroll the page
     REQUIRE(has(sc, "window.__swMore = { tb: tr.parentNode, i: tr.sectionRowIndex, btn: el }"));
     REQUIRE(has(sc, "addEventListener('htmx:afterRequest'"));
     REQUIRE(has(sc, "rc.elt !== mo.btn"));
+    // Failed Load more: focus goes back to the re-enabled button.
+    REQUIRE(has(sc, "if (mo.btn.isConnected) mo.btn.focus()"));
+    // An active devices filter is re-applied before choosing the first visible new row.
+    REQUIRE(has(sc, "gpSearch(flt)"));
+    // The script stays well under MSVC's 16,380-byte raw-literal cap (10.5 KB today).
+    REQUIRE(sc.size() < 15000);
     REQUIRE(has(sc, "rows[i].style.display !== 'none'"));
     REQUIRE(has(sc, "rows[mo.i].classList.contains('inv-more')"));
     REQUIRE(has(sc, "box.querySelector('.inv-devfilter')"));
