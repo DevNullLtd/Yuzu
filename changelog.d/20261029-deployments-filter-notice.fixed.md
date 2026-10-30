@@ -1,0 +1,1 @@
+- **The "No devices match this filter" notice now shows.** It never appeared in the pre-flight and deploy result grids when a filter matched no devices.
