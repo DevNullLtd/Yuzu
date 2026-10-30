@@ -1932,7 +1932,10 @@ message ReattachResponse {
     a few seconds above it, and no retries. At most `--reattach-challenge-concurrency` (default
     256, unmeasured) challenge forwards are in flight per replica, driven by the gRPC async
     client on the issuer's thread rather than a thread per forward; a challenge that cannot start
-    before its expiry is counted `send_failed` and resolved as `expired`. The answer is taken from
+    before its expiry resolves `send_failed` and is handled as a failed forward (below:
+    uninstalled, the record kept). Each challenge is counted under exactly one outcome; a
+    slice-11 test saturates the concurrency and asserts `send_failed` only, `expired` unchanged,
+    the record kept and `YuzuStateSignatureRefused` quiet. The answer is taken from
     that forward's `SendCommandResponse` stream and handed to the verifier; it is never ingested,
     exec-tracked or stored. The containment re-application after verification goes through the
     same bounded forwarder;
