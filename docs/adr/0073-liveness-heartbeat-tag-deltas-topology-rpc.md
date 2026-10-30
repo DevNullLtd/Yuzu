@@ -667,7 +667,14 @@ rpc ProxyTopology(yuzu.agent.v1.TopologyReport) returns (yuzu.agent.v1.TopologyA
   (`"report_inventory"`).
 - Both paths call the one shared parser, `FleetTopologyStore::parse_fleet_snapshot_json`. After D10
   there are exactly two callers.
-- The trust boundary is unchanged: `agent_id` and `os` come from the session.
+- **Session resolution.** `ProxyTopology` resolves the session through the route directory
+  exactly as `ProxyInventory` does (`resolve_sessions` in `gateway_service_impl.cpp`): a degraded
+  read with a local hint resolves; an unknown, ambiguous or unhinted-degraded id is refused
+  `UNKNOWN_SESSION`, and the agent retries with its backoff (below).
+- The trust boundary is unchanged: `agent_id` comes from the resolved session, and `os` from this
+  replica's installed `AgentSession` for that agent, never from the report. A replica that resolves
+  the id but has no installed session for the agent yet (its reattach has not landed) also refuses
+  `UNKNOWN_SESSION`.
 - The 2 MiB and 4096-row caps are checked before parsing.
 - The `topology.push.first` and `topology.push.rejected` audit rows are unchanged.
 
@@ -675,7 +682,8 @@ rpc ProxyTopology(yuzu.agent.v1.TopologyReport) returns (yuzu.agent.v1.TopologyA
 - a `report_topology/2` handler in `yuzu_gw_agent_service.erl`, admitted like `report_inventory/2`
   (`yuzu_gw_heartbeat_admission:admit_inventory/2`) but with its **own** permit pool;
 - a 2 MiB per-RPC message cap;
-- forwarding via `ProxyTopology` to the session's owning replica;
+- forwarding via `ProxyTopology` on the gateway's upstream connection. The gateway has one upstream
+  and no per-session replica routing; the server resolves the session (above);
 - **no buffering**: an unforwardable report fails `UNAVAILABLE` and the agent retries.
 
 **Peer authorization.** `ProxyTopology` is a new gateway-upstream RPC. It gets an explicit
@@ -938,7 +946,8 @@ Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
 **Alerts** (`docs/prometheus/yuzu-alerts.yml`, ticket severity, never paging):
 - `YuzuHeartbeatTagDivergenceSustained`: the `diverged` share stays above 1 % of heartbeats for
   30 min **while the gateway's coalescing rate is near zero**. Outside an outage, that indicates a
-  canonical-form or agent delta defect rather than a fleet event.
+  canonical-form or agent delta defect rather than a fleet event. Its runbook also names the
+  per-RPC-balancing symptom (*Server stores*): a `diverged` plus `no_base` share near 100 %.
 - `YuzuVizTopologyResyncBacklog`: `deferred` stays above 0 for 30 min.
 
 **Fleet-gauge semantics.** `yuzu_fleet_*` are rebuilt from the merged views. While an agent is
@@ -1265,7 +1274,8 @@ lands. The two are kept consistent as follows.
     asks the owner to accept it or to require agent signatures on this content.
 - **Gateway choice.** ADR-0074 lets agents move freely between gateways. Reattach adds no gateway
   affinity: a reattach succeeds on any server replica (D14, *HA*), and its adopt decision is the one
-  ProxyRegister uses.
+  ProxyRegister uses. The connection-level precondition in *Server stores* is about the gateway's
+  own upstream connection to a server replica, not about which gateway an agent chooses.
 
 ## Considered options
 
@@ -1408,8 +1418,28 @@ plus churn. Tags fall from about 4 KB to a few hundred bytes per beat.
 - the `Fetcher` seam is removed;
 - the `kPushedMapHardCap` LRU orders by `body_received_at`.
 
-Both stores stay in-memory and per-replica. HA gets cleaner, not worse: a replica that lacks a base
-or a body asks for it, rate-limited. A shared store is neither needed nor decided here.
+Both stores stay in-memory and per-replica. That rests on one precondition, stated so it is not
+assumed.
+
+**All heartbeats of one agent session reach one server replica for the life of a gateway upstream
+connection** (connection-level affinity). Today a gateway has one upstream (`upstream_addr` in
+`gateway/config/sys.config`) over one HTTP/2 connection, so the precondition holds when that
+connection terminates on one replica. ADR-0074 lists several upstream servers per gateway as open
+work (#5647 to #5651); this precondition binds that work.
+- **Per-RPC balancing of `GatewayUpstream` is unsupported.** A load balancer that spreads one
+  connection's RPCs across replicas leaves each replica a partial delta base, and most agents are
+  `diverged` or `no_base` on most heartbeats, resyncing without end.
+- **An upstream reconnect that lands on another replica is a replica change.** It costs one tag
+  resync per agent the gateway holds, and one topology resync per agent with no slot there, at the
+  rates in D8.
+- **Runbook symptom.** A `diverged` plus `no_base` share near 100 % of heartbeats, sustained, while
+  the gateway's coalescing rate is near zero, means per-RPC balancing in front of the server. The
+  divergence alert's runbook (D13) names it.
+
+Under the precondition, HA is no worse than today: a replica that lacks a base or a body asks for
+it, rate-limited. It is not cleaner: a replica change costs a resync wave. A shared or
+per-session-sticky delta base, which per-RPC balancing would need, is not decided here (open
+point 14).
 
 ### Consumers
 
@@ -1723,3 +1753,9 @@ release and merge to `dev` inside one release window. ADR-0074 gates its own wav
       agent's signature verifies. A failure tears the stream down and the agent registers again; or
     - (b) reattach is exempt from the D5 per-session proof, recorded as a new row in ADR-0074's
       accepted-risks table.
+14. **Per-RPC balancing of `GatewayUpstream`** (*Server stores*). As written, the per-replica,
+    in-memory delta base needs every heartbeat of one agent session to reach one replica for the
+    life of a gateway upstream connection, and per-RPC balancing is unsupported. Supporting it needs
+    either a shared delta base (a fleet-wide store written on every state change) or a
+    per-session-sticky route from gateway to replica. The owner decides whether to support it, and
+    if so which; until then the precondition stands and is documented for operators.
