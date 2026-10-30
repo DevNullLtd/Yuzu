@@ -3140,6 +3140,14 @@ TEST_CASE("REST dex/apps: the platform scope selects the population and the cove
     CHECK(lin["apps"][0]["crashes"] == 1);
     CHECK(lin["apps"][0]["distinct_devices"] == 1);
     CHECK(lin["crash_source_coverage"] == nlohmann::json{{"linux", "partial"}});
+    // The two published values the cases above do not send: an explicit `all` is the default, and
+    // `macos` selects the macOS population (one online device, no observation seeded for it).
+    CHECK(get("/api/v1/dex/apps?window=all&platform=all") == none);
+    const auto mac = get("/api/v1/dex/apps?window=all&platform=macos");
+    CHECK(mac["population_basis"] == "macos_online");
+    CHECK(mac["population"] == 1);
+    CHECK(mac["apps"].empty());
+    CHECK(mac["crash_source_coverage"] == nlohmann::json{{"macos", "partial"}});
 }
 
 TEST_CASE("REST dex/catalogue/group: family drill, unknown family -> 404, no audit",
