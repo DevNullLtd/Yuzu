@@ -1198,7 +1198,13 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     before the registry, `plugin_config_store_`, the execution tracker, `audit_store_` (the
     re-claim audit drain), `gw_mgmt_pool_` (its own gateway forwarders) and the Postgres pool it
     calls. On stop it cancels its in-flight forwards (`ClientContext::TryCancel`) before joining
-    them. Shutdown latency is bounded by one in-flight lease budget plus the pool's
+    them. Each forwarder owns its `ClientContext` for the RPC's whole duration and registers a
+    pointer to it in an issuer-owned in-flight table under one mutex; it checks the stop flag
+    under that same mutex and refuses to start the RPC if the flag is set, and it removes its entry
+    under that mutex before the context is destroyed. The stop sweep sets the flag and calls
+    `TryCancel` only while holding that mutex, so it never cancels a context that has finished or
+    been destroyed, and a forwarder starting during the stop never begins an uncancelled RPC. The
+    slice-6 shutdown test races a stop against forward completion under TSan. Shutdown latency is bounded by one in-flight lease budget plus the pool's
     `statement_timeout`, plus the re-claim audit drain's bound of about 6 s (D6); the forwarders' 10 s
     deadline does not add to it because they are cancelled first. The slice-6 shutdown test also
     stops during an in-flight forward; slice 8, which adds the re-claim audit queue, adds a stop
