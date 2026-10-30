@@ -2208,7 +2208,9 @@ of every ~30 s. The content is unchanged.
   `legacy_echo_wire_name` as at registration;
   a refusal before the adopt step leaves the route directory untouched; a successful reattach
   fires no `agent.registered` event; each outcome moves `yuzu_server_agent_reattach_total`, and
-  the three caller-attributable refusals write an `agent.reattach` audit row;
+  the two caller-attributable refusals (`NOT_ENROLLED`, `MALFORMED_SESSION`) write an
+  `agent.reattach` audit row, and `SUPERSEDED`, `NO_RECORD`, `DEGRADED` and `RATE_LIMITED` write
+  none;
 - `AgentRegistrationStore` under the ADR-0012 test conventions (`YUZU_REQUIRE_PG_DB`): upsert, plugin
   interning, the decommission cascade (including the `kCascadeStoreCount` bump), DB-authored
   timestamps;
