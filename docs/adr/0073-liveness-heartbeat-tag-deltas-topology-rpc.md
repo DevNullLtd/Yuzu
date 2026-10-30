@@ -1201,7 +1201,8 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     them. Shutdown latency is bounded by one in-flight lease budget plus the pool's
     `statement_timeout`, plus the re-claim audit drain's bound of about 6 s (D6); the forwarders' 10 s
     deadline does not add to it because they are cancelled first. The slice-6 shutdown test also
-    stops during an in-flight forward and during the audit drain. The pass swaps the pending set out under the set's mutex and never holds
+    stops during an in-flight forward; slice 8, which adds the re-claim audit queue, adds a stop
+    during the audit drain. The pass swaps the pending set out under the set's mutex and never holds
     that mutex across `build_classified_command`, a Postgres call or `send_to`, so ingestion's
     mark never waits on Postgres. The pass is a new background job: it gets a
     `background_jobs.hpp` row (WS-10; a diff against that array, never a silent addition),
@@ -2663,21 +2664,30 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
      `--tag-resync-rate` and `--topology-resync-rate`, the per-agent intervals and the backoff after
      `rejected`; the resync metrics (`yuzu_server_tag_resync_total`,
      `yuzu_viz_topology_resync_total`, `yuzu_server_resync_pending`); the reply drop at ingest;
-     minting, the exec-tracker skip, the catalogue pairs, and the operator-surface refusal.
+     minting, the exec-tracker skip, the catalogue pairs, and the operator-surface refusal;
+     the two `SystemReservedPush` enumerators, `kSystemReservedPushes` from 4 to 6 and the SCOPE
+     OF THE BYPASS entries; the issuer's own gateway forwarder (the `send_system_reserved`
+     variant that never uses `gw_pending_`, the pure batching function with its never-empty
+     `agent_ids` and 2,000-id rules, at most 8 forwards in flight and one per (cluster, action),
+     `timeout_seconds` 10, `TryCancel` at stop) and its tests.
 
    Covers both `tags` and `topology`; the `topology` action is inert until slice 8.
 7. **Gateway opacity.** Keep-newest whole-heartbeat coalescing; the per-tag checks and the
    tag-strip path removed (`heartbeat_invalid` stays for the remaining drops); pass-through and
    lexical eunit.
 7b. **Reattach, both ends.**
-    - Server: `ProxyReattach` with the shared adopt function, its rate limit, and the peer-guard
-      override.
-    - Gateway: replay sends ids; all three Register copies and the plugin-name lists removed; owner
+    - Server: `ProxyReattach` with the shared adopt function, its rate limit and the
+      `retry_after_ms` derivation, the step-6 `register_agent` refusal mapping, the
+      `yuzu_agents_registered_total` skip, the shared SPKI-principal helper for the
+      `agent.reattach` row, and the peer-guard override.
+    - Gateway: the per-session `RATE_LIMITED`/`DEGRADED` requeue timer that clears
+      `recent_replays`, with full jitter and a 0 floored at 1 s; replay sends ids; all three Register copies and the plugin-name lists removed; owner
       restart from ids; `NO_RECORD` closes the stream.
     - Agent: reconnect backoff with full jitter.
 8. **Server topology.** `ReportTopology`, digest confirm, the D6 slot changes, `stale_reason`,
    retain-on-disconnect, age rebasing, the topology resync trigger, the fetcher removed, server
-   topology metrics.
+   topology metrics; the re-claim audit queue, its drain on the issuer and
+   `yuzu_viz_topology_reclaim_audit_total`, with a stop-during-drain test.
 9. **Gateway topology and agent sender.**
    - Gateway: `report_topology/2` with its permit pool and cap, `ProxyTopology`, the peer-guard
      override.
