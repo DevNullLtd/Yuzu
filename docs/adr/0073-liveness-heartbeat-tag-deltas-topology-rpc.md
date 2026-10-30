@@ -2360,7 +2360,7 @@ of every ~30 s. The content is unchanged.
   - **S2, S1 with Postgres degraded** (300 ms added latency, pool saturated; slice 6): heartbeat
     ingestion is unaffected, resyncs are `deferred` and drain once the pool recovers, and a reattach
     whose read fails answers `DEGRADED` without closing a stream; `DEGRADED` reattach attempts per
-    second stay at or below the held session count divided by 5 s;
+    second stay at or below min(held sessions / 2.5 s, `--reattach-rate`), the full-jitter mean;
   - **S3, two replicas behind per-RPC balancing** (slices 4 and 6): asserts the connection-affinity
     precondition (*Server stores*) by showing the documented symptom, a `diverged` plus `no_base`
     share near 100 %, and that connection-level balancing converges;
