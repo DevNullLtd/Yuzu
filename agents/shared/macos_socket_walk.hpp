@@ -69,7 +69,6 @@ constexpr std::string_view socket_walk_tcp_state(int st) noexcept {
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>

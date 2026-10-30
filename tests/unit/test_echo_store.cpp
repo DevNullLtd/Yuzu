@@ -3904,13 +3904,13 @@ TEST_CASE("EchoDatabase: rollback_open_transaction clears a transaction an unwin
 
 TEST_CASE("EchoDatabase: a pre-auto_vacuum database converts with one VACUUM",
           "[echo][store][budget]") {
-    auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_av_");
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_av_"};
     {
         // A database as an older build left it: tables already exist, auto_vacuum none, and
         // plenty of free pages (the schema the open creates would otherwise use up a small
         // freelist).
         yuzu::test::SqliteHandleOwner<sqlite3> owner;
-        REQUIRE(sqlite3_open(tmp.string().c_str(), &owner.db) == SQLITE_OK);
+        REQUIRE(sqlite3_open(tmp.path.string().c_str(), &owner.db) == SQLITE_OK);
         REQUIRE(sqlite3_exec(owner.db,
                              "PRAGMA auto_vacuum=0; CREATE TABLE yuzu_test_pad(x BLOB);"
                              "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1500) "
@@ -3918,7 +3918,7 @@ TEST_CASE("EchoDatabase: a pre-auto_vacuum database converts with one VACUUM",
                              "DELETE FROM yuzu_test_pad WHERE rowid % 4 != 0;",
                              nullptr, nullptr, nullptr) == SQLITE_OK);
     }
-    auto opened = EchoDatabase::open(tmp);
+    auto opened = EchoDatabase::open(tmp.path);
     REQUIRE(opened.has_value());
     {
         EchoDatabase db = std::move(*opened);
@@ -3939,10 +3939,5 @@ TEST_CASE("EchoDatabase: a pre-auto_vacuum database converts with one VACUUM",
         CHECK(db.checkpoint(CheckpointMode::kTruncate) == CheckpointResult::kOk);
         CHECK(db.storage_bytes().wal_bytes == 0); // TRUNCATE reclaimed the WAL file
     }
-    std::error_code ec;
-    fs::remove(tmp, ec);
-    fs::remove(fs::path{tmp.string() + "-wal"}, ec);
-    fs::remove(fs::path{tmp.string() + "-shm"}, ec);
-    fs::remove(fs::path{tmp.string() + "-journal"}, ec);
 }
 

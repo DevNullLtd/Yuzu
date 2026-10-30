@@ -316,16 +316,10 @@ struct CatalogResult {
 // pointer); no path is re-resolved.
 std::vector<BYTE> catalog_hash_of(HCATADMIN admin, HANDLE image) {
     const LARGE_INTEGER start{};
-    if (!SetFilePointerEx(image, start, nullptr, FILE_BEGIN))
-        return {};
-    DWORD size = 0;
-    CryptCATAdminCalcHashFromFileHandle2(admin, image, &size, nullptr, 0); // sizing call
-    if (size == 0 || size > 64)
-        return {};
-    if (!SetFilePointerEx(image, start, nullptr, FILE_BEGIN))
-        return {};
-    std::vector<BYTE> hash(size);
-    if (!CryptCATAdminCalcHashFromFileHandle2(admin, image, &size, hash.data(), 0) || size == 0 ||
+    std::vector<BYTE> hash(64); // room for any catalog digest (SHA-1 is 20 bytes, SHA-256 32)
+    DWORD size = static_cast<DWORD>(hash.size());
+    if (!SetFilePointerEx(image, start, nullptr, FILE_BEGIN) ||
+        !CryptCATAdminCalcHashFromFileHandle2(admin, image, &size, hash.data(), 0) || size == 0 ||
         size > hash.size())
         return {};
     hash.resize(size);

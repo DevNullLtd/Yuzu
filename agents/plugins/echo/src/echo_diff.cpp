@@ -538,19 +538,15 @@ std::vector<NetworkEvent> compute_network_events(
     return events;
 }
 
-namespace {
-[[nodiscard]] bool pid_name_usable(const PidName& e, int64_t ts) noexcept {
-    return !e.name.empty() && (e.exited_at == 0 || ts - e.exited_at <= kPidNameGraceSec);
-}
-} // namespace
-
 std::string pid_name_lookup(const std::unordered_map<uint32_t, PidName>& names, uint32_t pid,
                             int64_t ts) {
     if (pid == 0)
         return {};
     const auto it = names.find(pid);
-    return (it != names.end() && pid_name_usable(it->second, ts)) ? it->second.name
-                                                                  : std::string{};
+    return (it != names.end() &&
+            (it->second.exited_at == 0 || ts - it->second.exited_at <= kPidNameGraceSec))
+               ? it->second.name
+               : std::string{};
 }
 
 void fill_process_names(std::vector<NetConnection>& conns,

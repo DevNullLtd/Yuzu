@@ -1019,13 +1019,11 @@ BudgetPassResult run_budget(EchoDatabase& db, int64_t now_epoch, int64_t target_
         return res;
 
     std::vector<BudgetCandidate> raw = raw_budget_candidates(db, now_epoch);
-    std::vector<BudgetCandidate> hourly;
-    bool hourly_built = false;
+    std::vector<BudgetCandidate> hourly = hourly_budget_candidates(db, now_epoch);
 
-    const auto fail = [&](std::string why) {
+    const auto fail = [&](const std::string& why) {
         res.failed = true;
-        res.error = std::move(why);
-        spdlog::warn("Echo budget: eviction pass stopped: {}", res.error);
+        spdlog::warn("Echo budget: eviction pass stopped: {}", why);
     };
 
     while (res.data_bytes_after > target_bytes) {
@@ -1033,10 +1031,6 @@ BudgetPassResult run_budget(EchoDatabase& db, int64_t now_epoch, int64_t target_
         bool in_raw = true;
         std::vector<BudgetCandidate>* tier = &raw;
         if (std::all_of(raw.begin(), raw.end(), [](const auto& c) { return c.exhausted; })) {
-            if (!hourly_built) {
-                hourly = hourly_budget_candidates(db, now_epoch);
-                hourly_built = true;
-            }
             in_raw = false;
             tier = &hourly;
         }
@@ -1118,9 +1112,6 @@ VacuumAction vacuum_decision(int64_t auto_vacuum, int64_t data_bytes, int64_t ta
 }
 
 std::optional<int64_t> parse_budget_bytes(std::string_view text) {
-    if (text.empty() ||
-        !std::all_of(text.begin(), text.end(), [](char ch) { return ch >= '0' && ch <= '9'; }))
-        return std::nullopt;
     int64_t v = 0;
     const auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), v);
     if (ec != std::errc{} || p != text.data() + text.size() || v < kEchoDbBudgetBytesMin)

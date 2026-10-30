@@ -402,14 +402,8 @@ struct SubtreeRead {
 /// whole Services root partial. The reader does not open it and the diff ignores it.
 [[nodiscard]] inline bool registry_path_excluded(std::string_view full) {
     constexpr std::string_view kBam = "HKLM\\SYSTEM\\CurrentControlSet\\Services\\bam\\State";
-    if (full.size() < kBam.size())
-        return false;
-    for (std::size_t i = 0; i < kBam.size(); ++i) {
-        auto lower = [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; };
-        if (lower(full[i]) != lower(kBam[i]))
-            return false;
-    }
-    return full.size() == kBam.size() || full[kBam.size()] == '\\';
+    return yuzu::profiles::iequals_ascii(full.substr(0, kBam.size()), kBam) &&
+           (full.size() == kBam.size() || full[kBam.size()] == '\\');
 }
 
 /// Pure budget accounting for the production reader (R9): one place decides when

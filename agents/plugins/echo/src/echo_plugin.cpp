@@ -2143,8 +2143,6 @@ private:
                     total_events += static_cast<int>(mrows.size());
                     module_seen_ = std::move(module_seen);
                 }
-            } else {
-                module_seen_ = std::move(module_seen); // nothing admitted; keep any hour rollover
             }
             module_overflows_.store(module_seen_.overflows(), std::memory_order_relaxed);
             if (auto d = module_stream_->dropped(); d > last_module_dropped_) {
@@ -3025,11 +3023,7 @@ private:
         // the last maintenance pass finished its hygiene; it can be non-zero while an echo.sql
         // read pins the WAL (the budget is hard for data pages, soft for the WAL).
         {
-            const auto budget_text = db_->get_config(std::string{yuzu::echo::kDbBudgetKey}, "");
-            ctx.write_output(std::format(
-                "db_budget_bytes|{}",
-                yuzu::echo::parse_budget_bytes(budget_text)
-                    .value_or(yuzu::echo::kEchoDbBudgetBytesDefault)));
+            ctx.write_output(std::format("db_budget_bytes|{}", configured_budget_bytes()));
             ctx.write_output(std::format("budget_over_bytes|{}",
                                          budget_over_.load(std::memory_order_relaxed)));
             ctx.write_output(std::format(

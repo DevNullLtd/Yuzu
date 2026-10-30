@@ -51,8 +51,6 @@ public:
     /// Times the cap forced a clear. Monotonic for the life of the process.
     [[nodiscard]] uint64_t overflows() const noexcept { return overflows_; }
 
-    [[nodiscard]] std::size_t size() const noexcept { return keys_.size(); }
-
 private:
     // Floor division, so a negative (pre-1970, dead-RTC) timestamp still lands in a stable hour.
     static int64_t hour_of(int64_t ts) noexcept {

@@ -3708,10 +3708,6 @@ bool EchoDatabase::vacuum_to_incremental() {
         spdlog::warn("EchoDatabase: VACUUM failed: {}", err.text());
         return false;
     }
-    // VACUUM in WAL mode writes the rebuilt file through the WAL; reclaim it now (best effort).
-    sqlite3_busy_timeout(db_, 0);
-    sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
-    sqlite3_busy_timeout(db_, 5000);
     return true;
 }
 

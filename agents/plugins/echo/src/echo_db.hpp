@@ -545,8 +545,10 @@ public:
     CheckpointResult checkpoint(CheckpointMode mode);
 
     /// Convert a database created before auto_vacuum was enabled to incremental mode with
-    /// one VACUUM, then truncate the WAL. Holds the database lock for the whole run.
-    /// True on success. Caller gates it (free disk, off-peak) -- see vacuum_decision().
+    /// one VACUUM. The rebuilt file passes through the WAL; the caller's post-pass checkpoint
+    /// reclaims it (TRUNCATE once the WAL outgrows its allowance). Holds the database lock for
+    /// the whole run. True on success. Caller gates it (free disk, off-peak) -- see
+    /// vacuum_decision().
     [[nodiscard]] bool vacuum_to_incremental();
 
     /// If a raw BEGIN left the write connection inside a transaction (an exception unwound

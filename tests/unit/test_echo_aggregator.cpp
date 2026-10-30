@@ -2890,7 +2890,6 @@ TEST_CASE("run_budget: a probe or delete error stops the pass as a failure, not 
         CHECK(res.failed);
         CHECK_FALSE(res.exhausted);
         CHECK_FALSE(res.deadline_hit);
-        CHECK_FALSE(res.error.empty());
         CHECK(res.evicted_raw == 0);
     }
     SECTION("a delete that errors part-way") {
@@ -2900,7 +2899,6 @@ TEST_CASE("run_budget: a probe or delete error stops the pass as a failure, not 
         const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
         CHECK(res.failed);
         CHECK_FALSE(res.exhausted);
-        CHECK_FALSE(res.error.empty());
         CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_live") == 3000); // the failed batch rolled back
         CHECK(db.get_config("budget_evicted_raw_rows_total", "none") == "none");
     }

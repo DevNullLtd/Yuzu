@@ -35,9 +35,9 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <string>
 #include <string_view>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -205,13 +205,8 @@ inline std::vector<ModuleEvent> apply_module_risk_filter(std::vector<ModuleEvent
         }
         if (signed_kept >= max_signed)
             continue; // per-drain cap (the hard bound); do NOT mark the key
-        std::string key{module_action_token(e.action)};
-        key += '\x1f';
-        key += e.process_name;
-        key += '\x1f';
-        key += e.module_name;
-        key += '\x1f';
-        key += e.module_dir;
+        auto key = std::format("{}\x1f{}\x1f{}\x1f{}", module_action_token(e.action),
+                               e.process_name, e.module_name, e.module_dir);
         if (!seen.first_this_hour(e.ts_unix, std::move(key)))
             continue; // already stored this hour
         ++signed_kept;

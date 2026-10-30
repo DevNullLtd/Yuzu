@@ -12,6 +12,7 @@
 
 #include <yuzu/audit_retention_rules.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -383,9 +384,8 @@ struct BudgetPassResult {
     bool exhausted{false};
     /// The pass ran out of time with eligible rows left.
     bool deadline_hit{false};
-    /// A probe or delete failed; the pass stopped. `error` names why. Not retried in-pass.
+    /// A probe or delete failed; the pass stopped (the cause is logged). Not retried in-pass.
     bool failed{false};
-    std::string error;
 };
 
 /**
@@ -418,8 +418,7 @@ struct BudgetPassResult {
 /// never on how the last eviction pass ended.
 [[nodiscard]] constexpr int64_t budget_over_bytes(int64_t data_bytes, int64_t wal_bytes,
                                                   int64_t budget_bytes) noexcept {
-    const int64_t over = data_bytes + wal_bytes - budget_bytes;
-    return over > 0 ? over : 0;
+    return std::max<int64_t>(0, data_bytes + wal_bytes - budget_bytes);
 }
 
 enum class VacuumAction { kSkip, kRun, kDefer };
