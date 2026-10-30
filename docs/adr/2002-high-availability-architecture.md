@@ -147,7 +147,8 @@ server+everything model.
   receiver dedup **plus outcome-replay** is what closes it).
   *Update (2026-10-30, ADR-0074 conflict 8): under the decided asynchronous default a failover can lose a
   claim, and a reclaimed step is sent under a new command id that WS-0 dedup does not absorb; this holds
-  across a failover only once ADR-0074 D13's execute-once-claims requirement is met.*
+  across a failover only once ADR-0074 D13's command-outbox-and-dispatch and execute-once-claims
+  requirements are met.*
 - **Events/SSE: at-least-once with gap detection.** Durable monotonic event IDs; consumers replay
   from a cursor / `Last-Event-ID`; NOTIFY is a latency hint only. A consumer may see a duplicate
   event and must tolerate it.
@@ -2446,7 +2447,7 @@ Yuzu ships Postgres, so HA Postgres is a delivery artifact we own.
 > `deploy/docker/ha-postgres/patroni-entrypoint.sh`): non-strict synchronous replication, where every
 > commit waits for one standby while any standby is up, and replication degrades to asynchronous only
 > on total standby loss. (2) **The decided default is asynchronous replication**: no commit waits for
-> a standby, and the synchronous profiles become an operator's choice. Many enterprise data-centre
+> a standby (except a transaction ADR-0074 D13's per-store requirements make wait), and the synchronous profiles become an operator's choice. Many enterprise data-centre
 > pairs are more than 2 ms apart, too far for a standby wait on every commit. The shipped default
 > changes in ADR-0074's wave 6; until then it is unchanged. What a failover can then lose, and the
 > requirement each store must meet in ADR-0074's wave 1 or wave 6, are in ADR-0074 D13.
@@ -2613,8 +2614,8 @@ committed events (§5); in-flight commands re-drive (§7); **directory re-home r
 duplicate** (§7). It must also cover **standby loss** (quorum-degrade behavior, §11). Owned by
 `build-ci` + `release-deploy`; scenarios by `chaos-injector`.
 
-> **Update (2026-10-30, ADR-0074 conflict 8).** The standby-loss scenario above applies to the optional
-> synchronous profiles. Under the decided asynchronous default, the harness also runs a failover that
+> **Update (2026-10-30, ADR-0074 conflict 8).** The standby-loss scenario above applies to every profile; on the
+> synchronous profiles it also covers quorum-degrade. Under the decided asynchronous default, the harness also runs a failover that
 > loses acknowledged writes, against the per-store requirements in ADR-0074 D13. On that failover the
 > assertions above (sessions survive, no committed event lost, no double-dispatch) hold only as far as
 > those requirements make them hold.
@@ -2644,7 +2645,7 @@ This ADR records the model and principles. Each area becomes a child ADR/issue:
 6. **PKI/CA HA** — shared CA key custody + node admission (not `SecretCodec`; §8 Update
    2026-09-23), CRL publication state machine, KEK versioning/rollout, enrollment to PG (§8).
 7. **HA-PG delivery** — Patroni+etcd+HAProxy profile with **selectable durability (3-node quorum
-   default)** + operator-plane LB (§11).
+   default)** + operator-plane LB (§11). *(Update 2026-10-30: the decided default becomes asynchronous; ADR-0074 conflict 8, §11 update.)*
 8. **Health contract + BYO-LB doc** (§12).
 9. **Failover test harness** incl. quorum-degrade + re-home-race cases (§14).
 10. **Background-job replica-safety classification (finding 4).** Active–active means every *existing*
@@ -2672,7 +2673,7 @@ This ADR records the model and principles. Each area becomes a child ADR/issue:
 - HA deployments **require the gateway** and take on **net-new distributed intra-cluster routing** and
   **shared presence state** — the honestly-priced cost of gateway-fronting.
 - We take on **operating a shipped HA-PG stack** (Patroni/etcd/HAProxy) with a **3-node quorum**
-  default footprint.
+  default footprint. *(Update 2026-10-30: the decided default becomes asynchronous; ADR-0074 conflict 8, §11 update.)*
 - We accept a **session-expiry monotonicity regression** on the DB host in exchange for shareable
   durable sessions (§4).
 - The **effectively-once** guarantee is contingent on **WS-0** (durable agent dedup); until it lands
