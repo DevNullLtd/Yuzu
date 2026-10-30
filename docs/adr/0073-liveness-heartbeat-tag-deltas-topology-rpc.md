@@ -1231,6 +1231,15 @@ message ReattachResponse {
     and the registration proceeds. A failed upsert leaves the previous row, which names the previous
     session, so the agent's next reattach answers `NO_RECORD` rather than installing stale plugin or
     tag facts, and the agent re-registers.
+  - **Cost at storm rates.** It is one transaction per registration, so it runs at the Register
+    rate: during a gateway-restart reconnect storm inside ADR-0074 D14's 60-second target, about
+    1,700 per second for 100,000 agents fleet-wide. The `registrations` row changes on every
+    registration, because `session_id` does, so the upsert cannot be skipped as unchanged. The
+    `plugin_sets` insert is skipped when the replica's in-memory cache already holds the hash, and
+    is otherwise an insert-if-absent. The write's bounded lease acquire adds to Register latency
+    under pool contention; it is measured with the combined rate in D8. A lost write is paid back
+    later, as one reconnect: the agent's next reattach answers `NO_RECORD`, and the agent pays a TLS
+    handshake and a full Register.
   - Reads on reattach fail closed (step 4).
 - **Backup and restore.** The schema is in the standard Postgres backup scope, like every
   server store. After a restore, rows whose `session_id` no longer matches the session an agent
