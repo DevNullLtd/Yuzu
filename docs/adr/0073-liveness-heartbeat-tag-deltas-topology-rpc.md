@@ -648,9 +648,10 @@ separate atomic (`latest_snapshot_`, `latest_snapshot_seq_`); both go.
 
 ### D6. Server topology liveness from the digest
 
-Each topology slot gains these fields, all on the server's wall clock:
+Each topology slot gains these fields:
 - `digest`;
-- `body_received_at`;
+- `body_received_at`, held twice: on `steady_clock` for every duration, and on the wall clock for
+  display only;
 - `last_heartbeat_at`: the last heartbeat that carried a `TopologyDigest` field for the agent,
   whatever its digest. It is the liveness key for `agent_silent`;
 - `confirmed_at`: the last heartbeat whose digest equalled the slot's. It is the key for the IP-claim
@@ -662,6 +663,17 @@ Each topology slot gains these fields, all on the server's wall clock:
 - `last_outcome`, `outcome_since` (when `last_outcome` last changed value) and `pump_interval_s`,
   from the latest heartbeat;
 - `mismatch_since`.
+
+**Every D6 duration is measured on the server's `steady_clock`.** That covers `last_heartbeat_at`,
+`confirmed_at`, `pump_advanced_at`, `outcome_since`, `mismatch_since`, the no-slot first sighting,
+the 300 s IP-claim reclaim, the 300 s retain-on-disconnect, `kReportGrace` and the connection-age
+rebase. The wall clock only renders ages and `body_received_at` for display, and stamps audit rows.
+A wall-clock step therefore cannot show a dead agent as live, expire every slot at once, or free a
+live agent's IP claims. This changes today's store: `push_snapshot` and the stale check key on
+`server_received_at` from `system_clock` (`fleet_topology_store.cpp`), and the 90 s stale and 300 s
+reclaim rules move to `steady_clock` with it. Only the render cache's age already uses
+`steady_clock`. The store's tests inject the clock, so a test advances it rather than pre-setting a
+receipt time.
 
 Every row below sets `last_heartbeat_at` and the pump fields when the agent has a slot.
 
@@ -1724,6 +1736,8 @@ of every ~30 s. The content is unchanged.
   agent with a late report reads `body_pending`, not `agent_silent`; an offline host past 300 s
   reads `offline` and a `--no-topology` agent `not_reported`; every reporting agent after a restart
   reads `awaiting_report` until its body lands; the schema enum matches the C++ enum;
+- a wall-clock step of an hour in either direction changes no `stale_reason`, no IP claim and no
+  retention outcome (an injected `steady_clock` and wall clock that move independently);
 - the no-slot grace (a normal start sends one body, no RESYNC), and no resync while a rejected
   report's digest is unchanged;
 - `pump_stuck` derived from `pump_interval_s` at 30, 60, 300 and 900 s: a healthy pump at each
