@@ -521,11 +521,17 @@ outside this rule; this ADR adds none of it.
       `__resync__.tags`. The agent answers with full heartbeats until two are acknowledged (D8), so
       one more coalescing during the resync does not lose the full set.
     - Coalescing happens only when a session sends two beats before a flush. In steady state that is
-      rare, because flushes run far more often than every 30 s.
-    - It is routine during an **upstream outage**. After an outage, every agent whose state tags
-      changed during it diverges once. The server then resyncs them at the configured rate (2000/s
-      per replica, about 4 KB each). For 100k agents that is at most about 50 s of resync traffic
-      after recovery.
+      rare at the default flush interval (`heartbeat_batch_interval_ms`, 1000 ms, valid 100 to
+      60,000), far below the 24 s minimum jittered heartbeat. The gateway does not enforce that
+      relation: a flush interval configured near 24 s or above makes coalescing routine, and each
+      coalesced state change then costs a resync. `docs/user-manual/gateway.md` states the relation.
+    - It is routine during an **upstream outage**. `AgentHealthStore` entries are not removed when a
+      stream or upstream connection ends (`AgentHealthStore::remove` has no production caller); they
+      are pruned after 90 s without a heartbeat. So an outage shorter than 90 s leaves the server's
+      bases in place, and only the agents whose state tags changed during it diverge once. After a
+      longer outage every entry is gone, every agent's next heartbeat is `no_base`, and all of them
+      resync once. Either way the server issues at the configured rate: N / 2000 s per replica, where
+      N is the agents whose heartbeats reach it, so about 50 s of issuing for N = 100,000 (D8).
   - The digest makes keep-newest correct, not merely tolerable. Whatever a lost heartbeat carried,
     the next delta's `base_digest` no longer matches the server's stored digest, and the server
     re-requests the full set (D3, step 6). A later heartbeat whose `state_digest` already equals the
@@ -862,10 +868,15 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
 - **Rate limits** (per replica, applied by the issuer). A mark over the rate stays in the set for a
   later pass and is counted `deferred`; nothing is dropped permanently, because divergence persists
   until fixed.
+  - **Figures are per replica.** Issuing takes N / rate seconds, where N is the number of agents
+    whose heartbeats reach that replica. Every figure here is for N = 100,000 on one replica. Both
+    defaults are unmeasured (see the combined Postgres rate above).
   - `tags`: `--tag-resync-rate`, default 2000/s, at most one per agent per 60 s. A full set is about
-    4 KB, so 100k agents resync in about 50 s.
-  - `topology`: `--topology-resync-rate`, default 200/s, at most one per agent per 5 min. 100k agents
-    repopulate in about 8 min at about 30 MB/s of body ingest.
+    4 KB. Issuing takes about 50 s for N = 100,000, but tags converge in about **two minutes**: the
+    first heartbeat after a restart (up to 36 s) marks the agent, issuing drains over about 50 s,
+    and the full set rides the agent's next heartbeat after delivery (up to 36 s more).
+  - `topology`: `--topology-resync-rate`, default 200/s, at most one per agent per 5 min. N / 200 s:
+    about 8 min for N = 100,000, at about 30 MB/s of body ingest.
   - **Per-agent backoff after `rejected`.** The per-agent `tags` interval starts at 60 s and doubles
     for each consecutive `rejected` outcome, to a cap of 15 min. An accepted payload resets it. A
     `diverged` or `no_base` outcome keeps the 60 s interval.
@@ -1004,8 +1015,9 @@ Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
 **Fleet-gauge semantics.** `yuzu_fleet_*` are rebuilt from the merged views. While an agent is
 `no_base` (after a server restart, until its full set lands), its state-derived gauges are absent,
 not zero, and its interval-derived gauges are present. The documented consequence: after a server
-restart, state-derived fleet gauges converge over about one minute (rate-limited full resync) instead
-of one heartbeat.
+restart, state-derived fleet gauges converge in about two minutes for N = 100,000 agents on one
+replica (N / `--tag-resync-rate` of issuing plus up to two jittered heartbeats, D8) instead of one
+heartbeat.
 
 ### D14. Registration replay by ids: the gateway keeps no RegisterRequest
 
@@ -1110,8 +1122,11 @@ message ReattachResponse {
        `TagStore`, so it never re-creates a tag an operator removed there.
 
   The CONNECTED re-announce then sets `gateway_node`, wire capabilities, `stream_home_id` and
-  `cluster_id`, as today. Status tags and topology are **not** in the record. The next heartbeat is `no_base`, and
-  `__resync__.tags`, then `__resync__.topology`, converge them (D3, D8).
+  `cluster_id`, as today. Status tags and topology are **not** in the record. A replica that still
+  holds the agent's `AgentHealthStore` entry (an upstream reconnect to the same replica within 90 s)
+  continues from that base. On a replica with none (a server restart, another replica, an entry
+  pruned after 90 s without a heartbeat) the next heartbeat is `no_base`, and `__resync__.tags`,
+  then `__resync__.topology`, converge them (D3, D8).
 - **Reattach is a continuation, not a registration.** A successful reattach fires no
   `agent.registered` webhook or offload event and writes no registration audit row, because the
   agent did not enrol or register again. Every outcome is counted on
@@ -1241,10 +1256,21 @@ message ReattachResponse {
    (`yuzu_gw_upstream:record_result/2`), so a reattach storm would open the breaker. Each reattach costs one lock,
    one enrollment-status read, one route CAS and one primary-key read, with the plugin set usually
    cached. That is lighter than today's ProxyRegister replay, which carries a 9 KB, 69-plugin
-   request. 100k agents reattach in about 50 s.
-2. **Tags follow.** `__resync__.tags` runs at 2000/s per replica, about 4 KB each: about 50 s,
-   overlapping step 1.
-3. **Topology follows.** `__resync__.topology` runs at 200/s per replica, about 8 min.
+   request.
+
+   **Throughput** is min(`--reattach-rate`, gateways × `upstream_replay_concurrency` / per-call
+   latency). The replay concurrency defaults to 24, half of `upstream_register_concurrency`'s 48
+   (`yuzu_gw_upstream_regulator.erl`). So one gateway at 50 ms per call reattaches about 480 agents
+   per second, and 100k agents behind one gateway take about 3.5 min; spread over ten or more
+   gateways they reach the 2000/s server cap and take about 50 s. A targeted replay queue holds at
+   most 10,000 agents per gateway (`registration_replay_queue_max`); a verdict that overflows it is
+   dropped and counted `queue_full`, and a later verdict queues those sessions again. The 2000/s
+   default and the per-call latency are unmeasured.
+2. **Tags follow.** A mark for an agent that has not reattached yet stays `deferred` (D8), so tag
+   issuing trails the reattach wave. At 2000/s per replica it adds about 50 s of issuing for
+   N = 100,000, and tags converge in about two minutes after an agent's reattach.
+3. **Topology follows.** `__resync__.topology` runs at 200/s per replica, about 8 min for
+   N = 100,000.
 4. **Agents do not reconnect** in steady state. Reattach is invisible to them. Only `NO_RECORD`
    agents reconnect, under jittered backoff.
 
@@ -1400,8 +1426,8 @@ It should say:
   health, and `/viz`). Operators see their heartbeats counted `absent` on
   `yuzu_server_heartbeat_tags_total`; they are sent no `__resync__` and do not move the divergence
   alert;
-- after a server restart, state-derived gauges converge over about a minute and topology over several
-  minutes;
+- after a server restart, state-derived gauges converge in about two minutes per 100,000 agents on a
+  replica, after those agents reattach, and topology over several minutes;
 - the new flags: `--topology-interval`, `--no-topology`, `--tag-resync-rate`,
   `--topology-resync-rate`, `--reattach-rate`;
 - `yuzu.uptime_s` is replaced by `yuzu.started_at`;
@@ -1497,8 +1523,9 @@ point 14).
 - **DEX performance and `/network`:** unchanged semantics. They read interval tags, which are still
   sent and replaced every beat. `network.md`'s interval-delta and absent-not-zero statements stay
   true.
-- **After a gateway upstream outage:** agents whose state tags changed during the outage diverge
-  once (keep-newest coalescing) and are resynced at the configured rate (D4).
+- **After a gateway upstream outage:** after an outage under 90 s, agents whose state tags changed
+  during it diverge once (keep-newest coalescing); after a longer one, every agent is `no_base`
+  once. Both are resynced at the configured rate (D4).
 - **Guardian:**
   - generation reconcile still fires every heartbeat, from the merged view;
   - its `yuzu.guardian_*` fleet gauges are unchanged once synced;
@@ -1676,7 +1703,8 @@ of every ~30 s. The content is unchanged.
 
 - `docs/fleet-viz-invariants.md`: push-ingestion section and the Metrics fetch-histogram bullet.
 - `docs/user-manual/network.md`: the carriage note; the semantics are unchanged.
-- `docs/user-manual/gateway.md`: the heartbeat batching text (about l.199-227); registration replay
+- `docs/user-manual/gateway.md`: the heartbeat batching text (about l.199-227), including that
+  `heartbeat_batch_interval_ms` must stay well below the heartbeat interval (D4); registration replay
   becomes reattach; the live management RPCs are `SendCommand` and `WatchEvents`, the other three
   deprecated and `UNIMPLEMENTED`.
 - `docs/user-manual/metrics.md`.
