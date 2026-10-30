@@ -27,6 +27,7 @@
 /// the legacy file so an environment where "no production fleet" turns out
 /// to be locally wrong gets a loud signal instead of silent loss.
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -35,6 +36,16 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+// PGconn (`consume_ticket`'s caller-held connection): included directly rather than
+// forward-declaring libpq's private `pg_conn` tag, per api_token_store.hpp's and
+// audit_store.hpp's rationale (#5342) - a re-declaration pins a third party's internal
+// name and breaks last and least legibly if libpq renames it.
+#include <libpq-fe.h>
+
+namespace yuzu {
+class MetricsRegistry;
+} // namespace yuzu
 
 namespace yuzu::server::pg {
 class PgPool;
@@ -52,7 +63,7 @@ namespace yuzu::server {
 enum class ApprovalOrigin {
     /// A mint that has not declared its surface, or a row minted before
     /// `submit()`'s `origin` parameter existed or before it was made
-    /// non-defaulted. REFUSED at redemption (declares_non_mcp_surface),
+    /// non-defaulted. REFUSED at redemption (origin_redeemable_as),
     /// same as kUnrecognised — since #2442's closing half, the MCP gate
     /// (the one surface that historically relied on this value granting)
     /// declares `kMcp` explicitly, so nothing in the tree writes
@@ -69,6 +80,12 @@ enum class ApprovalOrigin {
     kSchedule,
     /// The MCP approval-ticket gate (mcp_server.cpp).
     kMcp,
+    /// The Guardian rule-deploy approval (#6062, four-eyes MVP PR3). Always a
+    /// BOUND ticket (`submit_bound`): the reviewed rule set is frozen on the row,
+    /// and the deploy redeems it through the caller-held-connection `consume_ticket`
+    /// so the consume commits or rolls back with the deploy itself. Its definition
+    /// ids live under the reserved `guardian.` prefix (reserved_definition_id.hpp).
+    kGuardianDeploy,
     /// A stored value this build does not know — a row written by a newer
     /// binary, or a corrupted column. DISTINCT from kUnspecified because they
     /// are different FACTS ("declared nothing" vs. "this build cannot
@@ -81,10 +98,17 @@ enum class ApprovalOrigin {
     kUnrecognised,
 };
 
-/// True when `origin` names a surface that is NOT the MCP recall, or names no
-/// surface at all — kUnrecognised and kUnspecified both fail closed. False
-/// ONLY for kMcp, the one surface this binding must not refuse.
-bool declares_non_mcp_surface(ApprovalOrigin origin);
+/// THE redemption-time origin predicate (#2442, generalised by #6062): may a ticket
+/// recorded as `stored` be redeemed by a caller that declared `expected`?
+///
+/// True ONLY when BOTH are a concrete surface (neither kUnspecified nor
+/// kUnrecognised) and they are equal. kUnspecified and kUnrecognised therefore
+/// ALWAYS refuse - as the stored value ("declared nothing" / "this build cannot
+/// attribute it") and as the expected one (a caller that names no surface has no
+/// claim on any ticket, however the row reads). One definition, used by
+/// `consume_ticket` and by `find_pending`'s dedup filter: a second copy of this
+/// rule is how the two would drift the first time the enum grows.
+[[nodiscard]] bool origin_redeemable_as(ApprovalOrigin stored, ApprovalOrigin expected);
 
 /// Column text for `origin`. `kUnspecified` stores the empty string.
 ///
@@ -118,12 +142,21 @@ struct Approval {
     // One-time-consumption stamp for the MCP approval-ticket flow (#289 / Issue
     // 13.5): epoch-seconds when an approved ticket was recalled-and-executed,
     // 0 while unconsumed. SQLite-era additive column (v2); part of the
-    // Postgres v1 DDL from creation (ADR-0065).
+    // Postgres v1 DDL from creation (ADR-0065). For a SCHEDULE ticket (#6096) this
+    // means "settled", not "an approved ticket was recalled-and-executed": it is set,
+    // for approved and rejected tickets alike, by retire_schedule_tickets when the
+    // occurrence the ticket decided has been queued or skipped. A scheduled ticket
+    // needs this to be 0, which is necessary but not sufficient: the outbox ledger also
+    // decides (see ScheduleRunner).
     int64_t consumed_at{0};
     // WHO consumed the ticket (PR #1796 review H3/N2, SOC-2 CC7.2): the
     // principal whose recall executed the gated tool. Empty while unconsumed.
     // SQLite-era additive column (v3). Completes the ticket's evidence chain:
-    // submitted_by → reviewed_by → consumed_by.
+    // submitted_by → reviewed_by → consumed_by. For a schedule ticket (#6096) it is
+    // `schedule:<schedule_id>:<next_execution_at>` (the occurrence it settled),
+    // `schedule:ledger-spent:<schedule_id>:<next_execution_at>` (a ticket the outbox ledger
+    // showed an EARLIER occurrence had used), or `schedule:legacy-6096` for a ticket the v2
+    // migration retired.
     std::string consumed_by;
     /// Empty for an interactively-submitted ticket (workflow_routes.cpp) or an
     /// MCP-minted one (mcp_server.cpp); set to the owning schedule's id for a
@@ -187,7 +220,135 @@ struct Approval {
     /// Additive columns (migration v8).
     std::string target_plugin;
     std::string target_action;
+    /// The exact effect a reviewer is shown, frozen at mint (#6062, four-eyes MVP
+    /// PR2). EMPTY for every ticket minted through the unbound `submit()` (all MCP,
+    /// interactive-instruction and scheduled-fire tickets today, and every row that
+    /// predates migration v3): an empty value means "this ticket binds no request",
+    /// never "an empty request was reviewed". Only `submit_bound()` writes it, and
+    /// nothing updates it afterwards. The store treats it as an opaque UTF-8 JSON
+    /// document; the Approvals page renders a bounded summary of it (see
+    /// `approvals_page_render.hpp`): every key is listed, but a long value, a long
+    /// list or a long document is CUT, and the summary then says so and names the digest
+    /// as the identity of the whole request. The reviewer therefore reads a summary of
+    /// what is stored, not necessarily all of it.
+    std::string request_json;
+    /// Lowercase hex SHA-256 of `request_json`, computed by the store at mint (so
+    /// the two can never disagree) and frozen with it. Empty exactly when
+    /// `request_json` is. A redeemer that re-derives the effect it is about to
+    /// perform compares its own digest to this one.
+    std::string request_digest;
+    /// Human roots that may NOT approve this ticket, frozen at mint (#6062):
+    /// the people who designed the effect (ADR-0033 section 7 - the approver must
+    /// sit outside the set of humans who authored it), over and above the
+    /// submitter, who is always excluded. Empty for every unbound ticket.
+    std::vector<std::string> excluded_roots;
+    /// True when the stored `excluded_roots` column is not a JSON array of strings
+    /// (a hand-edited or corrupted row). `excluded_roots` then reads empty, which
+    /// must NOT be taken as "nobody is excluded": `approve()` reads the column
+    /// itself and refuses the ticket in this state, and any other reader that
+    /// acts on `excluded_roots` must refuse on this flag too.
+    bool excluded_roots_unreadable{false};
+    /// The row's Postgres version stamp (`xmin::text`) and tuple position (`ctid::text`) as of
+    /// the read that produced this `Approval`; both empty for a value built any other way. For
+    /// DML, an UPDATE by another transaction moves `xmin`, and any UPDATE at all (a second write
+    /// at the same (sub)transaction level included) moves `ctid`, so `consume_ticket` pins its
+    /// consuming statement to the pair it examined (see the pin comment in approval_manager.cpp,
+    /// including what it does not detect: the holding transaction's own CLUSTER, rewriting ALTER
+    /// TABLE or TRUNCATE plus re-insert, and a 32-bit xid wraparound). VACUUM FULL and CLUSTER
+    /// can also move `ctid`, which can refuse a consume once; when the other writer was only
+    /// such maintenance or a no-op rewrite, a retry clears it. Opaque: compare for equality,
+    /// nothing else; neither is part of any API shape.
+    std::string row_version;
+    std::string row_position;
 };
+
+/// Bounds on a bound ticket's frozen request (#6062). `request_json` is returned by
+/// every list/read of the table and rendered on the Approvals page, so it is capped;
+/// a request that does not fit is refused at mint, never truncated (a truncated
+/// request is a different request than the one that will be redeemed).
+inline constexpr std::size_t kMaxRequestJsonBytes = 16 * 1024;
+inline constexpr std::size_t kMaxRequestJsonDepth = 16; ///< nesting limit of the frozen request
+inline constexpr std::size_t kMaxExcludedRoots = 32;
+inline constexpr std::size_t kMaxExcludedRootBytes = 256;
+
+/// Whether `a`'s STORED state is sound enough for `approve()` to accept (#6062): a stored
+/// request that is readable and bounded and hashes to its digest (or no request and no digest
+/// at all, an unbound ticket), and an excluded-roots list that could be read. The request half is
+/// the very function `approve()` calls (`request_binding_fault`); `approve()` checks the
+/// excluded-roots half itself in `set_review_status`, so the roots half agrees with it by test, not
+/// by construction: test_approvals_fragment_routes.cpp ("Approve is withheld exactly when the
+/// store would refuse the stored state") drives the page and the real `approve()` from the same
+/// rows, and test_approval_manager_bound.cpp pins the predicate on its own states. The dashboard uses this to offer Approve only when the store would not refuse it
+/// for these reasons. A reviewer who is themselves excluded or the submitter is a separate,
+/// per-viewer question (`reviewer_is_excluded`).
+[[nodiscard]] bool approval_state_is_approvable(const Approval& a);
+
+/// THE excluded-reviewer predicate (#6062): is `reviewer` one of the human roots barred
+/// from approving? Byte-for-byte, the same comparison as the submitter check (a root IS
+/// the principal name at this layer; ADR-0033 section 7's resolution table is applied by
+/// whoever builds `excluded_roots` and picks the reviewer). `approve()`, the redemption
+/// integrity re-check and the dashboard (which hides Approve, never Reject, from an
+/// excluded viewer) all decide through this one function, so the page cannot offer a
+/// button the store refuses or hide one it allows. A caller that holds an `Approval` must
+/// ALSO refuse on `excluded_roots_unreadable`: an unreadable list is not an empty one.
+[[nodiscard]] bool reviewer_is_excluded(const std::string& reviewer,
+                                        const std::vector<std::string>& excluded_roots);
+
+/// Whether a stored bound request can be shown to a reviewer and verified (#6062): at
+/// most `kMaxRequestJsonBytes`, nested no deeper than `kMaxRequestJsonDepth`, and a JSON
+/// object. THE definition of "readable", shared by `approve()` (which refuses a request
+/// the reviewer could not have read) and the Approvals renderer (which takes its
+/// "unreadable" path instead of parsing or dumping it). The size and depth are checked
+/// lexically BEFORE any parse, so a hostile row is rejected without being expanded.
+/// An EMPTY string is not readable; callers treat an empty `request_json` as "unbound"
+/// before asking.
+[[nodiscard]] bool bound_request_is_readable(std::string_view request_json);
+
+/// True for a surface whose tickets MUST bind a request: `submit()` (unbound) refuses
+/// to mint one, and only `submit_bound()` does. Exhaustive over `ApprovalOrigin` in
+/// the .cpp (a new surface fails the build until it is classified).
+[[nodiscard]] bool requires_bound_request(ApprovalOrigin origin);
+
+/// What a bound ticket freezes at mint (#6062). Both parts are written once, at
+/// INSERT, and never updated.
+struct BoundRequest {
+    /// The exact effect the reviewer is shown, as one JSON OBJECT, at most
+    /// `kMaxRequestJsonBytes`. The store records it opaquely and derives
+    /// `request_digest` from these exact bytes; the Approvals page renders the
+    /// subset documented in `approvals_page_render.hpp`.
+    std::string request_json;
+    /// Human roots barred from approving, in addition to the submitter (who is
+    /// always barred). At most `kMaxExcludedRoots` non-empty entries of at most
+    /// `kMaxExcludedRootBytes` valid UTF-8 bytes each. Compared byte-for-byte with
+    /// the reviewer name, the same comparison the submitter check uses.
+    std::vector<std::string> excluded_roots;
+};
+
+/// Why `submit_bound` refused. A closed set so a caller can answer each cause
+/// distinctly without parsing `message`.
+enum class SubmitFailure {
+    kInvalidRequest,  ///< an argument or the frozen request failed validation
+    kEnginePrincipal, ///< the submitter is an engine principal (`engine:` namespace)
+    kQueueFull,       ///< the global pending cap is reached
+    kStoreError,      ///< store unavailable or a Postgres failure
+};
+
+struct SubmitError {
+    SubmitFailure kind{SubmitFailure::kStoreError};
+    std::string message;
+};
+
+/// Stable messages for the two refusals a route must be able to answer by name.
+inline constexpr const char* kEnginePrincipalSubmitMessage =
+    "engine principals cannot submit an approval for a gated effect";
+inline constexpr const char* kExcludedReviewerMessage =
+    "reviewer is excluded from approving this request";
+inline constexpr const char* kExcludedRootsUnreadableMessage =
+    "this request's excluded reviewers could not be read; it cannot be approved";
+inline constexpr const char* kBoundRequestUnreadableMessage =
+    "this request's frozen content could not be read or verified; it cannot be approved";
+inline constexpr const char* kBoundRequestRequiredMessage =
+    "this approval origin requires a bound request; use submit_bound";
 
 struct ApprovalQuery {
     std::string status;
@@ -229,7 +390,7 @@ struct ApprovalListResult {
 /// a precondition decline (see the impl) stays a log line by design; the
 /// caller's audit row is the durable record.
 ///
-/// A FUTURE second caller of the three-argument overload inherits this same
+/// A FUTURE second caller of `consume_ticket` with a precondition inherits this same
 /// obligation for its own kind of drift: (1) do not let its kPrecondition
 /// message fall through to the shared "already used" wording, and (2) if its
 /// `.message` carries anything the caller shouldn't learn before their own
@@ -240,7 +401,14 @@ enum class ConsumeFailure {
     kNotConsumable, ///< absent / not approved / already consumed (the CAS lost)
     kStoreError,    ///< store unavailable, missing argument, or a Postgres failure —
                     ///< see ConsumeError::sqlstate/binding_check_unevaluated
-    kForeignOrigin, ///< minted on a surface other than the MCP recall (#2442)
+    kForeignOrigin, ///< minted on a surface other than the MCP recall (#2442); ALSO the kind for a
+                    ///< ticket that fails the redemption integrity re-check (#6062): its stored
+                    ///< reviewer is the submitter or an excluded root, an approved ticket records
+                    ///< no reviewer, its excluded roots cannot be read, or its stored request_json
+                    ///< no longer hashes to request_digest (or is a digest with no request), or
+                    ///< its origin requires a bound request and it has none.
+                    ///< Same forgery class, same uniform message, no new audit/metric label value.
+                    ///< (A digest that cannot be COMPUTED is a kStoreError instead.)
     kForeignSubmitter, ///< recalled by a principal other than the ticket's submitter (#2442)
     kExpired,       ///< approved but unconsumed past kApprovalTicketTtlSeconds since its review
                     ///< (#6061) — refused at consume by DATABASE time, no submit() sweep needed
@@ -389,6 +557,19 @@ struct ConsumeError {
     bool binding_check_unevaluated = false;
 };
 
+/// One `kPrecondition` denial, handed to the observer installed with
+/// `ApprovalManager::set_precondition_denial_observer` (#6062). Plain data, no
+/// `Approval` row: the observer writes an audit record, and the row's
+/// `definition_id` / `scope_expression` are caller-supplied text the audit detail
+/// must not carry (see ConsumePrecondition).
+struct PreconditionDenial {
+    std::string approval_id;
+    ApprovalOrigin origin{ApprovalOrigin::kUnspecified}; ///< the ticket's (concrete) origin
+    std::string consumed_by;                             ///< who tried to redeem it
+    std::string reason; ///< the precondition's own message (server-authored, see ConsumePrecondition)
+};
+using PreconditionDenialObserver = std::function<void(const PreconditionDenial&)>;
+
 /// A cheap, read-only recheck of the state a ticket's effect depends on,
 /// evaluated between the ticket match and the consuming CAS (#2443). Returning
 /// an error denies the recall WITHOUT consuming; the string is operator-facing
@@ -417,6 +598,47 @@ public:
     ApprovalManager(const ApprovalManager&) = delete;
     ApprovalManager& operator=(const ApprovalManager&) = delete;
 
+    /// Wire the metrics registry for `yuzu_approval_precondition_denied_total{origin}`.
+    /// Set ONCE during single-threaded startup, before any consume; null (the default)
+    /// disables emission.
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
+    /// Install the observer that records a `kPrecondition` denial in the audit trail
+    /// (#6062: "a precondition denial gets an audit row plus a counter" - at the
+    /// STORE, so every present and future redeemer gets both, not just the one that
+    /// remembers). Set ONCE during single-threaded startup. The store increments the
+    /// counter itself and then calls the observer; an exception from the observer is
+    /// caught and logged, never propagated out of `consume_ticket`.
+    ///
+    /// The observer runs on the consuming thread, BEFORE `consume_ticket` returns,
+    /// and for the `PGconn*` overload while the caller's transaction is open. It must
+    /// therefore write its record on its OWN connection (AuditStore::log, never
+    /// log_in_txn on the caller's): a denial is evidence about the attempt, not part
+    /// of the caller's mutation, and must survive the caller rolling back.
+    void set_precondition_denial_observer(PreconditionDenialObserver obs) {
+        denial_observer_ = std::move(obs);
+    }
+
+    /// TEST SEAM (same precedent as `ApiTokenStore`'s `test_hook_before_*`): called by
+    /// `consume_ticket` at the points where a concurrent writer could change the row and where
+    /// an interleaving test cannot otherwise stand - before the first read (the window between a
+    /// caller's own earlier read of the ticket and this call), between the first read and the
+    /// precondition's fresher read (only when a precondition is supplied), and after every
+    /// check has passed, immediately before the consuming CAS. Never set in production. It is
+    /// read without a lock, so it is installed (and cleared) only while no consume runs on
+    /// another thread: tests install it per case or section on the test thread. A hook must not
+    /// call back into this manager's consume path. On the held overload, kBetweenReads and
+    /// kBeforeCas run under the row lock the first read took: SQL on a SECOND lease that touches
+    /// the row waits on it until the pool's lock_timeout (10 s by default, with a 30 s
+    /// statement_timeout) ends it with an error, so a hook there writes through the caller's own
+    /// connection instead. kBeforeFirstRead runs BEFORE that locking read, so it holds the row
+    /// lock only if the caller's transaction had already locked or written the row; otherwise a
+    /// second lease can update the row freely.
+    enum class ConsumeTestStage { kBetweenReads, kBeforeCas, kBeforeFirstRead };
+    void set_consume_test_hook_for_test(std::function<void(ConsumeTestStage)> hook) {
+        consume_test_hook_ = std::move(hook);
+    }
+
     /// Idempotent no-op kept for call-site compatibility — migration now
     /// runs unconditionally inside the constructor (PgMigrationRunner),
     /// unlike the SQLite era where callers invoked this explicitly.
@@ -429,16 +651,16 @@ public:
     /// `origin` (#2442) RECORDS the minting surface. It is not enforced here:
     /// this store does not refuse a `mcp.`-prefixed definition_id from any
     /// surface. The binding is applied at REDEMPTION, in `consume_ticket`,
-    /// which refuses a ticket whose recorded surface is not MCP — see the
-    /// rationale in `submit()`'s body for why the check moved.
+    /// which refuses a ticket whose recorded surface is not the one the redeemer
+    /// declares (`origin_redeemable_as`) - see the rationale in `submit()`'s body
+    /// for why the check moved.
     ///
     /// No default (#2442's closing half — was `= ApprovalOrigin::kUnspecified`
     /// until the MCP mint could declare `kMcp`; it does now). Every caller
     /// states its surface explicitly, so a future caller cannot silently
     /// regain the pre-fix behaviour by forgetting the argument — and forgetting
     /// it is now a compile error rather than a silent `kUnspecified`, which
-    /// itself refuses at redemption today, not grants (see
-    /// `declares_non_mcp_surface`).
+    /// itself refuses at redemption today, not grants (see `origin_redeemable_as`).
     ///
     /// `target_plugin`/`target_action` (#1398 hardening): see
     /// `Approval::target_plugin`'s doc comment. Both DEFAULTED (unlike
@@ -451,6 +673,45 @@ public:
            const std::string& scope_expression, const std::string& schedule_id,
            ApprovalOrigin origin, std::string target_plugin = {},
            std::string target_action = {});
+
+    /// Mint a ticket that BINDS the exact reviewed effect (#6062, four-eyes MVP PR2).
+    /// `bound.request_json` and its SHA-256 digest (computed here, so the two cannot
+    /// disagree) and `bound.excluded_roots` are frozen on the row at INSERT; no later
+    /// statement in this store updates them, and `approve()` refuses a reviewer named
+    /// in `excluded_roots`. Everything else (the pending cap, the lazy expiry sweep,
+    /// the id, `origin` having no default) is exactly `submit()`'s, in the same
+    /// transaction - there is one mint body, not two.
+    ///
+    /// There is deliberately no `schedule_id` parameter: a bound ticket is never a
+    /// scheduled one. `ScheduleRunner` matches approved tickets on (schedule id,
+    /// definition, scope) with no origin check and fires the schedule's own definition,
+    /// so a bound ticket carrying a schedule id could be fired without its frozen
+    /// request, digest or excluded roots ever being compared. The row is written with
+    /// an empty `schedule_id`, and the signature offers no way to supply one.
+    ///
+    /// Refused with a TYPED error (`SubmitFailure`), nothing written, when:
+    ///   - the submitter is an engine principal (`engine:` is a reserved namespace
+    ///     no human account can hold - the boot-time collision scan fails closed on
+    ///     one - so the prefix is the engine discriminator here; a caller that
+    ///     holds the session should also test `Session::is_engine()` first). A
+    ///     gated effect needs a human requester root (ADR-0033 section 7);
+    ///   - `origin` names no concrete surface (kUnspecified / kUnrecognised);
+    ///   - `origin` is a concrete surface that does not require a bound request (anything
+    ///     but kGuardianDeploy today: `requires_bound_request(origin)` is false). Bound and
+    ///     origin are one relation; the surfaces' redeemers decide what they compare;
+    ///   - `request_json` is empty, over `kMaxRequestJsonBytes`, nested deeper than
+    ///     `kMaxRequestJsonDepth`, not a JSON object, or contains a NUL byte anywhere
+    ///     (the JSON parser accepts a NUL after a complete value, but the column is bound
+    ///     as a C string: the digest, taken over every byte, would then disagree with
+    ///     the stored prefix);
+    ///   - an excluded root is empty, over-long, not valid UTF-8, contains a control
+    ///     character (below 0x20, or 0x7F; a principal name has none), or the list is
+    ///     over `kMaxExcludedRoots`.
+    [[nodiscard]] std::expected<std::string, SubmitError>
+    submit_bound(const std::string& definition_id, const std::string& submitted_by,
+                 const std::string& scope_expression, ApprovalOrigin origin,
+                 const BoundRequest& bound, std::string target_plugin = {},
+                 std::string target_action = {});
 
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;
 
@@ -534,7 +795,7 @@ public:
                                             const std::string& comment);
 
     /// Atomically consume an APPROVED, not-yet-consumed approval as a one-time
-    /// MCP ticket (#289). Returns ok() iff THIS call transitioned consumed_at
+    /// ticket (#289). Returns ok() iff THIS call transitioned consumed_at
     /// 0→now — the CAS (`WHERE status='approved' AND consumed_at=0 RETURNING 1`)
     /// carries the match signal in the step return code, so there is no
     /// `sqlite3_changes()` race on the shared FULLMUTEX connection (#1033). A
@@ -553,15 +814,60 @@ public:
     /// has swept it yet. The refusal leaves the row untouched.
 
     /// Is `id` an approved, unconsumed ticket still inside its lifetime, by DATABASE time?
-    /// This is the one liveness predicate (`ticket_live_sql()` in the .cpp): the same text
-    /// gates the consume CAS and submit()'s approved-ticket sweep, so an approved ticket
+    /// This is the one liveness predicate (`ticket_live_sql()` in the .cpp): the same window
+    /// gates the consume CAS (measured on the wall clock) and submit()'s approved-ticket
+    /// sweep (measured at transaction start), so an approved ticket
     /// that consume would refuse as expired is never fired by ScheduleRunner either
     /// (#6061, governance SG-2). A store failure is an error, not `false`: the caller
     /// (the scheduler) holds the occurrence rather than treating an unreadable ticket as
     /// a dead one. Read-only; consumes nothing.
     [[nodiscard]] std::expected<bool, std::string> ticket_is_live(const std::string& id) const;
 
-    /// consume_ticket with a pre-consume recheck (#2443). A ticket can sit
+    /// The schedule-origin retire (#6096): settle the approved or rejected tickets `ids` of
+    /// `schedule_id` once the ScheduleRunner has settled an occurrence, so a scheduled
+    /// ticket needs `consumed_at == 0` to be eligible (necessary but not sufficient: the outbox
+    /// ledger also decides). One guarded UPDATE keyed on
+    /// `consumed_at = 0` (not a read followed by a write) and on `id = ANY(ids)`, stamped from
+    /// DATABASE time, with `consumed_by = 'schedule:' + occurrence_id`, where `occurrence_id` is
+    /// the outbox key (`schedule_id:next_execution_at`) or `ledger-spent:<that key>`, so the
+    /// evidence chain is never empty.
+    /// Returns the number of rows THIS call retired; 0 is not an error (empty `ids`, nothing
+    /// unsettled, or another caller got there first). Pending tickets are never touched.
+    ///
+    /// SCOPED to the ids the caller OBSERVED in its own snapshot: the runner passes every
+    /// unsettled approved ticket of the schedule it saw this tick (matched, mismatch-skipped,
+    /// expired-unswept, outbox-spent) and, on a skip, the rejected ones. So an approved
+    /// mismatch-skipped ticket is retired with the one that fired (otherwise it could fire a
+    /// LATER occurrence after the definition is reverted), while a ticket approved after the
+    /// snapshot, or a successor occurrence's ticket, is never touched. A stale replica can
+    /// only settle tickets it saw, and each is a CAS from unsettled.
+    /// One approval == at most one scheduled run therefore needs no clock comparison.
+    ///
+    /// Accepted limitation: retire-ok followed by a failed schedule advance burns one approval.
+    /// The next tick finds the occurrence already in the outbox and advances without a fresh
+    /// ask (the outbox guard); the burnt ticket is simply spent. There is deliberately no
+    /// replay eligibility keyed on `consumed_by` equalling the occurrence key.
+    ///
+    /// Every retire site settles only observed ids, by a CAS from unsettled. The enqueue site
+    /// and the already-ran site run after the outbox row exists; the ledger-spent site settles
+    /// tickets whose outbox row belongs to an EARLIER occurrence; the rejected-skip site has no
+    /// outbox row.
+    ///
+    /// Deliberately NOT epoch-fenced. The only fenced write is the outbox INSERT
+    /// (`ScheduleRunner::tick` is FencedLeaderOnly). On the enqueue paths the retire only runs
+    /// after the outbox row exists (Enqueued or AlreadyEnqueued, whoever wrote it). On the
+    /// rejected-skip path there is no outbox row; the retire is an observed-ids-only CAS from
+    /// unsettled, so a stale leader can only settle tickets it saw (the deny direction).
+    /// Fencing it would only turn a harmless late settle into an extra held tick.
+    ///
+    /// A store failure is an error, not 0: the runner then holds the occurrence and retries,
+    /// which is safe because the enqueue is idempotent. `consume_ticket` still refuses
+    /// kSchedule origins; this is the only path that settles a scheduled ticket.
+    [[nodiscard]] std::expected<int, std::string>
+    retire_schedule_tickets(const std::string& schedule_id, const std::string& occurrence_id,
+                            const std::vector<std::string>& ids);
+
+    /// ORIGIN-DECLARED consume with a pre-consume recheck (#2443, #6062). A ticket can sit
     /// approved-but-unconsumed for up to the 7-day TTL, so the state its effect
     /// assumes may have moved on (the canonical case: an engine-key rotation the
     /// ticket confirms has already resolved). Without a recheck the recall
@@ -569,8 +875,20 @@ public:
     /// human-approved one-time capability on a no-op and forcing a fresh
     /// approval round.
     ///
-    /// Order: argument guards → #2442 origin+submitter binding check → match
-    /// the row → reject a non-consumable one → evaluate `precondition` → CAS.
+    /// `expected` is the surface the CALLER is, and it has no default on purpose
+    /// (#6062): a caller that does not say which surface it redeems for cannot
+    /// redeem. The ticket's recorded origin must equal it (`origin_redeemable_as`);
+    /// kUnspecified and kUnrecognised as `expected` ALWAYS refuse
+    /// (ConsumeFailure::kForeignOrigin, uniform message), whatever the row says.
+    ///
+    /// Order: argument guards → `expected` is a concrete surface → #2442
+    /// origin+submitter binding check → redemption integrity re-check (#6062: an
+    /// approved, unconsumed row whose stored reviewer is the submitter, an excluded
+    /// root or EMPTY, whose excluded_roots cannot be read, or whose non-empty request_json no
+    /// longer hashes to request_digest is refused as kForeignOrigin with the uniform
+    /// message, as is a row whose origin requires a bound request but has none; a legacy
+    /// unbound row with no request and no roots is unaffected) → match the
+    /// row → reject a non-consumable one → evaluate `precondition` → CAS.
     /// A precondition denial returns ConsumeFailure::kPrecondition and leaves
     /// the row untouched, so the same ticket is still recallable once the
     /// operator resolves the drift; the binding check has the same
@@ -587,12 +905,70 @@ public:
     /// stay correct when it does. The CAS remains the sole one-time-consumption
     /// guard, so a concurrent recall still loses exactly as before.
     ///
-    /// An empty `precondition` behaves exactly like the two-argument overload.
-    std::expected<void, ConsumeError> consume_ticket(const std::string& id,
+    /// An empty `precondition` runs no recheck.
+    ///
+    /// A `kPrecondition` denial is observable at the store for EVERY origin
+    /// (#6062): `yuzu_approval_precondition_denied_total{origin}` counts it and the
+    /// installed denial observer (`set_precondition_denial_observer`) writes the
+    /// audit row. MCP's own per-tool counter and `mcp_audit` row are unchanged and
+    /// additional.
+    [[nodiscard]] std::expected<void, ConsumeError> consume_ticket(const std::string& id,
                                                      const std::string& consumed_by,
+                                                     ApprovalOrigin expected,
+                                                     const ConsumePrecondition& precondition);
+
+    /// The same consume, joined to the CALLER's transaction (#6062): every read, the
+    /// precondition and the consuming CAS run on `conn`, which the caller has already
+    /// begun a transaction on, and this method neither begins, commits nor rolls
+    /// anything back. Rolling the caller's transaction back therefore rolls the
+    /// consume back with it, and committing it commits the consume atomically with
+    /// whatever else the caller wrote - the point of the overload: a deploy that
+    /// redeems its approval and records itself in one transaction cannot spend the
+    /// ticket without the deploy, nor deploy without spending it.
+    ///
+    /// The row is read `FOR UPDATE`, so it stays locked from the binding check
+    /// through the CAS until the caller ends the transaction - the precondition and
+    /// the CAS are one critical section here, unlike the pooled overload's two
+    /// leases. `precondition` therefore runs INSIDE the caller's transaction on
+    /// `conn`'s lock: keep it cheap and never have it touch `conn` or take another
+    /// store's lease it could wait on while the caller's pool is exhausted.
+    ///
+    /// Postgres aborts a transaction on any failed statement, so a kStoreError caused
+    /// by a failed SQL statement leaves the caller's transaction unusable until it
+    /// rolls back. A kStoreError in which no SQL statement failed (null `conn`, database
+    /// not open, an empty id or `consumed_by`, a precondition that threw, a digest
+    /// that could not be computed) leaves it usable; the caller must still roll
+    /// back on ANY error, which is the rule that needs no such distinction. A
+    /// refusal that is not a store error
+    /// (kForeignOrigin, kNotConsumable, kPrecondition, ...) leaves the transaction
+    /// healthy and the row untouched. `conn` must be non-null; null is a
+    /// kStoreError. The caller keeps `conn` and its lease alive for the call.
+    [[nodiscard]] std::expected<void, ConsumeError> consume_ticket(PGconn* conn, const std::string& id,
+                                                     const std::string& consumed_by,
+                                                     ApprovalOrigin expected,
                                                      const ConsumePrecondition& precondition);
 
 private:
+    /// The ONE consume body behind both public overloads. `held` is the caller's
+    /// transaction connection, or nullptr for the pooled path (own bounded leases,
+    /// exactly the pre-#6062 behaviour).
+    std::expected<void, ConsumeError> consume_core(PGconn* held, const std::string& id,
+                                                   const std::string& consumed_by,
+                                                   ApprovalOrigin expected,
+                                                   const ConsumePrecondition& precondition);
+
+    /// `get_checked`'s read on an already-held connection (no lease taken).
+    /// `for_update` adds `FOR UPDATE` - only meaningful inside a transaction.
+    std::expected<std::optional<Approval>, StoreReadError>
+    read_row(PGconn* conn, const std::string& id, bool for_update) const;
+
+    /// The ONE mint body behind `submit` (`bound == nullptr`) and `submit_bound`.
+    std::expected<std::string, SubmitError>
+    submit_impl(const std::string& definition_id, const std::string& submitted_by,
+                const std::string& scope_expression, const std::string& schedule_id,
+                ApprovalOrigin origin, const BoundRequest* bound, std::string target_plugin,
+                std::string target_action);
+
     std::expected<void, std::string> set_review_status(const std::string& id,
                                                        const std::string& status,
                                                        const std::string& reviewer,
@@ -609,6 +985,9 @@ private:
     // multi-replica coordination of the pending-cap/expiry-sweep
     // check-then-act is an ADR-2002 (HA) concern, not addressed here.
     mutable std::mutex mtx_;
+    yuzu::MetricsRegistry* metrics_{nullptr};     // borrowed; set_metrics, startup only
+    PreconditionDenialObserver denial_observer_;  // set_..._observer, startup only
+    std::function<void(ConsumeTestStage)> consume_test_hook_; // tests only, see the setter
 };
 
 } // namespace yuzu::server

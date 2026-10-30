@@ -35,7 +35,7 @@
 ///    return `std::expected<std::vector<T>, std::string>`; `get_rule` keeps a
 ///    three-state `std::expected<std::optional<Row>, GuaranteedStateReadError>`
 ///    (found / genuinely-absent / degraded — mirrors
-///    `DeviceInventoryStore::CiReadError`). `agent_rule_statuses` /
+///    `CiReadError`, device_inventory_types.hpp). `agent_rule_statuses` /
 ///    `agent_rule_statuses_for_agent` / `errored_rule_count` (enforce-gate/
 ///    census/ADR-0017 list-read input) are the same
 ///    `std::expected<..., std::string>` shape. A degraded read
@@ -99,6 +99,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "dex_types.hpp" // ADR-0031 WS-A4: DEX leaf value types relocated here (pure, store-free)
@@ -301,15 +302,21 @@ public:
     DexCrashSummary dex_crash_summary(const std::string& since = "",
                                       const std::string& platform = "") const;
     std::vector<DexAppCrashCount> dex_top_apps(const std::string& since = "", int limit = 20) const;
-    /// Windows-scoped (`platform`) application AND per-version stability rows in
-    /// ONE statement (one snapshot): for the `app_limit` applications affecting
-    /// the most devices (then events, then name; Windows rows only) -- the
+    /// Platform-scoped application AND per-version stability rows in ONE
+    /// statement (one snapshot); an empty `platform` means every platform. For
+    /// the `app_limit` applications affecting the most devices (then events,
+    /// then name; rows of `platform` only) -- the
     /// published activity order is the assembler's -- one total row (`version`
     /// nullopt, plus `version_count` and `apps_total`, the count of every
     /// qualifying application before the cut) and up to `version_limit`
     /// version rows (most devices affected first). `per_device_cap` caps each
     /// device's events in the `capped_*` sums (the stability score's caller
-    /// duty). `online_agent_ids` is the population the share, rate and score are
+    /// duty); `per_subject_caps` (exact ASCII-lowercased image name, cap) replace
+    /// it for the subjects they name: a subject matches when its ASCII-lowercase
+    /// fold (A-Z to a-z, nothing else, byte-identical to the policy resolver's
+    /// fold) equals the key, so a subject stored as "CapMe.EXE" gets the
+    /// override for "capme.exe". The keys of `per_subject_caps` must be unique (a duplicate fans
+    /// the join out and counts the subject's events twice). `online_agent_ids` is the population the share, rate and score are
     /// divided by: the `*_online` row figures and `capped_*` cover only those
     /// devices (so they are members of it), while `crashes`, `hangs` and
     /// `affected_devices` stay window-wide. At most `kDexAppsConcurrentReads`
@@ -322,7 +329,9 @@ public:
     std::optional<std::vector<DexAppStabilityRow>>
     dex_app_stability_checked(const std::string& since, const std::string& platform, int app_limit,
                               int version_limit, std::int64_t per_device_cap,
-                              const std::vector<std::string>& online_agent_ids) const;
+                              const std::vector<std::string>& online_agent_ids,
+                              const std::vector<std::pair<std::string, std::int64_t>>&
+                                  per_subject_caps = {}) const;
     std::vector<DexAppCrashCount> dex_device_top_apps(const std::string& agent_id,
                                                       const std::string& since = "",
                                                       int limit = 50) const;

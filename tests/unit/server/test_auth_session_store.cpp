@@ -18,10 +18,14 @@
 #include "auth_routes.hpp"    // AuthRoutes — the /logout route under test (#3716)
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "rbac_store.hpp"
 #include "session_store.hpp"
+#include "test_rbac_store_pg_helper.hpp" // RbacStorePg — RbacStore is PG-only (ADR-0041)
 #include "test_route_sink.hpp" // in-process HttpRouteSink (no socket — TSan-safe, #438)
 
 #include "../test_helpers.hpp"
+
+#include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -116,6 +120,49 @@ void drop_session_schema(PgPool& pool) {
 }
 
 } // namespace
+
+TEST_CASE("AuthManager+SessionStore: mark_session_mfa_verified authors the proof from the DB clock "
+          "and advances the generation",
+          "[auth][session_store][pg][stepup]") {
+    // The Settings enrol-confirm stamp and POST /login/mfa/stepup both go through this primitive; the
+    // bare-AuthManager route tests only reach its legacy system_clock branch, so this is the case
+    // that pins the production (durable) one.
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    auto mgr = make_mgr(store);
+
+    auto token = mgr->create_local_session_for_test("alice", Role::admin, /*mfa_verified=*/false);
+    REQUIRE_FALSE(token.empty());
+    auto before = mgr->validate_session(token);
+    REQUIRE(before.has_value());
+    CHECK(before->steady_mfa_verified.time_since_epoch().count() == 0);
+
+    auto g0 = store.read_generation();
+    REQUIRE(g0.has_value());
+    REQUIRE(mgr->mark_session_mfa_verified(token));
+    auto g1 = store.read_generation();
+    REQUIRE(g1.has_value());
+    CHECK(*g1 > *g0); // every replica's cache drops its stale copy on the next refresh
+
+    auto after = mgr->validate_session(token);
+    REQUIRE(after.has_value());
+    CHECK(after->steady_mfa_verified.time_since_epoch().count() != 0);
+    // A fresh proof: derived from the DB-authored instant, so its age is small and never negative.
+    const auto age = std::chrono::steady_clock::now() - after->steady_mfa_verified;
+    CHECK(age >= std::chrono::steady_clock::duration::zero());
+    CHECK(age < std::chrono::seconds(30));
+
+    // A second manager on the same store (another replica) sees the proof through the durable row.
+    auto other = make_mgr(store);
+    auto seen = other->validate_session(token);
+    REQUIRE(seen.has_value());
+    CHECK(seen->steady_mfa_verified.time_since_epoch().count() != 0);
+
+    // No such durable session: nothing is stamped and the caller is told so.
+    CHECK_FALSE(mgr->mark_session_mfa_verified("no-such-session-token"));
+}
 
 TEST_CASE("AuthManager+SessionStore: create_local_session → validate round-trips",
           "[auth][session_store][pg]") {
@@ -460,5 +507,182 @@ TEST_CASE("AuthManager+SessionStore: the validate cache is trusted only after th
         // cache would have returned the session without touching the store).
         drop_session_schema(pool);
         CHECK_FALSE(a->validate_session(tok).has_value());
+    }
+}
+
+TEST_CASE("AuthManager+SessionStore: an empty token is refused without touching the store",
+          "[auth][session_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    auto mgr = make_mgr(store);
+    mgr->set_metrics_registry(&metrics);
+
+    // The observable for "the store was consulted": with the schema gone every lookup fails and
+    // is counted as a validate degrade, so a store call shows up as a counter increment.
+    drop_session_schema(pool);
+    REQUIRE_FALSE(store.read_generation().has_value()); // schema is really gone
+    // Two store touches are observable: the cache-generation read that precedes a lookup
+    // (`generation_refresh`) and the lookup itself (`validate`). An empty token must reach
+    // neither, so both counters are asserted.
+    const auto degrades = [&](const std::string& op) {
+        const std::string needle =
+            "yuzu_auth_session_store_degrade_total{op=\"" + op + "\"}";
+        const auto text = metrics.serialize();
+        const auto pos = text.find(needle);
+        if (pos == std::string::npos)
+            return 0;
+        return std::stoi(text.substr(pos + needle.size() + 1));
+    };
+    const auto validate_degrades = [&] { return degrades("validate"); };
+    const auto refresh_degrades = [&] { return degrades("generation_refresh"); };
+
+    // An empty token (the no-cookie case) never reaches the store.
+    CHECK_FALSE(mgr->validate_session("").has_value());
+    CHECK(validate_degrades() == 0);
+    CHECK(refresh_degrades() == 0);
+
+    // Positive control: a non-empty token the replica has not seen DOES go to the store, so
+    // both counters above are able to move.
+    CHECK_FALSE(mgr->validate_session("not-a-session-token").has_value());
+    CHECK(validate_degrades() == 1);
+    CHECK(refresh_degrades() == 1);
+
+    // And the empty token still does not move either of them.
+    CHECK_FALSE(mgr->validate_session("").has_value());
+    CHECK(validate_degrades() == 1);
+    CHECK(refresh_degrades() == 1);
+}
+
+// A behaviour pin only: the legacy in-memory path has no store to touch and an empty token
+// misses its map whether or not validate_session short-circuits it, so this case does not
+// fail if the early return is removed. The store-call coverage above is what guards that.
+TEST_CASE("AuthManager legacy path: an empty token never matches a session",
+          "[auth][session]") {
+    AuthManager mgr;
+    CHECK_FALSE(mgr.validate_session("").has_value());
+    const auto token = mgr.create_local_session_for_test("alice", Role::user, /*mfa=*/false);
+    REQUIRE_FALSE(token.empty());
+    CHECK(mgr.validate_session(token).has_value());
+    CHECK_FALSE(mgr.validate_session("").has_value());
+}
+
+// ── #2343: a stored session the engine token authenticated is an engine at every gate ───────
+//
+// The bearer path cannot produce a Session whose stored kind says human while its source is
+// engine_token (synthesize_token_session sets both together), so the only way to put one in
+// front of the gates is the durable row, restored by a fresh (cold-cache) AuthManager. The v2
+// CHECK forbids the row, so the test drops it first, exactly as a hand edit of an older
+// database would. With RBAC off (the default), an engine-classed session is refused 403 by the
+// engine branch of every gate, while an ordinary human admin is admitted by the legacy path
+// (or, for require_fleet_read, reaches the 503 arm of an unwired store), so reverting any one
+// site to the raw stored-kind compare turns its assertion red.
+TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the engine branch",
+          "[auth_session_store][pg][engine_principal]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    std::string split_token;
+    std::string human_token;
+    {
+        auto minter = make_mgr(store);
+        split_token = minter->create_local_session_for_test("mallory", Role::admin, false);
+        human_token = minter->create_local_session_for_test("alice", Role::admin, false);
+    }
+    REQUIRE(!split_token.empty());
+    REQUIRE(!human_token.empty());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(yuzu::server::pg::exec_params(lease.get(),
+                                              "ALTER TABLE session_store.sessions DROP CONSTRAINT "
+                                              "sessions_principal_kind_consistent",
+                                              std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        REQUIRE(yuzu::server::pg::exec_params(
+                    lease.get(),
+                    "UPDATE session_store.sessions SET auth_source = 'engine_token' "
+                    "WHERE username = 'mallory'",
+                    std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+
+    yuzu::test::RbacStorePg rbac_bundle;
+    yuzu::server::RbacStore& rbac = *rbac_bundle;
+    REQUIRE(rbac.is_open());
+    REQUIRE_FALSE(rbac.is_rbac_enabled()); // the default posture
+    auto mgr = make_mgr(store);            // cold cache: the rows are read back from the store
+    Config cfg{};
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<yuzu::server::oidc::OidcProvider> oidc_provider; // empty
+    AuthRoutes ar(cfg, *mgr, &rbac, /*api_token=*/nullptr, /*audit=*/nullptr,
+                  /*mgmt_group=*/nullptr, /*tag=*/nullptr, /*analytics=*/nullptr, oidc_mu,
+                  oidc_provider);
+    auto request_for = [](const std::string& token) {
+        httplib::Request req;
+        req.headers.emplace("Cookie", "yuzu_session=" + token);
+        return req;
+    };
+
+    SECTION("require_permission") {
+        auto req = request_for(human_token);
+        httplib::Response res;
+        CHECK(ar.require_permission(req, res, "Infrastructure", "Read")); // control
+
+        auto sreq = request_for(split_token);
+        httplib::Response sres;
+        CHECK_FALSE(ar.require_permission(sreq, sres, "Infrastructure", "Read"));
+        CHECK(sres.status == 403);
+    }
+    SECTION("require_scoped_permission") {
+        auto req = request_for(human_token);
+        httplib::Response res;
+        CHECK(ar.require_scoped_permission(req, res, "Execution", "Execute", "agent-1"));
+
+        auto sreq = request_for(split_token);
+        httplib::Response sres;
+        CHECK_FALSE(
+            ar.require_scoped_permission(sreq, sres, "Execution", "Execute", "agent-1"));
+        CHECK(sres.status == 403);
+    }
+    SECTION("require_list_read") {
+        auto req = request_for(human_token);
+        httplib::Response res;
+        CHECK(ar.require_list_read(req, res, "GuaranteedState", "Read").admitted);
+
+        auto sreq = request_for(split_token);
+        httplib::Response sres;
+        CHECK_FALSE(ar.require_list_read(sreq, sres, "GuaranteedState", "Read").admitted);
+        CHECK(sres.status == 403);
+    }
+    SECTION("require_fleet_read") {
+        auto req = request_for(human_token);
+        httplib::Response res;
+        // No management-group store is wired here, so a human session stops at that
+        // check and is answered 503; the engine branch answers first with 403. The two statuses
+        // differ, so the 403 below is the engine branch and not the human arm.
+        auto control = ar.require_fleet_read(req, res, "GuaranteedState", "Read");
+        CHECK_FALSE(control.has_value());
+        CHECK(res.status == 503);
+
+        auto sreq = request_for(split_token);
+        httplib::Response sres;
+        CHECK_FALSE(ar.require_fleet_read(sreq, sres, "GuaranteedState", "Read").has_value());
+        CHECK(sres.status == 403);
+    }
+    SECTION("make_audit_event") {
+        // The audit class starts from the credential presentation (a cookie reads "human") and
+        // is re-stamped "engine" from the resolved session's is_engine(). The split session
+        // carries a human stored kind, so only the predicate, not the stored kind, yields it.
+        auto req = request_for(human_token);
+        CHECK(ar.make_audit_event(req, "test.action", "success").principal_class == "human");
+
+        auto sreq = request_for(split_token);
+        CHECK(ar.make_audit_event(sreq, "test.action", "success").principal_class == "engine");
     }
 }

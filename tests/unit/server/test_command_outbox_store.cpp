@@ -27,12 +27,14 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using namespace yuzu::server;
 
@@ -161,6 +163,127 @@ OutboxEnqueueRequest make_req(const std::string& occurrence_id, const std::strin
 TEST_CASE("CommandOutboxStore[pg]: opens and migrates", "[command_outbox][pg][store]") {
     CommandOutboxPg fx;
     CHECK(fx.store().is_open());
+}
+
+// Structural pin (not PG-gated): the v2 index build is bounded by a transaction-local 300 s
+// statement timeout, because the plain CREATE INDEX scans a table nothing prunes and would
+// otherwise run under the pool's default timeout.
+TEST_CASE("CommandOutboxStore: the v2 migration carries the 300 s statement timeout (#6096)",
+          "[command_outbox][store][migration][6096]") {
+    const auto& migs = CommandOutboxStore::migrations();
+    REQUIRE(migs.size() == 3);
+    CHECK(migs[1].version == 2);
+    CHECK(migs[1].sql.rfind("SET LOCAL statement_timeout = '300s';", 0) == 0);
+    CHECK(migs[1].sql.find("outbox_approval_idx") != std::string::npos);
+    CHECK(migs.front().version == 1);
+    // v3 is the Echo rename's one-line plugin-name rewrite (idempotent, scan lifted off the cap).
+    CHECK(migs.back().version == 3);
+    CHECK(migs.back().sql.rfind("SET LOCAL statement_timeout = 0;", 0) == 0);
+    CHECK(migs.back().sql.find("plugin = 'echo' WHERE plugin = 'tar'") != std::string::npos);
+}
+
+// #6096: the schedule runner's spent-ticket ledger reads.
+TEST_CASE("CommandOutboxStore[pg]: occurrences_for_approval and occurrence_exists (#6096)",
+          "[command_outbox][pg][store][6096]") {
+    CommandOutboxPg fx;
+    auto with_approval = [](const std::string& occ, const std::string& approval) {
+        auto r = make_req(occ, "cmd-" + occ);
+        r.approval_id = approval;
+        return r;
+    };
+    REQUIRE(fx.store().claim_and_enqueue(with_approval("s:1", "tkt-a"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    REQUIRE(fx.store().claim_and_enqueue(with_approval("s:2", "tkt-a"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    REQUIRE(fx.store().claim_and_enqueue(with_approval("s:3", "tkt-b"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    REQUIRE(fx.store().claim_and_enqueue(make_req("s:4", "cmd-s:4"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued); // a direct fire carries no approval id
+
+    auto a = fx.store().occurrences_for_approval("tkt-a");
+    REQUIRE(a.has_value());
+    std::sort(a->begin(), a->end());
+    CHECK(*a == std::vector<std::string>{"s:1", "s:2"});
+    auto b = fx.store().occurrences_for_approval("tkt-b");
+    REQUIRE(b.has_value());
+    CHECK(*b == std::vector<std::string>{"s:3"});
+    auto none = fx.store().occurrences_for_approval("tkt-unknown");
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+    CHECK_FALSE(fx.store().occurrences_for_approval("").has_value()); // refused, not "unspent"
+
+    auto yes = fx.store().occurrence_exists("s:1");
+    REQUIRE(yes.has_value());
+    CHECK(*yes);
+    auto no = fx.store().occurrence_exists("s:99");
+    REQUIRE(no.has_value());
+    CHECK_FALSE(*no);
+    CHECK_FALSE(fx.store().occurrence_exists("").has_value());
+}
+
+TEST_CASE("CommandOutboxStore[pg]: the ledger reads error on an unreachable store, never empty "
+          "(#6096)",
+          "[command_outbox][store][6096]") {
+    yuzu::server::pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                                          .size = 1,
+                                          .connect_timeout_s = 1}};
+    CommandOutboxStore store{unreachable};
+    REQUIRE_FALSE(store.is_open());
+    CHECK_FALSE(store.occurrences_for_approval("tkt-a").has_value());
+    CHECK_FALSE(store.occurrence_exists("s:1").has_value());
+}
+
+// v2 is schema only (a partial index for the ledger read). Seed a database at v1, let the
+// real constructor run the ladder, and check the index exists and the v1 row survived.
+TEST_CASE("CommandOutboxStore[pg]: the v2 migration adds the approval index to a v1 database "
+          "(#6096)",
+          "[command_outbox][pg][store][migration][6096]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const std::string v1 =
+            "CREATE TABLE public.schema_meta (store TEXT PRIMARY KEY, version INTEGER NOT NULL, "
+            "  upgraded_at BIGINT NOT NULL);"
+            "CREATE SCHEMA command_outbox_store;"
+            "SET search_path TO command_outbox_store, public;" +
+            CommandOutboxStore::migrations().front().sql +
+            "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+            "  VALUES ('command_outbox_store', 1, extract(epoch FROM now())::bigint);"
+            "INSERT INTO outbox (occurrence_id, command_id, source, plugin, action, approval_id) "
+            "  VALUES ('s:1', 'c1', 'schedule_runner', 'p', 'a', 'tkt-a'),"
+            // A pre-rename pending fire naming the retired plugin: v3 moves it to `echo`.
+            "         ('s:2', 'c2', 'schedule_runner', 'tar', 'query', '');";
+        yuzu::server::pg::PgResult r{PQexec(conn.get(), v1.c_str())};
+        REQUIRE(r.ok());
+    }
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CommandOutboxStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult idx{PQexec(
+        conn.get(), "SELECT indexdef FROM pg_indexes WHERE schemaname = 'command_outbox_store' "
+                    "AND indexname = 'outbox_approval_idx'")};
+    REQUIRE(idx.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(idx.get()) == 1);
+    CHECK(std::string(PQgetvalue(idx.get(), 0, 0)).find("approval_id <> ''") != std::string::npos);
+    yuzu::server::pg::PgResult ver{PQexec(
+        conn.get(), "SELECT version FROM public.schema_meta WHERE store = 'command_outbox_store'")};
+    REQUIRE(ver.status() == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "3"); // the ladder runs on through v3
+
+    // Echo rename v3: the legacy `tar` row is rewritten, the control row is untouched.
+    yuzu::server::pg::PgResult plug{PQexec(
+        conn.get(), "SELECT string_agg(occurrence_id || '=' || plugin, ',' ORDER BY occurrence_id) "
+                    "FROM command_outbox_store.outbox")};
+    REQUIRE(plug.status() == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(plug.get(), 0, 0)) == "s:1=p,s:2=echo");
+
+    auto spent = store.occurrences_for_approval("tkt-a");
+    REQUIRE(spent.has_value());
+    CHECK(*spent == std::vector<std::string>{"s:1"});
 }
 
 TEST_CASE("CommandOutboxStore[pg]: enqueue then list_pending", "[command_outbox][pg][store]") {

@@ -20,7 +20,8 @@ static analysis and NOT a substitute for review. The enforceable proxy for
 closure of the TU contains no store header. To call `store->method()` the
 class definition has to be VISIBLE via some include, so if no header in the
 closure defines a store class, the TU cannot be calling into one directly.
-That implication only breaks two ways, both ACKNOWLEDGED and NOT caught here:
+That implication breaks in the ways below, all ACKNOWLEDGED and NOT caught here (the two
+numbered shapes, plus the "ALSO NOT CAUGHT" list after them):
 
   1. A COMPUTED / macro-built include (`#include SOME_MACRO`, X-macro headers,
      `#define STORE_HEADER "foo_store.hpp"` + `#include STORE_HEADER`) - the
@@ -34,6 +35,48 @@ That implication only breaks two ways, both ACKNOWLEDGED and NOT caught here:
 Neither shape exists in any family this script covers today; if one is ever
 introduced, this check will pass while the seam is actually broken. That is a
 known, stated gap - not a silent one.
+
+HOTFIX REVERT: this file and tests/test_seam_closure_selftest.py are pinned in lockstep,
+so reverting one alone turns the selftest red - revert BOTH in one change.
+
+ALSO NOT CAUGHT (found in the WS-A4 S0 review, each reproduced on a scratch tree):
+  3. THE INCLUDE PARSER SEES DIRECTIVES, NOT THE PREPROCESSOR. It strips comments in one
+     linear lexer pass (`strip_comments`: `//`, `/* */` across lines, string/char/raw-string
+     aware), joins backslash-newline (trailing blanks / FF / VT allowed), drops a UTF-8 BOM,
+     decodes UTF-16, treats NUL as whitespace and accepts `%:include`, `include_next` and
+     `import` - cross-checked against `g++ -MM -MG` (a fuzz of ~100k files found hiding shapes in
+     earlier drafts, and two independent reviewers' own grammars found more in this one; each
+     reported shape is fixed and pinned in the selftest, but this is a hand-written lexer and
+     "no miss in the fuzz grammars tried" is the strongest claim available). It still extracts NOTHING from a
+     macro-built include (`#include SOME_MACRO`) or a `##`-spliced one, cannot see an include
+     guarded away by `__has_include`. A backslash-newline INSIDE a raw string (the compiler
+     reverts the splice there) and an include's `<header-name>` containing `//` or `/*` are lexed
+     as the compiler does (see `strip_comments`). Conversely an `#include` line inside `#if 0`
+     or alone on a line inside a raw string IS extracted and can false-FAIL (conservative).
+     THREAT MODEL: this is a regression lock against honest mistakes and refactors, not a proof
+     against an author deliberately contorting source to hide a store include (a macro include
+     already can); it is merge-gating, so it is held to "no MISS in the fuzz grammar", not to
+     "cannot be defeated".
+  4. THE DENYLIST IS HAND-MAINTAINED. A store-owning header that no pattern names is
+     invisible to the walk - `nvd_db.hpp` (a raw `sqlite3*`) was exactly this until S0.
+     Others unlisted today: `*_owner.hpp`, `app_perf_{cohort,group}_reader.hpp`,
+     `app_perf_rollup.hpp`, `sqlite_raii.hpp`. See `STORE_DEFINITION_FREE_TUS`.
+  5. EXTERNAL ANGLE HEADERS ARE OPAQUE: `<sqlite3.h>` / `<libpq-fe.h>` give raw database
+     access with no project class. The "cannot define a project store class" argument in
+     INCLUDE RESOLUTION below is about project classes only.
+  6. AN UNRESOLVED QUOTE INCLUDE IS A HARD ERROR on every lane (family, impl-purity,
+     abstract-header) unless it names a generated protobuf header
+     (`GENERATED_HEADER_SUFFIXES`, e.g. `agent.grpc.pb.h`) - because a header outside
+     the resolution roots truncates the closure under it, and the closure under a
+     generated header is not checked at all (they live only in the build directory). The
+     roots mirror the build's -I directories that can hold a checked-in header
+     (`Roots.extra_include`: `sdk/include`, `server/core/vendor/qrcodegen`, and meson's implicit
+     `-I server/core` and `-I proto`); a NEW build include directory must be added there, and
+     `DEFAULT_ROOTS` is frozen in the selftest so removing one is a loud change.
+     Unresolved ANGLE includes stay silent (they are external by default; item 5).
+  7. A FORWARD DECLARATION OF A STORE IS ALLOWED in a non-abstract closure (only the
+     abstract `*_api.hpp` headers get the type-name probe); calling through it needs the
+     full definition, which the walk would catch.
 
 ABSTRACT-VS-LOCAL SEAM (#4249): the fourth forbidden pattern,
 `*_api_local.hpp`, is NOT a store-layer header - it is the CORE-ONLY half of
@@ -87,22 +130,36 @@ FAMILY COVERAGE: today this checks ten families — `network`, `verify`, `compli
 `device`, `dex`, `dex_perf`, `schedule`, `workflow`, `guardian` and `crypto` — each contributing its dashboard/UI, REST-route (or seamed routes)
 and model translation units, plus the abstract in-process API header and (since
 #4249) the core-only `*_api_local.hpp` factory header. The exact per-family TU
-set is the FAMILIES dict below. Each family's REST-handler TWIN registrations
-live inside `rest_api_v1.cpp` (or the family's own routes TU), and its MCP-tool
-twin inside `mcp_server.cpp` - BOTH are
+set is the FAMILIES dict below. Separately, `STORE_DEFINITION_FREE_TUS` (WS-A4 S0,
+NOT a family and not counted above) enrols route/renderer TUs whose closure reaches no
+store DEFINITION (not "touches no store": see that list's KNOWN LIMITS), so they stay so; and S0 widened `FORBIDDEN_HEADER_PATTERNS` to the store-backed headers the
+`*_store.hpp` glob missed. Also separately (#6558, again a LANE and not a family),
+the MCP REGISTRY LANE include-closure-checks every `mcp_tools_<domain>.cpp` (globbed, with a pinned
+count and an accessor cross-check) plus the three headers a registry file may include
+(`mcp_tool_deps.hpp`, `mcp_tool_helpers.hpp`, `mcp_tool_registry.hpp`) and the seven
+store-free `*_types.hpp` headers they use: a registry file reaches data only through
+`ToolDeps` provider closures, so its closure must reach no header matching a store pattern
+(see the lane's KNOWN LIMITS: patterns only, include closure only, not linkage). Each family's REST-handler TWIN
+registrations live inside `rest_api_v1.cpp` (or the family's own routes TU), and its MCP-tool
+twin inside `mcp_server.cpp` (or, once carved, a registry file under the lane above) -
+`rest_api_v1.cpp` and `mcp_server.cpp` are
 multi-family translation units that legitimately hold real store access for
 ~20 OTHER families each. An include-closure check applied to either whole
 file would trivially fail (or be gamed by scoping) and would say nothing
 meaningful about a given family specifically. Those two files' per-family
 sections are therefore INSPECTED-NOT-ENFORCED - reviewed by hand today, not
-gated by this script - until a block-scoped or symbol-scoped successor
-exists. Do not read a clean run of this script as covering them.
+gated by this script - until each family is carved out into its own enforced file
+(the "WS-A4 per-family carve-out sub-tasks (#6558)" table in docs/presentation-core-split-delivery-matrix.md)
+or a block-scoped or symbol-scoped successor exists. Do not read a clean run of this
+script as covering them: the registry lane covers only the tools ALREADY carved into
+`mcp_tools_*.cpp`, not the inline branches still in `mcp_server.cpp`.
 
 USAGE
   check-seam-closure.py          # run the gate (CI mode); 0 pass / 1 fail
 """
 from __future__ import annotations
 
+import bisect
 import fnmatch
 import re
 import sys
@@ -124,9 +181,20 @@ class Roots(NamedTuple):
     server_src: Path
     server_include: Path
     common_include: Path
+    # Further directories the BUILD adds with -I (mirrored, not guessed): `sdk/include`
+    # (`"yuzu/metrics.hpp"`, reached through the yuzu_sdk dependency),
+    # `server/core/vendor/qrcodegen` (`"qrcodegen.hpp"`, the MFA-QR target,
+    # server/core/meson.build), and meson's implicit per-subdir `-I` for the two directories whose
+    # meson.build declares targets and that can hold a checked-in header: `server/core`
+    # (`<src/x_store.hpp>` resolves) and `proto`. Without them a legitimate quote include of a checked-in header
+    # would read as unresolved and - now that unresolved is a hard error - false-fail any
+    # future enrolment of a TU that reaches on_behalf_guard.hpp / mfa_qr.cpp.
+    extra_include: tuple = ()
 
 
-DEFAULT_ROOTS = Roots(ROOT, SERVER_SRC, SERVER_INCLUDE, COMMON_INCLUDE)
+DEFAULT_ROOTS = Roots(ROOT, SERVER_SRC, SERVER_INCLUDE, COMMON_INCLUDE,
+                      (ROOT / "sdk" / "include", SERVER_CORE / "vendor" / "qrcodegen",
+                       SERVER_CORE, ROOT / "proto"))
 
 # ── Forbidden header patterns (store layer + the core-only API half) ─────
 # Evidence (see the PR description / junior report for the exact commands):
@@ -175,6 +243,30 @@ FORBIDDEN_HEADER_PATTERNS = [
     # to close, just for a different store header naming convention.
     "schedule_engine.hpp",
     "workflow_engine.hpp",
+    # WS-A4 S0: store-layer headers the `*_store.hpp` / `pg/*.hpp` /
+    # `agent_registry.hpp` patterns above are blind to - each is Postgres-backed
+    # (`PgPool`) or fronts a store, yet is named neither `*_store.hpp` nor
+    # `pg/*.hpp`. Before this, two unenforced-but-"clean" route TUs
+    # (`approval_routes.cpp` -> `approval_manager.hpp` + `auth_db.hpp`,
+    # `enrollment_directory_routes.cpp` -> `directory_sync.hpp`) read as clean only
+    # BECAUSE of this gap, and the auth / executions / approvals families could not
+    # be gated at all. Deliberately NOT listed: `scope_engine.hpp`,
+    # `oidc_provider.hpp`, `saml_provider.hpp`, `response_templates_engine.hpp`,
+    # `auto_approve.hpp`, `visualization_engine.hpp` — in-memory/pure engines with no
+    # store dependency (`visualization_engine.hpp` already reaches
+    # `response_store.hpp`, so it is caught transitively); listing them would make
+    # this a "server-state class" ban, which is not what the gate claims.
+    "execution_tracker.hpp",
+    "auth_db.hpp",
+    "approval_manager.hpp",
+    "directory_sync.hpp",
+    "update_registry.hpp",
+    "patch_manager.hpp",
+    "deployment_engine.hpp",
+    # `NvdDatabase` wraps a raw `sqlite3*` (the NVD CVE database) but is named
+    # `*_db.hpp`, so no pattern above saw it; `nvd_routes.cpp` calls it directly
+    # (`deps.nvd_db->match_inventory(...)`).
+    "nvd_db.hpp",
 ]
 
 # ── Impl-purity rule (ADR-0031 WS-A4, Fable review) ──────────────────────────
@@ -265,10 +357,12 @@ ABSTRACT_API_HEADERS = [
 #     serializer before PR #4582.
 #   - store/infra CLASS names the "Store" suffix misses: `AuthDB`, `AgentRegistry`,
 #     `ExecutionTracker`, `PgPool` — data/identity/registry/pool types that must
-#     never surface in an abstract seam header (some, e.g. auth_db.hpp /
-#     execution_tracker.hpp, are not even in FORBIDDEN_HEADER_PATTERNS, so this
-#     name probe is their only guard). Added per the #4582 Fable review; verified
-#     absent from all five abstract-header closures today (no false-fire).
+#     never surface in an abstract seam header. (auth_db.hpp / execution_tracker.hpp
+#     were once absent from FORBIDDEN_HEADER_PATTERNS, making this probe their only
+#     guard; WS-A4 S0 added both there. The name probe stays load-bearing: a bare
+#     forward declaration names the type WITHOUT including its header, which the
+#     header patterns cannot see.) Added per the #4582 Fable review; verified
+#     absent from all abstract-header closures today (no false-fire).
 #   - `AppPerfFleetRow` (from app_perf_fleet_store.hpp) — the DexPerfApi seam's own
 #     raw B2 store row. It carries per-`(version,day)` histogram arrays the
 #     `kDexCohortFloor` suppression must apply to BEFORE anything crosses the
@@ -294,9 +388,15 @@ STORE_TYPE_TOKEN_RE = re.compile(r"\b[A-Z][A-Za-z0-9_]*Store\b")
 # TYPE-NAME-in-code probe (a forward-declared `class ScheduleEngine;` plus a
 # `list_schedules(ScheduleEngine*, …)` signature names the type without
 # including its header).
+#
+# WS-A4 S0: `ApprovalManager`, `DirectorySync`, `UpdateRegistry`, `PatchManager`,
+# `NvdDatabase` — the type-name twins of the new `FORBIDDEN_HEADER_PATTERNS` entries
+# above (same store-backed, not-`*Store`-named class gap).
 EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
                            "AgentRegistry", "ExecutionTracker", "PgPool",
-                           "ScheduleEngine", "WorkflowEngine"]
+                           "ScheduleEngine", "WorkflowEngine",
+                           "ApprovalManager", "DirectorySync", "UpdateRegistry",
+                           "PatchManager", "NvdDatabase"]
 
 # `<httplib.h>` allowlist for the impl-purity scan: one PRE-EXISTING core coupling.
 # `event_bus.hpp` is a CORE SSE primitive (the legacy `GET /events` content-provider
@@ -313,11 +413,11 @@ EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
 IMPL_HTTPLIB_ALLOWED = {"server/core/src/event_bus.hpp"}  # root-relative, exact file only
 
 # ── Family definitions ────────────────────────────────────────────────────
-# Nine families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
+# Ten families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
 # #4250, the SECOND family), `compliance` (the THIRD, #4337), `device`
 # (the FOURTH, #4484), `dex` (the FIFTH — the DEX signals seam), `dex_perf`
 # (the SIXTH — the DEX app-perf-over-time seam), `schedule` (the SEVENTH),
-# `workflow` (the EIGHTH) and `guardian` (the NINTH). Each set covers the
+# `workflow` (the EIGHTH), `guardian` (the NINTH) and `crypto` (the TENTH). Each set covers the
 # presentation-side TUs plus BOTH halves of the seam header pair: the
 # abstract `*_api.hpp` and the core-only `*_api_local.hpp` (#4249). Enforcing
 # the local header pins its own purity (forward decls only); it cannot
@@ -564,6 +664,8 @@ FAMILIES = {
             "server/core/src/crypto_types.hpp",
             "server/core/src/crypto_library_model.hpp",
             "server/core/src/crypto_library_model.cpp",
+            "server/core/src/crypto_widget_catalogue.hpp",
+            "server/core/src/crypto_widget_catalogue.cpp",
             "server/core/src/crypto_api.hpp",
             "server/core/src/crypto_api_local.hpp",
             "server/core/src/crypto_routes.hpp",
@@ -574,7 +676,178 @@ FAMILIES = {
     },
 }
 
-_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*(<[^>]+>|"[^"]+")')
+# ── Store-DEFINITION-free presentation TUs (WS-A4 S0, Fable review of the WS-A4 plan) ───
+# NOT a seam family: no `*Api` is involved and the count in FAMILIES (which the
+# docstring and the selftest pin) is unchanged. These are route/renderer TUs whose
+# include closure was ALREADY free of every forbidden header when this list was
+# written — they are fed by injected `std::function` providers (the
+# `docs/api-twin-recipe.md` style) or render from plain view types. Until now they
+# were clean by CONVENTION only; enrolling them turns that into a gate, so a future
+# edit that adds a store include to any of them fails CI instead of passing
+# silently. Zero refactor cost — it only locks in what is already true.
+#
+# "STORE-DEFINITION-FREE" means exactly this and no more: walking the TU's `#include` closure
+# reaches no header matching `FORBIDDEN_HEADER_PATTERNS` - i.e. no store/engine/DB class
+# DEFINITION. It does NOT mean "touches no store" (see KNOWN LIMITS below).
+#
+# Membership rule: a `*_routes.cpp` / `*_ui.cpp` whose closure is clean under the
+# CURRENT `FORBIDDEN_HEADER_PATTERNS` and which no FAMILIES entry already enforces.
+# `approval_routes.cpp`, `enrollment_directory_routes.cpp` and `nvd_routes.cpp` are
+# deliberately NOT here: they were clean only under the pre-S0 patterns (they reach
+# `approval_manager.hpp`/`auth_db.hpp`, `directory_sync.hpp` and `nvd_db.hpp`
+# respectively - the last a raw `sqlite3*` the first draft of this list missed). New unenforced
+# clean TUs are NOT auto-enrolled — add them here when they are written.
+# Being clean says nothing about being SEAMED: a TU here may still reach its data
+# through a provider closure that wraps a raw store in `server.cpp`; that is the
+# per-family seam work this list does not claim to have done. Enrolment is a
+# REGRESSION LOCK, not seam progress.
+#
+# KNOWN LIMITS of "store-definition-free" here (include-closure only, same as every family):
+#   - a header that merely FORWARD-DECLARES a store (`auth.hpp`, `authz_gates.hpp`,
+#     `dex_routes.hpp`, `preflight_routes.hpp`) is allowed; calling through it needs
+#     the full definition, which the closure walk would catch.
+#   - external angle headers (`<sqlite3.h>`, `<libpq-fe.h>`) are opaque to the walk;
+#     no enrolled closure includes either today.
+#   - a store-owning header that no pattern names stays invisible. Before enrolling
+#     MORE TUs, scan the union of their closures for headers owning a `PgPool` or a
+#     `sqlite3*` (today's unlisted owners include `*_owner.hpp`,
+#     `app_perf_{cohort_reader,group_reader,rollup}.hpp`, `sqlite_raii.hpp`) and add
+#     patterns first - the `nvd_db.hpp` miss was exactly this.
+STORE_DEFINITION_FREE_TUS = [
+    "server/core/src/access_audit_ui.cpp",
+    "server/core/src/access_tokens_ui.cpp",
+    "server/core/src/access_ui.cpp",
+    "server/core/src/approvals_ui.cpp",
+    "server/core/src/developer_ui.cpp",
+    "server/core/src/device_data_routes.cpp",
+    "server/core/src/executions_ui.cpp",
+    "server/core/src/groups_routes.cpp",
+    "server/core/src/groups_ui.cpp",
+    "server/core/src/guardian_page_ui.cpp",
+    "server/core/src/guardian_ui.cpp",
+    "server/core/src/help_ui.cpp",
+    "server/core/src/home_ui.cpp",
+    "server/core/src/instruction_ui.cpp",
+    "server/core/src/integrations_routes.cpp",
+    "server/core/src/integrations_ui.cpp",
+    "server/core/src/kek_routes.cpp",
+    "server/core/src/legacy_events_routes.cpp",
+    "server/core/src/login_ui.cpp",
+    "server/core/src/mcp_disabled_routes.cpp",
+    "server/core/src/pki_routes.cpp",
+    "server/core/src/preflight_ui.cpp",
+    "server/core/src/settings_data_ui.cpp",
+    "server/core/src/settings_general_ui.cpp",
+    "server/core/src/settings_pki_ui.cpp",
+    "server/core/src/settings_plugins_ui.cpp",
+    "server/core/src/settings_security_ui.cpp",
+    "server/core/src/settings_ui.cpp",
+    "server/core/src/echo_page_ui.cpp",
+    "server/core/src/echo_timeline_page_ui.cpp",
+    "server/core/src/echo_tree_routes.cpp",
+    "server/core/src/viz_host_page_ui.cpp",
+    "server/core/src/viz_page_ui.cpp",
+    "server/core/src/workflows_ui.cpp",
+]
+
+
+# MCP REGISTRY LANE (#6558, WS-A4) - a LANE, not a family. Every `mcp_tools_<domain>.cpp`
+# is a store-free registry file: a tool handler reaches data only through the provider
+# closures on `ToolDeps` (`mcp_tool_deps.hpp`), never a store, so its include closure must
+# reach no store DEFINITION. The TU set is GLOBBED (a new `mcp_tools_*.cpp` is enrolled the
+# moment it exists - nobody has to remember to add it here), and the file count is PINNED so
+# adding one is still a loud, reviewed edit rather than a silent widening. A count alone
+# cannot see a RENAME paired with an ADD (the count stays right while one file leaves the
+# glob), so the glob is also cross-checked against the one-accessor-per-domain contract in
+# `mcp_tool_registry.hpp` (`<domain>_tool_records()` <-> `mcp_tools_<domain>.cpp`, both
+# directions). The three shared headers are listed explicitly: they are the headers a
+# registry file may include (`mcp_server.hpp` includes `mcp_tool_deps.hpp`), so a store
+# header reached through any of them leaks into every registry file that includes it.
+#
+# The row/view types these files need live in store-free `*_types.hpp` headers
+# (MCP_REGISTRY_TYPES_HEADERS below); a store header re-includes its types header, never the
+# reverse. A registry file that wants a type still defined in a store header moves that
+# type out first - it does not get an exemption here. The types headers are enrolled
+# DIRECTLY, not merely reached through a registry TU: a header nothing includes any more
+# would otherwise leave the lane unguarded, and a store include added to it unseen.
+#
+# KNOWN LIMITS - read before quoting this lane as "store-free":
+#   - "store-free" means: no header matching FORBIDDEN_HEADER_PATTERNS is reachable. A
+#     store OWNER that no pattern names (`*_owner.hpp`, `*_sql_helpers.hpp`, the `app_perf_*`
+#     readers, `sqlite_raii.hpp`, `migration_runner.hpp`) passes the lane. Widening the
+#     patterns changes every family's policy and is a separate, not-yet-filed decision.
+#   - it proves an INCLUDE closure only, not linkage: a registry object can still link a store
+#     through a .cpp it does not include (`hardware_list_model.cpp` calls
+#     `TagStore::validate_key`; `build_routes_catalog`, declared in `discover_catalog_types.hpp`,
+#     is defined in `discover_routes.cpp`, whose TU includes `agent_registry.hpp`). Linkage is not
+#     checked here; the `nm` tripwire
+#     (check_core_presentation_link.py) covers only its own enrolled families (today `dex`), not
+#     registry objects.
+#   - the same include-closure-only limits as STORE_DEFINITION_FREE_TUS: a header that merely
+#     forward-declares a store is allowed, and a macro-built `#include` is invisible.
+#   - a registry TU outside the glob (another name, a subdirectory) is invisible to the
+#     glob; only the accessor cross-check notices one whose accessor is declared in
+#     `mcp_tool_registry.hpp` (a declaration elsewhere is caught only by the compiled
+#     dispatch test, tests/unit/server/test_mcp_dispatch_coverage.cpp). That cross-check is a
+#     lowercase `[a-z0-9_]` name scan of the comment-stripped header and is preprocessor-blind:
+#     an upper/camel-case accessor or a macro-pasted one is invisible, and an accessor kept in
+#     `#if 0` still counts as declared.
+# The `mcp_server.cpp` inline tool branches and the `rest_api_v1.cpp` route registrations are
+# NOT covered by this lane - they are still INSPECTED-NOT-ENFORCED, and carving each family
+# out of them into its own enforced file is the "WS-A4 per-family carve-out sub-tasks
+# (#6558)" table in docs/presentation-core-split-delivery-matrix.md.
+MCP_REGISTRY_TU_GLOB = "mcp_tools_*.cpp"
+MCP_REGISTRY_EXPECTED_TU_COUNT = 4
+MCP_REGISTRY_REGISTRY_HEADER = "server/core/src/mcp_tool_registry.hpp"
+MCP_REGISTRY_HEADERS = [
+    "server/core/src/mcp_tool_deps.hpp",
+    "server/core/src/mcp_tool_helpers.hpp",
+    MCP_REGISTRY_REGISTRY_HEADER,
+]
+MCP_REGISTRY_TYPES_HEADERS = [
+    "server/core/src/device_inventory_types.hpp",
+    "server/core/src/discover_catalog_types.hpp",
+    "server/core/src/inventory_types.hpp",
+    "server/core/src/offline_endpoint_types.hpp",
+    "server/core/src/quarantine_types.hpp",
+    "server/core/src/software_inventory_types.hpp",
+    "server/core/src/tag_types.hpp",
+]
+# One accessor per domain file, declared in mcp_tool_registry.hpp (see its own comment). The scan
+# is deliberately LOOSE - any `<name>_tool_records(` in the comment-stripped header - not the one
+# spelling the header uses today: a strict form-match would FAIL OPEN for a declaration written
+# another way (`noexcept`, a qualified or `const`-after `ToolRecord`, a trailing return type),
+# letting a registry file rename out of the glob unseen. `registered_tool_records` is the
+# aggregator (defined in mcp_server.cpp), not a domain accessor.
+_MCP_ACCESSOR_RE = re.compile(r'\b([a-z0-9_]+)_tool_records\s*\(')
+_MCP_ACCESSOR_NOT_DOMAINS = frozenset({"registered"})
+
+# The directive itself. By the time this runs every comment is already gone (see
+# `strip_comments`), backslash-newline is already joined, and string literals are intact, so
+# `#include/*c*/"x"`, `# /* c */ include "x"` and a multi-line comment closing before the `#`
+# all reach it as plain `#include "x"`. `include_next` is a GCC/Clang spelling of the same
+# thing. Horizontal whitespace only: the text is split on `\n` first.
+_INCLUDE_RE = re.compile(r'^[ \t\f\v]*(?:#|%:)[ \t\f\v]*(?:include(?:_next)?|import)[ \t\f\v]*'
+                         r'(<[^>\n]+>|"[^"\n]+")')
+# Translation phase 2: backslash-newline is deleted BEFORE comments and directives exist
+# (GCC/Clang also accept trailing blanks between the backslash and the newline, with a
+# warning, and MSVC does too).
+_LINE_CONTINUATION_RE = re.compile(r'\\[ \t\f\v]*\r?\n')
+# Per-logical-line directive tracking (see `_LineState`): the code on a line so far is
+# `#` / `%:` then `include` / `include_next` / `import` followed by a non-identifier character.
+_DIRECTIVE_PREFIX_RE = re.compile(r'[ \t\f\v]*(?:#|%:)[ \t\f\v]*(?:include_next|include|import)'
+                                  r'(?=[^A-Za-z0-9_$\x80-\U0010ffff])')
+_LT_OR_NL_RE = re.compile(r"[<\n]")
+_DIRECTIVE_PREFIX_CAP = 64   # `#   include_next` plus blanks fits; a longer prefix is not a directive
+_SPECIAL_RE = re.compile(r"[/\"']")
+_STR_END_RE = re.compile(r'["\\\n]')
+_CHR_END_RE = re.compile(r"['\\\n]")
+_RAW_OPEN_RE = re.compile(r'"([^()\\ \t\n]{0,16})\(')
+
+# Quote includes that legitimately resolve nowhere in the tree: generated protobuf/gRPC
+# headers (`agent.grpc.pb.h`, `common.pb.h`) exist only in the build directory. ANY other
+# unresolved quote include is a hard error (WS-A4 S0 governance, UP-4).
+GENERATED_HEADER_SUFFIXES = (".pb.h",)
 
 
 def gh(kind, msg):
@@ -582,24 +855,343 @@ def gh(kind, msg):
     print(f"::{kind}::{msg}", file=sys.stderr, flush=True)
 
 
+def _is_ident_char(ch: str) -> bool:
+    # `$` is an identifier character to GCC, Clang and MSVC (`$R"x(` is an identifier then a string),
+    # and so is any non-ASCII character (extended identifier characters).
+    return ch.isalnum() or ch == "_" or ch == "$" or ord(ch) > 127
+
+
+def _is_pp_run_char(ch: str) -> bool:
+    """A character that can be part of a run holding a pp-number or an identifier before a quote."""
+    return _is_ident_char(ch) or ch in ".+-"
+
+
+class _LineState:
+    """Tracks, for the CURRENT logical line (backslash-newline already joined; a multi-line block
+    comment is one blank and does not end it), whether the code so far is an include directive and
+    whether the lexer is inside a `<header-name>`.
+
+    The compiler lexes a header-name as ONE token, so `//` and `/*` inside it are not comments, and
+    in an include directive EVERY `<` after the keyword opens one (`#include<a.h></*>` has a second
+    header-name). The tracker is fed only plain code segments (comments contribute a blank, literals
+    are skipped via `literal()`), so a comment between `#`, `include` and `<` does not hide the
+    directive. Linear: each segment is scanned once, and the pre-keyword prefix is capped."""
+    __slots__ = ("prefix", "dead", "in_include", "in_name")
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.prefix = ""
+        self.dead = False
+        self.in_include = False
+        self.in_name = False
+
+    def literal(self):
+        # A string/char literal before the directive keyword makes this line not a directive; the
+        # `"` of `#include "x"` arrives before the keyword's follower, so look ahead with a blank.
+        if self.in_include or self.dead:
+            return
+        m = _DIRECTIVE_PREFIX_RE.match(self.prefix + " ")
+        if m:
+            self.in_include = True
+            self.prefix = ""
+        else:
+            self.dead = True
+
+    def feed(self, seg: str):
+        pos, n = 0, len(seg)
+        while pos < n:
+            if self.in_include:
+                if self.in_name:
+                    gt = seg.find(">", pos)
+                    nl = seg.find("\n", pos)
+                    if nl >= 0 and (gt < 0 or nl < gt):
+                        self.reset()
+                        pos = nl + 1
+                        continue
+                    if gt < 0:
+                        return
+                    self.in_name = False
+                    pos = gt + 1
+                else:
+                    m = _LT_OR_NL_RE.search(seg, pos)
+                    if m is None:
+                        return
+                    if m.group() == "\n":
+                        self.reset()
+                    else:
+                        self.in_name = True
+                    pos = m.end()
+            else:
+                nl = seg.find("\n", pos)
+                end = n if nl < 0 else nl
+                if not self.dead:
+                    self.prefix += seg[pos:end]
+                    m = _DIRECTIVE_PREFIX_RE.match(self.prefix)
+                    if m:
+                        rest = self.prefix[m.end():]
+                        self.in_include = True
+                        self.prefix = ""
+                        self.feed(rest)
+                    elif len(self.prefix) > _DIRECTIVE_PREFIX_CAP:
+                        self.dead = True
+                if nl < 0:
+                    return
+                self.reset()
+                pos = nl + 1
+
+
+def _quoted_end(text: str, k: int, end_re) -> int:
+    """Offset just past the string/char literal whose body starts at `k` (`end_re` finds the
+    closing quote, a backslash or a newline). Backslash skips the next character; an unterminated
+    literal ends AT the newline, which is not consumed; EOF ends it at len(text)."""
+    while True:
+        sm = end_re.search(text, k)
+        if sm is None:
+            return len(text)
+        ch = text[sm.start()]
+        if ch == "\\":
+            if text[sm.start() + 1:sm.start() + 2] == "\n":
+                return sm.start() + 1   # a surviving backslash-newline is not a splice: the literal ends
+            k = sm.start() + 2
+            continue
+        return sm.start() if ch == "\n" else sm.end()
+
+
+def _ends_in_pp_number(run: str) -> bool:
+    """`run` is a maximal run of identifier characters, `.`, `+` and `-`. True when its LAST token,
+    lexed from the left the way the compiler does, is a pp-number: it starts with an ASCII digit or
+    `.digit`, then takes letters, digits, `_`, `.`, `$`, non-ASCII characters, and a sign directly
+    after `e`/`E`/`p`/`P`. An identifier swallows its digits (`a$1`, `x1`); a `.`, `+` or `-` that
+    does not continue a number is punctuation (`x.5` is the identifier `x` then `.5`)."""
+    i, n = 0, len(run)
+    is_num = False
+    while i < n:
+        c = run[i]
+        if "0" <= c <= "9" or (c == "." and i + 1 < n and "0" <= run[i + 1] <= "9"):
+            i += 1
+            while i < n:
+                d = run[i]
+                if _is_ident_char(d) or d == ".":
+                    i += 1
+                elif d in "+-" and run[i - 1] in "eEpP":
+                    i += 1
+                else:
+                    break
+            is_num = True
+        elif _is_ident_char(c):
+            i += 1
+            while i < n and _is_ident_char(run[i]):
+                i += 1
+            is_num = False
+        else:
+            i += 1
+            is_num = False
+    return is_num
+
+
+def _raw_prefix_ok(text: str, r: int) -> bool:
+    """`text[r]` is an `R` directly before a `"`. True when `R`, `LR`, `uR`, `UR` or `u8R` starting
+    at `r` (or just before it) is a whole raw-string encoding prefix: NOT the tail of a longer
+    identifier or pp-number (`aLR"`, `1R"`, `0LR"`) and NOT a user-defined-literal suffix on a
+    preceding literal (`"s"R"`, `'c'LR"`)."""
+    k = r
+    while k >= 0 and _is_pp_run_char(text[k]):
+        k -= 1
+    if _ends_in_pp_number(text[k + 1:r + 1]):   # `1.R"`, `0x1R"`: the R belongs to a number
+        return False
+    start = r
+    if r >= 2 and text[r - 2:r] == "u8":
+        start = r - 2
+    elif r >= 1 and text[r - 1] in "LuU":
+        start = r - 1
+    return start == 0 or not (_is_ident_char(text[start - 1]) or text[start - 1] in "\"'")
+
+
+def strip_comments(text: str, blank_strings: bool, join_splices: bool = True) -> str:
+    """ONE LINEAR PASS over `text`: every `//` and `/* ... */` comment becomes a single space;
+    string, char and raw-string literals are skipped, so a `//` or `/*` INSIDE one is never
+    read as a comment; with `blank_strings` their contents are replaced by `""` / `''`.
+    Backslash-newline is deleted first (translation phase 2), so a `//` comment ending in a
+    backslash correctly swallows the next line, exactly as the compiler does.
+
+    Linear by construction: `_SPECIAL_RE` jumps to the next `/`, `"` or `'`, and each
+    terminator is found with `str.find` / a forward regex search from where the scan already
+    is (the header-name look-back is bounded by the previous comment's end). Do NOT replace this with `re.sub` over nested/lazy quantifiers: the previous versions
+    of this function were quadratic (a header of `"\\"\\"...` or of repeated unterminated
+    `/*` took 5-30 s per 64-240 KB) and this script gates CI.
+
+    Differentially tested against `g++ -MM -MG` as the oracle: the hand-written fixtures pinned in
+    the selftest (which re-checks them against GNU g++ when one is installed) and, in review,
+    ~100k randomly generated files from a grammar of comments / literals / raw strings / splices /
+    digraphs / NULs / prefixes / `<header-name>`s. That fuzz FOUND hiding shapes in earlier
+    drafts - a char literal after `return`/`L`/`u8`/a digit, `R` used as a user-defined-literal
+    suffix or as the tail of an identifier / pp-number (`aLR"`, `0LR"`), a NUL byte, a splice with
+    FF/VT before the newline, `#import`, a splice inside a raw string or inside the raw-string
+    OPENER, a `//` or `/*` inside `#include <a//b.hpp>`, and a leading-dot pp-number separator
+    (`.5'0`) - all fixed and pinned.
+
+    RAW-STRING SPLICES: phase-2 splices are removed before raw strings are lexed, but the compiler
+    REVERTS a backslash-newline INSIDE a raw string. So the raw string's closing `)delim"` is
+    searched in the ORIGINAL text (the offset is mapped back through the deleted splices), while
+    its opener is recognised on the joined text. (An earlier draft also lexed such files a second
+    time WITHOUT the join and unioned the results; with the mapping exact that was dead weight that
+    only added false FAILs, and no fixture needed it, so it was removed.)
+
+    HEADER-NAMES: `_LineState` follows each logical line (a multi-line block comment is one blank
+    and does not end it). Once the line is `#` / `%:` then `include` / `include_next` / `import`
+    - comments and blanks between the pieces are fine - EVERY `<` opens a header-name that runs to
+    `>` or the end of the line, and inside it no `//`, `/*`, `"` or `'` starts anything
+    (`#include<a.h></*>` has two header-names). Outside a directive a `<` means nothing.
+
+    An include on its own line inside `#if 0` or a raw string is still extracted (the
+    conservative direction: a possible false FAIL, never a hidden include). An unterminated
+    `/*` consumes the rest of the file (the compiler rejects such a file)."""
+    orig = text
+    cut_orig: list[int] = []   # original offset of each deleted splice
+    cut_join: list[int] = []   # joined offset at which each splice was deleted
+    cut_cum: list[int] = []    # cumulative deleted length up to and including that splice
+    if join_splices:
+        parts: list[str] = []
+        last_cut = 0
+        removed = 0
+        for sm in _LINE_CONTINUATION_RE.finditer(orig):
+            parts.append(orig[last_cut:sm.start()])
+            cut_orig.append(sm.start())
+            cut_join.append(sm.start() - removed)
+            removed += sm.end() - sm.start()
+            cut_cum.append(removed)
+            last_cut = sm.end()
+        parts.append(orig[last_cut:])
+        text = "".join(parts)
+    def to_orig(p: int) -> int:
+        # joined offset of a retained character -> its offset in the original text
+        k = bisect.bisect_right(cut_join, p)
+        return p + (cut_cum[k - 1] if k else 0)
+
+    def to_joined(e: int) -> int:
+        # original offset at a retained-character boundary -> joined offset
+        k = bisect.bisect_left(cut_orig, e)
+        return e - (cut_cum[k - 1] if k else 0)
+
+    n = len(text)
+    out: list[str] = []
+    last = 0
+    i = 0
+    ls = _LineState()
+    fed = 0         # text[:fed] has been fed to `ls`
+    last_sep = -1   # position of the previous digit-separator quote (a chain 1'0'0'0 is one token)
+    while True:
+        m = _SPECIAL_RE.search(text, i)
+        if m is None:
+            break
+        j = m.start()
+        c = text[j]
+        ls.feed(text[fed:j])
+        fed = j
+        if ls.in_name:
+            i = j + 1   # inside a `<header-name>`: no comment, string or char literal can start
+            continue
+        if c == "/":
+            nxt = text[j + 1:j + 2]
+            if nxt == "/":
+                end = text.find("\n", j + 2)
+                end = n if end < 0 else end
+                out.append(text[last:j])
+                out.append(" ")
+                last = i = fed = end
+                ls.feed(" ")
+            elif nxt == "*":
+                end = text.find("*/", j + 2)
+                out.append(text[last:j])
+                out.append(" ")
+                if end < 0:
+                    last = i = n
+                    break
+                last = i = fed = end + 2
+                ls.feed(" ")
+            else:
+                i = j + 1
+        elif c == '"':
+            end = None
+            # Raw string: R"delim( ... )delim" (also LR / uR / UR / u8R prefixes).
+            if j > 0 and text[j - 1] == "R" and _raw_prefix_ok(text, j - 1):
+                rm = _RAW_OPEN_RE.match(text, j)
+                if rm:
+                    # The compiler REVERTS phase-2 splices inside a raw string, so the closing
+                    # `)delim"` is searched in the ORIGINAL text, from just after the `(`.
+                    tail = ")" + rm.group(1) + '"'
+                    oclose = orig.find(tail, to_orig(rm.end() - 1) + 1)
+                    # max(): forward progress is guaranteed even if the offset mapping were wrong
+                    end = n if oclose < 0 else max(to_joined(oclose + len(tail)), rm.end())
+            if end is None:
+                end = _quoted_end(text, j + 1, _STR_END_RE)
+            ls.literal()
+            fed = end
+            if blank_strings:
+                out.append(text[last:j])
+                out.append('""')
+                last = end
+            i = end
+        else:  # a single quote
+            nx = text[j + 1:j + 2]
+            if j > 0 and nx and nx.isascii() and (nx.isalnum() or nx == "_"):
+                # C++14 digit separator (1'000'000) - but ONLY inside a pp-number: tokenise the run of
+                # identifier/number characters that ends here; the token touching the quote must be
+                # a pp-number (an earlier separator in the same chain counts). `return'/*'`,
+                # `L'x'`, `u8'x'`, `1'/*'`, `a$1'x'` are char literals; `x.5'0`, `.5'0`, `1.'5` and
+                # `5e+'1` are separators. The character after the quote must be ASCII [A-Za-z0-9_].
+                k = j - 1
+                while k >= 0 and _is_pp_run_char(text[k]):
+                    k -= 1
+                if (k >= 0 and k == last_sep) or _ends_in_pp_number(text[k + 1:j]):
+                    last_sep = j
+                    i = j + 1
+                    continue
+            end = _quoted_end(text, j + 1, _CHR_END_RE)
+            ls.literal()
+            fed = end
+            if blank_strings:
+                out.append(text[last:j])
+                out.append("''")
+                last = end
+            i = end
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _read_source(path: Path) -> str:
+    """Decode a source file: UTF-16 when it starts with a UTF-16 BOM (MSVC accepts such files),
+    else UTF-8 with a leading BOM dropped. Never raises on bad bytes (`replace`)."""
+    raw = path.read_bytes()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = raw.decode("utf-16", errors="replace")
+    else:
+        text = raw.decode("utf-8-sig", errors="replace")
+    # GCC treats a NUL byte as whitespace (with a warning), so `\0#include "x"` is a directive.
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\0", " ")
+
+
 def parse_includes(path: Path):
-    """Yields (is_angle, spelling) for every `#include` line in `path`, in
-    file order. Line-anchored regex, not a real preprocessor - a `#include`
-    reached only through an `#if 0`/macro-guarded block is still extracted as
-    if unconditional. That is conservative in the direction that matters for
-    this gate (it can only make the walk see MORE of the tree, never hide a
-    real include), so it is not a soundness gap for the "no store in the
-    closure" claim, only a possible source of a false-positive edge the
-    escapes section above does not need to cover."""
+    """Yields (is_angle, spelling) for every `#include` / `#include_next` directive in `path`,
+    in file order. Comments are removed first by the linear `strip_comments`, backslash-newline
+    is joined, a BOM is dropped and UTF-16 is decoded, so the forms a line-anchored regex
+    missed - `#include/*c*/"x"`, `# /* c */ include "x"`, a multi-line comment closing before the
+    `#`, `#include \\` + blank + newline, `%:include`, `include_next` - ARE found (each probed
+    in the selftest and cross-checked against `g++ -MM`).
+
+    Still NOT seen: a macro-built include (`#include SOME_MACRO`) or a `##`-spliced one.
+    Over-extracted (the conservative direction, a possible false FAIL): an `#include` line
+    inside `#if 0` or inside a raw string literal."""
     out = []
-    text = path.read_text(encoding="utf-8", errors="replace")
-    for line in text.splitlines():
+    for line in strip_comments(_read_source(path), blank_strings=False).split("\n"):
         m = _INCLUDE_RE.match(line)
         if not m:
             continue
-        spelling = m.group(1)
-        is_angle = spelling.startswith("<")
-        out.append((is_angle, spelling[1:-1]))
+        item = (m.group(1).startswith("<"), m.group(1)[1:-1])
+        if item not in out:
+            out.append(item)
     return out
 
 
@@ -609,20 +1201,27 @@ def resolve_include(includer: Path, is_angle: bool, name: str, roots: Roots = DE
     need not) see inside. See the module docstring's "INCLUDE RESOLUTION"
     section for why angle vs quote is not itself the external/internal
     signal in this codebase."""
+    def inside(candidate: Path):
+        # A header that resolves OUTSIDE the repository root (`"../../../x.h"`) is treated as not
+        # found: every error message and the chain printer assume root-relative paths.
+        resolved = candidate.resolve()
+        return resolved if roots.root.resolve() in resolved.parents else None
+
     if is_angle:
-        for r in (roots.server_include, roots.common_include):
+        for r in (roots.server_include, roots.common_include, *roots.extra_include):
             candidate = r / name
             if candidate.is_file():
-                return candidate.resolve()
+                return inside(candidate)
         return None
     # Quote form: directory of the includer first (ordinary compiler
     # behaviour), then the same internal roots plus server/core/src itself
     # (a fallback for a quote-include reaching a sibling file by a path
     # relative to src/ rather than to the includer's own subdirectory).
-    for d in (includer.parent, roots.server_include, roots.common_include, roots.server_src):
+    for d in (includer.parent, roots.server_include, roots.common_include,
+              *roots.extra_include, roots.server_src):
         candidate = d / name
         if candidate.is_file():
-            return candidate.resolve()
+            return inside(candidate)
     return None
 
 
@@ -635,12 +1234,12 @@ def closure(tu_path: Path, roots: Roots = DEFAULT_ROOTS):
       parent     - {child_path: includer_path} for chain reconstruction.
       unresolved - [(includer_path, spelling)] for a QUOTE include that could
                    not be resolved anywhere in the tree. Quote includes in
-                   this codebase are always in-tree by construction, so an
-                   unresolved one is reported as a warning (an extraction
-                   gap to fix, not itself evidence of a store reach) rather
-                   than silently ignored. An unresolved ANGLE include is the
-                   expected, common case (a real external header) and is not
-                   reported at all.
+                   this codebase are in-tree by construction, so an unresolved
+                   one TRUNCATES the closure under it and is a HARD ERROR on
+                   every lane (`report_unresolved`) unless it names a generated
+                   `*.pb.h`. An unresolved ANGLE include is the expected,
+                   common case (a real external header) and is not reported
+                   at all.
     """
     tu_path = tu_path.resolve()
     visited: set[Path] = set()
@@ -697,6 +1296,34 @@ def is_forbidden_header(abspath: Path, root: Path = ROOT,
     return False, None
 
 
+def report_unresolved(label: str, tu_rel, unresolved, roots: Roots = DEFAULT_ROOTS,
+                      seen: set | None = None) -> bool:
+    """False (and a `::error::` per include) if the closure holds a QUOTE include that
+    resolves nowhere and is not a generated header. Such an include TRUNCATES the closure
+    under it - a store header moved outside the resolution roots would otherwise
+    keep every TU that reaches it green on a warning nobody reads in a passing job."""
+    ok = True
+    for includer, spelling in unresolved:
+        if spelling.endswith(GENERATED_HEADER_SUFFIXES):
+            continue
+        ok = False
+        # One shared header reached by N enrolled TUs would otherwise print N identical errors
+        # and bury the finding: report each (includer, spelling) once per lane.
+        key = (str(includer), spelling)
+        if seen is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        gh("error",
+           f"check-seam-closure: {label}: {tu_rel}: could not resolve quote-include "
+           f"\"{spelling}\" from {includer.relative_to(roots.root)} - the closure under it "
+           f"is NOT checked. Prefer fixing the include path; if the header lives in a "
+           f"directory the build adds with -I, add that directory to Roots.extra_include. "
+           f"Widening GENERATED_HEADER_SUFFIXES re-opens the hole this error closes and needs "
+           f"security-guardian sign-off")
+    return ok
+
+
 def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
                   patterns=FORBIDDEN_HEADER_PATTERNS) -> bool:
     """Runs the seam-closure check for one family. `tus` is a list of
@@ -706,12 +1333,19 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
     defect this gate exists to prevent), reported and then EXCLUDED from the
     closure walk so the remaining members are still checked."""
     ok = True
+    kind = "lane" if name == "mcp_registry" else "family"
+    seen_unresolved: set = set()
     existing: list[Path] = []
     for rel in tus:
         p = (roots.root / rel).resolve()
         if not p.is_file():
             gh("error", f"check-seam-closure: expected family TU not found: "
-                        f"{rel} (family {name!r})")
+                        f"{rel} ({kind} {name!r}) - if it was renamed or deleted, "
+                        f"update "
+                        + ("STORE_DEFINITION_FREE_TUS" if name == "store_definition_free"
+                           else "MCP_REGISTRY_HEADERS / MCP_REGISTRY_TYPES_HEADERS" if name == "mcp_registry"
+                           else f"FAMILIES[{name!r}]")
+                        + " AND the frozen pin in tests/test_seam_closure_selftest.py")
             ok = False
             continue
         existing.append(p)
@@ -719,12 +1353,8 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
     for tu in existing:
         rel_tu = tu.relative_to(roots.root)
         visited, parent, unresolved = closure(tu, roots)
-        for includer, spelling in unresolved:
-            gh("warning",
-               f"check-seam-closure: {rel_tu}: could not resolve quote-"
-               f"include \"{spelling}\" from "
-               f"{includer.relative_to(roots.root)} (extraction gap, not "
-               f"itself a store-header finding)")
+        if not report_unresolved(f"{kind} {name!r}", rel_tu, unresolved, roots, seen_unresolved):
+            ok = False
         for f in sorted(visited, key=str):
             hit, pat = is_forbidden_header(f, roots.root, patterns)
             if not hit:
@@ -732,9 +1362,20 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
             chain = chain_to(f, parent, tu)
             chain_str = " -> ".join(str(c.relative_to(roots.root)) for c in chain)
             gh("error",
-               f"check-seam-closure: family {name!r}: {rel_tu} reaches "
+               f"check-seam-closure: {kind} {name!r}: {rel_tu} reaches "
                f"forbidden header {f.relative_to(roots.root)} (matches "
-               f"forbidden pattern {pat!r}) via include chain: {chain_str}")
+               f"forbidden pattern {pat!r}) via include chain: {chain_str}"
+               + (" - this TU is enrolled as store-definition-free: route the data through an "
+                  "injected provider or a `*Api` seam instead of including the store "
+                  "(see STORE_DEFINITION_FREE_TUS)"
+                  if name == "store_definition_free"
+                  else " - this TU is in the MCP registry lane, which must stay store-free: reach "
+                       "data through a provider closure on `ToolDeps`, and move any row type it "
+                       "needs out of the store header into a `*_types.hpp` (see "
+                       "MCP_REGISTRY_HEADERS / MCP_REGISTRY_TYPES_HEADERS)"
+                  if name == "mcp_registry" else "")
+               + " [ADR-0031 migration step 3; docs/presentation-core-split-delivery-matrix.md, "
+                 "WS-A4]")
             ok = False
     return ok
 
@@ -759,13 +1400,18 @@ def check_impl_purity(tus: list[str], roots: Roots = DEFAULT_ROOTS) -> bool:
     dex_api.cpp -> dex_routes.hpp -> httplib inversion. A missing declared TU is
     a HARD ERROR (same posture as check_family)."""
     ok = True
+    seen_unresolved: set = set()
     for rel in tus:
         tu = (roots.root / rel).resolve()
         if not tu.is_file():
-            gh("error", f"check-seam-closure: impl-purity: expected impl TU not found: {rel}")
+            gh("error", f"check-seam-closure: impl-purity: expected impl TU not found: {rel} - if it "
+                        f"was renamed or deleted, update IMPL_TUS AND the frozen pin in "
+                        f"tests/test_seam_closure_selftest.py")
             ok = False
             continue
-        visited, parent, _unresolved = closure(tu, roots)
+        visited, parent, unresolved = closure(tu, roots)
+        if not report_unresolved("impl-purity", rel, unresolved, roots, seen_unresolved):
+            ok = False
         # (a) presentation in-tree headers via resolved-path basename match.
         for f in sorted(visited, key=str):
             hit, pat = is_forbidden_header(f, roots.root, patterns=IMPL_FORBIDDEN_HEADER_PATTERNS)
@@ -792,31 +1438,19 @@ def check_impl_purity(tus: list[str], roots: Roots = DEFAULT_ROOTS) -> bool:
 
 
 def _strip_comments(text: str) -> str:
-    """Blank ordinary string/char literal CONTENTS first, then remove /* */
-    block comments and // line comments (covers /// doc comments too). Not a
-    full C++ lexer. Blanking literals before comment-stripping is load-bearing:
-    a `//` or `/*` INSIDE a string literal (e.g. `const char* u = "http://h";`)
-    would otherwise be treated as a comment and over-strip a real store-type
-    token that follows the literal on the same line — the exact bypass this
-    probe exists to prevent (#4582 review). After the literal-blank the pass is
-    sound in the direction that matters: it can under-strip (a leftover token
-    just produces an author-resolved false positive), and can no longer
-    over-strip via an ordinary literal. RESIDUAL: raw string literals
-    (`R"(...)"`) are not lexed, so a `//` inside one could still over-strip;
-    accepted because no abstract `*_api.hpp` closure contains a raw string (a
-    selftest case pins the ordinary-literal fix)."""
-    text = re.sub(r'"(?:\\.|[^"\\\n])*"', '""', text)  # blank string literals
-    text = re.sub(r"'(?:\\.|[^'\\\n])*'", "''", text)  # blank char literals
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
-    text = re.sub(r"//[^\n]*", " ", text)
-    return text
+    """Comments removed and string/char literal CONTENTS blanked, in ONE LINEAR PASS
+    (`strip_comments`). Blanking literals is load-bearing for the type-token probe: a `//` or
+    `/*` inside a string literal (`const char* u = "http://h";`) must not be read as a comment
+    start, or a real store-type token after it is over-stripped - the bypass #4582 found.
+    Raw strings are lexed too (this used to be a documented residual)."""
+    return strip_comments(text, blank_strings=True)
 
 
 def names_store_type(path: Path):
     """Returns the first store-type token this file NAMES in code (comments
     stripped), or None. Catches both `*Store` class names (regex) and the
     non-`Store` store row/data types (EXTRA_STORE_TYPE_TOKENS)."""
-    code = _strip_comments(path.read_text(encoding="utf-8", errors="replace"))
+    code = strip_comments(_read_source(path), blank_strings=True)
     m = STORE_TYPE_TOKEN_RE.search(code)
     if m:
         return m.group(0)
@@ -832,13 +1466,18 @@ def check_abstract_headers_store_type_free(headers: list[str],
     include closure — must NAME no store type in code (see the probe's block
     comment above). A missing declared header is a HARD ERROR."""
     ok = True
+    seen_unresolved: set = set()
     for rel in headers:
         tu = (roots.root / rel).resolve()
         if not tu.is_file():
-            gh("error", f"check-seam-closure: abstract-header probe: header not found: {rel}")
+            gh("error", f"check-seam-closure: abstract-header probe: header not found: {rel} - if it "
+                        f"was renamed or deleted, update ABSTRACT_API_HEADERS AND the frozen pin "
+                        f"in tests/test_seam_closure_selftest.py")
             ok = False
             continue
-        visited, parent, _unresolved = closure(tu, roots)
+        visited, parent, unresolved = closure(tu, roots)
+        if not report_unresolved("abstract-header probe", rel, unresolved, roots, seen_unresolved):
+            ok = False
         for f in sorted({tu} | visited, key=str):
             tok = names_store_type(f)
             if tok is None:
@@ -857,6 +1496,111 @@ def check_abstract_headers_store_type_free(headers: list[str],
     return ok
 
 
+def mcp_registry_cpps(roots: Roots = DEFAULT_ROOTS) -> list[str]:
+    """Root-relative paths of every regular `mcp_tools_*.cpp` under `roots.server_src`, sorted so
+    the order is stable. A symlink is NOT returned (see mcp_registry_symlinks)."""
+    return sorted(
+        p.relative_to(roots.root).as_posix()
+        for p in roots.server_src.glob(MCP_REGISTRY_TU_GLOB)
+        if p.is_file() and not p.is_symlink())
+
+
+def mcp_registry_symlinks(roots: Roots = DEFAULT_ROOTS) -> list[str]:
+    """Root-relative paths of glob matches that are symlinks. A registry file is a real file in
+    the tree; a link can point outside the repo and would crash the closure walk, so it is
+    reported and refused rather than followed."""
+    return sorted(
+        p.relative_to(roots.root).as_posix()
+        for p in roots.server_src.glob(MCP_REGISTRY_TU_GLOB) if p.is_symlink())
+
+
+def mcp_registry_tus(roots: Roots = DEFAULT_ROOTS) -> list[str]:
+    """Root-relative TU list for the MCP registry lane: the globbed registry files, the shared
+    headers (MCP_REGISTRY_HEADERS) and the store-free types headers (MCP_REGISTRY_TYPES_HEADERS)."""
+    return (mcp_registry_cpps(roots) + list(MCP_REGISTRY_HEADERS)
+            + list(MCP_REGISTRY_TYPES_HEADERS))
+
+
+def mcp_registry_accessor_errors(roots: Roots = DEFAULT_ROOTS) -> list[str]:
+    """Cross-check the globbed registry files against the one-accessor-per-domain contract in
+    mcp_tool_registry.hpp: every declared `<d>_tool_records()` must have a globbed
+    `mcp_tools_<d>.cpp`, and every globbed file must have its accessor. This is what notices a
+    RENAME paired with an ADD, which leaves the count pin satisfied while a registry file has
+    left the glob (and so left the lane). Returns human-readable error strings."""
+    hdr = roots.root / MCP_REGISTRY_REGISTRY_HEADER
+    if not hdr.is_file():
+        return [f"cannot cross-check registry accessors: {MCP_REGISTRY_REGISTRY_HEADER} not found"]
+    text = hdr.read_text(encoding="utf-8", errors="replace")
+    declared = set(_MCP_ACCESSOR_RE.findall(_strip_comments(text))) - _MCP_ACCESSOR_NOT_DOMAINS
+    globbed = {Path(c).name[len("mcp_tools_"):-len(".cpp")] for c in mcp_registry_cpps(roots)}
+    errs = []
+    for d in sorted(declared - globbed):
+        errs.append(f"{d}_tool_records() is declared in {MCP_REGISTRY_REGISTRY_HEADER} but "
+                    f"mcp_tools_{d}.cpp is not among the globbed registry files - a registry "
+                    f"file renamed (or moved) out of `{MCP_REGISTRY_TU_GLOB}` leaves this lane "
+                    f"unchecked while the count pin still passes (rename the file back to "
+                    f"mcp_tools_{d}.cpp, or rename the accessor to match; if the one-accessor-per-domain "
+                    f"contract itself is being changed, update _MCP_ACCESSOR_RE and "
+                    f"docs/api-twin-recipe.md in the same PR)")
+    for d in sorted(globbed - declared):
+        errs.append(f"mcp_tools_{d}.cpp is globbed as a registry file but "
+                    f"{MCP_REGISTRY_REGISTRY_HEADER} declares no {d}_tool_records() accessor "
+                    f"- a registry file serves nothing until its accessor is declared there and "
+                    f"listed in mcp_server.cpp's registered_tool_records() (if the "
+                    f"one-accessor-per-domain contract itself is being changed, update "
+                    f"_MCP_ACCESSOR_RE and docs/api-twin-recipe.md in the same PR)")
+    return errs
+
+
+def check_mcp_registry_lane(roots: Roots = DEFAULT_ROOTS,
+                            expected_count: int = MCP_REGISTRY_EXPECTED_TU_COUNT,
+                            patterns=FORBIDDEN_HEADER_PATTERNS) -> bool:
+    """The MCP registry lane (#6558): pin the globbed file count, cross-check the glob against
+    the accessor contract, refuse symlinks, then run the same closure check every family gets.
+    A count mismatch is a hard error in BOTH directions - fewer means a registry file was
+    renamed or deleted (the lane would quietly cover less than it claims); more means a new
+    registry file arrived and its enrolment was never reviewed. Either way the fix is one
+    reviewed edit across ALL of these pins, which must agree: MCP_REGISTRY_EXPECTED_TU_COUNT and
+    EXPECTED_MCP_REGISTRY_TU_COUNT / EXPECTED_MCP_REGISTRY_CPPS in
+    tests/test_seam_closure_selftest.py, MIN_REGISTRY_FILES in scripts/ci/check-api-parity.py,
+    and kRegistryDomainFiles in tests/unit/server/test_mcp_dispatch_coverage.cpp."""
+    ok = True
+    for link in mcp_registry_symlinks(roots):
+        gh("error",
+           f"check-seam-closure: MCP registry lane: {link} is a symlink - a registry file must "
+           f"be a regular file in the tree (a link can point outside the repo); refusing to "
+           f"follow it [ADR-0031 WS-A4, #6558]")
+        ok = False
+    # A symlinked shared/types header gets the same refusal as a symlinked registry file (an
+    # out-of-repo link would otherwise crash the closure walk), and is left out of the walk.
+    tus = []
+    for rel in mcp_registry_tus(roots):
+        if (roots.root / rel).is_symlink():
+            gh("error",
+               f"check-seam-closure: MCP registry lane: {rel} is a symlink - a lane header must "
+               f"be a regular file in the tree; refusing to follow it [ADR-0031 WS-A4, #6558]")
+            ok = False
+        else:
+            tus.append(rel)
+    n_cpp = len(mcp_registry_cpps(roots))
+    if n_cpp != expected_count:
+        gh("error",
+           f"check-seam-closure: MCP registry lane: found {n_cpp} `{MCP_REGISTRY_TU_GLOB}` "
+           f"file(s) under {roots.server_src.relative_to(roots.root).as_posix()}, expected "
+           f"{expected_count} - enrol a new registry file (or retire a removed one) by updating "
+           f"ALL of: MCP_REGISTRY_EXPECTED_TU_COUNT here; EXPECTED_MCP_REGISTRY_TU_COUNT and "
+           f"EXPECTED_MCP_REGISTRY_CPPS in tests/test_seam_closure_selftest.py; MIN_REGISTRY_FILES "
+           f"in scripts/ci/check-api-parity.py; kRegistryDomainFiles in "
+           f"tests/unit/server/test_mcp_dispatch_coverage.cpp [ADR-0031 WS-A4, #6558]")
+        ok = False
+    for msg in mcp_registry_accessor_errors(roots):
+        gh("error", f"check-seam-closure: MCP registry lane: {msg} [ADR-0031 WS-A4, #6558]")
+        ok = False
+    if not check_family("mcp_registry", tus, roots, patterns):
+        ok = False
+    return ok
+
+
 def run_check() -> int:
     ok = True
     checked = 0
@@ -864,6 +1608,10 @@ def run_check() -> int:
         checked += 1
         if not check_family(name, spec["tus"]):
             ok = False
+    if not check_family("store_definition_free", STORE_DEFINITION_FREE_TUS):
+        ok = False
+    if not check_mcp_registry_lane():
+        ok = False
     impl_ok = check_impl_purity(IMPL_TUS)
     if not impl_ok:
         ok = False
@@ -873,6 +1621,8 @@ def run_check() -> int:
     if ok:
         print(f"check-seam-closure: OK ({checked} famil"
               f"{'y' if checked == 1 else 'ies'} header-closure checked + "
+              f"{len(STORE_DEFINITION_FREE_TUS)} store-definition-free presentation TUs checked + "
+              f"{len(mcp_registry_tus())} MCP registry lane TUs checked + "
               f"{len(IMPL_TUS)} impl TUs impl-purity checked + "
               f"{len(ABSTRACT_API_HEADERS)} abstract headers store-type-free checked; "
               f"all closures free of store-layer / core-only `*_api_local.hpp` headers, "

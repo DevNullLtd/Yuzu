@@ -6,11 +6,13 @@
  * RegLoadKeyW mounting) are the impure Win32 shell; the SID classification,
  * name derivation, hive-state classification, and wire-row rendering below
  * are header-pure and pinned here on every host (the firewall_parsers.hpp /
- * tar_module_etw.hpp pattern). All SIDs in fixtures are synthetic, matching
- * the convention in test_tar_netconn.cpp.
+ * echo_module_etw.hpp pattern). All SIDs in fixtures are synthetic, matching
+ * the convention in test_echo_netconn.cpp.
  */
 
 #include "user_profile_model.hpp"
+
+#include <yuzu/log_token.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -18,6 +20,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace yuzu::profiles;
@@ -51,6 +54,24 @@ TEST_CASE("is_profile_backup_entry: a `.bak` suffix, any case, on a non-empty ke
     CHECK_FALSE(is_profile_backup_entry(""));
     CHECK_FALSE(is_profile_backup_entry(".bak"));
     CHECK_FALSE(is_profile_backup_entry("S-1-5-18"));
+}
+
+TEST_CASE("remove_backup_entries: drops the `<SID>.bak` leftovers and keeps the rest in order", "[profiles]") {
+    // mutant: the list is returned untouched (the per-user write path resolves a leftover, or lets it shadow the live profile)
+    std::vector<RawProfileRecord> records{
+        {std::string{kAliceSid} + ".bak", "C:\\Users\\jsmith"},
+        {std::string{kAliceSid}, "C:\\Users\\jsmith"},
+        {std::string{kBobSid}, "C:\\Users\\jsmith"},
+    };
+    std::vector<std::string> hku{};
+    auto profiles = build_profile_list(records, hku);
+    REQUIRE(profiles.size() == 3);
+    remove_backup_entries(profiles);
+    REQUIRE(profiles.size() == 2);
+    CHECK(profiles[0].sid == kAliceSid);
+    CHECK(profiles[1].sid == kBobSid);
+    remove_backup_entries(profiles); // idempotent on a list with none
+    CHECK(profiles.size() == 2);
 }
 
 // ── iequals_ascii ─────────────────────────────────────────────────────────
@@ -268,6 +289,64 @@ TEST_CASE("sanitize_field: ordinary text passes through unchanged", "[profiles]"
     CHECK(sanitize_field("alice") == "alice");
 }
 
+TEST_CASE("sanitize_field: folds C0 except TAB, DEL, C1, U+2028 and U+2029; nothing else", "[profiles]") {
+    CHECK(sanitize_field("a\x1b[31mb") == "a_[31mb");
+    CHECK(sanitize_field("a\x0b" "b\x0c" "c") == "a_b_c");                  // VT, FF
+    CHECK(sanitize_field("a\x1c" "b\x1d" "c\x1e" "d") == "a_b_c_d");        // FS, GS, RS
+    CHECK(sanitize_field("a\x01" "b\x08" "c\x0e" "d\x1f" "e") == "a_b_c_d_e");
+    CHECK(sanitize_field("a\x7f" "b") == "a_b");                             // DEL
+    CHECK(sanitize_field("a\xC2\x9B" "31mb") == "a_31mb");                  // C1 CSI U+009B
+    CHECK(sanitize_field("a\xC2\x9D" "0;t\x07" "b") == "a_0;t_b");          // C1 OSC U+009D, then BEL
+    CHECK(sanitize_field("\xC2\x80\xC2\x9F") == "__");                       // both ends of the C1 range
+    CHECK(sanitize_field("\xC2\xA0\xC2\x7F") == "\xC2\xA0\xC2_");           // U+00A0 kept; C2 then DEL is not C1
+    CHECK(sanitize_field("a\xC2\x85" "b") == "a_b");
+    CHECK(sanitize_field("a\xE2\x80\xA8" "b") == "a_b");
+    CHECK(sanitize_field("a\xE2\x80\xA9" "b") == "a_b");
+    CHECK(sanitize_field("\xE2\x80\xA8\xE2\x80\xA9\xC2\x85") == "___"); // adjacent, no sequence swallowed
+    CHECK(sanitize_field("x\xE2\x80") == "x\xE2\x80");                     // a truncated sequence is left alone
+    CHECK(sanitize_field("x\xC2") == "x\xC2");
+    CHECK(sanitize_field("a\tb") == "a\tb");                                 // a tab passes (process rows carry them)
+    CHECK(sanitize_field("Caf\xC3\xA9 \xE2\x80\xA7 \xC2\xA0") == "Caf\xC3\xA9 \xE2\x80\xA7 \xC2\xA0"); // other UTF-8 intact
+    CHECK(sanitize_field("") == "");
+}
+
+TEST_CASE("sanitize_field: trailing NULs are dropped, an interior NUL folds to '_'", "[profiles]") {
+    using namespace std::string_view_literals;
+    CHECK(sanitize_field("A\0B"sv) == "A_B");       // would cut the row at the C-string ABI
+    CHECK(sanitize_field("abc\0"sv) == "abc");      // a REG_SZ stored with its terminator
+    CHECK(sanitize_field("abc\0\0\0"sv) == "abc"); // ...or with extra ones: no trailing '_'
+    CHECK(sanitize_field("\0a\0\0"sv) == "_a");
+    CHECK(sanitize_field("\0\0\0"sv) == "");
+    CHECK(sanitize_field("a|b\0c\0"sv) == "a_b_c");
+}
+
+// The documented lossy contract (registry README, get_value / enumerate_* descriptions): a rendered field is display
+// text, so two raw inputs that differ only in a folded character render the same and cannot be told apart.
+TEST_CASE("sanitize_field: distinct inputs that fold to the same text are equal after folding (lossy contract)",
+          "[profiles]") {
+    CHECK(sanitize_field("a\xE2\x80\xA8" "b") == sanitize_field("a_b")); // U+2028
+    CHECK(sanitize_field("a\xC2\x9B" "b") == sanitize_field("a_b"));     // C1
+    CHECK(sanitize_field("a\x0b" "b") == sanitize_field("a_b"));          // a C0 control
+    CHECK(sanitize_field("a|b") == sanitize_field("a_b"));
+}
+
+// fold_line_breaks keeps a set of its own on purpose (header comment); on the three Unicode line breaks it must agree
+// with log_key_token. They differ elsewhere: log_key_token folds TAB and passes C1 other than U+0085.
+TEST_CASE("fold_line_breaks agrees with log_key_token on U+0085, U+2028 and U+2029", "[profiles]") {
+    for (const std::string_view in : {"a\xC2\x85" "b", "a\xE2\x80\xA8" "b", "a\xE2\x80\xA9" "b"}) {
+        std::string folded{in};
+        fold_line_breaks(folded);
+        CHECK(folded == yuzu::log_key_token(in));
+    }
+    std::string tab = "a\tb", csi = "a\xC2\x9B" "b";
+    fold_line_breaks(tab);
+    fold_line_breaks(csi);
+    CHECK(tab == "a\tb");
+    CHECK(yuzu::log_key_token("a\tb") == "a_b");
+    CHECK(csi == "a_b");
+    CHECK(yuzu::log_key_token("a\xC2\x9B" "b") == "a\xC2\x9B" "b");
+}
+
 TEST_CASE("render_profile_row: ordinary profile", "[profiles]") {
     ProfileInfo info{std::string{kAliceSid}, "alice", "C:\\Users\\alice", HiveState::loaded};
     CHECK(render_profile_row(info) == std::string{kAliceSid} + "|alice|C:\\Users\\alice|loaded");
@@ -275,6 +354,11 @@ TEST_CASE("render_profile_row: ordinary profile", "[profiles]") {
 
 TEST_CASE("render_profile_row: empty fields render as '-'", "[profiles]") {
     ProfileInfo info{std::string{kAliceSid}, "", "", HiveState::not_loaded};
+    CHECK(render_profile_row(info) == std::string{kAliceSid} + "|-|-|not_loaded");
+}
+
+TEST_CASE("render_profile_row: a field of only NULs renders as '-'", "[profiles]") {
+    ProfileInfo info{std::string{kAliceSid}, std::string("\0\0", 2), "", HiveState::not_loaded};
     CHECK(render_profile_row(info) == std::string{kAliceSid} + "|-|-|not_loaded");
 }
 
@@ -367,6 +451,69 @@ TEST_CASE("render_hive_access_lines: warning precedes the error on a failed moun
     CHECK(lines[1] == "error|failed to load hive for sid '" + std::string{kAliceSid} + "'");
 }
 
+// ── hive_access_token (related issue #5291) ────────────────────────────────
+
+TEST_CASE("hive_access_token: ok/not_found/privilege_missing/mount_failed render their literals "
+          "regardless of refusal",
+          "[profiles]") {
+    CHECK(hive_access_token(HiveAccessStatus::ok, "ignored") == "ok");
+    CHECK(hive_access_token(HiveAccessStatus::not_found, "ignored") == "not_found");
+    CHECK(hive_access_token(HiveAccessStatus::privilege_missing, "ignored") == "privilege_missing");
+    CHECK(hive_access_token(HiveAccessStatus::mount_failed, "ignored") == "mount_failed");
+    CHECK(hive_access_token(HiveAccessStatus::ok, "") == "ok");
+}
+
+TEST_CASE("hive_access_token: file_refused renders the guard token verbatim, or the generic "
+          "literal when empty",
+          "[profiles]") {
+    CHECK(hive_access_token(HiveAccessStatus::file_refused, "hive_owner_unexpected") ==
+          "hive_owner_unexpected");
+    CHECK(hive_access_token(HiveAccessStatus::file_refused, "timeout") == "timeout");
+    CHECK(hive_access_token(HiveAccessStatus::file_refused, "hive_stat_failed:win32_5") ==
+          "hive_stat_failed:win32_5");
+    CHECK(hive_access_token(HiveAccessStatus::file_refused, "") == "file_refused");
+}
+
+// ── render_hive_access_lines: the refusal token (fifth, defaulted argument) ─
+
+TEST_CASE("render_hive_access_lines: file_refused with a token names it on the error line",
+          "[profiles]") {
+    const std::string sid{kAliceSid};
+    const auto lines = render_hive_access_lines(HiveAccessStatus::file_refused, false, "",
+                                                 kAliceSid, "hive_owner_unexpected");
+    REQUIRE(lines.size() == 1);
+    CHECK(lines[0] ==
+          "error|hive file refused for sid '" + sid + "': hive_owner_unexpected");
+}
+
+TEST_CASE("render_hive_access_lines: file_refused with no token keeps the pre-existing wording",
+          "[profiles]") {
+    // The default empty `refusal` makes every pre-existing four-argument call site (registry,
+    // installed_apps) compile and behave unchanged.
+    const auto lines = render_hive_access_lines(HiveAccessStatus::file_refused, false, "",
+                                                 kAliceSid);
+    REQUIRE(lines.size() == 1);
+    CHECK(lines[0] == "error|hive file refused for sid '" + std::string{kAliceSid} + "'");
+}
+
+TEST_CASE("render_hive_access_lines: a pipe in the refusal token is sanitised", "[profiles]") {
+    const std::string sid{kAliceSid};
+    const auto lines = render_hive_access_lines(HiveAccessStatus::file_refused, false, "",
+                                                 kAliceSid, "bad|token");
+    REQUIRE(lines.size() == 1);
+    CHECK(lines[0] == "error|hive file refused for sid '" + sid + "': bad_token");
+}
+
+TEST_CASE("render_hive_access_lines: the unload warning still precedes a tokened refusal",
+          "[profiles]") {
+    const std::string sid{kAliceSid};
+    const auto lines = render_hive_access_lines(HiveAccessStatus::file_refused, true, "MNT",
+                                                 kAliceSid, "timeout");
+    REQUIRE(lines.size() == 2);
+    CHECK(lines[0].starts_with("warning|hive_unload_failed: HKU\\MNT "));
+    CHECK(lines[1] == "error|hive file refused for sid '" + sid + "': timeout");
+}
+
 TEST_CASE("render_hive_access_lines: all 8 status x unload combinations, exact strings",
          "[profiles]") {
     // Exhaustive so a future enumerator cannot be added without a decision
@@ -422,6 +569,9 @@ TEST_CASE("render_user_key_error: every status, exact strings", "[profiles]") {
           "error|value exceeds 1 MiB limit");
     CHECK(render_user_key_error(UserKeyStatus::value_malformed, "K") ==
           "error|value size too small for its declared type");
+    CHECK(render_user_key_error(UserKeyStatus::value_changed_during_read, "K") ==
+          "error|value changed while reading -- a concurrent writer kept growing it faster "
+          "than the bounded retry could keep up; retry the read");
     // Key-absent and value-absent stay deliberately identical: up-S4 asks only
     // that INFRASTRUCTURE errors be separated from absence.
     CHECK(render_user_key_error(UserKeyStatus::key_not_found, "K") ==

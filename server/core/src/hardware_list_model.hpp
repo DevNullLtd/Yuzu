@@ -6,28 +6,31 @@
 /// fragment, the REST v1 twin, and the MCP twin (the "one builder" the twin recipe
 /// mandates, docs/api-twin-recipe.md §1). No gRPC, and nothing in THIS file calls
 /// into httplib — every function here is a pure transform over already-fetched
-/// data (roster/query in, page/JSON out). `inventory_routes.hpp` (below, for
-/// `InventoryDeviceRow`) transitively pulls in `<httplib.h>` for its own route
-/// types, so the symbol is reachable from this TU, but nothing declared in this
-/// file needs it — this header must stay includable from a plain unit test with
-/// zero network/store dependencies, and every function here is callable without
-/// ever touching an httplib type.
+/// data (roster/query in, page/JSON out). Its row types come from the store-free
+/// `*_types.hpp` headers (ADR-0031 seam closure, #6558), so no store header is reachable
+/// from THIS HEADER (held by the MCP registry lane of the seam-closure gate; httplib is
+/// likewise not reachable today, but nothing gates that half): it must stay includable from
+/// a plain unit test with zero network/store dependencies and from the MCP registry lane.
+/// That is a statement about includes, not linkage: `hardware_list_model.cpp` includes `tag_store.hpp` for
+/// `TagStore::validate_key`, so the object file still links the store.
 ///
-/// Roster rows are `InventoryDeviceRow`s (declared in inventory_routes.hpp), built by
+/// Roster rows are `InventoryDeviceRow`s (declared in inventory_types.hpp), built by
 /// server.cpp's `build_hw_roster` (endpoint_state + device_ci join); this header only
 /// orders, filters, and paginates that roster — it never fetches it.
 
+#include "authz_model.hpp"                // authz::VisibleSet
 #include "device_containment_render.hpp" // kContainmentUi
-#include "device_inventory_store.hpp"    // DeviceCiRecord, CiReadError
-#include "inventory_routes.hpp"          // InventoryDeviceRow
-#include "offline_endpoint_store.hpp"    // OfflineEndpoint, PresenceReadError (stdlib-only header)
-#include "software_inventory_store.hpp"  // SoftwareEntry
-#include "tag_store.hpp"                 // DeviceTag
+#include "device_inventory_types.hpp"    // DeviceCiRecord, CiReadError
+#include "inventory_types.hpp"           // InventoryDeviceRow
+#include "offline_endpoint_types.hpp"    // OfflineEndpoint, PresenceReadError, OfflineRosterRead
+#include "software_inventory_types.hpp"  // SoftwareEntry
+#include "tag_types.hpp"                 // DeviceTag, TagReadError
 
 #include <nlohmann/json.hpp>
 
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -83,6 +86,35 @@ struct HardwareListQuery {
 /// an unrecognised token (the ONLY rejection case) — `limit`/`offset` are clamped,
 /// never rejected, and empty `os`/`status`/`q` normalise to "all"/"all"/"".
 [[nodiscard]] std::optional<HardwareListQuery> normalise_hardware_query(HardwareListQuery raw);
+
+/// Strict-typed parse of an MCP `tools/call` arguments object into a RAW `HardwareListQuery`
+/// (the transport-specific half of the shared list core; the REST twin's counterpart is
+/// `query_from_request`). Unlike the REST query string, a JSON argument has a type, so this
+/// refuses what REST would coerce or clamp (#4644 strictness):
+///   * `arguments` must be an object; unknown keys are ignored (REST parity);
+///   * `q`/`tag`: strings of at most 256 bytes; `os`/`status`/`sort`/`dir`: strings that are
+///     exactly one of the documented lowercase tokens (`dir` is asc|desc);
+///   * `limit`: an integer in [1, 200]; `offset`: an integer >= 0. A string ("50"), a float,
+///     a bool, null, a negative or an out-of-range value is a refusal, never a default or a
+///     clamp.
+/// Returns nullopt on any refusal (the MCP handler answers `kInvalidParams`); `why`, when
+/// non-null, receives a short caller-safe reason naming the argument. The result is still RAW:
+/// the caller passes it through `normalise_hardware_query`, which also validates the tag key.
+[[nodiscard]] std::optional<HardwareListQuery> hardware_query_from_args(const nlohmann::json& args,
+                                                                         std::string* why = nullptr);
+
+/// Assemble the operator-visible roster: the UNFILTERED roster from the RosterFn, scope-
+/// filtered by the FleetReadGate's own scope (the SOLE filter, never double up with a second
+/// scope predicate). Returns the filtered roster and the number of rows dropped (the
+/// `devices_omitted` count). Shared by the REST/fragment handlers and the MCP twin.
+[[nodiscard]] std::pair<std::vector<InventoryDeviceRow>, std::size_t>
+scoped_roster(const InventoryDevicesResult& all, const authz::VisibleSet& scope);
+
+/// Audit-trail floor for a device id taken raw from a URL or an argument: a device id reaches
+/// `target_id` on every audit row these surfaces write and on the permission-denial audit, so
+/// an id over `auth::kMaxAgentIdLength` bytes or carrying a byte below 0x20 (CR/LF) is refused
+/// before any audit write. Mirrors viz_routes.cpp's agent_id floor.
+[[nodiscard]] bool id_is_audit_safe(const std::string& id);
 
 /// Lowercased, whitespace-split, deduplicated-by-position search tokens, capped at 8.
 [[nodiscard]] std::vector<std::string> hw_search_tokens(std::string_view q);
@@ -218,6 +250,25 @@ offline_identity_row(const OfflineRosterRead& eps, std::string_view agent_id, st
 /// Identity read -> `identity` on success (nullopt = absent), `identity_degraded` on error.
 void apply_identity_read(HardwareCiDetail& detail,
                          std::expected<std::optional<InventoryDeviceRow>, PresenceReadError> ident);
+
+/// How a `HardwareCiDetail` reads for a single-record request, decided ONCE for every
+/// transport (REST maps it to 200/404/503, the MCP twin to success/not-found/store fault).
+/// Out-of-scope is NOT decided here: the caller checks `authz::in_scope` BEFORE it fetches the
+/// detail and answers the same "not found" as `NotFound`, so a hidden device and a nonexistent
+/// one stay indistinguishable (the existence-oracle closure).
+enum class HardwareCiRead {
+    Found,            ///< something is known about the device (identity, CI, software or tags)
+    NotFound,         ///< nothing is known and no read failed: a genuinely absent id
+    RosterUnreadable, ///< nothing is known AND the identity fallback failed (#5531): never a 404
+};
+
+/// "Nothing known" is: no identity, a CI read that ANSWERED (not degraded) with no record, and
+/// software and tag lists that are each absent (unwired or degraded) or empty. A degraded CI
+/// read therefore keeps the record `Found` (the body's `ci_state` says "degraded"), while a
+/// degraded software or tag read counts as empty, exactly as the REST handler has always
+/// treated them. Only a failed identity fallback (`identity_degraded`) turns an otherwise empty
+/// record into `RosterUnreadable`.
+[[nodiscard]] HardwareCiRead classify_hardware_ci_read(const HardwareCiDetail& detail);
 
 /// `ci_state` and `identity_state` in the output are each one of "found" |
 /// "absent" | "degraded" — never inferred by the reader from a blank field.

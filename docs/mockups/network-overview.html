@@ -23,9 +23,9 @@
      yuzu.net_degraded (bool). These + the existing yuzu.perf_* tags feed the
      fleet-now cards and the co-occurrence panel. Per-app / per-destination
      detail stays in the device warehouse, reached on the Devices drill via an
-     Execute-gated canned tar.sql (ADR-0004 federated model).
+     Execute-gated canned echo.sql (ADR-0004 federated model).
 
-  EFFICIENCY ("more efficiently"): per-app attribution is FREE — the TAR
+  EFFICIENCY ("more efficiently"): per-app attribution is FREE — the Echo
   network collector already maps socket->PID->process every pass, so RTT/loss
   "by app" falls out of a join we already do. No packet capture, no central
   flow pipeline; quality is computed at the edge from kernel counters the OS

@@ -18,16 +18,16 @@ Four of the five actions dispatch a platform-native dialog or notification mecha
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Infrastructure.Write]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[interaction.execute]
-  EX --> DND{DND active?<br/>notify/survey only}
-  DND -- yes --> SUP[status suppressed]
-  DND -- no / n-a --> VAL{required params present?}
-  VAL -- no --> ERR[status error]
-  VAL -- yes --> WIN[Windows leg<br/>Shell_NotifyIconW / MessageBoxW /<br/>PowerShell InputBox / WinForms]
-  VAL -- yes --> MAC[macOS leg<br/>osascript display notification / dialog]
-  VAL -- yes --> LIN[Linux leg<br/>notify-send / zenity]
-  SUP & ERR & WIN & MAC & LIN --> ROWS[key|value rows] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator / workflow"] --> SRV["Server - authz: Infrastructure.Write"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"] --> EX["interaction.execute"]
+  EX --> DND{"DND active? notify and survey only"}
+  DND -->|"yes"| SUP["status suppressed"]
+  DND -->|"no / n-a"| VAL{"required params present?"}
+  VAL -->|"no"| ERR["status error"]
+  VAL -->|"yes"| WIN["Windows leg - Shell_NotifyIconW / MessageBoxW / PowerShell InputBox / WinForms"]
+  VAL -->|"yes"| MAC["macOS leg - osascript display notification / dialog"]
+  VAL -->|"yes"| LIN["Linux leg - notify-send / zenity"]
+  SUP & ERR & WIN & MAC & LIN --> ROWS["key|value rows"] --> RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
 
 ## OS capability
@@ -144,7 +144,7 @@ Each action writes one or more `key|value` lines via `write_output()`. The dashb
 ### Where the data goes
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention), queryable at `/api/responses/{id}`.
-- **Not consumed by** daily-sync inventory, TAR, DEX, or metrics. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its five definitions. The dashboard's generic key/value renderer is the only non-ResponseStore consumer of these rows.
+- **Not consumed by** daily-sync inventory, Echo, DEX, or metrics. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its five definitions. The dashboard's generic key/value renderer is the only non-ResponseStore consumer of these rows.
 - **Sensitivity.** Nothing beyond the device id. Every column is either an enum/bool the plugin itself computes (`status`, `response` button choice, `cancelled`, `dnd_enabled`, `question_count`) or free text the interactively-logged-in user typed into a dialog (`response`, `answer_0`–`answer_4`) — the schema targets no username, device identifier, or software name, though a user could in principle type anything into a free-text field.
 - **Siblings:** none — no other plugin performs desktop notification/dialog interaction.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.interaction.notify")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.

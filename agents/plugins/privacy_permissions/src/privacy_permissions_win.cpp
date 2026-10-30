@@ -15,12 +15,14 @@
  * offline RegLoadKeyW mount of <profile>\NTUSER.DAT under SeBackup/SeRestore (held for the
  * whole mount under the process-wide offline_hive_mutex()).
  *
- * OFFLINE HIVE-FILE GUARD (HiveFileGuard, opt-in through with_user_hive's OfflineHiveFileCheck;
- * the other offline-arm consumers are unchanged): before the load, a UNC or non-fixed-drive path
+ * OFFLINE HIVE-FILE GUARD (HiveFileGuard, the shared default for every with_user_hive consumer;
+ * this plugin is the one that still supplies its own check, because it needs a deadline the
+ * shared default does not carry): before the load, a UNC or non-fixed-drive path
  * is refused, every ancestor directory is opened hop by hop from the drive root and refused if it
  * is a reparse point (no hop follows a junction/symlink), and the NTUSER.DAT leaf is checked from
- * its own handle (not a reparse point, a regular disk file, owner = the profile / LocalSystem /
- * Administrators, final path == requested path, size cap) and the `<leaf>*` transaction-log
+ * its own handle (not a reparse point, exactly one link, a regular disk file, owner = the
+ * profile / LocalSystem / Administrators, final path == requested path, size cap) and the
+ * `<leaf>*` transaction-log
  * sidecars beside it (a link there would be followed by the load) are refused if a
  * reparse point (from the directory listing and again from the opened handle) or hard-linked, or
  * if there are more than 64. The guard's logic is HiveFileGuard over a HiveFileProbe

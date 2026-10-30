@@ -52,6 +52,7 @@ std::string render_general_runtime(const RuntimeView& v) {
     const std::string level = normalise_level(v.log_level);
     const std::string hb = std::to_string(v.heartbeat_seconds);
     const std::string floor = std::to_string(kMinHeartbeatTimeoutSeconds);
+    const std::string ceiling = std::to_string(kMaxHeartbeatTimeoutSeconds);
     const bool off = !v.store_available;
 
     std::string html = "<form id=\"general-runtime-form\" class=\"form\" novalidate"
@@ -63,12 +64,12 @@ std::string render_general_runtime(const RuntimeView& v) {
 
     html += "<div class=\"row2\"><div class=\"fld\"><label for=\"gen-heartbeat\">Agent heartbeat "
             "timeout (seconds)</label><input class=\"in\" id=\"gen-heartbeat\" "
-            "name=\"heartbeat_timeout\" type=\"number\" min=\"" + floor + "\" step=\"1\" "
+            "name=\"heartbeat_timeout\" type=\"number\" min=\"" + floor + "\" max=\"" + ceiling + "\" step=\"1\" "
             "inputmode=\"numeric\" value=\"" +
             hb + "\" aria-describedby=\"gen-heartbeat-hint\"" + (off ? " disabled" : "") +
-            "><span class=\"hint\" id=\"gen-heartbeat-hint\">" + "Seconds, " + floor + " or more" + std::string(kHeartbeatHintTail) +
+            "><span class=\"hint\" id=\"gen-heartbeat-hint\">" + "Seconds, " + floor + " to " + ceiling + std::string(kHeartbeatHintTail) +
             "</span><span class=\"field-err\" id=\"gen-heartbeat-err\" role=\"alert\" hidden>"
-            "Enter a whole number of seconds, " + floor + " or more.</span></div>";
+            "Enter a whole number of seconds from " + floor + " to " + ceiling + ".</span></div>";
 
     html += "<div class=\"fld\"><label for=\"gen-log-level\">Log level</label><select "
             "id=\"gen-log-level\" name=\"log_level\" aria-describedby=\"gen-log-level-hint\"" +

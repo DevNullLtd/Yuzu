@@ -314,6 +314,34 @@ TEST_CASE("data-retention REST twin and fragment report the ENFORCED windows fro
     CHECK(frag->body.find("Unknown") != std::string::npos);
 }
 
+TEST_CASE("GET /api/v1/settings/data-retention carries the Echo tier defaults and the fragment renders them",
+          "[settings][rest][settings-read-twins][retention][echo]") {
+    SettingsReadTwinsHarness h;
+
+    auto rest = h.sink.Get("/api/v1/settings/data-retention");
+    REQUIRE(rest);
+    auto data = nlohmann::json::parse(rest->body).at("data");
+    CHECK(data.contains("response_retention_days"));
+    CHECK(data.contains("enforced"));
+    CHECK(data.at("echo").at("tick_seconds").get<int>() == 900);
+    const auto& tiers = data.at("echo").at("tiers");
+    REQUIRE(tiers.is_array());
+    bool found = false;
+    for (const auto& t : tiers)
+        found = found || (t.at("source") == "process" && t.at("tier") == "live" &&
+                          t.at("limit").get<long long>() == 100000);
+    CHECK(found);
+
+    auto frag = h.sink.Get("/fragments/settings/data-retention");
+    REQUIRE(frag);
+    CHECK(frag->status == 200);
+    CHECK(frag->body.find("Echo capture sources") != std::string::npos);
+    CHECK(frag->body.find("netqual") != std::string::npos);
+    CHECK(frag->body.find("procperf") != std::string::npos);
+    CHECK(frag->body.find("Look again after") != std::string::npos);
+    CHECK(frag->body.find("Guardian events") != std::string::npos);
+}
+
 TEST_CASE("data-retention fragment shows Unknown for every window when no reader is wired",
           "[settings][rest][settings-read-twins][retention]") {
     SettingsReadTwinsHarness h;
@@ -321,7 +349,8 @@ TEST_CASE("data-retention fragment shows Unknown for every window when no reader
     REQUIRE(frag);
     CHECK(frag->status == 200);
     CHECK(frag->body.find("Unknown") != std::string::npos);
-    CHECK(frag->body.find(" days") == std::string::npos); // no number nothing verified
+    // The three windows only: the Echo tier table below legitimately shows durations.
+    CHECK(frag->body.substr(0, frag->body.find("<caption")).find(" days") == std::string::npos);
 }
 
 TEST_CASE("GET /settings/data is admin-gated with a redirect, like /settings",

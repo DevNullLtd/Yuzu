@@ -188,6 +188,14 @@
       scopeEl.hidden = !scope;
       field(detail, 'no-scope').hidden = !!scope;
 
+      // A bound ticket (#6062) carries the frozen request as plain text: the reviewer reads
+      // what is being approved, not a bare digest. textContent only - never innerHTML.
+      var request = d.request || '';
+      var requestEl = field(detail, 'request');
+      requestEl.textContent = request;
+      requestEl.title = d.digest ? 'sha256:' + d.digest : '';
+      field(detail, 'request-row').hidden = !request;
+
       var decided = !!d.revBy;
       field(detail, 'rev-by-row').hidden = !decided;
       field(detail, 'rev-at-row').hidden = !decided;
@@ -207,16 +215,45 @@
       var pending = d.status === 'pending';
       var mine = d.mine === '1';
       var mcp = d.mcp === '1';
+      var excluded = d.excluded === '1';
       var list = $('.ops-list', host);
       var canDecide = !!list && list.getAttribute('data-can-decide') === '1';
       field(detail, 'self').hidden = !(pending && mine);
+      field(detail, 'excluded').hidden = !(pending && !mine && excluded && canDecide);
+      // The decision container serves every non-own pending row the viewer may decide.
+      // Approve is hidden when the server would refuse it: the viewer is an excluded
+      // root (they may still Reject, which is how a designer withdraws a request), or the
+      // stored request could not be read (Reject then clears the row).
       field(detail, 'actions').hidden = !(pending && !mine && canDecide);
+      var approveBtn = $('button[data-act="approve"]', detail);
+      if (approveBtn) approveBtn.hidden = excluded || d.unreadable === '1';
       field(detail, 'n-mcp').hidden = !mcp;
-      field(detail, 'n-params').hidden = mcp;
+      field(detail, 'n-params').hidden = mcp || !!request;
       field(detail, 'notes').hidden = !pending;
 
       field(detail, 'empty').hidden = true;
       field(detail, 'kv').hidden = false;
+    }
+
+    // #6079: an approver_assurance_required refusal names the exact next step in
+    // error.remediation. Show that instead of the generic text; other 403s are unchanged.
+    function approverRefusalText(env) {
+      var e = env && env.error;
+      if (e && typeof e.message === 'string' && e.message.indexOf('approver_assurance_required:') === 0 &&
+          typeof e.remediation === 'string' && e.remediation) return e.remediation;
+      return '';
+    }
+
+    // #6079: a 503 from the decision route (MFA state unreadable, clock fault, audit store down)
+    // carries error.message (the problem) and error.remediation (the next step; on its own it
+    // can read as "retry the request" with no problem named). Show both as ONE text: the
+    // message, a full stop, then the remediation; either alone when only one is a non-empty
+    // string; '' when neither, so the caller keeps the generic text.
+    function unavailableText(env) {
+      var e = env && env.error;
+      var m = e && typeof e.message === 'string' ? e.message : '';
+      var r = e && typeof e.remediation === 'string' ? e.remediation : '';
+      return m && r ? m.replace(/[.\s]+$/, '') + '. ' + r : m || r;
     }
 
     // Approve / reject dialog for the selected pending request. The facts are the row's
@@ -232,6 +269,11 @@
       facts.appendChild(factRow('Request', (d.name || '') + (d.def ? ' (' + d.def + ')' : '')));
       facts.appendChild(factRow('Requested by', d.by || ''));
       facts.appendChild(factRow('Scope', d.scope || 'None recorded', true));
+      if (d.request) {
+        var reqRow = factRow('Requested effect', d.request, true);
+        reqRow.lastChild.className = 'req';
+        facts.appendChild(reqRow);
+      }
       facts.appendChild(factRow('Requested', d.age || ''));
       var note = approve ?
         'Your decision is recorded in the audit log. Your comment is saved on the request and is ' +
@@ -239,6 +281,13 @@
         'You cannot approve your own request. ' +
         (d.mcp === '1' ?
           'The requesting agent must re-call the tool with this approval id for it to run.' :
+          d.request && d.shortened === '1' ?
+          'The summary above is shortened and is for orientation only; it does not show the ' +
+          'whole request. What you approve is the whole request as stored under the digest ' +
+          'shown.' :
+          d.request ?
+          'The summary above is for orientation. What you approve is the whole request as ' +
+          'stored under the digest shown.' :
           'The parameter values are not stored with this request. You are deciding on the ' +
           'instruction and scope only.') :
         'Your decision and reason are recorded. The requester can read the reason on the request.';
@@ -259,7 +308,10 @@
               if (r.ok) return null;
               if (r.status === 400) return r.message || 'The request was refused.';
               if (r.status === 401) return 'Your session has expired. Sign in again.';
-              if (r.status === 403) return 'You do not have permission to decide approvals.';
+              if (r.status === 403) return approverRefusalText(r.data) ||
+                'You do not have permission to decide approvals.';
+              if (r.status === 503) return unavailableText(r.data) ||
+                'Could not confirm the decision. Refresh to see the current state.';
               return 'Could not confirm the decision. Refresh to see the current state.';
             });
         }

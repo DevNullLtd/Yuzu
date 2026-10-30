@@ -10,6 +10,8 @@
  *    carries a toast in HX-Trigger is not toasted a second time.
  *  - htmx:beforeSwap on a 409 with an HTML body (a stale row; the body is the refreshed list):
  *    the body is swapped in, which htmx does not do for any 4xx by default.
+ *  - [data-gact=select] (a row in the group tree): point #grp-side at that group's detail
+ *    fragment and load it as the panel's own load, so its 401/403/failure use the handlers above.
  *  - [data-copy-token]: copy the sibling <code> to the clipboard.
  *  - [data-token-form]: the "unlimited, never expires" warning follows the two limit fields.
  *  - htmx:confirm on [data-rule-form]: the server's Add-rule question, plus a sentence when
@@ -132,6 +134,17 @@
   });
 
   document.addEventListener('click', function (e) {
+    var s = e.target.closest('[data-gact="select"]');
+    if (s) {
+      var side = document.getElementById('grp-side');
+      if (!side) return;
+      side.dataset.src = '/fragments/groups/detail?id=' + encodeURIComponent(s.dataset.id);
+      document.querySelectorAll('#grp-list tr.sel').forEach(function (row) { row.classList.remove('sel'); });
+      var tr = s.closest('tr');
+      if (tr) tr.classList.add('sel');
+      reload(side);
+      return;
+    }
     var r = e.target.closest('[data-gact="reload"]');
     if (r) { reload(document.getElementById(r.dataset.target)); return; }
     var c = e.target.closest('[data-copy-token]');
@@ -148,14 +161,16 @@
       function () { done('Copy failed. Select the text.'); });
   });
 
-  // Unlimited-token warning: shown while both limit fields are empty or zero.
+  // Unlimited-token warning: shown only while both limit fields hold a literal
+  // 0 — a field left BLANK takes the bounded default (72 h / 100 uses), not
+  // unlimited.
   document.addEventListener('input', function (e) {
     var f = e.target.closest('[data-token-form]');
     if (!f) return;
     var zero = function (n) {
       var i = f.querySelector('[name="' + n + '"]');
       var v = i ? i.value.trim() : '';
-      return v === '' || /^0+$/.test(v);
+      return /^-?0+$/.test(v);
     };
     var w = f.querySelector('[data-token-unlimited]');
     if (w) w.hidden = !(zero('max_uses') && zero('ttl_hours'));

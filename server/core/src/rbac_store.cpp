@@ -158,6 +158,8 @@ constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
 
 constexpr std::array<std::string_view, 3> kRecognizedIdpSources = {"entra", "saml", "ad"};
 constexpr std::string_view kLocalPrefix = "local:";
+// Keep in step with `authz::is_engine_principal_name` (authz_model.hpp), the engine-namespace test the
+// username-keyed server resolvers use; rbac_store.cpp does not depend on that header.
 constexpr std::string_view kEnginePrefix = "engine:";
 
 bool has_reserved_idp_prefix(std::string_view name) {
@@ -723,18 +725,52 @@ void RbacStore::seed_defaults() {
         std::string_view name;
         std::string_view desc;
     };
-    const std::array<RoleSeed, 7> roles = {
+    const std::array<RoleSeed, 8> roles = {
         RoleSeed{"Administrator", "Full access to all operations"},
         {"PlatformEngineer", "Author and manage YAML instruction definitions, sets, and schemas"},
         {"Operator", "Execute and manage instructions, schedules, and tags"},
         {"ApiTokenManager", "Create, revoke, and manage API tokens for programmatic access"},
         {"ITServiceOwner", "Admin control over devices tagged with the same IT Service"},
         {"Viewer", "Read-only access to operational data"},
-        {"Reviewer", "Read audit evidence and attest/flag access-review grants (SOC 2 CC6.2)"}};
+        {"Reviewer", "Read audit evidence and attest/flag access-review grants (SOC 2 CC6.2)"},
+        {"ForensicsAnalyst",
+         "Read forensic-tier response rows (Forensics:Read) plus the ordinary response, execution "
+         "and inventory reads needed to interpret them; read-only, cannot dispatch (#4990)"}};
     for (const auto& r : roles)
         exec("INSERT INTO rbac_store.roles (name, description, is_system, created_at) "
              "VALUES ($1, $2, TRUE, $3::bigint) ON CONFLICT (name) DO NOTHING",
              {std::string(r.name), std::string(r.desc), std::to_string(now)});
+
+    // #4990: the seed above is ON CONFLICT DO NOTHING, so an operator-authored role that already
+    // carries the name "ForensicsAnalyst" is kept as it is. The four seeded read grants are then
+    // NOT added to it: merging them would hand Forensics:Read to every existing assignee of a role
+    // nobody reviewed for that, and a non-system role is outside the structural bar that keeps
+    // engine principals off the seeded role. The grants are minted only when the row is the
+    // built-in (is_system) role; when the check cannot be answered they are withheld too (they are
+    // idempotent, so the next boot adds them). Grants an earlier build already merged into such a
+    // role are not removed here (they cannot be told apart from the operator's own).
+    bool mint_forensics_analyst_grants = false;
+    {
+        pg::PgResult fa = pg::exec_params(
+            c, "SELECT is_system FROM rbac_store.roles WHERE name = 'ForensicsAnalyst'",
+            std::vector<std::string>{});
+        if (fa.status() == PGRES_TUPLES_OK && PQntuples(fa.get()) == 1) {
+            if (to_bool(PQgetvalue(fa.get(), 0, 0))) {
+                mint_forensics_analyst_grants = true;
+            } else {
+                spdlog::error(
+                    "RbacStore: an existing non-system role named ForensicsAnalyst was found; "
+                    "the built-in Forensics read grants were NOT added to it and its definition "
+                    "was left unchanged, so the built-in role is unavailable. Engine principals "
+                    "could be assigned this role. Remove it (a role cannot be renamed while it has "
+                    "grants or holders; create a replacement under another name first if its "
+                    "holders need one) and restart to adopt the built-in role.");
+            }
+        } else {
+            spdlog::error("RbacStore: the ForensicsAnalyst role check could not be completed; "
+                          "the built-in Forensics read grants were not added this boot");
+        }
+    }
 
     // fable (Gate 4, #2703): skip a triple an operator explicitly revoked via
     // remove_permission() — revoked_seed_defaults is bookkeeping-only (never
@@ -1024,6 +1060,22 @@ void RbacStore::seed_defaults() {
     // Reviewer.
     grant("Reviewer", "AccessReview", "Read");
     grant("Reviewer", "AccessReview", "Attest");
+
+    // ForensicsAnalyst (#4990): the delegable read tier for Forensics-class response rows.
+    // EXACTLY four read pairs, no Execute and no write of any kind: collecting forensic data
+    // stays on its own approval-gated dispatch path, this role only READS what was collected.
+    // Seed-only by design: a new role row plus these four grants reach an existing database
+    // through this idempotent pass (no migrations() step), nothing is auto-assigned to any
+    // principal, and it is deliberately NOT added to ITServiceOwner or any other role. It is
+    // is_system, so the engine-principal dangerous-class gate refuses it structurally. With
+    // RBAC off the role does nothing (the legacy branch of require_permission is unedited).
+    // Withheld when an operator-authored role already holds the name (see the check above).
+    if (mint_forensics_analyst_grants) {
+        grant("ForensicsAnalyst", "Forensics", "Read");
+        grant("ForensicsAnalyst", "Response", "Read");
+        grant("ForensicsAnalyst", "Execution", "Read");
+        grant("ForensicsAnalyst", "Inventory", "Read");
+    }
 }
 
 bool RbacStore::load_enabled_flag() {
@@ -1504,6 +1556,19 @@ bool RbacStore::generation_view_stale_locked() const {
                                                    kRbacStaleServeBoundMs);
 }
 
+void RbacStore::age_refresh_state_for_test(std::chrono::milliseconds elapsed) {
+    const std::int64_t ms = elapsed.count();
+    {
+        std::lock_guard lock(cache_mtx_);
+        refresh_started_ms_ -= ms;
+        last_successful_refresh_ms_ -= ms;
+    }
+    {
+        std::lock_guard lock(breaker_mtx_);
+        breaker_last_probe_started_ms_ -= ms;
+    }
+}
+
 bool RbacStore::rbac_enabled_view_degraded() const {
     std::lock_guard lock(cache_mtx_);
     return generation_view_stale_locked();
@@ -1635,6 +1700,22 @@ RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept {
 
 bool rbac_enforcement_in_effect(const RbacStore* store) noexcept {
     return rbac_enforcement_label(store) != RbacEnforcementLabel::kDisabled;
+}
+
+std::expected<bool, std::string> engine_grant_checked(const RbacStore* store,
+                                                       const std::string& username,
+                                                       const std::string& securable_type,
+                                                       const std::string& operation) {
+    // ONE label snapshot per decision (see the header): never this call plus a second read.
+    switch (rbac_enforcement_label(store)) {
+    case RbacEnforcementLabel::kEnabled:
+        return store->check_permission_checked(username, securable_type, operation);
+    case RbacEnforcementLabel::kDisabled:
+        return false; // RBAC is off and the view is fresh: an engine holds no authority
+    case RbacEnforcementLabel::kDegraded:
+        break;
+    }
+    return std::unexpected(std::string(kRbacErrEnforcementUnconfirmed));
 }
 
 // to_string(RbacEnforcementLabel) is constexpr and header-inline (rbac_store.hpp) —
@@ -2685,7 +2766,8 @@ std::expected<ReconcileResult, std::string> RbacStore::reconcile_idp_memberships
 
 // ── Authorization check ──────────────────────────────────────────────────────
 
-std::vector<std::string> RbacStore::collect_roles(void* conn, const std::string& username) const {
+std::expected<std::vector<std::string>, std::string>
+RbacStore::collect_roles(void* conn, const std::string& username) const {
     std::vector<std::string> roles;
     auto* c = static_cast<PGconn*>(conn);
     // Three-way UNION: direct user grant, group-membership grant, and (§4.1)
@@ -2702,10 +2784,31 @@ std::vector<std::string> RbacStore::collect_roles(void* conn, const std::string&
         "SELECT role_name FROM rbac_store.principal_roles "
         "WHERE principal_type = 'engine' AND principal_id = $1",
         std::vector<std::string>{username});
+    // A failed read is an ERROR, never an empty role set: "this principal holds no role" (the
+    // healthy, common least-privilege answer) and "the role query failed" must stay apart, or a
+    // store fault reads as a definitive denial. The caller owns the accounting
+    // (`collect_roles_accounted`).
     if (r.status() != PGRES_TUPLES_OK)
-        return roles; // fail-closed: empty role set → deny
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(c));
     for (int i = 0; i < PQntuples(r.get()); ++i)
         roles.push_back(text_col(r.get(), i, 0));
+    return roles;
+}
+
+std::expected<std::vector<std::string>, std::string>
+RbacStore::collect_roles_accounted(void* conn, const std::string& username) const {
+    auto roles = collect_roles(conn, username);
+    if (!roles) {
+        // A real role-read failure is the same degrade as every sibling query error: counted
+        // under the `query_error` reason and fed to the breaker as a FAILURE. (A healthy empty
+        // result is NOT this branch; the caller books it as a breaker success.) The accounting
+        // lives here, not at the call sites, so a future caller cannot skip the metric.
+        breaker_note_result(false);
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("RbacStore: role read failed: {}; permission check unavailable",
+                         roles.error());
+    }
     return roles;
 }
 
@@ -2716,8 +2819,16 @@ std::string RbacStore::perm_cache_key(const std::string& user, const std::string
 
 bool RbacStore::check_permission(const std::string& username, const std::string& securable_type,
                                  const std::string& operation) const {
+    // The Boolean compatibility wrapper: every unavailable outcome (store not open, breaker open,
+    // pool timeout, a failed read) is the same fail-closed `false` it always was.
+    return check_permission_checked(username, securable_type, operation).value_or(false);
+}
+
+std::expected<bool, std::string>
+RbacStore::check_permission_checked(const std::string& username, const std::string& securable_type,
+                                    const std::string& operation) const {
     if (!open_)
-        return false; // fail-closed
+        return std::unexpected(std::string(kRbacErrStoreNotOpen)); // fail-closed
 
     // #2703 Gate 7 item 1 commit C: observes on every exit below, whichever
     // return statement fires — excludes the trivial !open_ short-circuit
@@ -2756,7 +2867,7 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
             spdlog::warn(
                 "RbacStore::check_permission: circuit breaker open — DENY without pool touch");
-        return false; // fail-closed
+        return std::unexpected(std::string(kRbacErrCircuitBreakerOpen)); // fail-closed
     }
 
     auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
@@ -2765,19 +2876,20 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
             spdlog::warn("RbacStore::check_permission: pool acquire timed out — DENY");
-        return false; // fail-closed
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout)); // fail-closed
     }
     PGconn* conn = lease.get();
 
-    const auto roles = collect_roles(conn, username);
-    if (roles.empty()) {
-        // collect_roles() cannot distinguish "genuinely no roles" (the
-        // common case for any least-privilege user) from "the query
-        // failed" — both return empty. Recording this as a breaker SUCCESS
-        // is the deliberate, safer default: treating it as a failure would
-        // trip the breaker on ordinary confined-user traffic while Postgres
-        // is perfectly healthy, which is worse than under-counting the
-        // narrower same-shape connection-failure case this leaves uncovered.
+    const auto roles = collect_roles_accounted(conn, username);
+    if (!roles) {
+        // A failed role read: already counted and booked as a breaker failure by the helper. It is
+        // an unavailable outcome, NOT a denial.
+        return std::unexpected(roles.error());
+    }
+    if (roles->empty()) {
+        // A healthy, genuinely empty role set (the common case for any least-privilege user) is a
+        // definitive denial and a breaker SUCCESS: it must not trip the breaker on ordinary
+        // confined-user traffic while Postgres is healthy. A failed read never reaches here.
         breaker_note_result(true);
         return false;
     }
@@ -2785,9 +2897,9 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
     std::string sql = "SELECT effect FROM rbac_store.role_permissions "
                       "WHERE securable_type = $1 AND operation = $2 AND role_name IN (";
     std::vector<std::string> params{securable_type, operation};
-    for (size_t i = 0; i < roles.size(); ++i) {
+    for (size_t i = 0; i < roles->size(); ++i) {
         sql += (i == 0 ? "$" : ",$") + std::to_string(3 + i);
-        params.push_back(roles[i]);
+        params.push_back((*roles)[i]);
     }
     sql += ")";
 
@@ -2798,7 +2910,7 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
         if (note_read_degrade(metrics_, kReasonQueryError, sampler))
             spdlog::warn("RbacStore::check_permission: query failed: {} — DENY",
                          PQerrorMessage(conn));
-        return false; // fail-closed
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(conn)); // fail-closed
     }
     breaker_note_result(true);
     bool has_allow = false;
@@ -2830,17 +2942,17 @@ std::vector<Permission> RbacStore::get_effective_permissions(const std::string& 
         return result;
     PGconn* conn = lease.get();
 
-    const auto roles = collect_roles(conn, username);
-    if (roles.empty())
-        return result;
+    const auto roles = collect_roles_accounted(conn, username);
+    if (!roles || roles->empty())
+        return result; // a failed read was counted by the helper; the display list is empty
 
     std::string sql =
         "SELECT role_name, securable_type, operation, effect FROM rbac_store.role_permissions "
         "WHERE role_name IN (";
     std::vector<std::string> params;
-    for (size_t i = 0; i < roles.size(); ++i) {
+    for (size_t i = 0; i < roles->size(); ++i) {
         sql += (i == 0 ? "$" : ",$") + std::to_string(1 + i);
-        params.push_back(roles[i]);
+        params.push_back((*roles)[i]);
     }
     sql += ") ORDER BY securable_type, operation";
 
@@ -3131,25 +3243,42 @@ ListReadAuthorization RbacStore::authorize_list_read(const std::string& username
     // null / load-failed store returns true from rbac_enforcement_in_effect and
     // falls through to the RBAC path, which denies (INV-1).
     if (!rbac_enforcement_in_effect(this)) {
-        out.decision = ListReadDecision::AdmitAll;
+        // An engine principal's only authority is an explicit RBAC grant (design §4.2): the
+        // legacy-open full-fleet read does not apply to it, so it stays DenyAll.
+        if (!username.starts_with(kEnginePrefix))
+            out.decision = ListReadDecision::AdmitAll;
         return out;
     }
 
-    // #1715(b): a global ALLOW overrides any group deny → unfiltered read.
-    if (check_permission(username, securable_type, operation)) {
+    // #1715(b): a global ALLOW overrides any group deny → unfiltered read. This read can FAIL (a
+    // pool timeout, an open breaker, a failed role query): that is a failed read, not "no
+    // global grant", so it denies with `read_failed` and reads nothing further.
+    const auto global = check_permission_checked(username, securable_type, operation);
+    if (!global) {
+        out.decision = ListReadDecision::DenyAll; // INV-1/INV-5: a failed read denies ...
+        out.read_failed = true;                   // ... and says so
+        return out;
+    }
+    if (*global) {
         out.decision = ListReadDecision::AdmitAll;
         return out;
     }
 
     // #1715(a): additive — a group allow admits even against a global deny/absent.
     auto pg = resolve_perm_groups(username, securable_type, operation, mgmt_store);
-    if (!pg || pg->allow_groups.empty()) {
-        out.decision = ListReadDecision::DenyAll; // INV-1/INV-5: error or no grant → deny
+    if (!pg) {
+        out.decision = ListReadDecision::DenyAll; // INV-1/INV-5: a failed read denies ...
+        out.read_failed = true;                   // ... and says so: it is not "no grant"
+        return out;
+    }
+    if (pg->allow_groups.empty()) {
+        out.decision = ListReadDecision::DenyAll; // INV-1: a genuine "no grant"
         return out;
     }
     auto visible = expand_visible_set(*pg, mgmt_store);
     if (!visible) {
         out.decision = ListReadDecision::DenyAll; // fail-closed on a subtree-read error
+        out.read_failed = true;
         return out;
     }
     out.decision = ListReadDecision::AdmitScoped;

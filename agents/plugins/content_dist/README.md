@@ -14,21 +14,103 @@
 
 ## How it works
 
-`stage` downloads over a raw httplib socket it opens itself (no shell), verifies the SHA-256 against the caller-supplied `sha256`, and — only once verified — persists that hash into agent KV under `staged_hash:<filename>` so a later `execute_staged` has a source of truth the staging-dir attacker can't also rewrite (`content_dist_plugin.cpp:529-540`, #808). `execute_staged` re-verifies the hash from KV (never trusts a caller-supplied hash), rejects a shebang-interpreted script on Linux before it ever reaches the runner (B6 fd-exec has no resolvable path for `binfmt_script`), chmods the file `0700` on POSIX, then execs it directly — no shell — via `yuzu::agent::run_bounded_subprocess` with a fixed 30-minute deadline. `list_staged` and `cleanup` are plain `std::filesystem` walks of the same staging directory; `cleanup` removes files older than an age cutoff and evicts their KV hash entry alongside them. `upload_file` is an unrelated protocol: it drives a session-open/chunk/commit/cancel exchange against the agent's own configured server URL (never an operator-supplied one) using a one-time `grant_id`/`grant_secret`, hashing the exact bytes each chunk transmitted as it is acknowledged.
+`content_dist` moves files onto and off an endpoint without a shell. `stage` downloads a file into the agent's own staging directory (`<agent.data_dir>/staged`, owner-only on POSIX) over a socket the agent opens itself, hashes it, and keeps it only if the SHA-256 equals the `sha256` the caller supplied; a match also records that hash in the agent's key-value store under `staged_hash:<filename>`. `execute_staged` takes a file name, optional `args` and an optional `expected_hash` drift check, and no hash for authorisation: it reads the recorded hash back, hashes the file again, refuses on any difference, then runs the file directly (no shell) with a fixed 30-minute deadline and reports its exit code and combined output. `list_staged` and `cleanup` are plain directory walks of the staging directory; `cleanup` deletes files older than `hours` (default 24) and drops their recorded hash. `upload_file` is a separate path: it sends one local file to the Yuzu server's upload endpoint in chunks, using a one-time grant minted by an operator, and reports the size and SHA-256 the server confirmed.
 
-Deliberately not: a shell. No action here ever invokes `/bin/sh`, `cmd.exe`, or any interpreter — downloads and uploads are direct socket clients, execution is a direct argv exec. Deliberately not: a general file manager — every filesystem action is scoped to the plugin's own `staging_dir()`.
+Deliberately not: a shell, because no action invokes `/bin/sh`, `cmd.exe` or an interpreter, and downloads and uploads are direct socket clients. Not a general file manager either: `stage`, `execute_staged`, `list_staged` and `cleanup` only touch the staging directory. `upload_file` is the exception, because it reads the local `path` you give it (anywhere the agent can read, unless `base_dir` restricts it) and talks only to the agent's own configured server address, never an address supplied in the call.
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow<br/>or the /auto Deploy engine] --> SRV[Server<br/>authz: SoftwareDeployment/Execution/FileRetrieval per action]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[content_dist.execute]
-  EX --> WIN[Windows leg<br/>httplib_tls · subprocess_runner:staged_payload · std_filesystem]
-  EX --> MAC[macOS leg<br/>httplib_tls · subprocess_runner:staged_payload · std_filesystem]
-  EX --> LIN[Linux leg<br/>httplib_tls · subprocess_runner:staged_payload (native only) · std_filesystem]
-  WIN & MAC & LIN --> ROWS[pipe rows +<br/>typed result status on execute_staged only]
-  ROWS -- CommandResponse --> RS[(ResponseStore)]
-  RS --> API[REST /api/responses · /auto Deploy engine]
+  OP["Operator, workflow or the /auto Deploy engine"] --> SRV["Server: authz per action - SoftwareDeployment, Execution or FileRetrieval"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"] --> EX["content_dist.execute"]
+  EX --> WIN["Windows leg: httplib_tls, subprocess_runner:staged_payload, std_filesystem"]
+  EX --> MAC["macOS leg: httplib_tls, subprocess_runner:staged_payload, std_filesystem"]
+  EX --> LIN["Linux leg: httplib_tls, subprocess_runner:staged_payload (native only), std_filesystem"]
+  WIN & MAC & LIN --> ROWS["pipe rows, typed result status on execute_staged only"]
+  ROWS -->|"CommandResponse"| RS[("ResponseStore")]
+  RS --> API["REST /api/responses and the /auto Deploy engine"]
 ```
+
+### What you can decide with it
+
+| Goal | Action | What you get |
+|---|---|---|
+| Put a known file on the device and prove it arrived intact | `stage` | `status\|ok` and `staged_path` only when the downloaded bytes hash to the `sha256` you supplied. A mismatch deletes the file and returns `error\|hash mismatch`. |
+| See what is staged and whether it is still the same bytes | `list_staged` | One `file\|size\|sha256` row per file, with the hash recomputed now. It does not compare against the recorded hash, so you compare it with the hash you staged. |
+| Run a staged installer or tool | `execute_staged` | `status\|ok` for exit 0, `error` otherwise, with `exit_code` and up to 16 MiB of combined output. An exit 0 shows the program ended cleanly, not that the software is installed. |
+| Free the staging directory | `cleanup` | `removed\|<n>`; `hours` of 0 or less removes every staged file. |
+| Pull one file off the device | `upload_file` | `status\|ok` with the `sha256`, `size` and `upload_id` the server confirmed, which must match the bytes sent. |
+
+Per OS: all five actions work on Windows, macOS and Linux. On Windows, `stage` and `upload_file` need the agent to have been built with OpenSSL; without it HTTPS fails with an error row. On Linux, `execute_staged` refuses files that start with `#!`, so stage a native executable. Nothing here returns a permission-denied status: a filesystem or network failure is an `error|...` row.
+
+A successful `stage` proves the bytes match the hash the caller gave, which is only as good as that hash. It says nothing about who built the file, because no code signature is checked.
+
+### The trust chain for `execute_staged`
+
+1. The hash you pass to `stage` is the root of trust. The URL, the network path and a plain `http://` source are not trusted; the hash is the only integrity check on the download.
+2. `stage` keeps the file only if its SHA-256 equals that hash, then stores the hash in the agent's key-value store, a separate database outside the staging directory.
+3. `execute_staged` ignores any hash in the call for authorisation. It reads the recorded hash from the key-value store, hashes the file on disk again, and refuses if there is no record or the two differ. A file dropped into the staging directory by anything other than `stage` has no record and does not run.
+4. The optional `expected_hash` parameter is only a drift check: it must equal the recorded hash or the call fails, and it can never authorise anything the record does not.
+5. On Linux the file is then run from the descriptor the runner opened, pinned to its verified size. A small window between the hash check and that open remains (Caveat 3).
+6. What is not covered: anyone who can act as the agent account can rewrite both the file and the stored hash, and the plugin does not verify a vendor signature.
+
+### Diagrams
+
+#### `stage`, then `execute_staged`
+
+```mermaid
+sequenceDiagram
+  participant Op as Operator or Deploy engine
+  participant Ag as content_dist
+  participant Src as Download server
+  participant KV as Agent key-value store
+  participant Dir as Staging directory
+  Op->>Ag: stage with url, filename, sha256
+  Ag->>Src: GET url
+  Src-->>Ag: file bytes
+  Ag->>Dir: write the file
+  Note over Ag: hash the file on disk
+  alt hash differs
+    Ag->>Dir: delete the file
+    Ag-->>Op: error, hash mismatch
+  else hash matches
+    Ag->>KV: store staged_hash for the filename
+    Ag-->>Op: status ok and staged_path
+  end
+  Op->>Ag: execute_staged with filename and args
+  Ag->>KV: read staged_hash
+  Ag->>Dir: hash the file again
+  Note over Ag: refuse if no record or the hash differs
+  Note over Ag: Linux rejects shebang files, args are checked, POSIX sets mode 0700
+  Ag->>Ag: run the file directly, 30 minute deadline
+  Ag-->>Op: status, exit_code, output
+```
+
+The download is only trusted after its hash matches the one you supplied, and the run is only allowed against the hash recorded at that moment. The run uses the agent's own identity and environment, with loader variables such as `LD_*` and `DYLD_*` removed on POSIX.
+
+#### `upload_file`
+
+```mermaid
+sequenceDiagram
+  participant Op as Operator
+  participant Ag as content_dist
+  participant Srv as Yuzu server upload endpoint
+  Op->>Ag: upload_file with path, grant_id, grant_secret
+  Note over Ag: check path, base_dir and size limit locally
+  Ag->>Srv: POST /api/v1/uploads with the grant
+  Srv-->>Ag: 201 with upload_id, session secret, chunk size, offset
+  loop each chunk
+    Ag->>Srv: PUT chunk with Content-Range
+    Srv-->>Ag: 200 with the acknowledged offset
+    Note over Ag: hash the bytes just acknowledged
+  end
+  Ag->>Srv: POST commit with the computed sha256
+  Srv-->>Ag: 200 with actual size and sha256
+  Note over Ag: size and hash must equal what was sent
+  Ag-->>Op: status ok, sha256, size, upload_id
+  Note over Ag,Srv: most failures after the session opens send a DELETE to cancel
+```
+
+The grant is minted beforehand by an operator through the upload-grants API and is single use. The agent checks the file locally (regular file, resolved path inside `base_dir` if given, not larger than `max_size_mb`, default 100, at most 1000), retries transient failures with backoff, resumes from the server's acknowledged offset, and hashes the exact bytes the server acknowledged, so a file that changes mid-upload yields the hash of what was sent. The connection is TLS only, with certificate verification, to `agent.server_web_url`.
 
 ## OS capability
 
@@ -52,11 +134,11 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442); `execute_staged` runs as `YuzuAgent` (`docs/agent-privilege-model.md:121`) | **None.** Every action stays inside the agent-owned staging directory or a socket the agent opens itself. | 2026-09-07, bare-metal, as `SYSTEM` (`windows.txt`) | no typed status — a filesystem/network failure surfaces as an `error\|<message>` line, not a `PERMISSION_DENIED` result status |
-| macOS | agent daemon, unprivileged (`_yuzu`) | **None.** `staging_dir()` creates the directory owner-only (`fs::perms::owner_all`, `content_dist_plugin.cpp:72-75`). | 2026-09-07, bare-metal, euid 501 (`macos.txt`) | same — an `error\|` line, no typed status |
-| Linux | agent daemon, unprivileged (`yuzu`) | **None.** Same owner-only staging directory. | 2026-09-06, container, euid 0 (`linux.txt`) — captured as root, not the unprivileged `yuzu` identity `execute_staged` actually runs as in production | same — an `error\|` line, no typed status |
+| Windows | Agent service account: LocalSystem today, intended `NT SERVICE\YuzuAgent` (`docs/agent-privilege-model.md`). The staged program runs as the same account | **None.** Every action stays inside the agent-owned staging directory or a socket the agent opens itself; `upload_file` reads the file at `path` as the agent | 2026-09-07, bare-metal, as `SYSTEM` (`windows.txt`) | No typed status: a filesystem or network failure surfaces as an `error\|<message>` line, not a `PERMISSION_DENIED` result status |
+| macOS | Agent daemon as root: the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md`). The staged program runs as root | **None.** `staging_dir()` creates the directory owner-only (`owner_all`) | 2026-09-07, bare-metal, euid 501 (`macos.txt`), below the production root daemon | Same: an `error\|` line, no typed status |
+| Linux | Agent daemon, unprivileged account (`yuzu-agent` on the packaged unit). The staged program runs as the same account | **None.** Same owner-only staging directory | 2026-09-06, container, euid 0 (`linux.txt`): captured as root, not as the unprivileged account `execute_staged` runs as in production | Same: an `error\|` line, no typed status |
 
-Binaries/subprocesses/network: `stage`/`upload_file` open raw TCP/TLS sockets via cpp-httplib (no subprocess). `execute_staged` spawns exactly one process — the staged file itself — via `yuzu::agent::run_bounded_subprocess` (no shell, no other binary). `list_staged`/`cleanup` touch no network and spawn nothing.
+Binaries, subprocesses and network: `stage` and `upload_file` open raw TCP/TLS sockets through cpp-httplib (no subprocess). `execute_staged` spawns exactly one process, the staged file itself, through `yuzu::agent::run_bounded_subprocess` (no shell, no other binary), and that child inherits the agent's environment. `list_staged` and `cleanup` touch no network and spawn nothing.
 
 ## Data contract
 
@@ -82,7 +164,7 @@ Binaries/subprocesses/network: `stage`/`upload_file` open raw TCP/TLS sockets vi
 
 ### Outputs
 
-Every action writes independent `key|value` lines via `ctx.write_output` — not a fixed-width pipe row like a collector's table. A validation or transport failure typically replaces the whole declared line set with a single unstructured `error|<message>` line rather than filling the declared columns with a placeholder value; there is no `-`-for-unknown convention in this plugin.
+Every action writes independent `key|value` lines via `ctx.write_output` — not a fixed-width pipe row like a collector's table. A validation or transport failure typically replaces the whole declared line set with a single unstructured `error|<message>` line rather than filling the declared columns with a placeholder value; there is no `-`-for-unknown convention in this plugin. `execute_staged` on POSIX can also emit a `warn|failed to set execute permission on staged file: ...` line before the run when the `0700` chmod fails; the run then proceeds and fails with its own error.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`agent.content_dist.cleanup` — `status|files_removed`**
@@ -129,22 +211,22 @@ Every action writes independent `key|value` lines via `ctx.write_output` — not
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `UNAVAILABLE` | PARTIAL | `subprocess_runner:spawn_error` | `execute_staged` only: the runner never confirmed exec (missing/non-executable staged file, or a Linux B6 exec_verify rejection) |
+| `UNAVAILABLE` | PARTIAL | `subprocess_runner:spawn_error` | `execute_staged` only: the runner never confirmed exec (missing or non-executable staged file, or a Linux exec-verification rejection) |
 | `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` | `execute_staged` only: the fixed 30-minute deadline fired and the process was killed |
 | `CONSTRAINED` | PARTIAL | `subprocess_runner:cancelled` | `execute_staged` only: a cancellation reached the runner mid-run |
 | `CONSTRAINED` | PARTIAL | `subprocess_runner:signaled` | `execute_staged` only: the staged process died of a signal it received itself |
-| `OK` | PARTIAL | `subprocess_runner:line_limit` | never reached for this plugin — `content_dist` never sets `max_lines`/`stop_after_max_lines` (`content_dist_exec_parsers.hpp:288-291`) |
+| `OK` | PARTIAL | `subprocess_runner:line_limit` | never reached for this plugin: `content_dist` never sets `max_lines` or `stop_after_max_lines` |
 
-`execute_staged`'s ordinary exit (rc 0 or nonzero) sets no typed status at all — `classify_runner_failure` returns `nullopt` for `exited` by design, leaving the `status`/`exit_code` lines to carry the outcome (`runner_status.hpp`). `stage`, `list_staged`, `cleanup`, and `upload_file` never call `set_result_status` anywhere in `content_dist_plugin.cpp`; every sample capture for all five actions shows `UNDECLARED / UNKNOWN /` because each capture failed at parameter validation, before any runner call could occur.
+`execute_staged`'s ordinary exit (rc 0 or nonzero) sets no typed status at all, because the runner's failure classifier (`classify_runner_failure`) reports nothing for a normal exit by design; the `status` and `exit_code` lines carry the outcome. `stage`, `list_staged`, `cleanup` and `upload_file` never call `set_result_status`, so the agent records `UNDECLARED` for them. The samples below only exercise parameter validation and an empty staging directory, so none shows a typed status.
 
 ### Where the data goes
 
-- **Instruction result, and the `/auto` Deploy engine.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore. `content_dist.stage`/`execute_staged` are additionally dispatched by the `/auto` Deploy engine (`server/core/src/deployment_engine.cpp:306,331`), which parses this exact wire contract via `server/core/src/deployment_parse.hpp:17-25` to drive its own per-device state machine — `content_dist` needed no new agent code for that surface.
-- **`upload_file`'s `grant_id`/`grant_secret` are redacted before any persisted audit/history copy** (`server/core/src/sensitive_instruction_params.hpp:6`) — never logged or stored beyond the upload store's own hashed record.
-- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics.
-- **Sensitivity.** `execute_staged`'s `output` line is the combined stdout+stderr of whatever binary the caller staged and ran — it can carry anything that process prints, including usernames, hostnames, or credentials — but the plugin's own declared columns (`staged_path`, `file`, `sha256`, `upload_id`) carry only caller-chosen filenames and content hashes, nothing that independently identifies a device, a person, or installed software.
-- **Siblings:** none in this catalogue — `execute_staged` is the only "run an arbitrary binary" action here; compare `script_exec.exec` for ad hoc admin commands/scripts.
-- **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("agent.content_dist.execute_staged")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`; `content_dist.stage`/`execute_staged` results are also polled by the `/auto` Deploy engine's `deployment_run_store`.
+- **Instruction result, and the `/auto` Deploy engine.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore. `stage` and `execute_staged` are also dispatched by the `/auto` Deploy engine (`server/core/src/deployment_engine.cpp`), which parses this wire contract through `server/core/src/deployment_parse.hpp` to drive its own per-device state machine, so that surface needed no extra agent code.
+- **`upload_file`'s `grant_id` and `grant_secret` are redacted before any persisted audit or history copy** (`server/core/src/sensitive_instruction_params.hpp`); the server keeps only a hash of the grant secret in the upload store.
+- **Not consumed by** daily-sync inventory, the Echo warehouse, DEX or metrics.
+- **Sensitivity.** `execute_staged`'s `output` line is the combined stdout and stderr of whatever program was staged and run, so it can carry anything that process prints, including usernames, hostnames or credentials. The plugin's own declared columns (`staged_path`, `file`, `sha256`, `upload_id`) carry only caller-chosen filenames and content hashes. `upload_file` moves the whole content of the named file off the device, so the sensitivity of that data is the file's own.
+- **Siblings:** none in this catalogue. `execute_staged` is the only "run a verified binary" action here; compare `script_exec.exec` for ad hoc admin commands and scripts.
+- **MCP / REST.** Discover: `discover_plugins` (summary) then `yuzu://plugin-docs` (this page as data) then `discover_instructions` / `get_definition("agent.content_dist.execute_staged")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`; `stage` and `execute_staged` results are also polled by the `/auto` Deploy engine's `deployment_run_store`.
 
 ## Sample output
 
@@ -230,11 +312,11 @@ error|missing required parameters: path, grant_id, grant_secret
 
 ## Caveats and known gaps
 
-1. **`cleanup`'s `filename` parameter is dead code.** The definition declares `filename` for targeted removal, but `do_cleanup` (in `content_dist_plugin.cpp`) only ever reads `hours` and sweeps the whole staging directory by age (default 24h) - a single-file removal is not implemented today. The definition's description and the `filename` parameter disclose this. `filename` stays declared so a call that sends it is not rejected by the server's parameter validation.
-2. **`cleanup`'s declared result columns don't match its wire output.** `status` is never emitted — there is no `status|` line anywhere in `do_cleanup`, including on an hours-parse failure (silently ignored, not reported) — and the declared `files_removed` column is actually wired as `removed|<n>`.
-3. **`execute_staged` rejects Linux shebang scripts by design — do not "fix" this.** B6 fd-exec (`execveat` with `AT_EMPTY_PATH`) gives the kernel no resolvable path for `binfmt_script` to build the interpreter's argv from; a `#!`-interpreted staged file is refused up front (`content_dist_exec_seam.hpp:81-105`) rather than spawn-failing opaquely. Stage a native executable instead.
-4. **A residual hash-time-to-exec-time swap window is accepted, not closed (CDX-001).** The #808 KV hash re-verification and the seam's independent B6 open both target the same path but not the same fd; full closure needs the runner itself to accept a caller-supplied digest, deferred to a follow-up runner package (`content_dist_plugin.cpp:628-652`).
-5. **Windows soft-terminate grace is configured but undeliverable.** `no_window=true` (restoring the deleted launcher's `CREATE_NO_WINDOW`) means a console-less child can never receive `GenerateConsoleCtrlEvent`/`CTRL_BREAK`, so the 30s grace is zeroed on the Windows path rather than claiming a grace the platform cannot deliver (`content_dist_exec_parsers.hpp:242-268`).
+1. **`cleanup` ignores `filename`, and its declared columns do not match its output.** `do_cleanup` reads only `hours` and sweeps the whole staging directory by age (default 24; 0 or less removes everything), so removing a single file is not possible. The declared `status` column is never emitted, an unparseable `hours` silently falls back to 24, and the declared `files_removed` is actually written as `removed|<n>`.
+2. **`execute_staged` rejects Linux shebang scripts by design; do not "fix" this.** The Linux runner executes the already-opened, verified file descriptor (the Linux `execveat` system call with an empty path), which gives the kernel no path to build an interpreter command line from, so a `#!` file is refused up front instead of failing opaquely. Stage a native executable instead.
+3. **A small window between the hash check and the exec is accepted, not closed.** The key-value hash check and the runner's own open of the file target the same path but not the same descriptor, and closing it needs the runner to accept a caller-supplied digest. The staging directory is owner-only, so exploiting the window already requires the agent's own identity, and the runner pins the executed descriptor to the verified size.
+4. **Termination grace differs by OS.** On Linux and macOS a deadline or cancel sends SIGTERM to the process group and waits 30 seconds before the hard kill. On Windows the child has no console (`CREATE_NO_WINDOW`), so a soft stop cannot reach it and the grace is zeroed: a deadline or cancel is an immediate hard kill, which can interrupt an installer mid-transaction.
+5. **The hash you supply is the only integrity control on a download.** `stage` accepts plain `http://` sources, does not follow redirects, applies no size cap to the download, and does not check a code signature, so a wrong or attacker-chosen hash makes a wrong file trusted. Samples exercise only parameter validation, so `stage`, `execute_staged` and `upload_file` have no successful capture, and `cleanup` is not captured although it only touches the plugin's own staging directory.
 
 ## Source and tests
 

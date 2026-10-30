@@ -11,12 +11,14 @@
 #include "audit_store.hpp"
 #include "auth_routes.hpp" // #4037: ListReadGate — get_guardian_status's require_list_read confinement seam
 #include "authz_gates.hpp" // #3290 Phase 2: authz::FleetReadGate — query_installed_software's real confinement seam
+#include "mcp_tool_deps.hpp" // ToolDeps: provider closures a registry handler may reach
 #include "authz_model.hpp" // #1788: VisibleSet — MCP dispatch confinement (in_scope/filter_to_scope)
 #include "ca_routes.hpp" // IssueCodeSigningFn/CodeSigningIssuance (free at yuzu::server scope, unlike
                          // CaRoutes::PublishCrlFn below) — reused verbatim by issue_code_signing_cert
                          // rather than re-declared, so the two error-prefix constants stay one copy.
 #include "ca_store.hpp"
 #include "command_capability.hpp" // #3685: CommandCapability / ClassificationError — ClassifyFn's return type
+#include "config_write.hpp" // config::Backing: get/set_runtime_config's backing pointers
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
 // ADR-0031 operator surface (PR1.6c) — MCP twins of the operator
 // mint/list/revoke upload-grant routes. Reuses UploadGrantListAuthorization/
@@ -32,6 +34,7 @@
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API seam
 #include "dex_perf_api.hpp" // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-time API seam
+#include "crypto_widget_catalogue.hpp" // crypto_widgets::Access / WidgetGate (pure)
 #include "crypto_api.hpp" // ADR-0031 WS-A4 (tenth family): the public in-process crypto-library read API seam
 #include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
@@ -58,6 +61,7 @@
 #include "policy_store.hpp"
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
+#include "forensics_visibility.hpp" // ForensicsVisibilityFn (#4990)
 #include "response_store.hpp"
 #include "result_set_model.hpp" // #2146 Batch B2: ResultSetStore (fwd-declared only otherwise) + shared JSON builder
 #include "schedule_api.hpp" // ADR-0031 WS-A4 (seventh family): the public in-process schedule-read API seam
@@ -68,17 +72,20 @@
 #include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): the public in-process workflow-read API seam
 #include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
 #include "workflow_engine.hpp" // still needed for the WorkflowEngine* build_handler param -- see set_workflow_api's doc comment
-// #4027: DeviceRow (via device_routes.hpp) + TarRetentionPausedScan/
-// TarPausedSourceRow + the tar_*_json pure builders the read-twin MCP tools
+// #4027: DeviceRow (via device_routes.hpp) + EchoRetentionPausedScan/
+// EchoPausedSourceRow + the echo_*_json pure builders the read-twin MCP tools
 // share with their REST siblings (api-twin-recipe.md Rule 1).
-#include "tar_tree_routes.hpp"
+#include "echo_tree_routes.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <expected>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -130,7 +137,7 @@ class BaselineStore;
 // (pointer-only in build_handler/register_routes); the .cpp includes
 // product_pack_model.hpp, which pulls in product_pack_store.hpp.
 class ProductPackStore;
-// #4027: backs list_tar_retention_paused — forward-declared (pointer-only via
+// #4027: backs list_echo_retention_paused — forward-declared (pointer-only via
 // set_dashboard_routes below); the .cpp includes dashboard_routes.hpp for the
 // full definition.
 class DashboardRoutes;
@@ -250,7 +257,8 @@ public:
     /// fan-out reads (the remaining #1634 work; see rest_api_v1.hpp ResponseScopeFn).
     /// The handler resolves the principal ONCE (it already authed the request) and
     /// passes `username` in, so the predicate does NOT re-resolve the session per
-    /// call. RBAC-off → returns true (legacy-open, matching require_scoped_permission).
+    /// call. RBAC-off → returns true for a human (legacy-open, matching require_scoped_permission), but
+    /// false for an engine principal, whose only authority is an explicit RBAC grant (#6204).
     ///
     /// FAIL-OPEN-WHEN-UNWIRED, deliberately: the default `= {}` means an unset
     /// predicate applies NO filter. This diverges from DeviceRoutes' required
@@ -500,6 +508,11 @@ public:
     /// "unavailable" rather than crashing or silently no-op'ing.
     void set_plugin_config_store(PluginConfigStore* store) { plugin_config_store_ = store; }
 
+    /// Backs get_runtime_config / set_runtime_config, the MCP twins of GET/PUT /api/v1/config
+    /// (api-parity rows get.api-config, put.api-config-param). Same objects the config routes
+    /// hold. Unset (all nullptr, the default) => both tools answer "unavailable".
+    void set_runtime_config_backing(config::Backing backing) { runtime_config_ = backing; }
+
     /// ADR-0031 operator surface (PR1.6c) — upload-grant store + the
     /// ADR-0017 list-admit resolver for list_upload_grants, backing
     /// mint/list/revoke_upload_grant. `list_read_fn` is the SAME shape as
@@ -603,6 +616,28 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
+    /// #4990 - the Forensics plugin set the stored-response read tier excludes
+    /// (`ServerImpl::forensics_plugin_set_`, borrowed: it outlives this object). Same live-read
+    /// timing as `set_fleet_read_fn`: the handlers read the member per request. Unset (nullptr, a
+    /// test harness) fails closed: the response tools refuse every row (`tier_filter_for`).
+    void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
+
+    /// #4990 - the resolver behind the response tools' Forensics tier (see
+    /// `forensics_visibility.hpp`); read live per request like `fleet_read_fn_`. Unset resolves to
+    /// present-empty at the use site.
+    void set_forensics_visibility_fn(ForensicsVisibilityFn fn) {
+        forensics_visibility_fn_ = std::move(fn);
+    }
+
+    /// The provider closures a registry tool handler may reach (mcp_tool_deps.hpp),
+    /// passed to every registry handler as `ctx.deps`. The SAME closure instances
+    /// `HardwareRoutes::Deps` receives, wired beside `set_fleet_read_fn` in the
+    /// ServerImpl constructor, so a twin cannot observe a different composition
+    /// than the REST route. Set once before `build_handler`; the value lives as long
+    /// as this McpServer, which outlives every request. Unset leaves every closure
+    /// empty and the handlers answer an internal error.
+    void set_tool_deps(ToolDeps deps) { tool_deps_ = std::move(deps); }
+
     /// #4037 — the injected-callback twin of `AuthRoutes::require_list_read`
     /// (ADR-0017), backing `get_guardian_status`'s real confinement and
     /// `list_plugin_config` (which refuses a scoped admission). Same
@@ -668,9 +703,9 @@ public:
     }
 
     /// #4143 review fix (external colleague review, BLOCKING, confirmed against
-    /// ADR-0017 INV-4/INV-7 by direct source inspection): `list_tar_process_
-    /// tree_devices`/`list_tar_capture_sources_devices` previously intersected
-    /// `fleet_read_fn_`'s admit-scope with `tar_devices_fn_`'s direct-
+    /// ADR-0017 INV-4/INV-7 by direct source inspection): `list_echo_process_
+    /// tree_devices`/`list_echo_capture_sources_devices` previously intersected
+    /// `fleet_read_fn_`'s admit-scope with `echo_devices_fn_`'s direct-
     /// membership-only pre-filter — two divergent resolvers, so an operator
     /// admitted via an ancestor-ward management-group role (not a DIRECT
     /// member) could see an incomplete or empty list despite being admitted
@@ -685,10 +720,10 @@ public:
     using AllDevicesFn = std::function<std::vector<DeviceRow>()>;
     void set_all_devices_fn(AllDevicesFn fn) { all_devices_fn_ = std::move(fn); }
 
-    /// #4027: `list_tar_retention_paused`'s data source — the SAME
-    /// `DashboardRoutes::gather_tar_retention_paused` the REST twin
-    /// `GET /api/v1/tar/retention-paused` calls, reached via a raw borrowed
-    /// pointer (same lifetime contract as `tar_tree_routes_`/
+    /// #4027: `list_echo_retention_paused`'s data source — the SAME
+    /// `DashboardRoutes::gather_echo_retention_paused` the REST twin
+    /// `GET /api/v1/echo/retention-paused` calls, reached via a raw borrowed
+    /// pointer (same lifetime contract as `echo_tree_routes_`/
     /// `dashboard_routes_` in `server.cpp`'s `ServerImpl`: a persistent
     /// `std::unique_ptr` member that outlives the web server, per `stop()`'s
     /// join-before-destruct ordering — safe to borrow raw, same reasoning as
@@ -806,11 +841,29 @@ public:
 
     /// ADR-0031 WS-A4 (tenth family): the SAME in-process crypto-library read seam the
     /// `/crypto` page and REST `GET /api/v1/crypto/libraries[/devices]` use - server.cpp wires
-    /// the IDENTICAL instance so `get_crypto_libraries` / `list_crypto_library_devices` can
-    /// never disagree with them. A SETTER, not a `build_handler` parameter, like the sibling
-    /// seams above. Unset (null, no software-inventory store) => the tools answer an internal
+    /// the IDENTICAL instance. A SETTER, not a `build_handler` parameter, like the sibling
+    /// seams above. Unset (null, no software-inventory store) => the tool answers an internal
     /// error, never an empty result.
+    ///
+    /// Only `list_issued_certs` (the filtered CA-certificate form) still reads this member. The
+    /// seven /crypto tools (get_crypto_libraries, list_crypto_library_devices,
+    /// export_crypto_cbom, list_crypto_widgets, get_crypto_dashboard_layout,
+    /// set_crypto_dashboard_layout, get_crypto_ca_stats) live in mcp_tools_crypto.cpp and reach
+    /// the same instance through ToolDeps' forwarding closures (server.cpp builds both from one
+    /// `crypto_api_`), so this seam and those closures cannot diverge.
     void set_crypto_api(std::shared_ptr<const CryptoApi> a) { crypto_api_ = std::move(a); }
+
+    /// The ONE non-auditing /crypto availability callback (server.cpp builds it once and wires
+    /// the SAME function into CryptoRoutes and into ToolDeps::crypto_access_fn, which serves
+    /// `list_crypto_widgets` from mcp_tools_crypto.cpp; `get_crypto_ca_stats` gates on
+    /// fleet_read_fn instead): this member serves the R2 confinement withhold of
+    /// `list_issued_certs` (both the filtered and the unfiltered form). It decides what is DRAWN
+    /// or withheld, never a grant (every data tool keeps its own gate). Unset => that path
+    /// answers an internal error, never a guessed answer.
+    using CryptoAccessFn = std::function<crypto_widgets::Access(
+        const httplib::Request&, crypto_widgets::WidgetGate, const std::string& securable_type,
+        const std::string& operation)>;
+    void set_crypto_access_fn(CryptoAccessFn fn) { crypto_access_fn_ = std::move(fn); }
 
     /// B4 (#2146 API-parity): mirrors `RestApiV1::LockoutClearFn` (rest_api_v1.hpp)
     /// so the MCP `unlock_account` tool clears an account's lockout counter
@@ -1206,6 +1259,13 @@ public:
                          // (kept last across the device_api merge).
                          AppUsageStore* app_usage_store = nullptr);
 
+    /// Test hook: push the cached `get_security_posture` payload's `generated_at`
+    /// backward by `elapsed`, so a test crosses the `ttl_seconds` cache window
+    /// without sleeping. A no-op while the cache is empty (nothing cached yet).
+    /// Production code MUST NOT call this — no caller in `server/core/src/**`
+    /// references it.
+    void age_posture_cache_for_test(std::chrono::milliseconds elapsed);
+
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──
     // COEXISTENCE (4.2→4.3 rebase): the 4.2 role-assignment handlers use the
@@ -1224,6 +1284,29 @@ private:
     // pre-dispatch dry run in mcp_server.cpp fails closed rather than
     // silently reverting to the pre-#3687 collapsed-envelope behaviour.
     AuthorizeDispatchFn authorize_dispatch_fn_;
+    // Posture cache shared across httplib worker threads (the POST handler lambda
+    // is captured by value, so every worker shares this one object). Reads and
+    // writes of the string fields MUST be serialised — an unsynchronised
+    // std::string read/write across threads is UB (G-S1, #1653 review). The
+    // cached `body` is the full posture payload MINUS the `data_age_seconds`
+    // field; that field is volatile (depends on read time) so it is injected
+    // per-request from the freshly computed age — never baked into the cache
+    // (G-S4: cache hits previously misreported freshness as 0).
+    //
+    // A member, not a build_handler local, so age_posture_cache_for_test can reach
+    // it. The scope widens from "per handler" to "per McpServer", which is benign:
+    // build_handler's one production call site is register_routes' single
+    // registration of its result on the /mcp/v1/ route (written without the call's
+    // quoted path: the header scan in test_step_up_route_inventory.cpp reads comments
+    // as code), so production still has exactly one cache per route (a test that calls
+    // build_handler again on the same McpServer shares this cache). build_handler
+    // copies the shared_ptr into the handler lambda.
+    struct PostureCache {
+        std::mutex mtx;
+        std::chrono::steady_clock::time_point generated_at{};
+        std::string body; // payload JSON object string, WITHOUT data_age_seconds
+    };
+    std::shared_ptr<PostureCache> posture_cache_ = std::make_shared<PostureCache>();
     // Progress bridge core (2f PR 3a) - see set_stream_bridge above.
     McpStreamBridge* stream_bridge_{nullptr};
     // KEK rotation seam (#2395 track C) - see set_kek_ops above. Default-
@@ -1234,10 +1317,15 @@ private:
     // use and answers a clean "unavailable" error, matching
     // engine_principal_store_'s contract above.
     PluginConfigStore* plugin_config_store_{nullptr};
+    config::Backing runtime_config_{};
     UploadGrantStore* upload_grant_store_{nullptr};
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.
     FleetReadFn fleet_read_fn_;
+    const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990 - see set_forensics_plugin_set
+    ForensicsVisibilityFn forensics_visibility_fn_;         // #4990 - see set_forensics_visibility_fn
+    // See set_tool_deps above; `&tool_deps_` is ToolCallContext::deps.
+    ToolDeps tool_deps_;
     // #4037 — see set_list_read_fn above.
     ListReadFn list_read_fn_;
     // #4036 (api-parity Batch A) — see set_preflight_run_store above.
@@ -1273,6 +1361,8 @@ private:
     std::shared_ptr<const GuardianApi> guardian_api_;
     // ADR-0031 WS-A4 (tenth family) - see set_crypto_api above.
     std::shared_ptr<const CryptoApi> crypto_api_;
+    // /crypto widgets - see set_crypto_access_fn above.
+    CryptoAccessFn crypto_access_fn_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

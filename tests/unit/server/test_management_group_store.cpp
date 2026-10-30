@@ -24,6 +24,8 @@
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
@@ -485,6 +487,16 @@ TEST_CASE("ManagementGroupStore: get_visible_agents honors RBAC-disabled posture
         CHECK(nobody->size() == 3);
     }
 
+    SECTION("RBAC disabled → an engine principal sees no agents (#6204), a human still sees all") {
+        store.set_rbac_enabled_probe([] { return false; });
+        auto engine = store.get_visible_agents("engine:vuln");
+        REQUIRE(engine.has_value()); // present-EMPTY, never nullopt and never the fleet
+        CHECK(engine->empty());
+        auto human = store.get_visible_agents("admin");
+        REQUIRE(human.has_value());
+        CHECK(human->size() == 3);
+    }
+
     SECTION("RBAC disabled → DISTINCT dedups an agent in multiple groups") {
         store.add_member(*gid_b, "agent-001"); // agent-001 now in A and B
         store.set_rbac_enabled_probe([] { return false; });
@@ -926,3 +938,91 @@ TEST_CASE("ManagementGroupStore: get_group_checked distinguishes a genuine "
     CHECK((*found)->name == "get-group-checked-found");
 }
 
+
+// The groups page reads the tree and the per-group member counts through degrade-distinguishable
+// twins, so a failed read cannot render as "no groups" or "0 members".
+TEST_CASE("ManagementGroupStore: list_groups_checked and count_members_by_group_checked degrade "
+          "on a closed store; list_groups stays fail-soft",
+          "[management_group][degrade]") {
+    PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    ManagementGroupStore store{pool};
+    REQUIRE(!store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    CHECK(!store.list_groups_checked().has_value());
+    CHECK(!store.count_members_by_group_checked().has_value());
+    CHECK(store.list_groups().empty());
+    // Three degraded reads, three counts: the legacy list_groups() now delegates to the checked
+    // twin, so its degrade is counted too (it was silent before).
+    CHECK(metrics
+              .counter("yuzu_server_mgmt_group_read_degrade_total", {{"reason", "store_not_open"}})
+              .value() == 3.0);
+}
+
+TEST_CASE("ManagementGroupStore: a failed query degrades both checked reads and is counted",
+          "[pg][management_group][degrade]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    const auto query_errors = [&] {
+        return metrics
+            .counter("yuzu_server_mgmt_group_read_degrade_total", {{"reason", "query_error"}})
+            .value();
+    };
+
+    // DROP ... CASCADE on the groups table removes only the foreign keys that reference it, so
+    // the members table survives: the group list degrades while the member counts still answer.
+    exec_sql(db.dsn(), "DROP TABLE management_group_store.management_groups CASCADE");
+    CHECK(!store.list_groups_checked().has_value());
+    CHECK(query_errors() == 1.0);
+    CHECK(store.count_members_by_group_checked().has_value());
+
+    exec_sql(db.dsn(), "DROP TABLE management_group_store.management_group_members");
+    CHECK(!store.count_members_by_group_checked().has_value());
+    CHECK(query_errors() == 2.0);
+}
+
+TEST_CASE("ManagementGroupStore: list_groups_checked lists groups and "
+          "count_members_by_group_checked counts members in one read",
+          "[pg][management_group][degrade]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto baseline = store.list_groups_checked();
+    REQUIRE(baseline.has_value());
+
+    ManagementGroup full;
+    full.name = "counts-full";
+    full.membership_type = "static";
+    full.created_by = "tester";
+    auto full_id = store.create_group(full);
+    REQUIRE(full_id.has_value());
+    ManagementGroup empty;
+    empty.name = "counts-empty";
+    empty.membership_type = "static";
+    empty.created_by = "tester";
+    auto empty_id = store.create_group(empty);
+    REQUIRE(empty_id.has_value());
+    REQUIRE(store.add_member(*full_id, "agent-a").has_value());
+    REQUIRE(store.add_member(*full_id, "agent-b").has_value());
+    REQUIRE(store.add_member(*full_id, "agent-c").has_value());
+
+    const auto groups = store.list_groups_checked();
+    REQUIRE(groups.has_value());
+    CHECK(groups->size() == baseline->size() + 2);
+
+    const auto counts = store.count_members_by_group_checked();
+    REQUIRE(counts.has_value());
+    REQUIRE(counts->contains(*full_id));
+    CHECK(counts->at(*full_id) == 3);
+    CHECK_FALSE(counts->contains(*empty_id));
+}

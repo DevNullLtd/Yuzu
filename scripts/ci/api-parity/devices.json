@@ -49,7 +49,7 @@
     "capability_id": "get.fragments-device-live",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#5955 revisit:2026-11-30 Renders a static panel menu; every data/action behind it is device/live/run. UI-only exception recorded by the ADR-1005 2026-10-22 entry (extends #5955)."
   },
   {
     "method": "GET",
@@ -57,7 +57,7 @@
     "capability_id": "get.fragments-device-live-result",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.fragments-device-live-run"
   },
   {
     "method": "GET",
@@ -86,8 +86,8 @@
       "method": "GET",
       "path": "/api/v1/devices"
     },
-    "mcp_twin": "list_agents",
-    "status": "twinned"
+    "mcp_twin": null,
+    "status": "exception:#4041 revisit:2027-01-31 MCP list_agents is unconfined (known gap, #4041) while GET /api/v1/devices is confined through require_fleet_read; not a twin until list_agents is confined (ADR-1005 2026-10-23 entry)"
   },
   {
     "method": "GET",
@@ -97,8 +97,8 @@
       "method": "GET",
       "path": "/api/v1/hardware/{param}"
     },
-    "mcp_twin": null,
-    "status": "twinned-rest-only"
+    "mcp_twin": "get_hardware_ci",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -122,7 +122,7 @@
     "capability_id": "get.fragments-hardware-ci-properties",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.api-agents-param-properties,get.api-property-schemas"
   },
   {
     "method": "GET",
@@ -138,7 +138,7 @@
     "capability_id": "get.fragments-hardware-ci-result",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.api-responses-param,post.api-command"
   },
   {
     "method": "GET",
@@ -148,8 +148,8 @@
       "method": "GET",
       "path": "/api/v1/hardware"
     },
-    "mcp_twin": null,
-    "status": "twinned-rest-only"
+    "mcp_twin": "list_hardware_ci",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -167,8 +167,8 @@
       "method": "GET",
       "path": "/api/v1/quarantine"
     },
-    "mcp_twin": null,
-    "status": "twinned-rest-only"
+    "mcp_twin": "list_quarantined_devices",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -179,6 +179,39 @@
       "path": "/api/v1/management-groups"
     },
     "mcp_twin": "list_management_groups",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/groups/list",
+    "capability_id": "get.fragments-groups-list",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/management-groups"
+    },
+    "mcp_twin": "list_management_groups",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/groups/detail",
+    "capability_id": "get.fragments-groups-detail",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/management-groups/{param}"
+    },
+    "mcp_twin": "get_management_group",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/groups/members",
+    "capability_id": "get.fragments-groups-members",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/management-groups/{param}"
+    },
+    "mcp_twin": "get_management_group",
     "status": "twinned"
   },
   {

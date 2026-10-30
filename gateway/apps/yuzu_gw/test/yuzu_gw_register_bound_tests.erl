@@ -17,8 +17,8 @@
 %%%     record_result_no_replay({ok, superseded}); a replay answered with the
 %%%     other four request-fault statuses stays neutral.
 %%%
-%%% The mock of grpcbox_client:unary/5 runs the REAL request encoder the way
-%%% grpcbox does, then answers like the server: INVALID_ARGUMENT for a bad
+%%% The mock of yuzu_grpc_client:unary/5 runs the REAL request encoder the way
+%%% the client does, then answers like the server: INVALID_ARGUMENT for a bad
 %%% agent id, RESOURCE_EXHAUSTED for a message over the 4 MiB receive limit of
 %%% a stock gRPC server, OK otherwise. The upstream and the registry are real.
 %%% Waits: none beyond the bounded receives in the concurrent burst test.
@@ -26,7 +26,7 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_register_bound_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("grpcbox/include/grpcbox.hrl").
+-include("../src/yuzu_grpc.hrl").
 
 -export([handle_event/4]).  %% telemetry handler callback
 -export([handle_refused/4]).  %% telemetry handler callback (edge refusals)
@@ -98,8 +98,7 @@ limit_test_() ->
      [
       t("a refused agent id logs once per interval, then the count rides the next line",
         fun refused_agent_id_warning_is_limited/0),
-      t("a replaced peer address logs once per interval, then the count rides the next line",
-        fun peer_address_warning_is_limited/0),
+      %% removed in the Cowboy edge merge: Register no longer reads the peer address from the agent's :authority header
       t("a Register that cannot be encoded: both its lines are limited",
         fun local_encode_warnings_are_limited/0),
       t("a Register the server answers as a request fault: its lines are limited",
@@ -125,14 +124,14 @@ cleanup_limits(Ctx) ->
 setup(Threshold) ->
     {ok, _} = application:ensure_all_started(telemetry),
     yuzu_gw_test_registry:ensure(),
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     catch meck:unload(yuzu_gw_conn),
     yuzu_gw_test_upstream:stop_upstream(),
     Prev = yuzu_gw_test_upstream:save_env(?ENV_KEYS),
     yuzu_gw_test_upstream:set_breaker_env(Threshold),
     Wire = atomics:new(1, [{signed, false}]),
     persistent_term:put(?WIRE_KEY, Wire),
-    ok = meck:new(grpcbox_client, [non_strict, no_link]),
+    ok = meck:new(yuzu_grpc_client, [non_strict, no_link]),
     ok = meck:new(yuzu_gw_conn, [non_strict, no_link]),
     ok = meck:expect(yuzu_gw_conn, key_from_ctx,
                      fun(Ctx) -> ctx:get(Ctx, ?CTX_KEY, undefined) end),
@@ -142,7 +141,7 @@ setup(Threshold) ->
 
 cleanup(#{prev_env := Prev}) ->
     yuzu_gw_test_upstream:stop_upstream(),
-    catch meck:unload([grpcbox_client, yuzu_gw_conn]),
+    catch meck:unload([yuzu_grpc_client, yuzu_gw_conn]),
     yuzu_gw_test_upstream:restore_env(Prev),
     persistent_term:erase(?WIRE_KEY),
     ok.
@@ -151,21 +150,21 @@ cleanup(#{prev_env := Prev}) ->
 %%% The mock server
 %%%===================================================================
 
-%% Runs the real encoder in the calling process (as grpcbox_client:unary/5
+%% Runs the real encoder in the calling process (as yuzu_grpc_client:unary/5
 %% does), then answers like the server. Every request that gets past the
 %% encoder counts as one send on the wire.
 mock_server() ->
-    meck:expect(grpcbox_client, unary,
-                fun(_Ctx, _Path, Req, #grpcbox_def{marshal_fun = Marshal}, _Opts) ->
+    meck:expect(yuzu_grpc_client, unary,
+                fun(_Ctx, _Path, Req, #{marshal := Marshal}, _Opts) ->
                     Bin = Marshal(Req),
                     atomics:add(persistent_term:get(?WIRE_KEY), 1, 1),
                     server_answer(Req, byte_size(Bin))
                 end).
 
-%% A mock that answers every request with one fixed grpcbox_client:unary/5 result.
+%% A mock that answers every request with one fixed yuzu_grpc_client:unary/5 result.
 mock_answer(Answer) ->
-    meck:expect(grpcbox_client, unary,
-                fun(_Ctx, _Path, Req, #grpcbox_def{marshal_fun = Marshal}, _Opts) ->
+    meck:expect(yuzu_grpc_client, unary,
+                fun(_Ctx, _Path, Req, #{marshal := Marshal}, _Opts) ->
                     _ = Marshal(Req),
                     atomics:add(persistent_term:get(?WIRE_KEY), 1, 1),
                     Answer
@@ -235,7 +234,7 @@ bad_agent_ids_are_refused_at_the_edge() ->
     %% None of them went upstream, and the breaker never moved.
     ?assertEqual({closed, 0}, breaker()),
     ?assertEqual(0, wire_count()),
-    ?assertEqual(0, meck:num_calls(grpcbox_client, unary, '_')),
+    ?assertEqual(0, meck:num_calls(yuzu_grpc_client, unary, '_')),
     [?assertMatch({grpc_error, {?GRPC_STATUS_INVALID_ARGUMENT, _}}, Reply) || Reply <- Replies],
     %% A good Register still succeeds.
     ?assertMatch({ok, #{session_id := _}, _}, good_register()),
@@ -522,7 +521,7 @@ transport_failures_count_by_reason() ->
             {closed, {error, closed}}]),
     %% An exception out of the client (a dead channel) counts too.
     restart_upstream(),
-    meck:expect(grpcbox_client, unary,
+    meck:expect(yuzu_grpc_client, unary,
                 fun(_Ctx, _Path, _Req, _Def, _Opts) -> exit(channel_down) end),
     {error, _} = yuzu_gw_upstream:proxy_register(register_req(<<"agent">>)),
     ?assertEqual({closed, 1}, breaker()).
@@ -570,7 +569,7 @@ local_encode_failure_has_its_own_error_code() ->
                            hostname => binary:copy(<<"h">>, ?SERVER_MAX_MESSAGE + 1)}},
         {error, _} = yuzu_gw_upstream:proxy_register(Huge),
         ?assertEqual([<<"encode">>], error_codes()),
-        meck:expect(grpcbox_client, unary,
+        meck:expect(yuzu_grpc_client, unary,
                     fun(_Ctx, _Path, _Req, _Def, _Opts) -> exit(channel_down) end),
         {error, _} = yuzu_gw_upstream:proxy_register(register_req(<<"agent">>)),
         ?assertEqual([<<"exception">>], error_codes()),
@@ -621,14 +620,8 @@ refused_agent_id_warning_is_limited() ->
                                          ctx(), register_req(binary:copy(<<"r">>, 300)))
                  end).
 
-peer_address_warning_is_limited() ->
-    limited_kind(register_peer_addr, <<"the peer address was replaced or cut">>,
-                 fun() ->
-                     Ctx = ctx:with_value(ctx(), md_incoming_key,
-                                          #{<<":authority">> => <<255, 254, 200>>}),
-                     {ok, _, _} = yuzu_gw_agent_service:register(
-                                    Ctx, register_req(unique(<<"peer-agent">>)))
-                 end).
+%% removed in the Cowboy edge merge: Register no longer reads the peer address from the agent's :authority header
+%% (peer_address_warning_is_limited); the address is the gateway's own origin decision.
 
 %% Two kinds fire for one Register that cannot be encoded: the client line and
 %% the handler line. Each is limited by its own kind.

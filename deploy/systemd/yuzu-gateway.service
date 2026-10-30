@@ -18,6 +18,11 @@ Group=yuzu-gw
 ExecStart=/opt/yuzu_gw/bin/yuzu_gw foreground
 Restart=on-failure
 RestartSec=5
+# Planned stop: on SIGTERM the gateway ends its agent sessions and sends their
+# DISCONNECTED notices to the server within shutdown_flush_budget_ms (default
+# 20 s), then stops its processes. 40 s covers that with margin; raise the two
+# together (docs/user-manual/gateway.md, "Planned stop").
+TimeoutStopSec=40
 # Surface the gateway's own log lines (incl. the #659 cookie boot-guard refusal)
 # under a clean journal tag so the cause isn't buried by OTP crash reports +
 # StartLimitBurst: `journalctl -t yuzu-gateway`.
@@ -28,6 +33,12 @@ SyslogIdentifier=yuzu-gateway
 # scrape sockets — the default 1024 limit caps useful fleet size at
 # ~700 agents in practice. 65536 mirrors yuzu-server.service.
 LimitNOFILE=65536
+# The listeners' limits.max_connections ceilings (60000 agent, 256 management, set
+# in the packaged release sys.config this unit runs and in sys.config.prod) are
+# sized to this limit; raise them together with it. Firewall the
+# management port (:50063 by default) to the server replicas: the 256 ceiling bounds
+# descriptors, it does not keep a stranger from filling it. See docs/user-manual/
+# gateway.md, "Connection ceilings and the unauthenticated ports".
 
 WorkingDirectory=/opt/yuzu_gw
 

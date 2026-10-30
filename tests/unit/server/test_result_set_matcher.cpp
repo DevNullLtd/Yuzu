@@ -4,8 +4,8 @@
  *
  * The matcher is a pure function of (matcher_json, status, output), so it
  * needs no SQLite / dispatch / tracker fixtures — every per-producer rule
- * (SUCCESS default, tar_rows_ge, any_response, column/op/value over both the
- * tar pipe shape and a JSON array-of-objects) is asserted directly here. The
+ * (SUCCESS default, echo_rows_ge, any_response, column/op/value over both the
+ * echo pipe shape and a JSON array-of-objects) is asserted directly here. The
  * server maintenance thread is a thin caller; this is where the rule lives.
  */
 
@@ -15,13 +15,14 @@
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace yuzu::server::rs_matcher;
 
 namespace {
-// A tar.sql response: `__schema__` header, `|`-joined rows, `__total__` trailer.
-std::string tar_rows(int n, const std::string& col = "pid") {
+// An echo.sql response: `__schema__` header, `|`-joined rows, `__total__` trailer.
+std::string echo_rows(int n, const std::string& col = "pid") {
     std::string out = "__schema__|" + col;
     for (int i = 0; i < n; ++i)
         out += "\n" + std::to_string(1000 + i);
@@ -35,9 +36,9 @@ constexpr int kFail = 2;            // any non-SUCCESS
 TEST_CASE("matcher: non-success response never qualifies", "[result_set][matcher]") {
     // Even a matcher that would otherwise pass must reject a failed exec —
     // an errored plugin is not evidence of a hit.
-    REQUIRE_FALSE(response_matches("", kFail, tar_rows(5)));
-    REQUIRE_FALSE(response_matches(R"({"kind":"any_response"})", kFail, tar_rows(5)));
-    REQUIRE_FALSE(response_matches(R"({"kind":"tar_rows_ge","n":1})", kFail, tar_rows(5)));
+    REQUIRE_FALSE(response_matches("", kFail, echo_rows(5)));
+    REQUIRE_FALSE(response_matches(R"({"kind":"any_response"})", kFail, echo_rows(5)));
+    REQUIRE_FALSE(response_matches(R"({"kind":"echo_rows_ge","n":1})", kFail, echo_rows(5)));
 }
 
 TEST_CASE("matcher: empty / blank matcher = SUCCESS default", "[result_set][matcher]") {
@@ -48,40 +49,61 @@ TEST_CASE("matcher: empty / blank matcher = SUCCESS default", "[result_set][matc
 }
 
 TEST_CASE("matcher: any_response includes every SUCCESS responder", "[result_set][matcher]") {
-    REQUIRE(response_matches(R"({"kind":"any_response"})", kOk, tar_rows(0)));
+    REQUIRE(response_matches(R"({"kind":"any_response"})", kOk, echo_rows(0)));
     REQUIRE(response_matches(R"({"kind":"any_response"})", kOk, "error|whatever"));
-    REQUIRE_FALSE(response_matches(R"({"kind":"any_response"})", kFail, tar_rows(3)));
+    REQUIRE_FALSE(response_matches(R"({"kind":"any_response"})", kFail, echo_rows(3)));
 }
 
-TEST_CASE("matcher: tar_rows_ge thresholds on row count", "[result_set][matcher]") {
-    REQUIRE(response_matches(R"({"kind":"tar_rows_ge","n":1})", kOk, tar_rows(1)));
-    REQUIRE(response_matches(R"({"kind":"tar_rows_ge","n":1})", kOk, tar_rows(5)));
-    REQUIRE_FALSE(response_matches(R"({"kind":"tar_rows_ge","n":1})", kOk, tar_rows(0)));
-    REQUIRE(response_matches(R"({"kind":"tar_rows_ge","n":3})", kOk, tar_rows(3)));
-    REQUIRE_FALSE(response_matches(R"({"kind":"tar_rows_ge","n":3})", kOk, tar_rows(2)));
+TEST_CASE("matcher: echo_rows_ge thresholds on row count", "[result_set][matcher]") {
+    REQUIRE(response_matches(R"({"kind":"echo_rows_ge","n":1})", kOk, echo_rows(1)));
+    REQUIRE(response_matches(R"({"kind":"echo_rows_ge","n":1})", kOk, echo_rows(5)));
+    REQUIRE_FALSE(response_matches(R"({"kind":"echo_rows_ge","n":1})", kOk, echo_rows(0)));
+    REQUIRE(response_matches(R"({"kind":"echo_rows_ge","n":3})", kOk, echo_rows(3)));
+    REQUIRE_FALSE(response_matches(R"({"kind":"echo_rows_ge","n":3})", kOk, echo_rows(2)));
     // n defaults to 1 when omitted.
-    REQUIRE(response_matches(R"({"kind":"tar_rows_ge"})", kOk, tar_rows(1)));
-    REQUIRE_FALSE(response_matches(R"({"kind":"tar_rows_ge"})", kOk, tar_rows(0)));
+    REQUIRE(response_matches(R"({"kind":"echo_rows_ge"})", kOk, echo_rows(1)));
+    REQUIRE_FALSE(response_matches(R"({"kind":"echo_rows_ge"})", kOk, echo_rows(0)));
 }
 
-TEST_CASE("matcher: tar error output counts as 0 rows", "[result_set][matcher]") {
-    REQUIRE(tar_row_count("error|missing required 'sql' parameter") == 0);
-    REQUIRE_FALSE(response_matches(R"({"kind":"tar_rows_ge","n":1})", kOk, "error|nope"));
+TEST_CASE("matcher: echo error output counts as 0 rows", "[result_set][matcher]") {
+    REQUIRE(echo_row_count("error|missing required 'sql' parameter") == 0);
+    REQUIRE_FALSE(response_matches(R"({"kind":"echo_rows_ge","n":1})", kOk, "error|nope"));
 }
 
-TEST_CASE("matcher: tar_row_count trailer + fallback", "[result_set][matcher]") {
-    REQUIRE(tar_row_count(tar_rows(4)) == 4);
-    REQUIRE(tar_row_count(tar_rows(0)) == 0);
+TEST_CASE("matcher: echo_row_count trailer + fallback", "[result_set][matcher]") {
+    REQUIRE(echo_row_count(echo_rows(4)) == 4);
+    REQUIRE(echo_row_count(echo_rows(0)) == 0);
     // No trailer → fall back to counting data lines (schema excluded).
-    REQUIRE(tar_row_count("__schema__|a\nx\ny") == 2);
-    REQUIRE(tar_row_count("") == 0);
+    REQUIRE(echo_row_count("__schema__|a\nx\ny") == 2);
+    REQUIRE(echo_row_count("") == 0);
 }
 
 TEST_CASE("matcher: unknown kind excludes conservatively", "[result_set][matcher]") {
-    REQUIRE_FALSE(response_matches(R"({"kind":"does_not_exist"})", kOk, tar_rows(9)));
+    REQUIRE_FALSE(response_matches(R"({"kind":"does_not_exist"})", kOk, echo_rows(9)));
 }
 
-TEST_CASE("matcher: column op over tar pipe shape", "[result_set][matcher]") {
+// Echo rename: a stale client still sending the pre-rename kind literal used to be admitted (202)
+// and then match nobody - an empty set indistinguishable from "no device matched". Admission now
+// refuses any kind outside the closed set {any_response, echo_rows_ge}.
+TEST_CASE("matcher: validate_matcher refuses a kind outside the closed set and names it",
+          "[result_set][matcher][echo_rename]") {
+    const std::string old_kind = R"({"kind":"tar_rows_ge","n":1})"; // legacy spelling, on purpose
+    const auto err = validate_matcher(old_kind);
+    REQUIRE(err.has_value());
+    CHECK(err->find("tar_rows_ge") != std::string::npos);
+    CHECK(err->find("echo_rows_ge") != std::string::npos);
+    CHECK(validate_matcher_object(nlohmann::json::parse(old_kind)).has_value());
+    CHECK(validate_matcher(R"({"kind":""})").has_value());
+    CHECK(validate_matcher(R"({"kind":"does_not_exist"})").has_value());
+
+    // The renamed kind is admitted and matches on the same output the old literal would have.
+    const auto out = echo_rows(2);
+    CHECK_FALSE(validate_matcher(R"({"kind":"echo_rows_ge","n":1})").has_value());
+    CHECK(response_matches(R"({"kind":"echo_rows_ge","n":1})", kOk, out));
+    CHECK_FALSE(validate_matcher(R"({"kind":"any_response"})").has_value());
+}
+
+TEST_CASE("matcher: column op over echo pipe shape", "[result_set][matcher]") {
     std::string out = "__schema__|pid|sha256\n42|abc\n43|def\n__total__|2";
     REQUIRE(response_matches(R"({"column":"sha256","op":"eq","value":"abc"})", kOk, out));
     REQUIRE(response_matches(R"({"column":"sha256","op":"eq","value":"def"})", kOk, out));
@@ -125,7 +147,7 @@ TEST_CASE("matcher: malformed column matcher falls back to default", "[result_se
 // stored matcher re-threw every 2 s and starved the GC and retention reaps behind it. A numeric n
 // outside int range also wrapped (4294967297 read as 1). Now a malformed n fails CLOSED like an
 // unknown kind: nobody qualifies, nothing throws.
-TEST_CASE("matcher: a malformed tar_rows_ge n never throws and matches nobody (#4644)",
+TEST_CASE("matcher: a malformed echo_rows_ge n never throws and matches nobody (#4644)",
           "[result_set][matcher][numeric_params]") {
     const std::vector<std::string> bad_n = {
         "\"2\"", "\"\"", "null", "true", "[]", "{}", "5.5", "1e3", "4294967297",
@@ -134,22 +156,22 @@ TEST_CASE("matcher: a malformed tar_rows_ge n never throws and matches nobody (#
         // refusal must not read `count >= 0` as "every responder qualifies".
         "0", "-1", "-2147483648"};
     for (const auto& n : bad_n) {
-        const std::string m = R"({"kind":"tar_rows_ge","n":)" + n + "}";
+        const std::string m = R"({"kind":"echo_rows_ge","n":)" + n + "}";
         INFO(m);
         bool r = true;
-        REQUIRE_NOTHROW(r = response_matches(m, kOk, tar_rows(5)));
+        REQUIRE_NOTHROW(r = response_matches(m, kOk, echo_rows(5)));
         CHECK_FALSE(r);
     }
 
     // The maintenance tick walks every pending set in one loop: a bad set must not stop the
     // sets after it (the old code threw out of the loop on the first one).
-    const std::vector<std::string> pending = {R"({"kind":"tar_rows_ge","n":"x"})",
-                                              R"({"kind":"tar_rows_ge","n":2})",
+    const std::vector<std::string> pending = {R"({"kind":"echo_rows_ge","n":"x"})",
+                                              R"({"kind":"echo_rows_ge","n":2})",
                                               R"({"kind":"any_response"})"};
     std::vector<bool> member;
     REQUIRE_NOTHROW([&] {
         for (const auto& m : pending)
-            member.push_back(response_matches(m, kOk, tar_rows(3)));
+            member.push_back(response_matches(m, kOk, echo_rows(3)));
     }());
     REQUIRE(member.size() == 3);
     CHECK_FALSE(member[0]);
@@ -159,40 +181,40 @@ TEST_CASE("matcher: a malformed tar_rows_ge n never throws and matches nobody (#
     // A PRESENT `kind` that is not a string is malformed, not absent: it must not fall through to
     // the accept-all default (or to a column matcher) and so admit every responder.
     for (const char* bad_kind :
-         {R"({"kind":1})", R"({"kind":null})", R"({"kind":true})", R"({"kind":["tar_rows_ge"]})",
+         {R"({"kind":1})", R"({"kind":null})", R"({"kind":true})", R"({"kind":["echo_rows_ge"]})",
           R"({"kind":{}})", R"({"kind":1,"column":"sha256","op":"exists"})"}) {
         INFO(bad_kind);
         bool r = true;
-        REQUIRE_NOTHROW(r = response_matches(bad_kind, kOk, tar_rows(5)));
+        REQUIRE_NOTHROW(r = response_matches(bad_kind, kOk, echo_rows(5)));
         CHECK_FALSE(r);
     }
 
     // Well-formed thresholds keep their meaning, including the INT_MAX boundary and an absent n.
-    CHECK(response_matches(R"({"kind":"tar_rows_ge","n":2147483647})", kOk, tar_rows(3)) == false);
-    CHECK(response_matches(R"({"kind":"tar_rows_ge","n":3})", kOk, tar_rows(3)));
-    CHECK(response_matches(R"({"kind":"tar_rows_ge"})", kOk, tar_rows(1)));
+    CHECK(response_matches(R"({"kind":"echo_rows_ge","n":2147483647})", kOk, echo_rows(3)) == false);
+    CHECK(response_matches(R"({"kind":"echo_rows_ge","n":3})", kOk, echo_rows(3)));
+    CHECK(response_matches(R"({"kind":"echo_rows_ge"})", kOk, echo_rows(1)));
 }
 
 TEST_CASE("matcher: validate_matcher accepts only an integer n of at least 1 (#4644)",
           "[result_set][matcher][numeric_params]") {
     for (const char* ok :
-         {"", "{}", R"({"kind":"any_response"})", R"({"kind":"tar_rows_ge"})",
-          R"({"kind":"tar_rows_ge","n":1})", R"({"kind":"tar_rows_ge","n":2147483647})",
+         {"", "{}", R"({"kind":"any_response"})", R"({"kind":"echo_rows_ge"})",
+          R"({"kind":"echo_rows_ge","n":1})", R"({"kind":"echo_rows_ge","n":2147483647})",
           R"({"column":"sha256","op":"eq","value":"x"})",
-          // n only means something for tar_rows_ge, and an unrecognised shape keeps its default.
+          // n only means something for echo_rows_ge, and an unrecognised shape keeps its default.
           R"({"kind":"any_response","n":"x"})", "not json", "[]"}) {
         INFO(ok);
         CHECK_FALSE(validate_matcher(ok).has_value());
     }
     for (const char* bad :
-         {R"({"kind":"tar_rows_ge","n":0})", R"({"kind":"tar_rows_ge","n":-1})",
-          R"({"kind":"tar_rows_ge","n":4294967297})",
-          R"({"kind":"tar_rows_ge","n":9223372036854775808})",
-          R"({"kind":"tar_rows_ge","n":18446744073709551615})", R"({"kind":"tar_rows_ge","n":2147483648})",
-          R"({"kind":"tar_rows_ge","n":1e3})", R"({"kind":"tar_rows_ge","n":5.5})",
-          R"({"kind":"tar_rows_ge","n":"7"})", R"({"kind":"tar_rows_ge","n":""})",
-          R"({"kind":"tar_rows_ge","n":null})", R"({"kind":"tar_rows_ge","n":true})",
-          R"({"kind":"tar_rows_ge","n":[]})", R"({"kind":"tar_rows_ge","n":{}})",
+         {R"({"kind":"echo_rows_ge","n":0})", R"({"kind":"echo_rows_ge","n":-1})",
+          R"({"kind":"echo_rows_ge","n":4294967297})",
+          R"({"kind":"echo_rows_ge","n":9223372036854775808})",
+          R"({"kind":"echo_rows_ge","n":18446744073709551615})", R"({"kind":"echo_rows_ge","n":2147483648})",
+          R"({"kind":"echo_rows_ge","n":1e3})", R"({"kind":"echo_rows_ge","n":5.5})",
+          R"({"kind":"echo_rows_ge","n":"7"})", R"({"kind":"echo_rows_ge","n":""})",
+          R"({"kind":"echo_rows_ge","n":null})", R"({"kind":"echo_rows_ge","n":true})",
+          R"({"kind":"echo_rows_ge","n":[]})", R"({"kind":"echo_rows_ge","n":{}})",
           // A present kind that is not a string would otherwise fall through to accept-all.
           R"({"kind":1})", R"({"kind":null})", R"({"kind":true})", R"({"kind":[]})",
           R"({"kind":{}})"}) {
@@ -213,12 +235,12 @@ TEST_CASE("matcher: validate_matcher_object refuses a non-object and defers to v
         REQUIRE(err.has_value());
         CHECK(err->find("JSON object") != std::string::npos);
     }
-    for (const char* ok : {"{}", R"({"kind":"any_response"})", R"({"kind":"tar_rows_ge","n":3})",
+    for (const char* ok : {"{}", R"({"kind":"any_response"})", R"({"kind":"echo_rows_ge","n":3})",
                            R"({"column":"c","op":"eq","value":"v"})"}) {
         INFO(ok);
         CHECK_FALSE(validate_matcher_object(json::parse(ok)).has_value());
     }
-    for (const char* bad : {R"({"kind":"tar_rows_ge","n":0})", R"({"kind":1})",
+    for (const char* bad : {R"({"kind":"echo_rows_ge","n":0})", R"({"kind":1})",
                             R"({"column":5,"op":"eq","value":"v"})"}) {
         INFO(bad);
         CHECK(validate_matcher_object(json::parse(bad)).has_value());
@@ -263,4 +285,306 @@ TEST_CASE("matcher: a JSON unsigned cell above INT64_MAX is not read as its int6
     const std::string out = R"([{"c":18446744073709551615}])";
     CHECK(response_matches(R"({"column":"c","op":"eq","value":"18446744073709551615"})", kOk, out));
     CHECK_FALSE(response_matches(R"({"column":"c","op":"eq","value":"-1"})", kOk, out));
+}
+
+// ── declared-column matcher over plain pipe rows ─────────────────────────────
+// A plugin that is neither echo nor JSON (security.certificates.list) writes a header row
+// then pipe rows; the column is resolved from the definition's declared names, which admission
+// stores in the matcher (bind_declared_columns).
+namespace {
+const char* kCertSchema =
+    R"([{"name":"subject","type":"string"},{"name":"issuer","type":"string"},)"
+    R"({"name":"thumbprint","type":"string"},{"name":"not_before","type":"string"},)"
+    R"({"name":"not_after","type":"string"},{"name":"serial","type":"string"},)"
+    R"({"name":"store","type":"string"},{"name":"key_usage","type":"string"}])";
+
+const char* kCertHeader = "subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage";
+
+std::string cert_matcher(const std::string& column, const std::string& op,
+                         const std::string& value = {}) {
+    nlohmann::json m{{"column", column}, {"op", op}};
+    if (!value.empty())
+        m["value"] = value;
+    bind_declared_columns(m, kCertSchema, "certificates");
+    return m.dump();
+}
+
+std::string cert_output(const std::string& extra = {}) {
+    return std::string(kCertHeader) +
+           "\nCN=a|CN=DigiCert CA|aa|2020|2030|01|Root|sig"
+           "\nCN=b|CN=eMudhra Sub CA|bb|2020|2030|02|Root|sig"
+           "\nCN=c|CN=Other CA|cc|2020|2030|03|Root|sig" +
+           extra;
+}
+} // namespace
+
+TEST_CASE("matcher: declared columns resolve a plain pipe-row column", "[result_set][matcher]") {
+    const auto m = cert_matcher("issuer", "contains", "eMudhra");
+    const auto j = nlohmann::json::parse(m);
+    REQUIRE(j["declared_columns"].size() == 8);
+    REQUIRE(j["declared_columns"][1] == "issuer");
+    REQUIRE(j["plugin"] == "certificates");
+    REQUIRE(response_matches(m, kOk, cert_output()));
+    REQUIRE_FALSE(response_matches(cert_matcher("issuer", "contains", "Nonexistent"), kOk,
+                                   cert_output()));
+    REQUIRE(response_matches(cert_matcher("issuer", "eq", "CN=Other CA"), kOk, cert_output()));
+    REQUIRE_FALSE(response_matches(m, kFail, cert_output()));
+}
+
+TEST_CASE("matcher: declared columns skip the header and short status rows",
+          "[result_set][matcher]") {
+    // The header's own cells would satisfy exists/contains if it were read as data.
+    const auto exists = cert_matcher("issuer", "exists");
+    REQUIRE_FALSE(response_matches(exists, kOk, kCertHeader));
+    REQUIRE_FALSE(response_matches(exists, kOk, std::string(kCertHeader) + "\nstatus|not_found"));
+    REQUIRE_FALSE(response_matches(cert_matcher("issuer", "contains", "issuer"), kOk,
+                                   std::string(kCertHeader) + "\n"));
+    REQUIRE_FALSE(response_matches(exists, kOk, "not_available|no store reachable"));
+    REQUIRE(response_matches(exists, kOk, cert_output()));
+    // A short status row after real data does not change the verdict either way.
+    REQUIRE(response_matches(cert_matcher("issuer", "contains", "eMudhra"), kOk,
+                             cert_output("\nstatus|not_found")));
+    REQUIRE_FALSE(response_matches(cert_matcher("issuer", "contains", "not_found"), kOk,
+                                   "status|not_found"));
+}
+
+TEST_CASE("matcher: declared columns keep row width across an escaped pipe",
+          "[result_set][matcher]") {
+    const std::string out = std::string(kCertHeader) +
+                            "\nCN=a\\|b|CN=eMudhra CA|aa|2020|2030|01|Root|sig";
+    REQUIRE(response_matches(cert_matcher("issuer", "contains", "eMudhra"), kOk, out));
+    REQUIRE(response_matches(cert_matcher("subject", "eq", "CN=a|b"), kOk, out));
+    // An UNescaped extra pipe makes the row 9 wide: dropped, not shifted.
+    REQUIRE_FALSE(response_matches(
+        cert_matcher("issuer", "contains", "eMudhra"), kOk,
+        std::string(kCertHeader) + "\nCN=a|b|CN=eMudhra CA|aa|2020|2030|01|Root|sig"));
+}
+
+TEST_CASE("matcher: a column outside the declared list binds nothing", "[result_set][matcher]") {
+    nlohmann::json m{{"column", "nope"}, {"op", "exists"}};
+    bind_declared_columns(m, kCertSchema, "certificates");
+    REQUIRE_FALSE(m.contains("declared_columns"));
+    REQUIRE_FALSE(m.contains("plugin"));
+    nlohmann::json empty{{"column", "issuer"}, {"op", "exists"}};
+    bind_declared_columns(empty, "", "certificates");
+    REQUIRE_FALSE(empty.contains("declared_columns"));
+    nlohmann::json kind{{"kind", "any_response"}, {"column", "issuer"}};
+    bind_declared_columns(kind, kCertSchema, "certificates");
+    REQUIRE_FALSE(kind.contains("declared_columns"));
+}
+
+TEST_CASE("matcher: wrong-typed declared_columns / plugin match nobody", "[result_set][matcher]") {
+    const auto good = nlohmann::json::parse(cert_matcher("issuer", "exists"));
+    for (const auto& bad : {nlohmann::json("issuer"), nlohmann::json::array({1, 2}),
+                            nlohmann::json::object()}) {
+        auto m = good;
+        m["declared_columns"] = bad;
+        REQUIRE_FALSE(response_matches(m.dump(), kOk, cert_output()));
+    }
+    auto m = good;
+    m["plugin"] = 5;
+    REQUIRE_FALSE(response_matches(m.dump(), kOk, cert_output()));
+}
+
+TEST_CASE("matcher: admission refuses caller-supplied server-authored keys",
+          "[result_set][matcher]") {
+    const auto dc = validate_matcher(R"({"column":"issuer","op":"exists","declared_columns":["issuer"]})");
+    REQUIRE(dc);
+    CHECK(dc->find("declared_columns") != std::string::npos);
+    const auto pl = validate_matcher(R"({"column":"issuer","op":"exists","plugin":"x"})");
+    REQUIRE(pl);
+    CHECK(pl->find("plugin") != std::string::npos);
+    REQUIRE_FALSE(validate_matcher(R"({"column":"issuer","op":"exists"})"));
+}
+
+TEST_CASE("matcher: declared columns leave echo and json matching unchanged",
+          "[result_set][matcher]") {
+    nlohmann::json m{{"column", "pid"}, {"op", "eq"}, {"value", "1000"}};
+    bind_declared_columns(m, kCertSchema, "certificates"); // pid not declared: unchanged
+    REQUIRE(response_matches(m.dump(), kOk, echo_rows(2)));
+    REQUIRE(response_matches(R"({"column":"sha256","op":"eq","value":"x"})", kOk,
+                             R"([{"sha256":"x"}])"));
+}
+
+// ── declared columns wider than a key/value plugin's key + remainder schema (#5624) ──
+// find_by_hash declares row_kind/path/size on the key/value `filesystem` plugin and OPTS IN to an
+// every-pipe split with `discriminator: true` on its first column. The matcher then takes a row
+// as a data row only when its field count equals the declared width, so the 9-field
+// `truncated|...` trailer and the 2-field `matches_found|N` summary are never data rows. A
+// definition without the key (search, search_dir, a stored 0.3.0 find_by_hash) keeps the
+// key + remainder split and never matches a wider declaration.
+// The schemas are literal copies (this binary has no YAML loader), in the object form
+// embed_content.py stores; the shipped find_by_hash definition is pinned to the same names, types,
+// row_kind values and `discriminator` by tests/test_filesystem_definition.py.
+namespace {
+const char* kFindByHashSchema =
+    R"({"columns":[{"name":"row_kind","type":"string","discriminator":true},)"
+    R"({"name":"path","type":"string"},{"name":"size","type":"int64"}]})";
+
+// find_by_hash 0.3.0 as an upgraded server still stores it: no discriminator.
+const char* kFindByHash030Schema =
+    R"({"columns":[{"name":"path","type":"string"},{"name":"size","type":"int64"},)"
+    R"({"name":"matches_found","type":"int32"}]})";
+
+// content/definitions/t2_capabilities.yaml: three declared columns, wire rows `match|<line>|<text>`
+// and `result|<path>|<type>` (a three-field row whose leading tag is not a declared column).
+const char* kSearchSchema =
+    R"({"columns":[{"name":"line_number","type":"int32"},{"name":"content","type":"string"},)"
+    R"({"name":"total_matches","type":"int32"}]})";
+const char* kSearchDirSchema =
+    R"({"columns":[{"name":"path","type":"string"},{"name":"entry_type","type":"string"},)"
+    R"({"name":"total_matches","type":"int32"}]})";
+
+// The verbatim trailer filesystem_find_by_hash.hpp writes (nine fields).
+const char* kTrailer = "truncated|deadline|visited=5|hashed=9|skipped_unreadable=1|"
+                       "skipped_symlink=0|skipped_not_regular=0|skipped_oversize=0|"
+                       "skipped_network_mount=0";
+
+const char* kHitOutput = "match|/etc/hosts|413\n"
+                         "truncated|deadline|visited=5|hashed=9|skipped_unreadable=1|"
+                         "skipped_symlink=0|skipped_not_regular=0|skipped_oversize=0|"
+                         "skipped_network_mount=0\n"
+                         "matches_found|1";
+
+// A device with no hit that skipped one entry: only the trailer and the zero count.
+const char* kZeroHitOutput = "truncated|none|visited=5|hashed=0|skipped_unreadable=0|"
+                             "skipped_symlink=1|skipped_not_regular=0|skipped_oversize=0|"
+                             "skipped_network_mount=0\n"
+                             "matches_found|0";
+
+// One column matcher through the production bind + evaluate path.
+bool matches(const char* schema, const std::string& column, const std::string& op,
+             const std::string& value, std::string_view output) {
+    nlohmann::json m{{"column", column}, {"op", op}};
+    if (!value.empty())
+        m["value"] = value;
+    bind_declared_columns(m, schema, "filesystem");
+    return response_matches(m.dump(), kOk, output);
+}
+
+bool find_by_hash_matches(const std::string& column, const std::string& op,
+                          const std::string& value = {}, const char* output = kHitOutput) {
+    return matches(kFindByHashSchema, column, op, value, output);
+}
+} // namespace
+
+TEST_CASE("matcher: a definition that declares a row discriminator matches match rows by "
+          "declared position",
+          "[result_set][matcher]") {
+    CHECK(find_by_hash_matches("row_kind", "eq", "match"));
+    CHECK(find_by_hash_matches("path", "contains", "/etc/hosts"));
+    CHECK(find_by_hash_matches("path", "exists"));
+    CHECK(find_by_hash_matches("size", "eq", "413"));
+    CHECK_FALSE(find_by_hash_matches("path", "contains", "/etc/passwd"));
+    CHECK_FALSE(find_by_hash_matches("size", "eq", "414"));
+}
+
+TEST_CASE("matcher: the trailer and the matches_found summary are not data rows (strict width)",
+          "[result_set][matcher]") {
+    // Neither row has three fields, so neither can satisfy a column matcher.
+    CHECK_FALSE(find_by_hash_matches("row_kind", "eq", "truncated"));
+    CHECK_FALSE(find_by_hash_matches("row_kind", "eq", "matches_found"));
+    CHECK_FALSE(find_by_hash_matches("size", "contains", "skipped_unreadable=1"));
+
+    // A zero-hit device that skipped an entry is NOT selected by an `exists` matcher: the trailer
+    // must not read as a match row.
+    CHECK_FALSE(find_by_hash_matches("path", "exists", {}, kZeroHitOutput));
+    CHECK_FALSE(find_by_hash_matches("size", "exists", {}, kZeroHitOutput));
+    CHECK_FALSE(find_by_hash_matches("row_kind", "exists", {}, kZeroHitOutput));
+    CHECK_FALSE(find_by_hash_matches("path", "contains", "none", kZeroHitOutput));
+    CHECK_FALSE(find_by_hash_matches("row_kind", "eq", "match", kTrailer));
+
+    // The unreadable-mount-table signal row has one value, so it is not a data row either.
+    CHECK_FALSE(find_by_hash_matches("row_kind", "exists", {},
+                                     "network_mount_guard|unavailable\nmatches_found|0"));
+}
+
+TEST_CASE("matcher: the discriminator is stored only from the definition and only when true",
+          "[result_set][matcher]") {
+    nlohmann::json opted{{"column", "path"}, {"op", "exists"}};
+    bind_declared_columns(opted, kFindByHashSchema, "filesystem");
+    CHECK(opted["row_discriminator"] == true);
+
+    // The array form of result_schema binds the same way.
+    nlohmann::json array_form{{"column", "path"}, {"op", "exists"}};
+    bind_declared_columns(array_form,
+                          R"([{"name":"row_kind","type":"string","discriminator":true},)"
+                          R"({"name":"path","type":"string"},{"name":"size","type":"int64"}])",
+                          "filesystem");
+    CHECK(array_form["row_discriminator"] == true);
+
+    // Absent, false, non-boolean, or on a later column: not opted in.
+    for (const char* schema :
+         {kSearchSchema,
+          R"({"columns":[{"name":"line_number","type":"int32","discriminator":false}]})",
+          R"({"columns":[{"name":"line_number","type":"int32","discriminator":"true"}]})",
+          R"({"columns":[{"name":"x","type":"string"},)"
+          R"({"name":"line_number","type":"int32","discriminator":true}]})"}) {
+        CAPTURE(schema);
+        nlohmann::json m{{"column", "line_number"}, {"op", "exists"}};
+        bind_declared_columns(m, schema, "filesystem");
+        REQUIRE(m.contains("declared_columns"));
+        CHECK_FALSE(m.contains("row_discriminator"));
+    }
+
+    // A caller may not supply it, and a wrong-typed stored value matches nobody.
+    const auto refused =
+        validate_matcher(R"({"column":"path","op":"exists","row_discriminator":true})");
+    REQUIRE(refused.has_value());
+    CHECK(refused->find("row_discriminator") != std::string::npos);
+    nlohmann::json bad = nlohmann::json::parse(opted.dump());
+    bad["row_discriminator"] = "yes";
+    CHECK_FALSE(response_matches(bad.dump(), kOk, "match|/etc/hosts|413"));
+}
+
+TEST_CASE("matcher: real search and search_dir rows never bind one position off without the "
+          "opt-in (#5624 review)",
+          "[result_set][matcher]") {
+    // `search` emits `match|<line>|<content>` against declared line_number/content/total_matches;
+    // `search_dir` emits `result|<path>|<type>` against path/entry_type/total_matches. The leading
+    // tag is not a declared column, so a three-cell split would read every cell one position
+    // early. Without the opt-in these rows split to key + remainder and never match.
+    const std::string search =
+        "match|19|# localhost name resolution is handled within DNS itself.\ntotal_matches|1";
+    CHECK_FALSE(matches(kSearchSchema, "content", "eq", "19", search));
+    CHECK_FALSE(matches(kSearchSchema, "content", "eq", "benign", search));
+    CHECK_FALSE(matches(kSearchSchema, "line_number", "eq", "match", search));
+    CHECK_FALSE(matches(kSearchSchema, "line_number", "eq", "19", search));
+    CHECK_FALSE(matches(kSearchSchema, "content", "contains", "localhost", search));
+
+    const std::string search_dir = "result|/tmp/foo|directory\ntotal_matches|1";
+    CHECK_FALSE(matches(kSearchDirSchema, "path", "eq", "result", search_dir));
+    CHECK_FALSE(matches(kSearchDirSchema, "path", "eq", "/tmp/foo", search_dir));
+    CHECK_FALSE(matches(kSearchDirSchema, "entry_type", "eq", "/tmp/foo", search_dir));
+    CHECK_FALSE(matches(kSearchDirSchema, "entry_type", "eq", "directory", search_dir));
+}
+
+TEST_CASE("matcher: a stored find_by_hash 0.3.0 definition keeps the old never-match behaviour",
+          "[result_set][matcher]") {
+    // 0.3.0 declares path/size/matches_found and carries no discriminator, so `path eq match`
+    // must not read the leading tag of a 0.4.0-agent match row as the path.
+    CHECK_FALSE(matches(kFindByHash030Schema, "path", "eq", "match", kHitOutput));
+    CHECK_FALSE(matches(kFindByHash030Schema, "path", "contains", "/etc/hosts", kHitOutput));
+    CHECK_FALSE(matches(kFindByHash030Schema, "size", "eq", "413", kHitOutput));
+}
+
+TEST_CASE("matcher: list_dir's four-field wire row is not a row of its three declared columns",
+          "[result_set][matcher]") {
+    // list_dir does not opt in, so its `entry|name|type|size` row splits to key + remainder.
+    nlohmann::json m{{"column", "entry_name"}, {"op", "eq"}, {"value", "entry"}};
+    bind_declared_columns(m,
+                          R"([{"name":"entry_name","type":"string"},)"
+                          R"({"name":"entry_type","type":"string"},)"
+                          R"({"name":"entry_size","type":"int64"}])",
+                          "filesystem");
+    CHECK_FALSE(response_matches(m.dump(), kOk, "entry|foo.txt|file|12"));
+}
+
+TEST_CASE("matcher: a two-column definition over a key/value plugin is unchanged",
+          "[result_set][matcher]") {
+    nlohmann::json m{{"column", "value"}, {"op", "eq"}, {"value", "ok"}};
+    bind_declared_columns(m, R"([{"name":"key","type":"string"},{"name":"value","type":"string"}])",
+                          "filesystem");
+    CHECK(response_matches(m.dump(), kOk, "status|ok"));
+    CHECK_FALSE(response_matches(m.dump(), kOk, "status|no"));
 }

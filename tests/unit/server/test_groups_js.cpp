@@ -127,4 +127,18 @@ TEST_CASE("groups glue: the unlimited-token warning follows both limit fields", 
     CHECK_THAT(js, ContainsSubstring("[data-token-form]"));
     CHECK_THAT(js, ContainsSubstring("[data-token-unlimited]"));
     CHECK_THAT(js, ContainsSubstring("zero('max_uses') && zero('ttl_hours')"));
+    // zero() counts only a literal zero (including the -0 spelling the route also reads as 0) —
+    // a blank field takes the bounded default, not unlimited.
+    CHECK_THAT(js, !ContainsSubstring("v === '' ||"));
+    CHECK_THAT(js, ContainsSubstring("/^-?0+$/.test(v)"));
+}
+
+TEST_CASE("groups glue: selecting a group re-points #grp-side and reloads it as an own load",
+          "[groups][js]") {
+    const std::string& js = yuzu::server::kYuzuGroupsJs;
+    for (const char* token : {"data-gact=\"select\"", "dataset.id", "'grp-side'", "encodeURIComponent",
+                              "/fragments/groups/detail?id=", "classList.add('sel')", "reload(side)"}) {
+        INFO(token);
+        CHECK_THAT(js, ContainsSubstring(token));
+    }
 }

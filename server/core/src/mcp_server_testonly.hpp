@@ -7,7 +7,8 @@
 // registry records, see mcp_tool_registry.hpp) so the annotation cross-check
 // test (a separate TU) can assert the served hints without duplicating the
 // maps. Every accessor below returns the MERGED view, not just the legacy
-// tables. Also exposes wrappers that run the REAL
+// tables (except tool_templates_for_test(), which returns the unexpanded
+// templates). Also exposes wrappers that run the REAL
 // C8 dispatch classifier / registration validator (#2383) over synthetic
 // tables, plus the validator's RBAC catalogue mirrors, so drift in any of
 // them cannot silently regress while tests stay green. Relocated out of
@@ -59,14 +60,19 @@ std::vector<std::string_view> tool_annotation_names_for_test();
 // silently execute under read-only mode).
 std::vector<std::string_view> write_tool_names_for_test();
 
-// The served tool names, in tools/list order: legacy kTools[] first, then the
-// registry records (#2383: no accessor existed before; the earlier tests
-// derived the served surface from a live tools/list call).
+// The served tool names, in tools/list order: sorted by tool name across the legacy
+// kTools[] rows and the registry records alike (#2383: no accessor existed before; the
+// earlier tests derived the served surface from a live tools/list call).
 std::vector<std::string> tool_names_for_test();
 
 // The names of the registry-resident tools only (mcp_tools_<domain>.cpp records),
 // so the dispatch-coverage test can tell them apart from the legacy chain's tools.
 std::vector<std::string> registry_tool_names_for_test();
+
+// The registry records themselves (name, description, input/output schema JSON, effect),
+// so the A5 context-contract test can check every registry tool, present and future, without
+// listing them by hand. Non-owning views over the constexpr record tables.
+std::span<const ToolRecord> registry_records_for_test();
 
 // Builds the merged catalogue (legacy tables plus `records` in place of the real
 // registry) and discards it. Throws std::logic_error, naming the record and the
@@ -146,6 +152,20 @@ void validate_tool_registration_for_test(
 // whole-table sweep test can compile every served schema and assert the
 // required-⊆-properties lint without duplicating the table.
 std::vector<ToolSchemaRowOwned> input_schemas_for_test();
+
+// One tool's pre-expansion texts. Output schema is "" when the tool has none.
+struct ToolTextRowOwned {
+    std::string name;
+    std::string description;
+    std::string input_schema_json;
+    std::string output_schema_json;
+};
+
+// The pre-expansion (name, description, input schema, output schema) texts of every served tool,
+// kTools[] then the registry records, so the provenance test can prove each ecosystem enum is a
+// generator token (the served copies are value-identical to a hand-typed table copy and cannot
+// show it).
+std::vector<ToolTextRowOwned> tool_templates_for_test();
 
 // The validator's closed-catalogue mirrors of rbac_store.cpp's seeded `ops[]`
 // and `types[]` (#2383 UP-6/C-3) — the [rbac_store] binding test compares

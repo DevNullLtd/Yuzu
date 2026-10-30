@@ -13,6 +13,10 @@
  */
 
 #include "management_group_store.hpp"
+#include "agent_registry.hpp"      // detail::classify_and_authorize_dispatch (#4990 gate case)
+#include "capability_fragments.hpp"  // YUZU_ALL_CAPABILITY_FRAGMENTS
+#include "command_capability.hpp"
+#include "dispatch_caller.hpp"
 #include "mcp_server_testonly.hpp" // rbac_ops/securables_for_test (#2383 mirror binding)
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -22,8 +26,10 @@
 
 #include "test_auth_db_pg_helper.hpp" // RBAC_STORE_WITH_AUTH — the last-admin guard's auth.users JOIN
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <libpq-fe.h>
 #include <yuzu/metrics.hpp>
 
@@ -540,6 +546,307 @@ TEST_CASE("RbacStore: seed data — Operator/PlatformEngineer/Viewer have Produc
 
 // ── RBAC toggle ──────────────────────────────────────────────────────────────
 
+// ── ForensicsAnalyst (#4990): the delegable read tier for Forensics-class rows ──────────────
+
+namespace {
+// The role's grant set as a sorted "Securable:Operation/effect" list, every effect included, so an
+// extra or a non-allow row cannot hide behind a membership probe.
+std::vector<std::string> grant_pairs(const RbacStore& store, const std::string& role) {
+    std::vector<std::string> out;
+    for (const auto& p : store.get_role_permissions(role))
+        out.push_back(p.securable_type + ":" + p.operation + "/" + p.effect);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+} // namespace
+
+TEST_CASE("RbacStore: seed data - ForensicsAnalyst is a system role holding exactly four read pairs",
+          "[rbac_store][pg][forensics_analyst]") {
+    RBAC_STORE(store);
+    auto role = store.get_role("ForensicsAnalyst");
+    REQUIRE(role.has_value());
+    CHECK(role->is_system);
+    // The set is asserted whole: no Execute, no Write, no Delete, nothing outside the four.
+    CHECK(grant_pairs(store, "ForensicsAnalyst") ==
+          std::vector<std::string>{"Execution:Read/allow", "Forensics:Read/allow",
+                                   "Inventory:Read/allow", "Response:Read/allow"});
+    CHECK(role_denies(store, "ForensicsAnalyst", "Execution", "Execute"));
+    CHECK(role_denies(store, "ForensicsAnalyst", "Response", "Write"));
+    CHECK(role_denies(store, "ForensicsAnalyst", "Forensics", "Write"));
+    CHECK(role_denies(store, "ForensicsAnalyst", "Infrastructure", "Read"));
+    CHECK(role_denies(store, "ForensicsAnalyst", "AuditLog", "Read"));
+    // A system role is not deletable.
+    CHECK_FALSE(store.delete_role("ForensicsAnalyst").has_value());
+}
+
+TEST_CASE("RbacStore: ForensicsAnalyst is seed-only - assigned to nobody and part of no other role",
+          "[rbac_store][pg][forensics_analyst]") {
+    RBAC_STORE(store);
+    CHECK(store.get_role_members("ForensicsAnalyst").empty());
+    // Nothing else gained the Forensics read: ITServiceOwner (a broad grant) and the sibling
+    // roles must not hold it; only Administrator does, as before.
+    for (const char* other : {"ITServiceOwner", "Operator", "Viewer", "PlatformEngineer",
+                              "ApiTokenManager", "Reviewer"}) {
+        INFO(other);
+        CHECK(role_denies(store, other, "Forensics", "Read"));
+    }
+    CHECK(role_grants(store, "Administrator", "Forensics", "Read"));
+    // Nobody is auto-assigned: no principal holds it on a fresh database.
+    const auto all = store.list_all_principal_roles_checked();
+    REQUIRE(all.has_value());
+    for (const auto& pr : *all)
+        CHECK(pr.role_name != "ForensicsAnalyst");
+}
+
+// The Forensics response-read resolver (`resolve_forensics_visible`) has no management-group-scoped
+// branch (#4990): a global Forensics:Read is the only thing that admits Forensics rows. A scoped
+// Forensics:Read grant is still consumed by the older per-device scoped gate (app_usage_routes.cpp
+// and the MCP get_agent_app_usage tool), a different consumer outside that finding, and no
+// production route can author one today: the scoped (group) assignment surfaces accept only
+// Operator and Viewer, and neither holds Forensics:Read. This case pins the SEED half of that
+// statement against the real store, over every role the seed pass creates, so a change that makes
+// a scoped grant authorable cannot do so silently.
+TEST_CASE("RbacStore: no role assignable at management-group scope holds Forensics:Read "
+          "(the per-device scoped Forensics gate stays unreachable from production)",
+          "[rbac_store][pg][forensics_analyst][security]") {
+    RBAC_STORE(store);
+    const char* const why =
+        "A role that can be assigned at management-group scope now holds Forensics:Read, or a "
+        "further role holds it fleet-wide. That makes the per-device scoped Forensics gate "
+        "(app_usage_routes.cpp, the MCP get_agent_app_usage tool) reachable by a role it was not "
+        "reviewed for. Re-review that gate, then update this pin.";
+
+    // Exactly the seeded roles that hold the grant today.
+    std::vector<std::string> holders;
+    for (const auto& role : store.list_roles())
+        if (role_grants(store, role.name, "Forensics", "Read"))
+            holders.push_back(role.name);
+    std::sort(holders.begin(), holders.end());
+    INFO(why);
+    CHECK(holders == std::vector<std::string>{"Administrator", "ForensicsAnalyst"});
+
+    // The roles the group-scope assignment routes (REST and MCP) accept, and the broad role the
+    // scoped surfaces never mint, none of which may hold it.
+    for (const char* mg_assignable : {"Operator", "Viewer"}) {
+        INFO(mg_assignable);
+        INFO(why);
+        CHECK(role_denies(store, mg_assignable, "Forensics", "Read"));
+    }
+    INFO(why);
+    CHECK(role_denies(store, "ITServiceOwner", "Forensics", "Read"));
+}
+
+TEST_CASE("RbacStore: ForensicsAnalyst seeding is idempotent across restarts",
+          "[rbac_store][pg][forensics_analyst]") {
+    RBAC_STORE(store);
+    const auto before_role = store.get_role("ForensicsAnalyst");
+    REQUIRE(before_role.has_value());
+    const auto before_grants = grant_pairs(store, "ForensicsAnalyst");
+    const auto role_count = store.list_roles().size();
+
+    // Two further constructions against the same pool each run the real seed pass again.
+    for (int i = 0; i < 2; ++i) {
+        RbacStore reopened{rbac_pool_fx_};
+        REQUIRE(reopened.is_open());
+    }
+    const auto after_role = store.get_role("ForensicsAnalyst");
+    REQUIRE(after_role.has_value());
+    CHECK(after_role->description == before_role->description);
+    CHECK(after_role->created_at == before_role->created_at);
+    CHECK(grant_pairs(store, "ForensicsAnalyst") == before_grants);
+    CHECK(store.list_roles().size() == role_count);
+}
+
+TEST_CASE("RbacStore: a user holding only ForensicsAnalyst reads Forensics-tier rows and holds no Execute",
+          "[rbac_store][pg][forensics_analyst]") {
+    RBAC_STORE(store);
+    REQUIRE(store.assign_role({"user", "ana", "ForensicsAnalyst"}).has_value());
+    REQUIRE(store.assign_role({"user", "vic", "Viewer"}).has_value());
+
+    CHECK(store.check_permission("ana", "Forensics", "Read"));
+    CHECK(store.check_permission("ana", "Response", "Read"));
+    CHECK(store.check_permission("ana", "Execution", "Read"));
+    CHECK(store.check_permission("ana", "Inventory", "Read"));
+    CHECK_FALSE(store.check_permission("ana", "Execution", "Execute"));
+    CHECK_FALSE(store.check_permission("ana", "Execution", "Write"));
+    CHECK_FALSE(store.check_permission("ana", "Infrastructure", "Read"));
+    CHECK_FALSE(store.check_permission("ana", "Infrastructure", "Execute"));
+    // A Viewer still cannot read the Forensics tier.
+    CHECK_FALSE(store.check_permission("vic", "Forensics", "Read"));
+    CHECK(store.check_permission("vic", "Response", "Read"));
+
+    // Operator + ForensicsAnalyst: the combined holder gains the Forensics READ and keeps
+    // Operator's Execution:Execute (the existing, approval-gated dispatch path).
+    REQUIRE(store.assign_role({"user", "oli", "Operator"}).has_value());
+    REQUIRE(store.assign_role({"user", "oli", "ForensicsAnalyst"}).has_value());
+    CHECK(store.check_permission("oli", "Forensics", "Read"));
+    CHECK(store.check_permission("oli", "Execution", "Execute"));
+    // No Forensics write or execute appears from the combination.
+    CHECK_FALSE(store.check_permission("oli", "Forensics", "Execute"));
+    CHECK_FALSE(store.check_permission("oli", "Forensics", "Write"));
+}
+
+TEST_CASE("RbacStore: an engine principal cannot be granted ForensicsAnalyst (system role)",
+          "[rbac_store][pg][forensics_analyst]") {
+    RBAC_STORE(store);
+    auto r = store.assign_role({"engine", "engine:nvd", "ForensicsAnalyst"});
+    REQUIRE_FALSE(r.has_value());
+    CHECK_THAT(r.error(), Catch::Matchers::ContainsSubstring("built-in system role"));
+    CHECK(store.get_principal_roles("engine", "engine:nvd").empty());
+}
+
+TEST_CASE("RbacStore: an existing database without the role gains it, with its four grants, on the next boot",
+          "[rbac_store][pg][forensics_analyst]") {
+    RBAC_STORE(store);
+    // Reproduce an upgrade: a database seeded by a build that predates the role (no role row, so no
+    // grants either; the grants cascade with the row), with unrelated principals already assigned.
+    REQUIRE(store.assign_role({"user", "pre-existing", "Operator"}).has_value());
+    {
+        auto lease = rbac_pool_fx_.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "DELETE FROM rbac_store.roles WHERE name = 'ForensicsAnalyst'",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    REQUIRE_FALSE(store.get_role("ForensicsAnalyst").has_value());
+    REQUIRE(store.get_role_permissions("ForensicsAnalyst").empty());
+
+    // The existing-database path: the same constructor the server runs on every boot, no migration.
+    // The seeded system role is the ordinary case, so the collision WARN must not fire.
+    yuzu::test::LogCapture capture(spdlog::level::warn);
+    RbacStore reopened{rbac_pool_fx_};
+    REQUIRE(reopened.is_open());
+    capture.stop();
+    CHECK_THAT(capture.text(), !Catch::Matchers::ContainsSubstring("non-system role named"));
+
+    auto role = reopened.get_role("ForensicsAnalyst");
+    REQUIRE(role.has_value());
+    CHECK(role->is_system);
+    CHECK(role->description.find("Forensics:Read") != std::string::npos); // the seeded text
+    CHECK(grant_pairs(reopened, "ForensicsAnalyst") ==
+          std::vector<std::string>{"Execution:Read/allow", "Forensics:Read/allow",
+                                   "Inventory:Read/allow", "Response:Read/allow"});
+    // Nothing was auto-assigned, and the existing assignment is untouched.
+    CHECK(reopened.get_role_members("ForensicsAnalyst").empty());
+    CHECK(reopened.get_principal_roles("user", "pre-existing").size() == 1);
+}
+
+TEST_CASE("RbacStore: a pre-existing custom role named ForensicsAnalyst is kept and gains no grants",
+          "[rbac_store][pg][forensics_analyst]") {
+    RBAC_STORE(store);
+    // Reproduce the upgrade state: a database that already carries an operator-authored
+    // (SQL-created) role of this name and never had the seeded one, with a human assignee.
+    {
+        auto lease = rbac_pool_fx_.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "DELETE FROM rbac_store.roles WHERE name = 'ForensicsAnalyst'",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    REQUIRE_FALSE(store.get_role("ForensicsAnalyst").has_value());
+    REQUIRE(store.create_role({"ForensicsAnalyst", "site-authored", false, 0}).has_value());
+    REQUIRE(store.set_permission({"ForensicsAnalyst", "Tag", "Read", "allow"}).has_value());
+    REQUIRE(store.assign_role({"user", "existing-holder", "ForensicsAnalyst"}).has_value());
+
+    // The next boot runs the real seed pass. It logs one ERROR naming the role; captured here so
+    // the boot visibility is pinned.
+    yuzu::test::LogCapture capture(spdlog::level::err);
+    RbacStore reopened{rbac_pool_fx_};
+    REQUIRE(reopened.is_open());
+    capture.stop();
+    const std::string logs = capture.text();
+    CHECK_THAT(logs, Catch::Matchers::ContainsSubstring("non-system role named ForensicsAnalyst"));
+    CHECK_THAT(logs, Catch::Matchers::ContainsSubstring("were NOT added"));
+
+    auto role = reopened.get_role("ForensicsAnalyst");
+    REQUIRE(role.has_value());
+    // The role row is untouched (ON CONFLICT DO NOTHING) and the four seeded pairs are NOT merged
+    // into it: its own grants are exactly what the operator gave it, so an existing holder gains
+    // no Forensics:Read from the upgrade.
+    CHECK_FALSE(role->is_system);
+    CHECK(role->description == "site-authored");
+    CHECK(grant_pairs(reopened, "ForensicsAnalyst") == std::vector<std::string>{"Tag:Read/allow"});
+    CHECK_FALSE(reopened.check_permission("existing-holder", "Forensics", "Read"));
+    CHECK_FALSE(reopened.check_permission("existing-holder", "Response", "Read"));
+    // Consequence worth knowing: because the row is not is_system, the engine-principal
+    // built-in bar does not apply to this collided role (the structural refusal only holds
+    // for the seeded row). Characterized here so a future change to it is deliberate.
+    CHECK(reopened.assign_role({"engine", "engine:nvd", "ForensicsAnalyst"}).has_value());
+
+    // Removing the hand-made role and restarting adopts the built-in role with its four grants.
+    {
+        auto lease = rbac_pool_fx_.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "DELETE FROM rbac_store.roles WHERE name = 'ForensicsAnalyst'",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    RbacStore adopted{rbac_pool_fx_};
+    REQUIRE(adopted.is_open());
+    auto builtin = adopted.get_role("ForensicsAnalyst");
+    REQUIRE(builtin.has_value());
+    CHECK(builtin->is_system);
+    CHECK(grant_pairs(adopted, "ForensicsAnalyst") ==
+          std::vector<std::string>{"Execution:Read/allow", "Forensics:Read/allow",
+                                   "Inventory:Read/allow", "Response:Read/allow"});
+}
+
+// Item (6) of the #4990 role design: the dispatch gate is unchanged. Holding Operator +
+// ForensicsAnalyst lets a caller PASS the RBAC step of a Forensics-class plugin dispatch (it now
+// holds Forensics:Read) but the approval dimension still applies: not an effective admin and no
+// approval provenance is ApprovalRequired, with a real ticket it is admitted. An Operator alone is
+// still Forbidden at the RBAC step. The decision function is the production chokepoint, over the
+// real composed catalogue and the real store's check_permission.
+TEST_CASE("RbacStore: Operator + ForensicsAnalyst gets only approval-gated Forensics collection",
+          "[rbac_store][pg][forensics_analyst][dispatch]") {
+    RBAC_STORE(store);
+    REQUIRE(store.assign_role({"user", "oli", "Operator"}).has_value());
+    REQUIRE(store.assign_role({"user", "oli", "ForensicsAnalyst"}).has_value());
+    REQUIRE(store.assign_role({"user", "opo", "Operator"}).has_value());
+    REQUIRE(store.assign_role({"user", "ana", "ForensicsAnalyst"}).has_value());
+
+    static const CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    const auto has_permission = [&](std::string_view principal, std::string_view securable,
+                                    authz::Operation op) {
+        return store.check_permission(std::string(principal), std::string(securable),
+                                      std::string(authz::to_string(op)));
+    };
+    const auto verdict = [&](const char* user, ApprovalProvenance prov) {
+        DispatchCaller caller{.principal = user, .principal_role = "user"};
+        caller.principal_is_admin = false;
+        caller.approval_provenance = prov;
+        return detail::classify_and_authorize_dispatch(registry, caller, "browser_inventory",
+                                                       "profiles", has_permission);
+    };
+
+    // Operator + ForensicsAnalyst: RBAC passes, the approval gate is what stops it.
+    auto oli = verdict("oli", ApprovalProvenance::None);
+    REQUIRE_FALSE(oli.has_value());
+    CHECK(oli.error().reason == detail::DispatchDenialReason::ApprovalRequired);
+    CHECK(verdict("oli", ApprovalProvenance::Ticket).has_value());
+
+    // Operator alone: still refused at the RBAC step, even holding an approval ticket.
+    auto opo = verdict("opo", ApprovalProvenance::Ticket);
+    REQUIRE_FALSE(opo.has_value());
+    CHECK(opo.error().reason == detail::DispatchDenialReason::Forbidden);
+
+    // ForensicsAnalyst alone: passes RBAC for the Forensics read but holds no Execute, and the
+    // gate still demands an approval.
+    auto ana = verdict("ana", ApprovalProvenance::None);
+    REQUIRE_FALSE(ana.has_value());
+    CHECK(ana.error().reason == detail::DispatchDenialReason::ApprovalRequired);
+    CHECK_FALSE(store.check_permission("ana", "Execution", "Execute"));
+    // Characterized: THIS chokepoint, on its own, admits that holder once a real approval ticket is
+    // present (the RBAC pair a Forensics-class plugin is dispatched under is Forensics:Read). What
+    // stops an analyst is the dispatch routes' own Execution:Execute gate, which sits in front of
+    // this decision: /api/command (test_command_routes.cpp) and MCP execute_instruction
+    // (test_mcp_server.cpp) pin that refusal. Do not read this line as "the analyst can dispatch".
+    CHECK(verdict("ana", ApprovalProvenance::Ticket).has_value());
+}
+
 TEST_CASE("RbacStore: RBAC disabled by default", "[rbac_store][pg]") {
     RBAC_STORE(store);
     CHECK_FALSE(store.is_rbac_enabled());
@@ -681,7 +988,7 @@ TEST_CASE("rbac_enforcement_label: cached-enabled short-circuits past a stale vi
     // technique the sibling rbac_enforcement_in_effect staleness test uses.
     auto held = pool_b.acquire();
     REQUIRE(held);
-    std::this_thread::sleep_for(std::chrono::milliseconds(5200));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(5200));
 
     // The view is now genuinely stale — proven directly, bypassing
     // is_rbac_enabled()'s own refresh attempt (Gate 8 technique, lines above)
@@ -2765,7 +3072,7 @@ TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation 
 
     // Clear replica_b's refresh gate so its next read genuinely attempts a
     // durable re-read rather than serving its just-constructed cache.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
 
     // Starve replica_b's own pool for the rest of the test: every subsequent
     // maybe_refresh_generation() call on replica_b cannot acquire a
@@ -2775,13 +3082,13 @@ TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation 
     // hot path), not the wider kReadTimeout, so a failed attempt's OWN
     // blocking time is no longer large enough to reliably carry the clock
     // across kRbacStaleServeBoundMs (5000ms) the way it could when the acquire
-    // itself took ~2s. This test now advances wall time with explicit sleeps
-    // instead of relying on that blocking duration.
+    // itself took ~2s. This test now advances replica_b's local clock readings explicitly
+    // (age_refresh_state_for_test) instead of relying on that blocking duration.
     auto held = pool_b.acquire();
     REQUIRE(held);
 
     // Bounded stale-serve (#2703 Gate 7, operator-adjudicated): this FIRST
-    // failed refresh attempt lands at roughly construction + 1.1s (the sleep
+    // failed refresh attempt lands at roughly construction + 1.1s (the aging
     // above) + <=0.25s (this call's own blocking kAuthzAcquireTimeout) — well
     // inside kRbacStaleServeBoundMs (5000ms) of replica_b's last confirmed-
     // good refresh (its own construction). This is the whole point of the
@@ -2790,12 +3097,12 @@ TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation 
     // store-level degrade), only the generation view is briefly unconfirmed.
     CHECK_FALSE(rbac_enforcement_in_effect(&replica_b));
 
-    // Push past the bound with an explicit sleep — comfortably clears both
+    // Push past the bound by aging replica_b's readings — comfortably clears both
     // the 1s stampede gate (so the next call genuinely attempts a fresh
     // refresh rather than serving the gated fast path) and, combined with
     // the ~1.1-1.35s already elapsed, pushes total elapsed time since
     // construction past kRbacStaleServeBoundMs (5000ms) with margin.
-    std::this_thread::sleep_for(std::chrono::milliseconds(4200));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(4200));
 
     // Pre-fix (adversarial-review round): is_rbac_enabled() correctly stayed
     // false (the existing contract), but rbac_enforcement_in_effect() ALSO
@@ -2846,7 +3153,7 @@ TEST_CASE("RbacStore: rbac_enabled_view_degraded fails closed on elapsed time al
     // maybe_refresh_generation() -- replica_b's pool is left healthy and
     // untouched throughout, so if the old `!generation_valid_`-only check
     // were still in place, nothing in this test would ever flip it.
-    std::this_thread::sleep_for(std::chrono::milliseconds(5200));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(5200));
 
     // Called directly (bypassing maybe_refresh_generation() entirely, unlike
     // is_rbac_enabled()/rbac_enforcement_in_effect() which always trigger a
@@ -2888,11 +3195,11 @@ TEST_CASE("RbacStore: a warm permission cache survives a generation-refresh "
 
     // Clear the refresh gate, let replica_b observe the durable enable +
     // grant, and genuinely populate perm_cache_ with an ALLOW.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     REQUIRE(replica_b.check_permission("bob", "Infrastructure", "Read"));
 
     // Starve the pool and force one failed refresh attempt inside the bound.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     auto held = pool_b.acquire();
     REQUIRE(held);
 
@@ -2935,20 +3242,20 @@ TEST_CASE("RbacStore: a warm permission cache is NOT served once the "
 
     // Clear the refresh gate, let replica_b observe the durable enable +
     // grant, and genuinely populate perm_cache_ with an ALLOW.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     REQUIRE(replica_b.check_permission("bob", "Infrastructure", "Read"));
 
     // Starve the pool, then push wall time past kRbacStaleServeBoundMs
-    // (5000ms) with an explicit sleep before the next call. Unlike the
+    // (5000ms) by aging replica_b's readings before the next call. Unlike the
     // sibling rbac_enforcement_in_effect fail-closed test above (whose
     // 4200ms works because its baseline is CONSTRUCTION, never updated since
     // every refresh attempt after it fails), this test's baseline is the
     // SUCCESSFUL warming call just above -- last_successful_refresh_ms_ was
-    // genuinely updated to ~now there, so the sleep alone must exceed the
+    // genuinely updated to ~now there, so the aging alone must exceed the
     // 5000ms bound, not merely combine with an earlier one to reach it.
     auto held = pool_b.acquire();
     REQUIRE(held);
-    std::this_thread::sleep_for(std::chrono::milliseconds(5200));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(5200));
 
     // Past the bound, with the pool starved: the previously-cached ALLOW
     // must NOT be served. check_permission()'s own internal
@@ -2987,7 +3294,7 @@ TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
     // Clear the refresh gate opened at construction so the first starved
     // call below genuinely attempts a fresh refresh rather than serving the
     // gated fast path.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
 
     auto held = pool_b.acquire();
     REQUIRE(held);
@@ -3020,7 +3327,7 @@ TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
     // the starved connection so the next attempt (the half-open probe) can
     // genuinely succeed and reset the streak to 0 — an open->closed
     // transition, so the gauge goes back to 0.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     held.reset();
     CHECK(replica_b.check_permission("bob", "Infrastructure", "Read"));
     CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
@@ -3065,7 +3372,7 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
                                      // breaker test — construction's own read
                                      // (if any) must not touch the counter.
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // clear the refresh gate
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100)); // clear the refresh gate
 
     auto held = pool_b.acquire();
     REQUIRE(held);
@@ -3168,6 +3475,57 @@ TEST_CASE("RbacStore: every checked read on a store that is not open reports the
     CHECK(std::string_view{r9.error()} == kRbacErrStoreNotOpen);
     // list_roles() is this read with the error collapsed: a closed store is an empty vector.
     CHECK(broken.list_roles().empty());
+    // engine_grant_checked is null-safe like the label it snapshots: a null or not-open store
+    // is an error (a retryable 503 at the gates), never a grant.
+    const auto e1 = engine_grant_checked(nullptr, "engine:x", "Response", "Read");
+    REQUIRE_FALSE(e1.has_value());
+    const auto e2 = engine_grant_checked(&broken, "engine:x", "Response", "Read");
+    REQUIRE_FALSE(e2.has_value());
+    // The degraded arm's own text, not the not-open text a forbidden grant read would return.
+    CHECK(std::string_view{e2.error()} == kRbacErrEnforcementUnconfirmed);
+    CHECK(std::string_view{e1.error()} == kRbacErrEnforcementUnconfirmed);
+    const auto r10 = broken.check_permission_checked("bob", "Response", "Read");
+    REQUIRE_FALSE(r10.has_value());
+    CHECK(std::string_view{r10.error()} == kRbacErrStoreNotOpen);
+    CHECK_FALSE(broken.check_permission("bob", "Response", "Read")); // the plain form denies
+}
+
+TEST_CASE("RbacStore::check_permission_checked: a failed role lookup is an error that counts, "
+          "a caller with no roles is a success that does not",
+          "[rbac_store][pg][read_failed]") {
+    yuzu::MetricsRegistry metrics; // declared before the store so the store never outlives it
+    RBAC_STORE(store);
+    store.set_metrics(&metrics);
+    REQUIRE(store.create_role({.name = "Reader", .description = "d"}).has_value());
+    REQUIRE(store.set_permission({"Reader", "Response", "Read", "allow"}).has_value());
+    REQUIRE(store.assign_role({"user", "alice", "Reader"}).has_value());
+
+    // Healthy: a caller with a grant is true, a caller with no roles is false, both successes.
+    const auto granted = store.check_permission_checked("alice", "Response", "Read");
+    REQUIRE(granted.has_value());
+    CHECK(*granted);
+    const auto none = store.check_permission_checked("nobody", "Response", "Read");
+    REQUIRE(none.has_value());
+    CHECK_FALSE(*none);
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 0.0);
+
+    // The role table cannot be read: an error, counted once, and not cached as a denial.
+    {
+        pg::PgConn c{PQconnectdb(rbac_db_fx_.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        pg::PgResult dr{PQexec(c.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(dr.ok());
+    }
+    const auto failed = store.check_permission_checked("bob", "Response", "Read");
+    REQUIRE_FALSE(failed.has_value());
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 1.0);
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0); // one failure, threshold 2
+    CHECK_FALSE(store.check_permission("bob", "Response", "Read")); // the plain form denies
+    // A second failed read (the failure is not cached) reaches the breaker threshold of 2: the
+    // role-lookup failure moves the breaker, which it did not before this change.
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
 }
 
 TEST_CASE("RbacStore: the checked reads without a breaker report the shared "
@@ -3454,7 +3812,7 @@ TEST_CASE("RbacStore: generation-refresh-failed degrade records the correct "
     replica_b.set_metrics(&metrics);
 
     // Genuinely populate replica_b's cache with a confirmed-good refresh.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     REQUIRE(replica_b.check_permission("bob", "Infrastructure", "Read"));
     // check_permission's own success path never fires a degrade — sanity
     // check that this test starts from a clean counter before starving.
@@ -3472,7 +3830,7 @@ TEST_CASE("RbacStore: generation-refresh-failed degrade records the correct "
     // perm_cache_), so it's served from cache and never reaches
     // check_permission's OWN pool-fallback branch — only
     // maybe_refresh_generation()'s degrade fires.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     auto held = pool_b.acquire();
     REQUIRE(held);
     CHECK(replica_b.check_permission("bob", "Infrastructure", "Read")); // served from cache
@@ -3483,13 +3841,13 @@ TEST_CASE("RbacStore: generation-refresh-failed degrade records the correct "
                           {{"reason", "generation_refresh_failed"}})
               .value() == 0.0); // the denying reason must NOT fire while still tolerated
 
-    // Push past the bound with an explicit sleep (mirrors the existing
+    // Push past the bound by aging replica_b's readings (mirrors the existing
     // rbac_enforcement_in_effect fail-closed test's technique). This second
     // failed refresh drops the cache, so THIS call also falls through to
     // check_permission's own (still-starved) pool-fallback branch — that
     // fires its own pool_acquire_timeout degrade too, a different reason
     // label from the two asserted below, so it doesn't affect them.
-    std::this_thread::sleep_for(std::chrono::milliseconds(4200));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(4200));
     CHECK_FALSE(replica_b.check_permission("bob", "Infrastructure", "Read"));
     CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
                           {{"reason", "generation_refresh_failed"}})
@@ -3653,7 +4011,7 @@ TEST_CASE("RbacStore: a refresh finding rbac_enabled's row absent (write_generat
     // refresh rather than serving the gated fast path, then trigger one.
     // Construction already counted as a genuine completed refresh, so
     // replica_b is not degraded yet at this point.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     REQUIRE_FALSE(replica_b.rbac_enabled_view_degraded());
     (void)replica_b.is_rbac_enabled(); // triggers maybe_refresh_generation()
 
@@ -3667,13 +4025,13 @@ TEST_CASE("RbacStore: a refresh finding rbac_enabled's row absent (write_generat
     // subsequent round can ever confirm rbac_enabled either. Each call
     // below re-triggers maybe_refresh_generation() (past its own 1s gate),
     // finding the same absent row every time.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     (void)replica_b.is_rbac_enabled();
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     (void)replica_b.is_rbac_enabled();
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     (void)replica_b.is_rbac_enabled();
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
 
     // THE FIX: the view is now degraded -- pre-fix, last_successful_refresh_ms_
     // kept advancing on every one of the calls above despite rbac_enabled
@@ -4357,7 +4715,7 @@ TEST_CASE("RbacStore Gate7-Fix7: the gauge is published on replica_b's ADOPT pat
 
     // Clear the 1s stampede gate so replica_b's next check genuinely attempts
     // a refresh rather than serving its just-constructed cache.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
 
     // Drives maybe_refresh_generation() -> the adopt branch's
     // publish_enforcement_gauge() call, a GENUINE adopt (durable_gen is
@@ -4433,7 +4791,7 @@ TEST_CASE("RbacStore: rbac_enabled adoption is generation-gated — a refresh ca
 
     // Clear the 1s stampede gate so the next check genuinely attempts a
     // refresh rather than serving the gated fast path.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
 
     // THE FIX: replica_b's own cached_generation_ is already at G (from its
     // own set_rbac_enforcement commit above); the durable pair it now reads
@@ -4795,4 +5153,195 @@ TEST_CASE("RbacStore::provision_first_admin fails closed — ok=false with a "
     // would otherwise leave "failadmin" stranded with no grant while this
     // test still passed on the error check alone.
     CHECK(auth_db->get_user("failadmin").error() == AuthDBError::UserNotFound);
+}
+
+// ── check_permission_checked: unavailable is not denied (#4990) ──────────────────────────────
+// `check_permission` collapses every unavailable outcome into the same `false` a definitive denial
+// gives. `check_permission_checked` keeps them apart so the Forensics-tier resolver can answer a
+// retryable error instead of a 200 with rows silently missing. The Boolean wrapper must stay
+// byte-for-byte the old fail-closed answer, so every case also asserts
+// `check_permission == checked.value_or(false)`.
+namespace {
+double rbac_degrade_count(yuzu::MetricsRegistry& metrics, const char* reason) {
+    return metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}}).value();
+}
+} // namespace
+
+TEST_CASE("RbacStore: check_permission_checked tells a grant, a definitive denial and a healthy "
+          "empty role set from an unavailable read",
+          "[rbac_store][pg][forensics]") {
+    RBAC_STORE(store);
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    REQUIRE(store.assign_role({"user", "bob", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "vera", "Viewer"}).has_value());
+
+    SECTION("a grant is expected(true)") {
+        const auto r = store.check_permission_checked("bob", "Forensics", "Read");
+        REQUIRE(r.has_value());
+        CHECK(*r);
+        CHECK(store.check_permission("bob", "Forensics", "Read") == *r);
+    }
+
+    SECTION("a role set without the pair, and an explicit deny, are expected(false)") {
+        const auto no_pair = store.check_permission_checked("vera", "Forensics", "Read");
+        REQUIRE(no_pair.has_value());
+        CHECK_FALSE(*no_pair);
+
+        REQUIRE(store.set_permission({"Viewer", "Response", "Read", "deny"}).has_value());
+        const auto denied = store.check_permission_checked("vera", "Response", "Read");
+        REQUIRE(denied.has_value());
+        CHECK_FALSE(*denied);
+        CHECK_FALSE(store.check_permission("vera", "Response", "Read"));
+
+        // Neither is a degrade: the counters stay flat.
+        CHECK(rbac_degrade_count(metrics, "query_error") == 0.0);
+        CHECK(rbac_degrade_count(metrics, "pool_acquire_timeout") == 0.0);
+    }
+
+    SECTION("a healthy EMPTY role set is a definitive denial: no error, no metric, breaker stays "
+            "closed") {
+        // "nobody" holds no role at all: the common least-privilege answer, not a failure. Several
+        // distinct pairs (every one a cache miss) are more than the breaker's trip threshold, so a
+        // regression that booked an empty set as a failure would open it here.
+        for (const char* op : {"Read", "Write", "Delete", "Execute", "Approve"}) {
+            const auto r = store.check_permission_checked("nobody", "Forensics", op);
+            REQUIRE(r.has_value());
+            CHECK_FALSE(*r);
+            CHECK_FALSE(store.check_permission("nobody", "Forensics", op));
+        }
+        CHECK(rbac_degrade_count(metrics, "query_error") == 0.0);
+        CHECK(rbac_degrade_count(metrics, "pool_acquire_timeout") == 0.0);
+        CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
+        // The breaker really is closed: a granted user still gets through afterwards.
+        CHECK(store.check_permission_checked("bob", "Forensics", "Read").value_or(false));
+    }
+}
+
+TEST_CASE("RbacStore: a role-query failure is a typed error, is counted as query_error and is "
+          "noted as a breaker failure",
+          "[rbac_store][pg][forensics]") {
+    RBAC_STORE(store);
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    REQUIRE(store.assign_role({"user", "bob", "Administrator"}).has_value());
+    REQUIRE(store.check_permission_checked("bob", "Forensics", "Read").value_or(false)); // healthy
+
+    // The role read is the first query of the miss path; moving its table aside fails it for real.
+    exec_on_test_db(rbac_db_fx_.dsn(),
+                    "ALTER TABLE rbac_store.principal_roles RENAME TO principal_roles_gone");
+
+    // Call 1: a cache miss (unique pair), the role read fails. Typed error, counted, streak 0->1.
+    const auto r1 = store.check_permission_checked("bob", "Forensics", "Write");
+    REQUIRE_FALSE(r1.has_value());
+    CHECK(r1.error().starts_with("query failed: "));
+    CHECK(rbac_degrade_count(metrics, "query_error") == 1.0);
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
+    // The Boolean wrapper is the unchanged fail-closed answer, and counts the same way.
+    CHECK_FALSE(store.check_permission("bob", "Forensics", "Delete"));
+    CHECK(rbac_degrade_count(metrics, "query_error") == 2.0);
+
+    // The second consecutive failure tripped the breaker: that is "noted as a breaker failure"
+    // (a failure booked as a success would have reset the streak and left the gauge at 0).
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
+
+    // Call 3: the breaker is open and inside its cooldown, so the error is the breaker's, with no
+    // pool touch; it lands on the pool_acquire_timeout label like every breaker denial. The
+    // cooldown is one second of wall time: if this thread stalls past it between the trip and this
+    // call, the call is the half-open probe instead (a real query failure that re-arms the
+    // cooldown), so the call is repeated, bounded, until the breaker answers, and each probe is
+    // accounted for below.
+    const auto is_breaker_denial = [](const std::expected<bool, std::string>& r) {
+        return !r.has_value() && std::string_view{r.error()} == kRbacErrCircuitBreakerOpen;
+    };
+    auto r3 = store.check_permission_checked("bob", "Forensics", "Execute");
+    int probes = 0;
+    while (probes < 4 && !is_breaker_denial(r3)) {
+        ++probes;
+        r3 = store.check_permission_checked("bob", "Forensics", "Execute");
+    }
+    REQUIRE_FALSE(r3.has_value());
+    CHECK(std::string_view{r3.error()} == kRbacErrCircuitBreakerOpen);
+    CHECK(rbac_degrade_count(metrics, "pool_acquire_timeout") == 1.0);
+    CHECK(rbac_degrade_count(metrics, "query_error") == 2.0 + probes);
+    CHECK_FALSE(store.check_permission("bob", "Forensics", "Execute"));
+
+    // The display accessor shares the role read, so its failure is counted too (the helper owns
+    // the accounting; no caller can skip it).
+    exec_on_test_db(rbac_db_fx_.dsn(),
+                    "ALTER TABLE rbac_store.principal_roles_gone RENAME TO principal_roles");
+    exec_on_test_db(rbac_db_fx_.dsn(),
+                    "ALTER TABLE rbac_store.principal_roles RENAME TO principal_roles_gone");
+    const double before = rbac_degrade_count(metrics, "query_error");
+    CHECK(store.get_effective_permissions("bob").empty());
+    CHECK(rbac_degrade_count(metrics, "query_error") == before + 1.0);
+
+    // Recovery: put the table back, wait out the cooldown, and the half-open probe succeeds.
+    exec_on_test_db(rbac_db_fx_.dsn(),
+                    "ALTER TABLE rbac_store.principal_roles_gone RENAME TO principal_roles");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    const auto ok = store.check_permission_checked("bob", "Forensics", "Read");
+    REQUIRE(ok.has_value());
+    CHECK(*ok);
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
+}
+
+TEST_CASE("RbacStore: a starved pool, an open breaker and a store that is not open are typed "
+          "errors, and a cache hit still wins over them",
+          "[rbac_store][pg][forensics]") {
+    RBAC_STORE(replica_a);
+    REQUIRE(replica_a.assign_role({"user", "bob", "Administrator"}).has_value());
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    yuzu::MetricsRegistry metrics;
+    replica_b.set_metrics(&metrics);
+
+    // Warm the cache for one pair while the pool is free.
+    const auto warm = replica_b.check_permission_checked("bob", "Forensics", "Read");
+    REQUIRE(warm.has_value());
+    REQUIRE(*warm);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // clear the refresh gate
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+
+    // Pool acquire timeout: a cache miss cannot get a connection.
+    const auto timed_out = replica_b.check_permission_checked("bob", "Forensics", "Write");
+    REQUIRE_FALSE(timed_out.has_value());
+    CHECK(std::string_view{timed_out.error()} == kRbacErrPoolAcquireTimeout);
+    CHECK_FALSE(replica_b.check_permission("bob", "Forensics", "Write"));
+    CHECK(rbac_degrade_count(metrics, "pool_acquire_timeout") >= 1.0);
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
+
+    // Breaker open (inside its cooldown): denied WITHOUT a pool touch, with the breaker's text.
+    // A stall past the one-second cooldown turns the call into the half-open probe (a pool timeout
+    // that re-arms the cooldown), so it is repeated, bounded, until the breaker answers.
+    auto open = replica_b.check_permission_checked("bob", "Forensics", "Delete");
+    for (int i = 0; i < 4 && (open.has_value() ||
+                              std::string_view{open.error()} != kRbacErrCircuitBreakerOpen);
+         ++i)
+        open = replica_b.check_permission_checked("bob", "Forensics", "Delete");
+    REQUIRE_FALSE(open.has_value());
+    CHECK(std::string_view{open.error()} == kRbacErrCircuitBreakerOpen);
+    CHECK_FALSE(replica_b.check_permission("bob", "Forensics", "Delete"));
+
+    // The cache lookup runs before the breaker: the warmed pair is still answered, as before.
+    const auto cached = replica_b.check_permission_checked("bob", "Forensics", "Read");
+    REQUIRE(cached.has_value());
+    CHECK(*cached);
+    CHECK(replica_b.check_permission("bob", "Forensics", "Read"));
+
+    SECTION("a store that is not open") {
+        PgPool bad{{.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1",
+                    .size = 1}};
+        RbacStore broken{bad};
+        REQUIRE_FALSE(broken.is_open());
+        const auto r = broken.check_permission_checked("bob", "Forensics", "Read");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(std::string_view{r.error()} == kRbacErrStoreNotOpen);
+        CHECK_FALSE(broken.check_permission("bob", "Forensics", "Read"));
+    }
 }

@@ -2,11 +2,13 @@
 /// HTTP-level coverage for the page-shell/static-asset route module (#2542)
 /// — driven in-process through TestRouteSink (no httplib acceptor, #438),
 /// mirroring test_plugin_config_routes.cpp's Harness shape. None of these
-/// 35 routes touches Postgres (no store), so every case here runs without
+/// 36 routes touches Postgres (no store), so every case here runs without
 /// YUZU_TEST_POSTGRES_DSN.
 
 #include "page_routes.hpp"
+#include "echo_timeline_page_ui.hpp"
 #include "test_route_sink.hpp"
+#include "web_utils.hpp"
 
 #include "agent_registry.hpp"
 #include "event_bus.hpp"
@@ -42,6 +44,7 @@ struct Harness {
 
     std::atomic<bool> viz_disabled{false};
     const yuzu::server::detail::AgentRegistry* registry{nullptr};
+    bool echo_timeline_ui{kEchoTimelineUi};
 
     yuzu::server::test::TestRouteSink sink;
 
@@ -74,6 +77,7 @@ struct Harness {
         };
         deps.viz_disabled = &viz_disabled;
         deps.registry = registry;
+        deps.echo_timeline_ui = echo_timeline_ui;
         page::register_page_routes(sink, deps);
     }
 };
@@ -338,7 +342,7 @@ TEST_CASE("page_routes: /api/help* serves real registry output when perm allows 
     CHECK(palette->get_header_value("Content-Type") == "text/html");
 }
 
-// ── /help, /tar, /result-sets, /instructions, /approvals, /executions, /workflows ──
+// ── /help, /echo, /result-sets, /instructions, /approvals, /executions, /workflows ──
 
 TEST_CASE("page_routes: /help serves the help page, ungated", "[server][routes][page_routes]") {
     Harness h;
@@ -351,7 +355,7 @@ TEST_CASE("page_routes: /help serves the help page, ungated", "[server][routes][
     CHECK_FALSE(r->body.empty());
 }
 
-TEST_CASE("page_routes: /tar, /result-sets, /instructions, /approvals, /executions, /workflows deny "
+TEST_CASE("page_routes: /echo, /result-sets, /instructions, /approvals, /executions, /workflows deny "
           "without auth "
           "(redirect to the landing page, carrying the screen key)",
           "[server][routes][page_routes][login]") {
@@ -363,7 +367,7 @@ TEST_CASE("page_routes: /tar, /result-sets, /instructions, /approvals, /executio
     // "Sign in to open <area>." and label the post-sign-in button. A shell
     // sub-page (Approvals, Executions, Workflows) opens as its parent item.
     const std::pair<std::string, std::string> expected[] = {
-        {"/tar", "/home?next=tar"},
+        {"/echo", "/home?next=echo"},
         {"/result-sets", "/home?next=result-sets"},
         {"/instructions", "/home?next=instructions"},
         {"/approvals", "/home?next=instructions"},
@@ -379,21 +383,21 @@ TEST_CASE("page_routes: /tar, /result-sets, /instructions, /approvals, /executio
     }
 }
 
-TEST_CASE("page_routes: /tar, /result-sets, /instructions, /approvals, /executions, /workflows serve "
+TEST_CASE("page_routes: /echo, /result-sets, /instructions, /approvals, /executions, /workflows serve "
           "200 when authed",
           "[server][routes][page_routes]") {
     Harness h;
     h.wire();
 
-    auto tar = h.sink.Get("/tar");
-    REQUIRE(tar);
-    CHECK(tar->status == 200);
-    CHECK(tar->get_header_value("Content-Type") == "text/html; charset=utf-8");
-    CHECK_FALSE(tar->body.empty());
-    // Title, heading and breadcrumb all read "TAR"; the long form is the subtitle only.
-    CHECK(tar->body.find("<title>Yuzu \xE2\x80\x94 TAR</title>") != std::string::npos);
-    CHECK(tar->body.find("<h1>TAR</h1>") != std::string::npos);
-    CHECK(tar->body.find("Timeline Activity Record:") != std::string::npos);
+    auto echo = h.sink.Get("/echo");
+    REQUIRE(echo);
+    CHECK(echo->status == 200);
+    CHECK(echo->get_header_value("Content-Type") == "text/html; charset=utf-8");
+    CHECK_FALSE(echo->body.empty());
+    // Title, heading and breadcrumb all read "Echo"; the long form is the subtitle only.
+    CHECK(echo->body.find("<title>Yuzu \xE2\x80\x94 Echo</title>") != std::string::npos);
+    CHECK(echo->body.find("<h1>Echo</h1>") != std::string::npos);
+    CHECK(echo->body.find("Echo activity record:") != std::string::npos);
 
     auto rs = h.sink.Get("/result-sets");
     REQUIRE(rs);
@@ -540,7 +544,7 @@ TEST_CASE("page_routes: /viz/host/:id rejects a malformed agent id with 400",
 // Routes that are not a kStaticAssets row: "/", the pages, /viz/*, the help API, the fragments.
 // A new static asset is one kStaticAssets row and leaves this alone, so two PRs that each add
 // an asset no longer collide on a hand-kept total. Add or remove any other route and this moves.
-constexpr std::size_t kNonAssetRoutes = 16;
+constexpr std::size_t kNonAssetRoutes = 17;
 
 TEST_CASE("page_routes: route count is assets + pages, with /viz/fleet reachable independently "
           "of /viz/host/:id (the documented registration order — /viz/fleet before the "
@@ -564,4 +568,90 @@ TEST_CASE("page_routes: route count is assets + pages, with /viz/fleet reachable
     REQUIRE(host);
     CHECK(host->status == 200);
     CHECK(host->body.find("somehost1") != std::string::npos);
+}
+
+// ── Echo timeline page (hidden behind kEchoTimelineUi) ───────────────────────
+
+namespace yuzu::server {
+extern const std::string kYuzuEchoTimelineJs;
+}
+
+TEST_CASE("page_routes: the Echo timeline page ships hidden; its routes do not exist by default",
+          "[server][routes][page_routes][echo][timeline]") {
+    CHECK_FALSE(kEchoTimelineUi);
+    Harness h;
+    h.wire();
+    // Unregistered, not disabled: nothing matches, so there is no 404 page to tell them apart.
+    CHECK(h.sink.Get("/echo/timeline?id=x") == nullptr);
+    CHECK(h.sink.Get("/echo/timeline") == nullptr);
+    CHECK(h.sink.Get("/static/yuzu-echo-timeline.js") == nullptr);
+    CHECK(h.sink.route_count() == kStaticAssets.size() + kNonAssetRoutes);
+}
+
+TEST_CASE("page_routes: with the flag on the timeline page and its script are registered",
+          "[server][routes][page_routes][echo][timeline]") {
+    Harness h;
+    h.echo_timeline_ui = true;
+    h.wire();
+    CHECK(h.sink.route_count() == kStaticAssets.size() + kNonAssetRoutes + 2);
+    // /echo is unaffected.
+    auto echo = h.sink.Get("/echo");
+    REQUIRE(echo);
+    CHECK(echo->status == 200);
+}
+
+TEST_CASE("page_routes: the timeline page needs a session and an id",
+          "[server][routes][page_routes][echo][timeline]") {
+    Harness h;
+    h.echo_timeline_ui = true;
+    h.session_present = false;
+    h.wire();
+    auto anon = h.sink.Get("/echo/timeline?id=x");
+    REQUIRE(anon);
+    CHECK(anon->status == 302);
+    // /echo/timeline is not in the nav: the redirect names its family screen, so the landing page
+    // says "Sign in to open Echo".
+    CHECK(anon->get_header_value("Location") == "/home?next=echo");
+
+    Harness a;
+    a.echo_timeline_ui = true;
+    a.wire();
+    for (const char* path : {"/echo/timeline", "/echo/timeline?id="}) {
+        INFO(path);
+        auto r = a.sink.Get(path);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(r->body == "missing id");
+        CHECK(r->get_header_value("Cache-Control").find("no-cache") != std::string::npos);
+    }
+}
+
+TEST_CASE("page_routes: the timeline page renders the id only in its encoded form, uncached",
+          "[server][routes][page_routes][echo][timeline]") {
+    Harness h;
+    h.echo_timeline_ui = true;
+    h.wire();
+    // The sink parses the query itself; "%22" and friends reach the handler already decoded.
+    auto r = h.sink.Get("/echo/timeline?id=a%22b%3Cc%3E&at=1792486800");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value("Cache-Control").find("no-cache") != std::string::npos);
+    CHECK(r->get_header_value("Content-Type").starts_with("text/html"));
+    const std::string enc = url_query_value("a\"b<c>");
+    CHECK(r->body.find("run?id=" + enc + "&at=1792486800") != std::string::npos);
+    CHECK(r->body.find("a\"b") == std::string::npos);
+    CHECK(r->body.find("<c>") == std::string::npos);
+}
+
+TEST_CASE("page_routes: the timeline script is served as javascript and never cached",
+          "[server][routes][page_routes][echo][timeline]") {
+    Harness h;
+    h.echo_timeline_ui = true;
+    h.wire();
+    auto r = h.sink.Get("/static/yuzu-echo-timeline.js");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value("Content-Type") == "application/javascript; charset=utf-8");
+    CHECK(r->get_header_value("Cache-Control").find("no-cache") != std::string::npos);
+    CHECK(r->body == yuzu::server::kYuzuEchoTimelineJs);
 }

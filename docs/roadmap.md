@@ -118,7 +118,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 7.4 | [#191](https://github.com/Tr3kkR/Yuzu/issues/191) | System Notifications | Done |
 | | 7.5 | [#194](https://github.com/Tr3kkR/Yuzu/issues/194) | Active Directory / Entra Integration | Done |
 | | 7.6 | [#195](https://github.com/Tr3kkR/Yuzu/issues/195) | Custom Properties on Devices | Done |
-| | 7.7 | [#196](https://github.com/Tr3kkR/Yuzu/issues/196) | Agent Deployment Jobs | Done |
+| | 7.7 | [#196](https://github.com/Tr3kkR/Yuzu/issues/196) | Agent Deployment Jobs | **Not implemented**, record-only (nothing executes a job); routes scheduled for removal, #6326 |
 | | 7.8 | [#197](https://github.com/Tr3kkR/Yuzu/issues/197) | Patch Deployment Workflow | **Partial** — records + audits only; dispatch (#4138) and ingestion (#3676) are unwired, see body note |
 | | 7.9 | [#198](https://github.com/Tr3kkR/Yuzu/issues/198) | Product Packs (Bundled Definitions) | Done |
 | | 7.10 | [#199](https://github.com/Tr3kkR/Yuzu/issues/199) | User Sessions and Group Membership Plugins | Done |
@@ -130,7 +130,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 7.16 | [#216](https://github.com/Tr3kkR/Yuzu/issues/216) | Wake-on-LAN Support | Done |
 | | 7.17 | [#217](https://github.com/Tr3kkR/Yuzu/issues/217) | Inventory Table Enumeration and Item Lookup | Done |
 | | 7.18 | [#218](https://github.com/Tr3kkR/Yuzu/issues/218) | Device Discovery (Unmanaged Endpoints) | Done |
-| | 7.19 | [#235](https://github.com/Tr3kkR/Yuzu/issues/235) | Timeline Activity Record (TAR) | Done |
+| | 7.19 | [#235](https://github.com/Tr3kkR/Yuzu/issues/235) | Echo | Done |
 | | 7.20 | [#236](https://github.com/Tr3kkR/Yuzu/issues/236) | MCP Server (Model Context Protocol) Phase 1 | Done — **doc-integrity note:** #236 is not an issue and never was — issues and PRs share one number sequence and #236 is PR "Release v0.1.0" (2026-03-21); the v2.0 link was wrong from birth. Status confirmed by code inspection (`server/core/src/mcp_server.cpp`) instead |
 | **8** | 8.1 | [#253](https://github.com/Tr3kkR/Yuzu/issues/253) | Response Visualization Engine | **Done** |
 | | 8.2 | [#254](https://github.com/Tr3kkR/Yuzu/issues/254) | Response Templates | **Done** |
@@ -151,7 +151,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 11.2 | [#269](https://github.com/Tr3kkR/Yuzu/issues/269) | Event Source Management | Open |
 | | 11.3 | [#270](https://github.com/Tr3kkR/Yuzu/issues/270) | PowerShell Module | Open |
 | | 11.4 | [#271](https://github.com/Tr3kkR/Yuzu/issues/271) | Python SDK | Open |
-| **12** | 12.1 | [#272](https://github.com/Tr3kkR/Yuzu/issues/272) | Mapped Drive History | **Done** (closed 2026-07-04 — shipped as the TAR capture source `tar_mapdrive_collector.cpp`, not a `users` plugin action) |
+| **12** | 12.1 | [#272](https://github.com/Tr3kkR/Yuzu/issues/272) | Mapped Drive History | **Done** (closed 2026-07-04 — shipped as the Echo capture source `echo_mapdrive_collector.cpp`, not a `users` plugin action) |
 | | 12.2 | [#273](https://github.com/Tr3kkR/Yuzu/issues/273) | Printer Inventory | Open |
 | | 12.3 | [#274](https://github.com/Tr3kkR/Yuzu/issues/274) | Port Scanning | Open |
 | | 12.4 | [#275](https://github.com/Tr3kkR/Yuzu/issues/275) | NetBIOS Lookup | Open |
@@ -164,7 +164,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 12.11 | [#282](https://github.com/Tr3kkR/Yuzu/issues/282) | Application Whitelisting | Open |
 | | 12.12 | [#283](https://github.com/Tr3kkR/Yuzu/issues/283) | Inventory Replication (Delta Sync) | **Done** (NOT_PLANNED, 2026-07-14, delivered differently: ADR-0016's hash-skip conditional sync, `sync_scheduler.hpp`) |
 | | 12.13 | [#284](https://github.com/Tr3kkR/Yuzu/issues/284) | Binary Resource Distribution | Open |
-| **13** | 13.1 | [#285](https://github.com/Tr3kkR/Yuzu/issues/285) | 2FA for Instruction Approval (TOTP) | Open (stale — TOTP/MFA step-up shipped generally, not wired to approval, see body note) |
+| **13** | 13.1 | [#285](https://github.com/Tr3kkR/Yuzu/issues/285) | 2FA for Instruction Approval (TOTP) | Open (stale - TOTP/MFA step-up shipped generally and is wired to approve/reject by #6061 and #6079; close this issue when #6079 merges, see body note) |
 | | 13.2 | [#286](https://github.com/Tr3kkR/Yuzu/issues/286) | Composable Instruction Chains | **Done** (NOT_PLANNED, 2026-07-14, delivered: `workflow_engine.cpp` `foreach_source` step field + step interpolation) |
 | | 13.3 | [#287](https://github.com/Tr3kkR/Yuzu/issues/287) | Process / Sync Logging UI | Open |
 | | 13.4 | [#288](https://github.com/Tr3kkR/Yuzu/issues/288) | Dashboard Branding | Open |
@@ -175,14 +175,14 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 14.4 | [#293](https://github.com/Tr3kkR/Yuzu/issues/293) | vCenter Connector | Open |
 | | 14.5 | [#294](https://github.com/Tr3kkR/Yuzu/issues/294) | Additional Connectors (BigFix, O365, Oracle) | Open |
 | | 14.6 | [#295](https://github.com/Tr3kkR/Yuzu/issues/295) | High Availability | Open (stale — superseded by ADR-2002, see body note) |
-| **15** | 15.A | [#547](https://github.com/Tr3kkR/Yuzu/issues/547) | TAR dashboard page shell + retention-paused source list | **Done** (paused_at + status extension + dashboard page + Scan + Re-enable + typed-confirmation Purge) |
+| **15** | 15.A | [#547](https://github.com/Tr3kkR/Yuzu/issues/547) | Echo dashboard page shell + retention-paused source list | **Done** (paused_at + status extension + dashboard page + Scan + Re-enable + typed-confirmation Purge) |
 | | 15.B | [#548](https://github.com/Tr3kkR/Yuzu/issues/548) | Result-set store + REST API (composable scope, the differentiator) | **Done** (closed 2026-07-04) |
 | | 15.C | [#549](https://github.com/Tr3kkR/Yuzu/issues/549) | Scope-engine `from_result_set:` + dashboard chip + sidebar + breadcrumb | **Done** (closed 2026-07-04) |
-| | 15.D | [#550](https://github.com/Tr3kkR/Yuzu/issues/550) | TAR SQL frame: relocate, scope-walking-aware, "save as result set" | **Done** (closed 2026-07-04) |
+| | 15.D | [#550](https://github.com/Tr3kkR/Yuzu/issues/550) | Echo SQL frame: relocate, scope-walking-aware, "save as result set" | **Done** (closed 2026-07-04) |
 | | 15.E | [#551](https://github.com/Tr3kkR/Yuzu/issues/551) | YAML DSL `fromResultSet:` + `definition_store` validation + spec amendment | **Done** (closed 2026-07-04) |
 | | 15.F | [#552](https://github.com/Tr3kkR/Yuzu/issues/552) | Reference walkthrough integration test (Chrome IR end-to-end) | **Done** (NOT_PLANNED, 2026-07-14, delivered differently: an in-process Catch2 test, `tests/unit/server/test_chrome_ir_chain.cpp`, not the originally-scoped scripted UAT variant, see body) |
 | | 15.G | [#553](https://github.com/Tr3kkR/Yuzu/issues/553) | Operational hardening — live re-eval, GC sweep, Prometheus + audit polish | **Done** (closed 2026-07-04) — `yuzu_result_set_resolve_seconds` histogram + audit-polish pass still outstanding (minor, non-blocking), see body |
-| | 15.H | [#554](https://github.com/Tr3kkR/Yuzu/issues/554) | TAR process tree viewer | **Done** 2026-06-18 (as-built: local-TAR-data-only reconstruction, no seed; `docs/tar-dashboard.md` §5). REST/MCP parity deferred. |
+| | 15.H | [#554](https://github.com/Tr3kkR/Yuzu/issues/554) | Echo process tree viewer | **Done** 2026-06-18 (as-built: local-Echo-data-only reconstruction, no seed; `docs/echo-dashboard.md` §5). REST/MCP parity deferred. |
 | **16** | 16.A | [#555](https://github.com/Tr3kkR/Yuzu/issues/555) | System Guardian — Windows-first delivery (PRs 1-15 per implementation plan) | Open — in progress: Spark engine rungs 1-7+, `GuardianEngine`, `BaselineStore`, `/guaranteed-state` UI shipped; Spark is wired (`agent.cpp:1255`) but inert by default — `prefer_spark_=false`, legacy `IGuard` remains the sole live enforcement path; 59 merged guardian PRs at the pin (more since) (issue itself still open — no sub-checklist tracks the PR ladder) |
 | | 16.B | [#556](https://github.com/Tr3kkR/Yuzu/issues/556) | System Guardian — Linux delivery (inotify, netlink, D-Bus, audit, sysctl) | Open — **started early** (`guard_systemd.cpp` exists) ahead of the stated 16.A-soak gate, see body note |
 | | 16.C | [#557](https://github.com/Tr3kkR/Yuzu/issues/557) | System Guardian — macOS delivery (Endpoint Security, fseventsd, launchd) | Open (gated on 16.A + 16.B soak + ES entitlement) |
@@ -198,7 +198,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 4: Agent Infrastructure | 8 | 0 | 8 | 100% |
 | 5: Policy Engine | 5 | 0 | 5 | 100% |
 | 6: Windows Depth | 6 | 0 | 6 | 100% |
-| 7: Scale & Integration | 19 | 1 | 20 | 95% — 7.8 is **Partial**, not Done (patch deploy records + audits only; dispatch #4138 and ingestion #3676 are unwired) |
+| 7: Scale & Integration | 18 | 2 | 20 | 90% — 7.7 is **Not implemented** (deployment jobs are record-only, #6326) and 7.8 is **Partial**, not Done (patch deploy records + audits only; dispatch #4138 and ingestion #3676 are unwired) |
 | 8: Visualization & Response Experience | 3 | 0 | 3 | 100% |
 | 9: Connector Framework & Multi-Source Inventory | 0 | 8 | 8 | 0% — **Deferred** (owner decision 2026-09-07: placement — core vs. use-case-engine — is an open question to be settled before any re-plan, see Phase 9 body note); demoted out of the #2 execution-order slot it held since 2026-03 |
 | 10: Software Catalog & License Compliance | 0 | 4 | 4 | 0% — 10.1 (product registry) is **Partial** (store compiled/tested, no production writer/reader at the pin); 10.2–10.4 closed NOT_PLANNED with no delivery, see Phase 10 note |
@@ -206,9 +206,9 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 12: Remaining Agent Capabilities | 3 | 10 | 13 | 23% |
 | 13: Security Hardening & Operational Polish | 2 | 3 | 5 | 40% |
 | 14: Scale & Enterprise Readiness | 0 | 6 | 6 | 0% — 14.3 is **Partial** (not implemented as designed; the underlying need is addressed differently by the Postgres substrate migration) |
-| 15: TAR Dashboard & Scope Walking | 8 | 0 | 8 | 100% |
+| 15: Echo Dashboard & Scope Walking | 8 | 0 | 8 | 100% |
 | 16: System Guardian — Real-Time GS | 0 | 3 | 3 | 0% — issue-closure only; substantial implementation progress not reflected here, see 16.A/16.B body notes |
-| **Total** | **86** | **40** | **126** | **68%** |
+| **Total** | **85** | **41** | **126** | **67%** |
 
 **Done** requires verified delivery: closed COMPLETED, or closed NOT_PLANNED *with* a cited delivery-evidence path/ADR (e.g. 12.12/#283 shipped differently as ADR-0016's hash-skip sync). A row whose annotation itself negates delivery (contains "not shipped"/"not built"/"not implemented") MUST carry the **Partial** literal, never `Done` — the annotation may qualify a `Done` row's *manner* of delivery, never contradict *that* delivery happened. **Open** is everything else, including issues closed **NOT_PLANNED with no delivery** (a real decision not to build the thing, distinct from a still-open backlog item — see the Issue Index's "Closed — not planned" rows for the per-issue distinction and `stateReason`) and **Partial** items (real but narrower delivery than "Done" implies: 2.9 per-device-only concurrency; 7.8 patch deploy records+audits with no working dispatch/ingestion path; 10.1 store+normalizer compiled/tested with zero production writer/reader at the pin; 14.3 not implemented as designed, underlying need addressed differently). The number moved from 94/126 (75%) → 90/126 (71%) → 89/126 (71%) → 88/126 (70%) → 87/126 (69%) → **86/126 (68%)** across five corrective passes: first, the initial pull used `state` without `stateReason` and miscounted 5 NOT_PLANNED-with-no-delivery closures (9.8, 10.2, 10.3, 10.4, 11.1) as Done while missing 1 NOT_PLANNED-with-delivery closure (12.12) that should have counted — net **−4**; second, 2.9 was reverted from Done to **Partial** per ADR-1007's own text ("Issue 2.9 no longer claims 'Done'; it reflects the real, narrower scope this ADR ships," `docs/adr/1007-concurrency-enforcement-scope.md:986`) — net **−1**; third, 7.8 was reverted from Done to **Partial** — the HTTP deploy path audits "Deployed … to N agents" but dispatches nothing (#4138) and patch inventory ingestion has zero production callers (#3676) — net **−1**; fourth, 10.1 was reverted from Done to **Partial** — `ProductRegistryStore` is constructed at boot and `/readyz`-wired but has zero production call sites invoking its data methods anywhere outside itself and its unit tests (`product_normalize.cpp` likewise uncalled in production; the SLE matcher that would use both is PR4, `product_registry_store.cpp:43`) — net **−1**; fifth, 14.3 was reverted from Done to **Partial** — its own annotation said "not implemented as designed," which the anti-negation rule above now forces onto the honest literal rather than leaving as a self-contradicting `Done` cell — net **−1**. 94 − 4 − 1 − 1 − 1 − 1 = **86**.
 
@@ -912,7 +912,9 @@ Extensible typed metadata on devices:
 **Files:** `server/core/src/server.cpp`, `proto/yuzu/server/v1/management.proto`
 
 ### Issue 7.7: Agent Deployment Jobs
-**Capability:** 19.7 | **Scope:** Server
+**Capability:** 19.7 | **Scope:** Server | **Status:** **Not implemented**, record-only; scheduled for removal (#6326)
+
+**Correction (2026-10-22):** only the job record is implemented (`DeploymentStore`; unversioned `/api/deployment-jobs` create/list/get/cancel). Nothing executes a job and none advances past `pending`; the `ssh` and `group_policy` methods are not implemented, and create returns a placeholder install command. The capabilities listed below were never delivered. See `docs/capability-map.md` §19.7.
 
 Server-initiated agent installation on discovered endpoints:
 - Store installer binaries per OS/arch
@@ -1078,7 +1080,7 @@ Targets carry typed auth (none / bearer / basic / hmac), a server-side batching 
 
 REST: `GET/POST/DELETE /api/v1/offload-targets`, `GET /api/v1/offload-targets/{id}`, `GET /api/v1/offload-targets/{id}/deliveries`. RBAC: `Infrastructure:Read`/`Write`. Audit events: `offload_target.create` (success | denied), `offload_target.delete`.
 
-**Known follow-up:** the dispatcher does not yet extract `spec.offload.targets` from the originating definition — `fire_event(target_filter)` honours an explicit caller-supplied filter, but the agent-service fan-out passes none. Wiring the per-instruction filter through the command_id -> execution_id correlation (HA WS-1(1b): `ExecutionTracker::lookup_execution_id`, not the retired in-proc `cmd_execution_ids_` map) -> `definition_id` -> `InstructionStore` is tracked separately so the global fan-out path lands clean first.
+**Known follow-up:** the dispatcher does not yet extract `spec.offload.targets` from the originating definition — `fire_event(target_filter)` honours an explicit caller-supplied filter, but the agent-service fan-out passes none. Wiring the per-instruction filter through the command_id -> execution_id correlation (HA WS-1(1b): `ExecutionTracker::lookup_command_record`, not the retired in-proc `cmd_execution_ids_` map) -> `definition_id` -> `InstructionStore` is tracked separately so the global fan-out path lands clean first.
 
 **Files:** `server/core/src/offload_target_store.{hpp,cpp}` (Postgres migration, ADR-0059, fresh-start cutover — no backfill), `server/core/src/offload_routes.{hpp,cpp}`, `server/core/src/server.cpp` (`SecretCodec`-gated construction + AgentService wiring + route registration), `server/core/src/agent_service_impl.{hpp,cpp}` (`set_offload_target_store` + fire_event at 3 call sites), `docs/yaml-dsl-spec.md` § `spec.offload`, `docs/user-manual/rest-api.md` § Offload Targets, `docs/adr/0059-offload-target-store-postgres-migration.md`, `tests/unit/server/test_offload_target_store.cpp`, `tests/unit/server/test_rest_offload_targets.cpp`.
 
@@ -1360,15 +1362,15 @@ Configure which system events generate notifications and webhook deliveries:
 *Close all 19 "Not Started" items from the capability map to reach 100% coverage.*
 
 ### Issue 12.1: Mapped Drive History
-**Capability:** 3.8 | **Scope:** Agent Plugin | **Status:** **Done** (closed 2026-07-04) — shipped as a **TAR capture source**, not `users` plugin actions
+**Capability:** 3.8 | **Scope:** Agent Plugin | **Status:** **Done** (closed 2026-07-04) — shipped as an **Echo capture source**, not `users` plugin actions
 
-**As shipped:** `tar_mapdrive_collector.cpp` — a TAR (Timeline Activity Record) capture source, queryable via `tar.sql`, not the two ad-hoc `users`-plugin actions sketched below.
+**As shipped:** `echo_mapdrive_collector.cpp` — an Echo capture source, queryable via `echo.sql`, not the two ad-hoc `users`-plugin actions sketched below.
 
 Original sketch — new actions in `users` plugin: `mapped_drives`, `mapped_drive_history`.
 - Windows: WMI `Win32_MappedLogicalDisk` + Event Log 4624/4634 for historical connections
 - Returns: drive_letter, remote_path, username, timestamp, direction (inbound/outbound)
 
-**Files (as shipped):** `agents/plugins/tar/src/tar_mapdrive_collector.cpp`
+**Files (as shipped):** `agents/plugins/echo/src/echo_mapdrive_collector.cpp`
 
 ### Issue 12.2: Printer Inventory
 **Capability:** 3.9 | **Scope:** Agent Plugin | **Status:** Open
@@ -1495,9 +1497,9 @@ Server-side resource registry for versioned binary blobs:
 *Close remaining security gaps and improve operational UX.*
 
 ### Issue 13.1: 2FA for Instruction Approval (TOTP)
-**Capability:** new | **Scope:** Server | **Status:** Open (stale — TOTP + MFA step-up landed generally, not wired to instruction approval specifically)
+**Capability:** new | **Scope:** Server | **Status:** Open (stale: TOTP + MFA step-up landed generally and gates instruction approve and reject, and #6061 and #6079 require an interactive session and an enrolled factor with a fresh proof; the `totp_code` parameter this issue asked for is not wired, the code is entered at the step-up prompt)
 
-TOTP (`totp.{hpp,cpp}`) and a general step-up MFA framework (`mfa_step_up.{hpp,cpp}`) shipped as part of the auth-and-authz workstream — `require_mfa_step_up` currently gates role-elevation endpoints (`auth_routes.cpp`), not the approval endpoint. This issue's specific ask — a `totp_code` requirement on instruction approval — is not wired; the primitive it would reuse already exists. Original sketch:
+TOTP (`totp.{hpp,cpp}`) and a general step-up MFA framework (`mfa_step_up.{hpp,cpp}`) shipped as part of the auth-and-authz workstream - the step-up check is enforced centrally on 37 named REST/dashboard routes (the three JIT-elevation routes keep their own handler gate) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`, and MCP tools are not step-up gated. MFA step-up now gates `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject` among those routes. This issue's specific ask, a `totp_code` request parameter on instruction approval, is not wired; the step-up check reads the session's MFA proof instead. Original sketch:
 
 TOTP (RFC 6238) second factor on instruction approval:
 - Per-user TOTP secret stored encrypted in auth store
@@ -1593,6 +1595,13 @@ Server supports multiple concurrent gateway registrations:
 
 **Files:** `server/core/src/agent_registry.cpp`, `server/core/src/gateway_service_impl.cpp`, `gateway/apps/yuzu_gw/src/yuzu_gw_cluster.erl`
 
+**Upstream side (gateway to several servers), added 2026-10-11.** Production runs dozens to hundreds of
+gateways against always at least two servers and a streaming-replication Postgres pair, so a gateway dialling
+several upstream servers is the standard case. Open work, in priority order: explicit server-to-gateway
+backpressure (#5647), a per-endpoint circuit breaker with failover (#5648), the registration-reconcile
+decision for several replicas (#5649), herd jitter for hundreds of gateways (#5650), and multi-server
+defaults and guidance (#5651). Design record: ADR-2002 §7g.
+
 ### Issue 14.3: Database Sharding (Response Partitioning)
 **Capability:** new | **Scope:** Server | **Status:** **Partial** (#292 closed NOT_PLANNED, 2026-07-14) — not implemented as designed below (no sharding/partitioning code exists); **obsoleted by the Postgres substrate migration**, which addresses the underlying scaling need differently
 
@@ -1642,25 +1651,25 @@ Active-passive failover for server resilience:
 
 ---
 
-## Phase 15: TAR Dashboard & Scope Walking
+## Phase 15: Echo Dashboard & Scope Walking
 
-*The differentiating operator experience. Composable scope from previous query results, surfaced in the dashboard and the YAML DSL, anchored on a dedicated TAR page that puts retention awareness, ad-hoc SQL, and process-tree forensics under one roof. The reference end-to-end walkthrough is the Chrome IR scenario in `docs/scope-walking-design.md` §10.*
+*The differentiating operator experience. Composable scope from previous query results, surfaced in the dashboard and the YAML DSL, anchored on a dedicated Echo page that puts retention awareness, ad-hoc SQL, and process-tree forensics under one roof. The reference end-to-end walkthrough is the Chrome IR scenario in `docs/scope-walking-design.md` §10.*
 
 > **Status correction (2026-07-01).** The bulk of this phase shipped on 2026-05-31 but the item statuses below were never updated from "Open". Corrected here: **15.A–15.E and 15.H are shipped**; **15.G is largely shipped** (GC-sweep thread, quota/pin caps, re-eval, GC/alive gauges); **15.F (this item) is the only substantially-open piece** and is in progress on `feat/tar-15f-chrome-ir-e2e`.
 
-### Issue 15.A: TAR Dashboard Page Shell + Retention-Paused Source List
-**Capability:** new | **Scope:** Server (dashboard + REST) + TAR plugin (status extension) | **Status:** **Shipped** — `/tar` page shell + retention-paused source list (scan / one-click re-enable) live 2026-05-31; typed-confirmation purge completed the frame 2026-07-01 (`tar_page_ui.cpp`, `dashboard_routes.cpp`). Persistence remains a tracked follow-up.
+### Issue 15.A: Echo Dashboard Page Shell + Retention-Paused Source List
+**Capability:** new | **Scope:** Server (dashboard + REST) + Echo plugin (status extension) | **Status:** **Shipped** — `/echo` page shell + retention-paused source list (scan / one-click re-enable) live 2026-05-31; typed-confirmation purge completed the frame 2026-07-01 (`echo_page_ui.cpp`, `dashboard_routes.cpp`). Persistence remains a tracked follow-up.
 
-New `/tar` page off the main dashboard nav. First frame is the retention-paused source list — directly enabled by the issue #539 retention guard. Per-source `<source>_paused_at` timestamp added to `tar.status`, server aggregates per-device responses, dashboard renders a sortable filterable table with one-click re-enable and a typed-confirmation purge. Independent re-enable per source (the #539 invariant).
+New `/echo` page off the main dashboard nav. First frame is the retention-paused source list — directly enabled by the issue #539 retention guard. Per-source `<source>_paused_at` timestamp added to `echo.status`, server aggregates per-device responses, dashboard renders a sortable filterable table with one-click re-enable and a typed-confirmation purge. Independent re-enable per source (the #539 invariant).
 
-**As shipped:** the destructive **Purge data** action (design §3.4) is a new agent action `tar.purge_source` (drops all warehouse tiers for a source, leaving it paused), a `POST /fragments/tar/retention-paused/purge` handler gated on `Infrastructure:Delete`, and a typed-hostname confirmation (a native `prompt()` — CSP-safe, no custom modal). The paused-guard is **agent-side** (`tar.purge_source` refuses if the source is enabled) — authoritative, and it closes the scan→purge TOCTOU; the server frame is an ephemeral live scan (no persisted paused-state, so no server-side `SOURCE_NOT_PAUSED` check). Audit verb `tar.source.purge`; metric `yuzu_tar_source_purge_total{result}`. `rows_deleted` is computed agent-side (returned in the response record), not in the fire-and-forget dispatch audit row.
+**As shipped:** the destructive **Purge data** action (design §3.4) is a new agent action `echo.purge_source` (drops all warehouse tiers for a source, leaving it paused), a `POST /fragments/echo/retention-paused/purge` handler gated on `Infrastructure:Delete`, and a typed-hostname confirmation (a native `prompt()` — CSP-safe, no custom modal). The paused-guard is **agent-side** (`echo.purge_source` refuses if the source is enabled) — authoritative, and it closes the scan→purge TOCTOU; the server frame is an ephemeral live scan (no persisted paused-state, so no server-side `SOURCE_NOT_PAUSED` check). Audit verb `echo.source.purge`; metric `yuzu_echo_source_purge_total{result}`. `rows_deleted` is computed agent-side (returned in the response record), not in the fire-and-forget dispatch audit row.
 
-**Files:** `server/core/src/dashboard_routes.cpp`, `server/core/src/dashboard_ui.cpp`, `agents/plugins/tar/src/tar_plugin.cpp`, new `tests/unit/server/test_tar_dashboard_*`. Design: `docs/tar-dashboard.md` §3.
+**Files:** `server/core/src/dashboard_routes.cpp`, `server/core/src/dashboard_ui.cpp`, `agents/plugins/echo/src/echo_plugin.cpp`, new `tests/unit/server/test_echo_dashboard_*`. Design: `docs/echo-dashboard.md` §3.
 
 ### Issue 15.B: Result-Set Store + REST API
 **Capability:** new (foundational) | **Scope:** Server | **Status:** **Shipped** 2026-05-31 (`68427bba`)
 
-`result_set_store.cpp` with new `result_sets.db`. Schema per `docs/scope-walking-design.md` §3 — immutable lineage edges, TTL with pin override, source payload JSON for live re-eval. REST: `POST /api/v1/result-sets`, `from-inventory-query`, `from-tar-query`, `from-instruction-result`, `GET .../{id}`, `.../{id}/members`, `.../{id}/lineage`, `pin` / `unpin` / `re-eval`, `DELETE`. Audit hooks per §9.
+`result_set_store.cpp` with new `result_sets.db`. Schema per `docs/scope-walking-design.md` §3 — immutable lineage edges, TTL with pin override, source payload JSON for live re-eval. REST: `POST /api/v1/result-sets`, `from-inventory-query`, `from-echo-query`, `from-instruction-result`, `GET .../{id}`, `.../{id}/members`, `.../{id}/lineage`, `pin` / `unpin` / `re-eval`, `DELETE`. Audit hooks per §9.
 
 **As shipped:** `result_set_store.{cpp,hpp}` is **SQLite** (born before the 2026-06-09 Postgres flip; queued for migration in `docs/postgres-migration-ladder.md`). The REST surface landed **in `rest_api_v1.cpp`**, not a separate `result_set_routes.cpp`. Covered by `test_result_set_store.cpp`, `test_result_set_matcher.cpp`, `test_rest_result_sets_async.cpp`.
 
@@ -1670,17 +1679,17 @@ New `/tar` page off the main dashboard nav. First frame is the retention-paused 
 **Capability:** 1.6 (extension) | **Scope:** Server | **Status:** **Shipped** 2026-05-31 (`68427bba`; owner-scope + IDOR/DoS hardening `4f10a69b`). `from_result_set:` short-circuit in `scope_engine`/`agent_registry`, sidebar/breadcrumb/chip UI in `result_sets_ui`. Covered by `test_scope_walking_authz.cpp`, `test_scope_engine.cpp`.
 **Depends on:** 15.B
 
-Scope Engine grammar gains `from_result_set:<id-or-alias>` as a third short-circuit kind alongside `__all__` and `group:<name>`. Composes with attribute predicates via `AND`/`OR`/`NOT`. Dashboard sidebar lists active result sets (last_used_at then created_at DESC); chain breadcrumb above every query frame mirrors `parent_id` walks; scope chip surfaces in TAR / inventory / instruction frames.
+Scope Engine grammar gains `from_result_set:<id-or-alias>` as a third short-circuit kind alongside `__all__` and `group:<name>`. Composes with attribute predicates via `AND`/`OR`/`NOT`. Dashboard sidebar lists active result sets (last_used_at then created_at DESC); chain breadcrumb above every query frame mirrors `parent_id` walks; scope chip surfaces in Echo / inventory / instruction frames.
 
 **Files:** `server/core/src/scope_engine.{cpp,hpp}`, `server/core/src/dashboard_routes.cpp`, `server/core/src/dashboard_ui.cpp`. Design: `docs/scope-walking-design.md` §4, §8.
 
-### Issue 15.D: TAR SQL Frame — Relocate, Scope-Walking-Aware, Save-as-Result-Set
-**Capability:** new | **Scope:** Server | **Status:** **Shipped** 2026-05-31 (`e7b47ca3`, PR-D). Async producers (`from-tar-query` / `from-instruction-result`), re-eval, the response matcher (`result_set_matcher.cpp`), and the scope-walking-aware TAR SQL frame. Covered by `test_rest_result_sets_async.cpp`, `test_result_set_matcher.cpp`.
+### Issue 15.D: Echo SQL Frame — Relocate, Scope-Walking-Aware, Save-as-Result-Set
+**Capability:** new | **Scope:** Server | **Status:** **Shipped** 2026-05-31 (`e7b47ca3`, PR-D). Async producers (`from-echo-query` / `from-instruction-result`), re-eval, the response matcher (`result_set_matcher.cpp`), and the scope-walking-aware Echo SQL frame. Covered by `test_rest_result_sets_async.cpp`, `test_result_set_matcher.cpp`.
 **Depends on:** 15.A, 15.B, 15.C
 
-Relocate the existing `/fragments/tar-sql` route onto the TAR dashboard page. Wire scope-chip resolution to `from_result_set:` (15.C). Add "Save as result set" affordance on the results pane — server creates a new result set with `source_kind=tar_query`, members = union of agents that returned ≥1 row by default. Default name is `tar-<5-char-sql-hash>`.
+Relocate the existing `/fragments/echo-sql` route onto the Echo dashboard page. Wire scope-chip resolution to `from_result_set:` (15.C). Add "Save as result set" affordance on the results pane — server creates a new result set with `source_kind=echo_query`, members = union of agents that returned ≥1 row by default. Default name is `echo-<5-char-sql-hash>`.
 
-**Files:** `server/core/src/dashboard_routes.cpp`, `server/core/src/agent_service_impl.cpp` (TAR result envelope to carry the producing agent IDs explicitly). Design: `docs/tar-dashboard.md` §4.
+**Files:** `server/core/src/dashboard_routes.cpp`, `server/core/src/agent_service_impl.cpp` (Echo result envelope to carry the producing agent IDs explicitly). Design: `docs/echo-dashboard.md` §4.
 
 ### Issue 15.E: YAML DSL `fromResultSet:` + `definition_store` Validation + Spec Amendment
 **Capability:** new | **Scope:** Server (DSL) | **Status:** **Shipped** 2026-05-31 (`e6361a3a`, relocation `9a6b15f7`, governance fixes `89c7b46c`, PR-E). `selector:` / `fromResultSet:` parses and lowers (`scope_yaml.{cpp,hpp}`); rules 1–2 enforced at create; rule 3 at dispatch via the `instruction.scope_resolution_failed` audit row. **Policy `fromResultSet:` deferred to PR-E2** (TTL vs. continuous policy eval; needs `Policy.owner_principal` + pinned-set rule). Covered by `test_scope_yaml.cpp`, `test_yaml_scan.cpp`.
@@ -1694,7 +1703,7 @@ Relocate the existing `/fragments/tar-sql` route onto the TAR dashboard page. Wi
 **Capability:** new (regression net) | **Scope:** Tests | **Status:** **Done** (#552 closed NOT_PLANNED, 2026-07-14, delivered differently — see "As built" below)
 **Depends on:** 15.B, 15.C, 15.D, 15.E
 
-Drives the §10 walkthrough (inventory-ground → TAR-query narrow → instruction-result narrow → pin) and asserts: the lineage chain is complete (`GET /{id}/lineage` reconstructs root→leaf); the audit trail is complete (one `result_set.create` per step + the pin); pinning prevents mid-incident GC (a pinned set survives `gc_sweep()` and cannot be deleted until unpinned); and the chain tears down cleanly.
+Drives the §10 walkthrough (inventory-ground → Echo-query narrow → instruction-result narrow → pin) and asserts: the lineage chain is complete (`GET /{id}/lineage` reconstructs root→leaf); the audit trail is complete (one `result_set.create` per step + the pin); pinning prevents mid-incident GC (a pinned set survives `gc_sweep()` and cannot be deleted until unpinned); and the chain tears down cleanly.
 
 **As built:** an **in-process Catch2 test** at `tests/unit/server/test_chrome_ir_chain.cpp` (server suite), driving the real `/api/v1/result-sets` handlers via `TestRouteSink` with a real `ResultSetStore` + a recording fake command-dispatch — CI-runnable, no live stack. There is **no** `tests/integration/` dir or `scripts/uat/synthetic-fleet.sh`; those design-doc paths were aspirational. A full multi-process UAT-stack variant remains a future option.
 
@@ -1710,19 +1719,19 @@ Live re-eval (`POST /api/v1/result-sets/{id}/re-eval`); background GC sweep ever
 
 **Files:** `server/core/src/result_set_store.cpp`, `server/core/src/result_set_routes.cpp`, `server/core/src/server.cpp`. Design: `docs/scope-walking-design.md` §3.3, §9.
 
-### Issue 15.H: TAR Process Tree Viewer
-**Capability:** new (forensic) | **Scope:** Server (engine + routes + UI) | **Status:** **Shipped** 2026-06-18 ([#1551](https://github.com/Tr3kkR/Yuzu/pull/1551)) — as-built: local-TAR-data-only, deviates from the original seed-snapshot design below.
+### Issue 15.H: Echo Process Tree Viewer
+**Capability:** new (forensic) | **Scope:** Server (engine + routes + UI) | **Status:** **Shipped** 2026-06-18 ([#1551](https://github.com/Tr3kkR/Yuzu/pull/1551)) — as-built: local-Echo-data-only, deviates from the original seed-snapshot design below.
 
-**As-built (shipped).** Reconstructs a per-host process tree entirely from that host's **local TAR warehouse** (`$Process_Live` + `$TCP_Live`, via the read-only `tar.sql` action) — **no seed**, no `/proc`/`CreateToolhelp32Snapshot`/`proc_listallpids` walk, no server-side mirror, no live probe. The tree is built server-side in C++ from the flat event stream (recursive CTEs are blocked on the agent). Collapsible two-column tree + sticky detail panel, inline remote-`IP:port` per row, same-name sibling grouping, client-side All/Running/Exited + anomalies-only + text filters, and a name-based suspicious parent→child spawn heuristic. Timescale is a preset (On boot · On agent install · Last minute · 10m · hour · day) or a custom From/To (UTC) window — **not** `?as_of`. Honest in-page limitations: no seed → aged-out-of-the-live-cap processes may not appear; **Windows is names-only** (ETW Kernel-Process — no path/cmdline; populated on Linux/macOS); "On boot"/"On agent install" are TAR-derived proxies. `Infrastructure:Read` to view; reconstruction dispatches a live `tar.sql` so it also requires `Execution:Execute` + device scope; the detail cache is keyed by a CSPRNG token bound to the originating operator. Audit verbs `tar.process_tree.read` (dispatch + success + `csprng_unavailable` failure) and `tar.process_tree.detail`.
+**As-built (shipped).** Reconstructs a per-host process tree entirely from that host's **local Echo warehouse** (`$Process_Live` + `$TCP_Live`, via the read-only `echo.sql` action) — **no seed**, no `/proc`/`CreateToolhelp32Snapshot`/`proc_listallpids` walk, no server-side mirror, no live probe. The tree is built server-side in C++ from the flat event stream (recursive CTEs are blocked on the agent). Collapsible two-column tree + sticky detail panel, inline remote-`IP:port` per row, same-name sibling grouping, client-side All/Running/Exited + anomalies-only + text filters, and a name-based suspicious parent→child spawn heuristic. Timescale is a preset (On boot · On agent install · Last minute · 10m · hour · day) or a custom From/To (UTC) window — **not** `?as_of`. Honest in-page limitations: no seed → aged-out-of-the-live-cap processes may not appear; **Windows is names-only** (ETW Kernel-Process — no path/cmdline; populated on Linux/macOS); "On boot"/"On agent install" are Echo-derived proxies. `Infrastructure:Read` to view; reconstruction dispatches a live `echo.sql` so it also requires `Execution:Execute` + device scope; the detail cache is keyed by a CSPRNG token bound to the originating operator. Audit verbs `echo.process_tree.read` (dispatch + success + `csprng_unavailable` failure) and `echo.process_tree.detail`.
 
-**Deliberate deviation.** The original design (next paragraph) reconstructed from a seed snapshot taken at agent install / first start, which depended on the agent service-install-hardening track. The as-built drops that dependency by reading only retained TAR events; the honesty banner states the resulting completeness limit. REST/MCP parity (`GET /api/v1/tar/process-tree/{id}`) is a tracked follow-up ([#1562](https://github.com/Tr3kkR/Yuzu/issues/1562)).
+**Deliberate deviation.** The original design (next paragraph) reconstructed from a seed snapshot taken at agent install / first start, which depended on the agent service-install-hardening track. The as-built drops that dependency by reading only retained Echo events; the honesty banner states the resulting completeness limit. REST/MCP parity (`GET /api/v1/echo/process-tree/{id}`) is a tracked follow-up ([#1562](https://github.com/Tr3kkR/Yuzu/issues/1562)).
 
 <details><summary>Original seed-based design (superseded — kept for history)</summary>
 
-`tar.process_tree` agent action walks `/proc` (Linux), `CreateToolhelp32Snapshot` + `Process32FirstW`/`NextW` (Windows), `proc_listallpids` + `proc_pidinfo(PROC_PIDTBSDINFO|PIDPATHINFO)` (macOS). Stores tagged `action='seed'` rows in `process_live` per PID. Server reconstructs the tree by replaying seed + subsequent `started` / `stopped` events from `process_live`. Renderer: collapsible nested `<details>` / `<summary>` for v1, no graph library. Time-slicing via `?as_of=<ts>`. Honest "tree as observed since <seed_ts>" badge; orphan reparenting shown as it would be in a live `ps`. Cmdline redaction reuses `tar_plugin.cpp` `load_redaction_patterns`. Data quality depends on the agent running from boot/install and being tamper-resistant — that hardening pillar is the parallel Guardian PR ladder.
+`echo.process_tree` agent action walks `/proc` (Linux), `CreateToolhelp32Snapshot` + `Process32FirstW`/`NextW` (Windows), `proc_listallpids` + `proc_pidinfo(PROC_PIDTBSDINFO|PIDPATHINFO)` (macOS). Stores tagged `action='seed'` rows in `process_live` per PID. Server reconstructs the tree by replaying seed + subsequent `started` / `stopped` events from `process_live`. Renderer: collapsible nested `<details>` / `<summary>` for v1, no graph library. Time-slicing via `?as_of=<ts>`. Honest "tree as observed since <seed_ts>" badge; orphan reparenting shown as it would be in a live `ps`. Cmdline redaction reuses `echo_plugin.cpp` `load_redaction_patterns`. Data quality depends on the agent running from boot/install and being tamper-resistant — that hardening pillar is the parallel Guardian PR ladder.
 </details>
 
-**Files (as-built):** `server/core/src/tar_process_tree.{hpp,cpp}` (pure engine), `server/core/src/tar_tree_routes.{hpp,cpp}` (routes), `server/core/src/tar_page_ui.cpp` (frame wiring), `tests/unit/server/test_tar_process_tree.cpp` + `test_tar_tree_routes.cpp`. Design: `docs/tar-dashboard.md` §5.
+**Files (as-built):** `server/core/src/echo_process_tree.{hpp,cpp}` (pure engine), `server/core/src/echo_tree_routes.{hpp,cpp}` (routes), `server/core/src/echo_page_ui.cpp` (frame wiring), `tests/unit/server/test_echo_process_tree.cpp` + `test_echo_tree_routes.cpp`. Design: `docs/echo-dashboard.md` §5.
 
 ---
 
@@ -2100,8 +2109,8 @@ Software Licensing & Entitlements (ADR-0024, status: proposed) — supersedes th
         NOT_PLANNED with no delivery): the 5-source entitlement plane (D12) and usage metering/
         reclamation (D15) — distinct from ADR-1005 Phase 7's *vulnerability* UCE below
 
-Phase 15 (TAR Dashboard & Scope Walking) — DONE, all 8 issues (15.A–15.H) shipped
-  └── requires ResponseStore (Phase 1.1), ScopeEngine (Phase 1.6), TAR plugin (Phase 7.19)
+Phase 15 (Echo Dashboard & Scope Walking) — DONE, all 8 issues (15.A–15.H) shipped
+  └── requires ResponseStore (Phase 1.1), ScopeEngine (Phase 1.6), Echo plugin (Phase 7.19)
 
 Phase 16 (System Guardian — Guaranteed State)
   16.A Windows-first ──── IN PROGRESS (Spark engine rungs 1-7+, GuardianEngine, BaselineStore,
@@ -2152,9 +2161,9 @@ Route-sink refactor (#2542) — cross-cutting, ongoing
 
 ## Recommended Execution Order
 
-Phases 0, 1, 3, 4, 5, 6, 8, and 15 are complete (all-Done). Phase 2 and Phase 7 are 92%/95% Done
-respectively — each has exactly one Partial item (2.9 concurrency, 7.8 patch deployment; see the Index
-for both). Phase 10 is 0/4 Done — 10.1 is placed in-server but Partial (no production writer/reader at
+Phases 0, 1, 3, 4, 5, 6, 8, and 15 are complete (all-Done). Phase 2 and Phase 7 are 92%/90% Done
+respectively — Phase 2 has exactly one Partial item (2.9 concurrency); Phase 7 has 7.7 (Not implemented,
+deployment jobs) and 7.8 (Partial, patch deployment); see the Index for each. Phase 10 is 0/4 Done — 10.1 is placed in-server but Partial (no production writer/reader at
 the pin); 10.2–10.4 closed NOT_PLANNED with no delivery (see Phase 10 note).
 Phase 9 is demoted (deferred pending an owner placement decision, not an ADR-1005 consequence — see
 Phase 9 body banner — no longer the #2 slot it held since 2026-03). The order below leads with the fronts the commit log and
@@ -2200,10 +2209,13 @@ before acting on any "open" / "in progress" claim:
    event_id` — WS-2a shows "done" at the row-status level, but its own row text in
    `docs/ha-delivery-matrix.md`'s WS-2 row names this the outstanding 2nd-replica precondition,
    corroborated by `docs/executions-history-ladder.md`'s replica-local `Last-Event-ID` mechanism);
-   #4014 (WS-11 leader identity/epoch + CRL-freshness-staleness metrics + split-brain alert + the
-   `/readyz` decision), which the WS-3 3.2 exit-criteria note names a **hard prerequisite before a 2nd
-   replica or any WS-9 failover scenario** and which is distinct from WS-8-readyz's per-tier health
-   contract already listed above; and #4098 (verify webhook/offload emit sites are per-replica-origin
+   #4014 (WS-11 leader identity/epoch metrics + split-brain alert + the `/readyz` decision), which the
+   WS-3 3.2 exit-criteria note names a **hard prerequisite before a 2nd replica or any WS-9 failover
+   scenario**, is distinct from WS-8-readyz's per-tier health contract already listed above, and has
+   shipped (leader/epoch metrics and the `yuzu-ha-leader` alerts; the CRL-freshness gauge it once
+   also listed is split out as #6527 and the remediation-claim counters as #6526, neither shipped);
+   the durable cluster-capability admission gate that would replace the procedural mixed-version
+   hold is #6528, not built; and #4098 (verify webhook/offload emit sites are per-replica-origin
    before a 2nd replica — tracked against `store_worker_pool.worker_loop`'s `StoreWorkerPool::workers_`
    thread — or a fleet-triggered emit double-delivers). That gate is procedural: nothing in code
    refuses a 2nd replica today. See
@@ -2263,7 +2275,7 @@ before acting on any "open" / "in progress" claim:
 | 12: Agent Capabilities | 13 | 13 |
 | 13: Security & Polish | 5 | 5 |
 | 14: Scale & Enterprise | 6 | 6 |
-| 15: TAR Dashboard & Scope Walking | 8 | 8 |
+| 15: Echo Dashboard & Scope Walking | 8 | 8 |
 | 16: System Guardian (Real-Time GS) | 3 | 10 |
 | **Total** | **126** | **159** |
 

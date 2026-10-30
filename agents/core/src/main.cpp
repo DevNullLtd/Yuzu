@@ -13,6 +13,7 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #include <yuzu/agent/updater.hpp>
 #include <yuzu/agent/update_signature_mode.hpp>
 #include <yuzu/agent/agent.hpp>
+#include <yuzu/agent/enrollment_token_file.hpp>
 #include <yuzu/agent/env_util.hpp>
 #include <yuzu/agent/identity_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
@@ -397,6 +398,16 @@ int main(int argc, char* argv[]) {
     app.add_option("--enrollment-token", cfg.enrollment_token,
                    "Pre-shared enrollment token for server registration")
         ->envname("YUZU_ENROLLMENT_TOKEN");
+    // Deliberately NOT ->excludes(--enrollment-token): the Windows installer puts this
+    // option on every service command line, so an upgraded service whose machine
+    // environment still carries YUZU_ENROLLMENT_TOKEN must keep starting (CLI11 counts
+    // an env-sourced value toward `excludes` and exits 108). Precedence is explicit
+    // instead — see resolve_enrollment_token below.
+    app.add_option("--enrollment-token-file", cfg.enrollment_token_file,
+                   "File holding the enrollment token (first line); a token read from it "
+                   "takes precedence over --enrollment-token; removed after the first "
+                   "accepted registration or when the server refuses the token")
+        ->envname("YUZU_ENROLLMENT_TOKEN_FILE");
     app.add_flag("--debug", "Enable debug mode (diagnostic features)")
         ->each([&cfg](const std::string&) { cfg.debug_mode = true; });
     app.add_flag("--verbose", "Enable verbose logging")->each([&cfg](const std::string&) {
@@ -765,6 +776,59 @@ int main(int argc, char* argv[]) {
         yuzu::agent::UpdateConfig{.signature_trust_bundle = cfg.update_trust_bundle,
                                   .require_signature = cfg.update_require_signature});
 
+    // --enrollment-token-file: resolved ONCE, here -- after the log hand-off is installed
+    // (a Windows service logs to its file only from that point, so any earlier warning is
+    // lost) and before make_agent(). resolve_enrollment_token owns the decision (a token
+    // read from the file wins over --enrollment-token / YUZU_ENROLLMENT_TOKEN, and the
+    // path is cleared unless a token was consumed from it, so neither the first accepted
+    // registration nor a refusal of the token removes a path the agent took no token
+    // from; the removal is by path, so an object placed there before either goes too);
+    // this block only logs the outcome. The read stays before the SCM hand-off so its
+    // warnings reach the log file, but it is NOT unbounded: the reader runs under a 5 s deadline on
+    // yuzu::shared::bounded_call's detached worker, so an open that never returns (an
+    // oplock held on a file another account placed there) costs this start five seconds
+    // and a tokenless run, never the 30 s START_PENDING hint (error 1053). It opens the
+    // leaf without following a link, never blocks on a FIFO, refuses a UNC, device or
+    // non-fixed-drive path without opening it (Windows), and accepts only a file owned
+    // by SYSTEM/root, Administrators or this process's own account (and, on POSIX, not
+    // group/other-writable). The token itself is never logged.
+    {
+        using yuzu::agent::TokenFileOutcome;
+        // Captured BEFORE resolve_enrollment_token clears cfg.enrollment_token_file,
+        // so the log lines below still name the file.
+        const std::string path = cfg.enrollment_token_file.string();
+        const auto resolved =
+            yuzu::agent::resolve_enrollment_token(cfg.enrollment_token, cfg.enrollment_token_file);
+        if (resolved.file_outcome) {
+            switch (*resolved.file_outcome) {
+            case TokenFileOutcome::ok:
+                break;
+            case TokenFileOutcome::absent:
+                spdlog::debug("No enrollment token file at {}", path);
+                break;
+            case TokenFileOutcome::not_regular:
+                spdlog::warn("Enrollment token file {} is not a regular file; ignored", path);
+                break;
+            case TokenFileOutcome::too_large:
+                spdlog::warn("Enrollment token file {} is larger than {} bytes; ignored", path,
+                             yuzu::agent::kEnrollmentTokenFileCap);
+                break;
+            case TokenFileOutcome::unreadable:
+                spdlog::warn("Enrollment token file {} could not be read ({}); ignored", path,
+                             resolved.file_detail);
+                break;
+            case TokenFileOutcome::untrusted_owner:
+                spdlog::warn("Enrollment token file {} is not trusted ({}); ignored", path,
+                             resolved.file_detail);
+                break;
+            case TokenFileOutcome::no_token:
+                spdlog::warn("Enrollment token file {} does not hold a token; ignored", path);
+                break;
+            }
+        }
+        spdlog::info("Enrollment token source: {}", resolved.source);
+    }
+
 #ifdef _WIN32
     // #1822: hand off to the SCM ServiceMain dispatcher instead of running the
     // console path below. run_service() blocks for the lifetime of the service.
@@ -783,7 +847,7 @@ int main(int argc, char* argv[]) {
     // (which no-ops when g_agent is null) never silently swallows a Ctrl-C/
     // SIGTERM that arrives during make_agent()'s work (a SQLite open/write in
     // resolve_agent_id() plus a trivial in-memory Agent construction -- the
-    // actual heavy work, plugin load and KV/TAR store open, happens later
+    // actual heavy work, plugin load and KV/Echo store open, happens later
     // inside agent->run() below, which was already covered by this
     // registration point before make_agent() existed). Installing the
     // handlers any earlier -- e.g. before calling make_agent() -- would

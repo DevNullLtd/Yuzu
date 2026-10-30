@@ -26,6 +26,7 @@
 #include "mcp_policy.hpp"
 #include "mfa_qr.hpp"
 #include "mfa_step_up.hpp"
+#include "step_up_gate.hpp"
 #include "oidc_principal.hpp" // oidc_principal_id — ADR-2001 §5 single principal-string builder
 #include "oidc_scim_link.hpp" // link_oidc_login_to_scim — ADR-2001 §2/D2 login-site orchestration
 #include "password_policy.hpp" // #5342 — password_exceeds_max (the /login max)
@@ -441,6 +442,23 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
 }
 
 std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request& req) {
+    // One principal per request. Once the step-up chokepoint has passed a gated request, every
+    // later resolution for it must yield the same principal or none: the walk below falls through
+    // cookie, Bearer and X-Yuzu-Token, so a later resolution is not guaranteed to land on the
+    // principal the check was made for. The binding is applied here, to whatever the walk
+    // returns, so no path of it can skip it. A request with no binding armed is unaffected.
+    auto session = resolve_session_unbound(req);
+    if (session && !detail::step_up_binding_admits(req, *session))
+        return std::nullopt;
+    return session;
+}
+
+std::optional<auth::Session> AuthRoutes::resolve_session_unbound(const httplib::Request& req) {
+    // The credential sources read here (Cookie, Authorization, X-Yuzu-Token) are mirrored by
+    // health::request_carries_credential (health_routes.hpp), which decides whether /health
+    // and /api/health resolve a session or charge the per-source budget. A new credential
+    // source added below must also be added there.
+    //
     // 1. Try session cookie (existing browser auth)
     auto token = extract_session_cookie(req);
     // Guard against oversized cookie values before passing to validate_session (#630).
@@ -454,7 +472,7 @@ std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request&
         // lapses is where the `role.elevation.expired` audit row is minted.
         // Uses audit_log_for_principal (not audit_log) because audit_log's
         // make_audit_event() itself calls resolve_session(req) — calling that
-        // from inside resolve_session would re-enter this function. `session`
+        // from inside resolve_session would re-enter the resolution. `session`
         // already carries the base role (Session::role is never the elevated
         // view), matching the `role.elevation.revoked` audit's principal_role.
         if (auto expired_user = auth_mgr_.reap_expired_elevation(token)) {
@@ -715,6 +733,29 @@ bool AuthRoutes::probe_permission(const httplib::Request& req, httplib::Response
     return require_permission(req, res, securable_type, operation);
 }
 
+bool AuthRoutes::probe_permission_unavailable_aware(const httplib::Request& req,
+                                                    httplib::Response& res,
+                                                    const std::string& securable_type,
+                                                    const std::string& operation) {
+    AuditProbeScope probe; // not const: require_auth records the gate's session into it
+    return require_permission_impl(req, res, securable_type, operation,
+                                   RbacDegradeMapping::UnavailableAs503);
+}
+
+void AuthRoutes::respond_rbac_unavailable(const httplib::Request& req, httplib::Response& res,
+                                          const std::string& securable_type,
+                                          const std::string& operation, const char* who) {
+    audit_log(req, "auth.permission_required", "denied", "", "",
+              std::string(who) + " denied: RBAC unavailable resolving " + securable_type + ":" +
+                  operation);
+    res.status = 503;
+    // A transient store outage is retryable, and no `.permission`: granting it does not fix an
+    // outage, so naming it would advertise a self-remediation that cannot work.
+    res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                      detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                    "application/json");
+}
+
 ListReadGate AuthRoutes::require_global_list_read(const httplib::Request& req,
                                                   httplib::Response& res,
                                                   const std::string& securable_type,
@@ -754,6 +795,16 @@ AuthRoutes::probe_fleet_read(const httplib::Request& req, httplib::Response& res
 bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Response& res,
                                     const std::string& securable_type,
                                     const std::string& operation) {
+    // Every route keeps ADR-0041's documented answer: an RBAC read that could not be completed
+    // is a 403 (deny-on-degrade). Only the Forensics-tier resolver opts into the 503 mapping.
+    return require_permission_impl(req, res, securable_type, operation,
+                                   RbacDegradeMapping::DenyAs403);
+}
+
+bool AuthRoutes::require_permission_impl(const httplib::Request& req, httplib::Response& res,
+                                         const std::string& securable_type,
+                                         const std::string& operation,
+                                         RbacDegradeMapping degrade) {
     auto session = require_auth(req, res);
     if (!session)
         return false;
@@ -780,7 +831,7 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // pre-RBAC legacy fallback below would otherwise hand an engine credential
     // fleet-wide Read the moment RBAC is off (the default). Resolve engine
     // sessions here, RBAC-only, or deny.
-    if (session->principal_kind == "engine") {
+    if (session->is_engine()) {
         if (!rbac_store_ || !rbac_store_->is_open()) {
             // Cannot evaluate authority — fail closed, 503.
             audit_log(req, "auth.permission_required", "denied", "", "",
@@ -792,8 +843,30 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                             "application/json");
             return false;
         }
-        if (!rbac_store_->is_rbac_enabled() ||
-            !rbac_store_->check_permission(session->username, securable_type, operation)) {
+        // The engine decision is `engine_grant_checked`, the same chokepoint the list-read and
+        // fleet-read engine gates use. It reads the grant only on a view proven fresh and
+        // enforced; a view proven fresh and disabled admits nothing; a degraded view, whose
+        // enforcement state cannot be confirmed, is refused without reading a grant, because
+        // RBAC may be genuinely off and an engine has no legacy fallback to land on. Engine
+        // authority stays RBAC-only: an engine is admitted solely through that check, never
+        // through a legacy or service-scoped path. `engine_unavailable` is set when the answer
+        // could not be completed (a failed grant read or an unconfirmed state), so the opt-in
+        // retryable answer surfaces; the default stays 403.
+        bool engine_unavailable = false;
+        bool engine_admitted = false;
+        {
+            const auto checked =
+                engine_grant_checked(rbac_store_, session->username, securable_type, operation);
+            engine_unavailable = !checked && degrade == RbacDegradeMapping::UnavailableAs503;
+            engine_admitted = checked.value_or(false);
+        }
+        if (!engine_admitted) {
+            if (engine_unavailable) {
+                // Opt-in only: still refused, but as the retryable outage it is, not as a
+                // definitive missing grant. The default stays 403.
+                respond_rbac_unavailable(req, res, securable_type, operation, "engine principal");
+                return false;
+            }
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "engine principal denied " + securable_type + ":" + operation);
             res.status = 403;
@@ -954,7 +1027,15 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // This is the SAME predicate the ADR-0017 per-row scope filters key on, so the
     // gate and the filter can never disagree on a corrupt store.
     if (rbac_store_ && rbac_enforcement_in_effect(rbac_store_)) {
-        if (!rbac_store_->check_permission(session->username, securable_type, operation)) {
+        const auto checked =
+            rbac_store_->check_permission_checked(session->username, securable_type, operation);
+        if (!checked && degrade == RbacDegradeMapping::UnavailableAs503) {
+            // Opt-in only (the Forensics-tier resolver): a read that could not be completed is a
+            // retryable outage, not a missing grant. Every other route takes the 403 below.
+            respond_rbac_unavailable(req, res, securable_type, operation, "RBAC");
+            return false;
+        }
+        if (!checked.value_or(false)) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "RBAC denied " + securable_type + ":" + operation);
             res.status = 403;
@@ -1123,7 +1204,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // pre-RBAC legacy fallback below would otherwise hand an engine credential
     // fleet-wide Read the moment RBAC is off (the default). Resolve engine
     // sessions here, RBAC-only, or deny.
-    if (session->principal_kind == "engine") {
+    if (session->is_engine()) {
         if (!rbac_store_ || !rbac_store_->is_open()) {
             // Cannot evaluate authority — fail closed, 503.
             audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
@@ -1441,7 +1522,7 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
     // default-deny). authorize_list_read's own legacy-open branch would
     // otherwise hand an engine credential fleet-wide read the moment RBAC is
     // disabled; resolve engine sessions here, RBAC-only, or deny.
-    if (session->principal_kind == "engine") {
+    if (session->is_engine()) {
         if (!rbac_store_ || !rbac_store_->is_open()) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "engine principal denied: RBAC store unavailable");
@@ -1452,8 +1533,25 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
                             "application/json");
             return gate;
         }
-        if (!rbac_store_->is_rbac_enabled() ||
-            !rbac_store_->check_permission(session->username, securable_type, operation)) {
+        // The checked read: a failed read is a retryable 503, not the 403 of "no grant".
+        // `engine_grant_checked` also answers a retryable error, not a 403, when the enforcement
+        // state itself cannot be confirmed (a stale cached-disabled view).
+        const auto engine_grant =
+            engine_grant_checked(rbac_store_, session->username, securable_type, operation);
+        if (!engine_grant) {
+            // A fixed token, never the error text (a failed read's text carries libpq output).
+            audit_log(req, "auth.permission_required", "failure", "", "",
+                      (engine_grant.error() == kRbacErrEnforcementUnconfirmed
+                           ? "engine principal: RBAC enforcement state unconfirmed for "
+                           : "engine principal: authorization read failed for ") +
+                          perm);
+            res.status = 503;
+            res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                              detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                            "application/json");
+            return gate;
+        }
+        if (!*engine_grant) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "engine principal denied " + perm);
             res.status = 403;
@@ -1511,6 +1609,19 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
 
     auto decision = rbac_store_->authorize_list_read(session->username, securable_type,
                                                       operation, mgmt_group_store_);
+    if (decision.read_failed) {
+        // DenyAll because a READ failed, not because the caller holds no grant: retryable, and
+        // never a 403 a client would read as a permanent "no grant".
+        // An outage is not cured by any grant: no `.permission` in the body, and a `failure`
+        // row (no authorization decision was made).
+        audit_log(req, "auth.permission_required", "failure", "", "",
+                  "RBAC list read " + perm + " blocked: authorization read failed");
+        res.status = 503;
+        res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                          detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                        "application/json");
+        return gate;
+    }
     switch (decision.decision) {
     case ListReadDecision::DenyAll:
         audit_log(req, "auth.permission_required", "denied", "", "",
@@ -1563,15 +1674,26 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
         // principal_class_of(req) above can only distinguish by credential
         // presentation (bearer token → "agent"), which mislabels an engine
         // principal's bearer-token requests. Re-stamp from the resolved
-        // session's persisted principal_kind so engine-principal actions are
-        // audited truthfully as "engine" (design §6 / adr-1005-execution-plan
+        // session's engine classification (Session::is_engine()) so
+        // engine-principal actions are audited truthfully as "engine"
+        // (design §6 / adr-1005-execution-plan
         // Decision 9 — the AuditStore column reports it now; the HTTP metric
         // is deferred to 4.5).
-        if (session->principal_kind == "engine") {
+        if (session->is_engine()) {
             event.principal_class = "engine";
         }
     }
     return event;
+}
+
+void AuthRoutes::expire_mfa_pending_for_test(const std::string& pending_token,
+                                             std::chrono::milliseconds elapsed) {
+    std::lock_guard lock(mfa_pending_mu_);
+    const auto it = mfa_pending_.find(pending_token);
+    if (it == mfa_pending_.end())
+        return;
+    it->second.expires_at -=
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(elapsed);
 }
 
 void AuthRoutes::reap_mfa_pending_locked() {
@@ -1672,7 +1794,7 @@ bool AuthRoutes::audit_log_for_session(const httplib::Request& req, const auth::
     // and, via `make_audit_event_for_principal`, the session correlator and source fields.
     return audit_log_for_principal(req, action, result, session.username, principal_role,
                                    target_type, target_id, detail,
-                                   session.principal_kind == "engine" ? "engine" : std::string{});
+                                   session.is_engine() ? "engine" : std::string{});
 }
 
 AuthRoutes::AuditAsSessionFn AuthRoutes::audit_as_session_fn() {
@@ -3295,8 +3417,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 is_oidc ? "OIDC sessions re-prove MFA by re-authenticating with the "
                           "identity provider — start a new SSO sign-in at /auth/oidc/start, "
                           "not local step-up"
-                : is_saml ? "MFA step-up is not available for SAML sessions in this release — "
-                            "re-authenticate via SAML at /auth/saml/start"
+                : is_saml ? "SAML sessions cannot satisfy step-up in this release; "
+                            "re-authenticating does not help"
                 : "step-up is for session-cookie callers only — re-issue the API "
                   "token to refresh MFA proof";
             nlohmann::json envelope = {
@@ -4814,16 +4936,20 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
     auto elevation_step_up = [this](const httplib::Request& req, httplib::Response& res,
                                     const auth::Session& session, const std::string& label,
                                     int window_secs) -> bool {
+        const StepUpAuditFn audit = [this](const httplib::Request& r, const std::string& a,
+                                           const std::string& rs, const std::string& tt,
+                                           const std::string& ti, const std::string& d) {
+            return audit_log(r, a, rs, tt, ti, d);
+        };
         auto* db = auth_mgr_.auth_db_ptr();
-        if (!db)
-            return true; // legacy config-file-only: step-up needs auth.db (fail-open, as elsewhere)
-        return require_mfa_step_up(
-            req, res, session, *db, window_secs,
-            [this](const httplib::Request& r, const std::string& a, const std::string& rs,
-                   const std::string& tt, const std::string& ti, const std::string& d) {
-                return audit_log(r, a, rs, tt, ti, d);
-            },
-            label, cfg_.mfa_enforcement, auth_mgr_.metrics_registry());
+        if (!db) {
+            // Fail closed: the privilege boundary never passes because the store is unwired.
+            refuse_step_up_store_unwired(req, res, session, audit, label,
+                                         auth_mgr_.metrics_registry());
+            return false;
+        }
+        return require_mfa_step_up(req, res, session, *db, window_secs, audit, label,
+                                   cfg_.mfa_enforcement, auth_mgr_.metrics_registry());
     };
     // Step-up window for the elevation surfaces: the global window when it is
     // positive, else 300 s. So disabling the global gate (<= 0) does not disable
@@ -4885,10 +5011,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         auto* db = auth_mgr_.auth_db_ptr();
         if (!db) {
+            // Defensive: the auth store is the PostgreSQL-backed AuthDB wired at boot (the server
+            // refuses to start without its database), so no flag fixes a missing one; the
+            // remediation is the generic retry/contact text, not a startup option.
             res.status = 503;
             res.set_content(detail::error_json_a4(503, "JIT elevation requires the "
                                                        "persistent auth store",
-                                                  cid, "start the server with --data-dir"),
+                                                  cid, "retry shortly or contact an administrator"),
                             "application/json");
             return;
         }
@@ -5031,10 +5160,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
         auto* db = auth_mgr_.auth_db_ptr();
         if (!db) {
+            // Defensive, as above: no startup flag fixes a missing PostgreSQL-backed auth store.
             res.status = 503;
             res.set_content(detail::error_json_a4(503, "JIT elevation requires the persistent auth "
                                                        "store",
-                                                  cid, "start the server with --data-dir"),
+                                                  cid, "retry shortly or contact an administrator"),
                             "application/json");
             return;
         }

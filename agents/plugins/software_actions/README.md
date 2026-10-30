@@ -14,19 +14,63 @@
 
 ## How it works
 
-`list_upgradable` asks the platform's own package manager what has an update pending: `winget upgrade` on Windows, `apt list --upgradable` then `yum`/`dnf check-update` on Linux, `softwareupdate -l` on macOS. `installed_count` asks the same class of tool for a raw record count, except on Windows, where it counts subkeys of the Uninstall registry key natively (no subprocess at all). Every acquisition goes through the shared bounded argv runner or a native OS read — never a shell, never `popen` (ADR-3002). A tool that ran but returned an ambiguous or truncated capture degrades the result rather than reporting it as clean, and a query that never ran (tool absent, spawn failed) reports `UNAVAILABLE`/`CONSTRAINED` with no `count|`/`upgradable|` data line that could be misread as a real answer — a `count|0` or "System is up to date" line is reserved for a tool that ran clean and genuinely found nothing.
+`list_upgradable` asks the host's own package tool what has an update waiting and reports one row per package. On Windows that tool is `winget upgrade` (60-second deadline), on macOS `softwareupdate -l` (60 seconds), and on Linux `apt list --upgradable` (20 seconds). On Linux, apt is authoritative when it runs clean: its answer, rows or "up to date", ends the query. `yum` or `dnf check-update` (20 seconds) is tried only when apt is absent or did not give a usable answer. `installed_count` returns one number: a native count of Uninstall registry subkeys on Windows (no subprocess), `pkgutil --pkgs` receipts on macOS, and `dpkg-query` or `rpm -qa` packages on Linux (20-second deadline for the subprocess legs). Every tool is run as a plain argument list through the agent's shared subprocess runner, which enforces a time limit, never through a shell.
 
-Neither action is a general software inventory: there is no publisher, install date, or per-user breakdown here, and Windows' `installed_count` deliberately reads only the default (64-bit) registry view, undercounting 32-bit apps under WOW6432Node rather than changing the reported number for every host. That inventory depth is `installed_apps`' job.
+A query that did not complete never looks clean. If the tool is missing, cannot start, times out, is cut short or fails with nothing parsed, the result carries a failure status and no `count|` or "up to date" row. The "System is up to date" row is written only when a tool ran clean and listed nothing. Neither action is a patch-compliance check or a software inventory: there is no severity, no publisher, no install date and no per-user breakdown here (see `installed_apps` for inventory).
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: SoftwareDeployment.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[software_actions.execute]
-  EX --> WIN[Windows leg<br/>winget via bounded argv runner list_upgradable<br/>native Reg*W subkey count installed_count]
-  EX --> MAC[macOS leg<br/>softwareupdate -l / pkgutil --pkgs via bounded argv runner]
-  EX --> LIN[Linux leg<br/>apt/yum check-update / dpkg-query/rpm via bounded argv runner]
-  WIN & MAC & LIN --> ROWS[rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator or workflow"] --> SRV["Server: SoftwareDeployment Read"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"] --> EX["software_actions.execute"]
+  EX --> WIN["Windows: winget upgrade for list_upgradable, Uninstall registry subkey count for installed_count"]
+  EX --> MAC["macOS: softwareupdate -l for list_upgradable, pkgutil --pkgs for installed_count"]
+  EX --> LIN["Linux: apt, else yum or dnf for list_upgradable, dpkg-query else rpm for installed_count"]
+  WIN --> ROWS["Rows and typed result status"]
+  MAC --> ROWS
+  LIN --> ROWS
+  ROWS --> RS[("Server response store")] --> API["REST /api/responses and MCP"]
 ```
+
+### What you can decide with it
+
+| | Windows | macOS | Linux |
+|---|---|---|---|
+| `list_upgradable` asks | `winget upgrade --accept-source-agreements` (60 s) | `softwareupdate -l` (60 s) | `apt list --upgradable` (20 s), else `yum` or `dnf check-update` (20 s) |
+| What it covers | Applications winget can match to one of its sources | Apple's own software-update list; no third-party, Homebrew or other app query is made | OS packages known to the host's apt or yum/dnf; no snap, flatpak or language-package query |
+| Where it works | Expected to work only when the agent runs in a user session (not measured). Winget is installed per user, and that per-user launcher does not exist when the agent runs as LocalSystem (the built-in all-powerful Windows service account); the Windows capture, taken as `SYSTEM`, fails with `subprocess_runner:spawn_error` | Measured as an ordinary user; nothing in the plugin needs more | Measured as root in a container; the plugin uses no `sudo` |
+| Row shape | name, current version, available version | Apple's update label, with `-` for both versions | apt: name, current, available. yum or dnf: name, `-`, available |
+| `installed_count` counts | Subkeys of the 64-bit `Uninstall` registry key (captured: 124) | Installer receipts listed by `pkgutil --pkgs` (captured: 68) | Installed packages from `dpkg-query` (including held ones), else lines of `rpm -qa` (captured: 206) |
+
+| Question | Use | Answer and limits |
+|---|---|---|
+| Does winget, Apple or the Linux package manager see an update waiting? | `list_upgradable` | Yes: one row per package. No: the `upgradable\|none\|System is up to date\|-` row, which means that one tool ran clean and listed nothing. A failure status with no data row means unknown, not clean |
+| Roughly how much software is on this host, and has it changed? | `installed_count` | A trend on one host. The units differ per OS (registry subkeys, receipts, packages), so counts do not compare across Windows, macOS and Linux, and a Windows count excludes 32-bit applications |
+| Is this host patched? | Neither | Not answerable. The lists are one tool per OS with its own scope, apt reads the package lists already on the host and the plugin never refreshes them, nothing is graded by severity or security, and on Windows the action does not run under the service account. Use `windows_updates` for missing-patch state, `vuln_scan` for CVE matching and `installed_apps` for a real inventory |
+
+### Diagrams
+
+#### Linux `list_upgradable` decision flow
+
+```mermaid
+flowchart TD
+  A{"apt present?"} -->|"yes"| R["Run apt list --upgradable, 20 s"]
+  A -->|"no"| Y{"yum or dnf present?"}
+  R --> C1{"Ran clean, exit 0, not truncated?"}
+  C1 -->|"yes"| D1["Done: apt rows, or the up-to-date row. yum and dnf are not tried"]
+  C1 -->|"no"| Y
+  Y -->|"yes"| YR["Run check-update, 20 s"]
+  Y -->|"no"| G{"apt was tried and failed?"}
+  YR --> C2{"Ran clean, exit 0 or 100?"}
+  C2 -->|"yes, rows"| D2["Rows returned. CONSTRAINED apt_list_upgradable_failed if apt had failed"]
+  C2 -->|"yes, no rows"| F{"apt was tried and failed?"}
+  C2 -->|"no"| D4["No data row. Status: the runner failure or yum_check_update_failed"]
+  F -->|"yes"| D5["No data row. Status: the apt failure"]
+  F -->|"no"| D6["Up-to-date row"]
+  G -->|"yes"| D5
+  G -->|"no"| D8["UNAVAILABLE no_supported_package_manager"]
+```
+
+apt is the only source consulted on a Debian-family host that runs it cleanly, so an unrelated `dnf` problem can never overwrite apt's answer. The fallback to `yum` or `dnf` exists for RPM hosts and for hosts where apt failed; in that second case a clean but empty `yum` answer is still reported as the apt failure, never as "up to date". A `yum` or `dnf` exit code of 100 means updates are available and is treated as success.
 
 ## OS capability
 
@@ -46,11 +90,11 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service identity — sample captured under `SYSTEM` (no row in `docs/agent-privilege-model.md` for this plugin) | `list_upgradable` needs a resolvable `%LOCALAPPDATA%` and a user-session context for the winget alias to exist; `installed_count`'s registry read needs no extra grant | 2026-09-07 on bare metal, `SYSTEM` | `list_upgradable`: `UNAVAILABLE`/PARTIAL, e.g. `subprocess_runner:spawn_error` or `software_actions:localappdata_unset`; `installed_count`: `UNAVAILABLE`/PARTIAL/`software_actions:registry_query_failed` |
-| macOS | agent daemon — sample captured at `euid 501 (jsmith)`, unprivileged | None measured; both tools run unprivileged | 2026-09-07 on macOS 26.6.2, euid 501 | `UNAVAILABLE`/PARTIAL/`software_actions:softwareupdate_not_present` or `:softwareupdate_failed`; `installed_count`: `:pkgutil_not_present` or `:pkgutil_query_failed` |
-| Linux | agent daemon — sample captured at `euid 0` (container) | None measured; apt/yum/dpkg-query/rpm are read-only queries | 2026-09-06 in a container, euid 0 | `list_upgradable`: `UNAVAILABLE`/PARTIAL/`software_actions:no_supported_package_manager`, `:apt_list_upgradable_failed`, or `:yum_check_update_failed`; `installed_count`: `:dpkg_query_failed`, `:rpm_query_failed`, or `:no_supported_package_manager` |
+| Windows | Agent service account: LocalSystem today, not yet the intended virtual service account (`docs/agent-privilege-model.md`); no row for this plugin there | `installed_count` reads `HKLM\...\Uninstall` natively and needs nothing extra. `list_upgradable` needs `%LOCALAPPDATA%` (the current user's application-data folder) and a user-session context: winget is a per-user launcher stub (a Windows "App Execution Alias") that does not exist when the agent runs as LocalSystem | 2026-09-07 on bare metal as `SYSTEM`: `installed_count` returned 124, `list_upgradable` failed with `subprocess_runner:spawn_error` | `list_upgradable`: `UNAVAILABLE` / partial with `subprocess_runner:spawn_error` or `software_actions:localappdata_unset`. `installed_count`: `UNAVAILABLE` / partial with `software_actions:registry_query_failed` |
+| macOS | Agent daemon as root: the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md`). The plugin does not drop privilege | None: `softwareupdate -l` and `pkgutil --pkgs` ran for an ordinary user | 2026-09-07 on macOS 26.6.2 as an ordinary non-root user, below the production identity | `UNAVAILABLE` / partial with `software_actions:softwareupdate_not_present` or `software_actions:softwareupdate_failed`; `installed_count`: `software_actions:pkgutil_not_present` or `software_actions:pkgutil_query_failed` |
+| Linux | Agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`) | None in the plugin: it uses no `sudo`. `apt list --upgradable`, `dpkg-query` and `rpm -qa` are local reads. `yum` or `dnf check-update` can contact repositories, and whether an unprivileged account may refresh their metadata is the tool's own behaviour, not measured here | 2026-09-06 in a container as root (`euid 0`), a more privileged identity than production | `list_upgradable`: `UNAVAILABLE` / partial with `software_actions:no_supported_package_manager`, `software_actions:apt_list_upgradable_failed` or `software_actions:yum_check_update_failed`; `installed_count`: `software_actions:dpkg_query_failed`, `software_actions:rpm_query_failed` or `software_actions:no_supported_package_manager` |
 
-Subprocesses: `winget.exe` (Windows, `list_upgradable` only), `apt`/`yum`/`dnf` (Linux, `list_upgradable`), `dpkg-query`/`rpm` (Linux, `installed_count`), `softwareupdate` (macOS, `list_upgradable`), `pkgutil` (macOS, `installed_count`) — all via the bounded argv runner, no shell. `installed_count` on Windows spawns nothing (native `RegOpenKeyExW`/`RegQueryInfoKeyW`). Network: `winget upgrade` and `softwareupdate -l` reach their configured update source/catalog over the network; every other leg is a local read.
+Subprocesses, all run as a plain argument list through the agent's subprocess runner with a time limit and no shell: `winget.exe` (Windows `list_upgradable`, 60 s), `softwareupdate` (macOS `list_upgradable`, 60 s), `apt` and `yum` or `dnf` (Linux `list_upgradable`, 20 s each), `dpkg-query` or `rpm` (Linux `installed_count`, 20 s), `pkgutil` (macOS `installed_count`, 20 s). A tool that outlives its deadline is killed and reported as `subprocess_runner:deadline`. `installed_count` on Windows spawns nothing. Network: `winget upgrade` and `softwareupdate -l` reach their configured update sources, and `yum` or `dnf check-update` can; the other legs are local reads.
 
 ## Data contract
 
@@ -82,28 +126,29 @@ Pipe-delimited rows, one literal-discriminator field followed by the action's ow
 
 ### Result status
 
+A clean read sets no result status (the agent records `UNDECLARED` / `UNKNOWN`, as the macOS and Linux samples show). Every failure below sets one and writes no `count|` line and no "up to date" row. Actions that fail return exit code 1. A partial result (`CONSTRAINED`) that still wrote data rows returns 0, so check the result status and not only the exit code: this covers `winget_header_unrecognized`, `winget_rows_unmapped`, `winget_partial_exit`, `softwareupdate_partial_exit`, and on Linux `apt_list_upgradable_failed` when `yum` or `dnf` found rows. A `CONSTRAINED` result with no rows written (for example `winget_no_table`) returns 1.
+
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `UNDECLARED` (sample shows `UNDECLARED / UNKNOWN /`) | — | — | clean run: rows/count emitted, no `set_result_status` call — every captured sample except the Windows `list_upgradable` failure |
-| `UNAVAILABLE` | PARTIAL | `software_actions:localappdata_unset` | Windows `list_upgradable`: no `%LOCALAPPDATA%` in the token's environment |
-| `UNAVAILABLE` | PARTIAL | `subprocess_runner:spawn_error` (forwarded via `forward_runner_failure`) or `software_actions:winget_failed` / `:softwareupdate_failed` / `:apt_list_upgradable_failed` / `:yum_check_update_failed` | the child process could not be spawned at all, or (the plugin fallback) a tool ran but its capture was otherwise unusable — timeout, truncation, or a failing exit with no rows parsed |
-| `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` / `subprocess_runner:cancelled` / `subprocess_runner:signaled` (forwarded via `forward_runner_failure`) | the runner's deadline elapsed and the child was killed still running, the run was cancelled before finishing, or the child was killed by a signal rather than a clean exit |
-| `OK` | PARTIAL | `subprocess_runner:line_limit` (forwarded via `forward_runner_failure`) | a deliberate bounded stop: the runner capped output at N lines and killed a still-producing child — not a failure, but incomplete |
-| `UNAVAILABLE` | PARTIAL | `software_actions:softwareupdate_not_present` / `software_actions:no_supported_package_manager` | the queried tool (or any supported package manager) is not present on this host |
-| `UNAVAILABLE` | PARTIAL | `software_actions:registry_query_failed` / `software_actions:dpkg_query_failed` / `software_actions:rpm_query_failed` / `software_actions:pkgutil_query_failed` / `software_actions:pkgutil_not_present` | `installed_count`: the native registry read or the package-manager query failed, or (`pkgutil_not_present`) `pkgutil` itself is absent on this host |
-| `CONSTRAINED` | PARTIAL | `software_actions:winget_header_unrecognized` / `software_actions:winget_rows_unmapped` / `software_actions:winget_partial_exit` / `software_actions:winget_no_table` | winget's table was found but partially unparseable, every matched row was dropped as unmapped, winget exited nonzero but real rows still parsed, or no recognisable table was found at all |
-| `CONSTRAINED` | PARTIAL | `software_actions:softwareupdate_partial_exit` | `softwareupdate -l` exited nonzero but real labels still parsed |
-| `CONSTRAINED` | PARTIAL | `software_actions:apt_list_upgradable_failed` | Linux: apt failed but yum/dnf still found rows — real data returned, apt's own failure flagged |
+| `UNDECLARED` | — | — | A clean run: rows, the up-to-date row, or a `count\|N` line |
+| `UNAVAILABLE` | PARTIAL | `software_actions:localappdata_unset` | Windows `list_upgradable`: no `%LOCALAPPDATA%` in the agent's environment, so the winget path cannot be built |
+| `UNAVAILABLE` | PARTIAL | `subprocess_runner:spawn_error` | The runner could not start the tool (for example winget under LocalSystem, as in the Windows sample) |
+| `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` / `subprocess_runner:cancelled` / `subprocess_runner:signaled` | The tool outlived its deadline and was killed, the run was cancelled, or the tool was killed by a signal |
+| `OK` | PARTIAL | `subprocess_runner:line_limit` | Never emitted by this plugin, which sets no line cap; named because the shared runner can produce it |
+| `UNAVAILABLE` | PARTIAL | `software_actions:winget_failed` / `software_actions:softwareupdate_failed` / `software_actions:apt_list_upgradable_failed` / `software_actions:yum_check_update_failed` | The tool ran but the capture was unusable (truncated or a failing exit) or a failing exit parsed no rows; on Linux this is also the status when apt failed and yum or dnf found nothing |
+| `UNAVAILABLE` | PARTIAL | `software_actions:softwareupdate_not_present` / `software_actions:no_supported_package_manager` | `softwareupdate` is missing, or on Linux neither apt nor yum or dnf is present |
+| `UNAVAILABLE` | PARTIAL | `software_actions:registry_query_failed` / `software_actions:dpkg_query_failed` / `software_actions:rpm_query_failed` / `software_actions:pkgutil_query_failed` / `software_actions:pkgutil_not_present` | `installed_count`: the registry read or the package-manager query failed, or `pkgutil` is absent |
+| `CONSTRAINED` | PARTIAL | `software_actions:winget_header_unrecognized` / `software_actions:winget_rows_unmapped` / `software_actions:winget_partial_exit` / `software_actions:winget_no_table` | winget's table was found but its header could not be read (rows are name only), some rows were dropped as unmapped, winget exited non-zero but rows still parsed, or no recognisable table was found (the row is then `upgradable\|none\|-\|-`) |
+| `CONSTRAINED` | PARTIAL | `software_actions:softwareupdate_partial_exit` | `softwareupdate -l` exited non-zero but update labels still parsed |
+| `CONSTRAINED` | PARTIAL | `software_actions:apt_list_upgradable_failed` | Linux: apt failed but `yum` or `dnf` returned rows; the rows are real and apt's failure is flagged |
 
 ### Where the data goes
 
-- **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention, `kDefaultResponseRetentionDays`), queryable at `/api/responses/{id}`.
-- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no grep hit for either definition id outside the plugin/definition/capability files themselves. Nothing runs on a schedule; each definition's `gather.ttlSeconds` (300 for `list_upgradable`, 120 for `installed_count`) only bounds result freshness for a dispatch, it does not trigger one.
-- **Sensitivity.** `list_upgradable` rows name specific installed software and its current/available
-  versions (`package_name`/`current_version`/`available_version`) — an installed-software inventory
-  by another route; `installed_count` carries only a record count, nothing identifying.
-- **Siblings:** `installed_apps` (`list`/`query`/`list_per_user`/`list_inventory`) is the general software inventory — name, version, publisher, install date, per-user breakdown, and the daily-sync `list_inventory` collector; `software_actions` answers only "what needs upgrading" and "roughly how much software is here," with no publisher/version/date detail and no daily-sync leg of its own.
-- **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.software_actions.list_upgradable")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
+- **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the server's response store (90-day default retention), queryable at `/api/responses/{id}`.
+- **Not consumed by** daily-sync inventory, the Echo warehouse, DEX (Digital Employee Experience) or metrics: nothing outside the plugin, its definitions and the capability files references either definition id. Nothing runs on a schedule; `gather.ttlSeconds` (300 for `list_upgradable`, 120 for `installed_count`) is the window the agent has to respond to a dispatch, not a trigger.
+- **Sensitivity.** `list_upgradable` rows name installed software with its current and available versions, which is an installed-software inventory by another route; `installed_count` carries only a number and nothing identifying.
+- **Siblings:** `installed_apps` is the general software inventory (name, version, publisher, install date, per-user breakdown, and the daily-sync collector). `windows_updates` covers missing patches and pending reboots, and `vuln_scan` CVE matching. `software_actions` answers only "does the platform's package tool list an update" and "roughly how many packages".
+- **MCP / REST.** Discover: `discover_plugins` (summary), then `yuzu://plugin-docs` (this page as data), then `discover_instructions` / `get_definition("device.software_actions.list_upgradable")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
@@ -147,11 +192,11 @@ count|206
 
 ## Caveats and known gaps
 
-1. **The Windows sample shows the real failure mode, not a synthetic one.** Captured under `SYSTEM`, `list_upgradable` fails with `subprocess_runner:spawn_error` — exactly the "winget alias unresolvable under the service account" case the descriptor's fallback text declares. Re-running this action under a user-session agent, per the matrix's `CONSTRAINED` note, is expected to succeed.
-2. **The up-to-date sentinel abuses the `current_version` field.** `upgradable|none|System is up to date|-` puts the human sentence "System is up to date" in the `current_version` slot rather than a version string or `-`; a consumer parsing that field as a version must special-case the literal `none` name.
-3. **`count|0` and a bare "up to date" line are reserved, never a default.** Every degrade path emits a typed `UNAVAILABLE`/`CONSTRAINED` status with no data line instead — do not reintroduce a fallback `count|0` or `upgradable|none|System is up to date|-` on a failed query; `installed_apps`' `exclusion_count|0`-style false-clean bug is the shape this guards against (`software_actions_plugin.cpp:430-436`, `:477-480`).
-4. **Linux `installed_count` counts held packages, not just installed ones.** `hi` (held) counts alongside `ii` (installed) since Wave 4 PR4.3b, matching `installed_apps`/`vuln_scan`'s presence filter — a genuine value change from the pre-migration `dpkg --list | grep '^ii'` behaviour, not a silent contract break.
-5. **`list_upgradable` is deliberately never dispatched from a unit test.** `softwareupdate -l` hits Apple's catalog over the network and can take tens of seconds; only `installed_count` is exercised end-to-end via `LocalDispatcher` (`tests/unit/test_software_actions_actions.cpp:10-16`).
+1. **It cannot say whether a host is patched.** Each OS answers from one tool with its own scope (winget's sources, Apple's update list, apt or yum/dnf), apt reads the package lists already on the host and the plugin never refreshes them, and no row carries a severity or a security flag. "Up to date" means that one tool listed nothing.
+2. **The Windows `list_upgradable` leg does not work under the shipped service account.** winget is installed per user, and its launcher does not exist when the agent runs as LocalSystem, so the Windows capture (taken as `SYSTEM`) is a `subprocess_runner:spawn_error` failure. The action is expected to work only when the agent runs in a user session (not measured; the `SYSTEM` capture fails). Even then it lists only what winget has a source for, not Windows Update.
+3. **`installed_count` is a gauge, not an inventory, and its unit differs per OS.** Windows counts every subkey of the 64-bit `Uninstall` key whether or not the subkey holds any values, and misses 32-bit applications and per-user installs; macOS counts installer receipts; Linux counts installed packages, held ones included. Compare a host with itself over time, never across operating systems.
+4. **Row shapes carry some conventions to special-case.** The up-to-date row puts a sentence in the `current_version` field, so key on the package name `none`. macOS rows hold Apple's update label with `-` for both versions, and `yum` or `dnf` rows have no current version. A row `upgradable|none|-|-` with `CONSTRAINED` / `winget_no_table` means winget's output was not recognised, not that the host is up to date.
+5. **A failed query is never made to look clean, and that is an invariant.** Failures write a typed status and no `count|0` or up-to-date row, and a failed apt followed by a clean empty `yum` answer still reports the apt failure. Do not add a fallback that emits `count|0` or the up-to-date row on error.
 
 ## Source and tests
 

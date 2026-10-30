@@ -2,11 +2,14 @@
 
 #include "command_delivery_finalization_owner.hpp" // #4982 round 5: ADR-0012 §3 shared cross-schema predicate
 #include "execution_event_bus.hpp"
+#include "forensics_error_detail.hpp"
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "refusal_log_throttle.hpp"
+#include "response_tier_filter.hpp" // ForensicsPluginSet
 #include "secure_random.hpp"
 
 #include <yuzu/audit_retention_rules.hpp>
@@ -22,6 +25,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <random>
+#include <string_view>
+#include <unordered_set>
 
 namespace yuzu::server {
 
@@ -174,6 +179,117 @@ const char* kSelectErrorDetailExpr =
 // unconditionally without branching on which column list was used.
 const char* kSelectErrorDetailEmpty = ", '' AS last_error_detail";
 
+// #4990: the executions, among `ids`, that ran at least one command of a Forensics-tier plugin.
+// The plugin is the one the server RECORDED at dispatch in `command_execution.plugin` (the same
+// value the ingest stores in `responses.plugin`), folded to ASCII lowercase in SQL with COLLATE "C"
+// so it agrees with `ForensicsPluginSet`. A record whose plugin is the empty string names no
+// plugin at all (the column default; `record_command_dispatch` refuses to write one, and the
+// ingest treats an empty plugin as unverified), so it counts as Forensics-tier here: the fail
+// closed reading, the same one the ingest takes. A failed read returns nullopt; the caller then treats EVERY
+// candidate as Forensics (the safe reading: a bounded token or the placeholder is shown instead of
+// free text). The lookup is by `execution_id`, served by `idx_command_execution_execution_id`
+// (migration 7), so its cost follows the rows of the named executions, not the size of the table;
+// it runs only when a result actually carries a non-empty error text.
+// The decision is per EXECUTION: a mixed execution (one Forensics command and one ordinary command)
+// has every agent's text reduced on read, while the bus and the outbox decide per frame's plugin.
+std::optional<std::unordered_set<std::string>>
+forensics_executions_among(PGconn* conn, const ForensicsPluginSet& set,
+                           const std::vector<std::string>& ids) {
+    std::vector<std::string_view> idv(ids.begin(), ids.end());
+    std::vector<std::string_view> names(set.names().begin(), set.names().end());
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "SELECT DISTINCT execution_id FROM execution_tracker.command_execution "
+        "WHERE execution_id = ANY($1::text[]) "
+        "AND (plugin = '' OR lower(plugin COLLATE \"C\") = ANY($2::text[]))",
+        std::vector<std::string>{pg::to_text_array(idv), pg::to_text_array(names)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::nullopt;
+    std::unordered_set<std::string> out;
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        out.insert(col_str(res.get(), i, 0));
+    return out;
+}
+
+// Reduce the error text of every Forensics-tier execution among the given (execution id, text)
+// slots. `set == nullptr` (unwired harness) leaves the texts as stored. Returns false only when
+// the Forensics lookup itself failed (every non-empty slot was then reduced, the fail-closed
+// reading); true otherwise, including when there was nothing to look up. `throttle_key` names the
+// caller's own warning throttle (the read paths and the write path each get one line a minute).
+bool scrub_error_texts(PGconn* conn, const ForensicsPluginSet* set,
+                       std::vector<std::pair<std::string, std::string*>> slots,
+                       const char* throttle_key = "forensics_execution_lookup_failed") {
+    if (!set)
+        return true;
+    std::erase_if(slots, [](const auto& s) { return s.second->empty(); });
+    if (slots.empty())
+        return true;
+    std::vector<std::string> ids;
+    ids.reserve(slots.size());
+    for (const auto& s : slots)
+        ids.push_back(s.first);
+    std::ranges::sort(ids);
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    const auto forensics = forensics_executions_among(conn, *set, ids);
+    if (!forensics) {
+        // The drawer repeats this read every few seconds, so the line is throttled (the text is
+        // withheld on every read regardless): at most one per minute.
+        static RefusalLogThrottle throttle;
+        if (throttle.should_warn(throttle_key))
+            spdlog::warn("ExecutionTracker: Forensics execution lookup failed; error text withheld "
+                         "for {} execution(s) (#4990; at most one log per 60 s)", ids.size());
+    }
+    for (auto& [exec_id, text] : slots)
+        if (!forensics || forensics->contains(exec_id))
+            *text = sanitize_forensics_error_detail(*text);
+    return forensics.has_value();
+}
+
+// The same reduction for the one caller that runs INSIDE an open write transaction (the agent
+// status upsert). A failed statement aborts a PostgreSQL transaction, and the upsert and the
+// durable outbox append share one, so a lookup error there would lose the agent's terminal status
+// (agents do not re-send). The lookup therefore runs under a SAVEPOINT that is rolled back on
+// failure: the transaction stays usable and the text is reduced to its bounded form (the same
+// fail-closed reading as the read paths) while the status write, the outbox row and the bus event
+// still commit. If the SAVEPOINT itself cannot be created the lookup is not attempted and the text
+// is reduced the same way. One sanitizer path: this calls `scrub_error_texts`.
+void scrub_error_texts_in_txn(PGconn* conn, const ForensicsPluginSet* set,
+                              std::vector<std::pair<std::string, std::string*>> slots) {
+    if (!set)
+        return;
+    pg::PgResult sp = pg::exec_params(conn, "SAVEPOINT forensics_lookup", std::vector<std::string>{});
+    if (sp.status() != PGRES_COMMAND_OK) {
+        static RefusalLogThrottle throttle;
+        if (throttle.should_warn("forensics_execution_savepoint_failed_in_write_txn"))
+            spdlog::warn("ExecutionTracker: could not open a savepoint for the Forensics execution "
+                         "lookup; error text withheld (#4990; at most one log per 60 s)");
+        for (auto& [exec_id, text] : slots)
+            *text = sanitize_forensics_error_detail(*text);
+        return;
+    }
+    const bool lookup_ok = scrub_error_texts(conn, set, std::move(slots),
+                                             "forensics_execution_lookup_failed_in_write_txn");
+    pg::PgResult fin = pg::exec_params(
+        conn, lookup_ok ? "RELEASE SAVEPOINT forensics_lookup" : "ROLLBACK TO SAVEPOINT forensics_lookup",
+        std::vector<std::string>{});
+    if (fin.status() != PGRES_COMMAND_OK) {
+        // Throttled like the two warnings above, and without the driver's error text (which can
+        // echo statement context): a failing connection makes every frame hit this line, and the
+        // outbox append that follows reports the lost write itself.
+        static RefusalLogThrottle throttle;
+        if (throttle.should_warn("forensics_execution_savepoint_close_failed_in_write_txn"))
+            spdlog::warn("ExecutionTracker: closing the Forensics lookup savepoint failed "
+                         "(#4990; at most one log per 60 s)");
+    }
+}
+
+void scrub_executions(PGconn* conn, const ForensicsPluginSet* set, std::vector<Execution>& execs) {
+    std::vector<std::pair<std::string, std::string*>> slots;
+    for (auto& e : execs)
+        slots.emplace_back(e.id, &e.last_error_detail);
+    scrub_error_texts(conn, set, std::move(slots));
+}
+
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for
     // the migration txn. Runtime statements below schema-qualify explicitly.
@@ -277,7 +393,7 @@ const std::vector<pg::PgMigration>& migrations() {
          // (notify_exec_tracker's `execution_id.empty()` early-return).
          // `cmd_execution_ids_` no longer exists: it was replaced by a
          // PG-backed, replica-safe correlation table
-         // (`ExecutionTracker::record_command_execution`/`lookup_execution_id`,
+         // (`ExecutionTracker::record_command_dispatch`/`lookup_command_record`,
          // HA WS-1(1b)), which now handles that restart case on its own.
          // `command_id` still rides on every CommandResponse (including
          // `__keepalive__`) independent of any server-side cache, and is
@@ -417,6 +533,45 @@ const std::vector<pg::PgMigration>& migrations() {
         // increasing, not contiguous, so the next migration added here
         // simply takes whatever the next free version number is at that
         // time.
+        //
+        // #4990 (UP-7), server-authored response provenance: `command_execution` becomes the
+        // server's record of every dispatch, not only the tracked ones. `plugin` is the plugin
+        // the server dispatched the command as (written at the dispatch chokepoint); a response
+        // whose command id has no row is labelled unverified at ingest. A constant default makes
+        // the ADD COLUMN metadata-only (no rewrite); the table was created in v2 and a fresh
+        // database runs v2 and v6 back to back. `execution_id` stays NOT NULL: an untracked
+        // dispatch (e.g. `/api/command`) now records the empty string, which readers treat as "no
+        // execution".
+        {6,
+         "ALTER TABLE command_execution ADD COLUMN plugin TEXT NOT NULL DEFAULT '';"},
+        // #4990: the read-side error-text reduction and the in-transaction one look up
+        // `command_execution` by `execution_id`; without an index each lookup is a scan of up to
+        // 24 hours of dispatch records (measured at 38 to 88 ms at 1M rows and 263 to 628 ms at
+        // 10M), which the sticky-terminal write path pays inside the agent-status transaction.
+        // A plain (transactional) index build: the fourth entry of the store playbook's recorded
+        // exception (docs/postgres-store-playbook.md), on the owner's hard-cutover ruling. This
+        // release is a fresh-database deployment, where the table is empty when the index is
+        // built (the playbook's empty-table rule). On an already-populated table the build holds
+        // a SHARE lock and can hit the pool's lock or statement timeout, which rolls the
+        // migration back and makes the server refuse to start; that population is outside the
+        // deployment contract. The `executions(parent_id)` index (#4624) is a separate item above.
+        {7,
+         "CREATE INDEX idx_command_execution_execution_id ON command_execution(execution_id);"},
+        // v8 (Echo rename, upgrade window): history and in-flight claims follow the renamed
+        // definition ids; the server-recorded dispatch label follows the renamed plugin.
+        // Idempotent (every UPDATE is guarded by its own predicate). The UPDATEs are sequential
+        // scans over all-time `executions`, `concurrency_claims` and `command_execution` (a
+        // default-collation btree cannot serve a prefix LIKE), so SET LOCAL lifts the pool's
+        // per-lease statement_timeout for this step's transaction only (precedent:
+        // approval_manager.cpp v2): past the 30 s cap the statement is cancelled, the version
+        // rolls back and the tracker stays disabled on every boot.
+        {8,
+         "SET LOCAL statement_timeout = 0;"
+         "UPDATE executions SET definition_id = replace(definition_id, "
+         "'crossplatform.tar.', 'crossplatform.echo.') WHERE definition_id LIKE 'crossplatform.tar.%';"
+         "UPDATE concurrency_claims SET definition_id = replace(definition_id, "
+         "'crossplatform.tar.', 'crossplatform.echo.') WHERE definition_id LIKE 'crossplatform.tar.%';"
+         "UPDATE command_execution SET plugin = 'echo' WHERE plugin = 'tar';"},
     };
     return kMigrations;
 }
@@ -439,7 +594,7 @@ const std::vector<pg::PgMigration>& migrations() {
 // counter, see the bus publish body). `created_at` is authored from Postgres
 // now() IN-SQL, so
 // the reap cutoff and the row share one DB clock domain (the same
-// DB-clock-authority reason record_command_execution authors created_at
+// DB-clock-authority reason record_command_dispatch authors created_at
 // in-SQL).
 //
 // ID-ORDERING CONTRACT for future consumers (HA WS-2a-2 forward poll): an
@@ -704,6 +859,7 @@ ExecutionTracker::query_executions_checked(const ExecutionQuery& q,
     results.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i)
         results.push_back(row_to_exec(res.get(), i));
+    scrub_executions(lease.get(), forensics_plugins_, results); // #4990
     return results;
 }
 
@@ -730,7 +886,15 @@ std::optional<Execution> ExecutionTracker::get_execution(const std::string& id) 
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
         return std::nullopt;
-    return exec_by_id_at(lease.get(), id);
+    // #4990: the same error-text scrub as the _checked readers; this accessor carries
+    // `last_error_detail` too, so it must not be the one tracker read that returns it as stored.
+    auto exec = exec_by_id_at(lease.get(), id);
+    if (!exec)
+        return std::nullopt;
+    std::vector<Execution> one;
+    one.push_back(std::move(*exec));
+    scrub_executions(lease.get(), forensics_plugins_, one);
+    return std::optional<Execution>{std::move(one.front())};
 }
 
 std::expected<std::optional<Execution>, std::string>
@@ -759,7 +923,10 @@ ExecutionTracker::get_execution_checked(const std::string& id) const {
     }
     if (PQntuples(res.get()) == 0)
         return std::optional<Execution>{std::nullopt};
-    return std::optional<Execution>{row_to_exec(res.get(), 0)};
+    std::vector<Execution> one;
+    one.push_back(row_to_exec(res.get(), 0));
+    scrub_executions(lease.get(), forensics_plugins_, one); // #4990
+    return std::optional<Execution>{std::move(one.front())};
 }
 
 ExecutionSummary ExecutionTracker::get_summary(const std::string& id) const {
@@ -829,6 +996,12 @@ ExecutionTracker::get_agent_statuses_checked(
         a.error_detail = col_str(res.get(), i, 6);
         a.plugin_result_status = to_i(col(res.get(), i, 7));
         results.push_back(std::move(a));
+    }
+    { // #4990
+        std::vector<std::pair<std::string, std::string*>> slots;
+        for (auto& a : results)
+            slots.emplace_back(execution_id, &a.error_detail);
+        scrub_error_texts(lease.get(), forensics_plugins_, std::move(slots));
     }
     return results;
 }
@@ -901,6 +1074,13 @@ ExecutionTracker::get_agent_statuses_for_executions_checked(
         a.plugin_result_status = to_i(col(res.get(), i, 8));
         by_execution[col_str(res.get(), i, 0)].push_back(std::move(a));
     }
+    { // #4990
+        std::vector<std::pair<std::string, std::string*>> slots;
+        for (auto& [exec_id, list] : by_execution)
+            for (auto& a : list)
+                slots.emplace_back(exec_id, &a.error_detail);
+        scrub_error_texts(lease.get(), forensics_plugins_, std::move(slots));
+    }
     return by_execution;
 }
 
@@ -965,6 +1145,9 @@ ExecutionTracker::get_children_checked(const std::string& parent_id,
         result.children.reserve(static_cast<std::size_t>(take));
         for (int i = 0; i < take; ++i)
             result.children.push_back(row_to_exec(res.get(), i));
+        // #4990: a no-op today (this read selects an empty error text, and an empty slot is not
+        // looked up). Kept so a future switch to the error-detail subquery is reduced, not leaked.
+        scrub_executions(c, forensics_plugins_, result.children); // #4990
         out = std::move(result);
         return true;
     });
@@ -1090,7 +1273,20 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
         payload["status"] = persisted_status;
         payload["exit_code"] = to_i64(col(res.get(), 0, 1));
         payload["completed_at"] = to_i64(col(res.get(), 0, 2));
-        const std::string returned_error = col_str(res.get(), 0, 3);
+        std::string returned_error = col_str(res.get(), 0, 3);
+        // #4990: the PERSISTED text can be older than this write (a terminal row is sticky, so a
+        // later frame returns what an earlier writer stored). The incoming text was already reduced
+        // at ingest (`AgentServiceImpl::failure_text_for_sinks`), so a persisted value equal to it
+        // needs no lookup: that is every ordinary frame, and it keeps this write transaction free
+        // of the Forensics scan. Only a persisted value that DIFFERS from the incoming one (the
+        // sticky-terminal case, or a raw text a caller wrote around the ingest-time reduction) is reduced here, as the read paths
+        // do, before it reaches the durable outbox or the bus; a value that already has the bounded
+        // shape needs no lookup either (the reduction is idempotent). The lookup runs under a
+        // SAVEPOINT so a failure of it can never abort this transaction (see
+        // `scrub_error_texts_in_txn`).
+        if (!returned_error.empty() && returned_error != s.error_detail &&
+            sanitize_forensics_error_detail(returned_error) != returned_error)
+            scrub_error_texts_in_txn(conn, forensics_plugins_, {{execution_id, &returned_error}});
         if (!returned_error.empty())
             payload["error_detail"] = returned_error;
         const int64_t returned_plugin_status = to_i64(col(res.get(), 0, 4));
@@ -2307,9 +2503,50 @@ namespace {
 // constants (clock-guarded-retention routed concern: "never copy the
 // numbers"). A command's realistic in-flight lifetime is seconds to a few
 // minutes; 24h is generous headroom over any documented per-command
-// timeout, so a mapping this old is stale by construction, not merely idle.
+// timeout, so a record this old is stale by construction, not merely idle.
+// KNOWN LIMIT (#4990): a command that has no wire expiry runs until finished (ADR-1007), and a
+// response arriving more than 24h after the dispatch record was last written finds no record and
+// is stored unverified (response_provenance.hpp). Re-driven commands refresh the record
+// (record_command_dispatch), so this bites only a single execution that outlives the window.
 constexpr std::int64_t kCmdExecutionReapWindowSecs = 24 * 3600;
-constexpr int kCmdExecutionReapCap = 5000;
+// Per-pass delete cap. RE-DECIDED for #4990 (recorded reasoning, not a copied number): this table
+// held one row per TRACKED execution; it now holds one row per DISPATCH (server-authored
+// provenance), including per-agent system pushes (`__guard__` policy pushes, `asset_tags` sync),
+// so inflow can reach one row per connected agent per fleet-wide event. The old cap (5000 per
+// ~60-minute pass = 120k rows/day of reclaim) would let the table grow without bound once inflow
+// exceeded that.
+//
+// What 50,000 per pass covers (assumptions stated, not measured on a fleet): 50,000 rows x 24
+// hourly passes = 1.2M rows/day of reclaim, so the table stays bounded while the SUSTAINED inflow
+// stays under 1.2M dispatch records a day (about 50,000 an hour, roughly 14 a second).
+//   - Short-term target, about 5,000 agents: a fleet-wide per-agent event is 5,000 rows, so 1.2M a
+//     day is about 240 such events a day; the organic dispatch rate is on the order of 1e4 rows a
+//     day. Covered by two orders of magnitude.
+//   - Long-term target, 500,000 agents: one fleet-wide per-agent event is 500,000 rows, so the cap
+//     covers up to two such events a day (1.0M rows) plus about 0.2M rows of other dispatches. A
+//     third event (1.5M rows) is above the reclaim rate. A burst is drained over the following
+//     passes (a 500,000-row burst past the window takes ten), but a SUSTAINED inflow above
+//     1.2M rows/day saturates the cap on every pass and the table then grows by the difference
+//     (about 210 bytes a row measured before the execution_id index of migration 7; roughly 250
+//     for a tracked row with it, reasoned and not measured).
+//   - The same ceiling applies to API-driven dispatch: a sustained rate above about 14 a second
+//     saturates it. A per-principal or per-address inflow quota is NOT part of this bound; it is
+//     tracked as a separate follow-up.
+// Saturation is observable and alerted: a saturated pass deletes exactly this cap, so
+// `yuzu_exec_correlation_reap_total` moves by the cap every hour, and the alert
+// YuzuExecCorrelationReapSaturated fires when the reap has run at or near the cap for 24 hours.
+//
+// Cost, measured (PostgreSQL 16, synthetic time-ordered tables built with generate_series, the
+// exact statement below, rolled back and repeated 5-6 times, cap 50,000): median 34 ms at 1M rows
+// and 35 ms at 10M rows. The earlier `DELETE .. WHERE command_id IN (SELECT .. LIMIT n)` shape
+// planned a Hash Semi Join over a Seq Scan of the whole table, so it cost O(table) whatever the
+// cap: median 180 ms at 1M rows and 1.74 s at 10M. The ctid form reads only the cap's worth of
+// index entries (Index Scan feeding a Tid Scan), so the pass cost follows the cap, not the table.
+// A pass holds row locks only on rows already past the window and no live dispatch touches them.
+// The cap stays an UNCONDITIONAL bound on the work one pass (and one skewed-clock pass) can do.
+// Cadence stays the caller's ~60 minutes (server.cpp kCmdExecutionReapEveryNTicks); it is NOT
+// shortened, because the clock-anomaly threshold below is sized against it.
+constexpr int kCmdExecutionReapCap = 50000;
 // A DB `now()` reading more than this far ahead of the persisted anchor is
 // an anomaly, not legitimate elapsed time between reap ticks. The nominal
 // inter-pass interval is ~3600s (server.cpp's kCmdExecutionReapEveryNTicks),
@@ -2350,70 +2587,80 @@ std::optional<std::int64_t> parse_reap_i64(const std::string& val) {
 }
 } // namespace
 
-bool ExecutionTracker::record_command_execution(const std::string& command_id,
-                                                const std::string& execution_id) {
+bool ExecutionTracker::record_command_dispatch(const std::string& command_id,
+                                               const std::string& plugin,
+                                               const std::string& execution_id,
+                                               std::optional<std::chrono::milliseconds> lease_timeout) {
     if (!open_)
         return false;
+    // A record without a plugin is not a provenance record (the reader treats one as absent), and
+    // an empty command id can never be looked up. Refuse both rather than store a row that cannot
+    // mean anything.
+    if (command_id.empty() || plugin.empty())
+        return false;
 
-    // SINGLE attempt, no retry — deliberately NOT update_agent_status's
-    // retry-once shape (governance Gate 4 unhappy-path/Gate 3 performance
-    // finding). This call sits on the SYNCHRONOUS pre-RPC dispatch path
-    // (record_execution_id / server.cpp's command_dispatch_fn calls this
-    // BEFORE the RPC, UP2-4); a retry-once here would double the worst-case
-    // block on the calling worker thread (REST/dashboard/MCP dispatch, or a
-    // background runner such as ScheduleRunner/PreflightRunner/
-    // PolicyEvaluator — anything feeding the shared CommandDispatchFn
-    // closure) (2*kWriteTimeout)
-    // under sustained pool contention. update_agent_status's retry lives on
-    // the async gateway-response path, where that tradeoff is free.
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    // SINGLE attempt, no retry (governance Gate 4 unhappy-path/Gate 3 performance finding). This
+    // call sits on the SYNCHRONOUS pre-RPC dispatch path (server.cpp's build_classified_command
+    // calls it BEFORE any frame is sent); a retry-once here would double the worst-case block on
+    // the calling worker thread (REST/dashboard/MCP dispatch, or a background runner such as
+    // ScheduleRunner/PreflightRunner/PolicyEvaluator, anything feeding the dispatch chokepoint)
+    // under sustained pool contention. kWriteTimeout bounds only the lease acquire; the statement
+    // itself runs under the pool's lock_timeout (10 s) and statement_timeout (30 s), so a held
+    // table lock blocks this write for about 10 s before it fails (measured 10.04 s), and a retry
+    // would double that. update_agent_status's retry lives on the
+    // async gateway-response path, where that tradeoff is free.
+    auto lease = pool_.try_acquire_for(lease_timeout.value_or(kWriteTimeout));
+    // Every failed record is counted by the caller (`yuzu_exec_correlation_write_degrade_total`);
+    // the line is for a human, and a pool or database outage fails EVERY dispatch, so it is
+    // throttled per cause (one line a minute each) instead of one ERROR per command.
+    static RefusalLogThrottle record_failure_throttle;
     if (!lease) {
-        spdlog::error("ExecutionTracker::record_command_execution: pool exhausted for "
-                      "command_id={} — this command's responses will not correlate to an "
-                      "execution_id on any replica (executions-drawer/SSE degraded for it, "
-                      "dispatch itself is unaffected)",
-                      command_id);
+        if (record_failure_throttle.should_warn("record_command_dispatch_pool_exhausted"))
+            spdlog::error("ExecutionTracker::record_command_dispatch: pool exhausted for "
+                          "command_id={} - this command's responses will be labelled unverified "
+                          "(withheld from readers without the Forensics grant) and will not "
+                          "correlate to an execution_id on any replica; dispatch itself is "
+                          "unaffected (first of a series; at most one log per 60 s per cause, the "
+                          "write-degrade counter records every failure)",
+                          command_id);
         return false;
     }
-    pg::PgResult res =
-        execution_id.empty()
-            ? pg::exec_params(lease.get(),
-                              "DELETE FROM execution_tracker.command_execution "
-                              "WHERE command_id = $1",
-                              std::vector<std::string>{command_id})
-            // created_at is authored from Postgres now() IN-SQL, not the
-            // calling replica's app clock (adversarial review Should-fix,
-            // PR #3780): reap_command_execution_mappings compares created_at
-            // against its own DB `now()` reading, so authoring created_at
-            // from a different (app) clock domain means a replica whose
-            // local clock lags the DB primary by more than the reap window
-            // can write a mapping that reads as already-expired the moment
-            // another replica's sweep runs -- silently dropping the exact
-            // correlation this migration exists to preserve, in the exact
-            // multi-replica scenario it targets. Matches session_store's
-            // DB-clock-authority precedent (#3715).
-            : pg::exec_params(
-                  lease.get(),
-                  "INSERT INTO execution_tracker.command_execution "
-                  "(command_id, execution_id, created_at) "
-                  "VALUES ($1, $2, extract(epoch FROM now())::bigint) "
-                  "ON CONFLICT (command_id) DO UPDATE SET "
-                  "execution_id = EXCLUDED.execution_id, created_at = EXCLUDED.created_at",
-                  std::vector<std::string>{command_id, execution_id});
+    // created_at is authored from Postgres now() IN-SQL, not the calling replica's app clock
+    // (adversarial review Should-fix, PR #3780): reap_command_execution_mappings compares
+    // created_at against its own DB `now()` reading, so authoring created_at from a different
+    // (app) clock domain means a replica whose local clock lags the DB primary by more than the
+    // reap window could write a record that reads as already-expired the moment another replica's
+    // sweep runs, silently dropping the exact provenance this table exists to carry. Matches
+    // session_store's DB-clock-authority precedent (#3715).
+    //
+    // ON CONFLICT: the PLUGIN is deliberately NOT updated (first writer wins; see the declaration).
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO execution_tracker.command_execution "
+        "(command_id, plugin, execution_id, created_at) "
+        "VALUES ($1, $2, $3, extract(epoch FROM now())::bigint) "
+        "ON CONFLICT (command_id) DO UPDATE SET "
+        "execution_id = CASE WHEN EXCLUDED.execution_id = '' "
+        "THEN execution_tracker.command_execution.execution_id ELSE EXCLUDED.execution_id END, "
+        "created_at = EXCLUDED.created_at",
+        std::vector<std::string>{command_id, plugin, execution_id});
     if (res.status() != PGRES_COMMAND_OK) {
-        spdlog::error("ExecutionTracker::record_command_execution: write failed for "
-                      "command_id={} — this command's responses will not correlate to an "
-                      "execution_id on any replica (executions-drawer/SSE degraded for it, "
-                      "dispatch itself is unaffected)",
-                      command_id);
+        if (record_failure_throttle.should_warn("record_command_dispatch_write_failed"))
+            spdlog::error("ExecutionTracker::record_command_dispatch: write failed for "
+                          "command_id={} - this command's responses will be labelled unverified "
+                          "(withheld from readers without the Forensics grant) and will not "
+                          "correlate to an execution_id on any replica; dispatch itself is "
+                          "unaffected (first of a series; at most one log per 60 s per cause, the "
+                          "write-degrade counter records every failure)",
+                          command_id);
         return false;
     }
     return true;
 }
 
-std::optional<std::string>
-ExecutionTracker::lookup_execution_id(const std::string& command_id,
-                                      std::string* degrade_reason) const {
+std::optional<CommandRecord>
+ExecutionTracker::lookup_command_record(const std::string& command_id,
+                                        std::string* degrade_reason) const {
     if (!open_)
         return std::nullopt; // not a runtime degrade -- construction already failed loudly
     auto lease = pool_.try_acquire_for(kReadTimeout);
@@ -2422,18 +2669,19 @@ ExecutionTracker::lookup_execution_id(const std::string& command_id,
             *degrade_reason = "pool_exhausted";
         return std::nullopt;
     }
-    pg::PgResult res = pg::exec_params(lease.get(),
-                                       "SELECT execution_id FROM execution_tracker.command_execution "
-                                       "WHERE command_id = $1",
-                                       std::vector<std::string>{command_id});
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT plugin, execution_id FROM execution_tracker.command_execution "
+        "WHERE command_id = $1",
+        std::vector<std::string>{command_id});
     if (res.status() != PGRES_TUPLES_OK) {
         if (degrade_reason)
             *degrade_reason = "query_failed";
         return std::nullopt;
     }
     if (PQntuples(res.get()) == 0)
-        return std::nullopt; // genuine miss -- out-of-band dispatch or an aged-out mapping
-    return col_str(res.get(), 0, 0);
+        return std::nullopt; // genuine miss -- a forged or never-issued id, or a reaped record
+    return CommandRecord{col_str(res.get(), 0, 0), col_str(res.get(), 0, 1)};
 }
 
 std::expected<CommandExecutionReapOutcome, std::string>
@@ -2536,18 +2784,28 @@ ExecutionTracker::reap_command_execution_mappings() {
             clock_anomaly = true;
             return true;
         }
+        // The deleted rows are counted in SQL, not returned: at the 50,000-row cap a RETURNING
+        // list would ship megabytes of ids to count them. The oldest rows go first (the index on
+        // created_at feeds the subselect, so the work follows the cap, not the table). The outer
+        // `created_at < cutoff` re-tests the age on the row version actually deleted: a row that
+        // `record_command_dispatch` refreshed between the subselect and the delete is a live
+        // dispatch, and must not be taken from under it (a refreshed row also changes ctid, which
+        // is skipped by the ctid match; the re-test is the explicit statement of the same rule).
         pg::PgResult dr = pg::exec_params(
             c,
-            "DELETE FROM execution_tracker.command_execution WHERE command_id IN "
-            "(SELECT command_id FROM execution_tracker.command_execution "
-            " WHERE created_at < $1::bigint LIMIT $2::bigint) RETURNING command_id",
+            "WITH d AS (DELETE FROM execution_tracker.command_execution "
+            " WHERE ctid = ANY(ARRAY(SELECT ctid FROM execution_tracker.command_execution "
+            "                         WHERE created_at < $1::bigint "
+            "                         ORDER BY created_at LIMIT $2::bigint)) "
+            "   AND created_at < $1::bigint RETURNING 1) "
+            "SELECT count(*) FROM d",
             std::vector<std::string>{std::to_string(now_s - kCmdExecutionReapWindowSecs),
                                      std::to_string(kCmdExecutionReapCap)});
-        if (dr.status() != PGRES_TUPLES_OK) {
+        if (dr.status() != PGRES_TUPLES_OK || PQntuples(dr.get()) != 1) {
             err = std::string("reap delete failed: ") + PQerrorMessage(c);
             return false;
         }
-        deleted = PQntuples(dr.get());
+        deleted = static_cast<int>(to_i64(col(dr.get(), 0, 0)));
         const std::int64_t new_anchor = has_anchor ? (std::max)(anchor, now_s) : now_s;
         pg::PgResult ur = pg::exec_params(
             c,
@@ -2566,24 +2824,25 @@ ExecutionTracker::reap_command_execution_mappings() {
 }
 
 namespace {
-// These values are bit-identical to the command_execution sibling's
-// (kCmdExecutionReapWindowSecs / kCmdExecutionReapCap / kMaxPlausibleSkewSecs)
-// and that is DELIBERATE, not a copy the clock-guarded-retention routed concern
-// forbids: that prohibition (part 1) is scoped to the WOULD-WIPE implausible-
-// ahead FLOOR, and this table takes the would-wipe carve-out, so it computes no
-// such floor at all. The two tables are the same KIND of thing — short-lived
-// per-execution observability feeds on the same maintenance cadence, same
-// substrate, same failover/reconnect replay horizon — so their window/cap/skew
-// are kept in LOCKSTEP with the sibling ON PURPOSE, and should be revisited
-// TOGETHER, not diverged silently. Rationale for the shared values: 24h of
-// durable frames comfortably covers a failover + a client-reconnect replay
-// window while bounding table growth; the skew threshold is ~24x the sibling's
-// ~3600s nominal cadence and absorbs scheduler jitter while still catching a
-// genuinely wrong clock (the event_outbox reap itself runs on a TIGHTER ~60s
-// cadence for volume reasons — see server.cpp — but the skew headroom is sized
-// against the same worst-case inter-pass gap the sibling documents). If a
-// future event-outbox-specific input (a consumer replay SLA, a failover MTTR
-// bound) argues for a different value, derive it then and let the two diverge.
+// The window and skew values are bit-identical to the command_execution sibling's
+// (kCmdExecutionReapWindowSecs / kMaxPlausibleSkewSecs) and that is DELIBERATE; the CAP is
+// deliberately NOT: #4990 re-decided the sibling's cap (50,000, see kCmdExecutionReapCap) because
+// that table now takes a row per dispatch, while this table's volume (one row per agent state
+// change) is unchanged and its 5000 is left as it was. So the two are kept together for the window
+// and the skew only; the cap of each is derived from its own table's inflow. The identical window
+// and skew are not a copy the clock-guarded-retention routed concern forbids: that prohibition
+// (part 1) is scoped to the WOULD-WIPE implausible-ahead FLOOR, and this table takes the
+// would-wipe carve-out, so it computes no such floor at all. The two tables are the same KIND of
+// thing (short-lived per-execution observability feeds on the same maintenance cadence, same
+// substrate, same failover/reconnect replay horizon), so their window and skew are kept equal ON
+// PURPOSE and should be revisited TOGETHER, not diverged silently. Rationale for the shared
+// values: 24h of durable frames comfortably covers a failover + a client-reconnect replay window
+// while bounding table growth; the skew threshold is ~24x the sibling's ~3600s nominal cadence and
+// absorbs scheduler jitter while still catching a genuinely wrong clock (the event_outbox reap
+// itself runs on a TIGHTER ~60s cadence for volume reasons, see server.cpp, but the skew headroom
+// is sized against the same worst-case inter-pass gap the sibling documents). If a future
+// event-outbox-specific input (a consumer replay SLA, a failover MTTR bound) argues for a
+// different value, derive it then and let the two diverge.
 constexpr std::int64_t kEventOutboxReapWindowSecs = 24 * 3600;
 constexpr int kEventOutboxReapCap = 5000;
 constexpr std::int64_t kEventOutboxMaxPlausibleSkewSecs = 24 * 3600;

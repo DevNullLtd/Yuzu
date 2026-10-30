@@ -2,7 +2,7 @@
  * test_rest_result_sets_async.cpp — HTTP-level coverage for the async
  * result-set producers added in scope-walking PR-D:
  *
- *   POST /api/v1/result-sets/from-tar-query
+ *   POST /api/v1/result-sets/from-echo-query
  *   POST /api/v1/result-sets/from-instruction-result
  *   POST /api/v1/result-sets/{id}/re-eval
  *
@@ -343,6 +343,22 @@ std::optional<ResultSet> get_ok(ResultSetStore& s, const std::string& id) {
     return *r;
 }
 
+// A certificates-shaped definition: the result_schema declares the plain pipe-row columns.
+std::string make_cert_instruction(InstructionStore& s) {
+    InstructionDefinition def;
+    def.name = "Certificates list";
+    def.version = "1.0";
+    def.plugin = "certificates";
+    def.action = "list";
+    def.type = "question";
+    def.description = "list certificates";
+    def.result_schema =
+        R"([{"name":"subject","type":"string"},{"name":"issuer","type":"string"},{"name":"thumbprint","type":"string"}])";
+    def.enabled = true;
+    auto id = s.create_definition(def);
+    REQUIRE(id.has_value());
+    return *id;
+}
 std::string make_instruction(InstructionStore& s) {
     InstructionDefinition def;
     def.name = "Chrome hash check";
@@ -372,51 +388,51 @@ std::string nested_array(int depth) {
 
 } // namespace
 
-TEST_CASE("from-tar-query: 202 pending, dispatch to __all__ when no parent",
-          "[pg][result_set][async][tar]") {
+TEST_CASE("from-echo-query: 202 pending, dispatch to __all__ when no parent",
+          "[pg][result_set][async][echo]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     int status = 0;
-    auto j = h.post("/api/v1/result-sets/from-tar-query",
+    auto j = h.post("/api/v1/result-sets/from-echo-query",
                     R"({"sql":"SELECT pid FROM process_live","name":"chrome-procs"})", status);
     REQUIRE(status == 202);
     auto data = j["data"];
     REQUIRE(data["status"] == "pending");
-    REQUIRE(data["source_kind"] == "tar_query");
+    REQUIRE(data["source_kind"] == "echo_query");
     REQUIRE_FALSE(data["source_execution_id"].get<std::string>().empty());
 
-    // Dispatch happened with tar/sql, an EXPLICIT `__all__` scope, sql param.
+    // Dispatch happened with echo/sql, an EXPLICIT `__all__` scope, sql param.
     // This case's name always said `__all__`; the assertion used to be
     // `scope_expr.empty()`, because empty was the proxy for broadcast at the
     // dispatch sink. #2500 inverted that default — empty now reaches nobody —
     // so the producer names the broadcast and the assertion finally matches
     // the name it has had all along.
     REQUIRE(h.calls.size() == 1);
-    REQUIRE(h.calls[0].plugin == "tar");
+    REQUIRE(h.calls[0].plugin == "echo");
     REQUIRE(h.calls[0].action == "sql");
     REQUIRE(h.calls[0].scope_expr == "__all__");
     REQUIRE(h.calls[0].params.at("sql") == "SELECT pid FROM process_live");
     // execution_id was minted BEFORE dispatch (create-before-dispatch).
     REQUIRE(h.calls[0].execution_id == data["source_execution_id"].get<std::string>());
 
-    // The row landed pending with the default tar matcher.
+    // The row landed pending with the default echo matcher.
     auto row = get_ok(*h.store, data["id"].get<std::string>());
     REQUIRE(row.has_value());
     REQUIRE(row->status == ResultSetStatus::Pending);
-    REQUIRE(row->matcher.find("tar_rows_ge") != std::string::npos);
+    REQUIRE(row->matcher.find("echo_rows_ge") != std::string::npos);
 }
 
-TEST_CASE("from-tar-query: parent_id scopes dispatch via from_result_set:",
-          "[pg][result_set][async][tar]") {
+TEST_CASE("from-echo-query: parent_id scopes dispatch via from_result_set:",
+          "[pg][result_set][async][echo]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     auto parent = h.seed_materialized("win-fleet", {"a1", "a2"});
     int status = 0;
-    auto j = h.post("/api/v1/result-sets/from-tar-query",
+    auto j = h.post("/api/v1/result-sets/from-echo-query",
                     R"({"sql":"SELECT 1","parent_id":")" + parent + R"("})", status);
     REQUIRE(status == 202);
     REQUIRE(h.calls.size() == 1);
@@ -427,8 +443,8 @@ TEST_CASE("from-tar-query: parent_id scopes dispatch via from_result_set:",
     REQUIRE(*row->parent_id == parent);
 }
 
-TEST_CASE("from-tar-query: parent alias is pre-resolved to canonical id",
-          "[pg][result_set][async][tar][alias]") {
+TEST_CASE("from-echo-query: parent alias is pre-resolved to canonical id",
+          "[pg][result_set][async][echo][alias]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -436,34 +452,34 @@ TEST_CASE("from-tar-query: parent alias is pre-resolved to canonical id",
     auto canonical = h.seed_materialized("my-alias", {"a1"});
     int status = 0;
     // parent_id given as the human alias, not the rs_ id.
-    auto j = h.post("/api/v1/result-sets/from-tar-query",
+    auto j = h.post("/api/v1/result-sets/from-echo-query",
                     R"({"sql":"SELECT 1","parent_id":"my-alias"})", status);
     REQUIRE(status == 202);
     REQUIRE(h.calls[0].scope_expr == "from_result_set:" + canonical);
     REQUIRE(*get_ok(*h.store, j["data"]["id"].get<std::string>())->parent_id == canonical);
 }
 
-TEST_CASE("from-tar-query: unknown parent alias 404s, no dispatch",
-          "[pg][result_set][async][tar][alias]") {
+TEST_CASE("from-echo-query: unknown parent alias 404s, no dispatch",
+          "[pg][result_set][async][echo][alias]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     int status = 0;
-    h.post("/api/v1/result-sets/from-tar-query",
+    h.post("/api/v1/result-sets/from-echo-query",
            R"({"sql":"SELECT 1","parent_id":"nonexistent-alias"})", status);
     REQUIRE(status == 404);
     REQUIRE(h.calls.empty());
 }
 
-TEST_CASE("from-tar-query: include_empty selects the any_response matcher",
-          "[pg][result_set][async][tar]") {
+TEST_CASE("from-echo-query: include_empty selects the any_response matcher",
+          "[pg][result_set][async][echo]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     int status = 0;
-    auto j = h.post("/api/v1/result-sets/from-tar-query",
+    auto j = h.post("/api/v1/result-sets/from-echo-query",
                     R"({"sql":"SELECT 1","include_empty":true})", status);
     REQUIRE(status == 202);
     REQUIRE(get_ok(*h.store, j["data"]["id"].get<std::string>())->matcher.find("any_response") !=
@@ -474,34 +490,34 @@ TEST_CASE("from-tar-query: include_empty selects the any_response matcher",
 // type_error on a type mismatch rather than coercing - a non-boolean
 // include_empty must be a clean 400, never an uncaught exception (matches
 // MCP's identical fix on the same field, same handler shape).
-TEST_CASE("from-tar-query: a non-boolean include_empty is refused with 400, never an "
+TEST_CASE("from-echo-query: a non-boolean include_empty is refused with 400, never an "
           "uncaught nlohmann::json::type_error",
-          "[pg][result_set][async][tar]") {
+          "[pg][result_set][async][echo]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     int status = 0;
-    h.post("/api/v1/result-sets/from-tar-query",
+    h.post("/api/v1/result-sets/from-echo-query",
            R"({"sql":"SELECT 1","include_empty":"yes"})", status);
     CHECK(status == 400);
     CHECK(h.calls.empty());
 }
 
-TEST_CASE("from-tar-query: missing sql is 400, no dispatch", "[pg][result_set][async][tar]") {
+TEST_CASE("from-echo-query: missing sql is 400, no dispatch", "[pg][result_set][async][echo]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     int status = 0;
-    h.post("/api/v1/result-sets/from-tar-query", R"({"name":"x"})", status);
+    h.post("/api/v1/result-sets/from-echo-query", R"({"name":"x"})", status);
     REQUIRE(status == 400);
     REQUIRE(h.calls.empty());
 }
 
-TEST_CASE("from-tar-query: a type-mismatched sql is refused with 400, never an "
+TEST_CASE("from-echo-query: a type-mismatched sql is refused with 400, never an "
           "uncaught nlohmann::json::type_error",
-          "[pg][result_set][async][tar][security][4406]") {
+          "[pg][result_set][async][echo][security][4406]") {
     // #4406 fix: body.value("sql", "") threw on a non-string sql rather than
     // coercing. Same guard shape as the pre-existing include_empty check
     // above, now applied to sql too.
@@ -510,15 +526,15 @@ TEST_CASE("from-tar-query: a type-mismatched sql is refused with 400, never an "
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     int status = 0;
-    auto j = h.post("/api/v1/result-sets/from-tar-query", R"({"sql":12345})", status);
+    auto j = h.post("/api/v1/result-sets/from-echo-query", R"({"sql":12345})", status);
     CHECK(status == 400);
     CHECK(h.calls.empty());
     CHECK(j["error"]["message"].get<std::string>().find("'sql' is required") != std::string::npos);
 }
 
-TEST_CASE("from-tar-query: a type-mismatched name is refused with 400, never an "
+TEST_CASE("from-echo-query: a type-mismatched name is refused with 400, never an "
           "uncaught nlohmann::json::type_error",
-          "[pg][result_set][async][tar][security][4406]") {
+          "[pg][result_set][async][echo][security][4406]") {
     // Adversarial-review finding: body.value("name", "") at the run_async call
     // site threw the same way sql/instruction_id did before #4406's fix -
     // missed in the first pass because name is passed inline as an argument,
@@ -529,15 +545,15 @@ TEST_CASE("from-tar-query: a type-mismatched name is refused with 400, never an 
     AsyncHarness h(pool);
     int status = 0;
     auto j =
-        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","name":123})", status);
+        h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 1","name":123})", status);
     CHECK(status == 400);
     CHECK(h.calls.empty());
     CHECK(j["error"]["message"].get<std::string>().find("name must be a JSON string") !=
           std::string::npos);
 }
 
-TEST_CASE("from-tar-query: an oversized name is refused with 400, never dispatched",
-          "[pg][result_set][async][tar][security]") {
+TEST_CASE("from-echo-query: an oversized name is refused with 400, never dispatched",
+          "[pg][result_set][async][echo][security]") {
     // PR review finding: same missing kResultSetNameMaxLen length cap as
     // the generic create route's own oversized-name test.
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
@@ -548,7 +564,7 @@ TEST_CASE("from-tar-query: an oversized name is refused with 400, never dispatch
     body["sql"] = "SELECT 1";
     body["name"] = std::string(257, 'n');
     int status = 0;
-    auto j = h.post("/api/v1/result-sets/from-tar-query", body.dump(), status);
+    auto j = h.post("/api/v1/result-sets/from-echo-query", body.dump(), status);
     CHECK(status == 400);
     CHECK(h.calls.empty());
     CHECK(j["error"]["message"].get<std::string>().find("name must be at most 256 bytes") !=
@@ -556,7 +572,7 @@ TEST_CASE("from-tar-query: an oversized name is refused with 400, never dispatch
 }
 
 TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not widened",
-          "[pg][result_set][async][tar][targeting][security]") {
+          "[pg][result_set][async][echo][targeting][security]") {
     // PG-port note (merge of #2500's dev-side case into the ADR-0036 branch):
     // the harness is now Postgres-backed, so the fixture preamble matches the
     // sibling cases and the case carries [pg] (shard-partition invariant —
@@ -578,7 +594,7 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
     SECTION("numeric parent_id") {
         AsyncHarness h(pool);
         int status = 0;
-        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","parent_id":123})",
+        h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 1","parent_id":123})",
                status);
         REQUIRE(status == 400);
         REQUIRE(h.calls.empty());
@@ -586,7 +602,7 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
     SECTION("empty-string parent_id") {
         AsyncHarness h(pool);
         int status = 0;
-        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","parent_id":""})",
+        h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 1","parent_id":""})",
                status);
         REQUIRE(status == 400);
         REQUIRE(h.calls.empty());
@@ -597,7 +613,7 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
         // indistinguishable here, and only one of them wants the entire fleet.
         AsyncHarness h(pool);
         int status = 0;
-        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","parent_id":null})",
+        h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 1","parent_id":null})",
                status);
         REQUIRE(status == 400);
         REQUIRE(h.calls.empty());
@@ -610,7 +626,7 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
         // field the caller never sent into the audit trail.
         AsyncHarness h(pool);
         int status = 0;
-        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","parent_id":123})",
+        h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 1","parent_id":123})",
                status);
         REQUIRE(status == 400);
         CHECK(h.metrics
@@ -756,14 +772,14 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
     SECTION("a non-object body is refused, not read as an absent parent_id") {
         AsyncHarness h(pool);
         int status = 0;
-        h.post("/api/v1/result-sets/from-tar-query", R"(["sql"])", status);
+        h.post("/api/v1/result-sets/from-echo-query", R"(["sql"])", status);
         REQUIRE(status == 400);
         CHECK(h.calls.empty());
     }
     SECTION("omitting parent_id still broadcasts — the over-broadness guard") {
         AsyncHarness h(pool);
         int status = 0;
-        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+        h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 1"})", status);
         REQUIRE(status == 202);
         REQUIRE(h.calls.size() == 1);
         REQUIRE(h.calls[0].scope_expr == "__all__");
@@ -786,19 +802,19 @@ TEST_CASE("#4734 — an oversized parent_id is refused before dispatch, on all t
     const std::string big(65, 'p');
     const std::string exact(yuzu::server::mcp::kResultSetParentIdMaxLen, 'p');
 
-    SECTION("from-tar-query") {
+    SECTION("from-echo-query") {
         AsyncHarness h(pool);
         int status = 0;
         nlohmann::json body;
         body["sql"] = "SELECT 1";
         body["parent_id"] = big;
-        auto j = h.post("/api/v1/result-sets/from-tar-query", body.dump(), status);
+        auto j = h.post("/api/v1/result-sets/from-echo-query", body.dump(), status);
         REQUIRE(status == 400);
         CHECK(j["error"]["message"].get<std::string>().find(
                   "parent_id must be at most 64 bytes") != std::string::npos);
         REQUIRE(h.calls.empty());
     }
-    SECTION("from-tar-query -- exactly 64 bytes clears the length cap (boundary, "
+    SECTION("from-echo-query -- exactly 64 bytes clears the length cap (boundary, "
             "404s on ownership since it's a random unowned id, but never the "
             "length-cap 400)") {
         AsyncHarness h(pool);
@@ -806,7 +822,7 @@ TEST_CASE("#4734 — an oversized parent_id is refused before dispatch, on all t
         nlohmann::json body;
         body["sql"] = "SELECT 1";
         body["parent_id"] = exact;
-        auto j = h.post("/api/v1/result-sets/from-tar-query", body.dump(), status);
+        auto j = h.post("/api/v1/result-sets/from-echo-query", body.dump(), status);
         REQUIRE(status == 404);
         CHECK(j["error"]["message"].get<std::string>().find(
                   "parent_id must be at most 64 bytes") == std::string::npos);
@@ -887,9 +903,9 @@ TEST_CASE("#4734 — an oversized parent_id is refused before dispatch, on all t
 // than resolved. This is the actual behaviour-changing case the fix
 // introduces (see changelog.d and docs/user-manual/server-admin.md's vNEXT
 // entry) -- it had zero test coverage until now.
-TEST_CASE("from-tar-query: a real alias longer than 64 bytes is refused before "
+TEST_CASE("from-echo-query: a real alias longer than 64 bytes is refused before "
           "resolution is attempted (the #4734 alias-length regression)",
-          "[pg][result_set][async][tar][alias][4734]") {
+          "[pg][result_set][async][echo][alias][4734]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -901,22 +917,22 @@ TEST_CASE("from-tar-query: a real alias longer than 64 bytes is refused before "
     nlohmann::json body;
     body["sql"] = "SELECT 1";
     body["parent_id"] = long_alias;
-    auto j = h.post("/api/v1/result-sets/from-tar-query", body.dump(), status);
+    auto j = h.post("/api/v1/result-sets/from-echo-query", body.dump(), status);
     REQUIRE(status == 400);
     CHECK(j["error"]["message"].get<std::string>().find("parent_id must be at most 64 bytes") !=
           std::string::npos);
     REQUIRE(h.calls.empty());
 }
 
-TEST_CASE("from-tar-query: zero agents reached is 503, execution cancelled, no pending row",
-          "[pg][result_set][async][tar]") {
+TEST_CASE("from-echo-query: zero agents reached is 503, execution cancelled, no pending row",
+          "[pg][result_set][async][echo]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     h.dispatch_sent = 0; // dispatch reaches nobody
     int status = 0;
-    h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 1"})", status);
     REQUIRE(status == 503);
     REQUIRE(h.calls.size() == 1); // dispatch was attempted
     // No pending set persisted (the operator gets a clean failure, not a row
@@ -925,15 +941,15 @@ TEST_CASE("from-tar-query: zero agents reached is 503, execution cancelled, no p
     REQUIRE(h.store->list_by_owner("operator-1", "", 50, next).empty());
 }
 
-TEST_CASE("from-tar-query: dispatch throw is 500, execution cancelled",
-          "[pg][result_set][async][tar]") {
+TEST_CASE("from-echo-query: dispatch throw is 500, execution cancelled",
+          "[pg][result_set][async][echo]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     h.dispatch_throws = true;
     int status = 0;
-    h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 1"})", status);
     REQUIRE(status == 500);
     std::string next;
     REQUIRE(h.store->list_by_owner("operator-1", "", 50, next).empty());
@@ -946,9 +962,9 @@ TEST_CASE("from-tar-query: dispatch throw is 500, execution cancelled",
 // result_set_store.* locks every other test in this file uses) and assert
 // the new yuzu_exec_tracker_bookkeeping_failed_total{op,surface="rest"}
 // counter.
-TEST_CASE("from-tar-query: zero agents reached AND mark_cancelled itself failing counts "
+TEST_CASE("from-echo-query: zero agents reached AND mark_cancelled itself failing counts "
           "yuzu_exec_tracker_bookkeeping_failed_total{op=mark_cancelled,surface=rest} (#4982)",
-          "[pg][result_set][async][tar][4982]") {
+          "[pg][result_set][async][echo][4982]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
     REQUIRE(pool.valid());
@@ -971,7 +987,7 @@ TEST_CASE("from-tar-query: zero agents reached AND mark_cancelled itself failing
     };
 
     int status = 0;
-    h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 1"})", status);
     REQUIRE(status == 503); // unchanged -- mark_cancelled's own failure is silent to the caller
 
     REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
@@ -987,10 +1003,10 @@ TEST_CASE("from-tar-query: zero agents reached AND mark_cancelled itself failing
               .value() == 0.0);
 }
 
-TEST_CASE("from-tar-query: set_agents_targeted failing after a real dispatch counts "
+TEST_CASE("from-echo-query: set_agents_targeted failing after a real dispatch counts "
           "yuzu_exec_tracker_bookkeeping_failed_total{op=set_agents_targeted,surface=rest} "
           "(#4982)",
-          "[pg][result_set][async][tar][4982]") {
+          "[pg][result_set][async][echo][4982]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
     REQUIRE(pool.valid());
@@ -1009,7 +1025,7 @@ TEST_CASE("from-tar-query: set_agents_targeted failing after a real dispatch cou
     };
 
     int status = 0;
-    h.post("/api/v1/result-sets/from-tar-query",
+    h.post("/api/v1/result-sets/from-echo-query",
           R"({"sql":"SELECT 1","name":"targetedfail"})", status);
     // set_agents_targeted's own failure is swallowed to the caller too -- the
     // row still lands pending (create_pending only touches result_set_store's
@@ -1029,13 +1045,13 @@ TEST_CASE("from-tar-query: set_agents_targeted failing after a real dispatch cou
               .value() == 0.0);
 }
 
-TEST_CASE("from-tar-query: 503 when command dispatch is unwired", "[pg][result_set][async][tar]") {
+TEST_CASE("from-echo-query: 503 when command dispatch is unwired", "[pg][result_set][async][echo]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool, /*with_dispatch=*/false);
     int status = 0;
-    h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 1"})", status);
     REQUIRE(status == 503);
 }
 
@@ -1064,7 +1080,51 @@ TEST_CASE("from-instruction-result: 202 pending with operator matcher persisted"
     REQUIRE(row->matcher.find("value_set") != std::string::npos);
 }
 
-// #4644: a tar_rows_ge matcher's `n` is stored on the pending row and read by the maintenance
+TEST_CASE("from-instruction-result: a column matcher is bound to the declared columns; "
+          "caller-supplied server-authored keys are refused",
+          "[pg][result_set][async][instruction]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_cert_instruction(*h.instr);
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result",
+                    R"({"instruction_id":")" + iid +
+                        R"(","matcher":{"column":"issuer","op":"contains","value":"eMudhra"}})",
+                    status);
+    REQUIRE(status == 202);
+    auto row = get_ok(*h.store, j["data"]["id"].get<std::string>());
+    auto stored = nlohmann::json::parse(row->matcher);
+    CHECK(stored["declared_columns"] ==
+          nlohmann::json::array({"subject", "issuer", "thumbprint"}));
+    CHECK(stored["plugin"] == "certificates");
+    CHECK(stored["column"] == "issuer");
+
+    // A column the definition does not declare: stored unchanged.
+    j = h.post("/api/v1/result-sets/from-instruction-result",
+               R"({"instruction_id":")" + iid + R"(","matcher":{"column":"nope","op":"exists"}})",
+               status);
+    REQUIRE(status == 202);
+    stored = nlohmann::json::parse(get_ok(*h.store, j["data"]["id"].get<std::string>())->matcher);
+    CHECK_FALSE(stored.contains("declared_columns"));
+    CHECK_FALSE(stored.contains("plugin"));
+
+    const auto calls_before = h.calls.size();
+    for (const char* key : {"declared_columns", "plugin"}) {
+        const std::string val = std::string(key) == "plugin" ? "\"x\"" : "[\"issuer\"]";
+        j = h.post("/api/v1/result-sets/from-instruction-result",
+                   R"({"instruction_id":")" + iid +
+                       R"(","matcher":{"column":"issuer","op":"exists",")" + key + R"(":)" + val +
+                       "}}",
+                   status);
+        CHECK(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find(key) != std::string::npos);
+    }
+    CHECK(h.calls.size() == calls_before); // nothing dispatched
+}
+
+// #4644: an echo_rows_ge matcher's `n` is stored on the pending row and read by the maintenance
 // tick. A wrong-typed n used to throw out of that tick on every pass; -1 admitted every responder.
 // It is now refused here, before anything is dispatched or stored.
 TEST_CASE("from-instruction-result: a malformed matcher n is refused with 400 and dispatches "
@@ -1079,7 +1139,7 @@ TEST_CASE("from-instruction-result: a malformed matcher n is refused with 400 an
          {"4294967297", "9223372036854775808", "18446744073709551615", "-1", "0", "1e3", "5.5",
           "\"7\"", "\"\"", "null", "true", "[]", "{}"}) {
         const std::string body = R"({"instruction_id":")" + iid +
-                                 R"(","matcher":{"kind":"tar_rows_ge","n":)" + n + "}}";
+                                 R"(","matcher":{"kind":"echo_rows_ge","n":)" + n + "}}";
         INFO(body);
         int status = 0;
         auto j = h.post("/api/v1/result-sets/from-instruction-result", body, status);
@@ -1105,7 +1165,7 @@ TEST_CASE("from-instruction-result: a malformed matcher n is refused with 400 an
     // A well-formed threshold still admits and is stored verbatim.
     int status = 0;
     auto j = h.post("/api/v1/result-sets/from-instruction-result",
-                    R"({"instruction_id":")" + iid + R"(","matcher":{"kind":"tar_rows_ge","n":2}})",
+                    R"({"instruction_id":")" + iid + R"(","matcher":{"kind":"echo_rows_ge","n":2}})",
                     status);
     REQUIRE(status == 202);
     CHECK(h.calls.size() == 1);
@@ -1148,7 +1208,7 @@ TEST_CASE("from-instruction-result: a type-mismatched instruction_id is refused 
 TEST_CASE("from-instruction-result: a type-mismatched name is refused with 400, "
           "never an uncaught nlohmann::json::type_error",
           "[pg][result_set][async][instruction][security][4406]") {
-    // Adversarial-review finding, same as from-tar-query's sibling test above.
+    // Adversarial-review finding, same as from-echo-query's sibling test above.
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -1353,7 +1413,7 @@ TEST_CASE("from-instruction-result: exact-boundary params are accepted and dispa
     REQUIRE(h.calls.size() == 1);
 }
 
-TEST_CASE("re-eval: tar_query set re-dispatches as a sibling (shares parent)",
+TEST_CASE("re-eval: echo_query set re-dispatches as a sibling (shares parent)",
           "[pg][result_set][async][reeval]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1361,8 +1421,8 @@ TEST_CASE("re-eval: tar_query set re-dispatches as a sibling (shares parent)",
     AsyncHarness h(pool);
     auto grandparent = h.seed_materialized("ground", {"a1", "a2"});
     int status = 0;
-    // Original tar_query parented at `grandparent`.
-    auto orig = h.post("/api/v1/result-sets/from-tar-query",
+    // Original echo_query parented at `grandparent`.
+    auto orig = h.post("/api/v1/result-sets/from-echo-query",
                        R"({"sql":"SELECT 7","parent_id":")" + grandparent + R"("})", status);
     REQUIRE(status == 202);
     auto orig_id = orig["data"]["id"].get<std::string>();
@@ -1396,7 +1456,7 @@ TEST_CASE("re-eval: a genuinely parentless original still broadcasts (no regress
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     int status = 0;
-    auto orig = h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    auto orig = h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 1"})", status);
     REQUIRE(status == 202);
     auto orig_id = orig["data"]["id"].get<std::string>();
     REQUIRE_FALSE(get_ok(*h.store, orig_id)->parent_id.has_value());
@@ -1418,7 +1478,7 @@ TEST_CASE("re-eval: refused when the original's live parent was deleted, "
     AsyncHarness h(pool);
     auto parent = h.seed_materialized("narrow-target", {"a1"});
     int status = 0;
-    auto orig = h.post("/api/v1/result-sets/from-tar-query",
+    auto orig = h.post("/api/v1/result-sets/from-echo-query",
                        R"({"sql":"SELECT 1","parent_id":")" + parent + R"("})", status);
     REQUIRE(status == 202);
     auto orig_id = orig["data"]["id"].get<std::string>();
@@ -1461,7 +1521,7 @@ TEST_CASE("re-eval: the parent-gone refusal surfaces a dropped audit row via "
     AsyncHarness h(pool);
     auto parent = h.seed_materialized("narrow-target-2", {"a1"});
     int status = 0;
-    auto orig = h.post("/api/v1/result-sets/from-tar-query",
+    auto orig = h.post("/api/v1/result-sets/from-echo-query",
                        R"({"sql":"SELECT 1","parent_id":")" + parent + R"("})", status);
     REQUIRE(status == 202);
     auto orig_id = orig["data"]["id"].get<std::string>();
@@ -1484,7 +1544,7 @@ TEST_CASE("re-eval: an alias-referenced parent is refused after deletion, never 
     auto parent = h.seed_materialized("my-alias", {"a1"});
     int status = 0;
     // Original parented via the ALIAS, not the canonical rs_ id.
-    auto orig = h.post("/api/v1/result-sets/from-tar-query",
+    auto orig = h.post("/api/v1/result-sets/from-echo-query",
                        R"({"sql":"SELECT 1","parent_id":"my-alias"})", status);
     REQUIRE(status == 202);
     auto orig_id = orig["data"]["id"].get<std::string>();
@@ -1512,10 +1572,10 @@ TEST_CASE("re-eval: refused when a GENERIC-create original's live parent was "
           "[pg][result_set][async][reeval][security][4306]") {
     // Adversarial review (Kimi + Codex) of the #4306 fix found that
     // scope_input_id was ONLY persisted by the two dedicated producer routes
-    // (from-tar-query / from-instruction-result). This route accepts an
+    // (from-echo-query / from-instruction-result). This route accepts an
     // UNRESTRICTED source_kind/source_payload (no allowlist) plus a
     // caller-supplied, owner-checked parent_id -- a row minted here with a
-    // crafted tar_query-shaped payload was indistinguishable at re-eval time
+    // crafted echo_query-shaped payload was indistinguishable at re-eval time
     // from a genuinely parentless original once its parent was deleted, and
     // would have silently broadcast to __all__ (the same #2500 shape #4306
     // itself closed for the producer routes).
@@ -1526,7 +1586,7 @@ TEST_CASE("re-eval: refused when a GENERIC-create original's live parent was "
     auto parent = h.seed_materialized("narrow-target-generic", {"a1"});
     int status = 0;
     auto orig = h.post("/api/v1/result-sets",
-                       R"({"source_kind":"tar_query","source_payload":{"sql":"SELECT 1"},)"
+                       R"({"source_kind":"echo_query","source_payload":{"sql":"SELECT 1"},)"
                        R"("parent_id":")" + parent + R"("})",
                        status);
     REQUIRE(status == 201);
@@ -1575,7 +1635,7 @@ TEST_CASE("re-eval: the parent-gone audit detail neutralises a delimiter-bearing
     AsyncHarness h(pool);
     int status = 0;
     auto orig = h.post("/api/v1/result-sets",
-                       R"({"source_kind":"tar_query",)"
+                       R"({"source_kind":"echo_query",)"
                        R"("source_payload":{"sql":"SELECT 1","scope_input_id":)"
                        R"("evil target_id=rs_other"}})",
                        status);
@@ -1626,7 +1686,7 @@ TEST_CASE("re-eval: a non-object source_payload on a GENERIC-create original wit
     int status = 0;
     // source_payload is a bare JSON STRING, not an object.
     auto orig = h.post("/api/v1/result-sets",
-                       R"({"source_kind":"tar_query","source_payload":"not-an-object",)"
+                       R"({"source_kind":"echo_query","source_payload":"not-an-object",)"
                        R"("parent_id":")" + parent + R"("})",
                        status);
     REQUIRE(status == 201);
@@ -1718,11 +1778,11 @@ TEST_CASE("re-eval: an oversized SQL smuggled onto an existing row is refused, "
           "never re-dispatched",
           "[pg][result_set][async][reeval]") {
     // Gate 8 fix (#2146 Batch B2 follow-up): the re-eval route re-applies the
-    // 100 KiB tar_query cap because the ORIGINAL row may predate the cap (or
+    // 100 KiB echo_query cap because the ORIGINAL row may predate the cap (or
     // was minted through a path that never enforced it) - this test proves
     // that guard actually fires, rather than trusting the comment at the
     // call site. Seeded directly in the store (never through
-    // /from-tar-query, which enforces the cap at creation and would itself
+    // /from-echo-query, which enforces the cap at creation and would itself
     // reject this payload).
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1731,7 +1791,7 @@ TEST_CASE("re-eval: an oversized SQL smuggled onto an existing row is refused, "
     CreateRequest cr;
     cr.owner_principal = "operator-1";
     cr.name = "legacy-oversized";
-    cr.source_kind = std::string(source_kind::kTarQuery);
+    cr.source_kind = std::string(source_kind::kEchoQuery);
     nlohmann::json payload;
     payload["sql"] = std::string(100001, 'x');
     cr.source_payload = payload.dump();
@@ -2041,7 +2101,7 @@ TEST_CASE("re-eval: params at the exact per-field bounds (32 keys, a "
     REQUIRE(j["data"]["source_kind"] == "instruction_result");
 }
 
-TEST_CASE("re-eval: a type-mismatched sql value on a tar_query row is a clean "
+TEST_CASE("re-eval: a type-mismatched sql value on an echo_query row is a clean "
           "400, never an uncaught type_error",
           "[pg][result_set][async][reeval]") {
     // nlohmann::json::value("sql", "") throws json::type_error on a type
@@ -2058,7 +2118,7 @@ TEST_CASE("re-eval: a type-mismatched sql value on a tar_query row is a clean "
     CreateRequest cr;
     cr.owner_principal = "operator-1";
     cr.name = "legacy-type-mismatched-sql";
-    cr.source_kind = std::string(source_kind::kTarQuery);
+    cr.source_kind = std::string(source_kind::kEchoQuery);
     cr.source_payload = payload.dump();
     auto seeded = h.store->create_materialized(cr, {});
     REQUIRE(seeded.has_value());
@@ -2135,8 +2195,8 @@ TEST_CASE("re-eval: an unparseable source_payload on an instruction_result row "
 // pass if the gate ran after the dispatch.
 // ═══════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("from-tar-query: an authenticated caller WITHOUT Execution:Execute dispatches nothing",
-          "[pg][result_set][async][tar][security]") {
+TEST_CASE("from-echo-query: an authenticated caller WITHOUT Execution:Execute dispatches nothing",
+          "[pg][result_set][async][echo][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -2144,7 +2204,7 @@ TEST_CASE("from-tar-query: an authenticated caller WITHOUT Execution:Execute dis
     AsyncHarness::permit_exec = false; // authenticated, but no Execution grant
 
     int status = 0;
-    h.post("/api/v1/result-sets/from-tar-query",
+    h.post("/api/v1/result-sets/from-echo-query",
            R"({"sql":"SELECT pid FROM process_live","name":"probe"})", status);
 
     CHECK(status == 403);
@@ -2180,7 +2240,7 @@ TEST_CASE("re-eval: an authenticated caller WITHOUT Execution:Execute dispatches
     // the grant — proving the gate is on the re-eval route itself, not merely
     // inherited from whoever created the original.
     int status = 0;
-    auto created = h.post("/api/v1/result-sets/from-tar-query",
+    auto created = h.post("/api/v1/result-sets/from-echo-query",
                           R"({"sql":"SELECT pid FROM process_live","name":"orig"})", status);
     REQUIRE(status == 202);
     const auto rs_id = created["data"]["id"].get<std::string>();
@@ -2218,8 +2278,8 @@ TEST_CASE("re-eval: an authenticated caller WITHOUT Execution:Execute dispatches
 // test_mcp_server.cpp's execute_instruction confinement cases.
 // ═══════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("from-tar-query: a confined caller's VisibleSet is derived and threaded into dispatch",
-          "[pg][result_set][async][tar][security][1788]") {
+TEST_CASE("from-echo-query: a confined caller's VisibleSet is derived and threaded into dispatch",
+          "[pg][result_set][async][echo][security][1788]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -2229,7 +2289,7 @@ TEST_CASE("from-tar-query: a confined caller's VisibleSet is derived and threade
     h.exec_visible_override = std::unordered_set<std::string>{"agent-A"};
 
     int status = 0;
-    h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","name":"svc"})", status);
+    h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 1","name":"svc"})", status);
     REQUIRE(status == 202);
 
     REQUIRE(h.calls.size() == 1);
@@ -2270,7 +2330,7 @@ TEST_CASE("re-eval: a confined caller's VisibleSet reaches the re-dispatch",
 
     int status = 0;
     auto created =
-        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 7","name":"o"})", status);
+        h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 7","name":"o"})", status);
     REQUIRE(status == 202);
     const auto rs_id = created["data"]["id"].get<std::string>();
     h.calls.clear();
@@ -2301,7 +2361,7 @@ TEST_CASE("async producers: an UNWIRED exec-visible derivation is an audited 500
     auto iid = make_instruction(*h.instr);
 
     int status = 0;
-    auto j = h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    auto j = h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 1"})", status);
     CHECK(status == 500);
     CHECK(j.dump().find("RESULT_SET_GATE_UNCONFIGURED") != std::string::npos);
     CHECK(h.calls.empty()); // THE assertion: nothing was dispatched
@@ -2332,7 +2392,7 @@ TEST_CASE("async producers: a LOST evidence row on the unwired-gate refusal is s
     h.audit_ok = false;
 
     int status = 0;
-    h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 1"})", status);
     CHECK(status == 500);
     CHECK(h.last_sec_audit_failed == "true");
     CHECK(h.calls.empty()); // still no dispatch
@@ -2345,7 +2405,7 @@ TEST_CASE("async producers: an unfiltered (nullopt) VisibleSet still dispatches 
     REQUIRE(pool.valid());
     AsyncHarness h(pool); // exec_visible_override defaults to nullopt
     int status = 0;
-    h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 1"})", status);
     REQUIRE(status == 202);
     REQUIRE(h.calls.size() == 1);
     // A genuine global administrator keeps full-fleet reach — that is their
@@ -3321,7 +3381,7 @@ TEST_CASE("POST /api/v1/result-sets: a type-mismatched name is refused with 400,
           "never an uncaught nlohmann::json::type_error",
           "[pg][result_set][security][4406]") {
     // Gate 8 sibling-sweep finding: this generic create route has the same
-    // unguarded body.value("name", "") shape as from-tar-query/
+    // unguarded body.value("name", "") shape as from-echo-query/
     // from-instruction-result did before #4406's fix, but was never part of
     // that sweep since it's a synchronous direct-create path, not one of the
     // three async producers.
@@ -3700,21 +3760,21 @@ TEST_CASE("POST /api/v1/result-sets: a device_ids entry of exactly 256 bytes "
     CHECK(j["data"]["device_count"] == 1);
 }
 
-TEST_CASE("from-tar-query: a body nested past the depth limit is rejected before dispatch",
-          "[pg][result_set][async][tar][security][depth]") {
+TEST_CASE("from-echo-query: a body nested past the depth limit is rejected before dispatch",
+          "[pg][result_set][async][echo][security][depth]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     int status = 0;
     const std::string body = R"({"sql":"SELECT 1","junk":)" + nested_array(40) + "}";
-    h.post("/api/v1/result-sets/from-tar-query", body, status);
+    h.post("/api/v1/result-sets/from-echo-query", body, status);
     CHECK(status == 400);
     CHECK(h.calls.empty());
 }
 
-TEST_CASE("from-tar-query: depth guard boundary, 32 levels passes and 33 is rejected",
-          "[pg][result_set][async][tar][security][depth]") {
+TEST_CASE("from-echo-query: depth guard boundary, 32 levels passes and 33 is rejected",
+          "[pg][result_set][async][echo][security][depth]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -3725,7 +3785,7 @@ TEST_CASE("from-tar-query: depth guard boundary, 32 levels passes and 33 is reje
         AsyncHarness h(pool);
         int status = 0;
         const std::string body = R"({"sql":"SELECT 1","junk":)" + nested_array(31) + "}";
-        h.post("/api/v1/result-sets/from-tar-query", body, status);
+        h.post("/api/v1/result-sets/from-echo-query", body, status);
         CHECK(status == 202);
         CHECK(h.calls.size() == 1);
     }
@@ -3733,7 +3793,7 @@ TEST_CASE("from-tar-query: depth guard boundary, 32 levels passes and 33 is reje
         AsyncHarness h(pool);
         int status = 0;
         const std::string body = R"({"sql":"SELECT 1","junk":)" + nested_array(32) + "}";
-        h.post("/api/v1/result-sets/from-tar-query", body, status);
+        h.post("/api/v1/result-sets/from-echo-query", body, status);
         CHECK(status == 400);
         CHECK(h.calls.empty());
     }
@@ -3792,7 +3852,7 @@ TEST_CASE("re-eval: a stored source_payload nested past the depth limit is refus
     CreateRequest cr;
     cr.owner_principal = "operator-1";
     cr.name = "legacy-poisoned";
-    cr.source_kind = std::string(source_kind::kTarQuery);
+    cr.source_kind = std::string(source_kind::kEchoQuery);
     // A raw string, never materialised as a live nlohmann::json object at
     // this depth.
     cr.source_payload = std::string(R"({"sql":"SELECT 1","junk":)") + nested_array(40) + "}";
@@ -3846,7 +3906,7 @@ TEST_CASE("re-eval: a second re-eval on an already-healed row gets a "
     CreateRequest cr;
     cr.owner_principal = "operator-1";
     cr.name = "poisoned-twice-reevaled";
-    cr.source_kind = std::string(source_kind::kTarQuery);
+    cr.source_kind = std::string(source_kind::kEchoQuery);
     cr.source_payload = std::string(R"({"sql":"SELECT 1","junk":)") + nested_array(40) + "}";
     auto seeded = h.store->create_materialized(cr, {});
     REQUIRE(seeded.has_value());
@@ -3889,7 +3949,7 @@ TEST_CASE("re-eval: a heal that loses the race to a concurrent delete is a "
     CreateRequest cr;
     cr.owner_principal = "operator-1";
     cr.name = "vanishes-mid-heal";
-    cr.source_kind = std::string(source_kind::kTarQuery);
+    cr.source_kind = std::string(source_kind::kEchoQuery);
     cr.source_payload = std::string(R"({"sql":"SELECT 1","junk":)") + nested_array(40) + "}";
     auto seeded = h.store->create_materialized(cr, {});
     REQUIRE(seeded.has_value());
@@ -3939,10 +3999,10 @@ TEST_CASE("re-eval: a heal that loses the race to a concurrent delete is a "
 // quota" on a store the async producers dispatch real commands through.
 // ═══════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("from-tar-query: a degraded quota pre-check fails closed BEFORE any dispatch — "
+TEST_CASE("from-echo-query: a degraded quota pre-check fails closed BEFORE any dispatch — "
           "nothing reaches an agent, the execution is cancelled, audit shows the failure "
           "(#4306 finding 1)",
-          "[pg][result_set][async][tar][security][4306]") {
+          "[pg][result_set][async][echo][security][4306]") {
     // No parent_id: a supplied parent_id would hit resolve_owned_parent's own
     // DB read first and 503 there instead, before ever reaching the quota
     // pre-check under test.
@@ -3961,7 +4021,7 @@ TEST_CASE("from-tar-query: a degraded quota pre-check fails closed BEFORE any di
                 .status() == PGRES_COMMAND_OK);
 
     int status = 0;
-    auto j = h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    auto j = h.post("/api/v1/result-sets/from-echo-query", R"({"sql":"SELECT 1"})", status);
     REQUIRE(status == 503);
     REQUIRE(j.contains("error"));
     const std::string msg = j["error"]["message"].get<std::string>();
@@ -4005,10 +4065,10 @@ TEST_CASE("from-tar-query: a degraded quota pre-check fails closed BEFORE any di
     CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
 }
 
-TEST_CASE("from-tar-query: a DbError from create_pending AFTER a successful dispatch maps "
+TEST_CASE("from-echo-query: a DbError from create_pending AFTER a successful dispatch maps "
           "to 500, not 400 — a server fault after real agents were already reached is not a "
           "client error (#4306 fold-in B)",
-          "[pg][result_set][async][tar][4306]") {
+          "[pg][result_set][async][echo][4306]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     // Short lock_timeout_ms (established technique) so the deliberately-held
     // lock below fails the blocked query deterministically and fast, rather
@@ -4034,7 +4094,7 @@ TEST_CASE("from-tar-query: a DbError from create_pending AFTER a successful disp
     };
 
     int status = 0;
-    auto j = h.post("/api/v1/result-sets/from-tar-query",
+    auto j = h.post("/api/v1/result-sets/from-echo-query",
                     R"({"sql":"SELECT 1","name":"foldinb"})", status);
     REQUIRE(status == 500);
     REQUIRE(j.contains("error"));

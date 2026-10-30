@@ -1,4 +1,8 @@
 app_usage_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, sqlite3_dep]
+if host_machine.system() == 'windows'
+  # GetSecurityInfo / EqualSid: win_echo_db_owner_probe.hpp (owner test on the echo.db it reads)
+  app_usage_deps += cxx.find_library('advapi32')
+endif
 app_usage_sources = files('src/app_usage_plugin.cpp')
 
 # Assigned to a variable (mirrors power_health_plugin_lib in

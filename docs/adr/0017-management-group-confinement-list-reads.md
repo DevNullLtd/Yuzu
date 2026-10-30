@@ -35,7 +35,7 @@ context-refs: #1634 (response-reader ruling), PR #1711 (per-row filter foundatio
 > replacing it, which does not compose (`require_permission`'s RBAC branch never consults
 > `ManagementGroupStore`); the corrected wiring (`369643caf`) replaced both with the single
 > `require_list_read` gate this ADR anticipated. This landed independently of the PR-B…E
-> enumeration below (which still tracks `responses`/device-list/inventory/audit-log/DEX/TAR) —
+> enumeration below (which still tracks `responses`/device-list/inventory/audit-log/DEX/Echo) —
 > update that list's own status per-surface as each one actually switches, don't infer this
 > route's completion applies to any of them.
 
@@ -50,7 +50,7 @@ caller who holds the permission either **globally** (step 1, the global `check_p
 `management_group_roles` table). A single `agent_id` is available, so the scoped check can serve as
 the gate.
 
-For **list / fan-out** reads (responses, the device list, inventory, audit-log, DEX/TAR list
+For **list / fan-out** reads (responses, the device list, inventory, audit-log, DEX/Echo list
 surfaces) there is no single `agent_id` to gate on. These routes instead gate on the **global**
 `require_permission` / `perm_fn` (e.g. `dashboard_routes.cpp:203`, `rest_api_v1.cpp:3479`,
 `mcp_server.cpp:1217`, `server.cpp:5307`) and then — where a filter exists at all — drop out-of-scope
@@ -64,7 +64,7 @@ attempts, all failed:
   step 1 returns true for **every** agent → the per-row filter is a no-op → sees the whole fleet.
   *(UAT: admin saw agent-1 + agent-2.)*
 - **Confined operator** (`Operator@G1`): the global gate is `check_permission`, which consults only
-  `principal_roles` (user) ∪ RBAC `group_members` (`collect_roles_locked`, `rbac_store.cpp:930-952`)
+  `principal_roles` (user) ∪ RBAC `group_members` (`collect_roles_locked`, `rbac_store.cpp:930-952`; since renamed `collect_roles_accounted`, which counts a failed role query as a read degrade, #4990)
   — **never** the management-group `GroupRoleAssignment`s. So the confined operator is **403'd at the
   gate** and never reaches the filter. *(UAT: opA → 403 on `/api/responses/*`, `/api/agents`,
   `/fragments/devices/list`.)*
@@ -164,7 +164,7 @@ RbacStore::authorize_list_read(user, securable, op) -> DenyAll | AdmitAll | Admi
   403 / audit envelope: `AuthRoutes::require_list_read` (REST, sibling to `require_scoped_permission`
   and to the `rest_audit.hpp` #1647 chokepoint precedent), the MCP equivalent, the dashboard
   equivalent.
-- `DenyAll` → 403 (REST) / empty (dashboard). `AdmitAll` → unfiltered read (global holder).
+- `DenyAll` → 403 (REST) / empty (dashboard); since 2026-10-24 a `DenyAll` carrying `read_failed` (a read inside the check failed) is a retryable 503 on the shared gates (see the CA bullet below). `AdmitAll` → unfiltered read (global holder).
   `AdmitScoped(set)` → the route reads **only** `set` (preferably pushed into SQL `WHERE agent_id IN
   (...)`).
 - For **aggregates** (`aggregate_responses`) and **paginated** reads (#1550), the visible set MUST be
@@ -321,8 +321,8 @@ gate.
 - **Audit-log** — `AuditLog:Read` reads (`server.cpp:5848`); audit rows carry `agent_id`, so a
   confined auditor must see only in-scope events. (Classified here per Gate-2/Gate-3 review; it is
   also a no-per-agent-filter reader, so it is in the fail-closed ship-now fix below.)
-- **DEX / TAR list surfaces** — the DEX `VisibleSetFn` seam (`server.cpp:7888` def, `:8386` wiring,
-  `dex_routes.hpp:311`) + remaining TAR/dashboard list fragments.
+- **DEX / Echo list surfaces** — the DEX `VisibleSetFn` seam (`server.cpp:7888` def, `:8386` wiring,
+  `dex_routes.hpp:311`) + remaining Echo/dashboard list fragments.
   - **Update (2026-09-28, WS-A4 PR-1):** `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/app`, and `GET
     /api/v1/dex/overview` (REST + MCP) stay pinned to a GLOBAL-only `GuaranteedState:Read` permission
     check — the same bare gate they had before this PR, never migrated onto `require_fleet_read`.
@@ -348,6 +348,12 @@ gate.
     `guardian_observations` rows (the per-application and per-version top-N membership) that is
     **not yet confined per-caller**. It publishes only distinct-device COUNTs, never an `agent_id`.
     The per-caller SQL slice is the same work item, tracked as #5090.
+- **CA issued-certificate reads** (`GET /api/v1/ca/issued` both forms, MCP `list_issued_certs`, the
+  `/crypto` drill, the Settings certificate panel's inventory): see the ADR-0070 Update
+  (2026-10-24). These are the exception to the "Out of scope" paragraph below, which lists CA
+  routes as global-gated. A read failure inside the check is answered 503 through
+  `ListReadAuthorization::read_failed`, so INV-1 and INV-5 hold; a caller with no grant is refused.
+  (The 2026-10-23 exception, tracked as #6382, is closed by that Update.)
 
 ### Out of scope (global by design)
 
@@ -362,7 +368,7 @@ definitive-out-of-scope) is exactly how a per-agent reader hides forever (audit-
 Two corrections are needed whether A or B is chosen and should ship independently of the gate work:
 
 - **Doc honesty.** The docs/comments that *claim* effective list-view scoping today are false-as-
-  shipped: `docs/user-manual/tar.md:302` ("scoped to your management-group visibility"), the
+  shipped: `docs/user-manual/echo.md:302` ("scoped to your management-group visibility"), the
   inventory/MCP "out-of-scope devices omitted" strings (`mcp_server.cpp:255/1436`,
   `mcp_server.hpp:96`, `rest_api_v1.cpp:3235`, `rest_api_v1.hpp:116/129`, `docs/user-manual/inventory.md:106/141`,
   `docs/rest-api.md:2659`, `docs/mcp-server.md:45`). **Highest priority:**
@@ -510,7 +516,7 @@ ahead of PR-A.)
    + json — consider splitting REST vs dashboard.
 4. **PR-D — inventory.** `query_installed_software` + `GET /api/v1/inventory/software` —
    **DONE (#3290)**. The `/software` devices expansion (`/fragments/inventory/software/devices`) is **DONE** (M.9 PR-3, see above).
-5. **PR-E — DEX / TAR / audit-log.** The DEX `VisibleSetFn` seam + remaining dashboard fragments +
+5. **PR-E — DEX / Echo / audit-log.** The DEX `VisibleSetFn` seam + remaining dashboard fragments +
    the `AuditLog:Read` surface.
 
 Gate-independent, shippable now (not on this ladder): the doc corrections + the ADR-0016 Update note,

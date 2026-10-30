@@ -22,12 +22,12 @@ Neither action shells out or spawns a subprocess; both are native, in-process fi
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: PluginSecret.Read get_log<br/>Security.Read get_key_files]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[agent_logging.execute]
-  EX --> WIN[Windows leg<br/>ifstream tail read /<br/>GetModuleFileNameA]
-  EX --> MAC[macOS leg<br/>ifstream tail read /<br/>_NSGetExecutablePath + realpath]
-  EX --> LIN[Linux leg<br/>ifstream tail read /<br/>proc self exe symlink]
-  WIN & MAC & LIN --> ROWS[key|value rows,<br/>no typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator / workflow"] --> SRV["Server - authz: PluginSecret.Read get_log, Security.Read get_key_files"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"] --> EX["agent_logging.execute"]
+  EX --> WIN["Windows leg - ifstream tail read / GetModuleFileNameA"]
+  EX --> MAC["macOS leg - ifstream tail read / _NSGetExecutablePath + realpath"]
+  EX --> LIN["Linux leg - ifstream tail read / proc self exe symlink"]
+  WIN & MAC & LIN --> ROWS["key|value rows, no typed result status"] --> RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
 
 ## OS capability
@@ -90,7 +90,7 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 ### Where the data goes
 
 - **Instruction result only.** Rows travel over the agent's response channel into the ResponseStore (default 90-day retention via `reap_expired()`), queryable at `/api/responses/{id}`.
-- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. The plugin executes only when an operator or workflow dispatches `device.agent_logging.get_log` or `device.agent_logging.get_key_files`; outside `agent_registry.cpp`'s static action-description catalogue (a name/description list, not a data sink), no other server code references this plugin.
+- **Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics. The plugin executes only when an operator or workflow dispatches `device.agent_logging.get_log` or `device.agent_logging.get_key_files`; outside `agent_registry.cpp`'s static action-description catalogue (a name/description list, not a data sink), no other server code references this plugin.
 - **Sensitivity.** `get_log`'s `line` field is a verbatim tail of the agent's log, which includes the line `"Registered with server (session=..., ...)"` — the agent's live session credential — plus whatever other free text the agent logged, including file paths that may embed a username; `get_key_files`'s `path` rows can likewise embed a username or hostname in the file path. Neither action names installed third-party software.
 - **Siblings:** none — no other plugin's definition references `agent_logging`.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.agent_logging.get_log")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.

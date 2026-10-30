@@ -55,7 +55,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
-#include <netioapi.h> // GetIpNetTable2 / MIB_IPNET_ROW2 (tar_arp_collector.cpp precedent)
+#include <netioapi.h> // GetIpNetTable2 / MIB_IPNET_ROW2 (echo_arp_collector.cpp precedent)
 #else
 #include <arpa/inet.h>
 #include <netdb.h>

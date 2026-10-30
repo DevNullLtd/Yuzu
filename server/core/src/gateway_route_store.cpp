@@ -153,6 +153,21 @@ std::optional<std::string> col_opt(PGresult* r, int row, int col) {
 // Postgres boolean text output is 't'/'f'.
 bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
 
+// True iff `res` failed on the v5 unique session index (#5683). Any other 23505
+// (the agent_id primary key) is NOT this, so it stays a db_error. The index name
+// is `GatewayRouteStore::kSessionUniqueIndexName`; keep it in sync with migration
+// v5's CREATE UNIQUE INDEX (a unit test pins the two together). An index
+// recreated under any other name is NOT remapped and would turn racing adopts
+// into db_error (see docs/user-manual/gateway.md recovery procedure).
+bool is_session_unique_violation(const pg::PgResult& res) {
+    if (res.status() != PGRES_FATAL_ERROR)
+        return false;
+    const char* state = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+    const char* constraint = PQresultErrorField(res.get(), PG_DIAG_CONSTRAINT_NAME);
+    return state != nullptr && constraint != nullptr && std::string_view(state) == "23505" &&
+           std::string_view(constraint) == GatewayRouteStore::kSessionUniqueIndexName;
+}
+
 // parse_reap_i64 / parse_declined_marker moved to gateway_route_reap_rules.hpp
 // (PR #4299 round-3 split): they are now shared by decide_reap (pure) AND this
 // store's apply tail, and both are unit-tested without Postgres.
@@ -168,14 +183,13 @@ const std::vector<pg::PgMigration>& GatewayRouteStore::migrations() {
     // lease_until are nullable — unknown at register-time, filled in later by
     // announce_connected.
     //
-    // The `session_id` index is load-bearing, not cosmetic: renew_leases() is
-    // the highest-frequency op (once per BatchHeartbeat batch) and (#4246 #10)
-    // joins against it via `r.session_id = t.session_id` (correlated with
-    // `agent_id` too, but `agent_id` is already the primary key), and
-    // deregister() filters on session_id too; without the index those are a
-    // seq scan of agent_routes per heartbeat tick, which grows with fleet
-    // size (governance perf/sre, WS-4 4.1). It ships in migration v1 because
-    // adding it later costs a second migration version.
+    // The `session_id` index is load-bearing, not cosmetic: lookup_by_sessions()
+    // (`session_id = ANY($1)`) and reclaim_tombstoned_session's cross-agent
+    // check are keyed on it; renew_leases() and deregister() also constrain
+    // `agent_id` (the primary key), so they do not depend on it. Migration v1
+    // shipped it NON-unique; v5 (#5683) replaced it with the UNIQUE partial
+    // `ux_agent_routes_session_id`, so a session id is now held by at most one
+    // row and a concurrent cross-agent adopt is serialised by the database.
     static const std::vector<pg::PgMigration> kMigrations = {
         {1,
          R"(
@@ -216,6 +230,61 @@ ALTER TABLE agent_routes ADD COLUMN stream_home_id TEXT;
         {4, R"(
 ALTER TABLE agent_routes ADD COLUMN home_cluster_id TEXT;
 )"},
+        // v5 (#5683): `session_id` becomes UNIQUE (partial: a tombstone's NULL
+        // is excluded), closing the READ COMMITTED window in which two agents
+        // adopting one unheld id both won. ACCESS EXCLUSIVE is taken FIRST (not
+        // a weaker mode upgraded later: DROP INDEX needs it, and an upgrade can
+        // deadlock against another replica's read-then-write txn) so no writer
+        // can commit a new duplicate between the dedup and the build. Every row
+        // of a duplicate group is tombstoned (the five placement columns NULLed,
+        // `connection_epoch` and `home_cluster_id` kept - the shape `deregister`
+        // writes): a group has no determinable owner, and each agent recovers
+        // through the existing renew -> reclaim replay, where the first reclaimer
+        // wins. The count is left in route_meta for the constructor to report.
+        // A plain (transactional) CREATE UNIQUE INDEX blocks writers while it
+        // builds: the accepted exception to ADR-0008's non-transactional rule
+        // recorded in ADR-0053 "Update (2026-10-20)" (no rolling upgrade yet).
+        // statement_timeout is lifted for the build; lock_timeout bounds the wait,
+        // on expiry the migration rolls back, boot is refused and a restart retries.
+        //
+        // The old index is dropped with IF EXISTS (a hand-dropped one must not
+        // abort the migration), but the CREATE UNIQUE INDEX deliberately has NO
+        // IF NOT EXISTS: a pre-existing object named ux_agent_routes_session_id
+        // (a wrong-shape index must fail loudly, not be adopted) aborts this
+        // migration by design - atomically, schema_meta stays 4 and boot is
+        // refused. The operator clears it with
+        // `DROP INDEX gateway_route_store.ux_agent_routes_session_id;` and
+        // restarts; the migration then runs afresh.
+        {5, R"(
+SET LOCAL lock_timeout = '30s';
+SET LOCAL statement_timeout = 0;
+LOCK TABLE agent_routes IN ACCESS EXCLUSIVE MODE;
+WITH dup AS (
+    SELECT session_id FROM agent_routes
+    WHERE session_id IS NOT NULL
+    GROUP BY session_id HAVING count(*) > 1
+), tomb AS (
+    UPDATE agent_routes
+    SET session_id = NULL, lease_until = NULL, cluster_id = NULL,
+        gateway_node = NULL, stream_home_id = NULL, updated_at = now()
+    WHERE session_id IN (SELECT session_id FROM dup)
+    RETURNING 1
+)
+INSERT INTO route_meta (key, value)
+SELECT 'v5_session_dedup_tombstoned_rows', count(*)::text FROM tomb
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+CREATE UNIQUE INDEX ux_agent_routes_session_id
+    ON agent_routes (session_id) WHERE session_id IS NOT NULL;
+DROP INDEX IF EXISTS agent_routes_session_id_idx;
+)"},
+        // v6 (Echo rename, upgrade window): whether the agent registered with the pre-rename
+        // plugin name `tar`, so the HA directory dispatch path (which has no session to consult)
+        // can still put the legacy name on the wire. Written by register_fresh only. Removing the
+        // other legacy-name shims drops the write and the read; the column stays as an additive
+        // column (DEFAULT FALSE is harmless; this codebase has no DROP COLUMN).
+        {6, R"(
+ALTER TABLE agent_routes ADD COLUMN legacy_echo_wire_name BOOLEAN NOT NULL DEFAULT FALSE;
+)"},
     };
     return kMigrations;
 }
@@ -230,10 +299,57 @@ GatewayRouteStore::GatewayRouteStore(pg::PgPool& pool) : pool_(pool) {
                       pool_.last_error());
         return;
     }
+    const int version_before = pg::PgMigrationRunner::current_version(lease.get(), kStoreName);
     if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
         spdlog::error("GatewayRouteStore: schema migration failed — gateway route directory "
                       "disabled");
         return;
+    }
+    if (version_before >= 0) {
+        // v5 (#5683) left its tombstone count in route_meta (written on every
+        // run of v5, 0 included, so the key is always present after it).
+        // Counts only: a session id is gateway-asserted identity and is never
+        // logged here. The read is advisory evidence, never a gate on opening.
+        pg::PgResult meta = pg::exec_params(
+            lease.get(),
+            "SELECT value FROM gateway_route_store.route_meta "
+            "WHERE key = 'v5_session_dedup_tombstoned_rows'",
+            std::vector<std::optional<std::string>>{});
+        std::int64_t recorded = 0;
+        bool parsed = false;
+        if (meta.status() == PGRES_TUPLES_OK && PQntuples(meta.get()) == 1 &&
+            PQgetisnull(meta.get(), 0, 0) == 0) {
+            const char* v = PQgetvalue(meta.get(), 0, 0);
+            const char* end = v + std::char_traits<char>::length(v);
+            const auto [ptr, ec] = std::from_chars(v, end, recorded);
+            parsed = (ec == std::errc{} && ptr == end && recorded >= 0);
+            if (!parsed)
+                recorded = 0;
+        }
+        if (version_before < 5) {
+            // THIS construction ran v5.
+            if (!parsed) {
+                spdlog::warn("GatewayRouteStore: migration v5 ran but its route_meta tombstone "
+                             "count could not be read; yuzu_server_gateway_route_session_dedup_"
+                             "total will read 0 even if rows were tombstoned (the durable record "
+                             "is route_meta key v5_session_dedup_tombstoned_rows)");
+            } else {
+                boot_session_dedup_rows_ = recorded;
+                if (recorded > 0) {
+                    spdlog::warn("GatewayRouteStore: migration v5 tombstoned {} agent_routes "
+                                 "row(s) that shared a session id (each affected agent "
+                                 "re-establishes its route through the normal renew/reclaim "
+                                 "replay)",
+                                 recorded);
+                }
+            }
+        } else if (parsed && recorded > 0) {
+            // A later start: boot_session_dedup_rows() stays 0 (it counts only
+            // THIS construction), so surface the durable record once.
+            spdlog::info("GatewayRouteStore: route_meta records {} agent_routes row(s) "
+                         "tombstoned by the v5 migration on an earlier start (not re-counted)",
+                         recorded);
+        }
     }
     open_ = true;
     // ADR-0009 fresh-start-by-default: born on Postgres, no legacy SQLite
@@ -244,7 +360,8 @@ GatewayRouteStore::GatewayRouteStore(pg::PgPool& pool) : pool_(pool) {
 }
 
 std::expected<RegisterFreshResult, GatewayRouteStoreError>
-GatewayRouteStore::register_fresh(std::string_view agent_id, std::string_view session_id) {
+GatewayRouteStore::register_fresh(std::string_view agent_id, std::string_view session_id,
+                                  bool legacy_echo_wire_name) {
     if (!open_)
         return std::unexpected(GatewayRouteStoreError::store_unavailable);
     auto lease = pool_.try_acquire_for(kWriteTimeout);
@@ -277,11 +394,14 @@ GatewayRouteStore::register_fresh(std::string_view agent_id, std::string_view se
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "INSERT INTO gateway_route_store.agent_routes "
-        "  (agent_id, connection_epoch, session_id, updated_at) "
-        "VALUES ($1, nextval('gateway_route_store.connection_epoch_seq'), $2, now()) "
+        "  (agent_id, connection_epoch, session_id, updated_at, legacy_echo_wire_name) "
+        "VALUES ($1, nextval('gateway_route_store.connection_epoch_seq'), $2, now(), $3::boolean) "
         "ON CONFLICT (agent_id) DO UPDATE SET "
         "  connection_epoch = EXCLUDED.connection_epoch, "
         "  session_id = EXCLUDED.session_id, "
+        // Upgrade-window shim, removed with the other legacy-name shims: a new connection
+        // re-states whether this agent still speaks the pre-rename plugin name.
+        "  legacy_echo_wire_name = EXCLUDED.legacy_echo_wire_name, "
         "  cluster_id = NULL, "
         "  gateway_node = NULL, "
         "  stream_home_id = NULL, "
@@ -296,8 +416,16 @@ GatewayRouteStore::register_fresh(std::string_view agent_id, std::string_view se
         "  updated_at = now() "
         "WHERE EXCLUDED.connection_epoch > agent_routes.connection_epoch "
         "RETURNING connection_epoch",
-        std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id)});
+        std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id),
+                                                 std::string(legacy_echo_wire_name ? "t" : "f")});
     if (res.status() != PGRES_TUPLES_OK) {
+        if (is_session_unique_violation(res)) {
+            // A server-minted id (128 random bits) cannot collide: this is an RNG
+            // fault or a planted row. Fail closed; the next attempt mints anew.
+            spdlog::error("GatewayRouteStore::register_fresh: minted session id is already "
+                          "held by another agent_routes row (#5683) — refusing");
+            return std::unexpected(GatewayRouteStoreError::db_error);
+        }
         spdlog::error("GatewayRouteStore::register_fresh: query failed: {}",
                       PQresultErrorMessage(res.get()));
         return std::unexpected(GatewayRouteStoreError::db_error);
@@ -430,6 +558,13 @@ GatewayRouteStore::announce_connected(std::string_view agent_id, std::string_vie
         std::vector<std::optional<std::string>>{
             std::string(agent_id), std::move(cluster_arg), std::string(gateway_node),
             std::string(session_id), std::to_string(lease_ttl_secs), std::move(home_id_arg)});
+    if (is_session_unique_violation(ins)) {
+        // #5683: another agent's row already holds this session id, so the
+        // fallback insert was refused by the unique index. The caller unpublishes.
+        return AnnounceResult{.matched = false,
+                              .cluster_affinity_violation = cluster_affinity_violation,
+                              .session_held_by_other_agent = true};
+    }
     if (ins.status() != PGRES_COMMAND_OK) {
         spdlog::error("GatewayRouteStore::announce_connected: fallback insert failed: {}",
                       PQresultErrorMessage(ins.get()));
@@ -486,6 +621,11 @@ GatewayRouteStore::reclaim_tombstoned_session(std::string_view agent_id,
         "SELECT EXISTS (SELECT 1 FROM ins), EXISTS (SELECT 1 FROM other)",
         std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id),
                                                  std::to_string(lease_ttl_secs)});
+    if (is_session_unique_violation(res)) {
+        // #5683: lost the race to a concurrent adopt of the same id; the
+        // unique index, not the snapshot above, is what arbitrates it.
+        return ReclaimOutcome::held_by_other_agent;
+    }
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
         spdlog::error("GatewayRouteStore::reclaim_tombstoned_session: query failed: {}",
                       PQresultErrorMessage(res.get()));
@@ -493,10 +633,10 @@ GatewayRouteStore::reclaim_tombstoned_session(std::string_view agent_id,
     }
     if (std::string_view(PQgetvalue(res.get(), 0, 0)) == "t")
         return ReclaimOutcome::adopted;
-    // Not adopted: either another agent's row holds the id (best-effort: the
-    // index is non-unique) or the caller's own row holds a LIVE session
-    // (normally a different one; a concurrent identical reclaim also lands
-    // here). Either way the caller must refuse it outright.
+    // Not adopted: either another agent's row holds the id or the caller's own
+    // row holds a LIVE session (normally a different one; a concurrent
+    // identical reclaim also lands here). Either way the caller must refuse it
+    // outright.
     return std::string_view(PQgetvalue(res.get(), 0, 1)) == "t"
                ? ReclaimOutcome::held_by_other_agent
                : ReclaimOutcome::superseded;
@@ -794,7 +934,7 @@ GatewayRouteStore::lookup_route(std::string_view agent_id) {
         "SELECT agent_id, cluster_id, gateway_node, connection_epoch, session_id, "
         "       (extract(epoch FROM lease_until) * 1000)::bigint AS lease_until_ms, "
         "       (lease_until IS NOT NULL AND lease_until < now()) AS is_stale, "
-        "       home_cluster_id "
+        "       home_cluster_id, legacy_echo_wire_name "
         "FROM gateway_route_store.agent_routes WHERE agent_id=$1",
         std::vector<std::optional<std::string>>{std::string(agent_id)});
     if (res.status() != PGRES_TUPLES_OK) {
@@ -819,6 +959,7 @@ GatewayRouteStore::lookup_route(std::string_view agent_id) {
                               : parse_ms(PQgetvalue(res.get(), 0, 5));
     row.is_stale = std::string_view(PQgetvalue(res.get(), 0, 6)) == "t";
     row.home_cluster_id = col_opt(res.get(), 0, 7); // #4669
+    row.legacy_echo_wire_name = std::string_view(PQgetvalue(res.get(), 0, 8)) == "t";
     return std::optional<RouteRow>(std::move(row));
 }
 
@@ -849,7 +990,7 @@ GatewayRouteStore::lookup_routes(std::span<const std::string> agent_ids) {
         "       (extract(epoch FROM lease_until) * 1000)::bigint AS lease_until_ms, "
         "       (lease_until IS NOT NULL AND lease_until < now()) AS is_stale, "
         "       (session_id IS NOT NULL AND lease_until >= now() AND cluster_id IS NOT NULL) "
-        "         AS routable "
+        "         AS routable, legacy_echo_wire_name "
         "FROM gateway_route_store.agent_routes WHERE agent_id = ANY($1::text[])",
         std::vector<std::string>{pg::to_text_array(views)});
     if (res.status() != PGRES_TUPLES_OK) {
@@ -875,6 +1016,7 @@ GatewayRouteStore::lookup_routes(std::span<const std::string> agent_ids) {
                                        : parse_ms(PQgetvalue(res.get(), i, 5));
         rr.route.is_stale = std::string_view(PQgetvalue(res.get(), i, 6)) == "t";
         rr.routable = std::string_view(PQgetvalue(res.get(), i, 7)) == "t";
+        rr.route.legacy_echo_wire_name = std::string_view(PQgetvalue(res.get(), i, 8)) == "t";
         out.push_back(std::move(rr));
     }
     return out;
@@ -901,8 +1043,8 @@ GatewayRouteStore::lookup_by_sessions(std::span<const std::string> session_ids) 
         return std::unexpected(GatewayRouteStoreError::store_unavailable);
     }
     // Array-param idiom and in-SQL DB-clock `routable` as lookup_routes, one
-    // statement per chunk on this lease; session_id is not unique so EVERY
-    // match is returned.
+    // statement per chunk on this lease; session_id has been unique since v5
+    // (#5683) but EVERY match is still returned (defence in depth).
     std::vector<RoutableRoute> out;
     for (std::size_t off = 0; off < views.size(); off += kSessionLookupChunk) {
         const std::size_t n_ids = std::min(kSessionLookupChunk, views.size() - off);

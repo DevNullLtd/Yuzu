@@ -196,7 +196,7 @@ constexpr char kBody[] = R"HTM(<body>
 )HTM";
 
 // ── Script: toasts, 401 handling, density, and the confirm-then-PUT runtime form flow.
-constexpr char kScript[] = R"HTM(<script>
+constexpr char kScriptPre[] = R"HTM(<script>
 (function () {
   'use strict';
   function $(id) { return document.getElementById(id); }
@@ -246,7 +246,10 @@ constexpr char kScript[] = R"HTM(<script>
   /* Colour scheme: the same browser-local pattern. The key and the whitelist are the ones the
      boot script in every page head reads, so a saved choice paints before first paint on the
      next page. Slate is the :root and the fallback for anything not on the list. */
-  var THEME_KEY = 'yuzu-theme', THEMES = /^(slate|navy|jade|light|light-baby|light-hot)$/;
+  var THEME_KEY = 'yuzu-theme', THEMES = /)HTM";
+
+// shell::kThemeWhitelistRe is spliced between kScriptPre and kScriptPost.
+constexpr char kScriptPost[] = R"HTM(/;
   function readTheme() {
     try { var v = window.localStorage.getItem(THEME_KEY); return THEMES.test(v) ? v : 'slate'; }
     catch (err) { return 'slate'; }
@@ -347,7 +350,7 @@ constexpr char kScript[] = R"HTM(<script>
     var v = hb.value.trim(), loadedHb = f.dataset.loadedHeartbeat, loadedLl = f.dataset.loadedLogLevel;
     var hbChanged = v !== loadedHb, llChanged = ll.value !== loadedLl;
     if (!hbChanged && !llChanged) return;
-    if (hbChanged && (!/^[0-9]+$/.test(v) || parseInt(v, 10) < parseInt(hb.min, 10))) {
+    if (hbChanged && (!/^[0-9]+$/.test(v) || parseInt(v, 10) < parseInt(hb.min, 10) || parseInt(v, 10) > parseInt(hb.max, 10))) {
       var err = $('gen-heartbeat-err');
       if (err) err.hidden = false;
       return;
@@ -408,14 +411,17 @@ constexpr char kScript[] = R"HTM(<script>
 // Each part is a raw-string literal; pin them well under MSVC's 16,380-byte limit.
 static_assert(sizeof(kHead) < 15000, "kHead exceeds the MSVC raw-literal ceiling");
 static_assert(sizeof(kBody) < 15000, "kBody exceeds the MSVC raw-literal ceiling");
-static_assert(sizeof(kScript) < 15000, "kScript exceeds the MSVC raw-literal ceiling");
+static_assert(sizeof(kScriptPre) < 15000 && sizeof(kScriptPost) < 15000,
+              "kScript exceeds the MSVC raw-literal ceiling");
 
 std::string assemble() {
     std::string page;
-    page.reserve(sizeof(kHead) + sizeof(kBody) + sizeof(kScript));
+    page.reserve(sizeof(kHead) + sizeof(kBody) + sizeof(kScriptPre) + sizeof(kScriptPost));
     page += kHead;
     page += kBody;
-    page += kScript;
+    page += kScriptPre;
+    page += yuzu::server::shell::kThemeWhitelistRe;
+    page += kScriptPost;
     return page;
 }
 

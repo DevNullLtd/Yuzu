@@ -13,7 +13,8 @@
 #
 # Big Tam: originally believed to "scale flat" and need no gate at all — false.
 # Its dominant contention turned out to be WITHIN-job meson fan-out (fixed by
-# --num-processes 2 on the flake-retry.py invocation in ci.yml, proved via
+# --num-processes 2 on the flake-retry.py invocation in ci.yml (the value then; the
+# pg-shards step has been 4 since Push 2c), proved via
 # back-computed shard start times landing within ~0.01s of each other), but
 # that alone left cross-job contention unmeasured (#3443 AC4). Now confirmed
 # real: a single push to dev launches its own 4-way Linux matrix simultaneously,

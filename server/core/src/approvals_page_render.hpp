@@ -17,6 +17,17 @@
 /// A row carries the whole request in `data-*` so the page's single detail panel is filled
 /// from the selected row with no further request: scope and reviewer comment appear in full
 /// ONLY there (`data-scope`, `data-comment`); the visible cell shows a clipped copy.
+///
+/// A BOUND ticket (#6062: `request_json` non-empty) also carries `data-request`, a
+/// plain-text rendering of what the reviewer is approving (definition name + hash,
+/// targets, parameters, any other field), built by `summarize_bound_request` and escaped
+/// like every other attribute, and `data-digest`, the frozen SHA-256. The raw JSON is
+/// never emitted. `data-excluded="1"` marks a row the viewing session may not approve
+/// because it is NAMED in the ticket's excluded roots (an unreadable list names nobody; that
+/// row is `unapprovable`, below).
+/// A bound row whose stored request cannot be read or bounded (`bound_request_is_readable`)
+/// carries `data-unreadable="1"` and a `data-request` that is the fixed "do not approve"
+/// notice; the controller offers Reject only.
 
 #include "name_lookup_memo.hpp"
 
@@ -40,7 +51,71 @@ struct ApprovalRowView {
     int64_t reviewed_at{0};
     bool mine{false}; ///< submitted_by == the viewing session's username
     bool mcp{false};  ///< definition_id is in the reserved `mcp.` namespace
+    /// The frozen request (#6062), raw JSON text as stored; EMPTY for an unbound ticket.
+    /// Only `summarize_bound_request` ever reads it, and nothing emits it verbatim.
+    std::string request_json;
+    std::string request_digest; ///< lowercase hex SHA-256 of `request_json`; empty if unbound
+    /// The viewing session may not approve this row: it is named in the ticket's excluded
+    /// roots (the server refuses the approval either way).
+    bool excluded{false};
+    /// The stored state is one the store refuses to approve whoever asks (an unreadable or
+    /// unverifiable request, unreadable excluded roots): the controller offers Reject only.
+    /// Emitted as `data-unreadable="1"`, alongside the same flag derived from the request.
+    bool unapprovable{false};
 };
+
+/// Plain-text rendering of a bound ticket's frozen request, for the detail panel and the
+/// decision dialog. Pure; parses defensively and never throws.
+///
+/// Shape, one fact per line, in this ORDER:
+///   Definition: <name>
+///   Hash: <hash>
+///   Targets (<n>):                    (an array: one value per line, indented)
+///     <value>
+///   Targets: <expression>             (or a single scope-expression string)
+///   Parameters:
+///     <key>: <value>
+///   Definition fields:                (any other key inside `definition`)
+///     <key>: <value>
+///   Other fields:                     (any other top-level key)
+///     <key>: <value>
+///   Shortened: ...                    (only when anything above was cut)
+///   Digest: sha256:<hex>
+/// Each optional section has its OWN byte budget and says on its own line when it shows fewer
+/// entries than the request holds ("... and N more not shown (section limit)"), so no section
+/// can push another out of the summary: the Definition line (and, when `definition` is an object,
+/// the Hash line) comes first and is never budgeted away, and every section keeps its heading
+/// whatever another one holds. When `definition` is absent or not an object the Definition line
+/// says so and there is no Hash line.
+/// `definition` ({name, hash}), `targets` and `params` are the recognised keys; every OTHER
+/// top-level key is listed under "Other fields", and every other key inside `definition`
+/// under "Definition fields". A key beyond a section's entry cap or byte budget is not shown, but
+/// is counted and the section says "... and N more not shown (section limit)"; a long VALUE is
+/// cut and the summary says so. DISPLAY-SAFE by construction: every string and key is shown
+/// JSON-escaped and ASCII-only except for the ellipsis that marks a cut value (a newline prints as `\n`; U+202E, U+2028,
+/// U+2066 and every other non-ASCII character print as `\uXXXX`), and each value sits on a
+/// line that starts with a fixed label, so a value can neither start a line of its own (a
+/// second "Definition:" or "Digest:") nor reorder the text around it. Output is bounded (per
+/// value, per section, total); when anything is cut the text says so on a "Shortened:" line
+/// before the digest. A request that is not a JSON object yields a fixed "could not be read,
+/// do not approve" notice. The summary is for ORIENTATION: the Digest line, over the exact
+/// stored bytes, is what identifies the request.
+[[nodiscard]] std::string summarize_bound_request(const std::string& request_json,
+                                                  const std::string& request_digest);
+
+/// `summarize_bound_request` plus whether the summary was CUT (a value over 512 bytes, a
+/// section over its byte budget or 40 entries, or - never in practice, the section budgets sum
+/// to less - the 6000-byte total) and whether the request was
+/// readable at all. When `shortened`, the text itself carries a "Shortened:" line above
+/// the digest, and the row carries `data-shortened="1"` so the decision dialog does not
+/// claim the reviewer saw the whole effect.
+struct BoundRequestSummary {
+    std::string text;
+    bool shortened{false};
+    bool readable{false};
+};
+[[nodiscard]] BoundRequestSummary summarize_bound_request_detail(const std::string& request_json,
+                                                                 const std::string& request_digest);
 
 struct ApprovalListView {
     std::vector<ApprovalRowView> rows; ///< newest first, as the store returned them

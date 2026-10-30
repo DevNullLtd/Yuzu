@@ -6,7 +6,7 @@ project(
   # once generated `int kVersionPatch = 1-dev;` and red-lined the whole C++
   # matrix (fca69e34). The suffix-tolerant split below (search
   # PROJECT_VERSION_PATCH) stays as defense-in-depth, not as licence.
-  version: '0.14.1',
+  version: '0.15.0',
   license: 'AGPL-3.0-or-later',
   meson_version: '>=1.3.0',
   default_options: [
@@ -393,8 +393,8 @@ if host_os == 'darwin'
   # `usr/lib/libEndpointSecurity.tbd` + `usr/include/EndpointSecurity/` in BOTH
   # the Command Line Tools SDK and the full Xcode SDK, so it is probed as a
   # library plus its header (an `appleframeworks` probe can never find it).
-  # This is the SINGLE probe site for every ES consumer in the tree: TAR's
-  # process stream (tar_proc_es.cpp), agent-core's pure ES helpers
+  # This is the SINGLE probe site for every ES consumer in the tree: Echo's
+  # process stream (echo_proc_es.cpp), agent-core's pure ES helpers
   # (es_client.hpp) and the test executables all consume
   # endpoint_security_dep/_deps/_args instead of probing independently.
   # Found: the real ES client compiles (-DYUZU_HAVE_ENDPOINT_SECURITY -fblocks;
@@ -404,7 +404,7 @@ if host_os == 'darwin'
   # Compiling and linking need no entitlement. RUNNING a client needs the
   # com.apple.developer.endpoint-security.client entitlement, root and Full
   # Disk Access: unentitled (every CI leg), es_new_client fails and each
-  # consumer falls back cleanly (TAR to the sysctl poll). See
+  # consumer falls back cleanly (Echo to the sysctl poll). See
   # docs/darwin-compat.md's EndpointSecurity pitfalls-table row.
   endpoint_security_dep = cxx.find_library('EndpointSecurity', required: false)
   endpoint_security_deps = []
@@ -548,7 +548,7 @@ if build_agent
   subdir('agents/plugins/registry')
   subdir('agents/plugins/rdp_control')
   subdir('agents/plugins/wmi')
-  subdir('agents/plugins/tar')
+  subdir('agents/plugins/echo')
   subdir('agents/plugins/wifi')
   subdir('agents/plugins/wol')
   subdir('agents/plugins/discovery')
@@ -696,13 +696,13 @@ if _gw_otp_bin != ''
   # ── Gateway tests (EUnit + Common Test) ──────────────────────────────
   _gw_test_script = meson.project_source_root() / 'scripts' / 'test_gateway.py'
   _python3 = yuzu_python
-  # Both gateway tests run on the OTP resolved above: YUZU_OTP_BIN (set in
+  # Every gateway test runs on the OTP resolved above: YUZU_OTP_BIN (set in
   # each test's env) goes first on PATH via erlang_toolchain.base_env().
   #
-  # Each suite gets its own REBAR_BASE_DIR so the eunit and ct tests
-  # never share `_build/test/lib/<dep>/` on disk. Meson schedules
-  # tests in parallel by default, and two rebar3 processes writing
-  # to the same ebin tree racing each other's `.bea#`→`.beam` rename
+  # Every gateway test gets its own REBAR_BASE_DIR so no two of them
+  # (the eunit shards and ct) ever share `_build/test/lib/<dep>/` on disk.
+  # Meson schedules tests in parallel by default, and two rebar3 processes
+  # writing to the same ebin tree racing each other's `.bea#`→`.beam` rename
   # fired consistently on Windows MSVC as
   #     "failed to rename proper_orddict.bea# to proper_orddict.beam:
   #      no such file or directory"
@@ -712,20 +712,49 @@ if _gw_otp_bin != ''
   # isolation fix applies unconditionally so the race can't come
   # back if Linux kernel semantics ever change. `test_gateway.py`
   # honors REBAR_BASE_DIR when computing the ebin wipe path.
-  # Timeout 600s — upper-bound safety net for the nightly Coverage and
-  # sanitizer jobs on slower cloud runners (scw-eager-lumiere) where
-  # parallel meson test execution can starve the eunit job of CPU.
-  # Healthy runs finish in ~30-90s on a fast runner and are unaffected
-  # by the upper bound. The previous 120s landed at exactly 120.03s on
-  # nightly Coverage and killed the suite by SIGTERM; gateway eunit is
-  # only reached during nightly anyway, so a generous bound is free.
-  test('gateway eunit',
-    _python3,
-    args: [_gw_test_script, _gw_src, 'eunit'],
-    suite: 'gateway',
-    timeout: 600,
-    env: {'REBAR_BASE_DIR': _gw_src / '_build_eunit', 'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
-  )
+  #
+  # EUnit runs as SHARDS (`gateway eunit shard A`, `... shard B`), each a
+  # deterministic share of the top-level apps/yuzu_gw/test modules
+  # (`test_gateway.py ... eunit --shard K/N`; partition, and why the shards
+  # together run exactly what `rebar3 eunit --dir apps/yuzu_gw/test` does,
+  # in scripts/gateway_eunit_shards.py, pinned by
+  # tests/test_gateway_eunit_shards.py). One whole-suite run took 461s on
+  # the Windows MSVC leg at 56f3e0df6 (85% of the wrapper's 540s deadline)
+  # and then exceeded it as PR #5695 added modules (runs 39078203756,
+  # 39103378230); compile is ~14s of that, the rest is test time (#2093:
+  # split the suite). Adding a shard: add an entry here (next letter,
+  # K/N with the new N on EVERY entry, its own _build_eunit_<K>) and to
+  # REQUIRED in scripts/ci/assert-gateway-tests.py; the self-test checks
+  # the entries stay consistent. Each shard compiles the whole test dir
+  # in its own base dir, so a shard costs one more ~14s compile.
+  #
+  # Timeout 600s per shard — must stay ABOVE test_gateway.py's per-suite
+  # `_SUITE_DEADLINE_SECS['eunit']` (540) so the wrapper's process-tree
+  # dump fires before meson's blind kill (#4800). It is also the upper
+  # bound for the nightly Coverage and sanitizer jobs on slower runners,
+  # where parallel meson test execution can starve a shard of CPU. Change
+  # this and the wrapper's value together.
+  #
+  # priority 120 (342ae2efe): gateway eunit is the longest entry of
+  # the Linux cheap-suites invocation (about 111 to 122 s unsharded over eleven
+  # runs on the self-hosted Linux runner, 2026-10-24) and, defined last, it used
+  # to start last. 120 sits between the pg shards (160-260, a sparse rank
+  # scale) and the non-pg shards (10-50) in tests/meson.build, so both eunit
+  # shards start first and overlap the other entries instead of trailing them.
+  # Priority only orders starts: it moves no case and cannot change the total
+  # work (at --num-processes 1 the order changes, the wall time does not).
+  _gw_eunit_shards = {'A': '1/2', 'B': '2/2'}
+  foreach _gw_shard_name, _gw_shard_spec : _gw_eunit_shards
+    test('gateway eunit shard ' + _gw_shard_name,
+      _python3,
+      args: [_gw_test_script, _gw_src, 'eunit', '--shard', _gw_shard_spec],
+      suite: 'gateway',
+      timeout: 600,
+      priority: 120,
+      env: {'REBAR_BASE_DIR': _gw_src / ('_build_eunit_' + _gw_shard_spec.split('/')[0]),
+            'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
+    )
+  endforeach
   # Timeout 600s — must stay ABOVE test_gateway.py's per-suite
   # `_SUITE_DEADLINE_SECS['ct']` (540) so the wrapper's process-tree dump
   # fires before meson's blind kill; the old 300s sat below the wrapper's

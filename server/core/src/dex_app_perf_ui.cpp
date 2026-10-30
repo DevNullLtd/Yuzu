@@ -263,9 +263,10 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
     if (apps.empty())
         return h + placeholder("No application performance history yet",
                                "Per-application performance roll-ups appear here once devices "
-                               "report retained daily summaries. Per-application sampling is "
-                               "opt-in (procperf_enabled, off by default) — enable it on the "
-                               "devices you want to track.");
+                               "report retained daily summaries. Per-application sampling "
+                               "(procperf_enabled) is on by default; a device appears after its "
+                               "first completed UTC day, so check procperf_enabled on any device "
+                               "that never appears.");
 
     // -- Controls: search, platform, sort — CSP-safe (htmx core attrs only, no
     // hx-on). Each control's hx-get carries every OTHER current param so a
@@ -619,7 +620,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
             // `version` PRESENT (not merely non-empty) and treats "" as the valid
             // "unknown version" bucket, never "unfiltered" — so the `(no version)`
             // row gets the affordance too (the ONLY bucket Linux procperf ever
-            // reports, tar_proc_perf.cpp).
+            // reports, echo_proc_perf.cpp).
             const std::string devices_qs =
                 "app=" + url_encode(app_name) + "&amp;version=" + url_encode(v.version);
             devices_cell += " <a style=\"cursor:pointer\" class=\"gp-mute\" "
@@ -725,9 +726,9 @@ std::string render_dex_device_app_perf(const std::vector<AppPerfDeviceApp>& apps
     if (apps.empty())
         return placeholder("No application performance history for this device",
                            "This device has reported no retained daily application performance "
-                           "yet. Per-application sampling is opt-in (procperf_enabled, off by "
-                           "default) and a daily summary appears only after the first completed "
-                           "UTC day — enable it on this device to populate this view.");
+                           "yet. Per-application sampling (procperf_enabled) is on by default "
+                           "and a daily summary appears only after the first completed UTC day "
+                           "— if it never appears, check procperf_enabled on this device.");
 
     std::string h = "<table class=\"gp-table\"><thead><tr><th>Application / version</th>"
                     "<th>Avg CPU</th><th>Peak CPU</th><th>CPU trend</th><th>Avg working set</th>"

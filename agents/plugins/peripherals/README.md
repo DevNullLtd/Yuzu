@@ -14,17 +14,62 @@
 
 ## How it works
 
-Three independent bus walks, dispatched by action name (`peripherals_plugin.cpp`): `usb` and `pci` enumerate the platform's device tree for that bus, one row per device; `thunderbolt` is the bus_inventory fold — one row per Thunderbolt/USB4 node, host controller or attached device, from whatever mechanism each OS exposes for that bus (there is no single "Thunderbolt API" the way there is a PCI or USB one). Every leg is a pure device-tree read: no configuration, no authorization-state change, no write of any kind. A leg that finds nothing still emits one `<kind>|none` row rather than silence, and a leg that cannot even attempt the read emits `<kind>|unavailable|<token>` and reports a degraded result status — never a plain empty result standing in for a failure. This plugin is deliberately NOT the source of PCI/USB vendor-ID-to-name lookups (no `pci.ids`/`usb.ids` database is shipped or parsed — vendor/product strings, where present, come straight from the OS), never shells out to a subprocess on any leg, and does not yet cover displays, Bluetooth, audio or camera devices (scoped out at Wave 1 planning, deferred to a later PR).
+`usb`, `pci` and `thunderbolt` each read one bus's device tree from the operating system and emit one row per device or node. All three are pure reads: nothing is configured, authorised or written. A bus with no devices answers with one `<kind>|none` row and a complete status; a read that could not be attempted answers with one `<kind>|unavailable|<token>` row and a `CONSTRAINED` / `PARTIAL` status, so an empty list is never standing in for a failure.
+
+Windows asks SetupAPI (`SetupDiGetClassDevsW`) for present devices under the `USB` or `PCI` enumerator, and `thunderbolt` is the PCI walk filtered to devices whose description names Thunderbolt or USB4. macOS asks IOKit for `IOUSBHostDevice`, `IOPCIDevice` or `IOThunderboltSwitch` services and reads their registry properties. Linux lists `/sys/bus/usb/devices`, `/sys/bus/pci/devices` or `/sys/bus/thunderbolt/devices` and reads the attribute files in each. No leg starts a subprocess.
+
+The plugin does not translate ids into names: no `pci.ids` or `usb.ids` database is shipped, so vendor and product text appears only where the operating system already supplies it. It does not cover displays, Bluetooth, audio or camera devices, and it does not report whether a device is working or what is plugged in physically beyond what each bus tree exposes.
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: Inventory.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[peripherals.execute]
-  EX --> WIN[Windows leg<br/>SetupAPI SetupDiGetClassDevsW]
-  EX --> MAC[macOS leg<br/>IOKit IOServiceMatching]
-  EX --> LIN[Linux leg<br/>/sys/bus/{usb,pci,thunderbolt}/devices reads]
-  WIN & MAC & LIN --> ROWS[rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  OP["Operator or workflow"] --> SRV["Server authz: Inventory.Read"]
+  SRV -- "gRPC mTLS" --> HOST["Agent plugin host"] --> EX["peripherals.execute"]
+  EX --> WIN["Windows leg: SetupAPI"]
+  EX --> MAC["macOS leg: IOKit registry"]
+  EX --> LIN["Linux leg: sysfs bus directories"]
+  WIN --> ROWS["Rows and typed result status"]
+  MAC --> ROWS
+  LIN --> ROWS
+  ROWS --> RS[("ResponseStore")] --> API["REST api/responses"]
 ```
+
+### What you can decide with it
+
+| Question | Action | Windows | macOS | Linux |
+|---|---|---|---|---|
+| Which USB devices are attached? | `usb` | Every present node under the USB enumerator, including each interface of a composite device (instance ids ending `&MI_nn`) and root hubs. Serial and speed are always `-`. | One row per USB device (`IOUSBHostDevice`), with serial and negotiated speed. | One row per USB device; interface entries are skipped. Serial and speed come from sysfs. |
+| Which PCI devices does the host have (GPU, NIC, storage controller)? | `pci` | Vendor, device and class ids and a description; subsystem ids always `0000` and `driver` always `-`. | Ids, class, subsystem ids, the registry name as `description` and a child class name as `driver`. | Ids, class, subsystem ids and the bound driver; `description` always `-`. |
+| Is there a Thunderbolt or USB4 controller, and are attached devices authorised? | `thunderbolt` | The host controller only, found by a text match on the description. No attached devices, no authorisation state. | Controllers and attached switches; `authorized` is not exposed (`-`). | Domains (host controller) and attached devices with `authorized` from sysfs; no live Thunderbolt bus has run this leg. |
+| Is this specific model of dock, token or adapter in use? | `usb`, match `vendor_id` and `product_id` | Yes, via the hardware id. | Yes. | Yes. |
+
+Bus by OS, with what each leg cannot show:
+
+| Bus | Source | Row identity | Not visible |
+|---|---|---|---|
+| USB | SetupAPI, IOKit, sysfs | Windows: device instance id, one row per interface on composite devices. macOS: IOKit location id. Linux: sysfs name such as `1-2.1`. | Windows: serial, speed. All: devices behind a hub the OS has not enumerated, and unplugged devices. |
+| PCI | SetupAPI, IOKit, sysfs | Windows: instance id. macOS: the registry `pcidebug` location, which several bridges can share. Linux: `0000:bus:slot.fn`. | Windows: subsystem ids and driver. Linux: description. |
+| Thunderbolt | SetupAPI text match, IOKit, sysfs | Windows: instance id. macOS: route string. Linux: `domainN` or `N-M`. | Windows: any downstream device. macOS: authorisation. Linux: retimer children. |
+
+What a result does and does not prove: a row is a node in the OS device tree, not a physical device, so one dock or keyboard can appear as several USB rows on Windows. `usb|none` or `pci|none` with `OK` means the tree was read and was empty. Two machines with the same peripheral report the same ids, so ids can be joined across the fleet, but only `serial` (where present) distinguishes one unit from another.
+
+### Diagrams
+
+Every action ends in one of three outcomes:
+
+```mermaid
+stateDiagram-v2
+  [*] --> Read
+  Read --> Rows: devices found
+  Read --> None: tree read, no devices
+  Read --> Unavailable: tree could not be read
+  Rows --> OK
+  None --> OK
+  Unavailable --> Constrained
+  OK --> [*]
+  Constrained --> [*]
+```
+
+`OK` carries either device rows or a single `<kind>|none` row. `Constrained` carries a single `<kind>|unavailable|<token>` row naming the cause (Windows `getclassdevs_failed` with the Win32 error, macOS `matching_failed`, Linux `eacces` or `read_failed`). An absent bus directory on Linux, such as no Thunderbolt bus, is `none`, not a failure.
 
 ## OS capability
 
@@ -41,17 +86,15 @@ flowchart LR
 - **`thunderbolt` / Linux** — walk verified against a sysfs fixture tree only; no live Linux venue with a Thunderbolt bus in this run
 <!-- END GENERATED -->
 
-The capability-matrix block above was regenerated on a Linux container by `tools/capmatrix-gen` dlopening the plugin's built binary on each OS (I91-6), and every sample's leg-hash stamp is resolved against it (I91-7) — the plugin's own descriptor (`peripherals_plugin.cpp`'s `kActionDescriptors`) and the generated block above now agree.
-
 ## Privileges and prerequisites
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | None documented for this plugin (`docs/agent-privilege-model.md`) | 2026-09-08, bare-metal, the-rig, `LocalSystem (elevated)` — P91-7's real MSVC capture (`docs/samples/windows.txt`) | `SetupDiGetClassDevsW` fails, action reports `<kind>\|unavailable\|windows:setupapi:getclassdevs_failed:<GetLastError>` |
-| macOS | agent daemon, root today (LaunchDaemon carries no `UserName` key — `docs/agent-privilege-model.md` TL;DR); this plugin's own reads need no elevation beyond that default | None — IOKit registry property reads are unprivileged | 2026-09-08, bare-metal, this Mac (`braga`), unprivileged (uid 501) — real `ioreg`-equivalent captures behind P91-6's fixtures (`tests/unit/fixtures/wave9/peripherals/macos/*.provenance.txt`); no root-privileged run of this plugin has been captured yet, so the root identity above is the documented production default, not a measured one | `IOServiceGetMatchingServices` itself fails (`kr != KERN_SUCCESS`), action reports `<kind>\|unavailable\|macos:iokit:matching_failed`; a query that succeeds but matches zero services is a clean `<kind>\|none`, not a failure |
-| Linux | agent daemon, default | None — sysfs bus directories under `/sys/bus/{usb,pci,thunderbolt}/devices` are world-readable by default | 2026-09-14, container (Docker VM on this Mac), root (`euid 0`) — a real live capture (`docs/samples/linux.txt`, I91-6/I91-7), plus the fixture tree at `tests/unit/fixtures/wave9/peripherals/linux/sysfs_tree/` (P91-5/P91-7) for the walk-logic unit tests | The bus directory exists but is unreadable (EACCES) or another listing error occurs, action reports `<kind>\|unavailable\|linux:sysfs:eacces` or `linux:sysfs:read_failed`; an absent bus directory (no such bus on this host) is a clean `<kind>\|none`, not a failure |
+| Windows | agent service account (LocalSystem today) | None documented for this plugin (`docs/agent-privilege-model.md`) | Bare-metal Windows 10.0.26200, `LocalSystem (elevated)`, 2026-09-08; see Sample output | `SetupDiGetClassDevsW` fails: the action reports `<kind>\|unavailable\|windows:setupapi:getclassdevs_failed:<GetLastError>` |
+| macOS | agent daemon, root today (the LaunchDaemon has no `UserName` key; see `docs/agent-privilege-model.md`) | None: IOKit registry property reads are unprivileged | Bare-metal macOS, unprivileged (uid 501), 2026-09-14; no root-privileged run has been captured, so root is the documented production identity, not a measured one | `IOServiceGetMatchingServices` fails: `<kind>\|unavailable\|macos:iokit:matching_failed`. A query that succeeds but matches nothing is a clean `<kind>\|none` |
+| Linux | agent daemon, dedicated unprivileged account, never root by design (`docs/agent-privilege-model.md`) | None: the sysfs bus directories under `/sys/bus/{usb,pci,thunderbolt}/devices` are world-readable by default | Debian container, root (`euid 0`), 2026-09-14; the Thunderbolt walk is exercised only against a fixture tree | A bus directory that exists but cannot be read reports `<kind>\|unavailable\|linux:sysfs:eacces` or `linux:sysfs:read_failed`. An absent bus directory is a clean `<kind>\|none` |
 
-Binaries/subprocesses: none — every leg is an in-process native call (SetupAPI, IOKit, or a direct `std::filesystem` sysfs read). Network: none.
+Binaries and subprocesses: none. Every leg is an in-process call (SetupAPI, IOKit, or a direct filesystem read of sysfs). Network: none.
 
 ## Data contract
 
@@ -63,7 +106,7 @@ No action takes parameters.
 
 ### Outputs
 
-Pipe-delimited rows, one per device, written via `write_output()`. Every field beyond the fixed-vocabulary `role` column goes through the shared untrusted-output escaper; a device with no value for a given optional field reports `-` rather than an empty or omitted field. A bus with no devices reports a single `<kind>|none` row; a leg that could not attempt the read at all reports `<kind>|unavailable|<token>` instead of any device rows.
+Pipe-delimited rows, one per device or node, with the action name as the first field. Every free-text field goes through the shared untrusted-output escaper, and a field the platform does not supply is `-`. A bus with no devices reports a single `<kind>|none` row; a read that could not be attempted reports `<kind>|unavailable|<token>` instead of device rows. A USB or PCI row is a node in the OS device tree, not necessarily a physical device: Windows lists each interface of a composite USB device separately.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`crossplatform.peripherals.pci` — `bus_path|vendor_id|device_id|class|subsystem_vendor|subsystem_device|driver|description`**
@@ -120,7 +163,7 @@ Pipe-delimited rows, one per device, written via `write_output()`. Every field b
 ### Where the data goes
 
 - **Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. Each of the three actions is also a gathered definition (`crossplatform.peripherals.usb`/`.pci`/`.thunderbolt`, 300s TTL).
-- **Not consumed by** daily-sync, TAR, DEX, or metrics.
+- **Not consumed by** daily-sync, Echo, DEX, or metrics.
 - **Sensitivity.** Rows carry hardware identifiers (USB/PCI vendor and product ids, serial numbers, Thunderbolt unique ids) that can fingerprint a specific device, and vendor/product strings that name installed peripheral hardware — a software/hardware inventory by another route. No row carries a username or account name.
 - **Siblings:** `hardware` (system/BIOS/CPU/memory/disk inventory — this plugin covers the bus-attached device tree `hardware` does not).
 
@@ -225,11 +268,11 @@ thunderbolt|none
 
 ## Caveats and known gaps
 
-1. **Windows Thunderbolt identification is a string heuristic, not a device class.** SetupAPI's PCI enumerator exposes no dedicated Thunderbolt/USB4 device class, so the Windows leg matches `DEVICEDESC` containing "Thunderbolt" or "USB4" (case-insensitive) on the PCI walk. It also only ever surfaces the host controller — SetupAPI's PCI enumerator cannot see a downstream Thunderbolt device — so every Windows Thunderbolt row reports role `host_controller`.
-2. **Linux Thunderbolt support is fixture-tree-verified only.** The `/sys/bus/thunderbolt/devices` walk has been exercised against a synthetic sysfs fixture tree (`tests/unit/fixtures/wave9/peripherals/linux/sysfs_tree/`); no live Linux host with an actual Thunderbolt bus has run this leg in this project to date.
-3. **Linux `pci` never reports a `description`.** Unlike Windows (`DEVICEDESC`) and macOS (`IOName`), no sysfs attribute carries a human-readable PCI device description, so the Linux `pci` action's `description` field is always `-`.
-4. **macOS `pci` reports the matched service's child class name as `driver`, not a kext/bundle identifier.** `IORegistryEntryGetChildEntry` in the service plane returns a generic IOKit class name (e.g. `IOPCI2PCIBridge`), which is the closest available proxy to "what's bound to this device" on macOS — it is not the driver bundle identifier a Windows `INF`/driver-key lookup or a Linux `driver` symlink would give.
-5. **Windows `pci`'s subsystem vendor/device fields are always `0000`.** SetupAPI's `SPDRP_HARDWAREID` `SUBSYS_` token and a driver-key lookup for the bound driver name are out of Wave-2 scope; both fields report the honest-unfilled `0000`/`-` sentinel rather than a guess (`peripherals_win.cpp`'s `emit_pci_row`).
+1. **Windows Thunderbolt identification is a text match and sees only the host controller.** SetupAPI has no Thunderbolt device class, so the leg matches a PCI device description containing "Thunderbolt" or "USB4" and reports every match as role `host_controller`. Downstream Thunderbolt devices and their authorisation state are not visible on Windows.
+2. **Linux Thunderbolt is verified against a fixture tree only.** The `/sys/bus/thunderbolt/devices` walk has been exercised against a synthetic sysfs tree; no live Linux host with a Thunderbolt bus has run it. The Linux sample is a container showing only virtual USB and virtio PCI devices, so it does not show real hardware rows.
+3. **Some fields are always unfilled.** Linux `pci` `description` is always `-` because sysfs carries none. Windows `pci` has subsystem ids `0000` and `driver` `-`, and Windows `usb` has serial and speed `-`; the Windows USB `vendor` is the driver manufacturer string, so it can read like `(Standard USB Host Controller)` rather than a company.
+4. **macOS `pci` and `thunderbolt` identities are weak.** `driver` is the registry child's class name (for example a bridge class), not a driver bundle identifier, and the `pcidebug` location used as `bus_path` can repeat across bridges, as the sample shows. `authorized` is always `-` on macOS.
+5. **Coverage is limited to the three buses.** There is no vendor-name lookup and no coverage of displays, Bluetooth, audio or camera devices. A name that looks incomplete, such as a blank vendor, means the operating system did not supply one.
 
 ## Source and tests
 

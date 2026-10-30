@@ -4,7 +4,7 @@
  * user_profile_model.hpp — pure model for Windows user-profile / registry-hive
  * discovery (PR1.7).
  *
- * windows.h-free by design (mirrors tar_module_etw.hpp's EtwImageSample
+ * windows.h-free by design (mirrors echo_module_etw.hpp's EtwImageSample
  * split): the Win32 shell (agents/shared/win_profiles.hpp) gathers raw
  * ProfileList rows and HKEY_USERS subkey names into the plain structs below;
  * every classification and formatting decision here is a pure function over
@@ -78,7 +78,7 @@ struct ProfileInfo {
 
 /// The three well-known local-system profile SIDs ProfileList always carries
 /// (LocalSystem / LocalService / NetworkService). Matches the existing
-/// convention in tar_mapdrive_collector.cpp's is_system_sid and
+/// convention in echo_mapdrive_collector.cpp's is_system_sid and
 /// licensing_win.cpp's enumerate_profiles verbatim — deliberately not a
 /// general S-1-5-* classifier, so it stays in lockstep with those call sites.
 [[nodiscard]] inline bool is_system_sid(std::string_view sid) {
@@ -107,6 +107,13 @@ struct ProfileInfo {
 /// filter it.
 [[nodiscard]] inline bool is_profile_backup_entry(std::string_view sid) {
     return sid.size() > 4 && iequals_ascii(sid.substr(sid.size() - 4), ".bak");
+}
+
+/// Drops the `<SID>.bak` leftovers from a built list (see is_profile_backup_entry): the per-user WRITE path resolves its
+/// target from the filtered list, so it can neither write through a leftover nor have a leftover shadow the live profile
+/// of the same user name. Reads keep the unfiltered list.
+inline void remove_backup_entries(std::vector<ProfileInfo>& list) {
+    std::erase_if(list, [](const ProfileInfo& p) { return is_profile_backup_entry(p.sid); });
 }
 
 /// Last '\' or '/' separated component of `profile_image_path`, with any
@@ -205,17 +212,47 @@ struct ProfileInfo {
     return std::nullopt;
 }
 
-/// Strips '|', '\r', '\n' from a field before it is written into the
-/// pipe-delimited plugin-output protocol, so a value containing one of those
-/// cannot forge a column or row boundary. Same behaviour as
-/// registry_plugin.cpp's local sanitize_field, which today applies only to
-/// the unknown-action error string; every field this header renders goes
-/// through this copy instead.
+/// Folds, in place, each of these to a single '_': every C0 control except TAB (0x00-0x08, 0x0A-0x1F, so NUL, ESC,
+/// CR, LF, VT, FF and FS/GS/RS too), DEL (0x7F), every C1 control U+0080-U+009F (UTF-8 `C2 80`-`C2 9F`: NEL U+0085,
+/// CSI U+009B and OSC U+009D among them), and U+2028 / U+2029 (`E2 80 A8` / `E2 80 A9`). A terminal reads ESC, CSI and
+/// OSC as escape introducers and a Unicode-aware splitter (Python's str.splitlines, a log viewer) reads the C0
+/// separators, NEL and U+2028 / U+2029 as line ends, so none may survive in a rendered field. Every other byte,
+/// truncated or invalid UTF-8 included, is left as it is. log_key_token (common/include/yuzu/log_token.hpp) folds
+/// every C0 byte, DEL and U+0085 / U+2028 / U+2029; this also folds C1, and keeps TAB: it is neither a line nor an escape boundary.
+/// log_key_token is not reused on purpose: agents/shared stays free of common/include, and it would fold those tabs.
+/// Lossy by design: "a<U+2028>b", "a<U+009B>b", "a<VT>b" and "a_b" all render as "a_b".
+inline void fold_line_breaks(std::string& s) {
+    std::size_t w = 0;
+    for (std::size_t i = 0; i < s.size(); ++w) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        const auto at = [&](std::size_t k) { return i + k < s.size() ? static_cast<unsigned char>(s[i + k]) : 0; };
+        std::size_t n = 0; // bytes of a folded code point; 0 = keep this byte
+        if ((c < 0x20 && c != '\t') || c == 0x7F)
+            n = 1;
+        else if (c == 0xC2 && at(1) >= 0x80 && at(1) <= 0x9F)
+            n = 2;
+        else if (c == 0xE2 && at(1) == 0x80 && (at(2) == 0xA8 || at(2) == 0xA9))
+            n = 3;
+        s[w] = n != 0 ? '_' : s[i];
+        i += n != 0 ? n : 1;
+    }
+    s.resize(w);
+}
+
+/// Renders untrusted text as one field of the pipe-delimited plugin-output protocol: trailing NULs are dropped (a
+/// REG_SZ is often stored with more than one), then '|' and everything fold_line_breaks folds (CR, LF, an interior
+/// NUL, the other controls, U+2028 / U+2029) become '_', so a value cannot forge a column or row boundary, split a log
+/// line, inject a terminal escape or be cut short where the output crosses the plugin C ABI as a C string. It is
+/// DISPLAY text: the folded characters are not recoverable from it. Every field this header renders goes through
+/// it, and the registry plugin's unknown-action error path calls it directly.
 [[nodiscard]] inline std::string sanitize_field(std::string_view s) {
+    while (!s.empty() && s.back() == '\0')
+        s.remove_suffix(1);
     std::string out;
     out.reserve(s.size());
     for (char c : s)
-        out += (c == '|' || c == '\n' || c == '\r') ? '_' : c;
+        out += c == '|' ? '_' : c;
+    fold_line_breaks(out);
     return out;
 }
 
@@ -231,7 +268,8 @@ struct ProfileInfo {
 /// column one position right of its header.
 [[nodiscard]] inline std::string render_profile_row(const ProfileInfo& info) {
     auto field = [](std::string_view v) -> std::string {
-        return v.empty() ? std::string{"-"} : sanitize_field(v);
+        auto s = sanitize_field(v);
+        return s.empty() ? std::string{"-"} : s;
     };
     std::string out = field(info.sid);
     out += '|';
@@ -289,6 +327,27 @@ enum class UserKeyStatus {
                               // its size.
 };
 
+/// Per-consumer token for one hive-access outcome, reused by every converted plugin so a
+/// refused hive is reported the same way everywhere. `refusal` is the OfflineHiveFileCheck token
+/// (HiveAccessReport::refusal); file_refused renders it verbatim when set, else the generic
+/// "file_refused" literal. Exhaustive switch, no default, like hive_state_name above — -Wswitch
+/// flags enum drift.
+[[nodiscard]] inline std::string hive_access_token(HiveAccessStatus st, std::string_view refusal) {
+    switch (st) {
+    case HiveAccessStatus::ok:
+        return "ok";
+    case HiveAccessStatus::not_found:
+        return "not_found";
+    case HiveAccessStatus::privilege_missing:
+        return "privilege_missing";
+    case HiveAccessStatus::mount_failed:
+        return "mount_failed";
+    case HiveAccessStatus::file_refused:
+        return refusal.empty() ? "file_refused" : std::string{refusal};
+    }
+    return "mount_failed"; // unreachable — cases are exhaustive so -Wswitch flags enum drift
+}
+
 /// Renders the operator-facing lines for one hive-access outcome, in emission
 /// order: the unload warning first (when set), then the terminal error (when
 /// the status is not ok). Returns an empty vector for a clean success.
@@ -302,10 +361,15 @@ enum class UserKeyStatus {
 /// unload_failed can be true even on mount_failed (RegLoadKeyW can succeed
 /// while the subsequent root re-open fails), so a status-first switch that
 /// returned early would drop it.
-[[nodiscard]] inline std::vector<std::string> render_hive_access_lines(HiveAccessStatus status,
-                                                                       bool unload_failed,
-                                                                       std::string_view mount_name,
-                                                                       std::string_view sid) {
+///
+/// `refusal` (defaulted empty, so every pre-existing four-argument call site compiles unchanged)
+/// is the OfflineHiveFileCheck token on a file_refused status; when non-empty it is appended to
+/// the error line as `: <token>` (sanitized — a token embeds no operator-controlled bytes today,
+/// but a future one might).
+[[nodiscard]] inline std::vector<std::string>
+render_hive_access_lines(HiveAccessStatus status, bool unload_failed,
+                         std::string_view mount_name, std::string_view sid,
+                         std::string_view refusal = {}) {
     std::vector<std::string> out;
     const std::string safe_sid = sanitize_field(sid);
 
@@ -337,7 +401,12 @@ enum class UserKeyStatus {
         out.push_back(std::format("error|failed to load hive for sid '{}'", safe_sid));
         break;
     case HiveAccessStatus::file_refused:
-        out.push_back(std::format("error|hive file refused for sid '{}'", safe_sid));
+        if (refusal.empty()) {
+            out.push_back(std::format("error|hive file refused for sid '{}'", safe_sid));
+        } else {
+            out.push_back(std::format("error|hive file refused for sid '{}': {}", safe_sid,
+                                      sanitize_field(refusal)));
+        }
         break;
     case HiveAccessStatus::ok:
         break;

@@ -1391,7 +1391,9 @@ std::optional<std::vector<DexAppStabilityRow>>
 GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const std::string& platform,
                                                 int app_limit, int version_limit,
                                                 std::int64_t per_device_cap,
-                                                const std::vector<std::string>& online_agent_ids) const {
+                                                const std::vector<std::string>& online_agent_ids,
+                                                const std::vector<std::pair<std::string, std::int64_t>>&
+                                                    per_subject_caps) const {
     static DegradeSampler sampler;
     static DegradeSampler budget_sampler; // a refusal storm must not hide a real fault's log line
     struct Slot {
@@ -1418,12 +1420,28 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
     for (const auto& a : online_agent_ids)
         online_views.emplace_back(a);
     const std::string online_array = pg::to_text_array(online_views);
+    // Per-subject caps ($7 subjects, $8 caps): at most the policy's 200 overrides.
+    std::vector<std::string> cap_values;
+    std::vector<std::string_view> cap_subject_views, cap_value_views;
+    cap_values.reserve(per_subject_caps.size());
+    for (const auto& entry : per_subject_caps) {
+        cap_subject_views.emplace_back(entry.first);
+        cap_value_views.emplace_back(cap_values.emplace_back(std::to_string(entry.second)));
+    }
+    const std::string cap_subject_array = pg::to_text_array(cap_subject_views);
+    const std::string cap_value_array = pg::to_text_array(cap_value_views);
     return dex_read_checked<std::vector<DexAppStabilityRow>>(
         open_, pool_, metrics_, "dex_app_stability", sampler,
         [&](PGconn* conn) -> std::optional<std::vector<DexAppStabilityRow>> {
             // d: per (subject, version, device), with o = the device is in the
             // caller's online set ($6; the share, rate and score numerators are
-            // members of the population they are divided by). tc/top: membership is the
+            // members of the population they are divided by) and cap = the
+            // per-device event cap of the subject: its entry in `caps` ($7/$8, the
+            // policy's per-application overrides) else the global $5. The join key
+            // folds the subject with an ASCII-only translate(), byte-identical to
+            // dex_score_policy_detail::ascii_lower, so exactly the subjects the
+            // policy resolver matches get the override (never lower(), whose
+            // locale fold can map non-ASCII bytes to ASCII). tc/top: membership is the
             // app_limit applications affecting the most devices (then events,
             // then name, byte order); the published activity order is the
             // assembler's. top.total counts every qualifying application before
@@ -1432,18 +1450,39 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
             // rows (ad JOIN vc JOIN top) and the capped version rows (ranked,
             // rn <= $4) are UNIONed. Online figures are COALESCEd: FILTER over
             // no rows is NULL.
-            pg::PgResult res = pg::exec_params(
-                conn,
-                "WITH d AS ("
-                " SELECT subject, version, agent_id,"
-                "  COUNT(*) FILTER (WHERE obs_type = 'process.crashed') AS c,"
-                "  COUNT(*) FILTER (WHERE obs_type = 'process.hung') AS h,"
-                "  MAX(observed_at) AS ls,"
-                "  bool_or(agent_id = ANY($6::text[])) AS o"
-                " FROM guaranteed_state_store.guardian_observations"
-                " WHERE obs_type IN ('process.crashed', 'process.hung')"
-                "  AND observed_at >= $1 AND platform = $2"
-                " GROUP BY subject, version, agent_id),"
+            // With no per-subject caps the caps CTE and its join are left out and the
+            // cap is the constant $5 (the join costs a translate() per observation row);
+            // $7/$8 are then not sent, as an unreferenced parameter has no type.
+            const bool has_caps = !per_subject_caps.empty();
+            std::vector<std::string> params{since,
+                                            platform,
+                                            std::to_string(std::clamp(app_limit, 0, kMaxEventsLimit)),
+                                            std::to_string(std::clamp(version_limit, 0, kMaxEventsLimit)),
+                                            std::to_string(per_device_cap),
+                                            online_array};
+            if (has_caps) {
+                params.push_back(cap_subject_array);
+                params.push_back(cap_value_array);
+            }
+            const std::string sql =
+                std::string(has_caps ? "WITH caps AS ("
+                                       " SELECT s, cap FROM unnest($7::text[], $8::bigint[])"
+                                       " AS k(s, cap)),"
+                                       "d AS ("
+                                     : "WITH d AS (") +
+                " SELECT g.subject, g.version, g.agent_id,"
+                "  COUNT(*) FILTER (WHERE g.obs_type = 'process.crashed') AS c,"
+                "  COUNT(*) FILTER (WHERE g.obs_type = 'process.hung') AS h,"
+                "  MAX(g.observed_at) AS ls,"
+                "  bool_or(g.agent_id = ANY($6::text[])) AS o,"
+                + std::string(has_caps ? "  MAX(COALESCE(k.cap, $5::bigint)) AS cap" : "  $5::bigint AS cap") +
+                " FROM guaranteed_state_store.guardian_observations g" +
+                std::string(has_caps ? " LEFT JOIN caps k ON k.s = translate(g.subject,"
+                                       "  'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+                                     : "") +
+                " WHERE g.obs_type IN ('process.crashed', 'process.hung')"
+                "  AND g.observed_at >= $1 AND ($2::text = '' OR g.platform = $2::text)"
+                " GROUP BY g.subject, g.version, g.agent_id),"
                 "tc AS ("
                 " SELECT subject, COUNT(DISTINCT agent_id) AS dev, SUM(c) + SUM(h) AS ev"
                 " FROM d GROUP BY subject),"
@@ -1452,15 +1491,15 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
                 " ORDER BY dev DESC, ev DESC, subject COLLATE \"C\" ASC LIMIT $3::bigint),"
                 "ad AS ("
                 " SELECT d.subject, d.agent_id, SUM(d.c) AS c, SUM(d.h) AS h, MAX(d.ls) AS ls,"
-                "  bool_or(d.o) AS o"
+                "  bool_or(d.o) AS o, MAX(d.cap) AS cap"
                 " FROM d JOIN top USING (subject) GROUP BY d.subject, d.agent_id),"
                 "ranked AS ("
                 " SELECT d.subject, d.version, SUM(d.c) AS c, SUM(d.h) AS h, COUNT(*) AS a,"
                 "  COUNT(*) FILTER (WHERE d.o) AS ao,"
                 "  COALESCE(SUM(d.c) FILTER (WHERE d.o), 0) AS co,"
                 "  COALESCE(SUM(d.h) FILTER (WHERE d.o), 0) AS ho,"
-                "  COALESCE(SUM(LEAST(d.c, $5::bigint)) FILTER (WHERE d.o), 0) AS cc,"
-                "  COALESCE(SUM(LEAST(d.h, $5::bigint)) FILTER (WHERE d.o), 0) AS ch,"
+                "  COALESCE(SUM(LEAST(d.c, d.cap)) FILTER (WHERE d.o), 0) AS cc,"
+                "  COALESCE(SUM(LEAST(d.h, d.cap)) FILTER (WHERE d.o), 0) AS ch,"
                 "  MAX(d.ls) AS ls, COUNT(*) OVER (PARTITION BY d.subject) AS n,"
                 "  ROW_NUMBER() OVER (PARTITION BY d.subject"
                 "   ORDER BY COUNT(*) DESC, d.version COLLATE \"C\" ASC) AS rn"
@@ -1468,8 +1507,8 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
                 "vc AS (SELECT subject, MAX(n) AS n FROM ranked GROUP BY subject) "
                 "SELECT ad.subject, NULL::text AS version, SUM(ad.c)::bigint, SUM(ad.h)::bigint,"
                 " COUNT(*)::bigint,"
-                " COALESCE(SUM(LEAST(ad.c, $5::bigint)) FILTER (WHERE ad.o), 0)::bigint,"
-                " COALESCE(SUM(LEAST(ad.h, $5::bigint)) FILTER (WHERE ad.o), 0)::bigint,"
+                " COALESCE(SUM(LEAST(ad.c, ad.cap)) FILTER (WHERE ad.o), 0)::bigint,"
+                " COALESCE(SUM(LEAST(ad.h, ad.cap)) FILTER (WHERE ad.o), 0)::bigint,"
                 " MAX(ad.ls), MAX(vc.n)::bigint, MAX(top.total)::bigint,"
                 " (COUNT(*) FILTER (WHERE ad.o))::bigint,"
                 " COALESCE(SUM(ad.c) FILTER (WHERE ad.o), 0)::bigint,"
@@ -1478,11 +1517,8 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
                 "UNION ALL "
                 "SELECT subject, version, c::bigint, h::bigint, a::bigint, cc::bigint, ch::bigint,"
                 " ls, 0::bigint, 0::bigint, ao::bigint, co::bigint, ho::bigint "
-                "FROM ranked WHERE rn <= $4::bigint",
-                std::vector<std::string>{since, platform,
-                                         std::to_string(std::clamp(app_limit, 0, kMaxEventsLimit)),
-                                         std::to_string(std::clamp(version_limit, 0, kMaxEventsLimit)),
-                                         std::to_string(per_device_cap), online_array});
+                "FROM ranked WHERE rn <= $4::bigint";
+            pg::PgResult res = pg::exec_params(conn, sql.c_str(), params);
             if (res.status() != PGRES_TUPLES_OK)
                 return std::nullopt;
             std::vector<DexAppStabilityRow> out;

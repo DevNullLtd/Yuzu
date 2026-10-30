@@ -234,7 +234,7 @@ outbox** with **durable monotonic event IDs** (replacing the per-process channel
   event spine**; presentation-terminated SSE/MCP consumers replay via `Last-Event-ID` / `?since=`
   against **core's spine API** (never the `yuzu` outbox directly) and **tolerate duplicates**
   (at-least-once). Cursor ownership: the client cursor is core's; presentation is a stateless relay.
-- The outbox inherits the **clock-guarded retention** rules (routed concern).
+- The outbox inherits the **clock-guarded retention** rules (routed concern). Its rows are also the schedule runner's spent-ticket ledger (#6096, `approval_id`), so any reaper must retain approval-bearing rows at least 7 days from creation.
 
 **Load-bearing prerequisite:** cross-instance correlation requires execution state in Postgres.
 `execution_tracker` (SQLite) and `cmd_execution_ids_` (in-process map, `agent_service_impl.hpp:330`)
@@ -247,9 +247,18 @@ instances).
 (fresh-start, no SQLite backfill); its `agents_responded`/`agents_success`/`agents_failure` counters
 are recomputed in-transaction from `agent_exec_status` via correlated `COUNT(*)` inside
 `UPDATE ... RETURNING`, never app-side read-modify-write. `cmd_execution_ids_` moved to
-`ExecutionTracker`'s PG-backed `command_execution` table (`record_command_execution`/
-`lookup_execution_id`), closing the cross-replica hazard this prerequisite names — see
+`ExecutionTracker`'s PG-backed `command_execution` table (`record_command_dispatch`/
+`lookup_command_record`), closing the cross-replica hazard this prerequisite names — see
 `docs/executions-history-ladder.md`.
+
+**Update (2026-10-24, #4990).** The table's entry points were renamed from `record_command_execution`/
+`lookup_execution_id` (and `AgentServiceImpl::record_execution_id`/`resolve_execution_id`) to
+`record_command_dispatch`/`lookup_command_record` (and `record_command_dispatch`/
+`resolve_response_provenance`), because the table now holds one row per DISPATCH carrying the
+dispatched `plugin` as well as the (possibly empty) execution id: a stored response's plugin label is
+the server's own record, and a response with no record is labelled `~unverified`. The per-pass reap cap
+was re-decided to 50,000 for the new inflow. The decision recorded above (a PG-backed correlation
+shared across replicas) is unchanged.
 
 ### 6. Background workers — fenced leader + transactional outbox (Q6)
 A single **core** instance holds the **fenced** leader lock and runs the singleton loops. The correctness
@@ -302,7 +311,18 @@ claim-commit and the external send is unavoidable:
 **Status (WS-3): 3.1 done (#4011); 3.2 done (#4134); 3.3 done (#4169); 3.4 LANDED.** `leader_elector.{hpp,cpp}`
 exists (the fenced-lock primitive) and is wired in `ServerImpl` for the leader-election loop (3.2).
 The transactional command outbox (3.3) has merged; `PolicyEvaluator` remediation redesign (3.4)
-has landed with the durable per-(policy,agent) claim.
+has landed with the durable per-(policy,agent) claim. **WS-11 (#4014) leader observability shipped:** each
+replica exports `yuzu_server_leader_*` (leader belief, the epoch it leads at, acquisitions, acquire
+failures and losses by closed cause, and the age of the last answered coordination query) and the
+`yuzu-ha-leader` alert group ships (split brain, no leader, flapping, stale coordination). The series are
+published at scrape time from a lock-free snapshot, so a stalled coordination probe cannot stall a scrape
+and the age keeps growing if the election loop wedges. `SplitBrain` is verified by Prometheus rule unit
+cases only (a real two-leader state cannot be built against one database), and a paused ex-leader is not
+caught by it — that case is the epoch fence's alone (a frozen process serves no `/metrics`, so no alert on its own series can evaluate;
+`YuzuLeaderNoLeader` fires if no other replica takes over), and `YuzuLeaderCoordinationStale` is the signal for a
+leader that is alive and serving `/metrics` but whose coordination connection stopped answering. The fence is per database: replicas pointed at different databases (a split DSN, a Patroni double-primary) each pass their own fence, and that is the case `SplitBrain` can actually observe. This does not lift the safe-to-scale gate; remediation-claim
+lifecycle counters (#6526), a CRL freshness gauge (#6527) and a durable cluster-capability admission gate
+(#6528) are separate, unshipped items.
 
 ### 7. Gateway cluster topology + routing (Q7)
 **Independent gateway clusters, one per trust zone / region** (internal-vs-external is a trust
@@ -314,7 +334,11 @@ cluster unit; intra-zone scale is more nodes.
   `ProxyRegister` with **conditional (CAS) register/deregister** keyed on `connection_epoch` — a
   delayed replay from an *older* connection **cannot overwrite** a newer re-home (the bug an
   unconditional self-healing write would create). A lease that expires without renewal marks the
-  route stale.
+  route stale. Upgrade window (Echo rename; removed with the other legacy-name shims): the directory row also
+  carries a `legacy_echo_wire_name` flag, set at `ProxyRegister` from the agent's reported plugin
+  inventory, so a replica that holds no session for an agent can still address it by the
+  pre-rename plugin name `tar` until the agent upgrades. The column stays after the write and read
+  are removed.
 - **Net-new intra-cluster routing (corrected claim).** Today `yuzu_gw_router:send_command` resolves an
   agent via node-local ETS (`yuzu_gw_registry.erl:90`) and returns `not_connected` on a miss — a
   targeted command landing on the wrong node of the right cluster fails even though a sibling holds
@@ -1213,8 +1237,10 @@ lost `Subscribe` stream and got `NOT_FOUND` on the new gateway, and v0.14.0-rc6 
 branch agent re-registered in 11 to 12 s with no rejections). Rollback is redeploying the
 previous gateway (the only new state is the in-memory index; derived from the change, not run).
 - **Connection key.** The key is the pid of the HTTP/2 connection process that carries the call, read
-  through a typed accessor added to the vendored grpcbox as its third `YUZU PATCH` site
-  (`grpcbox_stream:connection_pid/1`, `connection_pid_from_ctx/1`; `YUZU_PATCH.md`), wrapped by
+  through a typed accessor (as first shipped, added to a vendored grpcbox as its third `YUZU PATCH` site:
+  `grpcbox_stream:connection_pid/1`, `connection_pid_from_ctx/1`; `YUZU_PATCH.md`; that copy is deleted,
+  superseded by the gateway's own listener layer, which exposes `yuzu_grpc:conn_pid/1` and
+  `yuzu_grpc_stream:conn_pid/1`), wrapped by
   `yuzu_gw_conn` (the only module the handlers call for keys). Every stream of one connection reports
   the same key. A call without a key (`undefined`) never matches, not even a session registered without
   one.
@@ -1361,7 +1387,7 @@ one core replica a server-only restart now recovers through the replay described
   the production server today (`set_device_token_store` has no production caller), so that revoke is
   dormant until one is. Two cases replay a known session: (i) a verdict computed before a replay landed
   arrives after it (the guard stamp is taken when the replay is sent, and a stale verdict can arrive up to the 5 s flush
-  deadline, the vendored grpcbox client default, plus the replay RPC time later, so do not set
+  deadline, the upstream client's default per-call timeout (5000 ms; it was the vendored grpcbox client's default, and `yuzu_grpc_client`'s since 2026-10-11), plus the replay RPC time later, so do not set
   `registration_replay_session_guard_ms` below 5000 plus the expected replay RPC time; the default 10000 is
   safe, INFERRED); (ii) a double replay: a
   verdict replay runs first (no prior session, nothing revoked) and a later full breaker-recovery replay
@@ -1380,9 +1406,15 @@ one core replica a server-only restart now recovers through the replay described
 - **Multi-replica statement (read from the code; no multi-replica run exists, so this is inferred).**
   The verdict/replay reconcile is correct and bounded on one core replica. On several replicas it
   converges in one round only if a gateway's `BatchHeartbeat`, replay `ProxyRegister` and reannounce
-  `NotifyStreamStatus` reach the SAME replica during the reconcile. The shipped gateway does this per
-  connection (one grpcbox channel, one endpoint, one HTTP/2 connection) through an L4 VIP. A
-  multi-endpoint node list (grpcbox round-robins per RPC) or an L7 per-RPC balancer breaks it: the
+  `NotifyStreamStatus` reach the SAME replica during the reconcile. The shipped gateway did this per
+  connection (one grpcbox channel, one endpoint, one HTTP/2 connection) through an L4 VIP. Since
+  2026-10-11 the upstream client is `yuzu_grpc_client` over gun, whose channel opens `pool_size`
+  connections per endpoint and sends each call on the next live one, round-robin. The default
+  `pool_size` is 1, so this property is unchanged from grpcbox; **with `pool_size` above 1,
+  through an L4 VIP the connections can land on different replicas and it no longer holds** (read
+  from the code; no multi-replica run exists).
+  A multi-endpoint node list (the channel round-robins per call; grpcbox did per RPC) or an L7
+  per-RPC balancer breaks it: the
   lacking replica keeps listing the session, an arbitrary replica receives each replay, a replica that
   already holds the session re-installs it (placement wiped until its own reannounce lands on it), and
   the lacking replica learns the session only when a replay happens to land there. Convergence is then
@@ -1415,7 +1447,7 @@ one core replica a server-only restart now recovers through the replay described
   registry-unavailable abort, an `accepted=false` answer and a failing server feeding the breaker during a
   drip (the same list as "Observed on a rig" in the gateway manual).
 - **Observed: a stuck heartbeat batch, and the buffer change that closes it (post-change rig run
-  observed).** OBSERVED on a rig with an agent that had the TAR plugin, before this change: such an
+  observed).** OBSERVED on a rig with an agent that had the Echo plugin, before this change: such an
   agent's heartbeat can carry a `fleet_snapshot_json` of 200 to 800 KB (a busy rig host), and the gateway
   heartbeat buffer retained heartbeats on a failed flush capped by count only (10000). In an unplanned
   15.6 minute server outage and in a 300 s outage (run E2a) the retained batch exceeded the server's gRPC
@@ -1423,7 +1455,7 @@ one core replica a server-only restart now recovers through the replay described
   `Received message larger than max` and none ever drained, so there was no verdict and no replay until the
   gateway was restarted (in E2a `agents.online` stayed 0 for the whole observation and the route row was
   tombstoned). This is existing buffer behaviour, not introduced by the replay, and it disabled the recovery
-  this section describes; the earlier rig runs used an agent without the TAR plugin and did not meet it.
+  this section describes; the earlier rig runs used an agent without the Echo plugin and did not meet it.
   The change: the buffer keeps one entry per session (a newer heartbeat replaces the fields of the older
   one, except that the newest non-empty `fleet_snapshot_json` is kept, because the agent sends a snapshot
   only when it has a new one); a flush is split into chunks of at most about 3 MiB (estimated), oldest
@@ -1562,7 +1594,7 @@ one core replica a server-only restart now recovers through the replay described
   time inside the single `yuzu_gw_upstream` process, and without `TCP_NODELAY` on the gateway-to-server socket each
   call took about 41 to 43 ms, so one stock gateway registered about 24 agents per second and a burst of more than
   about 700 agents could not finish inside the agents' 30 s `Register` deadline (1000 agents: 703 registered). The
-  gateway now sets `TCP_NODELAY` on that one upstream channel by default (`upstream_tcp_nodelay`, `sys.config` only);
+  gateway now sets `TCP_NODELAY` on that one upstream channel by default (`upstream_tcp_nodelay`, `sys.config` only; since 2026-10-11 applied to each connection's socket by the gun-based client instead of by restarting the grpcbox channel);
   running the proxy RPC outside the process, shedding requests whose caller is gone and a shorter upstream deadline
   are planned follow-ups with no issue numbers yet. Rig pass 6 (`c518edd93`, simulated agents, loopback) registered 1000, 2000 and 5000 agents in 1.89 s, 4.16 s and 12.08 s with the shipped setting. Detail:
   `docs/user-manual/gateway.md`, "Registration rate per gateway".
@@ -1617,7 +1649,8 @@ earlier text of this section is left as written; the points below say what it no
 - **Residuals** are the ones listed under Known limits in `docs/user-manual/gateway.md`, among them: a probe
   success proves only the notification path, not registration; the synchronous RPCs still run inside the one
   upstream process, so casts queue in its mailbox while one runs; retry or breaker feedback for an ordinary
-  notification worker that fails is a follow-up.
+  notification worker that fails was a follow-up (since done in #5695: a failed send is held again and
+  retried, and counts against the breaker while it is closed).
 The measured evidence (rig runs against the previous build and with TLS, the governance run and the
 adversarial review) is `docs/security-reviews/gateway-notify-pending-store-2026-10-05.md`.
 
@@ -1928,9 +1961,11 @@ per session up to `max_heartbeat_buffer` (default 10,000), so a default gateway'
 10,000 ids, i.e. at most 10 statements. Tombstoned rows (`session_id` NULL) never match. The private
 `GatewayUpstreamServiceImpl::resolve_sessions` is store-AUTHORITATIVE whenever the route store is
 configured; the local `gateway_sessions_` map is only a degrade-time hint (and a lost-race fallback).
-The `agent_routes_session_id_idx` index is non-unique, so a `session_id` matching more than one row is
-REFUSED as ambiguous (desync metric `op=session_lookup`, `outcome=ambiguous_session`); a degraded read
-is counted under route-store failure op `session_lookup`.
+Since migration v5 (#5683, see the Update below) a non-NULL `session_id` is UNIQUE, so a match
+returns at most one row; a `session_id` that still matches more than one row (only a hand-dropped
+index can cause this) is REFUSED as ambiguous (desync metric `op=session_lookup`,
+`outcome=ambiguous_session`) as defense in depth. A degraded read is counted under route-store failure
+op `session_lookup`.
 
 - **BatchHeartbeat** ingests and renews leases for every resolvable entry. `unknown_session_ids` lists a
   session id when the directory does not know it OR when the directory knows it but this replica holds
@@ -2032,13 +2067,17 @@ nothing to tear down); a session this replica itself registered (a local hint) i
 acknowledged, lease-renewed and ingested during the degrade, which suspends the ambiguity refusal for
 that window. The gateway-to-server hop is protected by the gateway peer mTLS plus SPKI pin. Evidence
 for these decisions is metrics and server logs only — there is no per-event audit row (volume is
-unbounded). The `ProxyRegister` adopt path rejects a presented session id that is not `gw-session-`
-plus 32 lowercase hex characters (`proxy_register/malformed_session_id`), and refuses to adopt an id
-that a different agent's COMMITTED directory row already holds (`proxy_register/session_held_by_other_agent`,
-expected rate zero, alert `YuzuGatewaySessionHeldByOtherAgent`). That guard is a same-statement
-`NOT EXISTS`, not a lock: two CONCURRENT adopts of one id for different agents can both land (measured
-against live Postgres), and the ambiguity refusal (`YuzuGatewaySessionAmbiguous`) is the backstop
-until the deferred UNIQUE partial index. It also cannot see a victim row that is already tombstoned
+unbounded), except the `announce_connected/session_held_by_other_agent` refusal of #5683 (see the
+Update below), which writes a best-effort `gateway.session_held_by_other_agent` row. The `ProxyRegister`
+adopt path rejects a presented session id that is not `gw-session-` plus 32 lowercase hex characters
+(`proxy_register/malformed_session_id`), and refuses to adopt an id that a different agent's COMMITTED
+directory row already holds (`proxy_register/session_held_by_other_agent`, expected rate zero, alert
+`YuzuGatewaySessionHeldByOtherAgent`). The same-statement `NOT EXISTS` is only a fast path and is not a
+lock: as merged in #5694 two CONCURRENT adopts of one id for different
+agents could both land (measured against live Postgres). Migration v5 (#5683) closes that with a UNIQUE
+partial index, so the loser now fails 23505 and is refused as `held_by_other_agent`; the ambiguity
+refusal (`YuzuGatewaySessionAmbiguous`) remains as defence in depth for a hand-dropped index only.
+The guard still cannot see a victim row that is already tombstoned
 (an outage past 270 s): a presenter of that id can reclaim it, and the id then resolves to the
 presenter until the victim's stream reconnects. If the victim was already listed for replay, its
 replay is refused and forces that reconnect; otherwise the window lasts until the victim's next
@@ -2051,7 +2090,8 @@ gateway.
 **Rolling deploy.** An OLD replica answering a batch reports directory-known sessions as unknown
 (its local map is empty after restart), so the gateway re-registers those agents. Drain old replicas
 first; the supported topology remains exactly one replica until the safe-to-scale gate lifts (§7c).
-No migration, flag or proto field is involved, the gateway needs no restart, and rollback is safe.
+No flag or proto field is involved and the gateway needs no restart; slice 2 itself shipped no
+migration (the later #5683 migration is described in the Update below), and rollback is safe.
 
 **Validation evidence.** The `[ws5]`, `[gateway_route_wiring]` and `[heartbeat_ingestion]` unit
 tags, including a restart-reconcile case (a non-owning replica lists the store-only session, the
@@ -2062,9 +2102,8 @@ honestly).
 
 **Deferred, not silent.** hp-1 (a local session with an empty `gateway_node` and no
 stream shadows the directory fallback in `GatewayRouteFallback::prepare`; reachable only with a second
-replica, which the gate forbids) and hp-2, both #5685; a UNIQUE partial index on `agent_routes(session_id)` (#5683, own
-migration — the cross-agent `NOT EXISTS` adopt guard plus the ambiguity refusal are the interim
-guards, see Security notes); the local-only surfaces that still read only
+replica, which the gate forbids) and hp-2, both #5685. The UNIQUE partial index on `agent_routes(session_id)` (#5683) is no longer
+deferred: see the Update below. Also deferred: the local-only surfaces that still read only
 the local registry (`to_json_obj()`, `agent_count()`, the guardian heartbeat reconcile) on a replica
 that has not yet been hydrated; the degraded-read CONNECTED local acceptance, which is sound only
 for one replica (a supersede handled on another replica is invisible to this replica's
@@ -2073,6 +2112,136 @@ in-memory placement for the superseded session; the durable row is untouched bec
 session-guarded) and must be revisited with hp-1 before the gate lifts (#5685); TSan coverage of the new
 paths (not landed with this change; #5278); and the WS-9 validation script (follow-on PR-B). The
 local-only surfaces and the WS-9 script are tracked in the WS-5 row of `docs/ha-delivery-matrix.md`.
+
+**Update (2026-10-22, #5683): UNIQUE partial index on `agent_routes(session_id)`.** Migration v5 of
+`GatewayRouteStore` replaces the non-unique `agent_routes_session_id_idx` with
+`ux_agent_routes_session_id` (`UNIQUE ... WHERE session_id IS NOT NULL`; NULLs are tombstones and never
+collide). It serialises the cross-agent adopt race the `NOT EXISTS` guard could not: the second
+transaction waits on the first's uncommitted index entry and then fails 23505, which
+`reclaim_tombstoned_session` maps to `held_by_other_agent` (the existing `FAILED_PRECONDITION` refusal) and
+`announce_connected`'s fallback insert maps to a new `session_held_by_other_agent` flag (the CONNECTED
+handler unpublishes the in-memory placement, answers `acknowledged=false`, counts
+`announce_connected/session_held_by_other_agent` and writes a best-effort
+`gateway.session_held_by_other_agent` audit row without the session id). This covers a presenting agent
+that has NO directory row (the fallback insert is what the unique index refuses). An agent that still has
+a row, including a tombstone, is not covered: the insert's `ON CONFLICT (agent_id) DO NOTHING` arbiter
+hides the index conflict, so its CONNECTED lands as `session_mismatch` and does not unpublish. That is
+the tombstoned-victim residual listed under "Still open", unchanged by this change.
+`register_fresh` keeps failing closed (`db_error`) on a collision: a server-minted id (128 random bits)
+can only collide through an RNG fault or a planted row, and a distinct error line is logged. Only a
+violation of THIS index is remapped; any other 23505 stays `db_error`.
+The old index is dropped, not kept: `lookup_by_sessions` and the reclaim check are served by the new one
+(an `EXPLAIN` test pins it), and `renew_leases`/`deregister` also constrain the primary key.
+
+*Duplicates that already exist.* The migration takes `LOCK TABLE agent_routes IN ACCESS EXCLUSIVE MODE`
+first (`lock_timeout` 30 s, `statement_timeout` lifted). Only `DROP INDEX` needs ACCESS EXCLUSIVE (the
+dedup `UPDATE` needs only ROW EXCLUSIVE); it is taken up front so a later lock upgrade cannot deadlock
+against another replica's read-then-write transaction and no writer can commit a new duplicate between
+the dedup and the build. The old index is dropped with `IF EXISTS` (a hand-dropped one does not abort the
+migration); the `CREATE UNIQUE INDEX` deliberately has no `IF NOT EXISTS`.
+The migration tombstones EVERY row of any group sharing a session id (the five placement columns
+NULLed; `connection_epoch` and `home_cluster_id` kept, the shape `deregister` writes), then builds the
+index; a pre-existing object of that name aborts it atomically (the tombstones roll back too), by design:
+the operator drops it and restarts. It tombstones all rows rather than keeping one: a group has no
+determinable owner (no `created_at`; the newest `updated_at` is the later adopter, i.e. the likelier
+forger) and this is exactly what the reaper already does to both rows 270 s later. Each affected agent
+recovers through the existing renew shortfall -> gateway replay -> `reclaim` path, where the first
+reclaimer wins and the other is refused and reconnects.
+Evidence is the pre-seeded counter `yuzu_server_gateway_route_session_dedup_total` (rows tombstoned by
+THIS start's migration, expected 0; present only with `--gateway-upstream`) plus one WARN log with the
+count only; there is no audit row (the audit store is built after the route store). The durable record
+is the `route_meta` key `v5_session_dedup_tombstoned_rows`; a later start logs it once at INFO and the
+counter reads 0, so a future alert on it must use `> 0`, not `increase()`. When two server processes
+migrate the same database concurrently, each reads the winner's count, so the counter may be reported
+twice. The tombstoned agents race to replay, so some replays are refused as `session_held_by_other_agent`
+and raise `YuzuGatewaySessionHeldByOtherAgent` right after the migrating boot. The operator guidance (in
+`docs/user-manual/gateway.md`) calls those refusals the one-time migration artifact ONLY IF BOTH hold:
+(a) the number of `op="proxy_register"` `session_held_by_other_agent` refusals since that start,
+summed over every server replica, is at most N, the number of rows migration v5 tombstoned on that start
+(`yuzu_server_gateway_route_session_dedup_total` on the migrating start; the `migration v5 tombstoned N`
+WARN, or the `route_meta` value after a restart), because a tombstoned group of k rows can produce at
+most k-1 refusals (N is a safe upper bound); count the refusal WARN lines rather than the counter if any
+replica restarted since the migrating start (the counter resets on restart); any `op="announce_connected"` refusal is NOT the artifact;
+and (b) they all occur within that start's window: one or two agent heartbeat cycles (30 s by default,
+`--heartbeat` changes it), plus the gateway circuit breaker's backoff if it opened (up to 30 s on a
+gateway that includes #5695, cap `circuit_breaker_max_reset_timeout_ms` in `gateway/config/sys.config`;
+up to 300 s on an older gateway), plus the replay (on a #5695 gateway a random start delay of up to 1 s,
+`registration_replay_start_jitter_ms`, then up to 24 registrations in flight at once,
+`upstream_replay_concurrency`; on an older gateway a drip of about 20 ms per agent): allow roughly 2
+minutes at the defaults when every gateway includes #5695 (plus the replay itself: the gateway's agent count times the server's `ProxyRegister` time, divided by 24; about 10 s for 5,000 agents at 50 ms a call), or roughly 6 minutes plus 20 ms per agent if any gateway is older. Refusals past that window, or
+more than N, are
+NOT the artifact (escalating errs on the safe side): treat them as a forged or colliding id and
+escalate. Refusals inside the bound and the window are still NOT proof of benignness (a forged presenter
+acting at the same time could hide inside them, and a forger that wins the reclaim of a tombstoned id
+makes the legitimate agents' refusals look identical): the rule only lets
+an operator stop escalating once refusals have stopped inside the window, so the count is re-checked
+after the window and the alert is not silenced beyond it. The counter keeps its migrating-start value
+for the whole process lifetime, so it proves nothing about timing; timing comes from the WARN
+timestamps, and if the migrating start's time or log cannot be found the operator escalates.
+
+*Deviation from ADR-0008, signed off.* The build is a plain transactional `CREATE UNIQUE INDEX`, not
+`CONCURRENTLY` (the migration runner has no non-transactional kind, #4432). Fraser (project lead)
+approved this on the strength of ADR-0053 "Update (2026-10-20)", the maintainer's decision that rolling
+upgrade is not supported at this stage (recorded for `SoftwareInventoryStore` v7, measured at 4M rows in
+`docs/postgres-migration-ladder.md`; ADR-0053 reports its own CaStore v5 `ca_issued` builds at 1.3 s for
+250k rows and 8.6 s for 1M). It is recorded as a controlled exception, sign-off: project lead. The
+exception ends at the first of two events: rolling upgrades become supported, or #4432 delivers the
+non-transactional migration kind (ADR-0053's sunset condition); after either, the next `agent_routes`
+index must use that kind. `agent_routes` is O(fleet) (one row per agent plus soft tombstones). A first
+measurement on a local PostgreSQL 18 container with `fsync=off` (1,000,000 rows, no duplicates) took about
+6.4 s under the lock (dedup 1.9 s, build 4.4 s); a re-measure on a default PostgreSQL 18.4 container gave
+about 0.6 s at 200k rows, 2.4 s at 1M and 22 s at 10M (about 900 MB of WAL), roughly linear. The lock
+blocks every other statement on the table from any process. On lock-timeout expiry the migration rolls
+back, the store fails to open, the server exits and a supervisor restart retries about every 35 s
+(`docs/user-manual/upgrading.md`). Rollback to an older binary boots and works (it skips versions it
+knows and its queries are served by the new index), but its racing duplicate write now fails as a generic
+route-write error (`yuzu_server_gateway_route_write_failed_total{reason="db_error"}`): `ProxyRegister`
+fails closed (`UNAVAILABLE`) and `announce_connected` stays fail-open (the in-memory placement is not
+unpublished). The dedup tombstones are not undone.
+
+*Still open.* The tombstoned-victim window above is unchanged (a tombstone holds NULL, so no index can see
+it); it is tracked in #6339. This change does not touch #5685 and does NOT lift the safe-to-scale gate: it is the first
+cross-REPLICA serialisation of a session adopt, not a second-replica safety proof.
+
+### 7g. Gateway-to-server upstream topology — several servers is the standard (2026-10-11)
+
+**Stated production topology (maintainer, 2026-10-11).** Dozens to hundreds of gateways; always at least
+two servers; very likely globally only two PostgreSQL databases in a streaming-replication pair. A gateway
+therefore dials SEVERAL upstream servers as the normal case, not a lab configuration. This section records
+what that changes. It is a **design direction**: apart from the breaker classification below, none of it is
+implemented, and no multi-server run exists.
+
+**What it supersedes.** Section 7c's "Multi-replica statement" rests on the shipped gateway using ONE
+upstream channel and connection, so that a gateway's calls are connection-sticky to one core replica. That
+premise no longer holds as a default. Likewise the gateway guidance to "keep one connection per gateway"
+and the boot warning for a channel with more than one connection (`docs/user-manual/gateway.md`,
+`yuzu_gw_app:warn_multi_connection/1`) describe the case this topology makes ordinary.
+
+**Consequences, each tracked as its own issue:**
+
+1. **Explicit backpressure (#5647).** A database failover degrades BOTH servers at once, so every gateway
+   sees errors from every server together. A circuit breaker is the wrong response (it drops every agent a
+   gateway holds); the server should say "retry in N ms" with the gRPC pushback trailer
+   (`grpc-retry-pushback-ms`) and the gateway should treat that as a pause, not a failure.
+2. **Per-endpoint breaker and failover (#5648).** There is one breaker per gateway today, whatever the
+   channel lists. One dead server out of two must not stop the gateway using the other.
+3. **The reconcile decision (#5649).** Either the verdict/replay/re-announce reconcile (7c) is made sticky
+   to one upstream endpoint on the gateway side, or it is made safe on any replica on the server side
+   (adoption that does not wipe placement; see #5244). Until that is decided and run on two replicas, 7c's
+   convergence claim holds for one replica only.
+4. **Herd sizing (#5650).** The breaker's open interval is deterministic (10 s doubling to 30 s by default since #5695; 300 s before) and the
+   reconnect jitter is narrow; with hundreds of gateways, probes and reconnects must be spread.
+5. **Defaults and guidance (#5651).** Reference configs, the boot warning, the wizard and the Settings page
+   must treat a two-server channel as the standard.
+
+**Shipped separately from the upstream-client change.** The breaker counts only server faults: a gRPC answer that blames the request
+(`INVALID_ARGUMENT`, `NOT_FOUND`, `ALREADY_EXISTS`, `PERMISSION_DENIED`, `FAILED_PRECONDITION`,
+`OUT_OF_RANGE`, `UNAUTHENTICATED`) is the server answering correctly and no longer counts towards opening it.
+`RESOURCE_EXHAUSTED` stays counted until item 1 lands.
+
+**SRE implications.** Alerts keyed on the single breaker (`YuzuGatewayUpstreamCircuitOpened`) become
+per-endpoint signals once item 2 lands; a fleet-wide simultaneous breaker open is the signature of a shared
+cause (the database pair), not of one bad server, and the runbook should say so.
 
 ### 8. PKI / CA high availability (Q8)
 Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced *(the
@@ -2189,7 +2358,7 @@ enumeration:
 
 Any store matching **none** of these three follows the ladder at normal priority (its divergence is
 tolerable until it migrates). `runtime_config_store` / `webhook_store` sit here but **promote** the
-moment a workstream shows a cross-instance correctness dependency.
+moment a workstream shows a cross-instance correctness dependency. `runtime_config_store` is promoted for ONE key by #6086 (2026-10-23): the `dex_score_policy` document is a compare-and-set document written on one replica and read through on all (typically within 5 seconds); every other runtime-config key stays per-instance.
 
 **NVD/CVE (`nvd_db`) — withdrawn from this list (finding 1).** NVD sync/matching moves OUT of the
 server into the UCE engine (ADR-0023 / ADR-1005 Phase 7), so it is **not** a `yuzu` store to
@@ -2286,7 +2455,10 @@ gaps closed:
   connection so the next probe re-resolves, rather than staying on a standby that a proxy, DNS name
   or read-any port routed a new connection to. Consequence, accepted: a Postgres failover
   turns **every** replica red for the failover window — truthful, since nothing can serve writes.
-  Leadership is deliberately not a readiness condition.
+  Leadership is deliberately not a readiness condition, and neither is the elector being open (#4014):
+  a replica that cannot lead is a ready follower that still serves every operator-synchronous path, so
+  gating it out would evict a working replica from the load balancer. The pause of the leader-only passes
+  is surfaced by the `yuzu_server_leader_*` series and `YuzuLeaderNoLeader`, which are therefore not optional.
 - **Multi-host DSNs.** libpq walks the host list for the probe exactly as for the pool (order, which
   failures move on and which end the attempt, the pool's connection parameters), so the probe
   measures the host the pool reaches — every re-implementation of that walk diverged (governance

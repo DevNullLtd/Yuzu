@@ -10,7 +10,7 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 
 | Section | Description |
 |---|---|
-| [Device Management](device-management.md) | Agent enrollment (3-tier), heartbeat, identity, OTA updates, custom properties, device discovery, and deployment jobs |
+| [Device Management](device-management.md) | Agent enrollment (3-tier), heartbeat, identity, OTA updates, custom properties, device discovery, and deployment jobs (record-only, not functional) |
 | [Authentication](authentication.md) | Login, session management, mTLS, and Windows certificate store integration |
 | [SCIM v2 Provisioning](scim-provisioning.md) | Auto-provision and auto-deprovision operators from an enterprise IdP (Okta/Entra/OneLogin) via SCIM 2.0 (SOC 2 CC6.2/CC6.8); Users-only, Groups→role mapping deferred |
 | [RBAC](rbac.md) | Role-based access control -- principals, roles, securable types, per-operation permissions |
@@ -37,8 +37,8 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 | [TLS policy](tls.md) | Pinned TLS 1.2 cipher allow-list and version floor across the gRPC and HTTPS listeners -- what's pinned, what isn't yet, and what CI proves |
 | [REST API Reference](rest-api.md) | Complete REST API v1 endpoint reference with request/response examples |
 | [Gateway](gateway.md) | Erlang/OTP gateway node for multi-site deployments and scale-out |
-| [TAR (Timeline Activity Record)](tar.md) | Continuous system state change tracking -- processes, network, services, users |
-| [Upgrading](upgrading.md) | Version upgrades, rollback, and migration |
+| [Echo](echo.md) | Continuous system state change tracking -- processes, network, services, users |
+| [Upgrading](upgrading.md) | Version notes and the 0.15.0 fresh-deployment contract (no upgrade path from earlier builds) |
 | [Release Verification](release-verification.md) | SHA256SUMS, cosign signatures, SLSA provenance, and CycloneDX / SPDX SBOMs |
 | [MCP (AI Integration)](mcp.md) | Model Context Protocol server -- AI-driven fleet querying, tools, tokens, and approval workflows |
 | [Security Hardening](security-hardening.md) | mTLS setup, firewall rules, secret management, quarantine, IOC checking, certificate inventory, and production hardening |
@@ -51,12 +51,12 @@ The following features are documented within the files listed above:
 |---|---|---|
 | Custom Device Properties | [Device Management](device-management.md#custom-device-properties) | Typed key-value properties on devices with schema validation and scope integration |
 | Device Discovery | [Device Management](device-management.md#device-discovery) | Subnet scanning to find unmanaged devices |
-| Deployment Jobs | [Device Management](device-management.md#deployment-jobs) | Push agent installation to discovered endpoints |
+| Deployment Jobs | [Device Management](device-management.md#deployment-jobs) | Not functional: record-only, nothing installs an agent; scheduled for removal (#6326) |
 | Device Quarantine | [Security Hardening](security-hardening.md#device-quarantine) | Network isolation for compromised devices |
 | IOC Checking | [Security Hardening](security-hardening.md#ioc-checking) | Indicator of Compromise scanning for threat hunting |
 | Certificate Inventory | [Security Hardening](security-hardening.md#certificate-inventory) | System certificate enumeration, inspection, and deletion |
 | WiFi & WoL | [Agent Plugins](agent-plugins.md) · `agents/plugins/wifi/README.md`, `agents/plugins/wol/README.md` | WiFi network scanning and Wake-on-LAN magic packets |
-| Patch Management | [REST API](rest-api.md) | Patch deployment, status tracking, and fleet compliance (via `PatchManager`) |
+| Patch Management | [REST API](rest-api.md) | Patch records only: deployments are recorded but not dispatched and patch inventory is never populated, so `GET /api/patches` is always empty (#3669, #3676, #4138); `/api/patches*` removal tracked by #6326 |
 | Webhooks | [REST API](rest-api.md) | Event-driven HTTP notifications to external systems |
 | Product Packs | [REST API](rest-api.md) | Signed YAML bundles containing definitions, policies, and templates |
 
@@ -69,8 +69,8 @@ The following features are documented within the files listed above:
 | [Disaster Recovery](../operations/disaster-recovery.md) | Backup strategy, restore procedures, and failover architecture |
 | [Certificate Renewal](../operations/certificate-renewal.md) | TLS certificate lifecycle, rotation, and automated renewal |
 | [Capacity Planning](../operations/capacity-planning.md) | Server sizing, storage growth, network bandwidth, and scaling patterns |
-| [TAR Power Source](tar-power.md) | TAR power capture source: AC-line and sleep/wake history — on by default |
-| [TAR Removable Source](tar-removable.md) | TAR removable-media capture source: attach/detach and executed-from-removable evidence — on by default |
+| [Echo Power Source](echo-power.md) | Echo power capture source: AC-line and sleep/wake history — on by default |
+| [Echo Removable Source](echo-removable.md) | Echo removable-media capture source: attach/detach and executed-from-removable evidence — on by default |
 
 ---
 
@@ -108,7 +108,7 @@ The container images (`yuzu-server`, `yuzu-gateway`, `yuzu-agent` and their chis
 carry their own runtime libraries and are not affected; use them for the server and gateway
 on any other distribution. The exception is `yuzu-agent-bundle-chisel`, which delivers
 agent files: the Linux agent extracted from it has the tarball's requirements. Building the
-native packages to an older baseline is targeted for 0.15.0 (#5143).
+native packages to an older baseline is not part of 0.15.0; it is planned under ADR-2003 (#5143).
 
 ## Quick Start
 

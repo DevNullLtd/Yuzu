@@ -8,24 +8,36 @@
 %%% - Subscribe: terminated locally, one yuzu_gw_agent process spawned
 %%% - Heartbeat: admitted per session and connection, then buffered for
 %%%   batch upstream delivery
-%%% - ReportInventory: proxied upstream
+%%% - ReportInventory: admitted per session and connection (as Heartbeat),
+%%%   then proxied upstream
 %%% - ExecuteCommand: not used (Subscribe is the primary channel)
 %%%
-%%% grpcbox calling conventions (v0.17.1):
-%%%   Unary:   Module:Fun(Ctx, Request)   -> {ok, Response, Ctx} | {grpc_error, {Status, Msg}}
-%%%   Bidi:    Module:Fun(Ref, State)     -> any()  (loops until stream ends)
+%%% Calling conventions (yuzu_grpc_runner):
+%%%   Unary:         Module:Fun(Ctx, Request) -> {ok, Response, Ctx} | {grpc_error, {Status, Msg}}
+%%%   Server stream: Module:Fun(Request, Stream) -> ok | {grpc_error, {Status, Msg}}
+%%%   Bidi:          Module:Fun(Ref, Stream)  -> ok | {grpc_error, {Status, Msg}}
+%%%                  (loops until the stream ends)
+%%% A handler may also throw({grpc_error, {Status, Msg}}) from anywhere.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_agent_service).
 
--include_lib("grpcbox/include/grpcbox.hrl").
+-include("yuzu_grpc.hrl").
 
-%% grpcbox service callbacks
+%% service callbacks (yuzu_grpc_runner)
 -export([register/2,
          subscribe/2,
          heartbeat/2,
          execute_command/2,
          report_inventory/2]).
+
+%% The reservation guard's process body (proc_lib entry point, see guard/1).
+-export([reservation_guard/2]).
+
+%% The Subscribe relay loop, run by subscribe/2 once the owner is started.
+%% Exported for tests (yuzu_gw_owner_restart_tests runs it as a stand-in
+%% stream).
+-export([stream_loop/3]).
 
 %% The bound on a Register's agent id, the same condition the server applies in
 %% GatewayUpstreamServiceImpl::ProxyRegister (and in the direct Register) before
@@ -38,6 +50,12 @@
 %% must not count against the circuit breaker. A change to the server's constant
 %% must change this one.
 -define(MAX_AGENT_ID_BYTES, 256).
+%% The proxied-call refusals answered UNAVAILABLE (see retryable_error/2).
+%% upstream_unavailable: the upstream client or its permit regulator is not
+%% running (restarting under its supervisor); no RPC was made.
+-define(RETRYABLE(Reason), (Reason =:= circuit_open orelse Reason =:= overloaded orelse
+                            Reason =:= deadline orelse Reason =:= stopping orelse
+                            Reason =:= upstream_unavailable)).
 
 %%--------------------------------------------------------------------
 %% Register — proxy to C++ server
@@ -62,27 +80,41 @@ register(Ctx, RegisterReq) ->
                           <<"agent_id length exceeds 256 bytes or is empty">>}}
     end.
 
-register_checked(Ctx, RegisterReq) ->
-    Headers = grpcbox_metadata:from_incoming_ctx(Ctx),
-    AgentInfo0 = maps:get(info, RegisterReq, maps:get(<<"info">>, RegisterReq, #{})),
-    %% Agent supplied, and held in the pending store, logged and sent upstream
-    %% later: sanitised here, at the source (see yuzu_gw_peer_addr). A change is
-    %% logged once, with the agent and the original size.
-    PeerAddr = register_peer_addr(Headers, extract_agent_id(AgentInfo0)),
+register_checked(Ctx, RegisterReq0) ->
+    %% The address of the agent, as the gateway decided it (yuzu_grpc_origin):
+    %% the TCP peer, or the address a TRUSTED proxy vouched for. It is put in
+    %% RegisterRequest.gateway_observed_peer, which is gateway-authoritative: the
+    %% field is set here whatever the agent put in it, to an empty value when the
+    %% gateway has no observation (a trusted proxy gave no usable address). The
+    %% server records it as the agent's source_ip and trusts it on this path, so
+    %% passing the agent's own value through would let an agent choose the
+    %% address its registration is attributed to.
+    Origin = origin_text(Ctx),
+    RegisterReq = RegisterReq0#{gateway_observed_peer => Origin},
+    PeerAddr = case Origin of
+        <<>> -> <<"unknown">>;
+        _ -> Origin
+    end,
 
     %% A slot on the connection is RESERVED before the registration goes
     %% upstream: the check and the claim are one step in the registry, so
     %% concurrent Registers on one connection admit at most the quota and a
     %% refused one leaves nothing on the server. The reservation becomes the
-    %% pending row in store_pending/3 and is released here on every other way out
-    %% (a reservation of a crashed handler is swept after the pending TTL).
+    %% pending row in store_pending/3 and is released here on every other way out.
+    %% This process can be killed while it waits for the upstream (the stream was
+    %% reset, its deadline passed, the connection closed), and a kill skips the
+    %% `after' clause: a guard process watching this one releases the reservation
+    %% then, promptly (see guard/1).
+    AgentInfo0 = maps:get(info, RegisterReq, maps:get(<<"info">>, RegisterReq, #{})),
     case yuzu_gw_registry:reserve_session(yuzu_gw_conn:key_from_ctx(Ctx),
                                           extract_agent_id(AgentInfo0)) of
         {ok, Reservation} ->
+            Guard = guard(Reservation),
             try
                 register_upstream(Ctx, RegisterReq, PeerAddr, Reservation)
             after
-                yuzu_gw_registry:release_session(Reservation)
+                yuzu_gw_registry:release_session(Reservation),
+                disarm(Guard)
             end;
         {error, session_limit} ->
             session_limit_error();
@@ -93,8 +125,42 @@ register_checked(Ctx, RegisterReq) ->
                           <<"Registration failed: registry unavailable">>}}
     end.
 
+%% A process that releases Reservation when the calling process dies before it
+%% disarms the guard. Releasing is idempotent and keyed by the reservation's own
+%% reference, so a guard that fires after the reservation became a pending row
+%% (the reservation is gone by then) removes nothing. The guard is not linked:
+%% it must outlive the process it watches.
+guard(undefined) ->
+    undefined;
+guard(Reservation) ->
+    proc_lib:spawn(?MODULE, reservation_guard, [self(), Reservation]).
+
+disarm(undefined) ->
+    ok;
+disarm(Guard) ->
+    Guard ! {disarm, self()},
+    ok.
+
+%% @private
+reservation_guard(Watched, Reservation) ->
+    Mon = erlang:monitor(process, Watched),
+    receive
+        {disarm, Watched} ->
+            erlang:demonitor(Mon, [flush]),
+            ok;
+        {'DOWN', Mon, process, Watched, _Reason} ->
+            yuzu_gw_registry:release_session(Reservation)
+    end.
+
+%% The origin address of a call as text (a bare IP), or <<>> when it has none.
+origin_text(Ctx) ->
+    case yuzu_grpc:origin(Ctx) of
+        {Ip, _How} -> yuzu_grpc_origin:format(Ip);
+        undefined -> <<>>
+    end.
+
 register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
-    case yuzu_gw_upstream:proxy_register(RegisterReq) of
+    case yuzu_gw_upstream:proxy_register(RegisterReq, upstream_opts(Ctx)) of
         {ok, Response} when is_map(Response) ->
             %% Stash the session_id and agent_info; the agent process is
             %% created when Subscribe arrives (matched by session_id).
@@ -149,6 +215,9 @@ register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
             {grpc_error, {?GRPC_STATUS_INTERNAL,
                           <<"Upstream registration failed: malformed response">>}};
 
+        {error, Reason} when ?RETRYABLE(Reason) ->
+            retryable_error(<<"Registration">>, Reason);
+
         {error, Reason} ->
             yuzu_gw_safe_call:warn_limited(register_failed,
                                            "Upstream Register failed: ~p", [Reason]),
@@ -160,18 +229,18 @@ register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
 %%--------------------------------------------------------------------
 %% Subscribe — terminate bidi stream locally
 %%
-%% grpcbox calls this as subscribe(Ref, State) where:
-%%   Ref   = make_ref() used as the mailbox key for incoming agent data
-%%   State = grpcbox_stream:state() (opaque record; use grpcbox_stream API)
+%% Called as subscribe(Ref, Stream) in its own process, where:
+%%   Ref    = make_ref() used as the mailbox key for incoming agent data
+%%   Stream = the stream handle (opaque; use the yuzu_grpc_stream API)
 %%
 %% Incoming data (agent -> gateway) arrives as {Ref, DecodedMap} messages.
-%% To send data (gateway -> agent) use grpcbox_stream:send(Msg, State).
+%% To send data (gateway -> agent) use yuzu_grpc_stream:send(Stream, Msg).
 %% Stream end is signalled as {Ref, eos}.
 %%--------------------------------------------------------------------
 
 subscribe(Ref, State) ->
-    Ctx = grpcbox_stream:ctx(State),
-    Headers = grpcbox_metadata:from_incoming_ctx(Ctx),
+    Ctx = yuzu_grpc_stream:ctx(State),
+    Headers = yuzu_grpc:headers(Ctx),
     SessionId = maps:get(<<"x-yuzu-session-id">>, Headers, undefined),
 
     case SessionId of
@@ -242,14 +311,32 @@ subscribe(Ref, State) ->
             end
     end.
 
-%% Subscribe stream loop: relay messages between grpcbox and the agent process.
+%% Subscribe stream loop: relay messages between the stream and the agent
+%% process (its owner).
 %%
 %% Backpressure: before writing a command to the HTTP/2 stream, we check
 %% our own message queue length. If it exceeds the threshold (configurable
 %% via backpressure_threshold, default 1000), we emit a telemetry event
 %% and skip the send to prevent unbounded mailbox growth under load.
+%%
+%% The owner (OWNER-RESTART, #5695). This process MONITORS its owner; it is
+%% not linked to it, so the stream outlives an owner that crashes. The agent
+%% supervisor restarts a crashed owner, and the new owner re-attaches: it sends
+%% {yuzu_gw_owner_reattach, Dead, New, Alias} naming the owner this loop last
+%% delivered to; the loop then delivers to New and answers {Alias, reattached}
+%% (a re-attach naming any other process is answered {Alias, refused}). After
+%% an abnormal owner exit the loop waits ?REATTACH_WAIT_MS for one, dropping
+%% the agent's frames meanwhile (replies to commands the dead owner sent, which
+%% nobody waits for any more), and then ends the stream so the agent
+%% reconnects. An owner that ends `normal' or `shutdown' ends the stream at
+%% once: it is not restarted. Without the monitor a stream whose owner died
+%% relayed into the void until the agent's next heartbeat was refused.
+-define(REATTACH_WAIT_MS, 5000).
 
 stream_loop(Ref, State, AgentPid) ->
+    relay(Ref, State, AgentPid, erlang:monitor(process, AgentPid)).
+
+relay(Ref, State, AgentPid, Mon) ->
     receive
         {Ref, eos} ->
             %% Agent disconnected (gRPC stream closed by client).
@@ -259,15 +346,15 @@ stream_loop(Ref, State, AgentPid) ->
         {Ref, DataFromAgent} ->
             %% Data from the agent (CommandResponse frame).
             AgentPid ! {stream_data, DataFromAgent},
-            stream_loop(Ref, State, AgentPid);
+            relay(Ref, State, AgentPid, Mon);
 
         {send_command, Cmd} ->
             %% Command from the agent gen_statem to send to the agent.
             %% Check backpressure before writing to stream.
             case check_backpressure() of
                 ok ->
-                    grpcbox_stream:send(Cmd, State),
-                    stream_loop(Ref, State, AgentPid);
+                    yuzu_grpc_stream:send(State, Cmd),
+                    relay(Ref, State, AgentPid, Mon);
                 {backpressure, QueueLen} ->
                     %% H13: Log and count dropped commands instead of dropping silently.
                     CmdId = maps:get(<<"command_id">>, Cmd,
@@ -278,13 +365,64 @@ stream_loop(Ref, State, AgentPid) ->
                                       #{count => 1},
                                       #{stream_pid => self(), queue_len => QueueLen,
                                         command_id => CmdId}),
-                    stream_loop(Ref, State, AgentPid)
+                    relay(Ref, State, AgentPid, Mon)
             end;
 
         close_stream ->
             %% Agent process requested graceful disconnect.
-            ok
+            ok;
+
+        {yuzu_gw_owner_reattach, AgentPid, New, Alias} ->
+            %% A restarted owner, before this loop saw its predecessor's 'DOWN'
+            %% (the two come from different processes, so in either order).
+            reattach(Ref, State, Mon, New, Alias);
+
+        {yuzu_gw_owner_reattach, _Other, _New, Alias} ->
+            Alias ! {Alias, refused},
+            relay(Ref, State, AgentPid, Mon);
+
+        {'DOWN', Mon, process, AgentPid, Reason} ->
+            case restarted(Reason) of
+                true ->
+                    await_owner(Ref, State, AgentPid,
+                                erlang:monotonic_time(millisecond) + ?REATTACH_WAIT_MS);
+                false ->
+                    ok
+            end
     end.
+
+%% The owner is gone and its supervisor restarts it: wait for the new one.
+await_owner(Ref, State, Dead, Deadline) ->
+    receive
+        {yuzu_gw_owner_reattach, Dead, New, Alias} ->
+            reattach(Ref, State, undefined, New, Alias);
+        {yuzu_gw_owner_reattach, _Other, _New, Alias} ->
+            Alias ! {Alias, refused},
+            await_owner(Ref, State, Dead, Deadline);
+        {Ref, eos} ->
+            ok;
+        {Ref, _Orphaned} ->
+            await_owner(Ref, State, Dead, Deadline);
+        close_stream ->
+            ok
+    after max(0, Deadline - erlang:monotonic_time(millisecond)) ->
+        ok
+    end.
+
+reattach(Ref, State, OldMon, New, Alias) ->
+    case OldMon of
+        undefined -> ok;
+        _         -> erlang:demonitor(OldMon, [flush])
+    end,
+    Mon = erlang:monitor(process, New),
+    Alias ! {Alias, reattached},
+    relay(Ref, State, New, Mon).
+
+%% The exits the agent supervisor restarts (its children are transient).
+restarted(normal)          -> false;
+restarted(shutdown)        -> false;
+restarted({shutdown, _})   -> false;
+restarted(_Abnormal)       -> true.
 
 %% @doc Check if our message queue is too deep; emit telemetry if so.
 check_backpressure() ->
@@ -331,18 +469,40 @@ heartbeat(Ctx, HeartbeatReq) ->
 %% ExecuteCommand — not used (Subscribe is the primary channel)
 %%--------------------------------------------------------------------
 
-execute_command(_Ctx, _CommandReq) ->
+execute_command(_CommandReq, _Stream) ->
     {grpc_error, {?GRPC_STATUS_UNIMPLEMENTED,
                   <<"Use Subscribe for command delivery">>}}.
 
 %%--------------------------------------------------------------------
-%% ReportInventory — proxy upstream
+%% ReportInventory — admit, then proxy upstream
 %%--------------------------------------------------------------------
 
+%% Admitted like a heartbeat (yuzu_gw_heartbeat_admission:admit_inventory/2):
+%% only for a session this node holds, on the connection bound to it, and
+%% decided before any upstream permit is asked for, so a peer that never
+%% registered cannot hold the inventory permits or their wait queue (nor keep
+%% its decoded report alive in a queued runner). A refusal is the same
+%% NOT_FOUND "unknown session" Heartbeat answers; the agent's daily-sync sender
+%% treats any non-OK status as "retry next tick" without advancing its state,
+%% and its heartbeat, on the same channel, re-registers it.
 report_inventory(Ctx, InventoryReport) ->
-    case yuzu_gw_upstream:proxy_inventory(InventoryReport) of
+    SessionId = case is_map(InventoryReport) of
+        true  -> maps:get(session_id, InventoryReport, undefined);
+        false -> undefined
+    end,
+    case yuzu_gw_heartbeat_admission:admit_inventory(Ctx, SessionId) of
+        ok ->
+            forward_inventory(Ctx, InventoryReport);
+        rejected ->
+            {grpc_error, {?GRPC_STATUS_NOT_FOUND, <<"unknown session">>}}
+    end.
+
+forward_inventory(Ctx, InventoryReport) ->
+    case yuzu_gw_upstream:proxy_inventory(InventoryReport, upstream_opts(Ctx)) of
         {ok, Response} ->
             {ok, Response, Ctx};
+        {error, Reason} when ?RETRYABLE(Reason) ->
+            retryable_error(<<"Inventory report">>, Reason);
         {error, Reason} ->
             yuzu_gw_safe_call:warn_limited(inventory_failed,
                                            "Upstream ReportInventory failed: ~p", [Reason]),
@@ -355,29 +515,42 @@ report_inventory(Ctx, InventoryReport) ->
 %% Internal
 %%--------------------------------------------------------------------
 
-%% The peer address of a Register: the :authority header (else x-forwarded-for),
-%% made safe by yuzu_gw_peer_addr. When that changed the value (an address that
-%% is not UTF-8, or one over the limit) the operator is told once, with the agent
-%% and the original size, never the bytes: the address reads `invalid' or is cut
-%% in the logs and in the server, and this is the only place that says why.
-register_peer_addr(Headers, AgentId) ->
-    Raw = maps:get(<<":authority">>, Headers,
-                   maps:get(<<"x-forwarded-for">>, Headers, <<"unknown">>)),
-    PeerAddr = yuzu_gw_peer_addr:sanitize(Raw),
-    case PeerAddr =:= Raw of
-        true ->
-            ok;
-        false ->
-            yuzu_gw_safe_call:warn_limited(
-              register_peer_addr,
-              "Register from agent ~s: the peer address was replaced or cut "
-              "to fit (original size ~b bytes)",
-              [yuzu_gw_env:log_text(AgentId), raw_size(Raw)])
-    end,
-    PeerAddr.
+%% The options of a proxied call: the handler's deadline, so the call upstream,
+%% and any wait for a permit before it, ends before the agent stops waiting. The
+%% stream handler ends the handler at yuzu_grpc_stream_h:deadline_ms/1 of the
+%% agent's grpc-timeout, counted from when it armed the timer; counting from now
+%% instead leans late by the request-receive time, which the upstream's own
+%% margin (DEADLINE_MARGIN_MS) covers. No usable header: the upstream's default
+%% budget applies.
+upstream_opts(Ctx) ->
+    case yuzu_grpc_frame:parse_timeout(maps:get(<<"grpc-timeout">>, yuzu_grpc:headers(Ctx),
+                                                undefined)) of
+        {ok, Ms} -> #{deadline => erlang:monotonic_time(millisecond)
+                                  + yuzu_grpc_stream_h:deadline_ms(Ms)};
+        _        -> #{}
+    end.
 
-raw_size(Raw) when is_binary(Raw) -> byte_size(Raw);
-raw_size(_Raw) -> 0.
+%% A refusal that means "try again later", answered UNAVAILABLE (the retryable
+%% gRPC status the agent backs off on) with a fixed message per reason:
+%%   circuit_open  the server is unreachable (the breaker is open)
+%%   overloaded    every permit is held and the wait queue is full
+%%   deadline      the agent's deadline passed while it waited for a permit
+%%   stopping      this gateway is stopping (planned)
+%%   upstream_unavailable  the upstream client or its regulator is not running
+%%                 (restarting under its supervisor; no RPC was made)
+%% Not logged per request: the regulator counts them
+%% (yuzu_gw_upstream_permit_refused_total), the breaker logs its own moves, and
+%% a restarting upstream client is logged by its supervisor.
+retryable_error(What, Reason) ->
+    Why = case Reason of
+              circuit_open -> <<"the server is unreachable">>;
+              overloaded   -> <<"the gateway is busy">>;
+              deadline     -> <<"the gateway could not reach the server in time">>;
+              stopping     -> <<"the gateway is stopping">>;
+              upstream_unavailable -> <<"the gateway's upstream client is restarting">>
+          end,
+    {grpc_error, {?GRPC_STATUS_UNAVAILABLE, <<What/binary, " not forwarded: ", Why/binary,
+                                              "; retry">>}}.
 
 %% The answer to a session refused by the per-connection quota: UNAVAILABLE, the
 %% retryable status (the agent backs off and registers again; the quota frees as

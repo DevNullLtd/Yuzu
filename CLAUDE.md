@@ -45,7 +45,7 @@ Context is the scarce resource. Keep this thread lean; spend file-reading budget
 - **Summarise and hand off proactively** — record files touched, facts learned, open questions, next
   command; then continue or spawn a fresh agent.
 - **For code changes:** owning module → its tests → smallest coherent patch → targeted suite
-  (`meson test -C build-<os> --suite <agent|server|tar>`) before the broad one.
+  (`meson test -C build-<os> --suite <agent|server|echo>`) before the broad one.
 
 ## Agent team & governance
 
@@ -83,9 +83,13 @@ with `git show origin/dev:<path>`, never a working-tree `ls`.
 One row per concern — catastrophic-if-violated invariants, routed doc, loading agents. Split across
 four files solely for the per-file ceiling: the first holds platform/product/data/observability
 concerns, the second auth, access-control, and request-admission chokepoints, the third the
-read-only security-posture plugin rows and the gateway-upstream peer-authorization row, the fourth
-Forensics / per-user-software-data concerns (the third and fourth are the Wave 8 and Wave 10
-splits). Same authority as this file.
+read-only security-posture plugin rows, the gateway rows (upstream peer authorization, origin
+trust) and the same-site write-gate row, the fourth Forensics / per-user-software-data concerns
+(the third and fourth are the Wave 8 and Wave 10 splits). Same authority as this file.
+security-posture plugin rows (the read-only posture plugins and the mutating registry row), the
+gateway-upstream peer-authorization row and the same-site write-gate row, the fourth Forensics /
+per-user-software-data concerns (the third and fourth are the Wave 8 and Wave 10 splits). Same
+authority as this file.
 
 @.claude/routed-concerns.md
 @.claude/routed-concerns-access-control.md
@@ -144,7 +148,7 @@ Provisioning a native runner: `deploy/windows/README.md`.
 Every test target carries a `suite:` label so `--suite` filters directly:
 
 ```bash
-meson test -C build-linux --suite <server|agent|tar> --print-errorlogs   # omit --suite for everything
+meson test -C build-linux --suite <server|agent|echo> --print-errorlogs   # omit --suite for everything
 ```
 
 Tests need `-Dbuild_tests=true`. Catch2 tag filtering and the per-component symlinks are in

@@ -1557,24 +1557,24 @@ TEST_CASE("invalidate_session destroys session", "[auth][session]") {
 }
 
 // ── Idle (inactivity) session timeout — SOC 2 CC6.3 ──────────────────────────
-// The window is a real steady_clock interval, so these use a short (1-2s)
-// window + sleeps and are tagged [slow] (excludable with ~[slow]), matching the
-// account-lockout expiry test.
+// The window is a real clock interval, so each case ages the session's idle
+// anchor with AuthManager::idle_session_for_test (a store-less cache entry, as
+// make_temp_auth builds) instead of sleeping past a short (1-2s) window.
 
 TEST_CASE("idle timeout disabled by default: a session survives inactivity",
-          "[auth][session][idle][slow]") {
+          "[auth][session][idle]") {
     auto mgr = make_temp_auth();
     mgr->upsert_user("alice", "secret123456", Role::admin);
     auto token = mgr->authenticate("alice", "secret123456");
     REQUIRE(token.has_value());
     // session_inactivity_ defaults to 0 (disabled) — a pause does not
     // invalidate the session (only the absolute 8h lifetime applies).
-    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    mgr->idle_session_for_test(*token, std::chrono::milliseconds(1200));
     CHECK(mgr->validate_session(*token).has_value());
 }
 
 TEST_CASE("idle timeout invalidates and evicts an inactive session",
-          "[auth][session][idle][slow]") {
+          "[auth][session][idle]") {
     auto mgr = make_temp_auth();
     mgr->set_session_inactivity(std::chrono::seconds(1));
     mgr->upsert_user("alice", "secret123456", Role::admin);
@@ -1582,8 +1582,8 @@ TEST_CASE("idle timeout invalidates and evicts an inactive session",
     REQUIRE(token.has_value());
     CHECK(mgr->validate_session(*token).has_value()); // active immediately
 
-    // Idle past the 1s window (1.6s for calendar-second margin / runner I/O).
-    std::this_thread::sleep_for(std::chrono::milliseconds(1600));
+    // Idle past the 1s window: the idle anchor moves 1.6s into the past.
+    mgr->idle_session_for_test(*token, std::chrono::milliseconds(1600));
     CHECK_FALSE(mgr->validate_session(*token).has_value());
     // Evicted, not merely rejected — a replayed cookie cannot be re-touched
     // back to life; a second check is still nullopt.
@@ -1591,24 +1591,24 @@ TEST_CASE("idle timeout invalidates and evicts an inactive session",
 }
 
 TEST_CASE("idle timeout slides forward on activity (active session stays alive)",
-          "[auth][session][idle][slow]") {
+          "[auth][session][idle]") {
     auto mgr = make_temp_auth();
     mgr->set_session_inactivity(std::chrono::seconds(2));
     mgr->upsert_user("alice", "secret123456", Role::admin);
     auto token = mgr->authenticate("alice", "secret123456");
     REQUIRE(token.has_value());
 
-    // Validate every 0.7s for ~3.5s total. Each touch is within the 2s window,
-    // so the session lives well past the original 2s-from-creation mark — the
-    // window slides on every authenticated request.
+    // Five validations, each after the idle anchor has been moved 1.5s into the
+    // past. Each gap is inside the 2s window, so the session lives through 7.5s
+    // of simulated time — well past the original 2s-from-creation mark — because
+    // the window slides on every authenticated request.
     for (int i = 0; i < 5; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+        mgr->idle_session_for_test(*token, std::chrono::milliseconds(1500));
         REQUIRE(mgr->validate_session(*token).has_value());
     }
-    // Stop touching it; after > 2s idle it expires. 2.7s (vs the 2s window)
-    // leaves a full 700ms margin over the touch cadence so a starved CI runner
-    // can't dip the measured steady_clock gap below the eviction threshold.
-    std::this_thread::sleep_for(std::chrono::milliseconds(2700));
+    // Stop touching it; after > 2s idle it expires. 2.7s is a full 700ms past the
+    // 2s window.
+    mgr->idle_session_for_test(*token, std::chrono::milliseconds(2700));
     CHECK_FALSE(mgr->validate_session(*token).has_value());
 }
 

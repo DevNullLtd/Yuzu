@@ -14,23 +14,81 @@
 
 ## How it works
 
-`errors` reads Level=2/PRIORITY<=err events from the last `hours` hours (default 24, clamped 1–720) of a named log (Windows only; Linux/macOS always read the system journal/unified log). `query` requires `log` and `filter`, and keyword-matches messages case-insensitively; on Windows the match runs over the newest `count` events examined, while Linux and macOS return up to `count` matches. Both actions are pure reads — nothing is deleted, rotated, or acknowledged.
+`event_logs` reads the operating system's event log on the device and changes nothing: nothing is deleted, rotated or acknowledged. `errors` returns recent error-level events, newest 100 at most (on macOS, the first 100 lines of the window, oldest first), from the last `hours` hours (default 24, 1 to 720). `query` returns events whose message contains a keyword, up to `count` of them (default 50, at most 500). Each OS has its own source and its own limits, so the same action does not mean exactly the same thing on every host. Windows reads one named channel (default `System`) in-process through the Event Log API. Linux reads the systemd journal in-process and falls back to a bounded `journalctl` command if the journal cannot be read. macOS runs `log show` against the unified log, with a 10 second deadline.
 
-Each OS has its own acquisition path: Windows calls wevtapi in-process (`EvtQuery`/`EvtRender`, bounded `EvtNext`); Linux prefers an in-process bounded `sd_journal` walk and falls back to a bounded, pre-split `journalctl` argv invocation (no shell) when libsystemd is compiled out or the journal can't be opened; macOS always shells out to `/usr/bin/log show` through the bounded subprocess runner. A read that is denied, times out, or hits its scan bound reports a typed status rather than a confident empty result — except on macOS, which signals degradation only through the row content and a nonzero return code (see Caveats).
-
-Every OS-facing raw field (message text, provider/unit name) is escaped via `safe_output_field` before joining a pipe-delimited row, so a hostile `|` or embedded newline in log content cannot forge extra columns or rows.
+A read that is refused, times out or is cut short by its bound reports a typed status on Windows and Linux rather than a confident empty result. macOS signals the same conditions only through a sentinel row and a non-zero return code. The `log` parameter selects a channel on Windows only; Linux and macOS accept it and ignore it. Every untrusted field (message text, provider or process name) is escaped before it joins a pipe-delimited row, so log content containing `|` or a line break cannot forge extra columns or rows.
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow] --> SRV[Server<br/>authz: AuditLog.Read]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[event_logs.execute]
-  EX --> WIN[Windows leg<br/>wevtapi EvtQuery/EvtRender]
-  EX --> LIN[Linux leg<br/>sd_journal, or journalctl argv fallback]
-  EX --> MAC[macOS leg<br/>log show, pre-split argv]
-  WIN & LIN & MAC --> ROWS[pipe rows +<br/>typed result status]
-  ROWS -- CommandResponse --> RS[(ResponseStore<br/>90-day default retention)]
-  RS --> API[REST /api/responses]
+  OP["Operator or workflow"] --> SRV["Server: AuditLog Read"]
+  SRV -- "gRPC mTLS" --> HOST["Agent plugin host"] --> EX["event_logs.execute"]
+  EX --> WIN["Windows: Event Log API in-process, one channel"]
+  EX --> LIN["Linux: journal in-process, journalctl fallback"]
+  EX --> MAC["macOS: log show, fixed argument list"]
+  WIN & LIN & MAC --> ROWS["Pipe rows and typed result status (not set on macOS)"]
+  ROWS -- "CommandResponse" --> RS[("ResponseStore")]
+  RS --> API["REST /api/responses"]
 ```
+
+### What you can decide with it
+
+| Question | Action | Windows | macOS | Linux |
+|---|---|---|---|---|
+| What went wrong on this device recently? | `errors` | The newest 100 events at level Error (not Critical) from the chosen channel in the last `hours` hours | Error-type entries in the last `hours` hours, oldest first, so a busy host shows the start of the window and the cap drops the most recent | The newest 100 entries at priority err or worse (emergency, alert, critical, error) in the last `hours` hours |
+| Did anything mention this keyword? | `query` | The newest `count` events of any level in the chosen channel, then matched case-insensitively on message values and provider name. Nothing older than those `count` events is searched | Entries from the last 24 hours (fixed) whose message contains the keyword, **case-sensitively**; at most `count` lines in total, header row included | The newest `count` entries of any priority whose message contains the keyword, case-insensitively; scan bounded to 50,000 entries (native) or the newest 2,000 journal lines (fallback) |
+| Is the answer complete? | `errors`, `query` | Any non-clean status (`CONSTRAINED`, `UNAVAILABLE` or `PERMISSION_DENIED`) says it is not. The 100-event cap of `errors` raises no status | Only the sentinel rows and the return code (`timeout`, `permission_denied`, `unavailable`) say it is not; no status is set | A `CONSTRAINED` or `UNAVAILABLE` status says it is not. The 100-entry cap of `errors` raises no status |
+
+Row order differs by OS for both actions: Windows returns newest first, Linux returns oldest first (the newest entries are selected, then reversed), and macOS returns oldest first, as `log show` prints them.
+
+What a clean result proves. Zero rows with no status means the read ran and found nothing inside the bounds above. It does not mean the event never happened: the OS may have rotated or overwritten older entries, and the window, the 100-event cap and the `count` limit all hide older ones. It also says nothing about a different channel or log source, or about entries the agent's account is not allowed to see.
+
+What this plugin cannot answer: anything older than the OS still retains; completeness of an audit trail (the Windows `Security` channel needs an extra privilege, and `query` matches event data values rather than the formatted message); filtering by event ID, level or source; a count of how many events matched beyond the cap; a like-for-like comparison across operating systems, because the row shape, level coverage and ordering differ (below).
+
+Row shape by operating system. Field 0 is always `error` (for `errors`) or `event` (for `query`).
+
+| OS | `errors` row | `query` row | Placeholder row (nothing found or read failed) |
+|---|---|---|---|
+| Windows | `error\|timestamp\|event_id\|source\|message` | `event\|timestamp\|level\|event_id\|source\|message` | `error\|none\|<text>\|-\|-` and `event\|none\|-\|-\|-\|<text>` |
+| Linux | `error\|timestamp\|unit\|message` | `event\|timestamp\|unit\|message` | `error\|none\|-\|<text>` and `event\|none\|-\|<text>` |
+| macOS | `error\|<timestamp and level letter>\|<process or ->\|<rest of line>` | the same with `event` | A run with no matches prints only the `log show` header, so the result is the single row `error\|Timestamp\|\|...`; the `none` row is written only if no line at all arrives. Degraded runs add `error\|timeout\|-\|<reason>` (or `permission_denied`, `unavailable`) after any partial rows |
+
+On Windows the message is the event's data values joined by spaces, not the provider's formatted message text, and the timestamp is UTC. On Linux the timestamp is local time with a zone offset and `unit` is the syslog identifier with the process id in brackets, falling back to the systemd unit, then `-`. The macOS rows are not split into clean columns; see the next section.
+
+### Diagrams
+
+#### Linux: which mechanism answers
+
+```mermaid
+flowchart TD
+  S["errors or query on Linux"] --> C{"Journal reader built in and journal opens with visible entries?"}
+  C -- "no" --> F["journalctl command, fixed arguments, no shell, 20 second deadline"]
+  C -- "yes" --> W["Walk newest to oldest within 10 seconds"]
+  W --> Wd{"Stopped on time budget or on the 50,000 entry scan cap?"}
+  Wd -- "yes" --> K1["CONSTRAINED, journal truncated"]
+  Wd -- "no" --> OK["Rows, or clean-empty row, no status set"]
+  F --> R{"journalctl ran and exited 0?"}
+  R -- "did not run, killed by a signal, or non-zero exit" --> U["UNAVAILABLE with a reason row"]
+  R -- "timed out or output cut short" --> K2["CONSTRAINED"]
+  R -- "yes" --> Q{"query only: 2,000 line window full with fewer matches than count?"}
+  Q -- "yes" --> K3["CONSTRAINED, window exhausted"]
+  Q -- "no" --> OK2["Rows, or clean-empty row, no status set"]
+```
+
+The journal reader opens only the local journal and never waits for new entries. A reader that can see no entries at all is treated as a denied read, not an empty log, and falls to the `journalctl` command. The `errors` walk stops at 100 entries without any status.
+
+#### macOS: how one `log show` line becomes a row
+
+```mermaid
+flowchart TD
+  L["One line of log show output in compact style"] --> D{"Contains two spaces in a row?"}
+  D -- "no, for example a Df line with one space after the type" --> A["Row: prefix, whole line, dash, whole line (not shortened)"]
+  D -- "yes" --> T["Timestamp field is the text before the first double space, level letter included"]
+  T --> P{"Another double space in the rest of the line?"}
+  P -- "no, the usual case" --> M["Process field is a dash; message is the rest, process name and id included, cut to 200 bytes"]
+  P -- "yes" --> X["Process field is the text before it, which may be part of the message"]
+```
+
+`log show` prints Error entries as `<date> <time> E  process[pid:tid] ...` (two spaces after the one-letter type), so the timestamp field carries the trailing `E` and the process name stays inside the message. Default-level entries use a two-letter type (`Df`) followed by one space, so they take the whole-line path and the line appears twice in the row. The column header line that `log show` prints first is also converted to a row (`error|Timestamp||...`), and a message that spans several lines produces one extra row per continuation line. The 100-line cap on `errors` (`count` on `query`) includes that header row, and a search with no matches returns the header row alone. In a hand run on macOS 26, `log show` logged its own command line, which contains the keyword, and matched it, so a `query` can return a row from the `log` process itself; treat that as noise.
 
 ## OS capability
 
@@ -52,11 +110,11 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | `Event Log Readers` group; the `Security` log additionally needs `SeSecurityPrivilege` | 2026-09-07 on bare-metal Windows 10.0.26200 as `SYSTEM` | `PERMISSION_DENIED`, message "Cannot access the event log channel (requires elevated privileges)" |
-| macOS | agent daemon; production runs as a root LaunchDaemon | none for root; a non-root, non-login-session process cannot open the store at all | 2026-09-07 on bare-metal macOS 26.6.2, euid 501 (a real login session, not the production root daemon) | `log show` exits `EX_NOPERM` (77); row tagged `permission_denied`, rc 1 — **no typed result status is set** (see Caveats) |
-| Linux | agent daemon (dedicated `_yuzu`/`yuzu` account) | `systemd-journal` group | 2026-09-06 in a container, euid 0 (root) | native leg: journal open/visibility check fails, falls through to the fallback; fallback: `UNAVAILABLE`, message names the reason (e.g. "journalctl did not run") |
+| Windows | agent service account (LocalSystem today; the packaged service has not yet moved to the virtual service account) | `Event Log Readers` group; the `Security` channel additionally needs `SeSecurityPrivilege` | 2026-09-07 on bare-metal Windows 10.0.26200 as `SYSTEM` | `PERMISSION_DENIED`, message "Cannot access the event log channel (requires elevated privileges)" |
+| macOS | agent daemon; production runs as a root LaunchDaemon (`docs/agent-privilege-model.md`) | none for root; a non-root process outside a login session cannot open the log store at all | 2026-09-07 on bare-metal macOS 26.6.2 at euid 501 in a login session, not as the root daemon | `log show` exits 77; the output ends in an `error\|permission_denied\|-\|...` row and the return code is 1; no typed result status is set |
+| Linux | agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit) | `systemd-journal` group, or a world-readable journal | 2026-09-06 in a container as euid 0, which exercised neither Linux mechanism (Caveat 4) | native reader sees no entries and falls through to `journalctl`. The fallback is expected to report `UNAVAILABLE` with the reason when `journalctl` fails (for example "journalctl did not run"); a refused read has not been measured outside a container. The fallback runs `journalctl -q`, so if it exits 0 with no entries the answer is "No error events found" (or the `query` equivalent) with no status set |
 
-Binaries/subprocesses/network: none on Windows (wevtapi is in-process) and none on the Linux native leg (sd_journal is in-process). The Linux rung-2 fallback spawns `/usr/bin/journalctl` via the bounded subprocess runner (pre-split argv, no shell). macOS always spawns `/usr/bin/log show` the same way. No network access on any leg.
+Subprocesses and network: none on Windows and none on the Linux native reader (both read in-process). The Linux fallback runs `/usr/bin/journalctl` with a fixed argument list and no shell, and macOS runs `/usr/bin/log show` the same way, both through the bounded subprocess runner. No network access on any leg.
 
 ## Data contract
 
@@ -74,7 +132,7 @@ Binaries/subprocesses/network: none on Windows (wevtapi is in-process) and none 
 
 ### Outputs
 
-Pipe-delimited rows, one per event; field 0 is a literal discriminator (`error` or `event`). **The row shape differs by OS**, not only by action: the Windows rows carry the full 5/6-field shape below, while Linux and macOS collapse the `event_id`/`source` fields into a single `unit` (Linux) or `process` (macOS) field and never emit `event_id`. A missing/inapplicable value renders `-`, never an empty field. The message field is capped at 200 bytes, backed off to a UTF-8 character boundary (`event_logs_parsers.hpp:66`), so a non-ASCII message can be shorter than 200 characters.
+Pipe-delimited rows, one per event; field 0 is a literal discriminator (`error` or `event`). **The row shape differs by OS**, not only by action, as the table under "What you can decide with it" shows: Windows carries `event_id` and `source` (and `level` for `query`), Linux collapses them into one `unit` field, and macOS has no clean process column at all. A missing value renders `-`, except the macOS header row, which has an empty process field. The message is cut to 200 bytes at a UTF-8 character boundary, so a non-ASCII message can be shorter than 200 characters; the macOS whole-line fallback row is not cut. A placeholder row has `none` in field 1 and carries its explanation in the text; on Windows and Linux a typed status accompanies it and is the authoritative signal.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`device.event_logs.errors` — `timestamp|event_id|source|message`**
@@ -101,22 +159,22 @@ Pipe-delimited rows, one per event; field 0 is a literal discriminator (`error` 
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `PERMISSION_DENIED` | PARTIAL | `event_logs_win:access_denied` | Windows: `EvtQuery` fails `ERROR_ACCESS_DENIED` (`event_logs_plugin.cpp:136-139`) |
-| `UNAVAILABLE` | PARTIAL | `event_logs_win:channel_not_found` | Windows: channel doesn't exist (`event_logs_plugin.cpp:140-142`) |
-| `CONSTRAINED` | PARTIAL | `event_logs_win:evt_next_timeout` | Windows: `EvtNext` times out mid-query (`event_logs_plugin.cpp:143-146`) |
-| `UNAVAILABLE` | PARTIAL | `event_logs_win:evt_query_failed` | Windows: any other query failure (`event_logs_plugin.cpp:147-151`) |
-| `CONSTRAINED` | PARTIAL | `event_logs_win:count_window_full` | Windows `query`: the `count`-event examine window filled (`event_logs_plugin.cpp:548-550`) |
-| `CONSTRAINED` | PARTIAL | `event_logs_journal:errors_truncated` / `event_logs_journal:query_truncated` | Linux native leg hits its wall-clock budget or scan cap before finishing (`event_logs_plugin.cpp:264-266`) |
-| `UNAVAILABLE` | PARTIAL | `event_logs_journalctl:errors_unavailable` / `_query_unavailable` | Linux fallback: `journalctl` didn't run, was signaled, or exited nonzero (`event_logs_plugin.cpp:366-369`) |
-| `CONSTRAINED` | PARTIAL | same provenance as above | Linux fallback: `journalctl`'s own output was truncated, or (query only) the scan window filled before a confident answer (`event_logs_plugin.cpp:374-377`, `398-401`) |
-| *(none set)* | — | — | Windows/Linux clean success; **macOS never calls `set_result_status` on any path** — the agent records `UNDECLARED`/`UNKNOWN`, and degradation is signalled only via row content + return code (`event_logs_macos.hpp:187-233`; no `set_result_status` call in that file or its callers) |
+| `PERMISSION_DENIED` | PARTIAL | `event_logs_win:access_denied` | Windows: the channel query is refused (access denied) |
+| `UNAVAILABLE` | PARTIAL | `event_logs_win:channel_not_found` | Windows: the channel does not exist |
+| `CONSTRAINED` | PARTIAL | `event_logs_win:evt_next_timeout` | Windows: the Event Log service does not answer within 10 seconds mid-query |
+| `UNAVAILABLE` | PARTIAL | `event_logs_win:evt_query_failed` | Windows: any other query failure, including every returned event failing to render |
+| `CONSTRAINED` | PARTIAL | `event_logs_win:count_window_full` | Windows `query`: the `count` events examined were all read, so older events were not searched |
+| `CONSTRAINED` | PARTIAL | `event_logs_journal:errors_truncated`, `event_logs_journal:query_truncated` | Linux native reader: stopped on its 10 second budget, its 50,000-entry scan cap (`query`), or a read error after some entries |
+| `UNAVAILABLE` | PARTIAL | `event_logs_journalctl:errors_unavailable`, `event_logs_journalctl:query_unavailable` | Linux fallback: `journalctl` did not run, was killed by a signal, or exited non-zero |
+| `CONSTRAINED` | PARTIAL | the same two `event_logs_journalctl` tokens | Linux fallback: timed out at 20 seconds, its output was cut short, or (`query`) the 2,000-line window filled with fewer than `count` matches |
+| *(none set)* | - | - | Windows and Linux clean success, **and** the 100-event cap of `errors` on every OS; **macOS never sets a status on any path**, so the agent records `UNDECLARED`/`UNKNOWN` |
 
 ### Where the data goes
 
-- **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention per `docs/yaml-dsl-spec.md:194`; the definitions carry no `response.retentionDays` override), queryable at `/api/responses/{id}` and aggregatable (`errors` groups by `source`; `query` groups by `level`,`source` — `content/definitions/event_logs.yaml:73-75,172-174`).
-- **Not consumed by** daily-sync inventory, the TAR warehouse, or metrics. `event_logs` is one of `result_parsing.hpp`'s `kKeyValuePlugins` (`server/core/src/result_parsing.hpp:67`), so the server's legacy dashboard row renderer treats its output as generic `Agent|Key|Value` pairs rather than a fixed column set — a consequence of the same per-OS row-shape divergence documented above.
-- **Sensitivity.** `message` is raw log/journal text and can carry usernames, hostnames, or other operator-identifying content depending on what the OS logged; Windows' `source` (provider name) and Linux's `unit` field can themselves be an installed-software or service identifier — this plugin's rows are the least predictable in the catalogue for what they may disclose, by design.
-- **Siblings:** none — `event_logs` is the only plugin in the shipped catalogue reading OS event/journal/unified logs (`server/core/src/agent_registry.cpp:848-849`).
+- **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention; the definitions carry no override), queryable at `/api/responses/{id}` and aggregatable (`errors` groups by `source`, `query` by `level` and `source`, both meaningful on Windows only).
+- **Not consumed by** daily-sync inventory, the Echo warehouse, DEX or metrics. `event_logs` is among the plugins whose results the legacy dashboard row renderer shows as generic `Agent|Key|Value` pairs rather than a fixed column set, which fits the per-OS row shapes above.
+- **Sensitivity.** `message` is raw log text and can carry user names, host names or other identifying content depending on what the OS logged; the Windows `source` and the Linux `unit` can name installed software or services. These rows are the least predictable in the catalogue for what they may disclose.
+- **Siblings:** none expose a general event-log query. The `users` and `echo` plugins read specific Windows event channels internally (`users_plugin.cpp`, `echo_netconn_win.cpp`), and the agent daemon reads the Linux journal for its own use (`agents/core/src/dex_linux_journal.cpp`); none of those return event-log rows to an operator.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.event_logs.errors")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
@@ -185,11 +243,11 @@ event|none|-|journalctl did not run
 
 ## Caveats and known gaps
 
-1. **macOS never sets a typed result status.** `decide_log_show_output` (`event_logs_macos.hpp:187-233`) decides rows and an rc but calls `set_result_status` nowhere; every macOS run — success, permission denial, timeout, or a truncated capture — reports `UNDECLARED`/`UNKNOWN` at the ABI4 status layer. An operator must parse the row's second field (`permission_denied`/`timeout`/`unavailable`/`none`) or check rc, not the typed status, to detect a degraded macOS read.
-2. **The row shape is not the same across OSes for the same action.** The YAML `result.columns` for `errors` (`timestamp, event_id, source, message`) and `query` (adds `level`) describe the Windows row exactly; Linux and macOS instead emit `<prefix>|timestamp|unit|message` with no `event_id`/`level`/`source` fields at all. This is why `event_logs` is listed in the server's `kKeyValuePlugins` (`result_parsing.hpp:67`) rather than given a fixed dashboard column schema.
-3. **The Linux capture sample shows the fallback failing, not the native leg.** In the 2026-09-06 container capture, both actions fell straight through to `UNAVAILABLE` with reason "journalctl did not run" — meaning the native `sd_journal` leg also declined (compiled out or the journal was unreadable/unopenable for this account) and the rung-2 binary itself was absent from the minimal container image. Neither Linux mechanism was exercised end-to-end by this capture.
-4. **`sd_journal_open` succeeding proves nothing about read access.** A caller outside the `systemd-journal` group can open the journal and see zero entries; the native leg treats "no visible entries" as a denied read (`event_logs_journal.hpp:117-135`) and falls through to the argv fallback rather than reporting a confident empty log.
-5. **`journalctl --grep` is deliberately not used.** It exits 1 on a genuine no-match result (verified against systemd 257), which the plugin's own honesty rule would otherwise misclassify as an acquisition failure; filtering instead happens in-process with the same case-insensitive substring predicate the native leg uses (`event_logs_plugin.cpp:333-346`).
+1. **macOS rows are not split into the documented columns.** The timestamp field carries the trailing level letter (`2026-09-06 10:55:53.370 E`), the process field is `-` and the process name and id stay inside the message, `Df` lines come back as a whole-line row with the text repeated, the `log show` column header is returned as the first row, and multi-line messages add one row per continuation line. `log show` also prints oldest first, so when the 100-line cap bites `errors` keeps the oldest part of the window, and the cap includes the header, so at most 99 events come back (`count` minus one for `query`).
+2. **macOS `query` differs from the other legs and sets no status.** Its keyword match is case-sensitive (checked by hand: `error` does not match `ERROR`), although the parameter text says case-insensitive, and its window is a fixed 24 hours. Degradation shows only as a `timeout`, `permission_denied` or `unavailable` row plus return code 1, so a consumer must read the rows, not the status, to tell a partial macOS result from a complete one.
+3. **The caps are silent.** `errors` returns at most 100 events on every OS and sets no status when it reaches them, so a busy host looks complete; on Windows `query` examines only the newest `count` events (at most 500) and says so only through `count_window_full`. Bounds that do raise a status are the 10 second journal budget, the 50,000-entry native scan cap, and the fallback's 20 second deadline and 2,000-line window.
+4. **The Linux capture did not exercise either mechanism.** In the container capture both actions ended `UNAVAILABLE` ("journalctl did not run"), so the sample shows neither the native journal reader nor a working `journalctl` returning rows. A caller outside the `systemd-journal` group can open the journal and see no entries; the reader treats that as a denied read and falls through to the fallback instead of reporting an empty log.
+5. **Windows differences to know before automating.** The message column is the event's data values joined by spaces, not the provider's formatted text, so a rule that matches message wording from older releases no longer matches; match on event ID and provider. `errors` covers level Error only, not Critical, and `query` also matches on the provider name.
 
 ## Source and tests
 

@@ -26,14 +26,15 @@
 ///     authored but fires through `command_dispatch_fn`, which dispatches as
 ///     `DispatchCaller{.system = true}`, and the chokepoint's system_reserved
 ///     guard only refuses NON-system callers. Without this branch an operator
-///     who may not dispatch `tar.fleet_snapshot` directly could schedule it —
+///     who may not dispatch `echo.fleet_snapshot` directly could schedule it —
 ///     the definition ships operator-referencable — and the fire would reach
 ///     the fleet under system authority. Refused here, where the operator's
 ///     provenance is still known;
 ///   * a missing or unopened `RbacStore`.
 ///
 /// RBAC legacy-open (`rbac_enforcement_in_effect()` false) ADMITS, matching
-/// every other authz call site's posture.
+/// every other authz call site's posture, except for an engine principal (`engine:<slug>`),
+/// whose only authority is an explicit RBAC grant (#6204).
 
 #include "command_capability.hpp"
 #include "rbac_store.hpp"
@@ -59,7 +60,9 @@ namespace yuzu::server {
     if (rbac == nullptr || !rbac->is_open())
         return false;
     if (!rbac_enforcement_in_effect(rbac))
-        return true;
+        // Legacy-open arms for everyone EXCEPT an engine principal, whose only authority is an
+        // explicit RBAC grant (and RBAC is off here).
+        return !yuzu::server::authz::is_engine_principal_name(principal);
     return rbac->check_permission(principal, std::string(classified->securable),
                                   std::string(yuzu::server::authz::to_string(classified->operation)));
 }

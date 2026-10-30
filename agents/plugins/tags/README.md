@@ -14,22 +14,60 @@
 
 ## How it works
 
-All 7 actions are pure in-process reads/writes of a flat `<data_dir>/tags.json` object (tags_plugin.cpp:13,92-116); `load_tags()`/`save_tags()` re-serialize the whole file on every mutating call (tags_plugin.cpp:39-79). `set` validates the key (≤64 chars, `^[a-zA-Z0-9_.:\-]+$` by convention) and value (≤448 bytes) before writing (tags_plugin.cpp:178-201); `get`/`check`/`delete` look a single key up in the in-memory map, and `get_all`/`count` walk the whole map (tags_plugin.cpp:203-263). `clear` wipes every tag in one call and is classified Destructive/Irreversible (capdecls `plugin_action_catalogue_d.hpp:107-120`) rather than the Mutating/Reversible tier `set`/`delete` carry, and is the only action gated `AdminOrApproval` and restricted to `endpoint-admin` (`tags.yaml` `device.tags.clear`).
+`tags` keeps a small set of free-form key/value labels on the device, in a flat JSON file named `tags.json` in the agent's data directory. The plugin loads that file into memory when it starts. `set`, `get`, `get_all`, `delete`, `check` and `count` then work on the in-memory copy, and `set`, `delete` and `clear` rewrite the whole file after each change. `set` checks the key length (64 bytes at most) and the value size (448 bytes at most) before it writes. `clear` removes every tag in one call; it is the only Destructive action here, the only one gated `AdminOrApproval`, and the only one restricted to `endpoint-admin`.
 
-It is deliberately not the channel that reaches the server. `tags.json` is separately read verbatim by the agent's Register RPC path (`agent.cpp:1701-1725`), independent of this plugin's own load path, and the server drops any self-reported `service` key at ingest (`agent_registry.cpp:56-67`, #3295) before persisting the rest to the Postgres-backed TagStore (`tag_store.cpp` `sync_agent_tags:345-433`). It is also not the structured 4-category tag store — that role belongs to the sibling `asset_tags` plugin (see Siblings below).
+The plugin is deliberately not the channel that reaches the server. Separately from this plugin, the agent reads `tags.json` from disk each time it sends a Register request (when it connects or reconnects) and sends the contents as `AgentInfo.scopable_tags`. The server drops any `service` key, drops keys outside its own key rules, and, for an agent that registers directly with the server, replaces the agent-reported rows in its tag store with the rest. Those stored rows are what `tag:<key>` scope targeting reads first. An agent that registers through the gateway never has its tags written to the tag store (the server's registry notes "ProxyRegister has no TagStore call"); for it the server keeps the same filtered tags only in the in-memory session and falls back to them when the store has no row. Either way, a tag set here steers targeting only after the agent next registers. The structured four-category role, environment, location and service tags belong to the sibling `asset_tags` plugin.
 
 ```mermaid
 flowchart LR
-  OP[Operator / workflow<br/>dispatches set/get/delete/...] -- authz: Tag.Write or Tag.Read --> SRV[Server]
-  SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[tags.execute]
-  EX --> WIN[Windows leg<br/>local_json_store]
-  EX --> MAC[macOS leg<br/>local_json_store]
-  EX --> LIN[Linux leg<br/>local_json_store]
-  WIN & MAC & LIN --> FILE[("<data_dir>/tags.json")]
-  FILE --> ROWS[rows, UNDECLARED status] --> RS[(ResponseStore)] --> API[REST /api/responses]
-  FILE -. read directly at Register .-> REG[agent.cpp Register path] --> SCOPE[AgentInfo.scopable_tags]
-  SCOPE -- gRPC Register --> TS[TagStore sync<br/>'service' key dropped, #3289/#3295]
+  OP["Operator or workflow"] -->|"authz: Tag Read, Write or Delete"| SRV["Server"]
+  SRV -->|"gRPC mTLS"| HOST["Agent plugin host"] --> EX["tags execute"]
+  EX --> WIN["Windows: local JSON file"]
+  EX --> MAC["macOS: local JSON file"]
+  EX --> LIN["Linux: local JSON file"]
+  WIN --> FILE[("tags.json in data_dir")]
+  MAC --> FILE
+  LIN --> FILE
+  EX --> ROWS["rows, UNDECLARED status"] --> RS[("ResponseStore")] --> API["REST /api/responses"]
+  FILE -.->|"read at every Register"| REG["Agent Register path"] --> TS[("TagStore sync")]
 ```
+
+### What you can decide with it
+
+| Question | Action | What you learn |
+|---|---|---|
+| Does this device carry tag X, and with what value? | `check`, `get` | The agent's local copy of the tag. This is what the device itself holds, not what the server's scope targeting currently sees. |
+| What does the device say about itself? | `get_all`, `count` | Every local tag and the total. The same on Windows, macOS and Linux; the plugin reads and writes only a file, so there is no per-OS difference and no OS-level failure to report. |
+| Label a device so a later scope can find it | `set` | Writes the local file. The label becomes targetable by `tag:<key>` after the agent's next Register. |
+| Remove one label, or all of them | `delete`, `clear` | Edits the local file. `clear` is Destructive and Irreversible, needs an explicit in-scope target (no fleet broadcast), and there is no undo other than setting the tags again. |
+
+What it cannot tell you: whether the server has already picked up a change, and what the server holds for the device. To see what the server's tag store holds, read the `tags` array (key, value, source) on the server's device detail, `GET /api/v1/devices/{id}`, not this plugin; that array comes from the tag store only, so for a gateway-registered agent it does not show tags the agent reported itself. A clean `set` row proves the in-memory tag changed; only the absence of a `CONSTRAINED` status proves the file was replaced.
+
+Safe workflow for a retag: `get_all` to record the current set, `set` or `delete` the keys, `get_all` again to confirm, then wait for the agent to reconnect (or restart it) before relying on `tag:` targeting. Tags set here are device-authored; a same-named tag set by an operator on the server wins over the agent-reported one.
+
+### Diagrams
+
+```mermaid
+sequenceDiagram
+  participant Op as Operator
+  participant Pl as tags plugin
+  participant F as tags.json
+  participant Ag as Agent Register path
+  participant TS as Server TagStore
+  participant Sc as tag scope targeting
+  Op->>Pl: set key and value
+  Pl->>Pl: update in-memory map
+  Pl->>F: atomic rewrite of the whole file
+  Pl-->>Op: tag_set row (CONSTRAINED if the write failed)
+  Note over F,Ag: nothing reaches the server yet
+  Ag->>F: read on the next connect or reconnect
+  Ag->>TS: Register with scopable_tags
+  TS->>TS: drop service key and invalid keys, replace agent-sourced rows (direct Register only)
+  Sc->>TS: tag:key lookup
+  TS-->>Sc: new value (operator-set rows win on a clash)
+```
+
+The diagram shows two separate paths. The plugin only changes the local file; the agent's Register path, which does not go through the plugin, carries the file to the server. Until the next Register, scope targeting on the server still sees the old tag set.
 
 ## OS capability
 
@@ -49,11 +87,11 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account — LocalSystem today, not yet the intended `NT SERVICE\YuzuAgent` (#1442; `docs/agent-privilege-model.md:12`) | None — plain file I/O under `<data_dir>`; the shared writer calls `ReplaceFileW` (no extra privilege) | 2026-09-07 on bare metal as SYSTEM | No refusal path exists; a failed `save_tags()` write is logged and declared `CONSTRAINED` / `tags:persist_failed` on `set`/`delete`/`clear` (see Result status) |
-| macOS | agent daemon, root — the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md:14`) | None | 2026-09-07 on bare metal at euid 501 (jsmith) — unprivileged, not the production root daemon | Same as Windows |
-| Linux | dedicated unprivileged account (`_yuzu`/`yuzu`; `docs/agent-privilege-model.md:12`) | None | 2026-09-06 in a container at euid 0 — more privileged than the production account | Same as Windows |
+| Windows | agent service account; LocalSystem today, not yet the intended `NT SERVICE\YuzuAgent` (see `docs/agent-privilege-model.md`) | None; plain file I/O under the data directory (the shared writer uses `ReplaceFileW`, which needs no extra privilege) | 2026-09-07 on bare metal as SYSTEM | No refusal path for reads. A failed write of `tags.json` is logged and declared `CONSTRAINED` / `tags:persist_failed` on `set`, `delete` and `clear` (see Result status) |
+| macOS | agent daemon as root; the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md`) | None | 2026-09-07 on bare metal as an interactive non-root user, not the production root daemon | Same as Windows |
+| Linux | dedicated unprivileged account (`yuzu-agent` on the packaged unit; `docs/agent-privilege-model.md`) | None | 2026-09-06 in a container as root, more privileged than the production account | Same as Windows |
 
-No external binaries, no subprocesses, no network access — every action is an in-process read/write of a local JSON file (`tags_plugin.cpp`; a grep for `popen`/`CreateProcess`/socket calls over this file returns nothing).
+No external binaries, no subprocesses, no network access; every action reads or writes a local JSON file in process.
 
 ## Data contract
 
@@ -71,7 +109,7 @@ No external binaries, no subprocesses, no network access — every action is an 
 
 ### Outputs
 
-Every action writes one or more pipe-delimited lines via `ctx.write_output`; there is no shared discriminator across actions — each uses its own literal prefix (`tag_set`, `tag`, `tag_deleted`, `tag_exists`, `tags_cleared`, `count`) rather than the field names declared below. A missing/unset value reports as an empty string (a trailing empty field), never a `-` placeholder (`tags_plugin.cpp:212`; see the macOS sample's `get`). A validation failure returns `rc=1` and a distinct `error|<message>` line instead of the success row (`tags_plugin.cpp:181-184,192-195,205-208,229-232,242-245`).
+Every action writes one or more pipe-delimited lines through the plugin's output call. There is no shared discriminator across actions: each uses its own literal first field (`tag_set`, `tag`, `tag_deleted`, `tag_exists`, `tags_cleared`, `count`) rather than the field names declared below. An unset value reports as an empty string (a trailing empty field), never a `-` placeholder; see the macOS sample's `get`. A validation failure returns `rc=1` and a single `error|<message>` line instead of the success row.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`device.tags.check` — `key|exists`**
@@ -125,23 +163,23 @@ Every action writes one or more pipe-delimited lines via `ctx.write_output`; the
 
 ### Result status
 
-`set`, `delete` and `clear` declare a typed status only when the write of `tags.json` failed (`tags_plugin.cpp` `persist_after_mutation`): the return code stays `0` and the normal row is written, the in-memory tag advanced, and the status says the file did not. `get`, `get_all`, `check` and `count` set none, so the agent records `UNDECLARED` for them, as every captured sample shows.
+`set`, `delete` and `clear` declare a typed status only when the write of `tags.json` failed (`persist_after_mutation`): the return code stays `0` and the normal row is written, the in-memory tag has advanced, and the status says the file did not. `get`, `get_all`, `check` and `count` set none, so the agent records `UNDECLARED` for them, as every captured sample shows.
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `CONSTRAINED` | partial | `tags:persist_failed` | `set` / `delete` / `clear`: the atomic write of `<data_dir>/tags.json` failed (data dir not creatable or not a directory, disk error, fsync failure, or on Windows another process holding the file open without `FILE_SHARE_DELETE`); the reason is in the agent log and the tag is lost on restart |
+| `CONSTRAINED` | partial | `tags:persist_failed` | `set` / `delete` / `clear`: the atomic write of `tags.json` failed (data directory not creatable or not a directory, disk error, fsync failure, or on Windows another process holding the file open without `FILE_SHARE_DELETE`); the reason is in the agent log and the change is lost on restart |
 
 ### Where the data goes
 
-- **Persistence.** Writes stage through a randomly-named, exclusively-created sibling temp that is fsync'd (POSIX only — `F_FULLFSYNC`, then `fsync`, on macOS; the Windows leg writes through `std::ofstream` and does not fsync) and renamed into place (`agents/shared/atomic_file_write.hpp`) at the ordinary `0666 & ~umask` creation mode for a new file; an existing regular file keeps its rwx bits on POSIX (owner, group, ACLs and hard links are not preserved — the rename replaces the inode); a `tags.json` that is a symlink or hard link is replaced by a regular file, not written through (the old in-place write followed the link); a pre-existing file at the temp path fails the write rather than being followed or overwritten.
-- **Instruction result only** for row data — reaches the ResponseStore via the standard command-response path, queryable at `/api/responses/{id}`.
-- **`tags.json` is also read independently of this plugin, at agent Register time** (`agent.cpp:1701-1725`), populating `AgentInfo.scopable_tags` on the gRPC `Register` call; the server's handler syncs it into the Postgres-backed TagStore (`agent_service_impl.cpp:577-585` → `tag_store.cpp` `sync_agent_tags:345-433`) after dropping any self-reported `service` key (`agent_registry.cpp:56-67`, `tag_store.cpp:374-379`, #3289/#3295) — this happens whether or not an operator ever dispatches a `tags.*` action.
-- Every other key reaches `tag:<key>` scope-DSL evaluation via the store-first resolver (#3295) and management-group targeting.
-- `clear`'s dashboard dispatch is additionally subject to the Destructive-class targeting rule — no fleet broadcast, an explicit in-scope target is required (`changelog.d/3885-dashboard-destructive-targeting.security.md`, which names `tags.clear` directly).
-- **Not consumed by** daily-sync inventory, the TAR warehouse, or DEX.
-- **Sensitivity.** `key`/`value` rows are free-form text chosen entirely by the caller (bounded only by the length limits in Inputs) — whether a given tag identifies a device, a person, or installed software depends on what was set, not on anything the plugin itself constrains. The `count`/`found`/`exists` fields carry nothing beyond the device id.
-- **Siblings:** `asset_tags` — the narrower, server-authoritative 4-category (`role`/`environment`/`location`/`service`) tag sync, which only reacts to a server-pushed `sync`; `tags` is the general-purpose, agent-authoritative free-form key/value store, and the only one of the two an agent can write to unprompted.
-- **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("device.tags.get_all")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
+- **Persistence.** Writes stage through a randomly-named, exclusively-created sibling temp file and are renamed into place (`agents/shared/atomic_file_write.hpp`). On POSIX the temp file is fsync'd first (`F_FULLFSYNC`, then `fsync`, on macOS); the Windows leg writes through `std::ofstream` and does not fsync. A new file takes the ordinary `0666 & ~umask` mode and an existing regular file keeps its rwx bits on POSIX; owner, group, ACLs and hard links are not preserved because the rename replaces the file. A `tags.json` that is a symlink or hard link is replaced by a regular file rather than written through, and a pre-existing file at the temp path fails the write rather than being followed.
+- **Instruction result** for row data: reaches the ResponseStore through the standard command-response path, queryable at `/api/responses/{id}`.
+- **`tags.json` is also read independently of this plugin, at every agent Register.** The agent sends its contents as `AgentInfo.scopable_tags`; the server drops a self-reported `service` key and any key or value outside its limits, then, for a directly registered agent, replaces the device's agent-sourced rows in the Postgres-backed TagStore (operator-set rows are kept and win a clash); a gateway-registered agent's tags reach only the in-memory session fallback. This happens whether or not an operator ever dispatches a `tags.*` action.
+- Every other key reaches `tag:<key>` scope evaluation through the store-first resolver and management-group targeting.
+- `clear`'s dashboard dispatch is additionally subject to the Destructive-class targeting rule: no fleet broadcast, an explicit in-scope target is required.
+- **Not consumed by** daily-sync inventory, the Echo warehouse, or DEX (Digital Employee Experience).
+- **Sensitivity.** `key` and `value` rows are free-form text chosen entirely by the caller, bounded only by the length limits in Inputs. Whether a given tag identifies a device, a person, or installed software depends on what was set, not on anything the plugin constrains. The `count`, `found` and `exists` fields carry nothing beyond the device id.
+- **Siblings:** `asset_tags` is the narrower, server-authoritative four-category (`role`, `environment`, `location`, `service`) tag sync, which reacts to a server-pushed `sync`. `tags` is the general-purpose, device-authored free-form key/value store.
+- **MCP / REST.** Discover: `discover_plugins` (summary), `yuzu://plugin-docs` (this page as data), `discover_instructions` / `get_definition("device.tags.get_all")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
@@ -242,11 +280,11 @@ count|0
 
 ## Caveats and known gaps
 
-1. **The capture harness never calls `init()`, so every sample reflects a fresh, path-less store.** `load_tags()`/`save_tags()` both no-op when `g_tags_path` is empty (`tags_plugin.cpp:41-42,67-68`), and only `init()` sets that path from `agent.data_dir` (`tags_plugin.cpp:144-149`) — the plugin-capture driver's `PluginHandle::load` + `LocalDispatcher::run` path never calls it (confirmed against `agent.cpp:971-982`, which calls `init()` only from the agent's own boot loop). `set`'s `tag_set` line is a real in-memory write, but nothing lands on disk, so the very next `get`/`check`/`get_all`/`count` in the same sample sees an empty store. This is a harness artifact, not evidence that `set` fails to persist in production.
-2. **A persistence failure is declared, not fatal.** `save_tags()` logs `tags: state not persisted: ...` at warn and `set`/`delete`/`clear` return `rc=0` with their normal row but declare `CONSTRAINED` / `tags:persist_failed`; `get`/`check`/`count`/`get_all` keep answering from memory, and the file (what Register reads) is stale until the next successful write.
-3. **`clear` was never executed on a live host.** All three samples show `[not captured]` for `clear` — the mutator capture policy withholds Destructive/Irreversible actions. It is also the one action in this plugin whose dashboard dispatch now requires an explicit, in-scope target rather than a fleet broadcast (#3885).
-4. **The `tests/unit` files matching "tags" are not this plugin's tests.** `test_guardian_health_fleet_tags.cpp`, `test_guardian_journal_fleet_tags.cpp`, and `test_spark_fleet_tags.cpp` bind Prometheus heartbeat *label* keys for Guardian/Spark telemetry — none load `TagsPlugin` or reference `tags_plugin.cpp`. `tests/unit/test_tags_plugin.cpp` includes the TU and drives `save_tags()`/`load_tags()` directly (atomic write, round-trip, no leftover temp, creation mode); nothing exercises `execute()`.
-5. **`service` is the one key this plugin can set locally that the server will never honor.** A `tags.json` `service` entry is dropped both at Register ingest (`agent_registry.cpp:56-67`) and at TagStore sync (`tag_store.cpp:374-379`) — see #3289/#3295. Every other key set here reaches `tag:<key>` scope-DSL evaluation normally.
+1. **A change reaches the server only at the next Register, and an emptied set may not reach it at all.** `set`, `delete` and `clear` change only the local file; `tag:` targeting reads the server's TagStore, which learns the file at a direct Register (a gateway-registered agent is covered by the in-memory session fallback instead). The server skips the tag sync when the Register carries no tags, so after `delete` or `clear` removes the last tag, the agent-sourced rows already stored for the device are not purged.
+2. **Keys and values are checked for length, not content.** The plugin accepts any key up to 64 characters; the character rule (`[a-zA-Z0-9_.:-]`) lives in the definition and the server, which skips a key that breaks it at Register. The agent's Register-time reader of `tags.json` is a plain quote-scanner, so a value containing a double quote or backslash (stored escaped in the file) is truncated or mangled on its way to the server, while `get` still returns it intact.
+3. **A persistence failure is declared, not fatal.** `set`, `delete` and `clear` return `rc=0` with their normal row but declare `CONSTRAINED` / `tags:persist_failed`, and `get`, `check`, `count` and `get_all` keep answering from memory while the file, which Register reads, is stale until the next successful write. A `tags.json` that cannot be opened or parsed loads as an empty store without a message, and the next mutation overwrites it.
+4. **The samples do not show persistence, and `clear` is not captured.** The capture harness never calls the plugin's `init()`, which is what sets the file path, so each sample runs against a path-less store: `set` answers, but nothing lands on disk and the following `get` sees an empty store. This is a harness artefact, not evidence that `set` fails in production; `clear` is withheld by the capture policy for Destructive/Irreversible actions.
+5. **`service` is the one key this plugin can set locally that the server never honours.** A `service` entry is dropped at Register ingest and again at TagStore sync, because the service tag is operator or API assigned only. Every other valid key reaches `tag:<key>` evaluation normally.
 
 ## Source and tests
 

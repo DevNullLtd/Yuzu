@@ -1,22 +1,22 @@
 /**
- * app_usage_plugin.cpp — read-only Forensics-gated view over TAR's
- * usage_daily / usage_daily_user / usage_live tables inside tar.db.
+ * app_usage_plugin.cpp — read-only Forensics-gated view over Echo's
+ * usage_daily / usage_daily_user / usage_live tables inside echo.db.
  *
  * Actions:
  *   "summary"    — one `usage|` row per exe_key over a window (params:
  *                  days [1-365, default 30], top [1-500, default 25], by
  *                  [run_time|run_count, default run_time]), preceded by one
  *                  `meta|` row carrying the fold's health counters.
- *   "last_used"  — per-exe_key last/first-seen (within TAR's retained usage
+ *   "last_used"  — per-exe_key last/first-seen (within Echo's retained usage
  *                  window) plus a 30-day run_count/total_seconds window.
  *                  Optional `exe=<key>` param narrows to one executable
- *                  (normalised the same way tar_usage.hpp normalises
+ *                  (normalised the same way echo_usage.hpp normalises
  *                  exe_key on write); the unfiltered form is capped at
  *                  kMaxLastUsedRows exe_keys (app_usage_parsers.hpp) and
  *                  reports a trailing `constrained|last_used_truncated|<cap>`
  *                  row if the cap was reached. Refuses to run at all
  *                  (`constrained|usage_feeder_disabled`/`usage_feeder_errored`)
- *                  when TAR's own fold is not actually advancing — see
+ *                  when Echo's own fold is not actually advancing — see
  *                  do_last_used_on's usage_feeder_enabled check.
  *   "foreground" — always CONSTRAINED, rc 0: per-session focus-time
  *                  attribution is not captured by this source (see
@@ -27,21 +27,21 @@
  * argument) does, and most tests drive execute() directly without ever
  * calling init() (test_app_usage_local_dispatcher.cpp's real-plugin case is
  * the exception — it does call init() through StandalonePluginContext). So
- * init() caches `agent.data_dir` (same platform fallback as tar_plugin.cpp's
+ * init() caches `agent.data_dir` (same platform fallback as echo_plugin.cpp's
  * init() applies when it is empty), and every execute() call re-resolves
- * `<dir>/tar.db` through resolve_db_dir(), which reapplies the identical
+ * `<dir>/echo.db` through resolve_db_dir(), which reapplies the identical
  * fallback when the cached value is still empty — i.e. when a caller drives
  * execute() directly without ever calling init(), this plugin still finds
- * the platform-default tar.db, not a null path.
+ * the platform-default echo.db, not a null path.
  *
  * ALL SQL lives in app_usage_parsers.hpp, which takes an already-open
  * `sqlite3*` — this file only opens the connection (read-only, WAL-aware —
- * tar.db is always WAL, tar_db.cpp) and formats the typed outcome into the
+ * echo.db is always WAL, echo_db.cpp) and formats the typed outcome into the
  * CC-07 result status + exit code contract.
  *
  * Reads ONLY usage_daily, usage_daily_user (COUNT(DISTINCT user) only),
  * `SELECT COUNT(*) FROM usage_live` (count only — never a pid/exe column),
- * and the named tar_config keys. NEVER TAR's raw process-event table or
+ * and the named echo_config keys. NEVER Echo's raw process-event table or
  * any command-line column — see app_usage_parsers.hpp's file header and
  * the grep-based test that enforces this.
  */
@@ -61,13 +61,17 @@
 
 #include "app_usage_parsers.hpp"
 
+#ifdef _WIN32
+#include <win_echo_db_owner_probe.hpp> // the owner / hard-link test Echo applies before it opens
+#endif
+
 namespace {
 
 namespace fs = std::filesystem;
 
-// Same platform fallback tar_plugin.cpp's init() applies when
-// `agent.data_dir` is empty (tar_plugin.cpp:565-580) — kept in sync by
-// inspection, not by shared code, since app_usage cannot depend on tar's
+// Same platform fallback echo_plugin.cpp's init() applies when
+// `agent.data_dir` is empty (echo_plugin.cpp:565-580) — kept in sync by
+// inspection, not by shared code, since app_usage cannot depend on echo's
 // internal sources.
 std::string platform_default_data_dir() {
 #ifdef _WIN32
@@ -109,32 +113,43 @@ private:
     sqlite3* db_{nullptr};
 };
 
-// Opens tar.db read-only (SQLITE_OPEN_READONLY|SQLITE_OPEN_NOMUTEX per this
-// package's spec), sets a 2s busy timeout, and forces query_only — tar.db
-// is always WAL (tar_db.cpp:430); same process/user, so the -shm sidecar is
+// Opens echo.db read-only (SQLITE_OPEN_READONLY|SQLITE_OPEN_NOMUTEX per this
+// package's spec), sets a 2s busy timeout, and forces query_only — echo.db
+// is always WAL (echo_db.cpp:430); same process/user, so the -shm sidecar is
 // usable read-only. Returns an empty DbHandle and fills `out_err` on
 // failure; the returned handle owns the connection on success.
 //
-// Round-3 review finding (HIGH): sqlite3_open_v2 alone never proves tar.db's
-// integrity. TarDatabase::open (tar_db.cpp) runs a full PRAGMA
+// Round-3 review finding (HIGH): sqlite3_open_v2 alone never proves echo.db's
+// integrity. EchoDatabase::open (echo_db.cpp) runs a full PRAGMA
 // integrity_check and quarantines/fails closed on a corrupt file, but that
-// guarantee is scoped to TAR's own long-lived connection at ITS open time —
+// guarantee is scoped to Echo's own long-lived connection at ITS open time —
 // this plugin opens a fresh connection per dispatch and would otherwise
-// silently serve/sync rows from a file TAR itself has already rejected.
+// silently serve/sync rows from a file Echo itself has already rejected.
 // yuzu::app_usage::quick_check_ok (app_usage_parsers.hpp) trades the full
 // cross-index consistency pass for speed (appropriate here — this runs on
 // every dispatch, not once at process start) and stops at the first error
-// rather than enumerating every one; on a genuinely large/corrupt tar.db
+// rather than enumerating every one; on a genuinely large/corrupt echo.db
 // this still costs a scan, same as any integrity check.
 //
 // `out_token` is set to the distinct wire token the caller should emit --
-// "tar_db_unavailable" (missing file, permission denied, lock contention) or
-// "tar_db_corrupt" (opened fine, failed the integrity gate) -- governance
+// "echo_db_unavailable" (missing file, permission denied, lock contention, or on Windows a
+// planted file) or "echo_db_corrupt" (opened fine, failed the integrity gate) -- governance
 // Gate 6 sre finding: both used to collapse into the same token, leaving an
 // operator unable to distinguish "benign, often transient" from "possible
 // disk corruption, worth investigating" without parsing free-text detail.
 DbHandle open_readonly(const fs::path& path, std::string& out_err, std::string_view& out_token) {
-    out_token = "tar_db_unavailable";
+    out_token = "echo_db_unavailable";
+#ifdef _WIN32
+    // The daily sync ships these rows to the server, so a planted echo.db (or sidecar: -wal and
+    // -shm are read as database content) must not be read. Echo refuses the same files before it
+    // opens them, but a refused Echo init leaves the planted file in place, so this opener applies
+    // the same test itself, before SQLite touches anything, and again after the first read.
+    const yuzu::win::EchoDbOwnerProbe probe;
+    if (const auto why = probe.distrust(path)) {
+        out_err = *why;
+        return DbHandle{};
+    }
+#endif
     sqlite3* raw = nullptr;
     const int rc = sqlite3_open_v2(path.string().c_str(), &raw,
                                    SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nullptr);
@@ -153,15 +168,25 @@ DbHandle open_readonly(const fs::path& path, std::string& out_err, std::string_v
     sqlite3_busy_timeout(db.get(), 2000);
     sqlite3_exec(db.get(), "PRAGMA query_only=1", nullptr, nullptr, nullptr);
     if (!yuzu::app_usage::quick_check_ok(db.get())) {
-        out_err = "tar.db failed integrity quick_check";
-        out_token = "tar_db_corrupt";
+        out_err = "echo.db failed integrity quick_check";
+        out_token = "echo_db_corrupt";
         return DbHandle{};
     }
+#ifdef _WIN32
+    // The look above and sqlite3_open_v2 are two by-name operations, and an absent file passes
+    // the look, so a file moved in between would have been read. By now SQLite holds echo.db and
+    // the -wal/-shm it reads open without FILE_SHARE_DELETE, so those names are pinned to the
+    // files it read and anything planted is still there to be judged.
+    if (const auto why = probe.distrust(path)) {
+        out_err = *why;
+        return DbHandle{};
+    }
+#endif
     return db;
 }
 
 // Aligns a unix timestamp down to the start of its UTC day — usage_daily's
-// day_ts column is day-aligned (tar_usage.hpp, P21).
+// day_ts column is day-aligned (echo_usage.hpp, P21).
 constexpr int64_t kSecondsPerDay = 86400;
 int64_t align_to_day(int64_t ts) {
     return ts - (ts % kSecondsPerDay);
@@ -170,10 +195,10 @@ int64_t align_to_day(int64_t ts) {
 // Distinguishes "the key is genuinely absent" (a well-formed query that
 // simply returned zero rows) from "the query itself failed to prepare/step"
 // (busy/locked/I-O error) — the two are NOT interchangeable: absence falls
-// through to TAR's own default (source_state_from_config(nullopt) ==
+// through to Echo's own default (source_state_from_config(nullopt) ==
 // Enabled), while a read failure must map to SourceState::Errored and never
 // silently to Enabled (this plugin's routed concern, `.claude/routed-concerns.md`
-// row "`app_usage` agent plugin..." clause 3 — a `tar_config` read failure is
+// row "`app_usage` agent plugin..." clause 3 — an `echo_config` read failure is
 // fail-closed, the opposite of fail-open).
 enum class ConfigReadOutcome { kPresent, kMissing, kReadError };
 
@@ -182,8 +207,8 @@ struct ConfigReadResult {
     std::string value; // meaningful only when outcome == kPresent
 };
 
-ConfigReadResult get_tar_config(sqlite3* db, std::string_view key) {
-    static constexpr std::string_view kSql = "SELECT value FROM tar_config WHERE key = ?";
+ConfigReadResult get_echo_config(sqlite3* db, std::string_view key) {
+    static constexpr std::string_view kSql = "SELECT value FROM echo_config WHERE key = ?";
     // RAII via app_usage_parsers.hpp's detail::Stmt (governance Gate 7,
     // #app_usage-policy-floor) — a hand-rolled sqlite3_stmt* with a manual
     // sqlite3_finalize() here was leak-free by inspection (single path,
@@ -209,7 +234,7 @@ ConfigReadResult get_tar_config(sqlite3* db, std::string_view key) {
     return out;
 }
 
-// Resolves the tri-state for a named tar_config `<x>_enabled` key (shared by
+// Resolves the tri-state for a named echo_config `<x>_enabled` key (shared by
 // the `usage_enabled` checks in both do_summary_on/do_last_used_on, and the
 // `usage_feeder_enabled` check added to do_last_used_on below) — a genuine
 // read failure is mapped to SourceState::Errored HERE, directly, before
@@ -223,12 +248,12 @@ struct UsageSourceCheck {
 
 // `missing_means_enabled` (default true) controls what an ABSENT key maps
 // to -- true reuses source_state_from_config's nullopt->Enabled default,
-// correct for `usage_enabled` (TAR's own genuine default when that key has
+// correct for `usage_enabled` (Echo's own genuine default when that key has
 // never been written). Round-3 review should-fix: `usage_feeder_enabled`
-// has no such "safe missing" semantics -- TAR's fold (tar_usage.cpp) writes
+// has no such "safe missing" semantics -- Echo's fold (echo_usage.cpp) writes
 // this key unconditionally before it ever writes a usage_daily row, so a
 // genuinely absent key on a reachable host is itself an anomaly (a
-// hand-edited/restored tar.db, or a tar_config write fault) rather than
+// hand-edited/restored echo.db, or an echo_config write fault) rather than
 // "the fold simply hasn't run yet". Passing false at that call site treats
 // a missing key the same as an explicit "false", keeping the round-1 fix's
 // own stated "false/missing -> constrained" contract for the feeder key
@@ -236,7 +261,7 @@ struct UsageSourceCheck {
 // every other caller.
 UsageSourceCheck check_source_state(sqlite3* db, std::string_view config_key,
                                     bool missing_means_enabled = true) {
-    const auto cfg = get_tar_config(db, config_key);
+    const auto cfg = get_echo_config(db, config_key);
     if (cfg.outcome == ConfigReadOutcome::kReadError)
         return {yuzu::app_usage::SourceState::Errored, std::string{config_key} + "=<read_error>"};
 
@@ -264,7 +289,7 @@ UsageSourceCheck check_source_state(sqlite3* db, std::string_view config_key,
 // path (#560 tri-state, adjudication P3 respec §3) — a single failure mode,
 // so no ConstraintAccumulator here (that composes genuinely multi-source
 // failures; see read_meta). Errored covers both a corrupted stored value AND
-// a failed tar_config prepare/step (check_source_state maps the latter to
+// a failed echo_config prepare/step (check_source_state maps the latter to
 // Errored directly, fail-closed — never silently Enabled).
 bool report_if_gated(yuzu::CommandContext& ctx, const UsageSourceCheck& check,
                      std::string_view disabled_reason, std::string_view disabled_token,
@@ -288,28 +313,28 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "summary",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "tar.db usage_daily (derived from TAR process/procfs)",
+        {YUZU_SUPPORT_SUPPORTED, 1, "echo.db usage_daily (derived from Echo process/procfs)",
          nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1,
-         "tar.db usage_daily (derived from TAR process/endpoint_security or sysctl poll)",
+         "echo.db usage_daily (derived from Echo process/endpoint_security or sysctl poll)",
          "inherits the process source's names-only constraint; ES entitlement absent -> poll "
          "granularity"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "tar.db usage_daily (derived from TAR process/etw)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "echo.db usage_daily (derived from Echo process/etw)", nullptr},
     },
     {
         /* .action      = */ "last_used",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "tar.db usage_daily (derived from TAR process/procfs)",
+        {YUZU_SUPPORT_SUPPORTED, 1, "echo.db usage_daily (derived from Echo process/procfs)",
          nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1,
-         "tar.db usage_daily (derived from TAR process/endpoint_security or sysctl poll)",
+         "echo.db usage_daily (derived from Echo process/endpoint_security or sysctl poll)",
          "inherits the process source's names-only constraint; ES entitlement absent -> poll "
          "granularity"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "tar.db usage_daily (derived from TAR process/etw)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "echo.db usage_daily (derived from Echo process/etw)", nullptr},
     },
     {
         /* .action      = */ "foreground",
@@ -335,7 +360,7 @@ public:
     std::string_view name() const noexcept override { return "app_usage"; }
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Read-only machine-scope app usage inventory derived from TAR's usage fold "
+        return "Read-only machine-scope app usage inventory derived from Echo's usage fold "
                "(no pid, command line, or user names in output)";
     }
 
@@ -379,7 +404,7 @@ private:
     // so the platform fallback is reapplied on every call.
     fs::path resolve_db_path() const {
         const std::string dir = data_dir_.empty() ? platform_default_data_dir() : data_dir_;
-        return fs::path{dir} / "tar.db";
+        return fs::path{dir} / "echo.db";
     }
 
     int do_summary(yuzu::CommandContext& ctx, yuzu::Params& params) {
@@ -405,8 +430,8 @@ private:
         // Governance Gate 7 round 2 (UP-1): usage_daily_table_exists now
         // distinguishes a genuine read failure (busy/corrupt) from the
         // legitimate "no such table" case -- a failure must not be
-        // misreported as "older TAR schema" (same fail-closed shape as the
-        // tar_config Errored branch just above).
+        // misreported as "older Echo schema" (same fail-closed shape as the
+        // echo_config Errored branch just above).
         const auto table_exists = yuzu::app_usage::usage_daily_table_exists(db);
         if (!table_exists) {
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
@@ -417,7 +442,7 @@ private:
         if (!*table_exists) {
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
                                   YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  "usage_daily table absent (older TAR schema)");
+                                  "usage_daily table absent (older Echo schema)");
             ctx.write_output("constrained|usage_schema_missing");
             return 0;
         }
@@ -479,10 +504,10 @@ private:
                             "usage_source_errored"))
             return 0;
         // Round-3 review blocker: `usage_feeder_enabled` gates the FOLD's
-        // freshness, not merely the table's presence. TAR's own aggregator
-        // (tar_usage.cpp) computes usage_feeder_enabled = (usage_on &&
+        // freshness, not merely the table's presence. Echo's own aggregator
+        // (echo_usage.cpp) computes usage_feeder_enabled = (usage_on &&
         // process_on) and early-returns from the fold when either is off —
-        // i.e. TAR already knows and records "unable to observe" for this
+        // i.e. Echo already knows and records "unable to observe" for this
         // state, and this action was the only one that threw that signal
         // away (do_summary_on surfaces it via format_meta_line's
         // feeder_enabled field; this action has no meta row). Left
@@ -500,8 +525,8 @@ private:
         // Governance Gate 7 round 2 (UP-1): usage_daily_table_exists now
         // distinguishes a genuine read failure (busy/corrupt) from the
         // legitimate "no such table" case -- a failure must not be
-        // misreported as "older TAR schema" (same fail-closed shape as the
-        // tar_config Errored branch just above).
+        // misreported as "older Echo schema" (same fail-closed shape as the
+        // echo_config Errored branch just above).
         const auto table_exists = yuzu::app_usage::usage_daily_table_exists(db);
         if (!table_exists) {
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
@@ -512,7 +537,7 @@ private:
         if (!*table_exists) {
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
                                   YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  "usage_daily table absent (older TAR schema)");
+                                  "usage_daily table absent (older Echo schema)");
             ctx.write_output("constrained|usage_schema_missing");
             return 0;
         }

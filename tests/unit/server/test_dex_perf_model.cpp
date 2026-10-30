@@ -24,7 +24,7 @@
 #include "tag_store.hpp"
 #include "test_dex_perf_api_double.hpp"
 #include "test_route_sink.hpp"
-#include "../../../agents/plugins/tar/src/tar_schema_registry.hpp" // registry tripwire only
+#include "../../../agents/plugins/echo/src/echo_schema_registry.hpp" // registry tripwire only
 
 #include "../test_helpers.hpp"
 
@@ -695,9 +695,10 @@ TEST_CASE("procperf render: app drill links + escape + the soft empty state",
     CHECK(html.find("/fragments/dex/app?name=") != std::string::npos); // cross-link
     CHECK(html.find("names only") != std::string::npos);
 
-    // The SOFT truthful empty state: off-by-default OR no rollup yet — both said.
+    // The SOFT truthful empty state: disabled on the device OR no rollup yet — both said.
     auto empty = render_dex_procperf_panel({}, "7d");
-    CHECK(empty.find("off by default") != std::string::npos);
+    CHECK(empty.find("on by default") != std::string::npos);
+    CHECK(empty.find("usage-class") == std::string::npos); // the removed opt-in rationale
     CHECK(empty.find("no hourly rollup has completed yet") != std::string::npos);
 }
 
@@ -833,19 +834,19 @@ TEST_CASE("REST /dex/perf/fleet: stats + denominators, absent metric is null",
     CHECK(j["data"]["perf_capable_online"] == 3);
 }
 
-TEST_CASE("dex_perf_os_collects is pinned to the tar registry's perf rows (#1845 tripwire)",
+TEST_CASE("dex_perf_os_collects is pinned to the echo registry's perf rows (#1845 tripwire)",
           "[dex][perf][rules][registry]") {
     // The server keeps detail::dex_perf_os_collects as its runtime fact; this pins
     // it to the plugin's declared capture support. A collector landing for a new
     // OS in the registry fails here until dex_perf_rules.hpp is flipped too.
     bool saw_perf = false;
-    for (const auto& src : yuzu::tar::capture_sources()) {
+    for (const auto& src : yuzu::echo::capture_sources()) {
         if (src.name != "perf")
             continue;
         saw_perf = true;
         for (const auto& row : src.os_support) {
-            const bool collects = row.status == yuzu::tar::OsSupportStatus::kSupported ||
-                                  row.status == yuzu::tar::OsSupportStatus::kSupportedConstrained;
+            const bool collects = row.status == yuzu::echo::OsSupportStatus::kSupported ||
+                                  row.status == yuzu::echo::OsSupportStatus::kSupportedConstrained;
             INFO("os=" << row.os);
             CHECK(rules::dex_perf_os_collects(std::string{row.os}) == collects);
         }
@@ -1050,7 +1051,7 @@ TEST_CASE("procperf routes: own audit verb, Execute gate, result narrowing",
         -> yuzu::server::ConfinedDispatchOutcome {
         auto it = params.find("sql");
         dispatched_sql = it != params.end() ? it->second : "";
-        return {.sent = 1, .command_id = "tar-abc123"};
+        return {.sent = 1, .command_id = "echo-abc123"};
     };
     const std::string output =
         "__schema__|name|samples|instances_max|cpu_avg|cpu_max|ws_avg|ws_max|hours\n"
@@ -1058,7 +1059,7 @@ TEST_CASE("procperf routes: own audit verb, Execute gate, result narrowing",
     DexRoutes::ResponsesFn responses =
         [&](const std::string& command_id, const std::string& /*agent_id*/)
         -> std::vector<DexAgentResponse> {
-        if (command_id == "tar-abc123")
+        if (command_id == "echo-abc123")
             return {{"WS-1", 0, output, ""}};
         return {};
     };
@@ -1102,12 +1103,12 @@ TEST_CASE("procperf routes: own audit verb, Execute gate, result narrowing",
         CHECK(audited.empty());
         CHECK(dispatched_sql.empty());
     }
-    SECTION("result route renders the parsed panel; non-tar command_ids are rejected") {
+    SECTION("result route renders the parsed panel; non-echo command_ids are rejected") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
         routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, dispatch, responses);
         auto ok = sink.Get(
-            "/fragments/dex/device/procperf/result?command_id=tar-abc123&agent_id=WS-1&window=7d");
+            "/fragments/dex/device/procperf/result?command_id=echo-abc123&agent_id=WS-1&window=7d");
         REQUIRE(ok);
         CHECK(ok->status == 200);
         CHECK(ok->body.find("Teams.exe") != std::string::npos);

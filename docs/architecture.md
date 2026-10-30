@@ -236,10 +236,10 @@ Operator                     Server                                  Agent
    │                           ├── FleetTopologyStore::get(...)        │
    │                           │     ├── cache hit (5 s TTL) → return  │
    │                           │     └── miss → single-flight refill:  │
-   │                           │           dispatch tar.fleet_snapshot │
+   │                           │           dispatch echo.fleet_snapshot │
    │                           │           via fetcher seam            │
    │                           │                                       │
-   │                           │── tar.fleet_snapshot ────────────────►│
+   │                           │── echo.fleet_snapshot ────────────────►│
    │                           │   (CommandRequest, fan-out per agent) │
    │                           │                                       ├── Collect
    │                           │                                       │   processes,
@@ -277,9 +277,9 @@ Operator                     Server                                  Agent
 
 **Why a separate page route + REST surface?** Dashboard parity (agentic-first invariant A1) means every dashboard action must have a REST equivalent. The page (`/viz/fleet`) is the HTML shell + static asset bundle that browsers load; the REST endpoints (`/api/v1/viz/fleet/topology` and the `/fragments/...` companion) are what the renderer (and any LLM client / automation) actually call for data. Both go through the same `FleetTopologyStore`, the same kill-switch, RBAC, and audit gates.
 
-**Why store-side categorisation?** The TAR (Telemetry, Acquisition, Response) plugin on each agent ships a flat process list with `cmdline` and `path`. Categorising client-side would mean every browser holds its own copy of the heuristics; doing it on the server lets the JSON envelope carry a single canonical category per process and lets the rules evolve without a renderer roll-out.
+**Why store-side categorisation?** The Echo (Telemetry, Acquisition, Response) plugin on each agent ships a flat process list with `cmdline` and `path`. Categorising client-side would mean every browser holds its own copy of the heuristics; doing it on the server lets the JSON envelope carry a single canonical category per process and lets the rules evolve without a renderer roll-out.
 
-**Why a single-flight cache?** A topology fetch fans out to every agent in scope, so concurrent operator requests would otherwise dispatch N parallel `tar.fleet_snapshot` storms. The store coalesces concurrent misses onto one refill goroutine; in-flight waiters block on a condition variable up to a bounded timeout; subsequent gets within the 5 s TTL hit the cache.
+**Why a single-flight cache?** A topology fetch fans out to every agent in scope, so concurrent operator requests would otherwise dispatch N parallel `echo.fleet_snapshot` storms. The store coalesces concurrent misses onto one refill goroutine; in-flight waiters block on a condition variable up to a bounded timeout; subsequent gets within the 5 s TTL hit the cache.
 
 **Why ES modules + importmap rather than UMD?** Three.js dropped UMD in r150+ — modern releases only publish `three.module.min.js`. The page declares an importmap mapping the bare specifier `"three"` to the vendored bundle, so OrbitControls' own `import { ... } from 'three'` resolves through the same map without a build-time bundler. Importmap alone needs Chrome 89 / Firefox 108 / Safari 16.4, but the shared dashboard stylesheet (`color-mix()`, `:has()`) sets the real floor for every page: Chrome/Edge 111, Firefox 121, Safari 16.2, with this page's importmap raising Safari to 16.4 (see "Browser requirements" in `docs/user-manual/server-admin.md`).
 
@@ -300,7 +300,7 @@ in-process-untestable handler is an authorization/CSRF/scope-check blind spot) i
 surfaces this prose previously credited to this inline count have moved to their own
 `HttpRouteSink` modules: `POST /api/command` is `command_routes.cpp` (#2557); the
 page-shell/static-asset surface — `/static/*`, `/`, `/chargen`, `/procfetch`, `/api/help*`,
-`/help`, `/tar`, `/result-sets`, `/viz/fleet`, `/viz/host/:id`, `/instructions`; 29 routes — is
+`/help`, `/echo`, `/result-sets`, `/viz/fleet`, `/viz/host/:id`, `/instructions`; 29 routes — is
 `page_routes.{hpp,cpp}` (#2542 PR-2); a #2542 follow-up split 10 further scattered routes into
 `dashboard_api_routes.{hpp,cpp}` (`/api/me`, `/api/agents`, `/api/audit`, `POST
 /api/export/json-to-csv`, `POST /api/scope/validate`, `/api/analytics/{status,recent}`; 7 routes)
@@ -333,8 +333,8 @@ PR-11); the 3-route generic plugin-data Inventory API (Issue 7.17) — `GET
 colliding with `inventory_routes.hpp`'s unrelated `/inventory` dashboard, which lives directly in
 `yuzu::server`); and #2542 PR-12 (the Infra/Misc bundle — six small, heterogeneous modules with no
 single owning store, matching the `dashboard_api_routes`/`nvd_routes` bundling precedent) split a
-further 14 routes into six modules: the 2-route Runtime Configuration API (7.3) —
-`GET /api/config`, `PUT /api/config/:key` — is `config_routes.{hpp,cpp}`; the 5-route Chargen +
+further 14 routes into six modules: the Runtime Configuration API (7.3) —
+`GET /api/config`, `PUT /api/config/:key` and their `/api/v1/config` twins — is `config_routes.{hpp,cpp}` over the shared core in `config_write.{hpp,cpp}`; the 5-route Chargen +
 Procfetch diagnostic API — `POST /api/chargen/{start,stop}`, `POST /api/procfetch/fetch`,
 `GET /api/chargen/status`, `GET /api/procfetch/status` — is `diagnostics_routes.{hpp,cpp}`; the
 legacy `GET /events` SSE stream is `legacy_events_routes.{hpp,cpp}`; the 2-route Instructions HTMX
@@ -380,7 +380,7 @@ void MyRoutes::register_routes(httplib::Server& svr, /* deps... */) {
 **Why it is not optional.** A handler reachable only through the `httplib::Server&` overload
 cannot be exercised in-process, because binding a real port plus an acceptor thread in a test
 crashes under TSan with no TSan report (issue #438). Such a handler's authorization tier, CSRF
-gate, and scope checks are then untestable, which is how the TAR retention-paused purge/reenable
+gate, and scope checks are then untestable, which is how the Echo retention-paused purge/reenable
 fragments shipped a destructive operation with no route-handler coverage until #1786.
 
 **Invariant.** New route owners register through `HttpRouteSink&`; new routes on an existing owner

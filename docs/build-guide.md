@@ -49,6 +49,39 @@ headers are found and the link then fails on `undefined reference to fmt::v12::�
 out-of-tree build dir (a review worktree, a scratch checkout) needs the same two flags
 pointing at a populated `vcpkg_installed`.
 
+### Dependency features (agent-only installs)
+
+`vcpkg.json` splits dependencies into a shared base plus features, so an agent-only build need not compile server-only ports:
+
+| Set | Ports | Selected by |
+|---|---|---|
+| base (always) | grpc[codegen], protobuf, abseil, spdlog, nlohmann-json, cli11, cpp-httplib, sqlite3, openssl, zlib (Windows hand-wired grpc link, `_libzlib` in the root `meson.build`; also server/core), libxml2 (autoruns plugin) | always |
+| `server` | libpq, xmlsec, drogon | default feature |
+| `tests` | catch2 (`x64 \| arm64` only) | default feature |
+| `agent` | none today (placeholder) | explicit `--x-feature=agent` |
+
+`default-features` is `["server", "tests"]`, so every plain `vcpkg install --x-manifest-root=.` resolves the same package set as before the split (`scripts/setup.sh`, the server and CI images, the full CI matrix). Opt out for an agent-only install:
+
+```bash
+vcpkg install --triplet x64-linux --x-manifest-root=. --x-no-default-features
+meson setup build-linux -Dbuild_server=false ...   # -Dbuild_tests=false (default)
+# agent-only WITH tests: re-add the tests feature
+vcpkg install --triplet x64-linux --x-manifest-root=. --x-no-default-features --x-feature=tests
+```
+
+Planned (`vcpkg install --dry-run`, not built) on `x64-linux`: 23 → 16 target-triplet ports. The opt-out drops catch2, drogon, libpq, xmlsec, jsoncpp, libuuid and trantor, and libpq's bison/flex/autoconf build prerequisites are no longer needed either. `zlib` is declared in the base, not in `server`: the agent's Windows link requires it (`required: true`), so it must not depend on a grpc transitive happening to supply it. `brotli` stays (cpp-httplib's default `brotli` feature).
+
+**Shared trees and caches.** An agent-only and a full install of one triplet fill the same path, `vcpkg_installed/<triplet>/`, but vcpkg re-plans on every `install` and reconciles the tree in both directions: a default install onto an agent-only tree adds the server ports, and `--x-no-default-features` onto a full tree removes them (reproduced on `arm64-osx` with a scratch manifest on one `--x-install-root`; expected, not exercised, on Windows). A persistent self-hosted tree therefore needs no extra key, and `scripts/ci/vcpkg-triplet-sentinel.sh` deliberately takes no install profile: it would turn that incremental fix into a full wipe each time two jobs of different shapes share a runner.
+
+The remaining hazard is cost, not correctness: a GHA `actions/cache` key that saves `vcpkg_installed` (the `canary` job). A job that opts out and saves such a cache must put its install profile in the key, or an exact hit of the other shape skips that job's own save, so the wrong-shape tree stays in the cache and every run reconciles it again. The canary is a default (full) install, so its key needs no profile. Its `vcpkg.json` hash still changes once on merge, and the sentinel (which hashes `vcpkg.json`) then wipes the prefix-restored tree, so the first canary run after merge is one cold build (the canary has no binary cache).
+
+When you opt out:
+
+- `-Dbuild_server=false -Dbuild_tests=true` also needs `--x-feature=tests` (tests/meson.build requires Catch2).
+- `scripts/setup.sh` always installs the default set, so run vcpkg yourself as above.
+- vcpkg only *warns* on an unknown `--x-feature=` name (names are case-sensitive) and exits 0, and `--x-feature=agent` alone does not opt out of the defaults, so read the plan.
+- Only `Dockerfile.agent` and `Dockerfile.agent.chisel` opt out today. The one other agent-only leg, the Windows ASan job in `nightly.yml` (`-Dbuild_server=false -Dbuild_tests=true`), still installs the default set; switching it needs `--x-no-default-features --x-feature=tests`.
+
 ### Build options
 `-Dbuild_agent` / `-Dbuild_server` / `-Dbuild_examples` (default true — gates only the four demo plugins: `example`, `chargen`, `procfetch`, `netprobe`; every other plugin builds under `-Dbuild_agent` regardless) / `-Dbuild_tests` (default false) / `-Drequire_gateway` (default false; when true, a gateway that cannot be built - no `rebar3`, or no Erlang/OTP 28.4 or later 28.x - is a configure error instead of skipping the Erlang gateway build and its `gateway eunit`/`gateway ct` tests — for local fresh setups; CI legs instead run `scripts/ci/assert-gateway-tests.py` after configure, because a non-default option stored in a persistent CI build dir breaks older branches' reconfigures (see the comment above the `require_gateway` error in `meson.build` and PR #4851; #4841 is the separate macOS gap, where CI had no Erlang at all). The CI check guards only the workflow files: a local or shared build dir that has stored `-Drequire_gateway=true` must be reset to `false` from a checkout that still has the option (`meson configure -Drequire_gateway=false <dir>`) or wiped (`./scripts/setup.sh --wipe`) before another branch reconfigures it, because Meson validates `-D` against the dir's stored options and a branch whose `meson.options` lacks the option then fails with `Unknown options`), and the Meson built-ins `-Db_lto`, `-Db_sanitize=address,undefined` (ASan+UBSan) or `-Db_sanitize=thread` (TSan).
 
@@ -67,13 +100,13 @@ Per-OS build dirs prevent clobbering when one tree is built from multiple hosts 
 
 ## Test
 
-Every test target carries a `suite:` label (`agent`, `tar`, `server`) so `--suite <name>` filters directly:
+Every test target carries a `suite:` label (`agent`, `echo`, `server`, `proto`, `gateway`, `platform` for OS-contract tests that run on every CI leg, `docs` for OS-independent gates that run on the Linux leg only) so `--suite <name>` filters directly:
 
 ```bash
-meson test -C build-linux --suite <server|agent|tar> --print-errorlogs   # omit --suite for everything
+meson test -C build-linux --suite <server|agent|echo> --print-errorlogs   # omit --suite for everything
 ```
 
-Tests require `-Dbuild_tests=true`. vcpkg installs Catch2 only on `x64 | arm64`; the ARM64 cross-compile CI job intentionally skips tests.
+Tests require `-Dbuild_tests=true`. vcpkg installs Catch2 (the default-on `tests` feature, see "Dependency features") only on `x64 | arm64`; the ARM64 cross-compile CI job intentionally skips tests.
 
 ### Direct binary invocation
 

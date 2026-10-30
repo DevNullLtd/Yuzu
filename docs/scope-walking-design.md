@@ -1,6 +1,6 @@
 # Yuzu Scope-Walking — Composable Scope from Previous Query Results
 
-**Status:** Design (Phase 1 of TAR dashboard rollout — see `docs/roadmap.md` and `docs/tar-dashboard.md`)
+**Status:** Design (Phase 1 of Echo dashboard rollout — see `docs/roadmap.md` and `docs/echo-dashboard.md`)
 **Audience:** Architects, scope-engine maintainers, DSL implementers, dashboard UI engineers
 **Owners:** `architect` agent (cross-cutting), `dsl-engineer` agent (DSL surface), `consistency-auditor` (audit trail)
 
@@ -56,7 +56,7 @@ CREATE TABLE result_sets (
   ttl_at          INTEGER NOT NULL,        -- epoch seconds; row is GC'd when CURRENT_TIMESTAMP > ttl_at AND pinned=0
   pinned          INTEGER NOT NULL DEFAULT 0,
   parent_id       TEXT REFERENCES result_sets(id) ON DELETE SET NULL,  -- lineage edge (nullable for ground sets)
-  source_kind     TEXT NOT NULL,           -- 'inventory_query' | 'tar_query' | 'instruction_result' | 'manual_curate'
+  source_kind     TEXT NOT NULL,           -- 'inventory_query' | 'echo_query' | 'instruction_result' | 'manual_curate'
   source_payload  TEXT NOT NULL,           -- JSON; see §3.2
   device_count    INTEGER NOT NULL,
   CHECK (length(id) >= 5 AND substr(id,1,3) = 'rs_'),
@@ -87,7 +87,7 @@ All shapes carry enough information to **re-evaluate the query against the curre
   "evaluated_at": 1735689600
 }
 
-// source_kind = "tar_query"
+// source_kind = "echo_query"
 {
   "sql": "SELECT DISTINCT pid FROM process_live WHERE name = 'chrome.exe'",
   "scope_input_id": "rs_01HXYZ...",
@@ -107,6 +107,8 @@ All shapes carry enough information to **re-evaluate the query against the curre
 // source_kind = "manual_curate"
 { "note": "Friday tabletop — Chrome IR drill", "manual_inclusions": ["device-...", "..."] }
 ```
+
+**Column matchers on any instruction with a result schema.** A kind-less `{"column":C,"op":O,...}` matcher resolves `C` from an Echo `__schema__` line, from JSON array-of-objects output, or — for every other plugin's plain pipe rows — from the instruction definition's declared `result_schema`. At admission the server stores two **server-authored** keys in the stored matcher when `C` is a declared column: `"declared_columns": [<field names in output order>]` (the same source the dashboard names its columns from) and `"plugin": "<name>"`. Evaluation splits each output line exactly as the dashboard does (`split_fields`, `\|` escapes honoured) and skips the header row and any line whose width differs from `declared_columns` (`status|not_found`, `not_available|<reason>`, a longer trailer row, malformed rows). A definition may instead declare a row discriminator (`discriminator: true` on its first column, as `device.filesystem.find_by_hash` does): the server then also stores `"row_discriminator": true`, and evaluation splits each line on every unescaped pipe so a key-value plugin's wider declaration (`row_kind, path, size`) binds positionally, keeping the same strict width rule. Without the key a key-value plugin's rows stay key plus remainder and never match a wider declaration, so a stored definition that predates the key matches no device rather than binding the wrong cells. A caller supplying any of these server-authored keys is refused (400 / `-32602`); a stored row with a wrong-typed key matches no device. Re-eval reuses the stored matcher, so it behaves identically. A column the definition does not declare stores no extra keys and behaves as before.
 
 `evaluated_at` is informational; it does **not** make the membership list stale by itself — re-eval is operator-driven. See §5 for staleness semantics.
 
@@ -161,14 +163,14 @@ rs_01HXYZ resolved to 2,798 devices (3 dropped: 2 offline > 24h, 1 decommissione
 
 ## 5. Materialisation vs. lazy evaluation
 
-The default is **materialisation at create time** — the device IDs are written to `result_set_members` and never re-derived from the source query unless the operator triggers live re-eval. Trade-offs:
+The default is **materialisation at create time** — the device IDs are written to `result_set_members` and never re-derived from the source query. An operator can run a live re-eval, which creates a new sibling set and leaves the original unchanged (only `echo_query` and `instruction_result` sets can be re-run). Trade-offs:
 
 | Approach | Pros | Cons | Decision |
 |---|---|---|---|
 | **Materialise** | Stable, reproducible, audit-friendly, fast resolve | Membership goes stale as estate mutates | Default — operators *want* a stable target during IR |
-| **Lazy** | Always fresh | Re-evaluates a possibly-expensive query on every action; results shift mid-chain | Available via `?live=true` query param on resolve |
+| **Lazy** | Always fresh | Re-evaluates a possibly-expensive query on every action; results shift mid-chain | Not implemented. No route takes a `live` parameter; the only refresh is `POST /api/v1/result-sets/{id}/re-eval` |
 
-The dashboard surfaces the materialisation timestamp (`Created 09:42 UTC, 17m ago — Re-eval`) on every result-set chip so the operator knows what they are aiming at. Live re-eval is a one-click action that produces a *new* result set ID; the original stays put.
+The dashboard surfaces the materialisation timestamp on the result-set detail, so the operator knows what they are aiming at. Live re-eval is a one-click **Re-evaluate** button, shown only for the source kinds that can be re-run, that produces a *new* result set ID; the original stays put.
 
 ## 6. REST API
 
@@ -176,18 +178,20 @@ Base path: `/api/v1/result-sets`. All routes require an authenticated session an
 
 | Method | Path | Body | Returns | Notes |
 |---|---|---|---|---|
-| `POST` | `/api/v1/result-sets` | `{name?, source_kind, source_payload, device_ids[]}` | `{id, ttl_at, device_count}` | Direct create — operator passes pre-computed members. Used by dashboard for "I have a CSV" import. |
-| `POST` | `/api/v1/result-sets/from-inventory-query` | `{name?, query, parent_id?}` | `{id, ttl_at, device_count}` | Server runs the inventory query inside `parent_id`'s scope (or `__all__`) and persists the result. Reads the Postgres-backed generic `InventoryStore` (ADR-0037); returns **503** on a store degrade rather than persisting a result set built from a silent-empty read. |
-| `POST` | `/api/v1/result-sets/from-tar-query` | `{name?, sql, parent_id?}` | `{id, ttl_at, device_count}` | Dispatches the SQL to TAR agents in `parent_id`'s scope; the device-ID set is the union of agents that returned ≥1 row (default) or all agents that responded (`include_empty=true`). |
-| `POST` | `/api/v1/result-sets/from-instruction-result` | `{name?, instruction_id, params, matcher, parent_id?}` | `{id, ttl_at, device_count}` | Runs the instruction in `parent_id`'s scope; the device set is filtered by `matcher`. Mirrors the Chrome hash-check step. |
-| `GET` | `/api/v1/result-sets` | — | `{result_sets: [...]}` | Pagination by `?cursor=`. Default sort: `created_at DESC`. |
-| `GET` | `/api/v1/result-sets/{id}` | — | `{id, name, owner_principal, created_at, ttl_at, pinned, parent_id, source_kind, source_payload, device_count}` | |
-| `GET` | `/api/v1/result-sets/{id}/members` | — | `{device_ids: [...]}` | Pagination by `?cursor=`. |
-| `GET` | `/api/v1/result-sets/{id}/lineage` | — | `{chain: [{id, name, source_kind, device_count, narrowing}, ...]}` | Walks `parent_id` to root. The dashboard breadcrumb does **not** call this REST route — it is rendered server-side via `/fragments/result-sets/*`, which calls the plain `lineage()` store wrapper directly, with no HTTP hop through the REST API. |
-| `POST` | `/api/v1/result-sets/{id}/pin` | — | `{ttl_at, pinned}` | |
-| `POST` | `/api/v1/result-sets/{id}/unpin` | — | `{ttl_at, pinned}` | |
-| `POST` | `/api/v1/result-sets/{id}/re-eval` | — | `{new_id, device_count_delta}` | Re-runs `source_payload` and creates a new set with `parent_id = original.parent_id` (sibling, not child). |
-| `DELETE` | `/api/v1/result-sets/{id}` | — | `204` | Pinned sets must be unpinned first. |
+| `POST` | `/api/v1/result-sets` | `{name?, source_kind, source_payload, device_ids[], parent_id?}` | `201` and the full set record | Direct create — operator passes pre-computed members; an optional `parent_id` parents the new set onto an owned set. Used by dashboard for "I have a CSV" import. |
+| `POST` | `/api/v1/result-sets/from-inventory-query` | `{name?, combine?, conditions[], parent_id?}` | `201` and the full set record | Server runs the inventory query inside `parent_id`'s scope (or `__all__`) and persists the result. Reads the Postgres-backed generic `InventoryStore` (ADR-0037); returns **503** on a store degrade rather than persisting a result set built from a silent-empty read. |
+| `POST` | `/api/v1/result-sets/from-echo-query` | `{name?, sql, parent_id?}` | `202` and the full set record (`status` shows progress) | Dispatches the SQL to Echo agents in `parent_id`'s scope; the device-ID set is the union of agents that returned ≥1 row (default) or all agents that responded (`include_empty=true`). |
+| `POST` | `/api/v1/result-sets/from-instruction-result` | `{name?, instruction_id, params, matcher, parent_id?}` | `202` and the full set record (`status` shows progress) | Runs the instruction in `parent_id`'s scope; the device set is filtered by `matcher`. Mirrors the Chrome hash-check step. |
+| `GET` | `/api/v1/result-sets` | — | `{result_sets: [...], next_cursor}` | Pagination by `?cursor=`. Default sort: `created_at DESC`. |
+| `GET` | `/api/v1/result-sets/{id}` | — | `{id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}` | |
+| `GET` | `/api/v1/result-sets/{id}/members` | — | `{device_ids: [...], next_cursor}` | Pagination by `?cursor=`. |
+| `GET` | `/api/v1/result-sets/{id}/lineage` | — | `{chain: [{id, name, source_kind, device_count}, ...]}` | Walks `parent_id` to root. The dashboard breadcrumb does **not** call this REST route — it is rendered server-side via `/fragments/result-sets/*`, which calls the plain `lineage()` store wrapper directly, with no HTTP hop through the REST API. |
+| `POST` | `/api/v1/result-sets/{id}/pin` | — | the full set record | |
+| `POST` | `/api/v1/result-sets/{id}/unpin` | — | the full set record | |
+| `POST` | `/api/v1/result-sets/{id}/re-eval` | — | `202` and the full set record of the new set | Re-runs `source_payload` and creates a new set with `parent_id = original.parent_id` (sibling, not child). Only `echo_query` and `instruction_result` sets can be re-run; any other source kind is refused with `400`. |
+| `DELETE` | `/api/v1/result-sets/{id}` | — | `{deleted: true}` | Pinned sets must be unpinned first. |
+
+**Shipped behaviour (the table above is brought in line with it).** Every route answers inside the usual `{data, meta}` envelope. Create answers `201` with the full set record (`id`, `name`, `owner_principal`, `created_at`, `ttl_at`, `last_used_at`, `pinned`, `parent_id`, `source_kind`, `status`, `source_execution_id`, `device_count`); the two producers that dispatch to agents and `re-eval` answer `202` with that record while the set fills. `GET /api/v1/result-sets/{id}` does not return `source_payload`. `DELETE` answers `200` with `{"deleted": true}`; an unknown id is `404` and a pinned set `409`. Lineage nodes carry `id`, `name`, `source_kind` and `device_count` but no `narrowing`. `re-eval` writes the audit verb `result_set.create`; the `result_set.live_reeval` verb in the audit table below is not written by any handler.
 
 **`parent_id` is a targeting argument, and omitted is not the same as empty (#2500).** Omit
 `parent_id` to run against `__all__` deliberately. A **supplied** `parent_id` that is an empty
@@ -195,7 +199,7 @@ string, a non-string value, or an explicit `null` returns `400 RESULT_SET_BAD_PA
 than silently dropping the narrowing and running unscoped — a caller who believed it was
 narrowing to one result set must not search or dispatch across the whole fleet instead.
 
-**The three async producers are confined per device (#1788).** `from-tar-query`,
+**The three async producers are confined per device (#1788).** `from-echo-query`,
 `from-instruction-result` and `{id}/re-eval` DISPATCH to agents, so they are operator dispatch
 surfaces rather than reads. They admit on a global `Execution:Execute` grant and then reach the
 fleet by scope or `__all__` broadcast — so the caller's derived visible set, intersected at the
@@ -250,7 +254,7 @@ re-resolving `scope_input_id` or broadcasting. Re-resolution is deliberately not
 newer set; resolving it at re-eval time would retarget the dispatch to whatever the alias means
 *today*, not what it meant when the original was created. `scope_input_id` is recorded whenever
 `parent_id` was supplied at creation, on all four creation paths -- the dedicated
-`from-tar-query`/`from-instruction-result`/`from-inventory-query` producers (which always build a
+`from-echo-query`/`from-instruction-result`/`from-inventory-query` producers (which always build a
 well-formed JSON object payload themselves) and the generic `POST /api/v1/result-sets` / MCP
 `create_result_set` create routes (#4306 follow-up), all mirroring the identical
 `payload["scope_input_id"] = ...` persistence -- **except** that the two generic routes only merge
@@ -316,11 +320,11 @@ Persistent left-rail panel showing the current operator's result sets, ranked by
 ```
 [★] windows-chrome-suspects     2,798 devices  17m  pinned
 [ ] all-windows-fleet           4,011 devices   2h
-[ ] tar-chrome-procs           (tar query)     8m
+[ ] echo-chrome-procs           (echo query)     8m
 ```
 
 Each chip has:
-- Click → switch the active scope chip in any TAR / inventory / instruction frame
+- Click → switch the active scope chip in any Echo / inventory / instruction frame
 - Right-click → pin, unpin, re-eval, view lineage, delete, rename, copy ID
 
 ### 8.2 Chain breadcrumb
@@ -337,7 +341,7 @@ Clicking a breadcrumb segment switches the active scope to that ancestor. The br
 
 ### 8.3 Frame integration
 
-Every query frame (TAR SQL, Inventory, Instruction-launch) gains the same "scope chip" header:
+Every query frame (Echo SQL, Inventory, Instruction-launch) gains the same "scope chip" header:
 
 ```
 Scope: [windows-chrome-suspects ▼]   2,798 devices   pinned   17m old   [Re-eval]
@@ -352,7 +356,7 @@ Every state transition writes an `AuditEvent` per `docs/observability-convention
 | Action | Result | Notes |
 |---|---|---|
 | `result_set.create` | `success` / `failure` / `denied` | Includes source_kind (plus `execution_id` and the dispatched-agent count on the async producers); parent_id and device_count are not yet recorded (#4088). `denied` when a supplied `parent_id` names no parent set (#2500), with `detail=reason=parent_id_type\|parent_id_empty`, or when it exceeds 64 bytes (#4734), with `detail=reason=parent_id_too_long[ source_kind=<src_kind>]` -- audited on all five create surfaces but, unlike the shape-check refusal just named, never counted on `yuzu_server_dispatch_target_rejected_total`; also `denied` on `{id}/re-eval` when the original's live parent is gone but its persisted `scope_input_id` shows it was narrowed at creation (#4306), with `detail=reason=parent_gone source_kind=<orig source_kind> scope_input_id=<stale value>`, target_id=`<original id>` (`scope_input_id` added in the #4306 governance follow-up, run through `audit_token()`/`log_token` neutralisation like every other caller-influenced audit-detail token in this file, so the erased target is still forensically identifiable after the originating row TTL-expires when it is a canonical `rs_` id; when it is an ALIAS rather than a canonical id, the recorded string is only the caller's typed reference at creation time -- `resolve_alias`'s newest-wins lookup means the same alias may since be re-bound to a different set, so it must never be re-resolved later to mean "the erased target," only read as "what the caller typed"). `failure` on the inventory-query producer (#4496, extended by the #4496 follow-up) with `detail=reason=store_degraded\|query_truncated\|poison_excluded\|parse_error_excluded source_kind=inventory_query` |
-| `result_set.live_reeval` | `success` / `failure` | Includes original_id, new_id, device_count_delta |
+| `result_set.live_reeval` | `success` / `failure` | Design only: no shipped handler writes this verb (`re-eval` writes `result_set.create`). Would include original_id, new_id, device_count_delta |
 | `result_set.heal` | `success` / `failure` | #4493: written by REST `/re-eval` and MCP `reevaluate_result_set` when the stored `source_payload` is found nested past `kMcpMaxJsonDepth`. `success` = `heal_poisoned_payload` discarded the poisoned payload; `failure` = the caller's own depth check found poison but `heal_poisoned_payload`'s return was `false` - a genuine write failure (row unchanged, still poisoned), a benign race where a concurrent caller already healed the row first (row unchanged, already healthy), or the row was deleted between heal's own SELECT and UPDATE (#4540: a concurrent `delete_set` or the TTL GC sweep, neither holding a shared lock) and no longer exists at all - the three are not currently distinguished (#4524). Not written on a row already healthy at the caller's own check (heal is a no-op there, nothing to audit). |
 | `result_set.pin` / `result_set.unpin` | `success` | |
 | `result_set.delete` | `success` | Pinned sets require explicit unpin first; `delete` of an unpinned set is single-action |
@@ -390,7 +394,7 @@ Step 2.  Inventory narrowing scoped to rs_01:
          POST /api/v1/result-sets/from-inventory-query  (parent_id=rs_01)
          → rs_02: "windows-chrome-vulnerable" (412 devices)
 
-Step 3.  Instruction (tar.process_tree -> file.hash_check) scoped to rs_02:
+Step 3.  Instruction (echo.process_tree -> file.hash_check) scoped to rs_02:
          hash of "C:\Program Files\Google\Chrome\Application\chrome.exe" IN [bad_hashes]
          POST /api/v1/result-sets/from-instruction-result  (parent_id=rs_02, matcher in [...])
          → rs_03: "windows-chrome-bad-hash" (37 devices)
@@ -409,26 +413,26 @@ Step 7.  Action: software.uninstall scoped to rs_04, package="Google Chrome"
 Step 8.  Action: software.install scoped to rs_04, package="Google Chrome", version="125.0.x.x", source=trusted_repo
 Step 9.  Action: file.replace scoped to rs_04, path="...<vendor>.dll", source=trusted_blob_ref
 Step 10. Action: firewall.unblock_all scoped to rs_04
-Step 11. Watch: heightened TAR retention + IOC subscription scoped to rs_04 for 30 days
+Step 11. Watch: heightened Echo retention + IOC subscription scoped to rs_04 for 30 days
          (creates a TriggerTemplate-bound policy: rs_04 keeps its pin until the watch ends)
 ```
 
 Design intent, not yet implemented: every step's audit row should carry the parent and resulting result-set ids so a forensic timeline can reconstruct the full reasoning chain — *exactly the limited-context-window problem this primitive exists to solve*. Today a `result_set.create` row records the new set's id (`target_id`) and its `source_kind` (plus `execution_id` and the dispatched-agent count on the async producers), but not its `parent_id` or device count (#4088), and action-dispatch rows (steps 5–10) carry no result-set id. The walkable lineage is held in the result-set store's `parent_id` column, which is nulled when an ancestor set is deleted or garbage-collected, so pin every set in a chain you need to reconstruct later.
 
-This walkthrough is the reference scenario for end-to-end correctness. `tests/unit/server/test_chrome_ir_chain.cpp` covers a three-set narrowing chain modelled on steps 1–4 (the TAR-query and instruction-result producers), in-process through the real `/api/v1/result-sets` REST surface via `TestRouteSink`. It asserts that `GET /{id}/lineage` walks the chain to its root, that each narrowing step writes one `result_set.create` audit row (plus the pin and unpin rows), that a pinned set is not removed by `gc_sweep()` and cannot be deleted until unpinned (409), and that the chain tears down cleanly. It does not cover steps 5–11 (no scoped actions, no watch). The ground set uses the direct-create endpoint in place of the inventory-query producer, command dispatch is faked, and async sets are materialised directly rather than by live agents — see the test's own header. Its GC check runs on unexpired sets; the store-level `[result_set][gc]` tests in `tests/unit/server/test_result_set_store.cpp` back-date an unpinned set beside a pinned one and assert that only the unpinned set is swept.
+This walkthrough is the reference scenario for end-to-end correctness. `tests/unit/server/test_chrome_ir_chain.cpp` covers a three-set narrowing chain modelled on steps 1–4 (the Echo-query and instruction-result producers), in-process through the real `/api/v1/result-sets` REST surface via `TestRouteSink`. It asserts that `GET /{id}/lineage` walks the chain to its root, that each narrowing step writes one `result_set.create` audit row (plus the pin and unpin rows), that a pinned set is not removed by `gc_sweep()` and cannot be deleted until unpinned (409), and that the chain tears down cleanly. It does not cover steps 5–11 (no scoped actions, no watch). The ground set uses the direct-create endpoint in place of the inventory-query producer, command dispatch is faked, and async sets are materialised directly rather than by live agents — see the test's own header. Its GC check runs on unexpired sets; the store-level `[result_set][gc]` tests in `tests/unit/server/test_result_set_store.cpp` back-date an unpinned set beside a pinned one and assert that only the unpinned set is swept.
 
 ## 11. Roll-out — what ships when
 
 | PR | Deliverable | Doc / code touched |
 |---|---|---|
-| PR-A | TAR dashboard page shell + retention-paused source list (no scope-walking yet — uses existing scope) | `docs/tar-dashboard.md` PR-A scope. **Starts here** |
+| PR-A | Echo dashboard page shell + retention-paused source list (no scope-walking yet — uses existing scope) | `docs/echo-dashboard.md` PR-A scope. **Starts here** |
 | PR-B | `result_set_store.cpp` + `result_sets.db` schema + REST routes (§6) + audit hooks (§9) | Server-side storage and API only |
 | PR-C | Scope Engine `from_result_set:` kind (§4) + dashboard scope chip + sidebar + breadcrumb | UI integration of the primitive |
-| PR-D | TAR SQL frame consumes / produces result sets via §6 routes | First end-to-end loop in the dashboard |
+| PR-D | Echo SQL frame consumes / produces result sets via §6 routes | First end-to-end loop in the dashboard |
 | PR-E | DSL `fromResultSet:` (§7) + definition/policy validation + DSL spec amendment | **Shipped** — instruction-side validation + `selector:` lowering + dispatch alias resolution + `scope_resolution_failed` audit. **Policy `fromResultSet:` deferred to PR-E2** (owner field + `PolicyEvaluator` wiring + pinned-set rule). |
 | PR-F | Reference walkthrough integration test (§10) | Regression net |
 | PR-G | Live re-eval, pin storm guards, GC sweep, Prometheus + audit polish | Operational hardening |
-| PR-H | Process tree viewer (separate slice — see `docs/tar-dashboard.md` §6) | Builds on PR-D's frame pattern |
+| PR-H | Process tree viewer (separate slice — see `docs/echo-dashboard.md` §6) | Builds on PR-D's frame pattern |
 
 PR-A is in scope **for the current session** — it ships the page and the retention list against the existing scope grammar. Everything else is sequenced after.
 

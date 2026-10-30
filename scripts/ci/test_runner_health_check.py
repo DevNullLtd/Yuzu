@@ -320,19 +320,35 @@ class WorkflowWiringTests(unittest.TestCase):
             raise AssertionError(f"job {name!r} not found in {workflow}")
         return match.group(1)
 
+    @staticmethod
+    def meson_test_chunks() -> list[str]:
+        """tests/meson.build split at every test( call; each chunk starts after it."""
+        text = (ROOT / "tests" / "meson.build").read_text(encoding="utf-8")
+        return re.split(r"(?m)^[ \t]*test\(", text)[1:]
+
+    @staticmethod
+    def meson_test_name(chunk: str) -> str:
+        return re.match(r"\s*('[^']*')", chunk).group(1)
+
     def test_weetam_gate_matches_every_windows_consumer(self) -> None:
-        for workflow, job_name in (("ci.yml", "windows"), ("nightly.yml", "windows-asan")):
+        # ci.yml's pool probe lives in the fast `preflight-gate` job (the required
+        # `preflight` check carries only the source gates); nightly.yml still has
+        # the one `preflight` job.
+        for workflow, job_name, gate in (
+            ("ci.yml", "windows", "preflight-gate"),
+            ("nightly.yml", "windows-asan", "preflight"),
+        ):
             with self.subTest(workflow=workflow, job=job_name):
                 job = self.job(workflow, job_name)
                 self.assertRegex(
                     job,
                     r"(?m)^    runs-on: \[self-hosted, Windows, X64, yuzu-weetam-windows\]$",
                 )
-                self.assertIn("needs.preflight.outputs.weetam_pool_healthy == 'true'", job)
+                self.assertIn(f"needs.{gate}.outputs.weetam_pool_healthy == 'true'", job)
 
-        for workflow in ("ci.yml", "nightly.yml"):
+        for workflow, gate in (("ci.yml", "preflight-gate"), ("nightly.yml", "preflight")):
             with self.subTest(workflow=workflow):
-                preflight = self.job(workflow, "preflight")
+                preflight = self.job(workflow, gate)
                 self.assertIn("--require-pool weetam", preflight)
                 self.assertIn("weetam_pool_healthy", preflight)
 
@@ -344,11 +360,11 @@ class WorkflowWiringTests(unittest.TestCase):
                     job,
                     r"(?m)^    runs-on: \[self-hosted, macOS, ARM64, yuzu-bigmags-macos\]$",
                 )
-                self.assertIn("needs.preflight.outputs.bigmags_pool_healthy == 'true'", job)
+                self.assertIn("needs.preflight-gate.outputs.bigmags_pool_healthy == 'true'", job)
 
         for workflow in ("ci.yml",):
             with self.subTest(workflow=workflow):
-                preflight = self.job(workflow, "preflight")
+                preflight = self.job(workflow, "preflight-gate")
                 self.assertIn("--require-pool bigmags", preflight)
                 self.assertIn("bigmags_pool_healthy", preflight)
 
@@ -363,7 +379,7 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertIn(name_line, self.job(workflow, "preflight"))
 
     def test_automatic_fork_detection_comes_from_the_event_payload(self) -> None:
-        preflight = self.job("ci.yml", "preflight")
+        preflight = self.job("ci.yml", "preflight-gate")
         self.assertIn(
             "GITHUB_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}",
             preflight,
@@ -376,14 +392,159 @@ class WorkflowWiringTests(unittest.TestCase):
 
     def test_trusted_call_uses_its_input_and_always_verifies_checkout(self) -> None:
         trusted_inputs = self.job("ci.yml", "trusted_inputs")
+        gate = self.job("ci.yml", "preflight-gate")
         preflight = self.job("ci.yml", "preflight")
         self.assertIn('if [[ -z "$APPROVED_SHA" ]]', trusted_inputs)
         self.assertNotIn("EVENT_NAME", trusted_inputs)
         self.assertIn("checkout_sha=$head_sha", trusted_inputs)
         self.assertIn("trusted_execution=true", trusted_inputs)
-        self.assertIn("ref: ${{ github.workflow_sha }}", preflight)
+        self.assertIn("ref: ${{ github.workflow_sha }}", gate)
         self.assertIn("- name: Verify resolved checkout", preflight)
         self.assertNotIn("if: github.event_name == 'workflow_call'", preflight)
+        self.assertNotIn("if: github.event_name == 'workflow_call'", gate)
+
+    def test_ci_preflight_split_wiring(self) -> None:
+        """The required check name stays on `preflight`; the fast `preflight-gate`
+        job feeds every consumer, and `preflight` fails closed on it."""
+        gate = self.job("ci.yml", "preflight-gate")
+        for pool in ("bigtam", "weetam", "bigmags"):
+            self.assertIn(f"--require-pool {pool}", gate)
+        self.assertIn("id: codegate", gate)
+        self.assertIn("id: health", gate)
+        self.assertIn("secrets.RUNNER_INVENTORY_TOKEN", gate)
+        self.assertIn('name: "Preflight (gate)"', gate)
+
+        preflight = self.job("ci.yml", "preflight")
+        self.assertIn('name: "Preflight (runner health)"', preflight)
+        self.assertIn("needs: [trusted_inputs, preflight-gate]", preflight)
+        self.assertIn("if: ${{ !cancelled() }}", preflight)
+        self.assertIn("needs.preflight-gate.result", preflight)
+        # The only step that sees the administration-scoped token is in the gate.
+        self.assertNotIn("secrets.RUNNER_INVENTORY_TOKEN", preflight)
+
+        for job_name, pool in (
+            ("proto-compat", "linux"),
+            ("linux", "bigtam"),
+            ("windows", "weetam"),
+            ("macos", "bigmags"),
+        ):
+            with self.subTest(job=job_name):
+                job = self.job("ci.yml", job_name)
+                self.assertIn("needs: [preflight-gate]", job)
+                self.assertIn(
+                    f"needs.preflight-gate.outputs.{pool}_pool_healthy == 'true'", job
+                )
+                self.assertIn("needs.preflight-gate.outputs.code_changed == 'true'", job)
+        stub = self.job("ci.yml", "docs-required-checks")
+        self.assertIn("needs: [preflight-gate]", stub)
+        self.assertIn("needs.preflight-gate.outputs.code_changed == 'false'", stub)
+        text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertNotRegex(text, r"needs\.preflight\.outputs\.")
+
+    def test_windows_suite_cover_guards_match_their_selections(self) -> None:
+        """Both Windows Test steps run assert-suite-cover.py over the suites they
+        really select. The pg step must exclude `platform`, or its guard fails the
+        job on every debug/full run (#4884)."""
+        windows = self.job("ci.yml", "windows")
+        steps = [
+            step
+            for step in re.split(r"(?m)^      - ", windows)
+            if "python scripts/ci/assert-suite-cover.py" in step
+        ]
+        expected = (
+            (
+                {"agent", "platform", "proto", "echo", "gateway", "server-nonpg", "server-checks"},
+                {"server-pg", "server-pg-smoke", "docs"},
+            ),
+            (
+                {"server-pg"},
+                {"agent", "docs", "proto", "echo", "gateway", "server-nonpg", "server-checks",
+                 "server-pg-smoke", "platform"},
+            ),
+        )
+        self.assertEqual(len(expected), len(steps))
+        for step, (selected, excluded) in zip(steps, expected):
+            with self.subTest(selected=sorted(selected)):
+                suites = re.search(r"suites=\(([^)]*)\)", step)
+                self.assertIsNotNone(suites)
+                self.assertEqual(selected, set(re.findall(r"--suite (\S+)", suites.group(1))))
+                guard = re.search(
+                    r"python scripts/ci/assert-suite-cover\.py(?:[^\n]*\\\n)*[^\n]*", step
+                )
+                self.assertIsNotNone(guard)
+                self.assertEqual(excluded, set(re.findall(r"--exclude-suite (\S+)", guard.group(0))))
+                # The guard and flake-retry share one list, so neither can drift.
+                self.assertEqual(2, step.count('"${suites[@]}"'))
+
+    def test_per_leg_suite_selectors_and_platform_entries(self) -> None:
+        """docs runs on the Linux leg only; the OS-contract entries live in suite
+        `platform` and run on every leg (#4884)."""
+        self.assertIn(
+            "--suite agent --suite docs --suite proto --suite echo --suite gateway --suite platform",
+            self.job("ci.yml", "linux"),
+        )
+        self.assertIn("--no-suite docs", self.job("ci.yml", "macos"))
+        # A dual label ('healthcheck CLI contract' is ['server', 'platform']) counts too.
+        platform = {
+            self.meson_test_name(chunk)
+            for chunk in self.meson_test_chunks()
+            if re.search(r"suite:\s*(?:'platform'|\[[^\]]*'platform'[^\]]*\])", chunk)
+        }
+        self.assertEqual(
+            {
+                "'Windows toolchain contract'",
+                "'gateway build wrapper'",
+                "'gateway OTP pin resolution'",
+                "'instructions runner hardening'",
+                "'windows sdk contract'",
+                "'build_examples=false gating smoke test'",
+                "'start-UAT.sh kill_stale scoping (#5333)'",
+                "'capability matrix gate shell tests (#2204 F10)'",
+                "'healthcheck CLI contract (#5906)'",
+            },
+            platform,
+        )
+
+    def test_duration_summary_follows_every_flake_retry_test_step(self) -> None:
+        """meson overwrites testlog.json on each invocation, so the summary runs
+        once per flake-retry Test step, against that step's own build dir."""
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertEqual(6, len(re.findall(r"scripts/ci/test-durations-summary\.py --builddir", ci)))
+        for job_name, labels in (
+            ("linux", ["Linux non-pg (cheap suites)", "Linux non-pg (server shards)", "Linux pg shards"]),
+            ("windows", ["Windows non-pg", "Windows pg shards"]),
+            ("macos", ["macOS"]),
+        ):
+            with self.subTest(job=job_name):
+                job = self.job("ci.yml", job_name)
+                summaries = list(
+                    re.finditer(
+                        r'scripts/ci/test-durations-summary\.py --builddir (.+?) --label "([^"]+)"', job
+                    )
+                )
+                self.assertEqual(labels, [m.group(2) for m in summaries])
+                for m in summaries:
+                    runs = re.findall(r"flake-retry\.py --builddir (.+?) --", job[: m.start()])
+                    self.assertTrue(runs)
+                    self.assertEqual(runs[-1], m.group(1))
+
+    def test_every_catch2_entry_carries_durations(self) -> None:
+        """The per-case summary reads Catch2's `--durations=yes` (the `=` form is
+        required, see docs/ci-architecture.md). Every `*_exe` test() entry is a
+        Catch2 binary. The two exemptions are deliberate: a ~3 s push-only smoke
+        entry and the [tsan-heavy] checkpoints entry."""
+        exempt = {"'server pg smoke'", "'agent tsan-heavy checkpoints'"}
+        seen = set()
+        for chunk in self.meson_test_chunks():
+            m = re.match(r"\s*('[^']*'(?:\s*\+\s*\w+)?)\s*,\s*(\w+_exe)\b", chunk)
+            if not m:
+                continue
+            seen.add(m.group(1))
+            if m.group(1) not in exempt:
+                with self.subTest(entry=m.group(1)):
+                    self.assertIn("'--durations=yes'", chunk)
+        self.assertLessEqual(exempt, seen)
+        self.assertGreater(len(seen - exempt), 1)
 
     def test_trusted_fork_secret_and_cache_boundaries_are_explicit(self) -> None:
         wrapper = (ROOT / ".github" / "workflows" / "trusted-fork-ci.yml").read_text(
@@ -435,7 +596,7 @@ class WorkflowWiringTests(unittest.TestCase):
             with self.subTest(job=job_name):
                 job = self.job("ci.yml", job_name)
                 self.assertIn(
-                    "clean: ${{ needs.preflight.outputs.trusted_execution == 'true' }}",
+                    "clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}",
                     job,
                 )
                 self.assertIn("VCPKG_BINARY_SOURCES=clear", job)
@@ -502,7 +663,7 @@ class WorkflowWiringTests(unittest.TestCase):
         with self.subTest(job="macos"):
             job = self.job("ci.yml", "macos")
             self.assertNotIn(
-                "clean: ${{ needs.preflight.outputs.trusted_execution == 'true' }}",
+                "clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}",
                 job,
             )
             self.assertIn("VCPKG_BINARY_SOURCES=clear", job)

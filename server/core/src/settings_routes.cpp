@@ -28,6 +28,7 @@
 #include "integrations_render.hpp" // MCP + Gateway panel markup and the MCP form parser
 #include "json_extract.hpp" // #2557: shared extract_json_string (was an anonymous-namespace copy)
 #include "mcp_policy.hpp"
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log (enrol-confirm stamp log)
 #include "oidc_writer_gate.hpp" // writer priority for the OIDC lock (#5692 UP-13)
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
@@ -37,6 +38,7 @@
 #include "plugin_signing_helpers.hpp"
 #include "rest_a4_envelope.hpp"      // #4028 — detail::error_json_a4 for the settings read-twins
 #include "audited_write.hpp"          // detail::audit_attempted — audit-first settings.mcp
+#include "auth_routes.hpp"           // AuthRoutes::extract_session_cookie (enrol-confirm proof stamp)
 #include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
 #include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
 #include "settings_model.hpp"        // #4028 — shared REST/fragment read-twin builders
@@ -140,9 +142,14 @@ std::string url_encode(const std::string& s) {
 
 // A refused MFA step-up on an htmx form: `step_up_fn_` has already written the refusal (a 401/403/503
 // A4 envelope). htmx swaps no 4xx/5xx body, so without a toast the button looks dead. Show the
-// envelope's own `error.message` (never its `remediation`, which for a SAML session points back at
-// a sign-in that cannot help); fall back to a fixed message if the body is not an envelope.
+// envelope's own `error.message` (never its `remediation`, which names API-caller steps such as a
+// token or a POST route, not something the form can do); fall back to a fixed message if the body is not an envelope.
+// An in-handler refusal (require_mfa_step_up) already toasts on an htmx request via
+// render_step_up_refusal; Response::set_header appends to a multimap, so a second HX-Trigger here
+// would put two lines on the wire. Do nothing when one is already set.
 void toast_step_up_refusal(httplib::Response& res) {
+    if (res.has_header("HX-Trigger"))
+        return;
     std::string message = "MFA step-up required";
     try {
         const auto body = nlohmann::json::parse(res.body, nullptr, false);
@@ -869,6 +876,18 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
     return html;
 }
 
+namespace {
+// In-page retry for a degraded Engine Principals fragment. A plain inline onclick (the dashboard
+// CSP blocks hx-on) fires the event the section already listens for. The page itself must not be
+// reloaded to retry: a freshly minted or rotated secret is shown outside this section and a
+// reload discards it.
+constexpr const char* kEngineRetryControl =
+    "<button class=\"btn btn-secondary\" type=\"button\" "
+    "onclick=\"htmx.trigger(document.body,'refreshEnginePrincipals')\">Retry</button> "
+    "<span class=\"hint\">Retry here instead of reloading the page, which would discard a "
+    "credential secret shown above.</span>";
+} // namespace
+
 std::string SettingsRoutes::render_engine_principals_fragment() {
     if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
         return "<span class=\"muted\">Engine Principals store unavailable "
@@ -887,7 +906,15 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
     // Admin/auditor list surface — every engine principal, any lifecycle
     // state, so revoked rows stay visible (never quietly dropped from the
     // console — design doc §3.1 / §12 decision 1).
-    auto principals = engine_principal_store_->list_all(/*include_revoked=*/true);
+    // CHECKED roster read: the plain `list_all` returns an empty vector on a pool-lease
+    // timeout or query failure, which would render "No engine principals" during an outage.
+    auto principals_res = engine_principal_store_->list_all_checked(/*include_revoked=*/true);
+    if (!principals_res) {
+        spdlog::warn("settings engine-principals: roster read failed: {}", principals_res.error());
+        return "<div class=\"muted\">Engine principals unavailable: the list could not be "
+               "read. " + std::string(kEngineRetryControl) + "</div>";
+    }
+    const auto& principals = *principals_res;
 
     std::string html = "<table class=\"user-table\">"
                        "  <thead><tr><th>Principal ID</th><th>Display Name</th><th>Owner</th>"
@@ -895,6 +922,10 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                        "  <th>Revocation</th><th></th></tr></thead>"
                        "  <tbody>";
 
+    // True once a credential read has failed, or from the start when no token store was ever
+    // wired: either way no row can show a credential count, the row hint points at the Retry
+    // control, and the revoke-detail lookups below are skipped.
+    bool credentials_unreadable = (api_token_store_ == nullptr);
     if (principals.empty()) {
         html += "<tr><td colspan=\"8\" class=\"muted\">No engine principals</td></tr>";
     } else {
@@ -903,10 +934,29 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
             const std::string status_cls = active ? "role-ok" : "role-user";
             const std::string status_txt = active ? "Active" : "Revoked";
 
+            // CHECKED read: the plain accessor turns a closed store, pool-lease timeout or
+            // query failure into an empty vector, which this cell would show as "0" for a
+            // principal that holds a live credential. A read that cannot answer says so in
+            // the cell and leaves the rest of the row (read from the principal store) intact.
+            // After the first failed read the remaining rows are marked unavailable without
+            // another credential read (and without the revoke-detail audit lookup below, which
+            // waits on the same pool): each failing read waits out its store's lease timeout, so
+            // retrying per row would hold this request for roughly N x that timeout. A store
+            // that was never wired is treated the same way from the first row.
             std::size_t active_creds = 0;
-            if (api_token_store_ && api_token_store_->is_open()) {
-                active_creds = api_token_store_->list_active_for_principal(p.principal_id).size();
+            bool creds_known = false;
+            if (!credentials_unreadable) {
+                auto checked = api_token_store_->list_active_for_principal_checked(p.principal_id);
+                if (checked) {
+                    active_creds = checked->size();
+                    creds_known = true;
+                } else {
+                    credentials_unreadable = true;
+                }
             }
+            const std::string active_creds_cell =
+                creds_known ? std::to_string(active_creds)
+                            : std::string("<span class=\"muted\">unavailable</span>");
 
             // Revoked rows MUST surface the `superseded_by` linkage AND the
             // recorded revoke detail explicitly (design doc §3.1 / §12
@@ -931,7 +981,13 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                         ? "<em class=\"muted\">no successor recorded</em>"
                         : ("superseded by <code>" + html_escape(p.superseded_by) + "</code>");
                 std::string audit_detail = "(not recorded)";
-                if (audit_store_) {
+                if (credentials_unreadable) {
+                    // The pool is already failing reads; do not queue another lease wait per
+                    // revoked row (revoked rows are never pruned, so they only accumulate).
+                    // "(unavailable)" here means "not looked up", not "the audit store failed":
+                    // rows rendered before the first failed read still show their real detail.
+                    audit_detail = "(unavailable)";
+                } else if (audit_store_) {
                     AuditQuery q;
                     q.target_type = "EnginePrincipal";
                     q.target_id = p.principal_id;
@@ -970,7 +1026,7 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                     status_cls + "\">" + status_txt +
                     "</span></td>"
                     "<td>" +
-                    std::to_string(active_creds) +
+                    active_creds_cell +
                     "</td>"
                     "<td>" +
                     revocation_cell +
@@ -1006,7 +1062,12 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                 // htmx's own `hx-confirm` (that only fires for htmx-owned
                 // hx-post/hx-get triggers, which these forms deliberately
                 // are not).
-                if (active_creds == 0) {
+                if (!creds_known) {
+                    // The credential store could not answer, so neither "Mint" (no live
+                    // credential) nor "Rotate" (exactly one) can be offered truthfully.
+                    html += "<span class=\"hint\">Credential state unavailable; "
+                            "use Retry below.</span> ";
+                } else if (active_creds == 0) {
                     // No live credential yet — this principal needs an
                     // initial mint (POST .../credentials), not a rotate
                     // (rotate_engine_credential requires exactly one active
@@ -1068,6 +1129,10 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
     }
 
     html += "  </tbody></table>";
+    // Only with rows: an empty roster has no row hint to point at it, and for a store that was
+    // never wired a retry cannot help.
+    if (credentials_unreadable && !principals.empty())
+        html += "<p>" + std::string(kEngineRetryControl) + "</p>";
 
     // NOTE: the one-time-reveal target (#engine-principal-reveal) is
     // DELIBERATELY NOT emitted here — it lives in the static page shell
@@ -4423,8 +4488,9 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
-        // Same-site gate (audited_write.hpp rule 1), after the permission gate and before any
-        // state is read or changed.
+        // Same-site gate (audited_write.hpp rule 1): defence in depth behind the central
+        // pre-routing gate, which already answered any cookie-session write before this handler
+        // ran. This copy sits after the permission gate and before any state is read or changed.
         if (refuse_cross_site(req, res, *session, "/api/settings/users/{username}"))
             return;
         // PR2 — MFA step-up gate. Deleting a user destroys a principal;
@@ -4562,6 +4628,7 @@ void SettingsRoutes::register_routes(
         // user — never on "not a SCIM user"/"SCIM store unwired", which
         // degrade to the slug-only set (see its doc comment).
         std::string revoke_detail;
+        std::vector<std::string> erase_principals; // the post-commit erasure hook's set
         if (api_token_store_) {
             auto principals = resolve_deprovision_principals_for_username(scim_store_, username);
             if (!principals.has_value()) {
@@ -4625,6 +4692,7 @@ void SettingsRoutes::register_routes(
                     "application/json");
                 return;
             }
+            erase_principals = std::move(*principals);
         } else {
             // Governance Gate 7 BLOCKING fix (UP-7): FAIL CLOSED here —
             // mirror the SCIM seam's `revoke_linked_credentials_or_fail`
@@ -4664,6 +4732,9 @@ void SettingsRoutes::register_routes(
             spdlog::info("User '{}' removed", username);
             (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.delete", "success",
                                                 "User", username, revoke_detail);
+            // Post-commit personal-data erasure (ADR-0071): best-effort, never changes this
+            // response - see deprovision_erasure.hpp.
+            run_deprovisioned_hook(on_deprovisioned_, erase_principals);
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"User deleted","level":"success"}})");
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
@@ -4705,6 +4776,8 @@ void SettingsRoutes::register_routes(
             }
             audit_fn_(req, "user.delete", "partial", "User", username,
                       "account_deactivated session_wipe_failed=true " + revoke_detail);
+            // The account IS deactivated (committed): erase as on a clean removal.
+            run_deprovisioned_hook(on_deprovisioned_, erase_principals);
             respond_lifecycle_store_unavailable(
                 res, "User deactivated, but session cleanup failed. Repeat the delete to finish");
             return;
@@ -4967,12 +5040,13 @@ void SettingsRoutes::register_routes(
         auto max_uses_s = extract_form_value(req.body, "max_uses");
         auto ttl_s = extract_form_value(req.body, "ttl_hours");
 
-        int max_uses = 0;
-        int ttl_hours = 0;
+        int max_uses = auth::kDefaultEnrollmentTokenMaxUses;
+        int ttl_hours = auth::kDefaultEnrollmentTokenTtlHours;
         try {
             // Strict: `stoi("0x5")` is 0 and max_uses 0 means UNLIMITED, so a mistyped limit
-            // used to mint an unlimited token. Only an EMPTY field or a literal 0 means
-            // "unlimited" / "no expiry"; anything else must be one base-10 integer.
+            // used to mint an unlimited token. A field left BLANK takes the bounded default
+            // above; only a literal 0 means "unlimited" / "no expiry"; anything else must be
+            // one base-10 integer.
             if (!max_uses_s.empty())
                 max_uses = yuzu::server::strict_stoi(max_uses_s);
             if (!ttl_s.empty())
@@ -5025,7 +5099,7 @@ void SettingsRoutes::register_routes(
         // shown once in the response and must never reach the audit store.
         audit_fn_(req, "enrollment.token_create", "success", "EnrollmentToken", created->token_id,
                   "by=" + session->username + " max_uses=" + std::to_string(max_uses) +
-                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + label);
+                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + audit_token(label));
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Enrollment token created","level":"success"}})");
         no_store_private(res); // the raw token is in this body
@@ -5070,7 +5144,7 @@ void SettingsRoutes::register_routes(
         if (!admin_fn_(req, res))
             return;
         // A blank body keeps every default; any other body must be one JSON object (a truncated
-        // document used to mint the default 10 single-use tokens with no expiry).
+        // document used to mint 10 single-use tokens that never expire).
         nlohmann::json batch_body = nlohmann::json::object();
         const bool body_blank =
             std::all_of(req.body.begin(), req.body.end(),
@@ -5091,8 +5165,9 @@ void SettingsRoutes::register_routes(
         auto label = extract_json_string(batch_body, "label");
 
         int count = 10;
+        // Batch tokens stay single-use by default; only ttl_hours gets the bounded default.
         int max_uses = 1;
-        int ttl_hours = 0;
+        int ttl_hours = auth::kDefaultEnrollmentTokenTtlHours;
         try {
             // Strict (see the single-token route): a malformed limit must never read as 0.
             read_enrollment_int(batch_body, "count", count);
@@ -5166,8 +5241,8 @@ void SettingsRoutes::register_routes(
 
         audit_fn_(req, "enrollment.bulk_token_create", "success", "EnrollmentToken", "",
                   "by=" + session->username + " max_uses=" + std::to_string(max_uses) +
-                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + label + " " +
-                      bulk_audit_detail(token_ids));
+                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + audit_token(label) +
+                      " " + bulk_audit_detail(token_ids));
 
         no_store_private(res); // N raw tokens are in this body
         res.set_content(nlohmann::json({{"count", tokens.size()}, {"tokens", tokens}}).dump(),
@@ -5397,8 +5472,9 @@ void SettingsRoutes::register_routes(
 
         // Owner-scoped revocation (fixes the sibling IDOR to #222 on
         // the HTMX dashboard path). A caller with ApiToken:Delete
-        // may only revoke their own tokens; the global admin role
-        // is the only bypass. We return a generic "not found"
+        // may only revoke their own tokens; the only bypass is an
+        // effective admin (the global admin role, or a session holding
+        // a JIT admin elevation). We return a generic "not found"
         // fragment in both the missing-id and the not-owner cases
         // so the dashboard does not become an enumeration oracle.
         auto existing = api_token_store_->get_token(token_id);
@@ -5723,6 +5799,10 @@ void SettingsRoutes::register_routes(
         }
         return out;
     };
+    // Cookie-session writes require a same-site Origin or Referer; the pre-routing gate
+    // (same_site_write_gate.hpp) decides that, after authentication, before this handler runs.
+    // This copy is defence in depth and serves the TestRouteSink tests, which bypass
+    // pre-routing. It is not a substitute for the central gate.
     auto origin_safe = [this, sanitise](const httplib::Request& req, httplib::Response& res,
                                         const std::string& action_for_audit) -> bool {
         auto host = req.get_header_value("Host");
@@ -6080,9 +6160,9 @@ void SettingsRoutes::register_routes(
     sink.Post("/api/settings/mcp", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
-        // Same-site gate for a cookie-authorised write: unlike origin_safe above, a header-less
-        // cookie request is refused (browsers always send an Origin on a write); token callers
-        // are exempt.
+        // Same-site check for a cookie-authorised write: a cookie request without a same-site
+        // Origin or Referer is refused here too (the pre-routing gate decides it first, so this
+        // copy is defence in depth); token callers are exempt.
         const auto session = auth_fn_(req, res);
         if (!session)
             return;
@@ -6636,9 +6716,9 @@ void SettingsRoutes::register_routes(
     // are a different origin, which is what Origin/Referer catches.
     //
     // We require Origin (or Referer as fallback) to carry the
-    // same host as the request's Host header; absence means a non-
-    // browser caller (curl, automation) which is explicitly allowed
-    // because programmatic admin clients post without an Origin header.
+    // same host as the request's Host header. Cookie-session writes require a
+    // same-site Origin or Referer; the pre-routing gate (same_site_write_gate.hpp)
+    // decides that first, and this copy is defence in depth.
     // Mismatched host → 403, audited as csrf.denied for SIEM correlation.
     //
     // Hardenings from the re-review round of the Hermes fixes:
@@ -6653,14 +6733,13 @@ void SettingsRoutes::register_routes(
     //    validate URL shape, so anything containing `@`, `?`, or `#`
     //    is treated as a fail-closed mismatch.
     //
-    // Scoping note (Gate 4 SHOULD S2 — known follow-up): origin_safe is
-    // wired into the 4 mutating MFA POSTs and the 4 auto-approve writes
-    // only. 11 sibling state-changing Settings POSTs (/api/settings/users/*,
-    // plugin-signing, OIDC, cert, enrollment-tokens, tls) remain CSRF-unprotected
-    // pending a follow-up PR that wraps every admin HTMX mutation. The
-    // asymmetric defence is documented in CHANGELOG and is NOT a
-    // regression introduced by this PR — those sites were unprotected
-    // before PR1 too.
+    // Scoping note: cookie-session writes require a same-site Origin or
+    // Referer, enforced centrally in the pre-routing stage after
+    // authentication (same_site_write_gate.hpp). origin_safe is wired into
+    // the routes that carry a per-route copy, as defence in depth; its
+    // audit rows (result=error, sanitised header bytes) are written only
+    // for a request the central gate admitted, or by a TestRouteSink test
+    // that bypasses pre-routing.
 
     sink.Get("/fragments/settings/mfa", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
@@ -6828,7 +6907,65 @@ void SettingsRoutes::register_routes(
                                       "text/html; charset=utf-8");
                       return;
                   }
-                  audit_fn_(req, "mfa.enroll.verified", "ok", "User", session->username, "");
+                  // Enrolment has just committed, and the code that committed it IS a fresh proof
+                  // of the factor: stamp the CURRENT cookie session's step-up proof (the same
+                  // `mark_session_mfa_verified` as POST /login/mfa/stepup, so the DB-clock
+                  // authoring and every replica's cache refresh are that primitive's), so the
+                  // operator can regenerate recovery codes or disable MFA from this very session
+                  // without a separate step-up. Only a local cookie session is stamped, and only
+                  // when the cookie resolves to the SAME user the form was verified for: a bearer
+                  // credential, an OIDC/SAML session or a mismatched cookie never earns it. A
+                  // failed stamp does not undo the enrolment (the codes below are shown once), and
+                  // neither does a throw from the stamp: the stamp block is wrapped, so the stamp
+                  // can never drop the codes reveal or the audit rows below. Those two audit_fn_
+                  // calls and the render follow it unguarded, exactly like every other handler in
+                  // this file (a throw there is not caught here). The Settings
+                  // panel cannot prompt for a step-up, so an operator who is not stamped signs in
+                  // again to earn a proof. Never reached on a failed or rejected verification (all
+                  // return above).
+                  // The audit row below says only `not_stamped`; this line says why. Sampled (1 in
+                  // kStampThrewLogEvery, the first always) so a failing auth store cannot become a log storm.
+                  // `what()` is text an exception chose, so it is sanitised. Guarded: a formatter
+                  // or logger throw must not escape the catch and drop the codes reveal.
+                  const auto note_stamp_threw = [](const char* what) noexcept {
+                      try {
+                          static std::atomic<uint64_t> stamp_threw_hits{0};
+                          if (stamp_threw_hits.fetch_add(1, std::memory_order_relaxed) %
+                                  kStampThrewLogEvery != 0)
+                              return;
+                          if (what)
+                              spdlog::warn("enrol-confirm: step-up proof stamp threw; recording "
+                                           "not_stamped ({})",
+                                           onbehalf::sanitize_for_log(what));
+                          else
+                              spdlog::warn("enrol-confirm: step-up proof stamp threw; recording "
+                                           "not_stamped");
+                      } catch (...) { // NOLINT(bugprone-empty-catch)
+                      }
+                  };
+                  bool proof_stamped = false;
+                  try {
+                      if (auth_mgr_ && session->auth_source == "local") {
+                          const auto cookie_token = AuthRoutes::extract_session_cookie(req);
+                          if (!cookie_token.empty()) {
+                              const auto cookie_session = auth_mgr_->validate_session(cookie_token);
+                              if (cookie_session && cookie_session->auth_source == "local" &&
+                                  cookie_session->username == session->username) {
+                                  if (stamp_fault_hook_) // test seam, empty in production
+                                      stamp_fault_hook_();
+                                  proof_stamped = auth_mgr_->mark_session_mfa_verified(cookie_token);
+                              }
+                          }
+                      }
+                  } catch (const std::exception& ex) {
+                      proof_stamped = false;
+                      note_stamp_threw(ex.what());
+                  } catch (...) {
+                      proof_stamped = false;
+                      note_stamp_threw(nullptr);
+                  }
+                  audit_fn_(req, "mfa.enroll.verified", "ok", "User", session->username,
+                            proof_stamped ? "step_up_proof=stamped" : "step_up_proof=not_stamped");
                   audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
                             session->username, "10 codes issued");
                   set_no_store(res);
@@ -6846,6 +6983,14 @@ void SettingsRoutes::register_routes(
                   auto session = auth_fn_(req, res);
                   if (!session || session->username.empty()) {
                       res.status = 401;
+                      return;
+                  }
+                  // MFA step-up gate. Minting a fresh recovery-code set hands the caller a
+                  // credential that satisfies the step-up challenge itself, and disabling MFA removes
+                  // the factor the gate checks; both need a fresh proof first. Before any mutation.
+                  if (step_up_fn_ &&
+                      !step_up_fn_(req, res, *session, "POST /api/settings/mfa/recovery-codes")) {
+                      toast_step_up_refusal(res);
                       return;
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
@@ -6883,6 +7028,13 @@ void SettingsRoutes::register_routes(
                       res.status = 401;
                       return;
                   }
+                  // MFA step-up gate (see recovery-codes above): stripping the factor the gate
+                  // checks needs a fresh proof. Before the enforcement guard and any mutation.
+                  if (step_up_fn_ &&
+                      !step_up_fn_(req, res, *session, "POST /api/settings/mfa/disable")) {
+                      toast_step_up_refusal(res);
+                      return;
+                  }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
                   if (!db) {
                       res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
@@ -6913,18 +7065,104 @@ void SettingsRoutes::register_routes(
                           "text/html; charset=utf-8");
                       return;
                   }
-                  auto r = db->mfa_disable(session->username);
-                  if (!r) {
-                      audit_fn_(req, "mfa.disabled", "error", "User", session->username,
-                                "disable failed");
-                      res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
-                                                          "Could not disable MFA"),
-                                      "text/html; charset=utf-8");
+                  // Two rows per disable: an INTENT row ("attempted") written BEFORE the factor is
+                  // touched, and an OUTCOME row after. The outcome row is written AFTER the actor's
+                  // own session is deleted, so both are attributed to the session already
+                  // resolved, not re-resolved from the cookie. Order them by the audit `id`.
+                  // Returns whether the row persisted; the unwired fallback (tests, other callers)
+                  // is a void writer and reports true, so only the production binding can refuse.
+                  const auto audit = [&](const char* result, const std::string& detail) -> bool {
+                      if (audit_as_session_fn_)
+                          return audit_as_session_fn_(
+                              req, *session, auth::role_to_string(auth::effective_role(*session)),
+                              "mfa.disabled", result, "User", session->username, detail);
+                      audit_fn_(req, "mfa.disabled", result, "User", session->username, detail);
+                      return true;
+                  };
+                  // Fail closed on the intent row: an MFA clear that cannot be recorded does not
+                  // happen. Nothing has been cleared and no session has been ended.
+                  if (!audit("attempted", "MFA clear requested via Settings")) {
+                      spdlog::error("mfa.disabled: the audit store did not accept the intent row "
+                                    "for '{}'; MFA was NOT changed",
+                                    log_safe(session->username));
+                      res.status = 503;
+                      res.set_header("Retry-After", "5");
+                      res.set_header("Sec-Audit-Failed", "true");
+                      // /settings swaps no 5xx body (only /settings/security swaps this
+                      // fragment), so the toast is what tells the operator on the main page.
+                      res.set_header("HX-Trigger",
+                                     R"({"showToast":{"message":"Audit store unavailable; MFA )"
+                                     R"(was not changed.","level":"error"}})");
+                      res.set_content(
+                          render_mfa_fragment(*session, {}, {}, {}, {},
+                                              "Audit store unavailable; MFA was not changed."),
+                          "text/html; charset=utf-8");
                       return;
                   }
-                  audit_fn_(req, "mfa.disabled", "ok", "User", session->username, "");
-                  res.set_content(render_mfa_fragment(*session),
-                                  "text/html; charset=utf-8");
+                  // The clear has no undo, so a lost OUTCOME row cannot stop it; it is logged.
+                  const auto audit_outcome = [&](const char* result, const std::string& detail) {
+                      if (!audit(result, detail))
+                          spdlog::error("mfa.disabled: MFA cleared for '{}' but the outcome audit "
+                                        "row failed to persist",
+                                        log_safe(session->username));
+                  };
+                  // Same exit as logout: drop the cookie and send the browser to the landing page.
+                  const auto sign_out = [&] {
+                      res.set_header("Set-Cookie",
+                                     "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+                      res.set_header("HX-Redirect", "/home");
+                      res.set_content("", "text/plain");
+                  };
+                  // The pre-image comes from the clear's own row lock, so it cannot miss an
+                  // enrolment verified in between. A failed clear leaves it unknown, which counts
+                  // as enrolled: the fail-safe is to end sessions.
+                  auto r = db->mfa_disable_report(session->username);
+                  if (!r) {
+                      // The clear may have committed with its acknowledgement lost, so the
+                      // sessions end anyway (#6079).
+                      const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
+                      audit_outcome("error", "disable failed (sessions_ended=" +
+                                                 (ended.db_persisted ? std::to_string(ended.count)
+                                                                     : std::string("failed")) +
+                                                 ")");
+                      if (ended.db_persisted) {
+                          sign_out();
+                          return;
+                      }
+                      // Neither the clear nor the delete is confirmed: say the state is unknown.
+                      res.set_content(
+                          render_mfa_fragment(
+                              *session, {}, {}, {}, {},
+                              "Could not confirm MFA was disabled, and the account's sessions "
+                              "could not be ended. Its state is unknown: ask an administrator "
+                              "to check it and end the sessions."),
+                          "text/html; charset=utf-8");
+                      return;
+                  }
+                  const bool had_factor = *r;
+                  // Cancelling an enrolment that never completed clears no usable factor, so no
+                  // proof can predate one: nothing to end.
+                  if (!had_factor) {
+                      audit_outcome("ok", "no verified factor to clear");
+                      res.set_content(render_mfa_fragment(*session), "text/html; charset=utf-8");
+                      return;
+                  }
+                  // End EVERY session of the account, the caller's included (#6079): any of them
+                  // may hold an MFA proof made under the factor just cleared. The user signs in
+                  // again; a kept session would be a surviving proof we could not tell apart.
+                  const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
+                  if (!ended.db_persisted) {
+                      audit_outcome("partial", "sessions_ended=failed");
+                      res.set_content(
+                          render_mfa_fragment(
+                              *session, {}, {}, {}, {},
+                              "MFA was disabled, but the account's sessions could not be ended. "
+                              "Ask an administrator to end them."),
+                          "text/html; charset=utf-8");
+                      return;
+                  }
+                  audit_outcome("ok", std::format("sessions_ended={}", ended.count));
+                  sign_out();
               });
 }
 

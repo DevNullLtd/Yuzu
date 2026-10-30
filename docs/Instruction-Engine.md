@@ -56,7 +56,7 @@ This document is the architectural blueprint for that work.
 | **ScopeEngine** | `scope_engine.cpp` (494 LOC) | **Real** | Full recursive-descent parser. 9 comparison operators. AND/OR/NOT combinators. Wildcard LIKE matching. Numeric comparison with fallback. `AttributeResolver` callback for evaluation. |
 | **ResponseStore** | `response_store.hpp` | **Real** | PostgreSQL-backed (ADR-0039). `StoredResponse` with instruction_id, agent_id, timestamp, status, output, error_detail, ttl_expires_at. Query with agent/status/time filtering and pagination. Configurable retention (default 90 days). Background cleanup thread. |
 | **AuditStore** | `audit_store.hpp` | **Real** | PostgreSQL-backed (ADR-0040). `AuditEvent` with timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, user_agent, session_id, result. Query with filtering. Retention default 365 days. Background cleanup. |
-| **TagStore** | `tag_store.hpp` | **Real** | PostgreSQL-backed (ADR-0050, schema `tag_store`). `DeviceTag` with agent_id, key, value, source ("agent"/"server"/"api"/"mcp"), updated_at. CRUD, sync from agent heartbeat, validation (key 64 chars, value 448 bytes). `agents_with_tag` for scope queries. |
+| **TagStore** | `tag_store.hpp` | **Real** | PostgreSQL-backed (ADR-0050, schema `tag_store`). `DeviceTag` (declared in `tag_types.hpp`, which `tag_store.hpp` re-includes) with agent_id, key, value, source ("agent"/"server"/"api"/"mcp"), updated_at. CRUD, sync from agent heartbeat, validation (key 64 chars, value 448 bytes). `agents_with_tag` for scope queries. |
 | **Instruction UI** | `instruction_ui.cpp` | **Real** | HTMX page with 4 tabs (Definitions, Executions, Schedules, Approvals). Loads fragments via `hx-get`. Dark theme consistent with dashboard. |
 
 **Overall progress:** 150/184 capabilities done (82%). All 7 phases complete (72/72 issues). Instruction engine fully implemented.
@@ -1061,7 +1061,7 @@ spec:
 **Server-side check before dispatch:**
 1. Compare agent's `agent_version` (from `RegisterRequest.AgentInfo`) against `minAgentVersion`
 2. Compare agent's `plugins[]` list against `requiredPlugins`
-3. If incompatible → skip agent, record `REJECTED(4003)` in `AgentExecStatus`
+3. If incompatible → skip agent, record `REJECTED(4003)` in `AgentExecStatus` (design intent: dispatch does not compare `minAgentVersion` or `requiredPlugins` versions today, so an older agent is dispatched to)
 
 ### 14.2 Agent-Side Rejection
 
@@ -1085,7 +1085,7 @@ The plugin ABI (`plugin.h`) uses a single `abi_version` field, currently `YUZU_P
 During fleet upgrades, older agents coexist with newer agents:
 - Older agents receive ad-hoc `CommandRequest` messages (plugin + action + params) — same as today
 - Newer agents receive the same `CommandRequest` — the wire protocol doesn't change
-- InstructionDefinitions with `minAgentVersion` higher than an agent's version are simply not dispatched to that agent
+- InstructionDefinitions with `minAgentVersion` higher than an agent's version are meant not to be dispatched to that agent (declared and exported today; dispatch does not compare it)
 - No forced upgrades; the OTA update mechanism is opt-in per rollout configuration
 
 ### 14.5 OTA Rollback
@@ -1460,7 +1460,8 @@ This document is grounded in the following implementation files:
 | `server/core/src/schedule_engine.hpp` | InstructionSchedule struct, ScheduleEngine API |
 | `server/core/src/response_store.hpp` | StoredResponse struct, ResponseStore API |
 | `server/core/src/audit_store.hpp` | AuditEvent struct, AuditStore API |
-| `server/core/src/tag_store.hpp` | DeviceTag struct, TagStore API |
+| `server/core/src/tag_types.hpp` | DeviceTag struct, TagReadError |
+| `server/core/src/tag_store.hpp` | TagStore API |
 | `server/core/src/instruction_ui.cpp` | HTMX instruction management page |
 | `server/core/src/settings_ui.cpp` | File upload UI pattern (TLS certs, OTA binaries) |
 | `sdk/include/yuzu/plugin.h` | Plugin ABI v1, command handler signature |
