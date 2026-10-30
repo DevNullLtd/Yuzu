@@ -2061,17 +2061,21 @@ message ReattachResponse {
     challenge, D8) and `--reattach-challenge-concurrency` divided by the challenge round trip;
     the default concurrency, 256, is unmeasured and sized by Little's law as `--reattach-rate` ×
     the expected round trip (2,000/s × about 100 ms is 200), which slice 11 measures on the S1
-    rig. In-flight challenge forwards are also capped per `gateway_node` at the concurrency divided
-    by the connected gateways, with a floor of 8, so one blackholed or hostile gateway cannot hold
+    rig. In-flight challenge forwards are also capped per upstream gateway peer (the
+    transport-authenticated leaf SPKI from `grpc_peer_evidence.hpp`, the identity the
+    gateway-peer guard pins and the re-target check uses; never the gateway-asserted
+    `gateway_node` string, which a hostile gateway could multiply; gateways sharing one
+    certificate share one cap) at the concurrency divided by the connected peers, with a floor of 8, so one blackholed or hostile gateway cannot hold
     every slot. The global `--reattach-challenge-concurrency` still binds when the per-gateway
     floors sum above it; a change in the connected-gateway count recomputes the per-gateway cap
     for new starts only, never cancelling a call in flight. The global and per-gateway counts are
-    owned by the call table: a slot is charged at start to the `gateway_node` recorded on the call
+    owned by the call table: a slot is charged at start to the upstream peer recorded on the call
     object and released only when that call's final tag returns, never at resolution; any
     resolution while the call is still in flight (`superseded`, `kill_switched`, `capacity`,
     `expired`) calls `TryCancel` on it, so the slot is held for the cancel latency, not the client
-    deadline. The 40-gateway blackhole test asserts the in-flight count per `gateway_node` never
-    exceeds its cap, across a re-target included. A challenge that cannot start because
+    deadline. The 40-gateway blackhole test asserts the in-flight count per peer never exceeds its
+    cap, across a re-target included, and a test with one peer asserting 40 `gateway_node` values
+    asserts a healthy gateway's sessions all verify. A challenge that cannot start because
     of other gateways' occupancy is requeued, and if it is still requeued at its CONNECTED-wait
     deadline it resolves `capacity` (uninstalled, the record kept, not audited, not in the
     per-agent back-off); the backlog admission below is computed per gateway so that is the
@@ -2251,11 +2255,18 @@ message ReattachResponse {
     (`--reattach-connected-wait` + expiry), the sessions held), and the gauge
     `yuzu_server_reattach_challenge_oldest_pending_seconds`). Every `bad_signature` writes an `agent.reattach.challenge` audit row through
     `audit_token`, naming the agent and the gateway peer, never suppressed: an honest agent never
-    produces one, so it cannot flood. A well-formed answer whose signing certificate is revoked,
-    expired or not yet valid on the server's clock is `cert_invalid`, never `bad_signature` (D16
-    makes the same rule for state content): a revoked one clears the record as a failure does, an
-    expired or not-yet-valid one keeps it (the agent renews through ADR-0074 D6); a slice-11 test
-    answers with an expired leaf. A terminal frame carrying the challenge's id with an empty or
+    produces one, so it cannot flood. The classification order is fixed: (1) the certificate is
+    taken from the server's own issuance records for this `agent_id` (`CaStore`); an answer may
+    name one only as an index into those records, never supply it; (2) the signature is verified
+    under that certificate's key; (3) only an answer whose signature verifies is classified by the
+    certificate's validity. Such an answer whose certificate is revoked, expired or not yet valid
+    on the server's clock is `cert_invalid`, never `bad_signature` (D16 makes the same rule, in
+    the same order, for state content): a revoked one clears the record as a failure does, an
+    expired or not-yet-valid one keeps it (the agent renews through ADR-0074 D6). Any answer whose
+    signature does not verify under a certificate this server issued to this agent is
+    `bad_signature`, whatever certificate it names, so a forger cannot choose the less-alerted
+    class. Slice-11 tests answer honestly with an expired leaf (`cert_invalid`) and forge an
+    answer naming the agent's expired leaf (`bad_signature`, its audit row and the page). A terminal frame carrying the challenge's id with an empty or
     other plugin field (an agent older than slice 11 answers an unknown reserved command
     `REJECTED`) is `unsupported`: the call ends, the session is uninstalled and the record kept,
     with no `bad_signature` row. `cert_invalid`, `expired`, `degraded`, `send_failed` and
