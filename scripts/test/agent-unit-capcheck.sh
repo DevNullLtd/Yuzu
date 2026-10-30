@@ -99,10 +99,14 @@ for f in "$UNIT_FILE" "$HELPER" "$UPGRADING_DOC" "$DEB_SCRIPT" "$RPM_SPEC"; do
     [[ -f $f ]] || { echo "FAIL: missing input file: $f" >&2; exit 1; }
 done
 
+# The real shared library only: meson also writes libyuzu_agent_core.so.p/libyuzu_agent_core.so.symbols,
+# a regular file that a bare 'libyuzu_agent_core.so*' glob matches, and 'find -quit' can return it
+# before the library (the agent then fails to load in the unit).
+lib_match=( \( -name 'libyuzu_agent_core.so' -o -name 'libyuzu_agent_core.so.[0-9]*' \) \( -type f -o -type l \) )
 LIB_DIR=${YUZU_AGENT_LIB_DIR:-}
 if [[ -z $LIB_DIR ]]; then
     build_root=${AGENT%/agents/core/*}
-    found=$(find "$build_root" -name 'libyuzu_agent_core.so*' \( -type f -o -type l \) -print -quit 2>/dev/null || true)
+    found=$(find "$build_root" "${lib_match[@]}" -print -quit 2>/dev/null || true)
     [[ -n $found ]] && LIB_DIR=$(dirname "$found")
 fi
 [[ -n $LIB_DIR ]] || { echo "FAIL: libyuzu_agent_core.so* not found; set YUZU_AGENT_LIB_DIR" >&2; exit 1; }
@@ -181,8 +185,12 @@ getent passwd "$SVC_USER" >/dev/null ||
 # /tmp is unusable here: the unit sets PrivateTmp. /run/$id is root 0755 and readable by the account.
 as_root install -d -m 0755 "$run_dir" "$run_dir/bin" "$run_dir/lib" "$run_dir/plugins" "$run_dir/src"
 as_root install -m 0755 "$AGENT" "$run_dir/bin/yuzu-agent"
-find "$LIB_DIR" -maxdepth 1 -name 'libyuzu_agent_core.so*' \( -type f -o -type l \) -print0 |
+find "$LIB_DIR" -maxdepth 1 "${lib_match[@]}" -print0 |
     as_root xargs -0 -r install -m 0755 -t "$run_dir/lib"
+# The name the agent links against (its NEEDED entry). Without it the unit fails to load the
+# binary and every assertion that needs the real agent would otherwise be reached too late.
+[[ -e $run_dir/lib/libyuzu_agent_core.so ]] ||
+    { echo "FAIL: libyuzu_agent_core.so was not staged from '$LIB_DIR'; set YUZU_AGENT_LIB_DIR" >&2; exit 1; }
 find "$PLUGINS" -name '*.so' -type f -print0 |
     as_root xargs -0 -r install -m 0755 -t "$run_dir/plugins"
 as_root install -m 0755 "$HELPER" "$run_dir/yuzu-agent-dmi-snapshot.sh"
@@ -498,8 +506,10 @@ for _ in $(seq 1 60); do
 done
 st=$(as_root systemctl show -p ActiveState --value "$id.service")
 status=$(as_root systemctl show -p ExecMainStatus --value "$id.service")
-if [[ $st == failed && $status =~ ^[0-9]+$ && $status -ne 0 ]]; then
-    pass "refusal: agent exited non-zero when capset is denied (status $status)"
+# Exactly 1 (main()'s EXIT_FAILURE): a loader failure is 127 and a crash is 128+signal, and
+# neither is the agent refusing.
+if [[ $st == failed && $status == 1 ]]; then
+    pass "refusal: agent exited 1 when capset is denied"
 else
     fail "refusal: agent did not fail when capset is denied (state '$st', exit status '$status')"
 fi
