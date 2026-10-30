@@ -846,12 +846,45 @@ connection. So this ADR saves by **rate**, not location, and the collection stop
 lingering.
 
 **Agent send rules.** A per-connection topology sender mirrors the daily-sync thread (its own stub,
-joined on disconnect). It sends when:
+joined on disconnect). These reasons make a report due:
 - **CHANGED:** the latest digest differs from the last accepted one; delay uniform 0-10 s.
 - **REFRESH:** the floor expires; drawn uniformly from 12-18 min, restarted on every accepted
   report.
-- **STARTUP:** first report of the process; delay uniform 0-60 s.
+- **STARTUP:** first report of the process; delay uniform 0-60 s, drawn at process start.
 - **RESYNC:** on `__resync__.topology` (D8); delay uniform `[0, window_s]` from the command.
+
+**Pending reasons coalesce.** The sender keeps a set of pending reasons, each with its due time.
+- It sends once, at the earliest due time, and that one send satisfies every pending reason. The
+  report's `reason` is the highest pending one: `RESYNC`, then `STARTUP`, then `CHANGED`, then
+  `REFRESH`. So the first run after start, which is both STARTUP and CHANGED, sends one body.
+- **Never without a body.** It sends only once the pump has published a successful run, and it
+  always sends the latest published record whole (D5). A reason that falls due earlier waits for
+  the first body, so a STARTUP drawn at 10 s with a first run at 40 s sends at 40 s.
+- **An empty digest is treated like `DISABLED`:** no report is sent, and the server asks for none
+  (D6). A `__resync__.topology` that arrives before the first body is armed and answered by the
+  first report; the server sends one only after it has seen a non-empty digest, so it never
+  repeats a request the agent cannot answer.
+
+**Sender lifecycle.** The sender is a background thread on the agent's per-connection teardown
+path, and it follows the daily-sync thread's contract exactly (`agent.cpp`, `sync_thread_`):
+- **Waits are stop-interruptible.** Every wait (a reason's delay, the floor, a back-off) is a
+  sliced sleep of at most 2 s that checks its stop flag and a wake flag on every slice, as the
+  daily-sync loop checks `sync_wake_`. A condition variable is equally acceptable. No wait is a
+  single long `sleep_for`.
+- **Every `ReportTopology` has a deadline and is cancellable.** It runs with a bounded deadline
+  (30 s, as `ReportInventory`'s) and publishes its `grpc::ClientContext` through a `CtxSlot` on a
+  new `topology_ctx_` under `ctx_mu_`, so teardown cancels it through `cancel_ctx()`, the one
+  locked chokepoint. A stalled 2 MiB report therefore cannot hold a join.
+- **Stopped, cancelled and joined in the same places as `sync_thread_`.** At the per-connection
+  teardown after the read loop ends, it sets the sender's stop flag, calls
+  `cancel_ctx(topology_ctx_)`, then joins. `quiesce_run_workers()` does the same. `stop()` cancels
+  `topology_ctx_` next to `sync_ctx_`. The lock is never held across a join.
+- **`__resync__.topology` reaches it only through a member atomic plus wake**, the `sync_wake_`
+  pattern: the Subscribe reader thread stores the request and `window_s` and sets the wake flag. It
+  never calls into the sender or touches its state. The agent answers FAILURE when no sender thread
+  is running on this connection (D8).
+- A new connection starts a new sender, which keeps the process-wide "last accepted digest" and
+  the STARTUP-done flag but no pending reasons.
 
 It does not send on reconnect; the heartbeat digest lets the server decide. Failures back off
 exponentially with full jitter (base 15 s, cap 15 min). `UNIMPLEMENTED` is logged once per
@@ -940,8 +973,9 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
   arms a request and wakes the thread that acts on it, records the terminal, and writes the
   response. It never sends tags or a body itself.
   - `tags` sets a member atomic that the heartbeat thread reads. SUCCESS means armed.
-  - `topology` arms the topology sender and wakes it. SUCCESS means armed. With no running topology
-    sender (`--no-topology`, or none yet on this connection) the answer is a FAILURE terminal.
+  - `topology` stores the request and `window_s` in a member atomic and sets the sender's wake flag
+    (the `sync_wake_` pattern, D7). SUCCESS means armed. With no running topology sender
+    (`--no-topology`, or none yet on this connection) the answer is a FAILURE terminal.
   - An unknown action is a FAILURE terminal.
 - **Agent response.**
   - `tags`: the heartbeat thread sends `full = true` on **every** heartbeat until two full
@@ -1764,7 +1798,13 @@ of every ~30 s. The content is unchanged.
   an unknown action;
 - after `__resync__.tags`, every heartbeat is full until two full heartbeats are acknowledged, and a
   coalesced first full heartbeat does not end the repetition;
-- the topology send rules, with an injected RNG for jitter bounds, never timing;
+- the topology send rules, with an injected RNG for jitter bounds, never timing: pending reasons
+  coalesce into one send with the highest reason; nothing is sent before the first body or with an
+  empty digest;
+- topology sender teardown: a disconnect or `stop()` during each wait (a reason delay, the floor, a
+  back-off) and during an in-flight `ReportTopology` against a server that never answers joins the
+  sender within one sleep slice plus the cancel, both from the per-connection teardown and from
+  `quiesce_run_workers()`;
 - the pump record is published and read whole: a reader racing a publish sees one run's body,
   digest, `last_pump_at` and outcome, never a mix.
 
