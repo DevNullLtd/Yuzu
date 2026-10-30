@@ -820,8 +820,15 @@ When several conditions hold, the first in this order wins:
     fresh body then goes through first-claim-wins. The caller does not write the row on the
     heartbeat path either: it queues it for the resync issuer's thread (D8), which writes it
     before its next pass, so several conflicts in one `BatchHeartbeat` under a degraded pool
-    cannot push the batch past the gateway's 5 s call timeout. The queue is bounded by the slot
-    cap, because a retained slot conflicts at most once per reconnect. The anti-spoof evidence chain therefore records a refused re-claim exactly as
+    cannot push the batch past the gateway's 5 s call timeout. The queued row's lifecycle:
+    - a failed write keeps the row queued for the next pass and is counted
+      (`yuzu_viz_topology_reclaim_audit_total{result="deferred"}`, D13);
+    - the queue is capped at `kPushedMapHardCap` rows (a retained slot conflicts at most once per
+      reconnect, but a flapping agent through a degraded pool can conflict on each reconnect); an
+      overflow drops the oldest row, counts it (`result="dropped"`) and logs it at WARN;
+    - on stop the issuer drains the queue before it exits, each write bounded by one lease
+      budget, so a stop does not lose a row while the audit store is healthy; a row it cannot
+      write then is counted `dropped` and logged. The anti-spoof evidence chain therefore records a refused re-claim exactly as
     it records a refused push.
 
   A gateway restart thus costs zero bodies for agents back within five minutes. Eviction is lazy (in
@@ -1164,7 +1171,7 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     have stopped (so ingestion can no longer mark; a mark made after the stop is dropped) and
     before the registry, `plugin_config_store_`, the execution tracker and the Postgres pool it
     calls. Shutdown latency is bounded by one in-flight lease budget plus the pool's
-    `statement_timeout`. The pass swaps the pending set out under the set's mutex and never holds
+    `statement_timeout`, plus one lease budget per queued re-claim audit row it drains (D6). The pass swaps the pending set out under the set's mutex and never holds
     that mutex across `build_classified_command`, a Postgres call or `send_to`, so ingestion's
     mark never waits on Postgres. The pass is a new background job: it gets a
     `background_jobs.hpp` row (WS-10; a diff against that array, never a silent addition),
@@ -1359,6 +1366,8 @@ count-valued histograms here are not latencies, so they declare their own:
   `parse|digest_mismatch|ip_conflict|oversize|unknown_session` (D7; `parse` also moves the parse
   counter above);
 - `yuzu_viz_topology_reclaim_total{outcome}`, with `reclaimed|conflict` (D6);
+- `yuzu_viz_topology_reclaim_audit_total{result}`, with `written|deferred|dropped` (D6: the queued
+  `reclaim_conflict` audit row; a non-zero `dropped` is a lost evidence row);
 - `yuzu_viz_topology_digest_total{via,outcome}`, with `match|mismatch|no_slot|empty|disabled|absent`
   (`empty`: an empty digest; `disabled`: `DISABLED`; `absent`: no field);
 - `yuzu_viz_topology_resync_total{outcome}`, with `sent|deferred|send_failed`;
@@ -2301,8 +2310,8 @@ of every ~30 s. The content is unchanged.
   rejected digest reads `report_rejected`, not `body_pending`; every reporting agent after a
   restart reads `offline` (or is absent if it is not in the durable roster) until its reattach
   lands, then `awaiting_report` until its body lands; the schema enum matches the C++ enum;
-- a re-claim conflict writes `topology.push.rejected` with `reason=reclaim_conflict` before the slot
-  is dropped; re-claim and push share one claim function; a `PARSE`, `DIGEST_MISMATCH`, `OVERSIZE`
+- a re-claim conflict queues `topology.push.rejected` with `reason=reclaim_conflict`, which the
+  issuer writes; a failed write stays queued and is counted `deferred`; a stop drains the queue; re-claim and push share one claim function; a `PARSE`, `DIGEST_MISMATCH`, `OVERSIZE`
   or `UNKNOWN_SESSION` rejection writes no audit row and moves the rejection counter;
 - an accepted report sets `confirmed_at` and claims its IPs; the owner-live test reads
   `confirmed_at`, so a quiet, confirmed owner keeps its IPs past 300 s without a new body;
@@ -2374,7 +2383,8 @@ of every ~30 s. The content is unchanged.
     about 10 s of the forwards ending, command and containment forwarding are still served, marks
     above the in-flight bound are `deferred`, and agents behind a second, healthy gateway converge
     at the D8 rates during the blackhole;
-  - **S2 with re-claim conflicts** (slice 8): a gateway restart with IP churn among retained slots
+  - **S2 with re-claim conflicts** (slice 8), including a stop with rows still queued (each is
+    written or counted `dropped`): a gateway restart with IP churn among retained slots
     under a degraded pool leaves `BatchHeartbeat` under its timeout, with the audit rows written
     off the heartbeat path;
   - **S6, retain-on-disconnect IP conflict** (slice 8): a gateway restart during which another
