@@ -33726,8 +33726,6 @@ TEST_CASE("MCP 2f PR2: the GET close row's actor class follows Session::is_engin
             return true;
         };
     ts.start();
-    const auto sid = mint_session(ts);
-    REQUIRE_FALSE(sid.empty());
 
     const auto close_class = [&](const char* kind, const char* source) -> std::string {
         {
@@ -33736,6 +33734,10 @@ TEST_CASE("MCP 2f PR2: the GET close row's actor class follows Session::is_engin
         }
         ts.mock_principal_kind = kind;
         ts.mock_auth_source = source;
+        // A session answers only the credential class that minted it, so initialize runs
+        // under the class being tested rather than one id reused across a changing mock.
+        const auto sid = mint_session(ts);
+        REQUIRE_FALSE(sid.empty());
         {
             auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
                                                {"Accept", "text/event-stream"}});
@@ -35073,12 +35075,16 @@ TEST_CASE("MCP streamed POST close row: the actor class follows Session::is_engi
     };
     ts.start_with_dispatch(dispatch, "operator");
     ts.mcp.set_stream_bridge(&bridge);
-    auto minted = sessions.mint("test-user");
-    REQUIRE(minted.ok);
-    const auto sid = minted.session_id;
-    REQUIRE(sessions.stream_for(sid, "test-user") != nullptr);
-
     const auto close_class = [&](const char* kind, const char* source) -> std::string {
+        // A session answers only the credential class that minted it, so each class mints
+        // its own session instead of reusing one id across the changing mock credential.
+        auto binding = test_user_binding("operator");
+        binding.principal_kind = kind;
+        binding.auth_source = source;
+        auto minted = sessions.mint(binding);
+        REQUIRE(minted.ok);
+        const auto sid = minted.session_id;
+        REQUIRE(sessions.stream_for(sid, binding) != nullptr);
         {
             std::lock_guard lk{rows_mu};
             rows.clear();
