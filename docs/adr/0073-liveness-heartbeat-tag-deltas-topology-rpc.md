@@ -1726,9 +1726,10 @@ message ReattachResponse {
    D14 step 1), and the gateway requeues the session after a full-jittered share of that delay
    without touching the breaker. It is not answered
    `RESOURCE_EXHAUSTED`: the gateway counts that status as a breaker failure today
-   (`yuzu_gw_upstream:record_result/2`), so a reattach storm would open the breaker. Each reattach costs one lock,
-   one enrollment-status read, one route CAS and one primary-key read, with the plugin set usually
-   cached. That is lighter than today's ProxyRegister replay, which carries a 9 KB, 69-plugin
+   (`yuzu_gw_upstream:record_result/2`), so a reattach storm would open the breaker. Each reattach
+   costs one lock, one enrollment-status read, one route CAS and one primary-key read, with the
+   plugin set usually cached, and the `announce_connected` route write of the CONNECTED
+   re-announce that follows it (four Postgres operations, D8). That is lighter than today's ProxyRegister replay, which carries a 9 KB, 69-plugin
    request.
 
    **Throughput** is min(`--reattach-rate`, gateways × `upstream_replay_concurrency` / per-call
@@ -2090,7 +2091,8 @@ per replica, for N agents whose heartbeats reach it (estimates, unmeasured; slic
   today's map), plus a 35-byte digest, a version counter and the rejection count and backoff. It
   replaces today's map rather than adding to it. The payload is about 0.4 GB at N = 100,000, a
   lower bound: with `std::unordered_map` node, hash and `std::string` overhead (about 100-150 B per
-  entry) it is more likely 1-1.5 GB, about the same as today's map.
+  entry, about 1-1.5 GB at 100,000 agents × 97 entries on its own) it is more likely 1.4-1.9 GB in
+  total, about the same as today's map, which holds the same entries in the same container.
 - **Topology slots.** Unchanged in kind: each holds the parsed body, bounded by
   `kPushedMapHardCap` (100,000). Retained `disconnected` slots count against the same cap for their
   300 s. The no-slot entries and the per-slot D6 fields are tens of bytes each.
@@ -2120,8 +2122,8 @@ per replica, for N agents whose heartbeats reach it (estimates, unmeasured; slic
 - **Fleet gauges:** unchanged values in steady state. After a server restart they are briefly absent
   for `no_base` agents (D13).
 - **Viz:**
-  - a non-stale host's topology is at most one pump interval plus 10 s behind, plus the 60 s render
-    cache;
+  - a non-stale host's topology is at most one jittered pump interval (1.2 × the base) plus 10 s
+    behind, plus the 60 s render cache;
   - `stale` is true exactly when `stale_reason` is not null (D6);
   - a machine's `ts` keeps its meaning, the time the agent built the body, and stops being a
     freshness signal: a quiet host's `ts` can be up to 18 min old while it is fresh. Freshness is
