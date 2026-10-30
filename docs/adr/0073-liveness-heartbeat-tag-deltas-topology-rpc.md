@@ -1530,7 +1530,8 @@ count-valued histograms here are not latencies, so they declare their own:
   `parse|digest_mismatch|ip_conflict|oversize|unknown_session`, plus
   `bad_signature|replayed|unverified_session` from ADR-0074 wave 2 (D7, D16; `parse` also moves
   the parse counter above);
-- `yuzu_server_reattach_challenge_total{outcome}`, with `verified|bad_signature|expired`, and the
+- `yuzu_server_reattach_challenge_total{outcome}`, with
+  `verified|bad_signature|expired|degraded|send_failed`, and the
   gauge `yuzu_server_reattach_challenge_pending`, from ADR-0074 wave 2 (D14);
 - `yuzu_viz_topology_reclaim_total{outcome}`, with `reclaimed|conflict` (D6);
 - `yuzu_viz_topology_reclaim_audit_total{result}`, with `written|deferred|dropped` (D6: the queued
@@ -1654,7 +1655,11 @@ on the sustained condition and staying quiet on the expected one.
   replayed agent content, challenges are failing, or long-lived sessions have passed their bound
   certificate's notAfter with no re-bind (D16), so their state has stopped flowing. Responder: the
   `agent.state.bad_signature` and `agent.reattach.challenge` audit rows name the agent and the
-  gateway; check that gateway first, then certificate renewal. Tests: quiet through an expected
+  gateway (a `bad_signature` row is never suppressed, so the latest one names the gateway that
+  forged); check that gateway first, then certificate renewal. `degraded` and `send_failed` are
+  deliberately not in this rule: they report the server's revocation read or store, or the
+  management plane, failing, not a gateway altering content (`YuzuPgPoolSaturated` covers the
+  store). Tests: quiet through an expected
   post-restart challenge wave (`expired` 0, the pending gauge draining); fires on one
   `bad_signature`, on a stuck pending gauge, and on a sustained `unverified_session` share.
 
@@ -1941,7 +1946,9 @@ message ReattachResponse {
     `send_to`, `send_to_all` (the broadcast send, which does not call `send_to`) and
     `send_via_directory`. `send_to` and `send_to_all`'s per-session loop both refuse a
     `challenge_pending` session through one shared predicate, and `send_via_directory` refuses it
-    through `routable`. The one exemption is the `session_challenge` push, sent through the
+    through `routable`. The predicate is fail-closed: it admits a session only when its challenge
+    state is `verified` or the session never needed a challenge (a full Register), so `pending`,
+    `failed` and `expired` are all refused, and `routable` refuses the row on the same rule. The one exemption is the `session_challenge` push, sent through the
     issuer's `send_system_reserved` variant (D8) with the challenge flag, never a fourth send
     path. The issuer treats such a session as not installed (D8);
   - `challenge_pending` is an authentication gate, not an enablement gate, so it refuses the
@@ -1965,21 +1972,31 @@ message ReattachResponse {
     publication-discipline comment in `agent_registry.hpp` to list them. Resolving a challenge is
     one transition, `pending` to `verified`, `failed` or `expired`, taken under that lock; only
     the winner runs its side effects, so a late answer cannot revive an expired session and an
-    expiry cannot tear down a verified one. Slice 11's TSan tests race verification against
-    expiry (exactly one outcome counted, a consistent route row);
+    expiry cannot tear down a verified one. A winning `failed` or `expired` transition removes the
+    session from the registry's sendable set in the same critical section; only the Postgres
+    tombstone and record write wait for the lease. Slice 11's TSan tests race verification against
+    expiry (exactly one outcome counted, a consistent route row), and race a dispatch against a
+    failed transition whose lease write is blocked (zero sends);
   - on verification the server clears `challenge_pending` on both, then runs the #3425
     reconnect reconciler's containment re-application and marks a tags resync (D16): a
     containment re-dispatch refused during the window is re-fired, never dropped;
   - **failure ends the session for good.** A signature that fails to verify, or no answer within
     the expiry, makes the server uninstall the session, tombstone its route row and, in the same
     transaction, clear the `AgentRegistrationStore` record's `session_id`, itself; it does not rely
-    on the gateway closing the stream. The gateway's next targeted replay for that session then
+    on the gateway closing the stream. Both writes are conditional on the failed session's id (the
+    record's `session_id` still equal to it; the route row's existing session-fenced tombstone), so
+    a newer session from a full Register that lands first is never cleared; a write that matches no
+    row is counted as already superseded, not as an error. The gateway's next targeted replay for that session then
     gets `NO_RECORD`, which closes the agent's stream, so the agent registers again through the
     full path under its jittered reconnect backoff, and the session is never reattached and
     challenged again in a loop. A degraded read while verifying (the revocation check, or the
     store) is neither `bad_signature` nor `expired`: the check is retried within the expiry, and
     if it is still degraded at expiry the session is uninstalled without clearing the record,
-    counted `degraded`, and the agent may reattach again under `--reattach-rate`;
+    counted `degraded`, and the agent may reattach again under `--reattach-rate`. A challenge
+    whose forward fails (a transport error, or the gateway reporting `not_connected` or
+    `agent_disconnected`) is not retried: the challenge resolves at once through the same
+    transition, counted `send_failed`, and is handled like `degraded` (uninstalled, the record kept),
+    because nothing was learned about the agent;
   - **expiry is swept, not timed per challenge.** The issuer's pass (D8) scans `challenge_pending`
     sessions past their deadline and resolves each through the transition above; there is no
     per-challenge timer and no detached thread. The tombstone and record write runs on a bounded
@@ -1989,9 +2006,14 @@ message ReattachResponse {
   - every outcome is counted (`yuzu_server_reattach_challenge_total{outcome}`, with
     `verified|bad_signature|expired|degraded|send_failed`, and the gauge
     `yuzu_server_reattach_challenge_pending`, at most min(`--reattach-rate` × expiry, the sessions
-    held)). A failure writes an `agent.reattach.challenge` audit row through `audit_token`, at
-    most once per agent per 10 min; later failures are counted only, as the ADR already declines
-    to audit reconnect-storm outcomes row by row;
+    held)). Every `bad_signature` writes an `agent.reattach.challenge` audit row through
+    `audit_token`, naming the agent and the gateway peer, never suppressed: an honest agent never
+    produces one, so it cannot flood. `expired`, `degraded` and `send_failed` write one at most
+    once per (agent, gateway peer, outcome) per 10 min, the suppression map bounded by the sessions
+    held; later ones are counted only, as the ADR already declines to audit reconnect-storm
+    outcomes row by row. A slice-11 test runs an `expired` through one gateway and then a
+    `bad_signature` through another within 10 min, and asserts two rows, the second naming the
+    second gateway;
   - tests assert the exact send set: a reattached, unverified session receives no operator,
     scheduled, policy, Guardian or system-reserved command, broadcast included, and a quarantined
     device gets its containment re-applied after verification; a session whose challenge expires
