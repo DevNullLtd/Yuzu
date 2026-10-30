@@ -597,7 +597,8 @@ outside this rule; this ADR adds none of it.
       bases in place, and only the agents whose state tags changed during it diverge once. After a
       longer outage every entry is gone, every agent's next heartbeat is `no_base`, and all of them
       resync once. Either way the server issues at the configured rate: N / 2000 s per replica, where
-      N is the agents whose heartbeats reach it, so about 50 s of issuing for N = 100,000 (D8).
+      N is the agents whose heartbeats reach it, so about 50 s of issuing for N = 100,000 if the
+      issuer reaches that rate (D8: at measured Postgres latencies it may take 100-400 s).
   - The digest makes keep-newest correct, not merely tolerable. Whatever a lost heartbeat carried,
     the next delta's `base_digest` no longer matches the server's stored digest, and the server
     re-requests the full set (D3, step 6). A later heartbeat whose `state_digest` already equals the
@@ -1531,7 +1532,9 @@ Slice 10 records their measured values on the rig. No objective is set here (ope
 **Fleet-gauge semantics.** `yuzu_fleet_*` are rebuilt from the merged views. While an agent is
 `no_base` (after a server restart, until its full set lands), its state-derived gauges are absent,
 not zero, and its interval-derived gauges are present. The documented consequence after a server
-restart, for N = 100,000 agents on one replica (D8, D14):
+restart, for N = 100,000 agents on one replica, at the configured rates (upper-rate figures: D8
+gives the issuer's real throughput bounds, under which tag issuing may take 100-400 s, or about
+500 s behind a single gateway cluster; slice 10 measures it) (D8, D14):
 - an agent's tags converge about two minutes after **its** reattach (up to 36 s to the first
   heartbeat, issuing at N / `--tag-resync-rate`, about 50 s, then up to 36 s to the full set);
 - the reattach wave itself takes about 50 s (ten or more gateways, at the server's 2000/s cap) to
@@ -1853,7 +1856,8 @@ message ReattachResponse {
 2. **Tags follow.** An agent that has not reattached yet has no installed session, so it holds no
    mark (D8: such a mark is dropped and re-made by its next heartbeat after the reattach), and tag
    issuing trails the reattach wave. At 2000/s per replica it adds about 50 s of issuing for
-   N = 100,000, and tags converge in about two minutes after an agent's reattach.
+   N = 100,000 at that rate, and tags converge in about two minutes after an agent's reattach
+   (upper-rate figures; D8).
 3. **Topology follows.** `__resync__.topology` runs at 200/s per replica, about 8 min for
    N = 100,000.
 4. **Agents do not reconnect** in steady state. Reattach is invisible to the agent's connection:
@@ -2043,7 +2047,8 @@ It should say:
   every agent registers fresh, and recovery is rolling forward;
 - after a server restart, for 100,000 agents on a replica: each agent's state-derived gauges return
   about two minutes after it reattaches, the last agent's about 3 to 6 minutes after the restart,
-  and topology about 8 minutes after the reattach wave (D13);
+  and topology about 8 minutes after the reattach wave (D13), at the configured rates; the
+  issuer's measured throughput (slice 10) may make these several times longer;
 - the new flags and the gateway key, with defaults, ranges and environment names (*Configuration*):
   `--topology-interval`, `--no-topology`, `--tag-resync-rate`, `--topology-resync-rate`,
   `--reattach-rate`, `upstream_topology_concurrency`;
