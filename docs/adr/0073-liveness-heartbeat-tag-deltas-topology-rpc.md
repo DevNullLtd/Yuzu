@@ -880,8 +880,12 @@ message ReattachResponse {
   1. gateway peer authorization (`GatewayPeerGuardedService` override; D7's rule for a new upstream
      RPC);
   2. `registration_lock_for(agent_id)`;
-  3. enrollment status read (the existing fast-path read). If the agent is not enrolled, or is
-     denied or revoked, answer `NOT_ENROLLED`. Reattach can never enrol;
+  3. enrollment status read (the existing fast-path read, `get_pending_status`). Only
+     `PendingStatus::approved` proceeds. `pending`, `denied` or no row answers `NOT_ENROLLED`. A
+     store error answers `DEGRADED` (the fast path's `UNAVAILABLE` semantics), never
+     `NOT_ENROLLED`. Reattach can never enrol. "Revoked" is not an enrollment state: certificate
+     revocation is serial-scoped, and it does not gate reattach, just as it does not gate the
+     ProxyRegister fast path today;
   4. **the same adopt decision ProxyRegister uses** (`renew_leases` / `reclaim_tombstoned_session`
      CAS, `server/core/src/gateway_route_store.hpp` and its FORWARD NOTE), extracted into one shared
      function and called from both RPCs. Never a second copy. Whatever ADR-0074 decides about
@@ -906,15 +910,21 @@ message ReattachResponse {
   what step 5 refuses.
 - **Authority is unchanged, and stated so it stays that way.** Today's replay presents the stored
   request, but for an enrolled agent the server takes the fast path and ignores the token. Replay
-  authority already rests on three things:
+  authority already rests on two things:
   - the gateway's peer authorization;
-  - the agent's durable enrolled status;
-  - the route-directory CAS proving the session's row.
+  - the agent's durable enrolled status.
 
-  Reattach rests on exactly those three, so removing the token removes exposure, not a check. When
-  ADR-0074 D5 lands, the agent's per-session signature is a fourth, and it applies to a reattached
-  session as it does to a fresh one: reattach installs a session, and does not exempt it from the
-  session-start proof.
+  The route-directory CAS is a supersession fence, not proof that the gateway holds the session: it
+  refuses a session superseded by a different live one, but a tombstoned or absent row is reclaimed
+  under any well-formed session id. Reattach rests on the same two things as the ProxyRegister fast
+  path, so removing the token removes exposure, not a check.
+- **Reattach and ADR-0074 D5's per-session signature, stated plainly.** As designed here, reattach
+  has no agent step: it carries ids only and is invisible to the agent. It therefore cannot carry
+  the D5 per-session proof, which is the agent signing a server challenge at session start. Until
+  the owner resolves this (open point 13), a reattached session, and the route its CONNECTED
+  re-announce writes, inherit ADR-0074 Conflict 1's accepted route-claim risk: a compromised
+  gateway with a valid certificate can reattach any enrolled agent whose route row is not held by
+  a different live session, and claim that route.
 
 **What the server persists: `AgentRegistrationStore`.**
 - **Placement.** Born on Postgres, schema `agent_registration_store` (ADR-0006/0008 naming,
@@ -1215,8 +1225,10 @@ or a body asks for it, rate-limited. A shared store is neither needed nor decide
   ETS for the whole session, only for replay.
 - **Reattach is a new gateway-upstream RPC.** It gets a peer-guard override, an `rpc` label and a
   test row.
-- **Its authority is unchanged and cannot enrol** (D14). The same enrolled-status read and the same
-  shared adopt CAS gate it.
+- **Its authority is unchanged and cannot enrol** (D14). It rests on the gateway's peer
+  authorization and the same enrolled-status read as the ProxyRegister fast path; the shared adopt
+  CAS fences supersession but proves no session possession. Reattach cannot carry ADR-0074 D5's
+  per-session agent signature as designed (D14; open point 13).
 - **`AgentRegistrationStore` holds no secret** (ADR-0010).
 - **Heartbeat state content and the topology body are unsigned** under ADR-0074 D5's decided
   scope. D16 states what a compromised gateway can do with that; it is not covered by ADR-0074's
@@ -1451,3 +1463,11 @@ release and merge to `dev` inside one release window. ADR-0074 gates its own wav
     forged body. The digest check does not bound this. The owner either accepts it, as a new row in
     ADR-0074's accepted-risks table, or requires the agent to sign the `StatusTags` bytes and the
     `TopologyReport` under its D5 key.
+13. **How reattach meets ADR-0074 D5's per-session signature** (D14). Reattach is ids-only and has
+    no agent step, so it cannot carry the per-session proof as written. Until this is decided, a
+    reattached session inherits ADR-0074 Conflict 1's route-claim risk. The owner chooses:
+    - (a) after the reattach, the server sends a signed session-start challenge down the existing
+      stream. The route is not published, and no command but the challenge is dispatched, until the
+      agent's signature verifies. A failure tears the stream down and the agent registers again; or
+    - (b) reattach is exempt from the D5 per-session proof, recorded as a new row in ADR-0074's
+      accepted-risks table.
