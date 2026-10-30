@@ -1534,6 +1534,16 @@ count-valued histograms here are not latencies, so they declare their own:
   built from status tags and omits them. From slice 11 (ADR-0074 wave 2) an agent older than
   slice 11 is counted `unsigned`, not `absent` (D16), so the rollout check is this gauge and
   `yuzu_server_agents_state_unsigned` both at 0;
+- `yuzu_server_gateway_refused_total{reason}` (slice 11), a counter with the closed `reason` set
+  `pre_wave2`, unlabelled by gateway (the peer is in the WARN line and the audit row);
+- `yuzu_server_audit_state_rows_total{verb,result}` (slice 11), a counter with `verb`
+  `agent.state.bad_signature|gateway.upstream.refused|agent.reattach.challenge` and `result`
+  `written|deferred|dropped`;
+- every outcome and reason series that a slice-11 alert reads (the `bad_signature`, `unsigned`,
+  `replayed` and `unverified_session` values on the three state counters, every
+  `yuzu_server_reattach_challenge_total` outcome, `gateway_refused_total{reason="pre_wave2"}`
+  and `audit_state_rows_total{result="dropped"}`) is registered at 0 at start, so `increase()`
+  sees the first event; the promtool firing cases start with the series absent;
 - gauge `yuzu_server_agents_state_unsigned` (slice 11, from ADR-0074 wave 2): the sessions on this
   replica whose latest state payload was `unsigned` (D16: an agent older than slice 11), on the
   same timer and published at 0;
@@ -1548,7 +1558,7 @@ count-valued histograms here are not latencies, so they declare their own:
   `bad_signature|unsigned|replayed|unverified_session` from ADR-0074 wave 2 (D7, D16; `parse` also moves
   the parse counter above);
 - `yuzu_server_reattach_challenge_total{outcome}`, with
-  `verified|bad_signature|cert_invalid|expired|degraded|send_failed|superseded|unsupported|capacity`; the
+  `verified|bad_signature|cert_invalid|expired|degraded|send_failed|superseded|unsupported|capacity|kill_switched`; the
   counter
   `yuzu_server_reattach_challenge_extra_answer_total` (answers after the first, dropped
   unverified); and the gauges `yuzu_server_reattach_challenge_pending` and
@@ -1689,7 +1699,7 @@ on the sustained condition and staying quiet on the expected one.
   `expired`; quiet with `unsigned` stragglers; fires on one `bad_signature`, on an `expired`
   share above the threshold, and on a sustained `unverified_session` share.
 - `YuzuReattachChallengeDegraded` (ticket; slice 11): the share of
-  `yuzu_server_reattach_challenge_total{outcome=~"degraded|send_failed"}` above 0.2 of challenges
+  `yuzu_server_reattach_challenge_total{outcome=~"degraded|send_failed|capacity|kill_switched|cert_invalid|unsupported"}` above 0.2 of challenges
   resolved for 15 min, with at least 100 resolved, or
   `yuzu_server_reattach_challenge_oldest_pending_seconds` above 360 for 10 min (a sweep that is
   not resolving: the age of the oldest `challenge_pending` session, 0 when none is pending,
@@ -1697,11 +1707,23 @@ on the sustained condition and staying quiet on the expected one.
   re-tuned when either flag is changed, because a rule cannot read a flag).
   Meaning: reattached agents are not being verified because the revocation read or store is
   degraded, or the gateway management plane is failing forwards, or CONNECTED re-announces are
-  late; their state is not flowing and their reattaches are being backed off. Responder: the
-  revocation/CA read and `YuzuPgPoolSaturated`, then the gateway management plane and its
-  notify-queue depth. Tests: quiet through a post-restart wave; fires on a sustained `degraded`
-  share, on a held `send_failed` share, and on an oldest-pending age held past the bound with no
-  resolutions.
+  late, or challenge concurrency is undersized (`capacity`), or a kill switch is set on
+  `__session__.challenge` (`kill_switched`), or agents' certificates are invalid
+  (`cert_invalid`: renewal) or too old to answer (`unsupported`: upgrade them); their state is
+  not flowing. Responder, by the dominant outcome: the revocation/CA read and
+  `YuzuPgPoolSaturated`; the gateway management plane and its notify-queue depth;
+  `--reattach-challenge-concurrency`; the plugin configuration's kill switch; certificate
+  renewal; the agent version. Tests: quiet through a post-restart wave; fires on a sustained
+  share of each outcome, and on an oldest-pending age held past the bound with no resolutions.
+- `YuzuGatewayRefusedPreWave2` (ticket; slice 11):
+  `increase(yuzu_server_gateway_refused_total{reason="pre_wave2"}[1h]) > 0`. Meaning: a gateway
+  older than wave 2 is still connecting, and its agents are unreachable. Responder: upgrade the
+  gateway named in the WARN line and the `gateway.upstream.refused` row. Tests: fires on one
+  refusal; the slice-11 upgrade window is declared by silencing it for the window.
+- `YuzuStateAuditRowsDropped` (ticket; slice 11):
+  `increase(yuzu_server_audit_state_rows_total{result="dropped"}[1h]) > 0`. Meaning: a
+  tamper-detection or refusal audit row was lost. Responder: the audit store and
+  `YuzuPgPoolSaturated`; the WARN lines carry the lost rows' facts. Tests: fires on one drop.
 
 **Diagnosis.** The series above separate the three usual causes of divergence:
 
@@ -1957,7 +1979,15 @@ message ReattachResponse {
     enumerator (`session_challenge`; `kSystemReservedPushes` grows to 7, with its SCOPE OF THE
     BYPASS entry), refused to every operator surface by `classify_and_authorize_dispatch`. Its id
     is minted fresh per challenge, so the agent's dedup claim (the safe default; `__guard__`
-    stays the only bypass) is harmless. `notify_exec_tracker` skips its prefix, and its reply is
+    stays the only bypass) is harmless. It is not a protective action (the protective set stays
+    the closed list in `protective_actions.hpp`; widening it is a security decision this ADR does
+    not take), so `build_classified_command`'s kill-switch read applies: a whole-action or per-OS
+    switch on `__session__.challenge`, or an unreadable switch, resolves the challenge
+    `kill_switched` (uninstalled, the record kept, not audited per agent, never in the per-agent
+    back-off), and every gateway session stays unroutable until the switch is cleared, which is
+    the point of a switch; `YuzuReattachChallengeDegraded` names it. A slice-11 test sets the
+    switch during a reattach wave and asserts `kill_switched` only, no back-off entries, and
+    verification resuming once it is cleared. `notify_exec_tracker` skips its prefix, and its reply is
     dropped at both ingest paths before the provenance lookup, keyed on the response's plugin
     field as the `__resync__` reply is, and handed to the challenge verifier instead. A
     direct-connected agent gets it on its Subscribe stream. For a gateway agent there is no
@@ -2193,7 +2223,7 @@ message ReattachResponse {
     bounds it); a stop with challenges pending leaves them to the restart path, and a slice-11
     test checks `stop()` joins cleanly with one pending;
   - every outcome is counted (`yuzu_server_reattach_challenge_total{outcome}`, with
-    `verified|bad_signature|cert_invalid|expired|degraded|send_failed|superseded|unsupported|capacity`, and
+    `verified|bad_signature|cert_invalid|expired|degraded|send_failed|superseded|unsupported|capacity|kill_switched`, and
     the gauge `yuzu_server_reattach_challenge_pending`, at most min(`--reattach-rate` ×
     (`--reattach-connected-wait` + expiry), the sessions held), and the gauge
     `yuzu_server_reattach_challenge_oldest_pending_seconds`). Every `bad_signature` writes an `agent.reattach.challenge` audit row through
@@ -2468,11 +2498,16 @@ lands. The two are kept consistent as follows.
     relays is ever counted `bad_signature` or audited per heartbeat. The check is the gateway
     generation distinction ADR-0074 wave 2 must supply (a wave-1 gateway's certificate admits it
     exactly as a wave-2 one's does today; until ADR-0074 supplies one, slice 11 cannot ship). The
-    answer is `FAILED_PRECONDITION`, counted on `yuzu_server_gateway_refused_total{reason="pre_wave2"}`,
-    with at most one WARN line and one audit row per gateway peer per 10 min. A slice-11 test has
+    answer is `FAILED_PRECONDITION` with the message "gateway older than wave 2: upgrade this
+    gateway" (the gateway logs it with its own peer name and reports itself not ready), counted on
+    `yuzu_server_gateway_refused_total{reason="pre_wave2"}`, with at most one WARN line and one
+    `gateway.upstream.refused` audit row (detail `reason=pre_wave2`, the gateway peer identity
+    through `audit_token`) per gateway peer per 10 min, queued to the issuer drain like every
+    state-path audit row (below). A slice-11 test has
     a pre-wave-2 gateway relay an envelope-less heartbeat and topology report and asserts the
     refusal counter moves, `bad_signature` stays 0, no `agent.state.bad_signature` row is
-    written and `YuzuStateSignatureRefused` stays quiet;
+    written, exactly one `gateway.upstream.refused` row per peer per 10 min, and
+    `YuzuStateSignatureRefused` stays quiet;
   - **refusal.** From wave 2 a payload without a valid signature, a stripped one included, is
     `bad_signature` (`BAD_SIGNATURE` for a `TopologyReport`), never `absent` and never accepted,
     with one distinction for the rollout, scoped by delivery path: a payload carrying no envelope
@@ -2498,7 +2533,17 @@ lands. The two are kept consistent as follows.
     withholding. A payload whose sequence is
     not above the floor is `replayed`, a separate outcome that counts toward neither, so an honest
     reorder cannot back an agent off. The first `bad_signature` per session writes an
-    `agent.state.bad_signature` audit row through `audit_token`; later ones are counted only;
+    `agent.state.bad_signature` audit row (agent id, `via`, the gateway peer where known, and the
+    payload kind: tags, digest or topology) through `audit_token`; later ones are counted only.
+    Rows raised on the heartbeat or topology path (this one and `gateway.upstream.refused`) are
+    never written inline: they are queued to the issuer-owned drain exactly as D6's
+    `reclaim_conflict` rows are, with the same cap, stop-time drain and WARN-logged loss, and
+    counted on `yuzu_server_audit_state_rows_total{verb,result}` with `written|deferred|dropped`;
+    a non-zero `dropped` is a lost tamper-detection row and is ticketed by its own rule (D13).
+    `agent.reattach.challenge` rows are written by the verifier pool off every RPC path,
+    set-and-proceed (a failed write is counted `dropped` on the same counter, never withholds the
+    verdict). A slice-11 test sends a multi-session `bad_signature` batch with the pool degraded
+    and asserts the `BatchHeartbeat` answers inside the gateway's 5 s timeout;
   - **key.** The server verifies against the key of the certificate the session's challenge was
     verified with. That key is parsed once, at verification, and stored on the session with its
     notAfter as an owning, refcounted handle (a `shared_ptr` with an `EVP_PKEY_free` deleter, or a
@@ -2628,8 +2673,13 @@ It should say:
 - the order: server, then gateways, then agents. The server and gateways move in one maintenance
   window; the agents follow in short stages, and Guardian policy changes are paused until the last
   stage is done;
-- un-upgraded agents keep connecting and executing commands, but contribute **no** status tags and no
-  topology until upgraded (absent from fleet gauges, DEX performance, `/network`, Spark and Guardian
+- from slice 11, by delivery path: an un-upgraded direct agent keeps connecting and executing
+  commands but contributes no state (`unsigned`); an un-upgraded gateway agent is unreachable from
+  the gateway move until it is upgraded and re-enrolled on ADR-0074's new port, which needs its
+  enrolment credential, the firewall rule for the new port, and the binary delivered by a means
+  that does not depend on the gateway (ADR-0074 wave 2 must state that means; slice 11 cannot ship
+  until it does). Before slice 11, un-upgraded agents keep connecting and executing commands, but
+  contribute **no** status tags and no topology until upgraded (absent from fleet gauges, DEX performance, `/network`, Spark and Guardian
   health, and `/viz`). This lasts for the whole agent rollout, not one window. Alerts computed from
   the fleet gauges go silent for those agents rather than fire, and the Guardian generation re-push
   does not reach them. Their heartbeats are counted `absent` on `yuzu_server_heartbeat_tags_total`
@@ -2655,7 +2705,8 @@ It should say:
 - rollback, if the release's deployment contract permits one: the reverse order, agents, then
   gateways, then server. A new gateway must never front an old server (it cannot reattach). Status
   tags and topology are dark for each agent whose version does not match the server's until the
-  rollback completes, exactly as during the upgrade. The new schema is left in place and unread. A
+  rollback completes, exactly as during the upgrade; across slice 11 a gateway agent on the other
+  side of ADR-0074's clean break is unreachable, not dark, until it is re-enrolled to match. The new schema is left in place and unread. A
   release that ships under a hard-cutover deployment contract (the one `upgrading.md` states for the
   Forensics tier) has no in-place upgrade and no return to an earlier build: it is deployed fresh,
   every agent registers fresh, and recovery is rolling forward;
@@ -2883,6 +2934,13 @@ per replica, for N agents whose heartbeats reach it (estimates, unmeasured; slic
   unchanged from today, so an `offline` host is not-found there.
 
 ### Security
+
+- **Assurance claims must not precede slice 11.** Before slice 11 ships, no questionnaire,
+  whitepaper or architecture overview may claim integrity for gateway-relayed status tags or
+  topology, and ADR-0074's Conflict 1 route-claim risk stays open. After it ships, the claim is
+  bounded: a gateway's alteration of agent state is detected and rejected, but a gateway still
+  sees and can withhold content, can drop heartbeats (liveness is unsigned), and the direct port
+  is not challenge-gated; the key re-bind after renewal must also exist (D16).
 
 - **Enrollment tokens are no longer retained by the gateway.** Today each connected agent's token
   is held twice in ETS for the whole session, only for replay, and once more in the pending row
@@ -3167,6 +3225,11 @@ of every ~30 s. The content is unchanged.
   from slice 11, the signed state content and the post-reattach challenge (D14, D16), and in
   the quarantine section that an unverified reattached session receives no containment push
   until its challenge verifies, after which the stored containment is re-applied.
+- From slice 11: the customer-assurance set (the security whitepaper, the architecture overview,
+  the questionnaire answers on the integrity of agent-reported state, and the shared-responsibility
+  matrix), in the wording and limits *Security* gives; `docs/user-manual/gateway.md`
+  troubleshooting for the pre-wave-2 refusal; `docs/user-manual/audit-log.md` also for
+  `gateway.upstream.refused`.
 - From slice 11: `docs/user-manual/metrics.md` (the `bad_signature`, `unsigned`, `replayed` and
   `unverified_session` outcomes, the reattach-challenge counter and gauges,
   `yuzu_server_agents_state_unsigned`, `yuzu_server_reattach_challenge_extra_answer_total` and
@@ -3403,7 +3466,10 @@ renewal (D16, *key*).
       `challenge_pending` output-schema arm, `agents_challenge_pending` and its `retry_after_ms`
       (with `check-mcp-retry-hints.py`), and the A4 reason on `/api/command` and the legacy
       forwarder; the D6 rule that a refused heartbeat refreshes liveness only; the old-gateway
-      refusal and `yuzu_server_gateway_refused_total`.
+      refusal and `yuzu_server_gateway_refused_total`; the `kill_switched` outcome; the
+      `gateway.upstream.refused` verb; state-path audit rows queued to the issuer drain and
+      `yuzu_server_audit_state_rows_total`; zero-registration of every alerted series;
+      `YuzuGatewayRefusedPreWave2` and `YuzuStateAuditRowsDropped`.
     - Proto and gateway: the additive envelope fields in both proto copies and the gateway's
       `*_pb.erl`, passed through unchanged (checked by `check-proto-codegen.sh`); `session_id`
       kept top-level and unsigned; `estimate_bytes/1` counting the heartbeat envelope, with an
