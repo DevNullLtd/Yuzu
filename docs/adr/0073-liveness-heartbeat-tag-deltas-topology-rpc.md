@@ -2426,7 +2426,8 @@ of every ~30 s. The content is unchanged.
   - **S1, server restart storm** (5,000 and 10,000 agents; slices 6 and 7b): no agent reconnects
     except `NO_RECORD`; `BatchHeartbeat` p99 stays under 2 s; the gateway retries no heartbeat batch
     on a timeout; the breaker does not trip; tags and topology converge within the D13 figures for
-    that N;
+    that N, recomputed from the issuer's measured throughput and, for gateway agents, the measured
+    forward duration (D8), and slice 10 records both;
   - **S2, S1 with Postgres degraded** (300 ms added latency, pool saturated; slice 6): heartbeat
     ingestion is unaffected, resyncs are `deferred` and drain once the pool recovers, and a reattach
     whose read fails answers `DEGRADED` without closing a stream; `DEGRADED` reattach attempts per
