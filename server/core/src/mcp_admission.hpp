@@ -17,10 +17,11 @@
 ///
 /// Placement: `admit()` runs inside the auth hook that server.cpp builds with
 /// `make_admission_auth_fn()` and hands to `McpServer::register_routes`, which fans
-/// out to all three verbs, so `McpServer`
-/// and its unit fixture stay untouched. The per-tool `mcp_tier.empty()` guards in
-/// mcp_server.cpp and the empty-tier branches in mcp_policy.hpp remain as defence
-/// in depth.
+/// out to all three verbs. Admission lives in the registered auth callable, so
+/// `McpServer` needs no knowledge of it; the unit harness `McpTestServer` deliberately
+/// omits it so the handler-level tier guards stay testable. The per-tool
+/// `mcp_tier.empty()` guards in mcp_server.cpp and the empty-tier branches in
+/// mcp_policy.hpp remain as defence in depth.
 ///
 /// `admit()` performs the refusal (audit row + counter + A4 response) and returns
 /// whether the request is admitted; do not split the three effects across call sites.
@@ -171,7 +172,10 @@ inline constexpr std::size_t kAdmissionBudgetPrincipalBytes = 64;
         return true;
 
     const auto cid = yuzu::server::detail::make_correlation_id();
-    // The refused counter and the 403 are unconditional: nothing below may stop either.
+    // The audit-row work below is contained, so a failure there can never skip the refused
+    // counter or the 403. The correlation id and the counter increment are not contained: an
+    // allocation failure in either propagates, httplib answers 500, and the request is still
+    // NOT admitted (fail-closed).
     if (metrics != nullptr) {
         metrics
             ->counter(std::string{kAdmissionRefusedMetric},

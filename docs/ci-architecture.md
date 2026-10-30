@@ -2497,9 +2497,12 @@ test file or script itself, not behind a meson guard. Those nine carry the
 
 Linux selects `--suite docs … --suite platform`; Windows selects `--suite platform`
 (not `docs`) with `--exclude-suite docs` on its coverage guard; macOS runs
-everything but `--no-suite docs`. The two dual-labelled node tests
-(`shell bell script behaviour`, `tokens page rotate behaviour`; `['server', 'docs']`)
-therefore no longer run on Windows or macOS, by intent.
+everything but `--no-suite docs`. The five dual-labelled node tests
+(`shell bell script behaviour`, `tokens page rotate behaviour`,
+`echo timeline script behaviour`, `mcp http adapter behaviour` and
+`swagger page behaviour`; `['server', 'docs']`)
+therefore no longer run on Windows or macOS, by intent. Like its siblings, the
+`mcp http adapter behaviour` test skips (exit 77) wherever `node` is absent.
 Before moving an entry, grep the docs-suite tests, Python and shell, for a
 Windows- or macOS-positive branch: `skipUnless(... win32`,
 `if sys.platform == "win32":` guarding assertions, a Python ternary on

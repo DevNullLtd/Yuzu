@@ -1019,9 +1019,9 @@ public:
                           "a credential with no MCP tier (cookie session or tierless token)",
                           "counter");
         metrics_.describe("yuzu_mcp_admission_audit_suppressed_total",
-                          "/mcp/v1/ admission refusals whose mcp.session.reject audit row was not "
-                          "written because the per-principal audit budget was spent (the refused "
-                          "counter still counts every refusal)",
+                          "Audit rows not written for tier_required refusals at /mcp/v1/ "
+                          "admission (suppressed by the per-key budget or a budget failure); "
+                          "the refused counter is complete",
                           "counter");
         metrics_.describe("yuzu_mcp_initialize_protocol_total",
                           "MCP initialize handshakes by negotiated protocol revision", "counter");

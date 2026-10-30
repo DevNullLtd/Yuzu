@@ -3413,12 +3413,13 @@ test('echo timeline script behaviour',
 # MCP stdio adapter (scripts/mcp-http-adapter.js, #4309): runs the real script under node against a
 # stdlib HTTP stub on an ephemeral 127.0.0.1 port. Pins the id:null tier refusal re-addressed to the
 # request id, the synthesized -32000 for non-JSON-RPC HTTP errors, one sanitised stderr line, no token
-# or cookie leak, a `null` stdin line, and in-flight replies surviving stdin close. Skips (77) without node.
+# or cookie leak, odd stdin lines, in-flight replies surviving stdin close, the total per-request
+# deadline and the in-flight cap. ~8 s of real waits (SSE deadline, 40 slow requests). Skips (77) without node.
 test('mcp http adapter behaviour',
   _python3_test,
   args: [files('test_mcp_http_adapter_behaviour.py')],
   suite: ['server', 'docs'],
-  timeout: 60,
+  timeout: 120,
 )
 
 # README Docker Compose quickstart (#5419): the compose the README downloads must

@@ -300,6 +300,23 @@ TEST_CASE("mcp route registration: wiring -- server.cpp builds the MCP auth hook
     CHECK(live_count == 1);
 }
 
+// #4309: both admission metric families must be described (HELP/TYPE) and pre-seeded at 0 in
+// server.cpp, or a dashboard or alert reads "no data" instead of 0 until the first refusal. A
+// commented-out line does not begin its line, so it fails.
+TEST_CASE("mcp route registration: wiring -- server.cpp describes and pre-seeds both "
+          "yuzu_mcp_admission_* families",
+          "[server][routes][mcp][authz][4309]") {
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    for (const std::string family :
+         {"yuzu_mcp_admission_refused_total", "yuzu_mcp_admission_audit_suppressed_total"}) {
+        CAPTURE(family);
+        CHECK(find_live_call(src, "metrics_.describe(\"" + family + "\"") != std::string::npos);
+        CHECK(find_live_call(src, "metrics_.counter(\"" + family + "\"") != std::string::npos);
+    }
+}
+
 TEST_CASE("mcp route registration: wiring -- server.cpp wires the software sync runner before "
           "register_routes",
           "[server][routes][mcp]") {

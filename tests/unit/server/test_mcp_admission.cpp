@@ -647,11 +647,13 @@ TEST_CASE("mcp admission budget: the key is bounded for any username or source",
     const auto key = yuzu::server::mcp::admission_budget_key(s);
     // "tier_required|other|" is 20 bytes, plus the principal cut to 64.
     CHECK(key.size() == 84);
+    CHECK(key.size() <= yuzu::server::kAuditMaxKeyBytes);
     CHECK(key.rfind("tier_required|other|", 0) == 0);
     // The longest legitimate source label ("engine_token") gives the longest key: 27 + 64 = 91,
     // inside the budget's own 96-byte bound, so the budget never cuts into the principal.
     auto t = make_session("engine_token", "", "engine", std::string(200, 'e'));
     CHECK(yuzu::server::mcp::admission_budget_key(t).size() == 91);
+    CHECK(yuzu::server::mcp::admission_budget_key(t).size() <= yuzu::server::kAuditMaxKeyBytes);
 }
 
 TEST_CASE("mcp admission budget: an admitted request never touches the budget",

@@ -279,7 +279,7 @@ Risk-register entry (closed by #4309): an elevated cookie session's replay ring
 was readable by a non-elevated credential of the same class that held the session
 id. JIT elevation is per-request state outside the class. `/mcp/v1/` now refuses
 every credential with no MCP tier (`403`, `-32003`, audited `mcp.session.reject`
-`reason=tier_required`), which includes the only credential kind that can be
+`reason=tier_required`; audit row rate-limited, counter complete), which includes the only credential kind that can be
 elevated, so a cookie session can no longer hold an `/mcp/v1/` session; for a
 period before that change the residual stood as described. The session id should
 still be protected like a credential.
@@ -293,13 +293,16 @@ were not subject to the tier or approval controls. The check is enforced per
 replica, so a replica not yet upgraded during a rolling upgrade, or one rolled back,
 admits tierless callers again; see `docs/user-manual/upgrading.md` for the
 rolling-upgrade and rollback windows.
-Questionnaire wording: every tierless request to `/mcp/v1/` is refused (`403`) and
-counted. An audit row (`mcp.session.reject`, `reason=tier_required`) is written for
-the first refusals of each principal and source in a 10-second window (up to 10 per
-key; beyond 64 distinct keys in a window they share one 10-row bucket); further rows
-are suppressed and counted in a separate counter
-(`yuzu_mcp_admission_audit_suppressed_total`), and a failed audit write does not
-change the refusal.
+Questionnaire wording: every tierless request that reaches admission on an upgraded
+replica is refused (`403`) and counted on `yuzu_mcp_admission_refused_total`. An
+audit row (`mcp.session.reject`, `reason=tier_required`) is written for the first
+refusals of each principal and source in a 10-second window (up to 10 per key;
+beyond 64 distinct keys in a window they share one 10-row bucket); further rows are
+suppressed and counted on `yuzu_mcp_admission_audit_suppressed_total`. When audit
+writes succeed, rows plus suppressed equal refused. The counters are telemetry (per
+replica, reset on restart), requests refused by an earlier check (kill switch,
+`Origin`, protocol version, the streaming-off `405`, the same-site gate) are not
+counted here, and a failed audit write does not change the refusal.
 Stream liveness is principal-level: the class is checked when the stream attaches and is not re-derived from the live credential afterwards (the per-tick credential recheck compares the principal only, and the per-tick session check compares the class captured at attach).
 Further residuals: a class switch strands the old-class sessions against the
 per-principal cap (fixed at 8, no flag) for up to the 30-minute idle TTL (longer while
