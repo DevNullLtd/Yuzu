@@ -531,8 +531,10 @@ class check and the digest check all apply. An empty field is `absent`. A reject
 installs no state map, so the agent's first heartbeat is `no_base` and requests a resync.
 Registration itself never fails because of the tags.
 
-**Locking.** `AgentHealthStore::apply` holds the store's `mu_` only to copy and to commit:
-- under `mu_`, it copies the agent's state map, its stored digest and a per-agent version counter;
+**Locking.** `AgentHealthStore::apply` holds the store's `mu_` only to read, copy and commit:
+- under `mu_`, it reads the agent's stored digest and per-agent version counter. An empty delta
+  ends here (the digest compare above): no map is copied. Only a non-empty delta copies the
+  agent's state map; a `full = true` set replaces the map and never copies the old one;
 - it decodes, applies the delta to the copy and hashes **outside** `mu_`, so no SHA-256 runs under
   the fleet-wide mutex;
 - under `mu_` again, it commits only if the agent's version is unchanged, and bumps it. A changed
