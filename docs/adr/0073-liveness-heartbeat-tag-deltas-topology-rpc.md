@@ -573,6 +573,11 @@ rpc ProxyTopology(yuzu.agent.v1.TopologyReport) returns (yuzu.agent.v1.TopologyA
 ```
 
 **Server.**
+- Each new handler, `AgentServiceImpl::ReportTopology` and `GatewayUpstreamServiceImpl::ProxyTopology`,
+  begins with `onbehalf::enforce(context)` before any side effect, like every existing handler in
+  `agent_service_impl.cpp` and `gateway_service_impl.cpp`. Direct `ReportTopology` then calls
+  `reject_revoked_peer(context, "report_topology")`, as `ReportInventory` does
+  (`"report_inventory"`).
 - Both paths call the one shared parser, `FleetTopologyStore::parse_fleet_snapshot_json`. After D10
   there are exactly two callers.
 - The trust boundary is unchanged: `agent_id` and `os` come from the session.
@@ -877,6 +882,7 @@ message ReattachResponse {
   Only the payload changes, from a stored request to two ids and a peer address. That removes the
   `local_error` encode-failure branch of `replay_send/4`.
 - **Server** (`GatewayUpstreamServiceImpl::ProxyReattach`, `server/core/src/gateway_service_impl.cpp`):
+  0. `onbehalf::enforce(context)`, before any side effect, as in every gateway-upstream handler;
   1. gateway peer authorization (`GatewayPeerGuardedService` override; D7's rule for a new upstream
      RPC);
   2. `registration_lock_for(agent_id)`;
@@ -1255,6 +1261,9 @@ of every ~30 s. The content is unchanged.
 - the topology send rules, with an injected RNG for jitter bounds, never timing.
 
 **Server:**
+- `ReportTopology`, `ProxyTopology` and `ProxyReattach` each refuse an on-behalf-of request before
+  any side effect (`onbehalf::enforce` first); direct `ReportTopology` refuses a revoked peer
+  (`reject_revoked_peer`, label `report_topology`);
 - `ProxyReattach`: adopt via the shared decision (one function, called by both RPCs); every refusal;
   fail-closed on a degraded record read; never installs from partial facts; the rate limit;
 - `AgentRegistrationStore` under the ADR-0012 test conventions (`YUZU_REQUIRE_PG_DB`): upsert, plugin
