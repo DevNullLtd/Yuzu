@@ -2,6 +2,48 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: the packaged Linux agent can read root-only files
+
+**What changed.** The `.deb` and `.rpm` agent's systemd unit now grants the agent one Linux capability, `CAP_DAC_READ_SEARCH`, as an ambient capability. The capability bounding set is that one capability, and `NoNewPrivileges=true` is kept. Before, a packaged agent ran with no capabilities, so the system serial number and UUID (root-only `0400` files under `/sys/class/dmi/id`) read back as `unknown`.
+
+**What you will see after the upgrade.**
+
+- The hardware plugin's `system` action returns the serial and UUID instead of `unknown`.
+- `mgmt_posture` now reads `/etc/sssd/sssd.conf` and `remote_access_audit` now opens users' `authorized_keys`. Both previously answered `PERMISSION_DENIED` or `unknown` on a packaged agent, and now return data.
+- At every start the unit copies the firmware tables (`DMI` and `smbios_entry_point`) into `/var/lib/yuzu-agent/dmi/` (directory `0700`, files `0600`, owned by the agent account). It is removed and rebuilt each start, and absent when the host has no DMI or the copy fails. No plugin reads this copy yet.
+
+**Disclosure: what the capability allows.** Every plugin runs inside the agent process, so every plugin on a packaged Linux agent can now read any file on the host, read-only. That includes `/etc/shadow`, `/etc/sssd/sssd.conf` (and any bind credential in it) and users' `authorized_keys`. It does not allow writing, and it does not allow anything else: no other capability is granted. Scripts and helper programs the agent starts do not get it: the agent clears its inheritable and ambient capability sets at start, so after exec an ordinary child (non-root, no file capabilities) has no capabilities. The exceptions are a host binary that carries its own file capabilities (it keeps them) and the short window between fork and exec, when the child is still agent code. Setuid-root programs cannot elevate under `NoNewPrivileges`.
+
+**Verify.**
+
+```bash
+grep Cap /proc/$(systemctl show -p MainPID --value yuzu-agent)/status
+```
+
+On the agent's main process `CapEff`, `CapPrm` and `CapBnd` read `0000000000000004` (only the read capability) and `NoNewPrivs` reads `1`; `CapInh` and `CapAmb` read `0000000000000000` because the agent clears them at start. With the capability opted out, `CapEff` and `CapPrm` read `0000000000000000`.
+
+**Opt out.** Create a drop-in under `/etc/systemd/system/yuzu-agent.service.d/`, then `systemctl daemon-reload && systemctl restart yuzu-agent`. There are two separate choices:
+
+1. *Capability only.* The agent runs without the capability; the firmware table copy is still made at each start.
+
+   ```ini
+   [Service]
+   AmbientCapabilities=
+   ```
+
+2. *Capability and hardware-table copy.* Also disables the root helper and removes the existing copy at the next start.
+
+   ```ini
+   [Service]
+   AmbientCapabilities=
+   ExecStartPre=
+   ExecStartPre=-/bin/rm -rf /var/lib/yuzu-agent/dmi /var/lib/yuzu-agent/dmi.tmp
+   ```
+
+With the capability removed, serial and UUID read `unknown` again and the two plugins above return to their refusal answers.
+
+**Tested and untested.** The mechanism is verified on systemd 259 and, in CI, on a self-hosted Linux runner that asserts the live unit's capability sets and the copy behaviour. Real firmware tables had not been exercised before that CI check, and systemd 239 (RHEL 8) is designed for but untested.
+
 ## Behaviour change: the activity-record feature is renamed Echo (tar.db adopted as echo.db; stored references migrated)
 
 **What changed.** The feature that records endpoint activity was called TAR and is now called Echo, with no aliases for the old names except the upgrade-window shim below. The agent plugin is `echo` (`echo.dll`, `echo.so`, `echo.dylib`; the Windows installer removes the old `tar.dll`). REST routes move from `/api/v1/tar/...` to `/api/v1/echo/...`, MCP tools from `*_tar_*` to `*_echo_*` (for example `list_tar_retention_paused` is now `list_echo_retention_paused`, and `create_result_set_from_tar_query` is now `create_result_set_from_echo_query`), metrics from `yuzu_tar_*` to `yuzu_echo_*`, audit actions from `tar.*` to `echo.*`, instruction ids from `crossplatform.tar.*` to `crossplatform.echo.*`, the agent heartbeat tags from `yuzu.plugin.tar.*` to `yuzu.plugin.echo.*`, and the result-set matcher kind from `tar_rows_ge` to `echo_rows_ge` (a request that still sends the old kind to `POST /api/v1/result-sets/from-instruction-result` or its MCP twin is now refused with an error naming the kind, as is any other unrecognised kind, instead of being accepted into a set that never matches anything). The OpenAPI `operationId` and tag changes are listed in the OpenAPI note further down this page.
