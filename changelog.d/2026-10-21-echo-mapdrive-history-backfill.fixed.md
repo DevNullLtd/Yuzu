@@ -1,1 +1,0 @@
-- **The Echo inbound mapped-drive history backfill on Windows now completes.** It reads the newest 500 successful-logon events instead of 5,000: on the measured host a 5,000-event read exceeded its output cap on a normal Security log, so it recorded no row and cost every agent start a wasted read of up to its 15-second deadline.

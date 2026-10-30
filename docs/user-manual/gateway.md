@@ -347,8 +347,7 @@ rejection, doubling to a 300 s cap), drops its `Subscribe` stream and registers
 again. There is no wire or server change, and no agent change for the supported
 topologies. The recovery logic exists from v0.13.0 (checked in the agent source at
 the v0.12.0 and v0.13.0 tags), but the released v0.13.0 and v0.14.0-rc6 agents wedge in
-their reconnect path with default settings (bug #2182, fixed by PR #5183, in no release
-yet): after the rejection they log `(#1894)` and `Heartbeat thread stopped` and never
+their reconnect path with default settings (bug #2182, fixed by PR #5183, shipped in 0.15.0): after the rejection they log `(#1894)` and `Heartbeat thread stopped` and never
 re-register (observed, 19 minutes, reproduced on a second agent; the cause is inferred
 from the fix). They recover only with `--no-auto-update` (observed with v0.13.0 and
 v0.14.0-rc6, re-registering 20 to 21 s after a registry restart; a command-line flag
@@ -360,8 +359,8 @@ v0.12.0 is inferred from the agent source, not run) and, for
 persistent missing state, stay rejected until restarted or upgraded (a heartbeat that
 falls in the short gap between the session leaving the pending table and its agent
 process registering can succeed later without re-registration). Upgrade the agents
-first, then the gateway, with a build that includes the #2182 fix once released; until
-then, restart an agent that stays rejected (restarting the agent service re-registers
+first, then the gateway, with 0.15.0 or later (the #2182 fix); until the agents are upgraded,
+restart an agent that stays rejected (restarting the agent service re-registers
 it). Agents that do not connect through the gateway are not affected. Recovery matters
 only when heartbeats are rejected, which happens in four cases: a topology that breaks
 the one-connection assumption, a gateway running without the session index, a
@@ -551,8 +550,8 @@ is not tested.
 
 **Upgrading.** A rejected agent re-registers on its own only in a build that includes
 the #2182 fix, or with `--no-auto-update` on v0.13.0 and v0.14.0-rc6 (see Heartbeat
-admission): upgrade the agents first, then the gateway, with a build that includes the fix
-once released. Until then, restart an agent that stays rejected (restarting the agent service
+admission): upgrade the agents first, then the gateway, with 0.15.0 or later, which includes the fix.
+Until the agents are upgraded, restart an agent that stays rejected (restarting the agent service
 re-registers it). Agents that do not connect through the gateway are not affected. Deploy this
 change with a **gateway restart**. The session index is a
 new in-memory table created when the gateway registry starts, and hot code upgrade
@@ -3141,8 +3140,7 @@ fleet-wide reconnect for the node, and what the agents do next depends on their
 build. OBSERVED (a graceful gateway restart, see "Connection drain" under
 [Heartbeat admission](#heartbeat-admission) and "Agent dependency" below): released v0.13.0 and v0.14.0-rc6 agents with
 default settings did not re-register and stayed wedged, and v0.12.0 never
-re-registered; an agent build with the #5183 fix (bug #2182, in no release tag
-yet) re-registered in 11 to 12 s. So before you restart the gateway, upgrade the
+re-registered; an agent build with the #5183 fix (bug #2182, shipped in 0.15.0) re-registered in 11 to 12 s. So before you restart the gateway, upgrade the
 agents behind it to a build that includes #5183 where you have one, or expect to
 restart the agent service on every released agent behind that gateway. Whether
 restarting only the gateway recovers agents stranded by an earlier server restart
@@ -3449,9 +3447,9 @@ as an unknown session, so the agent stayed stranded without any signal
 arm has no `accepted` check and the only disconnect is the superseded
 `FAILED_PRECONDITION` arm, and from the server's unknown-session handling of a
 `CONNECTED` in `gateway_service_impl.cpp`; neither was run). The disconnect makes
-the strand visible and lets the agent follow its own registration path. Released
-agents that wedge after any disconnect still need the agent service restarted
-until a release containing #5183 ships.
+the strand visible and lets the agent follow its own registration path. Agents older than 0.15.0
+that wedge after any disconnect still need the agent service restarted;
+0.15.0 contains the #5183 fix.
 
 **Replay failures feed the shared circuit breaker.** A failed `ProxyRegister`
 during a verdict-driven drip calls the breaker's failure path like any other
@@ -4301,7 +4299,7 @@ the agent has to register again by itself. In the
 released agents v0.13.0 and v0.14.0-rc6 with default settings did not
 re-register after a `NOT_FOUND` heartbeat rejection, while the same agents run
 with `--no-auto-update` did; the cause is inferred to be bug #2182, fixed by
-#5183, which is in no release yet. Agent v0.12.0 never recovered by itself in
+#5183, which ships in 0.15.0. Agent v0.12.0 never recovered by itself in
 that test. Restarting the agent is the interim action for an agent that stays
 disconnected. Running an agent with `--no-auto-update` avoids the wedge but also
 disables the OTA update channel for that agent.

@@ -209,5 +209,4 @@ share|smb|projects|/srv/samba/projects|rw|false|hidden|smb_conf
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_shares.hpp`
 - Tests: `tests/test_shares_definition.py` · `tests/unit/test_shares_legs.cpp` · `tests/unit/test_shares_local_dispatcher.cpp` · `tests/unit/test_shares_parsers.cpp` · `tests/unit/test_shares_posix_fs.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-12-shares.added.md` · `changelog.d/2026-10-27-shares-windows-leg.added.md`
 <!-- END GENERATED -->
