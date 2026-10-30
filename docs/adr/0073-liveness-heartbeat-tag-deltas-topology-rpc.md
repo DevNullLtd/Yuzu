@@ -823,7 +823,12 @@ When several conditions hold, the first in this order wins:
     as `push_snapshot` audits today, so no Postgres write is held under the fleet-wide mutex. The
     fresh body then goes through first-claim-wins. The caller does not write the row on the
     heartbeat path either: it queues it for the resync issuer's thread (D8), which writes it
-    before its next pass, so several conflicts in one `BatchHeartbeat` under a degraded pool
+    before its next pass. Each steady-state drain pass is bounded: it writes at most 1 s of rows
+    (whatever has started by then finishes), checks the stop flag between writes and hands off to
+    the stop-time drain below when it is set, and leaves the rest queued for the next pass, so a
+    large backlog against a slow but healthy pool never holds up resync issuing for more than
+    about a second per pass and a stop mid-drain stays inside the issuer's shutdown bound. The
+    queue's depth is a gauge (`yuzu_viz_topology_reclaim_audit_queued`, D13). So several conflicts in one `BatchHeartbeat` under a degraded pool
     cannot push the batch past the gateway's 5 s call timeout. The queued row's lifecycle:
     - the queue is owned by the issuer and guarded by its own mutex, never `pushed_mu_`: the
       caller pushes the row after `pushed_mu_` is released, and the issuer swaps the whole queue
@@ -1478,6 +1483,7 @@ count-valued histograms here are not latencies, so they declare their own:
 - `yuzu_viz_topology_reclaim_total{outcome}`, with `reclaimed|conflict` (D6);
 - `yuzu_viz_topology_reclaim_audit_total{result}`, with `written|deferred|dropped` (D6: the queued
   `reclaim_conflict` audit row; a non-zero `dropped` is a lost evidence row);
+- `yuzu_viz_topology_reclaim_audit_queued`, a gauge (D6: the re-claim audit rows still queued);
 - `yuzu_viz_topology_digest_total{via,outcome}`, with `match|mismatch|no_slot|empty|disabled|absent`
   (`empty`: an empty digest; `disabled`: `DISABLED`; `absent`: no field);
 - `yuzu_viz_topology_resync_total{outcome}`, with `sent|deferred|send_failed`;
@@ -1595,6 +1601,7 @@ on the sustained condition and staying quiet on the expected one.
 | `unverifiable` rises | agents with a digest version the server does not implement (D3) | server and agent versions |
 | `diverged` plus `no_base` near 100 % | per-RPC balancing in front of the server (*Server stores*) | the load balancer |
 | `yuzu_server_resync_pending` high and `deferred` rising, `send_failed` at 0 | server overload: the issuer is deferring on Postgres (a record write or the enablement read failing) or on the rate | `YuzuPgPoolSaturated`, `--tag-resync-rate`, `--topology-resync-rate` |
+| `yuzu_viz_topology_reclaim_audit_queued` high and not falling | re-claim conflicts arriving faster than the bounded per-pass audit drain writes them (D6); the issuer still runs a pass after each 1 s of writing | Postgres write latency, then the gateway's IP churn |
 | `send_failed` rising | the `__resync__` kill switch (whole-action or per-OS), failed gateway forwards, agents a gateway reported `not_connected`, or a gateway without the dispatch-tag capability; the issuer's WARN log names the cause | plugin configuration, then the gateway management plane |
 
 **Freshness SLIs.** Two ratios measure what this ADR changes, per replica:
@@ -2523,7 +2530,9 @@ of every ~30 s. The content is unchanged.
   - **S2 with re-claim conflicts** (slice 8), including a stop with rows still queued (each is
     written or counted `dropped`): a gateway restart with IP churn among retained slots
     under a degraded pool leaves `BatchHeartbeat` under its timeout, with the audit rows written
-    off the heartbeat path;
+    off the heartbeat path; and a backlog of thousands of rows under 300 ms added latency keeps
+    resync passes running (about one pass per 1 s of audit writing) and a stop mid-drain
+    finishes inside the issuer's shutdown bound;
   - **S6, retain-on-disconnect IP conflict** (slice 8): a gateway restart during which another
     agent claims one of a retained slot's IPs writes `topology.push.rejected` with
     `reason=reclaim_conflict`, drops the slot and requests topology (D6).
@@ -2771,7 +2780,8 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
 8. **Server topology.** `ReportTopology`, digest confirm, the D6 slot changes, `stale_reason`,
    retain-on-disconnect, age rebasing, the topology resync trigger, the fetcher removed, server
    topology metrics; the re-claim audit queue, its drain on the issuer and
-   `yuzu_viz_topology_reclaim_audit_total`, with a stop-during-drain test.
+   `yuzu_viz_topology_reclaim_audit_total` and `yuzu_viz_topology_reclaim_audit_queued`, with a
+   stop-during-drain test and the bounded 1 s per-pass steady-state drain.
 9. **Gateway topology and agent sender.**
    - Gateway: `report_topology/2` with its permit pool and cap, `ProxyTopology`, the peer-guard
      override.
