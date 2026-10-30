@@ -65,7 +65,7 @@ TokenCaps token_caps(const Deps& d, const httplib::Request& req, bool rbac_enfor
 // principals through this cookie-session page, whatever grants they hold. A denial is audited.
 bool deny_engine_session(const Deps& d, const auth::Session& s, const httplib::Request& req,
                          httplib::Response& res, const char* action) {
-    const bool engine = s.principal_kind == "engine" || s.auth_source == "engine_token";
+    const bool engine = s.is_engine();
     if (!engine && s.mcp_tier.empty())
         return false;
     (void)detail::emit_behavioral_audit(d.audit_fn, req, res, action, "denied", "EnginePrincipal", "",
