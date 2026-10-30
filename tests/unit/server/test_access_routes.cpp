@@ -102,7 +102,8 @@ struct Harness {
     // Non-empty models a service-scoped API token: the deny stub then writes the 403 and returns true.
     std::string session_scope_service;
     std::vector<std::string> deny_actions;
-    std::expected<access::EnforcementView, std::string> enforce_result{access::EnforcementView{true, false, false}};
+    std::expected<access::EnforcementView, std::string> enforce_result{
+        access::EnforcementView{.enabled = true, .degraded = false, .may_toggle = false}};
     // The advisory authority answer the page is drawn from (server.cpp binds the real one). Every
     // session it was asked about is kept, so a case can pin WHO the hint was computed for.
     RbacAdminHint hint_result{RbacAdminHint::kMay};
@@ -802,7 +803,8 @@ TEST_CASE("access routes: the switch follows the hint: live, disabled as not per
 TEST_CASE("access routes: a degraded enforcement view never asks for, or draws, the switch hint",
           "[access][routes]") {
     Harness h;
-    h.enforce_result = access::EnforcementView{true, true, false};
+    h.enforce_result =
+        access::EnforcementView{.enabled = true, .degraded = true, .may_toggle = false};
     h.hint_result = RbacAdminHint::kMay;
     h.wire();
     const auto res = h.sink.dispatch("GET", "/fragments/access/enforcement");
