@@ -1108,6 +1108,9 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     - a 10 s deadline and no retries: the agent's next diverged heartbeat re-marks it;
     - no re-issue to an agent while an earlier forward for it is in flight; a mark above the
       in-flight bound stays `deferred`;
+    - at most one forward in flight per (cluster, action): a cluster's marks stay `deferred` while
+      its forward is in flight, so one cluster with a dead management plane holds at most 2 of the
+      8 slots and never blocks resyncs for the other gateways on the replica;
     - `forward_gateway_pending` and #3279 are unchanged for every other command.
 
     The `build_classified_command` call is a `DispatchCaller` construction, of the existing system
@@ -2360,8 +2363,9 @@ of every ~30 s. The content is unchanged.
   - **S5, server wall-clock step of ±10 min** (slice 8): no `stale_reason`, IP claim or retention
     outcome changes (D6, `steady_clock`);
   - **S1 with the gateway management port blackholed** (slice 6): the issuer's gateway forwarder
-    threads stay within their bound, command and containment forwarding are still served, and
-    marks above the in-flight bound are `deferred`;
+    threads stay within their bound, command and containment forwarding are still served, marks
+    above the in-flight bound are `deferred`, and agents behind a second, healthy gateway converge
+    at the D8 rates during the blackhole;
   - **S2 with re-claim conflicts** (slice 8): a gateway restart with IP churn among retained slots
     under a degraded pool leaves `BatchHeartbeat` under its timeout, with the audit rows written
     off the heartbeat path;
