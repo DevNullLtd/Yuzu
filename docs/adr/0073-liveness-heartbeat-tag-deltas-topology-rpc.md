@@ -975,6 +975,8 @@ Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
 - `yuzu_server_heartbeat_tags_total{via,outcome}`, with
   `synced|full|diverged|no_base|rejected|absent|unverifiable` (`via` includes `register`, D3);
 - `yuzu_server_tag_resync_total{outcome}`, with `sent|deferred|send_failed`;
+- gauge `yuzu_server_resync_pending{action}`, with `tags|topology`: the size of the pending set
+  (D8);
 - `yuzu_server_agent_reattach_total{outcome}`, with
   `accepted|no_record|not_enrolled|superseded|malformed_session|degraded|rate_limited` (D14);
 - `yuzu_server_agent_registration_store_failed_total{op}` (D14);
@@ -1741,13 +1743,18 @@ release and merge to `dev` inside one release window. ADR-0074 gates its own wav
 
    The tree is coherent but tags and topology are inert until slices 4-9 land.
 4. **Server tags.** `AgentHealthStore::apply`, the D3 ingestion order (including the tag caps moved
-   from the gateway), the Register-side consumer, hooks on the merged view, server tag metrics, and the divergence alert.
+   from the gateway), the Register-side consumer, hooks on the merged view, and
+   `yuzu_server_heartbeat_tags_total`. An outcome that needs a resync is counted only; slice 6 adds
+   the request.
 5. **Agent tags.** State and interval maps, the base and delta, full on Register,
    `yuzu.started_at`, `yuzu.uptime_s` removed, agent tag metrics.
 6. **`__resync__`, both ends.**
    - Agent: reserved dispatch, decision function, dedup claim.
-   - Server: minting, per-replica rate limits and per-agent intervals, the exec-tracker skip, the
-     catalogue pairs, and the operator-surface refusal.
+   - Server: the pending set and the issuer, and its call site in heartbeat ingestion (D3);
+     `--tag-resync-rate` and `--topology-resync-rate`, the per-agent intervals and the backoff after
+     `rejected`; the resync metrics (`yuzu_server_tag_resync_total`,
+     `yuzu_viz_topology_resync_total`, `yuzu_server_resync_pending`); the reply drop at ingest;
+     minting, the exec-tracker skip, the catalogue pairs, and the operator-surface refusal.
 
    Covers both `tags` and `topology`; the `topology` action is inert until slice 8.
 7. **Gateway opacity.** Keep-newest whole-heartbeat coalescing; the per-tag checks and
@@ -1768,7 +1775,8 @@ release and merge to `dev` inside one release window. ADR-0074 gates its own wav
      `--no-topology`.
 10. **Surfaces and docs.**
     - MCP and REST `stale_reason` and descriptions.
-    - Both alert rules.
+    - Both alert rules (`YuzuHeartbeatTagDivergenceSustained` and `YuzuVizTopologyResyncBacklog`);
+      this is the only slice that adds them.
     - Every doc listed above, the upgrading.md section and the changelog fragment.
     - The harness and rig rerun recorded as the measured outcome, using ADR-0074 D14's method.
 
