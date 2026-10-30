@@ -14,7 +14,9 @@
  *      for two personas, and, for the personas that can reach a real transition,
  *      `PUT /api/v1/rbac/enforcement`) is called and its answer
  *      classified: 2xx / 400 / 409 = authority admitted (kMay), 403 = kMayNot, 503 = kUnconfirmed.
- *      The hint must equal that classification, and must not have written an audit row.
+ *      A 403 or 503 counts only when its message is one of the gates the hint models (see
+ *      `classify`), so a refusal from the wrong gate fails the persona. The hint must equal that
+ *      classification, and must not have written an audit row.
  *   2. The fold itself: structural denies need no store, a null or degraded store is
  *      kUnconfirmed, `RbacAdminSurface` has no default argument.
  *
@@ -44,19 +46,47 @@ using namespace yuzu::server;
 
 namespace {
 
+/// The route's A4 error message ("error"."message"), or the raw body when it is not an A4 error.
+std::string error_message_of(const std::string& body) {
+    const auto j = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
+    if (j.is_discarded() || !j.is_object() || !j.contains("error") || !j["error"].is_object())
+        return body;
+    return j["error"].value("message", "");
+}
+
+bool starts_with(const std::string& s, std::string_view prefix) {
+    return s.compare(0, prefix.size(), prefix) == 0;
+}
+
 /// What a real route answer says about the caller's authority. Anything outside the three
-/// shapes is not an authority answer, so the test fails loudly rather than guessing. Two
-/// statuses are NOT modelled and would misclassify: the unassign route's 403
-/// `self_admin_unassign_blocked` (a refusal about the request, after the gates passed, which
-/// would read as kMayNot; no persona here removes its own Administrator grant) and a 503 from
-/// a store read after the gates passed (which would read as kUnconfirmed).
-std::optional<RbacAdminHint> classify(int status) {
+/// shapes is not an authority answer, so the test fails loudly rather than guessing. The status
+/// alone is not enough (a 403 or 503 from the WRONG place would pass for the right one), so a
+/// refusal also has to carry the message of a gate the hint models: the shared predicate refusal,
+/// the three structural belts that run before it (engine, MCP-tier and service-scoped sessions),
+/// or the enforcement store's own authority refusal for a 403; the shared "cannot confirm"
+/// message or the enforcement write failure for a 503. A message outside that closed set
+/// (notably the unassign route's 403 `self_admin_unassign_blocked`, a refusal about the request
+/// after the gates passed, and any other 503 from a read after the gates) returns nullopt: the
+/// persona then fails its `REQUIRE(classified)` instead of reading as kMayNot or kUnconfirmed.
+std::optional<RbacAdminHint> classify(int status, const std::string& body) {
     if ((status >= 200 && status < 300) || status == 400 || status == 409)
         return RbacAdminHint::kMay; // the gates passed; the refusal (if any) is about the request
-    if (status == 403)
-        return RbacAdminHint::kMayNot;
-    if (status == 503)
-        return RbacAdminHint::kUnconfirmed;
+    const auto message = error_message_of(body);
+    if (status == 403) {
+        if (message == kRbacAdminGateDeniedMessage ||
+            starts_with(message, "engine principals cannot access this endpoint") ||
+            starts_with(message, "MCP tokens cannot perform admin operations") ||
+            starts_with(message, "service-scoped tokens cannot") ||
+            starts_with(message, "refused: caller does not currently hold"))
+            return RbacAdminHint::kMayNot;
+        return std::nullopt;
+    }
+    if (status == 503) {
+        if (message == kRbacAdminGateUnavailableMessage ||
+            message == "RBAC store write failed; retry shortly")
+            return RbacAdminHint::kUnconfirmed;
+        return std::nullopt;
+    }
     return std::nullopt;
 }
 
@@ -81,6 +111,20 @@ std::string refusal_text(const std::string& body) {
     return j["error"].value("message", "") + " | " + j["error"].value("remediation", "");
 }
 
+// The two destination-guard refusals, verbatim: `message | remediation` as the route answers them
+// (rbac_admin_authority_owner.cpp's `refusal_message`, rest_api_v1.cpp's PUT enforcement
+// `remediation`). Pinned whole so a reworded or dropped remediation is a deliberate edit here.
+constexpr const char* kEnableRefusal =
+    "refused: enabling RBAC enforcement would leave the caller with no fleet-wide Administrator "
+    "grant; assign yourself Administrator first | POST /api/v1/rbac/roles/Administrator/"
+    "assignments {\"principal_type\":\"user\",\"principal_id\":\"<your username>\"} (or MCP "
+    "assign_rbac_role), then retry";
+constexpr const char* kDisableRefusal =
+    "refused: disabling RBAC enforcement would leave the caller without the local admin role that "
+    "is the only durable administrator authority while enforcement is off | only a local account "
+    "holding the admin role can disable enforcement; sign in as one, or have one set your local "
+    "role via POST /api/settings/users/{username}/role, then retry";
+
 RbacAdminHint hint_of(RbacRoleHarness& h) {
     return rbac_admin_hint(h.rest_session(), h.auth_db.get(), h.rbac.get(), RbacAdminSurface::kRest);
 }
@@ -88,7 +132,10 @@ RbacAdminHint hint_of(RbacRoleHarness& h) {
 /// A REAL AuditStore on the harness's database, counted by querying its table. The harness's own
 /// `audit_log` is fed only by the REST audit_fn, which the hint never receives, so it can never
 /// observe a hint-path write; this is the observation that could (the same rule
-/// test_access_authz.cpp's last case follows).
+/// test_access_authz.cpp's last case follows). `rbac_admin_hint` is handed no audit hook and no
+/// store writes `audit_store.audit_events` on its behalf, so "the count did not move" is only
+/// evidence if the watch is shown to see a write: `write_marker` is that positive control (a known
+/// write through a store on the same database), and every silence check calls it.
 class AuditWatch {
 public:
     explicit AuditWatch(RbacRoleHarness& h)
@@ -102,11 +149,32 @@ public:
         REQUIRE(r.has_value());
         return r->size();
     }
+    /// Writes one row through the watched store.
+    bool write_marker() {
+        AuditEvent e;
+        e.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+        e.principal = "audit-watch-control";
+        e.action = "test.audit_watch_control";
+        e.target_type = "Test";
+        e.target_id = "";
+        e.result = "success";
+        e.detail = "positive control";
+        return store_.log(e);
+    }
 
 private:
     pg::PgPool pool_;
     AuditStore store_;
 };
+
+/// The hint wrote no audit row, and the watch is shown to be able to see one.
+void check_hint_silent(AuditWatch& watch, std::size_t audits_before) {
+    CHECK(watch.rows() == audits_before); // the hint path is silent (#5792)
+    REQUIRE(watch.write_marker());        // positive control: the same watch sees a known write
+    CHECK(watch.rows() == audits_before + 1);
+}
 
 /// The break-glass rename P13 uses: the regime check's auth.users JOIN cannot run, while the
 /// predicate (principal_roles) still answers.
@@ -123,14 +191,14 @@ void check_assign(RbacRoleHarness& h, RbacAdminHint expected) {
     AuditWatch watch{h};
     const auto audits_before = watch.rows();
     const auto hint = hint_of(h);
-    CHECK(watch.rows() == audits_before); // the hint path is silent (#5792)
+    check_hint_silent(watch, audits_before);
     INFO("hint=" << name_of(hint) << " expected=" << name_of(expected));
     CHECK(hint == expected);
 
     const auto res = h.assign_rest("Viewer", R"({"principal_type":"user","principal_id":"hint-target"})");
     REQUIRE(res);
     INFO("assign status=" << res->status << " body=" << res->body);
-    const auto classified = classify(res->status);
+    const auto classified = classify(res->status, res->body);
     REQUIRE(classified.has_value());
     CHECK(*classified == hint);
 }
@@ -143,14 +211,14 @@ void check_unassign(RbacRoleHarness& h, RbacAdminHint expected) {
     AuditWatch watch{h};
     const auto audits_before = watch.rows();
     const auto hint = hint_of(h);
-    CHECK(watch.rows() == audits_before); // the hint path is silent (#5792)
+    check_hint_silent(watch, audits_before);
     INFO("hint=" << name_of(hint) << " expected=" << name_of(expected));
     CHECK(hint == expected);
 
     const auto res = h.unassign_rest("Viewer", "hint-target");
     REQUIRE(res);
     INFO("unassign status=" << res->status << " body=" << res->body);
-    const auto classified = classify(res->status);
+    const auto classified = classify(res->status, res->body);
     REQUIRE(classified.has_value());
     CHECK(*classified == hint);
 }
@@ -164,7 +232,7 @@ void check_enforcement(RbacRoleHarness& h, RbacAdminHint expected, bool target) 
     const auto res = h.set_enforcement_rest(target);
     REQUIRE(res);
     INFO("enforcement status=" << res->status << " body=" << res->body);
-    const auto classified = classify(res->status);
+    const auto classified = classify(res->status, res->body);
     REQUIRE(classified.has_value());
     CHECK(*classified == hint);
 }
@@ -403,6 +471,69 @@ TEST_CASE("rbac_admin_hint == PUT enforcement: engine session (P11)",
     check_enforcement(h, RbacAdminHint::kMayNot, /*target=*/true);
 }
 
+// ── The MCP surface (kMcp): the hint equals the real assign_rbac_role answer ──────────────────
+//
+// The hint's `kMcp` branch has no production caller yet, so it is pinned here against the real MCP
+// tool, called through the harness's ticket-then-recall dance with the harness's MCP session (its
+// `session_mcp_tier`, which `is_rbac_administrator(..., kMcp)` does not consult). The tool answers
+// with a result when it assigned the role (kMay), or a JSON-RPC error whose message is the shared
+// gate wording (kMayNot / kUnconfirmed).
+
+namespace {
+void check_mcp_assign(RbacRoleHarness& h, RbacAdminHint expected) {
+    const auto hint = rbac_admin_hint(h.session_with_tier(h.session_mcp_tier), h.auth_db.get(),
+                                      h.rbac.get(), RbacAdminSurface::kMcp);
+    INFO("hint=" << name_of(hint) << " expected=" << name_of(expected));
+    CHECK(hint == expected);
+
+    const auto res = h.mcp_call_tool_approved(
+        "assign_rbac_role",
+        {{"principal_type", "user"}, {"principal_id", "hint-target"}, {"role", "Viewer"}});
+    REQUIRE(res);
+    INFO("mcp body=" << res->body);
+    const auto body = nlohmann::json::parse(res->body, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(body.is_discarded());
+    std::optional<RbacAdminHint> classified;
+    if (body.contains("error")) {
+        const std::string message = body["error"].value("message", "");
+        if (message == kRbacAdminGateDeniedMessage)
+            classified = RbacAdminHint::kMayNot;
+        else if (message == kRbacAdminGateUnavailableMessage)
+            classified = RbacAdminHint::kUnconfirmed;
+    } else if (body.contains("result")) {
+        classified = RbacAdminHint::kMay;
+    }
+    REQUIRE(classified.has_value());
+    CHECK(*classified == hint);
+    // The side effect agrees: only an admitted caller's assignment happened.
+    CHECK(h.rbac->get_principal_roles("user", "hint-target").empty() ==
+          (*classified != RbacAdminHint::kMay));
+}
+} // namespace
+
+TEST_CASE("rbac_admin_hint (kMcp) == MCP assign_rbac_role: base user WITH the Administrator grant, RBAC on",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true);
+    check_mcp_assign(h, RbacAdminHint::kMay);
+}
+
+TEST_CASE("rbac_admin_hint (kMcp) == MCP assign_rbac_role: base admin with NO grant, RBAC on",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.rbac->set_rbac_enabled(true);
+    make_user(h, h.session_user, auth::Role::admin);
+    check_mcp_assign(h, RbacAdminHint::kMayNot);
+}
+
+TEST_CASE("rbac_admin_hint (kMcp) == MCP assign_rbac_role: regime store unreadable, RBAC on",
+          "[pg][rbac_admin_predicate][rbac_admin_hint]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true);
+    make_regime_store_unreadable(h);
+    check_mcp_assign(h, RbacAdminHint::kUnconfirmed);
+}
+
 // ── More personas on the PUT and DELETE routes (qe-2) ────────────────────────
 
 TEST_CASE("rbac_admin_hint == PUT enforcement: regime store unreadable, RBAC on (P13)",
@@ -548,7 +679,7 @@ TEST_CASE("rbac_admin_hint CHARACTERISATION: RBAC off, a local administrator wit
         CHECK(refusal_text(res->body) == first_body); // a stable, remediable refusal
         CHECK_FALSE(h.rbac->is_rbac_enabled()); // nothing changed
     }
-    CHECK_THAT(first_body, Catch::Matchers::ContainsSubstring("Administrator"));
+    CHECK(first_body == kEnableRefusal); // the full message and remediation, not a fragment
 }
 
 TEST_CASE("rbac_admin_hint CHARACTERISATION: RBAC on, a base-user Administrator-grant holder is drawn "
@@ -569,7 +700,33 @@ TEST_CASE("rbac_admin_hint CHARACTERISATION: RBAC on, a base-user Administrator-
         CHECK(refusal_text(res->body) == first_body);
         CHECK(h.rbac->is_rbac_enabled()); // nothing changed
     }
-    CHECK_FALSE(first_body.empty());
+    CHECK(first_body == kDisableRefusal); // the full message and remediation, not a fragment
+}
+
+// ── The classifier itself ────────────────────────────────────────────────────
+
+namespace {
+std::string a4_body(int code, const std::string& message) {
+    return nlohmann::json{{"error", {{"code", code}, {"message", message}}}}.dump();
+}
+} // namespace
+
+TEST_CASE("rbac_admin_hint classify: a refusal counts as an authority answer only from a modelled gate",
+          "[rbac_admin_predicate][rbac_admin_hint]") {
+    // The shared gate refusals classify as before.
+    CHECK(classify(403, a4_body(403, std::string(kRbacAdminGateDeniedMessage))) == RbacAdminHint::kMayNot);
+    CHECK(classify(503, a4_body(503, std::string(kRbacAdminGateUnavailableMessage))) ==
+          RbacAdminHint::kUnconfirmed);
+    CHECK(classify(409, a4_body(409, "anything")) == RbacAdminHint::kMay);
+    // A 403 from a gate the hint does not model is NOT kMayNot: the unassign route's post-gate
+    // self-removal refusal, and a 403 from somewhere else entirely.
+    CHECK_FALSE(classify(403, a4_body(403, "cannot remove your own Administrator role assignment"))
+                    .has_value());
+    CHECK_FALSE(classify(403, a4_body(403, "cross-site request refused")).has_value());
+    CHECK_FALSE(classify(403, "not json").has_value());
+    // Likewise a 503 that is not the authority gate's "cannot confirm".
+    CHECK_FALSE(classify(503, a4_body(503, "RBAC store read failed")).has_value());
+    CHECK_FALSE(classify(500, a4_body(500, "boom")).has_value());
 }
 
 // ── The fold itself ──────────────────────────────────────────────────────────

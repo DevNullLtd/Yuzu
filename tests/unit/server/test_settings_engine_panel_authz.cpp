@@ -90,6 +90,8 @@ using namespace yuzu::server;
 namespace pg = yuzu::server::pg;
 using pg::PgPool;
 
+extern const char* const kSettingsHtml; // settings_ui.cpp: the /settings page shell
+
 namespace {
 
 // One database holding both the RBAC and the engine-principal schemas (the production stores
@@ -114,6 +116,8 @@ constexpr const char* kFragment = "/fragments/settings/engine-principals";
 constexpr const char* kTwin = "/api/v1/engine-principals";
 constexpr const char* kSlug = "engine:epanel"; // seeded; its slug is the leak marker in the body
 constexpr const char* kRevokedId = "engine:revoked1";
+// The target both surfaces name on every engine_principal.list row: the securable, no id (a list).
+const std::vector<std::string> kListTarget{"EnginePrincipal:"};
 // The three rows of a revoked principal's history (Rig::seed_revoked_principal).
 constexpr const char* kRevokeMarker = "credentials_revoked=1; REVOKE-DETAIL-MARKER";
 constexpr const char* kFailedRevokeText = "FAILED-REVOKE-STORE-ERROR connection refused";
@@ -128,6 +132,12 @@ constexpr const char* kTruncatedWithDetail =
 constexpr const char* kTruncatedNoSuccess =
     " <span class=\"hint\">(more than 200 revoke events and none of the newest 200 "
     "succeeded)</span>";
+
+// The in-page Retry's explanation, shared in words by kEngineRetryControl (settings_routes.cpp) and
+// the page script's 5xx/429 note (settings_ui.cpp).
+constexpr const char* kRetrySentence =
+    "Retry here instead of reloading the page, which would discard a credential secret shown "
+    "above.";
 
 bool refused(int status) { return status == 401 || status == 403; }
 
@@ -163,7 +173,16 @@ struct Rig {
     std::unique_ptr<AuthRoutes> ar;
     std::vector<std::string> fragment_audits; // "action/result/detail" from the panel's own rows
     std::vector<std::string> twin_audits;     // the same shape, from the REST twin's audit_fn
+    // "target_type:target_id" of each row above, index for index: a row is only the twin's row if
+    // it names the same target as well as the same action/result/detail.
+    std::vector<std::string> fragment_targets;
+    std::vector<std::string> twin_targets;
     bool drop_audit_writes{false};            // both hooks report a dropped row (set-and-proceed)
+    // Both hooks ALSO write the row into the real AuditStore through the same
+    // `AuthRoutes::audit_log` server.cpp binds, so a test can read back what is PERSISTED (the
+    // string captures above hold only action/result/detail/target). Off by default: it adds rows
+    // that the denied-row counts of other cases would see.
+    bool persist_audits{false};
     SettingsRoutes settings;
     RestApiV1 api;
     yuzu::server::test::TestRouteSink sink; // LAST: handlers capture `this`
@@ -207,10 +226,14 @@ struct Rig {
         };
         auto perm_fn = [this](const httplib::Request& q, httplib::Response& r, const std::string& t,
                               const std::string& o) { return ar->require_permission(q, r, t, o); };
-        auto audit_fn = [this](const httplib::Request&, const std::string& action,
-                               const std::string& result, const std::string&, const std::string&,
-                               const std::string& detail) -> bool {
+        auto audit_fn = [this](const httplib::Request& req, const std::string& action,
+                               const std::string& result, const std::string& target_type,
+                               const std::string& target_id, const std::string& detail) -> bool {
             twin_audits.push_back(action + "/" + result + "/" + detail);
+            twin_targets.push_back(target_type + ":" + target_id);
+            if (persist_audits)
+                return ar->audit_log(req, action, result, target_type, target_id, detail) &&
+                       !drop_audit_writes;
             return !drop_audit_writes;
         };
         if (wire_engine_store)
@@ -223,10 +246,16 @@ struct Rig {
         auto settings_audit = [](const httplib::Request&, const std::string&, const std::string&,
                                  const std::string&, const std::string&, const std::string&) {};
         // The fail-closed audit hook server.cpp binds (the engine-session belt writes through it).
-        auto settings_audit_read = [this](const httplib::Request&, const std::string& action,
-                                          const std::string& result, const std::string&,
-                                          const std::string&, const std::string& detail) -> bool {
+        auto settings_audit_read = [this](const httplib::Request& req, const std::string& action,
+                                          const std::string& result,
+                                          const std::string& target_type,
+                                          const std::string& target_id,
+                                          const std::string& detail) -> bool {
             fragment_audits.push_back(action + "/" + result + "/" + detail);
+            fragment_targets.push_back(target_type + ":" + target_id);
+            if (persist_audits)
+                return ar->audit_log(req, action, result, target_type, target_id, detail) &&
+                       !drop_audit_writes;
             return !drop_audit_writes;
         };
         settings.register_routes(sink, auth_fn, admin_fn, perm_fn, settings_audit, cfg, auth_mgr,
@@ -397,6 +426,8 @@ struct Rig {
     void clear_audits() {
         fragment_audits.clear();
         twin_audits.clear();
+        fragment_targets.clear();
+        twin_targets.clear();
     }
     std::size_t roster_size() {
         auto all = engine_store.list_all_checked();
@@ -664,6 +695,7 @@ TEST_CASE("engine panel authz: an engine session that DOES hold EnginePrincipal:
     REQUIRE(r.rbac.set_permission({"EngineLister", "EnginePrincipal", "Read", "allow"}).has_value());
     REQUIRE(r.rbac.assign_role({"engine", kSlug, "EngineLister"}).has_value());
     r.rbac_on();
+    r.persist_audits = true; // read the PERSISTED rows back below
     const auto raw = r.token("engine-bearer", kSlug, "readonly", "engine");
 
     const auto frag = r.bearer_get(kFragment, raw);
@@ -676,6 +708,23 @@ TEST_CASE("engine panel authz: an engine session that DOES hold EnginePrincipal:
     CHECK_THAT(frag->body, !ContainsSubstring(kSlug));
     REQUIRE(r.fragment_audits.size() == 1);
     CHECK(r.fragment_audits[0] == "engine_principal.list/denied/engine_session_denied");
+    CHECK(r.fragment_targets == kListTarget);
+
+    // The PERSISTED rows (the panel's and the twin's): attributed to an engine actor, not "human"
+    // or "agent", with the denial's target.
+    AuditQuery q;
+    q.action = "engine_principal.list";
+    q.limit = 100;
+    const auto stored = r.audit_store.query(q);
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->size() == 2);
+    for (const auto& row : *stored) {
+        INFO("persisted row detail=" << row.detail << " principal=" << row.principal);
+        CHECK(row.result == "denied");
+        CHECK(row.detail == "engine_session_denied");
+        CHECK(row.target_type == "EnginePrincipal");
+        CHECK(row.principal_class == "engine");
+    }
 }
 
 // ---- revoke detail (sec-1) and the success audit row (sec-2): the CH-3 matrix ---------------
@@ -688,6 +737,10 @@ class AuditTableLock {
 public:
     explicit AuditTableLock(const std::string& dsn) : conn_{PQconnectdb(dsn.c_str())} {
         REQUIRE(PQstatus(conn_.get()) == CONNECTION_OK);
+        // A LOCK blocked behind another session's lock fails the test after 5 s instead of
+        // hanging it.
+        REQUIRE(pg::exec_params(conn_.get(), "SET lock_timeout = '5s'", std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
         REQUIRE(pg::exec_params(conn_.get(), "BEGIN", std::vector<std::string>{}).status() ==
                 PGRES_COMMAND_OK);
         REQUIRE(pg::exec_params(conn_.get(),
@@ -796,7 +849,7 @@ TEST_CASE("engine panel audit: per caller class the panel leaves the evidence th
     constexpr int kViews = 50;
     const auto admitted_cookie = [&](const char* label, const std::string& cred) {
         INFO("caller " << label);
-        int frag_ok = 0, twin_ok = 0, rows_equal = 0;
+        int frag_ok = 0, twin_ok = 0, rows_equal = 0, targets_ok = 0;
         for (int i = 0; i < kViews; ++i) {
             r.clear_audits();
             const auto frag = r.cookie_get(kFragment, cred);
@@ -808,10 +861,12 @@ TEST_CASE("engine panel audit: per caller class the panel leaves the evidence th
             twin_ok += (twin->status == 200 && r.twin_audits ==
                                                    std::vector<std::string>{success_row});
             rows_equal += (r.fragment_audits == r.twin_audits);
+            targets_ok += (r.fragment_targets == kListTarget && r.twin_targets == kListTarget);
         }
         CHECK(frag_ok == kViews);  // exactly one success row per view, with the twin's detail
         CHECK(twin_ok == kViews);
         CHECK(rows_equal == kViews);
+        CHECK(targets_ok == kViews); // and the twin's row names the same target, not just the text
     };
     // (a) EnginePrincipal:Read only, (b) that plus AuditLog:Read.
     admitted_cookie("(a) EnginePrincipal:Read only", r.cookie("carol", auth::Role::user));
@@ -830,8 +885,10 @@ TEST_CASE("engine panel audit: per caller class the panel leaves the evidence th
         CHECK_THAT(frag->body, !ContainsSubstring(kSlug));
         CHECK(r.fragment_audits ==
               std::vector<std::string>{"engine_principal.list/denied/mcp_session_denied"});
+        CHECK(r.fragment_targets == kListTarget);
         CHECK(twin->status == 200);
         CHECK(r.twin_audits == std::vector<std::string>{success_row});
+        CHECK(r.twin_targets == kListTarget);
     }
     {   // (d) an account administrator WITHOUT the grant, cookie session: the panel's quiet probe
         // leaves NO row (it auto-loads, nobody attempted anything); the twin's loud gate does.
@@ -862,6 +919,8 @@ TEST_CASE("engine panel audit: per caller class the panel leaves the evidence th
         CHECK(r.fragment_audits ==
               std::vector<std::string>{"engine_principal.list/denied/engine_session_denied"});
         CHECK(r.twin_audits == r.fragment_audits);
+        CHECK(r.fragment_targets == kListTarget);
+        CHECK(r.twin_targets == r.fragment_targets); // the same row, target and all
     }
     {   // (f) an engine session WITHOUT the read: the permission gate refuses, loudly on both
         // (an engine caller is never given the quiet treatment); no panel row, no twin row.
@@ -940,6 +999,12 @@ TEST_CASE("engine panel audit: an unreadable roster writes no success row, an un
         // A failed credential read, unlike an audit-only failure, draws the Retry control (and
         // proves the audit-only case's "no Retry" assertion is looking for the right words).
         CHECK_THAT(resp->body, ContainsSubstring("Retry</button>"));
+        // The Retry's sentence, whole: this C++ copy (kEngineRetryControl) and the page script's
+        // (settings_ui.cpp, pinned in test_settings_page_ui.cpp) are hand copies of one sentence,
+        // so each is pinned against the same literal and drift between them is a failing test.
+        CHECK_THAT(resp->body, ContainsSubstring(std::string("<span class=\"hint\">") +
+                                                 kRetrySentence + "</span>"));
+        CHECK_THAT(std::string(kSettingsHtml), ContainsSubstring(kRetrySentence));
     }
 }
 
@@ -1119,11 +1184,8 @@ TEST_CASE("engine panel audit: once the audit store fails the remaining revoked 
     CHECK(r.audit_query_error_degrades() == 1);
     CHECK(elapsed >= kTimeoutMs * 3 / 4);            // the one lookup did wait out its timeout
     CHECK(elapsed < (kRevoked - 1) * kTimeoutMs);    // generous: no per-row wait on a shared box
-    std::size_t unavailable = 0;
-    const std::string cell = detail_cell("(unavailable)");
-    for (std::size_t at = 0; (at = resp->body.find(cell, at)) != std::string::npos; ++at)
-        ++unavailable;
-    CHECK(unavailable == static_cast<std::size_t>(kRevoked));
+    CHECK(count_occurrences(resp->body, detail_cell("(unavailable)")) ==
+          static_cast<std::size_t>(kRevoked));
     // Only the audit lookup failed, so the credential reads are fine and the page draws no Retry
     // control: the documented recovery is a reload (after copying any secret shown on the page).
     CHECK_THAT(resp->body, !ContainsSubstring("Retry"));
@@ -1134,12 +1196,8 @@ TEST_CASE("engine panel audit: once the audit store fails the remaining revoked 
     const auto after = r.cookie_get(kFragment, dave);
     REQUIRE(after);
     CHECK(after->status == 200);
-    std::size_t committed = 0;
-    for (std::size_t at = 0; (at = after->body.find(detail_cell(kRevokeMarker), at)) !=
-                             std::string::npos;
-         ++at)
-        ++committed;
-    CHECK(committed == static_cast<std::size_t>(kRevoked));
+    CHECK(count_occurrences(after->body, detail_cell(kRevokeMarker)) ==
+          static_cast<std::size_t>(kRevoked));
     CHECK_THAT(after->body, !ContainsSubstring("(unavailable)"));
 }
 
@@ -1318,6 +1376,22 @@ TEST_CASE("engine panel audit: rows rendered before a credential-read failure ke
     CHECK(count_occurrences(resp->body, "<span class=\"muted\">unavailable</span>") == 2);
     CHECK_THAT(resp->body, ContainsSubstring("Retry</button>"));
     CHECK_THAT(resp->body, !ContainsSubstring("(not recorded)"));
+    // POSITION, not just counts: the committed text sits in the row BEFORE the failing one, and
+    // the first "(unavailable)" cell is at or after the failing row (rows render in roster order).
+    const auto ok_id = resp->body.find("engine:okfirst");
+    const auto marker = resp->body.find(detail_cell(kRevokeMarker));
+    const auto poison_id = resp->body.find("engine:poison");
+    const auto first_unavailable = resp->body.find(detail_cell("(unavailable)"));
+    const auto after_id = resp->body.find("engine:after");
+    REQUIRE(ok_id != std::string::npos);
+    REQUIRE(marker != std::string::npos);
+    REQUIRE(poison_id != std::string::npos);
+    REQUIRE(first_unavailable != std::string::npos);
+    REQUIRE(after_id != std::string::npos);
+    CHECK(ok_id < marker);
+    CHECK(marker < poison_id);
+    CHECK(poison_id < first_unavailable);
+    CHECK(first_unavailable < after_id);
 }
 
 // ---- the page itself is unchanged -------------------------------------------------------------
