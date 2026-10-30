@@ -651,7 +651,10 @@ separate atomic (`latest_snapshot_`, `latest_snapshot_seq_`); both go.
 Each topology slot gains these fields, all on the server's wall clock:
 - `digest`;
 - `body_received_at`;
-- `confirmed_at`: the last heartbeat whose digest equalled the slot's;
+- `last_heartbeat_at`: the last heartbeat that carried a `TopologyDigest` field for the agent,
+  whatever its digest. It is the liveness key for `agent_silent`;
+- `confirmed_at`: the last heartbeat whose digest equalled the slot's. It is the key for the IP-claim
+  refresh only;
 - `pump_marker` and `pump_advanced_at`: when `last_pump_at` last **changed**. The comparison is
   inequality, never ordering, so an agent clock step cannot keep a slot fresh or age it. It is
   updated on every heartbeat for an agent that has a slot, whether or not the digest matches, since
@@ -660,22 +663,48 @@ Each topology slot gains these fields, all on the server's wall clock:
   from the latest heartbeat;
 - `mismatch_since`.
 
+Every row below sets `last_heartbeat_at` and the pump fields when the agent has a slot.
+
 | Heartbeat says | Server does |
 |---|---|
-| digest equals slot | `confirmed_at = now`; refresh the slot's IP claims; advance `pump_advanced_at` if the marker changed; clear `mismatch_since` |
-| digest differs | set `mismatch_since` if unset. The agent's change report is expected; past `kReportGrace` (120 s), issue `__resync__.topology` (D8) |
-| non-empty digest, no slot | issue `__resync__.topology` (D8) |
-| no field, or `DISABLED` | no request; an existing slot ages out through the stale and evict rules |
+| digest equals slot | `confirmed_at = now`; refresh the slot's IP claims; clear `mismatch_since` |
+| non-empty digest, differs from slot | set `mismatch_since` if unset. The agent's change report is expected; past `kReportGrace` (120 s), issue `__resync__.topology` (D8) |
+| non-empty digest, no slot | record the first sighting in the agent's no-slot entry (below). The agent's STARTUP or CHANGED report is expected; past `kReportGrace` from the first sighting, issue `__resync__.topology` (D8). No request while the agent's last report was rejected and the digest has not changed since (below) |
+| empty digest (no good run since the agent started) | no request: there is no body to ask for. The slot, if any, is not confirmed, so its claims are not refreshed |
+| no field, or `DISABLED` | no request. Drop any slot and release its IP claims: there is no evict rule for a connected agent's slot, so it is not left to age |
 
-Rendered as `stale_reason`:
+**No-slot entries.** For a connected agent with no slot, the store keeps a small entry: the first
+sighting of a non-empty digest, `last_heartbeat_at`, and the digest and reason of the agent's last
+rejected report. An entry is dropped when a slot is installed or the agent's stream closes, so the
+entries are bounded by the agents whose heartbeats reach this replica, under the same cap as the
+slots (`kPushedMapHardCap`).
 
-| `stale_reason` | Condition | Notes |
-|---|---|---|
-| `agent_silent` | `now - confirmed_at > 90 s` | Same 90 s as `kPushedStaleAfter`: two jittered heartbeats (at most 36 s each) plus gateway flush slack. |
-| `pump_stuck` | `now - pump_advanced_at > T`, or `last_outcome ∈ {TRUNCATED, FAILED}` and `now - outcome_since > T`, where `T = 3 × 1.2 × pump_interval_s + 90 s` | Three missed runs at the longest jittered sleep, plus the 90 s heartbeat window, because the server sees a run only on the next heartbeat after it. `pump_interval_s` is clamped to the 30-900 s flag range before use, and a value of 0 (`DISABLED`) never evaluates this row. At the 60 s default `T` is 306 s; at 900 s it is 3,330 s. The server never assumes the default. |
-| `body_pending` | `mismatch_since` older than `kReportGrace` | new |
-| `disconnected` | slot retained after disconnect | below |
-| `not_reported` | roster agent with no slot | today's placeholder |
+**The grace for an agent with no slot.** An agent's own report normally arrives first: its STARTUP
+report goes within 60 s of its first body (D7), and the heartbeat that first shows the digest can
+arrive before it. Waiting `kReportGrace` from the first sighting means a normal start sends the body
+once, not once as STARTUP and again as RESYNC.
+
+**After a rejected report.** A report the server rejects (`PARSE`, `DIGEST_MISMATCH`, `OVERSIZE`,
+`IP_CONFLICT`) installs no slot. While the heartbeat digest still equals the rejected report's
+digest, the server issues no `__resync__.topology` for that agent: a resync would bring back the same
+body and the same rejection, every 5 minutes, defeating the agent's own back-off. The agent's retry
+rule covers it instead (D7: a full floor after `IP_CONFLICT`, exponential back-off otherwise). A new
+digest clears the record. `UNKNOWN_SESSION` is refused before the store and records nothing.
+
+**`stale_reason` is a closed enum.** Every rendered machine carries `stale` and `stale_reason`.
+`stale` is true exactly when `stale_reason` is not null; a fresh machine has `stale_reason = null`.
+When several conditions hold, the first in this order wins:
+
+| Order | `stale_reason` | Condition | Notes |
+|---|---|---|---|
+| 1 | `offline` | a host added from the durable offline-host roster (`merge_offline_topology`): no slot and no live session on this replica | today's offline placeholder: `ts = 0`, empty rows. It outlives every slot rule, so a host offline for more than 300 s is never confused with a connected one. |
+| 2 | `disconnected` | slot retained after its stream closed | below |
+| 3 | `agent_silent` | connected slot, `now - last_heartbeat_at > 90 s` | Same 90 s as `kPushedStaleAfter`: two jittered heartbeats (at most 36 s each) plus gateway flush slack. Keyed on any heartbeat, so a live agent whose report is late reads `body_pending`, never `agent_silent`. |
+| 4 | `pump_stuck` | `now - pump_advanced_at > T`, or `last_outcome ∈ {TRUNCATED, FAILED}` and `now - outcome_since > T`, where `T = 3 × 1.2 × pump_interval_s + 90 s` | Three missed runs at the longest jittered sleep, plus the 90 s heartbeat window, because the server sees a run only on the next heartbeat after it. `pump_interval_s` is clamped to the 30-900 s flag range before use, and a value of 0 (`DISABLED`) never evaluates this row. At the 60 s default `T` is 306 s; at 900 s it is 3,330 s. The server never assumes the default. |
+| 5 | `body_pending` | `mismatch_since` older than `kReportGrace` | new |
+| 6 | `report_rejected` | connected, no slot, last report rejected, digest unchanged since | new; the reason is in the metric and, for `IP_CONFLICT`, the audit row (D7) |
+| 7 | `awaiting_report` | connected, no slot, a non-empty digest seen: within `kReportGrace` of the first sighting, or a resync sent or `deferred` | new. After a server restart every reporting agent reads this until its body lands, which can take about 8 min per 100,000 agents (D8). |
+| 8 | `not_reported` | connected, no slot, and no non-empty digest: no field, an empty digest, `DISABLED`, or no heartbeat on this replica yet | today's roster placeholder |
 
 - **IP-claim reclaim** stays at 300 s, keyed on `confirmed_at`. A quiet host keeps its claim with a
   ~70-byte field; a silent host loses it at 300 s, as today.
@@ -1041,9 +1070,12 @@ Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
 - `yuzu_server_agent_registration_store_failed_total{op}` (D14);
 - `yuzu_viz_topology_pushed_total{via,reason}` (gains `reason`);
 - `yuzu_viz_topology_push_parse_errors_total{via}` (unchanged);
-- `yuzu_viz_topology_digest_total{via,outcome}`, with `match|mismatch|no_slot|absent`;
+- `yuzu_viz_topology_digest_total{via,outcome}`, with `match|mismatch|no_slot|empty|disabled|absent`
+  (`empty`: an empty digest; `disabled`: `DISABLED`; `absent`: no field);
 - `yuzu_viz_topology_resync_total{outcome}`, with `sent|deferred|send_failed`;
-- gauge `yuzu_viz_topology_slots{state}`.
+- gauge `yuzu_viz_topology_slots{state}`, with `fresh` plus every `stale_reason` value except
+  `offline` (D6), computed from the same enum when a snapshot is built. `offline` hosts are added at
+  read time from the durable roster and are not store entries.
 
 **Gateway:**
 - `yuzu_gw_topology_proxied_total{result}`;
@@ -1601,7 +1633,10 @@ point 14).
   - `stale` carries a reason;
   - MCP `fresh=true` bypasses only the render cache and never dispatches.
 - **MCP tools:** `get_fleet_topology` and `get_host_topology` gain `stale_reason` in their typed
-  output schema (A5), with updated descriptions. REST `/api/v1/viz/fleet/topology` matches.
+  output schema (A5), with updated descriptions. It is declared as a closed JSON-schema `enum` of
+  the eight D6 values plus `null`, in both MCP output schemas and in the OpenAPI schemas of both REST
+  twins, `/api/v1/viz/fleet/topology` and `/api/v1/viz/host/{id}/topology`. A new value is a schema
+  change, never a free string.
 
 ### Security
 
@@ -1685,6 +1720,12 @@ of every ~30 s. The content is unchanged.
 - interval replace semantics (a missing net tag disappears);
 - the D6 confirm, mismatch, grace, `stale_reason`, retain-on-disconnect, re-claim and conflict
   cases;
+- `stale_reason` precedence: each pair of simultaneous conditions renders the earlier value; a live
+  agent with a late report reads `body_pending`, not `agent_silent`; an offline host past 300 s
+  reads `offline` and a `--no-topology` agent `not_reported`; every reporting agent after a restart
+  reads `awaiting_report` until its body lands; the schema enum matches the C++ enum;
+- the no-slot grace (a normal start sends one body, no RESYNC), and no resync while a rejected
+  report's digest is unchanged;
 - `pump_stuck` derived from `pump_interval_s` at 30, 60, 300 and 900 s: a healthy pump at each
   interval never reads `pump_stuck`, a stopped one does after `T`, a `FAILED` outcome held past `T`
   does, a busy pump whose digest changes every run does not, and `pump_interval_s = 0` never
