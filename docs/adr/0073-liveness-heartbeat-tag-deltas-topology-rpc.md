@@ -38,6 +38,9 @@
 1. **The heartbeat becomes a liveness message.** It carries `session_id`, `sent_at`, a
    `StatusTags` delta serialized into an **opaque `bytes` field** the gateway never decodes (D2),
    and a ~70-byte `TopologyDigest` (D5).
+   - "Liveness-only", here and in the title, means no bulk body. The heartbeat still carries
+     liveness plus state-tag deltas and a topology digest, and that state content is not signed
+     (D16).
    - `fleet_snapshot_json` (field 4) is **no longer used**.
    - The flat `status_tags` map (field 3) is **no longer used** either. It is replaced, not extended.
    - Both stay in the proto, marked `[deprecated = true]` with a comment naming ADR-0073 (D15). The
@@ -1017,13 +1020,27 @@ lands. The two are kept consistent as follows.
   measures and kTLS (its D8).
 - **State.** Both ADRs use the same rule: no per-agent state beyond the connection. Fleet-level state
   any gateway could rebuild is allowed (ADR-0074's Conflict 5, decided 2026-10-28).
-- **Signing.** Under ADR-0074 D5 the server signs every command and the agent signs every result;
-  liveness heartbeats stay unsigned. So the tag delta and the topology digest, which ride the
-  heartbeat, carry no integrity beyond the agent's session. A compromised gateway could therefore
-  alter or drop them. The consequence is bounded: dropping or altering a delta makes the server's
-  digest check fail and triggers a signed `__resync__.tags`, and a forged digest can only keep a
-  topology slot looking fresh (`confirmed_at`) or force a body request. Whether `ReportTopology` is
-  signed as a result is left to ADR-0074 D5's final scope.
+- **Signing.** ADR-0074 D5's scope was decided on 2026-10-29: the server signs every command and
+  the gateway list, the agent signs every result, and the agent signs a per-session challenge.
+  Liveness heartbeats stay unsigned. That scope does not include `ReportTopology` or the state
+  tags. ADR-0074 accepts unsigned heartbeats as **liveness** only, and it lists "honest heartbeats"
+  among what D5 does not give.
+- **What that leaves a compromised gateway, stated plainly.** The tag delta and the topology
+  digest ride the unsigned heartbeat, and the topology body rides an unsigned unary. They carry no
+  integrity beyond the agent's TLS session to the gateway.
+  - The state digest (D3) detects loss and coalescing. It does not detect tampering: it is
+    unkeyed, and it travels in the same unsigned bytes, so a gateway that rewrites a delta can
+    rewrite the digest to match.
+  - A gateway can therefore set any state tag value the server will accept as synced. Examples:
+    suppress the Guardian generation re-push by reporting the current generation; mask
+    `yuzu.dedup_degraded` or `yuzu.ota_signature_refused`; forge or suppress the plugin
+    `db_corruption` facts that feed the corruption audit sink.
+  - A full set sent in answer to a signed `__resync__.tags` is itself an unsigned heartbeat, so the
+    signed command does not make the answer honest.
+  - A forged topology digest keeps a host's slot confirmed and its IP claims alive (D6). A forged
+    `ReportTopology` body can claim IPs for the agent.
+  - This is wider than ADR-0074's accepted heartbeat risk, which is liveness only. Open point 12
+    asks the owner to accept it or to require agent signatures on this content.
 - **Gateway choice.** ADR-0074 lets agents move freely between gateways. Reattach adds no gateway
   affinity: a reattach succeeds on any server replica (D14, *HA*), and its adopt decision is the one
   ProxyRegister uses.
@@ -1201,8 +1218,9 @@ or a body asks for it, rate-limited. A shared store is neither needed nor decide
 - **Its authority is unchanged and cannot enrol** (D14). The same enrolled-status read and the same
   shared adopt CAS gate it.
 - **`AgentRegistrationStore` holds no secret** (ADR-0010).
-- **Heartbeat content is unsigned** under ADR-0074 D5; D16 states what a compromised gateway can and
-  cannot do with that.
+- **Heartbeat state content and the topology body are unsigned** under ADR-0074 D5's decided
+  scope. D16 states what a compromised gateway can do with that; it is not covered by ADR-0074's
+  liveness-only acceptance (open point 12).
 - **Quarantine containment is unchanged:**
   - a reattach installs a session exactly as a replay-adopt does, so the heartbeat-driven
     reconnect reconciler (#3425) applies;
@@ -1426,6 +1444,10 @@ release and merge to `dev` inside one release window. ADR-0074 gates its own wav
    fact the server cannot rebuild.
 10. **`yuzu.uptime_s` retired for `yuzu.started_at`** (D1).
 11. **Pump default 60 s**: changed-host topology lags up to about 82 s instead of about 40 s.
-12. **Unsigned heartbeat content** (D16). Accept that a compromised gateway can alter tag deltas and
-    topology digests, bounded by the digest check and signed resync, as ADR-0074 D5 accepts for
-    liveness.
+12. **Unsigned state content on the heartbeat, and the unsigned topology body** (D16). ADR-0074 D5
+    accepts unsigned heartbeats as liveness only, and excludes heartbeat honesty. It does not
+    cover state tags or `ReportTopology`: a compromised gateway can set any state tag the server
+    accepts as synced, keep IP claims alive with a forged topology digest, and claim IPs with a
+    forged body. The digest check does not bound this. The owner either accepts it, as a new row in
+    ADR-0074's accepted-risks table, or requires the agent to sign the `StatusTags` bytes and the
+    `TopologyReport` under its D5 key.
