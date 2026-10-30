@@ -8,10 +8,12 @@
   - no backward compatibility;
   - jitter everything;
   - fold the status-tag shrink into this ADR;
-  - the gateway is an opaque relay. As reworded on 2026-10-28 for both this ADR and ADR-0074: the
-    gateway keeps **no per-agent state beyond the connection**. Fleet-level state that any gateway
+  - the gateway is an opaque relay. As reworded on 2026-10-28 for both this ADR and ADR-0074, and
+    decided in ADR-0074 Conflict 5 on 2026-10-29: the gateway keeps **no per-agent state beyond the
+    connection**. Fleet-level state that any gateway
     could rebuild (ADR-0074's cached CRL, drain flag, gateway list and cluster membership) is allowed;
   - fold in S1: registration replay by ids only;
+  - retire the gateway management reads `ListAgents`, `GetAgent` and `QueryInventory` (D14);
   - no proto subtraction: "proto subtractions are breaking, so we should just not use the field, not
     remove it from the protobufs" (recorded in #6555 and enforced by `proto/buf.yaml`).
 
@@ -81,8 +83,9 @@
 10. **The topology pump stays an agent-core thread**, made tunable and disableable now. Converting
     it to an ADR-0021 Reflex is deferred (D11).
 11. **Server-pull when `/viz` is viewed is not adopted** (D12).
-12. **The gateway no longer keeps the RegisterRequest** (D14). Today it holds it three times. On an
-    upstream reconnect or a server "unknown session" verdict, it sends **ids only**: a new
+12. **The gateway no longer keeps the RegisterRequest** (D14). Today it holds it three times. When it
+    replays a registration (the server reported sessions it does not know, or an owner restarted; an
+    upstream reconnect alone replays nothing since PR #5695), it sends **ids only**: a new
     `GatewayUpstream.ProxyReattach{agent_id, session_id, observed_peer}`.
     - The server rebuilds the session from a new durable, born-on-Postgres
       `AgentRegistrationStore`, written at every successful registration.
@@ -204,7 +207,8 @@ without a server change therefore breaks both:
 ### What it costs the gateway (budget: ADR-0074 D14)
 
 The budget is ADR-0074 D14: one gateway on 8 cores and 16 GB holds **100,000 idle agents** with
-mutual TLS, inside 8 GB of memory; and a CI regression check of **64 KiB per idle agent, all-in
+mutual TLS, inside 8 GB of memory; and a CI regression check (set by D14, not yet on `dev`) of
+**64 KiB per idle agent, all-in
 including the kernel's per-connection memory**. (D14 replaces the 8 KiB-per-connection goal that an
 earlier draft of this ADR cited.) The measurements below show why the heartbeat's payload is a large
 part of the gap to that check.
@@ -248,7 +252,7 @@ per agent).
 
   Those copies serve only:
   - the rare registration replay (`yuzu_gw_registry:entries_for_sessions/1` and
-    `all_register_reqs/0`, sent by `yuzu_gw_upstream:replay_send/4`);
+    `yuzu_gw_upstream:replay_send/4`; `all_register_reqs/0` is still exported but has no caller);
   - an owner restart (`yuzu_gw_agent_sup:restore_args/1`);
   - the management plane's `GetAgent`, `ListAgents` and `QueryInventory`
     (`yuzu_gw_mgmt_service.erl`).
@@ -374,8 +378,10 @@ message HeartbeatRequest {
 **Why the tags are `bytes`, not a typed sub-message.** The gateway decodes `HeartbeatRequest` to
 admit it (it needs `session_id`) and re-encodes it into a batch. A typed `StatusTags` would be
 decoded into Erlang terms on every beat, which is the heap growth the harness measured. It would
-also tie gateway gpb regeneration to every tag-schema change. As `bytes`, the payload stays one
-sub-binary of the received frame. The gateway cannot interpret it, so opacity is enforced by the
+also tie gateway gpb regeneration to every tag-schema change. As `bytes`, the payload is one binary.
+It is not a sub-binary of the frame: the gateway's gpb options (`gateway/rebar.config`) leave
+`copy_bytes` at its default, so the decoder copies it, one flat copy and no term per tag. The
+gateway cannot interpret it, so opacity is enforced by the
 type, not by review discipline.
 
 The cost is one extra decode on the server and agent, which is negligible. Producers (agent) and
@@ -384,6 +390,12 @@ consumers (server) use the generated `StatusTags` type.
 `buf breaking` runs with `WIRE_JSON` plus the explicit no-delete rules in `proto/buf.yaml` (the
 `proto-compat` job in `.github/workflows/ci.yml`). It accepts this shape with no exemption, because
 nothing is subtracted: fields 3 and 4 stay, deprecated, and everything else is an addition.
+`buf` covers `proto/` only. The gateway's two copies of each file (the flat
+`gateway/priv/proto/<x>.proto`, which `<x>_pb` is generated from, and the nested
+`gateway/priv/proto/yuzu/<pkg>/v1/<x>.proto`, which other protos import) are edited by hand in the
+same change. `gateway/scripts/check-proto-codegen.sh` checks the two copies against each other and
+against the committed `_pb.erl` modules, but nothing checks them against `proto/` or applies the
+no-delete rule to them, so review does.
 
 **Deletions are explicit.** A state key the agent no longer emits goes in `removed` once, and the
 server erases it. This preserves every "absence is meaningful" posture:
@@ -1362,9 +1374,10 @@ reader, not by habit:
 | `agent_id` | the routing key for command fan-out and the registry; sent on reattach |
 | `session_id` | heartbeat admission and binding (`yuzu_gw_heartbeat_admission`); sent on reattach for the route-directory CAS |
 | connection, stream and owner references | delivering commands down the agent's own Subscribe stream |
-| `stream_home_id`, owner key | already sent in the CONNECTED notification that follows a reattach (`yuzu_gw_upstream.erl`, `handle_cast({notify_stream_status, ...})` at about l.1442-1478), unchanged |
+| `stream_home_id` | already sent in the CONNECTED notification that follows a reattach (`yuzu_gw_upstream.erl`, `handle_cast({notify_stream_status, ...})` at about l.1442-1478), with `cluster_id` and the wire capabilities, unchanged |
+| owner key | the key of the session's `yuzu_gw_owner_sessions` row, so an owner restart finds its ids (`yuzu_gw_agent_sup`); process-local, never sent upstream |
 | observed peer address | a transport fact only the gateway sees. It fills `RegisterRequest.gateway_observed_peer` today and is sent on reattach so the server's session keeps it. The gateway keeps the raw origin it decided (`origin_text/1` in `yuzu_gw_agent_service.erl`), empty when it has no observation. Today's `peer_addr` substitutes `<<"unknown">>` for empty; that display value is never what reattach sends. |
-| `connected_at` | management-plane liveness answers |
+| `connected_at` | today read only by the management reads this ADR retires (`yuzu_gw_mgmt_service.erl`), and carried across an owner restart (`yuzu_gw_agent` recovery). With slice 0b it has no reader, and 0b removes it with its last reader |
 
 It keeps **no** hostname, platform, version, plugin list, plugin names, scopable tags, status tags,
 enrollment token, CSR, certificate or attestation.
@@ -1433,8 +1446,12 @@ message ReattachResponse {
      `plugin_not_found`, and empty scopable tags would silently change scope results;
   5. **the same adopt decision ProxyRegister uses** (`renew_leases` / `reclaim_tombstoned_session`
      CAS, `server/core/src/gateway_route_store.hpp` and its FORWARD NOTE), extracted into one shared
-     function and called from both RPCs. Never a second copy. Whatever ADR-0074 decides about
-     cluster affinity (its Conflict 1) therefore applies to both RPCs at once;
+     function and called from both RPCs. Never a second copy. The #4669 cluster-affinity guard is
+     not part of this decision: it is checked on the CONNECTED re-announce
+     (`GatewayRouteStore::announce_connected`), which follows a reattach exactly as it follows a
+     register, so it applies to both paths unchanged. ADR-0074 Conflict 1 decided on 2026-10-29 that
+     affinity is dropped; whether the guard goes before its wave 2 or with wave 4 is an ADR-0074
+     sign-off item, and either way it changes that one site;
   6. install the `AgentSession` through `AgentRegistry::register_agent`, from an `AgentInfo`
      rebuilt from the record, then map the adopted session id and `observed_peer` as
      ProxyRegister's adopt path does. Because the install
@@ -1628,8 +1645,9 @@ row, not a stored request, and re-registers through reattach, like any replay.
   calls only `SendCommand` (`gateway_mgmt_stub_pool.hpp`); a search of `server/core/src` at
   `51f08447d` finds no call to the other three.
 - **What stays.** `SendCommand` and `WatchEvents` stay live. The three retired RPCs and their
-  request and response messages also stay in `proto/yuzu/server/v1/management.proto` (and the
-  gateway's copy), marked `option deprecated = true;` with a comment naming ADR-0073 (D15: no proto
+  request and response messages also stay in `proto/yuzu/server/v1/management.proto` (and both
+  gateway copies, `gateway/priv/proto/management.proto` and
+  `gateway/priv/proto/yuzu/server/v1/management.proto`), marked `option deprecated = true;` with a comment naming ADR-0073 (D15: no proto
   subtraction). The gateway answers them `UNIMPLEMENTED`. The gateway gpb module is regenerated.
 - **Where agent views come from.** The server's REST and MCP surfaces are the only agent views.
   No back-compat.
@@ -1663,7 +1681,7 @@ lands. The two are kept consistent as follows.
   connection, the relay, the inet port and buffer, the index rows) is addressed by ADR-0074's memory
   measures and kTLS (its D8).
 - **State.** Both ADRs use the same rule: no per-agent state beyond the connection. Fleet-level state
-  any gateway could rebuild is allowed (ADR-0074's Conflict 5, decided 2026-10-28).
+  any gateway could rebuild is allowed (ADR-0074's Conflict 5, decided 2026-10-29).
 - **Signing.** ADR-0074 D5's scope was decided on 2026-10-29: the server signs every command and
   the gateway list, the agent signs every result, and the agent signs a per-session challenge.
   Liveness heartbeats stay unsigned. That scope does not include `ReportTopology` or the state
@@ -2169,7 +2187,10 @@ release and merge to `dev` inside one release window. ADR-0074 gates its own wav
     includes the proto deprecation (`option deprecated = true;`, the gateway answering
     `UNIMPLEMENTED`; nothing deleted), the gpb regen, the eunit updates, and the docs
     (`architecture.md`, `capability-map.md`, `erlang-gateway-blueprint.md`, `user-manual/gateway.md`).
-    It is independent of every other slice.
+    The mgmt `auth_fun` admission tests (`yuzu_gw_authz_rpc_tests.erl`) use `ListAgents` as their
+    probe. They are re-pointed, never deleted, so a positive-admission case remains: an admitted
+    peer calling a retired path gets `UNIMPLEMENTED` and a refused peer `UNAUTHENTICATED`, or the
+    probe moves to `WatchEvents`. It is independent of every other slice.
 1. **Agent jitter and measurement.**
    - Jittered heartbeat and pump sleeps (D9).
    - `yuzu_agent_heartbeat_bytes`. The would-be-delta histogram needs slice 2's class table, so it
