@@ -1223,14 +1223,16 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     same check. A withheld agent is refused and counted `send_failed`, left out of any gateway
     forward, and re-marked by its next diverged heartbeat. The withhold is applied at send time,
     after `build_classified_command` has already made its kill-switch read and written a
-    `command_execution` record, so each refused issuance costs two Postgres operations and a
-    record for a command never sent. A per-OS refusal therefore backs that agent off as a
+    `command_execution` record, so each refused issuance of a direct agent costs two Postgres
+    operations and a record for a command never sent. A withheld gateway agent costs nothing of
+    its own: it is left out of a forward whose two operations and record are paid once; only a
+    forward whose agents are all withheld still pays them and is then skipped as empty. A per-OS refusal therefore backs that agent off as a
     `rejected` outcome does: its per-agent interval doubles for each consecutive per-OS refusal,
     to a cap of 15 min, and resets on the agent's next successful send. So after an operator
     clears the switch, a long-withheld agent is re-issued only when its backed-off interval
     elapses: convergence after the clear can lag by up to 15 min per agent, which the runbook
     states. At the cap, W withheld
-    agents cost W / 900 issuances per second (about 56/s for W = 50,000), rather than W / 60, so
+    agents cost W / 900 issuances per second (about 56/s for W = 50,000), rather than W / 60 for tags (W / 300 for topology), so
     a switch held during an incident leaves the issuer's throughput to the other agents and does
     not load the pool. The refusals still hold the backlog alert's `send_failed` branch true,
     which is the intended signal that an operator switch is blocking convergence.
