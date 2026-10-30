@@ -383,7 +383,13 @@ shared by direct `Heartbeat` and gateway `BatchHeartbeat`):
    value, 256 KiB in total, valid UTF-8. These caps are enforced at the gateway today
    (`yuzu_gw_heartbeat_buffer.erl`: `MAX_STATUS_TAGS`, `MAX_TAG_ITEM_BYTES`, `MAX_TAG_BYTES_TOTAL`
    at l.117-130, and `screen/1` with the UTF-8 repair at about l.460-583). A payload that fails them
-   is discarded and counted `rejected`, and the agent is treated as `diverged`. A per-agent resync
+   is discarded and counted `rejected`, and the agent is treated as `diverged`. Two differences
+   from today, stated so they are not mistaken for parity:
+   - the caps are checked **after** the server decodes the bytes, so the decode itself is bounded
+     only by the size of the RPC message that carried it, not by the tag caps;
+   - invalid UTF-8 is **rejected, not repaired**. The tag maps are proto3 `string` fields, whose
+     C++ parse fails on invalid UTF-8, so the whole payload is rejected where the gateway today
+     repairs the offending bytes and keeps the rest. A per-agent resync
    backoff (D8) stops a persistently oversize agent from looping.
 3. Then branches:
    - If `full`: replace the state map with `upsert`. **Synced.**
