@@ -1499,9 +1499,13 @@ message ReattachResponse {
   `agent.registered` webhook or offload event and writes no registration audit row, because the
   agent did not enrol or register again. Every outcome is counted on
   `yuzu_server_agent_reattach_total{outcome}` (D13). The refusals that say something about the
-  caller, `NOT_ENROLLED`, `SUPERSEDED` and `MALFORMED_SESSION`, also write an `agent.reattach`
-  audit row with `result=refused` and the refusal. `NO_RECORD`, `DEGRADED` and `RATE_LIMITED` are
-  counted only, so a store outage or a restart storm cannot flood the audit log.
+  caller, `NOT_ENROLLED` and `MALFORMED_SESSION`, also write an `agent.reattach` audit row with
+  `result=refused` and the refusal: principal the gateway peer's identity (its SPKI pin), principal
+  class `gateway`, target the `agent_id`, and every caller-supplied field (`agent_id`, the
+  presented session id) through `audit_token` (CWE-117). `SUPERSEDED`, `NO_RECORD`, `DEGRADED`
+  and `RATE_LIMITED` are counted only, as ProxyRegister's replay refusals are today: runs of
+  `SUPERSEDED` are expected after every reconnect storm, so auditing them would flood the audit log
+  and add Postgres writes in the window D8 calls unmeasured.
 - **Every outcome, in one table.** The adopt decision is shared (step 5), so ProxyRegister and
   ProxyReattach answer from the same outcome. ProxyReattach always answers `OK` with a
   `ReattachResponse`; its refusals are values, never gRPC error statuses, so the gateway's breaker
