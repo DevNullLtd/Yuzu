@@ -1319,9 +1319,14 @@ on the sustained condition and staying quiet on the expected one.
   30 min, **and** that denominator above 1 heartbeat per second (a minimum-traffic guard, so a
   handful of agents cannot fire it).
   - For `via="gateway"` it also requires the fleet's coalescing to be low:
-    `sum(rate(yuzu_gw_heartbeat_coalesced_total[30m]))` below 0.1 % of the gateway heartbeat rate,
-    joined with `on()` over the two fleet-wide sums. No per-agent or per-gateway join exists or is
-    needed: the gateway series and the server series share no label.
+    `(sum(rate(yuzu_gw_heartbeat_coalesced_total[30m])) or vector(0))` divided by
+    `sum(rate(yuzu_server_heartbeat_tags_total{via="gateway"}[30m]))` below 0.001, joined with
+    `on()` over the two fleet-wide sums. The denominator is the server-side count of gateway-relayed
+    heartbeats, which the rule already computes; the gateway exports no heartbeat-total counter
+    (`yuzu_gw_telemetry.erl`). No per-agent or per-gateway join exists or is needed: the gateway
+    series and the server series share no label. The `or vector(0)` makes an unscraped gateway, or
+    a coalescing series with no samples yet, count as no coalescing, so the branch can still fire;
+    without it the `on()` join with an empty side returns nothing and the branch is silent.
   - For `via="direct"` there is no coalescing, so no join.
   - Meaning: outside an outage, a sustained share indicates a canonical-form or agent delta defect,
     not a fleet event. Responder: find the agent versions involved (MCP `list_agents`), compare
@@ -1329,7 +1334,7 @@ on the sustained condition and staying quiet on the expected one.
     `diverged` plus `no_base` share near 100 %).
   - Tests: fires at a 2 % share sustained for 30 min; quiet during a 20-minute post-restart
     `no_base` wave (not `diverged`); quiet below the traffic guard; quiet for `via="gateway"` while
-    coalescing is high.
+    coalescing is high; fires for `via="gateway"` when the coalescing series is absent.
 - `YuzuVizTopologyResyncBacklog`, either of:
   - the topology pending set never empties and deferrals continue:
     `min_over_time(yuzu_server_resync_pending{action="topology"}[30m]) > 0` and
