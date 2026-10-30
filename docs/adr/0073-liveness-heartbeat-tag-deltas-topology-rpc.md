@@ -1170,22 +1170,31 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     - `SendCommandRequest.timeout_seconds` of 10 and no retries: the agent's next diverged
       heartbeat re-marks it. The gateway's router keeps a forward's fan-out state for
       `timeout_seconds` (unset means its 300 s default) whatever the caller's own deadline, so
-      without it the server's bound would not bound the gateway. The client deadline is 12 s,
-      a margin over `timeout_seconds`, so a forward with a silent target ends on the gateway's own
-      fan-out timeout (a clean end of the stream), not on `DEADLINE_EXCEEDED`;
+      without it the server's bound would not bound the gateway. The client deadline is 15 s,
+      a margin over `timeout_seconds`, so a forward with a silent target normally ends on the
+      gateway's own fan-out timeout (a clean end of the stream), not on `DEADLINE_EXCEEDED`. The
+      gateway enforces the deadline itself (`yuzu_grpc_stream_h`'s `arm_deadline`), ending the
+      call at the deadline less min(1 s, a tenth), 14 s for 15 s, timed from stream start, while the
+      router's 10 s timer starts only after the request has arrived and been dispatched, so the
+      margin is about 4 s less request arrival and router queueing;
     - the forwarder reads the response stream to its end. It accepts a frame only if its
       `agent_id` is in that forward's set; a frame for any other agent is refused as
       `agent_mismatch` (the HA WS-4 forgery check, as `classify_gateway_forward_response` does
       for one expected agent today, here against a set), counted once per forward rather than once
-      per frame. `not_connected` is counted per agent. The frames are `__resync__` replies, which
+      per frame. The two gateway-synthesised per-agent failure frames (FAILURE, exit code -1,
+      output `not_connected` or `agent_disconnected`, the pair `classify_gateway_forward_response`
+      recognises) are counted per agent and are `send_failed`; the classifier's test covers
+      both. The frames are `__resync__` replies, which
       ingest drops (below), so the forwarder drops them itself and never calls
       `process_gateway_response`. A unit test on this pure classifier covers a 2,000-id forward
       with one silent target and one foreign frame;
-    - outcomes are per agent, never per forward: an agent the stream answered for, or that was
-      not reported `not_connected` before a clean end, is `sent`; `send_failed` is a transport
-      failure before delivery (an upstream error, or the 12 s deadline) for the agents of that
-      forward, or a `not_connected` agent. One slow agent therefore never turns the delivered
-      agents of its forward into `send_failed`;
+    - outcomes are per agent, never per forward: an agent the stream answered for with a reply,
+      or that was not reported `not_connected` or `agent_disconnected` before a clean end, is
+      `sent`; such a reported agent is `send_failed`. On a transport failure (an upstream error,
+      or `DEADLINE_EXCEEDED`), agents the stream already answered for stay `sent` and the rest are
+      `send_failed`, a set that can include agents that were delivered. One slow agent therefore
+      normally does not turn the delivered agents of its forward into `send_failed`; when it
+      does, the next diverged heartbeat re-marks only those still diverged;
     - no re-issue to an agent while an earlier forward for it is in flight; a mark above the
       in-flight bound stays `deferred`;
     - at most one forward in flight per (cluster, action): a cluster's marks stay `deferred` while
@@ -1579,7 +1588,7 @@ on the sustained condition and staying quiet on the expected one.
     rule; the runbook says so;
   - `increase(yuzu_viz_topology_resync_total{outcome="send_failed"}[30m]) > 0` or the same on
     `yuzu_server_tag_resync_total`: a send attempted on an installed session failed, so divergence
-    persists. The causes are a kill switch on `__resync__`, a failed gateway forward (its 12 s
+    persists. The causes are a kill switch on `__resync__`, a failed gateway forward (its 15 s
     deadline or an upstream error), an agent the gateway reported `not_connected`, a gateway without the dispatch-tag capability, or a stream
     that ended between the session check and the send (D8). A single transient failure therefore
     raises the ticket. A per-OS kill switch on `__resync__` for the agent's OS is a cause too.
@@ -2773,7 +2782,7 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
      OF THE BYPASS entries; the issuer's own gateway forwarder (the `send_system_reserved`
      variant that never uses `gw_pending_`, the pure batching function with its never-empty
      `agent_ids` and 2,000-id rules, at most 8 forwards in flight and one per (cluster, action),
-     `timeout_seconds` 10 with a 12 s client deadline, the set-membership response classifier
+     `timeout_seconds` 10 with a 15 s client deadline, the set-membership response classifier
      and the per-agent outcome rule, `TryCancel` at stop) and its tests; the `send_to` check
      function shared by `send_to` and the variant, returning its cause, with the
      per-OS-behind-a-gateway refusal test on the issuer path and the per-OS refusal backoff; the
