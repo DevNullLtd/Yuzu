@@ -474,8 +474,9 @@ shared by direct `Heartbeat` and gateway `BatchHeartbeat`):
    A per-agent resync backoff (D8) stops a persistently rejected agent from re-requesting a full
    set every minute.
 3. **Class check.** A key in `interval` that the class table (D1) does not classify interval, a key
-   in `upsert` or `removed` that it classifies interval, or a key in both `upsert` and `removed`,
-   makes the payload `rejected`, as in step 2. Nothing from it is applied.
+   in `upsert` or `removed` that it classifies interval, a key in both `upsert` and `removed`, or
+   a `full` payload with a non-empty `removed` or `base_digest` (D2), makes the payload
+   `rejected`, as in step 2. Nothing from it is applied.
 4. **Interval.** Replaces the agent's interval map with `interval`. A heartbeat that ended at step
    1, 2 or 3 clears the interval map instead: nothing measured this interval reached the server, and
    a kept value would be a stale rate published as current.
