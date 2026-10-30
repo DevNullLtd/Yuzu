@@ -2711,3 +2711,8 @@ make a new choice.
     command and containment routing, for other gateways' agents for the length of a storm. The
     alternative is a per-gateway-peer share keyed on the peer's SPKI or identity, as
     `PrincipalQuota` keys the OTA bounds. The owner decides.
+19. **`YuzuAgentsTagsAbsent` during a planned staged rollout** (D13, *Upgrade (breaking)*). As
+    written it raises a ticket once un-upgraded agents have been present for 24 h, which a rollout
+    staged over more than a day is expected to trigger, so it fires on a planned state. The
+    alternatives are to gate it on an `absent` rate that is not falling, to make its window a
+    rollout-policy setting, or to keep it as an explicit reminder ticket. The owner decides.
