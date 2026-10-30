@@ -930,8 +930,8 @@ message ReattachResponse {
      cluster affinity (its Conflict 1) therefore applies to both RPCs at once;
   6. install the `AgentSession` from the record, the adopted session id and `observed_peer`.
 
-  The CONNECTED re-announce then sets `gateway_node`, wire capabilities and `stream_home_id`, as
-  today. Status tags and topology are **not** in the record. The next heartbeat is `no_base`, and
+  The CONNECTED re-announce then sets `gateway_node`, wire capabilities, `stream_home_id` and
+  `cluster_id`, as today. Status tags and topology are **not** in the record. The next heartbeat is `no_base`, and
   `__resync__.tags`, then `__resync__.topology`, converge them (D3, D8).
 - **Fallback is re-registration by the agent, not `__resync__`.** On `NO_RECORD` or `NOT_ENROLLED`,
   the gateway does what it already does for a replay answered `accepted = false`
@@ -966,11 +966,14 @@ message ReattachResponse {
   ADR-0007/0012.
 - **Table `registrations`:**
   - columns: `agent_id TEXT PRIMARY KEY`, `session_id TEXT NOT NULL` (the session of the
-    registration that wrote the row), `hostname`, `os`, `arch`, `agent_version`, `cluster_id`,
+    registration that wrote the row), `hostname`, `os`, `arch`, `agent_version`,
     `scopable_tags JSONB`, `plugin_set_hash TEXT NOT NULL`, `registered_at BIGINT NOT NULL`;
   - `registered_at` is authored by Postgres `now()` in SQL, never the replica's clock (the ADR-2002
     #3715 DB-clock rule);
-  - no secret is stored: no enrollment token, CSR, certificate or attestation.
+  - no secret is stored: no enrollment token, CSR, certificate or attestation;
+  - no `cluster_id`: it is a per-connection routing fact, not a registration fact, and it comes
+    only from the CONNECTED re-announce that follows a reattach. Storing it would be the gateway
+    affinity D16 says reattach does not add.
 - **Table `plugin_sets`:**
   - columns: `plugin_set_hash TEXT PRIMARY KEY`, `plugins JSONB NOT NULL`;
   - the PluginInfo list is interned by a SHA-256 over its canonical encoding;
