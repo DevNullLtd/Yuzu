@@ -829,7 +829,10 @@ When several conditions hold, the first in this order wins:
     - on stop the issuer drains the queue before it exits, each write bounded by one lease
       budget and the whole drain by a 5 s deadline, so a stop does not lose a row while the audit
       store is healthy and the queue is short; a row it cannot write, or has not reached when the
-      deadline passes, is counted `dropped` and logged at WARN;
+      deadline passes, is logged at WARN with the total and the first and last conflict. Its
+      `dropped` count is best-effort, because the process is exiting and is normally not scraped
+      again: the WARN log is the durable record of a stop-time loss, and
+      `YuzuVizTopologyReclaimAuditDropped` sees runtime overflow drops only;
     - an unclean exit (OOM, `SIGKILL`, a crash) loses every row still queued, at most
       `kPushedMapHardCap`, and nothing counts them: the queue is in memory. A clean `stop()`
       never does. This is the cost of keeping the write off the heartbeat path; the conflict
