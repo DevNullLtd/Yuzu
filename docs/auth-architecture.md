@@ -3888,7 +3888,8 @@ resulting latency bounds.
   `require_list_read` (the last is the ADR-0017 admit-then-filter list-read
   gate, #3038 — see the Authentication/RBAC row in
   `.claude/routed-concerns-access-control.md`) all
-  branch on `session->principal_kind == "engine"` **before** falling through
+  branch on `session->is_engine()` (the stored `principal_kind` or an engine-token
+  `auth_source`, #2343) **before** falling through
   to the legacy pre-RBAC path or the MCP-tier/service-scoped resolution used
   for human and agent sessions. An engine session's authority is resolved
   **exclusively** against `RbacStore`:
@@ -3908,7 +3909,7 @@ resulting latency bounds.
   the concrete mechanism behind design §4.2's promise: *"An engine principal
   with no assignments can do nothing."*
 - **Audit attribution.** `AuthRoutes::make_audit_event` re-stamps
-  `principal_class="engine"` from the resolved session's `principal_kind`
+  `principal_class="engine"` when the resolved session `is_engine()`
   after the generic (credential-presentation-based) classification runs —
   an engine principal's bearer-token requests previously mislabelled as
   `"agent"` in the audit trail (design §6 / `adr-1005-execution-plan.md`

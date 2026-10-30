@@ -19999,7 +19999,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                 mcp::StreamAuditPrincipal audit_principal{
                                     .id = session->username,
                                     .role = auth::role_to_string(auth::effective_role(*session)),
-                                    .cls = session->principal_kind == "engine"
+                                    .cls = session->is_engine()
                                                ? std::string("engine")
                                                : std::string{}};
                                 auto req_copy = std::make_shared<httplib::Request>(req);
@@ -26129,7 +26129,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // though it cannot mutate it. Declared once here, used by every
             // handler below.
             auto deny_if_engine_session = [&]() -> bool {
-                if (session->principal_kind != "engine" && session->auth_source != "engine_token")
+                if (!session->is_engine())
                     return false;
                 mcp_audit("denied", "engine-classed session on lifecycle surface");
                 res.set_content(
@@ -28976,12 +28976,13 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
         // audit runs at teardown, when it may not resolve at all. All three fields must
         // come from the same live session, or the close row will disagree with the attach
         // row about who acted: principal_class in particular is re-stamped from
-        // principal_kind at request time, so an engine principal reads "engine" there and
-        // would read "agent" from bare credential presentation here.
+        // the session's engine classification at request time, so an engine
+        // principal reads "engine" there and would read "agent" from bare
+        // credential presentation here.
         mcp::StreamAuditPrincipal actor{
             .id = session->username,
             .role = auth::role_to_string(auth::effective_role(*session)),
-            .cls = session->principal_kind == "engine" ? std::string("engine") : std::string{}};
+            .cls = session->is_engine() ? std::string("engine") : std::string{}};
         handle_get_tail(req, res, binding_for(*session), *sessions, stream_budget, revalidate_fn,
                         metrics, audit_fn, per_principal_cap, std::move(actor),
                         principal_audit_fn);
