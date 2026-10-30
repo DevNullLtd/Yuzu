@@ -717,7 +717,8 @@ once, not once as STARTUP and again as RESYNC.
 digest, the server issues no `__resync__.topology` for that agent: a resync would bring back the same
 body and the same rejection, every 5 minutes, defeating the agent's own back-off. The agent's retry
 rule covers it instead (D7: a full floor after `IP_CONFLICT`, exponential back-off otherwise). A new
-digest clears the record. `UNKNOWN_SESSION` is refused before the store and records nothing.
+digest clears the record. `UNKNOWN_SESSION` is refused before the session is resolved, so it
+records nothing.
 
 **`stale_reason` is a closed enum.** Every rendered machine carries `stale` and `stale_reason`.
 `stale` is true exactly when `stale_reason` is not null; a fresh machine has `stale_reason = null`.
@@ -740,18 +741,9 @@ When several conditions hold, the first in this order wins:
   **amends** fleet-viz invariant UP-5 ("Eviction on disconnect", `docs/fleet-viz-invariants.md`):
   its claim-release half stands, and its slot-drop half is replaced (open point 2). On stream close,
   IP claims are released **immediately**, but the body and digest are kept for 300 s, rendered
-  `disconnected`.
-- **Only the current session's close marks the slot.** Both disconnect paths call
-  `mark_disconnected` only when `registry_.remove_agent_if_session` returned true
-  (`removed_current_session`). The gateway path already gates `evict_pushed` that way
-  (`gateway_service_impl.cpp`); the direct Subscribe path calls it ungated today
-  (`agent_service_impl.cpp`, after `mirror_departure_to_presence`), and gains the gate. Ungated, a
-  superseded session's late close would release a live session's IP claims and mark its slot
-  `disconnected`. Today the next heartbeat's body repairs that; under D6 no body is due, so the
-  damage would last until the next report. On the first confirming heartbeat after a reconnect, the
-  stored `local_ips` are re-claimed. The re-claim and `push_snapshot` call **one claim function**
-  (the IP scan, the owner-live test and the install), so the two can never judge a conflict
-  differently:
+  `disconnected`. On the first confirming heartbeat after a reconnect, the stored `local_ips` are
+  re-claimed. The re-claim and `push_snapshot` call **one claim function** (the IP scan, the
+  owner-live test and the install), so the two can never judge a conflict differently:
   - if they are free, the slot is live again with no body sent;
   - if any IP is held by another live agent, the server first writes `topology.push.rejected`
     (detail `reason=reclaim_conflict` with the claimant, the IP and the owner, each sanitised as
@@ -761,6 +753,14 @@ When several conditions hold, the first in this order wins:
 
   A gateway restart thus costs zero bodies for agents back within five minutes. Eviction is lazy (in
   `confirm` and `build_snapshot`), so no background loop is added.
+- **Only the current session's close marks the slot.** Both disconnect paths call
+  `mark_disconnected` only when `registry_.remove_agent_if_session` returned true
+  (`removed_current_session`). The gateway path already gates `evict_pushed` that way
+  (`gateway_service_impl.cpp`); the direct Subscribe path calls it ungated today
+  (`agent_service_impl.cpp`, after `mirror_departure_to_presence`), and gains the gate. Ungated, a
+  superseded session's late close would release a live session's IP claims and mark its slot
+  `disconnected`. Today the next heartbeat's body repairs that; under D6 no body is due, so the
+  damage would last until the next report.
 - **Connection ages.** Only **closed** rows are rebased: the rows that carry
   `last_seen_seconds_ago`, which the builder sets only on rows from TAR's connection history. At
   render time they show `last_seen_seconds_ago + (now - body_received_at)`, measured on
