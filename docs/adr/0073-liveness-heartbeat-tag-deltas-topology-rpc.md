@@ -800,10 +800,14 @@ When several conditions hold, the first in this order wins:
   re-claimed. The re-claim and `push_snapshot` call **one claim function** (the IP scan, the
   owner-live test and the install), so the two can never judge a conflict differently:
   - if they are free, the slot is live again with no body sent;
-  - if any IP is held by another live agent, the server first writes `topology.push.rejected`
-    (detail `reason=reclaim_conflict` with the claimant, the IP and the owner, each sanitised as
-    today), then drops the slot and requests topology, so the fresh body goes through
-    first-claim-wins. The anti-spoof evidence chain therefore records a refused re-claim exactly as
+  - if any IP is held by another live agent, the claim function decides the conflict, drops the
+    slot, releases its claims and marks a topology resync, all under `pushed_mu_`, and returns the
+    conflict detail. The caller writes `topology.push.rejected` (detail `reason=reclaim_conflict`
+    with the claimant, the IP and the owner, each sanitised as today) after the lock is released,
+    as `push_snapshot` audits today, so no Postgres write is held under the fleet-wide mutex. The
+    fresh body then goes through first-claim-wins. This audit write is the one Postgres write on
+    heartbeat ingestion: at most once per reconnect conflict, bounded by the audit store's write
+    lease. The anti-spoof evidence chain therefore records a refused re-claim exactly as
     it records a refused push.
 
   A gateway restart thus costs zero bodies for agents back within five minutes. Eviction is lazy (in
