@@ -1621,7 +1621,8 @@ message ReattachResponse {
      in every gateway-upstream handler; then the `--reattach-rate` token bucket. An over-rate call
      answers `RATE_LIMITED` here, before `registration_lock_for` and before any Postgres read, so
      the bucket protects the pool it exists for. `retry_after_ms` is backlog-aware, with a floor:
-     the larger of 1,000 ms and the refusals of the last second divided by the rate. The time to
+     max(1,000, 1,000 × refusals in the last second / `--reattach-rate`) milliseconds (10,000
+     refusals at 2,000/s gives 5,000 ms; a unit test pins that case). The time to
      the next token (about 0.5 ms at 2000/s) is not used, because it would send every over-rate
      gateway back in a tight, aligned loop that loads the same gRPC handlers `BatchHeartbeat`
      needs. The gateway waits a full-jittered delay in [0, `retry_after_ms`] before it requeues the
