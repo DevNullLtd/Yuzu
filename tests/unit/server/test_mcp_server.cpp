@@ -123,6 +123,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <shared_mutex>
@@ -1622,6 +1623,57 @@ private:
             auto deps = tool_deps_for_test;
             if (!deps.fleet_read_fn)
                 deps.fleet_read_fn = fleet_read_fn_for_test;
+            // Domain-verb audit rows (crypto.dashboard.layout.update, crypto.ca.stats.view)
+            // ride ToolDeps::audit_fn, which production wires to the SAME audit_log lambda it
+            // hands McpServer. The fixture's recorder is that lambda here, so those rows land in
+            // audit_log beside the generic mcp.<tool> rows exactly as they did when the legacy
+            // branches called the handler's own audit_fn.
+            if (!deps.audit_fn)
+                deps.audit_fn = audit_fn;
+            // The /crypto tools (mcp_tools_crypto.cpp) reach CryptoApi only through these
+            // closures. Forward them to crypto_api_for_test the way server.cpp forwards its
+            // `crypto_api_`, so a test that sets the seam keeps driving the tools, and leave
+            // them EMPTY when it is unset (the unwired answer). One unconditional wiring would
+            // make every "no CryptoApi" test read as wired.
+            if (crypto_api_for_test) {
+                const std::shared_ptr<const yuzu::server::CryptoApi> api = crypto_api_for_test;
+                if (!deps.crypto_library_summary_fn)
+                    deps.crypto_library_summary_fn = [api](const yuzu::server::CryptoSummaryQuery& q,
+                                                           const yuzu::server::authz::VisibleSet& s) {
+                        return api->library_summary(q, s);
+                    };
+                if (!deps.crypto_library_devices_fn)
+                    deps.crypto_library_devices_fn = [api](const yuzu::server::CryptoDevicesQuery& q,
+                                                           const yuzu::server::authz::VisibleSet& s) {
+                        return api->library_devices(q, s);
+                    };
+                if (!deps.crypto_ca_stats_fn)
+                    deps.crypto_ca_stats_fn = [api](std::optional<std::int64_t> as_of) {
+                        return api->ca_stats(as_of);
+                    };
+                if (!deps.crypto_dashboard_layout_fn)
+                    deps.crypto_dashboard_layout_fn = [api](const std::string& user) {
+                        return api->dashboard_layout(user);
+                    };
+                if (!deps.crypto_set_dashboard_layout_fn)
+                    deps.crypto_set_dashboard_layout_fn =
+                        [api](const std::string& user, const std::vector<std::string>& widgets,
+                              std::optional<std::int64_t> expected_version) {
+                            return api->set_dashboard_layout(user, widgets, expected_version);
+                        };
+            }
+            if (crypto_access_fn_for_test && !deps.crypto_access_fn)
+                deps.crypto_access_fn = crypto_access_fn_for_test;
+            // The registry path carries no session; the layout tools key on the caller's
+            // username, which production re-resolves from the request. Here it is the mock
+            // session's, unresolvable when the mock auth is switched off.
+            if (!deps.username_fn)
+                deps.username_fn = [this](const httplib::Request&)
+                    -> std::optional<std::string> {
+                    if (!mock_auth_enabled)
+                        return std::nullopt;
+                    return mock_username;
+                };
             mcp.set_tool_deps(std::move(deps));
         }
 
@@ -1751,7 +1803,9 @@ private:
         get_handler = mcp.build_get_handler(auth_fn, audit_fn, &mcp_disabled_, &streaming_disabled_,
                                             session_registry_for_test, allowed_origins_for_test,
                                             stream_budget_for_test, revalidate_fn_for_test,
-                                            metrics_for_test);
+                                            metrics_for_test,
+                                            yuzu::server::mcp::kMcpStreamsPerPrincipalDefault,
+                                            principal_audit_fn_for_test);
         delete_handler =
             mcp.build_delete_handler(auth_fn, audit_fn, &mcp_disabled_, &streaming_disabled_,
                                      session_registry_for_test, allowed_origins_for_test);
@@ -33639,6 +33693,68 @@ TEST_CASE("MCP 2f PR2: tearing down the response returns the worker and audits t
     CHECK(reg.active_count() == 1);
 }
 
+// #2343 / #6707: the GET tail captures its actor once, while the credential is live, and the
+// close row reuses it. The class comes from Session::is_engine(), so a human stored kind on the
+// engine token source (a hand-edited durable row) still reads "engine".
+TEST_CASE("MCP 2f PR2: the GET close row's actor class follows Session::is_engine()",
+          "[mcp][transport][2f][stream][engine_principal]") {
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 4}};
+    mcp::McpSessionRegistry reg;
+    std::mutex rows_mu; // the releaser writes from the server thread
+    std::vector<std::pair<std::string, std::string>> rows; // (action, actor class)
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.stream_budget_for_test = &budget;
+    ts.principal_audit_fn_for_test =
+        [&rows, &rows_mu](const httplib::Request&, const std::string& action, const std::string&,
+                const mcp::StreamAuditPrincipal& p, const std::string&, const std::string&,
+                const std::string&) {
+            std::lock_guard lk{rows_mu};
+            rows.emplace_back(action, p.cls);
+            return true;
+        };
+    ts.start();
+    const auto sid = mint_session(ts);
+    REQUIRE_FALSE(sid.empty());
+
+    const auto close_class = [&](const char* kind, const char* source) -> std::string {
+        {
+            std::lock_guard lk{rows_mu};
+            rows.clear();
+        }
+        ts.mock_principal_kind = kind;
+        ts.mock_auth_source = source;
+        {
+            auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                               {"Accept", "text/event-stream"}});
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+        } // ~Response runs the releaser, which writes the close row
+        // The server thread tears its half down after the client has its response, so poll
+        // for the row against a deadline rather than assuming it is already there.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        for (;;) {
+            {
+                std::lock_guard lk{rows_mu};
+                for (const auto& [action, cls] : rows) {
+                    if (action == "mcp.stream.close")
+                        return cls;
+                }
+            }
+            if (std::chrono::steady_clock::now() >= deadline)
+                return std::string{"<no close row>"};
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    };
+
+    SECTION("a human session on a local credential is unclassified") {
+        CHECK(close_class("human", "local").empty());
+    }
+    SECTION("a human kind on the engine token source reads engine") {
+        CHECK(close_class("human", "engine_token") == "engine");
+    }
+}
+
 TEST_CASE("MCP 2f PR2/CH-5: a rapid re-GET is refused while the superseded stream drains",
           "[mcp][transport][2f][stream][ch5]") {
     // Bounds the pool: a takeover skips the cap check (so a client is never locked out
@@ -34356,6 +34472,97 @@ TEST_CASE("streamed POST opt-out: --no-mcp-streamed-post falls back to a plain r
     CHECK(parsed.contains("result"));
     // And no streamed admission was taken against the shared budget.
     CHECK(budget.active_for(smcp::sse_bus::SseSurface::kMcpPost, "test-user") == 0);
+}
+
+// #2343 / #6707: the streamed POST close row names its actor from the session captured at
+// attach, and the class comes from Session::is_engine(). A session whose stored kind says
+// human but whose source is the engine token (a hand-edited durable row, the one shape the
+// two predicates disagree on) must still read "engine", and an ordinary human session must
+// stay unclassified.
+TEST_CASE("MCP streamed POST close row: the actor class follows Session::is_engine()",
+          "[pg][mcp][integration][execute][bridge][2f][3b][engine_principal]") {
+    namespace smcp = yuzu::server::mcp;
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+    yuzu::MetricsRegistry metrics;
+    smcp::McpSessionRegistry sessions{smcp::McpSessionRegistry::Config{}, {}, &metrics};
+    smcp::McpStreamBridge bridge{&bus, &sessions, &metrics};
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{.global_cap = 8}};
+
+    std::mutex rows_mu; // the releaser writes from the server thread
+    std::vector<std::pair<std::string, std::string>> rows; // (action, actor class)
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.session_registry_for_test = &sessions;
+    ts.metrics_for_test = &metrics;
+    ts.stream_budget_for_test = &budget;
+    ts.principal_audit_fn_for_test =
+        [&rows, &rows_mu](const httplib::Request&, const std::string& action, const std::string&,
+                const smcp::StreamAuditPrincipal& p, const std::string&, const std::string&,
+                const std::string&) {
+            std::lock_guard lk{rows_mu};
+            rows.emplace_back(action, p.cls);
+            return true;
+        };
+
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&,
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 1, .command_id = "cmd-class"};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+    ts.mcp.set_stream_bridge(&bridge);
+    auto minted = sessions.mint("test-user");
+    REQUIRE(minted.ok);
+    const auto sid = minted.session_id;
+    REQUIRE(sessions.stream_for(sid, "test-user") != nullptr);
+
+    const auto close_class = [&](const char* kind, const char* source) -> std::string {
+        {
+            std::lock_guard lk{rows_mu};
+            rows.clear();
+        }
+        ts.mock_principal_kind = kind;
+        ts.mock_auth_source = source;
+        const std::string body =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":790,"params":{"name":"execute_instruction",)"
+            R"("arguments":{"plugin":"os_info","action":"version"},)"
+            R"("_meta":{"progressToken":"tok-class"}}})";
+        {
+            auto res = ts.call_raw("POST", body,
+                                   {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+            REQUIRE(res->get_header_value("Content-Type") == "text/event-stream");
+        } // ~Response runs the releaser, which writes the close row
+        // The server thread tears its half down after the client has its response, so poll
+        // for the row against a deadline rather than assuming it is already there.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        for (;;) {
+            {
+                std::lock_guard lk{rows_mu};
+                for (const auto& [action, cls] : rows) {
+                    if (action == "mcp.stream.close")
+                        return cls;
+                }
+            }
+            if (std::chrono::steady_clock::now() >= deadline)
+                return std::string{"<no close row>"};
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    };
+
+    SECTION("a human session on a local credential is unclassified") {
+        CHECK(close_class("human", "local").empty());
+    }
+    SECTION("a human kind on the engine token source reads engine") {
+        CHECK(close_class("human", "engine_token") == "engine");
+    }
 }
 
 TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",

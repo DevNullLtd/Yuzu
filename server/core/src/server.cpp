@@ -22156,25 +22156,67 @@ private:
             // closure instances HardwareRoutes::Deps received above (roster, CI detail,
             // DEX score, quarantine list, fleet_read_fn gate, audit_fn), never a store
             // pointer, so an MCP twin cannot observe a different composition than REST.
-            mcp_server_->set_tool_deps(mcp::ToolDeps{.fleet_read_fn = fleet_read_fn,
-                                                     .audit_fn = audit_fn,
-                                                     .roster_fn = build_hw_roster,
-                                                     .ci_detail_fn = hw_ci_detail_fn,
-                                                     .dex_score_fn = hw_dex_score_fn,
-                                                     .quarantine_list_fn = hw_quarantine_list_fn});
-            // /crypto slice 1: the SAME CryptoApi instance CryptoRoutes serves, so
-            // get_crypto_libraries / list_crypto_library_devices cannot disagree with the
-            // page or the REST twins. Null (no inventory store) -> the tools answer an
-            // internal error, never an empty result.
-            mcp_server_->set_crypto_api(crypto_api_);
+            // Assigned member by member rather than designated-initialised: the /crypto
+            // closures below are set conditionally.
+            mcp::ToolDeps tool_deps;
+            tool_deps.fleet_read_fn = fleet_read_fn;
+            tool_deps.audit_fn = audit_fn;
+            tool_deps.roster_fn = build_hw_roster;
+            tool_deps.ci_detail_fn = hw_ci_detail_fn;
+            tool_deps.dex_score_fn = hw_dex_score_fn;
+            tool_deps.quarantine_list_fn = hw_quarantine_list_fn;
             // /crypto widgets: list_crypto_widgets' availability, get_crypto_ca_stats' R2
             // withhold and list_issued_certs' filtered form use the SAME callback as the REST
-            // routes and the dashboard.
-            mcp_server_->set_crypto_access_fn(
+            // routes and the dashboard. One instance feeds both consumers below: the seven
+            // registry-resident /crypto tools (ToolDeps::crypto_access_fn) and the
+            // `list_issued_certs` branch that stays in mcp_server.cpp (set_crypto_access_fn).
+            const mcp::ToolDeps::CryptoAccessFn crypto_access_cb =
                 [this](const httplib::Request& req, crypto_widgets::WidgetGate g,
                        const std::string& type, const std::string& op) {
                     return crypto_access(req, g, type, op);
-                });
+                };
+            // /crypto slice 1: the SAME CryptoApi instance CryptoRoutes serves, reached by the
+            // registry tools only through these forwarding closures (ToolDeps holds provider
+            // closures, never the seam object), so get_crypto_libraries /
+            // list_crypto_library_devices / export_crypto_cbom / the widget and CA-stats twins
+            // cannot disagree with the page or the REST twins. Null (no inventory store) leaves
+            // every closure EMPTY -> the tools answer an internal error, never an empty result.
+            if (crypto_api_) {
+                const std::shared_ptr<const CryptoApi> api = crypto_api_;
+                tool_deps.crypto_library_summary_fn = [api](const CryptoSummaryQuery& q,
+                                                            const authz::VisibleSet& scope) {
+                    return api->library_summary(q, scope);
+                };
+                tool_deps.crypto_library_devices_fn = [api](const CryptoDevicesQuery& q,
+                                                            const authz::VisibleSet& scope) {
+                    return api->library_devices(q, scope);
+                };
+                tool_deps.crypto_ca_stats_fn = [api](std::optional<std::int64_t> as_of) {
+                    return api->ca_stats(as_of);
+                };
+                tool_deps.crypto_dashboard_layout_fn = [api](const std::string& username) {
+                    return api->dashboard_layout(username);
+                };
+                tool_deps.crypto_set_dashboard_layout_fn =
+                    [api](const std::string& username, const std::vector<std::string>& widgets,
+                          std::optional<std::int64_t> expected_version) {
+                        return api->set_dashboard_layout(username, widgets, expected_version);
+                    };
+            }
+            tool_deps.crypto_access_fn = crypto_access_cb;
+            // The registry path carries no session, and the two dashboard-layout tools key the
+            // caller's OWN layout on the session username: re-resolve it from the request, the
+            // way crypto_access does for the gate (a request that just authenticated resolves;
+            // an unresolvable one makes the tool fail closed).
+            tool_deps.username_fn = [this](const httplib::Request& req)
+                -> std::optional<std::string> {
+                if (auto session = auth_routes_->resolve_session(req))
+                    return session->username;
+                return std::nullopt;
+            };
+            mcp_server_->set_tool_deps(std::move(tool_deps));
+            mcp_server_->set_crypto_api(crypto_api_);
+            mcp_server_->set_crypto_access_fn(crypto_access_cb);
             // #4037 — the SAME list_read_fn lambda wired into the REST
             // registration's trailing list_read_fn param below, so the REST
             // GET /guaranteed-state/status and MCP get_guardian_status twins
@@ -23759,8 +23801,9 @@ private:
     RateLimiter api_rate_limiter_;
     RateLimiter login_rate_limiter_;
 
-    // Per-principal quota cap (PR 4.4) — gates principal_kind=="engine"
-    // sessions only, at the pre-routing chokepoint. See principal_quota.hpp.
+    // Per-principal quota cap (PR 4.4) — gates engine-classed sessions only
+    // (stored principal_kind "engine" or an engine_token source), at the
+    // pre-routing chokepoint. See principal_quota.hpp.
     PrincipalQuota principal_quota_;
 };
 
