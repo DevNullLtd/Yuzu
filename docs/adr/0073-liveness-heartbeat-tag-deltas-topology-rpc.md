@@ -561,6 +561,15 @@ outside this rule; this ADR adds none of it.
   - the session-index ETS rows;
   - local heartbeat answering (`yuzu_gw_agent_service:heartbeat/2`, about l.448-466).
 - **Removed with the Register:** the plugin-name list (D14).
+- **Kept, and outside this ADR's scope:** two kinds of per-agent state beyond the connection that
+  today's gateway already holds, which ADR-0074 Conflict 5 leaves to its wave 4 (to keep as
+  rebuildable state, or to change):
+  - the per-agent `pg` groups across cluster members (`pg:join` in `yuzu_gw_registry.erl`);
+  - the DISCONNECTED resend window after a connection ends (the held-notification resend in
+    `yuzu_gw_upstream.erl`).
+
+  This ADR neither adds to them nor removes them. D4's "no per-agent state beyond the connection"
+  is a claim about what this ADR introduces, not a claim that the gateway meets the rule today.
 
 A fresh Register is decoded **transiently** to forward it as `ProxyRegister`, and nothing from it
 is kept, so its `status_tags_pb` (field 8) never enters gateway state. Its enrollment token is in
