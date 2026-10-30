@@ -181,10 +181,11 @@ code.
 
 A local gate in `/test`, not a CI job. It drives a headless browser against the running
 dashboard: it crawls every route the shell nav links to (200, the `Content-Security-Policy`
-header, no page error or `console.error`), cross-checks the discovered routes against the
-nav list in `app_shell.cpp` in both directions, checks that submit controls stay inside
-their form or dialog at two viewport sizes, and runs four write scenarios whose requests are
-answered by an in-browser stub, so nothing reaches the server. The gate first runs
+header, no page error, `console.error` or HTTP status of 400 or more), cross-checks the
+discovered routes against `EXPECTED`, a hand-copied list of the nav in `app_shell.cpp`, in both
+directions, checks that submit controls stay inside their form or dialog at two viewport sizes,
+and runs four scenarios (stubbed where they write: those requests are answered in the browser,
+so nothing reaches the server). The gate first runs
 `ui-smoke.mjs --selftest`, which checks against a local fixture (no stack) that each crawl and
 layout check fails when it should; a selftest failure fails the gate. A failure records FAIL (the
 older `Puppeteer` gate is warn-only); a missing `tests/puppeteer/node_modules/puppeteer`

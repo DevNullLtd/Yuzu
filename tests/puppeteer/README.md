@@ -50,9 +50,16 @@ runs it before the live run, and a selftest failure fails the gate. Add a case w
    `app_shell.cpp` means editing that list in the same change.
 2. Overflow: submit controls on the plugin upload form, the add-user dialog and the new-token
    dialog stay inside their form or dialog and the viewport at 1400x900 and 1024x768.
-3. Scenarios, each forcing its own precondition with a request stub (no write reaches the server):
+3. Scenarios, each forcing its own precondition (writes are answered by a request stub, so none
+   reaches the server):
    upload rollout percentage and a failing upload, add user, the Ctrl+K guard on a focused field,
    and the PKI audit-failed banner and load-error text.
+
+It does not check: WebGL scenes (the Fleet and Host maps), non-administrator roles, a write that
+really reaches the server, or any route the shell does not link to. The nav list it compares
+against is hand-copied, so a new nav entry fails the smoke until `EXPECTED` is edited. Needs
+Node 22.12 or newer (the pinned `puppeteer` requires it); run `(cd tests/puppeteer && npm ci)`
+once.
 
 ## Writing a scenario
 
