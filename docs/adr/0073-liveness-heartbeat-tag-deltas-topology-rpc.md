@@ -1467,8 +1467,12 @@ message ReattachResponse {
   1. `onbehalf::enforce(context)`, as the handler's first statement and before any side effect, as
      in every gateway-upstream handler; then the `--reattach-rate` token bucket. An over-rate call
      answers `RATE_LIMITED` here, before `registration_lock_for` and before any Postgres read, so
-     the bucket protects the pool it exists for. `retry_after_ms` is the time until the bucket next
-     holds a token. The bucket is one per replica, shared by every gateway, with no per-gateway
+     the bucket protects the pool it exists for. `retry_after_ms` is backlog-aware, with a floor:
+     the larger of 1,000 ms and the refusals of the last second divided by the rate. The time to
+     the next token (about 0.5 ms at 2000/s) is not used, because it would send every over-rate
+     gateway back in a tight, aligned loop that loads the same gRPC handlers `BatchHeartbeat`
+     needs. The gateway waits a full-jittered delay in [0, `retry_after_ms`] before it requeues the
+     session (D9). The bucket is one per replica, shared by every gateway, with no per-gateway
      share: during a storm one gateway's replay can hold another gateway's agents in
      `RATE_LIMITED`, with their streams up but no session installed, so no command, containment
      included, routes to them until a later attempt is admitted. The delay is bounded by the
@@ -1652,8 +1656,9 @@ message ReattachResponse {
 **Storm behaviour after a server restart at 100k agents.**
 1. **The gateway replays sessions as ids.** Pacing is the existing replay start jitter and permit
    concurrency. The server adds a per-replica token bucket, `--reattach-rate`, default 2000/s.
-   An over-rate call answers `OK` with refusal `RATE_LIMITED` and `retry_after_ms`, and the
-   gateway requeues the session after that delay without touching the breaker. It is not answered
+   An over-rate call answers `OK` with refusal `RATE_LIMITED` and `retry_after_ms` (at least 1 s,
+   D14 step 1), and the gateway requeues the session after a full-jittered share of that delay
+   without touching the breaker. It is not answered
    `RESOURCE_EXHAUSTED`: the gateway counts that status as a breaker failure today
    (`yuzu_gw_upstream:record_result/2`), so a reattach storm would open the breaker. Each reattach costs one lock,
    one enrollment-status read, one route CAS and one primary-key read, with the plugin set usually
