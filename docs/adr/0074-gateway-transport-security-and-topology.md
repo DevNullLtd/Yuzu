@@ -244,7 +244,7 @@ Each is re-accepted at the owner's sign-off at the end of wave 0.
 
 | Risk | Accepted by, date | Scope | Ends when |
 |---|---|---|---|
-| A compromised gateway with a valid gateway certificate claims any agent's route (conflict 1). | Nathan Dornbrook, 2026-10-29 | Every gateway-proxied agent, until D5. | Wave 2, once the route write depends on the server's verification of the session's agent signature. |
+| A compromised gateway with a valid gateway certificate claims any agent's route (conflict 1). | Recorded with Nathan Dornbrook's decision of 2026-10-29 to drop affinity; to be accepted explicitly at sign-off | Every gateway-proxied agent, until D5. | Wave 2, once the route write depends on the server's verification of the session's agent signature. |
 | The gateway reads commands and results in plaintext, and can report a dead agent as alive (D5's non-goals). | Nathan Dornbrook, 2026-10-29 | Every gateway-proxied agent. | Not ended in this programme: confidentiality from the gateway is a separate SaaS decision; a false heartbeat lasts until the next signed result or session start. |
 | A revoked agent keeps working for up to 60 s, about 2 minutes across a Postgres failover, or up to 15 minutes when the gateway reaches no server (D7). | Nathan Dornbrook, 2026-10-28 | New and live sessions behind a gateway. | Not ended: these are the design's bounds. Wave 2's Done-when proves them by test, since the gateway refuses agents at the handshake from wave 2. |
 
