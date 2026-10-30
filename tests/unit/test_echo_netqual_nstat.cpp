@@ -417,6 +417,49 @@ TEST_CASE("nstat_decode_tcp_src_desc decodes the descriptor's TCP state into the
     CHECK(nstat_build_open_event(1'700'000'000, decode(4)).state == "ESTABLISHED");
 }
 
+TEST_CASE("network_event_from_nstat_flow stores the descriptor state, a default for an unresolved "
+          "one, and CLOSED for a close",
+          "[echo][netqual][nstat]") {
+    NstatFlowEvent open;
+    open.ts_unix = 1'700'000'123;
+    open.is_open = true;
+    open.proto = "tcp6";
+    open.local_addr = "::1";
+    open.local_port = 5000;
+    open.remote_addr = "2001:db8::1";
+    open.remote_port = 443;
+    open.pid = 321;
+    open.process_name = "curl";
+
+    // The state the descriptor reported is what is stored, not a hard-coded ESTABLISHED.
+    open.state = "TIME_WAIT";
+    const auto closing = network_event_from_nstat_flow(open, 42);
+    CHECK(closing.state == "TIME_WAIT");
+    CHECK(closing.action == "connected");
+    CHECK(closing.ts == 1'700'000'123);
+    CHECK(closing.snapshot_id == 42);
+    CHECK(closing.proto == "tcp6");
+    CHECK(closing.local_addr == "::1");
+    CHECK(closing.local_port == 5000);
+    CHECK(closing.remote_addr == "2001:db8::1");
+    CHECK(closing.remote_port == 443);
+    CHECK(closing.remote_host.empty()); // a lifecycle stream does not resolve names
+    CHECK(closing.pid == 321);
+    CHECK(closing.process_name == "curl");
+
+    // A descriptor that never resolved a state falls back to ESTABLISHED.
+    open.state.clear();
+    CHECK(network_event_from_nstat_flow(open, 42).state == "ESTABLISHED");
+
+    // A close event is stored CLOSED with the disconnected action, whatever it carried.
+    NstatFlowEvent close = open;
+    close.is_open = false;
+    close.state = "ESTABLISHED";
+    const auto closed = network_event_from_nstat_flow(close, 42);
+    CHECK(closed.state == "CLOSED");
+    CHECK(closed.action == "disconnected");
+}
+
 TEST_CASE("nstat_decode_tcp_src_desc decodes the pname process identity",
           "[echo][netqual][nstat]") {
     // The macOS 13.3 tcp descriptor carries only pname (no epname/uid).

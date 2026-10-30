@@ -355,11 +355,10 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
 // data + WAL can sit above the budget until that reader ends. The overage is measured after
 // every pass and surfaced as `budget_over_bytes`, never hidden.
 
-/// Default and minimum `db_budget_bytes` (250 MB and 32 MiB).
+/// Default and minimum `db_budget_bytes` (250 MiB and 32 MiB). Eviction targets the budget less
+/// kEchoWalAllowanceBytes (echo_db.hpp) of data pages.
 inline constexpr int64_t kEchoDbBudgetBytesDefault = 262144000;
 inline constexpr int64_t kEchoDbBudgetBytesMin = 33554432;
-/// Room kept for the WAL: eviction targets `budget - this` of data pages.
-inline constexpr int64_t kEchoWalAllowanceBytes = 16 * 1024 * 1024;
 /// Rows per eviction batch; one batch is one transaction and one hold of the database lock.
 inline constexpr int64_t kBudgetBatchRows = 1000;
 /// Raw capture rows newer than this are never evicted, whatever the rollup mark says.

@@ -2634,7 +2634,7 @@ const auto kAlwaysTime = [] { return true; };
 
 TEST_CASE("run_budget: evicts the largest raw table first, oldest first, inside the preservation floors",
           "[echo][aggregator][budget]") {
-    yuzu::test::TempDbFile tmp{"echo-budget-main-"};
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_main_"};
     auto db = open_budget_db(tmp);
     seed_tcp_live(db, 4000, kBudgetNow - 72 * 3600, kBudgetNow);
     seed_module_live(db, 1000, kBudgetNow - 72 * 3600, kBudgetNow);
@@ -2671,7 +2671,7 @@ TEST_CASE("run_budget: evicts the largest raw table first, oldest first, inside 
 
 TEST_CASE("run_budget: with nothing else to take it empties exactly the eligible raw rows",
           "[echo][aggregator][budget]") {
-    yuzu::test::TempDbFile tmp{"echo-budget-exhaust-"};
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_exhaust_"};
     auto db = open_budget_db(tmp);
     seed_tcp_live(db, 3000, kBudgetNow - 72 * 3600, kBudgetNow);
     seed_process_live(db, 1000, kBudgetNow - 72 * 3600, kBudgetNow);
@@ -2695,7 +2695,7 @@ TEST_CASE("run_budget: with nothing else to take it empties exactly the eligible
 
 TEST_CASE("run_budget: the rollup mark is a floor when it is older than 24 h, and 0 means never rolled up",
           "[echo][aggregator][budget]") {
-    yuzu::test::TempDbFile tmp{"echo-budget-mark-"};
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_mark_"};
     auto db = open_budget_db(tmp);
     seed_tcp_live(db, 3000, kBudgetNow - 72 * 3600, kBudgetNow);
     seed_module_live(db, 1000, kBudgetNow - 72 * 3600, kBudgetNow);
@@ -2711,7 +2711,7 @@ TEST_CASE("run_budget: the rollup mark is a floor when it is older than 24 h, an
 }
 
 TEST_CASE("run_budget: already within target does nothing", "[echo][aggregator][budget]") {
-    yuzu::test::TempDbFile tmp{"echo-budget-noop-"};
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_noop_"};
     auto db = open_budget_db(tmp);
     seed_tcp_live(db, 1000, kBudgetNow - 72 * 3600, kBudgetNow);
     set_mark(db, "tcp", kBudgetNow - 2 * 3600);
@@ -2725,7 +2725,7 @@ TEST_CASE("run_budget: already within target does nothing", "[echo][aggregator][
 
 TEST_CASE("run_budget with REAL aggregation never takes a row the rollup can still reach",
           "[echo][aggregator][budget]") {
-    yuzu::test::TempDbFile tmp{"echo-budget-real-"};
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_real_"};
     auto db = open_budget_db(tmp);
     seed_tcp_live(db, 4000, kBudgetNow - 72 * 3600, kBudgetNow);
     // No hand-seeded mark: run_aggregation writes it.
@@ -2751,7 +2751,7 @@ TEST_CASE("run_budget: rows the H11 rollup clamp skipped are evictable like rete
     // window to the last 2 h, so rows older than that were never summarised. Their timestamps
     // are below the mark, so eviction treats them as the existing age-based retention already
     // does, oldest first and only under size pressure. Fixing the clamp is a separate change.
-    yuzu::test::TempDbFile tmp{"echo-budget-clamp-"};
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_clamp_"};
     auto db = open_budget_db(tmp);
     seed_tcp_live(db, 4000, kBudgetNow - 4 * 86400, kBudgetNow);
     (void)run_aggregation(db, kBudgetNow - 3 * 86400); // an old pass, then a 3-day gap
@@ -2767,7 +2767,7 @@ TEST_CASE("run_budget: rows the H11 rollup clamp skipped are evictable like rete
 
 TEST_CASE("run_budget: paused, errored and summary-less sources are never touched",
           "[echo][aggregator][budget]") {
-    yuzu::test::TempDbFile tmp{"echo-budget-exempt-"};
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_exempt_"};
     auto db = open_budget_db(tmp);
     seed_tcp_live(db, 3000, kBudgetNow - 72 * 3600, kBudgetNow);
     seed_module_live(db, 2000, kBudgetNow - 72 * 3600, kBudgetNow);
@@ -2775,7 +2775,7 @@ TEST_CASE("run_budget: paused, errored and summary-less sources are never touche
     for (const char* src : {"tcp", "module", "process"})
         set_mark(db, src, kBudgetNow - 2 * 3600);
     REQUIRE(db.set_config("usage_hwm_id", "1000"));
-    // The live-only registry source and the usage tables, old and numerous.
+    // The registry source (raw capture rows only, no summary tier) and the usage tables, old and numerous.
     REQUIRE(db.execute_sql(std::format(
         "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 1999) "
         "INSERT INTO registry_live (ts,snapshot_id,action,record_key) "
@@ -2804,7 +2804,7 @@ TEST_CASE("run_budget: paused, errored and summary-less sources are never touche
 
 TEST_CASE("run_budget: hourly rows only after the raw tier, never newer than 48 h, daily and monthly never",
           "[echo][aggregator][budget]") {
-    yuzu::test::TempDbFile tmp{"echo-budget-hourly-"};
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_hourly_"};
     auto db = open_budget_db(tmp);
     const int64_t hourly_floor = kBudgetNow - kBudgetHourlyFloorSec;
     seed_process_hourly_span(db, 3000, kBudgetNow - 120 * 3600, kBudgetNow);
@@ -2846,7 +2846,7 @@ TEST_CASE("run_budget: hourly rows only after the raw tier, never newer than 48 
 }
 
 TEST_CASE("run_budget: the largest hourly table is taken first", "[echo][aggregator][budget]") {
-    yuzu::test::TempDbFile tmp{"echo-budget-hourly-order-"};
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_hourly_order_"};
     auto db = open_budget_db(tmp);
     seed_process_hourly_span(db, 3000, kBudgetNow - 120 * 3600, kBudgetNow - 60 * 3600);
     REQUIRE(db.execute_sql(std::format(
@@ -2862,7 +2862,7 @@ TEST_CASE("run_budget: the largest hourly table is taken first", "[echo][aggrega
 }
 
 TEST_CASE("run_budget: the deadline is checked between batches", "[echo][aggregator][budget]") {
-    yuzu::test::TempDbFile tmp{"echo-budget-deadline-"};
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_deadline_"};
     auto db = open_budget_db(tmp);
     seed_tcp_live(db, 5000, kBudgetNow - 72 * 3600, kBudgetNow);
     set_mark(db, "tcp", kBudgetNow - 2 * 3600);
@@ -2877,7 +2877,7 @@ TEST_CASE("run_budget: the deadline is checked between batches", "[echo][aggrega
 
 TEST_CASE("run_budget: a probe or delete error stops the pass as a failure, not as exhaustion",
           "[echo][aggregator][budget]") {
-    yuzu::test::TempDbFile tmp{"echo-budget-fail-"};
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_fail_"};
     auto db = open_budget_db(tmp);
     seed_tcp_live(db, 3000, kBudgetNow - 72 * 3600, kBudgetNow);
     seed_module_live(db, 1000, kBudgetNow - 72 * 3600, kBudgetNow);
@@ -2906,7 +2906,7 @@ TEST_CASE("run_budget: a probe or delete error stops the pass as a failure, not 
 
 TEST_CASE("run_budget: eviction counters accumulate across passes batch by batch",
           "[echo][aggregator][budget]") {
-    yuzu::test::TempDbFile tmp{"echo-budget-counters-"};
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_counters_"};
     auto db = open_budget_db(tmp);
     seed_tcp_live(db, 4000, kBudgetNow - 72 * 3600, kBudgetNow);
     set_mark(db, "tcp", kBudgetNow - 2 * 3600);
@@ -2922,7 +2922,7 @@ TEST_CASE("run_budget: eviction counters accumulate across passes batch by batch
 }
 
 TEST_CASE("budget_rank_probe_sql ranks by two index searches, never a scan", "[echo][aggregator][budget]") {
-    yuzu::test::TempDbFile tmp{"echo-budget-plan-"};
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_plan_"};
     auto db = open_budget_db(tmp);
     for (const char* table : {"tcp_live", "process_hourly"}) {
         auto plan = db.execute_query("EXPLAIN QUERY PLAN " + budget_rank_probe_sql(table), 50);
@@ -2946,9 +2946,9 @@ TEST_CASE("budget_rank_probe_sql ranks by two index searches, never a scan", "[e
     CHECK(scalar(db, budget_rank_probe_sql("tcp_live")) == 10);
 }
 
-TEST_CASE("budget: a reader that pins the WAL makes the checkpoint report busy at once, and the overage clears after it",
+TEST_CASE("budget: a reader that pins the WAL makes the checkpoint report busy, and the overage clears after it",
           "[echo][aggregator][budget]") {
-    yuzu::test::TempDbFile tmp{"echo-budget-pinned-"};
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_pinned_"};
     auto db = open_budget_db(tmp);
     seed_tcp_live(db, 100, 1000, 2000);
     (void)db.checkpoint(CheckpointMode::kTruncate);
@@ -2959,16 +2959,23 @@ TEST_CASE("budget: a reader that pins the WAL makes the checkpoint report busy a
     REQUIRE(sqlite3_exec(reader.db, "BEGIN; SELECT COUNT(*) FROM tcp_live;", nullptr, nullptr, nullptr) ==
             SQLITE_OK);
 
-    // A write burst larger than the WAL allowance lands while the reader is pinned.
-    seed_tcp_live(db, 60000, 3000, 4000);
+    // A write burst larger than the WAL allowance lands while the reader is pinned. The disk
+    // cost is the point of the case: the WAL has to outgrow the production 16 MiB allowance for
+    // "busy, not reclaimed" to mean anything. Twenty ~1 MiB rows get there with the fewest rows.
+    REQUIRE(db.execute_sql(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 19) "
+        "INSERT INTO tcp_live (ts,snapshot_id,action,proto,local_addr,local_port,remote_addr,"
+        "remote_host,remote_port,state,pid,process_name) "
+        "SELECT 3000 + i, 1, 'connected', 'tcp', '10.0.0.1', i, '203.0.113.1', "
+        "hex(zeroblob(524288)), 443, 'ESTABLISHED', 1, 'curl' FROM n"));
     const auto pinned = db.storage_bytes();
     REQUIRE(pinned.wal_bytes > kEchoWalAllowanceBytes);
 
-    const auto t0 = std::chrono::steady_clock::now();
-    const auto busy = db.checkpoint(CheckpointMode::kTruncate);
-    const auto waited = std::chrono::steady_clock::now() - t0;
-    CHECK(busy == CheckpointResult::kBusy);
-    CHECK(waited < std::chrono::seconds(1)); // not the 5 s busy timeout, with the lock held
+    // Busy comes back instead of a wait: the pass must not sleep out the 5 s busy timeout with
+    // the database lock held. The deterministic proof is the result plus the timeout being put
+    // back after the call (it is dropped to 0 inside), not a clock reading.
+    CHECK(db.checkpoint(CheckpointMode::kTruncate) == CheckpointResult::kBusy);
+    CHECK(scalar(db, "PRAGMA busy_timeout") == 5000);
     CHECK(db.storage_bytes().wal_bytes >= pinned.wal_bytes); // nothing was reclaimed
 
     // The budget is hard for data pages and soft for the WAL: with the WAL pinned, data + WAL is
@@ -2979,6 +2986,7 @@ TEST_CASE("budget: a reader that pins the WAL makes the checkpoint report busy a
     // After the reader ends, the next pass truncates the WAL and the overage returns to 0.
     REQUIRE(sqlite3_exec(reader.db, "ROLLBACK", nullptr, nullptr, nullptr) == SQLITE_OK);
     CHECK(db.checkpoint(CheckpointMode::kTruncate) == CheckpointResult::kOk);
+    CHECK(scalar(db, "PRAGMA busy_timeout") == 5000);
     const auto after = db.storage_bytes();
     CHECK(after.wal_bytes == 0);
     CHECK(budget_over_bytes(after.data_bytes(), after.wal_bytes, budget) == 0);

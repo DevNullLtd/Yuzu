@@ -416,7 +416,8 @@ struct RemovableEvent {
 /// change the key watch observed (echo_registry_parsers.hpp). The actor columns hold
 /// the writer correlated to the change (a lead to verify, not proof): actor_pid is 0
 /// and actor_image '' when no writer is named, and `detail` says why (attr:*).
-/// `data`/`prev_data` are UNMASKED rendered values.
+/// `data` is the UNMASKED rendered new value; `prev_data` is empty for a row this build writes
+/// (the old value is not stored; `prev_data_type`/`prev_data_size` are).
 /// Warehouse columns are NOT NULL DEFAULT '' / 0, so "not applicable" (removals,
 /// key removals, gaps; the old value of an addition) is '' / 0, and `data_type`
 /// /`prev_data_type` == '' is what tells an absent value from an empty one.
@@ -461,6 +462,10 @@ struct EchoStats {
     int64_t db_size_bytes{0};
     int retention_days{7};
 };
+
+/// Room the WAL file is allowed beyond the data pages: `PRAGMA journal_size_limit` at open, and
+/// the amount the byte budget keeps out of its data target (see run_budget).
+inline constexpr int64_t kEchoWalAllowanceBytes = 16 * 1024 * 1024;
 
 /// Raw storage figures behind `db_size_bytes`, read in one pass under the database lock.
 struct StorageBytes {

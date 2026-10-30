@@ -698,7 +698,15 @@ public:
                          proc_stream_->method_name());
             // The stream reports only processes that start from now on; seed the pid -> name
             // map with the ones already running so their sockets and loads can be labelled.
-            note_pid_names(yuzu::agent::enumerate_processes());
+            // Best effort: init() is not contained at the plugin seam, and the map also fills
+            // from the stream and the next poll, so a failed seed must not fail the plugin.
+            try {
+                note_pid_names(yuzu::agent::enumerate_processes());
+            } catch (const std::exception& e) {
+                spdlog::warn("ECHO: process-name seed failed: {}", e.what());
+            } catch (...) {
+                spdlog::warn("ECHO: process-name seed failed");
+            }
         }
 
         // roadmap 2.2: construct + start the nstat client alongside the ES
@@ -1749,30 +1757,11 @@ private:
                 [&](std::vector<yuzu::echo::NstatFlowEvent> flow_events) {
                     std::vector<yuzu::echo::NetworkEvent> typed;
                     typed.reserve(flow_events.size());
-                    for (const auto& e : flow_events) {
-                        yuzu::echo::NetworkEvent ev;
-                        ev.ts = e.ts_unix;
-                        ev.snapshot_id = snap_id;
-                        ev.action = e.is_open ? "connected" : "disconnected";
-                        ev.proto = e.proto;
-                        ev.local_addr = e.local_addr;
-                        ev.local_port = e.local_port;
-                        ev.remote_addr = e.remote_addr;
-                        // nstat is a lifecycle event stream, not the
-                        // DNS-resolving poll (resolve_hostnames) —
-                        // remote_host stays empty, the same simplification
-                        // the ES process stream makes for cmdline.
-                        ev.remote_port = e.remote_port;
-                        // The open event carries the descriptor's TCP state when SRC_DESC
-                        // resolved it; ESTABLISHED is the best-effort label when it did
-                        // not, and CLOSED for "flow just vanished".
-                        ev.state = e.is_open ? (e.state.empty() ? std::string{"ESTABLISHED"}
-                                                                : e.state)
-                                             : std::string{"CLOSED"};
-                        ev.pid = e.pid;
-                        ev.process_name = e.process_name;
-                        typed.push_back(std::move(ev));
-                    }
+                    // remote_host stays empty: nstat is a lifecycle event stream, not the
+                    // DNS-resolving poll (resolve_hostnames), the same simplification the ES
+                    // process stream makes for cmdline.
+                    for (const auto& e : flow_events)
+                        typed.push_back(yuzu::echo::network_event_from_nstat_flow(e, snap_id));
                     if (!pending_nstat_evs_.empty()) {
                         typed.insert(typed.begin(),
                                      std::make_move_iterator(pending_nstat_evs_.begin()),

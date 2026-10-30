@@ -9,7 +9,7 @@
 //   Layer 1 (WHAT changed): a RegNotifyChangeKeyValue subtree watch marks a root
 //     dirty; a budgeted subtree read is diffed against the root's persisted
 //     BASELINE (echo_state `registry:<root>`), giving added/changed/removed values
-//     with old and new data (diff_registry_snapshot).
+//     with their new data and the old value's type and size (diff_registry_snapshot).
 //   Layer 2 (WHO): a write-only Kernel-Registry ETW session (SetValueKey |
 //     DeleteValueKey | DeleteKey, mask 0x4300). Those events carry the writer's
 //     pid and the VALUE NAME, but the key-name field is empty on most of them, so
@@ -992,7 +992,8 @@ retention_watermark(const std::map<std::string, RegistryRootState>& roots,
 
 /// The cursor row is a content store: besides positions it holds the HELD candidates --
 /// changes the key watch saw whose attribution is not final yet -- with their rendered
-/// old and new values, for up to one settle interval. It is written as version 2
+/// new value (and the old one only when the baseline came from an older build), for up to
+/// one settle interval. It is written as version 2
 /// whenever it holds a candidate or a loss epoch, else as version 1: a build that
 /// predates `held` ignores the field and would re-encode the cursor without it, dropping
 /// changes whose baseline already advanced with no gap row. Such a build only reads

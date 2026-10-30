@@ -53,6 +53,10 @@ namespace yuzu::echo {
 
 namespace {
 
+// Busy timeout of the main and read-only connections; checkpoint() drops the main one to 0 for
+// the call and restores it from here.
+constexpr int kBusyTimeoutMs = 5000;
+
 int64_t now_epoch_seconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -821,7 +825,7 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     sqlite3_free(err_msg);
 
     // Busy timeout for concurrent access
-    sqlite3_busy_timeout(raw_db, 5000);
+    sqlite3_busy_timeout(raw_db, kBusyTimeoutMs);
 
     // Secure delete -- zeroes deleted content; required for security
     err_msg = nullptr;
@@ -838,7 +842,9 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // burst (a backlog drain, a large eviction) leaves the -wal file at its high-water mark
     // forever. Only bites when a checkpoint resets the WAL; a pinned reader defers it.
     err_msg = nullptr;
-    rc = sqlite3_exec(raw_db, "PRAGMA journal_size_limit=16777216", nullptr, nullptr, &err_msg);
+    rc = sqlite3_exec(raw_db,
+                      std::format("PRAGMA journal_size_limit={}", kEchoWalAllowanceBytes).c_str(),
+                      nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK)
         spdlog::warn("EchoDatabase: PRAGMA journal_size_limit failed: {}",
                      err_msg ? err_msg : "unknown");
@@ -1286,7 +1292,7 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         int rrc = sqlite3_open_v2(path.string().c_str(), &ro,
                                   SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nullptr);
         if (rrc == SQLITE_OK) {
-            sqlite3_busy_timeout(ro, 5000);
+            sqlite3_busy_timeout(ro, kBusyTimeoutMs);
             sqlite3_db_config(ro, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0, nullptr);
             sqlite3_set_authorizer(ro, &echo_query_authorizer, nullptr);
             // Force the is_queryable_table allowlist's one-time static init now,
@@ -2242,8 +2248,9 @@ std::expected<int, std::string> EchoDatabase::purge_source(const std::string& so
 
     // registry (PR11.8): registry_live is not the only place the source keeps
     // captured content. Each root's BASELINE (`registry:<root>` echo_state rows)
-    // holds rendered values, and the CURSOR row holds the rendered old and new values
-    // of changes still waiting for their attribution to settle. Erase them all in THIS
+    // holds each value's type, size and hash (an older build also kept a rendered prefix),
+    // and the CURSOR row holds the rendered new value of changes still waiting for their
+    // attribution to settle. Erase them all in THIS
     // transaction, or a purge that the operator expects to be permanent leaves the very
     // values it removed. The cursor erase also means the next collect is a fresh
     // Baseline (zero rows), never a diff against a baseline that no longer exists.
@@ -3685,7 +3692,7 @@ CheckpointResult EchoDatabase::checkpoint(CheckpointMode mode) {
         db_, nullptr,
         mode == CheckpointMode::kTruncate ? SQLITE_CHECKPOINT_TRUNCATE : SQLITE_CHECKPOINT_PASSIVE,
         nullptr, nullptr);
-    sqlite3_busy_timeout(db_, 5000);
+    sqlite3_busy_timeout(db_, kBusyTimeoutMs);
     if (rc == SQLITE_OK)
         return CheckpointResult::kOk;
     if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED)

@@ -308,6 +308,23 @@ NstatFlowEvent nstat_build_close_event(std::int64_t ts_unix, const FlowState& la
     return ev;
 }
 
+NetworkEvent network_event_from_nstat_flow(const NstatFlowEvent& e, std::int64_t snapshot_id) {
+    NetworkEvent ev;
+    ev.ts = e.ts_unix;
+    ev.snapshot_id = snapshot_id;
+    ev.action = e.is_open ? "connected" : "disconnected";
+    ev.proto = e.proto;
+    ev.local_addr = e.local_addr;
+    ev.local_port = e.local_port;
+    ev.remote_addr = e.remote_addr;
+    ev.remote_port = e.remote_port;
+    ev.state = e.is_open ? (e.state.empty() ? std::string{"ESTABLISHED"} : e.state)
+                         : std::string{"CLOSED"};
+    ev.pid = e.pid;
+    ev.process_name = e.process_name;
+    return ev;
+}
+
 TcpQualitySample nstat_build_quality_sample(const FlowState& flow) {
     TcpQualitySample s;
     s.proto = flow.proto;

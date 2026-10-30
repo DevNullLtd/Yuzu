@@ -664,6 +664,21 @@ std::vector<UserEvent> compute_user_events(const std::vector<UserSession>& previ
     return (!host.empty() && host.front() != ':') ? "remote" : "interactive";
 }
 
+/// The session a utmp (Linux) or utmpx (macOS) USER_PROCESS record describes. One template
+/// because both structs carry ut_user/ut_line/ut_host as fixed-width character arrays: they are
+/// read bounded, `domain` is the recorded host ("local" when there is none) and `logon_type`
+/// follows logon_type_from_host. The platform enumerators only walk the database and call this.
+template <class Entry>
+[[nodiscard]] UserSession user_session_from_utmp(const Entry& e) {
+    UserSession us;
+    us.user = utmp_text(e.ut_user, sizeof(e.ut_user));
+    us.session_id = utmp_text(e.ut_line, sizeof(e.ut_line));
+    const std::string host = utmp_text(e.ut_host, sizeof(e.ut_host));
+    us.domain = host.empty() ? "local" : host;
+    us.logon_type = logon_type_from_host(host);
+    return us;
+}
+
 /**
  * Compute software install/uninstall diff.
  * Key: name (machine scope only — no per-user identity).

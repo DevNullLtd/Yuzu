@@ -334,7 +334,7 @@ TEST_CASE("EchoDatabase: try_get_state is tri-state", "[echo][store][registry]")
 TEST_CASE("EchoDatabase: purge_source(registry) erases the rows, the cursor (held values included) and every baseline",
           "[echo][store][purge][registry]") {
     auto t = make_test_db();
-    // The cursor row is a content store too: it holds the rendered old/new values of a change
+    // The cursor row is a content store too: it holds the rendered values of a change
     // whose writer is not settled yet. Purging the source must erase it with everything else.
     const std::string cursor_with_held =
        R"({"v":1,"tick":4,"held":[{"r":"HKLM\\A","k":"HKLM\\A\\K","v":"Secret","a":"changed",)"

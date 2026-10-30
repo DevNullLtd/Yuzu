@@ -941,7 +941,7 @@ int64_t parse_i64_or(const std::string& text, int64_t fallback) {
     return fallback;
 }
 
-// Raw tier: each enabled source's live table whose rows have already been summarised.
+// Raw tier: each enabled source's raw capture table whose rows have already been summarised.
 std::vector<BudgetCandidate> raw_budget_candidates(EchoDatabase& db, int64_t now_epoch) {
     std::vector<BudgetCandidate> out;
     for (const auto& src : capture_sources()) {

@@ -118,20 +118,9 @@ std::vector<UserSession> enumerate_users() {
         if (entry->ut_type != USER_PROCESS)
             continue;
 
-        UserSession us;
-        // ut_user/ut_line/ut_host are fixed-width and not NUL-terminated when full: read them
-        // bounded (std::string(char*) would run past the field into the next one).
-        us.user = utmp_text(entry->ut_user, sizeof(entry->ut_user));
-        us.session_id = utmp_text(entry->ut_line, sizeof(entry->ut_line));
-
-        std::string host = utmp_text(entry->ut_host, sizeof(entry->ut_host));
-        us.domain = host.empty() ? "local" : host;
-
-        // Remote when a host is recorded and it is not an X display. The tty name is no evidence:
-        // a local terminal emulator is a pts too.
-        us.logon_type = logon_type_from_host(host);
-
-        sessions.push_back(std::move(us));
+        // Bounded field reads and the remote-vs-interactive rule live in the shared conversion
+        // (echo_collectors.hpp), which the unit tests drive with hand-built records.
+        sessions.push_back(user_session_from_utmp(*entry));
     }
     endutent();
     return sessions;
@@ -150,19 +139,9 @@ std::vector<UserSession> enumerate_users() {
         if (entry->ut_type != USER_PROCESS)
             continue;
 
-        UserSession us;
-        // Fixed-width fields, not NUL-terminated when full: read them bounded.
-        us.user = utmp_text(entry->ut_user, sizeof(entry->ut_user));
-        us.session_id = utmp_text(entry->ut_line, sizeof(entry->ut_line));
-
-        std::string host = utmp_text(entry->ut_host, sizeof(entry->ut_host));
-        us.domain = host.empty() ? "local" : host;
-
-        // Remote when a host is recorded and it is not an X display. Every Terminal.app tab is a
-        // ttysNNN, so the line name classified local sessions as remote.
-        us.logon_type = logon_type_from_host(host);
-
-        sessions.push_back(std::move(us));
+        // Every Terminal.app tab is a ttysNNN, so the line name is no evidence of a remote
+        // session: the shared conversion classifies on ut_host (echo_collectors.hpp).
+        sessions.push_back(user_session_from_utmp(*entry));
     }
     endutxent();
     return sessions;

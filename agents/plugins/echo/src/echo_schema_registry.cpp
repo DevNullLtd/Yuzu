@@ -1068,16 +1068,17 @@ const std::vector<CaptureSourceDef>& build_sources() {
         },
         // ── registry (cursor-model seam, echo_cursor.hpp) — registry value and key
         // changes under a curated persistence/policy watch list (HKLM and each
-        // loaded HKU hive): what changed, with its old and new value. LIVE TIER
-        // ONLY, no rollups (P-008, same rationale as power above). Mechanism: a
+        // loaded HKU hive): what changed, with its new value and the old value's type and
+        // size. LIVE TIER ONLY, no rollups (P-008, same rationale as power above). Mechanism: a
         // RegNotifyChangeKeyValue subtree watch + a per-root baseline diff
         // (echo_state `registry:<root>`) say WHAT changed; a write-only
         // Kernel-Registry ETW session says WHO, by correlation on value name, type,
         // size and time window. actor_pid / actor_image hold the correlated writer
         // (a lead to verify, not proof) and are 0 / '' when none is named; `detail`
         // says why (attr:corr | ambiguous | none | degraded | off | lost-restart).
-        // Values are stored UNMASKED: `data`/`prev_data` are readable through
-        // echo.sql. Retention is a row count.
+        // Values are stored UNMASKED: `data` (the new value) is readable through echo.sql;
+        // `prev_data` is empty, the old value's type and size are kept instead. Retention is
+        // a row count.
         // Replay idempotence via the UNIQUE record_key index below.
         {
             .name = "registry",
@@ -1086,8 +1087,9 @@ const std::vector<CaptureSourceDef>& build_sources() {
             .unique_key_column = "record_key",
             .os_support = {
                 {"windows", OsSupportStatus::kSupported, "regnotify+etw",
-                 "RegNotifyChangeKeyValue subtree watch + baseline diff (what changed, old/new "
-                 "value) and a write-only Kernel-Registry ETW session that names the writing "
+                 "RegNotifyChangeKeyValue subtree watch + baseline diff (what changed: the new "
+                 "value, and the old value's type and size) and a write-only Kernel-Registry ETW "
+                 "session that names the writing "
                  "process by correlation; cursor-model (echo_cursor.hpp). Without an elevated "
                  "agent the session cannot open and rows carry attr:off."},
                 {"linux",   OsSupportStatus::kUnsupported, "",
@@ -1478,10 +1480,12 @@ bool is_queryable_table(std::string_view real_table_name) {
         // Reading it exposes a source name, a position and updated_at; the
         // cursor payload is the source's own bookkeeping, not captured content --
         // with one exception: the registry cursor row holds, for about one tick, the
-        // rendered old and new values of changes whose writer is not settled yet.
-        // echo_state carries the registry baselines (`registry:<root>`, rendered
-        // values), readable here consistently with registry_live's own unmasked
-        // values; purge_source("registry") erases the table, the cursor row and
+        // rendered new value of changes whose writer is not settled yet (and the old
+        // value only when the baseline came from an older build).
+        // echo_state carries the registry baselines (`registry:<root>`: type, size and
+        // a hash per value; an older build also wrote a rendered prefix), readable here
+        // consistently with registry_live's own unmasked values;
+        // purge_source("registry") erases the table, the cursor row and
         // every `registry:%` state row in one transaction.
         std::unordered_set<std::string> s{"echo_state", "echo_config", "echo_cursor"};
         for (const auto& [real, ref] : table_ref_map())

@@ -11,9 +11,19 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__APPLE__)
+#include <utmpx.h>
+using UtmpRecord = struct utmpx;
+#elif defined(__linux__)
+#include <utmp.h>
+using UtmpRecord = struct utmp;
+#endif
 
 using namespace yuzu::echo;
 using yuzu::agent::ProcessInfo;
@@ -991,3 +1001,61 @@ TEST_CASE("Echo logon_type_from_host: remote when a host is recorded and it is n
     CHECK(logon_type_from_host("laptop.example") == "remote");  // tty1 with a host
     CHECK(logon_type_from_host("10.0.0.5") == "remote");
 }
+
+#if defined(__APPLE__) || defined(__linux__)
+namespace {
+// A USER_PROCESS record of the host's own utmp(x) struct. Every other byte is 'Z', so a field
+// that is full and not NUL-terminated runs into non-NUL bytes: an unbounded read would show.
+UtmpRecord utmp_record(std::string_view user, std::string_view line, std::string_view host) {
+    UtmpRecord r;
+    std::memset(&r, 'Z', sizeof r);
+    const auto put = [](char* dst, std::size_t cap, std::string_view v) {
+        std::memset(dst, 0, cap);
+        std::memcpy(dst, v.data(), std::min(v.size(), cap));
+    };
+    put(r.ut_user, sizeof r.ut_user, user);
+    put(r.ut_line, sizeof r.ut_line, line);
+    put(r.ut_host, sizeof r.ut_host, host);
+    r.ut_type = USER_PROCESS;
+    return r;
+}
+} // namespace
+
+TEST_CASE("Echo user_session_from_utmp classifies a session by its host, not its tty",
+          "[echo][diff][user]") {
+    struct Case {
+        const char* line;
+        const char* host;
+        const char* domain;
+        const char* logon_type;
+    };
+    for (const auto& c : {Case{"pts/0", "", "local", "interactive"},
+                          Case{"pts/1", "10.1.2.3", "10.1.2.3", "remote"},
+                          Case{"pts/2", ":0", ":0", "interactive"},
+                          Case{"pts/3", ":1.0", ":1.0", "interactive"},
+                          Case{"tty1", "laptop.example", "laptop.example", "remote"},
+                          Case{"ttys003", "", "local", "interactive"}}) {
+        INFO("line=" << c.line << " host=" << c.host);
+        const auto us = user_session_from_utmp(utmp_record("alice", c.line, c.host));
+        CHECK(us.user == "alice");
+        CHECK(us.session_id == c.line);
+        CHECK(us.domain == c.domain);
+        CHECK(us.logon_type == c.logon_type);
+    }
+}
+
+TEST_CASE("Echo user_session_from_utmp reads full-width fields without running past them",
+          "[echo][diff][user]") {
+    UtmpRecord r = utmp_record("", "", "");
+    const auto fill = [](char* dst, std::size_t cap, char c) { std::memset(dst, c, cap); };
+    fill(r.ut_user, sizeof r.ut_user, 'u'); // no NUL anywhere in the field
+    fill(r.ut_line, sizeof r.ut_line, 'l');
+    fill(r.ut_host, sizeof r.ut_host, 'h');
+
+    const auto us = user_session_from_utmp(r);
+    CHECK(us.user == std::string(sizeof r.ut_user, 'u'));
+    CHECK(us.session_id == std::string(sizeof r.ut_line, 'l'));
+    CHECK(us.domain == std::string(sizeof r.ut_host, 'h'));
+    CHECK(us.logon_type == "remote");
+}
+#endif

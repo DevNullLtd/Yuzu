@@ -95,8 +95,8 @@ Flow:
    `try_lock` on `rollup_mu_`, so it never waits on a rollup). The budget is
    hard for data pages and soft for the WAL; `budget_over_bytes` in `status`
    reports the difference. A new source with a summary tier is picked up by
-   the budget from the registry with no change; a live-only source (no
-   `rollup_sql`) is never evicted.
+   the budget from the registry with no change; a source with raw capture
+   rows only (no `rollup_sql`) is never evicted.
 
 The schema registry (`echo_schema_registry.cpp`) is the single source of
 truth for table shape, retention behavior, rollup SQL, and per-OS
@@ -151,7 +151,7 @@ function, never in `applies_*` collectors.
 | **Uninstall** (`yuzu-agent --remove-service`, MSI uninstall) | echo.db is **left in place** by design. The data dir is operator-managed; uninstall removes the binary and service registration only. To wipe Echo data, delete `<data_dir>/echo.db` explicitly. |
 | **Reinstall over an existing data dir** | The new binary opens the existing echo.db, runs migration if the schema version differs, and resumes collection. State in `echo_state` may be stale (see §5). On Windows, files left by a different agent account are refused rather than adopted (`docs/user-manual/echo.md` "Data storage"). |
 | **`data_dir` change** (config update) | The new directory has no echo.db — the next collect_fast creates it from scratch. The old echo.db at the previous path is orphaned but not deleted. Operator concern, not Echo's. |
-| **Roll back to an older agent** | The older binary opens the same `echo.db` (the registry source adds no schema version) but does not know the `registry` source, so the `registry_live` table, the `registry` row of `echo_cursor` and every `registry:%` baseline in `echo_state` stay on disk, with the per-key baselines holding every watched value unmasked (and the cursor row, for about one tick, the rendered old and new values of changes still waiting for their writer), and the older binary has no way to erase them. An older agent that does know the `registry` source (the key-watch-only build) reads a cursor that holds changes (`held` or `loss`, written as cursor version 2) as lost: one `gap:cursorlost` row and a re-baseline, and those changes are never rows. Run `echo.purge_source` on the paused `registry` source BEFORE the rollback. |
+| **Roll back to an older agent** | The older binary opens the same `echo.db` (the registry source adds no schema version) but does not know the `registry` source, so the `registry_live` table, the `registry` row of `echo_cursor` and every `registry:%` baseline in `echo_state` stay on disk, with the per-key baselines holding each watched value's type, size and hash (a baseline an older build wrote also holds a rendered prefix of each value) and the cursor row, for about one tick, the rendered new value of changes still waiting for their writer, and the older binary has no way to erase them. An older agent that does know the `registry` source (the key-watch-only build) reads a cursor that holds changes (`held` or `loss`, written as cursor version 2) as lost: one `gap:cursorlost` row and a re-baseline, and those changes are never rows. Run `echo.purge_source` on the paused `registry` source BEFORE the rollback. |
 | **Corruption detected at open** (#559) | `EchoDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `echo.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `echo_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `echo.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — Echo refuses to load rather than trust the corrupt DB. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.echo.*` heartbeat tags; the server exposes `yuzu_fleet_echo_db_corruption_agents` and writes an `echo.db.corruption_quarantined` audit row — see docs/user-manual/echo.md "Fleet visibility". |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent
@@ -431,8 +431,9 @@ cursor.** What it adds to the pattern:
   the cursor, so a baseline can never advance without the rows that explain it.
   A baseline read goes through the tri-state `try_get_state`; `get_state`'s
   empty-on-failure would read a transient SQLite error as "no baseline" and
-  silently re-baseline. The baselines hold rendered (unmasked) values and are
-  readable through `echo.sql` like `registry_live` itself;
+  silently re-baseline. The baselines hold each value's type, size and hash (a baseline an
+  older build wrote also holds a rendered prefix) and are readable through
+  `echo.sql` like `registry_live` itself;
   `purge_source("registry")` erases the table, the cursor row and every
   `registry:%` baseline in one transaction.
 - **Four read statuses.** Complete, Absent, Unreadable, Capped. Removals are
@@ -525,8 +526,8 @@ cursor.** What it adds to the pattern:
   Lifting the pin would need a retained-floor marker in the cursor and a stitch rule
   that a window starting below it is `attr:degraded`: a design change, not a fix.
 - **The cursor row is a third content store.** Besides the rows and the
-  baselines, `held` carries each waiting candidate's rendered old and new values
-  until the next tick at most (readable through `echo.sql` as `echo_cursor`; erased by
+  baselines, `held` carries each waiting candidate's rendered new value (and its
+  old value only when the baseline came from an older build) until the next tick at most (readable through `echo.sql` as `echo_cursor`; erased by
   `purge_source("registry")`). A candidate held when the source is disabled stays in
   the row until re-enable (then written `attr:lost-restart` with its original
   `observed_at`; the disable does not drop it, since it is a change observed before

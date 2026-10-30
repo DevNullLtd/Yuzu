@@ -340,7 +340,7 @@ TEST_CASE("risk-filter: a boot seed does not consume the slot of a later load",
     REQUIRE(kept.size() == 2);
 
     // And through the real hourly rollup: one loaded row -> load_count 1.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-module-seed-load-"}};
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_module_seed_load_"}};
     auto opened = EchoDatabase::open(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
