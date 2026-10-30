@@ -1891,9 +1891,15 @@ message ReattachResponse {
     gateway impersonating the device. A quarantine stored before or during the window is
     re-applied on verification from the stored record through `redispatch_stored_containment`,
     never from a caller-supplied value. A fresh operator quarantine refused during the window is
-    written to the store as today (the store write does not depend on reach) and reported with a
-    `challenge_pending` zero-reach cause, added at all five cascade sites, so it does not read as a
-    permanent failure;
+    written to the store as today (the store write does not depend on reach, and REST
+    `POST /api/v1/quarantine` is record-only and never dispatches, so it is unaffected). MCP
+    `quarantine_device` answers through `quarantine_response_shape`, not the cascade sites, so a
+    refused fresh quarantine keeps today's `unconfirmed_retryable` answer with `challenge_pending`
+    named in its detail. For ordinary dispatch, `challenge_pending` is a new zero-reach cause at
+    all five cascade sites, ranked after `containment_unreadable`, next to `os_gate_unreadable`
+    (both are refused before targeting) and before `invalid_scope`; slice 11 amends the
+    `ConfinedDispatchOutcome` doc comment and the `docs/mcp-server.md` cascade bullet, and a test
+    at each of the five sites pins the rank;
   - on verification the server clears `challenge_pending` on both, then runs the #3425
     reconnect reconciler's containment re-application and marks a tags resync (D16): a
     containment re-dispatch refused during the window is re-fired, never dropped;
@@ -2136,7 +2142,12 @@ lands. The two are kept consistent as follows.
     verified challenge, and once that certificate passes its notAfter the server refuses state
     content as `unverified_session` (never `bad_signature`, so expiry never feeds the withholding).
     A renewal mid-session re-binds at the next challenge; how and when a renewed
-    agent re-answers is ADR-0074 wave 2's to define;
+    agent re-answers, and whether it keeps the superseded private key until then, is ADR-0074
+    wave 2's to define, and ADR-0074 at its governed head does not yet define it. Until it does,
+    with 24-hour leaves renewed at half-life, every session older than about 24 hours has its
+    state content refused until it reconnects: slice 11 cannot ship before the re-bind is
+    defined, and its tests include a session that outlives two renewals and keeps its signed
+    state accepted;
   - the liveness fields (`session_id`, `sent_at`, the fact that a heartbeat arrived) stay unsigned,
     as ADR-0074 D5 decided.
   The agent's signing cost and the server's verification rate are measured in wave 2 at the
@@ -2753,7 +2764,7 @@ of every ~30 s. The content is unchanged.
 - `docs/user-manual/security-hardening.md`: "Command Replay Protection" (`__resync__` is a second
   dedup-claimed reserved name); the quarantine section's server-internal pushes that reach a
   contained device (`__resync__` added, `echo.fleet_snapshot` no longer sent; *Security*); and
-      from slice 11, the signed state content and the post-reattach challenge (D14, D16), and in
+  from slice 11, the signed state content and the post-reattach challenge (D14, D16), and in
   the quarantine section that an unverified reattached session receives no containment push
   until its challenge verifies, after which the stored containment is re-applied.
 - From slice 11: `docs/user-manual/metrics.md` (the `bad_signature`, `replayed` and
