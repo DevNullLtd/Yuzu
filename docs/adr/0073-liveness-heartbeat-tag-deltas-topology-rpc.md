@@ -1534,6 +1534,9 @@ count-valued histograms here are not latencies, so they declare their own:
   built from status tags and omits them. From slice 11 (ADR-0074 wave 2) an agent older than
   slice 11 is counted `unsigned`, not `absent` (D16), so the rollout check is this gauge and
   `yuzu_server_agents_state_unsigned` both at 0;
+- `yuzu_server_reattach_admission_refused_total{reason}` (slice 11), a counter with the closed
+  `reason` set `kill_switched|revocation_degraded`: reattaches paced server-wide at admission
+  (D14), registered at 0;
 - `yuzu_server_gateway_refused_total{reason}` (slice 11), a counter with the closed `reason` set
   `pre_wave2`, unlabelled by gateway (the peer is in the WARN line and the audit row);
 - `yuzu_server_audit_state_rows_total{verb,result}` (slice 11), a counter with `verb`
@@ -2067,10 +2070,10 @@ message ReattachResponse {
     `gateway_node` string, which a hostile gateway could multiply; gateways sharing one
     certificate share one cap) at the concurrency divided by the connected peers, with a floor of 8, so one blackholed or hostile gateway cannot hold
     every slot. The global `--reattach-challenge-concurrency` still binds when the per-gateway
-    floors sum above it; a change in the connected-gateway count recomputes the per-gateway cap
+    floors sum above it; a change in the connected-peer count recomputes the per-peer cap
     for new starts only, never cancelling a call in flight. The global and per-gateway counts are
     owned by the call table: a slot is charged at start to the upstream peer recorded on the call
-    object and released only when that call's final tag returns, never at resolution; any
+    object (the peer whose adopt installed the session) and released only when that call's final tag returns, never at resolution; any
     resolution while the call is still in flight (`superseded`, `kill_switched`, `capacity`,
     `expired`) calls `TryCancel` on it, so the slot is held for the cancel latency, not the client
     deadline. The 40-gateway blackhole test asserts the in-flight count per peer never exceeds its
@@ -2230,8 +2233,16 @@ message ReattachResponse {
     agent cannot loop unbounded: the replica counts consecutive `send_failed`, `cert_invalid`
     (expired or not yet valid) and `unsupported` outcomes per `agent_id` in memory; `degraded` is
     never counted, because the revocation read is the server's own and a `degraded` is never the
-    agent's fault (its loop is bounded by `--reattach-rate` and alerted by
-    `YuzuReattachChallengeDegraded`), and `capacity` and `superseded` are never counted either;
+    agent's fault, and `capacity` and `superseded` are never counted either. The uncounted
+    server-side causes are instead paced at reattach admission, server-wide: before the adopt CAS,
+    while the challenge carrier's kill switch is set or unreadable, or the replica's revocation-read
+    breaker is open, a reattach answers `RATE_LIMITED` with a jittered `retry_after_ms` of 30 to
+    60 s and writes nothing, counted on
+    `yuzu_server_reattach_admission_refused_total{reason="kill_switched|revocation_degraded"}`
+    (registered at 0), so a set switch or a degraded store produces no adopt-and-uninstall churn
+    and no route writes into a degraded pool; a slice-11 test holds the switch set for 10 min and
+    asserts the adopt writes stay bounded by that pacing and verification resumes within one
+    `retry_after_ms` of clearing it. The per-agent count is kept
     in a map kept apart from the session (it survives the uninstall that each counted outcome
     causes), reset on `verified`, an entry expiring 30 min after its last failure (twice the
     back-off cap, so an agent held at the cap keeps its count), and the map
@@ -2533,7 +2544,13 @@ lands. The two are kept consistent as follows.
     generation distinction ADR-0074 wave 2 must supply (a wave-1 gateway's certificate admits it
     exactly as a wave-2 one's does today; until ADR-0074 supplies one, slice 11 cannot ship). The
     answer is `FAILED_PRECONDITION` with the message "gateway older than wave 2: upgrade this
-    gateway" (the gateway logs it with its own peer name and reports itself not ready), counted on
+    gateway". A gateway older than wave 2 is already deployed, so its reaction is fixed, and on
+    origin/dev it does not drain itself: `yuzu_gw_upstream.erl` treats `FAILED_PRECONDITION` as a
+    request fault (the breaker neither opens nor recovers, so `/readyz` stays 200) and
+    `yuzu_gw_agent.erl` maps it on a reregister to `superseded`, so its agents reconnect through
+    it again. Operators must take every pre-wave-2 gateway out of the load-balancer pool by hand
+    before the server is upgraded (`docs/user-manual/upgrading.md`); the server-side counter and
+    alert show any that remain. The refusal is counted on
     `yuzu_server_gateway_refused_total{reason="pre_wave2"}`, with at most one WARN line and one
     `gateway.upstream.refused` audit row (detail `reason=pre_wave2`, the gateway peer identity
     through `audit_token`) per gateway peer per 10 min, queued to the issuer drain like every
