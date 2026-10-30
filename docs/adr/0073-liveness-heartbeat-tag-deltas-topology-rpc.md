@@ -2753,7 +2753,9 @@ of every ~30 s. The content is unchanged.
 - `docs/user-manual/security-hardening.md`: "Command Replay Protection" (`__resync__` is a second
   dedup-claimed reserved name); the quarantine section's server-internal pushes that reach a
   contained device (`__resync__` added, `echo.fleet_snapshot` no longer sent; *Security*); and
-  from slice 11, the signed state content and the post-reattach challenge (D14, D16).
+      from slice 11, the signed state content and the post-reattach challenge (D14, D16), and in
+  the quarantine section that an unverified reattached session receives no containment push
+  until its challenge verifies, after which the stored containment is re-applied.
 - From slice 11: `docs/user-manual/metrics.md` (the `bad_signature`, `replayed` and
   `unverified_session` outcomes, the reattach-challenge counter and gauge);
   `docs/user-manual/audit-log.md` (`agent.state.bad_signature`, `agent.reattach.challenge`);
@@ -2950,7 +2952,9 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
       `RegisterRequest.status_tags_pb` ignored; the `bad_signature`, `replayed` and
       `unverified_session` outcomes, `BAD_SIGNATURE`, and the `agent.state.bad_signature` audit
       row; the post-reattach challenge, `challenge_pending` on the session and the route row,
-      the `send_to` and `routable` refusals, the reconciler re-application after verification, and
+      the shared `challenge_pending` predicate in `send_to` and
+      `send_to_all` and the `routable` refusal, the `challenge_pending` zero-reach cause at all
+      five cascade sites, the floors and epoch held in the session record, the reconciler re-application after verification, and
       the server-side uninstall and tombstone on failure or expiry; the challenge counter, gauge
       and audit verb; `--reattach-challenge-timeout`.
     - Proto and gateway: the additive envelope fields in both proto copies and the gateway's
@@ -2959,7 +2963,8 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
       pre-restart signed full set replayed after a restart and a reattach is refused (new epoch);
       honest reordering across the two paths and a lost-ack retry are accepted; a signed payload
       through a real gateway relay verifies; a reattached, unverified session receives no command
-      of any kind (exact send set) and no route, and is uninstalled and tombstoned on a bad or
+      of any kind, broadcast included (exact send set), and no route, a quarantine stored in the
+      window is re-applied from the stored record after verification, and is uninstalled and tombstoned on a bad or
       missing answer; containment is re-applied after verification. Signing and verification
       costs are measured on the wave-2 rig at the heartbeat rate.
 
