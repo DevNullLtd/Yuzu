@@ -2579,15 +2579,17 @@ EchoDatabase open_budget_db(const yuzu::test::TempDbFile& tmp) {
     return std::move(*opened);
 }
 
-// n rows spread evenly over [oldest, newest], ascending in id and ts, ~330 bytes each.
-void seed_tcp_live(EchoDatabase& db, int n, int64_t oldest, int64_t newest) {
+// n rows spread evenly over [oldest, newest], ascending in id and ts; each carries a
+// 2 * payload_bytes hex remote_host, ~330 bytes a row at the default.
+void seed_tcp_live(EchoDatabase& db, int n, int64_t oldest, int64_t newest,
+                   int payload_bytes = 100) {
     REQUIRE(db.execute_sql(std::format(
         "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < {0}) "
         "INSERT INTO tcp_live (ts,snapshot_id,action,proto,local_addr,local_port,remote_addr,"
         "remote_host,remote_port,state,pid,process_name) "
         "SELECT {1} + (i * ({2} - {1})) / {0}, 1, 'connected', 'tcp', '10.0.0.1', i % 60000, "
-        "'203.0.113.1', hex(zeroblob(100)), 443, 'ESTABLISHED', 1, 'curl' FROM n",
-        n - 1, oldest, newest)));
+        "'203.0.113.1', hex(zeroblob({3})), 443, 'ESTABLISHED', 1, 'curl' FROM n",
+        n - 1, oldest, newest, payload_bytes)));
 }
 
 void seed_module_live(EchoDatabase& db, int n, int64_t oldest, int64_t newest) {
@@ -2962,12 +2964,7 @@ TEST_CASE("budget: a reader that pins the WAL makes the checkpoint report busy, 
     // A write burst larger than the WAL allowance lands while the reader is pinned. The disk
     // cost is the point of the case: the WAL has to outgrow the production 16 MiB allowance for
     // "busy, not reclaimed" to mean anything. Twenty ~1 MiB rows get there with the fewest rows.
-    REQUIRE(db.execute_sql(
-        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 19) "
-        "INSERT INTO tcp_live (ts,snapshot_id,action,proto,local_addr,local_port,remote_addr,"
-        "remote_host,remote_port,state,pid,process_name) "
-        "SELECT 3000 + i, 1, 'connected', 'tcp', '10.0.0.1', i, '203.0.113.1', "
-        "hex(zeroblob(524288)), 443, 'ESTABLISHED', 1, 'curl' FROM n"));
+    seed_tcp_live(db, 20, 3000, 4000, 524288);
     const auto pinned = db.storage_bytes();
     REQUIRE(pinned.wal_bytes > kEchoWalAllowanceBytes);
 

@@ -1046,11 +1046,9 @@ TEST_CASE("Echo user_session_from_utmp classifies a session by its host, not its
 
 TEST_CASE("Echo user_session_from_utmp reads full-width fields without running past them",
           "[echo][diff][user]") {
-    UtmpRecord r = utmp_record("", "", "");
-    const auto fill = [](char* dst, std::size_t cap, char c) { std::memset(dst, c, cap); };
-    fill(r.ut_user, sizeof r.ut_user, 'u'); // no NUL anywhere in the field
-    fill(r.ut_line, sizeof r.ut_line, 'l');
-    fill(r.ut_host, sizeof r.ut_host, 'h');
+    // Wider than any field: `put` stops at the field width, so each is full with no NUL anywhere.
+    const UtmpRecord r =
+        utmp_record(std::string(1024, 'u'), std::string(1024, 'l'), std::string(1024, 'h'));
 
     const auto us = user_session_from_utmp(r);
     CHECK(us.user == std::string(sizeof r.ut_user, 'u'));

@@ -177,14 +177,6 @@ std::vector<std::vector<std::string>> raw_rows(const fs::path& db_path, const st
     return rows;
 }
 
-// Execute (write) `sql` on a fresh raw connection to the plugin's echo.db.
-void raw_exec(const fs::path& db_path, const std::string& sql) {
-    yuzu::test::SqliteHandleOwner<sqlite3> owner;
-    REQUIRE(sqlite3_open(db_path.string().c_str(), &owner.db) == SQLITE_OK);
-    sqlite3_busy_timeout(owner.db, 5000);
-    REQUIRE(sqlite3_exec(owner.db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
-}
-
 // `<key>|<value>` line of the plugin's `status` action.
 std::optional<std::string> plugin_status_value(yuzu::agent::LocalDispatcher& d,
                                                const YuzuPluginDescriptor* desc,
@@ -558,12 +550,8 @@ TEST_CASE("echo plugin: db_budget_bytes validates, persists and shows in status 
     REQUIRE(desc->init(ctx.get()) == 0);
     yuzu::agent::LocalDispatcher d;
 
-    const auto status_value = [&](const std::string& key) -> std::optional<std::string> {
-        const auto rows = rows_of(d.run(desc, "status").captured);
-        const auto line = row_with_prefix(rows, key + "|");
-        if (!line)
-            return std::nullopt;
-        return line->substr(key.size() + 1);
+    const auto status_value = [&](const std::string& key) {
+        return plugin_status_value(d, desc, key);
     };
 
     SECTION("a fresh database reports the default budget and zeroed counters") {
@@ -652,9 +640,10 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
 
     // A database as an older build left it: auto_vacuum none, and 48 MiB of pages the plugin will
     // find free once the pad rows are deleted below.
-    raw_exec(db_path, "PRAGMA auto_vacuum=0; CREATE TABLE yuzu_test_pad(x BLOB);"
-                      "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 48) "
-                      "INSERT INTO yuzu_test_pad SELECT zeroblob(1048576) FROM n;");
+    (void)raw_rows(db_path,
+                   "PRAGMA auto_vacuum=0; CREATE TABLE yuzu_test_pad(x BLOB);"
+                   "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 48) "
+                   "INSERT INTO yuzu_test_pad SELECT zeroblob(1048576) FROM n;");
 
     yuzu::agent::StandalonePluginContext ctx("echo", {{"agent.data_dir", dir_guard.path.string()}},
                                              &*kv);
@@ -665,16 +654,17 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
     // the preservation contract admits them whatever the clock clamp does): 20 MiB of data, over
     // the 16 MiB target. Then free the pad, so the file is mostly free pages.
     const auto now = static_cast<std::int64_t>(std::time(nullptr));
-    raw_exec(db_path,
-             std::format("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 19) "
-                         "INSERT INTO tcp_live (ts,snapshot_id,action,proto,local_addr,local_port,"
-                         "remote_addr,remote_host,remote_port,state,pid,process_name) "
-                         "SELECT {0} - 25 * 3600 - i * 3600, 1, 'connected', 'tcp', '10.0.0.1', i, "
-                         "'203.0.113.1', hex(zeroblob(524288)), 443, 'ESTABLISHED', 1, 'curl' FROM n;"
-                         "INSERT INTO echo_config (key, value) VALUES ('rollup_tcp_hourly_at', '{0}') "
-                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value;"
-                         "DELETE FROM yuzu_test_pad;",
-                         now));
+    (void)raw_rows(
+        db_path,
+        std::format("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 19) "
+                    "INSERT INTO tcp_live (ts,snapshot_id,action,proto,local_addr,local_port,"
+                    "remote_addr,remote_host,remote_port,state,pid,process_name) "
+                    "SELECT {0} - 25 * 3600 - i * 3600, 1, 'connected', 'tcp', '10.0.0.1', i, "
+                    "'203.0.113.1', hex(zeroblob(524288)), 443, 'ESTABLISHED', 1, 'curl' FROM n;"
+                    "INSERT INTO echo_config (key, value) VALUES ('rollup_tcp_hourly_at', '{0}') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value;"
+                    "DELETE FROM yuzu_test_pad;",
+                    now));
 
     const std::string budget_text = std::to_string(kMinBudget);
     const YuzuParam budget_param[] = {{"db_budget_bytes", budget_text.c_str()}};
