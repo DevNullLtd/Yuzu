@@ -256,3 +256,30 @@ TEST_CASE("expand_ecosystem_tokens: one exact-size allocation",
     // reserve(peak) on an empty string never doubles: allocator rounding only.
     CHECK(out.capacity() - out.size() < 64);
 }
+
+TEST_CASE("kSoftwareKinds and kSoftwareSources: UI vocabulary tables",
+          "[server][software_catalog][ui_vocab]") {
+    SECTION("kinds are exactly app, pkg, package, feat, in order") {
+        std::vector<std::string> values;
+        for (const auto& k : kSoftwareKinds)
+            values.emplace_back(k.value);
+        CHECK(values == std::vector<std::string>{"app", "pkg", "package", "feat"});
+    }
+    SECTION("the pkg tooltip names the MSI, snap and flatpak products it covers") {
+        const auto it = std::find_if(kSoftwareKinds.begin(), kSoftwareKinds.end(),
+                                     [](const auto& k) { return k.value == "pkg"; });
+        REQUIRE(it != kSoftwareKinds.end());
+        CHECK(it->tooltip.find("MSI") != std::string_view::npos);
+        CHECK(it->tooltip.find("snap") != std::string_view::npos);
+        CHECK(it->tooltip.find("flatpak") != std::string_view::npos);
+    }
+    SECTION("sources are exactly the six collector sources, in order") {
+        std::vector<std::string> values;
+        for (const auto& s : kSoftwareSources)
+            values.emplace_back(s.value);
+        CHECK(values == std::vector<std::string>{
+                            "installed_apps.list_inventory", "pkg_inventory.managers",
+                            "pkg_inventory.packages", "pkg_inventory.store_packages",
+                            "windows_optional_features.list", "msi_packages.list_inventory"});
+    }
+}

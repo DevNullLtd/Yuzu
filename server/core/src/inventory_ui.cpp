@@ -146,6 +146,8 @@ std::string inv_style() {
   .inv-frow .lab{min-width:88px;font-size:13px;font-weight:500;color:var(--ink2)}
   .inv-chip{height:28px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--mut);font:inherit;font-size:13px;font-weight:500;cursor:pointer}
   .inv-chip[data-g=src]{font-family:var(--mds-font-family-mono);font-size:12.5px;font-weight:400}
+  .inv-chip[data-f=win]{box-shadow:inset 3px 0 0 var(--c1)}.inv-chip[data-f=mac]{box-shadow:inset 3px 0 0 var(--c2)}
+  .inv-chip[data-f=lin]{box-shadow:inset 3px 0 0 var(--c3)}.inv-chip[data-f=oth]{box-shadow:inset 3px 0 0 var(--mut)}
   .inv-chip:hover{background:var(--surface2);color:var(--ink)}
   .inv-chip[aria-pressed=true]{border-color:var(--primary);background:color-mix(in srgb,var(--primary) 14%,transparent);color:var(--ink)}
   .inv-active{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
@@ -192,6 +194,7 @@ std::string inv_style() {
   .inv-exp-body .inv-degrade{margin-top:10px}
   .inv-exp-body,.inv-devs{padding:12px 16px 14px;background:var(--bg)}
   .inv-close{float:right;color:var(--mut);cursor:pointer}.inv-close:hover{color:var(--ink)}
+  button.inv-devbtn{background:none;border:0;padding:0;font:inherit}
   .inv-devbtn,.inv-hostlink{color:var(--primary);text-decoration:none;cursor:pointer}.inv-devbtn:hover,.inv-hostlink:hover{color:var(--primary-h)}
   .inv-hostlink:hover{text-decoration:underline}
   .inv-devhead{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;color:var(--mut)}.inv-devhead b{color:var(--ink);font-weight:600}
@@ -258,16 +261,6 @@ std::string eco_pill(std::string_view eco) {
            esc(std::string(eco)) + "</span>";
 }
 
-constexpr std::array<std::pair<const char*, const char*>, 4> kKinds{{
-    {"app", "applications"},
-    {"pkg", "macOS pkgutil and Homebrew packages"},
-    {"package", "OS packages (rpm, deb, apk, pacman)"},
-    {"feat", "Windows optional features"},
-}};
-constexpr std::array<const char*, 4> kSources{"installed_apps.list_inventory",
-                                              "pkg_inventory.packages", "pkg_inventory.managers",
-                                              "windows_optional_features.list"};
-
 bool any_filter(const SoftwarePageFilters& f) {
     return !f.q.empty() || !f.kind.empty() || !f.ecosystem.empty() || !f.source.empty() ||
            !f.agent_id.empty() || f.versions_min > 0;
@@ -320,7 +313,8 @@ std::string sw_head() {
            "title=\"Ask devices to re-send their software inventory now\">Sync now</button></div>"
            "<div class=\"inv-sub\">Installed-software inventory by application, version and "
            "device, synced <b>daily</b> from every endpoint (ADR-0016 daily-sync). Looking for a "
-           "device? See <a href=\"/hardware\">Hardware</a>.</div>";
+           "device? Open it from <a href=\"/hardware\">Hardware</a> &rarr; Installed "
+           "software &rarr; Open in Software.</div>";
 }
 
 // Retry re-requests the whole page WITH the current filters (a bare retry would drop them).
@@ -441,25 +435,36 @@ std::string chips_region(const SoftwarePageFilters& f, bool oob) {
                results_get(t) + ">" + esc(label) + "</button>";
     };
     h += kind_chip("", "All", "every kind");
-    for (const auto& [k, title] : kKinds)
-        h += kind_chip(k, k, title);
+    for (const auto& k : software_catalog::kSoftwareKinds)
+        h += kind_chip(std::string(k.value), std::string(k.title), std::string(k.tooltip));
     h += "</div></div>";
-    const auto chip_row = [&](const char* lab, const char* g, const std::string& cur, auto&& values) {
+    struct Chip {
+        std::string v, label, tooltip, family;
+    };
+    const auto chip_row = [&](const char* lab, const char* g, const std::string& cur,
+                              const std::vector<Chip>& chips) {
         h += std::string("<div class=\"inv-frow\"><span class=\"lab\">") + lab + "</span>";
-        for (const std::string v : values) {
+        for (const auto& c : chips) {
             SoftwarePageFilters t = f;
-            (std::string_view(g) == "eco" ? t.ecosystem : t.source) = (cur == v ? "" : v);
-            h += "<button type=\"button\" class=\"inv-chip\" data-g=\"" + std::string(g) + "\" data-v=\"" +
-                 esc(v) + "\" aria-pressed=\"" + (cur == v ? "true" : "false") + "\" title=\"" +
-                 esc(v) + "\" " + results_get(t) + ">" + esc(v) + "</button>";
+            (std::string_view(g) == "eco" ? t.ecosystem : t.source) = (cur == c.v ? "" : c.v);
+            h += "<button type=\"button\" class=\"inv-chip\" data-g=\"" + std::string(g) +
+                 "\" data-v=\"" + esc(c.v) + "\" aria-pressed=\"" +
+                 (cur == c.v ? "true" : "false") + "\" title=\"" + esc(c.tooltip) + "\" " +
+                 (c.family.empty() ? std::string() : "data-f=\"" + esc(c.family) + "\" ") +
+                 results_get(t) + ">" + esc(c.label) + "</button>";
         }
         h += "</div>";
     };
-    std::vector<std::string> ecos;
-    for (const auto& e : software_catalog::kEcosystemFamilies)
-        ecos.emplace_back(e.ecosystem);
+    std::vector<Chip> ecos, srcs;
+    for (const auto& e : software_catalog::kEcosystemFamilies) {
+        const std::string eco(e.ecosystem);
+        const std::string cls = family_cls(e.family);
+        ecos.push_back({eco, eco, eco, cls.empty() ? "oth" : cls});
+    }
+    for (const auto& s : software_catalog::kSoftwareSources)
+        srcs.push_back({std::string(s.value), std::string(s.title), std::string(s.tooltip), ""});
     chip_row("Ecosystem", "eco", f.ecosystem, ecos);
-    chip_row("Found by", "src", f.source, std::vector<std::string>(kSources.begin(), kSources.end()));
+    chip_row("Found by", "src", f.source, srcs);
     h += "<span id=\"sw-state\" hidden><input type=\"hidden\" name=\"kind\" value=\"" + esc(f.kind) +
          "\"><input type=\"hidden\" name=\"ecosystem\" value=\"" + esc(f.ecosystem) +
          "\"><input type=\"hidden\" name=\"source\" value=\"" + esc(f.source) +
@@ -578,17 +583,18 @@ std::string title_rows(const SoftwarePageFilters& f, const SoftwarePageData& d) 
             kinds += (kinds.empty() ? "" : "/") + std::string(one);
         });
         h += "<tr class=\"click\" data-t=\"" + std::to_string(i++) + "\" aria-expanded=\"false\" "
-             "data-tog=\"v\" title=\"Click for installs per version\" hx-get=\"" + esc(vurl) +
+             "data-tog=\"v\" role=\"button\" tabindex=\"0\" onkeydown=\"swKey(event,this)\" "
+             "title=\"Click for installs per version\" hx-get=\"" + esc(vurl) +
              "\" hx-target=\"#" + box + "\" hx-swap=\"innerHTML\"><td class=\"inv-name\">" +
              esc(r.name) + "</td><td class=\"inv-pub\">" + (r.publisher.empty() ? dash() : esc(r.publisher)) +
              "</td><td>" + pills + "<span class=\"inv-grey\">" + esc(kinds) + "</span></td>"
              "<td class=\"inv-num\">" + fmt_int(r.device_count) + "</td><td class=\"inv-num\">" +
              fmt_int(r.version_count) + "</td><td class=\"inv-mono\">" +
              ((r.newest_version.empty() || d.confined) ? dash() : esc(r.newest_version)) +
-             "</td><td class=\"inv-act\"><span class=\"inv-devbtn\" data-vers>versions &rsaquo;</span>"
-             " &middot; <span class=\"inv-devbtn\" data-devs data-tog=\"d\" "
+             "</td><td class=\"inv-act\"><button type=\"button\" class=\"inv-devbtn\" data-vers>versions &rsaquo;</button>"
+             " &middot; <button type=\"button\" class=\"inv-devbtn\" data-devs data-tog=\"d\" "
              "onclick=\"event.stopPropagation()\" hx-get=\"" + esc(durl) + "\" hx-target=\"#" + box +
-             "\" hx-swap=\"innerHTML\">devices &rsaquo;</span></td></tr>"
+             "\" hx-swap=\"innerHTML\">devices &rsaquo;</button></td></tr>"
              "<tr class=\"inv-exp\"><td colspan=\"7\"><div id=\"" + box + "\"></div></td></tr>";
     }
     const std::int64_t shown = d.shown_before + static_cast<std::int64_t>(d.rows->size());
@@ -752,7 +758,10 @@ std::string render_software_page(const SoftwarePageFilters& f, const SoftwarePag
         h += "<div id=\"sw-kpis\">" + caveat(d.caveat ? *d.caveat
                                                      : "Fleet-wide figures are not shown to a "
                                                        "management-group-scoped account; this page "
-                                                       "shows the selected device's software only.") +
+                                                       "shows the selected device's software only. "
+                                                       "Open a device from Hardware \xE2\x86\x92 "
+                                                       "Installed software \xE2\x86\x92 Open in "
+                                                       "Software.") +
              "</div>";
         if (d.caveat) // refused: the caveat is all there is, so it carries the reset too
             return h + "<div class=\"inv-caveat\">" + kResetLink + "</div></div>";
@@ -797,10 +806,10 @@ std::string render_software_versions_expansion(
              ((r.newest && !confined) ? " <span class=\"inv-pill on\">newest in fleet</span>" : "") +
              "</td><td class=\"inv-num\">" + fmt_int(r.device_count) +
              "</td><td><div class=\"inv-bar\"><span style=\"width:" + std::to_string(pct) +
-             "%\"></span></div></td><td class=\"inv-act\"><span class=\"inv-devbtn\" data-vdevs "
+             "%\"></span></div></td><td class=\"inv-act\"><button type=\"button\" class=\"inv-devbtn\" data-vdevs "
              "data-tog=\"d\" aria-expanded=\"false\" hx-get=\"" +
              esc(version_devices_url(f, name, r.version, r.device_count)) + "\" hx-target=\"#" + box +
-             "\" hx-swap=\"innerHTML\">devices &rsaquo;</span></td></tr><tr class=\"inv-exp\">"
+             "\" hx-swap=\"innerHTML\">devices &rsaquo;</button></td></tr><tr class=\"inv-exp\">"
              "<td colspan=\"4\"><div id=\"" + box + "\"></div></td></tr>";
     }
     h += "</tbody></table>";
@@ -935,6 +944,12 @@ function swMark(box, open) {
     if (tr) tr.setAttribute('aria-expanded', open ? 'true' : 'false');
   }
 }
+/* Title rows are role=button: Enter/Space fires the row's click (htmx's default trigger). A nested
+   native button (versions / devices) handles its own key. */
+function swKey(e, el) {
+  if ((e.key !== 'Enter' && e.key !== ' ') || e.target.closest('button')) return;
+  e.preventDefault(); el.click();
+}
 function swShut(box) { box.innerHTML = ''; box.removeAttribute('data-open'); swMark(box, false); }
 function swClose(x) {
   var b = x.closest('.inv-exp-body'), box = b && b.parentNode;
@@ -1027,11 +1042,35 @@ document.body.addEventListener('htmx:beforeRequest', function (e) {
     }
     return;
   }
+  if (el.getAttribute('data-act') === 'dmore') {  /* the swapped row is replaced in place: remember its index */
+    var tr = el.closest('tr');
+    if (tr) window.__swMore = { tb: tr.parentNode, i: tr.sectionRowIndex, btn: el };
+  }
   var m = el.getAttribute('data-tog');
   if (m && t && t.getAttribute('data-open') === m && t.firstChild) { e.preventDefault(); swShut(t); }
 });
+document.body.addEventListener('htmx:afterRequest', function (e) {
+  /* Load more finished (swapped, empty, failed or aborted): the marker is consumed only by its own request */
+  var mo = window.__swMore, rc = e.detail && e.detail.requestConfig;
+  if (!mo || !rc || rc.elt !== mo.btn) return;
+  window.__swMore = null;
+  if (!e.detail.successful) {  /* failed: put focus back on the re-enabled button */
+    if (e.detail.xhr && e.detail.xhr.status === 401) { location.assign('/login'); return; }
+    setTimeout(function () { if (mo.btn.isConnected) mo.btn.focus(); }, 0);
+    return;
+  }
+  var box = mo.tb.closest('div[id^="exp-"]') || mo.tb.closest('.inv-devs'),
+      flt = box && box.querySelector('.inv-devfilter'), rows = mo.tb.rows, ff, i;
+  if (flt && flt.value && typeof gpSearch === 'function') gpSearch(flt);  /* so hidden new rows are skipped */
+  for (i = mo.i; i < rows.length && !ff; i++)  /* first visible new row; it lands at the replaced row's index */
+    if (rows[i].style.display !== 'none' && !rows[i].classList.contains('inv-more')) ff = rows[i].querySelector('a,button');
+  if (!ff && rows[mo.i] && rows[mo.i].classList.contains('inv-more')) ff = rows[mo.i].querySelector('button');  /* empty page, next cursor */
+  ff = ff || flt;
+  if (ff) ff.focus();
+});
 document.body.addEventListener('htmx:afterSwap', function (e) {
-  var el = e.detail.elt, t = e.detail.target, m = el && el.getAttribute && el.getAttribute('data-tog');
+  var rc = e.detail.requestConfig, el = (rc && rc.elt) || e.detail.elt,  /* htmx 2: detail.elt is the target here */
+      t = e.detail.target, m = el && el.getAttribute && el.getAttribute('data-tog');
   if (m && t && t.id) { t.setAttribute('data-open', m); swMark(t, true); }
 });
 document.body.addEventListener('htmx:afterSettle', function () {
