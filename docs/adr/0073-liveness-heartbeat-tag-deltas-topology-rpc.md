@@ -2426,7 +2426,8 @@ of every ~30 s. The content is unchanged.
   `AgentRegistrationStore` (ADR-0012 contract, playbook, a migration-ladder row) and the
   decommission cascade.
 - **Authentication and enrollment:** `security-guardian`. The `ProxyReattach` enrollment gate must
-  stay equivalent to the ProxyRegister fast path, and the token leaves gateway memory.
+  stay equivalent to the ProxyRegister fast path, and the token is no longer retained in gateway
+  memory (it still transits the gateway during Register).
 - **HA WS-4 route adoption** (ADR-2002, `gateway_route_store.hpp` FORWARD NOTE): `security-guardian`
   and `cpp-safety`. The adopt decision is extracted into one function shared by ProxyRegister and
   ProxyReattach.
