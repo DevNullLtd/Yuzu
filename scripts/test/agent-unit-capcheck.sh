@@ -35,7 +35,7 @@
 #     * every thread has CapInh = CapAmb = 0 once plugins have loaded
 #     * the startup log line reports the same effective mask as /proc
 #     * with capset denied by seccomp (SystemCallFilter=~capset) the agent refuses to start:
-#       non-zero exit, the exact refusal line, no plugin loaded (the fail-closed path)
+#       exit 1 (EXIT_FAILURE), the exact refusal line, no plugin loaded (the fail-closed path)
 #     * the real firmware tables, when the host has them, are copied byte-identically; on a
 #       host with none, a stale snapshot is removed and the agent still starts
 #
