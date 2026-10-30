@@ -39,6 +39,10 @@
 
 ## Decision
 
+The numbered items summarise the decision. They do not map one-to-one onto the detail sections
+D1-D16; each item names the D-sections that hold its detail, and terms such as `diverged` and
+`no_base` are defined where they are first used there (D3).
+
 1. **The heartbeat becomes a liveness message.** It carries `session_id`, `sent_at`, a
    `StatusTags` delta serialized into an **opaque `bytes` field** the gateway never decodes (D2),
    and a ~70-byte `TopologyDigest` (D5).
@@ -2178,8 +2182,8 @@ of every ~30 s. The content is unchanged.
     on a timeout; the breaker does not trip; tags and topology converge within the D13 figures for
     that N;
   - **S2, S1 with Postgres degraded** (300 ms added latency, pool saturated; slice 6): heartbeat
-    ingestion is unaffected, resyncs are `deferred` and drain once the pool recovers, and reattach
-    answers `DEGRADED` without closing a stream;
+    ingestion is unaffected, resyncs are `deferred` and drain once the pool recovers, and a reattach
+    whose read fails answers `DEGRADED` without closing a stream;
   - **S3, two replicas behind per-RPC balancing** (slices 4 and 6): asserts the connection-affinity
     precondition (*Server stores*) by showing the documented symptom, a `diverged` plus `no_base`
     share near 100 %, and that connection-level balancing converges;
@@ -2416,6 +2420,10 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
       (D13) measured.
 
 ## Open points for the owner
+
+Points 4, 5 and 6 follow directly from the 2026-10-26 opaque-relay ruling (no parsing and no
+per-agent state in the gateway). They are listed for the owner to confirm the consequence, not to
+make a new choice.
 
 1. **Typed `TopologyDigest` field instead of a status tag** (D5). Recommended. Under tag deltas, a tag
    would also churn the state digest on every pump.
