@@ -9791,6 +9791,9 @@ public:
                     metrics_.gauge("yuzu_server_guardian_proj_failures_total")
                         .set(static_cast<double>(
                             guaranteed_state_store_->observations_proj_failures_total()));
+                    metrics_.gauge("yuzu_server_guardian_census_proj_failures_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->census_proj_failures_total()));
                     metrics_.gauge("yuzu_server_guardian_observations_reaped_total")
                         .set(static_cast<double>(
                             guaranteed_state_store_->observations_reaped_total()));

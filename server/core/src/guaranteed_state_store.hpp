@@ -492,6 +492,7 @@ public:
     uint64_t observations_proj_failures_total() const noexcept {
         return observations_proj_failures_.load();
     }
+    uint64_t census_proj_failures_total() const noexcept { return census_proj_failures_.load(); }
     uint64_t observations_reaped_total() const noexcept { return observations_reaped_.load(); }
     uint64_t events_dropped_total() const noexcept { return events_dropped_.load(); }
     uint64_t events_redelivered_total() const noexcept { return events_redelivered_.load(); }
@@ -530,6 +531,7 @@ private:
     std::atomic<uint64_t> events_written_{0};
     std::atomic<uint64_t> events_reaped_{0};
     std::atomic<uint64_t> observations_proj_failures_{0};
+    std::atomic<uint64_t> census_proj_failures_{0}; // census upsert failed (event kept); not a 23503 refusal
     std::atomic<uint64_t> observations_reaped_{0};
     std::atomic<uint64_t> events_dropped_{0};      // event_id conflict, MISMATCHED payload
     std::atomic<uint64_t> events_redelivered_{0};  // event_id conflict, MATCHING payload

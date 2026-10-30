@@ -424,7 +424,7 @@ TEST_CASE("device lenses: DEX lens — no signals in-window renders the honest-e
          std::string::npos);
 }
 
-TEST_CASE("device lenses: Guardian lens renders known guards incl. an orphan-rule-id fallback, "
+TEST_CASE("device lenses: Guardian lens renders known guards and drops a deleted rule's row, "
           "order-insensitive",
           "[pg][device][routes]") {
     YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
@@ -433,16 +433,18 @@ TEST_CASE("device lenses: Guardian lens renders known guards incl. an orphan-rul
     const std::string agent = "guardian-dev-1";
     REQUIRE(store.create_rule(make_lens_rule("r-alpha", "Alpha Guard")));
     REQUIRE(store.create_rule(make_lens_rule("r-bravo", "Bravo Guard")));
-    // r-orphan is NEVER created via create_rule — its status row has no
-    // matching rule catalogue entry, so the lens must fall back to the raw
-    // rule_id for its display name (guardian_device_all_guards's documented
-    // fallback; events table carries no FK to the rules table).
+    // r-orphan is created, reports, and is then deleted. The census row has a foreign key
+    // to the rule (schema v3, #5674), so the delete removes its status row and the lens no
+    // longer lists it; a status row with no rule row, which this test used to arrange to
+    // exercise the raw rule_id display-name fallback, can no longer exist.
+    REQUIRE(store.create_rule(make_lens_rule("r-orphan", "Orphan Guard")));
     REQUIRE(store.insert_event(
         make_drift_event("evt-alpha", "r-alpha", agent, "drift.detected", "2026-04-19T12:00:00Z")));
     REQUIRE(store.insert_event(make_drift_event("evt-bravo", "r-bravo", agent, "drift.remediated",
                                                 "2026-04-19T13:00:00Z")));
     REQUIRE(store.insert_event(make_drift_event("evt-orphan", "r-orphan", agent, "drift.detected",
                                                 "2026-04-19T14:00:00Z")));
+    REQUIRE(store.delete_rule("r-orphan"));
 
     auto dex_api = make_local_dex_api(&store, {});
     auto guardian_api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
@@ -455,9 +457,8 @@ TEST_CASE("device lenses: Guardian lens renders known guards incl. an orphan-rul
     auto r = sink.Get("/fragments/device/guardian?id=" + agent + "&bare=1");
     REQUIRE(r);
     CHECK(r->status == 200);
-    // 1 compliant (bravo) of 3 guards -> round(100/3) = 33%.
-    CHECK(r->body.find("<div class=\"n warn\">33%</div><div class=\"l\">Compliant</div>"
-                       "<div class=\"sx\">1 of 3 guards</div>") != std::string::npos);
+    // 1 compliant (bravo) of 2 guards -> 50%.
+    CHECK(r->body.find("<div class=\"sx\">1 of 2 guards</div>") != std::string::npos);
     // Order-insensitive: each row asserted independently by exact markup
     // (name cell + guard_state_badge markup + updated_at, byte-for-byte).
     CHECK(r->body.find("<tr><td class=\"name\">Alpha Guard</td><td><span "
@@ -470,11 +471,8 @@ TEST_CASE("device lenses: Guardian lens renders known guards incl. an orphan-rul
                        "font-weight:500;color:var(--ok);background:color-mix(in srgb,var(--ok) 14%,"
                        "transparent)\">compliant</span></td>"
                        "<td class=\"gp-mute\">2026-04-19T13:00:00Z</td></tr>") != std::string::npos);
-    CHECK(r->body.find("<tr><td class=\"name\">r-orphan</td><td><span "
-                       "style=\"display:inline-block;padding:1px 8px;border-radius:3px;font-size:12.5px;"
-                       "font-weight:500;color:var(--warn);background:color-mix(in srgb,var(--warn) 14%,"
-                       "transparent)\">drifted</span></td>"
-                       "<td class=\"gp-mute\">2026-04-19T14:00:00Z</td></tr>") != std::string::npos);
+    CHECK(r->body.find("r-orphan") == std::string::npos);
+    CHECK(r->body.find("Orphan Guard") == std::string::npos);
 }
 
 TEST_CASE("device lenses: Guardian lens: a guard.errored lifecycle event shows the rule as errored "

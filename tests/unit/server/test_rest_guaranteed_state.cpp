@@ -5404,31 +5404,28 @@ TEST_CASE("REST gs.device-compliance: unrecognized stored state folds into pendi
     CHECK(d["guards"][0]["updated_at"].get<std::string>() == "2026-06-20T10:00:00Z");
 }
 
-TEST_CASE("REST gs.device-compliance: snapshot guard with no rule row falls back to rule_id name",
+TEST_CASE("REST gs.device-compliance: a snapshot guard whose rule was deleted drops out with its census row",
           "[pg][rest][guaranteed_state][baseline]") {
     RestGsHarness h;
     h.seed_rule("r1", "Real Guard");
-    // r-gone is in the deployed snapshot but its rule row was never created (e.g. the
-    // Guard was deleted after deploy) -> name falls back to the rule_id. The device
-    // reported BOTH guards, so both are applicable.
+    h.seed_rule("r-gone", "Doomed Guard");
+    // r-gone is in the deployed snapshot and the device reported it, then the Guard was
+    // deleted after deploy. The census row has a foreign key to the rule (schema v3,
+    // #5674), so deleting the rule removes it and the device no longer reports r-gone; a
+    // census row with no rule row, which this test used to arrange to exercise the
+    // rule_id name fallback, can no longer exist.
     h.seed_deployed_baseline("B", {"r1", "r-gone"});
     h.seed_status("e1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
     h.seed_status("e2", "WS-1", "r-gone", "drift.detected", "2026-06-20T10:00:00Z");
+    REQUIRE(h.store->delete_rule("r-gone"));
 
     auto res = h.sink.Get("/api/v1/guaranteed-state/device-compliance?baseline=B&agent_id=WS-1");
     REQUIRE(res);
     auto j = nlohmann::json::parse(res->body);
     auto& d = j["data"];
-    CHECK(d["total_guards"].get<int>() == 2);
-    bool saw_fallback = false;
-    for (auto& g : d["guards"]) {
-        if (g["rule_id"].get<std::string>() == "r-gone") {
-            CHECK(g["name"].get<std::string>() == "r-gone"); // fallback to rule_id
-            CHECK(g["status"].get<std::string>() == "drifted");
-            saw_fallback = true;
-        }
-    }
-    CHECK(saw_fallback);
+    CHECK(d["total_guards"].get<int>() == 1);
+    for (auto& g : d["guards"])
+        CHECK(g["rule_id"].get<std::string>() != "r-gone");
 }
 
 TEST_CASE("REST gs.device-compliance: rule_names_for chunks the IN-list past 500 (perf-2/UP-6)",
