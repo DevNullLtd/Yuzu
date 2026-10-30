@@ -690,7 +690,7 @@ canonicalisation out of the server.
 **Pump.** The pump stays a Run()-lifetime thread (`snapshot_pump_thread_` in `agent.cpp`). Each run:
 1. execute `echo.fleet_snapshot` via `LocalDispatcher`;
 2. publish the body, digest, `last_pump_at`, outcome and `pump_interval_s` as **one record**;
-3. sleep a jittered 60 s.
+3. sleep a jittered `--topology-interval` (default 60 s; D9).
 
 Truncated runs (over 2 MiB) keep the previous body and digest and record `TRUNCATED`; a failed run
 keeps them too and records `FAILED`.
