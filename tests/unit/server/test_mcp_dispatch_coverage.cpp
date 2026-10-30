@@ -305,7 +305,7 @@ std::vector<std::string> declared_record_names(const std::string& code, const st
 // kRegistryDomainFiles together with MIN_REGISTRY_FILES in scripts/ci/check-api-parity.py (and the
 // seam-closure lane pins in scripts/ci/check-seam-closure.py) when a mcp_tools_<domain>.cpp is
 // added; bump kToolHeaderFiles when an mcp_tool*.hpp is added.
-constexpr std::size_t kRegistryDomainFiles = 3;
+constexpr std::size_t kRegistryDomainFiles = 4;
 constexpr std::size_t kToolHeaderFiles = 3;
 
 } // namespace

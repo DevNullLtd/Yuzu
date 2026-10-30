@@ -59,8 +59,9 @@
 // The context carries the nine things every legacy branch reads, plus one
 // pointer to a ToolDeps (mcp_tool_deps.hpp): a bundle of provider closures, the
 // same instances the REST routes receive, and NO store pointers. A handler
-// that needs a store, the agent registry or a write-capable callable is a sign
-// the tool belongs on the legacy path (or the provider set is wrong), not a
+// that needs a store, the agent registry or a write-capable callable outside the
+// criterion in mcp_tool_deps.hpp is a sign the tool belongs on the legacy path (or the
+// provider set is wrong), not a
 // reason to widen this struct; a lexical test keeps mcp_tools_*.cpp from
 // including a store header (direct includes only). The context BORROWS request-frame objects (see
 // ToolCallContext): a handler completes synchronously and never stores or
@@ -284,5 +285,6 @@ constexpr bool records_well_formed(std::span<const ToolRecord> records) {
 std::span<const ToolRecord> discovery_tool_records();
 std::span<const ToolRecord> hardware_tool_records();
 std::span<const ToolRecord> containment_tool_records();
+std::span<const ToolRecord> crypto_tool_records();
 
 } // namespace yuzu::server::mcp

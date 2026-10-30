@@ -233,7 +233,7 @@ MCP_REGISTRY_DIR = None
 # with the C++ twin constant `kRegistryDomainFiles` in tests/unit/server/test_mcp_dispatch_coverage.cpp;
 # a new mcp_tool*.hpp header needs `kToolHeaderFiles` there instead (this script does not count headers).
 # tests/test_docs_drift_selftest.py builds its --root fixture from this value, so it self-adjusts.
-MIN_REGISTRY_FILES = 3
+MIN_REGISTRY_FILES = 4
 LEDGER_DOC = ROOT / "docs" / "api-parity-ledger.md"
 
 DOC_BEGIN = ("<!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; "
