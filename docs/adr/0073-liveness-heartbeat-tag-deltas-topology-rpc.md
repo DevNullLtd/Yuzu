@@ -1976,13 +1976,30 @@ message ReattachResponse {
     `expired`); an answer's deadline is judged on its arrival on the queue. Each in-flight
     challenge is a heap-owned call object (its `ClientContext`, `ClientAsyncReader` and buffers)
     registered in an issuer-owned table under a mutex and freed only when its final tag comes
-    back from the queue; a call is created and started on the queue only while that mutex is
+    back from the queue. The call object, and each verifier queue entry, holds a
+    `shared_ptr<AgentSession>` (the registry's own holder type) plus the challenge's
+    `command_id`; every write to the answer slot and every transition first checks under
+    `stream_mu` that the session's current challenge id is still that `command_id`, and does
+    nothing otherwise, so a session uninstalled or replaced by a full Register while its call is
+    in flight or its answer is queued is never written (an ASan test uninstalls a session, by an
+    expiry followed by a full Register for the same agent, in both states). A call is created and started on the queue only while that mutex is
     held and the table is not `closed`. `stop()` takes the mutex, sets `closed` (a pass that then
     tries to start a challenge resolves it `send_failed` instead) and calls `TryCancel` on every
-    entry, then, after releasing it, `Shutdown()`s the queue (no call can start after this),
-    drains `Next()` until it returns false, and joins the polling thread and the verifier pool, all within the issuer's stop stage and so before `gw_mgmt_pool_` is destroyed; the
+    entry; the polling thread keeps running `Next()` and lets each cancelled call reach its final
+    tag, issuing its `Finish` as usual, until the call table is empty (bounded by the cancel
+    latency, not the client deadline); only then does `stop()` `Shutdown()` the queue, drain
+    `Next()` until it returns false and join the polling thread, so no operation is ever started
+    on a shut-down queue. Verifier threads check the issuer's stop flag before each job and
+    between revocation retries; once it is set, queued answers are discarded unverified (their
+    sessions are left to the restart path, as the sweep's pending ones are) and no new resolution
+    side effect starts, so the pool's join waits for at most one in-flight read or lease per
+    thread (4 + 10 + 30 s), alongside the pass and inside the issuer's 64 s figure. All of this
+    is within the issuer's stop stage and so before `gw_mgmt_pool_` is destroyed; the
     queue, its thread, the verifier pool and the call objects are slice 11's Resource Ledger
-    entries, with an ASan/TSan `stop()` test holding the full concurrency in flight and racing a
+    entries (with the session holders above), with an ASan/TSan `stop()` test holding the full
+    concurrency in flight (no gRPC assertion as `Finish` runs during the drain), stopping with
+    the revocation read held slow and the verifier queue full (the join inside the bound), and
+    racing a
     pass that starts challenges at full rate (no assertion; the drain bounded by the cancel
     latency, not the client deadline), and a test that holds an issuer
     pass in a slow lease past the expiry while honest answers are queued (all `verified`). The
@@ -2094,7 +2111,8 @@ message ReattachResponse {
     because nothing was learned about the agent. The keep-record outcomes cannot loop unbounded:
     the replica counts consecutive `degraded` and `send_failed` outcomes per `agent_id` in memory,
     in a map kept apart from the session (it survives the uninstall that each counted outcome
-    causes), reset on `verified`, an entry expiring 15 min after its last failure, and the map
+    causes), reset on `verified`, an entry expiring 30 min after its last failure (twice the
+    back-off cap, so an agent held at the cap keeps its count), and the map
     capped at the replica's held-session high-water mark with oldest-first eviction. After three
     in a row that agent's reattach answers `RATE_LIMITED` with `retry_after_ms` doubling from
     30 s to a 15 min cap. The count is per replica, so a reattach balanced onto another replica
