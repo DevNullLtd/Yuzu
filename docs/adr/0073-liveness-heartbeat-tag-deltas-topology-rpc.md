@@ -1742,7 +1742,8 @@ message ReattachResponse {
    most 10,000 agents per gateway (`registration_replay_queue_max`); a verdict that overflows it is
    dropped and counted `queue_full`, and a later verdict queues those sessions again. The 2000/s
    default and the per-call latency are unmeasured.
-2. **Tags follow.** A mark for an agent that has not reattached yet stays `deferred` (D8), so tag
+2. **Tags follow.** An agent that has not reattached yet has no installed session, so it holds no
+   mark (D8: such a mark is dropped and re-made by its next heartbeat after the reattach), and tag
    issuing trails the reattach wave. At 2000/s per replica it adds about 50 s of issuing for
    N = 100,000, and tags converge in about two minutes after an agent's reattach.
 3. **Topology follows.** `__resync__.topology` runs at 200/s per replica, about 8 min for
@@ -2239,7 +2240,7 @@ of every ~30 s. The content is unchanged.
 - a kill-switched `__resync__` counted `send_failed`;
 - heartbeat ingestion only marks a resync: no Postgres call and no send on the BatchHeartbeat path;
   the issuer ends a pass at the first failed record write and leaves the rest `deferred`; a mark for
-  an agent with no installed session stays `deferred`, never `send_failed`; a `__resync__` reply
+  an agent with no installed session is dropped from the set, never `deferred` or `send_failed`; a `__resync__` reply
   writes no `ResponseStore` row and makes no provenance lookup;
 - the catalogue pair's system-only refusal at operator surfaces;
 - hooks firing on unchanged-tag heartbeats (generation reconcile, corruption sink);
