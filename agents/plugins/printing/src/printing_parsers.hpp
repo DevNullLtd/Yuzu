@@ -11,7 +11,7 @@
 // document name reaches the operator's screen), so it carries the same
 // posture as any other instruction-result field: retained only as part of
 // the server's ordinary instruction-result history, never forwarded to
-// daily-sync, TAR, or DEX. Retaining COMPLETED job history beyond a single
+// daily-sync, Echo, or DEX. Retaining COMPLETED job history beyond a single
 // `jobs` call is explicitly deferred (D4) — this plugin has no history
 // store of its own.
 #pragma once

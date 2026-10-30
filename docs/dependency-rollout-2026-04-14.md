@@ -277,9 +277,9 @@ For every breakage encountered during any tier:
 > min), and two Catch2 binaries blow past their meson per-suite
 > timeouts under that slowness:
 >
-> - `yuzu_tar_tests` (30s timeout) — first test
->   `TarDatabase: warehouse tables created on open` SIGTERMed at 30s.
->   Schema-v2 migration alone took 23s on this build (`TarDatabase
+> - `yuzu_echo_tests` (30s timeout) — first test
+>   `EchoDatabase: warehouse tables created on open` SIGTERMed at 30s.
+>   Schema-v2 migration alone took 23s on this build (`EchoDatabase
 >   opened` log to `migrated to schema version 2` log delta). 1 of 9
 >   test cases reached.
 > - `yuzu_agent_tests` (120s timeout) — failed at
@@ -305,7 +305,7 @@ For every breakage encountered during any tier:
 > three artifacts:
 >
 > - **PR #412** (`ci/clang19-debug-timeouts`, open at this refresh)
->   carries the band-aid (`tests/meson.build` tar 30→90s, agent
+>   carries the band-aid (`tests/meson.build` echo 30→90s, agent
 >   120→240s) plus this doc's reconciliation. PR-time CI green on
 >   PR-event matrix; awaiting Windows MSVC and merge.
 > - **#242 squash-merged** as `90af2d7` ahead of #412 — the dev push
@@ -314,7 +314,7 @@ For every breakage encountered during any tier:
 >   time on the failed job); the next push run after #412 lands will
 >   be green.
 > - **Issue #413** (`bug,reliability,devops,P2`) carries the proper
->   investigation: why is `TarDatabase` schema-v2 migration 23s on
+>   investigation: why is `EchoDatabase` schema-v2 migration 23s on
 >   clang-19 debug vs presumably <5s on gcc-13 debug? Why does the
 >   trigger engine 5s graceful drain accumulate so much more on
 >   clang-19 debug that 337/338 cases don't fit in 120s? Hypotheses
@@ -440,14 +440,14 @@ Append-only. Newest entries at the top. Format:
   Test step. clang-19 debug binary execution is genuinely slower
   than gcc-13 debug on the same workload (~7 min job vs ~5 min) and
   two Catch2 binaries blow past their meson per-suite timeouts
-  under that slowness: `yuzu_tar_tests` (30s default — schema-v2
+  under that slowness: `yuzu_echo_tests` (30s default — schema-v2
   migration alone took 23s, single test couldn't fit in the
   remaining 7s window) and `yuzu_agent_tests` (120s — 337 of 338
   cases passed before SIGTERM, trigger engine 5s graceful drain
   pattern chained past the limit). Same job code path passed in
   4m 53s on gcc-13 debug for the same commit, so this is a
   compiler-flavor slowness, not a code regression. **Patched as a
-  band-aid:** `tests/meson.build` `tar` suite now `timeout: 90`,
+  band-aid:** `tests/meson.build` `echo` suite now `timeout: 90`,
   `agent` suite `timeout: 120 → 240`. Proper fix (investigate why
   schema migration is 23s on clang-19 debug and why trigger drain
   is heavier) deferred to a Track B Item to be filed separately —

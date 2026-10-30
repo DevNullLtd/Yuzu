@@ -1,7 +1,7 @@
 /**
  * test_operate_extras_ui.cpp — pins for the Operate extras page assets: the
  * shared ox- CSS chunk, the Dashboard markup that hosts the scope helper and
- * the TAR history form, and the embedded controller script.
+ * the Echo history form, and the embedded controller script.
  *
  * Pure string checks over compiled-in assets (no store, no process, no clock).
  */
@@ -17,7 +17,7 @@
 #include <string>
 
 extern const char* const kDashboardIndexHtml;
-extern const char* const kTarPageHtml;
+extern const char* const kEchoPageHtml;
 
 namespace yuzu::server {
 extern const std::string kYuzuOperateExtrasJs;
@@ -60,7 +60,7 @@ TEST_CASE("operate extras: the Dashboard page hosts the controller and the scope
     CHECK(has(page, "id=\"ox-preview\""));
     // The "Scope kinds" side panel is gone; the scope bar carries a server-rendered reference line.
     CHECK_FALSE(has(page, "id=\"ox-kinds\""));
-    CHECK(has(page, "id=\"ox-tar-open\""));
+    CHECK(has(page, "id=\"ox-echo-open\""));
     // The shared chunk is spliced into the page's own head.
     CHECK(has(page, ".ox-panel{"));
     // The shared dialog module loads before the controller that calls it.
@@ -77,9 +77,9 @@ TEST_CASE("operate extras: new Dashboard markup carries no hx-on and no inline h
     const auto panel = scope_panel_markup();
     CHECK_FALSE(has(panel, "hx-on"));
     CHECK_FALSE(std::regex_search(panel, std::regex("\\son[a-z]+\\s*=")));
-    // The TAR history button is new markup too.
+    // The Echo history button is new markup too.
     const std::string page = kDashboardIndexHtml;
-    const auto a = page.find("id=\"ox-tar-open\"");
+    const auto a = page.find("id=\"ox-echo-open\"");
     REQUIRE(a != std::string::npos);
     const auto tag = page.substr(a, page.find('>', a) - a);
     CHECK_FALSE(std::regex_search(tag, std::regex("\\son[a-z]+\\s*=")));
@@ -129,7 +129,7 @@ TEST_CASE("operate extras: fan-out confirm, history masking and the 403 listener
     CHECK(has(js, "'htmx:confirm'"));
     CHECK(has(js, "issueRequest(true)"));
     CHECK(has(js, "'htmx:responseError'"));
-    CHECK(has(js, "/api/dashboard/tar-execute"));
+    CHECK(has(js, "/api/dashboard/echo-execute"));
     // History and the confirm echo both pass typed text through the mask.
     CHECK(has(js, "body.dataset.secretParams"));
     CHECK(has(js, "(hidden: the secret parameter list is unavailable)"));
@@ -138,7 +138,7 @@ TEST_CASE("operate extras: fan-out confirm, history masking and the 403 listener
     // The raw command is never handed to History, and History is not fed from a status alone.
     CHECK_FALSE(has(js, "window.addHistory(cmd"));
     CHECK(has(js, "['Command', maskSecrets(cmd)]"));
-    // The TAR form explains the substring blocklist (S10).
+    // The Echo form explains the substring blocklist (S10).
     CHECK(has(js, "updated_at or created_by"));
     // The SQL is shown before it is sent.
     CHECK(has(js, "'Run this query?'"));
@@ -211,7 +211,7 @@ TEST_CASE("operate extras: the Result sets page hosts the producers and the cont
     CHECK(has(page, "<body data-page=\"result-sets\">"));
     CHECK(has(page, "id=\"ox-rs-instr\""));
     CHECK(has(page, "id=\"ox-rs-inv\""));
-    CHECK(has(page, "id=\"ox-rs-tar\""));
+    CHECK(has(page, "id=\"ox-rs-echo\""));
     const auto d = page.find("src=\"/static/yuzu-dialog.js\"");
     REQUIRE(d != std::string::npos);
     CHECK(d < page.find("src=\"/static/yuzu-operate-extras.js\""));
@@ -225,7 +225,7 @@ TEST_CASE("operate extras: result set producers call the real REST routes and co
     const auto& js = yuzu::server::kYuzuOperateExtrasJs;
     CHECK(has(js, "/api/v1/result-sets/from-instruction-result"));
     CHECK(has(js, "/api/v1/result-sets/from-inventory-query"));
-    CHECK(has(js, "/api/v1/result-sets/from-tar-query"));
+    CHECK(has(js, "/api/v1/result-sets/from-echo-query"));
     CHECK(has(js, "/re-eval"));
     CHECK(has(js, "/fragments/result-sets/producers"));
     // A fan-out or re-run is confirmed with what it will do.
@@ -237,21 +237,21 @@ TEST_CASE("operate extras: result set producers call the real REST routes and co
     CHECK(has(js, "Do not send it again"));
 }
 
-TEST_CASE("operate extras: the TAR page's Ad-hoc SQL frame is retired and points to Result sets",
+TEST_CASE("operate extras: the Echo page's Ad-hoc SQL frame is retired and points to Result sets",
           "[ui][operate_extras]") {
-    const std::string page = kTarPageHtml;
+    const std::string page = kEchoPageHtml;
     // Nothing of the old form or its script survives.
-    for (const char* gone : {"id=\"tar-sql-run\"", "id=\"tar-sql-text\"", "id=\"tar-sql-scope\"",
-                             "id=\"tar-sql-include-empty\"", "/api/v1/result-sets/from-tar-query",
+    for (const char* gone : {"id=\"echo-sql-run\"", "id=\"echo-sql-text\"", "id=\"echo-sql-scope\"",
+                             "id=\"echo-sql-include-empty\"", "/api/v1/result-sets/from-echo-query",
                              "Scope-walking SQL frame"}) {
         INFO("retired: " << gone);
         CHECK_FALSE(has(page, gone));
     }
     // The page says where it went; the destination carries every field the frame had.
     CHECK(has(page, "href=\"/result-sets\""));
-    CHECK(has(page, "From TAR query"));
+    CHECK(has(page, "From Echo query"));
     const auto& js = yuzu::server::kYuzuOperateExtrasJs;
-    CHECK(has(js, "/api/v1/result-sets/from-tar-query"));
+    CHECK(has(js, "/api/v1/result-sets/from-echo-query"));
     CHECK(has(js, "label: 'SQL (SELECT only)'"));
     CHECK(has(js, "name: 'parent'"));
     CHECK(has(js, "name: 'name'"));

@@ -2,10 +2,10 @@ REAL CAPTURE
 
 File: usage_live_macos.txt
 Host: the capturing developer's Mac (Darwin 25.6.0), 2026-09-14
-DB path: /private/tmp/yuzu-uat/agent-data/tar.db (mode 644, owner jsmith, WAL)
+DB path: /private/tmp/yuzu-uat/agent-data/echo.db (mode 644, owner jsmith, WAL)
 Writing agent: pid 50138, `yuzu-agent --data-dir /tmp/yuzu-uat/agent-data`, built from
   branch feat/wave7-pr72a-forensics-tar-usage (the usage fold dev carries as #4269,
-  merge 4ab9b9c83); live tar_config schema_version = 7 at capture time.
+  merge 4ab9b9c83); live echo_config schema_version = 7 at capture time.
 Command:
   sqlite3 -readonly "$DB" "SELECT COUNT(*) FROM usage_live" > usage_live_macos.txt
 

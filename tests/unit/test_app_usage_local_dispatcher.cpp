@@ -8,10 +8,10 @@
  *   - The UNGUARDED case: init() is never called, exactly the seam this
  *     package's spec calls out (CommandContext has no get_config; only
  *     PluginContext, init()'s argument, does). Proves execute() alone
- *     still resolves a sane tar.db path on a host with no live tar.db.
+ *     still resolves a sane echo.db path on a host with no live echo.db.
  *   - The StandalonePluginContext-seeded case (adjudication P6): builds a
- *     REAL tar.db (via app_usage_test_seed.hpp, the one justified
- *     `yuzu_test_`-prefixed temp file — the plugin opens tar.db by path,
+ *     REAL echo.db (via app_usage_test_seed.hpp, the one justified
+ *     `yuzu_test_`-prefixed temp file — the plugin opens echo.db by path,
  *     so there is no way to exercise the production acquisition path
  *     without a real file on disk), points `agent.data_dir` at it through
  *     StandalonePluginContext, runs the loaded plugin's real init(), and
@@ -178,8 +178,8 @@ TEST_CASE("app_usage plugin: ABI4 descriptors declare all three OS legs for ever
     }
 }
 
-TEST_CASE("app_usage plugin: summary — real tar.db if present, else an explicit "
-         "constrained|tar_db_unavailable|<path under the platform default dir>, never empty",
+TEST_CASE("app_usage plugin: summary — real echo.db if present, else an explicit "
+         "constrained|echo_db_unavailable|<path under the platform default dir>, never empty",
           "[app_usage][actions]") {
     auto plugin = load_app_usage_plugin();
     if (!plugin) {
@@ -197,9 +197,9 @@ TEST_CASE("app_usage plugin: summary — real tar.db if present, else an explici
 
     const auto first = split_fields(rows.front());
     if (first[0] == "constrained" && rows.size() >= 1 &&
-        rows.front().rfind("constrained|tar_db_unavailable|", 0) == 0) {
+        rows.front().rfind("constrained|echo_db_unavailable|", 0) == 0) {
         // "no db at path" distinguished from "no path": the resolved path
-        // must be non-empty and end in tar.db under the platform default
+        // must be non-empty and end in echo.db under the platform default
         // dir -- proving execute() actually resolved a real path rather
         // than looking nowhere.
         CHECK(result.rc == 1);
@@ -207,19 +207,19 @@ TEST_CASE("app_usage plugin: summary — real tar.db if present, else an explici
         REQUIRE(fields.size() >= 3);
         const std::string& resolved_path = fields[2];
         CHECK_FALSE(resolved_path.empty());
-        CHECK(resolved_path.size() >= 6);
-        CHECK(resolved_path.compare(resolved_path.size() - 6, 6, "tar.db") == 0);
+        CHECK(resolved_path.size() >= 7);
+        CHECK(resolved_path.compare(resolved_path.size() - 7, 7, "echo.db") == 0);
         CHECK(resolved_path.find(kPlatformDefaultDbDir) == 0);
         return;
     }
 
-    // A real tar.db was found on this host — meta + (zero or more) usage rows,
-    // or an explicit constrained token if that host's tar.db predates
+    // A real echo.db was found on this host — meta + (zero or more) usage rows,
+    // or an explicit constrained token if that host's echo.db predates
     // usage_daily or has usage_enabled=false (review M2 — legitimately rc 0).
     CHECK(result.rc == 0);
     if (rows.front().rfind("constrained|usage_source_disabled", 0) == 0 ||
         rows.front().rfind("constrained|usage_schema_missing", 0) == 0) {
-        SUCCEED("openable tar.db without a usage source: constrained token accepted");
+        SUCCEED("openable echo.db without a usage source: constrained token accepted");
         return;
     }
     CHECK(rows.front().rfind("meta|", 0) == 0);
@@ -253,7 +253,7 @@ TEST_CASE("app_usage plugin: foreground is always constrained, rc 0 -- a permane
 
 // ───────────────────── P6: StandalonePluginContext-seeded production path ──
 
-TEST_CASE("app_usage plugin: StandalonePluginContext-seeded real tar.db — init() resolves "
+TEST_CASE("app_usage plugin: StandalonePluginContext-seeded real echo.db — init() resolves "
          "agent.data_dir and execute() returns REAL summary/last_used rows, never "
          "'constrained' (P6, proves the production acquisition path)",
           "[app_usage][actions][p6]") {
@@ -266,7 +266,7 @@ TEST_CASE("app_usage plugin: StandalonePluginContext-seeded real tar.db — init
     REQUIRE(plugin->descriptor->shutdown != nullptr);
 
     // The one justified temp file (this package's spec, "boundaries"): the
-    // plugin opens tar.db by path, so there is no way to exercise the
+    // plugin opens echo.db by path, so there is no way to exercise the
     // production acquisition path without a real file on disk. `yuzu_test_`
     // prefix is the Defender-exclusion rule; yuzu::test::TempDir removes the
     // directory recursively in its destructor (test_helpers.hpp).
@@ -286,14 +286,14 @@ TEST_CASE("app_usage plugin: StandalonePluginContext-seeded real tar.db — init
     const int64_t today_ts = now - (now % kSecondsPerDay);
 
     sqlite3* writer = nullptr;
-    REQUIRE(sqlite3_open((data_dir / "tar.db").string().c_str(), &writer) == SQLITE_OK);
+    REQUIRE(sqlite3_open((data_dir / "echo.db").string().c_str(), &writer) == SQLITE_OK);
     seed::exec_or_fail(writer, "PRAGMA journal_mode=WAL");
     seed::create_schema(writer);
     seed::insert_usage_daily(writer, today_ts, "p6_seeded.exe", /*run_count=*/1,
                              /*total_seconds=*/60, /*first_seen=*/now, /*last_seen=*/now,
                              /*superseded_runs=*/0, /*expired_runs=*/0);
-    seed::insert_tar_config(writer, "usage_enabled", "true");
-    seed::insert_tar_config(writer, "usage_feeder_enabled", "true");
+    seed::insert_echo_config(writer, "usage_enabled", "true");
+    seed::insert_echo_config(writer, "usage_feeder_enabled", "true");
     sqlite3_close(writer);
 
     yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
@@ -326,9 +326,9 @@ TEST_CASE("app_usage plugin: StandalonePluginContext-seeded real tar.db — init
 }
 
 #ifdef _WIN32
-// ── Windows: a planted tar.db or sidecar is refused, not read ────────────────────────────────
-// The daily sync ships what this plugin reads, so it applies the same owner and link tests TAR
-// applies before it opens the files (win_tar_db_owner_probe.hpp, distrust(): tar.db, -wal, -shm
+// ── Windows: a planted echo.db or sidecar is refused, not read ────────────────────────────────
+// The daily sync ships what this plugin reads, so it applies the same owner and link tests Echo
+// applies before it opens the files (win_echo_db_owner_probe.hpp, distrust(): echo.db, -wal, -shm
 // and -journal; the same call runs again after the first read). The foreign owner needs
 // SeRestorePrivilege to set; those cases SKIP without it.
 namespace {
@@ -357,10 +357,10 @@ void set_owner(const fs::path& p, PSID sid) {
 
 } // namespace
 
-TEST_CASE("app_usage plugin (Windows): a planted tar.db or sidecar is refused, not read",
+TEST_CASE("app_usage plugin (Windows): a planted echo.db or sidecar is refused, not read",
           "[app_usage][actions][hardening]") {
-    // "" is tar.db itself, then the three sidecars SQLite reads or replays; "hardlink" is a
-    // second name for tar.db.
+    // "" is echo.db itself, then the three sidecars SQLite reads or replays; "hardlink" is a
+    // second name for echo.db.
     const std::string kind = GENERATE(as<std::string>{}, "", "-wal", "-shm", "-journal", "hardlink");
     const bool link = kind == "hardlink";
     auto plugin = load_app_usage_plugin();
@@ -375,7 +375,7 @@ TEST_CASE("app_usage plugin (Windows): a planted tar.db or sidecar is refused, n
     std::error_code ec;
     fs::create_directories(dir_guard.path, ec);
     REQUIRE_FALSE(ec);
-    const fs::path db = dir_guard.path / "tar.db";
+    const fs::path db = dir_guard.path / "echo.db";
 
     constexpr int64_t kSecondsPerDay = 86400;
     const auto now = static_cast<int64_t>(std::time(nullptr));
@@ -386,8 +386,8 @@ TEST_CASE("app_usage plugin (Windows): a planted tar.db or sidecar is refused, n
     seed::insert_usage_daily(writer, now - (now % kSecondsPerDay), "owner_probe.exe",
                              /*run_count=*/1, /*total_seconds=*/60, /*first_seen=*/now,
                              /*last_seen=*/now, /*superseded_runs=*/0, /*expired_runs=*/0);
-    seed::insert_tar_config(writer, "usage_enabled", "true");
-    seed::insert_tar_config(writer, "usage_feeder_enabled", "true");
+    seed::insert_echo_config(writer, "usage_enabled", "true");
+    seed::insert_echo_config(writer, "usage_feeder_enabled", "true");
     sqlite3_close(writer);
 
     yuzu::agent::StandalonePluginContext ctx("app_usage",
@@ -415,7 +415,7 @@ TEST_CASE("app_usage plugin (Windows): a planted tar.db or sidecar is refused, n
     REQUIRE(::ConvertStringSidToSidW(L"S-1-5-32-545", &users)); // BUILTIN\Users
     const std::unique_ptr<void, decltype(&::LocalFree)> users_guard{users, ::LocalFree};
 
-    // Plant: a second hard link to tar.db, or a sidecar (or tar.db itself) owned by a foreign
+    // Plant: a second hard link to echo.db, or a sidecar (or echo.db itself) owned by a foreign
     // account. `planted` is the extra name (hardlink) or the file the owner is set on.
     fs::path planted = db;
     if (link) {
@@ -435,10 +435,10 @@ TEST_CASE("app_usage plugin (Windows): a planted tar.db or sidecar is refused, n
     CHECK(refused.rc == 1);
     const auto refused_rows = captured_rows(refused.captured);
     REQUIRE_FALSE(refused_rows.empty());
-    CHECK(refused_rows.front().rfind("constrained|tar_db_unavailable|", 0) == 0);
-    // The detail names the file and why: the planted sidecar, or tar.db with its second link.
-    CHECK(refused_rows.front().find(link ? "tar.db has 2 hard links"
-                                         : "tar.db" + kind + " is owned by") !=
+    CHECK(refused_rows.front().rfind("constrained|echo_db_unavailable|", 0) == 0);
+    // The detail names the file and why: the planted sidecar, or echo.db with its second link.
+    CHECK(refused_rows.front().find(link ? "echo.db has 2 hard links"
+                                         : "echo.db" + kind + " is owned by") !=
           std::string::npos);
 
     // Reversible: undo the plant and the next read works, so the refusal was that file's.
@@ -461,13 +461,13 @@ TEST_CASE("app_usage plugin (Windows): a planted tar.db or sidecar is refused, n
 }
 #endif // _WIN32
 
-// ── regression: tar_config PREPARE failure must map to Errored, never ──────
+// ── regression: echo_config PREPARE failure must map to Errored, never ──────
 // silently to Enabled (governance Gate 7 finding — b88c3b690's fix had zero
 // regression coverage; every existing test only exercised the "value
 // present but malformed" and "key absent" cases, never a genuine SQL
 // prepare failure).
 
-TEST_CASE("app_usage plugin: a tar_config PREPARE failure (table missing) maps to "
+TEST_CASE("app_usage plugin: an echo_config PREPARE failure (table missing) maps to "
          "usage_source_errored, never silently to Enabled -- regression for b88c3b690",
           "[app_usage][actions][regression]") {
     auto plugin = load_app_usage_plugin();
@@ -489,10 +489,10 @@ TEST_CASE("app_usage plugin: a tar_config PREPARE failure (table missing) maps t
     const int64_t today_ts = now - (now % kSecondsPerDay);
 
     sqlite3* writer = nullptr;
-    REQUIRE(sqlite3_open((data_dir / "tar.db").string().c_str(), &writer) == SQLITE_OK);
+    REQUIRE(sqlite3_open((data_dir / "echo.db").string().c_str(), &writer) == SQLITE_OK);
     seed::exec_or_fail(writer, "PRAGMA journal_mode=WAL");
     // usage_daily exists (so the schema-missing branch is not what fires),
-    // but tar_config is deliberately NEVER created -- get_tar_config's
+    // but echo_config is deliberately NEVER created -- get_echo_config's
     // sqlite3_prepare_v2 genuinely FAILS (SQLITE_ERROR, "no such table"),
     // distinct from a well-formed query returning zero rows for an absent
     // key. check_usage_source_state must map this to SourceState::Errored,
@@ -513,7 +513,7 @@ TEST_CASE("app_usage plugin: a tar_config PREPARE failure (table missing) maps t
     const auto summary = dispatcher.run(plugin->descriptor, "summary");
     // check_usage_source_state's Errored branch reports CONSTRAINED, rc 0 --
     // never a silent Enabled that falls through to run_summary/read_meta as
-    // if the tar_config read had simply found nothing.
+    // if the echo_config read had simply found nothing.
     CHECK(summary.rc == 0);
     const auto summary_rows = captured_rows(summary.captured);
     REQUIRE(summary_rows.size() == 1);
@@ -524,6 +524,62 @@ TEST_CASE("app_usage plugin: a tar_config PREPARE failure (table missing) maps t
     const auto last_used_rows = captured_rows(last_used.captured);
     REQUIRE(last_used_rows.size() == 1);
     CHECK(last_used_rows.front().rfind("constrained|usage_source_errored|", 0) == 0);
+
+    plugin->descriptor->shutdown(ctx.get());
+}
+
+// ── Echo rename: a file the echo plugin has not migrated reads as Errored ───
+// app_usage never adopts or migrates. A database still holding the pre-rename `tar_config`
+// table (the echo plugin absent, kill-switched or failed at init) has no `echo_config`, so the
+// config read FAILS: the existing fail-closed contract (routed-concerns clause 3) maps that to
+// Errored. There is deliberately no fallback read of the legacy table, which would be a second
+// shim; this pins that the legacy table cannot make the source read as Enabled.
+
+TEST_CASE("app_usage plugin: a not-yet-migrated legacy schema (tar_config only) reads as "
+          "usage_source_errored, never Enabled",
+          "[app_usage][actions][regression]") {
+    auto plugin = load_app_usage_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    REQUIRE(plugin->descriptor->init != nullptr);
+    REQUIRE(plugin->descriptor->shutdown != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_app_usage_legacy_schema_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    REQUIRE_FALSE(ec);
+    const fs::path& data_dir = dir_guard.path;
+
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    sqlite3* writer = nullptr;
+    REQUIRE(sqlite3_open((data_dir / "echo.db").string().c_str(), &writer) == SQLITE_OK);
+    seed::exec_or_fail(writer, "PRAGMA journal_mode=WAL");
+    seed::exec_or_fail(writer,
+                       "CREATE TABLE tar_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    seed::exec_or_fail(writer, "INSERT INTO tar_config VALUES ('usage_enabled', 'true')");
+    seed::exec_or_fail(writer, "INSERT INTO tar_config VALUES ('usage_feeder_enabled', 'true')");
+    seed::exec_or_fail(writer,
+                       "CREATE TABLE usage_daily (day_ts INTEGER, exe_key TEXT, "
+                       "run_count INTEGER, total_seconds INTEGER, first_seen INTEGER, "
+                       "last_seen INTEGER, superseded_runs INTEGER, expired_runs INTEGER)");
+    seed::insert_usage_daily(writer, now - (now % 86400), "legacy.exe", /*run_count=*/1,
+                             /*total_seconds=*/60, /*first_seen=*/now, /*last_seen=*/now,
+                             /*superseded_runs=*/0, /*expired_runs=*/0);
+    sqlite3_close(writer);
+
+    yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
+    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto summary = dispatcher.run(plugin->descriptor, "summary");
+    CHECK(summary.rc == 0);
+    const auto rows = captured_rows(summary.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows.front().rfind("constrained|usage_source_errored|", 0) == 0);
+    // Never a real usage row built off the legacy table's "true".
+    CHECK(rows.front().find("legacy.exe") == std::string::npos);
 
     plugin->descriptor->shutdown(ctx.get());
 }
@@ -557,20 +613,20 @@ TEST_CASE("app_usage plugin: last_used with exe=\"\" returns every executable, m
     const int64_t today_ts = now - (now % kSecondsPerDay);
 
     sqlite3* writer = nullptr;
-    REQUIRE(sqlite3_open((data_dir / "tar.db").string().c_str(), &writer) == SQLITE_OK);
+    REQUIRE(sqlite3_open((data_dir / "echo.db").string().c_str(), &writer) == SQLITE_OK);
     seed::exec_or_fail(writer, "PRAGMA journal_mode=WAL");
     seed::create_schema(writer);
     // Two distinct executables -- an unfiltered "last_used" must return
     // both; a filter on the "(unknown)" sentinel would return neither.
     seed::insert_usage_daily(writer, today_ts, "blank_a.exe", 1, 60, now, now, 0, 0);
     seed::insert_usage_daily(writer, today_ts, "blank_b.exe", 1, 60, now, now, 0, 0);
-    seed::insert_tar_config(writer, "usage_enabled", "true");
+    seed::insert_echo_config(writer, "usage_enabled", "true");
     // Round-3 review should-fix: a missing usage_feeder_enabled key now
     // gates last_used (see the dedicated missing-key regression test) --
     // every OTHER real-data fixture in this file must seed it explicitly,
     // matching what a genuinely reachable host always has by the time
-    // usage_daily holds any row (TAR's fold writes this key first).
-    seed::insert_tar_config(writer, "usage_feeder_enabled", "true");
+    // usage_daily holds any row (Echo's fold writes this key first).
+    seed::insert_echo_config(writer, "usage_feeder_enabled", "true");
     sqlite3_close(writer);
 
     yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
@@ -619,14 +675,14 @@ TEST_CASE("app_usage plugin: last_used with usage_feeder_enabled=false reports "
     const int64_t today_ts = now - (now % kSecondsPerDay);
 
     sqlite3* writer = nullptr;
-    REQUIRE(sqlite3_open((data_dir / "tar.db").string().c_str(), &writer) == SQLITE_OK);
+    REQUIRE(sqlite3_open((data_dir / "echo.db").string().c_str(), &writer) == SQLITE_OK);
     seed::exec_or_fail(writer, "PRAGMA journal_mode=WAL");
     seed::create_schema(writer);
     // A real, otherwise-valid row -- if the feeder check did nothing, this
     // row would come back as a normal last_used| result.
     seed::insert_usage_daily(writer, today_ts, "frozen.exe", 1, 60, now, now, 0, 0);
-    seed::insert_tar_config(writer, "usage_enabled", "true");
-    seed::insert_tar_config(writer, "usage_feeder_enabled", "false");
+    seed::insert_echo_config(writer, "usage_enabled", "true");
+    seed::insert_echo_config(writer, "usage_feeder_enabled", "false");
     sqlite3_close(writer);
 
     yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
@@ -668,11 +724,11 @@ TEST_CASE("app_usage plugin: last_used with a garbage usage_feeder_enabled value
     const fs::path& data_dir = dir_guard.path;
 
     sqlite3* writer = nullptr;
-    REQUIRE(sqlite3_open((data_dir / "tar.db").string().c_str(), &writer) == SQLITE_OK);
+    REQUIRE(sqlite3_open((data_dir / "echo.db").string().c_str(), &writer) == SQLITE_OK);
     seed::exec_or_fail(writer, "PRAGMA journal_mode=WAL");
     seed::create_schema(writer);
-    seed::insert_tar_config(writer, "usage_enabled", "true");
-    seed::insert_tar_config(writer, "usage_feeder_enabled", "corrupted-value");
+    seed::insert_echo_config(writer, "usage_enabled", "true");
+    seed::insert_echo_config(writer, "usage_feeder_enabled", "corrupted-value");
     sqlite3_close(writer);
 
     yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
@@ -688,8 +744,8 @@ TEST_CASE("app_usage plugin: last_used with a garbage usage_feeder_enabled value
     plugin->descriptor->shutdown(ctx.get());
 }
 
-// Round-3 review round-2 should-fix: usage_feeder_enabled has no TAR-default
-// "safe missing" semantics the way usage_enabled does -- TAR's fold writes
+// Round-3 review round-2 should-fix: usage_feeder_enabled has no Echo-default
+// "safe missing" semantics the way usage_enabled does -- Echo's fold writes
 // this key unconditionally before it ever writes a usage_daily row, so a
 // genuinely ABSENT key (never written at all, not just "false") on a
 // reachable host is itself an anomaly. Confirms the omitted-key case is
@@ -724,7 +780,7 @@ TEST_CASE("app_usage plugin: last_used with usage_feeder_enabled entirely OMITTE
     std::unique_ptr<sqlite3, decltype(&sqlite3_close)> writer{nullptr, &sqlite3_close};
     {
         sqlite3* raw = nullptr;
-        const int rc = sqlite3_open((data_dir / "tar.db").string().c_str(), &raw);
+        const int rc = sqlite3_open((data_dir / "echo.db").string().c_str(), &raw);
         writer.reset(raw);
         REQUIRE(rc == SQLITE_OK);
     }
@@ -736,7 +792,7 @@ TEST_CASE("app_usage plugin: last_used with usage_feeder_enabled entirely OMITTE
     // constrained marker.
     seed::insert_usage_daily(writer.get(), today_ts, "frozen_no_feeder_key.exe", 1, 60, now, now,
                              0, 0);
-    seed::insert_tar_config(writer.get(), "usage_enabled", "true");
+    seed::insert_echo_config(writer.get(), "usage_enabled", "true");
     // Deliberately no usage_feeder_enabled row at all.
     writer.reset();
 
@@ -777,7 +833,7 @@ TEST_CASE("app_usage plugin: last_used (unfiltered) caps at kMaxLastUsedRows and
     const int64_t today_ts = now - (now % kSecondsPerDay);
 
     sqlite3* writer = nullptr;
-    REQUIRE(sqlite3_open((data_dir / "tar.db").string().c_str(), &writer) == SQLITE_OK);
+    REQUIRE(sqlite3_open((data_dir / "echo.db").string().c_str(), &writer) == SQLITE_OK);
     seed::exec_or_fail(writer, "PRAGMA journal_mode=WAL");
     seed::create_schema(writer);
     const auto over_cap =
@@ -791,8 +847,8 @@ TEST_CASE("app_usage plugin: last_used (unfiltered) caps at kMaxLastUsedRows and
                                  0);
     }
     seed::exec_or_fail(writer, "COMMIT");
-    seed::insert_tar_config(writer, "usage_enabled", "true");
-    seed::insert_tar_config(writer, "usage_feeder_enabled", "true");
+    seed::insert_echo_config(writer, "usage_enabled", "true");
+    seed::insert_echo_config(writer, "usage_feeder_enabled", "true");
     sqlite3_close(writer);
 
     yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
@@ -816,10 +872,10 @@ TEST_CASE("app_usage plugin: last_used (unfiltered) caps at kMaxLastUsedRows and
     plugin->descriptor->shutdown(ctx.get());
 }
 
-// ── round-3 review HIGH: a corrupt tar.db must never be silently served ────
+// ── round-3 review HIGH: a corrupt echo.db must never be silently served ────
 
-TEST_CASE("app_usage plugin: a corrupt tar.db fails the open-time quick_check and reports "
-         "constrained|tar_db_corrupt, rc 1, never a fabricated success",
+TEST_CASE("app_usage plugin: a corrupt echo.db fails the open-time quick_check and reports "
+         "constrained|echo_db_corrupt, rc 1, never a fabricated success",
           "[app_usage][actions][regression]") {
     auto plugin = load_app_usage_plugin();
     if (!plugin) {
@@ -844,11 +900,11 @@ TEST_CASE("app_usage plugin: a corrupt tar.db fails the open-time quick_check an
     // this round's HIGH finding added (mutation-testing this in isolation
     // confirmed it: neutering the text=="ok" comparison does NOT redden this
     // test). It still correctly proves the outer open_readonly failure path
-    // reports tar_db_corrupt/rc=1 for a garbage file, which is real
+    // reports echo_db_corrupt/rc=1 for a garbage file, which is real
     // coverage -- just not of quick_check's comparison logic. See the
     // sibling test below for that.
     {
-        std::ofstream f(data_dir / "tar.db", std::ios::binary | std::ios::trunc);
+        std::ofstream f(data_dir / "echo.db", std::ios::binary | std::ios::trunc);
         f << "not a valid sqlite database file -- forces quick_check to fail closed";
     }
 
@@ -860,12 +916,12 @@ TEST_CASE("app_usage plugin: a corrupt tar.db fails the open-time quick_check an
     CHECK(last_used.rc == 1);
     const auto rows = captured_rows(last_used.captured);
     REQUIRE(rows.size() == 1);
-    CHECK(rows.front().rfind("constrained|tar_db_corrupt|", 0) == 0);
+    CHECK(rows.front().rfind("constrained|echo_db_corrupt|", 0) == 0);
 
     plugin->descriptor->shutdown(ctx.get());
 }
 
-TEST_CASE("app_usage plugin: a WELL-FORMED tar.db with a corrupted data page fails "
+TEST_CASE("app_usage plugin: a WELL-FORMED echo.db with a corrupted data page fails "
          "quick_check's own \"ok\"-text comparison, never a fabricated success -- "
          "quality-engineer false-green finding, closes the gap the garbage-bytes "
          "test above cannot reach",
@@ -883,7 +939,7 @@ TEST_CASE("app_usage plugin: a WELL-FORMED tar.db with a corrupted data page fai
     fs::create_directories(dir_guard.path, ec);
     REQUIRE_FALSE(ec);
     const fs::path& data_dir = dir_guard.path;
-    const fs::path db_path = data_dir / "tar.db";
+    const fs::path db_path = data_dir / "echo.db";
 
     constexpr int64_t kSecondsPerDay = 86400;
     const auto now = static_cast<int64_t>(std::time(nullptr));
@@ -967,7 +1023,7 @@ TEST_CASE("app_usage plugin: a WELL-FORMED tar.db with a corrupted data page fai
     CHECK(last_used.rc == 1);
     const auto rows = captured_rows(last_used.captured);
     REQUIRE(rows.size() == 1);
-    CHECK(rows.front().rfind("constrained|tar_db_corrupt|", 0) == 0);
+    CHECK(rows.front().rfind("constrained|echo_db_corrupt|", 0) == 0);
 
     plugin->descriptor->shutdown(ctx.get());
 }

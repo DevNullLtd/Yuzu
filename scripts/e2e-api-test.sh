@@ -1158,6 +1158,9 @@ SETTINGS_FRAGMENTS=(
     "/fragments/settings/auto-approve"
     "/fragments/settings/api-tokens"
     "/fragments/settings/management-groups"
+    "/fragments/groups/list"
+    "/fragments/groups/detail?id=000000000000"
+    "/fragments/groups/members?id=000000000000"
     "/fragments/settings/tag-compliance"
     "/fragments/settings/updates"
     "/fragments/settings/gateway"
@@ -1193,11 +1196,14 @@ for frag in "${SETTINGS_FRAGMENTS[@]}"; do
     assert_status_any "GET $frag" "$HTTP_STATUS" 200 403 404
 done
 
-# The Users and roles fragments for the admin session this script runs as: exactly 200 (a 403 would
-# mean the gate regressed, a 404 an unregistered route; the loop above accepts both).
+# The Users and roles fragments, and the three Groups fragments (the root group 000000000000 always
+# exists, so its detail and members answer 200), for the admin session this script runs as: exactly
+# 200 (a 403 would mean the gate regressed, a 404 an unregistered route; the loop above accepts both).
 for frag in "/fragments/access/users/list" "/fragments/access/roles/list" \
             "/fragments/access/roles/permissions?role=Viewer" "/fragments/access/roles/assignments" \
-            "/fragments/access/enforcement"; do
+            "/fragments/access/enforcement" \
+            "/fragments/groups/list" "/fragments/groups/detail?id=000000000000" \
+            "/fragments/groups/members?id=000000000000"; do
     http_get "$SERVER_URL$frag"
     assert_status_any "GET $frag (admin)" "$HTTP_STATUS" 200
 done
