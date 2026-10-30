@@ -34,7 +34,7 @@
 #include "app_perf_compare.hpp" // app_perf_param_valid — shared cap + control-char/NUL re-floor
 #include "app_perf_daily_store.hpp" // AppPerfDailyStore::kRetentionDays -- the VERIFY compare window clamp
 #include "compliance_model.hpp"         // shared REST/MCP/fragment builders (#4034)
-#include "dashboard_routes.hpp"         // DashboardRoutes::gather_tar_retention_paused (#4027)
+#include "dashboard_routes.hpp"         // DashboardRoutes::gather_echo_retention_paused (#4027)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
 #include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
 #include "product_pack_model.hpp" // #4029: ProductPackStore (fwd-declared only in mcp_server.hpp) + shared builders
@@ -50,8 +50,7 @@
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_catalogue_model.hpp" // M.9: shared REST+MCP software catalogue model
 #include "software_catalog_rules.hpp"   // M.10b: kEcosystemFamilies + expand_ecosystem_tokens (ecosystem enums/pipe list)
-#include "crypto_cbom.hpp"          // export_crypto_cbom (CycloneDX 1.7 shaper)
-#include "crypto_library_model.hpp" // get_crypto_libraries / list_crypto_library_devices (shared model)
+#include "crypto_library_model.hpp" // crypto_library::dump_safe (list_issued_certs)
 #include "crypto_widget_catalogue.hpp" // the /crypto widget, layout and Yuzu-issued twins (shared model)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
@@ -121,7 +120,6 @@
 #include "license_model.hpp"
 #include "software_deployment_model.hpp"
 
-#include <yuzu/version.hpp> // kVersionString - the CBOM metadata tool version
 #include <yuzu/version_string.hpp> // canon_version (VERIFY compare version match)
 
 #include <spdlog/spdlog.h>
@@ -336,8 +334,9 @@ int64_t param_int(const nlohmann::json& params, const char* key, int64_t def = 0
 /// Builds the catalogue model's `Params` from the named MCP arguments (strings and integers
 /// only; any other JSON type is left out, and an integer is stringified for every key). Every
 /// caller refuses a wrongly typed argument first, through `strict_args_error` (the two
-/// catalogue twins), `installed_software_args_error` (query_installed_software) or
-/// `crypto_library::strict_{summary,devices}_args_error` (the two /crypto twins), so nothing
+/// catalogue twins), `installed_software_args_error` (query_installed_software) or the
+/// `list_issued_certs` filter check (the /crypto twins that used
+/// `crypto_library::strict_{summary,devices}_args_error` live in mcp_tools_crypto.cpp), so nothing
 /// is silently dropped or stringified here. MCP and REST parse through the one model.
 software_catalogue::Params catalogue_params(const nlohmann::json& args,
                                             std::initializer_list<const char*> keys) {
@@ -554,11 +553,6 @@ struct ToolDef {
 
 // kObjectOutputSchema lives in mcp_tool_registry.hpp (shared with registry handlers).
 
-// The remediation of a /crypto read refused because the Postgres pool is too small to spare it
-// (CryptoReadError::unavailable_until_restart): no retry hint, a retry fails identically.
-constexpr std::string_view kCryptoPoolTooSmallRemedy =
-    "restart the server with a larger --postgres-pool-size; a retry fails identically until then";
-
 std::string tool_result(std::string_view payload, const char* output_schema_json = nullptr) {
     JObj result;
     result.raw("content", JArr().add(JObj().add("type", "text").add("text", payload)).str());
@@ -645,49 +639,49 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}}},"required":["agents"]})j"},
 
-    // ── #4027 API-parity read twins: TAR process-tree / capture-sources device
+    // ── #4027 API-parity read twins: Echo process-tree / capture-sources device
     // pickers + retention-paused source list. Requires Infrastructure:Read,
     // enforced via fleet_read_fn_ (#4027 fix round, CDX-P1-01/K4 — the ADR-0017
     // admit-then-filter chokepoint; SAME gate their REST twins use, NOT the two
     // pre-existing HTML fragment siblings, which stay on the legacy bare
-    // require_permission gate this round — see tar_tree_routes.cpp's
+    // require_permission gate this round — see echo_tree_routes.cpp's
     // recorded-exception comments at their registration). #4143 review fix:
     // all three now read from an UNFILTERED source (all_devices_fn_ /
-    // DashboardRoutes::gather_tar_retention_paused with
+    // DashboardRoutes::gather_echo_retention_paused with
     // extra_scope_is_authoritative=true) exactly like list_agents' own
     // agents_fn, with fleet_read_fn_'s gate.scope as the SOLE filter — no
     // longer intersected with a separate per-operator-scoped provider. See
     // set_all_devices_fn's doc comment (mcp_server.hpp) for the full
     // rationale.
-    // GET /fragments/tar/process-tree/result and .../detail are DELIBERATELY NOT
-    // twinned by #4027 (see tar_tree_routes.hpp's file comment) — no REST/MCP-only
+    // GET /fragments/echo/process-tree/result and .../detail are DELIBERATELY NOT
+    // twinned by #4027 (see echo_tree_routes.hpp's file comment) — no REST/MCP-only
     // path exists to mint their required pcmd/tcmd/token inputs today.
-    {"list_tar_process_tree_devices",
-     "List the operator-scoped device picker for the TAR process-tree viewer. "
+    {"list_echo_process_tree_devices",
+     "List the operator-scoped device picker for the Echo process-tree viewer. "
      "Each row carries `online`, which is always true today — the sole wired "
      "provider sources this list from the live-session registry, so a "
      "disconnected enrolled device is not included (#4027 fix round, "
      "CDX-P1-02/K1). Requires Infrastructure:Read. Read-only twin of GET "
-     "/fragments/tar/process-tree's device picker / GET /api/v1/tar/process-tree.",
+     "/fragments/echo/process-tree's device picker / GET /api/v1/echo/process-tree.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"online":{"type":"boolean"}},"required":["agent_id","hostname","os","arch","agent_version","online"]}}},"required":["devices"]})j"},
 
-    {"list_tar_capture_sources_devices",
-     "List the operator-scoped device picker for the TAR capture-sources (ADR-0015 "
-     "enable/disable) frame. Same row shape as list_tar_process_tree_devices — "
+    {"list_echo_capture_sources_devices",
+     "List the operator-scoped device picker for the Echo capture-sources (ADR-0015 "
+     "enable/disable) frame. Same row shape as list_echo_process_tree_devices — "
      "`online` is always true today, same reason. Requires Infrastructure:Read. "
-     "Read-only twin of GET /fragments/tar/capture-sources's device picker / "
-     "GET /api/v1/tar/capture-sources.",
+     "Read-only twin of GET /fragments/echo/capture-sources's device picker / "
+     "GET /api/v1/echo/capture-sources.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"online":{"type":"boolean"}},"required":["agent_id","hostname","os","arch","agent_version","online"]}}},"required":["devices"]})j"},
 
-    {"list_tar_retention_paused",
-     "List the calling operator's most recent TAR retention-paused source scan "
+    {"list_echo_retention_paused",
+     "List the calling operator's most recent Echo retention-paused source scan "
      "(per-username state; filtered to the operator's visible agents), one row per "
      "(agent, paused source). Requires Infrastructure:Read. Read-only twin of GET "
-     "/fragments/tar/retention-paused / GET /api/v1/tar/retention-paused. Returns "
+     "/fragments/echo/retention-paused / GET /api/v1/echo/retention-paused. Returns "
      "scan_id=\"\" when the operator has not dispatched a scan yet (call "
-     "POST /fragments/tar/retention-paused/scan first, dashboard-only today). "
+     "POST /fragments/echo/retention-paused/scan first, dashboard-only today). "
      "result_truncated_by_cap=true means the scan's response read reached its "
      "10,000-row / 50 MiB cap, so rows and the counters are PARTIAL (a dropped "
      "response reads as an agent that never answered); store_degraded is then "
@@ -1294,8 +1288,8 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
-    {"create_result_set_from_tar_query",
-     "Create a result set by DISPATCHING a read-only TAR SQL query to the fleet. ASYNC: "
+    {"create_result_set_from_echo_query",
+     "Create a result set by DISPATCHING a read-only Echo SQL query to the fleet. ASYNC: "
      "returns immediately with status=\"pending\" — poll get_result_set by the returned id, "
      "or subscribe to /api/v1/events on source_execution_id, until status flips to "
      "\"materialized\" (or \"failed\"). Requires Execution:Execute, confined to the caller's "
@@ -1306,7 +1300,7 @@ static const ToolDef kTools[] = {
      "parent_id's CURRENT members when supplied, else broadcasts to every connected agent — "
      "omitting parent_id is the only way to broadcast; a supplied parent_id that resolves to "
      "nothing is refused (400), never silently widened. REST v1 twin: POST "
-     "/api/v1/result-sets/from-tar-query. NEVER re-send this call on a timeout or an "
+     "/api/v1/result-sets/from-echo-query. NEVER re-send this call on a timeout or an "
      "ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
      "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
      "RESULT_SET_STORE_UNAVAILABLE (the quota check degraded before anything was sent) "
@@ -1320,14 +1314,14 @@ static const ToolDef kTools[] = {
 
     {"create_result_set_from_instruction_result",
      "Create a result set by DISPATCHING an existing InstructionDefinition to the fleet. "
-     "ASYNC — same pending->materialize contract as create_result_set_from_tar_query: poll "
+     "ASYNC — same pending->materialize contract as create_result_set_from_echo_query: poll "
      "get_result_set by id, or subscribe to /api/v1/events on source_execution_id. Requires "
      "Execution:Execute, confined to the caller's derived visible device set — the ONLY "
      "per-device authorization on this dispatch surface. Membership is the responders whose "
      "output row satisfies the operator-supplied matcher (column/op/value); omitting matcher "
      "accepts every responder. Dispatches to parent_id's CURRENT members when supplied, else "
      "broadcasts — same omit-to-broadcast / refuse-if-resolves-to-nothing contract as "
-     "create_result_set_from_tar_query. Find valid instruction_id values via list_definitions "
+     "create_result_set_from_echo_query. Find valid instruction_id values via list_definitions "
      "or discover_instructions — do not guess. If the definition runs a Forensics-tier "
      "plugin (an action on the Forensics securable) the set materializes with no members "
      "for every creator, because the materializer never reads Forensics-tier output; an "
@@ -1340,13 +1334,13 @@ static const ToolDef kTools[] = {
      "RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store faulted after a real command "
      "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
      "poll executions for the outcome instead.",
-     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder. {kind:tar_rows_ge,n} needs n to be an integer from 1 to 2147483647"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
+     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder. {kind:echo_rows_ge,n} needs n to be an integer from 1 to 2147483647"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
     {"reevaluate_result_set",
      "Re-run an existing result set's OWN source query, creating a NEW SIBLING set (same "
-     "parent_id as the original, NOT a child of it) — a fresh snapshot of a tar_query or "
+     "parent_id as the original, NOT a child of it) — a fresh snapshot of an echo_query or "
      "instruction_result set's original question against today's fleet. Requires "
      "Execution:Execute (re-dispatches to the fleet, ASYNC, same pending->materialize "
      "contract as the create_result_set_from_* producers) — confined to the caller's derived "
@@ -3361,7 +3355,7 @@ static const ToolDef kTools[] = {
     {"get_agent_app_usage",
      "Query a single agent's per-executable app-usage projection (wave 7 PR7.2) — the "
      "MCP twin of GET /api/v1/forensics/agents/{id}/app-usage. One row per executable: "
-     "first_seen/last_seen (agent-observed, within TAR's retained usage window — 31 days "
+     "first_seen/last_seen (agent-observed, within Echo's retained usage window — 31 days "
      "default, operator-tunable) and a trailing-30-day run_count/total_seconds window. "
      "collected_at is the agent's batch collection time. No user names or pids — the "
      "store carries none. Requires Forensics:Read.",
@@ -4155,234 +4149,6 @@ static const ToolDef kTools[] = {
      R"j("command_id":{"type":"string"},"source":{"type":"string"},"requested_at":{"type":"integer"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"})j"
      R"j(},"required":["requested","agents_reached","skipped_offline","skipped_version","command_id","source","requested_at"]})j"},
-    // ── /crypto slice 1 twins - MCP mirrors of GET /api/v1/crypto/libraries[/devices], shaped
-    // by the SAME pure model (crypto_library_model.hpp) and read through the SAME CryptoApi seam
-    // as the REST routes and the /crypto page. Appended at the VERY END of kTools[] per the
-    // standing governance note above. The `family` enum is the model's families() ids; a test
-    // pins the two together.
-    {"get_crypto_libraries",
-     "Fleet view of which cryptographic libraries are installed: one row per library family "
-     "(OpenSSL, GnuTLS, NSS, Mbed TLS, wolfSSL, libsodium, Bouncy Castle and others), each with "
-     "the number of DISTINCT devices carrying any package of the family and a per-(version, "
-     "ecosystem) breakdown with the matching package names. Use it to answer 'where is library X "
-     "installed and at which versions'; chain it with list_crypto_library_devices to name the "
-     "devices behind a family or one version bucket. Evidence is the daily-synced "
-     "installed-software inventory matched by package NAME against a curated table "
-     "(table_version says which mapping answered; names_source says where the package NAMES "
-     "came from - 'catalogue' (the hourly software catalogue, fresh: a name first reported "
-     "after names_as_of appears after the next refresh) or 'live' (read from the inventory at "
-     "call time because the catalogue is not built, is stale or was refreshed over zero "
-     "titles; names_as_of null); counts and versions for listed names are live either "
-     "way). It reports presence and versions only and "
-     "never judges a library or version: interpreting a version is the caller's job. Families "
-     "with no matching device are omitted, and an empty families list means 'no matching package "
-     "rows in the caller's visible inventory' - NOT proof the library is absent: statically "
-     "linked, vendored and OS-bundled copies are invisible here, and Windows installer builds of "
-     "OpenSSL are not matched. coverage gives the denominator: "
-     "devices_reporting_inventory (visible devices with an installed-software report) and "
-     "devices_with_crypto_library (distinct devices matching any family). versions_truncated / "
-     "result_truncated true mean version rows were capped, never that devices are missing from "
-     "the counts; when the 2,000-row store ceiling fires (result_truncated) every family is "
-     "flagged versions_truncated, because which families lost rows is not known. Each version "
-     "bucket lists at most 8 package names; package_names_truncated is true when it has more. "
-     "Requires Inventory:Read; a management-group-confined caller sees only its visible devices "
-     "(counts, coverage and versions are all computed over that scope). A service-scoped token "
-     "is refused (403) while RBAC enforcement is off, the default; with RBAC enforcement on it "
-     "is admitted within the ITServiceOwner ceiling and sees only the devices tagged with its IT "
-     "service. Input is strict: a non-object arguments value, an unknown family, an ecosystem "
-     "outside the published set, a wrong JSON type or an over-long string is rejected (the REST "
-     "twin clamps). A degraded inventory store, or crypto read capacity in "
-     "use, is a retryable error, never an "
-     "empty result. Package names are cut to 256 bytes (a cut name ends in an ellipsis) and the "
-     "whole payload is byte-budgeted: a cut version list sets versions_truncated and "
-     "result_truncated. ecosystem is matched EXACTLY (empty string = rows with no ecosystem; "
-     "omit for any). Audited as mcp.get_crypto_libraries. Mirrors GET /api/v1/crypto/libraries.",
-     R"j({"type":"object","properties":{)j"
-     R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict to one library family id; omit for every family"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
-     R"j(}})j",
-     R"j({"type":"object","properties":{)j"
-     R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this answer"},)j"
-     R"j("names_source":{"type":"string","enum":["catalogue","live"],"description":"Where the package names came from: the fresh hourly catalogue, or a live read of the inventory (catalogue not built, stale or refreshed over zero titles)"},)j"
-     R"j("names_as_of":{"type":["integer","null"],"description":"Refresh time (epoch seconds) of the catalogue when names_source is catalogue; null when live. Counts and versions for listed names are live either way"},)j"
-     R"j("families":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"display":{"type":"string"},"device_count":{"type":"integer"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"ecosystem":{"type":"string"},"device_count":{"type":"integer"},"package_names":{"type":"array","items":{"type":"string"}},"package_names_truncated":{"type":"boolean","description":"True when the bucket has more matching package names than the 8 listed"}},"required":["version","ecosystem","device_count","package_names","package_names_truncated"]}},"versions_truncated":{"type":"boolean","description":"True when this family's version list is cut (per-family cap of 50, the byte budget, or the 2,000-row store ceiling, which flags every family)"}},"required":["id","display","device_count","versions","versions_truncated"]}},)j"
-     R"j("coverage":{"type":"object","properties":{"devices_reporting_inventory":{"type":"integer"},"devices_with_crypto_library":{"type":"integer"}},"required":["devices_reporting_inventory","devices_with_crypto_library"]},)j"
-     R"j("result_truncated":{"type":"boolean"},)j"
-     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
-     R"j(},"required":["table_version","names_source","names_as_of","families","coverage","result_truncated"]})j"},
-
-    {"list_crypto_library_devices",
-     "List the devices (and the matching package rows) behind one cryptographic library family, "
-     "optionally narrowed to one exact version and ecosystem - the drill-down after "
-     "get_crypto_libraries. Each row carries agent_id, hostname (null when the registry does not "
-     "know the device), package_name, version, release, ecosystem and kind. A device with several "
-     "matching packages appears once per package. Ordered by agent_id, package name; page with "
-     "next_cursor (non-null when more rows exist) passed back as cursor: a cursor reused with a "
-     "different family/version/ecosystem, one issued under a different table_version, a "
-     "malformed one, or a page whose cursor was issued on live package names when the next page "
-     "finds the shared catalogue in use (names_source live to catalogue; this recurs if the "
-     "catalogue goes stale and recovers mid-walk), is rejected and the walk must restart "
-     "without a cursor. A newer catalogue or a switch to live continues; a name new in the "
-     "newer source is listed for devices after the cursor, and its rows on devices already "
-     "passed are missed until you restart. version and ecosystem are matched "
-     "EXACTLY; pass an empty string for the rows that carry none, omit either for every value. An empty devices list means 'no matching package rows "
-     "in the caller's visible inventory' - NOT proof the library is absent: statically linked, "
-     "vendored and OS-bundled copies are invisible here. Presence and versions only; nothing is "
-     "judged. Requires Inventory:Read; a management-group-confined caller sees only its visible "
-     "devices. A service-scoped token is refused (403) while RBAC enforcement is off, the "
-     "default; with RBAC enforcement on it is admitted within the ITServiceOwner ceiling and "
-     "sees only the devices tagged with its IT service. Input is "
-     "strict: a non-object arguments value, an unknown family, an ecosystem outside the "
-     "published set, a wrong JSON type, an over-long string or a limit outside 1..1000 is "
-     "rejected rather than clamped. A degraded "
-     "inventory store, or crypto read capacity in use, is a retryable error, never an empty result. Every page served is audited "
-     "as mcp.list_crypto_library_devices (continuation pages tagged page=continuation). Mirrors "
-     "GET /api/v1/crypto/libraries/devices.",
-     R"j({"type":"object","properties":{)j"
-     R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Library family id (from get_crypto_libraries)"},)j"
-     R"j("version":{"type":"string","maxLength":1024,"description":"Exact version bucket; empty string selects rows with no version; omit for every version"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"},)j"
-     R"j("cursor":{"type":"string","maxLength":2048,"description":"Opaque next_cursor from the previous page; bound to the family/version/ecosystem filter and the table_version; refused if the previous page was read on live names and the catalogue is now in use; restart without a cursor"},)j"
-     R"j("limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Page size"})j"
-     R"j(},"required":["family"]})j",
-     R"j({"type":"object","properties":{)j"
-     R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this page; a cursor is bound to it"},)j"
-     R"j("names_source":{"type":"string","enum":["catalogue","live"],"description":"Where the package names came from: the fresh hourly catalogue, or a live read of the inventory (catalogue not built, stale or refreshed over zero titles)"},)j"
-     R"j("names_as_of":{"type":["integer","null"],"description":"Refresh time (epoch seconds) of the catalogue when names_source is catalogue; null when live. Counts and versions for listed names are live either way"},)j"
-     R"j("family":{"type":"string"},"version":{"type":["string","null"]},"ecosystem":{"type":["string","null"],"description":"The exact-ecosystem filter echoed; null when absent"},)j"
-     R"j("devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":["string","null"]},"package_name":{"type":"string"},"version":{"type":"string"},"release":{"type":"string"},"ecosystem":{"type":"string"},"kind":{"type":"string"}},"required":["agent_id","hostname","package_name","version","release","ecosystem","kind"]}},)j"
-     R"j("next_cursor":{"type":["string","null"]},"count":{"type":"integer"},)j"
-     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
-     R"j(},"required":["table_version","names_source","names_as_of","family","version","ecosystem","devices","next_cursor","count"]})j"},
-
-    {"export_crypto_cbom",
-     "A CycloneDX 1.7 inventory of the fleet's cryptographic LIBRARY packages (library "
-     "components only: no algorithms, certificates, keys or protocols yet), exported as a CBOM "
-     "(JSON): the same data and the same Inventory:Read gate as get_crypto_libraries, re-shaped "
-     "into a standard bill of materials a CBOM/SBOM tool can ingest. A large fleet can produce a "
-     "multi-MiB result (about 2.3 MiB worst case); prefer REST GET /api/v1/crypto/cbom for a "
-     "full export. The BOM is returned as a JSON string in "
-     "the 'bom' field (media type application/vnd.cyclonedx+json; version=1.7). One component "
-     "per (family, version, ecosystem) bucket, always type 'library' (an installed package "
-     "matched by NAME against a curated table), never 'cryptographic-asset': the export carries "
-     "NO cryptoProperties, strength, quantum-security-level or good/bad field - interpreting a "
-     "library or version is the consumer's job. Yuzu-specific facts ride in 'yuzu:crypto:*' "
-     "properties: metadata carries table_version, names_source, names_as_of (absent when names "
-     "are live), result_truncated, truncated_families, devices_reporting, the filters "
-     "applied and scope (fleet, or confined for a confined caller); the document carries "
-     "compositions aggregate=incomplete because a name match cannot see statically linked, "
-     "vendored or OS-bundled copies; each component carries family_id, ecosystem, device_count and package_name "
-     "entries. TRUNCATION IS NEVER SILENT: a family whose version list was cut (50 buckets per "
-     "family, 256 KiB byte budget, store row cap) sets yuzu:crypto:versions_truncated=true on "
-     "its components and is listed in yuzu:crypto:truncated_families (a family with every bucket "
-     "dropped has no component and appears only there); a truncated BOM is incomplete, not "
-     "wrong. An empty components list means 'no matching package rows in the caller's visible "
-     "inventory' - NOT proof the library is absent (statically linked, vendored and OS-bundled "
-     "copies are invisible). Each call mints a fresh random serialNumber and timestamp. "
-     "Requires Inventory:Read; a management-group-confined or service-scoped caller exports "
-     "only its visible devices. Input is strict: arguments must be a JSON object, only family "
-     "and ecosystem are accepted; an unknown family, an ecosystem outside the published set, a "
-     "wrong JSON type or an over-long string is rejected rather than clamped. A degraded "
-     "inventory store, or crypto read capacity in use, is a retryable error, never an empty "
-     "BOM. Audited as mcp.export_crypto_cbom. Mirrors GET /api/v1/crypto/cbom.",
-     R"j({"type":"object","additionalProperties":false,"properties":{)j"
-     R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict the BOM to one library family id; omit for every family"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
-     R"j(}})j",
-     R"j({"type":"object","properties":{)j"
-     R"j("bom":{"type":"string","description":"The CycloneDX 1.7 JSON document, serialised (media type application/vnd.cyclonedx+json; version=1.7)"},)j"
-     R"j("content_type":{"type":"string","enum":["application/vnd.cyclonedx+json; version=1.7"]},)j"
-     R"j("components":{"type":"integer","description":"Number of components in the BOM"},)j"
-     R"j("result_truncated":{"type":"boolean","description":"True when the store row cap or response byte budget cut the summary; per-family version cuts are flagged in yuzu:crypto:truncated_families and each component's versions_truncated"},)j"
-     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
-     R"j(},"required":["bom","content_type","components","result_truncated"]})j"},
-    // ── /crypto dashboard widgets (ADR-0070 D13) - MCP twins of GET /api/v1/crypto/widgets,
-    // GET/PUT /api/v1/crypto/dashboard/layout and GET /api/v1/crypto/ca/{stats,certificates},
-    // shaped by the SAME pure catalogue (crypto_widget_catalogue.hpp) and read through the SAME
-    // CryptoApi seam as the REST routes. Appended at the VERY END of kTools[] per the standing
-    // governance note above. The days enum below is the union of the closed window set; the
-    // per-kind check is strict_cert_args_error's.
-    {"list_crypto_widgets",
-     "List the /crypto dashboard widget catalogue: every widget's id, title, kind (number, bar, "
-     "line or table), group ('Crypto libraries' or 'Yuzu-issued certificates'), gate class, the "
-     "permission its data needs (securable + operation), its criterion in words (exactly what the "
-     "number counts), where a click drills to, and available / availability - whether YOU may "
-     "read it (available, not_available, confined, access_check_unavailable). Library widgets "
-     "need Inventory:Read and a confined caller gets a narrowed answer; the Yuzu-issued counts "
-     "need Inventory:Read and are WITHHELD from a confined caller (availability confined, never a "
-     "narrowed count). Yuzu-issued widgets also carry drill_available: the certificate rows behind "
-     "a count need Security:Read (list_issued_certs with kind/days/week/bucket). Facts only; the "
-     "only built-in checks are the D13 named windows, each shown with its criterion. available "
-     "decides what to draw only; each data tool keeps its own gate. Also returns the default "
-     "layout, the window set version (window_set) and the Yuzu-issued scope note. Takes no "
-     "arguments. Mirrors GET /api/v1/crypto/widgets.",
-     R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{)j"
-     R"j("window_set":{"type":"string","description":"Version of the closed window set"},"scope_note":{"type":"string"},)j"
-     R"j("widgets":{"type":"array","items":)j" R"j({"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"kind":{"type":"string","enum":["number","bar","line","table"]},"group":{"type":"string"},"gate":{"type":"string","enum":["fleet_read","fleet_wide_only","global"]},"securable":{"type":"string"},"operation":{"type":"string"},"criterion":{"type":"string","description":"What the widget counts, in words"},"drill":{"type":"string","enum":["library_families","library_family_devices","ca_certificates","ca_week"]},"available":{"type":"boolean","description":"Whether the caller may read the widget's data (drawing only, never a grant)"},"availability":{"type":"string","enum":["available","not_available","confined","access_check_unavailable"]},"ca_kind":{"type":"string"},"days":{"type":["integer","null"]},"drill_securable":{"type":"string"},"drill_operation":{"type":"string"},"drill_available":{"type":"boolean"}},"required":["id","title","kind","group","gate","securable","operation","criterion","drill","available","availability"]})j" R"j(},)j"
-     R"j("default_layout":{"type":"array","items":{"type":"string"}},"max_layout_widgets":{"type":"integer"})j"
-     R"j(},"required":["window_set","widgets","default_layout","max_layout_widgets","scope_note"]})j"},
-
-    {"get_crypto_dashboard_layout",
-     "Get YOUR OWN /crypto dashboard layout: the catalogue widget ids you placed, in display "
-     "order, and its version (pass it as expected_version to set_crypto_dashboard_layout). Ids "
-     "this server version does not know (a widget another version added) are counted in "
-     "preserved_unknown - not listed, but kept on every save. is_default is true when the layout "
-     "is the catalogue default (nothing saved, version 0, or a saved copy of it). Keyed by your "
-     "session; there is no way to read another operator's layout. A degraded layout store is a "
-     "retryable error, never the default served as if nothing were stored; a stored layout that "
-     "cannot be read is a non-retryable error whose remediation names the version to overwrite. "
-     "Takes no arguments. Mirrors GET /api/v1/crypto/dashboard/layout.",
-     R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"widgets":{"type":"array","items":{"type":"string"},"description":"Catalogue widget ids in display order"},"is_default":{"type":"boolean"},"version":{"type":"integer","description":"Stored version; 0 when nothing is stored"},"preserved_unknown":{"type":"integer","description":"Stored ids this server version does not know: kept, not listed"},"max_layout_widgets":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["widgets","is_default","version","preserved_unknown","max_layout_widgets"]})j"},
-
-    {"set_crypto_dashboard_layout",
-     "Replace YOUR OWN /crypto dashboard layout with the given widget ids, in display order "
-     "(add a widget by including its id, remove one by leaving it out; an empty list is a valid, "
-     "empty dashboard). It overwrites the previous layout (destructive to that layout only; no "
-     "data, no permission and no other operator is touched). Every id must come from "
-     "list_crypto_widgets, without repeats, at most 64. Ids another server version stored are "
-     "kept after yours. Pass expected_version (the version get_crypto_dashboard_layout returned; "
-     "0 = only if nothing is saved) to refuse the save when the layout changed meanwhile - a "
-     "conflict is a non-retryable error: read it again, then save. Omit only for a first save: "
-     "without it the save succeeds only when nothing is stored, and a stored layout is the same "
-     "non-retryable conflict naming the stored version. Idempotent: the same list twice stores the same layout. Keyed by your session. "
-     "Input is strict: an unknown or repeated id, more than 64 ids, a non-string id or any other "
-     "argument is rejected. Audited as crypto.dashboard.layout.update (an attempted row first: if "
-     "it cannot be written the layout is not changed). A degraded layout store is a retryable "
-     "error; a save whose commit outcome is unknown is a retryable error that says so (read the "
-     "layout to check). Mirrors PUT /api/v1/crypto/dashboard/layout.",
-     R"j({"type":"object","properties":{)j"
-     R"j("widgets":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":64},"description":"Catalogue widget ids in display order"},)j"
-     R"j("expected_version":{"type":"integer","minimum":0,"description":"The version you last read; 0 = only when nothing is saved. Omit only for a first save (a stored layout is then a conflict)"})j"
-     R"j(},"required":["widgets"],"additionalProperties":false})j",
-     R"j({"type":"object","properties":{"widgets":{"type":"array","items":{"type":"string"},"description":"Catalogue widget ids in display order"},"is_default":{"type":"boolean"},"version":{"type":"integer","description":"The new stored version"},"preserved_unknown":{"type":"integer"},"max_layout_widgets":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["widgets","is_default","version","preserved_unknown","max_layout_widgets"]})j"},
-
-    {"get_crypto_ca_stats",
-     "Counts of certificates issued by Yuzu's OWN internal CA (the agent, server, gateway, "
-     "HTTPS and code-signing certificates Yuzu minted - never the certificates on your devices), "
-     "each against as_of, the database clock at read time (epoch seconds and ISO 8601). Facts "
-     "only; the only built-in checks are the D13 named windows, each with its criterion: active; "
-     "expiring within 3, 7, 14, 21, 30 and 60 days and expired in the last 7, 30, 60 and 90 days, "
-     "status active only (a certificate is valid through its notAfter, inclusive; a revoked one "
-     "counts only in the revoked windows); revoked in the last 7, 30, 60 and "
-     "90 days, reported in three buckets by recorded reason - superseded, unpublished (recorded, "
-     "never delivered) and other - never summed or labelled; issued in the last 7 days excluding "
-     "unpublished; and issued and revoked per ISO week for the last 52 ISO weeks (UTC, Monday "
-     "start; the current week is partial and flagged). Every count carries rule_id, "
-     "threshold (or week), criterion, rule_set_version and as_of. Nothing is stored or "
-     "graded: recompute any count from list_issued_certs with the same kind/days/week/bucket and "
-     "as_of (needs Security:Read). Requires Inventory:Read; a caller whose view is confined is "
-     "refused (these are fleet-wide figures), never given a narrowed count. A degraded CA store, "
-     "or crypto read capacity in use, is a retryable error, never zeros. Takes no arguments. "
-     "Audited as crypto.ca.stats.view. Mirrors GET /api/v1/crypto/ca/stats.",
-     R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{)j"
-     R"j("scope":{"const":"yuzu_issued"},"scope_note":{"type":"string"},"window_edge_note":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer","description":"Database time (epoch seconds) every window was computed against"},"as_of_iso":{"type":"string"},)j"
-     R"j("active":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]},"expiring_within_days":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]}},"expired_within_days":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]}},"revoked_within_days":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]},"description":"Three entries per window: buckets superseded, unpublished, other"},"issued_within_days":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]},)j"
-     R"j("week_basis":{"type":"string"},"weeks":{"type":"array","items":{"type":"object","properties":{"week":{"type":"string","description":"ISO 8601 week, e.g. 2026-W40"},"week_start":{"type":"integer"},"partial":{"type":"boolean"},"issued":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]},"revoked":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]}}},"required":["week","week_start","partial","issued","revoked"]}},)j"
-     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
-     R"j(},"required":["scope","scope_note","rule_set_version","as_of","as_of_iso","active","expiring_within_days","expired_within_days","revoked_within_days","issued_within_days","week_basis","weeks"]})j"},
     // Twin of REST GET /api/v1/me (and legacy GET /api/me): the caller's own session
     // self-description, built by the ONE shared me_response::build_me_json. Legacy
     // (non-registry) tool, mirroring check_permission: the generic tier gate only,
@@ -4434,25 +4200,6 @@ static const ToolDef kTools[] = {
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
      R"j(},"required":["username","display_name","role","principal_kind","auth_source","mcp_tier","scope_service","rbac_enabled","rbac_roles_resolved","effective_role","elevated","can_access_settings"],"additionalProperties":false})j"},
 };
-
-// The audit-detail tag of a /crypto layout failure (never the username), shared by the two
-// MCP layout twins; the REST twin's crypto_routes.cpp layout_failure_detail is its mirror.
-static std::string layout_failure_tag(const yuzu::server::CryptoReadError& e) {
-    using K = yuzu::server::CryptoReadError::Kind;
-    switch (e.kind) {
-    case K::kOutcomeUnknown:
-        return "outcome=unknown";
-    case K::kConflict:
-        return "outcome=conflict";
-    case K::kCorrupt:
-        return "outcome=corrupt";
-    case K::kInvalid:
-        return "outcome=invalid";
-    case K::kDegraded:
-        break;
-    }
-    return e.cause == yuzu::server::CryptoReadCause::kCapacity ? "outcome=busy" : "outcome=degraded";
-}
 
 static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
               "the catalogue cursor bound must equal the MCP cursor input bound");
@@ -4518,7 +4265,7 @@ static const char* const kWriteToolsRaw[] = {
     // operation is "Read"; operation is the ONLY thing that decides
     // membership here, not whether a handler mutates state.
     "create_result_set", "create_result_set_from_inventory_query",
-    "create_result_set_from_tar_query",
+    "create_result_set_from_echo_query",
     "create_result_set_from_instruction_result", "reevaluate_result_set",
     "pin_result_set", "unpin_result_set", "delete_result_set",
     // #2146 Batch B1 — Guardian rule CRUD + push. create/update: Write;
@@ -4548,8 +4295,6 @@ static const char* const kWriteToolsRaw[] = {
     "create_offload_target", "delete_offload_target", "activate_platform_license",
     "create_software_deployment", "rollback_software_deployment",
     "cancel_software_deployment",
-    // /crypto widgets — Infrastructure:Write (the caller's own layout).
-    "set_crypto_dashboard_layout",
 };
 
 // The lookup set is DERIVED by catalogue() (merged with the registry records'
@@ -4596,9 +4341,9 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // (dashboard_routes.cpp) — none of the six #4027 surfaces admits a
     // service-scoped caller; this fix round closes the management-group gap
     // only, never widens the service-scope one.
-    {"list_tar_process_tree_devices", {"Infrastructure", "Read"}},
-    {"list_tar_capture_sources_devices", {"Infrastructure", "Read"}},
-    {"list_tar_retention_paused", {"Infrastructure", "Read"}},
+    {"list_echo_process_tree_devices", {"Infrastructure", "Read"}},
+    {"list_echo_capture_sources_devices", {"Infrastructure", "Read"}},
+    {"list_echo_retention_paused", {"Infrastructure", "Read"}},
     // #1700 / #3290 Phase 2: migrated onto require_fleet_read, which gives
     // this tool a REAL confinement mechanism (meet(management-group,
     // service-scope)) — reclassified from the default `denied` to
@@ -4624,23 +4369,6 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_inventory_tables", {"Infrastructure", "Read"}},
     {"get_agent_inventory", {"Infrastructure", "Read"}},
     {"query_installed_software", {"Inventory", "Read", ServiceScopeClass::confined}},
-    // /crypto slice 1: gated on fleet_read_fn_ (Inventory:Read), whose composed
-    // meet(management-group, service-scope) VisibleSet is pushed into the SQL by the CryptoApi
-    // seam - a REAL confinement mechanism, so `confined`, same as query_installed_software.
-    {"get_crypto_libraries", {"Inventory", "Read", ServiceScopeClass::confined}},
-    {"list_crypto_library_devices", {"Inventory", "Read", ServiceScopeClass::confined}},
-    {"export_crypto_cbom", {"Inventory", "Read", ServiceScopeClass::confined}},
-    // /crypto dashboard widgets. The catalogue and the caller's OWN layout are owner-scoped
-    // (session username, the result-set precedent: Infrastructure Read/Write for the tier, no
-    // RBAC gate in the handler) and touch no fleet data, so a service-scoped token stays
-    // `denied` (default). The Yuzu-issued counts (get_crypto_ca_stats) gate on the fleet-read
-    // Inventory:Read in the handler and the certificates behind them (list_issued_certs) on
-    // Security:Read, as GET /api/v1/ca/issued does; Yuzu's own PKI has no service scope, so
-    // both are `denied`.
-    {"list_crypto_widgets", {"Infrastructure", "Read"}},
-    {"get_crypto_dashboard_layout", {"Infrastructure", "Read"}},
-    {"set_crypto_dashboard_layout", {"Infrastructure", "Write"}},
-    {"get_crypto_ca_stats", {"Inventory", "Read"}},
     // M.9: the catalogue twins read a FLEET-WIDE rollup that cannot be scoped to a service tag,
     // so they keep the default-deny class (C8 refuses a service-scoped token before the handler).
     {"query_software_catalogue", {"Inventory", "Read"}},
@@ -4758,7 +4486,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // is the #1788/ADR-0017 confinement class -- get it right: the derived
     // VisibleSet is the ONLY per-device authorization on this surface, not
     // defense-in-depth.
-    {"create_result_set_from_tar_query", {"Execution", "Execute", ServiceScopeClass::confined}},
+    {"create_result_set_from_echo_query", {"Execution", "Execute", ServiceScopeClass::confined}},
     {"create_result_set_from_instruction_result",
      {"Execution", "Execute", ServiceScopeClass::confined}},
     {"reevaluate_result_set", {"Execution", "Execute", ServiceScopeClass::confined}},
@@ -5454,12 +5182,12 @@ struct ToolAnnotation {
 static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // ── Read-only tools (effect ReadOnly, idempotent) ─────────────────────────
     {"list_agents", {ToolEffect::ReadOnly, true, "List agents"}},
-    {"list_tar_process_tree_devices",
-     {ToolEffect::ReadOnly, true, "List TAR process-tree device picker"}},
-    {"list_tar_capture_sources_devices",
-     {ToolEffect::ReadOnly, true, "List TAR capture-sources device picker"}},
-    {"list_tar_retention_paused",
-     {ToolEffect::ReadOnly, true, "List TAR retention-paused sources"}},
+    {"list_echo_process_tree_devices",
+     {ToolEffect::ReadOnly, true, "List Echo process-tree device picker"}},
+    {"list_echo_capture_sources_devices",
+     {ToolEffect::ReadOnly, true, "List Echo capture-sources device picker"}},
+    {"list_echo_retention_paused",
+     {ToolEffect::ReadOnly, true, "List Echo retention-paused sources"}},
     {"get_agent_details", {ToolEffect::ReadOnly, true, "Get agent details"}},
     {"query_audit_log", {ToolEffect::ReadOnly, true, "Query audit log"}},
     {"list_definitions", {ToolEffect::ReadOnly, true, "List instruction definitions"}},
@@ -5473,15 +5201,6 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_inventory_tables", {ToolEffect::ReadOnly, true, "List inventory tables"}},
     {"get_agent_inventory", {ToolEffect::ReadOnly, true, "Get agent inventory"}},
     {"query_installed_software", {ToolEffect::ReadOnly, true, "Query installed software"}},
-    {"get_crypto_libraries", {ToolEffect::ReadOnly, true, "Get installed crypto libraries"}},
-    {"list_crypto_library_devices",
-     {ToolEffect::ReadOnly, true, "List devices carrying a crypto library"}},
-    {"export_crypto_cbom", {ToolEffect::ReadOnly, true, "Export crypto libraries as a CycloneDX CBOM"}},
-    {"list_crypto_widgets", {ToolEffect::ReadOnly, true, "List crypto dashboard widgets"}},
-    {"get_crypto_dashboard_layout", {ToolEffect::ReadOnly, true, "Get my crypto dashboard layout"}},
-    {"set_crypto_dashboard_layout",
-     {ToolEffect::Destructive, true, "Replace my crypto dashboard layout"}},
-    {"get_crypto_ca_stats", {ToolEffect::ReadOnly, true, "Get Yuzu-issued certificate counts"}},
     {"query_software_catalogue", {ToolEffect::ReadOnly, true, "Query the software catalogue"}},
     {"get_software_versions", {ToolEffect::ReadOnly, true, "Get a title's versions"}},
     {"list_dex_app_perf_devices",
@@ -5543,8 +5262,8 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"create_result_set", {ToolEffect::Additive, false, "Create result set"}},
     {"create_result_set_from_inventory_query",
      {ToolEffect::Additive, false, "Create result set from inventory query"}},
-    {"create_result_set_from_tar_query",
-     {ToolEffect::Destructive, false, "Create result set from TAR query"}},
+    {"create_result_set_from_echo_query",
+     {ToolEffect::Destructive, false, "Create result set from Echo query"}},
     {"create_result_set_from_instruction_result",
      {ToolEffect::Destructive, false, "Create result set from instruction result"}},
     {"reevaluate_result_set", {ToolEffect::Destructive, false, "Re-evaluate result set"}},
@@ -5877,6 +5596,8 @@ static_assert(std::is_same_v<ToolDeps::CiDetailFn, HardwareRoutes::CiDetailFn>,
               "ToolDeps::CiDetailFn drifted from HardwareRoutes::CiDetailFn");
 static_assert(std::is_same_v<ToolDeps::DexScoreFn, HardwareRoutes::DexScoreFn>,
               "ToolDeps::DexScoreFn drifted from HardwareRoutes::DexScoreFn");
+static_assert(std::is_same_v<ToolDeps::CryptoAccessFn, McpServer::CryptoAccessFn>,
+              "ToolDeps::CryptoAccessFn drifted from McpServer::CryptoAccessFn (mcp_server.hpp)");
 
 // ── Merged tool catalogue (registry seam) ────────────────────────────────
 //
@@ -5888,7 +5609,8 @@ static_assert(std::is_same_v<ToolDeps::DexScoreFn, HardwareRoutes::DexScoreFn>,
 std::span<const ToolRecord> registered_tool_records() {
     static const std::vector<ToolRecord> records = [] {
         std::vector<ToolRecord> all;
-        for (const auto span : {discovery_tool_records(), hardware_tool_records(), containment_tool_records()})
+        for (const auto span : {discovery_tool_records(), hardware_tool_records(),
+                                containment_tool_records(), crypto_tool_records()})
             all.insert(all.end(), span.begin(), span.end());
         return all;
     }();
@@ -9408,7 +9130,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
-            // ── #4027 read twins: TAR process-tree / capture-sources device
+            // ── #4027 read twins: Echo process-tree / capture-sources device
             // pickers + retention-paused source list. #4027 fix round
             // (CDX-P1-01/K4): all three now gate SOLELY on fleet_read_fn_
             // (require_fleet_read, the ADR-0017 admit-then-filter chokepoint),
@@ -9437,20 +9159,20 @@ McpServer::HandlerFn McpServer::build_handler(
             // (api-twin-recipe.md Rule 1) from an UNFILTERED registry snapshot
             // (all_devices_fn_ — same source list_agents' agents_fn and
             // GET /api/v1/devices (#4033) use), with gate.scope as the SOLE
-            // filter — not an intersection with tar_devices_fn_'s direct-
+            // filter — not an intersection with echo_devices_fn_'s direct-
             // membership-only pre-filter (see set_all_devices_fn's doc comment
             // above for why the old intersection design was an ADR-0017
             // INV-4/INV-7 violation). And both now fail LOUD (503-equivalent
             // kInternalError) when their provider is unwired, matching
-            // list_tar_retention_paused's existing posture below — the previous
+            // list_echo_retention_paused's existing posture below — the previous
             // code silently answered "0 devices in your scope" on a misconfigured
             // call site for these two tools only, indistinguishable from a
             // genuinely-empty-scope caller (a false "closed" that reads as data,
             // not an outage; the same class of bug the loud unwired-fleet_read_fn_
             // branch just above already guards against). ──
-            if (tool_name == "list_tar_process_tree_devices") {
+            if (tool_name == "list_echo_process_tree_devices") {
                 if (!fleet_read_fn_ || !all_devices_fn_) {
-                    spdlog::error("list_tar_process_tree_devices: fleet_read_fn_/"
+                    spdlog::error("list_echo_process_tree_devices: fleet_read_fn_/"
                                   "all_devices_fn_ unwired — misconfigured call site; "
                                   "failing closed");
                     res.set_content(error_response(id, kInternalError, "service unavailable"),
@@ -9469,7 +9191,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             visible.push_back(std::move(d));
                     devices.swap(visible);
                 }
-                const std::string devices_json = tar_process_tree_frame_json(devices);
+                const std::string devices_json = echo_process_tree_frame_json(devices);
                 mcp_audit("success");
                 res.set_content(
                     success_response(id,
@@ -9480,9 +9202,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
-            if (tool_name == "list_tar_capture_sources_devices") {
+            if (tool_name == "list_echo_capture_sources_devices") {
                 if (!fleet_read_fn_ || !all_devices_fn_) {
-                    spdlog::error("list_tar_capture_sources_devices: fleet_read_fn_/"
+                    spdlog::error("list_echo_capture_sources_devices: fleet_read_fn_/"
                                   "all_devices_fn_ unwired — misconfigured call site; "
                                   "failing closed");
                     res.set_content(error_response(id, kInternalError, "service unavailable"),
@@ -9501,7 +9223,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             visible.push_back(std::move(d));
                     devices.swap(visible);
                 }
-                const std::string devices_json = tar_capture_sources_devices_json(devices);
+                const std::string devices_json = echo_capture_sources_devices_json(devices);
                 mcp_audit("success");
                 res.set_content(
                     success_response(id,
@@ -9512,9 +9234,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
-            if (tool_name == "list_tar_retention_paused") {
+            if (tool_name == "list_echo_retention_paused") {
                 if (!fleet_read_fn_) {
-                    spdlog::error("list_tar_retention_paused: fleet_read_fn_ unwired — "
+                    spdlog::error("list_echo_retention_paused: fleet_read_fn_ unwired — "
                                   "misconfigured call site; failing closed");
                     res.set_content(error_response(id, kInternalError, "service unavailable"),
                                     "application/json");
@@ -9525,16 +9247,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     return; // gate already wrote the A4 error body + status
                 if (!dashboard_routes_) {
                     res.set_content(
-                        a4_error(kInternalError, "TAR retention-paused surface unavailable",
+                        a4_error(kInternalError, "Echo retention-paused surface unavailable",
                                  "this is a server configuration/wiring fault, not a caller "
                                  "error; contact an administrator"),
                         "application/json");
                     return;
                 }
                 // #4143 review fix: gate.scope is authoritative here — see
-                // gather_tar_retention_paused's doc comment.
+                // gather_echo_retention_paused's doc comment.
                 const std::string payload =
-                    tar_retention_paused_json(dashboard_routes_->gather_tar_retention_paused(
+                    echo_retention_paused_json(dashboard_routes_->gather_echo_retention_paused(
                         session->username, gate.scope, /*extra_scope_is_authoritative=*/true));
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
@@ -10611,480 +10333,6 @@ McpServer::HandlerFn McpServer::build_handler(
                 reply(swc::catalogue_response_json(page.rows, page.totals, page.kpis, page.next_cursor,
                                                    omit_newest, 0),
                       audit_ok);
-                return;
-            }
-
-            // ── get_crypto_libraries / list_crypto_library_devices (/crypto slice 1 twins) ──
-            // Shaped by crypto_library_model.hpp and read through the CryptoApi seam: the same
-            // model and instance the /crypto page and the REST twins use. fleet_read_fn_ is the
-            // SOLE gate (Inventory:Read); its composed meet(management-group, service-scope)
-            // VisibleSet is pushed into the SQL by the seam, so a confined caller gets a real,
-            // filtered answer (a service-scoped token is refused 403 by the gate while RBAC
-            // enforcement is off, and confined to its IT service's devices when it is on).
-            // ONE dispatch branch per tool, never a shared `||` branch: the A5 retry-hint gate
-            // (scripts/ci/check-mcp-retry-hints.py) scans each tool's own `if (tool_name ==`
-            // block, so a shared branch is invisible to it.
-            if (tool_name == "get_crypto_libraries") {
-                namespace cl = crypto_library;
-                if (!fleet_read_fn_) {
-                    spdlog::error("{}: fleet_read_fn_ unwired — misconfigured call site; failing "
-                                  "closed",
-                                  tool_name);
-                    res.set_content(error_response(id, kInternalError, "service unavailable"),
-                                    "application/json");
-                    return;
-                }
-                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
-                if (!gate.admitted)
-                    return; // gate already wrote the A4 error body + status
-                // Strict input (REST clamps, MCP refuses), judged before any parse or read.
-                if (const auto bad = cl::strict_summary_args_error(args)) {
-                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                if (!crypto_api_) {
-                    res.set_content(error_response(id, kInternalError,
-                                                   "Crypto library data unavailable"),
-                                    "application/json");
-                    return;
-                }
-                const auto parsed =
-                    cl::parse_summary_params(catalogue_params(args, {"family", "ecosystem"}));
-                if (!parsed) {
-                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                const std::string target = cl::audit_target(*parsed);
-                // The seam's caller-input refusal (a bad cursor) is answered through this
-                // helper so the `if (!read)` block below holds ONLY the retryable store-fault
-                // answer: the retry-hint gate then judges that branch on its own hint, and an
-                // exempt comment for the refusal cannot mask a missing retry_after_ms.
-                auto refuse_input = [&](const std::string& message) {
-                    res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
-                };
-                auto read = crypto_api_->library_summary(*parsed, gate.scope);
-                if (!read) {
-                    if (read.error().kind == CryptoReadError::Kind::kInvalid) {
-                        refuse_input(read.error().message);
-                        return;
-                    }
-                    mcp_audit("failure", cl::audit_detail_degraded("", read.error().cause,
-                                                                   gate.scope.has_value()) +
-                                             " target=" + target);
-                    if (read.error().unavailable_until_restart) { // the pool is too small for this read
-                        res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
-                        return;
-                    }
-                    res.set_content(a4_error(kInternalError,
-                                             std::string(cl::degraded_message(read.error().cause)),
-                                             "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
-                // Same key set as the REST/page rows; the MCP path mints no cid, and the
-                // tool name is the audit target so the filters ride in the detail.
-                const bool audit_ok = mcp_audit(
-                    "success", cl::audit_detail("", parsed->family.value_or("all"),
-                                                read->families.size(), read->names_from_catalogue,
-                                                false, gate.scope.has_value()) +
-                                   " target=" + target);
-                auto payload = cl::summary_json(*read);
-                if (!audit_ok)
-                    payload["audit_persisted"] = false;
-                res.set_content(success_response(id, tool_result(cl::dump_safe(payload),
-                                                                 kObjectOutputSchema)),
-                                "application/json");
-                return;
-            }
-
-            if (tool_name == "list_crypto_library_devices") {
-                namespace cl = crypto_library;
-                if (!fleet_read_fn_) {
-                    spdlog::error("{}: fleet_read_fn_ unwired — misconfigured call site; failing "
-                                  "closed",
-                                  tool_name);
-                    res.set_content(error_response(id, kInternalError, "service unavailable"),
-                                    "application/json");
-                    return;
-                }
-                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
-                if (!gate.admitted)
-                    return; // gate already wrote the A4 error body + status
-                if (const auto bad = cl::strict_devices_args_error(args)) {
-                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                if (!crypto_api_) {
-                    res.set_content(error_response(id, kInternalError,
-                                                   "Crypto library data unavailable"),
-                                    "application/json");
-                    return;
-                }
-                const auto parsed = cl::parse_devices_params(
-                    catalogue_params(args, {"family", "version", "ecosystem", "cursor", "limit"}));
-                if (!parsed) {
-                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                const std::string target = cl::audit_target(*parsed);
-                const bool continuation = !parsed->cursor.empty();
-                // The seam's caller-input refusal (a bad cursor) is answered through this
-                // helper so the `if (!read)` block below holds ONLY the retryable store-fault
-                // answer: the retry-hint gate then judges that branch on its own hint, and an
-                // exempt comment for the refusal cannot mask a missing retry_after_ms.
-                auto refuse_input = [&](const std::string& message) {
-                    res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
-                };
-                auto read = crypto_api_->library_devices(*parsed, gate.scope);
-                if (!read) {
-                    if (read.error().kind == CryptoReadError::Kind::kInvalid) {
-                        refuse_input(read.error().message);
-                        return;
-                    }
-                    mcp_audit("failure", cl::audit_detail_degraded("", read.error().cause,
-                                                                   gate.scope.has_value()) +
-                                             " target=" + target);
-                    if (read.error().unavailable_until_restart) { // the pool is too small for this read
-                        res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
-                        return;
-                    }
-                    res.set_content(a4_error(kInternalError,
-                                             std::string(cl::degraded_message(read.error().cause)),
-                                             "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
-                const bool audit_ok = mcp_audit(
-                    "success", cl::audit_detail("", parsed->family, read->devices.size(),
-                                                read->names_from_catalogue, continuation,
-                                                gate.scope.has_value()) +
-                                   " target=" + target);
-                auto payload = cl::devices_json(*read);
-                if (!audit_ok)
-                    payload["audit_persisted"] = false;
-                res.set_content(success_response(id, tool_result(cl::dump_safe(payload),
-                                                                 kObjectOutputSchema)),
-                                "application/json");
-                return;
-            }
-
-            // ── /crypto dashboard widget twins (ADR-0070 D13, R2) ─────────────────────────
-            // Shaped by crypto_widget_catalogue.hpp and read through the SAME CryptoApi seam
-            // instance as REST /api/v1/crypto/{widgets,dashboard/layout,ca/stats}. The catalogue
-            // and the layout are the caller's OWN (session username), tier-gated by the generic
-            // C8 check (Infrastructure Read/Write, the result-set precedent); the Yuzu-issued
-            // counts gate on fleet_read_fn_ Inventory:Read and are WITHHELD from a confined
-            // caller (R2). ONE dispatch branch per tool (the retry-hint gate scans each tool's
-            // own block).
-            if (tool_name == "list_crypto_widgets") {
-                namespace cw = crypto_widgets;
-                if (!args.is_object() || !args.empty()) {
-                    res.set_content(error_response(id, kInvalidParams, "list_crypto_widgets takes no arguments"), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                if (!crypto_access_fn_) {
-                    spdlog::error("{}: crypto_access_fn_ unwired — misconfigured call site; "
-                                  "failing closed",
-                                  tool_name);
-                    res.set_content(error_response(id, kInternalError, "service unavailable"),
-                                    "application/json");
-                    return;
-                }
-                cw::AccessMemo access([&](cw::WidgetGate g, std::string_view s, std::string_view o) {
-                    return crypto_access_fn_(req, g, std::string(s), std::string(o));
-                });
-                auto payload = cw::widgets_json(access);
-                mcp_audit("success");
-                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
-                                                                 kObjectOutputSchema)),
-                                "application/json");
-                return;
-            }
-
-            if (tool_name == "get_crypto_dashboard_layout") {
-                namespace cw = crypto_widgets;
-                if (!args.is_object() || !args.empty()) {
-                    res.set_content(error_response(id, kInvalidParams, "get_crypto_dashboard_layout takes no arguments"), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                if (!crypto_api_) {
-                    res.set_content(error_response(id, kInternalError,
-                                                   "Crypto dashboard layout unavailable"),
-                                    "application/json");
-                    return;
-                }
-                // Non-retryable answers (caller input, a corrupt stored layout) go through this
-                // helper so the `if (!read)` block below holds ONLY the retryable store fault.
-                auto refuse = [&](const CryptoReadError& e) {
-                    if (e.kind == CryptoReadError::Kind::kCorrupt)
-                        res.set_content(a4_error(kInternalError, e.message, "call set_crypto_dashboard_layout with expected_version=" + std::to_string(e.version) + " to replace it"), "application/json"); // retry-hint-exempt: stored-state defect, retrying reads it again
-                    else
-                        res.set_content(error_response(id, kInvalidParams, e.message), "application/json"); // retry-hint-exempt: caller-input rejection
-                };
-                auto read = crypto_api_->dashboard_layout(session->username);
-                if (!read) {
-                    if (read.error().kind != CryptoReadError::Kind::kDegraded) {
-                        mcp_audit("failure", layout_failure_tag(read.error()));
-                        refuse(read.error());
-                        return;
-                    }
-                    if (read.error().unavailable_until_restart) {
-                        mcp_audit("failure", read.error().message);
-                        res.set_content(a4_error(kInternalError, read.error().message, "the layout store did not open at server start; the default layout applies until the server is restarted with the store fixed"), "application/json"); // retry-hint-exempt: lasts until a restart, a retry fails identically
-                        return;
-                    }
-                    mcp_audit("failure", read.error().message);
-                    res.set_content(a4_error(kInternalError, read.error().message,
-                                             "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
-                mcp_audit("success");
-                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(
-                                                                     cw::layout_json(*read)),
-                                                                 kObjectOutputSchema)),
-                                "application/json");
-                return;
-            }
-
-            if (tool_name == "set_crypto_dashboard_layout") {
-                namespace cw = crypto_widgets;
-                if (const auto bad = cw::strict_layout_args_error(args)) {
-                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                const auto lr = cw::layout_request_from_args(args);
-                if (const auto bad = cw::layout_error(lr.widgets)) {
-                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                if (!crypto_api_) {
-                    res.set_content(error_response(id, kInternalError,
-                                                   "Crypto dashboard layout unavailable"),
-                                    "application/json");
-                    return;
-                }
-                const std::string& user = session->username;
-                const std::string detail_base =
-                    cw::audit_detail_layout("", lr.widgets.size(), lr.expected_version);
-                // "No audit row, no mutation" (ADR-0033 section 9), as the REST twin.
-                if (!audit_fn(req, "crypto.dashboard.layout.update", "attempted",
-                              "CryptoDashboard", user, detail_base)) {
-                    mcp_audit("failure", "audit unavailable; layout not changed");
-                    res.set_content(a4_error(kInternalError,
-                                             "audit log unavailable; the change was not made",
-                                             "retry once the audit log is available",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
-                // Non-retryable answers (caller input, a stale expected_version, a corrupt
-                // stored layout) go through this helper so the `if (!wrote)` block below holds
-                // ONLY the retryable answers (store fault, unknown commit outcome).
-                auto refuse = [&](const CryptoReadError& e) {
-                    if (e.kind == CryptoReadError::Kind::kConflict)
-                        res.set_content(a4_error(kInvalidParams, e.message, "read the layout with get_crypto_dashboard_layout (stored version " + std::to_string(e.version) + ") and save again with that expected_version"), "application/json"); // retry-hint-exempt: stale expected_version, resending it fails identically
-                    else if (e.kind == CryptoReadError::Kind::kCorrupt)
-                        res.set_content(a4_error(kInternalError, e.message, "save again with expected_version=" + std::to_string(e.version) + " to replace it"), "application/json"); // retry-hint-exempt: stored-state defect, the same call fails identically
-                    else
-                        res.set_content(error_response(id, kInvalidParams, e.message), "application/json"); // retry-hint-exempt: caller-input rejection
-                };
-                auto wrote = crypto_api_->set_dashboard_layout(user, lr.widgets, lr.expected_version);
-                if (!wrote) {
-                    (void)audit_fn(req, "crypto.dashboard.layout.update", "failure",
-                                   "CryptoDashboard", user,
-                                   detail_base + " " + layout_failure_tag(wrote.error()));
-                    mcp_audit("failure", layout_failure_tag(wrote.error()));
-                    if (wrote.error().kind != CryptoReadError::Kind::kDegraded &&
-                        wrote.error().kind != CryptoReadError::Kind::kOutcomeUnknown) {
-                        refuse(wrote.error());
-                        return;
-                    }
-                    if (wrote.error().unavailable_until_restart) {
-                        res.set_content(a4_error(kInternalError, wrote.error().message, "the layout store did not open at server start; layouts cannot be saved until the server is restarted with the store fixed"), "application/json"); // retry-hint-exempt: lasts until a restart, a retry fails identically
-                        return;
-                    }
-                    res.set_content(a4_error(kInternalError, wrote.error().message,
-                                             wrote.error().kind == CryptoReadError::Kind::kOutcomeUnknown
-                                                 ? "read the layout with get_crypto_dashboard_layout to see whether it was saved"
-                                                 : "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
-                const bool audit_ok =
-                    audit_fn(req, "crypto.dashboard.layout.update", "success", "CryptoDashboard",
-                             user,
-                             cw::audit_detail_layout("", wrote->widgets.size(), lr.expected_version) +
-                                 " version=" + std::to_string(wrote->version));
-                mcp_audit("success");
-                auto payload = cw::layout_json(*wrote);
-                if (!audit_ok)
-                    payload["audit_persisted"] = false;
-                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
-                                                                 kObjectOutputSchema)),
-                                "application/json");
-                return;
-            }
-
-            if (tool_name == "get_crypto_ca_stats") {
-                namespace cw = crypto_widgets;
-                if (!fleet_read_fn_) {
-                    spdlog::error("{}: fleet_read_fn_ unwired — misconfigured call site; failing "
-                                  "closed",
-                                  tool_name);
-                    res.set_content(error_response(id, kInternalError, "service unavailable"),
-                                    "application/json");
-                    return;
-                }
-                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
-                if (!gate.admitted)
-                    return; // gate already wrote the A4 error body + status
-                if (gate.scope.has_value()) {
-                    // ADR-0070 R2: a confined view never gets a fleet-wide count, nor a narrowed
-                    // one. No permission named: none would admit the caller.
-                    (void)audit_fn(req, "crypto.ca.stats.view", "denied", "Inventory", "yuzu_ca",
-                                   cw::audit_detail_ca_withheld("", cw::Access::kConfined));
-                    mcp_audit("denied", "withheld=confined");
-                    res.set_content(a4_error(kPermissionDenied, cw::kConfinedWithheldMessage), "application/json"); // retry-hint-exempt: authorization outcome, retrying cannot change it
-                    return;
-                }
-                if (!args.is_object() || !args.empty()) {
-                    res.set_content(error_response(id, kInvalidParams, "get_crypto_ca_stats takes no arguments"), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                if (!crypto_api_) {
-                    res.set_content(error_response(id, kInternalError,
-                                                   "Yuzu-issued certificate data unavailable"),
-                                    "application/json");
-                    return;
-                }
-                auto read = crypto_api_->ca_stats(std::nullopt);
-                if (!read) {
-                    (void)audit_fn(req, "crypto.ca.stats.view", "failure", "Inventory", "yuzu_ca",
-                                   cw::audit_detail_ca_degraded("", std::nullopt, read.error().cause));
-                    mcp_audit("failure", cw::audit_detail_ca_degraded("", std::nullopt, read.error().cause));
-                    if (read.error().unavailable_until_restart) { // the pool is too small for this read
-                        res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
-                        return;
-                    }
-                    res.set_content(a4_error(kInternalError, read.error().message,
-                                             "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
-                const bool audit_ok = audit_fn(req, "crypto.ca.stats.view", "success", "Inventory",
-                                               "yuzu_ca", cw::audit_detail_stats("", read->as_of));
-                mcp_audit("success", cw::audit_detail_stats("", read->as_of));
-                auto payload = cw::ca_stats_json(*read);
-                if (!audit_ok)
-                    payload["audit_persisted"] = false;
-                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
-                                                                 kObjectOutputSchema)),
-                                "application/json");
-                return;
-            }
-
-            // ── export_crypto_cbom (CycloneDX 1.7 export of the /crypto summary) ──────────
-            // Same gate (fleet_read_fn_, Inventory:Read), seam and admission bound as
-            // get_crypto_libraries; the BOM is shaped by crypto_cbom.hpp, the REST twin's shaper.
-            // Own branch (not folded into the pair above) so the retry-hint CI gate inspects it.
-            if (tool_name == "export_crypto_cbom") {
-                namespace cl = crypto_library;
-                if (!fleet_read_fn_) {
-                    spdlog::error("export_crypto_cbom: fleet_read_fn_ unwired - misconfigured call "
-                                  "site; failing closed");
-                    res.set_content(error_response(id, kInternalError, "service unavailable"),
-                                    "application/json");
-                    return;
-                }
-                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
-                if (!gate.admitted)
-                    return; // gate already wrote the A4 error body + status
-                // STRICT: a non-object `arguments` (null, array, string) is refused, judged
-                // before any parse or read.
-                if (const auto bad = crypto_cbom::strict_cbom_args_error(args)) {
-                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                if (!crypto_api_) {
-                    res.set_content(error_response(id, kInternalError,
-                                                   "Crypto library data unavailable"),
-                                    "application/json");
-                    return;
-                }
-                const auto parsed =
-                    cl::parse_summary_params(catalogue_params(args, {"family", "ecosystem"}));
-                if (!parsed) {
-                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
-                    return;
-                }
-                // No BOM without a unique serial. Minted BEFORE the store read so a CSPRNG
-                // failure costs no read slot and no scan; no audit row on this path (no
-                // inventory read has happened, so there is nothing to account for).
-                const auto identity = crypto_cbom::make_identity(yuzu::kVersionString);
-                if (!identity) {
-                    spdlog::error("export_crypto_cbom: CSPRNG failure minting the BOM serial number");
-                    res.set_content(a4_error(kInternalError, "service unavailable",
-                                             "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
-                const std::string target = cl::audit_target(*parsed);
-                // The seam's caller-input refusal is answered through this helper so the
-                // `if (!read)` block below holds ONLY the retryable store-fault answer (same
-                // pattern as get_crypto_libraries): the retry-hint gate judges that branch on
-                // its own hint, and an exempt comment for the refusal cannot mask a missing one.
-                auto refuse_input = [&](const std::string& message) {
-                    res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
-                };
-                const auto read = crypto_api_->library_summary(*parsed, gate.scope);
-                if (!read) {
-                    if (read.error().kind == CryptoReadError::Kind::kInvalid) {
-                        refuse_input(read.error().message);
-                        return;
-                    }
-                    mcp_audit("failure",
-                              cl::audit_detail_degraded("", read.error().cause,
-                                                        gate.scope.has_value()) +
-                                  " target=" + target);
-                    if (read.error().unavailable_until_restart) { // the pool is too small for this read
-                        res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
-                        return;
-                    }
-                    res.set_content(a4_error(kInternalError,
-                                             std::string(cl::degraded_message(read.error().cause)),
-                                             "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
-                const auto bom_options = crypto_cbom::CbomOptions{
-                    .filters = *parsed, .confined = gate.scope.has_value()};
-                auto bom = crypto_cbom::cbom_json(*read, *identity, bom_options);
-                const std::size_t components = bom.at("components").size();
-                const bool audit_ok = mcp_audit(
-                    "success", cl::audit_detail("", parsed->family.value_or("all"),
-                                                read->families.size(), read->names_from_catalogue,
-                                                false, gate.scope.has_value()) +
-                                   crypto_cbom::audit_evidence(*identity, *parsed, components) +
-                                   " target=" + target);
-                if (!audit_ok)
-                    crypto_cbom::mark_audit_not_persisted(bom);
-                nlohmann::json payload{{"bom", cl::dump_safe(bom)},
-                                       {"content_type", std::string(crypto_cbom::kContentType)},
-                                       {"components", components},
-                                       {"result_truncated", read->result_truncated}};
-                if (!audit_ok)
-                    payload["audit_persisted"] = false;
-                res.set_content(success_response(id, tool_result(cl::dump_safe(payload),
-                                                                 kObjectOutputSchema)),
-                                "application/json");
                 return;
             }
 
@@ -13738,7 +12986,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // see every connected agent, not just their own visible set.
                 // `fleet_read_fn_` REPLACES the permission check (it already
                 // performs the RBAC check internally) rather than being
-                // paired with it — same pattern as list_tar_process_tree_devices.
+                // paired with it — same pattern as list_echo_process_tree_devices.
                 if (!fleet_read_fn_) {
                     spdlog::error("preview_scope_targets: fleet_read_fn_ unwired — "
                                   "misconfigured call site; failing closed");
@@ -13898,7 +13146,7 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // `rs_run_async`: MCP twin of rest_api_v1.cpp's `run_async` — the
             // shared dispatch engine for the 3 async result-set producers
-            // (create_result_set_from_tar_query, create_result_set_from_
+            // (create_result_set_from_echo_query, create_result_set_from_
             // instruction_result, reevaluate_result_set). `args_for_parent` is
             // read ONLY for `parent_id` (everything else is passed explicitly
             // so reevaluate_result_set can synthesise it) — mirrors REST's
@@ -14331,7 +13579,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // from a genuinely parentless original once its parent is
                 // deleted (ON DELETE SET NULL) -- the same #4306/#2500
                 // target-erasure shape the dedicated
-                // create_result_set_from_tar_query/_instruction_result tools
+                // create_result_set_from_echo_query/_instruction_result tools
                 // are already protected against. Parse into a mutable object
                 // so scope_input_id can be merged in below, once pid's
                 // ownership check (rs_load_owned) succeeds -- mirrors those
@@ -14952,7 +14200,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
-            if (tool_name == "create_result_set_from_tar_query") {
+            if (tool_name == "create_result_set_from_echo_query") {
                 if (!perm_fn(req, res, "Execution", "Execute"))
                     return;
                 std::string sql = param_str(args, "sql");
@@ -15004,15 +14252,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 const bool include_empty = args.value("include_empty", false);
                 nlohmann::json matcher = include_empty
                                              ? nlohmann::json{{"kind", "any_response"}}
-                                             : nlohmann::json{{"kind", "tar_rows_ge"}, {"n", 1}};
-                // source_payload — design §3.2 tar_query shape (re-eval reads it).
+                                             : nlohmann::json{{"kind", "echo_rows_ge"}, {"n", 1}};
+                // source_payload — design §3.2 echo_query shape (re-eval reads it).
                 nlohmann::json payload;
                 payload["sql"] = sql;
                 payload["include_empty"] = include_empty;
                 if (args.contains("parent_id") && args["parent_id"].is_string())
                     payload["scope_input_id"] = args["parent_id"];
                 std::unordered_map<std::string, std::string> params{{"sql", sql}};
-                rs_run_async("tar", "sql", params, source_kind::kTarQuery, payload.dump(),
+                rs_run_async("echo", "sql", params, source_kind::kEchoQuery, payload.dump(),
                             matcher.dump(), args, param_str(args, "name"));
                 return;
             }
@@ -15071,7 +14319,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             return;
                         }
                     }
-                    // #4644: a malformed tar_rows_ge threshold (`n`) is refused here, before
+                    // #4644: a malformed echo_rows_ge threshold (`n`) is refused here, before
                     // anything is dispatched or stored, like the REST twin.
                     // A PRESENT matcher that is not a JSON object used to be dropped silently
                     // ("accept every responder"); it is refused now. Absent stays the default.
@@ -15253,7 +14501,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // no reeval_name), so hoist it to an early return right after
                 // sp is parsed. Mirrors REST's identical reorder on this
                 // route (rest_api_v1.cpp).
-                if (orig->source_kind != source_kind::kTarQuery &&
+                if (orig->source_kind != source_kind::kEchoQuery &&
                     orig->source_kind != source_kind::kInstructionResult) {
                     res.set_content(
                         error_response(id, kInvalidParams,
@@ -15273,7 +14521,7 @@ McpServer::HandlerFn McpServer::build_handler(
                            !sp["scope_input_id"].get_ref<const std::string&>().empty()) {
                     // #4306 / #2500-class target erasure: the original was
                     // NARROWED at creation (scope_input_id persisted into
-                    // source_payload by create_result_set_from_tar_query /
+                    // source_payload by create_result_set_from_echo_query /
                     // create_result_set_from_instruction_result, OR by the
                     // generic create_result_set -- #4306 follow-up, all three
                     // mirror the same payload["scope_input_id"] = ... pattern),
@@ -15324,10 +14572,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     orig->name.empty()                  ? std::string()
                     : orig->name.ends_with(" (re-eval)") ? orig->name
                                                          : (orig->name + " (re-eval)");
-                if (orig->source_kind == source_kind::kTarQuery) {
+                if (orig->source_kind == source_kind::kEchoQuery) {
                     // Adversarial review (PR #4330): sp.value("sql", "") throws
                     // nlohmann::json::type_error on a type mismatch rather than
-                    // coercing - unlike create_result_set_from_tar_query's own
+                    // coercing - unlike create_result_set_from_echo_query's own
                     // caller-facing "sql" arg, which gets an explicit type check.
                     // orig->source_payload isn't caller-supplied on THIS call,
                     // but a row minted via the generic (uncapped) create_result_set
@@ -15348,9 +14596,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     // Gate 4 unhappy-path BLOCKING fix: re-apply the SAME cap
-                    // create_result_set_from_tar_query enforces before dispatch.
+                    // create_result_set_from_echo_query enforces before dispatch.
                     // `orig` may have been minted via the uncapped create_result_set
-                    // (source_kind labeled tar_query with no create-time SQL-length
+                    // (source_kind labeled echo_query with no create-time SQL-length
                     // check of its own) - without this, re-eval would smuggle an
                     // oversized SQL payload past the 200 KiB pre-routing body cap
                     // that exists specifically for this SQL size, then dispatch it
@@ -15363,7 +14611,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     std::unordered_map<std::string, std::string> params{{"sql", sql}};
-                    rs_run_async("tar", "sql", params, source_kind::kTarQuery, orig->source_payload,
+                    rs_run_async("echo", "sql", params, source_kind::kEchoQuery, orig->source_payload,
                                 orig->matcher, synth, reeval_name);
                 } else if (orig->source_kind == source_kind::kInstructionResult) {
                     // Same type-confusion guard as the sql field above.
@@ -15386,7 +14634,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // oversized instruction_id would reach instruction_store's
                     // lookup unbounded, and an over-keyed or oversized params
                     // object would dispatch fleet-wide. Mirrors the sql-size
-                    // recheck in the kTarQuery branch above. chaos-injector's
+                    // recheck in the kEchoQuery branch above. chaos-injector's
                     // Finding 1 caught the instruction_id gap: the fix's own
                     // "re-apply the SAME caps" note originally covered only
                     // params, not this sibling field.
@@ -15461,7 +14709,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                 orig->source_payload, orig->matcher, synth, reeval_name);
                 }
                 // else: unreachable -- the early return above already refused
-                // every source_kind other than kTarQuery/kInstructionResult
+                // every source_kind other than kEchoQuery/kInstructionResult
                 // before we got here.
                 return;
             }
@@ -19125,7 +18373,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // `version` is REQUIRED-PRESENT (distinct from get_dex_app_perf's ""
                 // = all-versions convention above): this drill is always scoped to
                 // ONE exact version, and Linux procperf emits "" for every app
-                // (tar_proc_perf.cpp) — an omitted `version` would otherwise
+                // (echo_proc_perf.cpp) — an omitted `version` would otherwise
                 // silently collapse to that single bucket instead of surfacing a
                 // genuine parameter error.
                 if (!args.contains("version") || !args["version"].is_string()) {

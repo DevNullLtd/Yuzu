@@ -175,14 +175,14 @@ TEST_CASE("arming_check composition: a system_reserved capability is refused to 
     // through `command_dispatch_fn`, which dispatches as
     // `DispatchCaller{.system = true}`; the chokepoint's system_reserved
     // guard only refuses NON-system callers, so without this denial an
-    // operator could schedule `tar.fleet_snapshot` — a definition that ships
+    // operator could schedule `echo.fleet_snapshot` — a definition that ships
     // operator-referencable — and reach the fleet under system authority.
     //
     // The registry is composed over BOTH fragments deliberately:
     // `plugin_action_catalogue_a()` declares no system_reserved row at all
     // (see its header note), so a registry built from it alone cannot
     // express this case — which is part of why the old mirror never covered
-    // it. `tar.fleet_snapshot` is declared by the core fragment.
+    // it. `echo.fleet_snapshot` is declared by the core fragment.
     CommandCapabilityRegistry registry{capdecls::core_dispatch_capabilities(),
                                        capdecls::plugin_action_catalogue_a()};
 
@@ -192,14 +192,14 @@ TEST_CASE("arming_check composition: a system_reserved capability is refused to 
     // would ADMIT — the denial has to come from the system_reserved branch,
     // not from a missing grant. That is what makes this a real test of it.
     REQUIRE(rbac.assign_role(PrincipalRole{"user", "alice", "Administrator"}).has_value());
-    CHECK_FALSE(compose_arming_check(registry, &rbac, "alice", "tar", "fleet_snapshot"));
+    CHECK_FALSE(compose_arming_check(registry, &rbac, "alice", "echo", "fleet_snapshot"));
 
     // Legacy-open RBAC does not rescue it either: the reserved check runs
     // BEFORE the enforcement-in-effect early-return. Reuse the SAME store,
     // toggled open — a second clone would double the fixture cost for no
     // additional coverage, and the toggle is itself the production lever.
     rbac.set_rbac_enabled(false);
-    CHECK_FALSE(compose_arming_check(registry, &rbac, "alice", "tar", "fleet_snapshot"));
+    CHECK_FALSE(compose_arming_check(registry, &rbac, "alice", "echo", "fleet_snapshot"));
     rbac.set_rbac_enabled(true);
 
     // Sanity: a non-reserved row in the same composed registry still admits,
@@ -506,16 +506,16 @@ TEST_CASE("operator surface MCP twins: every tool satisfies the A5 contract",
         // would be the free-form-object footgun the spec forbids for any
         // tool that DOES take an argument — the original 11 rows here all
         // do. A tool that genuinely takes ZERO arguments (#4027's three
-        // list_tar_* tools, same shape as list_agents; #4037's
+        // list_echo_* tools, same shape as list_agents; #4037's
         // get_guardian_status/list_guardian_rules — the same "{}" shape
         // get_guardian_schemas already uses, outside this array) is not a
         // footgun; "{}" correctly documents "no arguments," it isn't a
         // lazily-typed free-form object. Exempted explicitly so the check
         // stays a real signal for every tool that DOES take arguments.
         static const std::unordered_set<std::string_view> kNoArgTools = {
-            "list_tar_process_tree_devices",
-            "list_tar_capture_sources_devices",
-            "list_tar_retention_paused",
+            "list_echo_process_tree_devices",
+            "list_echo_capture_sources_devices",
+            "list_echo_retention_paused",
             "get_guardian_status",
             "list_guardian_rules",
             "get_guardian_policy_generation",

@@ -7,9 +7,9 @@
 /// over the existing `ReportInventory` transport (a new `plugin_data` key — no
 /// proto change, no gateway regen). The server persists them in AppPerfDailyStore.
 ///
-/// It obtains the warehouse rows via `LocalDispatcher` → the TAR plugin's `sql`
+/// It obtains the warehouse rows via `LocalDispatcher` → the Echo plugin's `sql`
 /// action (the read-only, authorizer-sandboxed operator-SQL path) — no second
-/// tar.db handle from agent-core. NAMES ONLY (procperf is names-only + operator
+/// echo.db handle from agent-core. NAMES ONLY (procperf is names-only + operator
 /// redaction applied at collection). Windows-fed today (procperf is Windows-only;
 /// Linux/macOS report nothing until those collectors land).
 ///
@@ -47,7 +47,7 @@ struct AppPerfRow {
 /// max-of-max peaks, summed counts; grouped by `(name, version, UTC day)`. Pure.
 YUZU_EXPORT std::string build_app_perf_query(std::int64_t window_start, std::int64_t today_start);
 
-/// Parse the TAR `sql` action's captured output (`__schema__|…` header, pipe-
+/// Parse the Echo `sql` action's captured output (`__schema__|…` header, pipe-
 /// delimited rows in the SELECT's column order, `__total__|N` footer; `error|…`
 /// lines and the markers are skipped). Pure.
 YUZU_EXPORT std::vector<AppPerfRow> parse_app_perf_sql_output(const std::string& captured);
@@ -64,10 +64,10 @@ YUZU_EXPORT std::vector<AppPerfRow> canon_merge_app_perf(std::vector<AppPerfRow>
 /// Pure. (No byte-identical-with-server requirement — B1 is hash-less.)
 YUZU_EXPORT std::string render_app_perf_blob(std::vector<AppPerfRow> rows);
 
-/// Build the `app_perf` SyncSource. `tar_descriptor` is the loaded TAR plugin
-/// descriptor; when null (TAR not built/loaded) the source's collect returns
+/// Build the `app_perf` SyncSource. `echo_descriptor` is the loaded Echo plugin
+/// descriptor; when null (Echo not built/loaded) the source's collect returns
 /// std::nullopt and the scheduler no-ops it. An empty rollup (procperf disabled /
 /// no activity) also skips the cycle (network-kind — never sends an empty blob).
-YUZU_EXPORT SyncSource make_app_perf_source(const YuzuPluginDescriptor* tar_descriptor);
+YUZU_EXPORT SyncSource make_app_perf_source(const YuzuPluginDescriptor* echo_descriptor);
 
 } // namespace yuzu::agent

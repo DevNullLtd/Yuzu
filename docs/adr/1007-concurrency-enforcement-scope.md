@@ -33,7 +33,7 @@ audited for every distinct `concurrency:` value actually in use:
 
 | Value | Count | Plugin ownership |
 |---|---:|---|
-| `per-device` | 191 | 100% real `agents/plugins/` names (`tar`, `filesystem`, `registry`, `hardware`, `windows_updates`, `vuln_scan`, `antivirus`, …) |
+| `per-device` | 191 | 100% real `agents/plugins/` names (`echo`, `filesystem`, `registry`, `hardware`, `windows_updates`, `vuln_scan`, `antivirus`, …) |
 | `per-definition` | 21 | 100% `plugin: server`/`server_internal`/`_server` |
 | `global` | 17 | 100% `plugin: server`/`server_internal`/`_server` |
 | `global-singleton` | 4 | 100% `plugin: server`/`server_internal`/`_server` |
@@ -103,7 +103,7 @@ locally rejects. This ADR deviates from that, for reasons verified against the a
   one, cascading into mirroring `gateway/priv/proto/*/agent.proto` and regenerating `agent_pb.erl`
   (gpb silently drops unmirrored fields). `(plugin, action)` is not a safe proxy key: real
   duplicate pairs exist in shipped content (`antivirus/status`, `filesystem/replace`,
-  `filesystem/get_version_info`, several `tar/sql` definitions) — `instruction_definitions` has no
+  `filesystem/get_version_info`, several `echo/sql` definitions) — `instruction_definitions` has no
   `UNIQUE(plugin, action)` constraint.
 - The agent has no existing in-flight-execution tracking usable for this. `command_dedup_`
   (`agent.cpp`) is keyed on `command_id` for replay protection (HA WS-0) — a different problem
@@ -200,7 +200,7 @@ dispatch resolves its candidate set inside the sink, not in `resolve_and_dispatc
 **This is the primary collision case for many real `per-device` definitions, not an edge case** —
 Gate 3 architect review (2026-08-31) correctly pushed back on this ADR's first draft, which had
 characterized it as a narrow exception. A substantial share of the 191 real `per-device`
-definitions are exactly the kind of operation (`tar.fleet_snapshot`, scheduled scans, patch
+definitions are exactly the kind of operation (`echo.fleet_snapshot`, scheduled scans, patch
 inventory refresh) that operators legitimately dispatch fleet-wide via Broadcast, not to a hand-picked
 group — so a repeated fleet-wide dispatch of one of these definitions in quick succession is the
 realistic way a same-device double-dispatch happens in production, not a corner case. Extending
@@ -547,9 +547,9 @@ rather than silently dropped):
   direction, not undertaken now.
 - A `command_id`-prefix skip (`__guard__-`) was added to avoid a wasted write-pool lease on every
   guard push/reconcile response (Fable's load finding — the fallback turns every unmatched response
-  into a lease + UPDATE). The same optimization was deliberately NOT extended to `tar-`: `tar` is
+  into a lease + UPDATE). The same optimization was deliberately NOT extended to `echo-`: `echo` is
   also a real agent plugin name, and nothing in the code (only today's content library) guarantees a
-  `per-device`-gated `tar` definition could never exist — a string-prefix skip there would risk
+  `per-device`-gated `echo` definition could never exist — a string-prefix skip there would risk
   silently skipping a legitimate release if that ever changes.
 
 Regression tests: `test_execution_tracker.cpp`, search for "UP-1", "UP-2", "Fable adversarial-review
@@ -847,7 +847,7 @@ signature change — that shared type's `(command_id, int)` return shape is used
 (`bundle_orchestrator.hpp`, `dashboard_routes.hpp`, `deployment_engine.hpp`, `dex_routes.hpp`,
 `mcp_server.hpp`, `policy_evaluator.hpp`, `preflight_routes.hpp`/`preflight_runner.hpp`,
 `quarantine_containment_reconciler.hpp`, `rest_api_v1.hpp`, `schedule_runner.hpp`,
-`tar_tree_routes.hpp`, `workflow_routes.hpp`), so threading per-target skip reasons through it is
+`echo_tree_routes.hpp`, `workflow_routes.hpp`), so threading per-target skip reasons through it is
 out of proportion here. Six Prometheus signals ARE shipped in this change, via the existing
 post-construction `set_metrics(MetricsRegistry*)` setter (the idiom 20+ other stores already use —
 an earlier draft of this ADR incorrectly claimed this would require a constructor parameter, which

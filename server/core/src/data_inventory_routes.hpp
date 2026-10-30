@@ -13,8 +13,8 @@
 /// the member access (`inventory_store_.` -> `deps.store->`).
 ///
 /// NAMESPACE: `yuzu::server::data_inventory`, not `yuzu::server::inventory`
-/// — deliberately, to avoid colliding with `inventory_routes.hpp`'s
-/// `InventoryDeviceRow`/`InventoryRoutes` etc., which live directly in
+/// — deliberately, to avoid colliding with `InventoryDeviceRow` (`inventory_types.hpp`) /
+/// `InventoryRoutes` (`inventory_routes.hpp`) etc., which live directly in
 /// `yuzu::server` (no nested `inventory` namespace of its own) and back the
 /// unrelated `/inventory` dashboard page.
 ///

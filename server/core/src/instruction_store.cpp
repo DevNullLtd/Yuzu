@@ -27,6 +27,8 @@
 #include <cstdio>
 #include <format>
 #include <random>
+#include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 
@@ -190,6 +192,78 @@ std::string normalize_to_array_helper(const nlohmann::json& v) {
 
 // ── Migration DDL (ADR-0058) ─────────────────────────────────────────────────
 
+// ── Echo rename (upgrade window) ─────────────────────────────────────────────
+
+// The token chain the rename script applies to the builtin Echo definitions' prose, as
+// regexp_replace calls over one column expression. Word boundaries are Postgres ARE `\m` / `\M`.
+std::string echo_rename_text_chain(const std::string& col) {
+    std::string e = col;
+    const auto wrap = [&e](std::string_view pattern, std::string_view repl) {
+        e = std::format("regexp_replace({}, '{}', '{}', 'g')", e, pattern, repl);
+    };
+    wrap("Timeline Activity Record \\(TAR\\)", "Echo");
+    wrap("\\mTAR\\M", "Echo");
+    wrap("\\mtar_", "echo_");
+    wrap("\\mtar\\M", "echo");
+    return e;
+}
+
+std::string echo_rename_definitions_sql() {
+    // 1. The builtin Echo definitions (plugin `tar`, id `crossplatform.tar.*`): every free-text
+    //    column gets the whole token chain, because their prose names the feature. Any other row
+    //    of the renamed plugin (an operator-authored definition) only has its plugin column
+    //    moved: its description or a SQL literal may legitimately say "tar" for the archive
+    //    tool, so the bare-word chain must not touch it. Its YAML identity forms follow in 2.
+    std::string sql = "UPDATE instruction_definitions SET ";
+    bool first = true;
+    for (const char* col : {"name", "description", "yaml_source", "parameter_schema",
+                            "result_schema", "readable_payload", "visualization_spec",
+                            "response_templates_spec"}) {
+        sql += std::format("{}{} = {}", first ? "" : ", ", col, echo_rename_text_chain(col));
+        first = false;
+    }
+    sql += ", plugin = 'echo' WHERE plugin = 'tar' AND id LIKE 'crossplatform.tar.%';"
+           "UPDATE instruction_definitions SET plugin = 'echo' WHERE plugin = 'tar';";
+    // 2. Every row: operator-authored definitions may still name the renamed plugin in
+    //    their YAML (a quoted `plugin: "tar"`, `requiredPlugins: [..tar..]`, a block-list item
+    //    under `requiredPlugins:` / `tags:`, or a `crossplatform.tar.` id reference). Only those
+    //    anchored forms change, so a shell step that runs the archive tool, and a bare `- tar`
+    //    item under any other key (an archive-format enum, a package list), are left alone.
+    //    The two line-anchored rules tolerate a trailing `# comment` and CRLF line endings (the
+    //    ordinary dashboard-textarea case); the tail is captured and written back unchanged.
+    //    The block-list rule walks from the key line through only list-item, comment and blank
+    //    lines, so it can never reach a `- tar` under a different key. Postgres ARE: the whole
+    //    pattern is greedy (the first quantified atom decides), which only matters for a block
+    //    naming `tar` twice - the last such item is the one rewritten.
+    sql +=
+        "UPDATE instruction_definitions SET yaml_source = "
+        "regexp_replace("
+        " regexp_replace("
+        "  regexp_replace(replace(yaml_source, 'crossplatform.tar.', 'crossplatform.echo.'),"
+        "   '(plugin:[ \t]*[\"'']?)tar([\"'']?[ \t]*(?:#[^\r\n]*)?\r?)$', '\\1echo\\2', 'gn'),"
+        "  '(requiredPlugins:[ \t]*\\[[^\\]]*)\\mtar\\M', '\\1echo', 'g'),"
+        " '(^[ \t]*(?:requiredPlugins|tags):[ \t]*(?:#[^\r\n]*)?\r?\n"
+        "(?:[ \t]*(?:-[^\r\n]*)?(?:#[^\r\n]*)?\r?\n)*"
+        "[ \t]*-[ \t]*[\"'']?)tar([\"'']?[ \t]*(?:#[^\r\n]*)?\r?)$', '\\1echo\\2', 'gn') "
+        "WHERE yaml_source LIKE '%tar%';";
+    // 3. Identity columns, for every row.
+    sql +=
+        "UPDATE instruction_definitions SET required_plugins = array_to_string(ARRAY("
+        "  SELECT CASE WHEN btrim(x) = 'tar' THEN 'echo' ELSE x END "
+        "  FROM unnest(string_to_array(required_plugins, ',')) WITH ORDINALITY AS t(x, ord) "
+        "  ORDER BY ord), ',') "
+        "WHERE required_plugins LIKE '%tar%';"
+        "UPDATE instruction_definitions SET id = replace(id, 'crossplatform.tar.', 'crossplatform.echo.') "
+        "WHERE id LIKE 'crossplatform.tar.%' AND NOT EXISTS ("
+        "  SELECT 1 FROM instruction_definitions d2 "
+        "  WHERE d2.id = replace(instruction_definitions.id, 'crossplatform.tar.', 'crossplatform.echo.'));"
+        "UPDATE deleted_seed_content SET id = replace(id, 'crossplatform.tar.', 'crossplatform.echo.') "
+        "WHERE id LIKE 'crossplatform.tar.%' AND NOT EXISTS ("
+        "  SELECT 1 FROM deleted_seed_content t2 WHERE t2.kind = deleted_seed_content.kind "
+        "  AND t2.id = replace(deleted_seed_content.id, 'crossplatform.tar.', 'crossplatform.echo.'));";
+    return sql;
+}
+
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for the migration txn.
     // Runtime statements below schema-qualify explicitly. The pre-migration SQLite store's ~9
@@ -251,6 +325,12 @@ const std::vector<pg::PgMigration>& migrations() {
         // Harmless (nothing references it) but permanent schema drift; drop it
         // idempotently for the databases that have it, no-op for the ones that don't.
         {2, "DROP TABLE IF EXISTS sqlite_backfill_source;"},
+        // v3 (Echo rename, upgrade window). Builtin content reseeds ON CONFLICT (id) DO NOTHING
+        // (insert_definition_row), so nothing would ever refresh a stored row: every column the
+        // renamed content touches is rewritten here, or an upgraded deployment keeps the old ids,
+        // plugin and prose forever. Idempotent: each statement is guarded by its own predicate.
+        // The numbered steps are in echo_rename_definitions_sql().
+        {3, echo_rename_definitions_sql()},
     };
     return kMigrations;
 }

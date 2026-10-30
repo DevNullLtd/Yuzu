@@ -52,7 +52,7 @@
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "credential_change_owner.hpp" // #5342 — one-transaction local credential change
-#include "tar_corruption_audit.hpp" // #1567 corruption audit gate
+#include "echo_corruption_audit.hpp" // #1567 corruption audit gate
 #include "body_cap_policy.hpp" // #2407: pre-auth request-body cap policy table
 #include "ca_routes.hpp"
 #include "ca_store.hpp"
@@ -254,7 +254,7 @@
 #include "clock_drift_monitor.hpp" // HA WS-1/1a — backward wall-clock drift detector (ADR-2002 §4)
 #include "session_store.hpp"       // HA WS-1/1a — durable operator sessions (ADR-2002 §4)
 #include "preflight_runner.hpp"
-#include "tar_tree_routes.hpp"
+#include "echo_tree_routes.hpp"
 #include "background_jobs.hpp" // WS-10: pass-classification table + YUZU_ASSERT_BACKGROUND_JOB gate
 #include "coord_dsn.hpp"       // WS-3: build the elector's dedicated coordination DSN (testable)
 #include "leader_elector.hpp"  // WS-3: fenced leader-election primitive (ADR-2002 §3/§6/§10)
@@ -400,7 +400,7 @@ extern const char* const kSettingsHtml;
 // Help and Instruction management pages (separate TUs).
 extern const char* const kHelpHtml;
 extern const char* const kInstructionPageHtml;
-extern const char* const kTarPageHtml;
+extern const char* const kEchoPageHtml;
 extern const char* const kVizFleetPageHtml; // server/core/src/viz_page_ui.cpp (PR 5)
 extern const char* const kVizHostPageHtml;  // server/core/src/viz_host_page_ui.cpp (PR 9-pre)
 // kInstructionEditorHtml / kInstructionEditorDeniedHtml declarations moved
@@ -561,7 +561,7 @@ namespace detail {
 // #1290 adds (field confusion), and a CRLF could split the audit line. The
 // shared mapping is yuzu::log_token (common/include/yuzu/log_token.hpp) and
 // web_utils.hpp's audit_token forwards to it, so the same neutralizer guards every
-// structured-audit call site (here + tar_tree_routes.cpp) without the rule drifting; this `using` keeps the existing `detail::audit_token(...)`
+// structured-audit call site (here + echo_tree_routes.cpp) without the rule drifting; this `using` keeps the existing `detail::audit_token(...)`
 // spellings below resolving unchanged.
 using yuzu::server::audit_token;
 
@@ -2349,7 +2349,7 @@ public:
                           "Response result rows that did not persist (fail-soft ingest, ADR-0039), "
                           "by reason (store_not_open/pool_acquire_timeout/query_error/"
                           "malformed_identity_field) - the executions ladder still tracks the "
-                          "command; a sustained non-zero rate means drawer/TAR result history is "
+                          "command; a sustained non-zero rate means drawer/Echo result history is "
                           "silently lossy. malformed_identity_field is distinct: an "
                           "instruction_id/execution_id/plugin containing an embedded NUL byte was "
                           "rejected rather than silently truncated (#2691 UP-5) - a non-zero rate "
@@ -2456,8 +2456,8 @@ public:
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
-        metrics_.describe("yuzu_fleet_tar_db_corruption_agents",
-                          "Agents whose TAR database has ever been quarantined as corrupt "
+        metrics_.describe("yuzu_fleet_echo_db_corruption_agents",
+                          "Agents whose Echo database has ever been quarantined as corrupt "
                           "(cumulative per agent since install; a rising value is the signal)",
                           "gauge");
         metrics_.describe("yuzu_fleet_plugin_init_failed",
@@ -4413,7 +4413,7 @@ public:
         metrics_.describe("yuzu_viz_topology_request_seconds",
                           "End-to-end /api/v1/viz/fleet/topology request latency", "histogram");
         metrics_.describe("yuzu_viz_topology_fetch_duration_seconds",
-                          "Inner agent-dispatch (tar.fleet_snapshot fan-out) duration "
+                          "Inner agent-dispatch (echo.fleet_snapshot fan-out) duration "
                           "on cache-miss refills only; observed even on fetcher exception",
                           "histogram");
         metrics_.describe("yuzu_viz_cache_hit_total",
@@ -4429,7 +4429,7 @@ public:
                           "OfflineEndpointStore (hosts that aged out of the in-memory snapshot)",
                           "counter");
         metrics_.describe("yuzu_viz_agent_dispatch_timeout_total",
-                          "Per-agent timeouts during tar.fleet_snapshot fan-out", "counter");
+                          "Per-agent timeouts during echo.fleet_snapshot fan-out", "counter");
         metrics_.describe("yuzu_viz_refill_oversize_drops_total",
                           "Refills exceeding max_snapshot_bytes (returned to caller, not cached)",
                           "gauge");
@@ -5523,7 +5523,7 @@ public:
                 response_store_->set_metrics(&metrics_);
                 spdlog::warn("[PG] response history reset on Postgres cutover — the legacy "
                              "responses.db is not migrated (ADR-0039, skippable backfill class); "
-                             "the executions drawer/TAR views self-refill as new commands run");
+                             "the executions drawer/Echo views self-refill as new commands run");
             }
         }
 
@@ -5541,7 +5541,7 @@ public:
 
         // Initialize fleet topology store (PR 3 of feat/viz-engine).
         //
-        // The fetcher dispatches `tar.fleet_snapshot` to every connected
+        // The fetcher dispatches `echo.fleet_snapshot` to every connected
         // agent on cache miss, polls the response_store for matches keyed
         // on the synthesised command_id, and returns whatever arrived
         // before the deadline. Missing agents come back as stale=true rows
@@ -5576,18 +5576,18 @@ public:
 
                 // Sibling dispatchers use `<plugin>-<hex>` (server.cpp:2820,
                 // 4879, 5014). Stick to that shape so anyone grepping
-                // response_store for `tar-` finds viz fetcher dispatches too,
+                // response_store for `echo-` finds viz fetcher dispatches too,
                 // and so the `<plugin>-` prefix doesn't lie about the actual
                 // wire plugin (gov R3 C-3).
                 const auto command_id =
-                    "tar-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+                    "echo-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 
                 // PR1.9c: the ONE builder, under an explicit system caller —
-                // `tar.fleet_snapshot` is `system_reserved` (never a
+                // `echo.fleet_snapshot` is `system_reserved` (never a
                 // caller-attributable RBAC decision, capdecls::
                 // core_dispatch_capabilities.hpp).
                 auto classified = build_classified_command(
-                    yuzu::server::DispatchCaller{.system = true}, "tar", "fleet_snapshot",
+                    yuzu::server::DispatchCaller{.system = true}, "echo", "fleet_snapshot",
                     command_id);
                 if (!classified)
                     return out; // denied/unclassified — already counted + logged
@@ -5597,12 +5597,12 @@ public:
                 std::unordered_set<std::string> dispatched;
                 dispatched.reserve(agent_ids.size());
                 for (const auto& aid : agent_ids) {
-                    // #881: system_reserved internal push (tar.fleet_snapshot),
+                    // #881: system_reserved internal push (echo.fleet_snapshot),
                     // not operator instruction dispatch — deliberately NOT
                     // quarantine-gated (see dispatch_confined_arms.hpp).
                     if (send_system_reserved(
                             aid, *classified,
-                            yuzu::server::SystemReservedPush::tar_fleet_snapshot))
+                            yuzu::server::SystemReservedPush::echo_fleet_snapshot))
                         dispatched.insert(aid);
                 }
                 forward_gateway_pending();
@@ -5625,7 +5625,7 @@ public:
                     // Degrade → empty this iteration; the poll loop retries
                     // until the deadline (deny-or-benign, not authz — ADR-0039).
                     // #4990: internal consumer. Reads back the server's own system-caller
-                    // tar.fleet_snapshot dispatch for the topology graph; never returned as rows.
+                    // echo.fleet_snapshot dispatch for the topology graph; never returned as rows.
                     auto rows = response_store_
                                     ->query(command_id,
                                             ResponseTierFilter::unrestricted_internal_consumer(), q)
@@ -5735,7 +5735,7 @@ public:
 
             // Gate 7 UP-9 / hp-S1 — roster provider. The push path skips
             // the dispatch fetcher, so a registered agent that has not
-            // pushed (legacy build mid rolling-upgrade, TAR plugin off,
+            // pushed (legacy build mid rolling-upgrade, Echo plugin off,
             // wedged first-cycle pump) would silently vanish from the
             // topology. The store consults this to emit a stale placeholder
             // cube for every registered-but-unpushed agent. Session-sourced
@@ -5931,7 +5931,7 @@ public:
                 (void)audit_store_->log(ev);
             }
 
-            // #1567: tar.db corruption audit. AgentHealthStore surfaces candidates
+            // #1567: echo.db corruption audit. AgentHealthStore surfaces candidates
             // from heartbeat tags; the gate dedups DURABLY against the audit store
             // itself (one row per agent + quarantine identity across health-store
             // prunes, server restarts and HA node switches).
@@ -5941,7 +5941,7 @@ public:
                     if (!audit_store_ || !audit_store_->is_open())
                         return std::nullopt;
                     AuditQuery q;
-                    q.action = detail::kTarCorruptionAuditAction;
+                    q.action = detail::kEchoCorruptionAuditAction;
                     q.target_id = agent_id;
                     q.limit = 1;
                     auto rows = audit_store_->query(q);
@@ -5949,9 +5949,9 @@ public:
                         return std::nullopt; // degraded store: retry on a later heartbeat
                     if (rows->empty())
                         return std::optional<std::string>{};
-                    return detail::decode_tar_quarantine_from_detail(rows->front().detail);
+                    return detail::decode_echo_quarantine_from_detail(rows->front().detail);
                 };
-                auto gate = std::make_shared<detail::TarCorruptionAuditGate>(std::move(latest));
+                auto gate = std::make_shared<detail::EchoCorruptionAuditGate>(std::move(latest));
                 health_store_.set_corruption_sink([this, gate](const std::string& agent_id,
                                                                int64_t total,
                                                                const std::string& quarantine) {
@@ -5961,17 +5961,17 @@ public:
                         return;
                     // Reservation completes the slot even if AuditEvent construction
                     // or audit_store_->log() throws (log() is not noexcept).
-                    detail::TarCorruptionAuditGate::Reservation res(*gate);
+                    detail::EchoCorruptionAuditGate::Reservation res(*gate);
                     AuditEvent ev;
                     ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
                                        std::chrono::system_clock::now().time_since_epoch())
                                        .count();
                     ev.principal = "system";
                     ev.principal_role = "system";
-                    ev.action = detail::kTarCorruptionAuditAction;
-                    ev.target_type = detail::kTarCorruptionAuditTargetType;
+                    ev.action = detail::kEchoCorruptionAuditAction;
+                    ev.target_type = detail::kEchoCorruptionAuditTargetType;
                     ev.target_id = agent_id;
-                    ev.detail = detail::encode_tar_corruption_detail(total, quarantine);
+                    ev.detail = detail::encode_echo_corruption_detail(total, quarantine);
                     ev.result = "success";
                     if (audit_store_->log(ev))
                         res.logged(agent_id, quarantine);
@@ -7003,7 +7003,7 @@ public:
             // #1453 — make device visibility honor the RBAC-disabled posture.
             // When RBAC is globally off there are no per-user
             // management_group_roles rows, so get_visible_agents would return an
-            // empty set and the legacy-admin superuser would see no agents (TAR
+            // empty set and the legacy-admin superuser would see no agents (Echo
             // fleet scan, /api/me visible-agents). The probe lets the store
             // return the full enrolled set in that case; when RBAC is enabled it
             // reports true and the exact role-scoped join is preserved. Reads the
@@ -7011,7 +7011,7 @@ public:
             // does not matter.
             //
             // #1498 — the predicate fails CLOSED on a missing or load-failed
-            // store, so a corrupt rbac.db can never widen TAR fleet-scan
+            // store, so a corrupt rbac.db can never widen Echo fleet-scan
             // visibility to the whole fleet.
             mgmt_group_store_->set_rbac_enabled_probe(
                 [this]() { return rbac_enforcement_in_effect(rbac_store_.get()); });
@@ -12908,7 +12908,7 @@ private:
     /// agent `send_to` only QUEUES it, so this is acceptance, never delivery.
     ///
     /// HA WS-5 KNOWN LIMITATION (external review, 2026-09-22, accepted —
-    /// not fixed this slice): callers (Guardian rule push, TAR fleet
+    /// not fixed this slice): callers (Guardian rule push, Echo fleet
     /// snapshot) can select a target `agent_id` from a presence-widened
     /// candidate set (`AgentRegistry::all_ids()`/`evaluate_scope()`), but
     /// this helper calls `registry_.send_to` directly with NO
@@ -12950,7 +12950,7 @@ private:
     }
 
     /// Sync-on-demand (`__sync__.now {source}`): a system-reserved push to each id under ONE
-    /// command id and ONE gateway flush (the TAR fleet_snapshot shape). This is the
+    /// command id and ONE gateway flush (the Echo fleet_snapshot shape). This is the
     /// Guardian-push path (build_classified_command(system) + send_system_reserved +
     /// forward_gateway_pending) - NOT dispatch_confined, which would withhold `__sync__` as a
     /// plugin no agent advertises (#3511). Authorization and targeting belong to the caller:
@@ -13212,7 +13212,7 @@ private:
         // #4990 (UP-7): the SERVER's record of this dispatch, written once, here, at the one
         // chokepoint every operator, background and system dispatch passes through (REST
         // /api/command, dispatch_confined, the scheduler/outbox/workflow/policy/preflight/
-        // deployment/bundle/quarantine/TAR/DEX callers, the viz fetcher, the __guard__ push, the
+        // deployment/bundle/quarantine/Echo/DEX callers, the viz fetcher, the __guard__ push, the
         // asset-tag and __sync__ pushes, the legacy forwarder), AFTER classification,
         // authorization and the kill switch (a denied dispatch records nothing and sends
         // nothing) and BEFORE any frame is sent (a sub-millisecond loopback agent can reply
@@ -13261,7 +13261,8 @@ private:
         return yuzu::server::ConfinedDispatchSink{
             [this, &cmd, route_fallback](const std::string& aid) {
                 if (auto cluster = route_fallback->cluster_for(aid))
-                    return registry_.send_via_directory(aid, cmd, *cluster);
+                    return registry_.send_via_directory(aid, cmd, *cluster,
+                                                    route_fallback->legacy_wire_for(aid));
                 return registry_.send_to(aid, cmd);
             },
             [this, &cmd] { return registry_.send_to_all(cmd); },
@@ -13452,7 +13453,7 @@ private:
     /// three DispatchFn/CommandDispatchFn typedefs that feed it
     /// (McpServer::DispatchFn, DashboardRoutes::DispatchFn,
     /// WorkflowRoutes::CommandDispatchFn); every fake dispatch lambda in
-    /// test_mcp_server.cpp / test_dashboard_tar_fragments.cpp /
+    /// test_mcp_server.cpp / test_dashboard_echo_fragments.cpp /
     /// test_workflow_routes.cpp was updated for the signature-only change.
     /// `BundleOrchestrator::DispatchFn` (execute_bundle) is signature-identical
     /// to `McpServer::DispatchFn` — PR1.9c removed the old adapter, and its
@@ -16093,11 +16094,6 @@ private:
             .registry = &registry_,
         });
 
-        // Groups and enrolment page (Phase 2 UI): GET /groups and its script. The page's
-        // panels are the existing /fragments/settings/{tokens,pending,auto-approve}.
-        yuzu::server::groups::register_groups_routes(
-            inline_sink, yuzu::server::groups::Deps{.auth_fn = auth_fn});
-
         // #2542 follow-up: 7 dashboard/API routes with no single owning store
         // (/api/me, /api/agents, /api/audit, /api/export/json-to-csv,
         // /api/scope/validate, /api/analytics/{status,recent}), extracted
@@ -16147,6 +16143,41 @@ private:
                                     const std::string& op) -> yuzu::server::authz::FleetReadGate {
             return require_fleet_read(req, res, type, op);
         };
+        // Groups and enrolment page (Phase 2 UI): GET /groups, its script and the read-only
+        // management-group fragments. The enrolment panels are the existing
+        // /fragments/settings/{tokens,pending,auto-approve}. Registered here, after
+        // fleet_read_fn, because the members fragment's sole gate is that closure. Every store
+        // read is the degrade-distinguishable "_checked" twin; a null store reads as a degrade.
+        yuzu::server::groups::register_groups_routes(
+            inline_sink,
+            yuzu::server::groups::Deps{
+                .auth_fn = auth_fn,
+                .perm_fn = perm_fn,
+                .fleet_read_fn = fleet_read_fn,
+                .list_groups_fn =
+                    [this] {
+                        return mgmt_group_store_ ? mgmt_group_store_->list_groups_checked()
+                                                 : std::nullopt;
+                    },
+                .group_fn =
+                    [this](const std::string& id)
+                        -> std::expected<std::optional<ManagementGroup>, std::string> {
+                    if (!mgmt_group_store_)
+                        return std::unexpected(std::string("store not constructed"));
+                    return mgmt_group_store_->get_group_checked(id);
+                },
+                .members_fn =
+                    [this](const std::string& id) {
+                        return mgmt_group_store_ ? mgmt_group_store_->get_members_checked(id)
+                                                 : std::nullopt;
+                    },
+                .member_counts_fn =
+                    [this] {
+                        return mgmt_group_store_
+                                   ? mgmt_group_store_->count_members_by_group_checked()
+                                   : std::nullopt;
+                    },
+            });
         // Panel variants for the Dashboard fragments: same decision path, no denial audit
         // row (a page that renders panels per caller must not write rows for figures it
         // merely chose not to draw). The decision is identical to the loud gate's; only the
@@ -18148,7 +18179,7 @@ private:
                             // Membership: every responder whose (status,
                             // output) satisfies the pending row's matcher.
                             // rs_matcher centralises the per-producer rule —
-                            // empty matcher = SUCCESS responders; tar_rows_ge
+                            // empty matcher = SUCCESS responders; echo_rows_ge
                             // = SUCCESS with ≥N rows; column/op/value = a
                             // matching output row (PR-D, design §3.3).
                             // #4990: the read excludes the Forensics plugins (see
@@ -18891,9 +18922,9 @@ private:
         dex_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, guaranteed_state_store_.get(), dex_fleet_fn,
             audit_fn,
-            // A4 device perf panel: canned tar.sql dispatch through the shared
+            // A4 device perf panel: canned echo.sql dispatch through the shared
             // chokepoint (untracked path — empty execution_id, same posture as
-            // the dashboard TAR SQL surface).
+            // the dashboard Echo SQL surface).
             [command_dispatch_fn](const std::string& plugin, const std::string& action,
                                   const std::vector<std::string>& agent_ids,
                                   const std::string& scope_expr,
@@ -19010,8 +19041,8 @@ private:
         // and MCP list_agents/get_agent_details use, so all three surfaces can never
         // disagree. `make_device_row`/`devices_fn`/`lookup_fn` above are NOT retired
         // by this rewire — they are shared infrastructure with other live consumers
-        // (PreflightRoutes, DeploymentRoutes, TarTreeRoutes, and McpServer's/
-        // TarTreeRoutes' `set_all_devices_fn`), unrelated to DeviceRoutes itself.
+        // (PreflightRoutes, DeploymentRoutes, EchoTreeRoutes, and McpServer's/
+        // EchoTreeRoutes' `set_all_devices_fn`), unrelated to DeviceRoutes itself.
         auto device_api = make_local_device_api(registry_, tag_store_.get());
         // The customer score policy is one stored document read through a
         // bounded-refresh provider, so every instance converges within
@@ -19099,7 +19130,7 @@ private:
             // shared chokepoint — the live-snapshot cards (processes/list_tree +
             // network_diag/connections, services/list, users/logged_on,
             // network_config/{ip_addresses,arp,dns_cache}, network_diag/listening +
-            // connections, tar/status) plus os_info/uptime for the KPI. DELIBERATELY an
+            // connections, echo/status) plus os_info/uptime for the KPI. DELIBERATELY an
             // UNTRACKED dispatch (empty execution_id → no ExecutionTracker row, not in
             // the executions drawer): the snapshot auto-fires one query per card when an
             // operator clicks Get live info, so tracking would flood the drawer with a
@@ -19263,7 +19294,7 @@ private:
             // Round-3 Devices-page merge: agent version/arch (session-sourced,
             // online rows only — an offline row's version/arch come from the
             // endpoint_state v2 columns via the CI-attach step above, not here),
-            // live IPs (TAR fleet-snapshot claims, online-only, 60 s cache), and
+            // live IPs (Echo fleet-snapshot claims, online-only, 60 s cache), and
             // tags (bulk-preloaded, two queries for the whole roster — never a
             // per-row store call, matching the tag-compliance dashboard's own
             // ADR-0050 discipline above).
@@ -20121,22 +20152,22 @@ private:
             // reserves for a genuine `.system = true` background dispatcher only.
             [this](const auth::Session& sess) { return derive_exec_visible(sess); });
 
-        // TarTreeRoutes — /tar Frame 3 process tree viewer. Reuses DeviceRoutes'
+        // EchoTreeRoutes — /echo Frame 3 process tree viewer. Reuses DeviceRoutes'
         // scoped device picker (devices_fn) + identity lookup (lookup_fn) + the SAME
         // untracked dispatch (execution_id="" → not in the executions drawer, like the
         // device live-info + DEX-perf reads) and the narrow ResponseStore seam. It
-        // dispatches two canned read-only tar.sql ($Process_Live + $TCP_Live) to ONE
+        // dispatches two canned read-only echo.sql ($Process_Live + $TCP_Live) to ONE
         // host and reconstructs the tree server-side (recursive CTEs are blocked on the
-        // agent). Per-host only; data from the agent's local tar.db only.
-        tar_tree_routes_ = std::make_unique<TarTreeRoutes>();
-        tar_tree_routes_->register_routes(
+        // agent). Per-host only; data from the agent's local echo.db only.
+        echo_tree_routes_ = std::make_unique<EchoTreeRoutes>();
+        echo_tree_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
             // Review finding (#3133): was command_dispatch_fn (hardcoded
             // system=true, unfiltered) — the capture-source push dispatches
-            // the mutating, Infrastructure:Write-classified tar.configure
+            // the mutating, Infrastructure:Write-classified echo.configure
             // action, and this route only ever gated Infrastructure:Read.
             // Now forwards through command_dispatch_caller_fn with the real
-            // caller TarTreeRoutes derives via caller_fn below, so the
+            // caller EchoTreeRoutes derives via caller_fn below, so the
             // chokepoint's own classify+authorize check actually runs.
             [command_dispatch_caller_fn](
                 const std::string& plugin, const std::string& action,
@@ -20175,21 +20206,21 @@ private:
             });
         // #4027 fix round (CDX-P1-01/K4) — the SAME fleet_read_fn lambda wired
         // into dashboard_routes_/mcp_server_ below/elsewhere (#3290 Phase 2), so
-        // the two REST device-picker twins (`GET /api/v1/tar/process-tree`,
-        // `GET /api/v1/tar/capture-sources`) apply the real ADR-0017
+        // the two REST device-picker twins (`GET /api/v1/echo/process-tree`,
+        // `GET /api/v1/echo/capture-sources`) apply the real ADR-0017
         // admit-then-filter chokepoint instead of the bare `require_permission`
         // they shipped with. Injected via setter (not a register_routes param)
         // so this doesn't churn the call above or any test fixture's call —
         // an un-set fn fails closed (503 unwired), same contract as
         // DashboardRoutes'/McpServer's own fleet_read_fn seam. The two
-        // pre-existing `/fragments/tar/...` HTML routes stay on perm_fn_ this
+        // pre-existing `/fragments/echo/...` HTML routes stay on perm_fn_ this
         // round — see the recorded-exception comment at their registration.
-        tar_tree_routes_->set_fleet_read_fn(fleet_read_fn);
+        echo_tree_routes_->set_fleet_read_fn(fleet_read_fn);
         // #4143 review fix — same unfiltered source list_agents' agents_fn and
         // GET /api/v1/devices (#4033) read from; gate.scope (fleet_read_fn_
         // above) is the SOLE filter now, not an intersection with devices_fn's
         // direct-membership pre-filter. See set_all_devices_fn's doc comment.
-        tar_tree_routes_->set_all_devices_fn([this, make_device_row]() -> std::vector<DeviceRow> {
+        echo_tree_routes_->set_all_devices_fn([this, make_device_row]() -> std::vector<DeviceRow> {
             std::vector<DeviceRow> out;
             auto arr = registry_.to_json_obj();
             out.reserve(arr.size());
@@ -21636,7 +21667,7 @@ private:
             // This wiring was the bug. RestApiV1 was handed the 6-arg system
             // closure (exec_visible hardcoded nullopt = unfiltered, correct only
             // for background engines), and the async result-set producers
-            // (from-tar-query / from-instruction-result / re-eval) dispatched
+            // (from-echo-query / from-instruction-result / re-eval) dispatched
             // through it — so a service-scoped token, admitted by their bare
             // global Execution:Execute gate, reached every connected agent
             // instead of its own service. RestApiV1::CommandDispatchFn is now
@@ -22125,25 +22156,67 @@ private:
             // closure instances HardwareRoutes::Deps received above (roster, CI detail,
             // DEX score, quarantine list, fleet_read_fn gate, audit_fn), never a store
             // pointer, so an MCP twin cannot observe a different composition than REST.
-            mcp_server_->set_tool_deps(mcp::ToolDeps{.fleet_read_fn = fleet_read_fn,
-                                                     .audit_fn = audit_fn,
-                                                     .roster_fn = build_hw_roster,
-                                                     .ci_detail_fn = hw_ci_detail_fn,
-                                                     .dex_score_fn = hw_dex_score_fn,
-                                                     .quarantine_list_fn = hw_quarantine_list_fn});
-            // /crypto slice 1: the SAME CryptoApi instance CryptoRoutes serves, so
-            // get_crypto_libraries / list_crypto_library_devices cannot disagree with the
-            // page or the REST twins. Null (no inventory store) -> the tools answer an
-            // internal error, never an empty result.
-            mcp_server_->set_crypto_api(crypto_api_);
+            // Assigned member by member rather than designated-initialised: the /crypto
+            // closures below are set conditionally.
+            mcp::ToolDeps tool_deps;
+            tool_deps.fleet_read_fn = fleet_read_fn;
+            tool_deps.audit_fn = audit_fn;
+            tool_deps.roster_fn = build_hw_roster;
+            tool_deps.ci_detail_fn = hw_ci_detail_fn;
+            tool_deps.dex_score_fn = hw_dex_score_fn;
+            tool_deps.quarantine_list_fn = hw_quarantine_list_fn;
             // /crypto widgets: list_crypto_widgets' availability, get_crypto_ca_stats' R2
             // withhold and list_issued_certs' filtered form use the SAME callback as the REST
-            // routes and the dashboard.
-            mcp_server_->set_crypto_access_fn(
+            // routes and the dashboard. One instance feeds both consumers below: the seven
+            // registry-resident /crypto tools (ToolDeps::crypto_access_fn) and the
+            // `list_issued_certs` branch that stays in mcp_server.cpp (set_crypto_access_fn).
+            const mcp::ToolDeps::CryptoAccessFn crypto_access_cb =
                 [this](const httplib::Request& req, crypto_widgets::WidgetGate g,
                        const std::string& type, const std::string& op) {
                     return crypto_access(req, g, type, op);
-                });
+                };
+            // /crypto slice 1: the SAME CryptoApi instance CryptoRoutes serves, reached by the
+            // registry tools only through these forwarding closures (ToolDeps holds provider
+            // closures, never the seam object), so get_crypto_libraries /
+            // list_crypto_library_devices / export_crypto_cbom / the widget and CA-stats twins
+            // cannot disagree with the page or the REST twins. Null (no inventory store) leaves
+            // every closure EMPTY -> the tools answer an internal error, never an empty result.
+            if (crypto_api_) {
+                const std::shared_ptr<const CryptoApi> api = crypto_api_;
+                tool_deps.crypto_library_summary_fn = [api](const CryptoSummaryQuery& q,
+                                                            const authz::VisibleSet& scope) {
+                    return api->library_summary(q, scope);
+                };
+                tool_deps.crypto_library_devices_fn = [api](const CryptoDevicesQuery& q,
+                                                            const authz::VisibleSet& scope) {
+                    return api->library_devices(q, scope);
+                };
+                tool_deps.crypto_ca_stats_fn = [api](std::optional<std::int64_t> as_of) {
+                    return api->ca_stats(as_of);
+                };
+                tool_deps.crypto_dashboard_layout_fn = [api](const std::string& username) {
+                    return api->dashboard_layout(username);
+                };
+                tool_deps.crypto_set_dashboard_layout_fn =
+                    [api](const std::string& username, const std::vector<std::string>& widgets,
+                          std::optional<std::int64_t> expected_version) {
+                        return api->set_dashboard_layout(username, widgets, expected_version);
+                    };
+            }
+            tool_deps.crypto_access_fn = crypto_access_cb;
+            // The registry path carries no session, and the two dashboard-layout tools key the
+            // caller's OWN layout on the session username: re-resolve it from the request, the
+            // way crypto_access does for the gate (a request that just authenticated resolves;
+            // an unresolvable one makes the tool fail closed).
+            tool_deps.username_fn = [this](const httplib::Request& req)
+                -> std::optional<std::string> {
+                if (auto session = auth_routes_->resolve_session(req))
+                    return session->username;
+                return std::nullopt;
+            };
+            mcp_server_->set_tool_deps(std::move(tool_deps));
+            mcp_server_->set_crypto_api(crypto_api_);
+            mcp_server_->set_crypto_access_fn(crypto_access_cb);
             // #4037 — the SAME list_read_fn lambda wired into the REST
             // registration's trailing list_read_fn param below, so the REST
             // GET /guaranteed-state/status and MCP get_guardian_status twins
@@ -22169,7 +22242,7 @@ private:
             // (registered well above, in the same function, before MCP setup
             // begins).
             // #4143 review fix — see mcp_server.hpp's set_all_devices_fn doc
-            // comment; identical lambda wired into tar_tree_routes_ above so
+            // comment; identical lambda wired into echo_tree_routes_ above so
             // both transports read from the exact same unfiltered snapshot.
             mcp_server_->set_all_devices_fn([this, make_device_row]() -> std::vector<DeviceRow> {
                 std::vector<DeviceRow> out;
@@ -22767,7 +22840,8 @@ private:
         const yuzu::server::ConfinedDispatchSink sink{
             [&](const std::string& aid) {
                 if (auto cluster = legacy_route_fallback->cluster_for(aid))
-                    return registry_.send_via_directory(aid, *classified, *cluster);
+                    return registry_.send_via_directory(
+                        aid, *classified, *cluster, legacy_route_fallback->legacy_wire_for(aid));
                 return registry_.send_to(aid, *classified);
             },
             [&] { return registry_.send_to_all(*classified); },
@@ -23258,7 +23332,7 @@ private:
     std::unique_ptr<PreflightRoutes> preflight_routes_;
     std::unique_ptr<VerifyRoutes> verify_routes_;
     std::unique_ptr<DeploymentRoutes> deployment_routes_;
-    std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
+    std::unique_ptr<EchoTreeRoutes> echo_tree_routes_;
     // Guardian push fan-out, shared by baseline deploy / delete of a deployed Baseline, the
     // REST /push endpoint and the MCP push. Assigned during REST wiring (the `(guardian_push_fn_ =
     // ...)` site); GuardianRoutes captures `this` and reads it when a baseline deploy or

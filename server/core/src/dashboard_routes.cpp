@@ -9,7 +9,7 @@
 #include "forensics_read_audit.hpp" // #4990: response.forensics.read
 #include "rest_audit.hpp" // detail::try_persist_audit (E-1: audit-before-dispatch)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, make_correlation_id (#4027 REST twin)
-#include "tar_tree_routes.hpp" // TarRetentionPausedScan/TarPausedSourceRow/tar_retention_paused_json (#4027)
+#include "echo_tree_routes.hpp" // EchoRetentionPausedScan/EchoPausedSourceRow/echo_retention_paused_json (#4027)
 
 #include <algorithm>
 #include <chrono>
@@ -48,7 +48,7 @@ static int clamp(int val, int lo, int hi) {
 
 // -- Helper: format epoch seconds as a coarse "Xd Yh ago" age -----------------
 //
-// Used by the TAR retention-paused list. Intentionally coarse: operators care
+// Used by the Echo retention-paused list. Intentionally coarse: operators care
 // about "this has been paused for days/hours" not seconds. Returns "—" for 0
 // (sentinel for "never paused").
 static std::string format_age(int64_t epoch_then, int64_t now_epoch) {
@@ -260,32 +260,32 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     visible_set_fn_ = std::move(visible_set_fn);
 
     // Phase 15.A — issue #547 metric registrations. The design doc
-    // (docs/tar-dashboard.md §7) defines the catalog; PR-A implements the
+    // (docs/echo-dashboard.md §7) defines the catalog; PR-A implements the
     // two that are operational today (the rest land with their owning PRs).
     if (metrics_) {
         metrics_->describe(
-            "yuzu_tar_dashboard_view_total",
-            "Operator views of the TAR dashboard fragments by frame and result.",
+            "yuzu_echo_dashboard_view_total",
+            "Operator views of the Echo dashboard fragments by frame and result.",
             "counter");
         metrics_->describe(
-            "yuzu_tar_retention_paused_devices",
-            "Number of devices currently reporting a paused TAR source, by source name. "
+            "yuzu_echo_retention_paused_devices",
+            "Number of devices currently reporting a paused Echo source, by source name. "
             "Holds the last complete scan's value: a scan cut by the response-read cap does "
             "not update it.",
             "gauge");
         metrics_->describe(
-            "yuzu_tar_scan_dispatched_total",
-            "Operator-triggered tar.status scans dispatched by result (success / "
+            "yuzu_echo_scan_dispatched_total",
+            "Operator-triggered echo.status scans dispatched by result (success / "
             "rate_limited / no_visible_agents / no_connected_agents / denied).",
             "counter");
         metrics_->describe(
-            "yuzu_tar_source_reenable_total",
-            "Operator-triggered TAR source re-enable attempts by result "
+            "yuzu_echo_source_reenable_total",
+            "Operator-triggered Echo source re-enable attempts by result "
             "(success / scope_violation / agent_not_connected / denied / invalid_input).",
             "counter");
         metrics_->describe(
-            "yuzu_tar_source_purge_total",
-            "Operator-triggered TAR retention-paused source purge (destructive) attempts by "
+            "yuzu_echo_source_purge_total",
+            "Operator-triggered Echo retention-paused source purge (destructive) attempts by "
             "result (success / scope_violation / agent_not_connected / denied / invalid_input). "
             "Counts DISPATCH outcomes; the agent's rows_deleted / source_not_paused outcome is in "
             "the command response record.",
@@ -508,7 +508,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // The body is now principal-specific (confined per caller's
                 // visible scope) rather than fleet-common, so an unpartitioned
                 // shared cache would replay one operator's facet values to
-                // another — same guard the per-operator TAR fragments use.
+                // another — same guard the per-operator Echo fragments use.
                 res.set_header("Cache-Control", "no-store, private");
                 res.set_header("Vary", "Cookie");
                 res.set_content(html, "text/html; charset=utf-8");
@@ -644,7 +644,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto session = auth_fn_(req, res);
                  if (!session) return;
 
-                 // CSRF same-site gate (parity with the TAR re-enable/purge
+                 // CSRF same-site gate (parity with the Echo re-enable/purge
                  // fragments; defense-in-depth on top of SameSite=Lax, which
                  // does not stop a same-site sibling origin). This route
                  // materialises management-group membership and had no such
@@ -899,7 +899,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // never matches the literal `scope=` needle `extract_form_value`
                  // scans for — so encoding the key name reopened exactly the
                  // supplied-vs-omitted collapse CDX-R8-01 closed. Mirrors
-                 // tar-execute's identical fix below.
+                 // echo-execute's identical fix below.
                  auto scope = req.get_param_value("scope");
                  if (scope.empty())
                      scope = extract_form_value(req.body, "scope");
@@ -1149,7 +1149,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // ServerImpl::dispatch_confined instead and was left
                  // untargeted-fan-out-capable for every Destructive row that
                  // does not additionally carry ExecuteGate::AdminOrApproval —
-                 // tar.purge_source, registry.delete_key, filesystem
+                 // echo.purge_source, registry.delete_key, filesystem
                  // .delete_lines, tags.clear, storage.clear and the rest.
                  //
                  // SAME chokepoint, not a copy: evaluate_destructive_targeting
@@ -1288,7 +1288,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                              // answers in its own idiom for the reason given in
                              // the RefuseUntargeted arm. Audited as a scope
                              // violation, matching the sibling destructive
-                             // fragment (tar retention-paused purge) — as of
+                             // fragment (echo retention-paused purge) — as of
                              // #2557's fix #5, /api/command now ALSO audits
                              // and counts this arm (it previously audited
                              // nothing here) — an operator dropped by
@@ -1539,8 +1539,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  res.set_content(html, "text/html; charset=utf-8");
              });
 
-    // -- POST /api/dashboard/tar-execute (TAR warehouse SQL query) -------------
-    sink.Post("/api/dashboard/tar-execute",
+    // -- POST /api/dashboard/echo-execute (Echo warehouse SQL query) -------------
+    sink.Post("/api/dashboard/echo-execute",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "Execution", "Execute")) return;
                  if (refuse_cross_site_write(req, res)) return;
@@ -1589,7 +1589,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                  }
 
-                 // CDX-R8-01, the TAR sibling of the execute route above: tell a
+                 // CDX-R8-01, the Echo sibling of the execute route above: tell a
                  // SUPPLIED-but-empty `scope=` apart from an omitted one, and pass
                  // `__all__` through by NAME instead of stripping it to empty+empty.
                  //
@@ -1631,7 +1631,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                : yuzu::server::DispatchCaller{
                                      .exec_visible = yuzu::server::authz::deny_all()};
                  auto dispatch_outcome =
-                     dispatch_fn_("tar", "sql", agent_ids, scope_expr, params, caller);
+                     dispatch_fn_("echo", "sql", agent_ids, scope_expr, params, caller);
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
 
@@ -1654,7 +1654,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  html += "<span id=\"status-badge\" class=\"badge-running\""
                          " hx-swap-oob=\"outerHTML\">RUNNING</span>";
                  html += "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " class=\"result-context\">TAR SQL &rarr; " +
+                         " class=\"result-context\">Echo SQL &rarr; " +
                          std::to_string(sent) + " agent" +
                          (sent != 1 ? "s" : "") + "</span>";
                  html += "<strong id=\"row-count\" hx-swap-oob=\"true\">0</strong>";
@@ -1662,12 +1662,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  html += "<div id=\"result-summary\" hx-swap-oob=\"true\"></div>";
 
                  res.set_header("HX-Trigger",
-                     "{\"showToast\":{\"message\":\"TAR query sent to " +
+                     "{\"showToast\":{\"message\":\"Echo query sent to " +
                      std::to_string(sent) +
                      " agent(s)\",\"level\":\"success\"}}");
 
-                 audit_fn_(req, "tar.sql", "success", "command", command_id,
-                          "TAR SQL -> " + std::to_string(sent) + " agent(s)");
+                 audit_fn_(req, "echo.sql", "success", "command", command_id,
+                          "Echo SQL -> " + std::to_string(sent) + " agent(s)");
 
                  res.set_content(html, "text/html; charset=utf-8");
              });
@@ -1686,14 +1686,14 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
-    // -- TAR retention-paused source list (Phase 15.A — issue #547) -----------
+    // -- Echo retention-paused source list (Phase 15.A — issue #547) -----------
     //
     // GET renders the table for the calling operator from THEIR most-recent
-    // tar.status scan (per-username state); POST dispatches a fresh scan
+    // echo.status scan (per-username state); POST dispatches a fresh scan
     // **scoped to the operator's visible agents** and records the new
     // command_id under the username key. Both routes filter rendered
     // responses by the operator's visible agent set so an operator without
-    // visibility on a device cannot see its TAR config even via cached
+    // visibility on a device cannot see its Echo config even via cached
     // scan results.
     //
     // Permission tiers (after Gate 2 hardening):
@@ -1706,11 +1706,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     // fleet on every page load — the dispatch is an explicit operator action,
     // surfaced in the audit trail.
 
-    sink.Get("/fragments/tar/retention-paused",
+    sink.Get("/fragments/echo/retention-paused",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "Infrastructure", "Read")) {
                     if (metrics_) {
-                        metrics_->counter("yuzu_tar_dashboard_view_total",
+                        metrics_->counter("yuzu_echo_dashboard_view_total",
                                           {{"frame", "retention"},
                                            {"result", "denied"}}).increment();
                     }
@@ -1735,10 +1735,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 bool can_execute = perm_fn_(req, perm_probe, "Execution", "Execute");
                 bool can_delete = perm_fn_(req, perm_probe, "Infrastructure", "Delete");
                 res.set_content(
-                    render_tar_retention_paused(session->username, can_execute, can_delete),
+                    render_echo_retention_paused(session->username, can_execute, can_delete),
                     "text/html; charset=utf-8");
                 if (metrics_) {
-                    metrics_->counter("yuzu_tar_dashboard_view_total",
+                    metrics_->counter("yuzu_echo_dashboard_view_total",
                                       {{"frame", "retention"},
                                        {"result", "success"}}).increment();
                 }
@@ -1753,7 +1753,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     //
     // #4027 fix round (CDX-P1-01/K4): gate migrated from bare perm_fn_
     // (require_permission — a GLOBAL grant check that 403s a management-group
-    // -scoped Infrastructure:Read holder before gather_tar_retention_paused
+    // -scoped Infrastructure:Read holder before gather_echo_retention_paused
     // ever runs) to fleet_read_fn_ (require_fleet_read, the ADR-0017
     // admit-then-filter chokepoint) — same seam this class already wires for
     // /fragments/results above. The explicit service-scoped-token 403 BELOW is
@@ -1761,12 +1761,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     // correctly-confined service-scoped caller here: this route previously
     // denied EVERY service-scoped token outright (perm_fn_'s empty
     // kServiceScopeGlobalSafe default-deny), matching this tool's own
-    // list_tar_retention_paused MCP twin (C8 ServiceScopeClass::denied) and the
+    // list_echo_retention_paused MCP twin (C8 ServiceScopeClass::denied) and the
     // two REST device-picker twins (deny_fleet_wide_device_enumeration) — this
     // fix round repairs the management-group-scope gap, not a decision to
     // widen service-token access on this one surface while its twins stay
     // denied.
-    sink.Get("/api/v1/tar/retention-paused",
+    sink.Get("/api/v1/echo/retention-paused",
             [this](const httplib::Request& req, httplib::Response& res) {
                 const auto cid = detail::make_correlation_id();
                 res.set_header("X-Correlation-Id", cid);
@@ -1786,17 +1786,17 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                             res, 403,
                             "service-scoped tokens may not read the fleet-wide retention scan"),
                         "application/json");
-                    audit_fn_(req, "tar.retention_paused.view", "denied", "Infrastructure", "",
+                    audit_fn_(req, "echo.retention_paused.view", "denied", "Infrastructure", "",
                              "service-scoped token denied fleet-wide retention scan read");
                     if (metrics_) {
-                        metrics_->counter("yuzu_tar_dashboard_view_total",
+                        metrics_->counter("yuzu_echo_dashboard_view_total",
                                           {{"frame", "retention_rest"},
                                            {"result", "denied"}}).increment();
                     }
                     return;
                 }
                 if (!fleet_read_fn_) {
-                    spdlog::error("tar.retention_paused: fleet_read_fn_ unwired — "
+                    spdlog::error("echo.retention_paused: fleet_read_fn_ unwired — "
                                   "misconfigured call site; failing closed; cid={}", cid);
                     res.status = 503;
                     res.set_content(detail::error_json_a4(503, "service unavailable", cid),
@@ -1806,7 +1806,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
                 if (!gate.admitted) {
                     if (metrics_) {
-                        metrics_->counter("yuzu_tar_dashboard_view_total",
+                        metrics_->counter("yuzu_echo_dashboard_view_total",
                                           {{"frame", "retention_rest"},
                                            {"result", "denied"}}).increment();
                     }
@@ -1816,33 +1816,33 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 res.set_header("Cache-Control", "no-store, private");
                 res.set_header("Vary", "Cookie");
                 // #4143 review fix: gate.scope is authoritative here — see
-                // gather_tar_retention_paused's doc comment.
-                const TarRetentionPausedScan scan = gather_tar_retention_paused(
+                // gather_echo_retention_paused's doc comment.
+                const EchoRetentionPausedScan scan = gather_echo_retention_paused(
                     session->username, gate.scope, /*extra_scope_is_authoritative=*/true);
                 res.set_content(
-                    std::string("{\"data\":") + tar_retention_paused_json(scan) +
+                    std::string("{\"data\":") + echo_retention_paused_json(scan) +
                         ",\"meta\":{\"api_version\":\"v1\"}}",
                     "application/json");
                 if (metrics_) {
-                    metrics_->counter("yuzu_tar_dashboard_view_total",
+                    metrics_->counter("yuzu_echo_dashboard_view_total",
                                       {{"frame", "retention_rest"},
                                        {"result", "success"}}).increment();
                 }
             });
 
-    sink.Post("/fragments/tar/retention-paused/scan",
+    sink.Post("/fragments/echo/retention-paused/scan",
              [this](const httplib::Request& req, httplib::Response& res) {
                  // Dispatching a command to the fleet is an Execute action,
                  // not a Read. Sibling dispatch handlers (`run-instruction`,
-                 // `tar-execute`) all gate on Execution:Execute — match.
+                 // `echo-execute`) all gate on Execution:Execute — match.
                  if (!perm_fn_(req, res, "Execution", "Execute")) {
                      // Compliance F1: emit a denied audit row so SIEM rules
                      // alerting on RBAC-rejection probing have a data source.
                      // Without this, the audit catalog overclaims coverage.
-                     audit_fn_(req, "tar.status.scan", "denied", "command",
+                     audit_fn_(req, "echo.status.scan", "denied", "command",
                               "", "rbac_denied");
                      if (metrics_) {
-                         metrics_->counter("yuzu_tar_scan_dispatched_total",
+                         metrics_->counter("yuzu_echo_scan_dispatched_total",
                                            {{"result", "denied"}}).increment();
                      }
                      return;
@@ -1859,14 +1859,14 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  // sre CAP-1: per-operator 30-second scan cooldown to defend
                  // against an operator (or compromised session) clicking Scan
-                 // in a tight loop and storming the fleet with tar.status
+                 // in a tight loop and storming the fleet with echo.status
                  // RPCs. Uses the already-stored dispatched_at field; no new
                  // state needed.
                  constexpr int64_t kScanCooldownSec = 30;
                  {
-                     std::lock_guard<std::mutex> lk(tar_scan_mu_);
-                     auto it = tar_scans_by_user_.find(session->username);
-                     if (it != tar_scans_by_user_.end()) {
+                     std::lock_guard<std::mutex> lk(echo_scan_mu_);
+                     auto it = echo_scans_by_user_.find(session->username);
+                     if (it != echo_scans_by_user_.end()) {
                          auto since = now_epoch() - it->second.dispatched_at;
                          if (since < kScanCooldownSec) {
                              res.status = 429;
@@ -1879,13 +1879,13 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                  kScanCooldownSec - since,
                                  (kScanCooldownSec - since) == 1 ? "" : "s"),
                                  "text/html; charset=utf-8");
-                             audit_fn_(req, "tar.status.scan", "denied",
+                             audit_fn_(req, "echo.status.scan", "denied",
                                       "command", "",
                                       std::format("rate_limited cooldown={}s",
                                                    kScanCooldownSec - since));
                              if (metrics_) {
                                  metrics_->counter(
-                                     "yuzu_tar_scan_dispatched_total",
+                                     "yuzu_echo_scan_dispatched_total",
                                      {{"result", "rate_limited"}}).increment();
                              }
                              return;
@@ -1911,14 +1911,14 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          "role assignments.</div>",
                          "text/html; charset=utf-8");
                      if (metrics_) {
-                         metrics_->counter("yuzu_tar_scan_dispatched_total",
+                         metrics_->counter("yuzu_echo_scan_dispatched_total",
                                            {{"result", "no_visible_agents"}}).increment();
                      }
                      return;
                  }
 
                  std::unordered_map<std::string, std::string> params;
-                 // CDX-R7-02: this TAR scan already narrows `agent_ids` by
+                 // CDX-R7-02: this Echo scan already narrows `agent_ids` by
                  // management-group (username) visibility above; ALSO narrow to
                  // the caller's Execution:Execute visible set via the shared
                  // dispatch_confined seam, so a service-scoped token cannot scan
@@ -1929,34 +1929,34 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                : yuzu::server::DispatchCaller{
                                      .exec_visible = yuzu::server::authz::deny_all()};
                  auto dispatch_outcome = dispatch_fn_(
-                     "tar", "status", agent_ids, /*scope_expr=*/"", params, caller);
+                     "echo", "status", agent_ids, /*scope_expr=*/"", params, caller);
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
 
                  {
-                     std::lock_guard<std::mutex> lk(tar_scan_mu_);
+                     std::lock_guard<std::mutex> lk(echo_scan_mu_);
                      // Bounded LRU: drop the oldest entry by dispatched_at if
                      // we'd exceed the cap. Keeps memory bounded across
                      // operator turnover without per-request fairness games.
-                     if (tar_scans_by_user_.size() >= kTarScanStateCap &&
-                         !tar_scans_by_user_.contains(session->username)) {
-                         auto oldest = tar_scans_by_user_.begin();
-                         for (auto it = tar_scans_by_user_.begin();
-                              it != tar_scans_by_user_.end(); ++it) {
+                     if (echo_scans_by_user_.size() >= kEchoScanStateCap &&
+                         !echo_scans_by_user_.contains(session->username)) {
+                         auto oldest = echo_scans_by_user_.begin();
+                         for (auto it = echo_scans_by_user_.begin();
+                              it != echo_scans_by_user_.end(); ++it) {
                              if (it->second.dispatched_at <
                                  oldest->second.dispatched_at) {
                                  oldest = it;
                              }
                          }
-                         tar_scans_by_user_.erase(oldest);
+                         echo_scans_by_user_.erase(oldest);
                      }
-                     auto& st = tar_scans_by_user_[session->username];
+                     auto& st = echo_scans_by_user_[session->username];
                      st.command_id = command_id;
                      st.dispatched_count = sent;
                      st.dispatched_at = now_epoch();
                  }
 
-                 audit_fn_(req, "tar.status.scan", "success", "command",
+                 audit_fn_(req, "echo.status.scan", "success", "command",
                           command_id,
                           std::format("dispatched to {} agent(s) in scope",
                                        sent));
@@ -1974,7 +1974,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          "{\"showToast\":{\"message\":\"No connected agents "
                          "in scope to scan\",\"level\":\"warning\"}}");
                      if (metrics_) {
-                         metrics_->counter("yuzu_tar_scan_dispatched_total",
+                         metrics_->counter("yuzu_echo_scan_dispatched_total",
                                            {{"result", "no_connected_agents"}}).increment();
                      }
                  } else {
@@ -1986,10 +1986,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          sent, sent == 1 ? "" : "s",
                          html_escape(std::string{command_id}));
                      res.set_header("HX-Trigger", std::format(
-                         "{{\"showToast\":{{\"message\":\"TAR scan dispatched "
+                         "{{\"showToast\":{{\"message\":\"Echo scan dispatched "
                          "to {} agent(s)\",\"level\":\"success\"}}}}", sent));
                      if (metrics_) {
-                         metrics_->counter("yuzu_tar_scan_dispatched_total",
+                         metrics_->counter("yuzu_echo_scan_dispatched_total",
                                            {{"result", "success"}}).increment();
                      }
                  }
@@ -2004,29 +2004,29 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  res.set_content(body, "text/html; charset=utf-8");
              });
 
-    // POST /fragments/tar/retention-paused/reenable
+    // POST /fragments/echo/retention-paused/reenable
     //   form params: device_id, source
     //
-    // Dispatches `tar.configure` with `<source>_enabled=true` to the single
+    // Dispatches `echo.configure` with `<source>_enabled=true` to the single
     // named device. Per-source independence (the #539 invariant) means this
     // does not touch the other three sources on the device.
     //
     // Permission: Execution:Execute (dispatches a configure command — same
-    // tier as run-instruction and tar-sql siblings; Gate 2 governance flagged
+    // tier as run-instruction and echo-sql siblings; Gate 2 governance flagged
     // the original Infrastructure:Update as a tier mismatch).
     //
     // RBAC scope: device_id MUST be in the operator's visible agents set;
     // out-of-scope device_ids are rejected with the same 404 body as
     // not-connected so non-operators cannot use this endpoint as an
     // existence-enumeration oracle.
-    sink.Post("/fragments/tar/retention-paused/reenable",
+    sink.Post("/fragments/echo/retention-paused/reenable",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "Execution", "Execute")) {
                      // Compliance F1: denied audit on RBAC rejection.
-                     audit_fn_(req, "tar.source.reenable", "denied",
+                     audit_fn_(req, "echo.source.reenable", "denied",
                               "command", "", "rbac_denied");
                      if (metrics_) {
-                         metrics_->counter("yuzu_tar_source_reenable_total",
+                         metrics_->counter("yuzu_echo_source_reenable_total",
                                            {{"result", "denied"}}).increment();
                      }
                      return;
@@ -2043,23 +2043,23 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          origin_is_same_site(req.get_header_value("Host"), origin, referer,
                                              csrf_trusted_origins_);
                      if (!same_site) {
-                         audit_fn_(req, "tar.source.reenable", "denied", "command", "",
+                         audit_fn_(req, "echo.source.reenable", "denied", "command", "",
                                    "csrf_cross_origin");
                          if (metrics_) {
-                             metrics_->counter("yuzu_tar_source_reenable_total",
+                             metrics_->counter("yuzu_echo_source_reenable_total",
                                                {{"result", "denied"}})
                                  .increment();
                          }
                          res.status = 403;
                          res.set_content(
-                             "<span class=\"tar-row-error\">Cross-origin request refused.</span>",
+                             "<span class=\"echo-row-error\">Cross-origin request refused.</span>",
                              "text/html; charset=utf-8");
                          return;
                      }
                  }
                  if (!dispatch_fn_) {
                      res.status = 503;
-                     res.set_content("<span class=\"tar-row-error\">Dispatch "
+                     res.set_content("<span class=\"echo-row-error\">Dispatch "
                                      "unavailable.</span>",
                                      "text/html; charset=utf-8");
                      return;
@@ -2074,12 +2074,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  if (device_id.empty() || source.empty()) {
                      res.status = 400;
-                     res.set_content("<span class=\"tar-row-error\">"
+                     res.set_content("<span class=\"echo-row-error\">"
                                      "device_id and source are required."
                                      "</span>",
                                      "text/html; charset=utf-8");
                      if (metrics_) {
-                         metrics_->counter("yuzu_tar_source_reenable_total",
+                         metrics_->counter("yuzu_echo_source_reenable_total",
                                            {{"result", "invalid_input"}}).increment();
                      }
                      return;
@@ -2090,12 +2090,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (source != "process" && source != "tcp" &&
                      source != "service" && source != "user") {
                      res.status = 400;
-                     res.set_content("<span class=\"tar-row-error\">"
+                     res.set_content("<span class=\"echo-row-error\">"
                                      "Unknown source — must be one of "
                                      "process, tcp, service, user.</span>",
                                      "text/html; charset=utf-8");
                      if (metrics_) {
-                         metrics_->counter("yuzu_tar_source_reenable_total",
+                         metrics_->counter("yuzu_echo_source_reenable_total",
                                            {{"result", "invalid_input"}}).increment();
                      }
                      return;
@@ -2117,16 +2117,16 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  }
 
                  if (!visible) {
-                     audit_fn_(req, "tar.source.reenable", "failure",
+                     audit_fn_(req, "echo.source.reenable", "failure",
                               "command", "",
                               std::format("scope_violation source={}",
                                            source));
                      res.status = 404;
-                     res.set_content("<span class=\"tar-row-error\">"
+                     res.set_content("<span class=\"echo-row-error\">"
                                      "Agent not reachable.</span>",
                                      "text/html; charset=utf-8");
                      if (metrics_) {
-                         metrics_->counter("yuzu_tar_source_reenable_total",
+                         metrics_->counter("yuzu_echo_source_reenable_total",
                                            {{"result", "scope_violation"}}).increment();
                      }
                      return;
@@ -2144,33 +2144,33 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                : yuzu::server::DispatchCaller{
                                      .exec_visible = yuzu::server::authz::deny_all()};
                  auto dispatch_outcome = dispatch_fn_(
-                     "tar", "configure", {device_id}, /*scope_expr=*/"",
+                     "echo", "configure", {device_id}, /*scope_expr=*/"",
                      params, caller);
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
 
                  if (sent == 0) {
-                     audit_fn_(req, "tar.source.reenable", "failure",
+                     audit_fn_(req, "echo.source.reenable", "failure",
                               "command", "",
                               std::format("agent_not_connected source={}",
                                            source));
                      res.status = 404;
-                     res.set_content("<span class=\"tar-row-error\">"
+                     res.set_content("<span class=\"echo-row-error\">"
                                      "Agent not reachable.</span>",
                                      "text/html; charset=utf-8");
                      if (metrics_) {
-                         metrics_->counter("yuzu_tar_source_reenable_total",
+                         metrics_->counter("yuzu_echo_source_reenable_total",
                                            {{"result", "agent_not_connected"}}).increment();
                      }
                      return;
                  }
 
-                 audit_fn_(req, "tar.source.reenable", "success",
+                 audit_fn_(req, "echo.source.reenable", "success",
                           "command", command_id,
                           std::format("device={} source={}",
                                        device_id, source));
                  if (metrics_) {
-                     metrics_->counter("yuzu_tar_source_reenable_total",
+                     metrics_->counter("yuzu_echo_source_reenable_total",
                                        {{"result", "success"}}).increment();
                  }
 
@@ -2183,23 +2183,23 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  res.set_header("Vary", "Cookie");
                  // Empty response body — combined with hx-swap=delete on
                  // the row, this drops the row optimistically. The next
-                 // Refresh will reconcile against a fresh tar.status.
+                 // Refresh will reconcile against a fresh echo.status.
                  res.set_content("", "text/html; charset=utf-8");
              });
 
-    // POST /fragments/tar/retention-paused/purge — Phase 15.A destructive purge.
+    // POST /fragments/echo/retention-paused/purge — Phase 15.A destructive purge.
     // Mirrors /reenable but (a) gates on Infrastructure:Delete (higher tier than
-    // re-enable's Execution:Execute), (b) dispatches tar.purge_source, and (c)
+    // re-enable's Execution:Execute), (b) dispatches echo.purge_source, and (c)
     // leaves the source PAUSED (purge drops data without re-enabling collection).
     // The agent refuses if the source is still enabled — that is the authoritative
     // TOCTOU guard. Dispatch is fire-and-forget, so rows_deleted is computed
     // agent-side (returned in the response record) and is NOT in this audit row.
-    sink.Post("/fragments/tar/retention-paused/purge",
+    sink.Post("/fragments/echo/retention-paused/purge",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "Infrastructure", "Delete")) {
-                     audit_fn_(req, "tar.source.purge", "denied", "command", "", "rbac_denied");
+                     audit_fn_(req, "echo.source.purge", "denied", "command", "", "rbac_denied");
                      if (metrics_) {
-                         metrics_->counter("yuzu_tar_source_purge_total", {{"result", "denied"}})
+                         metrics_->counter("yuzu_echo_source_purge_total", {{"result", "denied"}})
                              .increment();
                      }
                      return;
@@ -2211,7 +2211,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // cross-origin OR header-less request before the irreversible dispatch —
                  // SameSite=Lax on the session cookie already blocks the naive cross-site
                  // top-level POST, this is defense-in-depth + convention. Programmatic
-                 // callers use the structured POST /api/v1/tar/retention-paused/purge, not
+                 // callers use the structured POST /api/v1/echo/retention-paused/purge, not
                  // this dashboard fragment, so requiring an Origin/Referer here is safe.
                  {
                      const std::string origin = req.get_header_value("Origin");
@@ -2221,22 +2221,22 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          origin_is_same_site(req.get_header_value("Host"), origin, referer,
                                              csrf_trusted_origins_);
                      if (!same_site) {
-                         audit_fn_(req, "tar.source.purge", "denied", "command", "",
+                         audit_fn_(req, "echo.source.purge", "denied", "command", "",
                                    "csrf_cross_origin");
                          if (metrics_) {
-                             metrics_->counter("yuzu_tar_source_purge_total", {{"result", "denied"}})
+                             metrics_->counter("yuzu_echo_source_purge_total", {{"result", "denied"}})
                                  .increment();
                          }
                          res.status = 403;
                          res.set_content(
-                             "<span class=\"tar-row-error\">Cross-origin request refused.</span>",
+                             "<span class=\"echo-row-error\">Cross-origin request refused.</span>",
                              "text/html; charset=utf-8");
                          return;
                      }
                  }
                  if (!dispatch_fn_) {
                      res.status = 503;
-                     res.set_content("<span class=\"tar-row-error\">Dispatch unavailable.</span>",
+                     res.set_content("<span class=\"echo-row-error\">Dispatch unavailable.</span>",
                                      "text/html; charset=utf-8");
                      return;
                  }
@@ -2248,11 +2248,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  if (device_id.empty() || source.empty()) {
                      res.status = 400;
-                     res.set_content("<span class=\"tar-row-error\">"
+                     res.set_content("<span class=\"echo-row-error\">"
                                      "device_id and source are required.</span>",
                                      "text/html; charset=utf-8");
                      if (metrics_) {
-                         metrics_->counter("yuzu_tar_source_purge_total", {{"result", "invalid_input"}})
+                         metrics_->counter("yuzu_echo_source_purge_total", {{"result", "invalid_input"}})
                              .increment();
                      }
                      return;
@@ -2262,12 +2262,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (source != "process" && source != "tcp" && source != "service" &&
                      source != "user") {
                      res.status = 400;
-                     res.set_content("<span class=\"tar-row-error\">"
+                     res.set_content("<span class=\"echo-row-error\">"
                                      "Unknown source — must be one of "
                                      "process, tcp, service, user.</span>",
                                      "text/html; charset=utf-8");
                      if (metrics_) {
-                         metrics_->counter("yuzu_tar_source_purge_total", {{"result", "invalid_input"}})
+                         metrics_->counter("yuzu_echo_source_purge_total", {{"result", "invalid_input"}})
                              .increment();
                      }
                      return;
@@ -2288,13 +2288,13 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                  }
                  if (!visible) {
-                     audit_fn_(req, "tar.source.purge", "failure", "command", "",
+                     audit_fn_(req, "echo.source.purge", "failure", "command", "",
                               std::format("scope_violation source={}", source));
                      res.status = 404;
-                     res.set_content("<span class=\"tar-row-error\">Agent not reachable.</span>",
+                     res.set_content("<span class=\"echo-row-error\">Agent not reachable.</span>",
                                      "text/html; charset=utf-8");
                      if (metrics_) {
-                         metrics_->counter("yuzu_tar_source_purge_total",
+                         metrics_->counter("yuzu_echo_source_purge_total",
                                            {{"result", "scope_violation"}})
                              .increment();
                      }
@@ -2303,7 +2303,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  std::unordered_map<std::string, std::string> params;
                  params["source"] = source;
-                 // CDX-R7-02: purge_source is DESTRUCTIVE (drops a device's TAR
+                 // CDX-R7-02: purge_source is DESTRUCTIVE (drops a device's Echo
                  // data), so narrowing to the caller's Execution:Execute visible
                  // set matters most here — a service-scoped token must not purge
                  // a device outside its service even if username visibility would
@@ -2314,29 +2314,29 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                : yuzu::server::DispatchCaller{
                                      .exec_visible = yuzu::server::authz::deny_all()};
                  auto dispatch_outcome =
-                     dispatch_fn_("tar", "purge_source", {device_id}, /*scope_expr=*/"", params,
+                     dispatch_fn_("echo", "purge_source", {device_id}, /*scope_expr=*/"", params,
                                   caller);
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
 
                  if (sent == 0) {
-                     audit_fn_(req, "tar.source.purge", "failure", "command", "",
+                     audit_fn_(req, "echo.source.purge", "failure", "command", "",
                               std::format("agent_not_connected source={}", source));
                      res.status = 404;
-                     res.set_content("<span class=\"tar-row-error\">Agent not reachable.</span>",
+                     res.set_content("<span class=\"echo-row-error\">Agent not reachable.</span>",
                                      "text/html; charset=utf-8");
                      if (metrics_) {
-                         metrics_->counter("yuzu_tar_source_purge_total",
+                         metrics_->counter("yuzu_echo_source_purge_total",
                                            {{"result", "agent_not_connected"}})
                              .increment();
                      }
                      return;
                  }
 
-                 audit_fn_(req, "tar.source.purge", "success", "command", command_id,
+                 audit_fn_(req, "echo.source.purge", "success", "command", command_id,
                           std::format("device={} source={}", device_id, source));
                  if (metrics_) {
-                     metrics_->counter("yuzu_tar_source_purge_total", {{"result", "success"}})
+                     metrics_->counter("yuzu_echo_source_purge_total", {{"result", "success"}})
                          .increment();
                  }
 
@@ -2349,7 +2349,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // The source stays paused (purge does not re-enable), so the row
                  // remains — replace the action buttons with a dispatched note; a
                  // Scan reconciles the (now-zero) counts.
-                 res.set_content("<span class=\"tar-row-note\">Purge dispatched — Scan to "
+                 res.set_content("<span class=\"echo-row-note\">Purge dispatched — Scan to "
                                  "refresh.</span>",
                                  "text/html; charset=utf-8");
              });
@@ -3184,10 +3184,10 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
 }
 
 // ---------------------------------------------------------------------------
-// render_tar_retention_paused — Phase 15.A retention-paused source list
+// render_echo_retention_paused — Phase 15.A retention-paused source list
 // ---------------------------------------------------------------------------
 //
-// Reads THIS OPERATOR'S most-recent tar.status scan (per-username state),
+// Reads THIS OPERATOR'S most-recent echo.status scan (per-username state),
 // queries the response store for that command_id, **filters responses to
 // the operator's visible agents**, parses each agent's
 // `config|<source>_enabled|false` lines plus the matching paused_at /
@@ -3200,23 +3200,23 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
 // informational placeholders rather than table-with-zero-rows so the
 // operator gets actionable guidance.
 
-// #4027: the data-gathering half, extracted from render_tar_retention_paused so the
-// HTML fragment renderer below AND the new GET /api/v1/tar/retention-paused REST twin
-// + list_tar_retention_paused MCP twin all read the SAME scan state / response store /
+// #4027: the data-gathering half, extracted from render_echo_retention_paused so the
+// HTML fragment renderer below AND the new GET /api/v1/echo/retention-paused REST twin
+// + list_echo_retention_paused MCP twin all read the SAME scan state / response store /
 // visibility filter exactly once (api-twin-recipe.md Rule 1) rather than the REST/MCP
 // surface re-deriving it. `store_degraded` covers BOTH "response_store_ was never
 // wired" and "the store was wired but the query itself failed" — the caller (the HTML
 // renderer's empty-state branch, or the JSON builder) doesn't need the distinction,
 // only "was this data trustworthy."
-TarRetentionPausedScan
-DashboardRoutes::gather_tar_retention_paused(const std::string& username,
+EchoRetentionPausedScan
+DashboardRoutes::gather_echo_retention_paused(const std::string& username,
                                              const authz::VisibleSet& extra_scope,
                                              bool extra_scope_is_authoritative) const {
-    TarRetentionPausedScan scan;
+    EchoRetentionPausedScan scan;
     {
-        std::lock_guard<std::mutex> lk(tar_scan_mu_);
-        auto it = tar_scans_by_user_.find(username);
-        if (it != tar_scans_by_user_.end()) {
+        std::lock_guard<std::mutex> lk(echo_scan_mu_);
+        auto it = echo_scans_by_user_.find(username);
+        if (it != echo_scans_by_user_.end()) {
             scan.scan_id = it->second.command_id;
             scan.scan_count = it->second.dispatched_count;
             scan.scan_at = it->second.dispatched_at;
@@ -3258,7 +3258,7 @@ DashboardRoutes::gather_tar_retention_paused(const std::string& username,
     // and every surface (HTML banner, REST/MCP JSON) reports the result as partial.
     ResponseQuery q;
     q.limit = 10000;
-    // #4990: the scan is a TAR dispatch the server issued itself (fixed plugin, not Forensics).
+    // #4990: the scan is an Echo dispatch the server issued itself (fixed plugin, not Forensics).
     const auto tier = ResponseTierFilter::for_fixed_plugin_poll(forensics_plugins_);
     auto bounded_opt = response_store_->query_bounded(scan.scan_id, tier, q, std::nullopt,
                                                       export_body_byte_cap().load());
@@ -3317,7 +3317,7 @@ DashboardRoutes::gather_tar_retention_paused(const std::string& username,
         // direct-membership-only check is skipped, so an ancestor-scoped
         // (not direct-member) admitted operator no longer has their rows
         // silently dropped by the older resolver. See set_all_devices_fn's
-        // doc comment (tar_tree_routes.hpp) for the identical rationale on
+        // doc comment (echo_tree_routes.hpp) for the identical rationale on
         // the two device pickers.
         const bool out_of_scope = extra_scope_is_authoritative
                                        ? !authz::in_scope(extra_scope, resp.agent_id)
@@ -3342,7 +3342,7 @@ DashboardRoutes::gather_tar_retention_paused(const std::string& username,
 
         bool any_paused_for_this_agent = false;
         // Iterate the four canonical sources. Hardcoding here is fine — these
-        // are stable across the project; new sources land via TAR registry
+        // are stable across the project; new sources land via Echo registry
         // changes, and the dashboard list is robust to unknown sources by
         // simply not rendering them (they will surface in PR-A.6 follow-up).
         for (const char* source : {"process", "tcp", "service", "user"}) {
@@ -3356,7 +3356,7 @@ DashboardRoutes::gather_tar_retention_paused(const std::string& username,
             // (silent omission shows clean state for an actually-paused source).
             const bool value_error = (it->second != "false");
 
-            TarPausedSourceRow row;
+            EchoPausedSourceRow row;
             row.agent_id = resp.agent_id;
             row.agent_display = registry_ ? registry_->display_name(resp.agent_id)
                                           : resp.agent_id;
@@ -3385,9 +3385,9 @@ DashboardRoutes::gather_tar_retention_paused(const std::string& username,
     return scan;
 }
 
-std::string DashboardRoutes::render_tar_retention_paused(
+std::string DashboardRoutes::render_echo_retention_paused(
     const std::string& username, bool can_execute, bool can_delete) const {
-    TarRetentionPausedScan scan = gather_tar_retention_paused(username);
+    EchoRetentionPausedScan scan = gather_echo_retention_paused(username);
     const std::string& scan_id = scan.scan_id;
     const int scan_count = scan.scan_count;
     const int64_t scan_at = scan.scan_at;
@@ -3397,13 +3397,13 @@ std::string DashboardRoutes::render_tar_retention_paused(
     const int agents_filtered_out_of_scope = scan.agents_filtered_out_of_scope;
     // Local, mutable alias (the HTML rendering below sorts in place) so the
     // unchanged HTML-building code (which iterates `rows` and reads
-    // `TarPausedSourceRow` fields) needs no further edits.
-    std::vector<TarPausedSourceRow>& rows = scan.rows;
+    // `EchoPausedSourceRow` fields) needs no further edits.
+    std::vector<EchoPausedSourceRow>& rows = scan.rows;
 
     if (scan_id.empty()) {
         return "<div class=\"empty-state\">No scan data yet — click "
                "<strong>Scan fleet</strong> above to query the agents "
-               "in your scope for TAR retention state.</div>";
+               "in your scope for Echo retention state.</div>";
     }
 
     int64_t now = now_epoch();
@@ -3427,7 +3427,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
             ++per_source_counts[r.source];
         }
         for (const auto& [src, count] : per_source_counts) {
-            metrics_->gauge("yuzu_tar_retention_paused_devices",
+            metrics_->gauge("yuzu_echo_retention_paused_devices",
                             {{"source", src}})
                 .set(static_cast<double>(count));
         }
@@ -3438,7 +3438,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
     // visibility-bounded view.
     std::string html;
     html.reserve(2048);
-    html += "<div class=\"tar-meta\">";
+    html += "<div class=\"echo-meta\">";
     html += std::format(
         "Scan <code>{}</code> &middot; dispatched to <strong>{}</strong> "
         "agent{} in your scope {} &middot; <strong>{}</strong> in-scope "
@@ -3521,7 +3521,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
     // the BOTTOM, inverting operator intent; sort 0 as the smallest (oldest)
     // instead so they rank at the top.
     std::sort(rows.begin(), rows.end(),
-              [](const TarPausedSourceRow& a, const TarPausedSourceRow& b) {
+              [](const EchoPausedSourceRow& a, const EchoPausedSourceRow& b) {
                   if (a.value_error != b.value_error)
                       return a.value_error; // errors float to the top
                   if (a.paused_at != b.paused_at)
@@ -3552,7 +3552,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
                     "</span> <span class=\"badge badge-danger\" title=\"agent reported "
                     "&#39;" + html_escape(r.enabled_raw) +
                     "&#39; for this source's enabled flag — expected true/false; check the "
-                    "agent's tar.db\">value error</span></td>";
+                    "agent's echo.db\">value error</span></td>";
         } else {
             html += "<td><span class=\"badge badge-warning\">" + html_escape(r.source) + "</span></td>";
         }
@@ -3562,7 +3562,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // the operator knows the row needs the agent upgraded rather than reading
         // "—" as "unknown / not paused".
         if (r.value_error) {
-            html += "<td colspan=\"2\"><span class=\"tar-tree-mute\">reported <code>" +
+            html += "<td colspan=\"2\"><span class=\"echo-tree-mute\">reported <code>" +
                     html_escape(r.enabled_raw) + "</code></span></td>";
         } else if (r.paused_at == 0) {
             html += "<td colspan=\"2\"><span class=\"badge badge-warning\" title=\"this agent "
@@ -3574,7 +3574,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
         }
         html += "<td class=\"r\">";
         if (r.live_rows < 0) {
-            html += "<span class=\"tar-tree-mute\">—</span>";
+            html += "<span class=\"echo-tree-mute\">—</span>";
         } else {
             html += std::format("{}", r.live_rows);
         }
@@ -3583,7 +3583,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // Re-enable button: HTMX POST with the device_id + source as form
         // values, swap=delete on the closest tr so the row drops
         // optimistically on success. The next operator-triggered Refresh
-        // will reconcile against a fresh tar.status if the agent failed
+        // will reconcile against a fresh echo.status if the agent failed
         // to apply the configure for any reason.
         //
         // hx-vals carries JSON inside an HTML attribute. JSON-escape FIRST
@@ -3600,7 +3600,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
         if (can_execute) {
             html += std::format(
                 "<button class=\"btn-secondary btn-sm\" "
-                "hx-post=\"/fragments/tar/retention-paused/reenable\" "
+                "hx-post=\"/fragments/echo/retention-paused/reenable\" "
                 "hx-vals='{{\"device_id\":\"{}\",\"source\":\"{}\"}}' "
                 "hx-target=\"closest tr\" hx-swap=\"delete\" "
                 "hx-confirm=\"Re-enable {} collector on {}?\">"
@@ -3610,13 +3610,13 @@ std::string DashboardRoutes::render_tar_retention_paused(
                 html_escape(r.source), html_escape(r.agent_display));
         }
         if (can_delete) {
-            // Purge is destructive: a typed-hostname confirm (tarPurgeConfirm, a
+            // Purge is destructive: a typed-hostname confirm (echoPurgeConfirm, a
             // native prompt) gates it — no hx-confirm. Data via HTML-escaped
             // data-* attrs (read by the JS), never interpolated into script.
             html += std::format(
                 "<button class=\"btn-danger btn-sm\" "
                 "data-device=\"{}\" data-host=\"{}\" data-source=\"{}\" "
-                "onclick=\"tarPurgeConfirm(this)\" "
+                "onclick=\"echoPurgeConfirm(this)\" "
                 "title=\"Permanently delete this source's stored data (source stays "
                 "paused)\">"
                 "Purge data"
@@ -3624,7 +3624,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
                 html_escape(r.agent_id), html_escape(r.agent_display), html_escape(r.source));
         }
         if (!can_execute && !can_delete) {
-            html += "<span class=\"tar-row-note\">&mdash;</span>";
+            html += "<span class=\"echo-row-note\">&mdash;</span>";
         }
         html += "</td>";
         html += "</tr>";
@@ -3633,7 +3633,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
 
     if (agents_responded < scan_count) {
         html += std::format(
-            "<div class=\"tar-meta\">"
+            "<div class=\"echo-meta\">"
             "{} of {} agent{} still pending — click "
             "<strong>Refresh</strong> to pick up additional responses.</div>",
             scan_count - agents_responded, scan_count,

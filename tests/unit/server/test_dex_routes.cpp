@@ -2013,7 +2013,7 @@ TEST_CASE("DEX perf/app fragment: the one-device floor publishes a three-device 
     }
 }
 
-// ── A4: device perf sparklines (federated TAR query) ────────────────────────
+// ── A4: device perf sparklines (federated Echo query) ────────────────────────
 
 TEST_CASE("DEX perf parse: schema-mapped columns, trailer skipped, chronological",
           "[dex][perf][parse]") {
@@ -2147,15 +2147,15 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
                         const std::unordered_map<std::string, std::string>& params)
         -> yuzu::server::ConfinedDispatchOutcome {
         ++dispatched;
-        CHECK(plugin == "tar");
+        CHECK(plugin == "echo");
         CHECK(action == "sql");
         REQUIRE(ids.size() == 1);
         seen_sql = params.count("sql") ? params.at("sql") : "";
-        return {.sent = fake_sent, .command_id = "tar-deadbeef"};
+        return {.sent = fake_sent, .command_id = "echo-deadbeef"};
     };
     std::vector<DexAgentResponse> fake_rows;
     auto responses = [&](const std::string& command_id, const std::string& /*agent_id*/) {
-        CHECK(command_id == "tar-deadbeef");
+        CHECK(command_id == "echo-deadbeef");
         return fake_rows;
     };
 
@@ -2169,7 +2169,7 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         CHECK(r->status == 200);
         CHECK(dispatched == 1);
         CHECK(seen_sql.find("$Perf_Hourly") != std::string::npos);
-        CHECK(r->body.find("/fragments/dex/device/perf/result?command_id=tar-deadbeef") !=
+        CHECK(r->body.find("/fragments/dex/device/perf/result?command_id=echo-deadbeef") !=
               std::string::npos);
         CHECK(audited == "dex.device.perf.query|success|WS-1");
     }
@@ -2184,7 +2184,7 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
 
     SECTION("result poll: pending -> re-poll with n+1; data -> panel; error -> note") {
         auto pending =
-            sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+            sink.Get("/fragments/dex/device/perf/result?command_id=echo-deadbeef&agent_id=WS-1&n=1");
         REQUIRE(pending);
         CHECK(pending->body.find("&amp;n=2") != std::string::npos); // re-poll bumps the attempt
 
@@ -2193,7 +2193,7 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
                       "3600|33|44|0|0\n",
                       ""}};
         auto done =
-            sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+            sink.Get("/fragments/dex/device/perf/result?command_id=echo-deadbeef&agent_id=WS-1&n=1");
         REQUIRE(done);
         CHECK(done->body.find("<svg") != std::string::npos);
         CHECK(done->body.find("hx-trigger") == std::string::npos); // polling stopped
@@ -2205,7 +2205,7 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         audited.clear();
         fake_rows = {{"WS-1", 0, "error|<b>no such table</b>", ""}};
         auto err =
-            sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+            sink.Get("/fragments/dex/device/perf/result?command_id=echo-deadbeef&agent_id=WS-1&n=1");
         REQUIRE(err);
         CHECK(err->body.find("reported an error") != std::string::npos);
         CHECK(err->body.find("<b>no such table</b>") == std::string::npos); // escaped, not raw
@@ -2222,7 +2222,7 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
                       "total|0\n",
                       ""}};
         auto empty =
-            sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+            sink.Get("/fragments/dex/device/perf/result?command_id=echo-deadbeef&agent_id=WS-1&n=1");
         REQUIRE(empty);
         CHECK(empty->body.find("No performance history") != std::string::npos);
         CHECK(empty->body.find("hx-trigger") == std::string::npos); // not re-polled
@@ -2235,18 +2235,18 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
                       "3600|33|44|0|0\n",
                       ""}};
         auto r =
-            sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+            sink.Get("/fragments/dex/device/perf/result?command_id=echo-deadbeef&agent_id=WS-1&n=1");
         REQUIRE(r);
         CHECK(r->body.find("<svg") == std::string::npos); // filtered out
 
         auto timeout = sink.Get(
-            "/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=20");
+            "/fragments/dex/device/perf/result?command_id=echo-deadbeef&agent_id=WS-1&n=20");
         REQUIRE(timeout);
         CHECK(timeout->body.find("timed out") != std::string::npos);
         CHECK(timeout->body.find("hx-trigger") == std::string::npos);
     }
 
-    SECTION("non-tar command_id is rejected - this route polls only tar dispatches") {
+    SECTION("non-echo command_id is rejected - this route polls only echo dispatches") {
         auto r = sink.Get(
             "/fragments/dex/device/perf/result?command_id=script_exec-123&agent_id=WS-1&n=1");
         REQUIRE(r);
@@ -2272,7 +2272,7 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         CHECK(r->body.find("Execute") != std::string::npos);
         CHECK(dispatched == 0);
         auto poll = sink2.Get(
-            "/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+            "/fragments/dex/device/perf/result?command_id=echo-deadbeef&agent_id=WS-1&n=1");
         REQUIRE(poll);
         CHECK(poll->body.find("Execute") != std::string::npos); // result leg gated too
     }
@@ -2341,14 +2341,14 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
                       "chrome.exe|10|3|25.5|40.0|1000000|2000000|5\n",
                       ""}};
         auto r = sink.Get(
-            "/fragments/dex/device/procperf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+            "/fragments/dex/device/procperf/result?command_id=echo-deadbeef&agent_id=WS-1&n=1");
         REQUIRE(r);
         CHECK(r->body.find("chrome.exe") != std::string::npos);
         CHECK(audited == "dex.device.procperf.query|rendered|WS-1");
     }
     SECTION("procperf result poll: still pending is NOT audited (no per-attempt spam)") {
         auto r = sink.Get(
-            "/fragments/dex/device/procperf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+            "/fragments/dex/device/procperf/result?command_id=echo-deadbeef&agent_id=WS-1&n=1");
         REQUIRE(r);
         CHECK(r->body.find("hx-trigger") != std::string::npos); // re-polling
         CHECK(audited.empty());

@@ -132,10 +132,10 @@ constexpr ExpectedResolution kExpected[] = {
     {"PUT",    "/api/v1/definitions/def-1/response-templates/tmpl-1",      64u * 1024, false, "response_templates"},
     // dashboard_routes.cpp:866 `sql.size() > 4096` on the DECODED field;
     // 16 KiB = 3x4096 worst-case percent-encoding + 4 KiB field/framing margin.
-    {"POST",   "/api/dashboard/tar-execute",              16u * 1024,         false, "tar_dashboard_sql"},
+    {"POST",   "/api/dashboard/echo-execute",              16u * 1024,         false, "echo_dashboard_sql"},
     // rest_api_v1.cpp:6802 `sql.size() > 100000` on the JSON-parsed field;
     // 200 KiB = 2x100000 for JSON-escaping headroom plus the other JSON keys.
-    {"POST",   "/api/v1/result-sets/from-tar-query",      200u * 1024,        false, "tar_result_set_sql"},
+    {"POST",   "/api/v1/result-sets/from-echo-query",      200u * 1024,        false, "echo_result_set_sql"},
     // rest_api_v1.cpp:7759,:7842 — explicit generous, no contract yet.
     {"POST",   "/api/v1/guaranteed-state/rules",          16u * 1024 * 1024,  false, "guardian_rule_authoring"},
     // rest_api_v1.cpp:7904 regex PUT update — same class, same bound.
@@ -228,10 +228,10 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "scim",
     "saml_acs",
     "response_templates",
-    "tar_dashboard_sql",
+    "echo_dashboard_sql",
     "upload_session",
     "plugin_config",
-    "tar_result_set_sql",
+    "echo_result_set_sql",
     "guardian_rule_authoring",
     "workflow_yaml",
     "product_pack_yaml",
@@ -387,7 +387,7 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // kek_ops(1: one prefix entry covers both rotate and rewrap) +
     // ca_import_chain_dashboard(1) + plugin_trust_bundle(1) + scim(1:
     // one any-method row) + saml_acs(1) + response_templates(2: POST/PUT) +
-    // tar_dashboard_sql(1) + tar_result_set_sql(1) +
+    // echo_dashboard_sql(1) + echo_result_set_sql(1) +
     // guardian_rule_authoring(2: POST create + PUT update) +
     // workflow_yaml(1) + product_pack_yaml(1) + instruction_import(1) +
     // instruction_yaml(3: save/validate/preview) + upload_session(1: the

@@ -156,7 +156,7 @@ MUTATIONS = [
     # Groups page: the call that installs /groups and its script.
     (r"yuzu::server::groups::register_groups_routes\(", "yuzu::server::groups::register_groups_route(",
      "register_groups_routes"),
-    (r"groups::Deps\{\.auth_fn = auth_fn\}", "groups::Deps{}", "auth_fn"),
+    (r"(groups::Deps\{\s*)\.auth_fn = auth_fn,", r"\1", "auth_fn"),
 ]
 
 
