@@ -1049,17 +1049,28 @@ document.body.addEventListener('htmx:beforeRequest', function (e) {
   var m = el.getAttribute('data-tog');
   if (m && t && t.getAttribute('data-open') === m && t.firstChild) { e.preventDefault(); swShut(t); }
 });
-function swMoreFail(e) {  /* failed Load more: drop the marker, put focus back on the re-enabled button */
-  var el = e.detail && e.detail.elt;
-  if (!el || !el.getAttribute || el.getAttribute('data-act') !== 'dmore') return;
+document.body.addEventListener('htmx:afterRequest', function (e) {
+  /* Load more finished (swapped, empty, failed or aborted): the marker is consumed only by its own request */
+  var mo = window.__swMore, rc = e.detail && e.detail.requestConfig;
+  if (!mo || !rc || rc.elt !== mo.btn) return;
   window.__swMore = null;
-  if (e.detail.xhr && e.detail.xhr.status === 401) { location.assign('/login'); return; }
-  setTimeout(function () { if (el.isConnected) el.focus(); }, 0);
-}
-document.body.addEventListener('htmx:responseError', swMoreFail);
-document.body.addEventListener('htmx:sendError', swMoreFail);
+  if (!e.detail.successful) {  /* failed: put focus back on the re-enabled button */
+    if (e.detail.xhr && e.detail.xhr.status === 401) { location.assign('/login'); return; }
+    setTimeout(function () { if (mo.btn.isConnected) mo.btn.focus(); }, 0);
+    return;
+  }
+  var box = mo.tb.closest('div[id^="exp-"]') || mo.tb.closest('.inv-devs'),
+      flt = box && box.querySelector('.inv-devfilter'), rows = mo.tb.rows, ff, i;
+  if (flt && flt.value && typeof gpSearch === 'function') gpSearch(flt);  /* so hidden new rows are skipped */
+  for (i = mo.i; i < rows.length && !ff; i++)  /* first visible new row; it lands at the replaced row's index */
+    if (rows[i].style.display !== 'none' && !rows[i].classList.contains('inv-more')) ff = rows[i].querySelector('a,button');
+  if (!ff && rows[mo.i] && rows[mo.i].classList.contains('inv-more')) ff = rows[mo.i].querySelector('button');  /* empty page, next cursor */
+  ff = ff || flt;
+  if (ff) ff.focus();
+});
 document.body.addEventListener('htmx:afterSwap', function (e) {
-  var el = e.detail.elt, t = e.detail.target, m = el && el.getAttribute && el.getAttribute('data-tog');
+  var rc = e.detail.requestConfig, el = (rc && rc.elt) || e.detail.elt,  /* htmx 2: detail.elt is the target here */
+      t = e.detail.target, m = el && el.getAttribute && el.getAttribute('data-tog');
   if (m && t && t.id) { t.setAttribute('data-open', m); swMark(t, true); }
 });
 document.body.addEventListener('htmx:afterSettle', function () {
@@ -1071,16 +1082,6 @@ document.body.addEventListener('htmx:afterSettle', function () {
   var f = document.querySelectorAll('.inv-devfilter');  /* Load-more rows join the filtered set */
   for (var i = 0; i < f.length; i++) if (f[i].value && typeof gpSearch === 'function') gpSearch(f[i]);
   swHash();
-  if (window.__swMore) {  /* focus the first new row (it lands at the replaced row's index) */
-    var mo = window.__swMore, r, ff;
-    window.__swMore = null;
-    r = mo.tb.rows[mo.i]; ff = r && r.querySelector('a,button');
-    if (!ff) {  /* empty page: fall back to the devices filter */
-      var box = mo.tb.closest('div[id^="exp-"]') || mo.tb.closest('.inv-devs');
-      ff = box && box.querySelector('.inv-devfilter');
-    }
-    if (ff) ff.focus();
-  }
 });
 </script>)js";
 }

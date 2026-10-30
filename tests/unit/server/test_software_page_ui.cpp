@@ -930,16 +930,23 @@ TEST_CASE("software page: title rows and drill controls are keyboard-operable", 
     REQUIRE(has(v, "<button type=\"button\" class=\"inv-devbtn\" data-vdevs"));
     REQUIRE_FALSE(has(v, "<span class=\"inv-devbtn\""));
     const std::string sc = software_page_script();
-    // The script: swKey ignores nested buttons and drives the row's click; Load-more focus lands on
-    // the replaced row's own index, falls back to the devices filter, and recovers from failures.
+    // The script: swKey ignores nested buttons and drives the row's click. Load-more focus is set
+    // by the request's own htmx:afterRequest (so an empty final page and a failure are covered and
+    // an unrelated swap cannot consume the marker); it lands on the first visible new row, else the
+    // new Load-more button, else the devices filter.
     REQUIRE(has(sc, "function swKey(e, el)"));
     REQUIRE(has(sc, "e.target.closest('button')"));
     REQUIRE(has(sc, "el.click()"));
     REQUIRE(has(sc, "window.__swMore = { tb: tr.parentNode, i: tr.sectionRowIndex, btn: el }"));
-    REQUIRE(has(sc, "mo.tb.rows[mo.i]"));
+    REQUIRE(has(sc, "addEventListener('htmx:afterRequest'"));
+    REQUIRE(has(sc, "rc.elt !== mo.btn"));
+    REQUIRE(has(sc, "rows[i].style.display !== 'none'"));
+    REQUIRE(has(sc, "rows[mo.i].classList.contains('inv-more')"));
     REQUIRE(has(sc, "box.querySelector('.inv-devfilter')"));
-    REQUIRE(has(sc, "addEventListener('htmx:responseError', swMoreFail)"));
-    REQUIRE(has(sc, "addEventListener('htmx:sendError', swMoreFail)"));
+    REQUIRE_FALSE(has(sc, "swMoreFail"));
+    REQUIRE_FALSE(has(sc, "mo.tb.rows[mo.i]"));
+    // The expansion toggle reads data-tog from the request's element (htmx 2 detail.elt is the target).
+    REQUIRE(has(sc, "el = (rc && rc.elt) || e.detail.elt"));
     REQUIRE(has(sc, "location.assign('/login')"));
 }
 
