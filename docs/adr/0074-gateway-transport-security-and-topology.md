@@ -297,10 +297,11 @@ Each line is something the named wave must state, decide or test. None is decide
 - `forwarded_for` cannot work on a strict main port, and PROXY protocol must be parsed before the kTLS handshake.
 - The privacy classification of `agent_id`, as an input to the TLS version choice (D8).
 - The signed-result evidence window. As designed, a signed result can be checked only while both the response (kept 90 days by default) and the signing certificate's `ca_issued` record are kept; whether evidence must outlive that is open.
-- How agents already running behind a gateway get the wave-2 agent binary, and who confirms the pilot check before wave 2 merges.
+- How agents already running behind a gateway get the wave-2 agent binary, and who confirms the pilot check before wave 2 merges. The wave 2 PR description records who confirmed it, on its merge date.
 
 **Wave 4**
 - Refusing to drain the last gateway.
+- What aborting or extending a drain does to agents already moved.
 - Operator surfaces for gateway drain and server drain: REST and MCP, with a dashboard twin, a securable, a step-up row and audit, plus read access to the gateway list (ADR-1005).
 
 **Wave 5**
@@ -308,8 +309,9 @@ Each line is something the named wave must state, decide or test. None is decide
 - Re-attestation when an agent's owning server changes.
 
 **Observability and readiness (waves 1 to 5, each for what it adds)**
-- Metrics for CRL age, fail-closed state, refusals by reason, CA signing rate, enrollment-port saturation, certificate-expiry horizons, drain progress and ring membership. Gateway and server certificate expiry pages; agent certificate expiry is a dashboard.
-- Readiness: a fail-closed or draining gateway is not ready for new agents but stays live.
+- Metrics for CRL age, fail-closed state, refusals by reason, CA signing rate, enrollment-port saturation, certificate-expiry horizons, drain progress and ring membership. A failed gateway or server certificate renewal pages, as does a gateway or server certificate with less than a quarter of its lifetime left; the expiry horizons themselves, and agent certificate expiry, are a dashboard.
+- Alerts from wave 1: entry into fail-closed pages, and so does a gateway CRL nearing the 15-minute fail-closed bound, because someone must restore the gateway's path to a server or the CRL signer.
+- Readiness: a fail-closed or draining gateway is not ready for new agents but stays live. Until wave 4 decides whether a fail-closed gateway gets weight zero, readiness is the only steer: a load balancer stops sending agents to it, but a gateway found by DNS still draws agents, which are refused and retry.
 
 ## Survey of comparable projects (2026-10-29)
 
