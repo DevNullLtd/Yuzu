@@ -472,6 +472,10 @@ Decision numbers are stable, since other documents cite them.
     `agent_decommission.hpp`, whose registered-target count is pinned by `kCascadeStoreCount` in `test_agent_decommission.cpp`.
     The conjunction named below as the cascade trigger's gate is superseded: the gate is the
     single scoped `Decommission:Delete`, see the Decision 9 update note.)*
+    *(Update 2026-10-23, slice-2 PR 2a-2a: the cascade now covers **eight** stores.
+    `CertificateInventoryStore` (schema `certificate_inventory_store`, the fleet certificate inventory of
+    ADR-0070 D12) joined, and its `delete_agent` erases its rows in one transaction. Its read securable,
+    `CertificateInventory`, arrives in PR 2a-2b.)*
     There is **no row-level erasure API**, a stated gap. The cascade's
     production trigger is `DELETE /api/v1/sle/agents/{id}`, authorized by the scoped
     `SoftwareLicensing:Delete` **AND** `Inventory:Delete` **AND** `GuaranteedState:Delete`
@@ -534,7 +538,7 @@ Decision numbers are stable, since other documents cite them.
     reclamation verdicts (categories, candidates, coverage) join usage with entitlement
     data for a purpose, so they are UCE interpretation. The **usage collection** half — an
     opt-in (`--usage-sync-enable`, default off) machine-scope daily-sync source reading
-    the agent's TAR warehouse locally through the plugin's sandboxed read-only `sql`
+    the agent's Echo warehouse locally through the plugin's sandboxed read-only `sql`
     action, user dimension dropped on-device — is agent-side fact collection and, if/when
     it ships, ships in-server as **mechanism only**; it is out of §27 v1. Recorded as
     module design input: usage **categories** (Used ≤30 d, Rarely 31–90 d, Unused >90 d,
@@ -543,7 +547,7 @@ Decision numbers are stable, since other documents cite them.
     lead with usage coverage and render zero coverage as explicit guidance, never as
     "nothing to reclaim". **Product tags on `ProductRegistryStore` stay core** (they drive
     tag-based views and time-boxed management-group rules). *Rejected: routing
-    licence/usage data through TAR as a transport — usage reads TAR locally and pushes via
+    licence/usage data through Echo as a transport — usage reads Echo locally and pushes via
     daily-sync.*
 
 16. **Out of scope.** Yuzu's own product-licence machinery (`LicenseStore`, the

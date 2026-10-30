@@ -205,7 +205,7 @@ std::string render_device_live_processes(const std::vector<LiveProcess>& procs);
 /// PURE: render a simple key/value live result (e.g. os_info/uptime) as a tile.
 std::string render_device_live_value(const std::string& label, const std::string& value);
 
-// ── Live snapshot v2: TAR-styled collapsible cards (feat/device-live-snapshot) ──
+// ── Live snapshot v2: Echo-styled collapsible cards (feat/device-live-snapshot) ──
 // Each card is fed by ONE live plugin action (process_tree joins a second), parsed
 // in device_routes.cpp and rendered by the typed PURE renderers below. All agent
 // fields are HTML-escaped at render. Mockup: docs/mockups/device-live-snapshot.html.
@@ -238,7 +238,7 @@ struct LiveUserRow { std::string user, host, logon_type, session; };
 struct LiveNetAddr { std::string adapter, ip; int prefix = 0; std::string gateway; };
 /// One volume's capacity reading (disk_space/free → disk|<path>|<total>|<free>|<percent_used>).
 struct LiveDiskVolume { std::string path; long long total = 0, free = 0; int percent_used = 0; };
-/// One TAR capture source's local state (tar/status → config|<src>_enabled / _live_rows).
+/// One Echo capture source's local state (echo/status → config|<src>_enabled / _live_rows).
 /// `dollar`/`category` are server-side presentation metadata (the agent schema registry
 /// is not linked into the server, so the source list is hand-held in device_routes.cpp;
 /// only sources the agent actually reports are rendered).
@@ -251,7 +251,7 @@ struct LiveCaptureSource {
 /// PURE renderers — one `.ls-tbl`/tree per card body, dark-theme, CSP-safe.
 /// render_device_live_tree reconstructs a parent→child tree from the flat node set
 /// (cycle/cap guarded) and joins `conns` by pid for the inline `tt-net` summary,
-/// mirroring the /tar process-tree viewer.
+/// mirroring the /echo process-tree viewer.
 std::string render_device_live_tree(const std::vector<LiveProcNode>& nodes,
                                     const std::vector<LiveConn>& conns);
 std::string render_device_live_arp(const std::vector<LiveArpEntry>& rows);

@@ -194,7 +194,7 @@ TEST_CASE("AgentRegistry::send_to: the gateway-capability refusal logs the gatew
 
     agent_pb::CommandRequest cmd;
     cmd.set_command_id("routed-cmd");
-    cmd.set_plugin("tar");
+    cmd.set_plugin("echo");
     cmd.set_action("fleet_snapshot");
     cmd.set_dispatch_tag(yuzu::server::encode_dispatch_tag(yuzu::server::DispatchClass::ReadOnly,
                                                            yuzu::server::Mutability::None,

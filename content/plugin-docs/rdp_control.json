@@ -418,7 +418,7 @@
   "version": "0.1.0",
   "where_the_data_goes": [
     "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (default 90-day retention), queryable at `/api/responses/{id}`.",
-    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. The plugin is registered only in the agent's instruction catalogue and the capability catalogue — nothing else in `server/` references `rdp_control` or the `windows.rdp.*` ids.",
+    "**Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics. The plugin is registered only in the agent's instruction catalogue and the capability catalogue — nothing else in `server/` references `rdp_control` or the `windows.rdp.*` ids.",
     "**Sensitivity.** Rows carry only boolean/enum posture state (`reg_status`/`firewall_status`/`service_status`/`overall`, `deny_ts_connections`/`firewall_group`/`term_service`/`rdp`) — nothing that identifies a specific device, person, or installed software beyond the device id.",
     "**Siblings:** none report combined RDP posture. `registry.get_value`/`registry.set_value` can reach the same `fDenyTSConnections` value in isolation, and `firewall.state`/`firewall.rules` read Windows Firewall generally, but neither combines the registry + firewall-group + service triad this plugin reports together.",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"windows.rdp.status\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."

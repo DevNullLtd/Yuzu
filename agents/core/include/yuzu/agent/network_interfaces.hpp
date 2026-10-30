@@ -4,7 +4,7 @@
  * network_interfaces.hpp -- Cross-platform local-IP enumeration for Yuzu agent
  *
  * Returns the set of IPv4 and IPv6 addresses bound to the host's non-loopback,
- * non-link-local network interfaces. Used by the TAR plugin's fleet_snapshot
+ * non-link-local network interfaces. Used by the Echo plugin's fleet_snapshot
  * action so the server can build a host -> agent_id map for cross-machine
  * connection resolution in the fleet-topology view.
  *

@@ -34,11 +34,11 @@ def check(cond, label, failures):
 def test_clean_coverage(failures):
     tests = [
         _entry("agent unit tests shard A", ["agent", "agent-shard"]),
-        _entry("tar unit tests", ["tar"]),
+        _entry("echo unit tests", ["echo"]),
         _entry("server pg unit tests shard C", ["server", "server-pg"]),
     ]
     ok, fail_msgs, stats = _mod.compute_coverage(
-        tests, {"agent", "tar"}, {"server-pg"})
+        tests, {"agent", "echo"}, {"server-pg"})
     check(ok, "clean: reports OK", failures)
     check(fail_msgs == [], "clean: no failure messages", failures)
     check(stats == {"selected": 2, "excluded": 1, "total": 3},

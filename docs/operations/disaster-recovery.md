@@ -91,7 +91,7 @@ curl http://localhost:8080/livez
 | Config file loss | Credentials, tokens | Minutes (restore from backup) |
 | Database corruption | Responses, audit, policies | Minutes (restore + migration) |
 | Full server loss | Everything | 15-30 minutes (new server + restore) |
-| Agent data loss | Agent state, TAR history | Agent re-enrolls, TAR rebuilds |
+| Agent data loss | Agent state, Echo history | Agent re-enrolls, Echo rebuilds |
 
 ## Failover Architecture
 

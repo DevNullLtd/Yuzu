@@ -44,7 +44,7 @@ Recommended order for a fresh install:
 > visibility has at least one management-group role assignment. With RBAC
 > **disabled**, all authenticated users see the full enrolled fleet. Turning RBAC
 > **on** immediately applies role-scoped visibility — a user without a
-> management-group role assignment will see **no agents** (including on the TAR
+> management-group role assignment will see **no agents** (including on the Echo
 > fleet scan), and the role-grant endpoints themselves require an existing group
 > role, which can be a chicken-and-egg lockout. The broadest grant is an
 > `ITServiceOwner` role on the root "All Devices" group; see
@@ -98,7 +98,7 @@ Recommended order for a fresh install:
 > prior "corrupt `rbac.db` fails open" behavior); watch the
 > `yuzu_server_rbac_read_degrade_total` metric. In that degraded state, device
 > visibility falls back to the role-scoped path for every caller, so agents stop
-> appearing in the dashboard list, `/api/agents`, and TAR fleet scans rather than
+> appearing in the dashboard list, `/api/agents`, and Echo fleet scans rather than
 > the whole fleet being exposed. **The same fail-closed posture covers MOST
 > response/execution readers (#1634):** `query_responses`, `aggregate_responses`,
 > and the legacy `GET /api/responses/{id}`
@@ -547,6 +547,36 @@ Settings uses, so the two stay equivalent.
   message with a Retry button. It never shows an empty list in that case, so a degraded store
   cannot be mistaken for "nobody is here".
 
+## Managing groups from the dashboard
+
+The **Groups and enrolment** page (`/groups`, in the **Estate** section of the sidebar) reads the
+management-group tree, one group's details and its members. These three panels are read-only.
+Creating, changing and deleting groups stays in Settings and the REST API. The roles held on a
+group are not on this page yet.
+
+- **Groups list and details** need the `ManagementGroup:Read` permission, the same check as
+  `GET /api/v1/management-groups`. Every holder sees every group's name, type and member count.
+- **Members** go through the fleet-read check (ADR-0017). A caller whose visibility is narrowed
+  to some management groups sees only the members inside that visibility. The panel says "Only
+  members within your scope are shown." and counts only the rows it shows; it never reveals how
+  many were left out.
+- **A refused panel** says it is not available to the account. It does not break the others.
+
+What each kind of caller sees (RBAC enforcement off is the default install):
+
+| Caller | Groups list and details | Members |
+|---|---|---|
+| Administrator, or a session elevated to it | Yes | All |
+| Legacy `user` account, RBAC enforcement off | Yes | All |
+| Viewer, RBAC on | Yes | Those in their scope |
+| `ITServiceOwner` on the root group (global) | Yes | Those in their scope |
+| `ITServiceOwner` on one group only | No (`403`) | Those in their scope if the fragment is called directly; the page cannot reach it because the list is refused |
+| Operator scoped to a group | No (`403`): Operator holds no `ManagementGroup` permission | Not reachable |
+| Service-scoped API token, RBAC on | No (`403`) | Those within the token's service scope |
+
+A page of "not available" notes is therefore the honest result for an operator who is scoped to a
+group and holds no global `ManagementGroup:Read`: the page cannot offer a "my groups" view.
+
 ## Concepts
 
 | Concept | Description |
@@ -613,7 +643,7 @@ Eight roles are created automatically and cannot be deleted:
 | `Inventory` | Installed-software inventory synced from endpoints (ADR-0016) |
 | `EnginePrincipal` | Engine-principal inventory and fleet-wide grant-graph reads (list/get engine principals, list their assigned roles) — cut away from `Security` (#2376) so this narrower read is not gated by the same broad permission that also covers CA/quarantine/KEK operational reads. See "The authorization topology floor" below. |
 | `Forensics` | Forensic-artefact reads (Windows execution artefacts — ShimCache/AmCache/Prefetch; per-device application-usage projection; per-app privacy-permission grants; per-account SSH authorized-key fingerprints and sshd settings). Held by default by Administrator and by the read-only `ForensicsAnalyst` role (absent from the Viewer read-list). The stored results of these plugins are served only to a caller who holds `Forensics:Read` in addition to `Response:Read`; to any other reader of the response APIs those rows are absent. With RBAC enforcement off, `Forensics:Read` is administrator-only, so a non-administrator session does not see them either. Only the `plugin` name is stored with a response row, so the filter is per plugin: a plugin that mixed Forensics and ordinary actions would have all of its rows treated as Forensics-tier until the action name is stored too (no such plugin exists today). Every catalogue row on it is single-target (exactly one agent id, no fleet/scope fan-out) and `AdminOrApproval`-gated. Wave 7 PR7.2/PR7.3. |
-| `Decommission` | Device-level agent-erasure gate for `DELETE /api/v1/sle/agents/{id}` (ADR-0024 Decision 9, amended Wave 7 PR7.2). `Decommission:Delete` authorizes for the whole decommission cascade's blast radius (seven per-agent stores: five spanning `Inventory`, `GuaranteedState`, and `SoftwareLicensing`, a sixth `Forensics`-governed store, and the `endpoint_state` presence row read on `/hardware` and `/viz/fleet`) in one grant, replacing a hand-maintained per-store conjunction. |
+| `Decommission` | Device-level agent-erasure gate for `DELETE /api/v1/sle/agents/{id}` (ADR-0024 Decision 9, amended Wave 7 PR7.2). `Decommission:Delete` authorizes for the whole decommission cascade's blast radius (eight per-agent stores: five spanning `Inventory`, `GuaranteedState`, and `SoftwareLicensing`, a sixth `Forensics`-governed store, the `endpoint_state` presence row read on `/hardware` and `/viz/fleet`, and the fleet certificate inventory, whose own read securable arrives with the certificate read surface) in one grant, replacing a hand-maintained per-store conjunction. |
 | `SoftwareLicensing` | Discovered software-licence facts synced from endpoints (ADR-0024) |
 | `AccessReview` | Periodic access-review campaigns and attestations (SOC 2 CC6.2). Seeded to Administrator and `Reviewer` only — deliberately NOT `AuditLog`, see "The authorization topology floor" above |
 | `Workflow` | Multi-step workflow definitions and executions |
@@ -653,9 +683,9 @@ The 8 routes/tools in this family authorize purely on `owner_principal == sessio
 
 **MCP tier/approval belt (added by #5047).** Ownership is the primary — and, for an untiered caller, only — gate on this surface. But the 4 write operations (create/pin/unpin/delete) also carry the same MCP tier/approval enforcement every RBAC-gated route gets (`AuthRoutes::require_tier_policy`, extracted from `require_permission`): a `readonly`-tier bearer cannot reach any of them, an `operator`-tier bearer cannot reach any of them (`Infrastructure:Write`/`:Delete` are not on `tier_allows()`'s operator allow-list), and a `supervised`-tier bearer's `delete` requires an approval ticket (`Infrastructure:Delete` is on `requires_approval()`'s list; create/pin/unpin are not). Before #5047 this belt applied on the MCP transport only — a tiered bearer could reach the identical REST/dashboard-fragment route and skip it entirely, since these routes have no `perm_fn`/RBAC gate to carry the belt. #5047 wires the belt into all 8 write sites (4 REST + 4 fragments) so a token cannot bypass its tier by switching endpoints (#520), matching MCP's own C8 chokepoint exactly. This belt is **not** RBAC — an empty-tier caller (a plain cookie session, or an API token minted with no `mcp_tier`) is untouched by it either way, which is the separate, already-tracked, open design question [#4309](https://github.com/Tr3kkR/Yuzu/issues/4309) tracks, not this fix.
 
-**The producers ARE RBAC-gated.** The routes/tools that reach into fleet data to *mint* a result set are a different surface, with real securables: `create_result_set_from_tar_query`, `create_result_set_from_instruction_result`, and `reevaluate_result_set` all gate on `Execution:Execute` with the caller's confined dispatch-visible set (ADR-0033 §2); `create_result_set_from_inventory_query` gates on `Inventory:Read` via the ADR-0017 admit-and-confine fleet-read chokepoint (its MCP `kToolSecurity` row is labelled `Inventory:Write`, but that is tier-bucketing only — the actual RBAC check is `Inventory:Read`, matching its REST twin). None of these four is affected by the ownership-only posture above.
+**The producers ARE RBAC-gated.** The routes/tools that reach into fleet data to *mint* a result set are a different surface, with real securables: `create_result_set_from_echo_query`, `create_result_set_from_instruction_result`, and `reevaluate_result_set` all gate on `Execution:Execute` with the caller's confined dispatch-visible set (ADR-0033 §2); `create_result_set_from_inventory_query` gates on `Inventory:Read` via the ADR-0017 admit-and-confine fleet-read chokepoint (its MCP `kToolSecurity` row is labelled `Inventory:Write`, but that is tier-bucketing only — the actual RBAC check is `Inventory:Read`, matching its REST twin). None of these four is affected by the ownership-only posture above.
 
-[#1207](https://github.com/Tr3kkR/Yuzu/issues/1207) tracks giving `ResultSet` a real RBAC securable for cross-operator sharing. When it lands, ownership must remain sufficient on its own — an operator's own result sets stay theirs whether or not they hold the new securable — and the grant must be **additive** (owner **OR** grant admits, never owner **AND** grant), so it only ever *widens* who can reach a set, never narrows an owner's own access. Sharing must be its own distinct, separately-gated operation, not a side effect of a broader grant. It must also cover the scope-expression resolver — the `from_result_set:<id>` evaluation path a shared set's grantee needs to actually *target* it (dispatch/policy/TAR scope evaluation, a code surface distinct from the CRUD routes: `scope_engine.cpp`, `scope_yaml.cpp`, `dispatch_scope_ladder.hpp`) — in addition to all three CRUD surfaces above (REST, MCP, and the 6 dashboard fragments); the CRUD surfaces alone let a grantee *see* a shared set without letting them *use* it in a scope.
+[#1207](https://github.com/Tr3kkR/Yuzu/issues/1207) tracks giving `ResultSet` a real RBAC securable for cross-operator sharing. When it lands, ownership must remain sufficient on its own — an operator's own result sets stay theirs whether or not they hold the new securable — and the grant must be **additive** (owner **OR** grant admits, never owner **AND** grant), so it only ever *widens* who can reach a set, never narrows an owner's own access. Sharing must be its own distinct, separately-gated operation, not a side effect of a broader grant. It must also cover the scope-expression resolver — the `from_result_set:<id>` evaluation path a shared set's grantee needs to actually *target* it (dispatch/policy/Echo scope evaluation, a code surface distinct from the CRUD routes: `scope_engine.cpp`, `scope_yaml.cpp`, `dispatch_scope_ladder.hpp`) — in addition to all three CRUD surfaces above (REST, MCP, and the 6 dashboard fragments); the CRUD surfaces alone let a grantee *see* a shared set without letting them *use* it in a scope.
 
 ## Operations
 
