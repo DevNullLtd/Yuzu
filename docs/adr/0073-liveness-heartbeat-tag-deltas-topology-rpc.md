@@ -2171,6 +2171,26 @@ of every ~30 s. The content is unchanged.
 - a lexical test that no non-generated source reads or writes heartbeat fields 3 or 4 (D3);
 - a UAT rig check that a quiet agent stays synced and non-stale for 30 min with one or two bodies
   sent;
+- **Chaos.** Each scenario below is owned by the slice that introduces the behaviour it tests, and
+  slice 10 records every result with the measured figures. Each asserts a number the ADR states:
+  - **S1, server restart storm** (5,000 and 10,000 agents; slices 6 and 7b): no agent reconnects
+    except `NO_RECORD`; `BatchHeartbeat` p99 stays under 2 s; the gateway retries no heartbeat batch
+    on a timeout; the breaker does not trip; tags and topology converge within the D13 figures for
+    that N;
+  - **S2, S1 with Postgres degraded** (300 ms added latency, pool saturated; slice 6): heartbeat
+    ingestion is unaffected, resyncs are `deferred` and drain once the pool recovers, and reattach
+    answers `DEGRADED` without closing a stream;
+  - **S3, two replicas behind per-RPC balancing** (slices 4 and 6): asserts the connection-affinity
+    precondition (*Server stores*) by showing the documented symptom, a `diverged` plus `no_base`
+    share near 100 %, and that connection-level balancing converges;
+  - **S4, upstream blackhole of 60 s and of 120 s with tag churn** (slice 7): under 90 s only the
+    agents whose tags changed diverge, once; over 90 s every agent is `no_base` once; both converge
+    at the D8 rates, and the gateway buffer stays inside its byte cap;
+  - **S5, server wall-clock step of ±10 min** (slice 8): no `stale_reason`, IP claim or retention
+    outcome changes (D6, `steady_clock`);
+  - **S6, retain-on-disconnect IP conflict** (slice 8): a gateway restart during which another
+    agent claims one of a retained slot's IPs writes `topology.push.rejected` with
+    `reason=reclaim_conflict`, drops the slot and requests topology (D6).
 - the idle-memory harness rerun with ADR-0074 D14's method (OS anonymous memory plus kernel, after
   settling, TLS on) at 5,000 and 10,000 agents, as the recorded before/after.
 
@@ -2291,9 +2311,26 @@ The same changes fix known truth-drift:
 
 ## Implementation slices
 
-Small PRs, in order. Slices 0-2b are wire-compatible and can land early. Slices 3-10 are the breaking
-release and merge to `dev` inside one release window. ADR-0074 gates its own waves at 5,000 agents
-(its Conflict 7); the measurements in slices 1 and 10 use the same counts.
+Small PRs, in order. Slices 0-2b are wire-compatible and could land early. Slices 3-10 are the
+breaking release and merge to `dev` inside one release window. ADR-0074 gates its own waves at
+5,000 agents (its Conflict 7); slice 10's measurement uses the same counts. Slice 1 measures
+per-agent bytes on the agent, at no fleet count.
+
+**Sequencing against acceptance.**
+- Slices 3-10 wait for this ADR to be Accepted, and so for ADR-0074's ratification (*Depends on*).
+- Slices 0-2b are additive and change no wire behaviour, but they are still implementation of a
+  Proposed ADR. Slice 2b in particular creates a durable Postgres schema that nothing reads until
+  slice 7b. Whether any of them may merge before acceptance is the owner's call (open point 17);
+  none has a tracking epic yet, and the implementing PRs open one.
+- **Slice 7b against ADR-0074 wave 2.** If 7b lands before wave 2, reattach carries today's replay
+  authority (D14, *Authority is unchanged*). If wave 2 lands first, open point 13 must be decided
+  before 7b: wave 2 gates the route write on a verified per-session agent signature, which
+  reattach cannot carry as designed.
+
+**No release or pilot build between slice 3 and slice 10.** From slice 3, status tags and topology
+are inert on `dev` (tags until slices 4-6, topology until slice 9), so a build cut in that range has
+no fleet gauges, no Guardian generation re-push and no `/viz` topology for any agent. No release
+tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 are partly merged.
 
 0. **Gateway: collect after any request of 64 KiB or more** (`yuzu_grpc_stream_h.erl`). Interim and
    independent; measurable on the harness at once.
@@ -2328,7 +2365,15 @@ release and merge to `dev` inside one release window. ADR-0074 gates its own wav
    - Regenerate the gateway gpb modules.
    - The minimal compiling removal of every field-3/4 reader and writer.
 
-   The tree is coherent but tags and topology are inert until slices 4-9 land.
+   The C++ readers and writers go here: the agent's field-4 attach and field-3 build, and the
+   server's field-3 and field-4 reads. The gateway's handling of fields 3 and 4 (the per-tag
+   checks and snapshot coalescing) goes in slice 7; until then the gateway screens and coalesces
+   fields that are now always empty, which is harmless.
+
+   The tree is coherent but tags and topology are inert until slices 4-9 land: tags until slice 6
+   (slice 4 applies them, slice 5 sends them, slice 6 heals divergence), topology until slice 9. In
+   particular slice 8 makes the server accept `ReportTopology`, but nothing sends it until slice 9
+   adds the agent sender and the gateway proxy, so `/viz` has no topology from slice 3 to slice 9.
 4. **Server tags.** `AgentHealthStore::apply`, the D3 ingestion order (including the tag caps moved
    from the gateway), the Register-side consumer, hooks on the merged view, and
    `yuzu_server_heartbeat_tags_total`. An outcome that needs a resync is counted only; slice 6 adds
@@ -2367,6 +2412,8 @@ release and merge to `dev` inside one release window. ADR-0074 gates its own wav
       `YuzuAgentsTagsAbsent`); this is the only slice that adds them.
     - Every doc listed above, the upgrading.md section and the changelog fragment.
     - The harness and rig rerun recorded as the measured outcome, using ADR-0074 D14's method.
+    - The chaos scenarios S1-S6 (*Tests*) recorded with their results, and the two freshness SLIs
+      (D13) measured.
 
 ## Open points for the owner
 
@@ -2419,3 +2466,8 @@ release and merge to `dev` inside one release window. ADR-0074 gates its own wav
     `--no-topology` on each agent. A fleet-wide switch would need new mechanism, for example the
     server answering every `ReportTopology` with a new refusal and issuing no `__resync__.topology`.
     The owner decides whether one is needed.
+17. **Whether slices 0-2b may merge before this ADR is Accepted** (*Implementation slices*). They are
+    wire-compatible and additive, but they implement a Proposed ADR, and slice 2b creates a durable
+    Postgres schema (`agent_registration_store`) that nothing reads until slice 7b and that
+    accumulates rows from its first deployment. The alternative is to hold every slice until
+    acceptance. The owner decides, and names the tracking epic.
