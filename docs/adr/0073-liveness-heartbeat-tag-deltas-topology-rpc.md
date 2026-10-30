@@ -1109,7 +1109,17 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     non-system caller a `system_reserved` row. No per-surface rule is added.
   - They are built with `build_classified_command(DispatchCaller{.system = true}, ...)` and sent
     with `send_system_reserved` to the agent's own stream, as `__sync__.now` is. For a gateway
-    agent they do **not** go through `forward_gateway_pending`: that path starts one untracked,
+    agent, today's `send_system_reserved` goes through `AgentRegistry::send_to`, which pushes the
+    frame onto the shared `gw_pending_` queue that the next `forward_gateway_pending()` from any
+    caller drains. So the issuer uses a `send_system_reserved` variant: still the single
+    system-reserved door, the same enumerators and the same `sent`/`undelivered` metering on
+    `yuzu_server_system_reserved_push_total`, and for a gateway session it runs `send_to`'s own
+    checks (the `gateway_capability_missing` deny for a gateway without
+    `kGatewayWireCapabilityDispatchTagV1`, the `cluster_id` stamp, `wire_for`) and hands the frame
+    to the issuer's own batch, never to `gw_pending_`. A test asserts a resync never appears in
+    `drain_gateway_pending()`, and one that a gateway lacking the dispatch-tag capability is
+    denied on the issuer path. Gateway resyncs therefore do **not** go through
+    `forward_gateway_pending`: that path starts one untracked,
     detached thread per command, holds a `SendCommand` open for up to 300 s with three retries,
     and is never joined at stop (#3279). At the issuer's rates, with the per-agent re-issue while
     an agent stays diverged, a slow or blackholed gateway management plane would turn a resync
