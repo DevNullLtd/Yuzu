@@ -289,6 +289,21 @@ data, so it is allowed under the #2549 firewall.
 default. A unit test fails if any key the agent core can emit is not explicitly listed. The default
 exists only so an unlisted plugin fact degrades to "sent on change" rather than being dropped.
 
+**Tag caps, applied by the agent.** The same header holds the tag caps, next to the class table: at
+most 512 keys, at most 64 KiB per key or value, at most 256 KiB of keys and values in total, and
+every key and value valid UTF-8. The numbers are today's gateway caps (D3, step 2). The agent applies
+them to the set it is about to emit, interval and state together, **before** it diffs against its
+base and computes the digest:
+- a key or value over 64 KiB, or not valid UTF-8, is dropped;
+- the remaining keys are admitted in key order, interval keys first, until the next one would pass
+  512 keys or 256 KiB in total; the rest are dropped;
+- every drop is counted (`yuzu_agent_status_tags_dropped_total{reason}`, D13) and logged once per
+  key per process.
+
+A value is dropped, never truncated, because a truncated value would be published as a real one. So
+the digest covers exactly the set that is sent, and a payload the server rejects for a cap (D3) is a
+defect, not an oversize agent.
+
 **Retired and changed keys** (no back-compat):
 - **`yuzu.uptime_s` is retired.** It changes every beat by construction, which makes it the worst
   possible state tag, and no server code reads it.
@@ -383,14 +398,17 @@ shared by direct `Heartbeat` and gateway `BatchHeartbeat`):
    value, 256 KiB in total, valid UTF-8. These caps are enforced at the gateway today
    (`yuzu_gw_heartbeat_buffer.erl`: `MAX_STATUS_TAGS`, `MAX_TAG_ITEM_BYTES`, `MAX_TAG_BYTES_TOTAL`
    at l.117-130, and `screen/1` with the UTF-8 repair at about l.460-583). A payload that fails them
-   is discarded and counted `rejected`, and the agent is treated as `diverged`. Two differences
-   from today, stated so they are not mistaken for parity:
+   is discarded and counted `rejected`, and the agent is treated as `diverged`. The agent applies
+   the same caps before it digests (D1), so a rejection means an agent or encoding defect. Two
+   differences from today, stated so they are not mistaken for parity:
    - the caps are checked **after** the server decodes the bytes, so the decode itself is bounded
      only by the size of the RPC message that carried it, not by the tag caps;
    - invalid UTF-8 is **rejected, not repaired**. The tag maps are proto3 `string` fields, whose
      C++ parse fails on invalid UTF-8, so the whole payload is rejected where the gateway today
-     repairs the offending bytes and keeps the rest. A per-agent resync
-   backoff (D8) stops a persistently oversize agent from looping.
+     repairs the offending bytes and keeps the rest.
+
+   A per-agent resync backoff (D8) stops a persistently rejected agent from re-requesting a full
+   set every minute.
 3. Then branches:
    - If `full`: replace the state map with `upsert`. **Synced.**
    - Else if the server holds no state map for the agent (server restart, HA replica change, a
@@ -402,7 +420,13 @@ shared by direct `Heartbeat` and gateway `BatchHeartbeat`):
 
 A diverged or unbased agent keeps its last verified state, if any, until the full set arrives. Its
 interval tags are always current. The full set arrives on the agent's next heartbeat after
-`__resync__.tags` reaches it (D8): within one heartbeat interval of the command.
+`__resync__.tags` reaches it (D8): at most 36 s after delivery (a jittered 30 s beat, D9). Delivery
+itself can wait for the per-replica rate limit and the per-agent interval (D8).
+
+**An agent rejected three times in a row is withheld.** Its last verified state map is kept but not
+served: its state-derived gauges are absent, as for `no_base`, until a payload is accepted. A defect
+that keeps an agent rejected must not show its last verified Guardian, dedup or Spark state as
+current indefinitely.
 
 **Per-heartbeat side effects read the merged view, never the wire:**
 - Guardian generation reconcile (`yuzu.guardian_generation`);
@@ -731,6 +755,9 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     4 KB, so 100k agents resync in about 50 s.
   - `topology`: `--topology-resync-rate`, default 200/s, at most one per agent per 5 min. 100k agents
     repopulate in about 8 min at about 30 MB/s of body ingest.
+  - **Per-agent backoff after `rejected`.** The per-agent `tags` interval starts at 60 s and doubles
+    for each consecutive `rejected` outcome, to a cap of 15 min. An accepted payload resets it. A
+    `diverged` or `no_base` outcome keeps the 60 s interval.
 - **Loss.** A command that cannot be sent (no stream) is not retried by itself. The agent's next
   diverged heartbeat re-triggers it after the per-agent interval. An agent whose stream is down
   reconnects, and its Register carries the full set anyway.
@@ -825,6 +852,8 @@ Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
 **Agent:**
 - `yuzu_agent_heartbeat_bytes` (histogram);
 - `yuzu_agent_heartbeat_tag_upserts` (histogram per beat);
+- `yuzu_agent_status_tags_dropped_total{reason}`, with
+  `key_oversize|value_oversize|invalid_utf8|count_cap|total_cap` (D1);
 - `yuzu_agent_heartbeat_full_tags_total{reason}`, with `register|resync`;
 - `yuzu_agent_commands_executed_total{plugin="__resync__"}` (the existing family);
 - `yuzu_agent_topology_pump_total{outcome}`, with `ok|unchanged|truncated|failed`;
@@ -1247,7 +1276,7 @@ lands. The two are kept consistent as follows.
 ### Upgrade (breaking)
 
 `docs/user-manual/upgrading.md` gains: "⚠️ Breaking: the heartbeat carries status-tag changes and a
-topology digest; fleet topology moved to its own RPC — upgrade server, gateways and agents together".
+topology digest; fleet topology moved to its own RPC; upgrade server, gateways and agents together".
 It should say:
 - the order: server, then gateways, then agents, in one maintenance window;
 - un-upgraded agents keep connecting and executing commands, but contribute **no** status tags and no
@@ -1335,7 +1364,9 @@ or a body asks for it, rate-limited. A shared store is neither needed nor decide
 - **Guardian:**
   - generation reconcile still fires every heartbeat, from the merged view;
   - its `yuzu.guardian_*` fleet gauges are unchanged once synced;
-  - a diverged agent shows its last verified values for up to about one minute.
+  - a diverged agent shows its last verified values until its full set lands: normally within two
+    heartbeats plus any rate-limit wait (D3, D8). An agent rejected three times in a row shows none
+    (D3).
 - **Spark:** the ABSENT posture travels as explicit removals.
 - **Fleet gauges:** unchanged values in steady state. After a server restart they are briefly absent
   for `no_base` agents (D13).
@@ -1381,6 +1412,8 @@ of every ~30 s. The content is unchanged.
 
 **Agent:**
 - delta computation, including removals, base-only-on-ack, and full-on-Register and full-on-resync;
+- the tag caps applied before the diff and the digest: an oversize or invalid-UTF-8 key is dropped
+  and counted, the digest covers only what is sent, and a capped set passes the server's checks;
 - the `__resync__` decision function, dedup claim, and terminal recorded before the write;
 - the topology send rules, with an injected RNG for jitter bounds, never timing.
 
