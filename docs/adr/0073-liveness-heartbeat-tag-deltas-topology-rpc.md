@@ -1442,9 +1442,11 @@ message ReattachResponse {
   when the metadata value is present and differs from the body, or when the body's id is not a
   server-minted session id (`is_server_minted_session_id`, the check ProxyRegister applies).
 - **Server** (`GatewayUpstreamServiceImpl::ProxyReattach`, `server/core/src/gateway_service_impl.cpp`):
-  0. `onbehalf::enforce(context)`, before any side effect, as in every gateway-upstream handler;
-  1. gateway peer authorization (`GatewayPeerGuardedService` override; D7's rule for a new upstream
-     RPC);
+  0. gateway peer authorization (`GatewayPeerGuardedService` override; D7's rule for a new upstream
+     RPC). The guard is the outer override, so it runs, and writes its own denial audit row,
+     before the handler is entered;
+  1. `onbehalf::enforce(context)`, as the handler's first statement and before any side effect, as
+     in every gateway-upstream handler;
   2. `registration_lock_for(agent_id)`;
   3. enrollment status read (the existing fast-path read, `get_pending_status`). Only
      `PendingStatus::approved` proceeds. `pending`, `denied` or no row answers `NOT_ENROLLED`. A
