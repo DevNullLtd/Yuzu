@@ -21,6 +21,20 @@
  */
 #pragma once
 
+#ifdef __APPLE__
+#include <arpa/inet.h>
+#include <libproc.h>
+#include <sys/proc_info.h>
+#include <sys/types.h>
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#endif
+
 #include <string_view>
 
 namespace yuzu::shared::detail {
@@ -60,18 +74,6 @@ constexpr std::string_view socket_walk_tcp_state(int st) noexcept {
 } // namespace yuzu::shared::detail
 
 #ifdef __APPLE__
-
-#include <arpa/inet.h>
-#include <libproc.h>
-#include <sys/proc_info.h>
-#include <sys/types.h>
-
-#include <cstdint>
-#include <optional>
-#include <string>
-#include <unordered_map>
-#include <utility>
-#include <vector>
 
 namespace yuzu::shared {
 

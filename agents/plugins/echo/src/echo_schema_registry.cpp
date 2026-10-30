@@ -953,7 +953,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
         },
 
         // ── power (cursor-model seam, echo_cursor.hpp) — sleep/wake/AC-power
-        // transitions. LIVE TIER ONLY, no rollups (P-008 — a mirror/aggregate
+        // transitions. RAW CAPTURE ROWS ONLY, no rollups (P-008 — a mirror/aggregate
         // shape was contradictory for a low-volume host-lifecycle source;
         // netconn's live-only shape is the precedent). Replay idempotence via
         // the UNIQUE record_key index below (echo_cursor.hpp rule 3), not
@@ -1007,7 +1007,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
 
         // ── removable (cursor-model seam, echo_cursor.hpp) — removable-media
         // attach/detach transitions, plus exec_from_removable correlation
-        // (process_enum.hpp's ProcessInfo::exec_path, P-004). LIVE TIER ONLY,
+        // (process_enum.hpp's ProcessInfo::exec_path, P-004). RAW CAPTURE ROWS ONLY,
         // no rollups (P-008, same rationale as power above). `image_path` +
         // `pid` are typed identity-adjacent columns (P-004) — `evidence` and
         // `record_key` are forensic/value fields only, never identity
@@ -1069,8 +1069,8 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // ── registry (cursor-model seam, echo_cursor.hpp) — registry value and key
         // changes under a curated persistence/policy watch list (HKLM and each
         // loaded HKU hive): what changed, with its new value and the old value's type and
-        // size. LIVE TIER ONLY, no rollups (P-008, same rationale as power above). Mechanism: a
-        // RegNotifyChangeKeyValue subtree watch + a per-root baseline diff
+        // size. Raw capture rows only, no rollups (P-008, same rationale as power above).
+        // Mechanism: a RegNotifyChangeKeyValue subtree watch + a per-root baseline diff
         // (echo_state `registry:<root>`) say WHAT changed; a write-only
         // Kernel-Registry ETW session says WHO, by correlation on value name, type,
         // size and time window. actor_pid / actor_image hold the correlated writer

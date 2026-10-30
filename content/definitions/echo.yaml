@@ -40,8 +40,10 @@ metadata:
     the last maintenance pass finished; 0 within budget, and non-zero while a
     long echo sql read pins the log or when nothing more is eligible to
     evict), budget_evicted_raw_rows_total and budget_evicted_hourly_rows_total
-    (cumulative rows the budget removed), and db_auto_vacuum (incremental,
-    none, or deferred while a one-off conversion waits for free disk space).
+    (cumulative rows the budget removed), and db_auto_vacuum (incremental;
+    none; or deferred once a one-off conversion was wanted and could not run,
+    for too little free disk space or a failed VACUUM, which stays until a
+    conversion succeeds).
     module_dedup_overflow_total and tcp_closing_dedup_overflow_total count how
     often the hourly de-duplication sets filled and were cleared.
   tags: [echo, timeline, monitoring, diagnostics]
@@ -723,19 +725,21 @@ spec:
           is listed as unsupported and records nothing. A curated watch list (Run and RunOnce, Services,
           Image File Execution Options, AppInit_DLLs, Winlogon, LSA, Policies and
           Defender under HKLM, plus Run, RunOnce, Policies and Winlogon under every
-          loaded user hive) is watched for changes; each added, changed or removed
-          value is recorded with its new value (up to 512 bytes of text) and the
+          loaded user hive) is watched for changes; each added or changed value
+          is recorded with its new value (up to 512 bytes of text), a removed
+          value by its name, and a changed or removed value also carries the
           type and size of its old value, never the old value itself.
           VALUES ARE STORED UNMASKED: the new value of every value added or
           changed under a watched key is readable through echo.sql in
           $Registry_Live (for example a Winlogon autologon DefaultPassword when
           it changes). A value that has not changed is not: the per-key baseline
-          in echo_state holds only its type, size and a hash. The source's cursor
-          row (echo_cursor) holds the new value of a change still waiting for its
-          writer. A baseline written by an older build also holds up to 512 bytes
-          of each value it saw, and a cursor row built from one also holds the old
-          value, until the next read of the root rewrites them. Treat all three
-          accordingly, or set "false" to opt out. The acting
+          in echo_state holds only its type, size and an unsalted hash. The
+          source's cursor row (echo_cursor) holds the new value of a change still
+          waiting for its writer. A baseline written by an older build also holds
+          up to 512 bytes of each value it saw until a complete read of that root
+          rewrites it, and a cursor row built from one also holds the old value
+          until that change is written (the next slow tick at most). Treat all
+          three accordingly, or set "false" to opt out. The acting
           process is CORRELATED to each change from a write-only Kernel-Registry
           ETW session (value writes, value deletions and key deletions) by value
           name, type, size and time window: actor_pid and actor_image name the

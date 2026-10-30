@@ -2749,7 +2749,7 @@ TEST_CASE("run_budget with REAL aggregation never takes a row the rollup can sti
 
 TEST_CASE("run_budget: rows the H11 rollup clamp skipped are evictable like retention prunes them",
           "[echo][aggregator][budget]") {
-    // Documents the preservation contract's edge (P2): after a long gap the rollup clamps its
+    // Documents the preservation contract's edge: after a long gap the rollup clamps its
     // window to the last 2 h, so rows older than that were never summarised. Their timestamps
     // are below the mark, so eviction treats them as the existing age-based retention already
     // does, oldest first and only under size pressure. Fixing the clamp is a separate change.

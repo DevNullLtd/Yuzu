@@ -964,7 +964,7 @@ TEST_CASE("Echo fill_process_names: fills empty names by pid, keeps a name, igno
 
 TEST_CASE("Echo fill_process_names: a reused pid does not inherit a stale name past the grace",
           "[echo][diff][network][pidname]") {
-    // P8: pid 100 'a' exits at t; its sockets still resolve inside the grace window, a reused
+    // pid 100 'a' exits at t; its sockets still resolve inside the grace window, a reused
     // pid whose start was missed resolves to '' after it, and a fresh start renames it.
     constexpr std::int64_t t = 5000;
     std::unordered_map<std::uint32_t, PidName> names;

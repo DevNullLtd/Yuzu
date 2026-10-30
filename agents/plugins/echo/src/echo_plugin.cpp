@@ -4484,7 +4484,8 @@ private:
     // The one-off conversion of a pre-existing database to incremental auto_vacuum. Never at
     // boot; only here, once eviction has brought data under target and the file holds many
     // free pages. Too little free disk (or a failed VACUUM) records the time and retries at
-    // most daily; status shows db_auto_vacuum|deferred meanwhile.
+    // most daily; status shows db_auto_vacuum|deferred until a conversion succeeds (the marker
+    // is not cleared when a later pass finds the freelist too small to warrant one).
     void maybe_vacuum_to_incremental(std::int64_t now_ts, std::int64_t target) {
         const auto sb = db_->storage_bytes();
         std::int64_t deferred_at = 0;

@@ -157,8 +157,9 @@ void make_config_key_unreadable(const fs::path& db_path, const std::string& key)
 }
 
 // Run `sql` on a fresh raw connection to the plugin's echo.db (no plugin code) and return the
-// rows as text, NULL as "". A second connection to a WAL database sees what the plugin committed.
-std::vector<std::vector<std::string>> raw_rows(const fs::path& db_path, const std::string& sql) {
+// rows as text, NULL as "" (empty for a statement that returns none: the seeding writes below
+// use it too). A second connection to a WAL database sees what the plugin committed.
+std::vector<std::vector<std::string>> raw_sql(const fs::path& db_path, const std::string& sql) {
     yuzu::test::SqliteHandleOwner<sqlite3> owner;
     REQUIRE(sqlite3_open(db_path.string().c_str(), &owner.db) == SQLITE_OK);
     sqlite3_busy_timeout(owner.db, 5000);
@@ -614,7 +615,10 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
     // reach. The loaded plugin is driven through the frozen C ABI, so a test has no seam to shrink
     // the thresholds: this uses the production constants (a 32 MiB budget leaves a 16 MiB data
     // target; the conversion wants a 32 MiB freelist) and pays for it in disk, about 70 MiB in the
-    // temp directory. No clock or timing assertion, no process.
+    // temp directory. No clock or timing assertion, no process. Measured at 0.17 s with
+    // `yuzu_agent_tests --durations=yes` on an Apple M4 (the writes are page-sized zeroblobs on one
+    // WAL connection); even at the 3-6x I/O amplification the shared CI runners show under load
+    // that is about a second.
     constexpr std::int64_t kMiB = 1024 * 1024;
     constexpr std::int64_t kMinBudget = 32 * kMiB;
 
@@ -640,10 +644,10 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
 
     // A database as an older build left it: auto_vacuum none, and 48 MiB of pages the plugin will
     // find free once the pad rows are deleted below.
-    (void)raw_rows(db_path,
-                   "PRAGMA auto_vacuum=0; CREATE TABLE yuzu_test_pad(x BLOB);"
-                   "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 48) "
-                   "INSERT INTO yuzu_test_pad SELECT zeroblob(1048576) FROM n;");
+    (void)raw_sql(db_path,
+                  "PRAGMA auto_vacuum=0; CREATE TABLE yuzu_test_pad(x BLOB);"
+                  "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 48) "
+                  "INSERT INTO yuzu_test_pad SELECT zeroblob(1048576) FROM n;");
 
     yuzu::agent::StandalonePluginContext ctx("echo", {{"agent.data_dir", dir_guard.path.string()}},
                                              &*kv);
@@ -654,7 +658,7 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
     // the preservation contract admits them whatever the clock clamp does): 20 MiB of data, over
     // the 16 MiB target. Then free the pad, so the file is mostly free pages.
     const auto now = static_cast<std::int64_t>(std::time(nullptr));
-    (void)raw_rows(
+    (void)raw_sql(
         db_path,
         std::format("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 19) "
                     "INSERT INTO tcp_live (ts,snapshot_id,action,proto,local_addr,local_port,"
@@ -686,7 +690,7 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
           std::optional<std::string>{"20"});
     CHECK(plugin_status_value(d, desc, "budget_evicted_hourly_rows_total") ==
           std::optional<std::string>{"0"});
-    const auto left = raw_rows(db_path, "SELECT count(*) FROM tcp_live");
+    const auto left = raw_sql(db_path, "SELECT count(*) FROM tcp_live");
     REQUIRE(left.size() == 1);
     CHECK(left[0][0] == "0");
 
@@ -701,7 +705,7 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
     // the freelist large, so the one-off VACUUM ran, succeeded and cleared its deferral marker.
     CHECK(plugin_status_value(d, desc, "db_auto_vacuum") == std::optional<std::string>{"incremental"});
     const auto deferred =
-        raw_rows(db_path, "SELECT value FROM echo_config WHERE key = 'auto_vacuum_deferred_at'");
+        raw_sql(db_path, "SELECT value FROM echo_config WHERE key = 'auto_vacuum_deferred_at'");
     REQUIRE(deferred.size() == 1);
     CHECK(deferred[0][0] == "0");
 
@@ -795,9 +799,27 @@ TEST_CASE("echo plugin: a polled tcp row is named by the process source, and sta
     // The poll legs set a socket's pid but never its process name, so on this host the only thing
     // that names a stored tcp row is the plugin's pid -> name map (filled from the process poll).
     // That map is plugin-private behind the frozen C ABI, hence the public path: a real socket
-    // pair owned by this process, one `collect_fast`, and a raw read of what tcp_live stored. The
-    // poll leg is the path for an unprivileged macOS user (the nstat stream is system-wide only
-    // as root), and for Linux and Windows always.
+    // pair owned by this process, one `collect_fast`, and a raw read of what tcp_live stored.
+    //
+    // Why real loopback sockets (the test-efficiency rule asks for the justification): the only
+    // input `collect_fast` takes through the frozen ABI is the OS socket table itself. There is no
+    // seam to hand the loaded .dylib/.so/.dll a fixture connection list (the collector is a free
+    // function the plugin calls directly), so the one way to put a row with THIS pid in front of
+    // the poll leg is to own a socket. Loopback is the cheapest such socket: no network, no DNS
+    // for its own addresses (the collector skips 127.0.0.1), kernel-chosen ports, torn down with
+    // the pair. The remaining host dependence is the collector's reverse-DNS pass over whatever
+    // OTHER sockets the host has open, bounded by its 3 s per-snapshot budget (the plugin has no
+    // switch to turn it off). The poll leg is the path for an unprivileged macOS user and for
+    // Linux and Windows always; as root on macOS the nstat stream becomes the primary tcp source
+    // and bypasses the poll leg, so the case is skipped there rather than asserting on a path
+    // the host would not take.
+#ifdef __APPLE__
+    if (::geteuid() == 0) {
+        WARN("running as root on macOS: nstat is the primary tcp source and the poll leg under "
+             "test is bypassed -- skipping");
+        return;
+    }
+#endif
     const auto plugin_path = find_echo_plugin();
     if (plugin_path.empty()) {
         if (std::getenv("MESON_BUILD_ROOT") != nullptr)
@@ -822,6 +844,18 @@ TEST_CASE("echo plugin: a polled tcp row is named by the process source, and sta
     const auto db_path = dir_guard.path / "echo.db";
     yuzu::agent::LocalDispatcher d;
 
+    // The loaded plugin instance outlives init/shutdown in this process and its source-health
+    // ledger is not reset by init, so whatever happens below the process source must be left
+    // reporting an enabled token (a later case reads `status` and expects no source_disabled in
+    // it) and the plugin shut down. Scope-exit, so a failed REQUIRE after the pause cannot leave
+    // the singleton paused for the rest of the run. CHECK only: this runs during unwind.
+    const YuzuParam resume[] = {{"process_enabled", "true"}};
+    const yuzu::test::ScopeExit restore_process_source{[&] {
+        CHECK(d.run(desc, "configure", resume).rc == 0);
+        (void)d.run(desc, "collect_fast");
+        desc->shutdown(ctx.get());
+    }};
+
     // The name the process enumeration reports for this very process: what the poll seeds the map
     // with, so it is the name a correctly named row must carry.
     std::string expected;
@@ -833,10 +867,10 @@ TEST_CASE("echo plugin: a polled tcp row is named by the process source, and sta
     // The client end of a pair: the row whose local port is the client's and whose remote port
     // is the listener's.
     const auto stored_row = [&](const LoopbackPair& pair) {
-        return raw_rows(db_path,
-                        std::format("SELECT process_name, pid FROM tcp_live WHERE local_port = {} "
-                                    "AND remote_port = {}",
-                                    pair.client_port, pair.listener_port));
+        return raw_sql(db_path,
+                       std::format("SELECT process_name, pid FROM tcp_live WHERE local_port = {} "
+                                   "AND remote_port = {}",
+                                   pair.client_port, pair.listener_port));
     };
 
     LoopbackPair first;
@@ -864,13 +898,4 @@ TEST_CASE("echo plugin: a polled tcp row is named by the process source, and sta
         CHECK(rows[0][0].empty());
         CHECK(rows[0][1] == std::to_string(current_pid()));
     }
-
-    // The loaded plugin instance outlives init/shutdown in this process and its source-health
-    // ledger is not reset by init, so leave the process source reporting an enabled token: a later
-    // case reads `status` and expects no source_disabled in it.
-    const YuzuParam resume[] = {{"process_enabled", "true"}};
-    REQUIRE(d.run(desc, "configure", resume).rc == 0);
-    (void)d.run(desc, "collect_fast");
-
-    desc->shutdown(ctx.get());
 }

@@ -230,7 +230,7 @@ TEST_CASE("risk-filter keeps risky even past the signed cap", "[echo][module][fi
 
 TEST_CASE("risk-filter cap is checked before the seen-set: a capped load is admitted on retry",
           "[echo][module][filter]") {
-    // P6: only an admitted row is marked. A load dropped by the per-drain cap must not consume
+    // Only an admitted row is marked. A load dropped by the per-drain cap must not consume
     // its hourly slot, or it would be lost for the rest of the hour.
     HourlySeenSet seen;
     auto first = apply_module_risk_filter(
@@ -329,7 +329,7 @@ TEST_CASE("risk-filter stream replay: one row per (action, process, module, dir)
 
 TEST_CASE("risk-filter: a boot seed does not consume the slot of a later load",
           "[echo][module][filter]") {
-    // P7: action is in the key. module_hourly.load_count counts 'loaded' rows only, so a seed
+    // Action is in the key. module_hourly.load_count counts 'loaded' rows only, so a seed
     // that shared the key would hide the load and the module would read as never loaded.
     auto seed = make_signed("app.exe", "k.dll", "MS");
     seed.action = ModuleAction::kSeed;
