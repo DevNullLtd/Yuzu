@@ -868,3 +868,11 @@ TEST_CASE("deployment routes: list fragment resolves the target label owner-scop
     CHECK(rig.polls == 0);
     CHECK(rig.audits.empty());
 }
+
+TEST_CASE("deployment routes: the deploy results script reveals the empty notice with 'block'",
+          "[deployment][routes][ui]") {
+    DeploymentRow dep;
+    const std::string h = render_deploy_results(dep, {}, "");
+    CHECK(h.find("e.style.display=vis?'none':'block'") != std::string::npos);
+    CHECK(h.find("vis?'none':''") == std::string::npos);
+}
