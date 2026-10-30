@@ -328,6 +328,7 @@ message StatusTags {
   repeated string     removed  = 3;   // state keys deleted since the base
   string state_digest          = 4;   // "v1:" + 32 lowercase hex over the agent's FULL state set after this change
   bool   full                  = 5;   // true: `upsert` IS the complete state set; server replaces, `removed` must be empty
+  string base_digest           = 6;   // state_digest of the base this delta was computed against; empty when full = true
 }
 
 message RegisterRequest {
@@ -366,7 +367,7 @@ server erases it. This preserves every "absence is meaningful" posture:
 - a cleared `yuzu.plugins_failed`;
 - a sync source with no skips.
 
-A key cannot appear in both `upsert` and `removed`; the server treats that as divergence.
+A key cannot appear in both `upsert` and `removed`; the server rejects such a payload (D3, step 3).
 
 **Base and acknowledgement.**
 - The agent's base is the state set as of its last **acknowledged** heartbeat, or the Register's
@@ -375,6 +376,9 @@ A key cannot appear in both `upsert` and `removed`; the server treats that as di
   from the server.
 - A failed or timed-out heartbeat does not advance the base, so its changes repeat in the next
   delta.
+- Every delta names its base in `base_digest`. The server applies a delta only to the base it names
+  (D3, step 6), so a delta computed against a base the server never reached, or a reordered older
+  delta, cannot be applied to the wrong map and pass by coincidence.
 - A heartbeat the gateway acknowledged but later lost (keep-newest coalescing, buffer drop, oversize
   drop) is caught by the digest (D3), not by the agent.
 
@@ -390,15 +394,26 @@ used by the agent and by the server alike. It is pure computation with no I/O, s
 which the #2549 firewall permits. OpenSSL is already a dependency of both binaries. Unlike ADR-0016's
 blob hash, the canonical form therefore exists once, and the two sides cannot drift.
 
+**Versioning.** The server verifies only the digest prefixes it implements; this ADR defines `v1:`.
+Any other prefix is counted `unverifiable` and never triggers a repeating resync (step 5). Golden
+test vectors for `v1` (the empty set, one pair, key ordering, a multi-byte UTF-8 value) live in one
+checked-in file that both the agent and the server test suites read, so a change to the canonical
+form fails both.
+
 **On each heartbeat** the server (`HeartbeatIngestion`, `server/core/src/heartbeat_ingestion.{hpp,cpp}`,
 shared by direct `Heartbeat` and gateway `BatchHeartbeat`):
 
-1. Replaces the agent's interval map with `tags.interval`.
-2. Decodes `status_tags_pb` and checks it against the tag caps: at most 512 keys, 64 KiB per key or
+1. **Absent payload.** An empty `status_tags_pb` comes from an agent older than this ADR: an
+   upgraded agent always sends a `state_digest`, so its payload is never empty. The server applies
+   nothing, requests no resync and counts `absent`. `absent` heartbeats are excluded from the
+   divergence alert (D13). They are what an un-upgraded agent produces during the upgrade window
+   (*Upgrade consequence* above).
+2. **Decode and caps.** Decodes `status_tags_pb` and checks it against the tag caps: at most 512 keys, 64 KiB per key or
    value, 256 KiB in total, valid UTF-8. These caps are enforced at the gateway today
    (`yuzu_gw_heartbeat_buffer.erl`: `MAX_STATUS_TAGS`, `MAX_TAG_ITEM_BYTES`, `MAX_TAG_BYTES_TOTAL`
    at l.117-130, and `screen/1` with the UTF-8 repair at about l.460-583). A payload that fails them
-   is discarded and counted `rejected`, and the agent is treated as `diverged`. The agent applies
+   is discarded and counted `rejected`; the agent is treated as `diverged`, subject to the backoff
+   below. The agent applies
    the same caps before it digests (D1), so a rejection means an agent or encoding defect. Two
    differences from today, stated so they are not mistaken for parity:
    - the caps are checked **after** the server decodes the bytes, so the decode itself is bounded
@@ -409,14 +424,33 @@ shared by direct `Heartbeat` and gateway `BatchHeartbeat`):
 
    A per-agent resync backoff (D8) stops a persistently rejected agent from re-requesting a full
    set every minute.
-3. Then branches:
-   - If `full`: replace the state map with `upsert`. **Synced.**
-   - Else if the server holds no state map for the agent (server restart, HA replica change, a
-     Register that never reached this replica): apply nothing, **issue `__resync__.tags`** (D8), and
-     count `no_base`.
+3. **Class check.** A key in `interval` that the class table (D1) does not classify interval, a key
+   in `upsert` or `removed` that it classifies interval, or a key in both `upsert` and `removed`,
+   makes the payload `rejected`, as in step 2. Nothing from it is applied.
+4. **Interval.** Replaces the agent's interval map with `interval`. A heartbeat that ended at step
+   1, 2 or 3 clears the interval map instead: nothing measured this interval reached the server, and
+   a kept value would be a stale rate published as current.
+5. **Digest version.** If `state_digest` carries a prefix the server does not implement, the server
+   counts `unverifiable`, leaves the state map unchanged and requests no resync, because a resync
+   would bring back the same prefix (see *Versioning* above).
+6. **State.** Then branches:
+   - If `full`: compute the digest of `upsert`. If it equals `state_digest`, replace the state map
+     with `upsert`, store the digest, and count `full`; the agent is **synced**. If not, the payload
+     is `rejected`: a full set that does not match its own digest is a defect.
+   - Else if the server holds no state map for the agent (server restart, HA replica change, an
+     entry pruned after 90 s without a heartbeat, a Register that never reached this replica): apply
+     nothing, **request `__resync__.tags`** (D8), and count `no_base`.
+   - Else if `base_digest` differs from the stored digest: if `state_digest` already equals the
+     stored digest, the delta is a duplicate or its changes are already applied, and the agent is
+     **synced** with nothing applied. Otherwise keep the map, **request `__resync__.tags`** (D8), and
+     count `diverged`.
+   - Else if the delta is empty (no `upsert`, no `removed`): the agent is **synced** if
+     `state_digest` equals the stored digest, with no copy and no hash; otherwise `diverged`, as
+     above. This is the steady-state case, so a quiet agent costs one string compare per heartbeat.
    - Else: apply `removed`, then `upsert`, to a copy. Recompute the digest. If it equals
-     `state_digest`, commit and the agent is **synced**. Otherwise keep the pre-delta map (the last
-     verified state), **issue `__resync__.tags`** (D8), and count `diverged`.
+     `state_digest`, commit it with its digest and the agent is **synced**. Otherwise keep the
+     pre-delta map (the last verified state), **request `__resync__.tags`** (D8), and count
+     `diverged`.
 
 A diverged or unbased agent keeps its last verified state, if any, until the full set arrives. Its
 interval tags are always current. The full set arrives on the agent's next heartbeat after
@@ -424,7 +458,8 @@ interval tags are always current. The full set arrives on the agent's next heart
 itself can wait for the per-replica rate limit and the per-agent interval (D8).
 
 **An agent rejected three times in a row is withheld.** Its last verified state map is kept but not
-served: its state-derived gauges are absent, as for `no_base`, until a payload is accepted. A defect
+served: its state-derived gauges are absent and the per-heartbeat hooks see no state, as for
+`no_base`, until a payload is accepted. A defect
 that keeps an agent rejected must not show its last verified Guardian, dedup or Spark state as
 current indefinitely.
 
@@ -433,8 +468,26 @@ current indefinitely.
 - the tar-corruption audit sink (`yuzu.plugin.tar.db_corruption_*`).
 
 Both depend on firing on **every** heartbeat, not only on change. The reconcile re-pushes a still
-lagging agent; the corruption sink retries a candidate the gate skipped. So they run after step 2,
+lagging agent; the corruption sink retries a candidate the gate skipped. So they run after step 6,
 over the agent's current merged state.
+
+**At registration.** Direct `Register` and `ProxyRegister` pass `RegisterRequest.status_tags_pb` to
+the same function, as a `full` payload, on the replica that handles the registration. The caps, the
+class check and the digest check all apply. An empty field is `absent`. A rejected Register payload
+installs no state map, so the agent's first heartbeat is `no_base` and requests a resync.
+Registration itself never fails because of the tags.
+
+**Locking.** `AgentHealthStore::apply` holds the store's `mu_` only to copy and to commit:
+- under `mu_`, it copies the agent's state map, its stored digest and a per-agent version counter;
+- it decodes, applies the delta to the copy and hashes **outside** `mu_`, so no SHA-256 runs under
+  the fleet-wide mutex;
+- under `mu_` again, it commits only if the agent's version is unchanged, and bumps it. A changed
+  version means two heartbeats for one agent raced. The later one is counted `diverged`, and the
+  next delta or a resync settles it;
+- the per-heartbeat hooks receive copies of the values they read and run outside `mu_`, as the
+  corruption sink does today, so the 90 s prune cannot erase anything they hold;
+- `apply` only returns an outcome. The caller makes any resync request after `apply` returns, never
+  under `mu_` (D8).
 
 Deprecating `HeartbeatRequest.status_tags` makes any surviving direct read a deprecation warning,
 not a compile error. The enforcement for this invariant is a lexical test that no non-generated
@@ -472,9 +525,10 @@ outside this rule; this ADR adds none of it.
       changed during it diverges once. The server then resyncs them at the configured rate (2000/s
       per replica, about 4 KB each). For 100k agents that is at most about 50 s of resync traffic
       after recovery.
-  - The digest makes keep-newest correct, not merely tolerable. A later delta that happens to
-    restore the server's view to the agent's state passes the digest and needs no resync, because
-    the check compares final states.
+  - The digest makes keep-newest correct, not merely tolerable. Whatever a lost heartbeat carried,
+    the next delta's `base_digest` no longer matches the server's stored digest, and the server
+    re-requests the full set (D3, step 6). A later heartbeat whose `state_digest` already equals the
+    server's view needs no resync.
 - **Every other lossy path is unchanged in behaviour and becomes self-healing.** All of these lose a
   delta, and the server then diverges and resyncs:
   - the buffer-full drop;
@@ -861,7 +915,8 @@ Labels are bounded enums. Counters are pre-seeded to 0. Changes follow
 - `yuzu_agent_topology_report_bytes` (histogram).
 
 **Server:**
-- `yuzu_server_heartbeat_tags_total{via,outcome}`, with `synced|full|diverged|no_base|rejected`;
+- `yuzu_server_heartbeat_tags_total{via,outcome}`, with
+  `synced|full|diverged|no_base|rejected|absent|unverifiable` (`via` includes `register`, D3);
 - `yuzu_server_tag_resync_total{outcome}`, with `sent|deferred|send_failed`;
 - `yuzu_server_agent_reattach_total{outcome}`, with
   `accepted|no_record|not_enrolled|superseded|malformed_session|degraded|rate_limited` (D14);
@@ -1433,7 +1488,15 @@ of every ~30 s. The content is unchanged.
 - `AgentRegistrationStore` under the ADR-0012 test conventions (`YUZU_REQUIRE_PG_DB`): upsert, plugin
   interning, the decommission cascade (including the `kCascadeStoreCount` bump), DB-authored
   timestamps;
-- the `apply` outcomes (synced, full, diverged, no_base, rejected), and the moved tag caps;
+- the `apply` outcomes (synced, full, diverged, no_base, rejected, absent, unverifiable), and the
+  moved tag caps; a wrong-class key and a key in both `upsert` and `removed` are rejected; a
+  rejected or absent heartbeat clears the interval map; a full set that fails its own digest is
+  rejected; a delta whose `base_digest` differs is diverged unless its `state_digest` already
+  matches (duplicate, synced); an empty delta is synced without a hash; three consecutive rejections
+  withhold the state map; the per-agent backoff after `rejected`;
+- the `v1` golden vectors, read by both the agent and server suites;
+- the Register-side consumer: Register and ProxyRegister apply `status_tags_pb` as a full payload,
+  and a rejected one leaves the agent `no_base` without failing the registration;
 - keep-newest loss producing `diverged` and then `__resync__.tags`;
 - the `__resync__-` exec-tracker skip, and fresh ids per issuance;
 - a kill-switched `__resync__` counted `send_failed`;
@@ -1589,7 +1652,7 @@ release and merge to `dev` inside one release window. ADR-0074 gates its own wav
 
    The tree is coherent but tags and topology are inert until slices 4-9 land.
 4. **Server tags.** `AgentHealthStore::apply`, the D3 ingestion order (including the tag caps moved
-   from the gateway), hooks on the merged view, server tag metrics, and the divergence alert.
+   from the gateway), the Register-side consumer, hooks on the merged view, server tag metrics, and the divergence alert.
 5. **Agent tags.** State and interval maps, the base and delta, full on Register,
    `yuzu.started_at`, `yuzu.uptime_s` removed, agent tag metrics.
 6. **`__resync__`, both ends.**
