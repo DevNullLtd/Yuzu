@@ -486,7 +486,9 @@ shared by direct `Heartbeat` and gateway `BatchHeartbeat`):
    a kept value would be a stale rate published as current.
 5. **Digest version.** If `state_digest` carries a prefix the server does not implement, the server
    counts `unverifiable`, leaves the state map unchanged and requests no resync, because a resync
-   would bring back the same prefix (see *Versioning* above).
+   would bring back the same prefix (see *Versioning* above). The stored map is withheld, as for
+   an agent rejected three times (below), until a verifiable payload is accepted, so the last
+   `v1`-verified map is never served as current behind an unverifiable payload.
 6. **State.** Then branches:
    - If `full`: compute the digest of `upsert`. If it equals `state_digest`, replace the state map
      with `upsert`, store the digest, and count `full`; the agent is **synced**. If not, the payload
