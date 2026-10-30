@@ -1557,7 +1557,10 @@ on the sustained condition and staying quiet on the expected one.
     persists. The causes are a kill switch on `__resync__`, a failed gateway forward (its 12 s
     deadline or an upstream error), an agent the gateway reported `not_connected`, a gateway without the dispatch-tag capability, or a stream
     that ended between the session check and the send (D8). A single transient failure therefore
-    raises the ticket; the runbook separates the causes by the issuer's WARN log. A degraded
+    raises the ticket. A per-OS kill switch on `__resync__` for the agent's OS is a cause too.
+    The shared `send_to` check function returns its cause (`per_os_withheld`, `tag_invalid`,
+    `gateway_capability_missing`, `no_stream`) rather than today's bare `false`, and the issuer
+    logs it at WARN, so the runbook separates the causes by that log. A degraded
     enablement store shows as `deferred`, in the first branch.
   - Responder: check Postgres pool saturation (`YuzuPgPoolSaturated`, the issuer defers at its
     first failed record write), the `__resync__` kill switch, and the issuing rate against N.
@@ -1592,7 +1595,7 @@ on the sustained condition and staying quiet on the expected one.
 | `unverifiable` rises | agents with a digest version the server does not implement (D3) | server and agent versions |
 | `diverged` plus `no_base` near 100 % | per-RPC balancing in front of the server (*Server stores*) | the load balancer |
 | `yuzu_server_resync_pending` high and `deferred` rising, `send_failed` at 0 | server overload: the issuer is deferring on Postgres (a record write or the enablement read failing) or on the rate | `YuzuPgPoolSaturated`, `--tag-resync-rate`, `--topology-resync-rate` |
-| `send_failed` rising | the `__resync__` kill switch, failed gateway forwards, or a gateway without the dispatch-tag capability | plugin configuration, then the gateway management plane |
+| `send_failed` rising | the `__resync__` kill switch (whole-action or per-OS), failed gateway forwards, agents a gateway reported `not_connected`, or a gateway without the dispatch-tag capability; the issuer's WARN log names the cause | plugin configuration, then the gateway management plane |
 
 **Freshness SLIs.** Two ratios measure what this ADR changes, per replica:
 - tag sync: the share of heartbeats counted `synced` or `full` among all but `absent` and
