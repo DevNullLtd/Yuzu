@@ -55,14 +55,12 @@ if ! as_user /bin/sh -c 'umask 077 && rm -rf "$1" "$2" && mkdir "$2"' sh "$dest"
 fi
 
 for name in smbios_entry_point DMI; do
+    # -f/-r first: cat on a FIFO or other non-regular source would block.
     if [ ! -f "$src/$name" ] || [ ! -r "$src/$name" ]; then
         echo "yuzu-agent-dmi-snapshot: $src/$name is not a readable file; no hardware table snapshot" >&2
-        remove "$tmp"
+        remove "$tmp" "$dest"
         exit 0
     fi
-done
-
-for name in smbios_entry_point DMI; do
     # cat to EOF: sysfs binary files report size 0, so a size-based copy would be empty.
     # shellcheck disable=SC2016 # the single-quoted script is meant for the inner shell
     if ! cat "$src/$name" | as_user /bin/sh -c 'umask 077 && cat > "$1"' sh "$tmp/$name"; then
