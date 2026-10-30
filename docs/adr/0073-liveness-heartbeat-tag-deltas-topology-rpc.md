@@ -2024,7 +2024,9 @@ point 14).
 per replica, for N agents whose heartbeats reach it (estimates, unmeasured; slice 10 measures them):
 - **The delta base.** One state map per agent (about 97 keys, about 4 KB of keys and values, as
   today's map), plus a 35-byte digest, a version counter and the rejection count and backoff. It
-  replaces today's map rather than adding to it: about 0.4 GB at N = 100,000, as today.
+  replaces today's map rather than adding to it. The payload is about 0.4 GB at N = 100,000, a
+  lower bound: with `std::unordered_map` node, hash and `std::string` overhead (about 100-150 B per
+  entry) it is more likely 1-1.5 GB, about the same as today's map.
 - **Topology slots.** Unchanged in kind: each holds the parsed body, bounded by
   `kPushedMapHardCap` (100,000). Retained `disconnected` slots count against the same cap for their
   300 s. The no-slot entries and the per-slot D6 fields are tens of bytes each.
