@@ -110,7 +110,8 @@ constexpr std::size_t kHostTypeaheadCap = 1000;
 constexpr const char* kConfinedFleetMsg =
     "The software catalogue is a fleet-wide aggregate that cannot be narrowed to your "
     "management groups, so it is not shown to a group-scoped account. Open a device from "
-    "Hardware to see its software, or ask for fleet-wide Inventory:Read.";
+    "Hardware (Installed software, then Open in Software) to see its software, or ask for "
+    "fleet-wide Inventory:Read.";
 constexpr const char* kConfinedHostMsg =
     "This device is outside your management groups (or unknown), so its software is not shown.";
 constexpr const char* kBuildingMsg =
