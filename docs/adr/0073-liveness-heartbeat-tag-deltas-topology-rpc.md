@@ -2236,8 +2236,10 @@ of every ~30 s. The content is unchanged.
   current session's slot `disconnected` or release its IP claims;
 - `stale_reason` precedence: each pair of simultaneous conditions renders the earlier value; a live
   agent with a late report reads `body_pending`, not `agent_silent`; an offline host past 300 s
-  reads `offline` and a `--no-topology` agent `not_reported`; every reporting agent after a restart
-  reads `awaiting_report` until its body lands; the schema enum matches the C++ enum;
+  reads `offline` and a `--no-topology` agent `not_reported`; a slotted agent with a pending
+  rejected digest reads `report_rejected`, not `body_pending`; every reporting agent after a
+  restart reads `offline` (or is absent if it is not in the durable roster) until its reattach
+  lands, then `awaiting_report` until its body lands; the schema enum matches the C++ enum;
 - a re-claim conflict writes `topology.push.rejected` with `reason=reclaim_conflict` before the slot
   is dropped; re-claim and push share one claim function; a `PARSE`, `DIGEST_MISMATCH`, `OVERSIZE`
   or `UNKNOWN_SESSION` rejection writes no audit row and moves the rejection counter;
