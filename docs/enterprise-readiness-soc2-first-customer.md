@@ -842,6 +842,20 @@ The DEX read model (`guardian_observations` + the `/dex` dashboard) is the first
 
 - PR review records, CI logs, deployment approvals, and release notes/change tickets.
 
+**Change-management status (2026-10-24, #119).** The branch, release and hotfix process is
+documented in `docs/branch-strategy.md`, which is the document to cite for CC8.1. It also records
+the current limits of the two controls listed above, each with a tracking issue: the one-approval
+rule on `main` and `dev` can be bypassed (inferred from the review state of merged PRs — the
+bypass-actor list is visible only to administrators; current figures in that document's §1) and
+there is no written emergency-change policy (#6431); one role authors and merges every change to
+`main`, by bypass where no review was given, with no compensating control yet (#6431); the release preflight's
+reconciliation check cannot pass under the PR-only rulesets and has been red at every 0.14.x
+release, so the operator's judgement is recorded in the promotion PR instead (#6427); and the
+governance review's only evidence is a committed `governance.d/` fragment that CI does not check
+for (#6430). Until those close, answer "branch protection and mandatory code review" as *process
+documented and substantially followed; enforcement partial; gaps disclosed and tracked* — not as
+fully enforced. "PR review records" as evidence must be read with the bypass caveat.
+
 **Addendum — the gateway Common Test CI check reported success while executing nothing,
 2026-05-13 to #4800 (CC8.1/CC7.2).** Recorded here because this section cites "Required
 CI checks … before merge" and "CI logs" as change-management evidence, and one of those
