@@ -1486,9 +1486,14 @@ message ReattachResponse {
   - start jitter (`registration_replay_start_jitter_ms`);
   - the replay permit pool and concurrency cap (`upstream_replay_concurrency`);
   - the 60 s full-replay cooldown (`FULL_REPLAY_COOLDOWN_MS`);
+  - the per-session replay guard (`registration_replay_session_guard_ms`, default 10 s), which
+    drops a verdict naming a session replayed inside the window;
   - re-announcing CONNECTED after an adopt (`yuzu_gw_agent:reannounce/2`).
 
-  Only the payload changes, from a stored request to two ids and a peer address. That removes the
+  The payload changes, from a stored request to two ids and a peer address, and one mechanism is
+  added: a per-session timer for `RATE_LIMITED` and `DEGRADED`, which requeues the session after a
+  full-jittered share of `retry_after_ms` and clears that session's `recent_replays` stamp, so the
+  10 s guard does not swallow the retry. No delayed requeue exists in `yuzu_gw_upstream` today. That removes the
   `local_error` encode-failure branch of `replay_send/4`.
 - **The observed peer on the server.** `observed_peer` is parsed with the same strict
   `normalize_bare_ip` that ProxyRegister applies to `gateway_observed_peer`. Empty, or a value
@@ -1585,7 +1590,7 @@ message ReattachResponse {
   | not `approved` (step 3) | rejected enrollment (`accepted = false`) | `NOT_ENROLLED` | disconnect the agent's stream | success |
   | superseded by a different live session, or held by another agent | `FAILED_PRECONDITION` | `SUPERSEDED` | disconnect the agent's stream | success |
   | presented id malformed, or body and metadata differ | `FAILED_PRECONDITION` | `MALFORMED_SESSION` | disconnect the agent's stream | neutral |
-  | enrollment, record or directory read degraded | `UNAVAILABLE` | `DEGRADED` | **keep the stream**; leave the session to the next targeted replay, after `retry_after_ms` | neutral |
+  | enrollment, record or directory read degraded | `UNAVAILABLE` | `DEGRADED` | **keep the stream**; requeue the session after `retry_after_ms` (the per-session timer) | neutral |
   | over `--reattach-rate` | not applicable | `RATE_LIMITED` | keep the stream; requeue the session after `retry_after_ms` | neutral |
   | install refused at step 6: `DeviceTokenStore::revoke_by_device` failed for a prior session on this replica (#3401, fail-closed) | `UNAVAILABLE` | `DEGRADED` | keep the stream; as for `DEGRADED` above | neutral |
   | install refused at step 6: a concurrent registration superseded it | `UNAVAILABLE` | `SUPERSEDED` | disconnect the agent's stream | success |
