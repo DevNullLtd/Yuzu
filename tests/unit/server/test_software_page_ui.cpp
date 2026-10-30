@@ -915,3 +915,38 @@ TEST_CASE("software page: Inventory sources host loads with the full page only",
     REQUIRE_FALSE(has(render_software_page({}, d, SoftwarePageMode::Rows),
                       "/fragments/inventory/sources"));
 }
+
+TEST_CASE("software page: title rows and drill controls are keyboard-operable", "[inventory][ui]") {
+    const std::string h = full({}, page());
+    // aria-expanded sits on a button role with a tab stop and the Enter/Space handler.
+    REQUIRE(has(h, "aria-expanded=\"false\" data-tog=\"v\" role=\"button\" tabindex=\"0\" "
+                   "onkeydown=\"swKey(event,this)\""));
+    REQUIRE(has(h, "<button type=\"button\" class=\"inv-devbtn\" data-vers>"));
+    REQUIRE(has(h, "<button type=\"button\" class=\"inv-devbtn\" data-devs"));
+    REQUIRE_FALSE(has(h, "<span class=\"inv-devbtn\""));
+    REQUIRE(has(h, "button.inv-devbtn{background:none;border:0;padding:0;font:inherit}"));
+    const std::string v =
+        render_software_versions_expansion({}, "Chrome", {{{"1.0", 3, true}}}, false);
+    REQUIRE(has(v, "<button type=\"button\" class=\"inv-devbtn\" data-vdevs"));
+    REQUIRE_FALSE(has(v, "<span class=\"inv-devbtn\""));
+    const std::string sc = software_page_script();
+    // The script: swKey ignores nested buttons and drives the row's click; Load-more focus lands on
+    // the replaced row's own index, falls back to the devices filter, and recovers from failures.
+    REQUIRE(has(sc, "function swKey(e, el)"));
+    REQUIRE(has(sc, "e.target.closest('button')"));
+    REQUIRE(has(sc, "el.click()"));
+    REQUIRE(has(sc, "window.__swMore = { tb: tr.parentNode, i: tr.sectionRowIndex, btn: el }"));
+    REQUIRE(has(sc, "mo.tb.rows[mo.i]"));
+    REQUIRE(has(sc, "box.querySelector('.inv-devfilter')"));
+    REQUIRE(has(sc, "addEventListener('htmx:responseError', swMoreFail)"));
+    REQUIRE(has(sc, "addEventListener('htmx:sendError', swMoreFail)"));
+    REQUIRE(has(sc, "location.assign('/login')"));
+}
+
+TEST_CASE("software page: the device pointer names the Hardware route in full", "[inventory][ui]") {
+    REQUIRE(has(full({}, page()), "<a href=\"/hardware\">Hardware</a> &rarr; Installed software "
+                                  "&rarr; Open in Software"));
+    SoftwarePageData d = page();
+    d.confined = true;
+    REQUIRE(has(full({}, d), "Hardware \xE2\x86\x92 Installed software \xE2\x86\x92 Open in Software"));
+}

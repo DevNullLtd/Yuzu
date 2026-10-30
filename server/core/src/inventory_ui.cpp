@@ -194,6 +194,7 @@ std::string inv_style() {
   .inv-exp-body .inv-degrade{margin-top:10px}
   .inv-exp-body,.inv-devs{padding:12px 16px 14px;background:var(--bg)}
   .inv-close{float:right;color:var(--mut);cursor:pointer}.inv-close:hover{color:var(--ink)}
+  button.inv-devbtn{background:none;border:0;padding:0;font:inherit}
   .inv-devbtn,.inv-hostlink{color:var(--primary);text-decoration:none;cursor:pointer}.inv-devbtn:hover,.inv-hostlink:hover{color:var(--primary-h)}
   .inv-hostlink:hover{text-decoration:underline}
   .inv-devhead{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;color:var(--mut)}.inv-devhead b{color:var(--ink);font-weight:600}
@@ -312,7 +313,8 @@ std::string sw_head() {
            "title=\"Ask devices to re-send their software inventory now\">Sync now</button></div>"
            "<div class=\"inv-sub\">Installed-software inventory by application, version and "
            "device, synced <b>daily</b> from every endpoint (ADR-0016 daily-sync). Looking for a "
-           "device? See <a href=\"/hardware\">Hardware</a>.</div>";
+           "device? Open it from <a href=\"/hardware\">Hardware</a> &rarr; Installed "
+           "software &rarr; Open in Software.</div>";
 }
 
 // Retry re-requests the whole page WITH the current filters (a bare retry would drop them).
@@ -581,17 +583,18 @@ std::string title_rows(const SoftwarePageFilters& f, const SoftwarePageData& d) 
             kinds += (kinds.empty() ? "" : "/") + std::string(one);
         });
         h += "<tr class=\"click\" data-t=\"" + std::to_string(i++) + "\" aria-expanded=\"false\" "
-             "data-tog=\"v\" title=\"Click for installs per version\" hx-get=\"" + esc(vurl) +
+             "data-tog=\"v\" role=\"button\" tabindex=\"0\" onkeydown=\"swKey(event,this)\" "
+             "title=\"Click for installs per version\" hx-get=\"" + esc(vurl) +
              "\" hx-target=\"#" + box + "\" hx-swap=\"innerHTML\"><td class=\"inv-name\">" +
              esc(r.name) + "</td><td class=\"inv-pub\">" + (r.publisher.empty() ? dash() : esc(r.publisher)) +
              "</td><td>" + pills + "<span class=\"inv-grey\">" + esc(kinds) + "</span></td>"
              "<td class=\"inv-num\">" + fmt_int(r.device_count) + "</td><td class=\"inv-num\">" +
              fmt_int(r.version_count) + "</td><td class=\"inv-mono\">" +
              ((r.newest_version.empty() || d.confined) ? dash() : esc(r.newest_version)) +
-             "</td><td class=\"inv-act\"><span class=\"inv-devbtn\" data-vers>versions &rsaquo;</span>"
-             " &middot; <span class=\"inv-devbtn\" data-devs data-tog=\"d\" "
+             "</td><td class=\"inv-act\"><button type=\"button\" class=\"inv-devbtn\" data-vers>versions &rsaquo;</button>"
+             " &middot; <button type=\"button\" class=\"inv-devbtn\" data-devs data-tog=\"d\" "
              "onclick=\"event.stopPropagation()\" hx-get=\"" + esc(durl) + "\" hx-target=\"#" + box +
-             "\" hx-swap=\"innerHTML\">devices &rsaquo;</span></td></tr>"
+             "\" hx-swap=\"innerHTML\">devices &rsaquo;</button></td></tr>"
              "<tr class=\"inv-exp\"><td colspan=\"7\"><div id=\"" + box + "\"></div></td></tr>";
     }
     const std::int64_t shown = d.shown_before + static_cast<std::int64_t>(d.rows->size());
@@ -755,7 +758,10 @@ std::string render_software_page(const SoftwarePageFilters& f, const SoftwarePag
         h += "<div id=\"sw-kpis\">" + caveat(d.caveat ? *d.caveat
                                                      : "Fleet-wide figures are not shown to a "
                                                        "management-group-scoped account; this page "
-                                                       "shows the selected device's software only.") +
+                                                       "shows the selected device's software only. "
+                                                       "Open a device from Hardware \xE2\x86\x92 "
+                                                       "Installed software \xE2\x86\x92 Open in "
+                                                       "Software.") +
              "</div>";
         if (d.caveat) // refused: the caveat is all there is, so it carries the reset too
             return h + "<div class=\"inv-caveat\">" + kResetLink + "</div></div>";
@@ -800,10 +806,10 @@ std::string render_software_versions_expansion(
              ((r.newest && !confined) ? " <span class=\"inv-pill on\">newest in fleet</span>" : "") +
              "</td><td class=\"inv-num\">" + fmt_int(r.device_count) +
              "</td><td><div class=\"inv-bar\"><span style=\"width:" + std::to_string(pct) +
-             "%\"></span></div></td><td class=\"inv-act\"><span class=\"inv-devbtn\" data-vdevs "
+             "%\"></span></div></td><td class=\"inv-act\"><button type=\"button\" class=\"inv-devbtn\" data-vdevs "
              "data-tog=\"d\" aria-expanded=\"false\" hx-get=\"" +
              esc(version_devices_url(f, name, r.version, r.device_count)) + "\" hx-target=\"#" + box +
-             "\" hx-swap=\"innerHTML\">devices &rsaquo;</span></td></tr><tr class=\"inv-exp\">"
+             "\" hx-swap=\"innerHTML\">devices &rsaquo;</button></td></tr><tr class=\"inv-exp\">"
              "<td colspan=\"4\"><div id=\"" + box + "\"></div></td></tr>";
     }
     h += "</tbody></table>";
@@ -938,6 +944,12 @@ function swMark(box, open) {
     if (tr) tr.setAttribute('aria-expanded', open ? 'true' : 'false');
   }
 }
+/* Title rows are role=button: Enter/Space fires the row's click (htmx's default trigger). A nested
+   native button (versions / devices) handles its own key. */
+function swKey(e, el) {
+  if ((e.key !== 'Enter' && e.key !== ' ') || e.target.closest('button')) return;
+  e.preventDefault(); el.click();
+}
 function swShut(box) { box.innerHTML = ''; box.removeAttribute('data-open'); swMark(box, false); }
 function swClose(x) {
   var b = x.closest('.inv-exp-body'), box = b && b.parentNode;
@@ -1030,9 +1042,22 @@ document.body.addEventListener('htmx:beforeRequest', function (e) {
     }
     return;
   }
+  if (el.getAttribute('data-act') === 'dmore') {  /* the swapped row is replaced in place: remember its index */
+    var tr = el.closest('tr');
+    if (tr) window.__swMore = { tb: tr.parentNode, i: tr.sectionRowIndex, btn: el };
+  }
   var m = el.getAttribute('data-tog');
   if (m && t && t.getAttribute('data-open') === m && t.firstChild) { e.preventDefault(); swShut(t); }
 });
+function swMoreFail(e) {  /* failed Load more: drop the marker, put focus back on the re-enabled button */
+  var el = e.detail && e.detail.elt;
+  if (!el || !el.getAttribute || el.getAttribute('data-act') !== 'dmore') return;
+  window.__swMore = null;
+  if (e.detail.xhr && e.detail.xhr.status === 401) { location.assign('/login'); return; }
+  setTimeout(function () { if (el.isConnected) el.focus(); }, 0);
+}
+document.body.addEventListener('htmx:responseError', swMoreFail);
+document.body.addEventListener('htmx:sendError', swMoreFail);
 document.body.addEventListener('htmx:afterSwap', function (e) {
   var el = e.detail.elt, t = e.detail.target, m = el && el.getAttribute && el.getAttribute('data-tog');
   if (m && t && t.id) { t.setAttribute('data-open', m); swMark(t, true); }
@@ -1046,6 +1071,16 @@ document.body.addEventListener('htmx:afterSettle', function () {
   var f = document.querySelectorAll('.inv-devfilter');  /* Load-more rows join the filtered set */
   for (var i = 0; i < f.length; i++) if (f[i].value && typeof gpSearch === 'function') gpSearch(f[i]);
   swHash();
+  if (window.__swMore) {  /* focus the first new row (it lands at the replaced row's index) */
+    var mo = window.__swMore, r, ff;
+    window.__swMore = null;
+    r = mo.tb.rows[mo.i]; ff = r && r.querySelector('a,button');
+    if (!ff) {  /* empty page: fall back to the devices filter */
+      var box = mo.tb.closest('div[id^="exp-"]') || mo.tb.closest('.inv-devs');
+      ff = box && box.querySelector('.inv-devfilter');
+    }
+    if (ff) ff.focus();
+  }
 });
 </script>)js";
 }
