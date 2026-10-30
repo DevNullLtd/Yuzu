@@ -359,6 +359,10 @@ Resolved in wave 0 (2026-10-29): the SPIFFE trust domain (D3), D5's scope, and w
 - **For wave 2:** whether the direct agent-to-server port of single-server installs gets the same enrollment and main port split (D2).
 - **For wave 1:** whether the owner accepts that CRL freshness depends every 15 minutes on the CA key, a Postgres write and the leader, or CRL signing is decoupled (D7).
 - **For wave 1:** whether a default install gains an issuing intermediate under the Yuzu root, so a mass revocation is not a root rotation (D7).
+- **For wave 1:** whether servers check gateway certificates against the `ca_issued` revoked set rather than the published CRL (D7).
+- **For wave 1:** whether a recently expired agent certificate may renew at the enrollment port on its own key (D6).
+- **No wave named yet:** the wave in which verifiers stop accepting `yuzu://` URIs (D3).
+- **For sign-off:** whether the owner accepts that, while the dedup store is degraded, a signed `unquarantine` or `whitelist` without a store-independent freshness proof is refused, which narrows the protective set's pass through every gate (D5).
 - **For wave 2:** how an agent learns that a server's signing key is revoked (D5).
 - **For wave 5:** how the server that owns an agent's stream learns of a revocation made on another server (D7, D12).
 - **For sign-off:** whether the #4669 cluster-affinity admission check is removed before wave 2, while the route-claim risk is open, or with wave 4 (conflict 1).
