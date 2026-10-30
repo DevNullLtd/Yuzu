@@ -1536,8 +1536,9 @@ count-valued histograms here are not latencies, so they declare their own:
   `bad_signature|unsigned|replayed|unverified_session` from ADR-0074 wave 2 (D7, D16; `parse` also moves
   the parse counter above);
 - `yuzu_server_reattach_challenge_total{outcome}`, with
-  `verified|bad_signature|expired|degraded|send_failed`, and the
-  gauges `yuzu_server_reattach_challenge_pending` and
+  `verified|bad_signature|expired|degraded|send_failed`; the counter
+  `yuzu_server_reattach_challenge_extra_answer_total` (answers after the first, dropped
+  unverified); and the gauges `yuzu_server_reattach_challenge_pending` and
   `yuzu_server_reattach_challenge_oldest_pending_seconds` (0 when none is pending), from ADR-0074
   wave 2 (D14);
 - `yuzu_viz_topology_reclaim_total{outcome}`, with `reclaimed|conflict` (D6);
@@ -1999,10 +2000,18 @@ message ReattachResponse {
     slice-11 test saturates the concurrency and asserts `send_failed` only, `expired` unchanged,
     the record kept and `YuzuStateSignatureRefused` quiet. The answer is taken from
     that forward's `SendCommandResponse` stream; it is never ingested, exec-tracked or stored. The
-    polling thread does no blocking work: on each `Next()` it records the answer and its arrival
-    time on the session's challenge state under `stream_mu` and hands it to the verifier, a
-    bounded pool (four threads, unmeasured) owned by the issuer and joined in its stop stage,
-    which runs the signature check and the revocation read with its in-expiry retries. A direct
+    polling thread does no blocking work: it records the answer and its arrival time on the
+    session's challenge state under `stream_mu` and hands it to the verifier, a bounded pool
+    (four threads, unmeasured) owned by the issuer and joined in its stop stage, which runs the
+    signature check and the revocation read with its in-expiry retries. A challenge accepts
+    exactly one answer: the first response on the forward's stream (or the first challenge reply
+    on a direct agent's Subscribe stream) fills a single slot that is never overwritten, the
+    gateway call is then finished or cancelled, and any further message is dropped unverified and
+    counted (`yuzu_server_reattach_challenge_extra_answer_total`). The verifier's queue therefore
+    holds at most one entry per `challenge_pending` session, bounded by the pending gauge's bound,
+    and slice 11's Resource Ledger entry for the pool names that bound; a slice-11 test streams
+    many answers on one gateway challenge and repeats a direct agent's reply, and asserts one
+    verification each, the extras counted and other sessions' verification latency unchanged. A direct
     agent's answer, which arrives on its Subscribe stream, is recorded and handed over the same
     way. The sweep never resolves `expired` for a session whose answer arrived inside the
     deadline; that session is left to the verifier, which resolves `verified`, `bad_signature`
@@ -3248,7 +3257,8 @@ renewal (D16, *key*).
       `NO_RECORD`; the `degraded` outcome; `REPLAYED` and `UNVERIFIED_SESSION` with the agent's
       retry rules; the `unsigned` outcome and `yuzu_server_agents_state_unsigned`; the
       after-the-flag re-claim drop; `YuzuStateSignatureRefused` and
-      `YuzuReattachChallengeDegraded` and the oldest-pending age gauge; the challenge verifier
+      `YuzuReattachChallengeDegraded` and the oldest-pending age gauge; the one-answer slot and
+      `yuzu_server_reattach_challenge_extra_answer_total`; the challenge verifier
       pool and the polling thread's no-blocking rule; the `closed` flag ordering in `stop()`.
     - Proto and gateway: the additive envelope fields in both proto copies and the gateway's
       `*_pb.erl`, passed through unchanged (checked by `check-proto-codegen.sh`); `session_id`
