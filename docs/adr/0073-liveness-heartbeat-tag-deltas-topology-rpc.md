@@ -648,8 +648,13 @@ without per-agent gateway state. Four options were weighed:
 relayed by the gateway like any command (no new gateway state).
 - The cost, re-weighed honestly:
   - one row per command in the agent's `CommandDedupStore` ring. The ring is a bounded, clock-free
-    rowid ring over terminal rows, so the cost is transient;
-  - one capability-catalogue entry with an `ExecuteGate` (compile-time, once);
+    rowid ring over terminal rows (`kMaxDedupRows`, 20,000), so the cost is transient. Each
+    `__resync__` does take one terminal slot, and so shortens by one command the window in which
+    ADR-0074 D5's replay bar can rely on the ring. The per-agent intervals below cap that at one
+    `tags` per 60 s and one `topology` per 5 min, and only while the agent diverges;
+  - one capability-catalogue row per action with an `ExecuteGate` (compile-time, once);
+  - one `command_execution` record per dispatch, written by `build_classified_command` like every
+    other dispatch (a Postgres upsert on the issuing replica);
   - one id-prefix skip in `notify_exec_tracker`;
   - a small `CommandResponse` relayed back up.
 - It is paid **only when divergence occurs**: after a server restart, replica change, upstream
@@ -682,16 +687,31 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
   - `tags`: the next heartbeat carries `full = true`. There is no extra RPC, because the heartbeat
     is already jittered.
   - `topology`: the topology sender sends `RESYNC` after a uniform delay in `[0, window_s]` (D7).
+- **Reserved name on the agent.** `__resync__` is added to `kReservedPluginNames`
+  (`agents/core/include/yuzu/agent/plugin_loader.hpp`, #822), so no plugin can claim the name.
 - **Server.**
-  - Command ids are minted `resync-*`, and `notify_exec_tracker` skips them like `polchk-` and
-    `preflight-` (`server/core/src/agent_service_impl.cpp`): no tracker row, no SSE, not in the
-    executions drawer.
-  - The pairs `(__resync__, tags)` and `(__resync__, topology)` are declared in the capability
-    catalogue as ReadOnly, `ExecuteGate::None`, system-only.
-  - Operator dispatch surfaces (REST `/api/command`, MCP `execute_instruction`, workflows, dashboard)
-    refuse them by the reserved-name rule, extended there if absent.
-  - They are sent through the server's system send path to the agent's own stream. That is not a
-    new `DispatchCaller` construction site and is not a fleet dispatch.
+  - Command ids are minted `__resync__-<action>-<epoch seconds>-<random hex>`, the reserved-literal
+    convention `mint_sync_now_command_id` uses for `__sync__-now-` (`server.cpp`). An id is never
+    derived from the agent id or from a previous id. `notify_exec_tracker` skips the
+    `__resync__-` prefix like `polchk-` and `preflight-` (`server/core/src/agent_service_impl.cpp`):
+    no tracker row, no SSE, not in the executions drawer. Every issuance mints a fresh id, because
+    an agent answers a repeated id from its dedup ring without acting on it again.
+  - The pairs `(__resync__, tags)` and `(__resync__, topology)` are two rows in
+    `server/core/src/capability_decls/core_dispatch_capabilities.hpp`, the fragment for dispatches
+    the server issues itself: `system_reserved = true`, ReadOnly, `ExecuteGate::None`. The change
+    updates that array's size, the file comment's row list, and the docstring of
+    `tests/test_capability_catalogue_complete.py`.
+  - Operator surfaces (REST `/api/command`, MCP `execute_instruction`, workflows, dashboard) are
+    refused centrally: `classify_and_authorize_dispatch` (`agent_registry.hpp`) denies any
+    non-system caller a `system_reserved` row. No per-surface rule is added.
+  - They are built with `build_classified_command(DispatchCaller{.system = true}, ...)` and sent
+    with `send_system_reserved` to the agent's own stream (plus `forward_gateway_pending` for a
+    gateway agent), as `__sync__.now` is. That is a `DispatchCaller` construction, of the
+    existing system kind; it threads no operator authority and adds no `approval_provenance`
+    stamping site. It is not a fleet dispatch. `SystemReservedPush` gains one enumerator for it.
+  - `__resync__` is **not** in the protective set. A kill switch on it, or a degraded enablement
+    store, refuses it at `build_classified_command`; that is counted `send_failed`, and divergence
+    persists until the next permitted issuance.
   - Issuance is per replica, from heartbeat ingestion, and is not leader-gated: the replica that
     lacks the state is the one that must ask.
   - Under ADR-0074 D5 every command is server-signed and every result agent-signed; `__resync__` is
@@ -750,7 +770,9 @@ The owner ruled 2026-10-26: no live customers; aggressive changes for the better
   - the **legacy dispatch fetcher** (`server.cpp`, the `tar.fleet_snapshot` fan-out at about
     l.5528-5700) goes, with the store's `Fetcher` seam and
     `yuzu_viz_topology_fetch_duration_seconds`. Cold start becomes roster placeholders filled by
-    resync, not a fleet-wide pull down the Subscribe streams.
+    resync, not a fleet-wide pull down the Subscribe streams;
+  - the `echo.fleet_snapshot` row in `core_dispatch_capabilities.hpp` stays `system_reserved`
+    with no server caller. It must not move to an operator-dispatchable catalogue fragment.
 - **Gateway heartbeat buffer** (`yuzu_gw_heartbeat_buffer.erl`): these go:
   - newest-snapshot coalescing (header l.13-24, `coalesce/2` at about l.588), snapshot-first
     eviction and send-without-snapshot;
@@ -1270,7 +1292,8 @@ of every ~30 s. The content is unchanged.
   interning, the decommission cascade, DB-authored timestamps;
 - the `apply` outcomes (synced, full, diverged, no_base, rejected), and the moved tag caps;
 - keep-newest loss producing `diverged` and then `__resync__.tags`;
-- the `resync-*` exec-tracker skip;
+- the `__resync__-` exec-tracker skip, and fresh ids per issuance;
+- a kill-switched `__resync__` counted `send_failed`;
 - the catalogue pair's system-only refusal at operator surfaces;
 - hooks firing on unchanged-tag heartbeats (generation reconcile, corruption sink);
 - interval replace semantics (a missing net tag disappears);
@@ -1322,9 +1345,10 @@ of every ~30 s. The content is unchanged.
   headers (no I/O; no CLAUDE.md annotation change needed).
 - **Durable agent command idempotency** (`docs/command-dedup.md`): `cpp-safety` and `architect`, for
   the new `__resync__` reserved dispatch (dedup-claimed, terminal before write).
-- **Executions-history ladder:** the `resync-` skip in `notify_exec_tracker`.
+- **Executions-history ladder:** the `__resync__-` skip in `notify_exec_tracker`.
 - **Dispatch-caller approval provenance / ExecuteGate:** `security-guardian` and `cpp-safety`, for
-  the two system-only catalogue pairs and confirmation that no new `DispatchCaller` site exists.
+  the two `system_reserved` rows in `core_dispatch_capabilities.hpp`, and confirmation that the
+  new `DispatchCaller{.system = true}` construction adds no `approval_provenance` stamping site.
 - **Prometheus metrics and alert rules** (`docs/observability-conventions.md`): `sre` and
   `architect`.
 - **TAR** (`tar_fleet_snapshot`, schema minor): `architect`, `plugin-developer`.
