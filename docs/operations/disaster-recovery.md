@@ -12,7 +12,7 @@
 > (HA WS-6 6.2, `auth.enrollment_tokens` / `auth.pending_agents`) — back them
 > up via the same `pg_dump`/`pg_restore` procedure as the rest of the `auth`
 > schema, not as local files. `enrollment-tokens.cfg`/`pending-agents.cfg` are
-> no longer written by a 6.2+ server; a copy found at any boot where the database holds no import record for it (a fresh database never does) is imported
+> no longer written by the 0.15.0 server; a copy found at any boot where the database holds no import record for it (a fresh database never does) is imported
 > exactly once as live credentials, without any check of where it came from (the
 > marker+fingerprint mechanics that refuse a later file with different content
 > are in

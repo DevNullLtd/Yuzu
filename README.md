@@ -144,7 +144,7 @@ Yuzu/
 
 Prebuilt artifacts are published with every tagged release. If you just want to run Yuzu, start here — you do not need to build from source.
 
-- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/DevNullLtd/Yuzu/releases). Latest stable is v0.15.0.
+- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/DevNullLtd/Yuzu/releases). Latest stable is v0.15.0, a fresh-deployment release: it supports initial deployment into a new database only, with no in-place upgrade from, and no return to, 0.14.x or earlier (see [Upgrading](docs/user-manual/upgrading.md#behaviour-change-stored-responses-of-forensics-tier-plugins-need-forensicsread-4990-fresh-deployment-only), Deployment contract).
 - **Container images** (published to GHCR on every tag):
   - `ghcr.io/devnullltd/yuzu-server:<version>`
   - `ghcr.io/devnullltd/yuzu-postgres:<version>`
