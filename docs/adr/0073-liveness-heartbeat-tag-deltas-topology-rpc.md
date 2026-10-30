@@ -2440,7 +2440,9 @@ tag, release candidate or pilot deployment is cut from `dev` while slices 3-10 a
      measures the tag saving before the wire changes (removed in slice 5).
 2b. **`AgentRegistrationStore`, written on every successful registration** (direct and gateway).
     It is additive and wire-compatible, so it can land early. Records accumulate before anything
-    reads them.
+    reads them, so this slice also registers the store in the decommission cascade (all four
+    steps of `agent_decommission.hpp`), adds its `docs/postgres-migration-ladder.md` row and adds
+    its data-inventory entries: it is the first slice to persist per-agent rows.
 3. **Proto and gpb.**
    - `StatusTags` (carried as `bytes`), `TopologyDigest`, `ReportTopology`, `ProxyTopology` and
      `ProxyReattach`.
