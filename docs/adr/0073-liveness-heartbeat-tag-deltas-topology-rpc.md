@@ -1336,7 +1336,9 @@ It should say:
 - the order: server, then gateways, then agents, in one maintenance window;
 - un-upgraded agents keep connecting and executing commands, but contribute **no** status tags and no
   topology until upgraded (absent from fleet gauges, DEX performance, `/network`, Spark and Guardian
-  health, and `/viz`);
+  health, and `/viz`). Operators see their heartbeats counted `absent` on
+  `yuzu_server_heartbeat_tags_total`; they are sent no `__resync__` and do not move the divergence
+  alert;
 - after a server restart, state-derived gauges converge over about a minute and topology over several
   minutes;
 - the new flags: `--topology-interval`, `--no-topology`, `--tag-resync-rate`,
