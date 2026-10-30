@@ -32,6 +32,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 struct sqlite3; // Forward declaration
@@ -454,9 +455,33 @@ struct EchoStats {
     int64_t record_count{0};
     int64_t oldest_timestamp{0};
     int64_t newest_timestamp{0};
+    /// Bytes the database holds: used pages ((page_count - freelist_count) * page_size) plus
+    /// the WAL file. Free pages are excluded because they are reusable, so this is the figure
+    /// the byte budget is enforced against; it is NOT the on-disk file size.
     int64_t db_size_bytes{0};
     int retention_days{7};
 };
+
+/// Raw storage figures behind `db_size_bytes`, read in one pass under the database lock.
+struct StorageBytes {
+    int64_t page_count{0};
+    int64_t freelist_count{0};
+    int64_t page_size{0};
+    int64_t wal_bytes{0};   ///< -wal file size; 0 when absent or unreadable
+    int64_t auto_vacuum{0}; ///< 0 = none, 1 = full, 2 = incremental
+
+    /// Used pages in bytes (free pages are reusable and not counted).
+    [[nodiscard]] int64_t data_bytes() const noexcept {
+        return (page_count - freelist_count) * page_size;
+    }
+    [[nodiscard]] int64_t freelist_bytes() const noexcept { return freelist_count * page_size; }
+    /// Main database file size (used plus free pages), excluding the WAL.
+    [[nodiscard]] int64_t file_bytes() const noexcept { return page_count * page_size; }
+};
+
+enum class CheckpointMode { kPassive, kTruncate };
+/// kBusy: a reader pins the WAL (or another writer holds it); nothing was waited for.
+enum class CheckpointResult { kOk, kBusy, kError };
 
 /// Optional baseline write that commits atomically with a diff-source insert.
 struct StateWrite {
@@ -493,6 +518,40 @@ public:
      * Queries typed warehouse tables (process_live, tcp_live, etc.)
      */
     EchoStats stats();
+
+    // ── Storage budget primitives (echo_aggregator.cpp run_budget) ───────────
+
+    /// Page counts, page size, WAL file size and auto_vacuum mode, read under the lock.
+    /// All zero when the store is closed.
+    [[nodiscard]] StorageBytes storage_bytes();
+
+    /**
+     * Run a DELETE ... RETURNING statement and a counter bump as ONE transaction.
+     * The row count comes from stepping the RETURNING rows, never sqlite3_changes() (that
+     * read races on the shared FULLMUTEX handle, #1033). The echo_config row `counter_key`
+     * is incremented by that count inside the same transaction, so a crash can never lose
+     * or double a count. Any failure rolls back both and returns the error.
+     * `sql` must be a complete statement ending in RETURNING; it is never built from
+     * operator input.
+     */
+    [[nodiscard]] std::expected<int64_t, std::string> delete_counted(const std::string& sql,
+                                                                     std::string_view counter_key);
+
+    /// Return up to `pages` free pages to the OS (no-op unless auto_vacuum is incremental).
+    void incremental_vacuum(int pages);
+
+    /// WAL checkpoint with the busy timeout dropped to 0 for the call, so a reader that pins
+    /// the WAL yields kBusy at once instead of stalling the lock for the 5 s busy timeout.
+    CheckpointResult checkpoint(CheckpointMode mode);
+
+    /// Convert a database created before auto_vacuum was enabled to incremental mode with
+    /// one VACUUM, then truncate the WAL. Holds the database lock for the whole run.
+    /// True on success. Caller gates it (free disk, off-peak) -- see vacuum_decision().
+    [[nodiscard]] bool vacuum_to_incremental();
+
+    /// If a raw BEGIN left the write connection inside a transaction (an exception unwound
+    /// past it), roll it back. No-op in autocommit.
+    void rollback_open_transaction() noexcept;
 
     // ── Snapshot state management ────────────────────────────────────────────
 
@@ -901,6 +960,9 @@ private:
     /// the diff-source inserts (which run it inside their transaction).
     static bool upsert_state_locked(sqlite3* db, const std::string& collector,
                                     const std::string& json);
+
+    /// storage_bytes() on an already-locked handle (shared with stats()).
+    [[nodiscard]] StorageBytes storage_bytes_locked();
 
     /// Internal set_config that assumes caller already holds mu_.
     bool set_config_locked(const std::string& key, const std::string& value);

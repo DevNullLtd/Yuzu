@@ -17,8 +17,8 @@
 Echo is the agent's local telemetry warehouse. Each capture source has a collector that reads current
 OS state on a timer, compares it with the baseline saved at the previous tick and appends only the
 differences, as change events, to a SQLite database (`echo.db`) on the device. Four interval triggers
-run the collectors and a fifth rolls the live rows up into hourly, daily and monthly tiers and then
-trims every tier to its limit. Three sources (`power`, `removable`, `registry`) do not diff a
+run the collectors and a fifth rolls the raw capture rows up into hourly, daily and monthly tiers,
+trims every tier to its limit and then holds the database to its byte budget. Three sources (`power`, `removable`, `registry`) do not diff a
 snapshot: they follow a saved position in an OS log or callback stream, and when that position is
 lost they record a `capture_gap` row and start again from the log's current end instead of replaying
 history. All 17 sources are on by default on every OS (`default_enabled` in `echo_schema_registry.cpp`,
@@ -39,7 +39,7 @@ reports `planned`, not a guessed read).
 | `echo.slow` | 300 s (30-7200) | `collect_slow` | `service`, `user`, `netconn`, `mapdrive` and the cursor sources `power`, `removable`, `registry` |
 | `echo.perf` | 30 s | `collect_perf` | `perf`, `procperf` (device and per-application counters, sampled rather than diffed) |
 | `echo.software` | 3600 s (0 removes the trigger, otherwise 300-86400) | `collect_software` | `software` |
-| `echo.rollup` | 900 s | `rollup` | aggregation into hourly, daily and monthly tiers, then retention |
+| `echo.rollup` | 900 s | `rollup` | aggregation into hourly, daily and monthly tiers, then retention, then the byte budget and file hygiene |
 
 The fast interval must stay below the slow interval. A diffed source's first tick records its baseline and
 no events, so a quiet first tick is not evidence about the past.
@@ -112,6 +112,27 @@ empty); `n/a` means the source does not apply to that OS. The table is read from
 - **Retention.** Live tables are row-count capped; the hourly, daily and monthly tiers are
   time-based (typically 24 hours, 31 days and about a year; a few tiers differ). Each pass deletes at
   most 5000 rows per table, and a disabled source's rows are never pruned.
+- **Byte budget.** `db_budget_bytes` (default 250 MB, minimum 32 MiB) caps used pages plus the
+  write-ahead log. Over budget, the rollup pass removes raw capture rows the hourly rollup has
+  already passed (largest table first, oldest first, never the newest 24 hours, and for `process`
+  only rows the usage fold has read), then hourly rows older than 48 hours. Daily and monthly rows,
+  the `usage` tables, paused or errored sources and the sources with no summary tier (`netconn`,
+  `power`, `removable`, `registry`) are never removed. A pass is batches of 1,000 rows, each in one
+  transaction with its persisted counter, and stops after 2 seconds; while still over budget each
+  fast tick runs another slice. The budget is hard for data pages and soft for the log: a long
+  `sql` read pins the log, and `budget_over_bytes` reports the overage. After a pass, free pages
+  are returned (`incremental_vacuum(256)`) and the log is checkpointed. A database created before
+  `auto_vacuum=INCREMENTAL` is converted by one `VACUUM` when data is under budget and the free
+  pages are at least 32 MiB and a quarter of the file; it needs twice the used size free on the
+  volume and otherwise reports `db_auto_vacuum|deferred`, retried at most daily.
+- **Raw capture row volume.** `tcp`: a socket first seen already closing is one row per process and
+  remote per hour, so the hourly `connect_count` is distinct remotes per process for those
+  sockets. `module` (Windows): unloads are not stored, risky loads always are, and every other load
+  is stored once per hour per loader, module and folder, so `load_count` is distinct combinations
+  for ordinary modules; an image with no embedded signature is looked up in the system catalogs
+  (a lookup error reads `unknown`, never risky). `registry`: 512-byte values, the old value is not
+  stored, `bam\State` is excluded and a row's time is the key's last-write time. `echo_state` is
+  rewritten only when a baseline changed.
 - **`netconn` and `power`/`removable` history.** On first enablement the read can reach back into
   OS-retained history, bounded by `netconn_lookback_seconds`, `power_lookback_seconds` (effective on
   macOS only) and `removable_lookback_seconds` (default 7 days, `0` means forward-only). If the
@@ -166,6 +187,11 @@ flowchart TD
   C -->|"plausible clock"| X["Delete aged rows, at most 5000 per table per pass"]
   C -->|"anomaly, first time seen"| N["Decline that table and count it in status"]
   C -->|"same anomaly seen again"| X
+  X --> B{"run_budget: data over db_budget_bytes less the 16 MiB log allowance?"}
+  N --> B
+  B -->|"yes"| Y["Evict summarised raw capture rows, then hourly rows older than 48 h, in 1000-row batches for at most 2 s"]
+  B -->|"no"| Z["Return free pages, checkpoint the log, report budget_over_bytes"]
+  Y --> Z
 ```
 
 Collectors write only the difference from the last complete snapshot, and a failed or partial read
@@ -175,7 +201,9 @@ that looks like a wall-clock jump (a pass that would wipe a table, more than 30 
 pass, a stored reading ahead of now, or no stored reading) and counts it in
 `retention_guard_declines_total`. It declines once per distinct anomaly: while the same anomaly
 persists, later passes delete again but never more than 5000 rows per table per pass. Row-count
-trimming needs no clock and is not clock-guarded, though it has the same per-pass cap.
+trimming needs no clock and is not clock-guarded, though it has the same per-pass cap. The byte budget
+runs after retention: it is size-triggered, not clock-triggered, and it only takes rows aggregation
+has already summarised, so a wrong clock cannot widen what it deletes.
 
 #### Disable, then purge a source
 
@@ -285,6 +313,7 @@ Windows runs an ETW session on provider `Microsoft-Windows-Kernel-Process`
 | Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
 | `crossplatform.echo.configure` | `retention_days` | string | no | - | pattern: ^[0-9]+$ | Number of days to retain Echo events before automatic purging. Valid range: 1-365. Default: 7. |
+| `crossplatform.echo.configure` | `db_budget_bytes` | string | no | - | pattern: ^[0-9]+$ | Cap on what echo.db holds (used pages plus the write-ahead log), in whole bytes. Minimum 33554432 (32 MiB). Default 262144000 (250 MB). A value below the minimum, or one that is not a whole number, is refused with an error\| line and nothing changes. When the database is over budget the maintenance pass removes raw capture rows already summarised into hourly rows (oldest first, never the newest 24 hours), then hourly rows older than 48 hours. Daily and monthly rows are never removed, and paused sources are exempt. |
 | `crossplatform.echo.configure` | `fast_interval` | string | no | - | pattern: ^[0-9]+$ | Interval in seconds for process and network collection. Valid range: 10-3600. Default: 60. |
 | `crossplatform.echo.configure` | `slow_interval` | string | no | - | pattern: ^[0-9]+$ | Interval in seconds for service and user session collection. Valid range: 30-7200. Default: 300. |
 | `crossplatform.echo.configure` | `redaction_patterns` | string | no | - | - | JSON array of case-insensitive SUBSTRING patterns (not glob) for command-line redaction. Leading/trailing `*` are stripped; `?` and `[abc]` are literals. Any process command line containing a pattern has its cmdline replaced with "[REDACTED by Echo]". At most 256 elements of at most 256 characters each; over-cap elements are dropped at load. Default patterns: ["*password*", "*secret*", "*token*", "*api_key*", "*credential*"]. These defaults are ALWAYS MERGED IN — your patterns are ADDED to them, never replace them, so an empty or all-invalid array cannot disable the baseline redaction. |
@@ -501,7 +530,7 @@ their declared columns at all; see Caveats.
 | `record_count` | int64 | - | Windows, Linux, macOS | `-` | Total number of Echo event rows currently stored across all warehouse tables. Values: non-negative integer. |
 | `oldest_timestamp` | int64 | - | Windows, Linux, macOS | `-` | Unix epoch seconds of the oldest event row still retained, or 0 when the warehouse is empty. Values: epoch seconds, or 0. |
 | `newest_timestamp` | int64 | - | Windows, Linux, macOS | `-` | Unix epoch seconds of the newest event row, or 0 when the warehouse is empty. Values: epoch seconds, or 0. |
-| `db_size_bytes` | int64 | - | Windows, Linux, macOS | `-` | Size in bytes of echo.db on disk. Values: non-negative integer. |
+| `db_size_bytes` | int64 | - | Windows, Linux, macOS | `-` | Bytes the Echo database holds: used pages (free pages are reusable and not counted) plus the write-ahead log file. This is the figure the byte budget (configure.db_budget_bytes) is enforced against; it is not the size of the file on disk, which can be larger until freed pages are returned. Values: non-negative integer. |
 | `retention_days` | int32 | - | Windows, Linux, macOS | `-` | Currently configured retention window in days (see configure.retention_days). Values: 1-365. |
 
 **`crossplatform.echo.tcp_by_process` — `output`**
@@ -519,7 +548,7 @@ their declared columns at all; see Caveats.
 
 **Actions without a definition.** `collect_perf` writes `echo\|collect_perf\|<n>\|<token>`, the same
 shape as `collect_fast`/`collect_slow` (see `do_collect_perf` in `echo_plugin.cpp`). `collect_software` follows the
-same convention. A failed perf/procperf counter read reports `counters_unavailable` where the registry lists the OS as supported and `unsupported_platform` where it has no perf collector. `status` additionally emits `db_health|<ok|quarantined>|<epoch>`, `config|perf_capture_method|<m>`, `config|procperf_procs_seen|<n>` and, per capture source, `config|<src>_last_status|<token>`, `config|<src>_consecutive_failures|<n>` and `config|<src>_last_status_at|<epoch>` (process memory only; see the user manual). A failed baseline-only save emits `error|<source> state_save_failed`. `purge_source` writes a single JSON line,
+same convention. A failed perf/procperf counter read reports `counters_unavailable` where the registry lists the OS as supported and `unsupported_platform` where it has no perf collector. `status` additionally emits `db_budget_bytes|<n>`, `budget_over_bytes|<n>`, `budget_evicted_raw_rows_total|<n>`, `budget_evicted_hourly_rows_total|<n>`, `db_auto_vacuum|<incremental|none|deferred>`, `module_dedup_overflow_total|<n>`, `tcp_closing_dedup_overflow_total|<n>`, `db_health|<ok|quarantined>|<epoch>`, `config|perf_capture_method|<m>`, `config|procperf_procs_seen|<n>` and, per capture source, `config|<src>_last_status|<token>`, `config|<src>_consecutive_failures|<n>` and `config|<src>_last_status_at|<epoch>` (process memory only; see the user manual). A failed baseline-only save emits `error|<source> state_save_failed`. `purge_source` writes a single JSON line,
 `{"source":"<name>","rows_deleted":<n>,"status":"purged"}` (see `do_purge_source` in `echo_plugin.cpp`), or an
 `error|` line if the named source is unknown, still enabled, or its enable flag cannot be read (`config_unreadable`).
 
@@ -566,7 +595,8 @@ every action shares — ever calls the setter, so the agent records the default 
   (name/publisher/version) reachable via `query type=software`/`sql`; `dns`/`mapdrive` add
   resolved hostnames and mapped-drive usernames/remote hosts; `removable` events name an
   attached device's vendor/product/serial and its BSD/udev device name; `registry` rows hold the
-  old and new data of every changed watched value, unmasked.
+  new data (first 512 bytes) of every changed watched value, unmasked, and the old value's type and
+  size but not the old value.
 - **Siblings:** `crossplatform.echo.*` (this plugin) is standalone; the `installed_software`
   daily-sync source (ADR-0016) is a separate, machine-scope inventory feed, distinct from Echo's
   `software` capture source.
@@ -809,19 +839,21 @@ three broken legs; it is one chokepoint. See Caveats item 1.
    macOS are `planned`: no code path exists for them (confirmed absent in `echo_perf.cpp`,
    `echo_proc_perf.cpp` and the non-Windows branch of `echo_software_collector.cpp`). A `planned`
    leg's table is queryable and empty, which means "not yet collecting", never "nothing happened".
-5. **Registry capture stores values unmasked and does not name the writer.** Every watched value,
-   changed or not, is readable through `sql` (the per-key baseline in `echo_state` holds the current
-   values, for example a Winlogon autologon `DefaultPassword`), and every row's `actor_pid` is 0.
-   A value written and reverted between two reads is not recorded, and a user hive that loads at
-   logon is baselined silently at its first read.
+5. **Registry capture stores new values unmasked and does not always name the writer.** The
+   new data of every changed watched value is readable through `sql` (up to 512 bytes, for example
+   a Winlogon autologon `DefaultPassword` when it changes); the per-key baseline in `echo_state`
+   holds only a hash, type and size, and the old value is not stored. A row's `actor_pid` is 0
+   unless the Kernel-Registry ETW correlation named a writer. A value written and reverted between
+   two reads is not recorded, and a user hive that loads at logon is baselined silently at its
+   first read.
 
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/echo/src/echo_aggregator.cpp` · `agents/plugins/echo/src/echo_aggregator.hpp` · `agents/plugins/echo/src/echo_arp_collector.cpp` · `agents/plugins/echo/src/echo_arp_parsers.hpp` · `agents/plugins/echo/src/echo_capture_status.hpp` · `agents/plugins/echo/src/echo_collectors.hpp` · `agents/plugins/echo/src/echo_cursor.hpp` · `agents/plugins/echo/src/echo_cursor_sources.cpp` · `agents/plugins/echo/src/echo_db.cpp` · `agents/plugins/echo/src/echo_db.hpp` · `agents/plugins/echo/src/echo_diff.cpp` · `agents/plugins/echo/src/echo_dns_collector.cpp` · `agents/plugins/echo/src/echo_fleet_snapshot.cpp` · `agents/plugins/echo/src/echo_fleet_snapshot.hpp` · `agents/plugins/echo/src/echo_local_image_path.hpp` · `agents/plugins/echo/src/echo_mapdrive_backfill.hpp` · `agents/plugins/echo/src/echo_mapdrive_collector.cpp` · `agents/plugins/echo/src/echo_mapdrive_macos_parsers.hpp` · `agents/plugins/echo/src/echo_module_etw.cpp` · `agents/plugins/echo/src/echo_module_etw.hpp` · `agents/plugins/echo/src/echo_module_stream.cpp` · `agents/plugins/echo/src/echo_module_stream.hpp` · `agents/plugins/echo/src/echo_netconn.hpp` · `agents/plugins/echo/src/echo_netconn_win.cpp` · `agents/plugins/echo/src/echo_netqual.hpp` · `agents/plugins/echo/src/echo_netqual_boot.cpp` · `agents/plugins/echo/src/echo_netqual_boot.hpp` · `agents/plugins/echo/src/echo_netqual_nstat.cpp` · `agents/plugins/echo/src/echo_netqual_nstat.hpp` · `agents/plugins/echo/src/echo_network_collector.cpp` · `agents/plugins/echo/src/echo_perf.cpp` · `agents/plugins/echo/src/echo_perf.hpp` · `agents/plugins/echo/src/echo_plugin.cpp` · `agents/plugins/echo/src/echo_power_collector.cpp` · `agents/plugins/echo/src/echo_power_parsers.hpp` · `agents/plugins/echo/src/echo_proc_es.cpp` · `agents/plugins/echo/src/echo_proc_es.hpp` · `agents/plugins/echo/src/echo_proc_etw.cpp` · `agents/plugins/echo/src/echo_proc_etw.hpp` · `agents/plugins/echo/src/echo_proc_perf.cpp` · `agents/plugins/echo/src/echo_proc_perf.hpp` · `agents/plugins/echo/src/echo_proc_stream.cpp` · `agents/plugins/echo/src/echo_proc_stream.hpp` · `agents/plugins/echo/src/echo_registry_parsers.hpp` · `agents/plugins/echo/src/echo_registry_source.cpp` · `agents/plugins/echo/src/echo_registry_source.hpp` · `agents/plugins/echo/src/echo_removable_collector.cpp` · `agents/plugins/echo/src/echo_removable_diskarb.mm` · `agents/plugins/echo/src/echo_removable_parsers.hpp` · `agents/plugins/echo/src/echo_schema_registry.cpp` · `agents/plugins/echo/src/echo_schema_registry.hpp` · `agents/plugins/echo/src/echo_service_collector.cpp` · `agents/plugins/echo/src/echo_service_parsers.hpp` · `agents/plugins/echo/src/echo_software_collector.cpp` · `agents/plugins/echo/src/echo_software_core.cpp` · `agents/plugins/echo/src/echo_software_core.hpp` · `agents/plugins/echo/src/echo_source_health.hpp` · `agents/plugins/echo/src/echo_sql_executor.cpp` · `agents/plugins/echo/src/echo_sql_executor.hpp` · `agents/plugins/echo/src/echo_status_format.hpp` · `agents/plugins/echo/src/echo_usage.cpp` · `agents/plugins/echo/src/echo_usage.hpp` · `agents/plugins/echo/src/echo_user_collector.cpp` · `agents/plugins/echo/src/echo_version.hpp` · `agents/plugins/echo/src/echo_win_process_name.hpp` · `agents/plugins/echo/src/echo_win_raii_guards.hpp`
+- Plugin: `agents/plugins/echo/src/echo_aggregator.cpp` · `agents/plugins/echo/src/echo_aggregator.hpp` · `agents/plugins/echo/src/echo_arp_collector.cpp` · `agents/plugins/echo/src/echo_arp_parsers.hpp` · `agents/plugins/echo/src/echo_capture_status.hpp` · `agents/plugins/echo/src/echo_collectors.hpp` · `agents/plugins/echo/src/echo_cursor.hpp` · `agents/plugins/echo/src/echo_cursor_sources.cpp` · `agents/plugins/echo/src/echo_db.cpp` · `agents/plugins/echo/src/echo_db.hpp` · `agents/plugins/echo/src/echo_diff.cpp` · `agents/plugins/echo/src/echo_dns_collector.cpp` · `agents/plugins/echo/src/echo_fleet_snapshot.cpp` · `agents/plugins/echo/src/echo_fleet_snapshot.hpp` · `agents/plugins/echo/src/echo_hour_dedup.hpp` · `agents/plugins/echo/src/echo_local_image_path.hpp` · `agents/plugins/echo/src/echo_mapdrive_backfill.hpp` · `agents/plugins/echo/src/echo_mapdrive_collector.cpp` · `agents/plugins/echo/src/echo_mapdrive_macos_parsers.hpp` · `agents/plugins/echo/src/echo_module_etw.cpp` · `agents/plugins/echo/src/echo_module_etw.hpp` · `agents/plugins/echo/src/echo_module_stream.cpp` · `agents/plugins/echo/src/echo_module_stream.hpp` · `agents/plugins/echo/src/echo_netconn.hpp` · `agents/plugins/echo/src/echo_netconn_win.cpp` · `agents/plugins/echo/src/echo_netqual.hpp` · `agents/plugins/echo/src/echo_netqual_boot.cpp` · `agents/plugins/echo/src/echo_netqual_boot.hpp` · `agents/plugins/echo/src/echo_netqual_nstat.cpp` · `agents/plugins/echo/src/echo_netqual_nstat.hpp` · `agents/plugins/echo/src/echo_network_collector.cpp` · `agents/plugins/echo/src/echo_perf.cpp` · `agents/plugins/echo/src/echo_perf.hpp` · `agents/plugins/echo/src/echo_plugin.cpp` · `agents/plugins/echo/src/echo_power_collector.cpp` · `agents/plugins/echo/src/echo_power_parsers.hpp` · `agents/plugins/echo/src/echo_proc_es.cpp` · `agents/plugins/echo/src/echo_proc_es.hpp` · `agents/plugins/echo/src/echo_proc_etw.cpp` · `agents/plugins/echo/src/echo_proc_etw.hpp` · `agents/plugins/echo/src/echo_proc_perf.cpp` · `agents/plugins/echo/src/echo_proc_perf.hpp` · `agents/plugins/echo/src/echo_proc_stream.cpp` · `agents/plugins/echo/src/echo_proc_stream.hpp` · `agents/plugins/echo/src/echo_registry_parsers.hpp` · `agents/plugins/echo/src/echo_registry_source.cpp` · `agents/plugins/echo/src/echo_registry_source.hpp` · `agents/plugins/echo/src/echo_removable_collector.cpp` · `agents/plugins/echo/src/echo_removable_diskarb.mm` · `agents/plugins/echo/src/echo_removable_parsers.hpp` · `agents/plugins/echo/src/echo_schema_registry.cpp` · `agents/plugins/echo/src/echo_schema_registry.hpp` · `agents/plugins/echo/src/echo_service_collector.cpp` · `agents/plugins/echo/src/echo_service_parsers.hpp` · `agents/plugins/echo/src/echo_software_collector.cpp` · `agents/plugins/echo/src/echo_software_core.cpp` · `agents/plugins/echo/src/echo_software_core.hpp` · `agents/plugins/echo/src/echo_source_health.hpp` · `agents/plugins/echo/src/echo_sql_executor.cpp` · `agents/plugins/echo/src/echo_sql_executor.hpp` · `agents/plugins/echo/src/echo_status_format.hpp` · `agents/plugins/echo/src/echo_usage.cpp` · `agents/plugins/echo/src/echo_usage.hpp` · `agents/plugins/echo/src/echo_user_collector.cpp` · `agents/plugins/echo/src/echo_version.hpp` · `agents/plugins/echo/src/echo_win_process_name.hpp` · `agents/plugins/echo/src/echo_win_raii_guards.hpp`
 - Definitions: `content/definitions/echo.yaml` · `content/definitions/echo_warehouse.yaml`
 - Capability rows: `server/core/src/capability_decls/core_dispatch_capabilities.hpp` · `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
 - Tests: `tests/test_echo_adoption_wiring_lexical.py` · `tests/test_echo_mapdrive_pin_lexical.py` · `tests/test_echo_timeline_script_behaviour.py` · `tests/unit/server/test_echo_process_tree.cpp` · `tests/unit/server/test_echo_rename_migration_pg.cpp` · `tests/unit/server/test_echo_retention_tiers.cpp` · `tests/unit/server/test_echo_timeline_page.cpp` · `tests/unit/server/test_echo_timeline_render.cpp` · `tests/unit/server/test_echo_tree_routes.cpp` · `tests/unit/test_echo_aggregator.cpp` · `tests/unit/test_echo_arp.cpp` · `tests/unit/test_echo_capability_table.cpp` · `tests/unit/test_echo_capture_status.cpp` · `tests/unit/test_echo_cursor.cpp` · `tests/unit/test_echo_diff.cpp` · `tests/unit/test_echo_local_dispatcher.cpp` · `tests/unit/test_echo_mapdrive.cpp` · `tests/unit/test_echo_module_etw.cpp` · `tests/unit/test_echo_module_stream.cpp` · `tests/unit/test_echo_netconn.cpp` · `tests/unit/test_echo_netqual_nstat.cpp` · `tests/unit/test_echo_perf.cpp` · `tests/unit/test_echo_power.cpp` · `tests/unit/test_echo_proc_es.cpp` · `tests/unit/test_echo_proc_etw.cpp` · `tests/unit/test_echo_proc_perf.cpp` · `tests/unit/test_echo_registry_source.cpp` · `tests/unit/test_echo_removable.cpp` · `tests/unit/test_echo_retention_tiers_table.cpp` · `tests/unit/test_echo_schema_registry.cpp` · `tests/unit/test_echo_service.cpp` · `tests/unit/test_echo_software.cpp` · `tests/unit/test_echo_source_health.cpp` · `tests/unit/test_echo_store.cpp` · `tests/unit/test_echo_usage.cpp` · `tests/unit/test_echo_warehouse.cpp` · `tests/unit/test_echo_win_raii_guards.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-14-dex-echo-titles.changed.md` · `changelog.d/2026-10-21-echo-all-sources-default-on.changed.md` · `changelog.d/2026-10-21-echo-mapdrive-history-backfill.fixed.md` · `changelog.d/2026-10-21-echo-timeline-render.added.md` · `changelog.d/2026-10-21-echo-windows-image-db-hardening.security.md` · `changelog.d/2026-10-23-echo-timeline-page.added.md` · `changelog.d/2026-10-25-echo-regchange-source.added.md` · `changelog.d/2026-10-25-echo-retention-tiers-api.added.md` · `changelog.d/2026-10-26-echo-regchange-actor-attribution.added.md` · `changelog.d/2026-10-26-echo-tiers-data-page.added.md` · `changelog.d/2026-10-28-echo-rename.changed.md` · `changelog.d/20261014-echo-adhoc-sql-moved.changed.md` · `changelog.d/20261021-echo-capture-sources-paused-core.fixed.md`
+- Changelog: `changelog.d/2026-10-14-dex-echo-titles.changed.md` · `changelog.d/2026-10-21-echo-all-sources-default-on.changed.md` · `changelog.d/2026-10-21-echo-mapdrive-history-backfill.fixed.md` · `changelog.d/2026-10-21-echo-timeline-render.added.md` · `changelog.d/2026-10-21-echo-windows-image-db-hardening.security.md` · `changelog.d/2026-10-23-echo-timeline-page.added.md` · `changelog.d/2026-10-25-echo-regchange-source.added.md` · `changelog.d/2026-10-25-echo-retention-tiers-api.added.md` · `changelog.d/2026-10-26-echo-regchange-actor-attribution.added.md` · `changelog.d/2026-10-26-echo-tiers-data-page.added.md` · `changelog.d/2026-10-28-echo-rename.changed.md` · `changelog.d/2026-10-30-echo-db-budget.fixed.md` · `changelog.d/20261014-echo-adhoc-sql-moved.changed.md` · `changelog.d/20261021-echo-capture-sources-paused-core.fixed.md`
 <!-- END GENERATED -->

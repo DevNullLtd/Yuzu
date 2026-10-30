@@ -11,9 +11,9 @@ metadata:
   version: 1.0.0
   description: >
     Returns the current status of the Echo database including record count,
-    oldest and newest event timestamps, database size on disk, and the
-    configured retention period. Use this to verify Echo is collecting data
-    and to monitor disk usage. Also reports both the configured
+    oldest and newest event timestamps, the database size (used pages plus the
+    write-ahead log), and the configured retention period. Use this to verify
+    Echo is collecting data and to monitor disk usage. Also reports both the configured
     network_capture_method and the network_capture_method_effective (the
     mechanism actually collecting — always polling today), so status never
     misrepresents the active capture mechanism. On the healthy path the FIRST
@@ -35,6 +35,15 @@ metadata:
     declines total only means the endpoint's clock is behaving if the failures
     total is also zero. Scrape this across the fleet to find hosts whose clocks
     need attention; the agent has no /metrics endpoint.
+    Reports the byte budget: db_budget_bytes (the configured cap),
+    budget_over_bytes (how far data plus the write-ahead log sat above it when
+    the last maintenance pass finished; 0 within budget, and non-zero while a
+    long echo sql read pins the log or when nothing more is eligible to
+    evict), budget_evicted_raw_rows_total and budget_evicted_hourly_rows_total
+    (cumulative rows the budget removed), and db_auto_vacuum (incremental,
+    none, or deferred while a one-off conversion waits for free disk space).
+    module_dedup_overflow_total and tcp_closing_dedup_overflow_total count how
+    often the hourly de-duplication sets filled and were cleared.
   tags: [echo, timeline, monitoring, diagnostics]
 
 spec:
@@ -69,7 +78,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: db_size_bytes
         type: int64
-        description: 'Size in bytes of echo.db on disk. Values: non-negative integer.'
+        description: 'Bytes the Echo database holds: used pages (free pages are reusable and not counted) plus the write-ahead log file. This is the figure the byte budget (configure.db_budget_bytes) is enforced against; it is not the size of the file on disk, which can be larger until freed pages are returned. Values: non-negative integer.'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: retention_days
@@ -354,8 +363,8 @@ metadata:
   description: >
     Updates Echo plugin configuration. Changes take effect on the next
     collection cycle. Configurable settings include data retention period,
-    collection intervals, and command-line redaction patterns for sensitive
-    data protection.
+    the database byte budget, collection intervals, and command-line
+    redaction patterns for sensitive data protection.
   tags: [echo, timeline, configuration, security]
 
 spec:
@@ -376,6 +385,20 @@ spec:
         description: >
           Number of days to retain Echo events before automatic purging.
           Valid range: 1-365. Default: 7.
+        validation:
+          pattern: "^[0-9]+$"
+      db_budget_bytes:
+        type: string
+        displayName: Database Byte Budget
+        description: >
+          Cap on what echo.db holds (used pages plus the write-ahead log), in
+          whole bytes. Minimum 33554432 (32 MiB). Default 262144000 (250 MB).
+          A value below the minimum, or one that is not a whole number, is
+          refused with an error| line and nothing changes. When the database
+          is over budget the maintenance pass removes raw capture rows already
+          summarised into hourly rows (oldest first, never the newest 24
+          hours), then hourly rows older than 48 hours. Daily and monthly
+          rows are never removed, and paused sources are exempt.
         validation:
           pattern: "^[0-9]+$"
       fast_interval:

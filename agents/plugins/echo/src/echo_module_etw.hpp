@@ -68,6 +68,21 @@ struct ModuleSignVerdict {
     std::string signer; ///< publisher CN / team id; "" if unresolved
 };
 
+/// What the system-catalog lookup found for an image WinVerifyTrust reported as having no
+/// embedded signature (TRUST_E_NOSIGNATURE). Most Windows system binaries carry no embedded
+/// signature: their hashes are listed in signed catalog files instead.
+enum class CatalogLookup : std::uint8_t {
+    kNotFound,   ///< no installed catalog lists the file hash: genuinely unsigned
+    kFoundValid, ///< a catalog lists the hash and WinVerifyTrust accepts the catalog member
+    kError,      ///< any API failure, or a catalog that lists the hash but did not verify
+};
+
+/// Pure mapping from a catalog lookup to a verdict: NotFound is kUnsigned, FoundValid is
+/// kSigned carrying the catalog's signer, everything else is kUnknown. A failed lookup is
+/// never kUnsigned, so it cannot make an ordinary system DLL read as risky.
+[[nodiscard]] ModuleSignVerdict catalog_lookup_verdict(CatalogLookup lookup,
+                                                       std::string catalog_signer = {});
+
 /// Verifier callback: full image path → verdict. The real Windows verifier
 /// (WinVerifyTrust on an open handle, signer from its provider chain, in the .cpp)
 /// is wired at drain; tests inject a fake. A null verifier yields {kUnknown, ""}

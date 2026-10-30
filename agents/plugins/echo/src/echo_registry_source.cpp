@@ -1047,6 +1047,11 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
     }
     const DWORD max_sub = before.max_sub, max_data = before.max_data;
     auto& values = ctx.out->keys[full]; // present even when empty: a vanished key is detectable
+    // The key's write time as first queried: a row takes it as its time. A key written during
+    // this walk makes the read Capped below, so nothing is built from a stale stamp.
+    ctx.out->written[full] = static_cast<std::int64_t>(
+        (static_cast<std::uint64_t>(before.written.dwHighDateTime) << 32) |
+        before.written.dwLowDateTime);
     // lpData is never null: with a null buffer RegEnumValueW answers ERROR_SUCCESS and only
     // reports the size, so a value that grew since QueryInfoKey would be copied from nullptr.
     const std::size_t buf_len =
@@ -1102,6 +1107,10 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
         }
         const std::string child_path =
            full + "\\" + yuzu::win::from_wide(sub.data(), static_cast<int>(slen));
+        // Not configuration (see registry_path_excluded): never opened, so its constant writes
+        // cannot disturb the read of the rest of the root.
+        if (registry_path_excluded(child_path))
+            continue;
         yuzu::win::RegKey child;
         // OPEN_LINK: a child that is a symbolic-link key is read as the link (its own
         // SymbolicLinkValue), never followed into whatever it points at.
@@ -1158,6 +1167,7 @@ SubtreeRead read_root(const std::string& root, std::int64_t deadline) noexcept {
         read_key(ctx, key.get(), root, 0);
         if (ctx.unreadable) {
             out.keys.clear();
+            out.written.clear();
             out.skipped.clear();
             out.status = RegistryReadStatus::Unreadable;
         } else {
@@ -1165,6 +1175,7 @@ SubtreeRead read_root(const std::string& root, std::int64_t deadline) noexcept {
         }
     } catch (...) {
         out.keys.clear();
+        out.written.clear();
         out.skipped.clear();
         out.status = RegistryReadStatus::Unreadable;
     }

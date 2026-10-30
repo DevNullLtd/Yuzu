@@ -64,6 +64,9 @@ rollup          │   echo_aggregator runs SQL       │
                 │ run_retention():                │
                 │   retention_sql() row-count     │ ───►  trims to a row ceiling
                 │   guarded capped DELETE (time)  │ ───►  paced, clock-guarded
+                │ run_budget():                   │
+                │   evict summarised raw rows     │ ───►  holds echo.db under
+                │   then old hourly rows          │       db_budget_bytes
                 └─────────────────────────────────┘
 ```
 
@@ -79,6 +82,21 @@ Flow:
    the rollup SQL from the schema registry to build hourly summaries
    from live, daily from hourly, monthly from daily. Each tier has
    independent retention.
+4. The same maintenance pass then holds the database to its byte budget
+   (`db_budget_bytes`), in this fixed order: aggregation, retention,
+   `run_budget`, the one-off conversion `VACUUM` gate, file hygiene
+   (`incremental_vacuum(256)` and a WAL checkpoint). `run_budget` takes only
+   raw capture rows the hourly rollup has already passed (never the newest
+   24 hours, and for `process` only rows the usage fold has read), then hourly
+   rows older than 48 hours, in 1,000-row transactions that also bump the
+   persisted eviction counter, stopping after 2 seconds. A pass that ends on
+   the deadline with rows left to evict arms a catch-up slice that
+   `do_collect_fast` runs after its collect (outside `collect_mu_`, under
+   `try_lock` on `rollup_mu_`, so it never waits on a rollup). The budget is
+   hard for data pages and soft for the WAL; `budget_over_bytes` in `status`
+   reports the difference. A new source with a summary tier is picked up by
+   the budget from the registry with no change; a live-only source (no
+   `rollup_sql`) is never evicted.
 
 The schema registry (`echo_schema_registry.cpp`) is the single source of
 truth for table shape, retention behavior, rollup SQL, and per-OS
@@ -271,7 +289,7 @@ Routine debugging entry points:
 | "Echo isn't recording anything for source X" | `echo.status` output → `<source>_enabled` row. Then `compatibility` action to confirm OS support. Then check the agent log for "Echo plugin initialized". |
 | "Query returns 0 rows but I know the event happened" | Check the collect interval (`fast_interval` / `slow_interval`) vs the event lifetime — anything shorter than the interval is sub-resolution. |
 | "TCP collector shows a flood of `connected` events" | Almost always a restart artifact. Confirm against the agent's start time. |
-| "echo.db is huge" | `status` returns `db_size_bytes`. If it's growing without bound the rollup trigger may not be firing — check trigger registration in `init()`. |
+| "echo.db is huge" | `status` returns `db_size_bytes` (used pages plus the WAL, not the file size) against `db_budget_bytes`. If it's growing without bound the rollup trigger may not be firing — check trigger registration in `init()`. A file that stays large while `db_size_bytes` is within budget is an older database waiting for its one-off `VACUUM` (`db_auto_vacuum|deferred` means the volume lacks twice the used size free). `budget_over_bytes` above 0 with no `sql` query running means everything left is exempt (newest 24 hours, paused sources, daily and monthly rows). |
 | "Schema migration failed at startup" | `agent.log` will show `EchoDatabase: migrated to schema version N` on success or the SQLite error on failure. Migrations are idempotent — fixing the underlying issue and restarting will retry. |
 
 For new-source bring-up, the smallest viable change is: add a

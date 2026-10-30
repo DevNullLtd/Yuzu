@@ -10,6 +10,8 @@
 
 #include "echo_netqual.hpp" // nq_delta_clamped
 
+#include <macos_socket_walk.hpp> // socket_walk_tcp_state: pure TCPS_* -> name, shared with the libproc walk
+
 #include <cstring>
 #include <format>
 
@@ -231,6 +233,7 @@ std::optional<DecodedTcpDesc> nstat_decode_tcp_src_desc(std::span<const std::byt
     // process); there is no effective-process name field at this OS floor, so
     // this is the single available process identity.
     out.process_name = cstr_from_fixed(desc.pname, sizeof(desc.pname));
+    out.state = std::string{yuzu::shared::detail::socket_walk_tcp_state(static_cast<int>(desc.state))};
     return out;
 }
 
@@ -287,6 +290,7 @@ NstatFlowEvent nstat_build_open_event(std::int64_t ts_unix, const DecodedTcpDesc
     ev.remote_port = desc.remote_port;
     ev.pid = desc.pid;
     ev.process_name = desc.process_name;
+    ev.state = desc.state;
     return ev;
 }
 

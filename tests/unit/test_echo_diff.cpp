@@ -10,7 +10,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::echo;
@@ -759,4 +761,233 @@ TEST_CASE("mapdrive diff: re-credentialed mount is removed + appeared",
     }
     CHECK(saw_appeared_bob);
     CHECK(saw_removed_alice);
+}
+
+// =============================================================================
+// Typed tcp events: closing-state rules (echo storage budget)
+// =============================================================================
+
+namespace {
+
+NetConnection tcp_conn(int local_port, const std::string& remote, int remote_port,
+                       const std::string& state, std::uint32_t pid = 0,
+                       const std::string& process = "") {
+    NetConnection c;
+    c.proto = "tcp";
+    c.local_addr = "10.0.0.1";
+    c.local_port = local_port;
+    c.remote_addr = remote;
+    c.remote_port = remote_port;
+    c.state = state;
+    c.pid = pid;
+    c.process_name = process;
+    return c;
+}
+
+std::vector<NetworkEvent> net_events(const std::vector<NetConnection>& prev,
+                                     const std::vector<NetConnection>& curr, std::int64_t ts,
+                                     HourlySeenSet& seen) {
+    return compute_network_events(prev, curr, ts, 1, seen);
+}
+
+} // namespace
+
+TEST_CASE("Echo tcp events: the closing-state rule matrix", "[echo][diff][network][tcp]") {
+    HourlySeenSet seen;
+    const auto est = tcp_conn(5000, "1.2.3.4", 443, "ESTABLISHED", 10, "curl");
+    auto tw = est;
+    tw.state = "TIME_WAIT";
+
+    SECTION("a new ESTABLISHED socket is connected") {
+        const auto ev = net_events({}, {est}, 1000, seen);
+        REQUIRE(ev.size() == 1);
+        CHECK(ev[0].action == "connected");
+        CHECK(ev[0].state == "ESTABLISHED");
+    }
+    SECTION("ESTABLISHED moving to TIME_WAIT is one disconnected row carrying the new state") {
+        const auto ev = net_events({est}, {tw}, 1000, seen);
+        REQUIRE(ev.size() == 1);
+        CHECK(ev[0].action == "disconnected");
+        CHECK(ev[0].state == "TIME_WAIT");
+    }
+    SECTION("a TIME_WAIT socket that then vanishes adds nothing") {
+        CHECK(net_events({tw}, {}, 1000, seen).empty());
+    }
+    SECTION("a staying TIME_WAIT socket adds nothing") {
+        CHECK(net_events({tw}, {tw}, 1000, seen).empty());
+    }
+    SECTION("an ESTABLISHED socket that vanishes is disconnected") {
+        const auto ev = net_events({est}, {}, 1000, seen);
+        REQUIRE(ev.size() == 1);
+        CHECK(ev[0].action == "disconnected");
+    }
+    SECTION("TIME_WAIT back to ESTABLISHED (the 4-tuple was reused) is connected") {
+        const auto ev = net_events({tw}, {est}, 1000, seen);
+        REQUIRE(ev.size() == 1);
+        CHECK(ev[0].action == "connected");
+        CHECK(ev[0].state == "ESTABLISHED");
+    }
+    SECTION("a socket first seen already closing is one connected row, state as seen") {
+        const auto ev = net_events({}, {tw}, 1000, seen);
+        REQUIRE(ev.size() == 1);
+        CHECK(ev[0].action == "connected");
+        CHECK(ev[0].state == "TIME_WAIT");
+        // ... and its vanishing later adds no disconnected row.
+        CHECK(net_events({tw}, {}, 1060, seen).empty());
+    }
+    SECTION("UDP (empty state) is not closing and behaves as before") {
+        NetConnection udp;
+        udp.proto = "udp";
+        udp.local_addr = "0.0.0.0";
+        udp.local_port = 5353;
+        const auto up = net_events({}, {udp}, 1000, seen);
+        REQUIRE(up.size() == 1);
+        CHECK(up[0].action == "connected");
+        const auto down = net_events({udp}, {}, 1060, seen);
+        REQUIRE(down.size() == 1);
+        CHECK(down[0].action == "disconnected");
+    }
+    SECTION("the Linux CLOSE and Windows DELETE_TCB spellings count as closing") {
+        CHECK(tcp_state_is_closing("CLOSE"));
+        CHECK(tcp_state_is_closing("DELETE_TCB"));
+        for (const char* s : {"TIME_WAIT", "CLOSING", "LAST_ACK", "FIN_WAIT1", "FIN_WAIT2",
+                              "CLOSE_WAIT", "CLOSED"})
+            CHECK(tcp_state_is_closing(s));
+        for (const char* s : {"ESTABLISHED", "LISTEN", "SYN_SENT", "SYN_RECV", ""})
+            CHECK_FALSE(tcp_state_is_closing(s));
+    }
+}
+
+TEST_CASE("Echo tcp events: replayed TIME_WAIT churn collapses to one row per remote per hour",
+          "[echo][diff][network][tcp]") {
+    // 14 recorded fast ticks, each showing 300 distinct ephemeral TIME_WAIT sockets (pid 0) to
+    // three remotes. Before the closing rules every tick wrote a connected row per socket.
+    constexpr std::int64_t kHour = 1'699'999'200;
+    const std::vector<std::pair<std::string, int>> remotes{
+        {"203.0.113.10", 443}, {"203.0.113.11", 443}, {"198.51.100.7", 8443}};
+    HourlySeenSet seen;
+    std::vector<NetConnection> prev;
+    std::size_t connected = 0, disconnected = 0;
+    const auto tick = [&](int n, std::int64_t ts) {
+        std::vector<NetConnection> curr;
+        for (int i = 0; i < 300; ++i) {
+            const auto& r = remotes[static_cast<std::size_t>(i) % remotes.size()];
+            curr.push_back(tcp_conn(32768 + n * 300 + i, r.first, r.second, "TIME_WAIT"));
+        }
+        for (const auto& e : net_events(prev, curr, ts, seen)) {
+            connected += e.action == "connected";
+            disconnected += e.action == "disconnected";
+        }
+        prev = std::move(curr);
+    };
+    for (int n = 0; n < 14; ++n)
+        tick(n, kHour + n * 60);
+    CHECK(connected == 3);
+    CHECK(disconnected == 0);
+    // After the hour boundary each remote is recorded once more.
+    tick(14, kHour + 3600 + 5);
+    CHECK(connected == 6);
+    CHECK(disconnected == 0);
+}
+
+TEST_CASE("Echo tcp events: the process name is part of the closing de-duplication key",
+          "[echo][diff][network][tcp]") {
+    HourlySeenSet seen;
+    const auto a = tcp_conn(40000, "203.0.113.10", 443, "TIME_WAIT", 7, "curl");
+    const auto b = tcp_conn(40001, "203.0.113.10", 443, "TIME_WAIT", 8, "wget");
+    CHECK(net_events({}, {a, b}, 1000, seen).size() == 2); // same remote, two processes
+}
+
+TEST_CASE("Echo tcp events: 20,001 distinct closing remotes in an hour overflow the set once",
+          "[echo][diff][network][tcp]") {
+    HourlySeenSet seen;
+    std::vector<NetConnection> curr;
+    curr.reserve(20'001);
+    for (int i = 0; i < 20'001; ++i)
+        curr.push_back(tcp_conn(40000 + (i % 1000), "198.18." + std::to_string(i / 250) + "." +
+                                                       std::to_string(i % 250),
+                                 443, "TIME_WAIT"));
+    std::vector<NetworkEvent> ev;
+    REQUIRE_NOTHROW(ev = net_events({}, curr, 1000, seen));
+    CHECK(seen.overflows() == 1);
+    CHECK(ev.size() == 20'001); // every first sighting is still a row; the clear only costs repeats
+}
+
+TEST_CASE("Echo HourlySeenSet: hour boundary clears, an earlier ts never rewinds",
+          "[echo][diff][dedup]") {
+    HourlySeenSet seen;
+    constexpr std::int64_t kHour = 1'699'999'200;
+    CHECK(seen.first_this_hour(kHour + 10, "k"));
+    CHECK_FALSE(seen.first_this_hour(kHour + 3599, "k"));
+    CHECK(seen.first_this_hour(kHour + 3600, "k"));      // strictly later hour: cleared
+    CHECK_FALSE(seen.first_this_hour(kHour + 10, "k"));  // earlier ts: checked against the set
+    CHECK(seen.first_this_hour(kHour + 10, "other"));    // ... and never moves the hour back
+    CHECK_FALSE(seen.first_this_hour(kHour + 3700, "other"));
+    // A negative (dead-RTC) stamp lands in a stable hour rather than rounding toward zero.
+    HourlySeenSet neg;
+    CHECK(neg.first_this_hour(-1, "k"));
+    CHECK_FALSE(neg.first_this_hour(-3600, "k")); // same hour as -1 (floor division)
+    HourlySeenSet small(2);
+    CHECK(small.first_this_hour(0, "a"));
+    CHECK(small.first_this_hour(0, "b"));
+    CHECK(small.first_this_hour(0, "c")); // full: cleared, one overflow
+    CHECK(small.overflows() == 1);
+    CHECK_FALSE(small.first_this_hour(0, "c"));
+}
+
+TEST_CASE("Echo fill_process_names: fills empty names by pid, keeps a name, ignores pid 0",
+          "[echo][diff][network][pidname]") {
+    std::unordered_map<std::uint32_t, PidName> names;
+    names[10] = PidName{"curl", 0};
+    names[0] = PidName{"System Idle", 0};
+    std::vector<NetConnection> conns{
+        tcp_conn(1, "1.1.1.1", 443, "ESTABLISHED", 10, ""),
+        tcp_conn(2, "1.1.1.1", 443, "ESTABLISHED", 10, "already"),
+        tcp_conn(3, "1.1.1.1", 443, "TIME_WAIT", 0, ""),
+        tcp_conn(4, "1.1.1.1", 443, "ESTABLISHED", 99, "")};
+    fill_process_names(conns, names, 1000);
+    CHECK(conns[0].process_name == "curl");
+    CHECK(conns[1].process_name == "already");
+    CHECK(conns[2].process_name.empty()); // pid 0 is never resolved
+    CHECK(conns[3].process_name.empty()); // unknown pid
+}
+
+TEST_CASE("Echo fill_process_names: a reused pid does not inherit a stale name past the grace",
+          "[echo][diff][network][pidname]") {
+    // P8: pid 100 'a' exits at t; its sockets still resolve inside the grace window, a reused
+    // pid whose start was missed resolves to '' after it, and a fresh start renames it.
+    constexpr std::int64_t t = 5000;
+    std::unordered_map<std::uint32_t, PidName> names;
+    names[100] = PidName{"a", t}; // exited at t
+    const auto name_at = [&](std::int64_t ts) {
+        std::vector<NetConnection> c{tcp_conn(1, "1.1.1.1", 443, "ESTABLISHED", 100, "")};
+        fill_process_names(c, names, ts);
+        return c[0].process_name;
+    };
+    CHECK(name_at(t + 30) == "a");
+    CHECK(name_at(t + kPidNameGraceSec) == "a");
+    CHECK(name_at(t + 300).empty());
+    names[100] = PidName{"b", 0}; // the pid started again as 'b'
+    CHECK(name_at(t + 300) == "b");
+}
+
+TEST_CASE("Echo utmp_text stops at the first NUL and at the field width",
+          "[echo][diff][user]") {
+    const char with_nul[8] = {'a', 'l', 'i', 'c', 'e', '\0', 'x', 'y'};
+    CHECK(utmp_text(with_nul, sizeof(with_nul)) == "alice");
+    const char full[4] = {'p', 't', 's', '0'}; // no terminator: must not read past the field
+    CHECK(utmp_text(full, sizeof(full)) == "pts0");
+    const char empty[4] = {'\0', 'x', 'x', 'x'};
+    CHECK(utmp_text(empty, sizeof(empty)).empty());
+    CHECK(utmp_text(nullptr, 4).empty());
+}
+
+TEST_CASE("Echo logon_type_from_host: remote when a host is recorded and it is not an X display",
+          "[echo][diff][user]") {
+    CHECK(logon_type_from_host("") == "interactive");           // pts/0, no host
+    CHECK(logon_type_from_host("10.1.2.3") == "remote");        // pts/1 over ssh
+    CHECK(logon_type_from_host(":0") == "interactive");         // pts/2 under an X display
+    CHECK(logon_type_from_host(":1.0") == "interactive");
+    CHECK(logon_type_from_host("laptop.example") == "remote");  // tty1 with a host
+    CHECK(logon_type_from_host("10.0.0.5") == "remote");
 }

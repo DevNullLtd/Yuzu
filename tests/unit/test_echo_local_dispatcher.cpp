@@ -472,3 +472,88 @@ TEST_CASE("echo plugin: every source is enabled by default with no stored flag; 
 
     desc->shutdown(ctx.get());
 }
+
+TEST_CASE("echo plugin: db_budget_bytes validates, persists and shows in status with the budget counters",
+          "[echo][local_dispatcher][budget]") {
+    const auto plugin_path = find_echo_plugin();
+    if (plugin_path.empty()) {
+        if (std::getenv("MESON_BUILD_ROOT") != nullptr)
+            FAIL("echo plugin library not found under meson test");
+        WARN("echo plugin library not found -- skipping (run from the build root or via meson test)");
+        return;
+    }
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    REQUIRE(handle.has_value());
+    const auto* desc = handle->descriptor();
+    REQUIRE(desc != nullptr);
+    REQUIRE(desc->init != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_echo_local_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    auto kv = yuzu::agent::KvStore::open(dir_guard.path / "kv_store.db");
+    REQUIRE(kv.has_value());
+    yuzu::agent::StandalonePluginContext ctx("echo", {{"agent.data_dir", dir_guard.path.string()}},
+                                             &*kv);
+    REQUIRE(desc->init(ctx.get()) == 0);
+    yuzu::agent::LocalDispatcher d;
+
+    const auto status_value = [&](const std::string& key) -> std::optional<std::string> {
+        const auto rows = rows_of(d.run(desc, "status").captured);
+        const auto line = row_with_prefix(rows, key + "|");
+        if (!line)
+            return std::nullopt;
+        return line->substr(key.size() + 1);
+    };
+
+    SECTION("a fresh database reports the default budget and zeroed counters") {
+        CHECK(status_value("db_budget_bytes") == std::optional<std::string>{"262144000"});
+        CHECK(status_value("budget_over_bytes") == std::optional<std::string>{"0"});
+        CHECK(status_value("budget_evicted_raw_rows_total") == std::optional<std::string>{"0"});
+        CHECK(status_value("budget_evicted_hourly_rows_total") == std::optional<std::string>{"0"});
+        CHECK(status_value("db_auto_vacuum") == std::optional<std::string>{"incremental"});
+        CHECK(status_value("module_dedup_overflow_total") == std::optional<std::string>{"0"});
+        CHECK(status_value("tcp_closing_dedup_overflow_total") == std::optional<std::string>{"0"});
+        // db_size_bytes is now used pages + WAL, never zero for an initialised database.
+        const auto size = status_value("db_size_bytes");
+        REQUIRE(size.has_value());
+        CHECK(std::stoll(*size) > 0);
+    }
+
+    SECTION("a value below the minimum or not a whole number is refused and changes nothing") {
+        for (const char* bad : {"33554431", "abc", "-1", "1e9", "32MiB", "0"}) {
+            INFO("value=" << bad);
+            const YuzuParam params[] = {{"db_budget_bytes", bad}};
+            const auto r = d.run(desc, "configure", params);
+            CHECK(r.rc == 1);
+            CHECK(r.captured.find("error|db_budget_bytes must be a whole number of bytes >= 33554432") !=
+                  std::string::npos);
+            CHECK(status_value("db_budget_bytes") == std::optional<std::string>{"262144000"});
+        }
+    }
+
+    SECTION("the minimum is accepted, applied and reported") {
+        const YuzuParam params[] = {{"db_budget_bytes", "33554432"}};
+        const auto r = d.run(desc, "configure", params);
+        CHECK(r.rc == 0);
+        CHECK(r.captured.find("config|db_budget_bytes|33554432") != std::string::npos);
+        CHECK(status_value("db_budget_bytes") == std::optional<std::string>{"33554432"});
+    }
+
+    SECTION("an invalid budget in a request with a valid change rejects the whole request") {
+        const YuzuParam params[] = {{"retention_days", "30"}, {"db_budget_bytes", "5"}};
+        const auto r = d.run(desc, "configure", params);
+        CHECK(r.rc == 1);
+        CHECK(status_value("retention_days") == std::optional<std::string>{"7"}); // nothing written
+    }
+
+    SECTION("a maintenance pass on a small database is a clean no-op for the budget") {
+        const auto r = d.run(desc, "rollup");
+        CHECK(r.rc == 0);
+        CHECK(status_value("budget_over_bytes") == std::optional<std::string>{"0"});
+        CHECK(status_value("budget_evicted_raw_rows_total") == std::optional<std::string>{"0"});
+    }
+
+    desc->shutdown(ctx.get());
+}
+

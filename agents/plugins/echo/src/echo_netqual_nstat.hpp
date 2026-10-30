@@ -400,6 +400,7 @@ struct DecodedTcpDesc {
     int remote_port{0};
     std::uint32_t pid{0};
     std::string process_name; ///< pname; "" if empty (the macOS 13.3 tcp descriptor has no epname/uid)
+    std::string state;        ///< TCP state name from the descriptor (ESTABLISHED, TIME_WAIT, ...)
 };
 /// PURE. Decodes a SRC_DESC message whose embedded provider is
 /// kNstatProviderTcp/kNstatProviderTcpKernel into a DecodedTcpDesc. Returns
@@ -437,6 +438,7 @@ struct NstatFlowEvent {
     int remote_port{0};
     std::uint32_t pid{0};
     std::string process_name;
+    std::string state; ///< open events: the descriptor's TCP state; "" on a close event
 };
 
 /// The lifecycle-event ring — EventRing<T> reused verbatim (echo_proc_stream.hpp),

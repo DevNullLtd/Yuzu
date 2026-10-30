@@ -393,6 +393,30 @@ TEST_CASE("nstat_decode_tcp_src_desc decodes an IPv4 flow", "[echo][netqual][nst
     REQUIRE(decoded->process_name == "testproc");
 }
 
+TEST_CASE("nstat_decode_tcp_src_desc decodes the descriptor's TCP state into the open event",
+          "[echo][netqual][nstat]") {
+    const auto decode = [](std::uint32_t state) {
+        TcpDescriptor desc{};
+        desc.local = make_v4({10, 0, 0, 5}, 1);
+        desc.remote = make_v4({10, 0, 0, 6}, 2);
+        desc.state = state;
+        auto decoded = nstat_decode_tcp_src_desc(build_src_desc_msg(7, kNstatProviderTcp, desc));
+        REQUIRE(decoded.has_value());
+        return *decoded;
+    };
+    // TCPS_* values: 4 ESTABLISHED, 10 TIME_WAIT, 1 LISTEN, 5 CLOSE_WAIT.
+    CHECK(decode(4).state == "ESTABLISHED");
+    CHECK(decode(10).state == "TIME_WAIT");
+    CHECK(decode(1).state == "LISTEN");
+    CHECK(decode(5).state == "CLOSE_WAIT");
+    CHECK(decode(99).state == "UNKNOWN"); // never fabricated into a real state
+
+    // The open event carries it, so a socket first reported already closing is not labelled
+    // ESTABLISHED by the plugin.
+    CHECK(nstat_build_open_event(1'700'000'000, decode(10)).state == "TIME_WAIT");
+    CHECK(nstat_build_open_event(1'700'000'000, decode(4)).state == "ESTABLISHED");
+}
+
 TEST_CASE("nstat_decode_tcp_src_desc decodes the pname process identity",
           "[echo][netqual][nstat]") {
     // The macOS 13.3 tcp descriptor carries only pname (no epname/uid).

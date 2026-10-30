@@ -111,10 +111,14 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "GetExtendedTcpTable / GetExtendedUdpTable — polled at the "
                  "fast collector interval. ETW Microsoft-Windows-Kernel-Network "
                  "is planned (capture_method='etw') for sub-second connect/close "
-                 "fidelity; not yet wired."},
+                 "fidelity; not yet wired. Sockets first seen already closing "
+                 "(TIME_WAIT and the like) are recorded once per hour per "
+                 "process/remote."},
                 {"linux",   OsSupportStatus::kSupported,           "procfs",
                  "Reads /proc/net/{tcp,tcp6,udp,udp6}. Connection lifetime "
-                 "below the fast interval may be missed."},
+                 "below the fast interval may be missed. Sockets first seen "
+                 "already closing (TIME_WAIT and the like) are recorded once "
+                 "per hour per process/remote."},
                 {"macos",   OsSupportStatus::kSupportedConstrained, "nstat",
                  "PRIMARY tcp-lifecycle source: com.apple.network.statistics "
                  "kctl (nstat) SRC_ADDED/SRC_REMOVED, the same client the "
@@ -260,10 +264,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "is the recommended successor for new code but is not yet wired."},
                 {"linux",   OsSupportStatus::kSupportedConstrained, "utmp",
                  "Reads /var/run/utmp via getutent. Containers running with "
-                 "no /var/run/utmp produce no events. logon_type is inferred "
-                 "from tty name (pts/* -> remote)."},
+                 "no /var/run/utmp produce no events. logon_type is remote "
+                 "when ut_host is set and is not an X display (:...)."},
                 {"macos",   OsSupportStatus::kSupportedConstrained, "utmpx",
-                 "getutxent. logon_type inferred from tty (ttys* -> remote). "
+                 "getutxent. logon_type is remote when ut_host is set and is "
+                 "not an X display (:...). "
                  "GUI logins are not always reflected in utmpx."},
             },
             .granularities = {
@@ -539,8 +544,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "keyword 0x40, events 5/6) on a dedicated ETW session; driver "
                  "loads surface as kernel image-loads (System pid). Signing is "
                  "verified out-of-band at drain on a no-reparse handle (WinVerifyTrust "
-                 "+ the verification-chain signer, cached); an image on a network path "
-                 "or behind a symlink/junction is never verified and reads unknown. "
+                 "+ the verification-chain signer, cached; catalog lookup "
+                 "(CryptCATAdmin) when there is no embedded signature); an image on a "
+                 "network path or behind a symlink/junction is never verified and reads "
+                 "unknown. Ordinary loads are stored once per hour per "
+                 "loader/module/folder; unloads are not stored. "
                  "module_dir is scrubbed of user-profile prefixes "
                  "before storage. CodeIntegrity/Operational (3033/3034) blocked-load "
                  "overlay is M3."},

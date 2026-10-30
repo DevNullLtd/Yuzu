@@ -8,7 +8,10 @@
 
 #include <yuzu/agent/process_enum.hpp>
 
+#include <charconv>
 #include <cstdint>
+#include <iterator>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -141,6 +144,67 @@ std::string uid_to_username(uid_t uid) {
 
 } // namespace
 
+namespace detail {
+
+std::string read_proc_bytes(std::istream& in) noexcept {
+    std::string out;
+    try {
+        for (std::istreambuf_iterator<char> it(in), end; it != end; ++it)
+            out.push_back(*it);
+    } catch (...) {
+        // Keep what was read before the failure (see the declaration).
+    }
+    return out;
+}
+
+#if defined(__linux__) || defined(__APPLE__)
+namespace {
+// Value of the first unsigned decimal number after `prefix_len` characters of `line` (spaces and
+// tabs skipped); nullopt when there is none or it does not fit.
+std::optional<std::uint32_t> status_u32(const std::string& line, std::size_t prefix_len) {
+    const auto pos = line.find_first_not_of(" \t", prefix_len);
+    if (pos == std::string::npos)
+        return std::nullopt;
+    std::uint32_t v = 0;
+    const auto [end, ec] = std::from_chars(line.data() + pos, line.data() + line.size(), v);
+    if (ec != std::errc{} || end == line.data() + pos)
+        return std::nullopt;
+    return v;
+}
+} // namespace
+
+void parse_proc_status(std::istream& in, ProcessInfo& pi) noexcept {
+    try {
+        std::string line;
+        bool got_name = false, got_ppid = false, got_uid = false;
+        while (std::getline(in, line)) {
+            // The first occurrence of each field wins; a repeated line never overwrites.
+            if (!got_name && line.starts_with("Name:")) {
+                const auto pos = line.find_first_not_of(" \t", 5);
+                if (pos != std::string::npos)
+                    pi.name = line.substr(pos);
+                got_name = true;
+            } else if (!got_ppid && line.starts_with("PPid:")) {
+                if (const auto ppid = status_u32(line, 5))
+                    pi.ppid = *ppid;
+                got_ppid = true;
+            } else if (!got_uid && line.starts_with("Uid:")) {
+                // First field after "Uid:" is the real UID. std::from_chars stops at the
+                // first space or tab, so the effective/saved/fs fields are not read.
+                if (const auto uid = status_u32(line, 4))
+                    pi.user = uid_to_username(static_cast<uid_t>(*uid));
+                got_uid = true;
+            }
+            // No early exit: the whole file is read so later fields stay reachable.
+        }
+    } catch (...) {
+        // A failed read or an allocation failure keeps whatever parsed so far.
+    }
+}
+#endif // __linux__ || __APPLE__
+
+} // namespace detail
+
 #ifdef _WIN32
 
 std::vector<ProcessInfo> enumerate_processes() {
@@ -213,41 +277,15 @@ std::vector<ProcessInfo> enumerate_processes() {
             std::ifstream ifs(base + "/status");
             if (!ifs.is_open())
                 continue;
-            std::string line;
-            bool got_name = false, got_ppid = false, got_uid = false;
-            while (std::getline(ifs, line)) {
-                if (!got_name && line.starts_with("Name:")) {
-                    auto pos = line.find_first_not_of(" \t", 5);
-                    if (pos != std::string::npos)
-                        pi.name = line.substr(pos);
-                    got_name = true;
-                } else if (!got_ppid && line.starts_with("PPid:")) {
-                    auto pos = line.find_first_not_of(" \t", 5);
-                    if (pos != std::string::npos)
-                        pi.ppid = static_cast<uint32_t>(std::stoul(line.substr(pos)));
-                    got_ppid = true;
-                } else if (!got_uid && line.starts_with("Uid:")) {
-                    // First field after "Uid:" is the real UID
-                    auto pos = line.find_first_not_of(" \t", 4);
-                    if (pos != std::string::npos) {
-                        auto end = line.find_first_of(" \t", pos);
-                        auto uid_str = line.substr(pos, end - pos);
-                        uid_t uid = static_cast<uid_t>(std::stoul(uid_str));
-                        pi.user = uid_to_username(uid);
-                    }
-                    got_uid = true;
-                }
-                if (got_name && got_ppid && got_uid)
-                    break;
-            }
+            detail::parse_proc_status(ifs, pi);
         }
 
         // Read /proc/[pid]/cmdline (null-separated args)
         {
             std::ifstream ifs(base + "/cmdline", std::ios::binary);
             if (ifs.is_open()) {
-                std::string raw((std::istreambuf_iterator<char>(ifs)),
-                                std::istreambuf_iterator<char>());
+                // A process that exits mid-read must cost this cmdline, not the agent.
+                std::string raw = detail::read_proc_bytes(ifs);
                 // Replace null separators with spaces
                 for (auto& c : raw) {
                     if (c == '\0')

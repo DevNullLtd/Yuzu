@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -344,5 +345,96 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
  * `source_enabled_state()`.
  */
 [[nodiscard]] bool source_enabled(EchoDatabase& db, std::string_view source);
+
+// ── Byte budget (echo.db size cap) ────────────────────────────────────────────
+//
+// `db_budget_bytes` caps what echo.db holds: used pages plus the WAL file. The cap is HARD for
+// data pages and SOFT for the WAL: journal_size_limit only truncates the WAL when a checkpoint
+// resets it, and a long echo.sql read on the read-only query connection can pin it, so
+// data + WAL can sit above the budget until that reader ends. The overage is measured after
+// every pass and surfaced as `budget_over_bytes`, never hidden.
+
+/// Default and minimum `db_budget_bytes` (250 MB and 32 MiB).
+inline constexpr int64_t kEchoDbBudgetBytesDefault = 262144000;
+inline constexpr int64_t kEchoDbBudgetBytesMin = 33554432;
+/// Room kept for the WAL: eviction targets `budget - this` of data pages.
+inline constexpr int64_t kEchoWalAllowanceBytes = 16 * 1024 * 1024;
+/// Rows per eviction batch; one batch is one transaction and one hold of the database lock.
+inline constexpr int64_t kBudgetBatchRows = 1000;
+/// Raw capture rows newer than this are never evicted, whatever the rollup mark says.
+inline constexpr int64_t kBudgetRawFloorSec = 86400;
+/// Hourly rows newer than this are never evicted. Daily and monthly rows are never evicted.
+inline constexpr int64_t kBudgetHourlyFloorSec = 172800;
+/// Steady-state wall-clock budget for one eviction pass, checked between batches.
+inline constexpr int64_t kBudgetPassDeadlineMs = 2000;
+
+/// echo_config keys written by the budget engine (the first two are cumulative counters).
+inline constexpr std::string_view kBudgetEvictedRawKey = "budget_evicted_raw_rows_total";
+inline constexpr std::string_view kBudgetEvictedHourlyKey = "budget_evicted_hourly_rows_total";
+inline constexpr std::string_view kDbBudgetKey = "db_budget_bytes";
+inline constexpr std::string_view kAutoVacuumDeferredKey = "auto_vacuum_deferred_at";
+
+struct BudgetPassResult {
+    int64_t evicted_raw{0};
+    int64_t evicted_hourly{0};
+    int64_t data_bytes_after{0};
+    /// Still over target and nothing evictable is left (floors, exemptions and the rollup
+    /// marks leave no eligible row).
+    bool exhausted{false};
+    /// The pass ran out of time with eligible rows left.
+    bool deadline_hit{false};
+    /// A probe or delete failed; the pass stopped. `error` names why. Not retried in-pass.
+    bool failed{false};
+    std::string error;
+};
+
+/**
+ * Evict warehouse rows until used data pages are at or under `target_bytes`.
+ *
+ * Order (Alex, 2026-10-30): raw capture rows first, from the table holding the most rows,
+ * oldest first; only once no raw row is eligible, hourly rows, never newer than 48 h. Daily,
+ * monthly, `usage_*`, netqual and the sources with no summary tier (netconn, power,
+ * removable, registry) are never touched. Paused and errored sources are exempt.
+ *
+ * Preservation contract: a raw row at or above its source's rollup mark is never evicted
+ * (the rollup can still summarise it), nor is any raw row newer than 24 h, nor a process_live
+ * row the usage fold has not read. Rows BELOW the mark that the H11 clamp skipped were never
+ * summarised; the existing retention already prunes them on age, and eviction treats them the
+ * same way, oldest first and only under size pressure.
+ *
+ * Each batch (kBudgetBatchRows) is one transaction that also bumps the persisted eviction
+ * counter, so a crash never loses a count. `time_left` is consulted before every batch.
+ */
+[[nodiscard]] BudgetPassResult run_budget(EchoDatabase& db, int64_t now_epoch,
+                                          int64_t target_bytes,
+                                          const std::function<bool()>& time_left);
+
+/// The table-ranking probe SQL: rows-by-id-span as two separate extrema probes (each is an
+/// O(log n) b-tree edge lookup; the combined MAX-MIN aggregate scans). Exposed for the
+/// query-plan test.
+[[nodiscard]] std::string budget_rank_probe_sql(std::string_view table);
+
+/// Bytes data + WAL sit above the budget; 0 within it. Depends only on the measured sizes,
+/// never on how the last eviction pass ended.
+[[nodiscard]] constexpr int64_t budget_over_bytes(int64_t data_bytes, int64_t wal_bytes,
+                                                  int64_t budget_bytes) noexcept {
+    const int64_t over = data_bytes + wal_bytes - budget_bytes;
+    return over > 0 ? over : 0;
+}
+
+enum class VacuumAction { kSkip, kRun, kDefer };
+
+/// Gate for the one-off conversion VACUUM (auto_vacuum -> incremental). Run only when the file is
+/// not already incremental, eviction has brought data under target, the freelist is large
+/// (at least 32 MiB and a quarter of the file), the volume has twice the used size free, and
+/// no deferral was recorded in the last 24 h. Too little free disk is kDefer (the caller
+/// records the time and reports `deferred`); every other unmet condition is kSkip.
+[[nodiscard]] VacuumAction vacuum_decision(int64_t auto_vacuum, int64_t data_bytes,
+                                           int64_t target_bytes, int64_t freelist_bytes,
+                                           int64_t file_bytes, int64_t free_disk_bytes,
+                                           int64_t deferred_at, int64_t now) noexcept;
+
+/// Parse a `db_budget_bytes` value: decimal digits only, fits int64, >= kEchoDbBudgetBytesMin.
+[[nodiscard]] std::optional<int64_t> parse_budget_bytes(std::string_view text);
 
 } // namespace yuzu::echo

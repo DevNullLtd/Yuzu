@@ -15,6 +15,8 @@
 
 #include "echo_module_etw.hpp"
 
+#include <utility>
+
 namespace yuzu::echo {
 
 // ── Pure, cross-platform (compiled + unit-tested on every platform) ──────────
@@ -37,6 +39,18 @@ ModuleEvent etw_image_sample_to_module_event(const EtwImageSample& s) {
     // signed_state / signer / process_name are resolved by the collector at
     // drain (off the ETW callback thread), left default here.
     return e;
+}
+
+ModuleSignVerdict catalog_lookup_verdict(CatalogLookup lookup, std::string catalog_signer) {
+    switch (lookup) {
+    case CatalogLookup::kNotFound:
+        return {ModuleSignedState::kUnsigned, {}};
+    case CatalogLookup::kFoundValid:
+        return {ModuleSignedState::kSigned, std::move(catalog_signer)};
+    case CatalogLookup::kError:
+        break;
+    }
+    return {ModuleSignedState::kUnknown, {}}; // never fabricate a verdict from a failed lookup
 }
 
 ModuleSignVerdict SigningCache::get(const std::string& full_path, std::int64_t mtime,
@@ -86,6 +100,7 @@ ModuleSignVerdict SigningCache::get(const std::string& full_path, std::int64_t m
 #include <softpub.h>
 #include <wincrypt.h>
 #include <wintrust.h>
+#include <mscat.h> // CryptCATAdmin* (catalog lookup for catalog-signed system images)
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 
 #include <spdlog/spdlog.h>
@@ -129,7 +144,9 @@ constexpr ULONGLONG kKeywordImage = 0x40;
 // across builds is tolerated, but a wrong id/name yields no rows (never a bad
 // row: a failed decode drops the event).
 constexpr USHORT kEventImageLoad = 5;
-constexpr USHORT kEventImageUnload = 6;
+// Image/Unload (id 6) is not consumed: unloads are not stored (apply_module_risk_filter drops
+// them), so decoding one would only add ring pressure. etw_image_sample_to_module_event still
+// maps an unload sample.
 
 // FILETIME (100 ns since 1601) → unix seconds. Wnode.ClientContext = 2 makes
 // EVENT_HEADER.TimeStamp a system-time FILETIME, so this is a plain rebase.
@@ -229,6 +246,168 @@ std::string cert_simple_display_name(PCCERT_CONTEXT cert) {
     std::wstring name(n - 1, L'\0');
     CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, name.data(), n);
     return wide_to_utf8(name);
+}
+
+// WinVerifyTrust allocates the trust state even when the verdict is bad; this closes it on every
+// exit, including a throw from the signer read (an allocation can throw).
+struct TrustStateCloser {
+    TrustStateCloser(GUID& a, WINTRUST_DATA& d) noexcept : action_(a), data_(d) {}
+    TrustStateCloser(const TrustStateCloser&) = delete;
+    TrustStateCloser& operator=(const TrustStateCloser&) = delete;
+    ~TrustStateCloser() {
+        data_.dwStateAction = WTD_STATEACTION_CLOSE;
+        WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action_, &data_);
+    }
+    GUID& action_;
+    WINTRUST_DATA& data_;
+};
+
+// Signer = chain index 0 (the signing certificate) of the first signer of an OPEN trust state.
+// A null at any step leaves "".
+std::string signer_from_trust_state(HANDLE state_data) {
+    if (CRYPT_PROVIDER_DATA* pd = WTHelperProvDataFromStateData(state_data)) {
+        if (CRYPT_PROVIDER_SGNR* sg = WTHelperGetProvSignerFromChain(pd, 0, FALSE, 0)) {
+            if (CRYPT_PROVIDER_CERT* pc = WTHelperGetProvCertFromChain(sg, 0)) {
+                if (pc->pCert != nullptr)
+                    return cert_simple_display_name(pc->pCert);
+            }
+        }
+    }
+    return {};
+}
+
+// RAII for the two catalog-admin handles (each release call needs the context it came from).
+struct CatAdminGuard {
+    explicit CatAdminGuard(HCATADMIN h) noexcept : h_(h) {}
+    CatAdminGuard(const CatAdminGuard&) = delete;
+    CatAdminGuard& operator=(const CatAdminGuard&) = delete;
+    ~CatAdminGuard() {
+        if (h_ != nullptr)
+            CryptCATAdminReleaseContext(h_, 0);
+    }
+    HCATADMIN get() const noexcept { return h_; }
+
+private:
+    HCATADMIN h_;
+};
+
+struct CatInfoGuard {
+    CatInfoGuard(HCATADMIN admin, HCATINFO info) noexcept : admin_(admin), info_(info) {}
+    CatInfoGuard(const CatInfoGuard&) = delete;
+    CatInfoGuard& operator=(const CatInfoGuard&) = delete;
+    ~CatInfoGuard() {
+        if (info_ != nullptr)
+            CryptCATAdminReleaseCatalogContext(admin_, info_, 0);
+    }
+    HCATINFO get() const noexcept { return info_; }
+
+private:
+    HCATADMIN admin_;
+    HCATINFO info_;
+};
+
+struct CatalogResult {
+    CatalogLookup lookup{CatalogLookup::kError};
+    std::string signer;
+};
+
+// Hash of the whole OPEN image under the admin context's algorithm; empty on any failure. The
+// handle is the one the embedded-signature check used, rewound first (that check moved the file
+// pointer); no path is re-resolved.
+std::vector<BYTE> catalog_hash_of(HCATADMIN admin, HANDLE image) {
+    const LARGE_INTEGER start{};
+    if (!SetFilePointerEx(image, start, nullptr, FILE_BEGIN))
+        return {};
+    DWORD size = 0;
+    CryptCATAdminCalcHashFromFileHandle2(admin, image, &size, nullptr, 0); // sizing call
+    if (size == 0 || size > 64)
+        return {};
+    if (!SetFilePointerEx(image, start, nullptr, FILE_BEGIN))
+        return {};
+    std::vector<BYTE> hash(size);
+    if (!CryptCATAdminCalcHashFromFileHandle2(admin, image, &size, hash.data(), 0) || size == 0 ||
+        size > hash.size())
+        return {};
+    hash.resize(size);
+    return hash;
+}
+
+// One algorithm's pass: hash the image, find a catalog listing the hash, then have WinVerifyTrust
+// verify the catalog member. kNotFound only when the catalog API says ERROR_NOT_FOUND; every other
+// failure is kError.
+CatalogResult catalog_lookup_with(const wchar_t* algorithm, HANDLE image,
+                                  const std::wstring& image_path) {
+    CatalogResult out; // kError
+    HCATADMIN raw_admin = nullptr;
+    if (!CryptCATAdminAcquireContext2(&raw_admin, nullptr, algorithm, nullptr, 0))
+        return out;
+    CatAdminGuard admin{raw_admin};
+
+    std::vector<BYTE> hash = catalog_hash_of(admin.get(), image);
+    if (hash.empty())
+        return out;
+
+    HCATINFO raw_info = CryptCATAdminEnumCatalogFromHash(
+        admin.get(), hash.data(), static_cast<DWORD>(hash.size()), 0, nullptr);
+    if (raw_info == nullptr) {
+        out.lookup = (GetLastError() == ERROR_NOT_FOUND) ? CatalogLookup::kNotFound
+                                                         : CatalogLookup::kError;
+        return out;
+    }
+    CatInfoGuard info{admin.get(), raw_info};
+
+    CATALOG_INFO catalog{};
+    catalog.cbStruct = sizeof(catalog);
+    if (!CryptCATCatalogInfoFromContext(info.get(), &catalog, 0))
+        return out;
+
+    // The member tag is the upper-case hex of the file hash.
+    static constexpr wchar_t kHex[] = L"0123456789ABCDEF";
+    std::wstring tag;
+    tag.reserve(hash.size() * 2);
+    for (const BYTE b : hash) {
+        tag.push_back(kHex[b >> 4]);
+        tag.push_back(kHex[b & 0x0F]);
+    }
+    std::wstring member_path = image_path; // WINTRUST_CATALOG_INFO takes non-const strings
+
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_CATALOG_INFO wci{};
+    wci.cbStruct = sizeof(wci);
+    wci.pcwszCatalogFilePath = catalog.wszCatalogFile;
+    wci.pcwszMemberTag = tag.data();
+    wci.pcwszMemberFilePath = member_path.data();
+    wci.hMemberFile = image;
+    wci.pbCalculatedFileHash = hash.data();
+    wci.cbCalculatedFileHash = static_cast<DWORD>(hash.size());
+    wci.hCatAdmin = admin.get(); // verify with the algorithm the hash was computed under
+    WINTRUST_DATA wd{};
+    wd.cbStruct = sizeof(wd);
+    wd.dwUIChoice = WTD_UI_NONE;
+    wd.fdwRevocationChecks = WTD_REVOKE_NONE; // same as the embedded path: no per-load network fetch
+    wd.dwUnionChoice = WTD_CHOICE_CATALOG;
+    wd.pCatalog = &wci;
+    wd.dwStateAction = WTD_STATEACTION_VERIFY;
+    const LONG st = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &wd);
+    TrustStateCloser closer{action, wd};
+    if (st == ERROR_SUCCESS) {
+        out.lookup = CatalogLookup::kFoundValid;
+        out.signer = signer_from_trust_state(wd.hWVTStateData); // the catalog's signer
+    }
+    return out; // anything but success: a catalog lists the hash and did not verify -> kError
+}
+
+// Catalog lookup for an image with no embedded signature: SHA-256 catalogs first, then SHA-1.
+// Never throws: any failure (including an allocation) is kError, which maps to unknown, not risky.
+CatalogResult catalog_lookup(HANDLE image, const std::wstring& image_path) noexcept {
+    try {
+        CatalogResult r = catalog_lookup_with(L"SHA256", image, image_path); // BCRYPT_SHA256_ALGORITHM
+        if (r.lookup == CatalogLookup::kNotFound)
+            r = catalog_lookup_with(L"SHA1", image, image_path); // BCRYPT_SHA1_ALGORITHM
+        return r;
+    } catch (...) {
+        return {};
+    }
 }
 
 } // namespace
@@ -335,26 +514,19 @@ ModuleSignVerdict verify_image_signature_win(void* image, const std::string& nt_
     wd.pFile = &fi;
     wd.dwStateAction = WTD_STATEACTION_VERIFY;
     const LONG st = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &wd);
-    // WinVerifyTrust allocates the trust state even when the verdict is bad; free it on every
-    // exit, including a throw from the signer read below (an allocation can throw).
-    struct TrustStateCloser {
-        TrustStateCloser(GUID& a, WINTRUST_DATA& d) noexcept : action_(a), data_(d) {}
-        TrustStateCloser(const TrustStateCloser&) = delete;
-        TrustStateCloser& operator=(const TrustStateCloser&) = delete;
-        ~TrustStateCloser() {
-            data_.dwStateAction = WTD_STATEACTION_CLOSE;
-            WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action_, &data_);
-        }
-        GUID& action_;
-        WINTRUST_DATA& data_;
-    } closer{action, wd};
+    TrustStateCloser closer{action, wd};
     switch (st) {
     case ERROR_SUCCESS:
         out.state = ModuleSignedState::kSigned;
         break;
-    case TRUST_E_NOSIGNATURE:
-        out.state = ModuleSignedState::kUnsigned;
-        break;
+    case TRUST_E_NOSIGNATURE: {
+        // No embedded signature. Most Windows system binaries are catalog-signed, so look the
+        // image hash up in the system catalogs before calling it unsigned: a miss is unsigned,
+        // a hit that verifies is signed (signer from the catalog), and any lookup failure is
+        // unknown -- never risky. Cost is paid once per file version (SigningCache).
+        CatalogResult cat = catalog_lookup(static_cast<HANDLE>(image), wpath);
+        return catalog_lookup_verdict(cat.lookup, std::move(cat.signer));
+    }
     case static_cast<LONG>(CERT_E_REVOKED):
         out.state = ModuleSignedState::kRevoked;
         break;
@@ -371,16 +543,8 @@ ModuleSignVerdict verify_image_signature_win(void* image, const std::string& nt_
         break;
     }
     if (out.state == ModuleSignedState::kSigned) {
-        // Signer = chain index 0 (the signing certificate) of the first signer, read BEFORE the
-        // state is closed. A null at any step leaves "".
-        if (CRYPT_PROVIDER_DATA* pd = WTHelperProvDataFromStateData(wd.hWVTStateData)) {
-            if (CRYPT_PROVIDER_SGNR* sg = WTHelperGetProvSignerFromChain(pd, 0, FALSE, 0)) {
-                if (CRYPT_PROVIDER_CERT* pc = WTHelperGetProvCertFromChain(sg, 0)) {
-                    if (pc->pCert != nullptr)
-                        out.signer = cert_simple_display_name(pc->pCert);
-                }
-            }
-        }
+        // Read BEFORE the state is closed (the closer runs at scope exit).
+        out.signer = signer_from_trust_state(wd.hWVTStateData);
     }
     return out;
 }
@@ -435,7 +599,7 @@ struct ModuleEtwCollector::Impl {
                 return;
             }
             const USHORT id = rec->EventHeader.EventDescriptor.Id;
-            if (id != kEventImageLoad && id != kEventImageUnload) {
+            if (id != kEventImageLoad) {
                 return;
             }
             EtwImageSample s;
@@ -443,7 +607,7 @@ struct ModuleEtwCollector::Impl {
             if (s.ts_unix <= 0) {
                 return; // corrupt/torn timestamp — never emit a bogus-dated row
             }
-            s.is_load = (id == kEventImageLoad);
+            s.is_load = true;
             // pid: prefer the decoded property, fall back to the event header.
             std::uint32_t pid = 0;
             if (!prop_u32(rec, L"ProcessID", pid)) {
@@ -465,19 +629,27 @@ struct ModuleEtwCollector::Impl {
             // have no user process to name.
             if (ev.pid != 0 && !ev.is_kernel) {
                 auto it = self->pid_name.find(ev.pid);
-                if (it == self->pid_name.end()) {
-                    // The IMAGE session sees NO process-stop event to evict on, so
-                    // bound the cache by flushing wholesale at the cap — this kills
-                    // the past-cap naming blackout (a stop-inserting cap would leave
-                    // every new pid unnamed once full). PID reuse can yield a brief
-                    // stale name within a fill cycle: best-effort — $Process_Live is
-                    // the authoritative pid→process record (cross-reference by pid+ts).
-                    if (self->pid_name.size() >= kPidNameCap) {
-                        self->pid_name.clear();
+                if (it != self->pid_name.end()) {
+                    ev.process_name = it->second;
+                } else {
+                    // Cache only a name that resolved: an exited or protected process looks the
+                    // same as a failed open, and caching "" would leave every later load from
+                    // that pid unnamed. The plugin fills an empty name from its own pid map.
+                    std::string name = process_basename_for_pid(ev.pid);
+                    if (!name.empty()) {
+                        // The IMAGE session sees NO process-stop event to evict on, so
+                        // bound the cache by flushing wholesale at the cap — this kills
+                        // the past-cap naming blackout (a stop-inserting cap would leave
+                        // every new pid unnamed once full). PID reuse can yield a brief
+                        // stale name within a fill cycle: best-effort — $Process_Live is
+                        // the authoritative pid→process record (cross-reference by pid+ts).
+                        if (self->pid_name.size() >= kPidNameCap) {
+                            self->pid_name.clear();
+                        }
+                        self->pid_name.emplace(ev.pid, name);
                     }
-                    it = self->pid_name.emplace(ev.pid, process_basename_for_pid(ev.pid)).first;
+                    ev.process_name = std::move(name);
                 }
-                ev.process_name = it->second;
             }
             // signed_state / signer + module_dir redaction happen at DRAIN, off
             // this thread (signing reads the file — too slow for the callback).

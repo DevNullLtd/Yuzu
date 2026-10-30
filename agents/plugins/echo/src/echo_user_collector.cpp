@@ -119,15 +119,17 @@ std::vector<UserSession> enumerate_users() {
             continue;
 
         UserSession us;
-        us.user = std::string(entry->ut_user);
-        us.session_id = std::string(entry->ut_line);
+        // ut_user/ut_line/ut_host are fixed-width and not NUL-terminated when full: read them
+        // bounded (std::string(char*) would run past the field into the next one).
+        us.user = utmp_text(entry->ut_user, sizeof(entry->ut_user));
+        us.session_id = utmp_text(entry->ut_line, sizeof(entry->ut_line));
 
-        std::string host(entry->ut_host);
+        std::string host = utmp_text(entry->ut_host, sizeof(entry->ut_host));
         us.domain = host.empty() ? "local" : host;
 
-        // Determine logon type from tty name
-        std::string line_str(entry->ut_line);
-        us.logon_type = line_str.starts_with("pts/") ? "remote" : "interactive";
+        // Remote when a host is recorded and it is not an X display. The tty name is no evidence:
+        // a local terminal emulator is a pts too.
+        us.logon_type = logon_type_from_host(host);
 
         sessions.push_back(std::move(us));
     }
@@ -149,15 +151,16 @@ std::vector<UserSession> enumerate_users() {
             continue;
 
         UserSession us;
-        us.user = std::string(entry->ut_user);
-        us.session_id = std::string(entry->ut_line);
+        // Fixed-width fields, not NUL-terminated when full: read them bounded.
+        us.user = utmp_text(entry->ut_user, sizeof(entry->ut_user));
+        us.session_id = utmp_text(entry->ut_line, sizeof(entry->ut_line));
 
-        std::string host(entry->ut_host);
+        std::string host = utmp_text(entry->ut_host, sizeof(entry->ut_host));
         us.domain = host.empty() ? "local" : host;
 
-        // Determine logon type from tty name
-        std::string line_str(entry->ut_line);
-        us.logon_type = line_str.starts_with("ttys") ? "remote" : "interactive";
+        // Remote when a host is recorded and it is not an X display. Every Terminal.app tab is a
+        // ttysNNN, so the line name classified local sessions as remote.
+        us.logon_type = logon_type_from_host(host);
 
         sessions.push_back(std::move(us));
     }
