@@ -1533,7 +1533,7 @@ count-valued histograms here are not latencies, so they declare their own:
 - `yuzu_viz_topology_push_parse_errors_total{via}` (unchanged);
 - `yuzu_viz_topology_report_rejected_total{via,reason}`, with
   `parse|digest_mismatch|ip_conflict|oversize|unknown_session`, plus
-  `bad_signature|replayed|unverified_session` from ADR-0074 wave 2 (D7, D16; `parse` also moves
+  `bad_signature|unsigned|replayed|unverified_session` from ADR-0074 wave 2 (D7, D16; `parse` also moves
   the parse counter above);
 - `yuzu_server_reattach_challenge_total{outcome}`, with
   `verified|bad_signature|expired|degraded|send_failed`, and the
@@ -2317,19 +2317,27 @@ lands. The two are kept consistent as follows.
     to an unbounded one;
   - **refusal.** From wave 2 a payload without a valid signature, a stripped one included, is
     `bad_signature` (`BAD_SIGNATURE` for a `TopologyReport`), never `absent` and never accepted,
-    with one distinction for the rollout: a payload carrying no envelope at all, from a session
-    that has never verified a challenge, is counted `unsigned` instead (an agent older than slice
-    11, which cannot sign). It is refused and withheld exactly as `bad_signature` is, but it does
-    not count toward the `rejected` backoff or the three-rejects withholding, writes no audit row
-    and is not in `YuzuStateSignatureRefused`; the gauge `yuzu_server_agents_state_unsigned`
-    counts the sessions whose latest state payload was `unsigned`. An envelope-less payload on a
-    session that has verified a challenge is a stripped envelope and is `bad_signature`. ADR-0074's
-    clean break means every gateway agent signs (an un-upgraded gateway agent cannot reach a
-    wave-2 gateway port, and reattach is a gateway path, so no un-upgraded agent is ever
-    challenged after a reattach); `unsigned` can therefore only come from a direct-connected
-    agent, which ADR-0074 leaves open. It applies nothing; like any payload that
-    fails before D3 step 6 it clears the interval map (D3 step 4), and it counts toward the
-    per-agent `rejected` backoff and the three-rejects withholding. A payload whose sequence is
+    with one distinction for the rollout, scoped by delivery path: a payload carrying no envelope
+    at all that arrives DIRECTLY (`via="direct"`) from a session that has never verified a
+    challenge is counted `unsigned` instead (an agent older than slice 11, which cannot sign).
+    Any envelope-less payload that arrives through a gateway (`BatchHeartbeat`, the proxied
+    topology report) is `bad_signature`, whatever the session's verification state: ADR-0074's
+    clean break means every gateway agent signs (an un-upgraded agent cannot reach a wave-2
+    gateway port), so no honest gateway payload lacks the envelope, and a gateway cannot move a
+    stripped payload into the unaudited outcome by stripping before the first verification (a
+    fresh Register, or a reattach on a restarted or different replica). An envelope-less direct
+    payload on a session that has verified a challenge is also `bad_signature`. `unsigned` is
+    refused and withheld exactly as `bad_signature` is, but it does not count toward the
+    `rejected` backoff or the three-rejects withholding, writes no audit row and is not in
+    `YuzuStateSignatureRefused`; the gauge `yuzu_server_agents_state_unsigned` counts the direct
+    sessions whose latest state payload was `unsigned`. For a `TopologyReport` the wire reason
+    for `unsigned` stays `BAD_SIGNATURE` (an agent older than slice 11 cannot read a new value);
+    only the counter label differs. A slice-11 test strips the envelope through a gateway during a
+    pending reattach challenge and during a fresh Register window, and asserts `bad_signature`,
+    an `agent.state.bad_signature` row and the `unsigned` gauge unchanged. A `bad_signature`
+    applies nothing; like any payload that fails before D3 step 6 it clears the interval map (D3
+    step 4), and it counts toward the per-agent `rejected` backoff and the three-rejects
+    withholding. A payload whose sequence is
     not above the floor is `replayed`, a separate outcome that counts toward neither, so an honest
     reorder cannot back an agent off. The first `bad_signature` per session writes an
     `agent.state.bad_signature` audit row through `audit_token`; later ones are counted only;
