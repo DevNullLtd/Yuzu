@@ -192,6 +192,19 @@ const std::vector<pg::PgMigration>& migrations() {
         // no longer has a writer. Version-bumped (not edited into v1) because v1 has
         // actually run against real dev/UAT databases — see ADR-0036's Update.
         {2, "DROP TABLE IF EXISTS sqlite_backfill;"},
+        // v3 (Echo rename, upgrade window): a persisted result set's source kind, matcher and
+        // source payload (which carries the producing instruction id, so a re-evaluation of a
+        // pre-rename set resolves it) follow the renamed vocabulary. Idempotent. matcher and
+        // source_payload are TEXT, so this is a textual replace() of the `tar_rows_ge` and
+        // `crossplatform.tar.` tokens anywhere in those columns, not a path update: an operator
+        // literal or persisted SQL that contains exactly one of those tokens is rewritten too.
+        {3,
+         "UPDATE result_sets SET source_kind = 'echo_query' WHERE source_kind = 'tar_query';"
+         "UPDATE result_sets SET matcher = replace(matcher, 'tar_rows_ge', 'echo_rows_ge') "
+         "WHERE matcher LIKE '%tar_rows_ge%';"
+         "UPDATE result_sets SET source_payload = replace(source_payload, "
+         "'crossplatform.tar.', 'crossplatform.echo.') "
+         "WHERE source_payload LIKE '%crossplatform.tar.%';"},
     };
     return kMigrations;
 }
@@ -1196,8 +1209,8 @@ bool ResultSetStore::heal_poisoned_payload(const std::string& id) {
 // Part-6 anchor decision (recorded, per the invariant): a MISSING stored
 // reading is ordinary — the fresh-store / first-pass-after-migration case —
 // and says nothing by itself; it is reported only when the pass would ALSO
-// expire every datable row (the AuditStore choice, not the TAR choice,
-// because unlike TAR this table is legitimately empty/short-lived in normal
+// expire every datable row (the AuditStore choice, not the Echo choice,
+// because unlike Echo this table is legitimately empty/short-lived in normal
 // operation and a first pass against it deletes at most 1-hour-old scratch).
 namespace {
 constexpr int64_t kGcSweepCapPerPass = 5000;      // part 5: unconditional

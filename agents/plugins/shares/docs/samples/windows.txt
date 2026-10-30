@@ -1,0 +1,9 @@
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-28 · LocalSystem (elevated) · leg-hash deed980e339d
+== action=list
+status|list|supported|-
+source|netshareenum|read|3
+share|smb|ADMIN$|C:/Windows|-|-|disk,special|netshareenum
+share|smb|C$|C:/|-|-|disk,special|netshareenum
+share|smb|IPC$|-|-|-|ipc,special|netshareenum
+[result_status] OK / FULL / 
+

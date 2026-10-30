@@ -4,6 +4,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "agent_registry.hpp"
@@ -67,8 +68,12 @@ public:
         if (!res)
             return true; // degraded read — caller surfaces route_unreadable
         for (auto& rr : *res)
-            if (rr.routable && rr.route.cluster_id)
+            if (rr.routable && rr.route.cluster_id) {
                 routable_[rr.route.agent_id] = *rr.route.cluster_id;
+                // Upgrade-window shim, removed with the other legacy-name shims.
+                if (rr.route.legacy_echo_wire_name)
+                    legacy_wire_.insert(rr.route.agent_id);
+            }
         return false;
     }
 
@@ -84,10 +89,18 @@ public:
         return it == routable_.end() ? std::nullopt : std::optional<std::string>(it->second);
     }
 
+    /// Upgrade-window shim (removed with the other legacy-name shims): whether the directory row
+    /// says this agent still speaks the pre-rename plugin name `tar`. Pass to
+    /// `send_via_directory`'s `legacy_wire`.
+    [[nodiscard]] bool legacy_wire_for(const std::string& agent_id) const {
+        return legacy_wire_.contains(agent_id);
+    }
+
 private:
     yuzu::server::detail::AgentRegistry& registry_;
     GatewayRouteStore* store_;
     std::unordered_map<std::string, std::string> routable_; // agent_id -> cluster_id
+    std::unordered_set<std::string> legacy_wire_;           // agent_ids on the legacy wire name
 };
 
 } // namespace yuzu::server

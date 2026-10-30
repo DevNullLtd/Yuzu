@@ -902,7 +902,7 @@ void report_open_nft_diagnostic(yuzu::CommandContext& ctx, int sock_err) {
 [[nodiscard]] std::expected<yuzu::agent::ScopedFd, int>
 open_nft_socket(std::chrono::milliseconds send_budget) {
     // Own the fd in a ScopedFd from creation, same discipline as
-    // tar_netqual_nstat.cpp's nstat socket open: every early return below
+    // echo_netqual_nstat.cpp's nstat socket open: every early return below
     // closes it automatically via the destructor, so no call site here
     // needs its own raw ::close() -- including any future one added between
     // socket() and the bind check.

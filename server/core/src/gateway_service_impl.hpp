@@ -37,6 +37,7 @@ class AppPerfDailyStore;
 class DeviceInventoryStore;
 class SoftwareLicensingStore;
 class AppUsageStore;
+class CertificateInventoryStore;
 class FleetTopologyStore;
 class HeartbeatIngestion;
 class AnalyticsEventStore;
@@ -148,6 +149,11 @@ public:
     /// Typed per-agent last-used app-usage projection (Wave 7 PR7.2, ADR-0016
     /// §5) — receives the app_usage daily-sync source via ProxyInventory.
     void set_app_usage_store(AppUsageStore* store) { app_usage_store_ = store; }
+    /// Typed fleet certificate inventory (slice-2 PR 2a-2a) — receives the
+    /// certificate_inventory daily-sync source via ProxyInventory.
+    void set_certificate_inventory_store(CertificateInventoryStore* store) {
+        certificate_inventory_store_ = store;
+    }
     // PR 10 / UAT 2026-05-12: gateway-proxied heartbeats carry the
     // same fleet_snapshot_json field as direct heartbeats. Wire the
     // topology store so BatchHeartbeat ingests pushes from agents that
@@ -249,6 +255,7 @@ private:
     DeviceInventoryStore* device_inventory_store_{nullptr};
     SoftwareLicensingStore* software_licensing_store_{nullptr};
     AppUsageStore* app_usage_store_{nullptr};
+    CertificateInventoryStore* certificate_inventory_store_{nullptr};
     FleetTopologyStore* fleet_topology_store_{nullptr};
     HeartbeatIngestion* heartbeat_ingestion_{nullptr};
     std::weak_ptr<AnalyticsEventStore> analytics_store_;

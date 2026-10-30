@@ -124,6 +124,8 @@ The gateway source lives in `gateway/apps/yuzu_gw/src/`:
 | `yuzu_grpc`, `yuzu_grpc_stream`, `yuzu_grpc_route`, `yuzu_grpc_runner`, `yuzu_grpc_frame` | The rest of the gRPC layer: context accessors (`peer/1`, `origin/1`, `peer_cert/1`), the stream API handlers use (`send/2`), route table built from the proto modules, handler runner (unary, server-streaming, bidi), and gRPC message framing |
 | `yuzu_gw_telemetry` | Telemetry event definitions and handlers |
 | `yuzu_gw_gauge` | Periodic gauge emission for Prometheus |
+| `yuzu_gw_mem_reclaim` | Gives OS memory back after the agent count drops (see "Giving memory back after a drop") |
+| `yuzu_gw_mem_trim` | Optional loader of the `malloc_trim` NIF, built on glibc Linux only |
 | `yuzu_gw_proto` | Protobuf encode/decode wrappers |
 
 ---
@@ -1402,6 +1404,56 @@ few points between the two marks so it does not flap. The kill and receive-timeo
 counters above (`yuzu_gw_grpc_connection_killed_total`,
 `yuzu_gw_grpc_recv_timeout_total`) tell you whether the pressure is a flood of
 half-finished requests rather than genuine fleet growth.
+
+**Giving memory back after a drop.** After a reconnect storm or a drain, the
+gateway's memory does not fall back with its agent count by itself: most of what it
+still holds is garbage in the long-lived processes whose heaps grew during the storm
+(the connection supervisors, the acceptors, the registries), which are rarely
+collected once they are quiet again. `yuzu_gw_mem_reclaim` reads the agent count
+every `interval_ms` and, when it has fallen by a quarter of its peak and by at least
+1,000 agents, garbage-collects every process holding more than `gc_min_bytes`, so the
+VM can hand that memory back to the OS. It repeats the pass `followup_ms` later,
+because the count falls before the closing connections' processes and buffers have
+gone. On glibc Linux it then also calls `malloc_trim(0)`, which returns the free pages
+of the C allocator (OpenSSL's, for one), after each pass and every `trim_interval_ms`.
+
+*Which builds trim.* The `malloc_trim` call is a small NIF compiled only when the
+gateway is built on glibc Linux: the chiselled image (`Dockerfile.gateway.chisel`) and
+a release built on a glibc Linux host (the `.deb` and `.rpm`) have it; the default
+Alpine image (musl has no `malloc_trim`), macOS and Windows do not, and there every
+pass is garbage collection only. The first pass on such a build logs one notice,
+`gateway memory reclaim: malloc_trim unavailable (...); garbage collection only`.
+
+*What a pass logs and costs.* Each pass logs one notice line, `gateway memory reclaim:
+#{agents => ..., gc_processes => ..., trim => ..., rss_anon_kb_before => ...,
+rss_anon_kb_after => ..., ms => ...}` (the RSS figures come from `/proc/self/status`
+and are `undefined` off Linux). There is no metric for it. Measured on a transport and
+HTTP/2 probe, not the full gateway (10,000 TLS connections and a 30,000-handshake
+storm, all closed; 2026-10-29): two minutes after the close, the memory held above the
+pre-test level fell from 343 MiB (musl) and 251 MiB (glibc) to about 150 MiB on both
+with these passes, and to 121 MiB on glibc with `malloc_trim` too (that run also had
+two other allocator settings this release does not ship). A pass walks every process
+on the node; over 300,000 processes it took 350-450 ms on a laptop (2026-10-29). It
+runs in its own process, never on an agent's call path, and `malloc_trim` runs on a
+dirty scheduler.
+
+Configure it under `{yuzu_gw, [{mem_reclaim, #{...}}]}` (read once at start; no
+`YUZU_GW_*` environment variable maps to it; not present in any shipped `sys.config`).
+A value of the wrong type or out of range, or an unknown key, is logged as a warning
+(`gateway memory reclaim: ignoring ...`) and the default is used; it never stops the
+gateway starting.
+
+| Key | Meaning | Default |
+|---|---|---|
+| `enabled` | `false` turns it off (no pass, no trim). | `true` |
+| `interval_ms` | How often the agent count is read (a positive integer). | `10000` |
+| `drop_fraction` | The fall below the peak that triggers a pass, as a fraction of the peak (above 0, at most 1). | `0.25` |
+| `min_drop` | The fall must also be at least this many agents. | `1000` |
+| `min_gap_ms` | The shortest time between two passes the count triggers (the follow-up pass is not held back by it). | `60000` |
+| `gc_min_bytes` | Only processes holding more than this many bytes are collected. A hibernated agent connection holds a few KB and is skipped. | `32768` |
+| `followup_ms` | The second pass runs this long after the first; `0` runs no second pass. | `30000` |
+| `trim` | `false` stops every `malloc_trim` call (after passes and periodic); the passes still collect. | `true` |
+| `trim_interval_ms` | `malloc_trim(0)` on its own this often, whatever the count does; `0` never. | `300000` |
 
 A leftover `{grpcbox, [{servers, ...}]}` block **refuses boot**: nothing reads it, so
 it would configure no listener while the file reads as if it did. The same goes for a
@@ -3601,7 +3653,7 @@ the raw rig logs are local only.
   T0 + 17.1 s, same session, same process, no reconnect, counters unchanged
   after convergence. The web UI over HTTPS was not tested.
 - **E2a and an unplanned long outage: a stuck heartbeat batch (before the
-  buffer change).** OBSERVED on a rig with an agent that had the TAR plugin
+  buffer change).** OBSERVED on a rig with an agent that had the Echo plugin
   (default plugin set), one core replica, before the heartbeat buffer change
   described under "Heartbeat Batching". Such an agent's heartbeats can carry a
   `fleet_snapshot_json` of 200 to 800 KB (this rig host, busy). At that time the
@@ -3619,7 +3671,7 @@ the raw rig logs are local only.
   one gateway (run E3c) failed the same way: the first flush after T0 was 28
   heartbeats, 20,035,889 bytes, and was rejected. This is existing buffer
   behaviour, not introduced by the verdict replay, but it disabled the recovery
-  this section describes. The R runs above used an agent without the TAR plugin,
+  this section describes. The R runs above used an agent without the Echo plugin,
   so their heartbeats were small and did not meet it. After the buffer change
   (one entry per session, chunked flush, byte cap) the same scenarios recovered
   (runs F1 to F6 in the table below, at `990e57e48`), and the same sequence on a
@@ -3664,17 +3716,17 @@ table, which include the nodelay commits); the other rig run on it is the
 registration-rate investigation on `71ee2b02f` (runs K1 and K2 in the table, not a
 recovery pass). The four review fix commits after `c518edd93` are not in any rig
 build. T0 is the first `/health` 200 of the restarted server. "Default agents" means the
-default plugin set with the TAR plugin loaded; "no TAR" means the TAR plugin was
+default plugin set with the Echo plugin loaded; "no Echo" means the Echo plugin was
 removed so the heartbeat carried no snapshot.
 
 | Run | Commit | Scenario | Observed |
 |---|---|---|---|
 | E1 | `848709698` | 1 default agent, server killed for a nominal 10 s | verdict at T0 + 17.6 s, same session, no reconnect (R1: T0 + 17.5 s) |
 | E2a | `848709698` | 1 default agent, 300 s outage | FAIL, the stuck batch: 10 buffered heartbeats, 7,067,350 bytes, `larger than max`, never recovered in 420 s plus 91 s |
-| E2b, E2c | `848709698` | 1 agent (E2b with no plugins loaded, E2c no TAR), 302 s and 402 s outages | recovered at T0 + 0.38 s and T0 + 0.33 s, same session and process, breaker closed |
+| E2b, E2c | `848709698` | 1 agent (E2b with no plugins loaded, E2c no Echo), 302 s and 402 s outages | recovered at T0 + 0.38 s and T0 + 0.33 s, same session and process, breaker closed |
 | E2x | `848709698` | 1 default agent, unplanned 15.6 minute outage | breaker opened, breaker replay at T0 + 36 s, then the stuck batch (31 buffered, 24,805,137 bytes) until the gateway was restarted |
-| E3a | `848709698` | 10 agents, no TAR, 10 s outage | last agent online at T0 + 17.9 s, one replay per agent, drip gap median 44 ms |
-| E3b | `848709698` | 30 agents, no TAR, 10 s outage | last agent online at T0 + 17.6 s, drip gap median 43 ms, queue depth peak 15, gateway CPU peak 35% of one core, RSS 243 to 256 MB |
+| E3a | `848709698` | 10 agents, no Echo, 10 s outage | last agent online at T0 + 17.9 s, one replay per agent, drip gap median 44 ms |
+| E3b | `848709698` | 30 agents, no Echo, 10 s outage | last agent online at T0 + 17.6 s, drip gap median 43 ms, queue depth peak 15, gateway CPU peak 35% of one core, RSS 243 to 256 MB |
 | E3c | `848709698` | 30 default agents, 10 s outage | FAIL, the stuck batch: first flush 28 heartbeats, 20,035,889 bytes, no recovery in 200 s plus 61 s |
 | E4 | `848709698` | R2b state reproduced twice (partitions of 431 s and 411 s), then a recovery action | restarting only the agent re-armed the route row at +10.5 s with a new session; restarting only the gateway re-armed it at +14.2 s with a new session; commands worked throughout |
 | E5 | `848709698` | crash and timeout variants with the crash report filter, 30 agents, release build | all seven markers counted 0 in three variants; the control with the filter removed had hits |
@@ -3705,7 +3757,7 @@ removed so the heartbeat carried no snapshot.
 | K0 (pass 6) | `c518edd93` | nodelay on the stock configuration (no nodelay setting in `sys.config`) | start log `Upstream channel default_channel: TCP_NODELAY on`; the upstream client socket reported `{nodelay,true}` after the first agent registered |
 | K1 to K3 (pass 6) | `c518edd93` | cold-start bursts of 1000, 2000 and 5000 simulated agents (a load generator: one connection per agent, the real 9,054 byte `Register`, the 30 s deadline; it answers no commands and sends no inventory), stock gateway, shipped nodelay | 1000 agents: all registered in 1.89, 2.11 and 2.09 s (three runs), 0 deadline failures, 1.0 `ProxyRegister` per agent; 2000 agents 4.16 s; 5000 agents 12.08 s; 0 failures, WARN 0, ERROR 0 in every run |
 | K1-control (pass 6) | `c518edd93` | the 1000 agent load with `upstream_tcp_nodelay` set to `false` | 703 registered inside the deadline and 297 hit it (the same count as the stock run on `71ee2b02f`), 1297 attempts, last agent at 55.5 s |
-| K4a to K4d (pass 6) | `c518edd93` | real agents (TAR plugin loaded): 30 agents and a 12 s outage; 45 agents and 150 s; 1 agent and 300 s (plus an open-breaker variant); 20 agents and three gateway kill -9 | K4a all 30 online at T0 + 15.5 s, same sessions; K4b breaker open, all 45 online at T0 + 17.3 s, 0 buffer drops; K4c online at T0 + 0.98 s (breaker closed), K4c2 at T0 + 52.9 s (breaker open); K4d 20 of 20 re-registered in every gateway life (12 to 13 s), 0 refused, 0 stale pending rows |
+| K4a to K4d (pass 6) | `c518edd93` | real agents (Echo plugin loaded): 30 agents and a 12 s outage; 45 agents and 150 s; 1 agent and 300 s (plus an open-breaker variant); 20 agents and three gateway kill -9 | K4a all 30 online at T0 + 15.5 s, same sessions; K4b breaker open, all 45 online at T0 + 17.3 s, 0 buffer drops; K4c online at T0 + 0.98 s (breaker closed), K4c2 at T0 + 52.9 s (breaker open); K4d 20 of 20 re-registered in every gateway life (12 to 13 s), 0 refused, 0 stale pending rows |
 | K5 (pass 6) | `c518edd93` | grace of a closed connection's pending rows, probe client | default grace: a `Subscribe` on a new connection accepted, rows 2 at +10 s and 0 at +17 s, a late `Subscribe` refused; with `dead_connection_grace_ms` 2000 the rows were gone by +3.7 s. The refusal reached the probe as status 2 (the previous transport; the current layer answers `UNAVAILABLE`, 14) |
 | K6 (pass 6) | `c518edd93` | server-only restart with 1000 and 2000 simulated agents that heartbeat and hold a `Subscribe` (the load generator) | 1000 agents all back at T0 + 22.7 to 23.3 s (10 s and 60 s outages), 2000 agents at T0 + 46.1 s; breaker closed throughout (the generator sends no inventory), 0 drops, original session ids kept |
 | K7 (pass 6) | `c518edd93` | 5 minute steady state after K4c, 1 real agent | WARN 0, ERROR 0, 0 flush errors |
@@ -4277,7 +4329,7 @@ env keys with defaults, which a reverted build ignores.
 - **Heartbeat buffer: agent snapshot size, server limit, shutdown flush.**
   (1) The agent's snapshot size is not bounded by this change. The agent proto
   comment says a snapshot is typically 5 to 20 KB, while 200 to 800 KB was
-  observed on one busy rig host with the TAR plugin, and the server accepts a
+  observed on one busy rig host with the Echo plugin, and the server accepts a
   snapshot of up to 2 MiB (`kPushedSnapshotMaxBytes` in `fleet_topology_store.hpp`,
   read from the code). The gateway keeps each request under the server's limit by
   chunking and by eviction, but a smaller snapshot from the agent side is the
