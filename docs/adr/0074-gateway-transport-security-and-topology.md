@@ -1,7 +1,7 @@
 # ADR-0074: Gateway transport security and topology: mutual TLS on every hop, SPIFFE identities, many gateways, many servers
 
 - **Status:** Proposed. The owner's decisions below were taken on 2026-10-28 and 2026-10-29; the whole ADR needs the owner's sign-off at the end of wave 0.
-- **Shipped:** nothing in D1 to D14. Today the agent-to-gateway hop is one-way TLS (see Context). Do not cite this ADR as a current capability.
+- **Shipped:** nothing in D1 to D13; of D14, only the memory measures in its last paragraphs are on `dev`. Today the agent-to-gateway hop is one-way TLS (see Context). Do not cite this ADR as a current capability.
 - **Date:** 2026-10-28 (wave 0 decisions folded in 2026-10-29)
 - **Authors:** Nathan Dornbrook
 - **Supersedes:** nothing. Amends ADR-2002 (see its section 7h, added with this ADR). Amends ADR-2004 (the server identity form and the `mgmt_peer_auth_mode` default; see "Rules this design re-opens").
@@ -34,7 +34,7 @@ So gateway and server already authenticate each other in both directions. The mi
 
 ### Measurements behind the transport choice (rocky9, 2026-10-28)
 
-These come from branch `perf/gateway-idle-mem-ktls` (a kTLS handover NIF) and are recorded in the private gateway wiki. Wave 0 commits the measurements the waves gate on to the repository, as an artefact, before they gate anything.
+These come from branch `perf/gateway-idle-mem-ktls` (a kTLS handover NIF) and are not yet in the repository. Wave 0 commits the measurements the waves gate on to the repository, as an artefact, before they gate anything.
 
 | Measure | OTP `ssl` | kTLS NIF |
 |---|---|---|
@@ -102,7 +102,6 @@ Why signed messages rather than a key agreed per session with a MAC on every mes
 **What D5 deliberately does not give, stated plainly:**
 - **Confidentiality from the gateway.** The gateway still reads commands and results in plaintext. Hiding them would need encryption to the agent's key, a separate decision for SaaS.
 - **Honest heartbeats.** A compromised gateway can report a dead agent as alive. The lie lasts until the next signed result or the next session start.
-- **Reading payloads.** D5 does not stop a gateway that holds the agent from reading command payloads (the first point above).
 
 **To measure in wave 2:** the agent's cost of signing each result, and the server's verification rate, at the result rate of the 5,000-agent rig, alongside D14's handshake budget.
 
@@ -264,7 +263,7 @@ Each wave ends with the owner's guidance before the next starts. Waves 1 to 6 ar
 
 | Wave | Content | Done when |
 |---|---|---|
-| 0 | This ADR and ADR-2002 section 7h ratified; the conflicts above decided; ADR-0073 to PR (done, PR #6704). A survey of what comparable open-source projects and commercial endpoint platforms do (done 2026-10-29; the open-source half is recorded below). The memory-measures PR (split from the kTLS branch). The gateway performance-harness PR (#6710). A fuzz harness and an ASan run for the trim NIF (D8). The common memory baseline (D14), on both rigs. | Owner sign-off. |
+| 0 | This ADR and ADR-2002 section 7h ratified; the conflicts above decided; ADR-0073 to PR (done, PR #6704). A survey of what comparable open-source projects and commercial endpoint platforms do (done 2026-10-29; the open-source half is recorded below). The memory-measures PR (split from the kTLS branch; done, on `dev` at 857ac374e). The gateway performance-harness PR (#6710). A fuzz harness and an ASan run for the trim NIF (D8). The common memory baseline (D14), on both rigs. | Owner sign-off. |
 | 1 | The CA: SPIFFE-form identities; 24-hour agent and 7-day gateway and server certificates with renewal; importing a customer intermediate; the CRL served to gateways. Gateway and server move from pins to CA trust plus identity plus revocation, in both directions. Measured: the CA's signing rate, and the Register rate against the real server with one-way TLS, Postgres pool 16 and 64. | Both directions refuse a revoked, expired, wrong-role or wrong-CA peer, proven by test. The measured rates are recorded; if they fall well short of about 1,700 per second, D14's 60-second target is revised or the bottleneck found before wave 2. Chaos: a gateway partitioned until its CRL is stale heals, clock skew, and leaf expiry. |
 | 2 | The agent edge: the enrollment port (token, or a machine certificate through CNG, Keychain or file); the strict main port; certificate and CRL checks in kTLS; D5's per-session agent signature checked by the server, server-signed commands and agent-signed results. CI fuzzing, ASan, and the shared accept/refuse suite. Measured: the Register rate with mutual TLS and the per-session signature, and a mass re-enrollment after a simulated outage. | The shared suite passes on both TLS paths; 100 real Windows agents (rig100) enroll and connect with mutual TLS. Chaos: a mass re-enrollment under a flood on the enrollment port; a replayed signed command; a revoked agent refused within 60 s, within about 2 minutes across a Postgres failover, and within 15 minutes with no server reachable. |
 | 3 | The server, before agents move: an agent seen on two gateways at once must not lose its route (RR7: about 50 of 5,000 lost in 8 of 8 forced-move runs); response storage must not drop under pool pressure; the in-memory registry must not lag the Postgres routes after a restart. Accepted by Nathan on 2026-10-28 from the BigColin review. | The RR7 forced-move, pool-pressure and post-restart cells pass with no loss, on BigColin's rig and ours. |
