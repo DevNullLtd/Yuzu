@@ -542,7 +542,9 @@ and bumps its per-agent version counter, which is monotonic for the life of the 
 reset by a drop, so any `apply` that read before the drop fails its commit check (below) and is
 counted `diverged`; a drop never re-arms a stale apply. An empty field is then `absent`. A rejected Register payload installs no
 state map, so the agent's first heartbeat is `no_base` and requests a resync.
-Registration itself never fails because of the tags.
+Registration itself never fails because of the tags. From ADR-0074 wave 2 the Register payload is
+ignored as state and the base comes from the first signed full set after the session's challenge
+verifies (D16).
 
 **Locking.** `AgentHealthStore::apply` holds the store's `mu_` only to read, copy and commit:
 - under `mu_`, it reads the agent's stored digest and per-agent version counter. An empty delta
