@@ -56,7 +56,7 @@
 # Inputs (mirroring agent-shutdown-smoke.sh):
 #   YUZU_AGENT_BIN      agent binary           (default build-linux/agents/core/yuzu-agent)
 #   YUZU_PLUGIN_DIR     built plugins          (default build-linux/agents/plugins)
-#   YUZU_AGENT_LIB_DIR  dir holding libyuzu_agent_core.so* (default: found under the build dir)
+#   YUZU_AGENT_LIB_DIR  dir holding libyuzu_agent_core.so (default: found under the build dir)
 #
 # Exit: 0 all passed, 1 a check failed, 77 skipped (local runs only; in CI a missing
 # precondition is a FAIL, never a skip).
@@ -99,17 +99,17 @@ for f in "$UNIT_FILE" "$HELPER" "$UPGRADING_DOC" "$DEB_SCRIPT" "$RPM_SPEC"; do
     [[ -f $f ]] || { echo "FAIL: missing input file: $f" >&2; exit 1; }
 done
 
-# The real shared library only: meson also writes libyuzu_agent_core.so.p/libyuzu_agent_core.so.symbols,
+# The library itself only: meson also writes libyuzu_agent_core.so.p/libyuzu_agent_core.so.symbols,
 # a regular file that a bare 'libyuzu_agent_core.so*' glob matches, and 'find -quit' can return it
 # before the library (the agent then fails to load in the unit).
-lib_match=( \( -name 'libyuzu_agent_core.so' -o -name 'libyuzu_agent_core.so.[0-9]*' \) \( -type f -o -type l \) )
+lib_match=( -name libyuzu_agent_core.so \( -type f -o -type l \) )
 LIB_DIR=${YUZU_AGENT_LIB_DIR:-}
 if [[ -z $LIB_DIR ]]; then
     build_root=${AGENT%/agents/core/*}
     found=$(find "$build_root" "${lib_match[@]}" -print -quit 2>/dev/null || true)
     [[ -n $found ]] && LIB_DIR=$(dirname "$found")
 fi
-[[ -n $LIB_DIR ]] || { echo "FAIL: libyuzu_agent_core.so* not found; set YUZU_AGENT_LIB_DIR" >&2; exit 1; }
+[[ -n $LIB_DIR ]] || { echo "FAIL: libyuzu_agent_core.so not found; set YUZU_AGENT_LIB_DIR" >&2; exit 1; }
 
 # Unique names so concurrent runners on one box never collide (shared-identity CI pools).
 id=$(printf 'yuzu-capcheck-%s-%s-%s' "${GITHUB_RUN_ID:-local}" "${RUNNER_NAME:-host}" "$$" |
