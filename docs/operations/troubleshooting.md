@@ -79,6 +79,15 @@ Health probes (`/livez`, `/readyz`, `/health`, `/api/health`) are exempt from th
 | `outside_validity` on every call although the certificate was renewed | The guard re-checks the certificate on every call, but the gateway keeps its long-lived connection and presents the certificate it had when it dialled; status 16 does not make it redial. Renew **before** `notAfter`, then check whether the gateway already redialled (cause class B in the row above: restart that node, one at a time, only if denials continue after about 2 minutes and its agents can take the disconnect, because unless the agents run a build with the #5183 fix, shipped in 0.15.0, released agents stay wedged afterwards). A renewal over the same key needs no pin change and no server restart; a new key needs its pin first |
 | Process limit | Erlang default process limit is 262144 — sufficient for most fleets |
 
+### Gateway image build fails at the platform check
+
+`deploy/docker/Dockerfile.gateway` builds for `linux/amd64` only (#6711). The first
+step of its `deps` stage refuses any other architecture:
+
+| Message | Fix |
+|---------|-----|
+| `Dockerfile.gateway supports linux/amd64 only (TARGETARCH=...)` | Build with `--platform linux/amd64` (for the UAT scripts and compose files that pass no platform: `DOCKER_DEFAULT_PLATFORM=linux/amd64`, or `platform: linux/amd64` on the compose service; `scripts/start-viz-uat.sh` takes `VIZ_UAT_PLATFORM=linux/amd64`). On an arm64 host this runs under emulation, which has not been validated for the gateway build (and `VIZ_UAT_PLATFORM` builds all three images that way, so the first run takes much longer than the usual 25 to 40 minutes). The reason: the pinned `erlang:28-alpine` index builds arm64 on a newer Alpine than the runtime stage, and musl 1.2.6 with OTP older than 29.1 aborts at boot on AMX CPUs (#1743). For a single-node arm64 demo, `deploy/docker/Dockerfile.gateway.chisel` builds natively; it is the demo variant, runs no `gateway-entrypoint.sh`, and so cannot resolve its own advertise address automatically (set `YUZU_GW_ADVERTISE_ADDR` per node yourself; see [Gateway](../user-manual/gateway.md)), so do not use it for a scaled or clustered gateway. |
+
 ### Gateway image build fails at abi-guard
 
 When you build `deploy/docker/Dockerfile.gateway` yourself, a step in the
