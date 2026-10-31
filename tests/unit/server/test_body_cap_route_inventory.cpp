@@ -339,6 +339,7 @@ constexpr DefaultAllow kDefaultIsCorrectFor[] = {
     // own workflow_yaml/product_pack_yaml kBodyCapTable entries.
     {"POST", R"body_cap_path(/api/scope/estimate)body_cap_path", "Trigger body: small JSON (scope estimate params) -- not a YAML-authoring route."},
     {"POST", R"body_cap_path(/api/instructions/([^/]+)/execute)body_cap_path", "Trigger body: small JSON (instruction execution args) -- not a YAML-authoring route."},
+    {"POST", R"body_cap_path(/api/v1/instructions/([^/]+)/execute)body_cap_path", "v1 twin of the route above (instruction_execute_routes.cpp): small JSON (targeting + params); the MCP twin bounds params at 32 keys x 64 KiB and agent_ids at 10000, so the 4 MiB default is already above every honest body."},
 
     // ── Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up,
     // 2026-08-07): 68 routes went from invisible to this scan to resolving
