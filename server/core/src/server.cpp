@@ -1480,9 +1480,12 @@ public:
         // emitted-but-unseeded, which passes its own test and silently breaks
         // absent() alerting. This commit's six targeting reasons went into
         // that array, not into a list here - which is the tether working.
+        // execute_instruction_definition (#2146) bounds its arguments with the same closed
+        // reason set (mcp_instruction_execute.cpp's check_args), so it is the second emitter.
         for (const auto reason : yuzu::server::mcp::kExecInstrBoundReasons) {
-            metrics_.counter("yuzu_mcp_tool_args_too_large_total",
-                             {{"tool", "execute_instruction"}, {"reason", std::string(reason)}});
+            for (const char* tool : {"execute_instruction", "execute_instruction_definition"})
+                metrics_.counter("yuzu_mcp_tool_args_too_large_total",
+                                 {{"tool", tool}, {"reason", std::string(reason)}});
         }
         // #4353 follow-up (Gate 2 finding on #4364): the 19 kFieldBoundTools
         // share the SAME counter as execute_instruction above but a single
@@ -22061,6 +22064,9 @@ private:
         // POST /api/instructions/{id}/execute. The stores, the dispatch closure, the
         // authorizer and the validator cache are the SAME ones the legacy route, MCP and
         // /api/v1/quarantine use; only the wire envelope and audit action are route-local.
+        // Shared with the MCP twin (set_instruction_execute_ports below): one binding of the
+        // stores, one dispatch closure, one authorizer, so the two surfaces cannot disagree.
+        yuzu::server::instruction_execute::Ports instr_exec_ports;
         {
             yuzu::server::instruction_execute::StoreBindings instr_exec_bindings;
             instr_exec_bindings.instruction_store = instruction_store_.get();
@@ -22094,7 +22100,8 @@ private:
                     return derive_dispatch_caller(*s);
                 return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
             };
-            instr_exec_deps.ports = yuzu::server::instruction_execute::make_ports(instr_exec_bindings);
+            instr_exec_ports = yuzu::server::instruction_execute::make_ports(instr_exec_bindings);
+            instr_exec_deps.ports = instr_exec_ports;
             HttplibRouteSink instr_exec_sink{*web_server_};
             yuzu::server::instruction_execute::register_instruction_execute_routes(
                 instr_exec_sink, std::move(instr_exec_deps));
@@ -22197,6 +22204,9 @@ private:
             // presence). The closure itself is `authorize_dispatch`, defined before the REST
             // registration above (#6065 PR-Q): one definition, two consumers.
             mcp_server_->set_authorize_dispatch_fn(authorize_dispatch);
+            // #2146: execute_instruction_definition runs the SAME pipeline, over the SAME
+            // bindings, as POST /api/v1/instructions/{id}/execute (instr_exec_ports above).
+            mcp_server_->set_instruction_execute_ports(instr_exec_ports);
             // #3290 Phase 2 — the SAME fleet_read_fn lambda wired into the REST
             // registration's trailing fleet_read_fn param below, so the REST and MCP
             // query_installed_software twins cannot observe a different admit

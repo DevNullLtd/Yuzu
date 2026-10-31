@@ -101,6 +101,7 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::exempt ("create_result_set_from_instruction_result", step_up_detail::kOperationalData, "POST", R"(/api/v1/result-sets/from-instruction-result)"),
     step_up_mcp_detail::exempt ("execute_bundle",                       step_up_detail::kExecutionDispatch, "POST",   R"(/api/v1/bundles)"),
     step_up_mcp_detail::exempt ("execute_instruction",                  step_up_detail::kExecutionDispatch),
+    step_up_mcp_detail::exempt ("execute_instruction_definition",       step_up_detail::kExecutionDispatch, "POST",   R"(/api/v1/instructions/([^/]+)/execute)"),
     step_up_mcp_detail::exempt ("reevaluate_result_set",                step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/(rs_[0-9a-f]+)/re-eval)"),
     step_up_mcp_detail::exempt ("sync_hardware_software",               step_up_detail::kSyncTrigger,       "POST",   R"(/api/v1/hardware/sync)"),
     // GuaranteedState:Delete / Push / Write

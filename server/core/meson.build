@@ -791,6 +791,7 @@ yuzu_server_core_lib = static_library(
     'src/mcp_server.cpp',
     'src/mcp_input_schema.cpp',
     'src/instruction_param_schema.cpp',
+    'src/mcp_instruction_execute.cpp', # MCP twin of POST /api/instructions/{id}/execute: bounds + JSON-RPC rendering over instruction_execute
     'src/mcp_orientation.cpp',
     'src/mcp_session.cpp',
     'src/mcp_stream.cpp',

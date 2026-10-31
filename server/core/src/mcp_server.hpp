@@ -17,6 +17,7 @@
                          // CaRoutes::PublishCrlFn below) — reused verbatim by issue_code_signing_cert
                          // rather than re-declared, so the two error-prefix constants stay one copy.
 #include "ca_store.hpp"
+#include "instruction_execute.hpp" // #2146: Ports for execute_instruction_definition
 #include "command_capability.hpp" // #3685: CommandCapability / ClassificationError — ClassifyFn's return type
 #include "config_write.hpp" // config::Backing: get/set_runtime_config's backing pointers
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
@@ -479,6 +480,14 @@ public:
     /// immediately above (the handler's `[=]` lambda captures `this`, so the
     /// injection is a live read on the next request).
     void set_authorize_dispatch_fn(AuthorizeDispatchFn fn) { authorize_dispatch_fn_ = std::move(fn); }
+    /// #2146: the shared pipeline's ports for `execute_instruction_definition`
+    /// (instruction_execute.hpp). server.cpp builds them with `instruction_execute::make_ports`
+    /// from the SAME stores, dispatch closure and authorizer the REST twin uses. Left unset,
+    /// every seam is empty and the tool FAILS CLOSED (definition store unavailable) rather than
+    /// running anything. Same setter idiom as `set_capability_classify_fn`.
+    void set_instruction_execute_ports(instruction_execute::Ports ports) {
+        instr_exec_ports_ = std::move(ports);
+    }
 
     /// Progress bridge (2f PR 3a). Same setter idiom + lifetime argument as
     /// set_engine_principal_store above (the handler's `[=]` lambda captures
@@ -1284,6 +1293,8 @@ private:
     // pre-dispatch dry run in mcp_server.cpp fails closed rather than
     // silently reverting to the pre-#3687 collapsed-envelope behaviour.
     AuthorizeDispatchFn authorize_dispatch_fn_;
+    // #2146: see set_instruction_execute_ports. Default-constructed = every seam unwired.
+    instruction_execute::Ports instr_exec_ports_;
     // Posture cache shared across httplib worker threads (the POST handler lambda
     // is captured by value, so every worker shares this one object). Reads and
     // writes of the string fields MUST be serialised — an unsynchronised

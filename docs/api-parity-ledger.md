@@ -214,7 +214,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | viz | 2 | 2 | 0 |
 | executions | 6 | 0 | 6 |
 | scope-result-sets | 1 | 0 | 1 |
-| instructions | 27 | 14 | 13 |
+| instructions | 27 | 15 | 12 |
 | compliance-policy | 22 | 5 | 17 |
 | settings | 30 | 11 | 19 |
 | rbac | 17 | 5 | 12 |
@@ -226,11 +226,11 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | enrollment | 21 | 4 | 17 |
 | crypto | 5 | 5 | 0 |
 | other | 82 | 27 | 55 |
-| **Total** | **347** | **135** | **212** |
+| **Total** | **347** | **136** | **211** |
 
-Registered `/api/vN/*` routes: 265. OpenAPI `paths` entries: 264. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 206.
+Registered `/api/vN/*` routes: 266. OpenAPI `paths` entries: 265. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 207.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 212. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 83.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 211. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 82.
 
 <!-- END GENERATED -->
 

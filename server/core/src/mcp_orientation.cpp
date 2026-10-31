@@ -113,8 +113,9 @@ constexpr std::string_view kDexPerf[] = {"get_dex_perf_fleet",   "get_dex_perf_c
                                          "get_dex_device_app_perf"};
 constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devices",
                                         "list_discovered_devices"};
-constexpr std::string_view kExecution[] = {"execute_instruction", "execute_bundle",
-                                           "get_bundle_result", "sync_hardware_software"};
+constexpr std::string_view kExecution[] = {"execute_instruction", "execute_instruction_definition",
+                                           "execute_bundle", "get_bundle_result",
+                                           "sync_hardware_software"};
 constexpr std::string_view kRemediation[] = {"quarantine_device", "list_quarantined_devices"};
 // gap-matrix #10 (ADR-1005 A5 parity): issue_code_signing_cert joins the
 // family — same Security securable domain, same "Certificates" mental model.
