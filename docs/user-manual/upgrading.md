@@ -4,6 +4,22 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 > **Fresh deployment only.** 0.15.0 supports initial deployment into a freshly provisioned database; it provides no upgrade path from an earlier build's database or backups and no return to an earlier build. The server does not enforce this: migrations do not refuse a database written by another build, and an importer that runs at any boot where the database holds no import record for the file still reads leftover `enrollment-tokens.cfg` and `pending-agents.cfg` files without checking where they came from. Procedures below that describe upgrading, rolling back or restoring an earlier build's data are historical and not supported for 0.15.0 (see "Deployment contract (hard cutover)" in the Forensics section of this page).
 
+## ⚠️ Breaking: the scoped-permission audit row changes shape and separates a store outage from a missing grant (#3739)
+
+**What changed.** When the ordinary RBAC check behind a per-agent permission gate (the Tag, device-page, agent-properties and other `require_scoped_permission` routes) refuses a request, the `auth.scoped_permission_required` audit row is now written with the fields in their proper place, and its `detail` says whether a failed read stood behind the refusal. Nothing about the request or response changes: the answer is the same fail-closed `403`, with the same body.
+
+| Field | Before | After |
+|---|---|---|
+| `target_type` | the agent id | `Agent` |
+| `target_id` | `RBAC denied <Securable>:<Operation>` | the agent id |
+| `detail` | empty | `RBAC denied <Securable>:<Operation>`, plus ` (read degraded: mgmt_group_store)` or ` (read degraded: rbac_store)` when a failed read means a missing grant could not be ruled out |
+
+**Who is affected.** Anyone with a SIEM rule, saved query or export that matches this action by the agent id in `target_type` or by the text in `target_id`. Those rules stop matching without an error. Rules keyed on `target_type=Agent` start matching these rows for the first time.
+
+**What to do.** Re-key the rule to `target_type=Agent` and `target_id=<agent>`, and match the message on `detail`. **Other refusal paths of the same action keep their earlier shape** (their agent id, text and detail sit in varying fields, or both id fields are empty; tracked in #3219), so `target_type` is not `Agent` on every row of this action yet.
+
+**Reading the new detail.** `read degraded` means the check could not read what it needed (an RBAC read or a management-group read), so a missing grant could not be ruled out, and it refused fail-closed. It is not a policy decision and not a control failure. The source named is the first read that failed. To see the outage itself, use `yuzu_server_mgmt_group_read_degrade_total` and `yuzu_server_rbac_read_degrade_total` (alerts `YuzuMgmtGroupReadDegraded` and `YuzuRbacReadDegraded`). During an outage the `403` body still reads "permission denied", so a user may be told to request a permission they already hold; only the audit row and the counters show the cause.
+
 ## ⚠️ Breaking: the MCP stream endpoint refuses service-scoped tokens, and an MCP session works only for the credential class that created it (#4754)
 
 **What changed.** Two things, both on `/mcp/v1/`.
@@ -3166,7 +3182,9 @@ To find affected callers, search the audit log for `action=auth.fleet_read_requi
 `result=denied` and a detail containing "ITServiceOwner permission" (definitive deny, `403`) versus
 "RBAC read degraded" (store fault, `503`), for the sibling gate `action=auth.scoped_permission_required`
 with the same two details ("lacks ITServiceOwner permission" for the `403`, "RBAC read degraded" for
-the `503`), and for `action=upload_grant.list.access_denied`. `action=auth.permission_required` never
+the `503`; the ordinary-RBAC refusal of the same action, a `403`, instead reads `RBAC denied ...` and may end
+in `(read degraded: mgmt_group_store)` or `(read degraded: rbac_store)`, see the #3739 note at the top of this
+guide), and for `action=upload_grant.list.access_denied`. `action=auth.permission_required` never
 carries the "RBAC read degraded" detail: a service token on a route behind the plain permission gate is
 refused by the default-deny allow-list ("default-deny", `403`) whatever the ceiling read returns, and
 during an outage of the `ITServiceOwner` read that row ends with "ceiling read degraded" (a healthy
