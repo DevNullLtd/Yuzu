@@ -1003,6 +1003,8 @@ curl -s -b cookies.txt \
 
 The `scope` field controls which agents are included. Set `"scope": "failed_only"` to target only agents that reported failure; any other value (or omitting the field) reruns all agents.
 
+**What a rerun does.** It creates a new `pending` execution record linked to the original; it does not send anything to any device. The REST v1 route `POST /api/v1/executions/{id}/rerun` and the MCP tool `record_execution_rerun` do the same, take a boolean `failed_only` instead of the `scope` string, and answer `dispatched_to_devices: false`. Likewise `POST /api/v1/executions/{id}/cancel` and `cancel_execution` only mark the execution cancelled; they do not stop a command a device already received. See `docs/user-manual/rest-api.md`.
+
 ### Cancel
 
 Cancellation records the requesting user for audit:

@@ -24,6 +24,7 @@
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
 #include "network_perf_model.hpp"
+#include "execution_mutation.hpp" // cancel/rerun twins: the shared admit-audit-effect sequence + its test seam
 #include "execution_tracker.hpp"
 #include "guaranteed_state_store.hpp"
 #include "instruction_store.hpp"
@@ -745,6 +746,14 @@ public:
     /// `device_ids` is unaffected either way.
     void set_all_agent_ids_fn(AllAgentIdsFn fn) { all_agent_ids_fn_ = std::move(fn); }
 
+    /// TEST SEAM for POST /api/v1/executions/{id}/cancel and .../rerun. Production leaves this
+    /// unset and the routes bind `make_tracker_mutation_ports(execution_tracker)`; a test that
+    /// has no Postgres sets fake ports instead. MUST be called BEFORE `register_routes()`. An
+    /// unwired set of ports (the default) is ignored, never used as "no store".
+    void set_execution_mutation_ports_for_test(ExecutionMutationPorts ports) {
+        execution_mutation_ports_ = std::move(ports);
+    }
+
     /// #5342 Gate 7 (C5) — an audit writer that stamps the principal
     /// EXPLICITLY instead of re-resolving it from the request's session.
     /// Wired from `AuthRoutes::audit_log_for_principal`. The password routes
@@ -856,6 +865,7 @@ private:
     std::vector<std::string> csrf_trusted_origins_;
     ScopeEvaluateFn scope_evaluate_fn_;
     AllAgentIdsFn all_agent_ids_fn_;
+    ExecutionMutationPorts execution_mutation_ports_; // see set_execution_mutation_ports_for_test
 };
 
 } // namespace yuzu::server

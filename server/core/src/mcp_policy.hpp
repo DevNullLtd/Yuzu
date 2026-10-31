@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <string_view>
 
 namespace yuzu::server::mcp {
@@ -225,6 +226,44 @@ inline bool requires_approval(std::string_view mcp_tier,
 /// Returns true if the given string is a valid MCP tier name.
 inline bool is_valid_tier(std::string_view tier) {
     return tier.empty() || tier == "readonly" || tier == "operator" || tier == "supervised";
+}
+
+/// MCP tools exempt from the supervised-tier approval ticket although their (securable,
+/// operation) pair is one `requires_approval()` gates. CLOSED LIST; adding a name is a security
+/// decision recorded where the tool is classified, never a convenience.
+///
+/// Why this is a tool-name list and not a distinct operation (the `ApiToken:Rotate` route):
+/// `requires_approval()` is keyed on the pair alone and `AuthRoutes::require_permission` mirrors
+/// it on every non-MCP transport, so a pair-level carve-out would also relax every REST route
+/// that shares the pair. The exemption is read ONLY by the generic C8 gate in mcp_server.cpp (and
+/// the boot-time and metric-seeding derivations that must agree with it) via
+/// `requires_approval_for_tool()`, so the REST mirror is untouched: a supervised-tier MCP token
+/// that calls the REST twin of an exempt tool is still refused there. That asymmetry (MCP looser
+/// than REST for this one tool) is deliberate and is documented in docs/mcp-server.md.
+///
+///   cancel_execution (Execution:Execute): owner ruling 2026-10-30 (Dave). It is a risk-reducing
+///     action: it only marks a tracker row cancelled and sends nothing to any device, so asking
+///     a human to approve a STOP would only delay the safe state. The handler still gates on
+///     Execution:Execute then Execution:Read, admits a confined caller only with COMPLETE cohort
+///     visibility, and audits an `attempted` row before the effect.
+inline constexpr std::array<std::string_view, 1> kApprovalExemptTools = {"cancel_execution"};
+
+[[nodiscard]] constexpr bool tool_exempt_from_approval(std::string_view tool) {
+    for (const auto t : kApprovalExemptTools) {
+        if (t == tool)
+            return true;
+    }
+    return false;
+}
+
+/// `requires_approval()` for a named tool: false for the tools on `kApprovalExemptTools`.
+/// Every MCP-side consumer of the approval rule (the C8 gate, the boot validator, the metric
+/// pre-seeding list) goes through this one function so they cannot disagree about an exempt tool.
+[[nodiscard]] inline bool requires_approval_for_tool(std::string_view mcp_tier,
+                                                     std::string_view tool,
+                                                     std::string_view securable_type,
+                                                     std::string_view operation) {
+    return !tool_exempt_from_approval(tool) && requires_approval(mcp_tier, securable_type, operation);
 }
 
 } // namespace yuzu::server::mcp

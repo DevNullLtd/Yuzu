@@ -6736,6 +6736,66 @@ When the 100-row (scoped) cap drops rows, `data.result_truncated_by_cap` is adde
 }
 ```
 
+#### `POST /api/v1/executions/{id}/cancel` and `POST /api/v1/executions/{id}/rerun` (#2146 batch B)
+
+REST v1 twins of the legacy `POST /api/executions/{id}/cancel` and `.../rerun` documented above;
+MCP twins `cancel_execution` and `record_execution_rerun`. All of them run the same
+admit, audit, change, audit sequence (`execution_mutation.hpp`).
+
+**Neither route sends anything to any device.** Cancel only marks the execution's tracker record
+cancelled: a command a device has already received is not stopped or recalled. Rerun only creates a
+**pending** tracker record linked to the original through `rerun_of`; no agent runs anything because
+of it, and a `201` does not mean devices were re-run (the body says `dispatched_to_devices: false`).
+To run the work again on devices, dispatch it.
+
+**Permission:** `Execution:Execute` and `Execution:Read` (the target-visibility check runs through
+the fleet-read gate), in that order. A service-scoped API token is refused (`403`). A supervised-tier
+MCP token that calls these REST routes is refused (`403`, approval required on this transport); the
+MCP `cancel_execution` tool is the one that is exempt from the approval ticket (see `docs/mcp-server.md`).
+Step-up: cancel is classified "stops an in-flight effect" and rerun "execution dispatch"; neither
+asks for a fresh MFA proof.
+
+**Confinement.** A caller confined to management groups may use these only on an execution they
+dispatched that no device has reported on yet, or one whose complete targeted device list is visible
+to them. Every other case, including an id that does not exist, answers the same `404` body and
+writes the same `denied` audit row, so a hidden execution cannot be told from a missing one.
+An unconfined caller naming an unknown id gets the `404` and no audit row. A caller whose identity
+cannot be resolved is refused with a `503`; there is no fallback user.
+
+**Audit (fail closed).** Both write `execution.cancel` / `execution.rerun` rows. An `attempted` row
+is written **before** the change; if it cannot be saved the call answers `503` with
+`Sec-Audit-Failed: true` and changes nothing. The outcome then writes `success` (for rerun the target
+is the new record), `denied` (cancel `409`) or `failure` (`503`). If only the outcome row fails after
+the change was applied, the success response carries `Sec-Audit-Failed: true`.
+
+**`POST /api/v1/executions/{id}/cancel`** takes no body. `200`:
+
+```json
+{ "data": { "execution_id": "exec-1", "status": "cancelled" }, "meta": { "api_version": "v1" } }
+```
+
+`409`: the execution already finished (`succeeded`, `completed` or `cancelled`); nothing changed.
+`503` (with `retry_after_ms`): the tracker or audit store is degraded; nothing changed.
+
+**`POST /api/v1/executions/{id}/rerun`** takes an optional JSON object with one field,
+`failed_only` (boolean, default `false`; an empty body means `false`). `failed_only: true` sizes the
+new record to the original's failed, timed-out and rejected devices. The legacy
+`{"scope": "failed_only"}` string is **not** accepted: any other field, a non-object body or a
+non-boolean `failed_only` is a `400`. Each call creates another record. `201`:
+
+```json
+{
+  "data": {
+    "execution_id": "exec-9", "rerun_of": "exec-1", "status": "pending",
+    "failed_only": true, "dispatched_to_devices": false
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+These routes do not emit the `execution.created` / `execution.completed` webhook events that the
+legacy routes emit.
+
 #### `GET /api/v1/schedules`
 
 **Permission:** same two-stage gate as `GET /fragments/schedules`: a service-scoped API token is

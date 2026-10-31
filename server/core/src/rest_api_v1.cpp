@@ -1507,7 +1507,7 @@ const std::string& openapi_spec() {
       "overview": ["An execution is one dispatch of an instruction to a set of devices. This group has a live view and a stored view. The live view is a Server-Sent Events stream for one running execution, built for agentic workers that need to react as devices report. The stored view lists executions, returns one execution with optional per-device detail, returns its responses, and lists the executions it spawned.", "Every call is confined to what the caller may see. A caller limited to some management groups sees only executions that involve a device in scope, or that they dispatched themselves, and sees counts and event detail trimmed to that scope."],
       "how_it_works": [{"title": "Dispatch", "text": "Dispatching an instruction creates an execution with an id. That id is the only handle the stream needs."}, {"title": "Subscribe", "text": "Call the events stream with execution_id. An execution that is missing, or outside your scope, gives the same 404. An execution that has already finished gives 410."}, {"title": "Stream", "text": "Events arrive as JSON envelopes with numeric ids. A heartbeat event keeps the connection alive while nothing else is sent."}, {"title": "Resume", "text": "After a disconnect, reconnect with since or Last-Event-ID to replay what you missed. If the buffer no longer holds those events, a replay-gap event says which ids are missing."}, {"title": "Read final state", "text": "When the execution is complete, read GET /executions/{id}, its responses and its children to get the final picture."}],
       "tables": [{"title": "Stream event types", "caption": "The last column shows what a caller confined to some management groups receives.", "columns": ["Type", "Meaning", "Confined caller"], "rows": [["agent-transition", "One device changed status", "Only devices in scope"], ["execution-progress", "Running totals for the whole execution", "Not sent"], ["execution-completed", "The execution reached a final state", "Status only"], ["heartbeat", "Liveness signal, empty data", "Sent"], ["replay-gap", "Events between missing_from and missing_to are no longer buffered", "Sent"], ["events-dropped", "This connection fell behind and events were discarded", "Sent"]]}],
-      "access": {"permissions": ["Execution:Read, via the fleet-read check, gates /events, /executions, /executions/{id} and /executions/{id}/children.", "Response:Read, via the fleet-read check, gates /executions/{id}/responses. It is a different securable from Execution:Read, so holding one does not give the other."], "audit": ["api.v1.events.subscribe, written on each successful subscribe, and as a denied row when the execution is missing or outside the caller's scope. If the success row cannot be saved the stream still starts and the response carries Sec-Audit-Failed: true. A rejected since writes no success row.", "execution.detail.fetch, written when the responses call succeeds and when the detail call is made with include=agents. Both fail with 503 if the row cannot be saved. The detail call also writes a denied row when it answers 404.", "execution.read, written as a denied row by the children call when a confined caller asks about an execution they cannot see."], "notes": ["The execution's dispatcher is admitted to see it so that a just-dispatched execution does not look missing. This does not bypass the trimming of counts and events for a confined caller.", "A plain list, a plain detail call and a successful children call write no audit row."]},
+      "access": {"permissions": ["Execution:Read, via the fleet-read check, gates /events, /executions, /executions/{id} and /executions/{id}/children.", "Response:Read, via the fleet-read check, gates /executions/{id}/responses. It is a different securable from Execution:Read, so holding one does not give the other.", "Execution:Execute and then Execution:Read, via the fleet-read check, gate POST /executions/{id}/cancel and POST /executions/{id}/rerun. Neither sends anything to a device: cancel marks the stored execution cancelled, and rerun creates a pending record."], "audit": ["api.v1.events.subscribe, written on each successful subscribe, and as a denied row when the execution is missing or outside the caller's scope. If the success row cannot be saved the stream still starts and the response carries Sec-Audit-Failed: true. A rejected since writes no success row.", "execution.detail.fetch, written when the responses call succeeds and when the detail call is made with include=agents. Both fail with 503 if the row cannot be saved. The detail call also writes a denied row when it answers 404.", "execution.read, written as a denied row by the children call when a confined caller asks about an execution they cannot see.", "execution.cancel and execution.rerun, written by the cancel and rerun calls: an attempted row before the change (503 with Sec-Audit-Failed: true, and no change, if it cannot be saved), then success, denied or failure. A confined caller's denial is identical for a hidden and a nonexistent execution."], "notes": ["The execution's dispatcher is admitted to see it so that a just-dispatched execution does not look missing. This does not bypass the trimming of counts and events for a confined caller.", "A plain list, a plain detail call and a successful children call write no audit row."]},
       "good_to_know": [{"label": "Execution id required", "text": "The stream needs execution_id, matching letters, digits, underscore and hyphen, up to 128 characters. There is no stream across all executions."}, {"label": "Replay window", "text": "Replay comes from a bounded in-memory buffer of 1000 events per execution. With neither since nor Last-Event-ID the buffer is replayed from its start. A since that is not one non-negative whole number is a 400, answered before the stream budget is used and before any success audit row is written. A Last-Event-ID header that is malformed gives no error and replays nothing, so the stream is live only."}, {"label": "Slow readers", "text": "Each connection queues up to 500 events. When it is full the oldest are discarded and an events-dropped event reports how many."}, {"label": "Stream limits", "text": "Each open stream uses a worker from the shared stream budget (--max-sse-streams). Over the limit you get 429 with retry_after_ms. A single principal may hold 16 event streams at once."}, {"label": "Paging does not page", "text": "The list returns up to limit rows with no cursor. limit defaults to 100 and is held between 1 and 500, and a limit that is not a whole number is a 400. pagination.total is the number of rows returned, and page_size always reads 50."}, {"label": "Confined view", "text": "For a confined caller, scope_expression and parameter_values read (redacted - confined view), and the agent counts include only devices in scope. Counts can run low because they only include devices that have already responded."}, {"label": "Per-device detail", "text": "include=agents adds per-device rows and a kpi summary. The match is a substring test on the include value, and this expansion is audited."}, {"label": "Responses paging", "text": "The responses call rejects offset with 400 because the order changes while an execution runs. Use limit (up to 1000) and since. Rows have a narrower shape than the general responses calls."}, {"label": "Children cap", "text": "The children call returns at most 100 executions and sets result_truncated_by_cap inside data when there were more. It has no pagination object."}, {"label": "Degraded reads", "text": "If the execution tracker or response store cannot be read, these calls answer 503 with retry_after_ms. They do not answer 404 or an empty list."}],
       "docs": ["docs/user-manual/rest-api.md", "docs/user-manual/response-store.md"]
     }},
@@ -2235,6 +2235,16 @@ const std::string& openapi_spec() {
     },
     "/executions/{id}/children": {
       "get": {"operationId": "getExecutionsByIdChildren", "summary": "List an execution's child executions", "tags": ["Events"], "description": "REST v1 twin of the legacy GET /api/executions/{id}/children and MCP get_execution_children; all three return the same row shape. Gated on the fleet-read check (Execution:Read), with the same confinement rules as GET /executions/{id}: an invisible or nonexistent parent 404s identically to a nonexistent one, and each child is checked against the caller's visibility independently of the parent's own visibility (a visible parent does not by itself disclose a child dispatched by, or targeting, someone else). Not audited on a successful read; a confined denial is audited as execution.read. The underlying query is hard-capped at 100 rows (no caller-visible limit/cursor). The cap is applied together with the caller's own visibility scope, before LIMIT: a confined caller's cap applies to their OWN visible children, not the fleet-wide raw row set, so an invisible sibling cannot displace a visible child out of the capped window. result_truncated_by_cap:true means that scoped row set exceeded the cap; when result_truncated_by_cap is absent, every child THIS caller can see was returned.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Child execution list ({children: [{id, status, dispatched_at}], result_truncated_by_cap?: true})", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"type": "object", "required": ["children"], "properties": {"children": {"type": "array", "items": {"$ref": "#/components/schemas/ExecutionChildRow"}}, "result_truncated_by_cap": {"type": "boolean", "description": "Present (true) only when the server-side child cap dropped rows."}}}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found (unknown id, or outside the caller's fleet-read scope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised/degraded; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    })json"
+        // Fresh literal (MSVC C2026 ~16,380-byte per-literal cap): the execution
+        // cancel/rerun twins (#2146 batch B). Adjacent string literals are
+        // concatenated at compile time.
+        R"json(,
+    "/executions/{id}/cancel": {
+      "post": {"operationId": "postExecutionsByIdCancel", "summary": "Mark an execution cancelled (tracker record only; sends nothing to any device)", "tags": ["Events"], "description": "REST v1 twin of the legacy POST /api/executions/{id}/cancel and MCP cancel_execution. Updates the server's execution tracker record to cancelled and NOTHING ELSE: nothing is sent to any device, and a command a device has already received is not stopped or recalled. Valid only while the execution is not finished: one that already succeeded, completed or was cancelled answers 409 and nothing changes. Irreversible. Requires Execution:Execute and, through the fleet-read check, Execution:Read. A caller confined to management groups may cancel only an execution they dispatched that no device has reported on yet, or one whose COMPLETE targeted device list is visible to them; any other case, including a nonexistent id, answers the same 404 body and writes the same denied audit row, so the two cannot be told apart. An unconfined caller naming an unknown id gets the 404 and no audit row. Audited as execution.cancel: an attempted row is written BEFORE the change and, if it cannot be saved, the call answers 503 with Sec-Audit-Failed: true and changes nothing; the outcome then writes success, denied (409) or failure (503). A service-scoped API token is refused (403). A supervised-tier MCP token is refused (403, approval required on this transport); use the MCP tool instead. Needs a fresh MFA proof: no (exempt: stops an in-flight effect).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "{execution_id, status: cancelled}", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the change was applied but its outcome audit row failed to persist."}}, "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"type": "object", "required": ["execution_id", "status"], "properties": {"execution_id": {"type": "string"}, "status": {"type": "string", "enum": ["cancelled"]}}}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Execute or Execution:Read), a service-scoped token, or a supervised-tier MCP token", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "404": {"description": "Execution not found (unknown id, or outside the caller's fleet-read scope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "409": {"description": "The execution already finished; nothing was changed", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker or audit store unavailable (Sec-Audit-Failed: true when the audit row could not be saved; nothing was changed); envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
+    "/executions/{id}/rerun": {
+      "post": {"operationId": "postExecutionsByIdRerun", "summary": "Create a pending rerun record for an execution (sends nothing to any device)", "tags": ["Events"], "description": "REST v1 twin of the legacy POST /api/executions/{id}/rerun and MCP record_execution_rerun. Creates a PENDING record in the server's execution tracker, linked to the original through rerun_of. It sends NOTHING to any device: no agent runs anything because of this call and the new record stays pending, so a 201 does NOT mean devices were re-run (the body carries dispatched_to_devices: false). To run the work again, dispatch it. failed_only (boolean, default false) sizes the new record to the original's failed, timed-out and rejected devices instead of its whole targeted list; the legacy scope=failed_only string is not accepted, and any field other than failed_only is a 400. Each call creates another record. Requires Execution:Execute and, through the fleet-read check, Execution:Read. A caller confined to management groups may use it only on an execution they dispatched that no device has reported on yet, or one whose COMPLETE targeted device list is visible to them; any other case, including a nonexistent id, answers the same 404 body and writes the same denied audit row. Audited as execution.rerun: an attempted row is written BEFORE the record is created and, if it cannot be saved, the call answers 503 with Sec-Audit-Failed: true and creates nothing; the outcome then writes success (target: the new record) or failure. A service-scoped API token is refused (403). A supervised-tier MCP token is refused (403, approval required on this transport). Needs a fresh MFA proof: no (exempt: execution dispatch class).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "additionalProperties": false, "properties": {"failed_only": {"type": "boolean", "default": false, "description": "Size the new record to the original's failed, timed-out and rejected devices."}}}}}}, "responses": {"201": {"description": "{execution_id (the NEW pending record), rerun_of, status: pending, failed_only, dispatched_to_devices: false}", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the change was applied but its outcome audit row failed to persist."}}, "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"type": "object", "required": ["execution_id", "rerun_of", "status", "failed_only", "dispatched_to_devices"], "properties": {"execution_id": {"type": "string"}, "rerun_of": {"type": "string"}, "status": {"type": "string", "enum": ["pending"]}, "failed_only": {"type": "boolean"}, "dispatched_to_devices": {"type": "boolean", "enum": [false]}}}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "400": {"description": "Body is not a JSON object, has a field other than failed_only, or failed_only is not a boolean", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Execute or Execution:Read), a service-scoped token, or a supervised-tier MCP token", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "404": {"description": "Execution not found (unknown id, or outside the caller's fleet-read scope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker or audit store unavailable (Sec-Audit-Failed: true when the audit row could not be saved; nothing was created); envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     })json"
         // Split here (MSVC C2026 ~16,380-byte per-literal cap): the
         // Executions/Workflows/Schedules read-twin routes (#4030) grew this
@@ -3838,6 +3848,11 @@ void RestApiV1::register_routes(
     ScopeEvaluateFn scope_evaluate_fn = scope_evaluate_fn_;
     // #4983 — see set_all_agent_ids_fn's doc comment in the .hpp.
     AllAgentIdsFn all_agent_ids_fn = all_agent_ids_fn_;
+    // Cancel/rerun twins: bound to the tracker unless a test installed fake ports (see
+    // set_execution_mutation_ports_for_test). Snapshotted like the members above.
+    ExecutionMutationPorts execution_mutation_ports =
+        execution_mutation_ports_.wired() ? execution_mutation_ports_
+                                          : make_tracker_mutation_ports(execution_tracker);
 
     // #1788: resolve the caller's confinement set on a route whose PRIMARY
     // authorization is the per-target `scoped_perm_fn` gate — the Echo retention
@@ -12833,6 +12848,235 @@ void RestApiV1::register_routes(
             if (children_opt->truncated)
                 result_obj.add("result_truncated_by_cap", true);
             res.set_content(ok_json(result_obj.str()), "application/json");
+        });
+
+    // ── POST /api/v1/executions/{id}/cancel and /rerun (#2146 batch B) ───
+    //
+    // REST v1 twins of the legacy POST /api/executions/{id}/{cancel,rerun}
+    // (execution_routes.cpp) and of MCP cancel_execution / record_execution_rerun.
+    // Both surfaces run execution_mutation.hpp's apply_execution_mutation, the ONE copy
+    // of the admit -> audit -> effect -> audit sequence; the handlers below only gate,
+    // resolve the principal and map the status onto the A4 envelope. The gate calls stay
+    // inline in each handler (check-api-parity's gate-parity check reads them there).
+    //
+    // WHAT THEY DO NOT DO. Cancel marks the tracker row cancelled and sends nothing to any
+    // device. Rerun creates a PENDING tracker record linked to the original and sends
+    // nothing to any device either; no agent runs anything because of it. The OpenAPI text
+    // says so and so must any edit here.
+    //
+    // Gate: perm_fn Execution:Execute, then fleet_read_fn Execution:Read (the legacy order),
+    // then admission by admit_confined_mutation inside the shared sequence. A service-scoped
+    // token is refused by perm_fn (Execution:Execute is not on kServiceScopeGlobalSafe); an
+    // engine principal resolves RBAC-only inside perm_fn. Differences from the legacy twin,
+    // all deliberate: an unresolved principal is refused (the legacy handlers fall back to
+    // the user "unknown"), an `attempted` audit row is written BEFORE the effect and a
+    // failed write refuses it (503 + Sec-Audit-Failed), the rerun input is the boolean
+    // `failed_only` (not scope="failed_only"), and no webhook event is emitted (the legacy
+    // routes emit execution.created / execution.completed; this function has no emit hook).
+    //
+    // step_up_policy.hpp classifies both routes (cancel kStopsEffect, rerun
+    // kExecutionDispatch); body_cap_policy.hpp's catch-all caps the rerun body.
+    const auto finish_execution_mutation = [](httplib::Response& res, ExecutionMutation what,
+                                              const ExecutionMutationRequest& mreq,
+                                              const ExecutionMutationOutcome& outcome) {
+        const bool is_cancel = what == ExecutionMutation::kCancel;
+        using S = ExecutionMutationStatus;
+        switch (outcome.status) {
+        case S::kNoPrincipal:
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "unable to resolve caller identity",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        case S::kStoreDegraded:
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        case S::kNotFound:
+            // Identical for a nonexistent id and one hidden from this caller.
+            res.status = 404;
+            res.set_content(detail::a4_error(res, "execution not found"), "application/json");
+            return;
+        case S::kAuditFailed:
+            res.status = 503;
+            res.set_header("Sec-Audit-Failed", "true");
+            res.set_content(
+                detail::a4_error(res,
+                                 is_cancel ? "audit subsystem unavailable; the execution was NOT "
+                                             "cancelled"
+                                           : "audit subsystem unavailable; no rerun record was "
+                                             "created",
+                                 {.retry_after_ms = 5000,
+                                  .remediation = "retry once the audit store recovers"}),
+                "application/json");
+            return;
+        case S::kAlreadyFinished:
+            if (!outcome.audit_persisted)
+                res.set_header("Sec-Audit-Failed", "true");
+            res.status = 409;
+            res.set_content(detail::a4_error(res, "execution already finished"),
+                            "application/json");
+            return;
+        case S::kStoreFailed:
+            if (!outcome.audit_persisted)
+                res.set_header("Sec-Audit-Failed", "true");
+            res.status = 503;
+            res.set_content(detail::a4_error(res,
+                                             is_cancel ? "cancel failed; execution store degraded"
+                                                       : "rerun record could not be created; "
+                                                         "execution store degraded",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        case S::kDone:
+            break;
+        }
+        if (!outcome.audit_persisted)
+            res.set_header("Sec-Audit-Failed", "true");
+        if (is_cancel) {
+            res.set_content(ok_json(JObj()
+                                        .add("execution_id", mreq.execution_id)
+                                        .add("status", "cancelled")
+                                        .str()),
+                            "application/json");
+            return;
+        }
+        res.status = 201;
+        res.set_content(ok_json(JObj()
+                                    .add("execution_id", outcome.new_execution_id)
+                                    .add("rerun_of", mreq.execution_id)
+                                    .add("status", "pending")
+                                    .add("failed_only", mreq.failed_only)
+                                    .add("dispatched_to_devices", false)
+                                    .str()),
+                        "application/json");
+    };
+
+    sink.Post(
+        R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/cancel)",
+        [perm_fn, fleet_read_fn, auth_fn, audit_fn, execution_mutation_ports,
+         finish_execution_mutation](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Execution", "Execute"))
+                return;
+            const auto cid = detail::ensure_correlation_id(res);
+            if (!fleet_read_fn) {
+                spdlog::error("POST /api/v1/executions/{{id}}/cancel: fleet_read_fn unwired; "
+                              "cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Execution", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
+            if (!execution_mutation_ports.wired()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "execution tracker unavailable",
+                                                 {.retry_after_ms = 5000}),
+                                "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return; // auth_fn wrote the 401.
+
+            ExecutionMutationRequest mreq;
+            mreq.what = ExecutionMutation::kCancel;
+            mreq.execution_id = req.matches[1].str();
+            mreq.username = session->username;
+            mreq.scope = gate.scope;
+            mreq.audit_context = "surface=rest-v1 cid=" + cid;
+            const auto outcome = apply_execution_mutation(
+                execution_mutation_ports, mreq,
+                [&](const std::string& action, const std::string& result,
+                    const std::string& target, const std::string& audit_detail) {
+                    // An unwired audit_fn is an audit-off deployment, not a failed write.
+                    return !audit_fn ||
+                           audit_fn(req, action, result, "execution", target, audit_detail);
+                });
+            finish_execution_mutation(res, mreq.what, mreq, outcome);
+        });
+
+    sink.Post(
+        R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/rerun)",
+        [perm_fn, fleet_read_fn, auth_fn, audit_fn, execution_mutation_ports,
+         finish_execution_mutation](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Execution", "Execute"))
+                return;
+            const auto cid = detail::ensure_correlation_id(res);
+            if (!fleet_read_fn) {
+                spdlog::error("POST /api/v1/executions/{{id}}/rerun: fleet_read_fn unwired; "
+                              "cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Execution", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
+            if (!execution_mutation_ports.wired()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "execution tracker unavailable",
+                                                 {.retry_after_ms = 5000}),
+                                "application/json");
+                return;
+            }
+
+            ExecutionMutationRequest mreq;
+            mreq.what = ExecutionMutation::kRerun;
+            mreq.execution_id = req.matches[1].str();
+            mreq.scope = gate.scope;
+            mreq.audit_context = "surface=rest-v1 cid=" + cid;
+
+            // Strict body: only {"failed_only": <bool>} (an empty body means false). An unknown
+            // key is a 400, so the legacy {"scope":"failed_only"} spelling can never be silently
+            // read as a FULL rerun.
+            if (!req.body.empty()) {
+                auto body = nlohmann::json::parse(req.body, nullptr, /*exceptions=*/false);
+                if (!body.is_object()) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, "request body must be a JSON object"),
+                                    "application/json");
+                    return;
+                }
+                for (auto it = body.begin(); it != body.end(); ++it) {
+                    if (it.key() != "failed_only") {
+                        res.status = 400;
+                        res.set_content(detail::a4_error(res,
+                                                         "unknown field; the only accepted field "
+                                                         "is the boolean failed_only"),
+                                        "application/json");
+                        return;
+                    }
+                }
+                if (body.contains("failed_only")) {
+                    if (!body["failed_only"].is_boolean()) {
+                        res.status = 400;
+                        res.set_content(detail::a4_error(res, "failed_only must be a boolean"),
+                                        "application/json");
+                        return;
+                    }
+                    mreq.failed_only = body["failed_only"].get<bool>();
+                }
+            }
+
+            auto session = auth_fn(req, res);
+            if (!session)
+                return; // auth_fn wrote the 401.
+            mreq.username = session->username;
+            const auto outcome = apply_execution_mutation(
+                execution_mutation_ports, mreq,
+                [&](const std::string& action, const std::string& result,
+                    const std::string& target, const std::string& audit_detail) {
+                    // An unwired audit_fn is an audit-off deployment, not a failed write.
+                    return !audit_fn ||
+                           audit_fn(req, action, result, "execution", target, audit_detail);
+                });
+            finish_execution_mutation(res, mreq.what, mreq, outcome);
         });
 
     // ── GET /api/v1/approvals/{id} — single approval status (A4 status_url) ──

@@ -39,6 +39,7 @@
 #include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "network_perf_model.hpp"
+#include "execution_mutation.hpp" // cancel_execution/record_execution_rerun test seam type
 #include "execution_tracker.hpp"
 #include "execution_statistics_model.hpp" // #2146 Batch B3: shared REST+MCP statistics builders
 #include "fleet_topology_store.hpp" // #2146 Batch B3: FleetTopologyStore + merge_offline_topology
@@ -512,6 +513,13 @@ public:
     /// (api-parity rows get.api-config, put.api-config-param). Same objects the config routes
     /// hold. Unset (all nullptr, the default) => both tools answer "unavailable".
     void set_runtime_config_backing(config::Backing backing) { runtime_config_ = backing; }
+
+    /// TEST SEAM for cancel_execution / record_execution_rerun. Production leaves this unset and
+    /// the tools bind `make_tracker_mutation_ports(execution_tracker)`; a test with no Postgres
+    /// installs fake ports. An unwired set is ignored, never used as "no store".
+    void set_execution_mutation_ports_for_test(ExecutionMutationPorts ports) {
+        execution_mutation_ports_for_test_ = std::move(ports);
+    }
 
     /// ADR-0031 operator surface (PR1.6c) — upload-grant store + the
     /// ADR-0017 list-admit resolver for list_upload_grants, backing
@@ -1318,6 +1326,7 @@ private:
     // engine_principal_store_'s contract above.
     PluginConfigStore* plugin_config_store_{nullptr};
     config::Backing runtime_config_{};
+    ExecutionMutationPorts execution_mutation_ports_for_test_{}; // see set_execution_mutation_ports_for_test
     UploadGrantStore* upload_grant_store_{nullptr};
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.

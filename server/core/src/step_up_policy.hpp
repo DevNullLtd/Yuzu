@@ -293,6 +293,8 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/fragments/auto/run)",                                                     step_up_detail::kExecutionDispatch),
     // rest_api_v1.cpp
     step_up_detail::exempt("POST",  R"(/api/v1/bundles)",                                                         step_up_detail::kExecutionDispatch),
+    step_up_detail::exempt("POST",  R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/cancel)",                        step_up_detail::kStopsEffect),
+    step_up_detail::exempt("POST",  R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/rerun)",                         step_up_detail::kExecutionDispatch),
     step_up_detail::pending("POST",  R"(/api/v1/echo/retention-paused/purge)"),
     step_up_detail::pending("POST",  R"(/api/v1/management-groups)"),
     step_up_detail::pending("PUT",   R"(/api/v1/management-groups/([a-f0-9]+))"),

@@ -82,6 +82,7 @@
 #include "dispatch_destructive_gate.hpp" // #3685: evaluate_destructive_targeting — shared with /api/command
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
+#include "execution_mutation.hpp" // cancel_execution / record_execution_rerun: the shared admit-audit-effect sequence
 #include "execution_scope_rules.hpp" // #2146 A2-R1: execution_visible, shared with rest_api_v1.cpp/execution_routes.cpp
 #include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
 #include "workflow_execution_list_model.hpp" // shared REST+MCP parser/row builder for the run list
@@ -451,6 +452,52 @@ int param_int32(const nlohmann::json& params, const char* key, int def = 0) {
 /// adjacent `k=v` field or split the line). Ordinary ids pass through unchanged.
 std::string audit_caller_id(std::string_view id) {
     return audit_token(id.substr(0, 128));
+}
+
+// ── cancel_execution / record_execution_rerun: outcome -> MCP error ──────────
+// Maps a non-kDone ExecutionMutationOutcome onto the JSON-RPC error the two tools return, so
+// the two handler branches (kept separate on purpose: check-api-parity derives a tool's gate
+// calls from its own `if (tool_name == ...)` branch) cannot word the same outcome differently.
+// A `retry_after_ms >= 0` error is a retryable store/audit fault (a4_error with a hint); a
+// negative one is a terminal business answer (error_response, no hint).
+struct ExecMutationMcpError {
+    int code{kInternalError};
+    std::string message;
+    std::string remediation;
+    long retry_after_ms{-1};
+};
+
+ExecMutationMcpError exec_mutation_mcp_error(ExecutionMutation what,
+                                             const ExecutionMutationOutcome& outcome,
+                                             const std::string& execution_id) {
+    using S = ExecutionMutationStatus;
+    const bool cancel = what == ExecutionMutation::kCancel;
+    switch (outcome.status) {
+    case S::kNoPrincipal:
+        return {kInternalError, "unable to resolve caller identity", "retry the call",
+                mcp::kMcpStoreFaultRetryMs};
+    case S::kStoreDegraded:
+        return {kInternalError, "execution tracker degraded", "retry once the server reports ready",
+                mcp::kMcpStoreFaultRetryMs};
+    case S::kNotFound:
+        // Identical for a nonexistent id and one hidden from this caller.
+        return {kInvalidParams, "Execution not found: " + execution_id, {}, -1};
+    case S::kAuditFailed:
+        return {kInternalError,
+                cancel ? "the audit record could not be persisted; the execution was NOT cancelled"
+                       : "the audit record could not be persisted; no rerun record was created",
+                "retry once the audit store recovers", mcp::kMcpStoreFaultRetryMs};
+    case S::kAlreadyFinished:
+        return {kInvalidParams, "execution already finished (nothing was changed)", {}, -1};
+    case S::kStoreFailed:
+        return {kInternalError,
+                cancel ? "cancel failed; execution store degraded"
+                       : "rerun record could not be created; execution store degraded",
+                "retry once the server reports ready", mcp::kMcpStoreFaultRetryMs};
+    case S::kDone:
+        break;
+    }
+    return {};
 }
 
 // B5 (api-parity #2146) — mirrors rest_api_v1.cpp's file-local
@@ -1125,6 +1172,50 @@ static const ToolDef kTools[] = {
      "this caller can see was returned.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","minLength":1,"description":"Parent execution ID"}},"required":["execution_id"]})",
      R"j({"type":"object","properties":{"children":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"}},"required":["id","status","dispatched_at"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["children"]})j"},
+
+    // Cancel/rerun twins (#2146 batch B). Both run execution_mutation.hpp's
+    // apply_execution_mutation, the same sequence POST /api/v1/executions/{id}/cancel and
+    // .../rerun run. NEITHER sends anything to a device; the names and descriptions say so.
+    {"cancel_execution",
+     "Mark ONE execution as cancelled in the server's execution tracker. This updates the "
+     "tracker record only: it sends NOTHING to any device and does not stop or recall a command "
+     "a device has already received, so a cancelled execution can still have running work on "
+     "devices. Use it to stop the server counting an execution as in progress (for example one "
+     "that is stuck); it is not a way to halt work on endpoints. Valid only while the execution "
+     "is not finished: one that already succeeded, completed or was cancelled answers the "
+     "business error 'execution already finished' and nothing changes (retrying will not help). "
+     "Irreversible: a cancelled execution cannot be resumed. A caller confined to management "
+     "groups may cancel only an execution they dispatched that no device has reported on yet, or "
+     "one whose COMPLETE targeted device list is visible to them; any other case, including an id "
+     "that does not exist, returns the SAME not-found error (the two cannot be told apart). "
+     "Mirrors POST /api/v1/executions/{id}/cancel. Not approval-gated at the supervised tier "
+     "because it only reduces risk (owner ruling 2026-10-30); the REST twin is still refused for "
+     "a supervised-tier token. Writes an 'attempted' audit row (execution.cancel) BEFORE the "
+     "change and refuses with a retryable error, changing nothing, if that row cannot be saved. "
+     "Requires Execution:Execute and Execution:Read.",
+     R"j({"type":"object","properties":{"execution_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,128}$","maxLength":128,"description":"Execution id from list_executions or get_execution_status"}},"required":["execution_id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"execution_id":{"type":"string"},"status":{"const":"cancelled"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the outcome audit row failed to persist after the cancel had been applied"}},"required":["execution_id","status"]})j"},
+
+    {"record_execution_rerun",
+     "Create a PENDING rerun record for an existing execution in the server's execution tracker, "
+     "linked to the original through rerun_of. This sends NOTHING to any device: no agent runs "
+     "anything because of this call, and the new record stays 'pending'. Do NOT read a success "
+     "result as 'the devices were re-run'; the result carries dispatched_to_devices:false. To run "
+     "the work again on devices, dispatch it with execute_instruction. failed_only (default "
+     "false) sizes the new record to the original's failed, timed-out and rejected devices "
+     "instead of its whole targeted list; it is a boolean (the legacy REST scope=\"failed_only\" "
+     "string is not accepted here). Each call creates another record (not idempotent). A caller "
+     "confined to management groups may use it only on an execution they dispatched that no "
+     "device has reported on yet, or one whose COMPLETE targeted device list is visible to them; "
+     "any other case, including an id that does not exist, returns the SAME not-found error. "
+     "Mirrors POST /api/v1/executions/{id}/rerun. Approval-gated at the supervised tier: the "
+     "first call returns kApprovalRequired with an approval_id, and the call is repeated with "
+     "that approval_id after an administrator approves. Writes an 'attempted' audit row "
+     "(execution.rerun) BEFORE the record is created and refuses with a retryable error, "
+     "creating nothing, if that row cannot be saved. Requires Execution:Execute and "
+     "Execution:Read.",
+     R"j({"type":"object","properties":{"execution_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,128}$","maxLength":128,"description":"Id of the execution to record a rerun of, from list_executions or get_execution_status"},"failed_only":{"type":"boolean","description":"Default false. True sizes the new record to the original's failed, timed-out and rejected devices"},"approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after administrator approval"}},"required":["execution_id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Id of the NEW pending record"},"rerun_of":{"type":"string"},"status":{"const":"pending"},"failed_only":{"type":"boolean"},"dispatched_to_devices":{"const":false},"audit_persisted":{"type":"boolean","description":"Present (false) only when the outcome audit row failed to persist after the record had been created"}},"required":["execution_id","rerun_of","status","failed_only","dispatched_to_devices"]})j"},
 
     {"list_executions", "List recent command executions. Confined by management group: a "
      "caller admitted through a management-group grant (rather than a global permission) "
@@ -4295,6 +4386,9 @@ static const char* const kWriteToolsRaw[] = {
     "create_offload_target", "delete_offload_target", "activate_platform_license",
     "create_software_deployment", "rollback_software_deployment",
     "cancel_software_deployment",
+    // #2146 batch B - execution cancel/rerun records (Execution:Execute). Neither sends anything
+    // to a device.
+    "cancel_execution", "record_execution_rerun",
 };
 
 // The lookup set is DERIVED by catalogue() (merged with the registry records'
@@ -4415,6 +4509,16 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // #2146 A2-R1 - same fleet_read_fn_-gated confinement mechanism as
     // get_execution_status/list_executions above.
     {"get_execution_children", {"Execution", "Read", ServiceScopeClass::confined}},
+    // Cancel/rerun twins (#2146 batch B). ServiceScopeClass is the `denied` default for BOTH:
+    // the REST twins' perm_fn(Execution:Execute) refuses a service-scoped token (the pair is not
+    // on kServiceScopeGlobalSafe, which is empty), and the only confinement these handlers have
+    // is admit_confined_mutation, which is a management-group mechanism, not a service-scope
+    // one. Calling it `confined` would claim a downstream service-scope mechanism that does not
+    // exist (the lie this classification exists to prevent). cancel_execution is exempt from the
+    // supervised approval ticket via mcp_policy.hpp's kApprovalExemptTools (same pair); rerun is
+    // gated like every other Execution:Execute tool.
+    {"cancel_execution", {"Execution", "Execute"}},
+    {"record_execution_rerun", {"Execution", "Execute"}},
     {"list_executions", {"Execution", "Read", ServiceScopeClass::confined}},
     {"list_schedules", {"Schedule", "Read", ServiceScopeClass::confined}},
     // #4030: Workflow (multi-step orchestration) — RBAC seeding prerequisite
@@ -5016,8 +5120,9 @@ void validate_tool_security_registration(
                                           [&](const auto& r) { return r.name == s.name; });
             if (row == security_rows.end())
                 continue;  // parity offence already reported above
-            const bool gated = requires_approval("operator", row->securable, row->operation) ||
-                               requires_approval("supervised", row->securable, row->operation);
+            const bool gated =
+                requires_approval_for_tool("operator", s.name, row->securable, row->operation) ||
+                requires_approval_for_tool("supervised", s.name, row->securable, row->operation);
             if (!gated)
                 continue;
             const auto parsed =
@@ -5572,6 +5677,15 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
      {ToolEffect::Destructive, false, "Roll back software deployment"}},
     {"cancel_software_deployment",
      {ToolEffect::Destructive, false, "Cancel software deployment"}},
+    // cancel_execution is a one-way tracker transition (a repeat answers 'already finished', not
+    // a clean no-op) -> Destructive, not idempotent. record_execution_rerun only INSERTS a
+    // pending record, but its kToolSecurityRows operation is Execute, and the 2g PR2
+    // safe-direction floor (test_mcp_server.cpp) mandates destructiveHint:true for every
+    // Delete/Execute-gated tool (same reasoning as create_software_deployment above); each call
+    // creates another record, so it is not idempotent either.
+    {"cancel_execution", {ToolEffect::Destructive, false, "Cancel execution record"}},
+    {"record_execution_rerun",
+     {ToolEffect::Destructive, false, "Record execution rerun (sends nothing to devices)"}},
 };
 
 // The registry header spells the PermFn signature out (it must not include the
@@ -6333,7 +6447,7 @@ std::vector<std::string> approval_gated_tool_names() {
     std::vector<std::string> out;
     for (const auto& r : catalogue().raw_security)
         for (const char* tier : {"operator", "supervised"})
-            if (requires_approval(tier, r.securable, r.operation)) {
+            if (requires_approval_for_tool(tier, r.name, r.securable, r.operation)) {
                 out.emplace_back(r.name);
                 break;
             }
@@ -8052,7 +8166,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
 
-                if (requires_approval(tier, sec_type, sec_op)) {
+                // requires_approval_for_tool: false for the closed mcp_policy.hpp
+                // kApprovalExemptTools list (cancel_execution - risk-reducing, owner ruling
+                // 2026-10-30); every other tool is unchanged.
+                if (requires_approval_for_tool(tier, tool_name, sec_type, sec_op)) {
                     // ── Approval ticket flow (#289 / Issue 13.5, design D1) ──
                     // ticket-then-recall: the first call MINTS a pollable
                     // approval and returns kApprovalRequired (-32006) with
@@ -25048,6 +25165,187 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!audit_ok)
                     payload_j["audit_persisted"] = false;
                 mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload_j.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── cancel_execution (#2146 batch B) ───────────────────────────
+            // REST v1 twin: POST /api/v1/executions/{id}/cancel (rest_api_v1.cpp); legacy:
+            // POST /api/executions/{id}/cancel (execution_routes.cpp, untouched). All paths of
+            // the REST and MCP twins run execution_mutation.hpp's apply_execution_mutation.
+            // Tracker-only: nothing is sent to any device. Exempt from the supervised approval
+            // ticket (mcp_policy.hpp kApprovalExemptTools, owner ruling 2026-10-30); the REST
+            // twin keeps its approval mirror, so a supervised-tier token is refused there.
+            if (tool_name == "cancel_execution") {
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    return;
+                if (!fleet_read_fn_) {
+                    spdlog::error("cancel_execution: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Execution", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
+                const ExecutionMutationPorts ports =
+                    execution_mutation_ports_for_test_.wired()
+                        ? execution_mutation_ports_for_test_
+                        : make_tracker_mutation_ports(execution_tracker);
+                if (!ports.wired()) {
+                    res.set_content(
+                        a4_error(kInternalError, "Execution tracker unavailable", {},
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                // Strict arguments (this tool is not approval-gated, so the C8 schema check does
+                // not run for it): one execution_id of the shared id charset, nothing else.
+                for (auto it = args.begin(); it != args.end(); ++it) {
+                    if (it.key() != "execution_id") {
+                        res.set_content(error_response(id, kInvalidParams,
+                                                       "unknown argument '" +
+                                                           it.key().substr(0, 64) +
+                                                           "'; cancel_execution takes only "
+                                                           "execution_id"),
+                                        "application/json");
+                        return;
+                    }
+                }
+                const auto exec_id = param_string_strict(args, "execution_id");
+                if (!exec_id || !is_valid_execution_id(*exec_id)) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "execution_id must be 1-128 characters from "
+                                                   "A-Z a-z 0-9 _ -"),
+                                    "application/json");
+                    return;
+                }
+                ExecutionMutationRequest mreq;
+                mreq.what = ExecutionMutation::kCancel;
+                mreq.execution_id = *exec_id;
+                mreq.username = session->username;
+                mreq.scope = gate.scope;
+                mreq.audit_context = "surface=mcp";
+                const auto outcome = apply_execution_mutation(
+                    ports, mreq,
+                    [&](const std::string& action, const std::string& result,
+                        const std::string& target, const std::string& audit_detail) {
+                        return yuzu::server::detail::try_persist_audit(
+                            audit_fn, req, action, result, "execution", target, audit_detail);
+                    });
+                if (outcome.status != ExecutionMutationStatus::kDone) {
+                    mcp_audit(outcome.status == ExecutionMutationStatus::kNotFound ||
+                                      outcome.status == ExecutionMutationStatus::kAlreadyFinished
+                                  ? "denied"
+                                  : "error",
+                              audit_caller_id(*exec_id));
+                    const auto err = exec_mutation_mcp_error(mreq.what, outcome, *exec_id);
+                    res.set_content(err.retry_after_ms >= 0
+                                        ? a4_error(err.code, err.message, err.remediation,
+                                                   err.retry_after_ms)
+                                        : error_response(id, err.code, err.message),
+                                    "application/json");
+                    return;
+                }
+                nlohmann::json payload_j = {{"execution_id", *exec_id}, {"status", "cancelled"}};
+                if (!outcome.audit_persisted)
+                    payload_j["audit_persisted"] = false;
+                mcp_audit("success", audit_caller_id(*exec_id));
+                res.set_content(
+                    success_response(id, tool_result(payload_j.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── record_execution_rerun (#2146 batch B) ─────────────────────
+            // REST v1 twin: POST /api/v1/executions/{id}/rerun. Creates a PENDING tracker
+            // record only; NOTHING is sent to any device. Approval-gated at the supervised tier
+            // like every other Execution:Execute tool (generic C8 gate, before this branch).
+            if (tool_name == "record_execution_rerun") {
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    return;
+                if (!fleet_read_fn_) {
+                    spdlog::error("record_execution_rerun: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Execution", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
+                const ExecutionMutationPorts ports =
+                    execution_mutation_ports_for_test_.wired()
+                        ? execution_mutation_ports_for_test_
+                        : make_tracker_mutation_ports(execution_tracker);
+                if (!ports.wired()) {
+                    res.set_content(
+                        a4_error(kInternalError, "Execution tracker unavailable", {},
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                for (auto it = args.begin(); it != args.end(); ++it) {
+                    if (it.key() != "execution_id" && it.key() != "failed_only" &&
+                        it.key() != "approval_id") {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "unknown argument '" + it.key().substr(0, 64) +
+                                               "'; record_execution_rerun takes execution_id and "
+                                               "the boolean failed_only"),
+                            "application/json");
+                        return;
+                    }
+                }
+                const auto exec_id = param_string_strict(args, "execution_id");
+                if (!exec_id || !is_valid_execution_id(*exec_id)) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "execution_id must be 1-128 characters from "
+                                                   "A-Z a-z 0-9 _ -"),
+                                    "application/json");
+                    return;
+                }
+                const auto failed_only = param_bool_strict(args, "failed_only", false);
+                if (!failed_only) {
+                    res.set_content(error_response(id, kInvalidParams, "failed_only must be a boolean"), // retry-hint-exempt: input-parse failure, not a store fault
+                                    "application/json");
+                    return;
+                }
+                ExecutionMutationRequest mreq;
+                mreq.what = ExecutionMutation::kRerun;
+                mreq.execution_id = *exec_id;
+                mreq.username = session->username;
+                mreq.scope = gate.scope;
+                mreq.failed_only = *failed_only;
+                mreq.audit_context = "surface=mcp";
+                const auto outcome = apply_execution_mutation(
+                    ports, mreq,
+                    [&](const std::string& action, const std::string& result,
+                        const std::string& target, const std::string& audit_detail) {
+                        return yuzu::server::detail::try_persist_audit(
+                            audit_fn, req, action, result, "execution", target, audit_detail);
+                    });
+                if (outcome.status != ExecutionMutationStatus::kDone) {
+                    mcp_audit(outcome.status == ExecutionMutationStatus::kNotFound ? "denied"
+                                                                                    : "error",
+                              audit_caller_id(*exec_id));
+                    const auto err = exec_mutation_mcp_error(mreq.what, outcome, *exec_id);
+                    res.set_content(err.retry_after_ms >= 0
+                                        ? a4_error(err.code, err.message, err.remediation,
+                                                   err.retry_after_ms)
+                                        : error_response(id, err.code, err.message),
+                                    "application/json");
+                    return;
+                }
+                nlohmann::json payload_j = {{"execution_id", outcome.new_execution_id},
+                                            {"rerun_of", *exec_id},
+                                            {"status", "pending"},
+                                            {"failed_only", *failed_only},
+                                            {"dispatched_to_devices", false}};
+                if (!outcome.audit_persisted)
+                    payload_j["audit_persisted"] = false;
+                mcp_audit("success", audit_caller_id(outcome.new_execution_id));
                 res.set_content(
                     success_response(id, tool_result(payload_j.dump(), kObjectOutputSchema)),
                     "application/json");
