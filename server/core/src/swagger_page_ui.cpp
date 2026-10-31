@@ -103,6 +103,8 @@ extern const char* const kSwaggerCss = R"SWG(.sw-page{padding:22px 28px 36px;dis
 .panel .sw-guide table{width:100%;border-collapse:collapse}
 .sw-unavail{display:flex;gap:10px;align-items:baseline;margin-top:12px;padding:8px 12px;border:1px solid color-mix(in srgb,var(--warn) 50%,var(--line2));border-radius:var(--rad-ctl);background:var(--mds-color-bg-warning-tinted);color:var(--ink2)}
 .sw-unavail .pill{flex:none}
+.sw-auth{display:flex;gap:10px;align-items:baseline;margin-top:12px;color:var(--ink2)}
+.sw-auth .pill{flex:none}
 .sw-alt{margin-top:6px;padding-left:10px;border-left:2px solid var(--line)}
 .sw-error .btn{margin-top:10px}
 .sw-sr{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0})SWG";
@@ -307,9 +309,10 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     var base = o.path.indexOf('/v2/') === 0 ? '/api' : '/api/v1'; // the only v2 route is keyed /v2/... and served at /api/v2/...
     var mth = o.method.toUpperCase(), sends = mth === 'POST' || mth === 'PUT' || mth === 'PATCH';
     // -g: curl's URL globbing would rewrite the braces of a path parameter.
-    var curl = 'curl -s -g -X ' + mth + ' \\\n  -H "Authorization: Bearer $YUZU_TOKEN" \\\n' +
+    var curl = 'curl -s -g -X ' + mth + ' \\\n' + curlAuth(op) +
       (sends ? '  -H "Content-Type: application/json" \\\n  -d \'{}\' \\\n' : '') + '  "' + location.origin + base + o.path + '"';
     kids.push(h('h3', '', ['Request']));
+    kids.push(authNote(op));
     kids.push(h('pre', '', [curl]));
     if (op.parameters && op.parameters.length) { kids.push(h('h3', '', ['Parameters'])); kids.push(paramsTable(op.parameters)); }
     var rb = op.requestBody;
@@ -441,6 +444,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null ta
 
     var typed = ops.filter(function (o) { return o.typed; }).length;
     var unavailable = ops.filter(function (o) { return o.unavail; }).length;
+    var own = ops.filter(function (o) { return Array.isArray(o.op.security); }).length;
     var q = h('input', 'sw-ctl'); q.type = 'search'; q.id = 'sw-q'; q.placeholder = 'Search path, summary or description'; q.setAttribute('aria-label', 'Search operations');
     var msel = h('select', 'sw-ctl', [h('option', '', ['All methods'])].concat(METHODS.map(function (m) { return h('option', '', [m.toUpperCase()]); }))); msel.id = 'sw-m'; msel.setAttribute('aria-label', 'Method');
     var tsel = h('select', 'sw-ctl', [h('option', '', ['All groups'])].concat(tags.map(function (t) { return h('option', '', [t]); }))); tsel.id = 'sw-t'; tsel.setAttribute('aria-label', 'Group');
@@ -452,7 +456,8 @@ extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null ta
       h('span', 'chip', ['Groups', h('b', '', [String(tags.length)])]),
       h('span', 'chip', ['Typed responses', h('b', '', [typed + ' (' + (ops.length ? Math.round(100 * typed / ops.length) : 0) + '%)'])]),
       unavailable ? h('span', 'chip', ['Unavailable', h('b', '', [String(unavailable)])]) : null,
-      h('span', 'chip', ['Auth', h('b', '', ['Bearer token, X-Yuzu-Token, or session cookie'])])
+      h('span', 'chip', ['Auth', h('b', '', [ways({}).length ? waysText(ways({})) : 'none declared'])]),
+      own ? h('span', 'chip', ['Own credentials', h('b', '', [String(own)])]) : null
     ]);
     var bar = h('div', 'sw-bar', [q, msel, tsel, ysel, count]);
 
@@ -646,7 +651,45 @@ extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null ta
 )SWG";
 
 // Renderer, part 3 of 3: the schema flattening, kept apart so no piece nears the size gate.
-extern const char* const kSwaggerJs3 = R"SWG(  // allOf -> one schema (in this piece to keep the first under the size gate; declarations
+extern const char* const kSwaggerJs3 = R"SWG(  // ---- credentials (in this piece to keep the first under the size gate; declarations hoist) ----
+  // The document's top-level `security` is the default and an operation's own `security`
+  // replaces it; an empty list means the route takes no credential. Each entry is one acceptable
+  // way in, and the schemes inside one entry are all required together.
+  function schemeOf(n) {
+    var s = spec.components && spec.components.securitySchemes;
+    return isObj(s) && Object.prototype.hasOwnProperty.call(s, n) && isObj(s[n]) ? s[n] : null;
+  }
+  function isBearer(d) { return d.type === 'http' && String(d.scheme).toLowerCase() === 'bearer'; }
+  function isNamed(d) {
+    return d.type === 'apiKey' && typeof d.name === 'string' && /^[A-Za-z0-9_-]+$/.test(d.name) && (d.in === 'header' || d.in === 'cookie');
+  }
+  function ways(op) {
+    var s = Array.isArray(op.security) ? op.security : spec.security;
+    return (Array.isArray(s) ? s : []).filter(isObj).map(function (a) { return Object.keys(a); }).filter(function (a) { return a.length; });
+  }
+  function envOf(n) { return n.replace(/^x[-_]/i, '').replace(/-/g, '_').toUpperCase(); }
+  function curlAuth(op) {
+    var w = ways(op);
+    return (w.length ? w[0] : []).map(function (n) {
+      var d = schemeOf(n);
+      if (!d) return '';
+      if (isBearer(d)) return '  -H "Authorization: Bearer $YUZU_TOKEN" \\\n';
+      if (!isNamed(d)) return '';
+      return d.in === 'cookie' ? '  -b "' + d.name + '=$' + envOf(d.name) + '" \\\n' : '  -H "' + d.name + ': $' + envOf(d.name) + '" \\\n';
+    }).join('');
+  }
+  function credName(n) {
+    var d = schemeOf(n);
+    if (d && isBearer(d)) return 'Bearer token';
+    return d && isNamed(d) ? d.name + (d.in === 'cookie' ? ' cookie' : ' header') : n;
+  }
+  function waysText(w) { return w.map(function (a) { return a.map(credName).join(' and '); }).join(', or '); }
+  function authNote(op) {
+    var w = ways(op);
+    return h('div', 'sw-auth', [pill('auth', 'idle'), h('span', '', [w.length ? 'Send ' + waysText(w) : Array.isArray(op.security) ? 'No credential needed' : 'No credential declared'])]);
+  }
+
+  // allOf -> one schema (in this piece to keep the first under the size gate; declarations
   // hoist). Members are followed through $ref; properties and required merge in order, the
   // first definition wins and a later one only fills a missing description or format; type,
   // description, oneOf, anyOf, items and enum come from the first member having one. seen

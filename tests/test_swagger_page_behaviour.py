@@ -523,6 +523,11 @@ const out = {};
   out.x_guides = root.byClass('sw-gbtn').length; out.x_guides_open = root.byClass('sw-gbtn').filter(isOpen).length;
   out.x_models = root.byClass('sw-model-h').length; out.x_models_open = root.byClass('sw-model-h').filter(isOpen).length;
   out.x_errors = root.byClass('sw-error').length; out.x_console = consoleErrors.length;
+  // What each operation says about its credential: the note and the request snippet.
+  out.x_auth = root.byClass('sw-op').map(r => ({ k: r.byClass('pill')[0].textContent + ' ' + pathOf(r),
+    note: r.byClass('sw-auth').length ? r.byClass('sw-auth')[0].lastChild.textContent : null,
+    curl: r.byTag('pre').length ? r.byTag('pre')[0].textContent : '' }));
+  out.x_chips = root.byClass('chip').map(c => c.textContent);
   console.log(JSON.stringify(out));
 })().catch(e => { console.log(JSON.stringify({ crash: String(e && e.stack || e) })); process.exit(1); });
 """
@@ -762,6 +767,44 @@ def main():
           "a GET snippet carries -g and no body: %r" % out["r_get_curl"])
     check(out["r_post_curl"].startswith("curl -s -g -X POST") and "Content-Type: application/json" in out["r_post_curl"] and "-d '{}'" in out["r_post_curl"],
           "a POST snippet carries -g, a JSON content type and a body placeholder: %r" % out["r_post_curl"])
+    # The credential each operation shows. The expected lines are derived here from the document's
+    # own `security` (the top-level default, replaced by an operation's own key), through a fixed
+    # table, not by the page's logic. A route that takes only the session cookie, or an upload
+    # credential, must not be shown with a Bearer example, and a public route with none.
+    cred_lines = {
+        "bearerAuth": '-H "Authorization: Bearer $YUZU_TOKEN"',
+        "apiKeyHeader": '-H "X-Yuzu-Token: $YUZU_TOKEN"',
+        "cookieAuth": '-b "yuzu_session=$YUZU_SESSION"',
+        "uploadGrantAuth": '-H "X-Yuzu-Upload-Grant: $YUZU_UPLOAD_GRANT"',
+        "uploadSessionAuth": '-H "X-Yuzu-Upload-Session: $YUZU_UPLOAD_SESSION"',
+    }
+    shown = {a["k"]: a for a in out["x_auth"]}
+    own_keys = 0
+    for path, path_item in real["paths"].items():
+        for method in ("get", "post", "put", "patch", "delete"):
+            op = path_item.get(method)
+            if not isinstance(op, dict):
+                continue
+            key = method.upper() + " " + path
+            own_keys += 1 if "security" in op else 0
+            sec = op["security"] if "security" in op else real.get("security", [])
+            ways = [list(entry) for entry in sec if entry]
+            unknown = [n for w in ways for n in w if n not in cred_lines]
+            check(not unknown, "%s uses a scheme this test does not know (add it to cred_lines): %r" % (key, unknown))
+            if unknown or key not in shown:
+                check(key in shown, "no rendered row for %s" % key)
+                continue
+            want = sorted(cred_lines[n] for n in (ways[0] if ways else []))
+            got = sorted(line.strip().rstrip("\\").strip() for line in shown[key]["curl"].split("\n")
+                         if line.strip().startswith(("-H \"Authorization", "-H \"X-Yuzu", "-b ")))
+            check(got == want, "%s request snippet credentials: want %r, got %r" % (key, want, got))
+            check(shown[key]["note"] is not None and (("Send " in shown[key]["note"]) == bool(ways)),
+                  "%s credential note: %r" % (key, shown[key]["note"]))
+    check(own_keys >= 11, "expected the nine single-credential routes and the public ones to carry their own security: %r" % own_keys)
+    check(any(c == "AuthBearer token, or X-Yuzu-Token header, or yuzu_session cookie" for c in out["x_chips"]),
+          "the Auth chip must come from the document's default security: %r" % out["x_chips"])
+    check(any(c == "Own credentials%d" % own_keys for c in out["x_chips"]),
+          "the Own credentials chip must count the operations that carry their own security: %r" % out["x_chips"])
     # The expected pill counts are derived here, in Python, from the document, not by the
     # page's own predicate.
     py = {"typed": 0, "untyped": 0, "unavail": 0}
