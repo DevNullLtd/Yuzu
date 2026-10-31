@@ -161,6 +161,19 @@ TEST_CASE("execute: the AdminOrApproval gate admits an administrator and refuses
     }
 }
 
+TEST_CASE("execute: an unwired dispatch is refused BEFORE the 'requested' audit row is written",
+          "[instruction_execute]") {
+    Rig r;
+    r.defs["d"] = make_def("d");
+    auto p = r.ports();
+    p.dispatch = nullptr;
+    auto out = run(r.request("d", json::object(), make_caller("u", true)), p, r.audit());
+    REQUIRE(as_refusal(out));
+    CHECK(as_refusal(out)->kind == RefusalKind::kMisconfigured);
+    CHECK(r.audits.empty()); // no evidence row for a call that could never have run
+    CHECK(r.rows.empty());
+}
+
 TEST_CASE("execute: tolerate_approval_required admits ONLY the approval-required denial",
           "[instruction_execute][security]") {
     Rig r;
@@ -869,6 +882,19 @@ TEST_CASE("REST execute: 200 envelope, gate pair, audit rows", "[instruction_exe
     CHECK(r.core.audits[0].result == "requested");
     CHECK(r.core.audits[1].result == "success");
     CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+}
+
+TEST_CASE("REST execute: a chokepoint denial names the definition's plugin.action in its text",
+          "[instruction_execute][rest]") {
+    RouteRig r;
+    r.core.defs["g"] = make_def("g", "gated");
+    r.caller = make_caller("bob", /*admin=*/false);
+    auto res = r.post("g", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    const auto j = json::parse(res->body);
+    CHECK(j["error"]["reason"] == "approval_required");
+    CHECK(j["error"]["message"].get<std::string>().find("testplug.gated") != std::string::npos);
 }
 
 TEST_CASE("REST execute: a denied gate runs nothing", "[instruction_execute][rest][security]") {

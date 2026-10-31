@@ -62,7 +62,7 @@ void send_refusal(httplib::Response& res, const Refusal& r) {
         break;
     case RefusalKind::kDispatchDenied: {
         const auto& d = *r.denial;
-        const auto text = describe_dispatch_denial(d.reason, "", "", d, DenialSurface::kRest);
+        const auto text = describe_dispatch_denial(d.reason, r.plugin, r.action, d, DenialSurface::kRest);
         message = text.message;
         remediation = text.remediation;
         switch (text.cls) {

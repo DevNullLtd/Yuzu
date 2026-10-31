@@ -195,6 +195,10 @@ struct Refusal {
     std::optional<int> retry_after_ms;
     /// Engaged for kDispatchDenied.
     std::optional<detail::DispatchDenial> denial;
+    /// The definition's pair, set with `denial`: the denial text names it ("approval required
+    /// for testplug.gated"), so the renderers must not pass empty strings.
+    std::string plugin;
+    std::string action;
 };
 
 struct PendingApproval {

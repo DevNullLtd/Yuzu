@@ -107,7 +107,7 @@ Rendered render_refusal(const Refusal& r, bool audit_dropped, const std::string&
         break;
     case RefusalKind::kDispatchDenied: {
         const auto& d = *r.denial;
-        const auto text = describe_dispatch_denial(d.reason, "", "", d, DenialSurface::kMcp);
+        const auto text = describe_dispatch_denial(d.reason, r.plugin, r.action, d, DenialSurface::kMcp);
         message = text.message;
         remediation = text.remediation;
         switch (text.cls) {

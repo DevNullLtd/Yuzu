@@ -44060,6 +44060,22 @@ TEST_CASE("MCP execute_instruction_definition: unwired ports fail closed",
     CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
 }
 
+TEST_CASE("MCP execute_instruction_definition: a chokepoint denial names the definition's plugin.action",
+          "[mcp][integration][execute][idef]") {
+    McpTestServer ts;
+    Rig rig;
+    rig.defs["g"] = yuzu::test::instr_exec::make_def("g", "gated"); // AdminOrApproval pair
+    idef_start(ts, rig, "operator", /*admin=*/false);
+    auto res = ts.call(idef_call({{"definition_id", "g"}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["data"]["reason"] == "approval_required");
+    CHECK(body["error"]["message"].get<std::string>().find("testplug.gated") != std::string::npos);
+    CHECK(rig.calls.empty());
+}
+
 TEST_CASE("MCP execute_instruction_definition: an unknown definition is -32602 and dispatches nothing",
           "[mcp][integration][execute][idef]") {
     McpTestServer ts;

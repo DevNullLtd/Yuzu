@@ -135,6 +135,8 @@ PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& a
             c.audit("denied", "reason=" + reason + " definition=" + def_token);
             Refusal r = make_refusal(RefusalKind::kDispatchDenied, reason, {});
             r.denial = denial;
+            r.plugin = def.plugin;
+            r.action = def.action;
             return refuse(c, std::move(r));
         }
     }
@@ -388,6 +390,12 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
     const InstructionDefinition& def = plan.def;
     const std::string def_token = ::yuzu::log_token(rq.definition_id);
 
+    if (!p.dispatch) {
+        return Outcome{make_refusal(RefusalKind::kMisconfigured, "dispatch_unconfigured",
+                                    "command dispatch unavailable", "retry shortly", kRetryAfterMs),
+                       c.audit_dropped};
+    }
+
     // 7. Audit BEFORE the side effect, fail closed (house v1 dispatch pattern).
     if (!safe_audit(c.hook, "requested",
                     "definition=" + def_token + " " + ident_pair(def) +
@@ -397,11 +405,6 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
                                     "audit subsystem unavailable: refusing to dispatch without "
                                     "durable evidence",
                                     "retry the request", kRetryAfterMs),
-                       c.audit_dropped};
-    }
-    if (!p.dispatch) {
-        return Outcome{make_refusal(RefusalKind::kMisconfigured, "dispatch_unconfigured",
-                                    "command dispatch unavailable", "retry shortly", kRetryAfterMs),
                        c.audit_dropped};
     }
 
