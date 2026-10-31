@@ -70,7 +70,8 @@ class ManagementGroupStore; // forward declaration
 /// cannot be answered. They are a CONTRACT with `authz::ceiling_degrade_reason`
 /// (authz_gates.cpp), which maps a failed ceiling read to a `yuzu_server_rbac_read_degrade_total`
 /// reason label by matching these prefixes: every producer and that mapping use these
-/// constants, never a re-typed literal. A failed query is `"query failed: "` followed by the
+/// constants, never a re-typed literal. (`kRbacErrMgmtGroupReadDegraded` below is the one
+/// exception: that mapping never sees it.) A failed query is `"query failed: "` followed by the
 /// libpq message and has no constant (it is the label mapping's fallthrough).
 inline constexpr std::string_view kRbacErrStoreNotOpen = "rbac store not open";
 inline constexpr std::string_view kRbacErrPoolAcquireTimeout = "pool acquire timeout";
@@ -79,6 +80,14 @@ inline constexpr std::string_view kRbacErrCircuitBreakerOpen = "circuit breaker 
 /// cached-disabled view), so no grant read was attempted.
 inline constexpr std::string_view kRbacErrEnforcementUnconfirmed =
     "rbac enforcement state unconfirmed";
+/// `check_scoped_permission_checked` (#3739): the scoped decision needed the management-group
+/// store (`get_assignments_for_principal` via `resolve_perm_groups`, `get_agent_groups`,
+/// `get_ancestor_ids`) and that read degraded (ADR-0042). The exact reason (`store_not_open` /
+/// `pool_acquire_timeout` / `query_error`) is carried by
+/// `yuzu_server_mgmt_group_read_degrade_total{reason}`, not by this text. NOT consumed by
+/// `authz::ceiling_degrade_reason` (the ceiling path never reaches the scoped check); its only
+/// consumer is the audit-source label in `AuthRoutes::require_scoped_permission`.
+inline constexpr std::string_view kRbacErrMgmtGroupReadDegraded = "management group read degraded";
 
 struct RbacRole {
     std::string name;
@@ -676,10 +685,25 @@ public:
                              const std::string& operation) const;
 
     /// Scoped permission check: first tries global, then checks group-scoped
-    /// roles. FAIL-CLOSED: false on any store error.
+    /// roles. FAIL-CLOSED: false on any store error. Boolean compatibility wrapper over
+    /// `check_scoped_permission_checked` (`value_or(false)`), like `check_permission`.
     bool check_scoped_permission(const std::string& username, const std::string& securable_type,
                                  const std::string& operation, const std::string& agent_id,
                                  const ManagementGroupStore* mgmt_store) const;
+
+    /// The same decision with a degrade-driven denial told apart from a definitive one (#3739):
+    /// `true` = granted, `false` = definitively denied (no grant among the reads that completed,
+    /// an explicit deny-group hit, an empty reachable set, or no mgmt store / agent id wired AND
+    /// no earlier read failed), `unexpected(msg)` = the answer is a deny BECAUSE a read failed.
+    /// `msg` is `kRbacErrMgmtGroupReadDegraded` when the FIRST failed read belonged to the
+    /// management-group store (the assignments, member or ancestor reads), otherwise the
+    /// RBAC-side error text (`kRbacErr*` or `"query failed: ..."`). An ALLOW and an explicit
+    /// deny-group hit are returned as such even if an earlier read degraded. The decision itself
+    /// is identical to the Boolean wrapper's.
+    [[nodiscard]] std::expected<bool, std::string>
+    check_scoped_permission_checked(const std::string& username, const std::string& securable_type,
+                                    const std::string& operation, const std::string& agent_id,
+                                    const ManagementGroupStore* mgmt_store) const;
 
     // ── ADR-0017 admit-then-filter list gate ─────────────────────────────
     /// The single chokepoint for list/fan-out reads of per-agent data under
