@@ -25308,8 +25308,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 const auto failed_only = param_bool_strict(args, "failed_only", false);
                 if (!failed_only) {
-                    res.set_content(error_response(id, kInvalidParams,
-                                                   "failed_only must be a boolean"),
+                    res.set_content(error_response(id, kInvalidParams, "failed_only must be a boolean"), // retry-hint-exempt: input-parse failure, not a store fault
                                     "application/json");
                     return;
                 }
