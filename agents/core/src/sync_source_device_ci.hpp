@@ -19,9 +19,17 @@
 
 #include <yuzu/plugin.h> // YuzuPluginDescriptor (C ABI) — typedef, so include not fwd-decl
 
+#include <cstddef>
 #include <string>
 
 namespace yuzu::agent {
+
+/// The device-CI blob ceiling: 96 KiB (98,304 bytes). MUST equal the server's
+/// `yuzu::server::kDeviceCiMaxBlobBytes` (server/core/src/device_ci_kinds.hpp). The two binaries
+/// share no header, so each side's test pins its own constant to the literal 98304
+/// (tests/unit/test_device_ci_sync.cpp here). The derivation and the sender trim contract are
+/// recorded at the server constant and in ADR-0016 update "device_ci blob v2".
+inline constexpr std::size_t kDeviceCiMaxBlobBytes = 96u * 1024;
 
 /// One device-CI record — the canonical, ordered field set. The canonical blob is
 /// these fields in THIS exact order (positional), 0x1F-separated and 0x1E-terminated
