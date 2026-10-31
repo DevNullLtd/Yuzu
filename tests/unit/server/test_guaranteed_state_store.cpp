@@ -3799,6 +3799,8 @@ TEST_CASE("GuaranteedStateStore: an abandoned census savepoint stores nothing, i
     cap.stop();
 
     CHECK(r.outcome == EventInsertOutcome::Error);
+    // The caller reports the failure and does not go on to commit.
+    CHECK(r.error.find("census savepoint failed") != std::string::npos);
     CHECK(store.events_ingest_errors_total() == 1);
     CHECK(store.census_proj_failures_total() == 0);
     // Nothing of the abandoned transaction was committed: not the event, not the census row.
@@ -3806,8 +3808,18 @@ TEST_CASE("GuaranteedStateStore: an abandoned census savepoint stores nothing, i
                                  "guaranteed_state_events") == "1");
     CHECK(census_state(db.dsn(), "agent-A", "r1") == "compliant");
     // The census error that started it is logged with the event, agent and rule.
+    CHECK(cap.text().find("census write abandoned") != std::string::npos);
     CHECK(cap.text().find("savepoint could not be rolled back and released") !=
           std::string::npos);
+    // ... and so is the error of the census statement itself, not only the control statement's:
+    // the line ends in the libpq text, whatever its wording on this libpq version.
+    {
+        const std::string log = cap.text();
+        const std::string tail_key = "rule_id=r1: ";
+        const auto at = log.find(tail_key);
+        REQUIRE(at != std::string::npos);
+        CHECK(log.size() > at + tail_key.size());
+    }
     CHECK(cap.text().find("event_id=e2") != std::string::npos);
     CHECK(cap.text().find("rule_id=r1") != std::string::npos);
 
@@ -3942,11 +3954,20 @@ TEST_CASE("GuaranteedStateStore: the documented remedy reopens a database with a
     }
     exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
                        "DROP CONSTRAINT guardian_agent_rule_status_rule_fk");
-    exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
-                       "ADD CONSTRAINT guardian_agent_rule_status_rule_fk "
-                       "FOREIGN KEY (rule_id) REFERENCES "
-                       "guaranteed_state_store.guaranteed_state_rules(rule_id) "
-                       "ON DELETE CASCADE DEFERRABLE");
+    SECTION("a deferrable key") {
+        exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                           "ADD CONSTRAINT guardian_agent_rule_status_rule_fk "
+                           "FOREIGN KEY (rule_id) REFERENCES "
+                           "guaranteed_state_store.guaranteed_state_rules(rule_id) "
+                           "ON DELETE CASCADE DEFERRABLE");
+    }
+    SECTION("a key on the wrong column") {
+        exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                           "ADD CONSTRAINT guardian_agent_rule_status_rule_fk "
+                           "FOREIGN KEY (agent_id) REFERENCES "
+                           "guaranteed_state_store.guaranteed_state_rules(rule_id) "
+                           "ON DELETE CASCADE");
+    }
     {
         PgPool pool{{.conninfo = db.dsn(), .size = 2}};
         GuaranteedStateStore store(pool);
@@ -3962,6 +3983,9 @@ TEST_CASE("GuaranteedStateStore: the documented remedy reopens a database with a
     REQUIRE(store.is_open());
     CHECK(query_scalar(db.dsn(), "SELECT condeferrable FROM pg_constraint WHERE conname = "
                                  "'guardian_agent_rule_status_rule_fk'") == "f");
+    CHECK(query_scalar(db.dsn(), "SELECT a.attname FROM pg_constraint c JOIN pg_attribute a ON "
+                                 "a.attrelid = c.conrelid AND a.attnum = c.conkey[1] WHERE "
+                                 "c.conname = 'guardian_agent_rule_status_rule_fk'") == "rule_id");
 }
 
 TEST_CASE("GuaranteedStateStore: columns a later schema version adds do not stop the store opening",

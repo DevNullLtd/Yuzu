@@ -465,7 +465,9 @@ const std::vector<pg::PgMigration>& migrations() {
 // only key checked, by its shape: cascade, not deferrable, on rule_id in both tables. A check
 // of the other columns would refuse a later schema version that adds columns to the same
 // tables. Returns an empty string when the key is present, else the cause, for the boot
-// error. Any query failure is a cause too.
+// error. Any query failure is a cause too. The refusal's remedy resets the version row to 2 so
+// that migration v3 runs again; a later migration must therefore be safe to run again, or the
+// remedy must be revisited with it.
 std::string census_schema_defect(PGconn* conn) {
     pg::PgResult res = pg::exec_params(
         conn,
@@ -1045,7 +1047,9 @@ enum class CensusOutcome {
 // Abandoned means a SAVEPOINT, ROLLBACK TO or RELEASE statement itself failed, so the
 // transaction may be aborted and the caller must return an error without committing (a
 // COMMIT of an aborted transaction reports success to libpq).
-// A Failed outcome is counted on `failures` and logged at error. A Rejected outcome is not
+// An Abandoned outcome after a failed census statement is logged at error with that
+// statement's error (it is not counted on `failures`; the caller's error is counted as an
+// ingest error). A Failed outcome is counted on `failures` and logged at error. A Rejected outcome is not
 // counted and is logged at debug only; the database server still records the refused
 // statement in its own log. The count moves before the caller's COMMIT, so a COMMIT that
 // then fails leaves it one ahead of the events actually stored.
@@ -1080,9 +1084,9 @@ enum class CensusOutcome {
         !control("RELEASE SAVEPOINT census_upsert")) {
         // The caller reports only the control statement's own libpq text, so record the census
         // error that started this here or it is lost.
-        spdlog::error("GuaranteedStateStore: census upsert failed and its savepoint could not be "
-                      "rolled back and released, transaction abandoned event_id={} agent_id={} "
-                      "rule_id={}: {}",
+        spdlog::error("GuaranteedStateStore: census write abandoned, the census statement failed "
+                      "and its savepoint could not be rolled back and released, the event is "
+                      "not stored event_id={} agent_id={} rule_id={}: {}",
                       log_id_token(row.event_id), log_id_token(row.agent_id),
                       log_id_token(row.rule_id), ::yuzu::log_key_token(err));
         return CensusOutcome::Abandoned;
