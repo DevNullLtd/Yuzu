@@ -420,4 +420,59 @@ inline bool wait_for_pg_lock_waiter(const std::string& dsn, const std::string& l
     return false;
 }
 
+/// #3808: drive the REAL "concurrent MFA disable lands inside an enroll-verify's
+/// load -> guarded-UPDATE window" race, deterministically and without a test hook.
+///
+///   1. A dedicated session opens a txn and takes `SELECT ... FOR UPDATE` on the
+///      user's row. Plain reads are not blocked by it, so the victim still loads
+///      and decrypts the provisional secret and TOTP-verifies normally.
+///   2. `victim` runs on its own thread; its guarded enrolment UPDATE
+///      (`UPDATE auth.users SET mfa_enrolled_at = now() ...`) queues on that lock.
+///   3. Once `wait_for_pg_lock_waiter` confirms the UPDATE really is queued, the
+///      holder runs `interfering_sql` (each statement bound to `username` as $1) in
+///      the SAME txn and COMMITs — what a committed `mfa_disable` (or a disable +
+///      re-init) does to the row.
+///   4. Under READ COMMITTED the released UPDATE re-evaluates its WHERE against the
+///      committed row, matches 0 rows and enters the classifier under test.
+///
+/// Returns true iff the victim's UPDATE was observed queued. On false the victim is
+/// still released (nothing hangs) but its result is not the race under test, so the
+/// caller must REQUIRE the return value before asserting on it. If the holder
+/// session cannot be opened the victim is NOT run and false is returned.
+/// `victim` must capture its own result by reference; `interfering_sql` are
+/// test-authored literals, never input.
+template <class Victim>
+[[nodiscard]] inline bool run_enroll_verify_race(const std::string& dsn,
+                                                 const std::string& username,
+                                                 const std::vector<std::string>& interfering_sql,
+                                                 Victim&& victim) {
+    using yuzu::server::pg::PgConn;
+    using yuzu::server::pg::PgResult;
+    PgConn holder{PQconnectdb(dsn.c_str())};
+    if (PQstatus(holder.get()) != CONNECTION_OK)
+        return false;
+    const char* params[] = {username.c_str()};
+    auto exec1 = [&](const char* sql) {
+        PgResult r{PQexecParams(holder.get(), sql, 1, nullptr, params, nullptr, nullptr, 0)};
+        return r.status() == PGRES_COMMAND_OK || r.status() == PGRES_TUPLES_OK;
+    };
+    {
+        PgResult b{PQexec(holder.get(), "BEGIN")};
+        if (b.status() != PGRES_COMMAND_OK)
+            return false;
+    }
+    if (!exec1("SELECT 1 FROM auth.users WHERE username = $1 FOR UPDATE")) {
+        PgResult rb{PQexec(holder.get(), "ROLLBACK")};
+        return false;
+    }
+    std::thread t([&] { victim(); });
+    const bool queued = wait_for_pg_lock_waiter(dsn, "UPDATE auth.users SET mfa_enrolled_at%");
+    bool interfered = true;
+    for (const auto& sql : interfering_sql)
+        interfered = exec1(sql.c_str()) && interfered;
+    PgResult c{PQexec(holder.get(), "COMMIT")};
+    t.join();
+    return queued && interfered && c.status() == PGRES_COMMAND_OK;
+}
+
 } // namespace yuzu::test

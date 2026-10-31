@@ -6873,10 +6873,24 @@ void SettingsRoutes::register_routes(
                       // does not inflate bad-code-attempt counts (#3777, CC7.2),
                       // and tell the operator the true state rather than "code
                       // rejected". `MfaAlreadyEnrolled` is not in
-                      // is_store_unavailable(), so no false 503/degrade path. (A
-                      // bare disable+re-init without a subsequent winning verify
-                      // leaves mfa_enrolled_at NULL, so it does NOT reach here — it
-                      // stays fail-closed WriteFailed.)
+                      // is_store_unavailable(), so no false 503/degrade path.
+                      if (codes_res.error() == AuthDBError::MfaEnrollmentCancelled) {
+                          // A concurrent disable (or disable+re-init) replaced the
+                          // provisional secret this code was verified against (#3808).
+                          // Benign and nothing was enrolled: audit it as its own
+                          // outcome (not mfa.enroll.failed, not a store outage —
+                          // MfaEnrollmentCancelled is outside is_store_unavailable(),
+                          // so no degrade counter) and tell the operator to restart.
+                          audit_fn_(req, "mfa.enroll.cancelled", "ok", "User", session->username,
+                                    "provisional enrollment cancelled or replaced by a "
+                                    "concurrent disable; nothing enrolled");
+                          res.set_content(
+                              render_mfa_fragment(*session, {}, {}, {}, session->username,
+                                                  "Enrollment was cancelled or replaced. Start "
+                                                  "enrollment again."),
+                              "text/html; charset=utf-8");
+                          return;
+                      }
                       if (codes_res.error() == AuthDBError::MfaAlreadyEnrolled) {
                           audit_fn_(req, "mfa.enroll.race", "ok", "User", session->username,
                                     "already enrolled by a concurrent verify; no duplicate "

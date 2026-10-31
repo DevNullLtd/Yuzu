@@ -1118,6 +1118,58 @@ TEST_CASE("POST /login/mfa/enroll for an already-enrolled account audits mfa.enr
     CHECK(h.count_audits("mfa.enroll.failed", "alice") == 0);
 }
 
+TEST_CASE("POST /login/mfa/enroll answers 409 and audits mfa.enroll.cancelled when a concurrent "
+          "disable lands mid-verify, not a 503 store outage (#3808)",
+          "[pg][mfa][enroll][routes][auth_routes]") {
+    // The REAL race, not a simulation: a committed MFA disable lands between this verify's
+    // secret load and its guarded UPDATE (run_enroll_verify_race queues the UPDATE behind a row
+    // lock, commits the disable, and releases it). The store grades that
+    // MfaEnrollmentCancelled; before #3808 it was WriteFailed, which is_store_unavailable()
+    // routed to a false 503 + yuzu_auth_secret_unavailable_total + a kCritical audit.
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto step1 =
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    const std::string pending = body.at("mfa_pending_token");
+    const std::string secret = body.at("secret_base32");
+    const std::string code = h.totp_at(secret, 0);
+    const auto enroll_body = form({{"mfa_pending_token", pending}, {"code", code}});
+
+    decltype(h.sink.Post("/login/mfa/enroll", enroll_body, "application/x-www-form-urlencoded"))
+        step2;
+    REQUIRE(yuzu::test::run_enroll_verify_race(
+        h.auth_db.dsn(), "alice",
+        {"UPDATE auth.users SET mfa_totp_secret = NULL, mfa_enrolled_at = NULL WHERE "
+         "username = $1"},
+        [&] {
+            step2 = h.sink.Post("/login/mfa/enroll", enroll_body,
+                                "application/x-www-form-urlencoded");
+        }));
+
+    REQUIRE(step2);
+    CHECK(step2->status == 409);                           // not 503, not 401 "wrong code"
+    CHECK(step2->body.find("cancelled") != std::string::npos);
+    CHECK(step2->get_header_value("Set-Cookie").empty()); // no session minted
+    // Audited as its own benign outcome — not a rejected code, not the already-enrolled race,
+    // and not the store-unavailable failure.
+    CHECK(h.count_audits("mfa.enroll.cancelled", "alice") >= 1);
+    CHECK(h.count_audits("mfa.enroll.failed", "alice") == 0);
+    CHECK(h.count_audits("mfa.enroll.race", "alice") == 0);
+    // Nothing was enrolled (the account really is un-enrolled after the disable).
+    auto status = h.auth_db->mfa_status("alice");
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->enrolled);
+
+    // The pending token was spent: its provisional secret is gone, so a retry cannot reuse it.
+    auto retry = h.sink.Post("/login/mfa/enroll", enroll_body, "application/x-www-form-urlencoded");
+    REQUIRE(retry);
+    CHECK(retry->status == 401);
+    CHECK(retry->get_header_value("Set-Cookie").empty());
+}
+
 TEST_CASE("POST /login under mfa_enforcement=admin-only: admin enrolls, regular user logs in "
           "normally",
           "[pg][mfa][enroll][routes][auth_routes]") {

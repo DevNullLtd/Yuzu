@@ -580,6 +580,7 @@ Every transition writes to `AuditStore` via `AuthRoutes::audit_log`
 | `mfa.enroll.verified` | `POST /api/settings/mfa/verify` or `POST /login/mfa/enroll`: first code accepted. A Settings confirm also stamps a step-up proof on the confirming session; the detail is `step_up_proof=stamped`, or `step_up_proof=not_stamped` when the session could not be stamped (bearer principal, absent or mismatched cookie, or a store failure) |
 | `mfa.enroll.failed` | First code rejected (Settings or login bootstrap); or, detail `credential_changed` (#5342 F4), an enrolment write — Settings init/verify, the `POST /login` bootstrap init, or `POST /login/mfa/enroll` — found the account's password changed since its credential anchor was established (nothing revealed, written or enrolled) |
 | `mfa.enroll.race` | Result `ok` — a concurrent verify already resolved enrollment; the benign loser, kept out of the `mfa.enroll.failed` bad-code population (#3777, CC7.2) |
+| `mfa.enroll.cancelled` | Result `ok` — a concurrent `mfa_disable` (or disable + re-init) replaced the provisional secret the first code was verified against, so nothing was enrolled (#3808). Benign: not a bad code (`mfa.enroll.failed`) and not a store outage (no 503, no `yuzu_auth_secret_unavailable_total`). `POST /login/mfa/enroll` answers 409 and the pending token is spent (sign in again); Settings shows "Enrollment was cancelled or replaced. Start enrollment again." |
 | `mfa.disabled` | `POST /api/settings/mfa/disable` (an `attempted` + `MFA clear requested via Settings` intent row first, written before the factor is touched and fail-closed: the route answers `503` and changes nothing if it is not accepted; then the outcome row: `ok` + `sessions_ended=<n>`; `ok` + `no verified factor to clear` when an unfinished enrolment was cancelled and no session ended; `partial` + `sessions_ended=failed` when the factor was cleared but its sessions were not ended; `error` + `disable failed (sessions_ended=<n>\|failed)` when the clear itself failed (its sessions are still ended); `error` + `blocked: mfa_enforcement=<mode>` when the self-target guard fires) |
 | `mfa.login.required` | `POST /login` returned a pending token |
 | `mfa.login.verified` | `POST /login/mfa` TOTP code accepted |
@@ -691,7 +692,12 @@ regress:
    destructive UPDATE clears both the secret and all recovery codes;
    any concurrent verify either sees the old state (and matches) or the
    new state (and fails). No half-disabled "secret cleared but
-   recovery codes still active" state.
+   recovery codes still active" state. An enroll-verify that loses this
+   race (its loaded secret is no longer the stored one) returns
+   `MfaEnrollmentCancelled` (#3808) — a benign business outcome outside
+   `is_store_unavailable()`, audited `mfa.enroll.cancelled` — never a
+   false store-outage 503. A password change outranks it
+   (`CredentialChanged`), since a reset also wipes the provisional secret.
 4. **`mfa_pending_` token TTL is enforced on every access** via
    `reap_mfa_pending_locked`. A 5-minute window between password
    success and TOTP submission is a credential-stuffing surface — keep

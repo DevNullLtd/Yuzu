@@ -2050,6 +2050,211 @@ TEST_CASE("AuthDB MFA: enrollment guard claims only the row whose stored secret 
     CHECK(run_guard(kSecretA) == 0);
 }
 
+// ── #3808: the 0-row classifier grades a lost enroll-verify race by its real cause ──
+//
+// When the guarded UPDATE above matches nothing, `mfa_verify_enrollment` runs ONE classify
+// SELECT and maps its four facts through the pure `detail::classify_enroll_verify_miss`.
+// The race itself (a disable landing between the secret load and the UPDATE) cannot be
+// interleaved deterministically, so this pins both halves separately: the precedence
+// ladder over every boolean combination, and the classify SELECT's facts against seeded rows
+// (mirroring the production statement -- a drift between the two is the thing to notice).
+// The point of the whole ladder: a benign concurrent cancel must NOT land on WriteFailed,
+// which `is_store_unavailable()` routes to a false 503 + degrade metric.
+TEST_CASE("AuthDB MFA: classify_enroll_verify_miss precedence covers every combination (#3808)",
+          "[auth_db][mfa]") {
+    using yuzu::server::AuthDBError;
+    using yuzu::server::detail::classify_enroll_verify_miss;
+    for (int bits = 0; bits < 16; ++bits) {
+        const bool active = (bits & 8) != 0;
+        const bool enrolled = (bits & 4) != 0;
+        const bool cred = (bits & 2) != 0;
+        const bool secret_differs = (bits & 1) != 0;
+        AuthDBError want = AuthDBError::WriteFailed; // inactive, or nothing explains the miss
+        if (active) {
+            if (enrolled)
+                want = AuthDBError::MfaAlreadyEnrolled;
+            else if (cred)
+                want = AuthDBError::CredentialChanged; // outranks a cancel: a reset wipes the secret
+            else if (secret_differs)
+                want = AuthDBError::MfaEnrollmentCancelled;
+        }
+        CAPTURE(bits);
+        CHECK(classify_enroll_verify_miss(active, enrolled, cred, secret_differs) == want);
+    }
+    // The new outcome is a business result, never a store outage.
+    CHECK_FALSE(yuzu::server::is_store_unavailable(AuthDBError::MfaEnrollmentCancelled));
+}
+
+TEST_CASE("AuthDB MFA: enroll-verify classify SELECT reports a disabled or rotated secret (#3808)",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("enrollclass", "anchorhash", "s", yuzu::server::auth::Role::user)
+                .has_value());
+
+    auto set_col = [&](const char* sql) {
+        const char* v[] = {"enrollclass"};
+        PgResult r{PQexecParams(h.conn.get(), sql, 1, nullptr, v, nullptr, nullptr, 0)};
+        REQUIRE(r.ok());
+    };
+    auto provisional = [&] {
+        set_col("UPDATE auth.users SET is_active = TRUE, mfa_enrolled_at = NULL, "
+                "mfa_totp_secret = decode('0011223344','hex') WHERE username = $1");
+    };
+    // The exact classify statement from mfa_verify_enrollment: $2 = credential anchor,
+    // $3 = hex of the secret that was loaded and verified.
+    struct Facts {
+        bool active, enrolled, cred_changed, secret_differs;
+    };
+    auto classify = [&](const char* anchor, const char* loaded_hex) -> Facts {
+        const char* v[] = {"enrollclass", anchor, loaded_hex};
+        PgResult r{PQexecParams(h.conn.get(),
+                                "SELECT is_active, (mfa_enrolled_at IS NOT NULL), "
+                                "(password_hash IS DISTINCT FROM $2), "
+                                "(mfa_totp_secret IS DISTINCT FROM decode($3, 'hex')) "
+                                "FROM auth.users WHERE username = $1",
+                                3, nullptr, v, nullptr, nullptr, 0)};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(r.get()) == 1);
+        auto b = [&](int c) { return std::string(PQgetvalue(r.get(), 0, c)) == "t"; };
+        return {b(0), b(1), b(2), b(3)};
+    };
+    const char* kLoadedA = "0011223344";
+
+    // Untouched provisional row: no fact set, so a miss would be unexplained (WriteFailed).
+    provisional();
+    auto f = classify("anchorhash", kLoadedA);
+    CHECK((f.active && !f.enrolled && !f.cred_changed && !f.secret_differs));
+
+    // Plain disable: mfa_disable NULLed the secret -> secret_differs (NULL IS DISTINCT FROM A).
+    provisional();
+    set_col("UPDATE auth.users SET mfa_totp_secret = NULL WHERE username = $1");
+    f = classify("anchorhash", kLoadedA);
+    CHECK((f.active && !f.enrolled && !f.cred_changed && f.secret_differs));
+
+    // Disable + re-init: a different provisional secret B -> secret_differs.
+    provisional();
+    set_col("UPDATE auth.users SET mfa_totp_secret = decode('aabbccddee','hex') WHERE username = $1");
+    f = classify("anchorhash", kLoadedA);
+    CHECK((f.active && !f.enrolled && !f.cred_changed && f.secret_differs));
+
+    // Password reset also wipes the secret: BOTH facts are set, and the ladder lets
+    // CredentialChanged win (covered by the precedence test above).
+    provisional();
+    set_col("UPDATE auth.users SET mfa_totp_secret = NULL, password_hash = 'newhash' WHERE username = $1");
+    f = classify("anchorhash", kLoadedA);
+    CHECK((f.active && !f.enrolled && f.cred_changed && f.secret_differs));
+
+    // Enrolled by a concurrent winner.
+    provisional();
+    set_col("UPDATE auth.users SET mfa_enrolled_at = now() WHERE username = $1");
+    f = classify("anchorhash", kLoadedA);
+    CHECK((f.active && f.enrolled));
+
+    // Deactivated: the ladder's first rung (WriteFailed) keys off this.
+    provisional();
+    set_col("UPDATE auth.users SET is_active = FALSE WHERE username = $1");
+    f = classify("anchorhash", kLoadedA);
+    CHECK_FALSE(f.active);
+}
+
+// ── #3808: the REAL race, through the real mfa_verify_enrollment ─────────────
+//
+// The two tests above pin the ladder and the classify SELECT's facts separately. This one
+// drives the actual production path: a committed `mfa_disable` (or disable + re-init) landing
+// BETWEEN the verify's secret load and its guarded UPDATE. `run_enroll_verify_race` holds a row
+// lock so the UPDATE queues, rendezvouses on pg_stat_activity (no sleeps), commits the
+// interference, and the released UPDATE re-evaluates its WHERE to 0 rows. The grade it gets
+// decides whether the operator sees a benign "cancelled" or a false store-outage 503.
+TEST_CASE("AuthDB MFA: a disable that lands inside enroll-verify is MfaEnrollmentCancelled, "
+          "not a store outage (#3808)",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+
+    struct Outcome {
+        std::optional<AuthDBError> error;
+        bool enrolled_after = true;
+    };
+    // Enrol `user` up to (but not through) the verify, race `interfering_sql` into the window,
+    // and report what the verify returned plus whether the row ended up enrolled.
+    auto race = [&](const std::string& user, const std::vector<std::string>& interfering_sql) {
+        REQUIRE(h.db.upsert_user(user, "pwhash", "s", yuzu::server::auth::Role::user).has_value());
+        auto init = h.db.mfa_init_enrollment(user, "Yuzu", std::nullopt);
+        REQUIRE(init.has_value());
+        auto raw = yuzu::server::mfa::base32_decode(init->secret_base32);
+        REQUIRE(raw.has_value());
+        const auto code = yuzu::server::mfa::generate(
+            std::string_view(reinterpret_cast<const char*>(raw->data()), raw->size()),
+            yuzu::server::mfa::current_counter(std::chrono::system_clock::now()));
+
+        Outcome out;
+        const bool queued = yuzu::test::run_enroll_verify_race(db.dsn(), user, interfering_sql, [&] {
+            auto r = h.db.mfa_verify_enrollment(user, code, std::nullopt);
+            if (!r.has_value())
+                out.error = r.error();
+            else
+                out.error.reset();
+        });
+        // The victim's UPDATE was really queued behind the lock, so the 0-row branch ran.
+        REQUIRE(queued);
+
+        const char* v[] = {user.c_str()};
+        PgResult e{PQexecParams(h.conn.get(),
+                                "SELECT (mfa_enrolled_at IS NOT NULL) FROM auth.users WHERE "
+                                "username = $1",
+                                1, nullptr, v, nullptr, nullptr, 0)};
+        REQUIRE(e.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(e.get()) == 1);
+        out.enrolled_after = std::string(PQgetvalue(e.get(), 0, 0)) == "t";
+        return out;
+    };
+
+    // What mfa_disable does to the row: secret and enrolled_at both NULL.
+    const std::string kDisable =
+        "UPDATE auth.users SET mfa_totp_secret = NULL, mfa_enrolled_at = NULL WHERE username = $1";
+
+    SECTION("plain disable -> cancelled, nothing enrolled, not a store outage") {
+        auto o = race("raceplain", {kDisable});
+        REQUIRE(o.error.has_value());
+        CHECK(*o.error == AuthDBError::MfaEnrollmentCancelled);
+        CHECK_FALSE(yuzu::server::is_store_unavailable(*o.error));
+        CHECK_FALSE(o.enrolled_after);
+    }
+
+    SECTION("disable + re-init to a DIFFERENT secret -> cancelled, never enrolled over it") {
+        auto o = race("racerotated",
+                      {"UPDATE auth.users SET mfa_totp_secret = decode('aabbccddee','hex'), "
+                       "mfa_enrolled_at = NULL WHERE username = $1"});
+        REQUIRE(o.error.has_value());
+        CHECK(*o.error == AuthDBError::MfaEnrollmentCancelled);
+        CHECK_FALSE(yuzu::server::is_store_unavailable(*o.error));
+        // The #3781 guarantee: the account is NOT enrolled against a secret whose code was
+        // never verified.
+        CHECK_FALSE(o.enrolled_after);
+    }
+
+    SECTION("a password change in the same window outranks the cancel") {
+        // A reset also wipes the provisional secret, so BOTH facts are true; the uniform-401
+        // CredentialChanged refusal must win.
+        auto o = race("racecred",
+                      {kDisable, "UPDATE auth.users SET password_hash = 'changedhash' WHERE "
+                                 "username = $1"});
+        REQUIRE(o.error.has_value());
+        CHECK(*o.error == AuthDBError::CredentialChanged);
+        CHECK_FALSE(o.enrolled_after);
+    }
+
+    SECTION("an interference that changes nothing keeps the victim's success (control)") {
+        // Same lock-and-release dance with a no-op "interference": the guard must still let a
+        // legitimate verify through, proving the cancel above comes from the row change and not
+        // from the lock choreography itself.
+        auto o = race("racecontrol", {"UPDATE auth.users SET updated_at = now() WHERE username = $1"});
+        CHECK_FALSE(o.error.has_value());
+        CHECK(o.enrolled_after);
+    }
+}
+
 // ── #3762: the enrollment guard must NOT wedge a legitimate re-enroll ───────
 //
 // The `mfa_enrolled_at IS NULL` guard is safe against blocking a post-disable
