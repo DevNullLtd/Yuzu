@@ -126,6 +126,22 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
             return;
         }
 
+        // An unwired audit sink fails CLOSED: this route is audit-first (the `requested` row is
+        // written before any effect), so a deployment with no sink cannot be treated as "audit
+        // off". Behind the gate (an unauthorised caller learns nothing about the configuration)
+        // and before any body work, store read or dispatch. No retry hint: an unwired sink is a
+        // server defect, not a transient fault.
+        if (!deps.audit_fn) {
+            res.status = 503;
+            res.set_header("Sec-Audit-Failed", "true");
+            res.set_content(error_body(res, 503, "audit subsystem not configured; nothing was sent",
+                                       "audit_unavailable", std::nullopt,
+                                       "the server has no audit sink wired; this is a server "
+                                       "configuration defect and retrying will not help"),
+                            "application/json");
+            return;
+        }
+
         // #2437-class guard: raw-text depth check BEFORE parse, so a pathologically nested
         // `params` cannot crash the dump below.
         if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
@@ -160,7 +176,7 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
         const std::string definition_id = rq.definition_id;
         const AuditHook audit = [&](std::string_view result, const std::string& detail_text) {
             if (!deps.audit_fn)
-                return true;
+                return false; // unreachable past the guard above; never "audit off"
             return deps.audit_fn(req, std::string(kAuditAction), std::string(result),
                                  "instruction", definition_id, detail_text);
         };

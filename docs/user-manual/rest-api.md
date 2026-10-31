@@ -3698,7 +3698,7 @@ Omitting **both** `agent_ids` and `scope` targets every connected agent. Supplyi
 
 **`approval_mode`.** `auto` dispatches. `always`, any unrecognised value, and `role-gated` for a caller who is not an effective administrator answer **`202`** and dispatch nothing. `role-gated` lets an administrator (including an active JIT elevation) through. A non-auto definition with no approval manager is `503` `approval_unavailable`. **Per-principal cap.** A caller who already holds 25 pending approvals (the same limit the MCP `execute_instruction_definition` tool and the MCP approval-ticket mint apply, one shared constant) is refused with **`429`** `approval_cap_reached` before any approval is created; `retry_after_ms` is `null` because only a reviewer handling the pending requests, or their 7-day expiry, frees a slot, so a blind retry loop cannot succeed. Other principals are unaffected by one caller's count, and the refusal is audited (`instruction.execute` `denied`, detail `reason=approval_cap_reached`) and counted on `yuzu_server_approval_submit_refused_total{reason="approval_cap_reached"}`. The `202` ticket cannot be redeemed through the API: it is a request for an operator to review, not a token that releases this call, so re-send the request after the definition is changed or the approval is handled out of band.
 
-**Audit.** Action `instruction.execute`, target `instruction`/`{id}`: `denied` for a refusal, `pending` for a `202`, then `requested` written **before** dispatch, then `success` or `failure`. If the `requested` row cannot be stored the call is `503` `audit_unavailable` with `Sec-Audit-Failed: true` and **nothing is dispatched**. A later best-effort row that fails to store sets `Sec-Audit-Failed: true` on the response; the command already ran.
+**Audit.** Action `instruction.execute`, target `instruction`/`{id}`: `denied` for a refusal, `pending` for a `202`, then `requested` written **before** dispatch, then `success` or `failure`. If the `requested` row cannot be stored the call is `503` `audit_unavailable` with `Sec-Audit-Failed: true` and **nothing is dispatched**. A server with no audit sink wired answers the same `503` `audit_unavailable` (with `retry_after_ms: null`, a configuration defect) right after the permission check. A later best-effort row that fails to store sets `Sec-Audit-Failed: true` on the response; the command already ran.
 
 **Events.** As the legacy route does, a dispatch that reached at least one agent publishes the platform event `instruction.executed`, and a call that creates a pending approval (the `202`) publishes `approval.created`, once each, after the audit row (no attributes or payload; see [analytics-events.md](../analytics-events.md)). A refusal, a zero-reach and a dispatch that threw publish nothing, and a failed publish never changes the answer.
 
@@ -6823,7 +6823,9 @@ cannot be resolved is refused with a `503`; there is no fallback user.
 
 **Audit (fail closed).** Both write `execution.cancel` / `execution.rerun` rows. An `attempted` row
 is written **before** the change; if it cannot be saved the call answers `503` with
-`Sec-Audit-Failed: true` and changes nothing. The outcome then writes `success` (for rerun the target
+`Sec-Audit-Failed: true` and changes nothing. A server with no audit sink wired is treated the same
+way (`503`, `Sec-Audit-Failed: true`, no `retry_after_ms`: a configuration defect, not a transient
+fault), never as "audit off". The outcome then writes `success` (for rerun the target
 is the new record), `denied` (cancel `409`) or `failure` (`503`, or `500` when the change itself threw). If only the outcome row fails after
 the change was applied, the success response carries `Sec-Audit-Failed: true`.
 

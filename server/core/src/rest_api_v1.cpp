@@ -13009,6 +13009,22 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
+            if (!audit_fn) {
+                // An unwired audit sink is never "audit off": both mutations are audit-first, so
+                // the route refuses before any read or effect. No retry hint (a server defect).
+                spdlog::error("POST /api/v1/executions/{{id}}/cancel: audit_fn unwired; refusing; "
+                              "cid={}",
+                              cid);
+                res.status = 503;
+                res.set_header("Sec-Audit-Failed", "true");
+                res.set_content(
+                    detail::a4_error(res, "audit subsystem not configured; nothing was changed",
+                                     {.remediation = "the server has no audit sink wired; this is "
+                                                     "a server configuration defect and retrying "
+                                                     "will not help"}),
+                    "application/json");
+                return;
+            }
             auto session = auth_fn(req, res);
             if (!session)
                 return; // auth_fn wrote the 401.
@@ -13023,8 +13039,8 @@ void RestApiV1::register_routes(
                 execution_mutation_ports, mreq,
                 [&](const std::string& action, const std::string& result,
                     const std::string& target, const std::string& audit_detail) {
-                    // An unwired audit_fn is an audit-off deployment, not a failed write.
-                    return !audit_fn ||
+                    // Unwired is refused above; the false is defence in depth, never "audit off".
+                    return audit_fn &&
                            audit_fn(req, action, result, "execution", target, audit_detail);
                 },
                 bind_event_emit(emit_event_fn, req, metrics_registry));
@@ -13055,6 +13071,22 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, "execution tracker unavailable",
                                                  {.retry_after_ms = 5000}),
                                 "application/json");
+                return;
+            }
+            if (!audit_fn) {
+                // An unwired audit sink is never "audit off": both mutations are audit-first, so
+                // the route refuses before any read or effect. No retry hint (a server defect).
+                spdlog::error("POST /api/v1/executions/{{id}}/rerun: audit_fn unwired; refusing; "
+                              "cid={}",
+                              cid);
+                res.status = 503;
+                res.set_header("Sec-Audit-Failed", "true");
+                res.set_content(
+                    detail::a4_error(res, "audit subsystem not configured; nothing was changed",
+                                     {.remediation = "the server has no audit sink wired; this is "
+                                                     "a server configuration defect and retrying "
+                                                     "will not help"}),
+                    "application/json");
                 return;
             }
 
@@ -13104,8 +13136,8 @@ void RestApiV1::register_routes(
                 execution_mutation_ports, mreq,
                 [&](const std::string& action, const std::string& result,
                     const std::string& target, const std::string& audit_detail) {
-                    // An unwired audit_fn is an audit-off deployment, not a failed write.
-                    return !audit_fn ||
+                    // Unwired is refused above; the false is defence in depth, never "audit off".
+                    return audit_fn &&
                            audit_fn(req, action, result, "execution", target, audit_detail);
                 },
                 bind_event_emit(emit_event_fn, req, metrics_registry));

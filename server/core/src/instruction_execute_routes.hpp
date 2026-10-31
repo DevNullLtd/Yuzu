@@ -33,7 +33,9 @@
 /// AUDIT: action `instruction.execute`, target `instruction`/`<definition id>`, rows `denied`
 /// (refusals), `pending`, `requested` (fail closed: 503 + `Sec-Audit-Failed`, nothing
 /// dispatched), then `success` or `failure`. A best-effort row that fails to persist sets
-/// `Sec-Audit-Failed` on the response; the command already ran.
+/// `Sec-Audit-Failed` on the response; the command already ran. An UNWIRED `audit_fn` is not
+/// "audit off": it is a 503 `audit_unavailable` + `Sec-Audit-Failed` (no retry hint, a server
+/// defect) right after the gate, before any body work or dispatch.
 
 #include "instruction_execute.hpp"
 

@@ -1084,7 +1084,7 @@ struct RouteRig {
 
     // `pre` arranges the core fake BEFORE the routes are registered: which seams are wired is a
     // construction-time fact (everything else is read live through `core`).
-    explicit RouteRig(const std::function<void(Rig&)>& pre = {}) {
+    explicit RouteRig(const std::function<void(Rig&)>& pre = {}, bool audit_wired = true) {
         if (pre)
             pre(core);
         RouteDeps deps;
@@ -1097,17 +1097,19 @@ struct RouteRig {
             }
             return true;
         };
-        deps.audit_fn = [this](const httplib::Request&, const std::string& action,
-                               const std::string& result, const std::string& type,
-                               const std::string& id, const std::string& detail_text) {
-            ++audit_calls;
-            CHECK(action == "instruction.execute");
-            CHECK(type == "instruction");
-            core.audits.push_back({result, detail_text + " [id=" + id + "]"});
-            if (result == "requested")
-                return !core.audit_requested_fails;
-            return !core.audit_other_fails;
-        };
+        if (audit_wired) {
+            deps.audit_fn = [this](const httplib::Request&, const std::string& action,
+                                   const std::string& result, const std::string& type,
+                                   const std::string& id, const std::string& detail_text) {
+                ++audit_calls;
+                CHECK(action == "instruction.execute");
+                CHECK(type == "instruction");
+                core.audits.push_back({result, detail_text + " [id=" + id + "]"});
+                if (result == "requested")
+                    return !core.audit_requested_fails;
+                return !core.audit_other_fails;
+            };
+        }
         if (caller_wired)
             deps.caller_fn = [this](const httplib::Request&) { return caller; };
         deps.emit_event_fn = [this](const std::string& type, const httplib::Request&,
@@ -1436,6 +1438,24 @@ TEST_CASE("REST execute: a dropped best-effort audit sets Sec-Audit-Failed on a 
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("REST execute: an UNWIRED audit sink is a 503 with Sec-Audit-Failed, never audit-off",
+          "[instruction_execute][rest][audit][security]") {
+    RouteRig r({}, /*audit_wired=*/false);
+    r.core.real_dispatch = true;
+    r.core.defs["d"] = make_def("d");
+    auto res = r.post("d", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    const auto j = json::parse(res->body);
+    CHECK(j["error"]["reason"] == "audit_unavailable");
+    CHECK(j["error"]["retry_after_ms"].is_null()); // a server defect, not a transient fault
+    // Nothing was dispatched, no execution row was created, and the gate still ran first.
+    CHECK(r.core.drain().empty());
+    CHECK(r.audit_calls == 0);
+    CHECK(r.perm_calls.size() == 1);
 }
 
 TEST_CASE("REST execute: an unwired caller derivation fails closed on visibility",

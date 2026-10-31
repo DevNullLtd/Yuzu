@@ -708,7 +708,8 @@ struct RestHarness {
     bool emit_throws{false};
     RestApiV1 api;
 
-    explicit RestHarness(bool wire_ports = true, bool wire_fleet_read = true) {
+    explicit RestHarness(bool wire_ports = true, bool wire_fleet_read = true,
+                         bool wire_audit = true) {
         if (wire_ports)
             api.set_execution_mutation_ports_for_test(store.ports());
         if (emit_wired)
@@ -755,7 +756,8 @@ struct RestHarness {
             ++dispatch_calls;
             return ConfinedDispatchOutcome{};
         };
-        api.register_routes(sink, auth_fn, perm_fn, audit_fn,
+        api.register_routes(sink, auth_fn, perm_fn,
+                            wire_audit ? RestApiV1::AuditFn(audit_fn) : RestApiV1::AuditFn{},
                             /*rbac_store=*/nullptr,
                             /*mgmt_store=*/nullptr,
                             /*token_store=*/nullptr,
@@ -935,6 +937,26 @@ TEST_CASE("REST POST cancel/rerun: an attempted row that cannot be saved refuses
         CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
         CHECK(h.store.effects() == 0);
         CHECK(body_of(*res)["error"]["retry_after_ms"] == 5000);
+    }
+}
+
+TEST_CASE("REST POST cancel/rerun: an UNWIRED audit sink is refused with 503 and Sec-Audit-Failed, "
+          "never treated as audit-off",
+          "[rest][executions][mutation][security][2146]") {
+    for (const char* verb : {"cancel", "rerun"}) {
+        RestHarness h(/*wire_ports=*/true, /*wire_fleet_read=*/true, /*wire_audit=*/false);
+        h.store.exec = make_exec("alice", 1);
+        auto res = h.sink.Post(std::string("/api/v1/executions/exec-1/") + verb, "");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        // Refused before any read or effect, and nothing reached a device.
+        CHECK(h.store.exec_reads == 0);
+        CHECK(h.store.effects() == 0);
+        CHECK(h.dispatch_calls == 0);
+        CHECK(h.audit_rows.empty());
+        // A server defect, not a transient fault: no retry hint.
+        CHECK(body_of(*res)["error"]["retry_after_ms"].is_null());
     }
 }
 
