@@ -700,6 +700,7 @@ yuzu_server_core_lib = static_library(
     'src/instruction_routes.cpp',
     'src/execution_tracker.cpp',
     'src/execution_model.cpp',
+    'src/execution_mutation.cpp', # cancel/rerun REST v1 + MCP twins: one admit-audit-effect sequence
     'src/execution_routes.cpp',
     'src/health_routes.cpp',
     'src/healthcheck_probe.cpp', # #5906: yuzu-server --healthcheck transport

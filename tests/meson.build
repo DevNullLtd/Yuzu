@@ -1915,6 +1915,7 @@ if build_server
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',
       'unit/server/test_rest_executions_v1_twins.cpp',
+      'unit/server/test_execution_cancel_rerun_twins.cpp', # #2146 batch B: cancel/rerun REST v1 + shared sequence, no Postgres
       'unit/server/test_rest_responses_v1_twins.cpp', # #2146 A2-R2: GET /api/v1/responses{,/aggregate,/export}
       'unit/server/test_response_templates_engine.cpp',
       'unit/server/test_rest_response_templates.cpp',
