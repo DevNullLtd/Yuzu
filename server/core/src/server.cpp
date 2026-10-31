@@ -1965,7 +1965,7 @@ public:
         for (auto reason : {"missing_session_header", "unknown_session", "not_acceptable",
                             "per_principal_stream_cap", "global_stream_cap",
                             "stream_handover_pending", "replay_window_exceeded", "origin",
-                            }) {
+                            "service_scoped", "credential_mismatch"}) {
             metrics_.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}});
         }
         // 2f PR 3b streamed-POST admission denials, derived from the bridge's own
@@ -23801,8 +23801,9 @@ private:
     RateLimiter api_rate_limiter_;
     RateLimiter login_rate_limiter_;
 
-    // Per-principal quota cap (PR 4.4) — gates principal_kind=="engine"
-    // sessions only, at the pre-routing chokepoint. See principal_quota.hpp.
+    // Per-principal quota cap (PR 4.4) — gates engine-classed sessions only
+    // (stored principal_kind "engine" or an engine_token source), at the
+    // pre-routing chokepoint. See principal_quota.hpp.
     PrincipalQuota principal_quota_;
 };
 

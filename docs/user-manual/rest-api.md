@@ -225,7 +225,7 @@ HTTP status codes follow standard conventions: `200` for success, `201` for reso
 
 The R2 A4 completion (2026-07) routed the RBAC/tier denial gates (`require_admin`, `require_permission`, and the service-scope denials in the auth layer) and the ~156 legacy `error_json` sites in `rest_api_v1.cpp` through this one envelope. The #1552 sweep PR-1 (2026-09) converted 8 more route files — `auth_routes.cpp` (including its MFA-flow branches), `workflow_routes.cpp`, `webhook_routes.cpp`, `settings_routes.cpp`, `file_retrieval_routes.cpp`, `viz_routes.cpp`, `offload_routes.cpp`, and `sle_routes.cpp` (audited, already compliant via its own local builder) — so it does **not** yet cover literally every path, but the remaining gap is now precisely enumerated rather than open-ended: 7 more route files (`compliance_routes.cpp`, `discovery_routes.cpp`, `command_routes.cpp`, `dashboard_api_routes.cpp`, `notification_routes.cpp`, `schedule_routes.cpp`, `nvd_routes.cpp`, tracked as #1552's PR-2), roughly 86 hand-rolled sites still inline in `server.cpp` itself (not yet decomposed into a `*_routes.cpp` file), and the pre-routing chokepoint's own "no session" 401 (`server.cpp`, `{"error":{"code","message"},"meta"}` with no `correlation_id` — every unauthenticated `/api/v1/*` request hits this before any route's own A4 gate runs; tracked as #2003). Automation crossing surfaces should treat the enrichment fields as present-when-available until all three close.
 
-**Per-principal quota cap (PR 4.4, ADR-1005 class engine principals).** REST traffic from an **engine principal** session (`principal_kind=="engine"`, username `engine:<slug>`) is subject to a per-principal cap enforced at the server's single pre-routing chokepoint — before the request reaches any route handler. Two independent dimensions are checked: an in-flight **concurrency** cap and a per-principal token-bucket **rate** cap (see `docs/user-manual/engine-principals.md` for the operator-facing tuning guide). Exhausting either dimension returns `429` with the standard A4 envelope plus an HTTP `Retry-After` header (whole seconds, rounded up from `retry_after_ms`):
+**Per-principal quota cap (PR 4.4, ADR-1005 class engine principals).** REST traffic from an **engine principal** session (stored `principal_kind` `engine` or an `engine_token` authentication source, username `engine:<slug>`) is subject to a per-principal cap enforced at the server's single pre-routing chokepoint — before the request reaches any route handler. Two independent dimensions are checked: an in-flight **concurrency** cap and a per-principal token-bucket **rate** cap (see `docs/user-manual/engine-principals.md` for the operator-facing tuning guide). Exhausting either dimension returns `429` with the standard A4 envelope plus an HTTP `Retry-After` header (whole seconds, rounded up from `retry_after_ms`):
 
 ```json
 {
@@ -9485,11 +9485,11 @@ Browser-facing page that renders the 3D fleet topology. The page itself is auth-
 
 **Renderer behaviour (PR 6):**
 
-The page renders one translucent cube per fleet machine on a deterministic grid. Per-OS palette: Linux `#2dd4bf`, macOS/Darwin `#f5c542`, Windows `#4c9aff`, default `#9aa2ae`. Live agents render at opacity `0.18`; stale agents (no response within the 5 s `echo.fleet_snapshot` deadline) render at opacity `0.08` so they remain visible without competing for attention. Hostname labels appear below each cube as `Sprite` text and always face the camera; labels longer than 24 characters truncate with an ellipsis (the full hostname is visible in the hover tooltip). Layout is seeded by an FNV-1a 32-bit hash of `agent_id` so the same fleet renders identically across reloads even when the server returns rows in a different order.
+The page renders one translucent cube per fleet machine on a deterministic grid. Per-OS palette (on the default Slate scheme; the other schemes follow their own chart tokens): Linux `#2dd4bf`, macOS/Darwin `#f5c542`, Windows `#4c9aff`, default `#9aa2ae`. Live agents render at opacity `0.18`; stale agents (no response within the 5 s `echo.fleet_snapshot` deadline) render at opacity `0.08` so they remain visible without competing for attention. Hostname labels appear below each cube as `Sprite` text and always face the camera; labels longer than 24 characters truncate with an ellipsis (the full hostname is visible in the hover tooltip). Layout is seeded by an FNV-1a 32-bit hash of `agent_id` so the same fleet renders identically across reloads even when the server returns rows in a different order.
 
 **Renderer behaviour (PR 7):**
 
-Each machine cube contains interior `SphereGeometry` dots, one per process reported in the `processes` array of the topology payload. Dots are coloured by process category using a fixed six-colour palette: system `#9aa2ae`, browser `#4c9aff`, database `#f5c542`, web `#2dd4bf`, runtime `#a78bfa`, other `#9199a6`. Category values in the JSON payload are lowercase strings matching `category_to_string()` in the server's process classifier (`server/core/src/process_category.hpp`); the renderer normalises with `String(category).trim().toLowerCase()` and uses `Object.prototype.hasOwnProperty.call` for the palette lookup so unknown / mixed-case / whitespace-padded values fall through to `other` and prototype keys (`constructor`, `__proto__`) cannot poison the colour pipeline.
+Each machine cube contains interior `SphereGeometry` dots, one per process reported in the `processes` array of the topology payload. Dots are coloured by process category using a six-colour palette (on the default Slate scheme; the other schemes follow their own chart tokens): system `#9aa2ae`, browser `#4c9aff`, database `#f5c542`, web `#2dd4bf`, runtime `#a78bfa`, other `#9199a6`. Category values in the JSON payload are lowercase strings matching `category_to_string()` in the server's process classifier (`server/core/src/process_category.hpp`); the renderer normalises with `String(category).trim().toLowerCase()` and uses `Object.prototype.hasOwnProperty.call` for the palette lookup so unknown / mixed-case / whitespace-padded values fall through to `other` and prototype keys (`constructor`, `__proto__`) cannot poison the colour pipeline.
 
 Dot positions are deterministic across reloads — `hash(pid|ppid)`-mod-bucket layout inside 78% of the cube's interior volume, with per-process `hash('j|pid')` jitter to break visual stripes. Per-machine processes are attached as a named child group (`yuzu-processes`) of each cube so they orbit and pan with the cube under OrbitControls without synchronisation overhead. To bound the worst-case render cost on heavily-threaded hosts (e.g. JVM thread pools), the renderer soft-caps at **1000 dots per cube**; the cube tooltip's `processes` count still reflects the true total reported by the agent.
 
@@ -13090,7 +13090,12 @@ below).
 **Permission:** the same credential as `POST /mcp/v1/`, plus the session's
 `Mcp-Session-Id` header. The credential is re-checked once per tick (~3 s), whether or
 not a heartbeat frame is emitted, so revoking it ends a *live* stream, not just future
-ones.
+ones. A service-scoped API token is refused outright (`403`, below). The session is
+bound to the principal and credential class that created it (authentication source,
+principal kind, MCP tier, service scope; not elevation state). Stream liveness is
+principal-level: the class is checked when the stream attaches and is not re-derived
+from the live credential afterwards (the per-tick credential recheck compares the
+principal only, and the per-tick session check compares the class captured at attach).
 
 **Required headers:** `Mcp-Session-Id` (from `initialize`), `Accept: text/event-stream`.
 **Optional:** `Last-Event-ID` to resume.
@@ -13101,8 +13106,9 @@ ones.
 |---|---|
 | `200` | SSE stream (`text/event-stream`, chunked, held open) |
 | `400` | `Mcp-Session-Id` absent (`-32600`) |
-| `404` | Session unknown, expired, another principal's, **or** the `Last-Event-ID` cursor is outside the replay window (`-32007`) — re-initialize |
+| `404` | Session unknown, expired, another principal's, another credential class's, **or** the `Last-Event-ID` cursor is outside the replay window (`-32007`) — re-initialize with the credential you will use |
 | `403` | `Origin` not in `--mcp-allowed-origin` (`-32008`) |
+| `403` | Service-scoped API token (`-32003`; no `permission` field, because no permission grant would admit the caller; use a token without `scope_service`). Checked after the kill switches, `Origin`, protocol version and authentication, and before the session header, `Accept` and the stream lease, so it answers even when `Mcp-Session-Id` is absent. Audited `mcp.session.reject` `reason=service_scoped` |
 | `405` | Streaming disabled (`--mcp-no-streaming`) |
 | `406` | `Accept` did not include `text/event-stream` (`-32011`) |
 | `429` | Concurrent-stream cap, or a superseded stream on this session is still closing (`-32012`; honour `retry_after_ms`) |
@@ -13122,7 +13128,7 @@ name the reason in that same A4 shape.
 #### `DELETE /mcp/v1/`
 
 Ends the session named by `Mcp-Session-Id` (and closes its stream). `200` on success;
-`404` if the session is unknown or belongs to another principal; `400` if the header is
+`404` if the session is unknown, expired, already ended, or belongs to another principal or another credential class (call `initialize` to start a new session; the original session is not terminated by a class mismatch); `400` if the header is
 absent.
 
 #### `POST /mcp/v1/`
@@ -13270,8 +13276,8 @@ carrying `_meta.progressToken` (see `docs/user-manual/mcp.md`'s `progressToken`
 definition for the type/length contract; an out-of-spec value is silently treated as
 absent — no error, no progress) opts into progress tracking — **this requires an
 active session**: a non-empty `Mcp-Session-Id` header from a prior `initialize`. A
-`Mcp-Session-Id` that is present but invalid (unknown, expired, or another
-principal's) fails the **entire call** with `404`/`-32007` before progress tracking is
+`Mcp-Session-Id` that is present but invalid (unknown, expired, another
+principal's, or another credential class's) fails the **entire call** with `404`/`-32007` before progress tracking is
 even considered — that is a property of every non-`initialize` method on this
 endpoint, not specific to progress tracking, and is covered above under `GET /mcp/v1/`.
 The table below assumes a valid session or none at all; where progress *is* tracked,
