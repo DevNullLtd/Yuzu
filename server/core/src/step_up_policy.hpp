@@ -99,7 +99,12 @@ inline constexpr std::string_view kContentAuthoring =
 inline constexpr std::string_view kPolicyLifecycle =
     "policy lifecycle: governed by the Policy securable and approval";
 inline constexpr std::string_view kEvidenceCapture = "evidence capture under its own securable";
-inline constexpr std::string_view kStopsEffect = "stops an in-flight effect; reduces risk";
+/// A cancel that only closes a record. It marks a pending tracker or pipeline record cancelled and
+/// sends NOTHING to any device: it does not stop, recall or undo a command a device has already
+/// received. The class is exempt because it starts no new work, NOT because it halts a running
+/// effect; do not reword it into a claim that it does (#2146 CA-4).
+inline constexpr std::string_view kCancelsRecord =
+    "cancels a pending record; sends nothing to any device and starts no work";
 inline constexpr std::string_view kAlertingConfig = "alerting and notification configuration";
 inline constexpr std::string_view kMfaEnrolment =
     "MFA enrolment flow: cannot replace or remove an enabled factor";
@@ -293,7 +298,7 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/fragments/auto/run)",                                                     step_up_detail::kExecutionDispatch),
     // rest_api_v1.cpp
     step_up_detail::exempt("POST",  R"(/api/v1/bundles)",                                                         step_up_detail::kExecutionDispatch),
-    step_up_detail::exempt("POST",  R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/cancel)",                        step_up_detail::kStopsEffect),
+    step_up_detail::exempt("POST",  R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/cancel)",                        step_up_detail::kCancelsRecord),
     step_up_detail::exempt("POST",  R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/rerun)",                         step_up_detail::kExecutionDispatch),
     // command_v1_routes.cpp: the REST v1 twin of /api/command and MCP execute_instruction (kExecutionDispatch, like both)
     step_up_detail::exempt("POST",  R"(/api/v1/commands)",                                                        step_up_detail::kExecutionDispatch),
@@ -334,7 +339,7 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::pending("DELETE",R"(/api/v1/device-tokens/([a-f0-9]+))"),
     step_up_detail::pending("POST",  R"(/api/v1/software-deployments)"),
     step_up_detail::pending("POST",  R"(/api/v1/software-deployments/([a-f0-9]+)/rollback)"),
-    step_up_detail::exempt("POST",  R"(/api/v1/software-deployments/([a-f0-9]+)/cancel)",                         step_up_detail::kStopsEffect),
+    step_up_detail::exempt("POST",  R"(/api/v1/software-deployments/([a-f0-9]+)/cancel)",                         step_up_detail::kCancelsRecord),
     step_up_detail::pending("POST",  R"(/api/v1/license)"),
     step_up_detail::pending("DELETE",R"(/api/v1/license/([a-f0-9]+))"),
     step_up_detail::exempt("POST",  R"(/api/v1/dex/devices/([^/]+)/live)",                                        step_up_detail::kReadShaped),

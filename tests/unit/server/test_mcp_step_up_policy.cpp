@@ -264,7 +264,7 @@ TEST_CASE("mcp step-up policy: the pending rows are the baseline plus the post-b
     CHECK(baseline_pending_rows() + second_list_pending_rows() == pending_rows());
     CHECK(second_list_pending_rows() == kMcpPendingBecauseRestTwinRequired.size());
     // The MCP table shape: 68 rows, 22 exempt, 46 pending (#2146 batch B added the two
-    // execution twins, both exempt: cancel_execution kStopsEffect, record_execution_rerun
+    // execution twins, both exempt: cancel_execution kCancelsRecord, record_execution_rerun
     // kExecutionDispatch; and execute_instruction_definition, exempt kExecutionDispatch).
     CHECK(std::size(kMcpStepUpPolicy) == 68);
     std::size_t exempt = 0;

@@ -44160,7 +44160,7 @@ TEST_CASE("MCP cancel_execution / record_execution_rerun: each publishes its leg
     }
 }
 
-TEST_CASE("MCP cancel_execution: at the SUPERVISED tier it needs no approval ticket (risk-reducing, "
+TEST_CASE("MCP cancel_execution: at the SUPERVISED tier it needs no approval ticket (tracker-only, "
           "owner ruling 2026-10-30); record_execution_rerun still does",
           "[mcp][execution][mutation][approval][2146]") {
     McpExecFake fs;

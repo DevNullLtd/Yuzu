@@ -1199,8 +1199,8 @@ static const ToolDef kTools[] = {
      "one whose COMPLETE targeted device list is visible to them; any other case, including an id "
      "that does not exist, returns the SAME not-found error (the two cannot be told apart). "
      "Mirrors POST /api/v1/executions/{id}/cancel. Not approval-gated at the supervised tier "
-     "because it only reduces risk (owner ruling 2026-10-30); the REST twin is still refused for "
-     "a supervised-tier token. Writes an 'attempted' audit row (execution.cancel) BEFORE the "
+     "because it only updates the tracker record and starts no work (owner ruling 2026-10-30); "
+     "the REST twin is still refused for a supervised-tier token. Writes an 'attempted' audit row (execution.cancel) BEFORE the "
      "change and refuses with a retryable error, changing nothing, if that row cannot be saved. "
      "Requires Execution:Execute and Execution:Read.",
      R"j({"type":"object","properties":{"execution_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,128}$","maxLength":128,"description":"Execution id from list_executions or get_execution_status"}},"required":["execution_id"],"additionalProperties":false})j",
@@ -8244,7 +8244,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
 
                 // requires_approval_for_tool: false for the closed mcp_policy.hpp
-                // kApprovalExemptTools list (cancel_execution - risk-reducing, owner ruling
+                // kApprovalExemptTools list (cancel_execution - tracker-only, starts no work, owner ruling
                 // 2026-10-30); every other tool is unchanged.
                 if (requires_approval_for_tool(tier, tool_name, sec_type, sec_op)) {
                     // ── Approval ticket flow (#289 / Issue 13.5, design D1) ──

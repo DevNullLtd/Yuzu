@@ -241,9 +241,11 @@ inline bool is_valid_tier(std::string_view tier) {
 /// that calls the REST twin of an exempt tool is still refused there. That asymmetry (MCP looser
 /// than REST for this one tool) is deliberate and is documented in docs/mcp-server.md.
 ///
-///   cancel_execution (Execution:Execute): owner ruling 2026-10-30 (Dave). It is a risk-reducing
-///     action: it only marks a tracker row cancelled and sends nothing to any device, so asking
-///     a human to approve a STOP would only delay the safe state. The handler still gates on
+///   cancel_execution (Execution:Execute): owner ruling 2026-10-30 (Dave). It only marks a
+///     tracker row cancelled: it sends NOTHING to any device and does not stop or recall a
+///     command a device already received, so it is NOT a stop of a running effect. It is exempt
+///     because it starts no new work and so adds no device risk; it does not make anything
+///     safe on a device. The handler still gates on
 ///     Execution:Execute then Execution:Read, admits a confined caller only with COMPLETE cohort
 ///     visibility, and audits an `attempted` row before the effect.
 inline constexpr std::array<std::string_view, 1> kApprovalExemptTools = {"cancel_execution"};

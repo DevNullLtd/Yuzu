@@ -6811,7 +6811,7 @@ To run the work again on devices, dispatch it.
 the fleet-read gate), in that order. A service-scoped API token is refused (`403`). A supervised-tier
 MCP token that calls these REST routes is refused (`403`, approval required on this transport); the
 MCP `cancel_execution` tool is the one that is exempt from the approval ticket (see `docs/mcp-server.md`).
-Step-up: cancel is classified "stops an in-flight effect" and rerun "execution dispatch"; neither
+Step-up: cancel is classified "cancels a pending record" (it sends nothing to any device) and rerun "execution dispatch"; neither
 asks for a fresh MFA proof.
 
 **Confinement.** A caller confined to management groups may use these only on an execution they

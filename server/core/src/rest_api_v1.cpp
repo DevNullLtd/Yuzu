@@ -12886,7 +12886,7 @@ void RestApiV1::register_routes(
     // sequence publishes execution.completed (cancel) / execution.created (rerun) through its
     // optional hook, once, on success only (event_emit.hpp; set_emit_event_fn).
     //
-    // step_up_policy.hpp classifies both routes (cancel kStopsEffect, rerun
+    // step_up_policy.hpp classifies both routes (cancel kCancelsRecord, rerun
     // kExecutionDispatch); body_cap_policy.hpp's catch-all caps the rerun body.
     const auto finish_execution_mutation = [](httplib::Response& res, ExecutionMutation what,
                                               const ExecutionMutationRequest& mreq,
