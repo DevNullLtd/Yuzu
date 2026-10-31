@@ -23,6 +23,41 @@ The `GET` deny runs after the kill switches, the `Origin` check, the protocol-ve
 
 **Rolling upgrade.** The class binding and the `GET` deny are enforced per replica. A replica that has not been upgraded yet still has the old behaviour, so finish the roll promptly.
 
+## New: v1 REST and MCP twins for command dispatch, execution cancel and rerun, and stored-definition execute (#2146)
+
+Additive: no existing route, tool, permission or audit action changes, and no action is needed to keep a
+deployment working. The new surfaces are `POST /api/v1/commands` (the REST v1 twin of `POST /api/command` and
+the MCP `execute_instruction`; it creates an execution row and returns `execution_id`),
+`POST /api/v1/executions/{id}/cancel` and `.../rerun` with the MCP tools `cancel_execution` and
+`record_execution_rerun`, and `POST /api/v1/instructions/{id}/execute` with the MCP tool
+`execute_instruction_definition` (reference: `rest-api.md`, `mcp.md`). Cancel only marks the tracker record
+cancelled and rerun only creates a `pending` record: neither sends anything to a device.
+
+What an operator should know:
+
+- **Audit first, fail closed.** `POST /api/v1/commands`, the instruction execute twins and the cancel and rerun
+  twins write their audit row before the effect, and refuse (`503` with `Sec-Audit-Failed: true` on the dispatch
+  routes; nothing sent or changed) when it cannot be stored. The instruction route also answers `503`
+  (`audit_unavailable`, no retry hint) rather than run without a durable audit sink if the sink is not wired at
+  boot, which a correctly started server never is. Two result
+  values are new in the audit log: `requested` (the row written before a dispatch) and `pending` (an instruction
+  execute held for approval). A SIEM rule that treats `result != "success"` as a failure now also matches them;
+  key on the outcome row, as for `attempted` (`audit-log.md`, "Result vocabulary").
+- **Supervised MCP tokens.** `cancel_execution` is exempt from the supervised-tier approval ticket (it only
+  updates the tracker record), the one tool on a closed exempt list; the REST route still refuses a
+  supervised-tier token. `record_execution_rerun` and `execute_instruction_definition` need a ticket as any
+  other `Execution:Execute` write does. A definition whose own `approval_mode` is not `auto` still cannot be
+  run through the execute routes or tools: its approval can be recorded but nothing redeems it (#6064).
+- **Pending-approval cap.** `POST /api/v1/instructions/{id}/execute` refuses a principal that already holds 25
+  pending approvals with `429` (`approval_cap_reached`), the cap the MCP tools already applied. A looping script
+  or agentic worker that used the legacy route without a cap will meet it on the v1 route. The legacy
+  `POST /api/instructions/{id}/execute` is unchanged.
+- **Metrics.** Two new counters, `yuzu_server_approval_submit_refused_total{reason}` and
+  `yuzu_server_event_emit_failed_total{event}`, are pre-seeded to `0`. `yuzu_server_dispatch_target_rejected_total`
+  gains `route="command_v1"`, and `yuzu_server_instruction_param_rejected_total` gains `route="mcp"`
+  (`metrics.md`). The platform events `command.dispatched`, `execution.created`, `execution.completed`,
+  `approval.created` and `instruction.executed` are also published by the new twins (`analytics-events.md`).
+
 ## Behaviour change: the activity-record feature is renamed Echo (tar.db adopted as echo.db; stored references migrated)
 
 **What changed.** The feature that records endpoint activity was called TAR and is now called Echo, with no aliases for the old names except the upgrade-window shim below. The agent plugin is `echo` (`echo.dll`, `echo.so`, `echo.dylib`; the Windows installer removes the old `tar.dll`). REST routes move from `/api/v1/tar/...` to `/api/v1/echo/...`, MCP tools from `*_tar_*` to `*_echo_*` (for example `list_tar_retention_paused` is now `list_echo_retention_paused`, and `create_result_set_from_tar_query` is now `create_result_set_from_echo_query`), metrics from `yuzu_tar_*` to `yuzu_echo_*`, audit actions from `tar.*` to `echo.*`, instruction ids from `crossplatform.tar.*` to `crossplatform.echo.*`, the agent heartbeat tags from `yuzu.plugin.tar.*` to `yuzu.plugin.echo.*`, and the result-set matcher kind from `tar_rows_ge` to `echo_rows_ge` (a request that still sends the old kind to `POST /api/v1/result-sets/from-instruction-result` or its MCP twin is now refused with an error naming the kind, as is any other unrecognised kind, instead of being accepted into a set that never matches anything). The OpenAPI `operationId` and tag changes are listed in the OpenAPI note further down this page.
