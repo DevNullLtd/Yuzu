@@ -65,6 +65,10 @@ updates:
     #     on AMX CPUs (#1743). Block major AND minor; digest refreshes of 3.23
     #     still flow. Move it by hand, together with the builder, once the
     #     gateway is on OTP 29.1 or newer (the build's abi-guard enforces this).
+    #     A digest refresh of the erlang index is also checked by
+    #     scripts/ci/check-gateway-base-index.py (docker-healthcheck-invariants.yml):
+    #     the platforms Dockerfile.gateway supports (linux/amd64 only, #6711) must
+    #     be annotated in the index as built on the runtime stage's Alpine release.
     ignore:
       - dependency-name: "erlang"
         update-types: ["version-update:semver-major"]

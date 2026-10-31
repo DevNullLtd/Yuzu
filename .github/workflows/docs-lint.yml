@@ -218,6 +218,11 @@ jobs:
       # Docker.
       - name: Gateway image abi-guard
         run: python3 tests/test_gateway_abi_guard.py
+      # #6711: the gateway image is amd64-only; the lint that keeps its pinned
+      # builder index honest, run against fixture indexes (the registry read is
+      # in docker-healthcheck-invariants.yml).
+      - name: Gateway base index lint
+        run: python3 tests/test_gateway_base_index.py
       - name: QA-stack gateway crash signatures
         run: python3 tests/test_qa_stack_crash_pat.py
       # #5420: the Compose Wizard's generated composes keep /etc/yuzu/certs
