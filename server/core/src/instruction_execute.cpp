@@ -217,6 +217,18 @@ PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& a
                                               "parameter schema and re-call; nothing was "
                                               "dispatched and no approval ticket was created."));
             }
+        } else if (rq.body.contains("params") && !rq.body["params"].is_null() &&
+                   !rq.body["params"].is_object()) {
+            // No stored schema to hold `params` to a shape, but a supplied value that is not an
+            // object (stringified JSON is the likely mistake) would otherwise be dropped and the
+            // action run with its defaults. Refuse it rather than ignore it.
+            count_reject("shape");
+            c.audit("denied", "reason=params_type definition=" + def_token);
+            return refuse(c, make_refusal(RefusalKind::kBadRequest, "params_type",
+                                          "params must be a JSON object",
+                                          "send params as an object of named values and re-call; "
+                                          "nothing was dispatched and no approval ticket was "
+                                          "created"));
         }
     }
 

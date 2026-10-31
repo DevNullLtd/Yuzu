@@ -3689,7 +3689,7 @@ List all instruction definitions.
 |---|---|
 | `agent_ids` | Non-empty array of agent ids. Exclusive with `scope`. |
 | `scope` | Non-empty scope expression (`__all__`, `group:<id>`, or the scope DSL). Exclusive with `agent_ids`. |
-| `params` | Object of parameters. Validated against the definition's stored `parameter_schema`; typed values are sent as JSON types. |
+| `params` | Object of parameters. Validated against the definition's stored `parameter_schema`; typed values are sent as JSON types. A value that is not an object (or `null`) is `400` even when the definition declares no schema (`params_type`), rather than being dropped. |
 
 Omitting **both** `agent_ids` and `scope` targets every connected agent. Supplying either one empty, of the wrong type, or both together is `400` (`reason` = `agent_ids_empty`, `agent_ids_type`, `agent_id_type`, `scope_empty`, `scope_type`, `target_conflict`) and is never widened to the fleet. A body that is not an object is `400` (`body_type`). A **Destructive** action requires explicit non-empty `agent_ids` (broadcast and `scope` are `400` `destructive_untargeted`) and its ids are confined to the agents the caller may see (`404` `destructive_no_visible_target` when none are); a **Forensics** action requires exactly one (`forensic_untargeted`).
 

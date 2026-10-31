@@ -262,6 +262,25 @@ TEST_CASE("execute: a parameter-schema violation dispatches NOTHING and queues n
     CHECK(r.audits.front().detail.find("reason=param_schema path=/level") == 0);
 }
 
+TEST_CASE("execute: params that is not an object is refused even with no stored schema, never dropped",
+          "[instruction_execute][security]") {
+    Rig r;
+    r.defs["d"] = make_def("d", "ping", "always"); // no parameter_schema
+    for (const json& bad : {json("{\"a\":1}"), json(7), json::array({1}), json(true)}) {
+        auto out = run(r.request("d", json{{"params", bad}}, make_caller("u", true)), r.ports(), r.audit());
+        const auto* ref = as_refusal(out);
+        REQUIRE(ref);
+        CHECK(ref->kind == RefusalKind::kBadRequest);
+        CHECK(ref->reason == "params_type");
+    }
+    CHECK(r.calls.empty());
+    CHECK(r.approvals.empty());
+    // null and an object stay fine.
+    r.defs["d"].approval_mode = "auto";
+    CHECK(as_dispatched(run(r.request("d", json{{"params", nullptr}}, make_caller("u", true)), r.ports(), r.audit())));
+    CHECK(as_dispatched(run(r.request("d", json{{"params", json::object()}}, make_caller("u", true)), r.ports(), r.audit())));
+}
+
 TEST_CASE("execute: an unpreparable stored schema fails CLOSED", "[instruction_execute][security]") {
     Rig r;
     auto d = make_def("d");
