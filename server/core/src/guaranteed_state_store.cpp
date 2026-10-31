@@ -1025,17 +1025,18 @@ std::expected<void, std::string> project_observation(PGconn* conn,
 enum class CensusOutcome {
     Applied,   // upserted (or a stale event matched the ON CONFLICT guard: zero rows, not an error)
     Rejected,  // SQLSTATE 23503: the rule is gone; definitive, not a fault
-    Failed,    // any other statement error; the savepoint was rolled back, the transaction is usable
+    Failed,    // any other statement error; the savepoint was rolled back and released, the
+               // transaction is usable
     Abandoned, // a savepoint control statement failed; the transaction must be abandoned
 };
 
 // Write one (agent, rule) compliance state inside the caller's open transaction, under
 // SAVEPOINT census_upsert, so a failed upsert never aborts the transaction holding the
-// event. Rejected and Failed leave the transaction usable (the savepoint was rolled back);
-// neither failure discards the event, which is stored when the caller commits. Abandoned
-// means a SAVEPOINT, ROLLBACK TO or RELEASE statement itself failed, so the transaction may
-// be aborted and the caller must return an error without committing (a COMMIT of an aborted
-// transaction reports success to libpq).
+// event. Rejected and Failed leave the transaction usable (the savepoint was rolled back and
+// released); neither failure discards the event, which is stored when the caller commits.
+// Abandoned means a SAVEPOINT, ROLLBACK TO or RELEASE statement itself failed, so the
+// transaction may be aborted and the caller must return an error without committing (a
+// COMMIT of an aborted transaction reports success to libpq).
 // A Failed outcome is counted on `failures` and logged at error. A Rejected outcome is not
 // counted and is logged at debug only; the database server still records the refused
 // statement in its own log. The count moves before the caller's COMMIT, so a COMMIT that

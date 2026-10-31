@@ -3581,9 +3581,10 @@ TEST_CASE("GuaranteedStateStore::errored_rule_count — ADR-0017 INV-3 SQL-level
     REQUIRE(store.insert_event(ev("e1", "r1", "a1", "guard.unhealthy")));
     REQUIRE(store.insert_event(ev("e2", "r1", "a2", "guard.unhealthy")));
     REQUIRE(store.insert_event(ev("e3", "r2", "a1", "guard.unhealthy")));
-    // r-orphan has a census row but was never created as a rule — the SQL JOIN
-    // against guaranteed_state_rules must exclude it (mirrors the C++
-    // rule_names.count() intersection the route used to do post-fetch).
+    // r-orphan was never created as a rule: the foreign key refuses its census write, so
+    // the event is stored but no census row exists, and the counts below must not include
+    // it. (The SQL JOIN against guaranteed_state_rules is the second line of defence; the
+    // route-level test with the key removed exercises that.)
     REQUIRE(store.insert_event(ev("e4", "r-orphan", "a1", "guard.unhealthy")));
     // r1 also compliant on a3 — must not contribute.
     REQUIRE(store.insert_event(ev("e5", "r1", "a3", "guard.compliant")));
