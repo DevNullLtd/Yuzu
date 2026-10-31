@@ -21187,7 +21187,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         }
                     }
                     mcp_audit("denied", "reason=" + agent_ids.error().reason);
-                    res.set_content(error_response(id, kInvalidParams, agent_ids.error().message),
+                    res.set_content(error_response(id, kInvalidParams, agent_ids.error().message), // retry-hint-exempt: input-parse failure, not a store fault
                                     "application/json");
                     return;
                 }
