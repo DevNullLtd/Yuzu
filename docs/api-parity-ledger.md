@@ -143,7 +143,10 @@ fresh render; a twinned row whose REST route and MCP tool disagree on securable,
 operation or confinement kind (check 6, gate parity: the REST gate is compared with the tool's
 declared pair, and for a compared row a derived MCP handler's own gate calls are held to that
 pair too, a label-and-call-site tripwire
-with a size-pinned, shrink-only allowlist, `GATE_PARITY_KNOWN_MISMATCHES`, plus
+with a size-pinned allowlist, `GATE_PARITY_KNOWN_MISMATCHES` (its cap, `GATE_PARITY_KNOWN_MISMATCHES_MAX`,
+is a pin that the script holds equal to the entry count: an entry that goes stale must be removed with the cap
+lowered, and a new entry needs the cap raised in the same change with a stated reviewed reason; it went from 6 to
+7 for `POST /api/v1/commands` / `execute_instruction` by owner ruling of 2026-10-31), plus
 `GATE_PARITY_NO_GATE_ALLOWED` for routes whose gate it cannot read); a registry
 tool whose test file does not name it, assert a schema refusal and an audit row, or
 appear in `tests/meson.build` (check 7); a registry file count that is not

@@ -370,7 +370,7 @@ day-to-day operational use.
 **supervised** -- Full access to all operations, but destructive actions
 require admin approval before taking effect. This includes:
 
-- Instruction executions
+- Instruction executions, including `execute_instruction_definition` and `record_execution_rerun`
 - Any delete operation
 - Policy writes
 - Security setting writes
@@ -386,6 +386,11 @@ token can make them without a human: `set_plugin_config` (plugin configuration v
 `heartbeat_timeout`, `response_retention_days`, `guardian_event_retention_days`,
 `auto_approve_enabled` and `log_level`). Each is audited before it applies, and the
 administrator-only keys, including every sign-in setting, stay out of an MCP-tier token's reach.
+`cancel_execution` is the third: it only marks one execution cancelled in the server's tracker
+(nothing is sent to a device and nothing running is stopped), it writes an `attempted`
+`execution.cancel` audit row before the change, and it is on the server's closed
+approval-exempt list (`kApprovalExemptTools`, a list of one). The exemption is MCP only: the REST
+twin `POST /api/v1/executions/{id}/cancel` still refuses a supervised-tier token.
 
 Use the supervised tier for automation pipelines where an AI assistant proposes
 changes that a human reviews and approves.

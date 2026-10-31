@@ -16,8 +16,9 @@
 // `ConfinedDispatchOutcome` and one bool.
 //
 // FIXED priority order (first match wins). Copied from the MCP
-// `execute_instruction` cascade (mcp_server.cpp, the `if (dispatch_outcome.
-// scope_parse_error)` chain starting near line 19661):
+// `execute_instruction` cascade (mcp_server.cpp, the zero-reach block that
+// tests `dispatch_outcome.scope_parse_error` first; find it by that symbol, not
+// by line number):
 //
 //   1. invalid_scope            outcome.scope_parse_error set     permanent
 //   2. containment_unreadable   outcome.containment_unreadable    retryable
