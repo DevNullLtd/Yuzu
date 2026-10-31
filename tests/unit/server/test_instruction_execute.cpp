@@ -145,6 +145,48 @@ TEST_CASE("execute: an unwired authorizer fails closed, never to no gate", "[ins
     CHECK(r.calls.empty());
 }
 
+// CA-7 (#2146): a kMisconfigured refusal is a server defect (a port never wired at boot). It does
+// not clear by itself, so it must advertise NO retry (`retry_after_ms` null) and its remediation
+// must say it is a configuration defect, on the core and on both wire surfaces.
+TEST_CASE("execute: every kMisconfigured arm carries no retry hint and a defect remediation",
+          "[instruction_execute][retryhint]") {
+    const auto check_refusal = [](const Outcome& out, const char* reason) {
+        REQUIRE(as_refusal(out));
+        const auto& ref = *as_refusal(out);
+        CHECK(ref.kind == RefusalKind::kMisconfigured);
+        CHECK(ref.reason == reason);
+        CHECK_FALSE(ref.retry_after_ms.has_value());
+        CHECK(ref.remediation.find("retrying will not help") != std::string::npos);
+        CHECK(ref.remediation.find("configuration defect") != std::string::npos);
+    };
+    SECTION("authorizer") {
+        Rig r;
+        r.defs["d"] = make_def("d");
+        r.authorize_unwired = true;
+        check_refusal(run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit()),
+                      "authorizer_unconfigured");
+    }
+    SECTION("validators") {
+        Rig r;
+        auto d = make_def("d");
+        d.parameter_schema = kLevelSchema;
+        r.defs["d"] = d;
+        auto p = r.ports();
+        p.validators = nullptr;
+        check_refusal(run(r.request("d", json{{"params", json{{"level", "x"}}}}, make_caller("u", true)),
+                          p, r.audit()),
+                      "validators_unconfigured");
+    }
+    SECTION("dispatch") {
+        Rig r;
+        r.defs["d"] = make_def("d");
+        auto p = r.ports();
+        p.dispatch = nullptr;
+        check_refusal(run(r.request("d", json::object(), make_caller("u", true)), p, r.audit()),
+                      "dispatch_unconfigured");
+    }
+}
+
 TEST_CASE("execute: the AdminOrApproval gate admits an administrator and refuses a non-admin",
           "[instruction_execute][security]") {
     Rig r;
@@ -1456,6 +1498,34 @@ TEST_CASE("REST execute: an UNWIRED audit sink is a 503 with Sec-Audit-Failed, n
     CHECK(r.core.drain().empty());
     CHECK(r.audit_calls == 0);
     CHECK(r.perm_calls.size() == 1);
+}
+
+TEST_CASE("REST and MCP: a kMisconfigured refusal is 500 / -32603 with retry_after_ms null",
+          "[instruction_execute][rest][retryhint]") {
+    // REST: the authorizer is unwired.
+    RouteRig r([](Rig& core) { core.authorize_unwired = true; });
+    r.core.defs["d"] = make_def("d");
+    auto res = r.post("d", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    const auto j = json::parse(res->body);
+    CHECK(j["error"]["reason"] == "authorizer_unconfigured");
+    CHECK(j["error"]["retry_after_ms"].is_null());
+    CHECK(j["error"]["remediation"].get<std::string>().find("retrying will not help") !=
+          std::string::npos);
+
+    // MCP: the same refusal rendered by the MCP surface.
+    Refusal ref;
+    ref.kind = RefusalKind::kMisconfigured;
+    ref.reason = "dispatch_unconfigured";
+    ref.message = "command dispatch unavailable";
+    ref.remediation = "this is a server configuration defect and retrying will not help";
+    const auto rendered = yuzu::server::mcp::instruction_definition::render_refusal(ref, false, "cid");
+    CHECK(rendered.is_error);
+    const auto d = json::parse(rendered.data_json);
+    CHECK(d["retry_after_ms"].is_null());
+    CHECK(d["remediation"].is_string());
+    CHECK(d["reason"] == "dispatch_unconfigured");
 }
 
 TEST_CASE("REST execute: an unwired caller derivation fails closed on visibility",

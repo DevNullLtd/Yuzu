@@ -200,7 +200,7 @@ enum class RefusalKind : std::uint8_t {
     kApprovalSubmitFailed, ///< 500: the approval store could not take the ticket
     kApprovalCapReached,   ///< 429-class: this principal already holds the cap of pending approvals
     kClassifierUnavailable,///< 503: the destructive-targeting classifier is not wired
-    kMisconfigured,        ///< 500: a required port is unwired
+    kMisconfigured,        ///< 500: a required port is unwired (a server defect: NO retry hint, ever)
     kAuditUnavailable,     ///< 503 + Sec-Audit-Failed: nothing was dispatched without durable evidence
     kDispatchFailed,       ///< 500: the dispatch threw (any exception type); the execution row (if any) was cancelled,
                            ///< a `failure` audit row is written, and NO retry is advertised (agents may have been sent it)

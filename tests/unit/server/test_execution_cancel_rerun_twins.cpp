@@ -917,6 +917,9 @@ TEST_CASE("REST POST cancel/rerun: no resolved principal is refused, never run a
             auto res = h.sink.Post(std::string("/api/v1/executions/exec-1/") + verb, "");
             REQUIRE(res);
             CHECK(res->status == 503);
+            // Permanent for this credential: no retry hint, and the remediation says what to do.
+            CHECK(body_of(*res)["error"]["retry_after_ms"].is_null());
+            CHECK(body_of(*res)["error"]["remediation"].is_string());
             CHECK(h.store.exec_reads == 0);
             CHECK(h.store.effects() == 0);
             CHECK(h.audit_rows.empty());

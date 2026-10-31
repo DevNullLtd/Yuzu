@@ -460,12 +460,15 @@ std::string audit_caller_id(std::string_view id) {
 // the two handler branches (kept separate on purpose: check-api-parity derives a tool's gate
 // calls from its own `if (tool_name == ...)` branch) cannot word the same outcome differently.
 // A `retry_after_ms >= 0` error is a retryable store/audit fault (a4_error with a hint); a
-// negative one is a terminal business answer (error_response, no hint).
+// negative one is a terminal business answer (error_response, no hint) unless `envelope` is set,
+// which sends the A4 data object with `retry_after_ms: null` and the remediation (an error that
+// is permanent for this caller and must say so rather than stay silent).
 struct ExecMutationMcpError {
     int code{kInternalError};
     std::string message;
     std::string remediation;
     long retry_after_ms{-1};
+    bool envelope{false};
 };
 
 ExecMutationMcpError exec_mutation_mcp_error(ExecutionMutation what,
@@ -475,8 +478,11 @@ ExecMutationMcpError exec_mutation_mcp_error(ExecutionMutation what,
     const bool cancel = what == ExecutionMutation::kCancel;
     switch (outcome.status) {
     case S::kNoPrincipal:
-        return {kInternalError, "unable to resolve caller identity", "retry the call",
-                mcp::kMcpStoreFaultRetryMs};
+        // Permanent for this credential: no retry hint, and the prose says so.
+        return {kInternalError, "unable to resolve caller identity",
+                "this credential does not resolve to a principal and retrying with it will not "
+                "help; use a credential that names a user or engine principal",
+                -1, /*envelope=*/true};
     case S::kStoreDegraded:
         return {kInternalError, "execution tracker degraded", "retry once the server reports ready",
                 mcp::kMcpStoreFaultRetryMs};
@@ -25450,7 +25456,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                   : "error",
                               audit_caller_id(*exec_id));
                     const auto err = exec_mutation_mcp_error(mreq.what, outcome, *exec_id);
-                    res.set_content(err.retry_after_ms >= 0
+                    res.set_content(err.retry_after_ms >= 0 || err.envelope
                                         ? a4_error(err.code, err.message, err.remediation,
                                                    err.retry_after_ms)
                                         : error_response(id, err.code, err.message),
@@ -25540,7 +25546,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                                                                     : "error",
                               audit_caller_id(*exec_id));
                     const auto err = exec_mutation_mcp_error(mreq.what, outcome, *exec_id);
-                    res.set_content(err.retry_after_ms >= 0
+                    res.set_content(err.retry_after_ms >= 0 || err.envelope
                                         ? a4_error(err.code, err.message, err.remediation,
                                                    err.retry_after_ms)
                                         : error_response(id, err.code, err.message),

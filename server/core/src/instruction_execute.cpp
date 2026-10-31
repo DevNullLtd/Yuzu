@@ -20,6 +20,12 @@ namespace {
 
 constexpr int kRetryAfterMs = 5000;
 
+/// A kMisconfigured refusal is a SERVER defect (a required port was never wired at boot): it does
+/// not clear by itself, so it carries NO retry hint (`retry_after_ms` stays null) and says so.
+constexpr std::string_view kMisconfiguredRemediation =
+    "this is a server configuration defect and retrying will not help; report it to the server "
+    "operator";
+
 /// An audit hook that throws (bad_alloc class) must not turn a refusal into a 500 or, worse,
 /// skip the fail-closed gate: a throw reads as "did not persist".
 bool safe_audit(const AuditHook& hook, std::string_view result, const std::string& detail) noexcept {
@@ -121,7 +127,8 @@ PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& a
     //    the 403-before-400 order of POST /api/command is preserved for destructive pairs.
     if (!ports.authorize) {
         return refuse(c, make_refusal(RefusalKind::kMisconfigured, "authorizer_unconfigured",
-                                      "dispatch authorizer not configured"));
+                                      "dispatch authorizer not configured",
+                                      std::string(kMisconfiguredRemediation)));
     }
     if (auto decision = ports.authorize(rq.caller, def.plugin, def.action); !decision) {
         const auto& denial = decision.error();
@@ -179,7 +186,8 @@ PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& a
         };
         if (!ports.validators) {
             return refuse(c, make_refusal(RefusalKind::kMisconfigured, "validators_unconfigured",
-                                          "parameter validators not configured"));
+                                          "parameter validators not configured",
+                                          std::string(kMisconfiguredRemediation)));
         }
         auto validator = ports.validators->get(def.id, def.parameter_schema);
         if (!validator) {
@@ -412,7 +420,8 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
 
     if (!p.dispatch) {
         return Outcome{make_refusal(RefusalKind::kMisconfigured, "dispatch_unconfigured",
-                                    "command dispatch unavailable", "retry shortly", kRetryAfterMs),
+                                    "command dispatch unavailable",
+                                    std::string(kMisconfiguredRemediation)),
                        c.audit_dropped};
     }
 

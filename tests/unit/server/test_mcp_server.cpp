@@ -44340,7 +44340,9 @@ TEST_CASE("MCP cancel_execution / record_execution_rerun: an empty principal is 
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("error"));
-        CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        // Permanent for this credential (CA-7): no retry hint, and the remediation says so.
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(body["error"]["data"]["remediation"].is_string());
         CHECK(fs.exec_reads == 0);
         CHECK(fs.effects() == 0);
         for (const auto& row : ts.audit_log)

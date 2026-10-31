@@ -120,7 +120,9 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
             if (!deps.perm_fn) { // unwired is misconfiguration, never "no gate"
                 res.status = 500;
                 res.set_content(error_body(res, 500, "authorization not configured",
-                                           "misconfigured", std::nullopt),
+                                           "misconfigured", std::nullopt,
+                                           "this is a server configuration defect and retrying "
+                                           "will not help; report it to the server operator"),
                                 "application/json");
             }
             return;

@@ -12895,10 +12895,16 @@ void RestApiV1::register_routes(
         using S = ExecutionMutationStatus;
         switch (outcome.status) {
         case S::kNoPrincipal:
+            // Permanent for this credential: it resolved no principal, and the same credential
+            // will resolve none on a retry. No retry hint; the caller must change credential.
             res.status = 503;
-            res.set_content(detail::a4_error(res, "unable to resolve caller identity",
-                                             {.retry_after_ms = 5000}),
-                            "application/json");
+            res.set_content(
+                detail::a4_error(res, "unable to resolve caller identity",
+                                 {.remediation = "this credential does not resolve to a principal "
+                                                 "and retrying with it will not help; "
+                                                 "authenticate with a credential that names a "
+                                                 "user or engine principal"}),
+                "application/json");
             return;
         case S::kStoreDegraded:
             res.status = 503;
