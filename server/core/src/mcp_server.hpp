@@ -837,6 +837,22 @@ public:
     /// `!workflow_engine` guard's behaviour exactly.
     void set_workflow_api(std::shared_ptr<const WorkflowApi> a) { workflow_api_ = std::move(a); }
 
+    /// ADR-1007 per-device concurrency variant of `DispatchFn` (REST's `WorkflowRoutes::
+    /// ConcurrencyDispatchFn`, same shape), used ONLY by `execute_workflow` so a workflow step
+    /// honours its instruction's `concurrency_mode` exactly as the REST twin does. Unset (the
+    /// default, and every harness that does not wire it) means `execute_workflow` dispatches each
+    /// step through the plain `DispatchFn` with no concurrency claim: the pre-ADR-1007 behaviour
+    /// `execute_instruction` still has. server.cpp wires the identical closure the REST route gets.
+    using ConcurrencyDispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
+        const std::string& plugin, const std::string& action,
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters,
+        const std::string& execution_id, const yuzu::server::DispatchCaller& caller,
+        const std::string& definition_id, const std::string& concurrency_mode)>;
+    void set_workflow_concurrency_dispatch_fn(ConcurrencyDispatchFn fn) {
+        workflow_concurrency_dispatch_fn_ = std::move(fn);
+    }
+
     /// ADR-0031 WS-A4 (ninth family): the SAME in-process Guardian-read API
     /// seam the REST `GET /api/v1/guaranteed-state/*` handlers use —
     /// server.cpp wires the IDENTICAL instance so the eight Guardian read
@@ -1377,6 +1393,7 @@ private:
     std::shared_ptr<const ScheduleApi> schedule_api_;
     // ADR-0031 WS-A4 (eighth family) — see set_workflow_api above.
     std::shared_ptr<const WorkflowApi> workflow_api_;
+    ConcurrencyDispatchFn workflow_concurrency_dispatch_fn_; // see set_workflow_concurrency_dispatch_fn
     // ADR-0031 WS-A4 (ninth family) — see set_guardian_api above.
     std::shared_ptr<const GuardianApi> guardian_api_;
     // ADR-0031 WS-A4 (tenth family) - see set_crypto_api above.

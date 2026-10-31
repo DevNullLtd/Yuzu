@@ -17,6 +17,9 @@
 #include "list_keyset.hpp"
 
 #include <cstdint>
+#include <expected>
+#include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -43,6 +46,23 @@ struct Workflow {
     int64_t created_at{0};
     int64_t updated_at{0};
 };
+
+// ── Dispatch callback type ───────────────────────────────────────────────────
+// The workflow engine invokes this callback to dispatch a step to agents.
+// Returns a JSON result string on success, or an error string on failure.
+// (Relocated from workflow_engine.hpp so the abstract `WorkflowApi::execute_workflow` can name it
+// without reaching the Postgres-backed engine class; std-only, so the pure-header rule holds.)
+using StepDispatchFn = std::function<std::expected<std::string, std::string>(
+    const std::string& instruction_id,
+    const std::string& agent_ids_json,
+    const std::string& parameters_json)>;
+
+// ── Condition evaluator callback type ────────────────────────────────────────
+// Evaluates a compliance/CEL expression against result fields.
+// Returns true if the condition is satisfied.
+using ConditionEvalFn = std::function<bool(
+    const std::string& expression,
+    const std::map<std::string, std::string>& result_fields)>;
 
 enum class WorkflowExecutionStatus {
     kPending,

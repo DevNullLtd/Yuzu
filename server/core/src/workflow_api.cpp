@@ -45,6 +45,16 @@ public:
         return engine_.query_executions_page(q, visible);
     }
 
+    // A straight forward to the engine; see the interface comment for why this carries no
+    // authorization of its own. `engine_` is non-const (execute writes), the API object is
+    // shared as `const WorkflowApi`, and the engine serialises its own writes.
+    [[nodiscard]] std::expected<std::string, std::string>
+    execute_workflow(const std::string& workflow_id, const std::vector<std::string>& agent_ids,
+                     StepDispatchFn dispatch_fn, ConditionEvalFn condition_fn) const override {
+        return engine_.execute(workflow_id, agent_ids, std::move(dispatch_fn),
+                               std::move(condition_fn));
+    }
+
 private:
     WorkflowEngine& engine_;
 };

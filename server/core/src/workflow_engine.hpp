@@ -42,20 +42,9 @@ class MetricsRegistry;
 
 namespace yuzu::server {
 
-// ── Dispatch callback type ───────────────────────────────────────────────────
-// The workflow engine invokes this callback to dispatch a step to agents.
-// Returns a JSON result string on success, or an error string on failure.
-using StepDispatchFn = std::function<std::expected<std::string, std::string>(
-    const std::string& instruction_id,
-    const std::string& agent_ids_json,
-    const std::string& parameters_json)>;
-
-// ── Condition evaluator callback type ────────────────────────────────────────
-// Evaluates a compliance/CEL expression against result fields.
-// Returns true if the condition is satisfied.
-using ConditionEvalFn = std::function<bool(
-    const std::string& expression,
-    const std::map<std::string, std::string>& result_fields)>;
+// `StepDispatchFn` (the per-step dispatch callback `execute()` invokes) and `ConditionEvalFn` (the
+// step-condition evaluator) now live in `workflow_types.hpp`, included above, so the store-free
+// `WorkflowApi` seam can name them. Same types, same namespace: no includer changes.
 
 // ── Execution-list SQL ──────────────────────────────────────────────────────
 
