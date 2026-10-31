@@ -190,12 +190,9 @@
     "method": "POST",
     "path": "/api/workflows/{param}/execute",
     "capability_id": "post.api-workflows-param-execute",
-    "rest_v1_twin": {
-      "method": "POST",
-      "path": "/api/v1/workflows/{param}/execute"
-    },
-    "mcp_twin": "execute_workflow",
-    "status": "twinned"
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
   },
   {
     "method": "GET",

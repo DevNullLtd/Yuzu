@@ -252,9 +252,6 @@ constexpr DefaultAllow kDefaultIsCorrectFor[] = {
     {"POST", R"body_cap_path(/fragments/auto/delete)body_cap_path", "/auto Pre-flight trigger: small JSON body (run id / cohort selection)."},
     {"POST", R"body_cap_path(/fragments/auto/run)body_cap_path", "/auto Pre-flight trigger: small JSON body (run id / cohort selection)."},
 
-    // workflow_execute_routes.cpp (1)
-    {"POST", R"body_cap_path(/api/v1/workflows/([^/]+)/execute)body_cap_path", "Workflow-run trigger: a small JSON object holding agent_ids, which parse_workflow_execute_body bounds at 10000 entries of at most 128 bytes (about 1.4 MB, under the 4 MiB default); the steps and parameters come from the stored workflow, never from this body."},
-
     // rest_api_v1.cpp (38)
     {"POST", R"body_cap_path(/api/v1/echo/retention-paused/purge)body_cap_path", "REST management/config JSON body: ids, flags, small structured payloads (management groups, engine principals, tokens, tags, access reviews, inventory queries, result-set derivation, device tokens, software packages/deployments, license, guaranteed-state push, DEX live-snapshot trigger)."},
     {"POST", R"body_cap_path(/api/v1/management-groups)body_cap_path", "REST management/config JSON body: ids, flags, small structured payloads (management groups, engine principals, tokens, tags, access reviews, inventory queries, result-set derivation, device tokens, software packages/deployments, license, guaranteed-state push, DEX live-snapshot trigger)."},

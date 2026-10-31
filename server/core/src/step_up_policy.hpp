@@ -407,7 +407,6 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/api/workflows)",                                                          step_up_detail::kContentAuthoring),
     step_up_detail::exempt("DELETE",R"(/api/workflows/([^/]+))",                                                  step_up_detail::kContentAuthoring),
     step_up_detail::exempt("POST",  R"(/api/workflows/([^/]+)/execute)",                                          step_up_detail::kExecutionDispatch),
-    step_up_detail::exempt("POST",  R"(/api/v1/workflows/([^/]+)/execute)",                                       step_up_detail::kExecutionDispatch),
     step_up_detail::exempt("POST",  R"(/api/instructions/([^/]+)/execute)",                                       step_up_detail::kExecutionDispatch),
     // instruction_execute_routes.cpp (#2146): the v1 twin of the row above, same class.
     step_up_detail::exempt("POST",  R"(/api/v1/instructions/([^/]+)/execute)",                                    step_up_detail::kExecutionDispatch),
