@@ -26,6 +26,7 @@
 #include "web_utils.hpp"
 #include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
 #include "workflow_execution_list_model.hpp" // shared REST+MCP parser/row builder for the run list
+#include "workflow_execute_routes.hpp" // #2146 batch B: POST /api/v1/workflows/{id}/execute
 #include "workflow_model.hpp" // #4030: shared workflow/workflow-execution row builders
 
 #include <nlohmann/json.hpp>
@@ -2850,6 +2851,32 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         res.set_content(nlohmann::json({{"execution_id", *result}, {"status", "running"}}).dump(),
                         "application/json");
     });
+
+    // POST /api/v1/workflows/:id/execute -- the REST v1 twin of the route above (#2146 batch B).
+    // Its own file: a different, fail-closed sequence shared with MCP `execute_workflow`
+    // (workflow_execute.hpp); nothing above is routed through it.
+    register_workflow_execute_v1_route(
+        sink,
+        WorkflowExecuteRouteDeps{
+            .perm_fn = perm_fn,
+            .audit_fn = audit_fn,
+            .persist_audit_fn = persist_audit_fn,
+            .workflow_api = workflow_api,
+            .instruction_store_open =
+                [instruction_store] { return instruction_store && instruction_store->is_open(); },
+            .approval_gate_available = [approval_manager] { return approval_manager != nullptr; },
+            .lookup = make_instruction_lookup(instruction_store),
+            .classify =
+                capability_registry
+                    ? WorkflowClassifyFn{[capability_registry](std::string_view plugin,
+                                                               std::string_view action) {
+                          return capability_registry->classify(plugin, action);
+                      }}
+                    : WorkflowClassifyFn{},
+            .command_dispatch_fn = cmd_dispatch,
+            .command_dispatch_fn_concurrency = cmd_dispatch_concurrency,
+            .caller_fn = caller_fn,
+            .metrics = metrics});
 
     // GET /api/workflow-executions/:id -- get execution status
     sink.Get(R"(/api/workflow-executions/([^/]+))", [fleet_read_fn,
