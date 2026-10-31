@@ -68,8 +68,11 @@ constexpr std::string_view kProductPacks[] = {"list_product_packs", "get_product
 constexpr std::string_view kResponses[] = {"query_responses", "aggregate_responses"};
 // #2146 A2-R1: get_execution_children joins the family - same securable
 // (Execution:Read), same domain as get_execution_status/list_executions.
+// #2146 batch B: cancel_execution and record_execution_rerun join the family - same securable
+// pair (Execution:Execute) as dispatch, but tracker-record-only: neither sends anything to a device.
 constexpr std::string_view kExecutionsAudit[] = {"get_execution_status", "get_execution_children",
-                                                 "list_executions", "query_audit_log"};
+                                                 "list_executions", "query_audit_log",
+                                                 "cancel_execution", "record_execution_rerun"};
 constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_tables",
                                            "get_agent_inventory", "query_installed_software",
                                            "query_software_licenses", "get_agent_app_usage",

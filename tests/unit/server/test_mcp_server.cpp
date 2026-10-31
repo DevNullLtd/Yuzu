@@ -1022,6 +1022,11 @@ struct McpTestServer {
     /// MCP test that needs the lifecycle to be a no-op.
     yuzu::server::ExecutionTracker* execution_tracker_for_test{nullptr};
 
+    /// #2146 batch B: fake store ports for cancel_execution / record_execution_rerun, so those
+    /// tools run without Postgres. Unwired (the default) leaves the tools on
+    /// `execution_tracker_for_test`, exactly as production binds them.
+    yuzu::server::ExecutionMutationPorts execution_mutation_ports_for_test{};
+
     /// #4030 Gate 8 fix: optionally wire a real WorkflowEngine so
     /// list_workflows/get_workflow/get_workflow_execution can be exercised
     /// end-to-end -- until this fix, no MCP test wired one at all (every
@@ -1611,6 +1616,8 @@ private:
         // predicate's "legacy-open" posture, so this is a no-op change of
         // shape for every pre-existing test that never touches it.
         mcp.set_fleet_read_fn(fleet_read_fn_for_test);
+        if (execution_mutation_ports_for_test.wired())
+            mcp.set_execution_mutation_ports_for_test(execution_mutation_ports_for_test);
 
         // #4990: the Forensics tier for the response tools, wired like the fleet gate above.
         if (!forensics_unwired_for_test) {
@@ -43835,4 +43842,472 @@ TEST_CASE("MCP runtime config: the set_runtime_config description names exactly 
     }
     CHECK(writable.find("oidc_") == std::string::npos);
     CHECK(refused.find("oidc_") != std::string::npos);
+}
+
+// ── cancel_execution / record_execution_rerun (#2146 batch B) ───────────────────────────────
+// REST twins: POST /api/v1/executions/{id}/cancel and .../rerun (test_execution_cancel_rerun_twins.cpp).
+// Both run execution_mutation.hpp's apply_execution_mutation; here it runs against a fake store, so
+// none of these cases needs Postgres. Neither tool sends anything to a device.
+namespace {
+
+struct McpExecFake {
+    std::optional<yuzu::server::Execution> exec;
+    std::vector<yuzu::server::AgentExecStatus> statuses;
+    yuzu::server::ExecutionTracker::MarkCancelledOutcome cancel_outcome{
+        yuzu::server::ExecutionTracker::MarkCancelledOutcome::kCancelled};
+    int exec_reads{0}, status_reads{0}, cancel_calls{0}, rerun_calls{0};
+    std::string effect_user;
+    bool effect_failed_only{false};
+
+    yuzu::server::ExecutionMutationPorts ports() {
+        yuzu::server::ExecutionMutationPorts p;
+        p.get_execution = [this](const std::string&)
+            -> std::expected<std::optional<yuzu::server::Execution>, std::string> {
+            ++exec_reads;
+            return exec;
+        };
+        p.get_statuses = [this](const std::string&)
+            -> std::optional<std::vector<yuzu::server::AgentExecStatus>> {
+            ++status_reads;
+            return statuses;
+        };
+        p.mark_cancelled = [this](const std::string&, const std::string& user) {
+            ++cancel_calls;
+            effect_user = user;
+            return cancel_outcome;
+        };
+        p.create_rerun = [this](const std::string&, const std::string& user, bool failed_only)
+            -> std::expected<std::string, std::string> {
+            ++rerun_calls;
+            effect_user = user;
+            effect_failed_only = failed_only;
+            return std::string("rerun-new-1");
+        };
+        return p;
+    }
+    int effects() const { return cancel_calls + rerun_calls; }
+};
+
+yuzu::server::Execution mcp_exec(const std::string& by, int targeted) {
+    yuzu::server::Execution e;
+    e.id = "exec-1";
+    e.dispatched_by = by;
+    e.agents_targeted = targeted;
+    e.status = "running";
+    return e;
+}
+
+yuzu::server::AgentExecStatus mcp_exec_status(const std::string& agent) {
+    yuzu::server::AgentExecStatus a;
+    a.agent_id = agent;
+    a.status = "running";
+    return a;
+}
+
+yuzu::server::authz::VisibleSet mcp_exec_scope(std::initializer_list<const char*> agents) {
+    std::unordered_set<std::string> s;
+    for (auto* a : agents)
+        s.emplace(a);
+    return yuzu::server::authz::VisibleSet{std::move(s)};
+}
+
+std::unique_ptr<httplib::Response> exec_tool_call(McpTestServer& ts, const std::string& tool,
+                                                  const std::string& args) {
+    return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":")" + tool +
+                   R"(","arguments":)" + args + "}}");
+}
+
+} // namespace
+
+TEST_CASE("MCP cancel_execution / record_execution_rerun: registered with truthful annotations and "
+          "descriptions that say nothing reaches a device",
+          "[mcp][execution][2146]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    int found = 0;
+    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"]) {
+        const auto name = t["name"].get<std::string>();
+        if (name != "cancel_execution" && name != "record_execution_rerun")
+            continue;
+        ++found;
+        INFO(name);
+        CHECK(t["annotations"]["readOnlyHint"] == false);
+        CHECK(t["annotations"]["destructiveHint"] == true);
+        CHECK(t["annotations"]["idempotentHint"] == false);
+        const auto desc = t["description"].get<std::string>();
+        CHECK(desc.find("NOTHING") != std::string::npos);
+        CHECK(desc.find("any device") != std::string::npos);
+        CHECK(t.contains("outputSchema"));
+        CHECK(t["inputSchema"]["additionalProperties"] == false);
+        CHECK(t["inputSchema"]["properties"]["execution_id"]["maxLength"] == 128);
+        if (name == "record_execution_rerun") {
+            CHECK(t["inputSchema"]["properties"]["failed_only"]["type"] == "boolean");
+            CHECK(t["inputSchema"]["properties"].contains("approval_id"));
+            CHECK(t["outputSchema"]["properties"]["dispatched_to_devices"]["const"] == false);
+        }
+    }
+    CHECK(found == 2);
+}
+
+TEST_CASE("MCP cancel_execution: unconfined caller cancels; evidence first; nothing dispatched",
+          "[mcp][execution][mutation][2146]") {
+    McpExecFake fs;
+    fs.exec = mcp_exec("alice", 1);
+    McpTestServer ts;
+    ts.execution_mutation_ports_for_test = fs.ports();
+    int dispatched = 0;
+    ts.start_with_dispatch(
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>&,
+            const std::string&, const yuzu::server::DispatchCaller&)
+            -> yuzu::server::ConfinedDispatchOutcome {
+            ++dispatched;
+            return {};
+        },
+        "operator");
+    auto res = exec_tool_call(ts, "cancel_execution", R"({"execution_id":"exec-1"})");
+    REQUIRE(res);
+    const auto payload = operator_surface_payload(res);
+    CHECK(payload["execution_id"] == "exec-1");
+    CHECK(payload["status"] == "cancelled");
+    CHECK(fs.cancel_calls == 1);
+    CHECK(fs.effect_user == "test-user");
+    CHECK(dispatched == 0);
+    // domain rows attempted -> success, then the generic mcp.<tool> row
+    REQUIRE(ts.audit_log.size() >= 3);
+    CHECK(ts.audit_log[0] == "execution.cancel|attempted");
+    CHECK(ts.audit_log[1] == "execution.cancel|success");
+    CHECK(ts.audit_log.back() == "mcp.cancel_execution|success");
+}
+
+TEST_CASE("MCP cancel_execution: at the SUPERVISED tier it needs no approval ticket (risk-reducing, "
+          "owner ruling 2026-10-30); record_execution_rerun still does",
+          "[mcp][execution][mutation][approval][2146]") {
+    McpExecFake fs;
+    fs.exec = mcp_exec("alice", 1);
+    McpTestServer ts;
+    ts.execution_mutation_ports_for_test = fs.ports();
+    // No approval manager is wired: a tool that DID require a ticket cannot mint one and is
+    // refused, so cancel succeeding here proves the exemption and rerun being refused proves the
+    // gate.
+    ts.start("supervised");
+    auto cancel = exec_tool_call(ts, "cancel_execution", R"({"execution_id":"exec-1"})");
+    REQUIRE(cancel);
+    CHECK(operator_surface_payload(cancel)["status"] == "cancelled");
+    CHECK(fs.cancel_calls == 1);
+
+    auto rerun = exec_tool_call(ts, "record_execution_rerun", R"({"execution_id":"exec-1"})");
+    REQUIRE(rerun);
+    auto body = nlohmann::json::parse(rerun->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    CHECK(fs.rerun_calls == 0);
+}
+
+TEST_CASE("MCP cancel_execution: the exemption is exactly one tool, in the metric seeding set and "
+          "the policy derivations alike",
+          "[mcp][execution][approval][2146]") {
+    using namespace yuzu::server::mcp;
+    CHECK(tool_exempt_from_approval("cancel_execution"));
+    CHECK_FALSE(tool_exempt_from_approval("record_execution_rerun"));
+    CHECK_FALSE(tool_exempt_from_approval("execute_instruction"));
+    CHECK(kApprovalExemptTools.size() == 1);
+    // The pair itself is still approval-gated for every other tool; only the named tool is exempt.
+    CHECK(requires_approval("supervised", "Execution", "Execute"));
+    CHECK_FALSE(requires_approval_for_tool("supervised", "cancel_execution", "Execution", "Execute"));
+    CHECK(requires_approval_for_tool("supervised", "record_execution_rerun", "Execution", "Execute"));
+    const auto gated = approval_gated_tool_names();
+    CHECK(std::ranges::find(gated, "cancel_execution") == gated.end());
+    CHECK(std::ranges::find(gated, "record_execution_rerun") != gated.end());
+}
+
+TEST_CASE("MCP cancel_execution / record_execution_rerun: readonly tier and service-scoped tokens "
+          "are refused before any store read",
+          "[mcp][execution][mutation][security][2146]") {
+    for (const char* tool : {"cancel_execution", "record_execution_rerun"}) {
+        SECTION(std::string(tool) + ": readonly tier") {
+            McpExecFake fs;
+            fs.exec = mcp_exec("alice", 1);
+            McpTestServer ts;
+            ts.execution_mutation_ports_for_test = fs.ports();
+            ts.start("readonly");
+            auto res = exec_tool_call(ts, tool, R"({"execution_id":"exec-1"})");
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+            CHECK(fs.exec_reads == 0);
+            CHECK(fs.effects() == 0);
+        }
+        SECTION(std::string(tool) + ": service-scoped token is default-denied (class: denied)") {
+            McpExecFake fs;
+            fs.exec = mcp_exec("alice", 1);
+            McpTestServer ts;
+            ts.execution_mutation_ports_for_test = fs.ports();
+            ts.mock_token_scope_service = "payments";
+            ts.start("operator");
+            auto res = exec_tool_call(ts, tool, R"({"execution_id":"exec-1"})");
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+            CHECK(fs.exec_reads == 0);
+            CHECK(fs.effects() == 0);
+        }
+        SECTION(std::string(tool) + ": an engine-classed session with no RBAC grant is denied") {
+            McpExecFake fs;
+            fs.exec = mcp_exec("alice", 1);
+            McpTestServer ts;
+            ts.execution_mutation_ports_for_test = fs.ports();
+            ts.mock_principal_kind = "engine";
+            ts.mock_auth_source = "engine";
+            // Engine principals resolve RBAC-only and are default-deny: no grant, no Execute.
+            ts.perm_override_for_test = [](const std::string&, const std::string&) { return false; };
+            ts.start("operator");
+            auto res = exec_tool_call(ts, tool, R"({"execution_id":"exec-1"})");
+            REQUIRE(res);
+            CHECK(fs.exec_reads == 0);
+            CHECK(fs.effects() == 0);
+            for (const auto& row : ts.audit_log)
+                CHECK(row.find("success") == std::string::npos);
+        }
+        SECTION(std::string(tool) + ": permission denied before any store read") {
+            McpExecFake fs;
+            fs.exec = mcp_exec("alice", 1);
+            McpTestServer ts;
+            ts.execution_mutation_ports_for_test = fs.ports();
+            ts.perm_override_for_test = [](const std::string&, const std::string&) { return false; };
+            ts.start("operator");
+            auto res = exec_tool_call(ts, tool, R"({"execution_id":"exec-1"})");
+            REQUIRE(res);
+            CHECK(res->status == 403);
+            CHECK(fs.exec_reads == 0);
+            CHECK(fs.effects() == 0);
+        }
+    }
+}
+
+TEST_CASE("MCP cancel_execution / record_execution_rerun: hidden and nonexistent are "
+          "indistinguishable (same error, same audit, same store round trips)",
+          "[mcp][execution][mutation][confinement][security][2146]") {
+    for (const char* tool : {"cancel_execution", "record_execution_rerun"}) {
+        McpExecFake missing, hidden;
+        hidden.exec = mcp_exec("alice", 1);
+        hidden.statuses = {mcp_exec_status("hidden")};
+        auto run = [&](McpExecFake& fs) {
+            McpTestServer ts;
+            ts.execution_mutation_ports_for_test = fs.ports();
+            ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                           const std::string&, const std::string&)
+                -> yuzu::server::authz::FleetReadGate {
+                return {true, mcp_exec_scope({"a"})};
+            };
+            ts.start("operator");
+            auto res = exec_tool_call(ts, tool, R"({"execution_id":"exec-1"})");
+            REQUIRE(res);
+            return std::make_tuple(nlohmann::json::parse(res->body), ts.audit_log,
+                                   ts.audit_details);
+        };
+        auto [body_missing, audit_missing, details_missing] = run(missing);
+        auto [body_hidden, audit_hidden, details_hidden] = run(hidden);
+        REQUIRE(body_missing.contains("error"));
+        CHECK(body_missing["error"]["code"] == body_hidden["error"]["code"]);
+        CHECK(body_missing["error"]["message"] == body_hidden["error"]["message"]);
+        CHECK(audit_missing == audit_hidden);
+        CHECK(details_missing == details_hidden);
+        CHECK(missing.exec_reads == hidden.exec_reads);
+        CHECK(missing.status_reads == hidden.status_reads);
+        CHECK(missing.effects() == 0);
+        CHECK(hidden.effects() == 0);
+    }
+}
+
+TEST_CASE("MCP cancel_execution / record_execution_rerun: a confined caller needs complete cohort "
+          "visibility (partial denies, full admits)",
+          "[mcp][execution][mutation][confinement][security][2146]") {
+    for (const char* tool : {"cancel_execution", "record_execution_rerun"}) {
+        for (const bool full : {false, true}) {
+            McpExecFake fs;
+            fs.exec = mcp_exec("alice", 2);
+            fs.statuses = {mcp_exec_status("a"), mcp_exec_status(full ? "b" : "hidden")};
+            McpTestServer ts;
+            ts.execution_mutation_ports_for_test = fs.ports();
+            ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                           const std::string&, const std::string&)
+                -> yuzu::server::authz::FleetReadGate {
+                return {true, mcp_exec_scope({"a", "b"})};
+            };
+            ts.start("operator");
+            auto res = exec_tool_call(ts, tool, R"({"execution_id":"exec-1"})");
+            REQUIRE(res);
+            INFO(tool << " full=" << full);
+            CHECK(fs.effects() == (full ? 1 : 0));
+        }
+    }
+}
+
+TEST_CASE("MCP cancel_execution / record_execution_rerun: an empty principal is refused, never "
+          "run as 'unknown'",
+          "[mcp][execution][mutation][security][2146]") {
+    for (const char* tool : {"cancel_execution", "record_execution_rerun"}) {
+        McpExecFake fs;
+        fs.exec = mcp_exec("", 1);
+        McpTestServer ts;
+        ts.execution_mutation_ports_for_test = fs.ports();
+        ts.mock_username = "";
+        ts.start("operator");
+        auto res = exec_tool_call(ts, tool, R"({"execution_id":"exec-1"})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(fs.exec_reads == 0);
+        CHECK(fs.effects() == 0);
+        for (const auto& row : ts.audit_log)
+            CHECK(row.find("execution.") == std::string::npos);
+    }
+}
+
+TEST_CASE("MCP cancel_execution / record_execution_rerun: the attempted audit row failing means "
+          "NO change, with a retry hint",
+          "[mcp][execution][mutation][security][2146]") {
+    for (const char* tool : {"cancel_execution", "record_execution_rerun"}) {
+        McpExecFake fs;
+        fs.exec = mcp_exec("alice", 1);
+        McpTestServer ts;
+        ts.execution_mutation_ports_for_test = fs.ports();
+        ts.audit_fail_result_ = "attempted";
+        ts.start("operator");
+        auto res = exec_tool_call(ts, tool, R"({"execution_id":"exec-1"})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(fs.effects() == 0);
+    }
+}
+
+TEST_CASE("MCP cancel_execution: already finished is a terminal business error; a store failure "
+          "is retryable",
+          "[mcp][execution][mutation][2146]") {
+    SECTION("already finished") {
+        McpExecFake fs;
+        fs.exec = mcp_exec("alice", 1);
+        fs.cancel_outcome = yuzu::server::ExecutionTracker::MarkCancelledOutcome::kNoOp;
+        McpTestServer ts;
+        ts.execution_mutation_ports_for_test = fs.ports();
+        ts.start("operator");
+        auto res = exec_tool_call(ts, "cancel_execution", R"({"execution_id":"exec-1"})");
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("already finished") !=
+              std::string::npos);
+        REQUIRE(ts.audit_log.size() >= 2);
+        CHECK(ts.audit_log[1] == "execution.cancel|denied");
+    }
+    SECTION("store failure") {
+        McpExecFake fs;
+        fs.exec = mcp_exec("alice", 1);
+        fs.cancel_outcome = yuzu::server::ExecutionTracker::MarkCancelledOutcome::kFailed;
+        McpTestServer ts;
+        ts.execution_mutation_ports_for_test = fs.ports();
+        ts.start("operator");
+        auto res = exec_tool_call(ts, "cancel_execution", R"({"execution_id":"exec-1"})");
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        REQUIRE(ts.audit_log.size() >= 2);
+        CHECK(ts.audit_log[1] == "execution.cancel|failure");
+    }
+}
+
+TEST_CASE("MCP record_execution_rerun: failed_only is a strict boolean; the result says nothing "
+          "was dispatched",
+          "[mcp][execution][mutation][2146]") {
+    SECTION("true and false are forwarded") {
+        for (const bool failed_only : {false, true}) {
+            McpExecFake fs;
+            fs.exec = mcp_exec("alice", 4);
+            McpTestServer ts;
+            ts.execution_mutation_ports_for_test = fs.ports();
+            int dispatched = 0;
+            ts.start_with_dispatch(
+                [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                    const std::string&, const std::unordered_map<std::string, std::string>&,
+                    const std::string&, const yuzu::server::DispatchCaller&)
+                    -> yuzu::server::ConfinedDispatchOutcome {
+                    ++dispatched;
+                    return {};
+                },
+                "operator");
+            auto res = exec_tool_call(
+                ts, "record_execution_rerun",
+                std::string(R"({"execution_id":"exec-1","failed_only":)") +
+                    (failed_only ? "true" : "false") + "}");
+            const auto payload = operator_surface_payload(res);
+            CHECK(payload["execution_id"] == "rerun-new-1");
+            CHECK(payload["rerun_of"] == "exec-1");
+            CHECK(payload["status"] == "pending");
+            CHECK(payload["failed_only"] == failed_only);
+            CHECK(payload["dispatched_to_devices"] == false);
+            CHECK(fs.effect_failed_only == failed_only);
+            CHECK(fs.rerun_calls == 1);
+            CHECK(dispatched == 0); // the send set is empty
+            REQUIRE(ts.audit_log.size() >= 3);
+            CHECK(ts.audit_log[0] == "execution.rerun|attempted");
+            CHECK(ts.audit_log[1] == "execution.rerun|success");
+        }
+    }
+    SECTION("omitted means false") {
+        McpExecFake fs;
+        fs.exec = mcp_exec("alice", 4);
+        McpTestServer ts;
+        ts.execution_mutation_ports_for_test = fs.ports();
+        ts.start("operator");
+        auto res = exec_tool_call(ts, "record_execution_rerun", R"({"execution_id":"exec-1"})");
+        CHECK(operator_surface_payload(res)["failed_only"] == false);
+        CHECK_FALSE(fs.effect_failed_only);
+    }
+}
+
+TEST_CASE("MCP cancel_execution / record_execution_rerun: malformed arguments are refused with "
+          "-32602 before any store read",
+          "[mcp][execution][mutation][2146]") {
+    struct Case {
+        const char* tool;
+        const char* args;
+    };
+    const Case cases[] = {
+        {"cancel_execution", R"({})"},
+        {"cancel_execution", R"({"execution_id":42})"},
+        {"cancel_execution", R"({"execution_id":""})"},
+        {"cancel_execution", R"({"execution_id":"a b"})"},
+        {"cancel_execution", R"({"execution_id":"a=b\nx"})"},
+        {"cancel_execution", R"({"execution_id":"exec-1","failed_only":true})"},
+        {"record_execution_rerun", R"({})"},
+        {"record_execution_rerun", R"({"execution_id":"exec-1","failed_only":"true"})"},
+        {"record_execution_rerun", R"({"execution_id":"exec-1","failed_only":1})"},
+        // the legacy REST spelling must not be silently read as a FULL rerun
+        {"record_execution_rerun", R"({"execution_id":"exec-1","scope":"failed_only"})"},
+        {"record_execution_rerun", R"({"execution_id":"a/b"})"},
+    };
+    for (const auto& c : cases) {
+        McpExecFake fs;
+        fs.exec = mcp_exec("alice", 1);
+        McpTestServer ts;
+        ts.execution_mutation_ports_for_test = fs.ports();
+        ts.start("operator");
+        auto res = exec_tool_call(ts, c.tool, c.args);
+        REQUIRE(res);
+        INFO(c.tool << " " << c.args);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(fs.exec_reads == 0);
+        CHECK(fs.effects() == 0);
+    }
 }
