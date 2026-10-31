@@ -1989,19 +1989,19 @@ TEST_CASE("REST gs.status: errored_rules is real, census-derived and DISTINCT-ru
     CHECK(j["data"]["total_rules"].get<int>() == 3);
 }
 
-TEST_CASE("REST gs.status: an errored census row for a DELETED rule is excluded (not counted)",
+TEST_CASE("REST gs.status: an event for a rule that does not exist adds no census row (not counted)",
           "[pg][rest][guaranteed_state][status]") {
-    // Adversarial-review finding: delete_rule's own status-table cleanup is
-    // explicitly best-effort (no changes-count check, warn-only on failure) with no
-    // FK — so a census row can outlive its rule. errored_rules must intersect
-    // against the live catalogue, or a deleted rule inflates the count forever.
+    // Schema v3: guardian_agent_rule_status has a foreign key to
+    // guaranteed_state_rules, so a census row for a missing rule is refused and
+    // cannot be arranged. This pins the observable result (errored_rules counts the
+    // live rule only); the live-catalogue intersection in the route remains as
+    // defense in depth.
     RestGsHarness h;
     REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r-live", "live"))
                 ->status == 201);
     h.seed_status("e1", "WS-1", "r-live", "guard.unhealthy", "2026-06-20T10:00:00Z");
-    // r-orphan has a census row but was NEVER created as a rule (models the
-    // best-effort-cleanup-failed / late-event-after-delete case without needing to
-    // race the actual delete path).
+    // r-orphan was NEVER created as a rule: the event is stored, its census write
+    // is refused by the foreign key.
     h.seed_status("e2", "WS-1", "r-orphan", "guard.unhealthy", "2026-06-20T10:00:00Z");
 
     auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
@@ -2250,8 +2250,9 @@ TEST_CASE("REST gs.status: a guard.errored lifecycle event counts as an errored 
     CHECK(j["data"]["compliant_rules"].get<int>() == 0);
 }
 
-TEST_CASE("REST gs.status/{agent_id}: an errored census row for a DELETED rule is excluded",
+TEST_CASE("REST gs.status/{agent_id}: an event for a rule that does not exist adds no census row",
           "[pg][rest][guaranteed_state][status]") {
+    // Schema v3: the foreign key refuses the census row for the missing rule.
     RestGsHarness h;
     REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r-live", "live"))
                 ->status == 201);

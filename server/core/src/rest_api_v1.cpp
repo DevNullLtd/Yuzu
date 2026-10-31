@@ -20223,12 +20223,12 @@ void RestApiV1::register_routes(
     //
     // Count = DISTINCT rule_ids with >=1 census row in state "errored" AND still present
     // in the live rule catalogue, fleet-wide — intersected against rule_names() the same
-    // way guardian_routes.cpp's dashboard rollup_by_rule is. A census row is NOT
-    // guaranteed to be deleted atomically with its rule: delete_rule's own status
-    // cleanup is a SEPARATE, explicitly best-effort statement (no changes-count check,
-    // warn-only on failure) with no FK enforcing it, and a late/racing event can upsert
-    // a row after deletion — an earlier version of this comment claimed an orphan row
-    // was "impossible"; that was wrong (adversarial-review finding). One remaining
+    // way guardian_routes.cpp's dashboard rollup_by_rule is. Since schema v3 a census
+    // row cannot outlive its rule: guardian_agent_rule_status carries a foreign key to
+    // guaranteed_state_rules with ON DELETE CASCADE, so delete_rule removes the rows in
+    // the same statement, and a late event for a deleted rule has its census write
+    // refused (SQLSTATE 23503). The intersection is kept as defense in depth in case
+    // that constraint is ever missing. One remaining
     // deliberate delta from the dashboard: no offline-agent fold to "unknown" (this
     // route counts a rule as errored if ANY agent currently reports it errored,
     // regardless of that agent's liveness) — documented in the note field.
