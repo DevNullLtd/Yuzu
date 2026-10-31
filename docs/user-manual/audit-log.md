@@ -64,6 +64,17 @@ Every audit event contains the following fields:
 | `session_id` | string | For dashboard requests, the SHA-256 hex digest (64 characters) of the `yuzu_session` cookie the request presented — the value the session store keys on (`token_hash`). Empty when the request carried no cookie (API-token, Bearer and `X-Yuzu-Token` calls normally have none); when the cookie did not resolve a session on the session-resolving path (an expired or unknown cookie; the `auth.logout` row, written after the session is invalidated); and on a few hand-built rows that do not stamp it (`api_token.create`/`api_token.revoke`, `management_group.create`/`management_group.delete`). Pre-session sign-in rows (login, MFA, OIDC/SAML callback) carry the digest of any cookie presented. If a token call also presents a cookie, the digest is of that cookie, which may not be the credential that authenticated the call; `principal` is authoritative. Agent-session rows (`session.*` actions written by the gRPC service) carry the agent session identifier when the request presented one, otherwise empty. Rows written by an earlier release, or by a server still on one during a rolling upgrade, hold the value recorded at the time; the two forms look alike and are separated by `timestamp` against each server's upgrade date. The audit readers do not return this column; read it from the database. |
 | `result` | string | Outcome: `success`, `denied`, or `failure` (or `attempted`, the audit-first row an operation writes before it changes anything, or `requested`, the audit-first row the v1 dispatch twins write before sending anything, or `pending`, the outcome row of a call held for approval, or `no_change`, the outcome row of an idempotent request that found nothing to change). See **Result vocabulary** below the actions table for the precise semantics of each value. **On the behavioural-PII access-audit rows** (`dex.device.view`, `dex.signal.view`, `guardian.device.view`, and siblings — #4858), `result=success` does NOT uniformly mean "data was disclosed"; see that same section for the pre-read-vs-post-read split. |
 
+### Caller text in `detail`
+
+`detail` is assembled as space-separated `key=value` fields, and a caller-supplied value (a definition id, a plugin or action name, an execution id) is neutralised before it goes in, so it cannot forge a neighbouring field or start a new line:
+
+- Control bytes, DEL, space, `=` and `,` become `_`.
+- The Unicode characters a line splitter treats as a line break also become `_` (one per character): the C1 controls U+0080 to U+009F (including NEL, U+0085), LINE SEPARATOR U+2028 and PARAGRAPH SEPARATOR U+2029. Every other well-formed UTF-8 character (accented letters, CJK, emoji) is kept as written.
+- A byte that is not part of a well-formed UTF-8 sequence becomes `_` (one per byte), so the neutralised value is always valid UTF-8. A folded line-separator character becomes a single `_`.
+- Where a value is length-bounded (the software sync routes cap it at 128 bytes and append `...`), the cut falls on a character boundary: a character that would straddle the cap is dropped whole, never kept as half a character.
+
+The store itself is a second line of defence: every text column is scrubbed before the insert (invalid UTF-8 and NUL become U+FFFD), so a hostile byte can never make the audit write fail. A request cannot cause an `audit_unavailable` refusal by what it sends, and no outcome row is lost to it.
+
 ## Logged actions
 
 The following actions are recorded automatically. No operator configuration is

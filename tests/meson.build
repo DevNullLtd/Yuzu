@@ -1468,6 +1468,7 @@ if build_server
       'unit/server/test_pg_retention_guard.cpp',
       'unit/server/test_audit_retention_rules.cpp',
       'unit/server/test_log_token.cpp',
+      'unit/server/test_audit_token_hostile_bytes.cpp',
       'unit/server/test_sqlite_raii.cpp',
       'unit/server/test_rest_audit_sample.cpp',
       'unit/server/test_rest_audit_query.cpp',

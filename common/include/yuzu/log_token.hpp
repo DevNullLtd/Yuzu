@@ -15,15 +15,25 @@
  * differed between the two sides would silently break the join for exactly the ids that need
  * it.
  *
- * Three functions, the first two sharing one mapping core (log_id_token calls log_token, so
- * that predicate exists once); log_key_token deliberately does NOT call either -- its mapping is
+ * Three functions, the first two sharing one ASCII predicate (detail::is_structural_ascii, so it
+ * exists once); log_key_token deliberately does NOT call either -- its mapping is
  * narrower (see below) and folding it through log_token's stricter predicate would defeat the
  * point of having a separate, more permissive function:
- *   - log_token(s): control bytes, DEL, space, '=' and ',' -> '_'. Bytes >= 0x80 pass
- *     through. No length cap. This is the structured-audit-detail neutraliser (audit_token in
- *     server/core/src/web_utils.hpp forwards to it).
+ *   - log_token(s): control bytes, DEL, space, '=' and ',' -> '_'. A byte >= 0x80 that is part of
+ *     a well-formed UTF-8 sequence (no overlong form, no surrogate, nothing above U+10FFFF, the
+ *     exact set PostgreSQL's UTF8 accepts) passes through, EXCEPT the sequences a line splitter
+ *     treats as a line break, which fold to ONE '_' per code point: the C1 controls U+0080-U+009F
+ *     (`C2 80`..`C2 9F`, NEL U+0085 among them), LINE SEPARATOR U+2028 (`E2 80 A8`) and PARAGRAPH
+ *     SEPARATOR U+2029 (`E2 80 A9`) -- the same three log_key_token folds, for the same reason
+ *     (Python's str.splitlines(), used by the evidence readers, breaks a line on each). A byte
+ *     that is not part of a well-formed sequence (a stray continuation byte, an overlong or
+ *     surrogate form, a truncated lead) maps to '_' too, one per byte, so the output is ALWAYS
+ *     valid UTF-8. No length cap. This is the structured-audit-detail neutraliser (audit_token in
+ *     server/core/src/web_utils.hpp forwards to it). The registry plugin's audit line
+ *     (registry_parsers.hpp) folds the same code points with the same single '_' by its own
+ *     fold_line_breaks, so its output is unchanged.
  *   - log_id_token(s): for an id written to a Guardian log line. Stricter: it applies
- *     log_token's mapping and then also maps every byte >= 0x80 to '_' (so a multi-byte
+ *     log_token's ASCII mapping and maps EVERY byte >= 0x80 to '_', one per byte (so a multi-byte
  *     character can neither be cut mid-sequence into invalid UTF-8 nor smuggle a Unicode line
  *     separator into a line), and an id longer than kGuardianLogIdMaxBytes is shortened to
  *     exactly that length as <head> '~' <last kGuardianLogIdTailBytes bytes> before mapping.
@@ -82,14 +92,69 @@ inline constexpr std::size_t kGuardianLogIdTailBytes = 24;
 static_assert(kGuardianLogIdMaxBytes > kGuardianLogIdTailBytes + 1,
               "an over-long id must keep a non-empty head, the marker and the tail");
 
+/// Length (2..4) of the well-formed UTF-8 sequence that starts at s[i], or 0 when the bytes at i
+/// are not one. "Well-formed" is exactly what PostgreSQL's UTF8 encoding accepts, the same rules
+/// as server/core/src/utf8_sanitize.hpp (not includable here: this root has no server types).
+/// Precondition: s[i] >= 0x80.
+[[nodiscard]] inline std::size_t utf8_sequence_length(std::string_view s, std::size_t i) noexcept {
+    const std::size_t n = s.size();
+    const auto cont = [&](std::size_t j) {
+        return j < n && (static_cast<unsigned char>(s[j]) & 0xC0) == 0x80;
+    };
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    const unsigned char c1 = i + 1 < n ? static_cast<unsigned char>(s[i + 1]) : 0;
+    if (c >= 0xC2 && c <= 0xDF)
+        return cont(i + 1) ? 2 : 0;
+    if (c == 0xE0)
+        return (c1 >= 0xA0 && c1 <= 0xBF && cont(i + 2)) ? 3 : 0; // overlong 80..9F refused
+    if ((c >= 0xE1 && c <= 0xEC) || c == 0xEE || c == 0xEF)
+        return (cont(i + 1) && cont(i + 2)) ? 3 : 0;
+    if (c == 0xED)
+        return (c1 >= 0x80 && c1 <= 0x9F && cont(i + 2)) ? 3 : 0; // surrogates A0..BF refused
+    if (c == 0xF0)
+        return (c1 >= 0x90 && c1 <= 0xBF && cont(i + 2) && cont(i + 3)) ? 4 : 0;
+    if (c >= 0xF1 && c <= 0xF3)
+        return (cont(i + 1) && cont(i + 2) && cont(i + 3)) ? 4 : 0;
+    if (c == 0xF4)
+        return (c1 >= 0x80 && c1 <= 0x8F && cont(i + 2) && cont(i + 3)) ? 4 : 0; // > U+10FFFF refused
+    return 0; // 0x80..0xC1 (stray continuation, overlong lead) and 0xF5..0xFF
+}
+
+namespace detail {
+/// The ASCII bytes log_token and log_id_token both neutralise: control bytes, DEL, space, '='
+/// and ','. ONE predicate, so the two mappings cannot drift apart on the ASCII range.
+[[nodiscard]] constexpr bool is_structural_ascii(unsigned char c) noexcept {
+    return c < 0x20 || c == 0x7F || c == ' ' || c == '=' || c == ',';
+}
+} // namespace detail
+
 [[nodiscard]] inline std::string log_token(std::string_view s) {
     std::string out;
     out.reserve(s.size());
-    for (const unsigned char c : s) {
-        if (c < 0x20 || c == 0x7F || c == ' ' || c == '=' || c == ',')
+    for (std::size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80) {
+            out.push_back(detail::is_structural_ascii(c) ? '_' : static_cast<char>(c));
+            ++i;
+            continue;
+        }
+        const std::size_t len = utf8_sequence_length(s, i);
+        if (len == 0) { // not part of a well-formed sequence: one '_' for the one byte
             out.push_back('_');
+            ++i;
+            continue;
+        }
+        const unsigned char c1 = static_cast<unsigned char>(s[i + 1]);
+        // C1 controls U+0080-U+009F (`C2 80`..`C2 9F`) and U+2028 / U+2029 (`E2 80 A8` / `E2 80 A9`).
+        const bool folds = (c == 0xC2 && c1 <= 0x9F) ||
+                           (c == 0xE2 && c1 == 0x80 &&
+                            (static_cast<unsigned char>(s[i + 2]) == 0xA8 ||
+                             static_cast<unsigned char>(s[i + 2]) == 0xA9));
+        if (folds)
+            out.push_back('_'); // one '_' per folded code point, as log_key_token does
         else
-            out.push_back(static_cast<char>(c));
+            out.append(s.substr(i, len));
+        i += len;
     }
     return out;
 }
@@ -104,11 +169,13 @@ static_assert(kGuardianLogIdMaxBytes > kGuardianLogIdTailBytes + 1,
     } else {
         raw.assign(s);
     }
-    std::string out = log_token(raw);
-    for (char& ch : out) {
-        if (static_cast<unsigned char>(ch) >= 0x80)
-            ch = '_';
-    }
+    // Byte-wise, deliberately NOT log_token(): every byte >= 0x80 becomes one '_' here, so the
+    // output is pure ASCII and as long as the (already shortened) input, whatever log_token does
+    // with a code point. The Guardian T_wire/T_server join depends on this staying identical.
+    std::string out;
+    out.reserve(raw.size());
+    for (const unsigned char c : raw)
+        out.push_back((c >= 0x80 || detail::is_structural_ascii(c)) ? '_' : static_cast<char>(c));
     return out;
 }
 

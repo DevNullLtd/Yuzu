@@ -65,6 +65,46 @@ TEST_CASE("log_token: ordinary identifiers pass through unchanged", "[log_token]
     CHECK(log_token("caf\xC3\xA9") == "caf\xC3\xA9");
 }
 
+TEST_CASE("log_token: Unicode line separators and C1 controls fold, one '_' per code point (CH-12)",
+          "[log_token]") {
+    // U+0085 NEL, U+2028, U+2029: the code points a splitlines()-style reader breaks a line on.
+    CHECK(log_token("a\xC2\x85" "b") == "a_b");
+    CHECK(log_token("a\xE2\x80\xA8" "b") == "a_b");
+    CHECK(log_token("a\xE2\x80\xA9" "b") == "a_b");
+    // The whole C1 range U+0080-U+009F folds, both ends included.
+    CHECK(log_token("\xC2\x80") == "_");
+    CHECK(log_token("\xC2\x9F") == "_");
+    // Near misses do NOT fold: U+00A0 (NBSP), U+2027, U+202A, U+00E9, U+20AC.
+    CHECK(log_token("\xC2\xA0") == "\xC2\xA0");
+    CHECK(log_token("\xE2\x80\xA7") == "\xE2\x80\xA7");
+    CHECK(log_token("\xE2\x80\xAA") == "\xE2\x80\xAA");
+    CHECK(log_token("caf\xC3\xA9") == "caf\xC3\xA9");
+    CHECK(log_token("\xE2\x82\xAC") == "\xE2\x82\xAC");
+    CHECK(log_token("\xF0\x9F\x98\x80") == "\xF0\x9F\x98\x80"); // U+1F600, 4 bytes
+}
+
+TEST_CASE("log_token: bytes that are not well-formed UTF-8 map to '_' one per byte and the output is "
+          "always valid UTF-8 (CH-12)",
+          "[log_token]") {
+    CHECK(log_token("a\xFF\xFE" "b") == "a__b");           // never valid
+    CHECK(log_token("a\x80" "b") == "a_b");                // stray continuation
+    CHECK(log_token("a\xC0\xAF" "b") == "a__b");          // overlong '/'
+    CHECK(log_token("a\xED\xA0\x80" "b") == "a___b");    // surrogate U+D800
+    CHECK(log_token("a\xF5\x80\x80\x80" "b") == "a____b"); // above U+10FFFF
+    CHECK(log_token("a\xE2\x82") == "a__");               // truncated 3-byte lead
+    CHECK(log_token("a\xE2" "b") == "a_b");                // lead followed by ASCII
+    for (const std::string s : {std::string("a\xFF\xFEb\xC0\xAF" "c\xED\xA0\x80" "d\xF5\x80\x80\x80" "e\xE2\x82"),
+                                std::string("x\xC2\x85y\xE2\x80\xA8z\xE2\x80\xA9"),
+                                std::string("caf\xC3\xA9 \xE2\x82\xAC\xF0\x9F\x98\x80")}) {
+        CHECK(is_well_formed_utf8(log_token(s)));
+    }
+    // log_id_token's pinned output is unchanged: still one '_' per byte >= 0x80.
+    CHECK(log_id_token("a\xFF" "b") == "a_b");
+    CHECK(log_id_token("a\xE2\x80\xA8" "b") == "a___b");
+    CHECK(log_id_token("a\xC2\x85" "b") == "a__b");
+    CHECK(log_id_token("caf\xC3\xA9") == "caf__");
+}
+
 TEST_CASE("log_token: every structural byte maps to '_'", "[log_token]") {
     CHECK(log_token("a b") == "a_b");
     CHECK(log_token("a=b") == "a_b");
