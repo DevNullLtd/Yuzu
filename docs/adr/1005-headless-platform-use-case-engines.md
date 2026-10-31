@@ -904,7 +904,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      registry tool is both a ledger `mcp_twin` and a `kExpectedTwins` row. Each
      check carries a size-pinned, shrink-only allowlist seeded from the tree as
      it stood. The gate-parity table (`GATE_PARITY_KNOWN_MISMATCHES`) holds
-     the six rows whose REST and MCP gates still differ, or whose agreement
+     the six rows (seven since the 2026-10-31 entry below) whose REST and MCP gates still differ, or whose agreement
      the check cannot prove, after it learned two shapes (a REST handler that
      refuses a service-scoped token before its gate, and an MCP handler whose
      own fleet read confines), with a
@@ -1081,6 +1081,22 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      surface; the migration guide (`docs/user-manual/upgrading.md`) lists the
      old and new names. The ledger records the retirement because the policy
      requires it.
+   - **2026-10-31 - gate parity (check 6) pins one more known mismatch for
+     `POST /api/v1/commands` and `execute_instruction`.** Owner ruling: the
+     gate-parity table `GATE_PARITY_KNOWN_MISMATCHES` gains the entry
+     `("POST", "/api/v1/commands", "execute_instruction")` and its cap
+     `GATE_PARITY_KNOWN_MISMATCHES_MAX` rises from 6 to 7. The REST route is read
+     as `plain:Execution:Execute` and the tool's declared pair as
+     `confined:Execution:Execute`, so the lexical comparison cannot agree. Both
+     surfaces call the same `require_permission(Execution, Execute)`, whose
+     service-scoped branch answers 403 because `kServiceScopeGlobalSafe` is
+     empty, so a service-scoped caller is refused on both. The MCP `confined`
+     label is the C8 `ServiceScopeClass`, and is not a claim that the tool is
+     usable by a service-scoped caller. The entry is a deferral, not a proof of
+     agreement: the check compares labels and cannot see this. It is removed,
+     and the cap lowered, when the comparison can read the two gates as the same
+     kind. Tracking: programme #2146. This is the ruling the 2026-10-23 entry
+     above requires before a pin is raised.
 
 ## Interim rules (until the named follow-ups ship)
 
