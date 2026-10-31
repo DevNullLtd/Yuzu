@@ -6851,6 +6851,11 @@ non-boolean `failed_only` is a `400`. Each call creates another record. `201`:
 }
 ```
 
+An original that exists but cannot be read (store degraded, pool exhausted) answers `503` with
+`retry_after_ms`, a `failure` audit row and no new record; it is never reported as `404`. (The
+legacy `POST /api/executions/{id}/rerun` still reads without that check and reports an unreadable
+original as `400 original execution not found`.)
+
 These routes do not emit the `execution.created` / `execution.completed` webhook events that the
 legacy routes emit.
 

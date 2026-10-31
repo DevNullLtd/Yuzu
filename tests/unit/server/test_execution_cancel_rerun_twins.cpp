@@ -7,7 +7,8 @@
  * fake store, so every case below runs in every environment instead of skipping without a DSN.
  * The ports bound to a real `ExecutionTracker` (`make_tracker_mutation_ports`) are a thin
  * adapter over `get_execution_checked` / `get_agent_statuses_checked` / `mark_cancelled_checked`
- * / `create_rerun`, whose own behaviour is covered by test_execution_tracker.cpp (PG).
+ * / `create_rerun_checked`; the adapter itself is tested against a real tracker (PG, plus an
+ * unreachable-pool "closed" tracker) in test_execution_tracker.cpp.
  *
  * The MCP twins (cancel_execution, record_execution_rerun) are exercised in test_mcp_server.cpp,
  * where the McpTestServer fixture lives; they use the same fake ports.
@@ -51,7 +52,7 @@ struct FakeStore {
     /// non-std type. The effect call is counted BEFORE it throws.
     int effect_throws{0};
     Outcome cancel_outcome{Outcome::kCancelled};
-    std::expected<std::string, std::string> rerun_result{std::string("rerun-new-1")};
+    std::expected<std::string, ExecutionTracker::RerunError> rerun_result{std::string("rerun-new-1")};
 
     int exec_reads{0}, status_reads{0}, cancel_calls{0}, rerun_calls{0};
     std::string effect_user;
@@ -90,7 +91,7 @@ struct FakeStore {
             return cancel_outcome;
         };
         p.create_rerun = [this](const std::string&, const std::string& user, bool failed_only)
-            -> std::expected<std::string, std::string> {
+            -> std::expected<std::string, ExecutionTracker::RerunError> {
             ++rerun_calls;
             effect_user = user;
             effect_failed_only = failed_only;
@@ -444,7 +445,7 @@ TEST_CASE("execution mutation: rerun forwards failed_only, records the NEW id, a
     SECTION("a store failure is a 503-shaped failure with no raw text") {
         FakeStore fs;
         fs.exec = make_exec("alice", 1);
-        fs.rerun_result = std::unexpected("PQerror: connection reset by peer");
+        fs.rerun_result = std::unexpected(ExecutionTracker::RerunError::kWriteFailed);
         AuditRecorder audit{&fs};
         const auto out = apply_execution_mutation(
             fs.ports(), req(ExecutionMutation::kRerun, "bob"), audit.fn());
@@ -456,11 +457,25 @@ TEST_CASE("execution mutation: rerun forwards failed_only, records the NEW id, a
     SECTION("the row vanishing after admission reads as not-found") {
         FakeStore fs;
         fs.exec = make_exec("alice", 1);
-        fs.rerun_result = std::unexpected("original execution not found");
+        fs.rerun_result = std::unexpected(ExecutionTracker::RerunError::kOriginalNotFound);
         AuditRecorder audit{&fs};
         const auto out = apply_execution_mutation(
             fs.ports(), req(ExecutionMutation::kRerun, "bob"), audit.fn());
         CHECK(out.status == S::kNotFound);
+        REQUIRE(audit.rows.size() == 2);
+        CHECK(audit.rows[1].result == "denied");
+    }
+    SECTION("an UNREADABLE store is unavailable (retryable, failure row), never a not-found") {
+        FakeStore fs;
+        fs.exec = make_exec("alice", 1);
+        fs.rerun_result = std::unexpected(ExecutionTracker::RerunError::kStoreDegraded);
+        AuditRecorder audit{&fs};
+        const auto out = apply_execution_mutation(
+            fs.ports(), req(ExecutionMutation::kRerun, "bob"), audit.fn());
+        CHECK(out.status == S::kStoreDegraded);
+        CHECK(out.new_execution_id.empty());
+        REQUIRE(audit.rows.size() == 2);
+        CHECK(audit.rows[1].result == "failure");
     }
 }
 
@@ -863,11 +878,32 @@ TEST_CASE("REST POST rerun: failed_only is a boolean; nothing is dispatched to a
     SECTION("a store failure creating the record is a 503") {
         RestHarness h;
         h.store.exec = make_exec("alice", 4);
-        h.store.rerun_result = std::unexpected("boom");
+        h.store.rerun_result = std::unexpected(ExecutionTracker::RerunError::kWriteFailed);
         auto res = h.sink.Post("/api/v1/executions/exec-1/rerun", "");
         REQUIRE(res);
         CHECK(res->status == 503);
         CHECK(body_of(*res)["error"]["retry_after_ms"] == 5000);
+    }
+    SECTION("an UNREADABLE original is a 503 (never a 404) with a failure row") {
+        RestHarness h;
+        h.store.exec = make_exec("alice", 4);
+        h.store.rerun_result = std::unexpected(ExecutionTracker::RerunError::kStoreDegraded);
+        auto res = h.sink.Post("/api/v1/executions/exec-1/rerun", "");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(body_of(*res)["error"]["retry_after_ms"] == 5000);
+        REQUIRE(h.audit_rows.size() == 2);
+        CHECK(h.audit_rows[1].result == "failure");
+    }
+    SECTION("a row that vanished after admission is the uniform 404") {
+        RestHarness h;
+        h.store.exec = make_exec("alice", 4);
+        h.store.rerun_result = std::unexpected(ExecutionTracker::RerunError::kOriginalNotFound);
+        auto res = h.sink.Post("/api/v1/executions/exec-1/rerun", "");
+        REQUIRE(res);
+        CHECK(res->status == 404);
+        REQUIRE(h.audit_rows.size() == 2);
+        CHECK(h.audit_rows[1].result == "denied");
     }
 }
 

@@ -65,8 +65,11 @@ struct ExecutionMutationPorts {
     std::function<std::optional<std::vector<AgentExecStatus>>(const std::string&)> get_statuses;
     std::function<ExecutionTracker::MarkCancelledOutcome(const std::string&, const std::string&)>
         mark_cancelled;
-    std::function<std::expected<std::string, std::string>(const std::string&, const std::string&,
-                                                          bool)>
+    /// A typed error, never text: `kStoreDegraded` (an unreadable store) and
+    /// `kOriginalNotFound` are different outcomes (503 vs 404) and must not be told apart by
+    /// comparing strings.
+    std::function<std::expected<std::string, ExecutionTracker::RerunError>(
+        const std::string&, const std::string&, bool)>
         create_rerun;
 
     [[nodiscard]] bool wired() const {
@@ -94,7 +97,8 @@ struct ExecutionMutationRequest {
 enum class ExecutionMutationStatus {
     kDone,            ///< cancel: the row is now cancelled. rerun: a pending record exists.
     kNoPrincipal,     ///< empty username; nothing read, written or audited.
-    kStoreDegraded,   ///< an admission read failed; retryable; nothing written.
+    kStoreDegraded,   ///< a read failed (an admission read, or the rerun's own read of the original);
+                      ///< retryable; nothing was written. NEVER reported as a not-found.
     kNotFound,        ///< nonexistent OR hidden from this caller (indistinguishable).
     kAuditFailed,     ///< the attempted row was not durable; the effect was NOT performed.
     kAlreadyFinished, ///< cancel only: unknown-by-now or already terminal; no state change.

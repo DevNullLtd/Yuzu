@@ -43871,6 +43871,8 @@ struct McpExecFake {
     std::vector<yuzu::server::AgentExecStatus> statuses;
     yuzu::server::ExecutionTracker::MarkCancelledOutcome cancel_outcome{
         yuzu::server::ExecutionTracker::MarkCancelledOutcome::kCancelled};
+    std::expected<std::string, yuzu::server::ExecutionTracker::RerunError> rerun_result{
+        std::string("rerun-new-1")};
     int exec_reads{0}, status_reads{0}, cancel_calls{0}, rerun_calls{0};
     std::string effect_user;
     bool effect_failed_only{false};
@@ -43903,12 +43905,12 @@ struct McpExecFake {
             return cancel_outcome;
         };
         p.create_rerun = [this](const std::string&, const std::string& user, bool failed_only)
-            -> std::expected<std::string, std::string> {
+            -> std::expected<std::string, yuzu::server::ExecutionTracker::RerunError> {
             ++rerun_calls;
             effect_user = user;
             effect_failed_only = failed_only;
             throw_if_armed();
-            return std::string("rerun-new-1");
+            return rerun_result;
         };
         return p;
     }
@@ -44342,6 +44344,43 @@ TEST_CASE("MCP cancel_execution / record_execution_rerun: a throwing effect is -
             CHECK(ts.audit_log[0] == "execution." + verb + "|attempted");
             CHECK(ts.audit_log[1] == "execution." + verb + "|failure");
         }
+    }
+}
+
+TEST_CASE("MCP record_execution_rerun: an unreadable original is a retryable -32603 with a failure "
+          "row, a vanished one is -32602; neither creates a record",
+          "[mcp][execution][mutation][2146]") {
+    using yuzu::server::ExecutionTracker;
+    {
+        McpExecFake fs;
+        fs.exec = mcp_exec("alice", 1);
+        fs.rerun_result = std::unexpected(ExecutionTracker::RerunError::kStoreDegraded);
+        McpTestServer ts;
+        ts.execution_mutation_ports_for_test = fs.ports();
+        ts.start("operator");
+        auto res = exec_tool_call(ts, "record_execution_rerun", R"({"execution_id":"exec-1"})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        REQUIRE(ts.audit_log.size() >= 2);
+        CHECK(ts.audit_log[1] == "execution.rerun|failure");
+    }
+    {
+        McpExecFake fs;
+        fs.exec = mcp_exec("alice", 1);
+        fs.rerun_result = std::unexpected(ExecutionTracker::RerunError::kOriginalNotFound);
+        McpTestServer ts;
+        ts.execution_mutation_ports_for_test = fs.ports();
+        ts.start("operator");
+        auto res = exec_tool_call(ts, "record_execution_rerun", R"({"execution_id":"exec-1"})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        REQUIRE(ts.audit_log.size() >= 2);
+        CHECK(ts.audit_log[1] == "execution.rerun|denied");
     }
 }
 

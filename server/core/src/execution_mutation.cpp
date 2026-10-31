@@ -69,7 +69,7 @@ ExecutionMutationPorts make_tracker_mutation_ports(ExecutionTracker* tracker) {
         return tracker->mark_cancelled_checked(id, user);
     };
     p.create_rerun = [tracker](const std::string& id, const std::string& user, bool failed_only) {
-        return tracker->create_rerun(id, user, failed_only);
+        return tracker->create_rerun_checked(id, user, failed_only);
     };
     return p;
 }
@@ -183,7 +183,8 @@ ExecutionMutationOutcome apply_execution_mutation(const ExecutionMutationPorts& 
         return out;
     }
 
-    std::expected<std::string, std::string> rerun = std::unexpected(std::string{});
+    using RerunError = ExecutionTracker::RerunError;
+    std::expected<std::string, RerunError> rerun = std::unexpected(RerunError::kWriteFailed);
     try {
         rerun = ports.create_rerun(id, req.username, req.failed_only);
     } catch (const std::exception& e) {
@@ -197,15 +198,29 @@ ExecutionMutationOutcome apply_execution_mutation(const ExecutionMutationPorts& 
         return effect_threw();
     }
     if (!rerun) {
-        // The store's text is never echoed (it can carry internals). "original execution not
-        // found" can only mean the row vanished after the admission read above.
-        const bool vanished = rerun.error() == "original execution not found";
-        out.audit_persisted =
-            write_audit(audit, action, vanished ? "denied" : "failure", id,
-                        with_context(vanished ? "original execution no longer exists"
-                                              : "store write failed",
-                                     req.audit_context));
-        out.status = vanished ? Status::kNotFound : Status::kStoreFailed;
+        // The store's text is never echoed (it can carry internals). kOriginalNotFound can only
+        // mean the row vanished after the admission read above; an unreadable store is its own
+        // typed outcome (fail closed: unavailable, never a not-found).
+        switch (rerun.error()) {
+        case RerunError::kOriginalNotFound:
+            out.audit_persisted =
+                write_audit(audit, action, "denied", id,
+                            with_context("original execution no longer exists", req.audit_context));
+            out.status = Status::kNotFound;
+            return out;
+        case RerunError::kStoreDegraded:
+            out.audit_persisted = write_audit(
+                audit, action, "failure", id,
+                with_context("store unreadable; nothing was created", req.audit_context));
+            out.status = Status::kStoreDegraded;
+            return out;
+        case RerunError::kWriteFailed:
+            out.audit_persisted = write_audit(audit, action, "failure", id,
+                                              with_context("store write failed", req.audit_context));
+            out.status = Status::kStoreFailed;
+            return out;
+        }
+        out.status = Status::kStoreFailed; // unreachable: closed enum
         return out;
     }
     out.new_execution_id = *rerun;

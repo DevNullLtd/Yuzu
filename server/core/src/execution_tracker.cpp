@@ -1593,6 +1593,45 @@ ExecutionTracker::create_rerun(const std::string& original_id, const std::string
     return create_execution(rerun);
 }
 
+std::expected<std::string, ExecutionTracker::RerunError>
+ExecutionTracker::create_rerun_checked(const std::string& original_id, const std::string& user,
+                                       bool failed_only) {
+    auto orig_r = get_execution_checked(original_id);
+    if (!orig_r)
+        return std::unexpected(RerunError::kStoreDegraded);
+    if (!orig_r->has_value())
+        return std::unexpected(RerunError::kOriginalNotFound);
+    const Execution& orig = **orig_r;
+
+    Execution rerun;
+    rerun.definition_id = orig.definition_id;
+    rerun.scope_expression = orig.scope_expression;
+    rerun.parameter_values = orig.parameter_values;
+    rerun.dispatched_by = user;
+    rerun.parent_id = original_id;
+    rerun.rerun_of = original_id;
+    rerun.status = "pending";
+
+    if (failed_only) {
+        auto agents = get_agent_statuses_checked(original_id);
+        if (!agents)
+            return std::unexpected(RerunError::kStoreDegraded);
+        int failed_count = 0;
+        for (const auto& a : *agents) {
+            if (a.status == "failure" || a.status == "timeout" || a.status == "rejected")
+                ++failed_count;
+        }
+        rerun.agents_targeted = failed_count;
+    } else {
+        rerun.agents_targeted = orig.agents_targeted;
+    }
+
+    auto created = create_execution(rerun);
+    if (!created)
+        return std::unexpected(RerunError::kWriteFailed);
+    return *created;
+}
+
 bool ExecutionTracker::mark_cancelled(const std::string& id, const std::string& user) {
     return mark_cancelled_checked(id, user) == MarkCancelledOutcome::kCancelled;
 }
