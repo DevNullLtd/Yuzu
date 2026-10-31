@@ -59,9 +59,10 @@
 #include <atomic>
 #include <cctype>
 #include <cstddef>
+#include <functional>
 #include <iterator>
-#include <optional>
 #include <map>
+#include <optional>
 #include <regex>
 #include <set>
 #include <string>
@@ -1438,6 +1439,63 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
         INFO("sorted operationIds hash to " << yuzu::server::content_etag(joined)
              << " (update kOperationIdChecksum, and see the comment above it)");
         CHECK(yuzu::server::content_etag(joined) == kOperationIdChecksum);
+    }
+}
+
+TEST_CASE("openapi documents: no text cites an issue, an ADR, a build wave or the review process",
+          "[openapi][structure]") {
+    // The document is read by operators and by agentic workers integrating with the API, on
+    // /swagger and in generated clients. It states behaviour; it does not cite the issue, ADR
+    // decision, design section, build wave, SOC 2 control, review gate or C++ symbol that shaped
+    // it. Every string value in the document is checked, in both forms (keys are not text).
+    static const std::regex kInternal(
+        R"((^|[^A-Za-z0-9])#[0-9]+\b|\bADR-?[0-9]{4}|\bSOC ?2\b|\b[Ii]ssues? [0-9]|\b[Pp]ull request [0-9]|github\.com|\bmanifest_by_name\b|\bCC-?[0-9]|\bPhase [0-9]|\bWave [0-9]|)"
+        R"(\bPRs? ?[0-9]|\bWS-[A-Z][0-9]|\bA2-R[0-9]|\bINV-[0-9]|\bUP-[0-9]+|\bCDX-|[Gg]overnance|)"
+        R"(\bGate [0-9]|fix round|re-review|[Aa]pi-parity|API-parity|\bBatch [A-Z]\b|\bsprint\b|§|)"
+        R"(decision log|docs/adr/|\badr/[0-9]{4}|[A-Za-z_]+::[A-Za-z_]|\.(hpp|cpp)\b|\b[a-z]+_fn\b|)"
+        R"(\bk[A-Z][a-z]+[A-Z]\w*|\(new\)|\([A-B][0-9]\)|\bA4 (error )?envelope|\bB[12]\b|)"
+        R"(\b[a-z][a-z_]+\(\)|routed-concerns|parity ledger|\bHermes\b|\bAstra\b|\b(SOLE|sole) (gate|authorization)|)"
+        R"([a-z0-9]_fn\b|_(row|detail)_json\b|\bagent_ids_json\b|\bspec_json\b|)"
+        R"(\brequire_(fleet_read|scoped_permission)\b|\bis_rbac_administrator\b|\bdispatch_confined|)"
+        R"((^|[^/A-Za-z0-9])A[1-5]([^A-Za-z0-9]|$)|A4Error|)"
+        R"(\b(ExecutionTracker|WorkflowEngine|SessionStore|TagStore|AuthFn|ExecutionEventBus|MachineNode|ClientValidation)\b|)"
+        R"(\(M[0-9]\b|capability [0-9]+\.[0-9]|UAT non-functional|tracked open|\b(shared|same|one|row)( [A-Za-z_]+)? builder\b|)"
+        R"(authorization-topology floor|\b(ledger|ladder)\b|docs/[a-z-]*(ladder|invariants)\.md|)"
+        R"(\bBRD\b|\bF[0-9]+[a-z]\b|\bSprint\b|\bADR [0-9]|\bGH-[0-9]|\b[Tt]icket [0-9]|\bJira\b|\bEpic [0-9]|\bslice [0-9])");
+    // The line an operator reads first is held to more: no control number, gate word or label.
+    static const std::regex kSummary(R"(SOC ?2|\bCC-?[0-9]|\bGate\b|\bADR\b|\([A-B][0-9]\)|(^|[^A-Za-z0-9])#[0-9]|\bA[1-5]\b|capability [0-9])");
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        std::size_t strings = 0;
+        const std::function<void(const json&, const std::string&)> walk =
+            [&](const json& node, const std::string& where) {
+                if (node.is_string()) {
+                    ++strings;
+                    INFO(where);
+                    const std::string text = node.get<std::string>();
+                    // The one retained schema reference names A4ErrorEnvelope (renaming it would
+                    // change generated clients); no prose may.
+                    if (text != "#/components/schemas/A4ErrorEnvelope") {
+                        std::smatch hit;
+                        const bool internal = std::regex_search(text, hit, kInternal);
+                        INFO("matched: " << hit.str());
+                        CHECK_FALSE(internal);
+                    }
+                } else if (node.is_array()) {
+                    for (std::size_t i = 0; i < node.size(); ++i)
+                        walk(node[i], where + "/" + std::to_string(i));
+                } else if (node.is_object()) {
+                    for (const auto& [key, value] : node.items())
+                        walk(value, where + "/" + key);
+                }
+            };
+        walk(spec, "");
+        CHECK(strings > 1000); // the walk really reached the text
+        for (const auto& o : all_operations(spec)) {
+            INFO(o.where());
+            CHECK_FALSE(std::regex_search(o.op.value("summary", std::string()), kSummary));
+        }
     }
 }
 
