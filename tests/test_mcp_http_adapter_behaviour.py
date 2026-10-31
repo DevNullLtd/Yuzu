@@ -43,6 +43,7 @@ import pathlib
 import re
 import shutil
 import socket
+import socketserver
 import subprocess
 import sys
 import threading
@@ -146,6 +147,13 @@ class Stub:
 
         class Server(http.server.ThreadingHTTPServer):
             address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+
+            def server_bind(self):
+                # HTTPServer.server_bind() calls socket.getfqdn(), a reverse lookup that took
+                # ~35 s per server on a macOS host with a slow resolver; the stub needs only
+                # the bound port.
+                socketserver.TCPServer.server_bind(self)
+                self.server_name, self.server_port = host, self.socket.getsockname()[1]
 
         self.server = Server((host, 0), Handler)
         port = self.server.server_address[1]
