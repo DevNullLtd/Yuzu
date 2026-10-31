@@ -3998,11 +3998,13 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_guardian_census_proj_failures_total",
                           "Compliance-census (guardian_agent_rule_status) writes that failed "
-                          "for a reason other than the rule having been deleted. The source "
-                          "event is kept; only the census row update is lost, so the pair keeps "
-                          "its previous state until a later event arrives. >0 means the census "
-                          "may be stale. A write refused because the rule no longer exists "
-                          "(SQLSTATE 23503) is a normal outcome and is not counted.",
+                          "for a reason other than the rule not existing. The failure does not "
+                          "discard the source event; only the census row update is lost, so "
+                          "the pair keeps its previous state until a later state-changing "
+                          "event for it arrives. >0 means the census may be stale; the server "
+                          "log line 'census upsert failed' names the agent and rule. A write "
+                          "refused because the rule is not defined on this server (SQLSTATE "
+                          "23503) is a normal outcome and is not counted.",
                           "counter");
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "

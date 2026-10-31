@@ -1595,9 +1595,10 @@ flip, with a red-first test each:
     losses (operator decision, 2026-10-12): (1) an identical re-push no longer re-emits
     `guard.compliant` for a skipped rule, so it no longer repairs a lost recovery event by
     accident, and server-state loss (a Postgres restore, an outbox drop) no longer self-heals by
-    re-push; an explicit census resync mechanism is a flip precondition, tracked in #5718 (the census write
-    is now in the event transaction under a savepoint, #5674 PR1, with a Redelivered event still not repairing it, and `guard.errored` is now a census state,
-    #5667 residual (a), so more stale census rows exist than when this loss was first written); (2) it no longer restarts the `pending_initial` demotion clock; (3) a crash after
+    re-push; an explicit census resync mechanism is a flip precondition, tracked in #5718 (since
+    #5674 PR1 the census write is in the event transaction under a savepoint, though a
+    Redelivered event still does not repair it; and `guard.errored` is now a census state, #5667
+    residual (a), so more stale census rows can exist than when this loss was first written); (2) it no longer restarts the `pending_initial` demotion clock; (3) a crash after
     the absent-row sweep and before the per-rule rewrites leaves the previous rows for carried
     rules, i.e. OLD content, including a rule the push disabled or changed, until the next push
     (a restart then re-arms those); this window is live on the legacy path too; (4) a faulted or dead shared
@@ -2457,9 +2458,10 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   equivalent here) - so a rule stuck errored has no age signal; C-1's census mapping is resolved (#5667), so
   the errored state itself now shows on the `/guardian` overview and in the `errored_rules`
   counts, but item (3) stays open: there is still no age or duration gauge for an errored
-  rule. A further gap, pre-flip and tracked in #5674 (sre-1): a census upsert failure
-  (`guaranteed_state_store.cpp:962-968`) is currently only a warn-level log line with no
-  counter.
+  rule. A further gap, pre-flip and tracked in #5674 (sre-1): a census upsert failure was
+  only a warn-level log line with no counter. Closed by #5674 PR1: it is now logged at error
+  and counted on `yuzu_server_guardian_census_proj_failures_total`; no alert rule ships for the
+  counter yet (tracked in #5718).
 - **Dormant-claim verifiability (compliance-officer Gate 6), PRE-PR-5 GATING, cross-PR scope** -
   every "dormant while `prefer_spark_=false`" disposition in this row (and elsewhere in
   this doc) rests on a code-reading assertion, not an auditor-checkable per-deployment
@@ -2809,7 +2811,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   the stream out of enqueue order (a release is counted even if that call launches nothing).
   The audit trail is complete, but the data-integrity consequence is #5690: a later-launched
   sender overtaking an older one, combined with the server's same-second `>=` tie in
-  `upsert_rule_status` (`guard.errored` versus a delayed `guard.compliant`), can leave the
+  `project_rule_status` (`guard.errored` versus a delayed `guard.compliant`), can leave the
   server holding a false `compliant`. #5690 is open and gates the flip. Correlate with
   `yuzu.guardian_send_stalls` / send exceptions on the same endpoint
   (`docs/user-manual/metrics.md`). The gauge is an unlabelled fleet sum and there is no

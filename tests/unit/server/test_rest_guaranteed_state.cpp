@@ -2012,6 +2012,37 @@ TEST_CASE("REST gs.status: an event for a rule that does not exist adds no censu
     CHECK(j["data"]["total_rules"].get<int>() == 1);
 }
 
+TEST_CASE("REST gs.status: with the foreign key removed, an errored census row for a deleted rule "
+          "is still excluded",
+          "[pg][rest][guaranteed_state][status]") {
+    // The route intersects the census with the live rule catalogue as defense in depth in
+    // case the schema v3 foreign key is ever missing. The key is dropped here so an orphan
+    // census row can be arranged and that intersection observed; with the key in place the
+    // test above cannot reach it.
+    RestGsHarness h;
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r-live", "live"))
+                ->status == 201);
+    h.seed_status("e1", "WS-1", "r-live", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult res = yuzu::server::pg::exec_params(
+            conn.get(),
+            "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+            "DROP CONSTRAINT guardian_agent_rule_status_rule_fk",
+            std::vector<std::string>{});
+        REQUIRE(PQresultStatus(res.get()) == PGRES_COMMAND_OK);
+    }
+    h.seed_raw_status("WS-1", "r-orphan", "errored", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["errored_rules"].get<int>() == 1); // r-live only; r-orphan intersected out
+    CHECK(j["data"]["total_rules"].get<int>() == 1);
+}
+
 TEST_CASE("REST gs.status: an unwired list_read_fn fails closed (503, mirrors "
           "wire_scoped_perm=false on the per-device route)",
           "[pg][rest][guaranteed_state][status]") {

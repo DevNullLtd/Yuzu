@@ -1253,6 +1253,10 @@ TEST_CASE("GuaranteedStateStore: a reserved sentinel rule_id never updates the c
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
+    // A rule row with the reserved id is created so the census foreign key would ACCEPT a
+    // row for it: without this the key refuses the write on its own and the test could not
+    // tell whether the store's reserved-id skip is still in place.
+    REQUIRE(store.create_rule(make_rule("__observation__", "reserved-id-rule")));
     GuaranteedStateEventRow abuse;
     abuse.event_id = "__observation__-abuse-1";
     abuse.rule_id = "__observation__";
@@ -1383,6 +1387,9 @@ TEST_CASE("GuaranteedStateStore: a hostile rule_id is neutralised on a failed "
     // or leaking a second, forged rule_id= token.
     CHECK(logs.find("rule_id=rule_injected-line") != std::string::npos);
     CHECK(logs.find("rule_id=rule\ninjected-line") == std::string::npos);
+    // The database error text echoes the failing row, including the raw newline; the
+    // logged message folds it too, so no second log line can start with the hostile text.
+    CHECK(logs.find("\ninjected-line") == std::string::npos);
 }
 
 TEST_CASE("GuaranteedStateStore: a hostile event_id is neutralised on a failed "
@@ -2541,7 +2548,9 @@ TEST_CASE("GuaranteedStateStore: batch ingest never pollutes the census with the
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
-    create_rules(store, {"rule-real"});
+    // The reserved-id rule row exists on purpose: the census foreign key would otherwise
+    // refuse the sentinel row on its own and hide the store's reserved-id skip.
+    create_rules(store, {"rule-real", "__observation__"});
     std::vector<GuaranteedStateEventRow> batch;
     // A real rule's drift (SHOULD create a census row) + a hostile sentinel row
     // with a census-mapping event_type (must NOT) in the same batch.
@@ -3647,7 +3656,7 @@ std::string census_count(const std::string& dsn) {
 
 } // namespace
 
-TEST_CASE("GuaranteedStateStore: delete_rule removes the rule's census rows with it, atomically",
+TEST_CASE("GuaranteedStateStore: delete_rule removes the rule's census rows with it",
           "[pg][guaranteed_state_store][rules][census]") {
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -3834,20 +3843,46 @@ TEST_CASE("GuaranteedStateStore: a database carrying a different schema v3 is re
         REQUIRE(store.is_open());
     }
 
-    SECTION("census-order column on the census table") {
+    SECTION("the discarded design: census-order columns and no cascade key") {
         exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
                            "ADD COLUMN updated_at_ns BIGINT");
-    }
-    SECTION("census-order column on the events table") {
         exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guaranteed_state_events "
                            "ADD COLUMN census_order_ns BIGINT");
+        exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                           "DROP CONSTRAINT guardian_agent_rule_status_rule_fk");
     }
     SECTION("no cascade key although the version row reads 3") {
         exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
                            "DROP CONSTRAINT guardian_agent_rule_status_rule_fk");
     }
 
+    yuzu::test::LogCapture cap(spdlog::level::err);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     GuaranteedStateStore store(pool);
+    cap.stop();
     CHECK_FALSE(store.is_open());
+    // The refusal names its cause and says the server will not start (the operator sees
+    // only this line before the generic "Refusing to start" one).
+    CHECK(cap.text().find("unsupported schema, refusing to start") != std::string::npos);
+    CHECK(cap.text().find("no ON DELETE CASCADE foreign key") != std::string::npos);
+}
+
+TEST_CASE("GuaranteedStateStore: columns a later schema version adds do not stop the store opening",
+          "[pg][guaranteed_state_store][db][census]") {
+    // The boot check looks only at the cascade key, so a later migration can add columns to
+    // the census and event tables (the locked ordering work does) without this schema's
+    // check refusing the database it produced.
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        GuaranteedStateStore store(pool);
+        REQUIRE(store.is_open());
+    }
+    exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                       "ADD COLUMN updated_at_ns BIGINT");
+    exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guaranteed_state_events "
+                       "ADD COLUMN census_order_ns BIGINT");
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    GuaranteedStateStore store(pool);
+    CHECK(store.is_open());
 }

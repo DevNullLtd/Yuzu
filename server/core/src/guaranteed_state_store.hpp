@@ -531,7 +531,9 @@ private:
     std::atomic<uint64_t> events_written_{0};
     std::atomic<uint64_t> events_reaped_{0};
     std::atomic<uint64_t> observations_proj_failures_{0};
-    std::atomic<uint64_t> census_proj_failures_{0}; // census upsert failed (event kept); not a 23503 refusal
+    // census upsert failed for a reason other than a 23503 refusal; the failure does not discard
+    // the event (counted before the caller's COMMIT)
+    std::atomic<uint64_t> census_proj_failures_{0};
     std::atomic<uint64_t> observations_reaped_{0};
     std::atomic<uint64_t> events_dropped_{0};      // event_id conflict, MISMATCHED payload
     std::atomic<uint64_t> events_redelivered_{0};  // event_id conflict, MATCHING payload

@@ -202,7 +202,7 @@ std::string format_conflict(std::string_view detail) {
 // detection backend produces it, so it is dormant until the agent's prefer_spark
 // default flips. guard.armed, guard.disarmed and guard.healthy are deliberately NOT
 // mapped: they are lifecycle or recovery markers, not verdicts.
-// Ordering: upsert_rule_status keeps a row when the new updated_at is >= the stored
+// Ordering: project_rule_status keeps a row when the new updated_at is >= the stored
 // one. Event timestamps have one-second resolution, so two distinct events in the same
 // second tie and the later arrival wins; an exact redelivery of one event_id exits at
 // insert_event_classified (Redelivered/Conflict) before the census write is reached.
@@ -430,7 +430,15 @@ const std::vector<pg::PgMigration>& migrations() {
         // upsert for a rule that is gone is refused by the database (SQLSTATE 23503). Rows
         // already orphaned are deleted first, or the constraint could not be added.
         // The ADD CONSTRAINT is guarded so a re-run of this text adds nothing twice.
+        // The LOCK TABLE comes first, with its own 3 s SET LOCAL lock_timeout (the SessionStore
+        // v2 and CaStore v4 precedent): ADD CONSTRAINT takes SHARE ROW EXCLUSIVE anyway, so
+        // taking it before the DELETE adds no wait of its own, and a census row committed by a
+        // binary that has not been upgraded cannot slip in between the DELETE and the
+        // validation and refuse boot. The whole migration rolls back and retries on the next
+        // boot if the lock is not granted in time.
         {3, R"SQL(
+            SET LOCAL lock_timeout = '3s';
+            LOCK TABLE guardian_agent_rule_status IN SHARE ROW EXCLUSIVE MODE;
             DELETE FROM guardian_agent_rule_status s
              WHERE NOT EXISTS (SELECT 1 FROM guaranteed_state_rules r WHERE r.rule_id = s.rule_id);
             DO $do$
@@ -452,30 +460,30 @@ const std::vector<pg::PgMigration>& migrations() {
 
 // A database whose `guaranteed_state_store` version row reads 3 is skipped by the runner, so
 // the runner cannot tell this schema's v3 from another branch's v3 (#5674 hard cutover: a
-// database stamped by the discarded census-order design carries `updated_at_ns` /
-// `census_order_ns` and no foreign key). Returns an empty string when the schema is the
-// expected one, else the cause, for the boot error. Any query failure is a cause too.
+// database stamped by the discarded census-order design has no foreign key on the census
+// table). The cascade key is the one structural fact this schema's v3 adds, so it is the
+// only thing checked: a column check would refuse a later schema version that adds columns
+// to the same tables. Returns an empty string when the key is present, else the cause, for
+// the boot error. Any query failure is a cause too.
 std::string census_schema_defect(PGconn* conn) {
     pg::PgResult res = pg::exec_params(
         conn,
-        "SELECT "
-        "(SELECT count(*) FROM information_schema.columns "
-        "  WHERE table_schema = 'guaranteed_state_store' AND "
-        "   ((table_name = 'guardian_agent_rule_status' AND column_name = 'updated_at_ns') OR "
-        "    (table_name = 'guaranteed_state_events' AND column_name = 'census_order_ns'))), "
-        "(SELECT count(*) FROM pg_constraint "
-        "  WHERE conrelid = 'guaranteed_state_store.guardian_agent_rule_status'::regclass "
-        "    AND confrelid = 'guaranteed_state_store.guaranteed_state_rules'::regclass "
-        "    AND contype = 'f' AND confdeltype = 'c')",
+        "SELECT count(*) FROM pg_constraint "
+        "WHERE conrelid = 'guaranteed_state_store.guardian_agent_rule_status'::regclass "
+        "  AND confrelid = 'guaranteed_state_store.guaranteed_state_rules'::regclass "
+        "  AND contype = 'f' AND confdeltype = 'c'",
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
-        return std::string("census schema probe failed: ") + PQerrorMessage(conn);
-    if (to_i64(PQgetvalue(res.get(), 0, 0)) != 0)
-        return "database carries census-order columns (updated_at_ns / census_order_ns) from a "
-               "different schema v3; recreate the guaranteed_state_store schema";
-    if (to_i64(PQgetvalue(res.get(), 0, 1)) != 1)
+        return std::string("census schema probe failed: ") +
+               ::yuzu::log_key_token(PQerrorMessage(conn));
+    if (to_i64(PQgetvalue(res.get(), 0, 0)) < 1)
         return "guardian_agent_rule_status has no ON DELETE CASCADE foreign key to "
-               "guaranteed_state_rules";
+               "guaranteed_state_rules. Back up the database first. A database stamped by a "
+               "different branch's schema v3 is not supported: recreating the "
+               "guaranteed_state_store schema DELETES every Guardian rule, event and "
+               "observation. If only the key is missing, run \"UPDATE public.schema_meta SET "
+               "version = 2 WHERE store = 'guaranteed_state_store'\" and restart, which re-runs "
+               "the idempotent v3 migration";
     return {};
 }
 
@@ -499,9 +507,9 @@ GuaranteedStateStore::GuaranteedStateStore(pg::PgPool& pool, int retention_days,
         return;
     }
     if (const std::string defect = census_schema_defect(lease.get()); !defect.empty()) {
-        spdlog::error("GuaranteedStateStore: unsupported schema ({}) — Guardian persistence "
-                      "disabled",
-                      defect);
+        // `defect` is fixed text, or the probe failure with its libpq message already
+        // sanitised; log_key_token here would cut the remedy off at its 256-byte cap.
+        spdlog::error("GuaranteedStateStore: unsupported schema, refusing to start: {}", defect);
         return;
     }
     open_ = true;
@@ -1024,12 +1032,16 @@ enum class CensusOutcome {
 // Write one (agent, rule) compliance state inside the caller's open transaction, under
 // SAVEPOINT census_upsert, so a failed upsert never aborts the transaction holding the
 // event. Rejected and Failed leave the transaction usable (the savepoint was rolled back);
-// the caller keeps the event. Abandoned means a SAVEPOINT, ROLLBACK TO or RELEASE statement
+// neither failure discards the event, which is stored when the caller commits. Abandoned means a SAVEPOINT, ROLLBACK TO or RELEASE statement
 // itself failed, so the transaction may be aborted and the caller must return an error
 // without committing (a COMMIT of an aborted transaction reports success to libpq).
-// A Failed outcome is counted on `failures` and logged at error; Rejected is neither.
-CensusOutcome project_rule_status(PGconn* conn, std::atomic<uint64_t>& failures,
-                                  const GuaranteedStateEventRow& row, const char* state) {
+// A Failed outcome is counted on `failures` and logged at error. A Rejected outcome is not
+// counted and is logged at debug only; the database server still records the refused
+// statement in its own log. The count moves before the caller's COMMIT, so a COMMIT that
+// then fails leaves it one ahead of the events actually stored.
+[[nodiscard]] CensusOutcome project_rule_status(PGconn* conn, std::atomic<uint64_t>& failures,
+                                                const GuaranteedStateEventRow& row,
+                                                const char* state) {
     if (row.agent_id.empty() || row.rule_id.empty())
         return CensusOutcome::Applied; // nothing to write
     const auto control = [conn](const char* sql) {
@@ -1061,10 +1073,10 @@ CensusOutcome project_rule_status(PGconn* conn, std::atomic<uint64_t>& failures,
         return CensusOutcome::Rejected;
     }
     failures.fetch_add(1, std::memory_order_relaxed);
-    spdlog::error("GuaranteedStateStore: census upsert failed (event kept, status row not "
-                  "updated) event_id={} agent_id={} rule_id={}: {}",
+    spdlog::error("GuaranteedStateStore: census upsert failed (status row not updated, event "
+                  "not discarded by this failure) event_id={} agent_id={} rule_id={}: {}",
                   log_id_token(row.event_id), log_id_token(row.agent_id),
-                  log_id_token(row.rule_id), err);
+                  log_id_token(row.rule_id), ::yuzu::log_key_token(err));
     return CensusOutcome::Failed;
 }
 

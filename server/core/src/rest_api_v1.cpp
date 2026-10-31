@@ -20228,10 +20228,10 @@ void RestApiV1::register_routes(
     // guaranteed_state_rules with ON DELETE CASCADE, so delete_rule removes the rows in
     // the same statement, and a late event for a deleted rule has its census write
     // refused (SQLSTATE 23503). The intersection is kept as defense in depth in case
-    // that constraint is ever missing. One remaining
-    // deliberate delta from the dashboard: no offline-agent fold to "unknown" (this
-    // route counts a rule as errored if ANY agent currently reports it errored,
-    // regardless of that agent's liveness) — documented in the note field.
+    // that constraint is ever missing. One remaining deliberate delta from the dashboard:
+    // no offline-agent fold to "unknown" (this route counts a rule as errored if ANY agent
+    // currently reports it errored, regardless of that agent's liveness) — documented in
+    // the note field.
     //
     // World-A / ADR-0017: this route's SOLE authorization gate is
     // AuthRoutes::require_list_read (list_read_fn below) — never perm_fn, and
