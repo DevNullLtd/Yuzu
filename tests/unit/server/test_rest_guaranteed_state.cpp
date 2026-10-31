@@ -815,7 +815,7 @@ struct RestGsHarness {
     }
 
     // Seed one device's reported verdict for a Guard via the status feed
-    // (insert_event → upsert_rule_status). event_type maps to state per
+    // (insert_event → project_rule_status). event_type maps to state per
     // event_state_from_type: guard.compliant/drift.remediated→compliant,
     // drift.detected→drifted, remediation.failed/guard.unhealthy/guard.errored→errored.
     // NOTE: the upsert keeps the row only when excluded.updated_at >= the existing
@@ -843,7 +843,7 @@ struct RestGsHarness {
     // Ported from a raw sqlite3 connection (ADR-0038): unconditional
     // INSERT ... ON CONFLICT DO UPDATE (no updated_at guard) — this helper
     // wants to FORCE the state regardless, unlike the store's own
-    // upsert_rule_status, which only advances on a newer timestamp.
+    // project_rule_status, which only advances on a newer timestamp.
     void seed_raw_status(const std::string& agent, const std::string& rule_id,
                          const std::string& state, const std::string& ts) {
         yuzu::server::pg::PgConn conn{PQconnectdb(gs_db_pg->dsn().c_str())};

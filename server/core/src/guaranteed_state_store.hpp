@@ -55,8 +55,9 @@
 ///    failure) bump the existing `yuzu_server_guardian_events_{dropped,ingest_errors}_total` family (ADR-0037
 ///    label convention) IN ADDITION to the existing four-way
 ///    `EventInsertOutcome` classification + its per-outcome atomics below.
-///  - **Status upserts — fail-soft with the same counter**; status READS stay
-///    type-distinguishable (see above).
+///  - **Status upserts — fail-soft**; the census upsert has its own failure counter and runs in
+///    the event transaction under a savepoint (ADR-0038 Update, 2026-10-31, #5674); status READS
+///    stay type-distinguishable (see above).
 ///  - **DEX analytic reads — deferred widening (ADR-0038, follow-up #2659).**
 ///    The ~20 `dex_*` aggregate reads plus `query_events` / `rule_activity` /
 ///    `daily_remediations` / `query_observations` KEEP their plain

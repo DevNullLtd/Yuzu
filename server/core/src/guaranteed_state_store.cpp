@@ -1032,9 +1032,10 @@ enum class CensusOutcome {
 // Write one (agent, rule) compliance state inside the caller's open transaction, under
 // SAVEPOINT census_upsert, so a failed upsert never aborts the transaction holding the
 // event. Rejected and Failed leave the transaction usable (the savepoint was rolled back);
-// neither failure discards the event, which is stored when the caller commits. Abandoned means a SAVEPOINT, ROLLBACK TO or RELEASE statement
-// itself failed, so the transaction may be aborted and the caller must return an error
-// without committing (a COMMIT of an aborted transaction reports success to libpq).
+// neither failure discards the event, which is stored when the caller commits. Abandoned
+// means a SAVEPOINT, ROLLBACK TO or RELEASE statement itself failed, so the transaction may
+// be aborted and the caller must return an error without committing (a COMMIT of an aborted
+// transaction reports success to libpq).
 // A Failed outcome is counted on `failures` and logged at error. A Rejected outcome is not
 // counted and is logged at debug only; the database server still records the refused
 // statement in its own log. The count moves before the caller's COMMIT, so a COMMIT that
@@ -1067,8 +1068,8 @@ enum class CensusOutcome {
     if (!control("ROLLBACK TO SAVEPOINT census_upsert"))
         return CensusOutcome::Abandoned;
     if (rejected) {
-        spdlog::debug("GuaranteedStateStore: census write refused, rule no longer exists "
-                      "(event kept) agent_id={} rule_id={}",
+        spdlog::debug("GuaranteedStateStore: census write refused, rule not defined on this "
+                      "server (event not discarded) agent_id={} rule_id={}",
                       log_id_token(row.agent_id), log_id_token(row.rule_id));
         return CensusOutcome::Rejected;
     }
