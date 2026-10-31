@@ -198,6 +198,7 @@
 #include "legacy_events_routes.hpp" // #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
 #include "instruction_fragment_routes.hpp" // #2542 PR-12: the 2-route Instructions HTMX fragment pair, extracted onto the HttpRouteSink seam
 #include "approvals_fragment_routes.hpp" // #2542 PR-12: the Approvals HTMX fragment, extracted onto the HttpRouteSink seam
+#include "mcp_admission.hpp" // #4309: /mcp/v1/ refuses an empty-tier credential (admit())
 #include "mcp_disabled_routes.hpp" // #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
@@ -1009,6 +1010,18 @@ public:
                           // refused, not by surface.
                           "MCP SSE stream denials by reason - GET attach denials plus "
                           "streamed-POST admission denials",
+                          "counter");
+        // Answers a different question from the family above: who was turned away at
+        // the /mcp/v1/ door (any verb, before a session or stream exists), not which
+        // stream check refused a channel. Closed label set: tier_required.
+        metrics_.describe("yuzu_mcp_admission_refused_total",
+                          "Requests refused at /mcp/v1/ admission by reason - tier_required is "
+                          "a credential with no MCP tier (cookie session or tierless token)",
+                          "counter");
+        metrics_.describe("yuzu_mcp_admission_audit_suppressed_total",
+                          "Audit rows not written for tier_required refusals at /mcp/v1/ "
+                          "admission (suppressed by the per-key budget or a budget failure); "
+                          "the refused counter is complete",
                           "counter");
         metrics_.describe("yuzu_mcp_initialize_protocol_total",
                           "MCP initialize handshakes by negotiated protocol revision", "counter");
@@ -1976,6 +1989,10 @@ public:
         for (auto reason : mcp::McpStreamBridge::kPostRejectReasons) {
             metrics_.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}});
         }
+        // #4309: the admission refusal family (mcp_admission.hpp), pre-seeded so a
+        // dashboard reads "0" before the first refusal. Closed set: tier_required.
+        metrics_.counter("yuzu_mcp_admission_refused_total", {{"reason", "tier_required"}});
+        metrics_.counter("yuzu_mcp_admission_audit_suppressed_total");
         // Pre-seed both supported MCP protocol revisions to 0 so a
         // revision-deprecation dashboard reads "0" (not absent) for an unused
         // revision (observability-conventions.md; 2g PR 1). Values mirror the
@@ -22400,8 +22417,20 @@ private:
             }
             mcp_server_->register_routes(
                 *web_server_,
-                [this](const httplib::Request& req, httplib::Response& res)
-                    -> std::optional<auth::Session> { return require_auth(req, res); },
+                // #4309: credential-class admission. Every MCP verb resolves its
+                // session through this one hook, so refusing an empty tier here covers
+                // GET, POST and DELETE before any JSON-RPC parse. The factory resolves
+                // the session, then runs admit() (audit + counter + 403) on the same
+                // request; see mcp_admission.hpp. This is the only call site.
+                mcp::make_admission_auth_fn(
+                    [this](const httplib::Request& req, httplib::Response& res)
+                        -> std::optional<auth::Session> { return require_auth(req, res); },
+                    [this](const httplib::Request& req, const std::string& action,
+                           const std::string& result, const std::string& target_type,
+                           const std::string& target_id, const std::string& detail) -> bool {
+                        return audit_log(req, action, result, target_type, target_id, detail);
+                    },
+                    &metrics_),
                 [this](const httplib::Request& req, httplib::Response& res, const std::string& type,
                        const std::string& op) -> bool {
                     return require_permission(req, res, type, op);

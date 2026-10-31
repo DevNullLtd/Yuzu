@@ -214,12 +214,12 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   dashboard-rewire PR-2 to decide the fate of. Net behaviour vs base: identical for every caller
   class on all three routes EXCEPT a JIT-elevated administrator, who now sees the full unfiltered
   device list on `GET /api/v1/dex/app`/`GET /api/v1/dex/overview` (was narrowed to their base
-  identity's usually-empty grant) — REST **and** MCP: both surfaces' `perm_fn`/`tier_allows` wiring
-  in `server.cpp` resolves the SAME `require_auth`/`require_permission` pair REST uses, so an MCP
-  call authenticated via a cookie session (never a bearer API token — those cannot be elevated) is
-  admitted/narrowed identically to its REST twin; `tier_allows()` never blocks it either, since an
-  empty `mcp_tier` (what a cookie session carries) short-circuits to "not an MCP token, defer to
-  RBAC" (`mcp_policy.hpp`). Dashboard
+  identity's usually-empty grant) — REST only in practice: a JIT-elevated administrator is a cookie
+  session (a bearer API token cannot be elevated), and since #4309 `/mcp/v1/` refuses any
+  credential with no MCP tier, so a cookie session no longer reaches the MCP twins at all and an
+  MCP caller is always a tiered token that is admitted/narrowed by its RBAC grants and its tier.
+  The MCP twins' `perm_fn`/`tier_allows` wiring in `server.cpp` still resolves the same
+  `require_auth`/`require_permission` pair REST uses. Dashboard
   renderer rewire is still PR-2 (unaffected by any of this cycle — its own tracking issue is TO BE
   FILED with this PR, not #4576, which closed only the device-lens half of a DIFFERENT deferral);
   the dashboard fragments gate on the SAME global `perm_fn` these three routes do (a confined

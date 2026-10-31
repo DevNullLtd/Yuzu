@@ -249,7 +249,7 @@ the documented case; see `docs/user-manual/upgrading.md`). Breaking for
 service-scoped tokens only; human sessions, engine principals and MCP tiers are
 unchanged. Evidence for this entry is the governance ledger for #3526.
 
-**Addendum: the MCP stream endpoint and MCP sessions, authorisation gap narrowed; residual tracked under #4309 (CC6.1/CC6.3/CC7.2, #4754, 2026-10-29).**
+**Addendum: the MCP stream endpoint and MCP sessions, the tier-and-approval gap closed (#4309) and the stream and session-binding gap closed (#4754); further residuals are listed below (CC6.1/CC6.3/CC7.2, 2026-10-29).**
 Before this change `GET /mcp/v1/` (the session's SSE channel, which replays a
 bounded per-session ring of frames) required authentication only, and a session id
 was bound to the username alone. Two reaches existed. A service-scoped API token
@@ -275,20 +275,43 @@ been able to read that session's replayed frames.** The id is 128-bit and is ret
 only in the `initialize` response header, so the exposure needed the id as well as
 the credential; no measurement exists of whether any deployment issued
 service-scoped tokens that used the channel.
-Risk-register entry: an elevated cookie session's replay ring is readable by a
-non-elevated credential of the same class that holds the session id, until the
-tierless-human refusal at `/mcp/v1/` (#4309, PR B) lands, which refuses the only
-credential kind that can be elevated. JIT elevation is per-request state outside
-the class; the residual is accepted by the maintainer with that PR as the stated
-closure. The existing mitigation is that the session id must be protected like a
-credential. Stream liveness is principal-level: the class is checked when the stream attaches and is not re-derived from the live credential afterwards (the per-tick credential recheck compares the principal only, and the per-tick session check compares the class captured at attach).
+Risk-register entry (closed by #4309): an elevated cookie session's replay ring
+was readable by a non-elevated credential of the same class that held the session
+id. JIT elevation is per-request state outside the class. `/mcp/v1/` now refuses
+every credential with no MCP tier (`403`, `-32003`, audited `mcp.session.reject`
+`reason=tier_required`; audit row rate-limited, counter complete), which includes the only credential kind that can be
+elevated, so a cookie session can no longer hold an `/mcp/v1/` session; for a
+period before that change the residual stood as described. The session id should
+still be protected like a credential.
+**Audit-period disclosure (#4309).** Before this change a human principal with an
+empty MCP tier (a cookie session or an API token minted without `mcp_tier`) could
+call the MCP tool surface without the tier ceiling or the supervised-tier approval
+gate; per-tool authorization (RBAC, or the legacy role check when enforcement was
+off) still applied to every call. The fix is not retroactive: for any audit period
+covered by builds that predate this change, MCP calls made by a tierless principal
+were not subject to the tier or approval controls. The check is enforced per
+replica, so a replica not yet upgraded during a rolling upgrade, or one rolled back,
+admits tierless callers again; see `docs/user-manual/upgrading.md` for the
+rolling-upgrade and rollback windows.
+Questionnaire wording: every tierless request that reaches admission on an upgraded
+replica is refused (`403`) and counted on `yuzu_mcp_admission_refused_total`. An
+audit row (`mcp.session.reject`, `reason=tier_required`) is written for the first
+refusals of each principal and source in a 10-second window (up to 10 per key;
+beyond 64 distinct keys in a window they share one 10-row bucket); further rows are
+suppressed and counted on `yuzu_mcp_admission_audit_suppressed_total`. When audit
+writes succeed, rows plus suppressed equal refused. The counters are telemetry (per
+replica, reset on restart), requests refused by an earlier check (kill switch,
+`Origin`, protocol version, the streaming-off `405`, the same-site gate) are not
+counted here, and a failed audit write does not change the refusal.
+Stream liveness is principal-level: the class is checked when the stream attaches and is not re-derived from the live credential afterwards (the per-tick credential recheck compares the principal only, and the per-tick session check compares the class captured at attach).
 Further residuals: a class switch strands the old-class sessions against the
 per-principal cap (fixed at 8, no flag) for up to the 30-minute idle TTL (longer while
 a stream stays attached, because the stream's per-tick liveness check keeps the
 session alive) with no administrator reap path; and during a rolling upgrade the gap stays open on any replica not yet
 upgraded.
 Audit evidence: the `mcp.session.*` rows are written set-and-proceed (a failure to
-persist one is logged at warning level and the denial is still answered) and they are queryable through
+persist one is logged at warning level and the denial is still answered; `tier_required`
+rows are rate-limited per principal, and the refused counter is complete) and they are queryable through
 `GET /api/v1/audit`, but they are NOT in the CC7.2 authentication sample
 (`GET /api/v1/audit/auth-sample` selects the `auth.`, `mfa.`, `session.` and
 `engine_principal.` prefixes only), so an auditor sampling that surface does not see
