@@ -5121,7 +5121,14 @@ the list/scope reads), NEVER allow. Where a caller needs to distinguish "denied"
 from "store degraded" for a 403-vs-503 decision (e.g. `authorize_list_read`),
 that is exposed via a **separate** tri-state / `std::expected` accessor — the
 plain `bool` path stays deny-on-error so no existing chokepoint can regress to
-fail-open. This **closes the prior "fails open on a corrupt `rbac.db`" hole**:
+fail-open. `RbacStore::check_scoped_permission_checked` (#3739) is that accessor for the
+per-agent scoped gate: `true` is granted, `false` is a definitive denial, and
+`unexpected(msg)` means the answer is a deny *because a read failed* (the first
+failed read wins; an allow and an explicit deny-group hit are returned as such).
+`check_scoped_permission` is its `value_or(false)` wrapper, so every other
+caller is unchanged. `AuthRoutes::require_scoped_permission` uses it only to
+label the `auth.scoped_permission_required` audit row `(read degraded:
+mgmt_group_store|rbac_store)`; the response stays a fail-closed 403. This **closes the prior "fails open on a corrupt `rbac.db`" hole**:
 under SQLite a corrupt/unreadable RBAC store could fall through to an engaged
 allow at some call sites; the PostgreSQL `rbac_store` now denies on any degrade.
 
