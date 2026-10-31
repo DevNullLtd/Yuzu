@@ -235,7 +235,7 @@ public:
      * INSERT OR IGNORE (a key already present under `to` keeps its value), then delete the
      * `from` rows. All-or-nothing; true when the move committed (including "nothing to
      * move", which is decided by a read that takes no write lock), false on error or on a
-     * refused call: `from` or `to` empty, `from == to`, or either in the reserved `__x__` range
+     * refused call: `from` or `to` empty, `from == to`, or either name starting with `__`
      * (the agent-owned namespaces). Upgrade-window step for the tar -> echo rename, removed
      * with the other legacy-name shims.
      */

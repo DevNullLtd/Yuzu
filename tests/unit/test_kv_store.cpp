@@ -1415,6 +1415,12 @@ TEST_CASE("KvStore::rename_plugin refuses a misuse and leaves every row alone",
     CHECK(t.store.get("__guardian__", "meta:boot_epoch") == std::optional<std::string>{"42"});
     CHECK_FALSE(t.store.get("echo", "meta:boot_epoch").has_value());
     CHECK_FALSE(t.store.get("echo", "a").has_value());
+
+    // The boundary of the prefix refusal: one leading underscore is an ordinary name.
+    REQUIRE(t.store.set("_tar", "k", "v"));
+    CHECK(t.store.rename_plugin("_tar", "echo"));
+    CHECK(t.store.get("echo", "k") == std::optional<std::string>{"v"});
+    CHECK_FALSE(t.store.get("_tar", "k").has_value());
 }
 
 TEST_CASE("KvStore::rename_plugin with nothing to move does not wait for another connection's "
