@@ -225,12 +225,12 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | ota | 15 | 1 | 14 |
 | enrollment | 21 | 4 | 17 |
 | crypto | 5 | 5 | 0 |
-| other | 82 | 29 | 53 |
-| **Total** | **347** | **137** | **210** |
+| other | 82 | 30 | 52 |
+| **Total** | **347** | **138** | **209** |
 
-Registered `/api/vN/*` routes: 267. OpenAPI `paths` entries: 266. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 208.
+Registered `/api/vN/*` routes: 268. OpenAPI `paths` entries: 267. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 208.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 210. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 81.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 209. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 80.
 
 <!-- END GENERATED -->
 

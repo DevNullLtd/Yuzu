@@ -295,6 +295,8 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/api/v1/bundles)",                                                         step_up_detail::kExecutionDispatch),
     step_up_detail::exempt("POST",  R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/cancel)",                        step_up_detail::kStopsEffect),
     step_up_detail::exempt("POST",  R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/rerun)",                         step_up_detail::kExecutionDispatch),
+    // command_v1_routes.cpp: the REST v1 twin of /api/command and MCP execute_instruction (kExecutionDispatch, like both)
+    step_up_detail::exempt("POST",  R"(/api/v1/commands)",                                                        step_up_detail::kExecutionDispatch),
     step_up_detail::pending("POST",  R"(/api/v1/echo/retention-paused/purge)"),
     step_up_detail::pending("POST",  R"(/api/v1/management-groups)"),
     step_up_detail::pending("PUT",   R"(/api/v1/management-groups/([a-f0-9]+))"),

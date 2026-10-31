@@ -495,7 +495,7 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # (GET/PUT /api/v1/config and the MCP tools get_runtime_config / set_runtime_config).
 # 213 -> 212 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me flipped from planned to twinned
 # (GET /api/v1/me + the get_me MCP tool).
-BASELINE_UNTWINNED = 210
+BASELINE_UNTWINNED = 209
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
@@ -506,7 +506,7 @@ BASELINE_UNTWINNED = 210
 GENERIC_PLANNED_STATUS = "planned:#2146"
 GENERIC_PLANNED_ISSUE = 2146
 # 84 -> 83 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me became twinned.
-BASELINE_GENERIC_PLANNED = 81
+BASELINE_GENERIC_PLANNED = 80
 
 # A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
 # today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.
@@ -2323,7 +2323,7 @@ def extract_mcp_handlers(by_tool, registry, tools):
 # x2, create_result_set), whose extra handler gate their reasons already explain. The switch exists so
 # the selftest can exercise both settings; do not turn it off to unblock a twin.
 HANDLER_PAIR_RULE = True
-GATE_PARITY_KNOWN_MISMATCHES_MAX = 6
+GATE_PARITY_KNOWN_MISMATCHES_MAX = 7
 GATE_PARITY_KNOWN_MISMATCHES = {
     ("GET", "/api/v1/dex/perf/devices", "list_dex_perf_devices"): (
         "refused:GuaranteedState:Read", "confined:GuaranteedState:Read",
@@ -2349,6 +2349,13 @@ GATE_PARITY_KNOWN_MISMATCHES = {
         "the tool serves the taxonomy at Infrastructure:Read and gates the role-to-permission "
         "grid in-handler on UserManagement:Read (declared via roles_omitted); this route is the "
         "grid half, so the tier row and the REST gate name different securables by design"),
+    ("POST", "/api/v1/commands", "execute_instruction"): (
+        "plain:Execution:Execute", "confined:Execution:Execute",
+        "both surfaces call the same require_permission(Execution, Execute), whose service-scoped "
+        "branch 403s because kServiceScopeGlobalSafe is empty, so a service-scoped caller is "
+        "refused on both; the MCP 'confined' label is the C8 ServiceScopeClass and is not a claim "
+        "that the tool is usable by a service-scoped caller (mcp_server.cpp, C8 comment), which "
+        "this lexical comparison cannot see. ADR-1005 owner ruling 2026-10-31; programme #2146"),
     ("POST", "/api/v1/result-sets", "create_result_set"): (
         "fleet:Infrastructure:Read",
         "denied:Infrastructure:Write; handler also gates on fleet:Infrastructure:Read",
