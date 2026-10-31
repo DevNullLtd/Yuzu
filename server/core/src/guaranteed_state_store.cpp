@@ -462,26 +462,34 @@ const std::vector<pg::PgMigration>& migrations() {
 // the runner cannot tell this schema's v3 from another branch's v3 (#5674 hard cutover: a
 // database stamped by the discarded census-order design has no foreign key on the census
 // table). The cascade key is the one structural fact this schema's v3 adds, so it is the
-// only thing checked: a column check would refuse a later schema version that adds columns
-// to the same tables. Returns an empty string when the key is present, else the cause, for
-// the boot error. Any query failure is a cause too.
+// only key checked, by its shape: cascade, not deferrable, on rule_id in both tables. A check
+// of the other columns would refuse a later schema version that adds columns to the same
+// tables. Returns an empty string when the key is present, else the cause, for the boot
+// error. Any query failure is a cause too.
 std::string census_schema_defect(PGconn* conn) {
     pg::PgResult res = pg::exec_params(
         conn,
-        "SELECT count(*) FROM pg_constraint "
+        "SELECT count(*) FROM pg_constraint c "
         "WHERE conrelid = 'guaranteed_state_store.guardian_agent_rule_status'::regclass "
         "  AND confrelid = 'guaranteed_state_store.guaranteed_state_rules'::regclass "
-        "  AND contype = 'f' AND confdeltype = 'c'",
+        "  AND contype = 'f' AND confdeltype = 'c' AND NOT condeferrable "
+        "  AND conkey = ARRAY[(SELECT attnum FROM pg_attribute "
+        "                       WHERE attrelid = c.conrelid AND attname = 'rule_id')] "
+        "  AND confkey = ARRAY[(SELECT attnum FROM pg_attribute "
+        "                        WHERE attrelid = c.confrelid AND attname = 'rule_id')]",
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
         return std::string("census schema probe failed: ") +
                ::yuzu::log_key_token(PQerrorMessage(conn));
     if (to_i64(PQgetvalue(res.get(), 0, 0)) < 1)
-        return "guardian_agent_rule_status has no ON DELETE CASCADE foreign key to "
-               "guaranteed_state_rules. Back up the database first. A database stamped by a "
-               "different branch's schema v3 is not supported: recreating the "
-               "guaranteed_state_store schema DELETES every Guardian rule, event and "
-               "observation. If only the key is missing, run \"UPDATE public.schema_meta SET "
+        return "guardian_agent_rule_status has no ON DELETE CASCADE foreign key on rule_id to "
+               "guaranteed_state_rules (a deferrable key, or one on other columns, does not "
+               "count). Back up the database first. A database stamped by a different "
+               "branch's schema v3 is not supported: recreating the guaranteed_state_store "
+               "schema DELETES every Guardian rule, event and observation. If only the key is "
+               "missing or has the wrong shape, run \"ALTER TABLE "
+               "guaranteed_state_store.guardian_agent_rule_status DROP CONSTRAINT IF EXISTS "
+               "guardian_agent_rule_status_rule_fk\" and then \"UPDATE public.schema_meta SET "
                "version = 2 WHERE store = 'guaranteed_state_store'\" and restart, which re-runs "
                "the idempotent v3 migration";
     return {};
@@ -1069,8 +1077,16 @@ enum class CensusOutcome {
     // ROLLBACK TO keeps the savepoint defined, so release it too: a batch otherwise stacks
     // one live savepoint per failed row until the transaction ends.
     if (!control("ROLLBACK TO SAVEPOINT census_upsert") ||
-        !control("RELEASE SAVEPOINT census_upsert"))
+        !control("RELEASE SAVEPOINT census_upsert")) {
+        // The caller reports only the control statement's own libpq text, so record the census
+        // error that started this here or it is lost.
+        spdlog::error("GuaranteedStateStore: census upsert failed and its savepoint could not be "
+                      "rolled back and released, transaction abandoned event_id={} agent_id={} "
+                      "rule_id={}: {}",
+                      log_id_token(row.event_id), log_id_token(row.agent_id),
+                      log_id_token(row.rule_id), ::yuzu::log_key_token(err));
         return CensusOutcome::Abandoned;
+    }
     if (rejected) {
         spdlog::debug("GuaranteedStateStore: census write refused, rule not defined on this "
                       "server (event not discarded) agent_id={} rule_id={}",
