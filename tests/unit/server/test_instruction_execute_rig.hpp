@@ -149,6 +149,7 @@ struct Rig {
     std::optional<DispatchDenial> force_denial;
     std::set<std::string> denied_securables; // has_permission() answers false for these
     bool authorize_unwired{false};
+    bool classify_unwired{false};
 
     struct AuditRow {
         std::string result, detail;
@@ -224,9 +225,11 @@ struct Rig {
             };
         }
         p.validators = &validators;
-        p.classify = [this](std::string_view pl, std::string_view ac) {
-            return caps.classify(pl, ac);
-        };
+        if (!classify_unwired) {
+            p.classify = [this](std::string_view pl, std::string_view ac) {
+                return caps.classify(pl, ac);
+            };
+        }
         if (!authorize_unwired) {
             p.authorize = [this](const DispatchCaller& caller, std::string_view pl,
                                  std::string_view ac)

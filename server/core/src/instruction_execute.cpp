@@ -20,8 +20,9 @@ namespace {
 
 constexpr int kRetryAfterMs = 5000;
 
-/// A kMisconfigured refusal is a SERVER defect (a required port was never wired at boot): it does
-/// not clear by itself, so it carries NO retry hint (`retry_after_ms` stays null) and says so.
+/// A kMisconfigured or kClassifierUnavailable refusal is a SERVER defect (a required port was never
+/// wired at boot): it does not clear by itself, so it carries NO retry hint (`retry_after_ms` stays
+/// null) and says so.
 constexpr std::string_view kMisconfiguredRemediation =
     "this is a server configuration defect and retrying will not help; report it to the server "
     "operator";
@@ -245,8 +246,7 @@ PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& a
     if (!ports.classify) {
         return refuse(c, make_refusal(RefusalKind::kClassifierUnavailable, "classifier_unavailable",
                                       "capability registry not available",
-                                      "retry shortly; the capability classifier is not wired",
-                                      kRetryAfterMs));
+                                      std::string(kMisconfiguredRemediation)));
     }
     {
         const auto gate = evaluate_destructive_targeting(

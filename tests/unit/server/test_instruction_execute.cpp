@@ -792,6 +792,26 @@ TEST_CASE("execute: an unwired classifier fails closed (503)", "[instruction_exe
     CHECK(r.calls.empty());
 }
 
+// #2146: an unwired classifier is a server wiring defect, exactly like kMisconfigured: retrying
+// will not help, so the refusal carries NO retry hint and a defect remediation (core, REST, MCP).
+TEST_CASE("execute: an unwired classifier advertises no retry and says it is a server defect",
+          "[instruction_execute][retryhint]") {
+    {
+        Rig r;
+        r.defs["d"] = make_def("d");
+        auto p = r.ports();
+        p.classify = nullptr;
+        auto out = run(r.request("d", json::object(), make_caller("u", true)), p, r.audit());
+        REQUIRE(as_refusal(out));
+        const auto& ref = *as_refusal(out);
+        CHECK(ref.kind == RefusalKind::kClassifierUnavailable);
+        CHECK_FALSE(ref.retry_after_ms.has_value());
+        CHECK(ref.remediation.find("retrying will not help") != std::string::npos);
+        CHECK(ref.remediation.find("configuration defect") != std::string::npos);
+        CHECK(ref.remediation.find("retry shortly") == std::string::npos);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Audit-first, execution row, claim parameters, bookkeeping.
 // ---------------------------------------------------------------------------------------------
@@ -1526,6 +1546,30 @@ TEST_CASE("REST and MCP: a kMisconfigured refusal is 500 / -32603 with retry_aft
     CHECK(d["retry_after_ms"].is_null());
     CHECK(d["remediation"].is_string());
     CHECK(d["reason"] == "dispatch_unconfigured");
+}
+
+TEST_CASE("REST and MCP: an unwired classifier is 503 / -32603 with retry_after_ms null",
+          "[instruction_execute][rest][retryhint]") {
+    // REST: 503 with a null retry_after_ms.
+    RouteRig rr([](Rig& core) { core.classify_unwired = true; });
+    rr.core.defs["d"] = make_def("d");
+    auto res = rr.post("d", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    const auto j = json::parse(res->body);
+    CHECK(j["error"]["reason"] == "classifier_unavailable");
+    CHECK(j["error"]["retry_after_ms"].is_null());
+    CHECK(j["error"]["remediation"].get<std::string>().find("retrying will not help") !=
+          std::string::npos);
+    // MCP rendering of the same refusal.
+    Refusal ref;
+    ref.kind = RefusalKind::kClassifierUnavailable;
+    ref.reason = "classifier_unavailable";
+    ref.message = "capability registry not available";
+    ref.remediation = "this is a server configuration defect and retrying will not help";
+    const auto rendered = yuzu::server::mcp::instruction_definition::render_refusal(ref, false, "cid");
+    CHECK(rendered.is_error);
+    CHECK(json::parse(rendered.data_json)["retry_after_ms"].is_null());
 }
 
 TEST_CASE("REST execute: an unwired caller derivation fails closed on visibility",
