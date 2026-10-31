@@ -153,6 +153,10 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
         rq.caller = deps.caller_fn ? deps.caller_fn(req)
                                    : DispatchCaller{.exec_visible = authz::deny_all()};
 
+        // The same per-principal share of the pending-approval queue MCP has: a script looping on
+        // an approval-gated definition must not fill the cap every other principal shares.
+        rq.submitter_pending_cap = kSubmitterPendingCap;
+
         const std::string definition_id = rq.definition_id;
         const AuditHook audit = [&](std::string_view result, const std::string& detail_text) {
             if (!deps.audit_fn)

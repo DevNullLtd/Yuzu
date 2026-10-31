@@ -292,18 +292,37 @@ PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& a
             spdlog::error("instruction '{}' requires approval (mode={}) but no approval manager is "
                           "available: rejecting execution",
                           def_token, ::yuzu::log_token(def.approval_mode));
+            bump(ports, kApprovalRefusedMetric,
+                 {{"reason", kReasonApprovalUnavailable}});
             c.audit("failure", "reason=approval_unavailable mode=" +
                                    ::yuzu::log_token(def.approval_mode) + " definition=" + def_token);
-            return refuse(c, make_refusal(RefusalKind::kApprovalUnavailable, "approval_unavailable",
+            return refuse(c, make_refusal(RefusalKind::kApprovalUnavailable, kReasonApprovalUnavailable,
                                           "approval system unavailable: cannot execute an "
                                           "approval-gated instruction",
                                           "retry shortly; the approval manager is not available",
                                           kRetryAfterMs));
         }
-        if (rq.submitter_pending_cap > 0 && ports.pending_count_for &&
+        // A cap was requested but its counter is unwired: refuse, never silently run uncapped
+        // (the same fail-closed stance as an unwired approval manager above).
+        if (rq.submitter_pending_cap > 0 && !ports.pending_count_for) {
+            spdlog::error("instruction '{}' requires approval but the pending-approval counter is "
+                          "unwired: rejecting rather than running without the per-principal cap",
+                          def_token);
+            bump(ports, kApprovalRefusedMetric, {{"reason", kReasonApprovalUnavailable}});
+            c.audit("failure", "reason=approval_unavailable mode=" +
+                                   ::yuzu::log_token(def.approval_mode) + " definition=" + def_token);
+            return refuse(c, make_refusal(RefusalKind::kApprovalUnavailable, kReasonApprovalUnavailable,
+                                          "approval system unavailable: cannot execute an "
+                                          "approval-gated instruction",
+                                          "retry shortly; the approval manager is not available",
+                                          kRetryAfterMs));
+        }
+        if (rq.submitter_pending_cap > 0 &&
             ports.pending_count_for(rq.caller.principal) >= rq.submitter_pending_cap) {
+            bump(ports, kApprovalRefusedMetric,
+                 {{"reason", kReasonApprovalCapReached}});
             c.audit("denied", "reason=approval_cap_reached definition=" + def_token);
-            return refuse(c, make_refusal(RefusalKind::kApprovalCapReached, "approval_cap_reached",
+            return refuse(c, make_refusal(RefusalKind::kApprovalCapReached, kReasonApprovalCapReached,
                                           "too many pending approvals for this principal; approve "
                                           "or let existing requests expire before creating more",
                                           "wait for your pending approvals to be reviewed"));
@@ -312,9 +331,11 @@ PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& a
                                                def.plugin, def.action);
         if (!submitted) {
             spdlog::error("approval submit failed for '{}': {}", def_token, submitted.error());
+            bump(ports, kApprovalRefusedMetric,
+                 {{"reason", kReasonApprovalSubmitFailed}});
             c.audit("failure", "reason=approval_submit_failed definition=" + def_token);
             return refuse(c, make_refusal(RefusalKind::kApprovalSubmitFailed,
-                                          "approval_submit_failed",
+                                          kReasonApprovalSubmitFailed,
                                           "failed to create approval request", "retry later",
                                           kRetryAfterMs));
         }

@@ -120,6 +120,10 @@ struct Rig {
     bool approvals_wired{true};
     bool approval_fails{false};
     int pending_for{0};
+    /// When set, `pending_count_for(user)` is `pending_for` plus the approvals THIS rig has
+    /// accepted for that user, so a loop of real submits walks into the per-principal cap and
+    /// another principal's count stays independent (the production counter is per submitter).
+    bool pending_counts_submitted{false};
     struct ApprovalCall {
         std::string def, user, scope, plugin, action;
     };
@@ -245,7 +249,14 @@ struct Rig {
                 approvals.push_back({d, u, s, pl, ac});
                 return std::string("appr-") + std::to_string(approvals.size());
             };
-            p.pending_count_for = [this](const std::string&) { return pending_for; };
+            p.pending_count_for = [this](const std::string& user) {
+                int n = pending_for;
+                if (pending_counts_submitted)
+                    for (const auto& a : approvals)
+                        if (a.user == user)
+                            ++n;
+                return n;
+            };
         }
         p.visible_agents = [this](const std::string&) { return visible_agents; };
         if (ledger_wired) {

@@ -1569,6 +1569,22 @@ public:
         // Stored `parameter_schema` refusals on the instruction execute route: a separate
         // family (a validation refusal, not a targeting one), seeded in workflow_routes.cpp.
         seed_instruction_param_rejected_metrics(metrics_);
+        // Approval-submit refusals on the instruction execute core (REST v1 + MCP
+        // execute_instruction_definition) and the MCP C8 ticket mint's per-principal cap. A
+        // saturated per-principal share is the early signal for a looping client; the global
+        // queue (1000) filling is what it protects. Closed reason set, every member pre-seeded so
+        // an absent() alert reads "never happened", not "no series yet".
+        metrics_.describe(yuzu::server::instruction_execute::kApprovalRefusedMetric,
+                          "Approval-gated execute calls refused at the approval-submit step, by "
+                          "reason: approval_cap_reached (this principal already holds 25 pending "
+                          "approvals, HTTP 429 / MCP tier-denied), approval_unavailable (no "
+                          "approval manager), approval_submit_failed (the approval store refused "
+                          "the row, including the global queue being full). No approval row is "
+                          "created on a refusal.",
+                          "counter");
+        for (const auto reason : yuzu::server::instruction_execute::kApprovalRefusedReasons)
+            metrics_.counter(yuzu::server::instruction_execute::kApprovalRefusedMetric,
+                             {{"reason", std::string(reason)}});
         // Wave 7 PR7.2: the Forensics single-target refusal — same routes as
         // its Destructive sibling above, since `evaluate_destructive_targeting`
         // is called generically for any classified capability on all of them

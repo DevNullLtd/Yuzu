@@ -8759,9 +8759,22 @@ McpServer::HandlerFn McpServer::build_handler(
                         // key defeats the args-hash) would still fill the GLOBAL
                         // pending cap shared with the REST approval workflow. Bound
                         // any single principal's share far below that global cap.
-                        constexpr int kMcpSubmitterPendingCap = 25;
+                        constexpr int kMcpSubmitterPendingCap =
+                            yuzu::server::instruction_execute::kSubmitterPendingCap;
                         if (approval_manager->pending_count_for(session->username) >=
                             kMcpSubmitterPendingCap) {
+                            if (metrics != nullptr) {
+                                try {
+                                    metrics
+                                        ->counter(yuzu::server::instruction_execute::
+                                                      kApprovalRefusedMetric,
+                                                  {{"reason",
+                                                    yuzu::server::instruction_execute::
+                                                        kReasonApprovalCapReached}})
+                                        .increment();
+                                } catch (...) { // NOLINT(bugprone-empty-catch)
+                                }
+                            }
                             mcp_audit("denied", "per-submitter pending-approval cap reached");
                             res.set_content(
                                 a4_error(kTierDenied,

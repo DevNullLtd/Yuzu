@@ -63,8 +63,10 @@ namespace yuzu::server::mcp::instruction_definition {
 
 inline constexpr const char* kToolName = "execute_instruction_definition";
 
-/// One principal's share of the global pending-approval queue (the C8 mint uses the same 25).
-inline constexpr int kSubmitterPendingCap = 25;
+/// One principal's share of the global pending-approval queue. Aliases the ONE shared constant
+/// (`instruction_execute::kSubmitterPendingCap`, also used by REST and the C8 mint): never a
+/// second literal.
+inline constexpr int kSubmitterPendingCap = yuzu::server::instruction_execute::kSubmitterPendingCap;
 
 /// `definition_id` bound (bytes). Stored ids are short slugs; the schema literal repeats it.
 inline constexpr std::size_t kDefinitionIdMaxLen = kExecInstrIdentMaxLen;

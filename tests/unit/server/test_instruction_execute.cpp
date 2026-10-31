@@ -23,6 +23,7 @@
 #include "dispatch_zero_reach.hpp"
 #include "instruction_execute.hpp"
 #include "instruction_execute_routes.hpp"
+#include "mcp_instruction_execute.hpp" // kSubmitterPendingCap alias
 #include "service_scope_policy.hpp"
 
 #include "../test_helpers.hpp"
@@ -442,6 +443,82 @@ TEST_CASE("execute: the per-submitter pending cap (MCP) refuses before minting",
     CHECK(r.approvals.empty());
     r.pending_for = 24;
     CHECK(as_pending(run(rq, r.ports(), r.audit())));
+}
+
+TEST_CASE("execute: the cap refusal is counted, creates no approval, and is per principal",
+          "[instruction_execute][approval][metrics]") {
+    Rig r;
+    r.pending_counts_submitted = true;
+    r.defs["d"] = make_def("d", "ping", "always");
+    const yuzu::Labels cap{{"reason", "approval_cap_reached"}};
+    auto submit_as = [&](const char* user) {
+        auto rq = r.request("d", json::object(), make_caller(user, false), Surface::kRest);
+        rq.submitter_pending_cap = kSubmitterPendingCap;
+        return run(rq, r.ports(), r.audit());
+    };
+    // Below the cap every submit lands a pending approval.
+    for (int i = 0; i < kSubmitterPendingCap; ++i)
+        REQUIRE(as_pending(submit_as("alice")));
+    CHECK(r.approvals.size() == static_cast<std::size_t>(kSubmitterPendingCap));
+    CHECK(r.counter(std::string(kApprovalRefusedMetric), cap) == 0);
+
+    // At the cap: refused, nothing created, counted exactly once per refusal.
+    auto out = submit_as("alice");
+    REQUIRE(as_refusal(out));
+    CHECK(as_refusal(out)->kind == RefusalKind::kApprovalCapReached);
+    CHECK(as_refusal(out)->reason == "approval_cap_reached");
+    CHECK_FALSE(as_refusal(out)->retry_after_ms.has_value());
+    CHECK(r.approvals.size() == static_cast<std::size_t>(kSubmitterPendingCap));
+    CHECK(r.counter(std::string(kApprovalRefusedMetric), cap) == 1);
+    CHECK(as_refusal(submit_as("alice")));
+    CHECK(r.counter(std::string(kApprovalRefusedMetric), cap) == 2);
+
+    // Another principal is unaffected by alice's share.
+    CHECK(as_pending(submit_as("bob")));
+    CHECK(r.approvals.back().user == "bob");
+    CHECK(r.counter(std::string(kApprovalRefusedMetric), cap) == 2);
+    CHECK(r.calls.empty()); // nothing dispatched on any path
+}
+
+TEST_CASE("execute: a cap with an unwired pending counter fails closed, never uncapped",
+          "[instruction_execute][approval][security]") {
+    Rig r;
+    r.defs["d"] = make_def("d", "ping", "always");
+    auto ports = r.ports();
+    ports.pending_count_for = nullptr;
+    auto rq = r.request("d", json::object(), make_caller("u", false), Surface::kRest);
+    rq.submitter_pending_cap = kSubmitterPendingCap;
+    auto out = run(rq, ports, r.audit());
+    REQUIRE(as_refusal(out));
+    CHECK(as_refusal(out)->kind == RefusalKind::kApprovalUnavailable);
+    CHECK(r.approvals.empty());
+    CHECK(r.counter(std::string(kApprovalRefusedMetric),
+                    {{"reason", "approval_unavailable"}}) == 1);
+}
+
+TEST_CASE("execute: approval store failure and a missing approval manager are counted",
+          "[instruction_execute][approval][metrics]") {
+    Rig r;
+    r.defs["d"] = make_def("d", "ping", "always");
+    r.approval_fails = true;
+    (void)run(r.request("d", json::object(), make_caller("u", false)), r.ports(), r.audit());
+    CHECK(r.counter(std::string(kApprovalRefusedMetric),
+                    {{"reason", "approval_submit_failed"}}) == 1);
+    r.approval_fails = false;
+    r.approvals_wired = false;
+    (void)run(r.request("d", json::object(), make_caller("u", false)), r.ports(), r.audit());
+    CHECK(r.counter(std::string(kApprovalRefusedMetric),
+                    {{"reason", "approval_unavailable"}}) == 1);
+    CHECK(r.counter(std::string(kApprovalRefusedMetric),
+                    {{"reason", "approval_cap_reached"}}) == 0);
+}
+
+TEST_CASE("the shared cap constant is ONE value across REST, MCP and the C8 mint",
+          "[instruction_execute][approval]") {
+    CHECK(kSubmitterPendingCap == 25);
+    CHECK(yuzu::server::mcp::instruction_definition::kSubmitterPendingCap == kSubmitterPendingCap);
+    // The closed reason set the boot seed iterates.
+    CHECK(kApprovalRefusedReasons.size() == 3);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1072,6 +1149,41 @@ TEST_CASE("REST execute: 202 pending_approval body, and nothing dispatched",
     // The same definition for an administrator dispatches.
     r.caller = make_caller("root", true);
     CHECK(r.post("d", "{}")->status == 200);
+}
+
+TEST_CASE("REST execute: the per-principal pending-approval cap answers 429 and creates nothing",
+          "[instruction_execute][rest][approval]") {
+    RouteRig r([](Rig& c) { c.pending_counts_submitted = true; });
+    r.core.defs["d"] = make_def("d", "ping", "always");
+    r.caller = make_caller("bob", /*admin=*/false);
+    // The route applies the shared cap WITHOUT the test setting it on a Request.
+    for (int i = 0; i < kSubmitterPendingCap; ++i) {
+        auto ok = r.post("d", "{}");
+        REQUIRE(ok);
+        REQUIRE(ok->status == 202);
+    }
+    CHECK(r.core.approvals.size() == static_cast<std::size_t>(kSubmitterPendingCap));
+    auto res = r.post("d", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 429);
+    const auto j = json::parse(res->body);
+    CHECK(j["error"]["code"] == 429);
+    CHECK(j["error"]["reason"] == "approval_cap_reached");
+    CHECK(j["error"]["retry_after_ms"].is_null());
+    CHECK(j["error"].contains("correlation_id"));
+    CHECK(j["error"].contains("remediation"));
+    CHECK(r.core.approvals.size() == static_cast<std::size_t>(kSubmitterPendingCap));
+    CHECK(r.core.audits.back().result == "denied");
+    CHECK(r.core.counter(std::string(kApprovalRefusedMetric),
+                         {{"reason", "approval_cap_reached"}}) == 1);
+
+    // Another principal is not throttled by bob's share.
+    r.caller = make_caller("carol", /*admin=*/false);
+    CHECK(r.post("d", "{}")->status == 202);
+    // An auto definition is unaffected by the approval cap (it needs no approval).
+    r.core.defs["a"] = make_def("a", "ping", "auto");
+    r.caller = make_caller("bob", /*admin=*/false);
+    CHECK(r.post("a", "{}")->status == 200);
 }
 
 TEST_CASE("REST execute: zero reach maps to 400 (invalid_scope) or 503 with an honest retry hint",

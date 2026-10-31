@@ -65,6 +65,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -82,6 +83,27 @@ class MetricsRegistry;
 namespace yuzu::server::instruction_execute {
 
 enum class Surface : std::uint8_t { kRest, kMcp };
+
+/// One principal's share of the global pending-approval queue (`ApprovalManager::
+/// kMaxPendingApprovals`, 1000). ONE constant for every surface that creates a pending approval
+/// on a principal's behalf: REST `POST /api/v1/instructions/{id}/execute`, MCP
+/// `execute_instruction_definition` and the MCP C8 ticket mint. An agentic loop (or a script)
+/// must not be able to fill the cap it shares with every human and every schedule.
+inline constexpr int kSubmitterPendingCap = 25;
+
+/// `reason` label of `yuzu_server_approval_submit_refused_total`, and the same token the audit
+/// row and the wire `reason` carry. CLOSED set, every member pre-seeded at boot in server.cpp from
+/// this array. `approval_cap_reached` is the per-principal cap above; `approval_unavailable` is
+/// "no approval manager wired"; `approval_submit_failed` is the store refusing the row (which
+/// includes the global queue being full). Only refusals at the approval-submit step count: a
+/// refusal earlier in `prepare` (targeting, params, gate) creates no approval and counts under
+/// its own family.
+inline constexpr char kApprovalRefusedMetric[] = "yuzu_server_approval_submit_refused_total";
+inline constexpr char kReasonApprovalCapReached[] = "approval_cap_reached";
+inline constexpr char kReasonApprovalUnavailable[] = "approval_unavailable";
+inline constexpr char kReasonApprovalSubmitFailed[] = "approval_submit_failed";
+inline constexpr std::array<std::string_view, 3> kApprovalRefusedReasons{
+    kReasonApprovalCapReached, kReasonApprovalUnavailable, kReasonApprovalSubmitFailed};
 
 /// `route` label of `yuzu_server_dispatch_target_rejected_total` and
 /// `yuzu_server_instruction_param_rejected_total` for a surface. Both are pre-seeded in
@@ -105,8 +127,9 @@ struct Request {
     /// The caller, fully derived by the surface. `principal` is the audit/approval identity,
     /// `exec_visible` the confinement set, `principal_is_admin` the role-gated bypass.
     DispatchCaller caller;
-    /// 0 = no cap. The MCP surface bounds one principal's share of the global pending
-    /// approval queue (an agentic loop must not fill the cap shared with every human).
+    /// 0 = no cap. Every production surface sets `kSubmitterPendingCap`: it bounds one principal's
+    /// share of the global pending approval queue (an agentic loop or a script must not fill the
+    /// cap shared with every human). Only a test leaves it 0.
     int submitter_pending_cap{0};
 };
 

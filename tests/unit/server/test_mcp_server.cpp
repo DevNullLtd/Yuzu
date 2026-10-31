@@ -824,6 +824,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 #include "schedule_api_local.hpp"       // ADR-0031 WS-A4 (seventh family): wire the real ScheduleApi seam
 #include "workflow_api_local.hpp"       // ADR-0031 WS-A4 (eighth family): wire the real WorkflowApi seam
 #include "mcp_server.hpp"
+#include "instruction_execute.hpp" // kApprovalRefusedMetric / kSubmitterPendingCap (#2146)
 #include "mcp_server_testonly.hpp"      // tool_*_for_test() accessors (issue #2385)
 
 #include "pg/pg_exec.hpp"               // exec_params — degrade the store in the [pg] degrade test
@@ -30893,13 +30894,17 @@ TEST_CASE("MCP approval mint enforces a per-submitter pending sub-cap",
         yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
 
+    yuzu::MetricsRegistry cap_metrics;
     McpTestServer ts;
+    ts.metrics_for_test = &cap_metrics;
     ts.tag_store_for_test = &tags;
     ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
                                     const std::string&, const std::string&,
                                     const std::string&) -> bool { return true; };  // K-06: scope now fail-closed; wire a permissive stub
     ts.approval_manager_for_test = &appr;
     ts.start("operator");
+    const yuzu::Labels cap_label{{"reason", "approval_cap_reached"}};
+    const std::string cap_metric(yuzu::server::instruction_execute::kApprovalRefusedMetric);
 
     // 25 distinct-args mints (different agent_id each) all succeed → kApprovalRequired.
     for (int i = 0; i < 25; ++i) {
@@ -30920,6 +30925,8 @@ TEST_CASE("MCP approval mint enforces a per-submitter pending sub-cap",
     REQUIRE(capped.contains("error"));
     CHECK(capped["error"]["code"] == yuzu::server::mcp::kTierDenied);
     CHECK(appr.pending_count() == 25); // not 26
+    // The C8 mint's cap refusal feeds the same counter as the shared execute core.
+    CHECK(cap_metrics.counter(cap_metric, cap_label).value() == 1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -44554,6 +44561,32 @@ TEST_CASE("MCP execute_instruction_definition: a non-auto definition with no app
     CHECK(body["error"]["data"]["reason"] == "approval_unavailable");
     CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
     CHECK(rig.calls.empty());
+}
+
+TEST_CASE("MCP execute_instruction_definition: the per-principal pending cap refuses, counts, and "
+          "creates no approval",
+          "[mcp][integration][execute][idef][approval][security]") {
+    McpTestServer ts;
+    Rig rig;
+    rig.pending_for = yuzu::server::instruction_execute::kSubmitterPendingCap;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "always");
+    idef_start(ts, rig, "operator");
+    auto res = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    CHECK(body["error"]["data"]["reason"] == "approval_cap_reached");
+    CHECK(rig.approvals.empty());
+    CHECK(rig.calls.empty());
+    CHECK(rig.counter(std::string(yuzu::server::instruction_execute::kApprovalRefusedMetric),
+                      {{"reason", "approval_cap_reached"}}) == 1);
+    // One below the cap the same call lands a pending approval.
+    rig.pending_for = yuzu::server::instruction_execute::kSubmitterPendingCap - 1;
+    auto ok = ts.call(idef_call({{"definition_id", "d"}}, 2));
+    REQUIRE(ok);
+    CHECK_FALSE(nlohmann::json::parse(ok->body).contains("error"));
+    CHECK(rig.approvals.size() == 1);
 }
 
 TEST_CASE("MCP execute_instruction_definition: params that violate the stored schema dispatch "
