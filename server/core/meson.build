@@ -874,6 +874,7 @@ yuzu_server_core_lib = static_library(
     'src/workflow_routes.cpp',
     'src/notification_routes.cpp',
     'src/command_routes.cpp',
+    'src/command_v1_routes.cpp', # POST /api/v1/commands: the REST v1 twin of /api/command + MCP execute_instruction (#2146)
     'src/page_routes.cpp',
     'src/dashboard_api_routes.cpp',
     'src/nvd_routes.cpp',

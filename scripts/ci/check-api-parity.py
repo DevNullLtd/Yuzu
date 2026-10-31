@@ -495,7 +495,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # (GET/PUT /api/v1/config and the MCP tools get_runtime_config / set_runtime_config).
 # 213 -> 212 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me flipped from planned to twinned
 # (GET /api/v1/me + the get_me MCP tool).
-BASELINE_UNTWINNED = 212
+# 212 -> 211 (REST v1 command twin, #2146): post.api-command flipped to `twinned` (POST /api/v1/commands + the
+# existing MCP tool execute_instruction).
+BASELINE_UNTWINNED = 211
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
@@ -506,7 +508,8 @@ BASELINE_UNTWINNED = 212
 GENERIC_PLANNED_STATUS = "planned:#2146"
 GENERIC_PLANNED_ISSUE = 2146
 # 84 -> 83 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me became twinned.
-BASELINE_GENERIC_PLANNED = 83
+# 83 -> 82 (REST v1 command twin, #2146): post.api-command became twinned.
+BASELINE_GENERIC_PLANNED = 82
 
 # A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
 # today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.

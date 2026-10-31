@@ -172,6 +172,7 @@
 #include "dispatch_scope_ladder.hpp" // A-3/QE-2: the shared scope-resolution ladder + caller wiring
 #include "json_extract.hpp" // #2557: shared JSON body-extraction helpers (was 7 ServerImpl statics)
 #include "command_routes.hpp" // #2557: POST /api/command, extracted onto the HttpRouteSink seam
+#include "command_v1_routes.hpp" // POST /api/v1/commands: the REST v1 twin of /api/command + MCP execute_instruction (#2146)
 #include "page_routes.hpp" // #2542: page-shell/static-asset routes, extracted onto the HttpRouteSink seam
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
@@ -1528,7 +1529,7 @@ public:
         // can never emit them. Seeding the full product would publish series
         // that no code path can reach, which reads on a dashboard as "this has
         // never happened" when the truth is "this cannot happen" (governance).
-        for (const char* route : {"command", "instruction_execute"}) {
+        for (const char* route : {"command", "instruction_execute", "command_v1"}) {
             for (const auto reason : yuzu::server::kTargetingShapeReasons)
                 metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                                  {{"route", route}, {"reason", std::string(reason)}});
@@ -1555,7 +1556,7 @@ public:
         // only on first use reads as ABSENT until the first refusal, which is
         // exactly the absent()-alerting break the single-array discipline exists
         // to prevent -- and three docs tell operators to alert on this series.
-        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow"})
+        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow", "command_v1"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
@@ -1566,7 +1567,7 @@ public:
         // its Destructive sibling above, since `evaluate_destructive_targeting`
         // is called generically for any classified capability on all of them
         // (a Forensics row is never Destructive, but reaches the same gate).
-        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow"})
+        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow", "command_v1"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonForensicUntargeted)}});
@@ -1577,10 +1578,11 @@ public:
         // confinement step, so seeding those routes here would publish a
         // series claiming a reachability that does not exist (same rule the
         // per-route seeding throughout this block already follows).
-        metrics_.counter(
-            "yuzu_server_dispatch_target_rejected_total",
-            {{"route", "command"},
-             {"reason", std::string(yuzu::server::kReasonDestructiveNoVisibleTarget)}});
+        for (const char* route : {"command", "command_v1"})
+            metrics_.counter(
+                "yuzu_server_dispatch_target_rejected_total",
+                {{"route", route},
+                 {"reason", std::string(yuzu::server::kReasonDestructiveNoVisibleTarget)}});
         for (const auto reason : {yuzu::server::kReasonParentIdType,
                                   yuzu::server::kReasonParentIdEmpty})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
@@ -22046,6 +22048,76 @@ private:
             // a copy of the SAME closure MCP's set_authorize_dispatch_fn receives
             // below, never a route-local one. Unwired would make those routes answer 500.
             authorize_dispatch);
+
+        // POST /api/v1/commands (#2146): the REST v1 twin of POST /api/command and of MCP
+        // execute_instruction. Every closure below is the SAME one the sibling surfaces hold --
+        // the confined dispatch seam, the authorize-dispatch dry run, the classifier, the
+        // session-bound audit writer and `derive_dispatch_caller` -- so this route cannot
+        // observe a different decision for the same caller. It constructs no DispatchCaller of
+        // its own. See command_v1_routes.hpp for the order of checks.
+        {
+            HttplibRouteSink command_v1_sink{*web_server_};
+            yuzu::server::command_v1::register_command_v1_routes(
+                command_v1_sink,
+                yuzu::server::command_v1::Deps{
+                    .auth_fn = [this](const httplib::Request& req, httplib::Response& res)
+                        -> std::optional<auth::Session> { return require_auth(req, res); },
+                    .perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                      const std::string& type, const std::string& op) -> bool {
+                        return require_permission(req, res, type, op);
+                    },
+                    .audit_fn = [this](const httplib::Request& req, const std::string& action,
+                                       const std::string& result, const std::string& target_type,
+                                       const std::string& target_id,
+                                       const std::string& detail) -> bool {
+                        return audit_log(req, action, result, target_type, target_id, detail);
+                    },
+                    .audit_as_session = auth_routes_->audit_as_session_fn(),
+                    .classify_fn = [this](std::string_view p, std::string_view a) {
+                        return capability_registry_.classify(p, a);
+                    },
+                    .authorize_dispatch_fn = authorize_dispatch,
+                    .dispatch_fn = command_dispatch_caller_fn,
+                    .derive_caller_fn = [this](const auth::Session& sess) {
+                        return derive_dispatch_caller(sess);
+                    },
+                    .visible_agents_fn =
+                        [this](const std::string& username)
+                        -> std::optional<std::vector<std::string>> {
+                        if (!mgmt_group_store_)
+                            return std::nullopt; // fail closed: none visible
+                        return mgmt_group_store_->get_visible_agents(username);
+                    },
+                    .execution =
+                        {.create =
+                             [this](const std::string& by, const std::string& scope,
+                                    const std::string& parameter_values_json)
+                             -> std::expected<std::string, std::string> {
+                            if (!execution_tracker_)
+                                return std::unexpected(std::string("no execution tracker"));
+                            Execution exec;
+                            exec.status = "running";
+                            exec.scope_expression = scope;
+                            exec.parameter_values = parameter_values_json;
+                            exec.dispatched_by = by;
+                            return execution_tracker_->create_execution(exec);
+                        },
+                         .mark_cancelled =
+                             [this](const std::string& id, const std::string& by) {
+                                 return execution_tracker_ &&
+                                        execution_tracker_->mark_cancelled(id, by);
+                             },
+                         .set_targeted =
+                             [this](const std::string& id, int reached) {
+                                 if (!execution_tracker_)
+                                     return false;
+                                 const bool ok = execution_tracker_->set_agents_targeted(id, reached);
+                                 execution_tracker_->refresh_counts(id);
+                                 return ok;
+                             }},
+                    .metrics = &metrics_,
+                });
+        }
 
         // -- Register MCP server routes ----------------------------------------
 

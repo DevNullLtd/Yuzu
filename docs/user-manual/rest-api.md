@@ -309,7 +309,7 @@ Every request is checked against a per-route body-size cap **before authenticati
 | Status | Meaning |
 |---|---|
 | `413` | The body's **declared `Content-Length`** exceeds the resolved cap for this route's class. |
-| `411` | The body cannot be **measured** in advance **by framing** — chunked `Transfer-Encoding`, or a POST/PUT/PATCH with no `Content-Length` at all — and this route's class refuses that. **Four classes refuse an unmeasurable body today: `/mcp/`, `upload_session` (`PUT /api/v1/uploads/{id}/chunk` and its sibling agent-facing upload routes), `hardware` and `dex_score_policy`** — every other class below falls through and is admitted up to httplib's own 100 MiB backstop, because chunked request bodies are legal HTTP and this repo does not control every client population talking to public REST/SCIM/upload routes. This is a deliberate per-class opt-in (`requires_measurable`), not a blanket rule. `upload_session` opts in for the same reason `/mcp/` does: its session gate lives in the route HANDLER, after httplib would otherwise buffer the body, so the pre-routing bound is what actually stops an unauthenticated caller forcing a ~100 MiB buffer per connection — the agent uploader always sends an identity-encoded body with a `Content-Length` (the protocol's `Content-Range` header requires knowing it), so this costs a conforming client nothing. A non-`identity` `Content-Encoding` is judged separately — see `415` below, not this row. |
+| `411` | The body cannot be **measured** in advance **by framing** — chunked `Transfer-Encoding`, or a POST/PUT/PATCH with no `Content-Length` at all — and this route's class refuses that. **Five classes refuse an unmeasurable body today: `/mcp/`, `upload_session` (`PUT /api/v1/uploads/{id}/chunk` and its sibling agent-facing upload routes), `hardware`, `dex_score_policy` and `commands`** — every other class below falls through and is admitted up to httplib's own 100 MiB backstop, because chunked request bodies are legal HTTP and this repo does not control every client population talking to public REST/SCIM/upload routes. This is a deliberate per-class opt-in (`requires_measurable`), not a blanket rule. `upload_session` opts in for the same reason `/mcp/` does: its session gate lives in the route HANDLER, after httplib would otherwise buffer the body, so the pre-routing bound is what actually stops an unauthenticated caller forcing a ~100 MiB buffer per connection — the agent uploader always sends an identity-encoded body with a `Content-Length` (the protocol's `Content-Range` header requires knowing it), so this costs a conforming client nothing. A non-`identity` `Content-Encoding` is judged separately — see `415` below, not this row. |
 | `415` | The request carries a `Content-Encoding` header set to anything other than `identity` (case-insensitive). Refused **unconditionally, on every route class, regardless of `requires_measurable`** — unlike the framing rule above, this does not depend on a per-class opt-in. Why: this build compiles `CPPHTTPLIB_BROTLI_SUPPORT`, httplib decompresses transparently and enforces only its 100 MiB global limit against the **decompressed** size, so `Content-Length` on a compressed body measures the wrong thing and a sub-cap compressed body can expand to ~100 MiB before anything downstream sees it. No Yuzu route accepts a compressed request body today, so this costs a conforming client nothing — send the body identity-encoded by **omitting `Content-Encoding` entirely**. Do **not** send `Content-Encoding: identity` explicitly: `has_non_identity_content_encoding` correctly admits it past this gate (it isn't a compressed encoding), but httplib's own body reader then calls `create_decompressor("identity")` — which matches none of gzip/deflate/br/zstd, returns null, and httplib answers a bare `415` itself (`httplib.h`'s `prepare_content_receiver`), before this gate, any route handler, or the A4/SCIM envelope code ever runs. That response carries none of the structure this section promises — no A4 envelope, no `correlation_id`, no `yuzu_body_cap_rejected_total` increment. Until that gap is closed at the code level, the only conforming way to send an identity-encoded body is to omit the header. |
 
 All three responses use the standard [A4 error envelope](#json-envelope) with a `remediation` hint (no `permission` field — the request is rejected before any principal is resolved) — **except the `scim` class**, which publishes SCIM's own RFC 7644 §3.12 error shape (`schemas`/`status`/`detail`) on `application/scim+json` instead of the generic envelope (`scim::error()`, `scim_json.hpp:192`; wired into all three status codes above in `server.cpp`'s pre-routing handler). This gate is separate from, and runs *before*, any route-local body check a handler may also carry (e.g. the SCIM/response-template 64 KiB checks below) — those still exist for defense-in-depth if a future edit widens this table's entry, but on the current table this pre-routing gate rejects first. **This is not purely a timing change for every affected class.** For most (response templates, CA import), an earlier rejection at the same byte count is the entire effect. SCIM is **no longer** an exception to that either (fixed as part of this change, D7): the pre-routing rejection's SCIM shape matches the wording of the handler's own (now-superseded, and unreachable — the pre-routing cap and the handler check the identical 64 KiB threshold, so the pre-routing gate always wins first) `413` check exactly, and extends the same shape to the `411`/`415` cases the handler-level check never covered.
@@ -337,7 +337,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 
 | Method | Path prefix | Cap | `path_class` | Notes |
 |---|---|---|---|---|
-| any | `/mcp/` | 4 MiB | `mcp` | One of four classes with `requires_measurable=true` — see the 411 row above. |
+| any | `/mcp/` | 4 MiB | `mcp` | One of five classes with `requires_measurable=true` — see the 411 row above. |
 | POST | `/api/v1/bundles` | 70 MiB | `bundles` | Sized to the live-query bundle route's own computed 64 MiB parameter-byte floor plus JSON overhead headroom. |
 | any | `/api/v1/uploads` | 8 MiB | `upload_session` | The second `requires_measurable=true` class. Exact mirror of the PR1.6a chunked-receive protocol's own `kDefaultChunkMaxBytes` (`upload_grant_parsers.hpp`), bound to it by a `static_assert` in `file_retrieval_routes.cpp` so the two cannot drift. Any method — the session-open POST, chunk PUT, status GET, commit POST, and cancel DELETE all share this class; only the chunk PUT carries a large body, but scoping to PUT alone would silently drop the sibling verbs to the 4 MiB catch-all. |
 | any | `/api/v1/plugin-config` | 256 KiB | `plugin_config` | † The store's own grammar caps a config value at 8 KiB and a secret plaintext at 64 KiB (`plugin_config_parsers.hpp`); 256 KiB covers the larger of the two plus JSON framing/escaping headroom, while keeping an unauthenticated flood against this surface two orders of magnitude under the 4 MiB catch-all. Any method — PUT config/secret writes, DELETE carries no body, GET/list are bodyless. |
@@ -372,6 +372,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | any | `/api/v1/dex/score-policy` | 320 KiB | `dex_score_policy` | The fourth `requires_measurable=true` class. `PUT`'s body IS the score policy document, which the handler caps at 256 KiB (`kDexScorePolicyMaxBytes`); 320 KiB leaves framing headroom, so a legitimate document is never refused here. `GET` and `DELETE` are bodyless siblings sharing the class. The permission gate runs in the handler, after the body is buffered (a cookie session's same-site gate runs earlier, pre-routing), so an unmeasurable (chunked) body is refused up front with `411`. |
 | any | `/api/v1/crypto` | 16 KiB | `crypto` | The `/crypto` REST v1 subtree. The only body-bearing route is `PUT /api/v1/crypto/dashboard/layout` (at most 64 catalogue ids, about 4.4 KiB even fully escaped); 16 KiB mirrors the handler's own `kLayoutBodyMaxBytes` exactly. Any method, because every sibling is a bodyless GET and shares the prefix. |
 | any | `/api/v1/config` | 16 KiB | `config` | The runtime-configuration REST v1 subtree. The only body-bearing route is `PUT /api/v1/config/{key}` (`{"value": ...}`, one scalar: an integer, a flag, a log level, a tag key, an OIDC client secret or a string holding a short JSON array); 16 KiB is far above any legal value. Any method, because the sibling `GET /api/v1/config` is bodyless and shares the prefix. The legacy `PUT /api/config/{key}` stays on the catch-all. |
+| any | `/api/v1/commands` | 4 MiB | `commands` | The fifth `requires_measurable=true` class. The REST v1 twin of MCP `execute_instruction` (`POST /api/v1/commands`). The same 4 MiB as the `/mcp/` class, because the same worst case rides it: 10000 agent ids, 32 parameters of 64 KiB and an 8 KiB scope come to about 3.3 MiB. `requires_measurable=true`, like `/mcp/`: a chunked (unmeasurable) body is refused here rather than read unbounded. Any method, so a sibling under the prefix is capped too. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `echo_dashboard_sql`/`echo_result_set_sql` history above is a shipped example).
@@ -11531,6 +11532,101 @@ The governed path this message points at (`POST /api/instructions/{id}/execute`)
 approval workflow this route deliberately does not — `/api/command` mints no approval ticket of
 its own (one core-owned approval primitive, ADR-1005). An admin caller, or a caller redispatching
 with a redeemed approval ticket via the governed path, is not subject to this denial.
+
+#### `POST /api/v1/commands`
+
+The REST v1 twin of `POST /api/command` and of the MCP tool `execute_instruction`. It sends one
+plugin action to connected agents through the same confined dispatch seam, creates an execution row
+and returns its `execution_id`, so the result is collected with the execution routes. It has no UI
+fields (no `thead_html`, no `HX-Trigger`, no event published to the dashboard).
+
+Requires `Execution:Execute`. A service-scoped API token is refused at that gate (`403`); the
+service-scope allow-list is empty. Every agent the command reaches is also intersected with the
+caller's own visible set, so a caller confined by management group or by tag never reaches an agent
+outside it. An engine principal holds no authority here unless an RBAC grant gives it one.
+
+**Request body** (a JSON object; any field not listed is refused with `reason: "unknown_field"`,
+so a legacy `stagger` or `delay` is never silently dropped):
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `plugin` | string | Yes | Plugin name, at most 128 bytes. Lowercased before dispatch. |
+| `action` | string | Yes | Action name, at most 128 bytes. Lowercased before dispatch. |
+| `params` | object | No | At most 32 keys; a key at most 256 bytes; a value at most 64 KiB (a non-string value is sent as its JSON text). Anything but an object is refused (`params_type`). |
+| `agent_ids` | array of strings | No | At most 10000 entries of at most 128 bytes. Present means non-empty. |
+| `scope` | string | No | A scope expression, at most 8192 bytes, or `__all__`. Present means non-empty. |
+
+Targeting: omit both `agent_ids` and `scope` to target the whole fleet. A targeting argument that
+is supplied but names nothing (`"agent_ids": []`, `"scope": ""`) is refused (`agent_ids_empty`,
+`scope_empty`), never widened to the fleet. `agent_ids` together with a real `scope` is refused
+(`target_conflict`); `agent_ids` together with `__all__` dispatches to the listed agents only.
+
+A `Destructive` pair (and a `Forensics` read) must name explicit `agent_ids`: broadcast and scope
+fan-out are refused with `400` and `reason: "destructive_untargeted"` (`forensic_untargeted` for a
+Forensics pair, which needs exactly one id). The pair's own securable is checked first (`403`
+before `400`). Listed agents outside the caller's management-group-visible set are dropped silently;
+when none is left the answer is `404` with `reason: "destructive_no_visible_target"`.
+
+**Success** is `202 Accepted`:
+
+```json
+{
+  "data": {
+    "command_id": "echo-0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+    "execution_id": "exec-...",
+    "agents_reached": 2,
+    "plugin": "echo",
+    "action": "status",
+    "withheld_quarantined": 0,
+    "withheld_unknown_plugin": 0,
+    "withheld_kill_switched_os": 0
+  },
+  "meta": {"api_version": "v1"}
+}
+```
+
+`agents_reached` is at least 1. `execution_id` is an empty string when the execution row could not
+be created (the command is still sent). The `withheld_*` counts are agents the command was not sent
+to by the quarantine gate, an absent plugin, or a per-OS kill switch.
+
+**Audit.** The route writes `command.dispatch` rows stamped from the session it resolved. A
+`requested` row is written before anything is sent; if it cannot be stored the answer is `503`
+with `Sec-Audit-Failed: true` and nothing is dispatched. An outcome row follows (`success`, or
+`failure` with the reason); that row cannot undo a dispatch, so when it is lost the response
+carries `Sec-Audit-Failed: true` and the `requested` row remains the evidence. A refusal writes a
+`denied` row with `reason=`.
+
+**Errors.** Every error is the A4 envelope with a machine-readable `error.reason`.
+
+| Status | `reason` | Meaning |
+|---|---|---|
+| `400` | `body_depth`, `body_type`, `unknown_field`, `params_type`, `ident_empty`, `ident_len`, `scope_len`, `param_count`, `param_key_len`, `param_value_len`, `agent_ids_count`, `agent_id_len`, `agent_ids_type`, `agent_id_type`, `agent_ids_empty`, `scope_type`, `scope_empty`, `target_conflict` | The request is malformed or over a bound; fix it and re-send. |
+| `400` | `destructive_untargeted`, `forensic_untargeted` | See above. |
+| `400` | `unclassified`, `ambiguous` | The `plugin`/`action` pair is not in the capability catalogue. |
+| `401` | `principal_changed` | The request's credentials resolved to two different principals; retry. |
+| `403` | `forbidden`, `approval_required`, `kill_switched`, `anonymous_operator` | The dispatch check refused the caller; `approval_required` means this route mints no approval ticket, so use an administrator or `POST /api/instructions/{id}/execute`. No `permission` field is returned. |
+| `404` | `destructive_no_visible_target` | See above. |
+| `503` | `audit_unavailable` | The `requested` row could not be stored; nothing was sent. Carries `retry_after_ms`. |
+| `500` | `dispatch_exception` | The dispatch threw. No retry hint: whether an agent received the command is unknown. |
+
+When the command reaches no agent (`sent == 0`) the answer is one of these, chosen by a fixed
+priority order (the first that applies) and carrying `command_id`, `execution_id` (the row is
+marked cancelled), `agents_reached: 0` and the withheld counts in the `error` object:
+
+| Order | `reason` | Status | `retry_after_ms` | Meaning |
+|---|---|---|---|---|
+| 1 | `invalid_scope` | `400` | `null` | The scope expression did not parse; fix it. |
+| 2 | `containment_unreadable` | `503` | `5000` | The quarantine state is unreadable; dispatch fails closed. |
+| 3 | `route_unreadable` | `503` | `5000` | The gateway routing directory could not be read for some targets. |
+| 4 | `os_gate_unreadable` | `503` | `5000` | Presence could not be read while a per-OS kill switch is set. |
+| 5 | `quarantined` | `409` | `null` | Every target is quarantined. |
+| 6 | `plugin_not_found` | `422` | `null` | The plugin is in no target agent's inventory. |
+| 7 | `kill_switched_os` | `403` | `null` | Every target runs an OS for which the action is switched off. |
+| 8 | `no_agents_reached` | `503` | `5000` | Every target was unreachable. |
+
+A protective action (the quarantine control actions and `__guard__.push_rules`) never yields
+`os_gate_unreadable`, `plugin_not_found` or `kill_switched_os`. Refusals in the targeting family
+increment `yuzu_server_dispatch_target_rejected_total{route="command_v1"}`.
 
 ---
 

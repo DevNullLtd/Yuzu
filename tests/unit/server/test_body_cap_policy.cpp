@@ -205,6 +205,10 @@ constexpr ExpectedResolution kExpected[] = {
     {"PUT",    "/api/v1/configevil/log_level",                         4u * 1024 * 1024, false, "default"},
     {"GET",    "/api/v1/crypto/ca/stats",                              16u * 1024, false, "crypto"},
     {"PUT",    "/api/v1/cryptoevil",                                   4u * 1024 * 1024, false, "default"},
+    // body_cap_policy.hpp commands row - POST /api/v1/commands (the REST v1 twin of MCP
+    // execute_instruction). requires_measurable like the /mcp/ row; segment-boundary probe below.
+    {"POST",   "/api/v1/commands",                                     4u * 1024 * 1024, true,  "commands"},
+    {"POST",   "/api/v1/commandsevil",                                 4u * 1024 * 1024, false, "default"},
     // Catch-all default — ordinary JSON/form traffic.
     {"POST",   "/api/v1/some-ordinary-mutation-route",    4u * 1024 * 1024,   false, "default"},
     {"GET",    "/api/v1/devices",                         4u * 1024 * 1024,   false, "default"},
