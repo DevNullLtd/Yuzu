@@ -3,8 +3,8 @@
 /// @file workflow_api.hpp
 /// The EIGHTH per-family in-process API seam for the presentation/core/
 /// engine split (ADR-0031, WS-A4), covering the multi-step-workflow READ
-/// surface — the Postgres-backed `WorkflowEngine`'s `GET /api/v1/workflows`,
-/// `GET /api/v1/workflows/{id}`, `GET /api/v1/workflow-executions` and
+/// surface plus (since #2146 batch B) the execute mutator — the Postgres-backed
+/// `WorkflowEngine`'s `GET /api/v1/workflows`, `GET /api/v1/workflows/{id}`, `GET /api/v1/workflow-executions` and
 /// `GET /api/v1/workflow-executions/{id}` resources (and their MCP twins
 /// `list_workflows`/`get_workflow`/`list_workflow_executions`/
 /// `get_workflow_execution`). Abstract, ZERO store-shaped dependencies — it
@@ -13,8 +13,8 @@
 /// presentation-side client without dragging the server's `WorkflowEngine` (a
 /// Postgres-backed store, `workflow_engine.hpp`) along.
 ///
-/// The four methods == the four public REST v1 resources above (plus their
-/// MCP twins), so a presentation/MCP caller consumes only what the public,
+/// The four read methods == the four public REST v1 resources above (plus their
+/// MCP twins), and `execute_workflow` == `POST /api/v1/workflows/{id}/execute` (plus its twin), so a presentation/MCP caller consumes only what the public,
 /// versioned core API serves (ADR-0031 B3, INV-31-4 "no private core API") —
 /// a local in-process implementation today (`LocalWorkflowApi`,
 /// `workflow_api.cpp`), a core HTTP client after the WS-B2 cutover. Adding a
@@ -26,18 +26,30 @@
 /// all, not even by forward declaration, so a presentation TU including it
 /// cannot reach one.
 ///
-/// Deliberately NOT in this seam: the legacy unversioned `POST /api/workflows`
-/// (create), `DELETE /api/workflows/{id}` and
-/// `POST /api/workflows/{id}/execute` mutators, and the legacy unversioned
-/// GET routes (`GET /api/workflows`, `GET /api/workflows/{id}`,
+/// `execute_workflow` (#2146 batch B, the workflow-execute twins `POST
+/// /api/v1/workflows/{id}/execute` / MCP `execute_workflow`) is the one MUTATOR in this seam. It
+/// was previously excluded on purpose; adding it is an architect-reviewed change. It is a thin
+/// wrap of `WorkflowEngine::execute`: the caller supplies the per-step dispatch callback, so the
+/// confinement, approval-mode, targeting and audit decisions stay in the shared
+/// `workflow_execute.hpp` sequence both transports run, not in this interface. A method that
+/// takes an in-process callback is NOT HTTP-shaped: it works for the local implementation and
+/// will have to be rethought (the engine, not the presentation tier, must own step dispatch)
+/// when the WS-B2 core HTTP client replaces `LocalWorkflowApi`. This is not cutover-ready and is
+/// not claimed to be.
+///
+/// Deliberately still NOT in this seam: the legacy unversioned `POST /api/workflows` (create),
+/// `DELETE /api/workflows/{id}` and `POST /api/workflows/{id}/execute` mutators, and the legacy
+/// unversioned GET routes (`GET /api/workflows`, `GET /api/workflows/{id}`,
 /// `GET /api/workflow-executions/{id}`) — a SEPARATE, deliberately untouched
-/// capability with no public REST v1/MCP twin of their own (the mutators) or
+/// capability with no public REST v1/MCP twin of their own (create and delete) or
 /// sharing the SAME store call as their v1 twin without themselves being the
 /// versioned resource (the legacy GETs; `workflow_routes.cpp` keeps its own
-/// `WorkflowEngine*` wiring for both, unaffected by this seam — mirrors the
+/// `WorkflowEngine*` wiring for them, unaffected by this seam — mirrors the
 /// `schedule` family's precedent for its own legacy `/api/schedules`
 /// mutators, #4334-style: there is nothing to carve out of an enforced TU
-/// here, since these routes were never in it).
+/// here, since these routes were never in it). The legacy execute route keeps its own
+/// handler and its own (fail-open when unwired) approval pre-check; only the v1 twin and the
+/// MCP tool run the shared fail-closed sequence.
 
 #include "authz_model.hpp" // authz::VisibleSet: the caller's admitted agent set (pure, store-free)
 #include "workflow_types.hpp"
@@ -98,6 +110,24 @@ public:
     [[nodiscard]] virtual std::expected<WorkflowExecutionPage, std::string>
     list_workflow_executions(const WorkflowExecutionListQuery& q,
                              const authz::VisibleSet& scope) const = 0;
+
+    /// Start one execution of `workflow_id` against `agent_ids` — a thin wrap of
+    /// `WorkflowEngine::execute`. The engine admits the run (creates the execution row and the
+    /// pending step rows in one transaction, re-proving the workflow is not soft-deleted),
+    /// then calls `dispatch_fn` for each step SYNCHRONOUSLY on the calling thread, including
+    /// retry sleeps, and returns the execution id once the step loop has finished. A failed
+    /// step is recorded in the execution, not returned here.
+    ///
+    /// This method has NO authorization, confinement, approval-mode or audit logic of its own:
+    /// every caller MUST run the shared sequence in `workflow_execute.hpp`, which decides all
+    /// of that BEFORE this call and supplies a `dispatch_fn` that confines each step to the
+    /// caller. Calling it directly would dispatch to the named agents unconfined.
+    ///
+    /// `std::unexpected` carries the engine's own text: a `kDbErrorPrefix` store failure
+    /// (genericize before display) or "workflow not found: ..." / "workflow has no steps".
+    [[nodiscard]] virtual std::expected<std::string, std::string>
+    execute_workflow(const std::string& workflow_id, const std::vector<std::string>& agent_ids,
+                     StepDispatchFn dispatch_fn, ConditionEvalFn condition_fn) const = 0;
 };
 
 } // namespace yuzu::server
