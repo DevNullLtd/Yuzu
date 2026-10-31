@@ -496,6 +496,23 @@ TEST_CASE("command_v1: a Destructive pair without explicit agent_ids is refused 
           rig.perm_calls.end());
 }
 
+TEST_CASE("command_v1: a Destructive pair also needs the pair's own securable, checked before "
+          "the targeting refusal (403 before 400)",
+          "[server][command_v1][dispatch][security]") {
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    rig.visible_agents = Ids{kA};
+    rig.perm_denied.insert("Infrastructure:Delete"); // echo.purge_source's own securable
+    for (const json& b : {json({{"plugin", "echo"}, {"action", "purge_source"}, {"agent_ids", Ids{kA}}}),
+                          json({{"plugin", "echo"}, {"action", "purge_source"}})}) {
+        const auto res = rig.post(b);
+        CHECK(res->status == 403);
+        CHECK(rig.dispatch_calls == 0);
+        CHECK(rig.sent().empty());
+        CHECK(rig.exec_created == 0);
+    }
+}
+
 TEST_CASE("command_v1: a Destructive pair with explicit ids is confined to the management-group "
           "visible agents (404 when none is left)",
           "[server][command_v1][dispatch][security]") {
