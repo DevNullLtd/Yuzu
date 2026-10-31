@@ -20,9 +20,9 @@ namespace {
 
 constexpr int kRetryAfterMs = 5000;
 
-/// A kMisconfigured or kClassifierUnavailable refusal is a SERVER defect (a required port was never
-/// wired at boot): it does not clear by itself, so it carries NO retry hint (`retry_after_ms` stays
-/// null) and says so.
+/// A kMisconfigured, kClassifierUnavailable or kApprovalUnavailable refusal is a SERVER defect (a
+/// required port was never wired at boot): it does not clear by itself, so it carries NO retry
+/// hint (`retry_after_ms` stays null) and says so.
 constexpr std::string_view kMisconfiguredRemediation =
     "this is a server configuration defect and retrying will not help; report it to the server "
     "operator";
@@ -309,8 +309,7 @@ PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& a
             return refuse(c, make_refusal(RefusalKind::kApprovalUnavailable, kReasonApprovalUnavailable,
                                           "approval system unavailable: cannot execute an "
                                           "approval-gated instruction",
-                                          "retry shortly; the approval manager is not available",
-                                          kRetryAfterMs));
+                                          std::string(kMisconfiguredRemediation)));
         }
         // A cap was requested but its counter is unwired: refuse, never silently run uncapped
         // (the same fail-closed stance as an unwired approval manager above).
@@ -324,8 +323,7 @@ PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& a
             return refuse(c, make_refusal(RefusalKind::kApprovalUnavailable, kReasonApprovalUnavailable,
                                           "approval system unavailable: cannot execute an "
                                           "approval-gated instruction",
-                                          "retry shortly; the approval manager is not available",
-                                          kRetryAfterMs));
+                                          std::string(kMisconfiguredRemediation)));
         }
         if (rq.submitter_pending_cap > 0 &&
             ports.pending_count_for(rq.caller.principal) >= rq.submitter_pending_cap) {

@@ -44653,7 +44653,9 @@ TEST_CASE("MCP execute_instruction_definition: a non-auto definition with no app
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
     CHECK(body["error"]["data"]["reason"] == "approval_unavailable");
-    CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+    CHECK(body["error"]["data"]["remediation"].get<std::string>().find("retrying will not help") !=
+          std::string::npos);
     CHECK(rig.calls.empty());
 }
 

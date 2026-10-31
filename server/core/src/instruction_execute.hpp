@@ -95,8 +95,9 @@ inline constexpr int kSubmitterPendingCap = 25;
 /// `reason` label of `yuzu_server_approval_submit_refused_total`, and the same token the audit
 /// row and the wire `reason` carry. CLOSED set, every member pre-seeded at boot in server.cpp from
 /// this array. `approval_cap_reached` is the per-principal cap above; `approval_unavailable` is
-/// "no approval manager wired"; `approval_submit_failed` is the store refusing the row (which
-/// includes the global queue being full). Only refusals at the approval-submit step count: a
+/// "no approval manager wired" (a server defect: 503 with a null `retry_after_ms`);
+/// `approval_submit_failed` is the store refusing the row (which includes the global queue being
+/// full). Only refusals at the approval-submit step count: a
 /// refusal earlier in `prepare` (targeting, params, gate) creates no approval and counts under
 /// its own family.
 inline constexpr char kApprovalRefusedMetric[] = "yuzu_server_approval_submit_refused_total";
@@ -196,7 +197,7 @@ enum class RefusalKind : std::uint8_t {
     kNoVisibleTarget,      ///< 404: a destructive pair whose named targets are all out of scope
     kDispatchDenied,       ///< the chokepoint dry run refused; see Refusal::denial
     kSchemaInvalid,        ///< 500: the stored parameter_schema cannot be prepared (fail closed)
-    kApprovalUnavailable,  ///< 503: non-auto definition and no approval manager
+    kApprovalUnavailable,  ///< 503: no approval manager (a server defect: NO retry hint)
     kApprovalSubmitFailed, ///< 500: the approval store could not take the ticket
     kApprovalCapReached,   ///< 429-class: this principal already holds the cap of pending approvals
     kClassifierUnavailable,///< 503: the destructive-targeting classifier is not wired

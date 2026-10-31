@@ -137,8 +137,11 @@ WHAT IT CHECKS
      A route with no recognisable gate (auth_fn
      only, a helper closure, a member-function gate) fails CLOSED unless named in the
      size-pinned, shrink-only GATE_PARITY_NO_GATE_ALLOWED; a mismatch is an error unless
-     named, with its exact gates and a reason, in GATE_PARITY_KNOWN_MISMATCHES (same pin and
-     shrink-only rules; a stale or reshaped entry fails). A lexical gate drops an entry only
+     named, with its exact gates and a reason, in GATE_PARITY_KNOWN_MISMATCHES (the table size
+     must EQUAL its pin, GATE_PARITY_KNOWN_MISMATCHES_MAX: it is a pin, not a shrink-only cap.
+     It was raised 6 -> 7 by owner ruling 2026-10-31; raising it again needs a ruling recorded
+     in ADR-1005, while lowering it in the same change that retires an entry is routine; a stale
+     or reshaped entry fails). A lexical gate drops an entry only
      when the handler text proves the two sides agree; what it cannot prove stays listed.
      PRIMARY HANDLER PAIR RULE (HANDLER_PAIR_RULE, on): a derived MCP handler's gate call for a
      (securable, operation) other than the tool's declared pair, not spent matching a further REST

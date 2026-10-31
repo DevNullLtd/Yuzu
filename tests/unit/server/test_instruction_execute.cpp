@@ -453,7 +453,11 @@ TEST_CASE("execute: a non-auto definition with no approval manager is 503, never
     const auto* ref = as_refusal(out);
     REQUIRE(ref);
     CHECK(ref->kind == RefusalKind::kApprovalUnavailable);
-    CHECK(ref->retry_after_ms == 5000);
+    // An unwired approval manager is a server defect: it never clears by itself, so no retry hint.
+    CHECK_FALSE(ref->retry_after_ms.has_value());
+    CHECK(ref->remediation.find("retrying will not help") != std::string::npos);
+    CHECK(ref->remediation.find("configuration defect") != std::string::npos);
+    CHECK(ref->remediation.find("retry shortly") == std::string::npos);
     CHECK(r.calls.empty());
     CHECK(r.rows.empty());
     // ... while an AUTO definition does not need one.
@@ -673,6 +677,8 @@ TEST_CASE("execute: a cap with an unwired pending counter fails closed, never un
     auto out = run(rq, ports, r.audit());
     REQUIRE(as_refusal(out));
     CHECK(as_refusal(out)->kind == RefusalKind::kApprovalUnavailable);
+    CHECK_FALSE(as_refusal(out)->retry_after_ms.has_value());
+    CHECK(as_refusal(out)->remediation.find("retrying will not help") != std::string::npos);
     CHECK(r.approvals.empty());
     CHECK(r.counter(std::string(kApprovalRefusedMetric),
                     {{"reason", "approval_unavailable"}}) == 1);
@@ -1341,7 +1347,9 @@ TEST_CASE("REST execute: a non-auto definition with no approval manager is 503, 
     CHECK(res->status == 503);
     const auto j = json::parse(res->body);
     CHECK(j["error"]["reason"] == "approval_unavailable");
-    CHECK(j["error"]["retry_after_ms"] == 5000);
+    CHECK(j["error"]["retry_after_ms"].is_null());
+    CHECK(j["error"]["remediation"].get<std::string>().find("retrying will not help") !=
+          std::string::npos);
     CHECK(r.core.calls.empty());
 }
 
