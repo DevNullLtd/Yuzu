@@ -309,7 +309,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     var base = o.path.indexOf('/v2/') === 0 ? '/api' : '/api/v1'; // the only v2 route is keyed /v2/... and served at /api/v2/...
     var mth = o.method.toUpperCase(), sends = mth === 'POST' || mth === 'PUT' || mth === 'PATCH';
     // -g: curl's URL globbing would rewrite the braces of a path parameter.
-    var curl = 'curl -s -g -X ' + mth + ' \\\n' + curlAuth(op) +
+    var curl = 'curl -s -g -X ' + mth + ' \\\n' + curlAuth(op, mth) +
       (sends ? '  -H "Content-Type: application/json" \\\n  -d \'{}\' \\\n' : '') + '  "' + location.origin + base + o.path + '"';
     kids.push(h('h3', '', ['Request']));
     kids.push(authNote(op));
@@ -668,15 +668,23 @@ extern const char* const kSwaggerJs3 = R"SWG(  // ---- credentials (in this piec
     return (Array.isArray(s) ? s : []).filter(isObj).map(function (a) { return Object.keys(a); }).filter(function (a) { return a.length; });
   }
   function envOf(n) { return n.replace(/^x[-_]/i, '').replace(/-/g, '_').toUpperCase(); }
-  function curlAuth(op) {
-    var w = ways(op);
-    return (w.length ? w[0] : []).map(function (n) {
+  // True when an empty entry sits among the alternatives: the route also works with no credential.
+  function anon(op) {
+    var s = Array.isArray(op.security) ? op.security : spec.security;
+    return Array.isArray(s) && s.some(function (a) { return isObj(a) && !Object.keys(a).length; });
+  }
+  function shows(d) { return !!d && (isBearer(d) || isNamed(d)); }
+  function curlAuth(op, mth) {
+    var w = ways(op), first = w.length ? w[0] : [], cookie = false;
+    var lines = first.map(function (n) {
       var d = schemeOf(n);
-      if (!d) return '';
+      if (!shows(d)) return '';
       if (isBearer(d)) return '  -H "Authorization: Bearer $YUZU_TOKEN" \\\n';
-      if (!isNamed(d)) return '';
-      return d.in === 'cookie' ? '  -b "' + d.name + '=$' + envOf(d.name) + '" \\\n' : '  -H "' + d.name + ': $' + envOf(d.name) + '" \\\n';
+      if (d.in === 'cookie') { cookie = true; return '  -b "' + d.name + '=$' + envOf(d.name) + '" \\\n'; }
+      return '  -H "' + d.name + ': $' + envOf(d.name) + '" \\\n';
     }).join('');
+    // A write that carries the session cookie is refused unless it names the page's own origin.
+    return lines + (cookie && mth !== 'GET' && mth !== 'HEAD' ? '  -H "Origin: ' + location.origin + '" \\\n' : '');
   }
   function credName(n) {
     var d = schemeOf(n);
@@ -685,8 +693,9 @@ extern const char* const kSwaggerJs3 = R"SWG(  // ---- credentials (in this piec
   }
   function waysText(w) { return w.map(function (a) { return a.map(credName).join(' and '); }).join(', or '); }
   function authNote(op) {
-    var w = ways(op);
-    return h('div', 'sw-auth', [pill('auth', 'idle'), h('span', '', [w.length ? 'Send ' + waysText(w) : Array.isArray(op.security) ? 'No credential needed' : 'No credential declared'])]);
+    var w = ways(op), hidden = (w.length ? w[0] : []).filter(function (n) { return !shows(schemeOf(n)); });
+    var t = w.length ? 'Send ' + waysText(w) + (anon(op) ? ', or no credential' : '') : Array.isArray(op.security) ? 'No credential needed' : 'No credential declared';
+    return h('div', 'sw-auth', [pill('auth', 'idle'), h('span', '', [t + (hidden.length ? ' (the example below cannot show ' + hidden.map(credName).join(', ') + ')' : '')])]);
   }
 
   // allOf -> one schema (in this piece to keep the first under the size gate; declarations

@@ -528,6 +528,44 @@ const out = {};
     note: r.byClass('sw-auth').length ? r.byClass('sw-auth')[0].lastChild.textContent : null,
     curl: r.byTag('pre').length ? r.byTag('pre')[0].textContent : '' }));
   out.x_chips = root.byClass('chip').map(c => c.textContent);
+  // Credential shapes the real document does not use: an AND of schemes, a non-first
+  // alternative, an unknown scheme, a hostile header name and scheme key, an apiKey in a query,
+  // http basic, an optional credential, no schemes declared at all. Each is drawn and opened.
+  const SO = (sec, extra) => Object.assign({ operationId: 'o', summary: 's', tags: ['T'], responses: R() }, sec === undefined ? {} : { security: sec }, extra || {});
+  const authRows = async body => {
+    consoleErrors.length = 0;
+    await reload({ status: 200, body });
+    root.byClass('sw-op-h').forEach(b => b.click());
+    const rows = {};
+    root.byClass('sw-op').forEach(r => { rows[r.byClass('pill')[0].textContent + ' ' + pathOf(r)] = {
+      note: r.byClass('sw-auth').length ? r.byClass('sw-auth')[0].lastChild.textContent : null,
+      curl: r.byTag('pre').length ? r.byTag('pre')[0].textContent : '' }; });
+    return { rows, errors: root.byClass('sw-error').length, console: consoleErrors.length };
+  };
+  out.s_shapes = await authRows({ openapi: '3.0.3', info: { title: 't', version: '1' }, tags: [{ name: 'T', description: 't' }],
+    security: [{ bearerAuth: [] }],
+    paths: {
+      '/and': { get: SO([{ keyA: [], cookieB: [] }]), post: SO([{ keyA: [], cookieB: [] }]) },
+      '/alt': { get: SO([{ cookieB: [] }, { bearerAuth: [] }]) },
+      '/unknown': { get: SO([{ mystery: [] }]) },
+      '/hostile': { get: SO([{ evilName: [] }]) },
+      '/hostilekey': { get: SO([{ 'x"$(id)': [] }]) },
+      '/query': { get: SO([{ queryKey: [] }]) },
+      '/basic': { get: SO([{ basicAuth: [] }]) },
+      '/optional': { get: SO([{}, { bearerAuth: [] }]) },
+      '/inherit': { get: SO() },
+      '/none': { get: SO([]) }
+    },
+    components: { securitySchemes: {
+      bearerAuth: { type: 'http', scheme: 'bearer' },
+      keyA: { type: 'apiKey', in: 'header', name: 'X-Key-A' },
+      cookieB: { type: 'apiKey', in: 'cookie', name: 'sid' },
+      evilName: { type: 'apiKey', in: 'header', name: 'X-A"; rm -rf ~; echo "' },
+      'x"$(id)': { type: 'apiKey', in: 'header', name: 'X-Ok' },
+      queryKey: { type: 'apiKey', in: 'query', name: 'k' },
+      basicAuth: { type: 'http', scheme: 'basic' } } } });
+  out.s_nosch = await authRows({ openapi: '3.0.3', info: { title: 't', version: '1' }, tags: [{ name: 'T', description: 't' }],
+    security: [{ bearerAuth: [] }], paths: { '/nos': { get: SO() } } });
   console.log(JSON.stringify(out));
 })().catch(e => { console.log(JSON.stringify({ crash: String(e && e.stack || e) })); process.exit(1); });
 """
@@ -778,33 +816,101 @@ def main():
         "uploadGrantAuth": '-H "X-Yuzu-Upload-Grant: $YUZU_UPLOAD_GRANT"',
         "uploadSessionAuth": '-H "X-Yuzu-Upload-Session: $YUZU_UPLOAD_SESSION"',
     }
+    # What the note calls each scheme, written out here, not read from the page.
+    cred_names = {
+        "bearerAuth": "Bearer token",
+        "apiKeyHeader": "X-Yuzu-Token header",
+        "cookieAuth": "yuzu_session cookie",
+        "uploadGrantAuth": "X-Yuzu-Upload-Grant header",
+        "uploadSessionAuth": "X-Yuzu-Upload-Session header",
+    }
+    # The routes that carry their own credential, pinned by name: a route that gains or loses
+    # one fails here and has to be looked at, not just counted.
+    own_expected = {
+        "POST /users/me/password": [["cookieAuth"]],
+        "POST /users/{username}/password": [["cookieAuth"]],
+        "POST /elevate": [["cookieAuth"]],
+        "POST /elevate/revoke": [["cookieAuth"]],
+        "POST /uploads": [["uploadGrantAuth"]],
+        "PUT /uploads/{upload_id}/chunk": [["uploadSessionAuth"]],
+        "GET /uploads/{upload_id}": [["uploadSessionAuth"]],
+        "DELETE /uploads/{upload_id}": [["uploadSessionAuth"]],
+        "POST /uploads/{upload_id}/commit": [["uploadSessionAuth"]],
+        "GET /ca/root": [],
+        "GET /ca/crl": [],
+    }
+    # Lines of the snippet that carry a credential or the origin a cookie write needs.
+    cred_prefixes = ('-H "Authorization', '-H "X-', '-H "Origin', "-b ")
     shown = {a["k"]: a for a in out["x_auth"]}
-    own_keys = 0
+    own_found = {}
     for path, path_item in real["paths"].items():
         for method in ("get", "post", "put", "patch", "delete"):
             op = path_item.get(method)
             if not isinstance(op, dict):
                 continue
             key = method.upper() + " " + path
-            own_keys += 1 if "security" in op else 0
+            if "security" in op:
+                own_found[key] = [list(entry) for entry in op["security"]]
             sec = op["security"] if "security" in op else real.get("security", [])
             ways = [list(entry) for entry in sec if entry]
+            check(all(entry for entry in sec), "%s has an empty security entry; the page's optional-credential wording must be checked against it" % key)
             unknown = [n for w in ways for n in w if n not in cred_lines]
             check(not unknown, "%s uses a scheme this test does not know (add it to cred_lines): %r" % (key, unknown))
             if unknown or key not in shown:
                 check(key in shown, "no rendered row for %s" % key)
                 continue
             want = sorted(cred_lines[n] for n in (ways[0] if ways else []))
+            if any(n == "cookieAuth" for n in (ways[0] if ways else [])) and method != "get":
+                want.append('-H "Origin: https://yuzu.test"')
             got = sorted(line.strip().rstrip("\\").strip() for line in shown[key]["curl"].split("\n")
-                         if line.strip().startswith(("-H \"Authorization", "-H \"X-Yuzu", "-b ")))
-            check(got == want, "%s request snippet credentials: want %r, got %r" % (key, want, got))
-            check(shown[key]["note"] is not None and (("Send " in shown[key]["note"]) == bool(ways)),
-                  "%s credential note: %r" % (key, shown[key]["note"]))
-    check(own_keys >= 11, "expected the nine single-credential routes and the public ones to carry their own security: %r" % own_keys)
+                         if line.strip().startswith(cred_prefixes))
+            check(got == sorted(want), "%s request snippet credentials: want %r, got %r" % (key, sorted(want), got))
+            if ways:
+                want_note = "Send " + ", or ".join(" and ".join(cred_names[n] for n in w) for w in ways)
+            else:
+                want_note = "No credential needed" if "security" in op else "No credential declared"
+            check(shown[key]["note"] == want_note, "%s credential note: want %r, got %r" % (key, want_note, shown[key]["note"]))
+    drift = sorted(set(own_found) ^ set(own_expected)) + sorted(k for k in own_found if k in own_expected and own_found[k] != own_expected[k])
+    check(own_found == own_expected,
+          "the routes carrying their own security changed; update own_expected after checking each handler: %r" % drift)
+    own_keys = len(own_found)
     check(any(c == "AuthBearer token, or X-Yuzu-Token header, or yuzu_session cookie" for c in out["x_chips"]),
           "the Auth chip must come from the document's default security: %r" % out["x_chips"])
     check(any(c == "Own credentials%d" % own_keys for c in out["x_chips"]),
           "the Own credentials chip must count the operations that carry their own security: %r" % out["x_chips"])
+    # Shapes the real document does not use. Every credential line is written out; the page must
+    # never turn a hostile name or scheme key into shell text.
+    sh = out["s_shapes"]
+    check(sh["errors"] == 0 and sh["console"] == 0, "odd security shapes must draw without an error: %r" % sh)
+    def creds(row):
+        return sorted(line.strip().rstrip("\\").strip() for line in row["curl"].split("\n") if line.strip().startswith(cred_prefixes))
+    expect_shapes = {
+        "GET /and": (['-H "X-Key-A: $KEY_A"', '-b "sid=$SID"'], "Send X-Key-A header and sid cookie"),
+        "POST /and": (['-H "Origin: https://yuzu.test"', '-H "X-Key-A: $KEY_A"', '-b "sid=$SID"'], "Send X-Key-A header and sid cookie"),
+        "GET /alt": (['-b "sid=$SID"'], "Send sid cookie, or Bearer token"),
+        "GET /unknown": ([], "Send mystery (the example below cannot show mystery)"),
+        "GET /hostile": ([], "Send evilName (the example below cannot show evilName)"),
+        "GET /hostilekey": (['-H "X-Ok: $OK"'], "Send X-Ok header"),
+        "GET /query": ([], "Send queryKey (the example below cannot show queryKey)"),
+        "GET /basic": ([], "Send basicAuth (the example below cannot show basicAuth)"),
+        "GET /optional": (['-H "Authorization: Bearer $YUZU_TOKEN"'], "Send Bearer token, or no credential"),
+        "GET /inherit": (['-H "Authorization: Bearer $YUZU_TOKEN"'], "Send Bearer token"),
+        "GET /none": ([], "No credential needed"),
+    }
+    check(sorted(sh["rows"]) == sorted(expect_shapes), "odd-shape rows drawn: %r" % sorted(sh["rows"]))
+    for k, (want_creds, want_note) in expect_shapes.items():
+        row = sh["rows"].get(k)
+        if row is None:
+            continue
+        check(creds(row) == sorted(want_creds), "%s credential lines: want %r, got %r" % (k, sorted(want_creds), creds(row)))
+        check(row["note"] == want_note, "%s note: want %r, got %r" % (k, want_note, row["note"]))
+    hostile_text = "".join(r["curl"] for r in sh["rows"].values())
+    check("rm -rf" not in hostile_text and "$(id)" not in hostile_text and 'x"' not in hostile_text,
+          "a hostile header name or scheme key reached the request snippet: %r" % hostile_text[:300])
+    ns = out["s_nosch"]
+    check(ns["errors"] == 0 and ns["console"] == 0 and creds(ns["rows"].get("GET /nos", {"curl": ""})) == []
+          and ns["rows"].get("GET /nos", {}).get("note") == "Send bearerAuth (the example below cannot show bearerAuth)",
+          "a document with no securitySchemes must name the scheme and show no credential: %r" % ns)
     # The expected pill counts are derived here, in Python, from the document, not by the
     # page's own predicate.
     py = {"typed": 0, "untyped": 0, "unavail": 0}
