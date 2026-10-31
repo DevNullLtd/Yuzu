@@ -792,6 +792,7 @@ yuzu_server_core_lib = static_library(
     'src/mcp_server.cpp',
     'src/mcp_input_schema.cpp',
     'src/instruction_param_schema.cpp',
+    'src/mcp_instruction_execute.cpp', # MCP twin of POST /api/instructions/{id}/execute: bounds + JSON-RPC rendering over instruction_execute
     'src/mcp_orientation.cpp',
     'src/mcp_session.cpp',
     'src/mcp_stream.cpp',
@@ -880,6 +881,9 @@ yuzu_server_core_lib = static_library(
     'src/dashboard_api_routes.cpp',
     'src/nvd_routes.cpp',
     'src/approval_routes.cpp',
+    'src/instruction_execute.cpp', # the transport-free core shared by the v1 REST and MCP instruction-definition execute twins (#2146)
+    'src/instruction_execute_ports.cpp', # production store bindings for the shared core
+    'src/instruction_execute_routes.cpp', # POST /api/v1/instructions/{id}/execute
     'src/config_write.cpp', # the transport-free core shared by the config routes (legacy + v1) and the MCP get/set_runtime_config tools
     'src/config_routes.cpp', # #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
     'src/diagnostics_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API, extracted onto the HttpRouteSink seam

@@ -471,7 +471,7 @@ over a limit makes execute answer `500`):
 
 `enabled: false` hides a definition from the discovery catalog and stops its schedules (the schedule
 poller records `definition_disabled`), but it does **not** stop `POST /api/instructions/{id}/execute`:
-that route does not read `enabled`.
+that route does not read `enabled`, and neither do its v1 and MCP twins.
 
 ### Replacing a stored parameter schema
 
@@ -1324,6 +1324,8 @@ curl -s -b cookies.txt \
 ```
 
 > **Approval gate:** The response varies based on the definition's `approval_mode`. Definitions with `approval_mode: auto` return HTTP 200 with an immediate execution result. Definitions with `approval_mode: role-gated` or `always` return HTTP 202 with a `pending_approval` status and an `approval_id` when the caller requires approval. See [Section 7](#7-approval-workflows) for details.
+
+**Versioned and MCP twins (#2146).** `POST /api/v1/instructions/{id}/execute` and the MCP tool `execute_instruction_definition` run the same pipeline with the same `agent_ids` / `scope` / `params` and the same `approval_mode` rules, with these differences from the route above: the v1 response is wrapped as `{"data": {...}, "meta": {"api_version": "v1"}}` and every error carries an A4 envelope with a machine-readable `reason`; a call is audited `requested` BEFORE it dispatches and refused with `503` if that row cannot be stored (the legacy route audits after the send); the `202` body adds `approval_mode`; zero agents reached is an error with a `reason` (`400` for `invalid_scope`, `503` otherwise) rather than the legacy untyped `503`; the check order puts the dispatch authorization (`403`/`400` with a `reason`) and the destructive-targeting rules (`400` `destructive_untargeted` / `forensic_untargeted`, `404` `destructive_no_visible_target`) before the definition's approval, so a call that is refused for those reasons never queues an approval. Like the legacy route, neither twin reads the definition's `enabled` flag. The MCP twin does not stream progress, and a definition whose `approval_mode` is not `auto` answers `pending_approval` for an operator-tier or a supervised-tier token alike: a tier's auto-approval or consumed ticket never stands in for the definition's own approval. See the [REST API reference](rest-api.md) and the [MCP guide](mcp.md).
 
 #### List definitions (v1 endpoint)
 

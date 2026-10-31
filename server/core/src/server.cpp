@@ -100,6 +100,8 @@
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet gauge names + HELP (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
 #include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
+#include "instruction_execute_ports.hpp"  // #2146: shared core of the instruction-definition execute twins
+#include "instruction_execute_routes.hpp" // POST /api/v1/instructions/{id}/execute
 #include "instruction_store.hpp"
 #include "on_behalf_guard.hpp"
 #include "principal_class.hpp"
@@ -1479,9 +1481,12 @@ public:
         // emitted-but-unseeded, which passes its own test and silently breaks
         // absent() alerting. This commit's six targeting reasons went into
         // that array, not into a list here - which is the tether working.
+        // execute_instruction_definition (#2146) bounds its arguments with the same closed
+        // reason set (mcp_instruction_execute.cpp's check_args), so it is the second emitter.
         for (const auto reason : yuzu::server::mcp::kExecInstrBoundReasons) {
-            metrics_.counter("yuzu_mcp_tool_args_too_large_total",
-                             {{"tool", "execute_instruction"}, {"reason", std::string(reason)}});
+            for (const char* tool : {"execute_instruction", "execute_instruction_definition"})
+                metrics_.counter("yuzu_mcp_tool_args_too_large_total",
+                                 {{"tool", tool}, {"reason", std::string(reason)}});
         }
         // #4353 follow-up (Gate 2 finding on #4364): the 19 kFieldBoundTools
         // share the SAME counter as execute_instruction above but a single
@@ -1572,9 +1577,10 @@ public:
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonForensicUntargeted)}});
-        // #2557: `destructive_no_visible_target` is emitted ONLY by the two REST
+        // #2557: `destructive_no_visible_target` is emitted by the two REST
         // routes' (`/api/command`, `POST /api/v1/commands`) confine-to-visible-agents
-        // 404 arm today — unlike its `destructive_untargeted` sibling above, MCP's execute_instruction
+        // 404 arm and, since #2146, by the instruction-definition execute twins (below) —
+        // unlike its `destructive_untargeted` sibling above, MCP's raw execute_instruction
         // and the dashboard exec console have no equivalent post-authz
         // confinement step, so seeding those routes here would publish a
         // series claiming a reachability that does not exist (same rule the
@@ -1584,6 +1590,14 @@ public:
                 "yuzu_server_dispatch_target_rejected_total",
                 {{"route", route},
                  {"reason", std::string(yuzu::server::kReasonDestructiveNoVisibleTarget)}});
+        // #2146: the v1 instruction-definition execute twin (instruction_execute.cpp) confines a
+        // Destructive / Forensics pair's named targets to the operator's visible agents exactly
+        // as `/api/command` does, so it emits the same reason; the MCP twin shares the `mcp`
+        // route label and is seeded with it.
+        for (const char* route : {"instruction_execute", "mcp"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonDestructiveNoVisibleTarget)}});
         for (const auto reason : {yuzu::server::kReasonParentIdType,
                                   yuzu::server::kReasonParentIdEmpty})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
@@ -22120,6 +22134,53 @@ private:
                 });
         }
 
+        // #2146 (ledger row post.api-instructions-param-execute): the v1 REST twin of
+        // POST /api/instructions/{id}/execute. The stores, the dispatch closure, the
+        // authorizer and the validator cache are the SAME ones the legacy route, MCP and
+        // /api/v1/quarantine use; only the wire envelope and audit action are route-local.
+        // Shared with the MCP twin (set_instruction_execute_ports below): one binding of the
+        // stores, one dispatch closure, one authorizer, so the two surfaces cannot disagree.
+        yuzu::server::instruction_execute::Ports instr_exec_ports;
+        {
+            yuzu::server::instruction_execute::StoreBindings instr_exec_bindings;
+            instr_exec_bindings.instruction_store = instruction_store_.get();
+            instr_exec_bindings.execution_tracker = execution_tracker_.get();
+            instr_exec_bindings.approval_manager = approval_manager_.get();
+            instr_exec_bindings.mgmt_store = mgmt_group_store_.get();
+            instr_exec_bindings.capability_registry = &capability_registry_;
+            instr_exec_bindings.authorize = authorize_dispatch;
+            instr_exec_bindings.validators = param_validator_cache_;
+            instr_exec_bindings.dispatch = command_dispatch_concurrency_fn;
+            instr_exec_bindings.metrics = &metrics_;
+            yuzu::server::instruction_execute::RouteDeps instr_exec_deps;
+            instr_exec_deps.perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                             const std::string& securable_type,
+                                             const std::string& operation) {
+                return require_permission(req, res, securable_type, operation);
+            };
+            instr_exec_deps.audit_fn = [this](const httplib::Request& req,
+                                              const std::string& action, const std::string& result,
+                                              const std::string& target_type,
+                                              const std::string& target_id,
+                                              const std::string& detail) -> bool {
+                return audit_log(req, action, result, target_type, target_id, detail);
+            };
+            // The SAME derivation the legacy execute route uses (wf_deps.caller_fn above):
+            // an unresolved session yields an empty principal with a present-EMPTY set.
+            instr_exec_deps.caller_fn =
+                [this](const httplib::Request& req) -> yuzu::server::DispatchCaller {
+                httplib::Response throwaway;
+                if (auto s = require_auth(req, throwaway))
+                    return derive_dispatch_caller(*s);
+                return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
+            };
+            instr_exec_ports = yuzu::server::instruction_execute::make_ports(instr_exec_bindings);
+            instr_exec_deps.ports = instr_exec_ports;
+            HttplibRouteSink instr_exec_sink{*web_server_};
+            yuzu::server::instruction_execute::register_instruction_execute_routes(
+                instr_exec_sink, std::move(instr_exec_deps));
+        }
+
         // -- Register MCP server routes ----------------------------------------
 
         if (cfg_.mcp_disable) {
@@ -22217,6 +22278,9 @@ private:
             // presence). The closure itself is `authorize_dispatch`, defined before the REST
             // registration above (#6065 PR-Q): one definition, two consumers.
             mcp_server_->set_authorize_dispatch_fn(authorize_dispatch);
+            // #2146: execute_instruction_definition runs the SAME pipeline, over the SAME
+            // bindings, as POST /api/v1/instructions/{id}/execute (instr_exec_ports above).
+            mcp_server_->set_instruction_execute_ports(instr_exec_ports);
             // #3290 Phase 2 — the SAME fleet_read_fn lambda wired into the REST
             // registration's trailing fleet_read_fn param below, so the REST and MCP
             // query_installed_software twins cannot observe a different admit

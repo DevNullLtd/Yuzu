@@ -97,9 +97,12 @@ struct DispatchCaller {
     ///      provenance here at send time (a re-authorized AlwaysApproval action
     ///      still clears the #1398 ExecuteGate because the approval that
     ///      admitted the occurrence already happened).
-    ///   2. MCP `execute_instruction` / `quarantine_device` handlers
-    ///      (`mcp_server.cpp`) — `Ticket`, stamped only after
-    ///      `approval_ticket_just_consumed` is true (supervised tier).
+    ///   2. MCP `execute_instruction` / `execute_instruction_definition` /
+    ///      `quarantine_device` handlers (`mcp_server.cpp`): `Ticket`, stamped only
+    ///      after `approval_ticket_just_consumed` is true (supervised tier).
+    ///      `execute_instruction_definition` (#2146) joined this site: it is a tier
+    ///      fact about the TOKEN only, and the definition's own `approval_mode` gate
+    ///      (`instruction_execute.hpp`) never reads it.
     ///   3. `DeploymentEngine` / `DeploymentRoutes` (`deployment_engine.cpp`
     ///      / `deployment_routes.cpp`) — `GovernedPipeline` on their
     ///      content_dist dispatches.

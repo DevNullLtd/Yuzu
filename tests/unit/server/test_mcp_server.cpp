@@ -62,6 +62,7 @@
 #include "rest_api_v1.hpp"      // M.9 PR-2b: cross-transport cursor walk (REST + MCP)
 #include "test_forensics_tier_fixture.hpp" // #4990: the Forensics tier fixture
 #include "test_route_sink.hpp"  // M.9 PR-2b: in-process sink for that REST half
+#include "test_instruction_execute_rig.hpp" // #2146: Ports rig (no Postgres) for execute_instruction_definition
 #include "test_principal_lock_gate.hpp" // SqlFault: a REAL table moved aside in the throwaway DB
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
@@ -1434,6 +1435,10 @@ struct McpTestServer {
     yuzu::server::detail::StreamBudget* stream_budget_for_test{nullptr};
     yuzu::server::mcp::StreamRevalidateFn revalidate_fn_for_test{};
     yuzu::MetricsRegistry* metrics_for_test{nullptr};
+
+    /// #2146: the shared pipeline's ports for execute_instruction_definition. Default-constructed
+    /// = every seam unwired, which the tool must treat as UNAVAILABLE, never as "no check".
+    yuzu::server::instruction_execute::Ports instr_exec_ports_for_test{};
     /// 2f PR 3b: explicit-principal sink for mcp.stream.close. Empty = the
     /// streamed releaser falls back to the generic audit_fn, which is what the
     /// tests that only care THAT a close row was written rely on.
@@ -1767,6 +1772,7 @@ private:
         // preserves every pre-#3687 test's behaviour instead of tripping
         // the new fail-closed-when-unwired gate.
         mcp.set_authorize_dispatch_fn(authorize_dispatch_fn_for_test);
+        mcp.set_instruction_execute_ports(instr_exec_ports_for_test);
 
         // M5 remediation: the plugin-config/upload-grant stores ALSO ride
         // setters, same pattern as the two above — wire before the handlers
@@ -31709,6 +31715,9 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         {"unlock_account", nlohmann::json::parse(R"({"username":"alice"})")},
         // Execution:Execute twin of POST /api/v1/hardware/sync.
         {"sync_hardware_software", nlohmann::json::parse(R"({"scope":"__all__"})")},
+        // #2146: the MCP twin of POST /api/v1/instructions/{id}/execute (a stored definition,
+        // not execute_instruction's raw plugin.action); gated by the same Execution:Execute rule.
+        {"execute_instruction_definition", nlohmann::json::parse(R"({"definition_id":"d"})")},
     };
 
     // Tether: the gated set derived from security rows + requires_approval()
@@ -43926,6 +43935,56 @@ std::unique_ptr<httplib::Response> exec_tool_call(McpTestServer& ts, const std::
 
 } // namespace
 
+// ═══════════════════════════════════════════════════════════════════════════
+// execute_instruction_definition (#2146, ledger row post.api-instructions-param-execute)
+//
+// The MCP twin of POST /api/instructions/{id}/execute. The pipeline is
+// instruction_execute.hpp's (covered in test_instruction_execute.cpp); these cases pin what is
+// MCP-specific: the tier ladder composed with the definition's own approval_mode, the C8
+// pre-mint probe, the JSON-RPC rendering and the input bounds. NO Postgres except the
+// [pg]-tagged supervised-tier cases, which need a real ApprovalManager for the tier ticket and
+// are SKIPPED when no DSN is set.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+using yuzu::test::instr_exec::Rig;
+
+std::string idef_call(const nlohmann::json& arguments, int id = 1) {
+    return nlohmann::json{{"jsonrpc", "2.0"},
+                          {"method", "tools/call"},
+                          {"id", id},
+                          {"params", {{"name", "execute_instruction_definition"}, {"arguments", arguments}}}}
+        .dump();
+}
+
+nlohmann::json idef_payload(const httplib::Response& res) {
+    const auto body = nlohmann::json::parse(res.body);
+    REQUIRE(body.contains("result"));
+    const auto text = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(body["result"]["structuredContent"] == text);
+    return text;
+}
+
+// Wire the rig into the harness and install the handler at `tier`.
+void idef_start(McpTestServer& ts, Rig& rig, const std::string& tier, bool admin = true,
+                yuzu::server::authz::VisibleSet vis = std::nullopt) {
+    ts.instr_exec_ports_for_test = rig.ports();
+    ts.caller_fn_for_test = [admin, vis](const yuzu::server::auth::Session& s) {
+        return yuzu::test::instr_exec::make_caller(s.username, admin, vis);
+    };
+    ts.start(tier);
+}
+
+bool idef_audited(const McpTestServer& ts, const std::string& result) {
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.execute_instruction_definition|" + result)
+            return true;
+    return false;
+}
+
+} // namespace
+
 TEST_CASE("MCP cancel_execution / record_execution_rerun: registered with truthful annotations and "
           "descriptions that say nothing reaches a device",
           "[mcp][execution][2146]") {
@@ -44317,4 +44376,448 @@ TEST_CASE("MCP cancel_execution / record_execution_rerun: malformed arguments ar
         CHECK(fs.exec_reads == 0);
         CHECK(fs.effects() == 0);
     }
+}
+
+TEST_CASE("MCP execute_instruction_definition: operator tier dispatches an auto definition and "
+          "answers the typed success result",
+          "[mcp][integration][execute][idef]") {
+    McpTestServer ts;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+    idef_start(ts, rig, "operator");
+    auto res = ts.call(idef_call({{"definition_id", "d"}, {"params", {{"a", "b"}}}}));
+    REQUIRE(res);
+    const auto j = idef_payload(*res);
+    CHECK(j["command_id"] == "cmd-1");
+    CHECK(j["execution_id"] == "exec-1");
+    CHECK(j["agents_reached"] == 1);
+    CHECK(j["definition_id"] == "d");
+    CHECK(j["plugin"] == "testplug");
+    CHECK(j["action"] == "ping");
+    REQUIRE(rig.calls.size() == 1);
+    CHECK(rig.calls[0].definition_id == "d"); // the ADR-1007 claim key
+    CHECK(rig.calls[0].concurrency_mode == "per-device");
+    CHECK(rig.calls[0].params.at("a") == "b");
+    // Operator tier: no ticket was ever consumed, so no provenance is fabricated.
+    CHECK(rig.calls[0].provenance == yuzu::server::ApprovalProvenance::None);
+    // Audit-first: requested precedes the dispatch, success follows it.
+    CHECK(idef_audited(ts, "requested"));
+    CHECK(idef_audited(ts, "success"));
+}
+
+TEST_CASE("MCP execute_instruction_definition: an operator-tier auto-approval can NOT skip a "
+          "non-auto definition (the binding rule)",
+          "[mcp][integration][execute][idef][approval][security]") {
+    struct Case {
+        const char* mode;
+        bool admin;
+        bool pending;
+    };
+    // `always` and an unknown mode need approval for everyone; role-gated only for a non-admin.
+    const Case cases[] = {{"always", true, true},       {"always", false, true},
+                          {"role-gated", false, true},  {"role-gated", true, false},
+                          {"bogus", true, true},        {"auto", false, false}};
+    for (const auto& c : cases) {
+        INFO(c.mode << " admin=" << c.admin);
+        McpTestServer ts;
+        Rig rig;
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", c.mode);
+        idef_start(ts, rig, "operator", c.admin);
+        auto res = ts.call(idef_call({{"definition_id", "d"}}));
+        REQUIRE(res);
+        const auto j = idef_payload(*res); // a SUCCESS result, never -32006 / an error
+        if (c.pending) {
+            CHECK(j["status"] == "pending_approval");
+            CHECK(j["approval_id"] == "appr-1");
+            CHECK(j["approval_mode"] == c.mode);
+            CHECK(j["definition_id"] == "d");
+            CHECK(rig.calls.empty()); // NOTHING dispatched
+            CHECK(rig.rows.empty());
+            REQUIRE(rig.approvals.size() == 1);
+            CHECK(rig.approvals[0].user == "test-user");
+            CHECK(rig.approvals[0].plugin == "testplug"); // bound to the pair
+            CHECK(idef_audited(ts, "pending"));
+            CHECK_FALSE(idef_audited(ts, "requested"));
+        } else {
+            CHECK(j["agents_reached"] == 1);
+            CHECK(rig.approvals.empty());
+        }
+    }
+}
+
+TEST_CASE("MCP execute_instruction_definition: a non-auto definition with no approval manager is "
+          "an error, never a dispatch",
+          "[mcp][integration][execute][idef][approval][security]") {
+    McpTestServer ts;
+    Rig rig;
+    rig.approvals_wired = false;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "always");
+    idef_start(ts, rig, "operator");
+    auto res = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["reason"] == "approval_unavailable");
+    CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+    CHECK(rig.calls.empty());
+}
+
+TEST_CASE("MCP execute_instruction_definition: params that violate the stored schema dispatch "
+          "nothing and queue no approval",
+          "[mcp][integration][execute][idef][security]") {
+    McpTestServer ts;
+    Rig rig;
+    auto d = yuzu::test::instr_exec::make_def("d", "ping", "always");
+    d.parameter_schema = yuzu::test::instr_exec::kLevelSchema;
+    rig.defs["d"] = d;
+    idef_start(ts, rig, "operator");
+    auto res = ts.call(idef_call({{"definition_id", "d"}, {"params", {{"level", "SECRET-VALUE"}}}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["data"]["reason"] == "param_schema");
+    CHECK(res->body.find("SECRET-VALUE") == std::string::npos);
+    CHECK(rig.calls.empty());
+    CHECK(rig.approvals.empty());
+    CHECK(rig.rows.empty());
+}
+
+TEST_CASE("MCP execute_instruction_definition: tier, service-scope and gate refusals run nothing",
+          "[mcp][integration][execute][idef][security]") {
+    SECTION("readonly tier") {
+        McpTestServer ts;
+        Rig rig;
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+        idef_start(ts, rig, "readonly");
+        auto res = ts.call(idef_call({{"definition_id", "d"}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+        CHECK(rig.calls.empty());
+    }
+    SECTION("a service-scoped token (default-deny: the REST gate is the plain global pair)") {
+        McpTestServer ts;
+        Rig rig;
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+        ts.mock_token_scope_service = "svc-a";
+        idef_start(ts, rig, "operator");
+        auto res = ts.call(idef_call({{"definition_id", "d"}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(rig.calls.empty());
+        CHECK(rig.approvals.empty());
+    }
+    SECTION("the RBAC gate refuses Execution:Execute (what an engine principal without a grant meets)") {
+        McpTestServer ts;
+        Rig rig;
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+        ts.perm_override_for_test = [](const std::string& sec, const std::string& op) {
+            return !(sec == "Execution" && op == "Execute");
+        };
+        idef_start(ts, rig, "operator");
+        auto res = ts.call(idef_call({{"definition_id", "d"}}));
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(rig.calls.empty());
+        CHECK(rig.approvals.empty());
+    }
+}
+
+TEST_CASE("MCP execute_instruction_definition: unwired ports fail closed",
+          "[mcp][integration][execute][idef][security]") {
+    McpTestServer ts;
+    ts.start("operator"); // instr_exec_ports_for_test default-constructed
+    auto res = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["reason"] == "store_unavailable");
+    CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+}
+
+TEST_CASE("MCP execute_instruction_definition: a chokepoint denial names the definition's plugin.action",
+          "[mcp][integration][execute][idef]") {
+    McpTestServer ts;
+    Rig rig;
+    rig.defs["g"] = yuzu::test::instr_exec::make_def("g", "gated"); // AdminOrApproval pair
+    idef_start(ts, rig, "operator", /*admin=*/false);
+    auto res = ts.call(idef_call({{"definition_id", "g"}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["data"]["reason"] == "approval_required");
+    CHECK(body["error"]["message"].get<std::string>().find("testplug.gated") != std::string::npos);
+    CHECK(rig.calls.empty());
+}
+
+TEST_CASE("MCP execute_instruction_definition: an unknown definition is -32602 and dispatches nothing",
+          "[mcp][integration][execute][idef]") {
+    McpTestServer ts;
+    Rig rig;
+    idef_start(ts, rig, "operator");
+    auto res = ts.call(idef_call({{"definition_id", "nope"}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["data"]["reason"] == "not_found");
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+    CHECK(rig.calls.empty());
+}
+
+TEST_CASE("MCP execute_instruction_definition: the audit row is written BEFORE dispatch and its "
+          "loss dispatches nothing",
+          "[mcp][integration][execute][idef][audit][security]") {
+    McpTestServer ts;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+    ts.audit_fail_result_ = "requested";
+    idef_start(ts, rig, "operator");
+    auto res = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["reason"] == "audit_unavailable");
+    CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+    CHECK(rig.calls.empty());
+    CHECK(rig.rows.empty());
+}
+
+TEST_CASE("MCP execute_instruction_definition: a dropped success row is reported, not hidden",
+          "[mcp][integration][execute][idef][audit]") {
+    McpTestServer ts;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+    ts.audit_fail_result_ = "success";
+    idef_start(ts, rig, "operator");
+    auto res = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(res);
+    const auto j = idef_payload(*res);
+    CHECK(j["agents_reached"] == 1); // the command ran
+    CHECK(j["audit_persisted"] == false);
+}
+
+TEST_CASE("MCP execute_instruction_definition: every zero-reach cause is a status with an honest "
+          "retry hint, and the execution row is cancelled",
+          "[mcp][integration][execute][idef][zero_reach]") {
+    using yuzu::server::ConfinedDispatchOutcome;
+    struct Case {
+        const char* status;
+        ConfinedDispatchOutcome o;
+        bool retry;
+    };
+    auto mk = [](auto&& f) {
+        ConfinedDispatchOutcome o{.sent = 0, .command_id = "cmd-z"};
+        f(o);
+        return o;
+    };
+    const Case cases[] = {
+        {"invalid_scope", mk([](auto& o) { o.scope_parse_error = "bad"; }), false},
+        {"containment_unreadable", mk([](auto& o) { o.containment_unreadable = true; }), true},
+        {"route_unreadable", mk([](auto& o) { o.route_unreadable = true; }), true},
+        {"os_gate_unreadable", mk([](auto& o) { o.os_gate_unreadable = true; }), true},
+        {"quarantined", mk([](auto& o) { o.denied_quarantined_count = 1; }), false},
+        {"plugin_not_found", mk([](auto& o) { o.unknown_plugin_count = 1; }), false},
+        {"kill_switched_os", mk([](auto& o) { o.kill_switched_os_count = 1; }), false},
+        {"no_agents_reached", mk([](auto&) {}), true},
+    };
+    for (const auto& c : cases) {
+        INFO(c.status);
+        McpTestServer ts;
+        Rig rig;
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+        rig.stub_outcome = c.o;
+        idef_start(ts, rig, "operator");
+        auto res = ts.call(idef_call({{"definition_id", "d"}}));
+        REQUIRE(res);
+        const auto j = idef_payload(*res);
+        CHECK(j["status"] == c.status);
+        CHECK(j["agents_reached"] == 0);
+        if (c.retry)
+            CHECK(j["retry_after_ms"] == 5000);
+        else
+            CHECK(j["retry_after_ms"].is_null());
+        CHECK(j["execution_id"] == "exec-1");
+        CHECK(rig.cancelled == std::vector<std::string>{"exec-1"});
+    }
+}
+
+TEST_CASE("MCP execute_instruction_definition: a Destructive action needs explicit agent_ids, "
+          "confined to the visible set",
+          "[mcp][integration][execute][idef][security]") {
+    McpTestServer ts;
+    Rig rig;
+    rig.defs["w"] = yuzu::test::instr_exec::make_def("w", "wipe", "always");
+    rig.defs["w2"] = yuzu::test::instr_exec::make_def("w2", "wipe");
+    rig.visible_agents = std::vector<std::string>{yuzu::test::instr_exec::kA};
+    idef_start(ts, rig, "operator");
+    // Untargeted: refused BEFORE the approval step (so no approval is queued for it).
+    auto bad = ts.call(idef_call({{"definition_id", "w"}}));
+    REQUIRE(bad);
+    const auto bj = nlohmann::json::parse(bad->body);
+    REQUIRE(bj.contains("error"));
+    CHECK(bj["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(bj["error"]["data"]["reason"] == "destructive_untargeted");
+    CHECK(rig.approvals.empty());
+    CHECK(rig.calls.empty());
+    // Targeted at A and B with only A visible: only A reaches dispatch.
+    auto ok = ts.call(idef_call({{"definition_id", "w2"}, {"agent_ids", {"agent-A", "agent-B"}}}));
+    REQUIRE(ok);
+    CHECK(idef_payload(*ok)["agents_reached"] == 1);
+    REQUIRE(rig.calls.size() == 1);
+    CHECK(rig.calls[0].agent_ids == std::vector<std::string>{"agent-A"});
+}
+
+TEST_CASE("MCP execute_instruction_definition: a confined caller reaches exactly its visible agents "
+          "(real registry, exact send set)",
+          "[mcp][integration][execute][idef][confinement][security]") {
+    McpTestServer ts;
+    Rig rig;
+    rig.real_dispatch = true;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+    idef_start(ts, rig, "operator", /*admin=*/true,
+               std::unordered_set<std::string>{yuzu::test::instr_exec::kA});
+    auto res = ts.call(idef_call({{"definition_id", "d"}, {"agent_ids", {"agent-A", "agent-B", "agent-C"}}}));
+    REQUIRE(res);
+    CHECK(idef_payload(*res)["agents_reached"] == 1);
+    CHECK(rig.drain() == std::vector<std::pair<std::string, std::string>>{{"agent-A", "testplug.ping"}});
+
+    // Broadcast (both targets omitted) is intersected with the same visible set.
+    auto bc = ts.call(idef_call({{"definition_id", "d"}}, 2));
+    REQUIRE(bc);
+    CHECK(idef_payload(*bc)["agents_reached"] == 1);
+    CHECK(rig.drain() == std::vector<std::pair<std::string, std::string>>{{"agent-A", "testplug.ping"}});
+}
+
+TEST_CASE("MCP execute_instruction_definition: input bounds and targeting shape are -32602 before anything runs",
+          "[mcp][integration][execute][idef][bounds]") {
+    struct Case {
+        nlohmann::json args;
+        const char* reason;
+    };
+    nlohmann::json many = nlohmann::json::object();
+    for (int i = 0; i < 40; ++i)
+        many["k" + std::to_string(i)] = "v";
+    const Case cases[] = {
+        {{{"definition_id", ""}}, "ident_empty"},
+        {{{"definition_id", std::string(129, 'x')}}, "ident_len"},
+        {{{"definition_id", "d"}, {"params", many}}, "param_count"},
+        {{{"definition_id", "d"}, {"params", {{std::string(257, 'k'), "v"}}}}, "param_key_len"},
+        {{{"definition_id", "d"}, {"params", {{"k", std::string(65537, 'v')}}}}, "param_value_len"},
+        {{{"definition_id", "d"}, {"scope", std::string(8193, 's')}}, "scope_len"},
+        {{{"definition_id", "d"}, {"agent_ids", nlohmann::json::array()}}, "agent_ids_empty"},
+        {{{"definition_id", "d"}, {"agent_ids", {"a"}}, {"scope", "tag:x"}}, "target_conflict"},
+        {{{"definition_id", "d"}, {"scope", ""}}, "scope_empty"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.reason);
+        McpTestServer ts;
+        Rig rig;
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "always");
+        idef_start(ts, rig, "operator");
+        auto res = ts.call(idef_call(c.args));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(rig.calls.empty());
+        CHECK(rig.approvals.empty()); // refused BEFORE the approval step
+    }
+}
+
+TEST_CASE("MCP execute_instruction_definition: bounds counters are pre-registered for the tool",
+          "[mcp][idef][metrics]") {
+    // The metric is emitted with the tool's own name; server.cpp seeds it from the same array.
+    McpTestServer ts;
+    Rig rig;
+    yuzu::MetricsRegistry reg;
+    ts.metrics_for_test = &reg;
+    idef_start(ts, rig, "operator");
+    (void)ts.call(idef_call({{"definition_id", ""}}));
+    CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                      {{"tool", "execute_instruction_definition"}, {"reason", "ident_empty"}})
+              .value() == 1);
+}
+
+// ── Supervised tier: needs a real ApprovalManager for the C8 tier ticket (Postgres) ──────────
+
+TEST_CASE("MCP execute_instruction_definition: supervised tier answers a non-auto definition "
+          "pending_approval at once and mints NO tier ticket",
+          "[pg][mcp][integration][execute][idef][approval][security]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "always");
+    // `always` + a pair carrying AdminOrApproval: the probe tolerates ONLY approval_required.
+    rig.defs["g"] = yuzu::test::instr_exec::make_def("g", "gated", "always");
+    idef_start(ts, rig, "supervised", /*admin=*/false);
+    for (const char* id : {"d", "g"}) {
+        auto res = ts.call(idef_call({{"definition_id", id}}));
+        REQUIRE(res);
+        const auto j = idef_payload(*res);
+        CHECK(j["status"] == "pending_approval");
+    }
+    CHECK(appr.pending_count() == 0); // no mcp tier ticket was minted
+    CHECK(rig.approvals.size() == 2); // the definition's own approvals
+    CHECK(rig.calls.empty());
+}
+
+TEST_CASE("MCP execute_instruction_definition: supervised tier on an auto definition mints the tier "
+          "ticket, and the recall dispatches with Ticket provenance",
+          "[pg][mcp][integration][execute][idef][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    Rig rig;
+    rig.defs["g"] = yuzu::test::instr_exec::make_def("g", "gated"); // AdminOrApproval pair, auto def
+    idef_start(ts, rig, "supervised", /*admin=*/false);
+    auto first = ts.call(idef_call({{"definition_id", "g"}}));
+    REQUIRE(first);
+    const auto fb = nlohmann::json::parse(first->body);
+    REQUIRE(fb.contains("error"));
+    CHECK(fb["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    CHECK(rig.calls.empty());
+    const std::string ticket = fb["error"]["data"]["approval_id"];
+    REQUIRE(appr.approve(ticket, "admin", "ok").has_value());
+    auto second = ts.call(idef_call({{"definition_id", "g"}, {"approval_id", ticket}}, 2));
+    REQUIRE(second);
+    CHECK(idef_payload(*second)["agents_reached"] == 1);
+    REQUIRE(rig.calls.size() == 1);
+    CHECK(rig.calls[0].provenance == yuzu::server::ApprovalProvenance::Ticket);
+}
+
+TEST_CASE("MCP execute_instruction_definition: an approved tier ticket cannot launder a definition "
+          "that became non-auto before the recall",
+          "[pg][mcp][integration][execute][idef][approval][security]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "auto");
+    idef_start(ts, rig, "supervised", /*admin=*/false);
+    auto first = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(first);
+    const std::string ticket = nlohmann::json::parse(first->body)["error"]["data"]["approval_id"];
+    REQUIRE(appr.approve(ticket, "admin", "ok").has_value());
+    rig.defs["d"].approval_mode = "always"; // an editor tightens the definition meanwhile
+    auto second = ts.call(idef_call({{"definition_id", "d"}, {"approval_id", ticket}}, 2));
+    REQUIRE(second);
+    CHECK(idef_payload(*second)["status"] == "pending_approval");
+    CHECK(rig.calls.empty());
+    // The probe answered BEFORE the ticket was consumed: it is still spendable.
+    auto row = appr.get(ticket);
+    REQUIRE(row);
+    CHECK(row->consumed_at == 0);
 }

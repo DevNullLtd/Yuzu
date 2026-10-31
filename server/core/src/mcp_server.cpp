@@ -10,6 +10,7 @@
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
 #include "mcp_approval_error.hpp" // shared approval-store failure body (#2786)
 #include "mcp_input_schema.hpp" // input-schema subset compiler (#2405 C8 pre-approval gate)
+#include "mcp_instruction_execute.hpp" // execute_instruction_definition: bounds + rendering over instruction_execute (#2146)
 #include "mcp_jsonrpc.hpp"
 #include "discovered_devices_model.hpp" // list_discovered_devices shared builders
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
@@ -2536,6 +2537,63 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"status":{"const":"no_agents_reached"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false})j"
      R"j(]})j"},
 
+    // #2146 (ledger row post.api-instructions-param-execute): the MCP twin of POST
+    // /api/instructions/{id}/execute and POST /api/v1/instructions/{id}/execute. Distinct from
+    // execute_instruction, which is a RAW plugin/action call. The input bounds below are the
+    // MCP schema contract AND are re-enforced server-side on every tier by
+    // mcp_instruction_execute.cpp's check_args (the literals and kExecInstr* are one contract).
+    {"execute_instruction_definition",
+     "Execute a STORED instruction definition by id on one or more agents. ASYNC: returns "
+     "immediately with command_id + execution_id + agents_reached; the agents run it and report "
+     "back separately, so poll query_responses or get_execution_status with execution_id, and "
+     "NEVER re-send this call to check on it, which would run the action a second time. Use "
+     "discover_instructions to find a definition id and its parameter schema. This is NOT "
+     "execute_instruction: that tool runs a raw plugin.action with no definition, no "
+     "approval_mode and no parameter schema; this one enforces the definition's own rules. "
+     "ORDER OF CHECKS, none of which dispatches, mints or consumes anything before it passes: "
+     "the definition exists; the caller may run its plugin.action; the arguments are well formed "
+     "(params is an object, agent_ids and scope are not empty and not both given); params match "
+     "the definition's stored parameter_schema (a violation is -32602 and nothing is queued for "
+     "approval); a Destructive or Forensics action names explicit agent_ids; then the "
+     "definition's approval_mode. "
+     "APPROVAL: the definition's approval_mode is evaluated FIRST and independently of your MCP "
+     "tier. auto dispatches. always, any unknown value, and role-gated for a caller who is not an "
+     "administrator return a SUCCESS result with status pending_approval and dispatch NOTHING. "
+     "That ticket cannot be redeemed through this tool: do NOT pass its approval_id back as the "
+     "approval_id argument (the recall refuses it), and do not poll it for a dispatch; an "
+     "operator approves it out of band. An operator-tier token's auto-approval and a supervised "
+     "token's consumed ticket never satisfy a definition's approval_mode. SUPERVISED tier: a "
+     "call whose definition is auto first returns the usual approval_required (-32006) tier "
+     "ticket; after an admin approves it re-call with that approval_id. A call whose definition "
+     "needs approval returns pending_approval at once and mints no tier ticket. "
+     "TARGETING: omit BOTH agent_ids and scope to target every connected agent; supplying either "
+     "empty, or both, is rejected rather than widened. A Destructive-classified action requires "
+     "explicit non-empty agent_ids (broadcast and scope are refused) and a Forensics-classified "
+     "one exactly one, both confined to the agents you may see. "
+     "ZERO AGENTS: a SUCCESS result with agents_reached 0 carries a status to branch on, not "
+     "message text: invalid_scope, quarantined, plugin_not_found and kill_switched_os are "
+     "PERMANENT (retry_after_ms is null; retrying the same request cannot help); "
+     "containment_unreadable, route_unreadable, os_gate_unreadable and no_agents_reached are "
+     "transient (retry_after_ms 5000). A dispatch-authorization denial is a JSON-RPC error whose "
+     "error.data.reason is one of unclassified, ambiguous, anonymous_operator, forbidden, "
+     "approval_required, kill_switched. A per-device definition takes the ADR-1007 concurrency "
+     "claim, so a device already running it may be skipped (no_agents_reached). "
+     "Every call is audit-logged (mcp.execute_instruction_definition) BEFORE dispatch; if that "
+     "row cannot be stored nothing is dispatched (-32603, retryable). Service-scoped API tokens "
+     "are refused. Mirrors POST /api/v1/instructions/{id}/execute. Requires Execution:Execute.",
+     R"j({"type":"object","properties":{)j"
+     R"j("definition_id":{"type":"string","minLength":1,"maxLength":128,"description":"Id of the stored instruction definition (discover_instructions lists them)"},)j"
+     R"j("params":{"type":"object","description":"Parameters, validated against the definition's stored parameter_schema BEFORE anything else happens. Typed values are sent as JSON types (a number as a number); at most 32 keys, each key at most 256 bytes, each value at most 65536 bytes once serialised."},)j"
+     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. Omit BOTH this and agent_ids to target all agents; supplying either one empty is rejected rather than widened. A Destructive or Forensics action refuses scope outright."},)j"
+     R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs. EXCLUSIVE with scope. Omit entirely to target all agents; an EMPTY array is rejected. A Destructive action requires this field, non-empty; a Forensics action exactly one."},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"SUPERVISED tier only: the tier ticket id from a prior approval_required (-32006) response, supplied after an admin approves it. NOT the approval_id of a pending_approval result, which is never redeemable here."})j"
+     R"j(},"required":["definition_id"]})j",
+     R"j({"oneOf":[)j"
+     R"j({"type":"object","properties":{"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":1},"definition_id":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"audit_persisted":{"const":false}},"required":["command_id","execution_id","agents_reached","definition_id","plugin","action"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"pending_approval"},"approval_id":{"type":"string"},"approval_mode":{"type":"string"},"definition_id":{"type":"string"},"audit_persisted":{"const":false}},"required":["status","approval_id","approval_mode","definition_id"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"enum":["invalid_scope","containment_unreadable","route_unreadable","os_gate_unreadable","quarantined","plugin_not_found","kill_switched_os","no_agents_reached"]},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"definition_id":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"type":["integer","null"]},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0},"audit_persisted":{"const":false}},"required":["status","command_id","execution_id","agents_reached","definition_id","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false})j"
+     R"j(]})j"},
+
     // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
     // One instruction → several plugin actions on ONE device → collated results,
     // via server-side async fan-out. The agent is unchanged.
@@ -4309,7 +4367,7 @@ static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
 // an offence — not a silent first-wins collapse at static init.
 static const char* const kWriteToolsRaw[] = {
     "sync_hardware_software",
-    "set_tag",         "delete_tag",     "execute_instruction",
+    "set_tag",         "delete_tag",     "execute_instruction", "execute_instruction_definition",
     "approve_request", "reject_request", "quarantine_device",
     "revoke_certificate", "execute_bundle", "issue_code_signing_cert", "import_ca_chain",
     // Engine-principal lifecycle tools (ADR-1005 item 2b, plan PR 4.3).
@@ -4698,6 +4756,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"set_tag", {"Tag", "Write", ServiceScopeClass::confined}},
     {"delete_tag", {"Tag", "Delete", ServiceScopeClass::confined}},
     {"execute_instruction", {"Execution", "Execute", ServiceScopeClass::confined}},
+    // #2146: the REST twin gates on the plain, global Execution:Execute pair, which a
+    // service-scoped token cannot clear (kServiceScopeGlobalSafe is seeded empty), so this is
+    // `denied`: `confined` would claim a per-agent mechanism that gate does not have.
+    {"execute_instruction_definition", {"Execution", "Execute", ServiceScopeClass::denied}},
     // Live-query bundle (ADR-0011) — same securable as the underlying ops:
     // dispatch is Execution:Execute, collate is Response:Read.
     {"execute_bundle", {"Execution", "Execute", ServiceScopeClass::confined}},
@@ -5470,6 +5532,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // execute_*: dispatch caller-selected plugin actions → worst-case destructive,
     // and each call is a fresh async run (new command/execution ids) → not idempotent.
     {"execute_instruction", {ToolEffect::Destructive, false, "Execute instruction"}},
+    {"execute_instruction_definition", {ToolEffect::Destructive, false, "Execute stored instruction definition"}},
     {"execute_bundle", {ToolEffect::Destructive, false, "Execute live-query bundle"}},
     // approve/reject: one-way pending→decided transition (approve also arms a live
     // one-time execution ticket) → destructive + non-idempotent.
@@ -8303,6 +8366,55 @@ McpServer::HandlerFn McpServer::build_handler(
                     // deny-without-consume shape as the schema violation above;
                     // the handler keeps its own copy as defense in depth for
                     // the ungated tiers.
+                    // #2146 execute_instruction_definition: the definition's OWN approval_mode
+                    // is evaluated FIRST, before the tier ticket below is minted or consumed
+                    // (owner ruling 2026-10-30; see mcp_instruction_execute.hpp for the whole
+                    // composition). The probe runs the shared pipeline's steps 1-6, so a call
+                    // that is going to be refused, or that needs the definition's approval
+                    // anyway, mints no tier ticket and burns none. It tolerates the chokepoint's
+                    // approval_required denial (this ticket is what will supply that
+                    // provenance) and nothing else. A Plan falls through to mint/recall.
+                    if (tool_name == "execute_instruction_definition") {
+                        namespace idef = yuzu::server::mcp::instruction_definition;
+                        if (auto bv = idef::check_args(args)) {
+                            const std::string cid = yuzu::server::detail::make_correlation_id();
+                            count_denial("yuzu_mcp_tool_args_too_large_total", bv->reason);
+                            mcp_audit("denied", std::string("input bound exceeded: ") + bv->reason +
+                                                    " correlation_id=" + cid);
+                            res.set_content(a4_error(kInvalidParams, bv->message,
+                                                     "correct the argument and re-call; no "
+                                                     "approval ticket was created or consumed",
+                                                     -1, cid),
+                                            "application/json");
+                            return;
+                        }
+                        yuzu::server::instruction_execute::Request probe;
+                        probe.surface = yuzu::server::instruction_execute::Surface::kMcp;
+                        probe.definition_id = args["definition_id"].get<std::string>();
+                        probe.body = idef::core_body(args);
+                        probe.caller = caller_fn
+                                           ? caller_fn(*session)
+                                           : DispatchCaller{.exec_visible =
+                                                                yuzu::server::authz::deny_all()};
+                        probe.tolerate_approval_required = true;
+                        probe.submitter_pending_cap = idef::kSubmitterPendingCap;
+                        const std::string probe_cid = yuzu::server::detail::make_correlation_id();
+                        const auto prepared = yuzu::server::instruction_execute::prepare(
+                            probe, instr_exec_ports_,
+                            [&](std::string_view result_status, const std::string& detail_text) {
+                                return mcp_audit(std::string(result_status), detail_text);
+                            });
+                        if (const auto early = idef::render_unless_plan(prepared, probe_cid)) {
+                            res.set_content(
+                                early->is_error
+                                    ? error_response(id, early->code, early->message,
+                                                     early->data_json)
+                                    : success_response(id, tool_result(early->payload_json,
+                                                                       kObjectOutputSchema)),
+                                "application/json");
+                            return;
+                        }
+                    }
                     if (tool_name == "execute_instruction") {
                         if (auto bv = check_exec_instruction_shape(args)) {
                             const std::string cid =
@@ -18908,6 +19020,65 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── execute_instruction ───────────────────────────────────────
             // Tier check handled by generic C8 block above (catalogue().security).
+            // #2146: the MCP twin of POST /api/instructions/{id}/execute (ledger row
+            // post.api-instructions-param-execute). The pipeline is instruction_execute.hpp's,
+            // shared with POST /api/v1/instructions/{id}/execute. TIER x APPROVAL, as
+            // implemented here: the tier ladder ran in C8 (and the pre-mint probe above ran the
+            // definition gate FIRST for supervised callers); this branch re-runs the whole
+            // pipeline, so an operator-tier call (no ticket, so C8 never ran) reaches the same
+            // definition gate. `approval_provenance` is stamped Ticket ONLY when C8 consumed a
+            // ticket for THIS request, and the definition gate does not read it: neither an
+            // operator-tier auto-approval nor a consumed supervised ticket can skip a non-auto
+            // definition.
+            if (tool_name == "execute_instruction_definition") {
+                namespace idef = yuzu::server::mcp::instruction_definition;
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    return;
+                if (auto bv = idef::check_args(args)) {
+                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                    if (metrics != nullptr) {
+                        try {
+                            metrics
+                                ->counter("yuzu_mcp_tool_args_too_large_total",
+                                          {{"tool", tool_name}, {"reason", bv->reason}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                        }
+                    }
+                    mcp_audit("denied", std::string("input bound exceeded: ") + bv->reason +
+                                            " correlation_id=" + cid);
+                    res.set_content(a4_error(kInvalidParams, bv->message,
+                                             "correct the argument and re-call", -1, cid),
+                                    "application/json");
+                    return;
+                }
+                yuzu::server::instruction_execute::Request rq;
+                rq.surface = yuzu::server::instruction_execute::Surface::kMcp;
+                rq.definition_id = args["definition_id"].get<std::string>();
+                rq.body = idef::core_body(args);
+                rq.caller = caller_fn ? caller_fn(*session)
+                                      : DispatchCaller{.exec_visible =
+                                                           yuzu::server::authz::deny_all()};
+                rq.caller.approval_provenance = approval_ticket_just_consumed
+                                                    ? yuzu::server::ApprovalProvenance::Ticket
+                                                    : yuzu::server::ApprovalProvenance::None;
+                rq.submitter_pending_cap = idef::kSubmitterPendingCap;
+                const auto out = yuzu::server::instruction_execute::run(
+                    rq, instr_exec_ports_,
+                    [&](std::string_view result_status, const std::string& detail_text) {
+                        return mcp_audit(std::string(result_status), detail_text);
+                    });
+                const auto rendered =
+                    idef::render_outcome(out, yuzu::server::detail::make_correlation_id());
+                res.set_content(
+                    rendered.is_error
+                        ? error_response(id, rendered.code, rendered.message, rendered.data_json)
+                        : success_response(id, tool_result(rendered.payload_json,
+                                                           kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
             if (tool_name == "execute_instruction") {
                 if (!perm_fn(req, res, "Execution", "Execute"))
                     return;

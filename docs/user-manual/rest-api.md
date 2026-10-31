@@ -3678,6 +3678,62 @@ List all instruction definitions.
 
 **404** if no definition has that id. **503** if the instruction store is unavailable or the read fails (A4 envelope, `retry_after_ms: 5000`).
 
+#### `POST /api/v1/instructions/{id}/execute`
+
+(#2146) Execute a stored instruction definition. Twin of the legacy `POST /api/instructions/{id}/execute` and of the MCP `execute_instruction_definition` tool (the existing MCP `execute_instruction` is a raw `plugin.action` call and is not its twin); both v1 surfaces run one shared pipeline. Dispatch is **asynchronous**: the response names the command and execution, and the agents report separately (poll `GET /api/v1/executions/{execution_id}` or subscribe to `GET /api/v1/events`).
+
+**Permission:** `Execution:Execute`, a plain global grant. A service-scoped token is refused (the service-scope allow-list is empty), an engine principal needs an explicit grant, and a supervised-tier MCP token is refused on this REST path (the ticket flow exists only on `/mcp/v1/`). The gate admits the call; who is **reached** is decided at dispatch from the caller's own `Execution:Execute` visible set, and an agent outside it is silently left out.
+
+**Body:** a JSON object. All keys are optional.
+
+| Key | Meaning |
+|---|---|
+| `agent_ids` | Non-empty array of agent ids. Exclusive with `scope`. |
+| `scope` | Non-empty scope expression (`__all__`, `group:<id>`, or the scope DSL). Exclusive with `agent_ids`. |
+| `params` | Object of parameters. Validated against the definition's stored `parameter_schema`; typed values are sent as JSON types. A value that is not an object (or `null`) is `400` even when the definition declares no schema (`params_type`), rather than being dropped. |
+
+Omitting **both** `agent_ids` and `scope` targets every connected agent. Supplying either one empty, of the wrong type, or both together is `400` (`reason` = `agent_ids_empty`, `agent_ids_type`, `agent_id_type`, `scope_empty`, `scope_type`, `target_conflict`) and is never widened to the fleet. A body that is not an object is `400` (`body_type`). A **Destructive** action requires explicit non-empty `agent_ids` (broadcast and `scope` are `400` `destructive_untargeted`) and its ids are confined to the agents the caller may see (`404` `destructive_no_visible_target` when none are); a **Forensics** action requires exactly one (`forensic_untargeted`).
+
+**Order of checks.** The first refusal wins, and nothing before the audit row dispatches, creates an execution row, or queues an approval: the gate, the depth guard (`400` `body_too_deep`) and JSON parse (`400` `invalid_json`), the definition lookup (`404` `not_found`; `503` `store_unavailable`, `retry_after_ms: 5000`), the dispatch chokepoint's dry run for the definition's `plugin.action` (`403` `forbidden` / `approval_required` / `kill_switched`, `400` `unclassified` / `ambiguous`, `403` `anonymous_operator`), the body shape, the stored `parameter_schema` (`400` `param_schema`; a stored schema that cannot be prepared is `500` `param_schema_invalid`, fail closed), the destructive targeting rules above, the definition's `approval_mode`, the audit row, then dispatch.
+
+**`approval_mode`.** `auto` dispatches. `always`, any unrecognised value, and `role-gated` for a caller who is not an effective administrator answer **`202`** and dispatch nothing. `role-gated` lets an administrator (including an active JIT elevation) through. A non-auto definition with no approval manager is `503` `approval_unavailable`. The `202` ticket cannot be redeemed through the API: it is a request for an operator to review, not a token that releases this call, so re-send the request after the definition is changed or the approval is handled out of band.
+
+**Audit.** Action `instruction.execute`, target `instruction`/`{id}`: `denied` for a refusal, `pending` for a `202`, then `requested` written **before** dispatch, then `success` or `failure`. If the `requested` row cannot be stored the call is `503` `audit_unavailable` with `Sec-Audit-Failed: true` and **nothing is dispatched**. A later best-effort row that fails to store sets `Sec-Audit-Failed: true` on the response; the command already ran.
+
+**Concurrency.** A definition whose `concurrency_mode` is `per-device` takes the per-device claim (ADR-1007) inside the dispatch, so a device already running it can be skipped.
+
+**`200` response** (dispatched):
+
+```json
+{
+  "data": {
+    "command_id": "echo-3f2a...",
+    "execution_id": "ex-91c0...",
+    "agents_reached": 3,
+    "definition_id": "filesystem.exists"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**`202` response** (approval required, nothing dispatched):
+
+```json
+{
+  "data": {
+    "status": "pending_approval",
+    "approval_id": "a1b2c3...",
+    "approval_mode": "role-gated",
+    "definition_id": "filesystem.exists"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Zero agents reached** is an error, discriminated by `error.reason`: `invalid_scope` is `400`; `containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `quarantined`, `plugin_not_found`, `kill_switched_os` and `no_agents_reached` are `503`. `retry_after_ms` is `5000` for `containment_unreadable`, `route_unreadable`, `os_gate_unreadable` and `no_agents_reached`, and `null` for the permanent causes (`invalid_scope`, `quarantined`, `plugin_not_found`, `kill_switched_os`), where retrying the same request cannot succeed. The error object also carries `command_id`, `execution_id` (the cancelled execution row) and the counts `agents_quarantined`, `agents_unknown_plugin`, `agents_kill_switched_os`. `no_agents_reached` includes the case where a per-device claim excluded every target.
+
+Other errors use the A4 envelope with a `reason`: `500` `dispatch_failed` (the execution row is cancelled).
+
 ---
 
 ### Product Packs
