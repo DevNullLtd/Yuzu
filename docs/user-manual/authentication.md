@@ -1345,6 +1345,8 @@ curl -s -X POST http://localhost:8080/mcp/v1/ \
   }'
 ```
 
+Send only the `Authorization` header: do not add a session cookie. `/mcp/v1/` refuses any credential with no MCP tier (`403`, `-32003`, counted on `yuzu_mcp_admission_refused_total` and audited as `mcp.session.reject` with `reason=tier_required`; the audit rows are rate-limited per principal, the counter is complete), and the server resolves a live session cookie before a Bearer token, so a request carrying both is classed as the cookie and refused.
+
 ### Server-Side Kill Switches
 
 | Flag | Description |

@@ -15,6 +15,8 @@ Usage:
 Credentials (read from files, never hardcoded):
     Anthropic API key : $ANTHROPIC_API_KEY, else ~/.config/anthropic/key
     Yuzu MCP token    : $YUZU_MCP_TOKEN,    else ~/.config/anthropic/mcp-token
+                        (an API token minted with an mcp_tier: readonly, operator or
+                        supervised; /mcp/v1/ refuses a token without one)
 
 The MCP endpoint defaults to the local viz-UAT server; override with --mcp-url
 or $YUZU_MCP_URL.

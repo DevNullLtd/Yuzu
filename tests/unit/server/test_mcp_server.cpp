@@ -883,6 +883,11 @@ namespace {
 /// surface fully exercised without any of that threading.
 struct McpTestServer {
     // Mock state
+    // NOTE (#4309): an EMPTY mock_tier is a state /mcp/v1/ can no longer reach in production
+    // (mcp_admission.hpp refuses every empty-tier credential before any handler; this fixture's
+    // auth hook deliberately omits that gate). Cases that use it test the per-tool handler guards
+    // as defence in depth, not a reachable caller. The admission rule itself is exercised in
+    // test_mcp_admission.cpp.
     std::string mock_tier;              // MCP tier for mock auth
     // Non-empty simulates a service-scoped API token session (SEC-3 sibling
     // gap: get_dex_signal_detail / list_dex_perf_devices / list_network_devices
@@ -4630,9 +4635,9 @@ TEST_CASE("MCP create_api_token/revoke_api_token/unlock_account/rotate_api_token
     // MCP with NEITHER of the two controls its REST twin enforces - REST's
     // step_up_fn (never called by any MCP handler) nor the supervised-tier
     // approval gate (requires_approval() itself no-ops on an empty tier, per
-    // mcp_policy.hpp's own documented contract). #4309 tracks the
-    // architecture-wide root cause; this pinned the mitigation for the
-    // first three high-value operations.
+    // mcp_policy.hpp's own documented contract). #4309 closed the
+    // architecture-wide root cause at /mcp/v1/ admission (mcp_admission.hpp); this
+    // case now pins the per-tool guards that remain as defence in depth.
     //
     // Gate 8 follow-up review round (same batch, user directive): extended
     // to rotate_api_token/confirm_api_token_rotation, which shared the
@@ -43731,7 +43736,8 @@ TEST_CASE("MCP runtime config: a secret value reaches neither the response nor a
     RuntimeConfigPgWired w{db.dsn()};
     McpTestServer ts;
     ts.runtime_config_for_test = w.backing();
-    ts.start(); // an untiered administrator token: admitted for oidc_* as on REST
+    ts.start(); // handler-level: an untiered administrator is admitted for oidc_* here, a state
+                // /mcp/v1/ admission (#4309) can no longer reach in production
     auto body = set_runtime_config_call(ts, "oidc_client_secret", "s3cret-via-mcp");
     INFO(body.dump());
     REQUIRE_FALSE(body.contains("error"));

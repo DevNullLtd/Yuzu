@@ -18,11 +18,13 @@ namespace yuzu::server::mcp {
 ///                set, which stays denied even at this tier
 
 /// Returns true if the MCP tier permits (securable_type, operation).
-/// An empty tier string means "not an MCP token" → allow everything (defer to RBAC).
+/// An empty tier string is refused for every principal at /mcp/v1/ admission
+/// (mcp_admission.hpp), so no tool handler is reached with one. This branch is retained
+/// for non-MCP transports and as defence in depth: it allows everything (defers to RBAC).
 inline bool tier_allows(std::string_view mcp_tier,
                         std::string_view securable_type,
                         std::string_view operation) {
-    if (mcp_tier.empty()) return true;  // Not an MCP token
+    if (mcp_tier.empty()) return true;  // non-MCP transport / defence in depth (see above)
 
     // ── #520/#4028/#4031: MCP tokens must never administer the server ────
     //
@@ -145,7 +147,9 @@ inline bool tier_allows(std::string_view mcp_tier,
 inline bool requires_approval(std::string_view mcp_tier,
                               std::string_view securable_type,
                               std::string_view operation) {
-    if (mcp_tier.empty()) return false;  // Not an MCP token
+    // An empty tier is refused at /mcp/v1/ admission (mcp_admission.hpp); this branch is
+    // retained for non-MCP transports and as defence in depth.
+    if (mcp_tier.empty()) return false;
 
     // readonly tokens can't do anything that needs approval
     if (mcp_tier == "readonly") return false;
