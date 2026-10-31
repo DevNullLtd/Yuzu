@@ -888,7 +888,7 @@ TEST_CASE("rbac_admin_hint classify: a refusal counts as an authority answer onl
 TEST_CASE("rbac_admin_hint classify: every arm of the closed refusal set classifies, each by its "
           "production text, and a near miss does not",
           "[rbac_admin_predicate][rbac_admin_hint]") {
-    // The texts below are the routes' own (rest_api_v1.cpp:318/358/7917/8263/8446, matched by
+    // The texts below are the routes' own (rest_api_v1.cpp:317/357/7915/8261/8444, matched by
     // prefix where the route appends detail; rbac_admin_authority_owner.cpp:594/607), so a dead arm
     // in `classify` is a failure here and not a silent pass for a persona that happens to hit
     // another arm.
