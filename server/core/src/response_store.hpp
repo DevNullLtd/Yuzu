@@ -6,7 +6,7 @@
 /// `responses` (per-agent result rows) + `response_facets` (denormalised
 /// column values powering the dashboard's facet filters). High-write (every
 /// command result from every agent), TTL'd (default 90-day retention via
-/// `reap_expired()`, called from the server's maintenance tick), a `/tar`-
+/// `reap_expired()`, called from the server's maintenance tick), a `/echo`-
 /// and executions-drawer read source.
 ///
 /// Substrate contract (ADR-0008/0012): holds a `pg::PgPool&`, migrates at
@@ -18,7 +18,7 @@
 ///  - **Ingest (`store`)**: FAIL-SOFT (ADR-0037 shape). A dropped result row
 ///    is re-derivable operational telemetry (the executions ladder tracks the
 ///    command; the agent's result is best-effort persisted for the
-///    drawer/TAR). Never blocks the gRPC thread. Drops counted
+///    drawer/Echo). Never blocks the gRPC thread. Drops counted
 ///    (`yuzu_server_response_ingest_dropped_total{reason}`).
 ///  - **Reads** (`query`/`query_by_execution`/`get_by_instruction`/
 ///    `query_by_ids`/`aggregate`/`distinct_agent_ids`/`facet_values`/
@@ -26,7 +26,7 @@
 ///    seam (`std::optional<std::vector<...>>`, nullopt = degrade) +
 ///    `yuzu_server_response_read_degrade_total{reason,source}` + a sampled
 ///    log. NOT the catastrophic-read class — these feed the executions
-///    drawer / TAR dashboard, not an enforce/target/authz decision, so
+///    drawer / Echo dashboard, not an enforce/target/authz decision, so
 ///    consumers may render degraded (503 on the REST twin, empty +
 ///    degrade-banner on the dashboard) — but the seam MUST distinguish empty
 ///    from degraded. The #1634 group-scoped-read seam (`ResponseQuery{

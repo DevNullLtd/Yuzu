@@ -430,14 +430,14 @@ TEST_CASE("build_data_retention_settings carries Guardian events and the enforce
     CHECK(none.at("enforced").at("audit_retention_days").is_null());
 }
 
-TEST_CASE("build_data_retention_settings publishes the TAR retention tiers",
-          "[settings][settings_model][retention][tar]") {
+TEST_CASE("build_data_retention_settings publishes the Echo retention tiers",
+          "[settings][settings_model][retention][echo]") {
     Config cfg;
     auto j = sm::build_data_retention_settings(cfg);
 
-    REQUIRE(j.at("tar").is_object());
-    CHECK(j.at("tar").at("tick_seconds").get<int>() == 900);
-    const auto& tiers = j.at("tar").at("tiers");
+    REQUIRE(j.at("echo").is_object());
+    CHECK(j.at("echo").at("tick_seconds").get<int>() == 900);
+    const auto& tiers = j.at("echo").at("tiers");
     REQUIRE(tiers.is_array());
     for (const auto& t : tiers)
         CHECK(t.size() == 6);
@@ -459,12 +459,12 @@ TEST_CASE("build_data_retention_settings publishes the TAR retention tiers",
     CHECK(daily->at("guaranteed_depth_seconds").get<long long>() == 2592000);
 }
 
-TEST_CASE("build_data_retention_settings emits tar:null when no table is available",
-          "[settings][settings_model][retention][tar]") {
+TEST_CASE("build_data_retention_settings emits echo:null when no table is available",
+          "[settings][settings_model][retention][echo]") {
     Config cfg;
     auto j = sm::build_data_retention_settings(cfg, {}, nullptr);
-    REQUIRE(j.contains("tar"));
-    CHECK(j.at("tar").is_null());
+    REQUIRE(j.contains("echo"));
+    CHECK(j.at("echo").is_null());
 }
 
 namespace {
@@ -482,27 +482,27 @@ nlohmann::json tier(const char* src, const char* t, const char* kind, long long 
     return {{"source", src}, {"tier", t}, {"limit_kind", kind},
             {"limit", limit}, {"bucket_seconds", 0}, {"guaranteed_depth_seconds", depth}};
 }
-nlohmann::json retention_with_tar(nlohmann::json tiers, nlohmann::json tick = 900) {
+nlohmann::json retention_with_echo(nlohmann::json tiers, nlohmann::json tick = 900) {
     Config cfg;
     auto j = sm::build_data_retention_settings(cfg, {}, nullptr);
-    j["tar"] = {{"tiers", std::move(tiers)}};
+    j["echo"] = {{"tiers", std::move(tiers)}};
     if (!tick.is_null())
-        j["tar"]["tick_seconds"] = tick;
+        j["echo"]["tick_seconds"] = tick;
     return j;
 }
 } // namespace
 
-TEST_CASE("render_retention_table appends the TAR tier table after the three windows",
-          "[settings][settings_model][retention][tar]") {
+TEST_CASE("render_retention_table appends the Echo tier table after the three windows",
+          "[settings][settings_model][retention][echo]") {
     Config cfg;
     auto with = sm::build_data_retention_settings(cfg);
     auto without = with;
-    without.erase("tar");
+    without.erase("echo");
     const auto w = sm::render_retention_table(with);
     const auto wo = sm::render_retention_table(without);
     CHECK(w.compare(0, wo.size(), wo) == 0);
-    CHECK_FALSE(has(wo, "TAR capture sources"));
-    for (const char* n : {"<caption>TAR capture sources</caption>", "<th>Exact</th>", "<th>Boot</th>",
+    CHECK_FALSE(has(wo, "Echo capture sources"));
+    for (const char* n : {"<caption>Echo capture sources</caption>", "<th>Exact</th>", "<th>Boot</th>",
                           "<th>Look again after</th>", ">process<", "100,000 rows", ">1 day<",
                           ">31 days<", ">12 months<", ">11 months<", "400 rows", "Row count only",
                           ">7 days<", ">30 days<", "every 900 s", "never pruned", "not per-device"})
@@ -512,36 +512,36 @@ TEST_CASE("render_retention_table appends the TAR tier table after the three win
     CHECK_FALSE(has(w.substr(cap), "class=\"pill"));
 }
 
-TEST_CASE("render_retention_table with tar:null renders only the three windows",
-          "[settings][settings_model][retention][tar]") {
+TEST_CASE("render_retention_table with echo:null renders only the three windows",
+          "[settings][settings_model][retention][echo]") {
     Config cfg;
     auto j = sm::build_data_retention_settings(cfg, {}, nullptr);
     auto absent = j;
-    absent.erase("tar");
+    absent.erase("echo");
     const auto html = sm::render_retention_table(j);
     CHECK(html == sm::render_retention_table(absent));
-    CHECK_FALSE(has(html, "tar-tiers"));
+    CHECK_FALSE(has(html, "echo-tiers"));
     CHECK_FALSE(has(html, "<caption"));
 }
 
-TEST_CASE("tar_duration_text worked examples", "[settings][settings_model][retention][tar]") {
+TEST_CASE("echo_duration_text worked examples", "[settings][settings_model][retention][echo]") {
     constexpr long long d = 86400;
-    CHECK(sm::tar_duration_text(3 * d) == "3 days");
-    CHECK(sm::tar_duration_text(42 * d) == "6 weeks");
-    CHECK(sm::tar_duration_text(300 * d) == "10 months");
-    CHECK(sm::tar_duration_text(420 * d) == "14 months");
-    CHECK(sm::tar_duration_text(d) == "1 day");
-    CHECK(sm::tar_duration_text(31 * d) == "31 days");
-    CHECK(sm::tar_duration_text(82800) == "23 hours");
-    CHECK(sm::tar_duration_text(3600) == "1 hour");
-    CHECK(sm::tar_duration_text(59) == "Under an hour");
-    CHECK(sm::tar_duration_text(60 * d) == "2 months");
-    CHECK(sm::tar_duration_text(14 * d) == "2 weeks");
-    CHECK(sm::tar_duration_text(13 * d) == "13 days");
+    CHECK(sm::echo_duration_text(3 * d) == "3 days");
+    CHECK(sm::echo_duration_text(42 * d) == "6 weeks");
+    CHECK(sm::echo_duration_text(300 * d) == "10 months");
+    CHECK(sm::echo_duration_text(420 * d) == "14 months");
+    CHECK(sm::echo_duration_text(d) == "1 day");
+    CHECK(sm::echo_duration_text(31 * d) == "31 days");
+    CHECK(sm::echo_duration_text(82800) == "23 hours");
+    CHECK(sm::echo_duration_text(3600) == "1 hour");
+    CHECK(sm::echo_duration_text(59) == "Under an hour");
+    CHECK(sm::echo_duration_text(60 * d) == "2 months");
+    CHECK(sm::echo_duration_text(14 * d) == "2 weeks");
+    CHECK(sm::echo_duration_text(13 * d) == "13 days");
 }
 
-TEST_CASE("TAR tier table escapes the source name", "[settings][settings_model][retention][tar]") {
-    const auto html = sm::render_retention_table(retention_with_tar(
+TEST_CASE("Echo tier table escapes the source name", "[settings][settings_model][retention][echo]") {
+    const auto html = sm::render_retention_table(retention_with_echo(
         nlohmann::json::array({tier("<img src=x onerror=alert(1)>&\"'", "hourly", "seconds", 86400, 82800)}),
         nullptr));
     CHECK(has(html, "&lt;img src=x onerror=alert(1)&gt;&amp;&quot;"));
@@ -549,8 +549,8 @@ TEST_CASE("TAR tier table escapes the source name", "[settings][settings_model][
     CHECK_FALSE(has(html, "every "));
 }
 
-TEST_CASE("TAR tier table tolerates unknown and malformed tiers",
-          "[settings][settings_model][retention][tar]") {
+TEST_CASE("Echo tier table tolerates unknown and malformed tiers",
+          "[settings][settings_model][retention][echo]") {
     auto tiers = nlohmann::json::array({
         tier("X", "live", "rows", 10),
         tier("Y", "weekly", "seconds", 86400),
@@ -560,8 +560,8 @@ TEST_CASE("TAR tier table tolerates unknown and malformed tiers",
         tier("Y", "boot", "rows", 1),
     });
     std::string html;
-    REQUIRE_NOTHROW(html = sm::render_retention_table(retention_with_tar(tiers)));
-    // header row + X + Y in the TAR table, after the three-row table's own four
+    REQUIRE_NOTHROW(html = sm::render_retention_table(retention_with_echo(tiers)));
+    // header row + X + Y in the Echo table, after the three-row table's own four
     const auto tbody = html.substr(html.find("<caption"));
     CHECK(count_sub(tbody, "<tr>") == 3);
     CHECK_FALSE(has(tbody, ">Z<"));
@@ -569,9 +569,9 @@ TEST_CASE("TAR tier table tolerates unknown and malformed tiers",
     CHECK(count_sub(tbody, "<td class=\"mono\">") == 2);
 }
 
-TEST_CASE("TAR look-again reads guaranteed depth not the limit",
-          "[settings][settings_model][retention][tar]") {
-    const auto html = sm::render_retention_table(retention_with_tar(nlohmann::json::array({
+TEST_CASE("Echo look-again reads guaranteed depth not the limit",
+          "[settings][settings_model][retention][echo]") {
+    const auto html = sm::render_retention_table(retention_with_echo(nlohmann::json::array({
         tier("A", "monthly", "seconds", 31536000, 28857600),
         tier("B", "live", "rows", 100),
         tier("C", "live", "rows", 100),
@@ -592,9 +592,9 @@ TEST_CASE("TAR look-again reads guaranteed depth not the limit",
     CHECK_FALSE(has(row, "<td class=\"look\">30 days</td>"));
 }
 
-TEST_CASE("TAR hint copy renders the supplied tick and each fixed clause",
-          "[settings][settings_model][retention][tar]") {
-    const auto html = sm::render_retention_table(retention_with_tar(
+TEST_CASE("Echo hint copy renders the supplied tick and each fixed clause",
+          "[settings][settings_model][retention][echo]") {
+    const auto html = sm::render_retention_table(retention_with_echo(
         nlohmann::json::array({tier("A", "hourly", "seconds", 86400, 82800)}), 123));
     const auto t = html.substr(html.find("<caption"));
     CHECK(has(t, "pruned every 123 s"));
@@ -604,9 +604,9 @@ TEST_CASE("TAR hint copy renders the supplied tick and each fixed clause",
         CHECK(has(t, n));
 }
 
-TEST_CASE("TAR tier css block is tokens only", "[settings][settings_model][retention][tar][css]") {
+TEST_CASE("Echo tier css block is tokens only", "[settings][settings_model][retention][echo][css]") {
     const std::string& css = kYuzuCss;
-    const std::string marker = "/* -- Settings > Data: TAR retention tiers";
+    const std::string marker = "/* -- Settings > Data: Echo retention tiers";
     const auto start = css.find(marker);
     REQUIRE(start != std::string::npos);
     CHECK(count_sub(css, marker) == 1);
@@ -614,7 +614,7 @@ TEST_CASE("TAR tier css block is tokens only", "[settings][settings_model][reten
     const std::string block = css.substr(start, end == std::string::npos ? std::string::npos : end - start);
     for (const char* banned : {"#", "gradient", "url(", "@import"})
         CHECK_FALSE(has(block.substr(block.find('\n')), banned));
-    CHECK(has(block, ".tar-tiers caption"));
+    CHECK(has(block, ".echo-tiers caption"));
     CHECK(has(block, "var(--ink)"));
 }
 

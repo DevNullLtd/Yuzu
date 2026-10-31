@@ -116,7 +116,7 @@ AppUsageParse parse_app_usage_last_used_output(const std::string& captured) {
 
         if (kind == "constrained") {
             // A legitimate "nothing to say this cycle" (usage disabled, older
-            // TAR schema, tar.db unavailable) — never treated as a zero-row
+            // Echo schema, echo.db unavailable) — never treated as a zero-row
             // replace (see the header). Stop parsing; the caller skips.
             out.constrained = true;
             return out;

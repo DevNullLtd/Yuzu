@@ -1,0 +1,48 @@
+# Resource Ledger -- the Echo registry capture source (key watch, baseline diff, store, status)
+
+Range described: `a5054012d..c94fc8fcd` (branch `feat/tar-registry-live-watch`). Symbols are cited by file and function; the tree is C++23 and every line moves with an edit. This ledger REPLACES the Gate 1 text, which claimed "no shared handle wrapper exists": that was wrong (finding `gov1-B1`), and the figures below are the corrected ones, read against `agents/plugins/echo/src/echo_registry_source.cpp` at `c94fc8fcd`.
+
+## Summary
+
+The source owns three kinds of resource: registry key handles (`HKEY`), Windows event handles, and one watcher `std::thread`. Every one is held by an RAII owner from the moment it is acquired; there is no manual `CloseHandle`, `RegCloseKey` or `join` call outside an owner's destructor or `WinWatcher::shutdown()`. The watcher thread is joined in `shutdown()`, which the destructor calls, and the whole thread body and `watch()` are contained by `try/catch(...)` so an exception cannot reach `std::terminate`. There is no subprocess, no stored callback, and no temp file in production code. Tests create temp files and registry keys only under salted, prefixed names and remove them through RAII owners.
+
+## Table 1 -- owned resources
+
+| # | Resource | Owner | Copy / move | Acquired | Released | Early returns / failure |
+|---|---|---|---|---|---|---|
+| 1 | an open registry key `HKEY` (every key the reader and the watcher hold) | `yuzu::win::RegKey` (`agents/shared/win_reg_handle.hpp`): the reader's `child` key per subkey in `read_key`, the root key in `read_root`, `WinWatcher::hku_key`, and `WinWatcher::Slot::key` | move-only | `RegOpenKeyExW` through `put()`; `open_root` and the child open both pass `REG_OPTION_OPEN_LINK` (gov1-B5) | `~RegKey` (`RegCloseKey`), or `reset()`: `arm()` resets the slot key before reopening and again on a failed notify | a failed open leaves the owner empty; a predefined root (`HKEY_USERS`, `HKEY_LOCAL_MACHINE`, returned by `hive_of`) is a constant and is never wrapped or closed |
+| 2 | the event `HANDLE`s: `stop_event`, `hku_event` and each `Slot::event` | `yuzu::agent::detail::EventHandle` (`agents/core/src/guard_win_handle.hpp`, `ScopedWinHandle`; the echo plugin's include path already reaches `agents/core/src`) | move-only (a `Slot` move moves the owner; the old implicit move copied a raw `HANDLE`, gov1-B1) | `CreateEventW` in `WinWatcher::watch`; a null result leaves the owner empty | `shutdown()` clears `slots` (each slot's key closes first, then its event), then resets `hku_key`, `hku_event` and `stop_event`; the destructor calls `shutdown()` | if either control event is null, `can_watch` is false: no thread starts and every slot is unarmed (the gauge tells the truth); a throwing `slots.push_back` leaves the event in the local `Slot`, whose owner closes it |
+| 3 | the watcher thread | `WinWatcher::thread` (`std::thread`) | not copyable or movable as a member of a non-movable struct held by `shared_ptr` | `watch()` after `live = true` (set first so the thread re-arms under the same lock) | `shutdown()` sets `stop_event`, joins if joinable, then clears `live`; the destructor calls it. A `live` flag plus `unarm_all()` (noexcept) make "armed" truthful | `run()` wraps `wait_loop()` in `try/catch(...)`; any non-stop exit (WAIT_FAILED or an exception) calls `unarm_all()`; a throwing `std::thread` constructor is caught in `watch()`, which calls `unarm_all()`; `rearm()` refuses when not live. There is no restart after a contained exception (follow-up `gov2-UP-5`) |
+| 4 | shared watcher state | `std::mutex mu` in `WinWatcher`, guarding `slots` (key and `armed`) and `live` between the thread and the collect tick | not copyable | member | member | `unarm_all()` is noexcept: a failed lock terminates explicitly rather than implicitly in its callers (the comment records the reasoning) |
+| 5 | the dirty table | `std::shared_ptr<RegistryDirtyTable>` created in `make_windows_registry_reader`; held by `RegistryReader::dirty` and by `WinWatcher::dirty`; captured by the reader lambdas | shared ownership, last owner frees | `std::make_shared` | when the cursor source and the watcher are both destroyed | the table is internally locked; the watcher thread is joined before the watcher is destroyed, so the thread never outlives the table |
+| 6 | the watcher itself | `std::shared_ptr<WinWatcher>` captured by the `watch_roots`, `root_armed`, `rearm` and `stop` lambdas of `RegistryReader` | shared ownership | `std::make_shared` in `make_windows_registry_reader` | last lambda destroyed; `RegistryReader::stop` calls `shutdown()` explicitly at `RegistryCursorSource::stop()` | `~WinWatcher` calls `shutdown()` again, which is idempotent |
+| 7 | read buffers | `ReadCtx`: `std::vector<BYTE> data` (at least one byte, bounded at 4 MiB) and `std::vector<wchar_t> name` (16383 + 1, allocated once per root); `std::vector<wchar_t> sub` per key | local value members | per root and per key | scope exit | a null data buffer is impossible by construction (gov1-B2); `SUCCESS` with `dlen` above the buffer is truncation; an over-long name marks the read Capped (gov1-B3) |
+| 8 | sqlite statements for the registry store | `StmtPtr` (RAII over `sqlite3_stmt*`) in `EchoDatabase::insert_registry_events_and_cursor` (`registry_live` insert and the duplicate-check select), inside `insert_events_and_cursor_locked`, which runs under `EchoDatabase::mu_` and one transaction | move-only | `sqlite3_prepare_v2`, wrapped in `StmtPtr` on the next line | scope exit, including every early `return false` | a failed prepare returns before any owner exists; a rolled-back transaction leaves no row |
+| 9 | the registry purge | `EchoDatabase::purge_source("registry")`: deletes `registry_live`, then the `echo_cursor` row and the `echo_state` rows `registry:%` in the SAME transaction | none | `BEGIN`/`COMMIT` in the existing purge | `COMMIT`; every failing `sqlite3_exec` rolls back and returns the error | a purge never leaves baselines behind; the next collect after a purge is a fresh Baseline |
+| 10 | the per-root persisted state | cursor JSON row (`echo_cursor`) and baseline rows `echo_state` `registry:<root>`, written by the cursor driver | database rows | each tick that changes a root | the retention sweep (500000 rows for `registry_live`) and the purge above | a Capped or Unreadable read keeps the previous baseline; the stored denied-child set is clamped to `kSkippedCap` (32) after any union (adv2-K1) |
+| 11 | test-only: scratch registry keys and the symbolic-link key | `TestKey` (RAII over a salted `yuzu_test_reg_<pid>_<tick>` HKLM key, `RegDeleteTreeW` on scope exit) and `LinkKey` (RAII over a symbolic-link key, opened with `REG_OPTION_OPEN_LINK\|DELETE` and removed with `NtDeleteKey` resolved by `GetProcAddress`; idempotent, the destructor calls `remove()`) | `LinkKey` copy deleted | the live `[registry][windows]` cases | scope exit, a red `REQUIRE` included | the pre-fix defect (a link key stranded in HKLM, finding `cr2-W1`) is closed; the Windows leftover check reads 0 |
+| 12 | test-only: the on-disk `EchoDatabase` | `yuzu::test::unique_temp_path("yuzu_test_echo_registry_")` (the `yuzu_test_` prefix is the Defender-exclusion convention) | n/a | per test | the test removes it | none |
+
+## Table 2 -- borrowed state
+
+| Holder | Borrows | Lifetime |
+|---|---|---|
+| `WinWatcher::run()` / `wait_loop()` (watcher thread) | `this`, the `slots` vector, the two control events, the dirty table | the thread is joined in `shutdown()` before any of them is destroyed; reads of `slots` happen under `mu` |
+| the `HANDLE` vector built in `wait_loop()` | raw `HANDLE`s from the owners in rows 1-2 | rebuilt under `mu`; the owners outlive the wait because `shutdown()` joins first |
+| `RegistryCursorSource` | the `RegistryReader` it was constructed with (value copy of the lambdas, which hold the shared owners in rows 5-6) | the source's lifetime; `stop()` calls `reader.stop` |
+| reader lambdas | `std::shared_ptr` captures only, no references and no `this` | owned by the lambda |
+| `registry_gap_row` / `denied_children_detail` | the denied path strings by value | the call |
+
+## Items checked and not applicable
+
+- **Subprocess:** none. No `CreateProcess`, `popen` or `system` in the source, the parsers or the store changes.
+- **Stored callbacks:** none held beyond the `RegistryReader` hooks, which are `std::function` values owned by the cursor source and capture shared owners by value.
+- **Temp paths in production code:** none. Temp files exist only in tests (row 12).
+- **Ownership-type changes:** none to existing types; `EventHandle` is reused, not mirrored.
+- **Timeout and bound derivations:** every registry read carries the existing per-tick `RegistryReadBudget` and a deadline (a root skipped for the deadline keeps its status, finding `cr2-K-F1`); caps are 20k keys / 50k values per read, 62 watch handles, `kSkippedCap` 32, 4 MiB per value, 500000 `registry_live` rows. The watcher wait has no timeout by design (it waits on the stop event); `shutdown()` sets the event, so the join is bounded by one wake-up.
+
+## Accepted residuals
+
+- **Windows-only reader below the test seam.** The enumeration guards (gov1-B2, gov1-B3, gov2-UP-2) and the watcher containment (gov1-M1) are covered by compile plus the live cases; no fault seam exists (follow-ups `cr2-K-F2`, `cr2-K-F3`). The `c94fc8fcd` Windows re-run is pending at the time of writing.
+- **gov1-B5 is fixed regardless of an unrun probe.** `REG_OPTION_OPEN_LINK` is defence in depth; the Windows probe of a user-planted HKU-to-HKLM link was not run.
+- **Unmasked values** are the owner's ruling and are stated plainly in the shipped manual.

@@ -510,7 +510,7 @@ place, **Hardware** and **Software**, each its own page:
 
 - **`/hardware`** — a ServiceNow-style Configuration-Item list and record; the successor
   to the old **Devices** tab, extended with a generic action runner. The list shows
-  hostname, **IP** (new — read live from the TAR fleet-snapshot cache, so it is honestly
+  hostname, **IP** (new — read live from the Echo fleet-snapshot cache, so it is honestly
   blank once a device goes offline rather than a stale last-known address), OS,
   online/offline/**stale** status, per-page **DEX score**, agent version, last-seen,
   **Tags** (new — click a chip to filter by that exact `key` or `key=value`, or type
@@ -942,6 +942,16 @@ ingest is failing. Four further series sharpen the picture:
   `YuzuGenericInventoryPersistenceDropped` warns only after a non-`stale` reason's rate
   remains non-zero for 15 minutes, avoiding alerts for a single self-healing report or
   expected clock-step stale suppression.
+- `yuzu_inventory_typed_purge_rows_total` (counter) — stray typed-source rows removed from the
+  generic store by the background boot purge. Present at 0 on every boot; it rises only after
+  an upgrade or rollback that left such rows. The pass runs once per boot and then stops, so a
+  flat counter after the first minutes is normal.
+- `yuzu_inventory_typed_purge_failures_total` (counter) — background purge passes that gave up after a failed
+  batch (closed store, pool timeout, SQL error, 20 s statement timeout) through its retries with backoff
+  at smaller batch sizes, or because typed rows stayed locked by another session across the retries
+  (that path retries without halving). The pass is not retried until the next boot; **a restart re-runs it**, which is the remediation once the database is healthy;
+  stray rows stay unreadable meanwhile. Any non-zero value after a boot is worth a look at the
+  Postgres pool, not a page. Readiness does not depend on the pass.
 - `yuzu_inventory_query_truncated_total` (counter) — generic-store reads that hit their
   row cap or 8 MiB aggregate payload cap. A non-zero rate on the result-set
   producer path pairs with 503s from
@@ -1108,8 +1118,8 @@ columns, fields, and audit/degrade posture.
 ## App usage inventory (`app_usage`)
 
 A further daily-sync source, **`app_usage`**, is live on the agent and server. It
-derives machine-scope executable usage evidence read-only from TAR's `usage` fold
-(`usage_daily`/`usage_daily_user`/`usage_live` inside `tar.db`) and persists it in
+derives machine-scope executable usage evidence read-only from Echo's `usage` fold
+(`usage_daily`/`usage_daily_user`/`usage_live` inside `echo.db`) and persists it in
 the typed Postgres schema **`app_usage_store`**: per-executable run counts, total
 seconds, first/last-seen, and a distinct-user count over a 30-day sliding window.
 

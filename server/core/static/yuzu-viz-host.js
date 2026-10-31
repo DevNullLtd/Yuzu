@@ -184,9 +184,9 @@ function renderGraph(machine) {
     style: graphStyle(),
   });
 
-  // Slice 4: tap a process node → broadcast the pid so the TAR tree
+  // Slice 4: tap a process node → broadcast the pid so the Echo tree
   // pane below can scroll-into-view + highlight the matching <details>.
-  // One-way: IPC graph → TAR tree. Reverse direction is post-v1.
+  // One-way: IPC graph → Echo tree. Reverse direction is post-v1.
   _cy.on("tap", 'node[kind = "process"]', (evt) => {
     const pid = evt.target.data("pid");
     if (pid == null) return;

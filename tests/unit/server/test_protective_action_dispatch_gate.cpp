@@ -3,7 +3,7 @@
  * quarantine plugin's four actions plus `__guard__.push_rules`) are never
  * refused by plugin enablement. Mirrors test_os_kill_switch_dispatch_gate.cpp:
  * every gate is bound with a real `AgentRegistry` and the exact send set
- * (`drain_gateway_pending`), with `tar.sql` as the control that is still
+ * (`drain_gateway_pending`), with `echo.sql` as the control that is still
  * refused at every gate. Presence is an injected stub — no Postgres, no I/O.
  */
 
@@ -65,8 +65,8 @@ constexpr CommandCapability protective_cap(std::string_view plugin, std::string_
     };
 }
 
-constexpr CommandCapability kTarSql{
-    .plugin = "tar",
+constexpr CommandCapability kEchoSql{
+    .plugin = "echo",
     .action = "sql",
     .dispatch_class = DispatchClass::ReadOnly,
     .mutability = Mutability::None,
@@ -184,17 +184,17 @@ TEST_CASE("kill_switch_denial: a protective action is never refused and never co
     CHECK(finalize(guard, os_off.fn()).kill_switched_os().empty());
 }
 
-TEST_CASE("kill_switch_denial: control — tar.sql is still refused / still carries its OS set",
+TEST_CASE("kill_switch_denial: control — echo.sql is still refused / still carries its OS set",
           "[server][dispatch][protective][security]") {
     CountingSwitch off{std::nullopt};
-    const auto r = yuzu::server::detail::kill_switch_denial(kTarSql, off.fn());
+    const auto r = yuzu::server::detail::kill_switch_denial(kEchoSql, off.fn());
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().reason == yuzu::server::detail::DispatchDenialReason::KillSwitched);
     CHECK(r.error().securable == "Infrastructure");
     CHECK(*off.calls == 1);
 
     CountingSwitch os_off{IdSet{"windows"}};
-    CHECK(finalize(kTarSql, os_off.fn()).kill_switched_os() == IdSet{"windows"});
+    CHECK(finalize(kEchoSql, os_off.fn()).kill_switched_os() == IdSet{"windows"});
 }
 
 TEST_CASE("ids_missing_plugin: protective pairs are never reported missing",
@@ -209,11 +209,11 @@ TEST_CASE("ids_missing_plugin: protective pairs are never reported missing",
     CHECK_FALSE(registry.ids_missing_plugin("__guard__", "push_rules").contains("dev-A"));
 
     CHECK(registry.ids_missing_plugin("quarantine", "reapply").contains("dev-A"));
-    CHECK(registry.ids_missing_plugin("tar", "sql").contains("dev-A"));
+    CHECK(registry.ids_missing_plugin("echo", "sql").contains("dev-A"));
 }
 
 TEST_CASE("wire_and_dispatch_confined: protective dispatch reaches every target past an OS-off "
-          "row and a stale inventory and a >100k presence read; tar.sql does not",
+          "row and a stale inventory and a >100k presence read; echo.sql does not",
           "[server][dispatch][protective][security]") {
     EventBus bus;
     yuzu::MetricsRegistry metrics;
@@ -239,9 +239,9 @@ TEST_CASE("wire_and_dispatch_confined: protective dispatch reaches every target 
     }
     CHECK(*stub.calls == 0); // the presence reader is never invoked
 
-    // Control: tar.sql with the same registry / stub / OS-off fn is refused.
+    // Control: echo.sql with the same registry / stub / OS-off fn is refused.
     CountingSwitch os_off{IdSet{"windows"}};
-    const auto control = wire(registry, finalize(kTarSql, os_off.fn()), ids);
+    const auto control = wire(registry, finalize(kEchoSql, os_off.fn()), ids);
     CHECK(control.os_gate_unreadable);
     CHECK(control.sent == 0);
     CHECK(*stub.calls == 1);
@@ -261,9 +261,9 @@ TEST_CASE("wire_and_dispatch_confined: a degraded store never stops a protective
     CountingSwitch degraded{std::nullopt};
     const std::vector<std::string> ids{"dev-A", "dev-B"};
 
-    // tar.sql never reaches the wire.
+    // echo.sql never reaches the wire.
     CHECK_FALSE(yuzu::server::detail::finalize_classified_command(
-                    kTarSql, degraded.fn(), "tar", "sql", "protective-cmd", {}, {}, 0, 0, {}, {})
+                    kEchoSql, degraded.fn(), "echo", "sql", "protective-cmd", {}, {}, 0, 0, {}, {})
                     .has_value());
 
     for (const auto& [plugin, action] : kProtectiveWire) {
@@ -274,7 +274,7 @@ TEST_CASE("wire_and_dispatch_confined: a degraded store never stops a protective
     }
 }
 
-TEST_CASE("send_to: __guard__.push_rules reaches a device whose OS switch is off; tar.sql does not",
+TEST_CASE("send_to: __guard__.push_rules reaches a device whose OS switch is off; echo.sql does not",
           "[server][dispatch][protective][security][registry]") {
     EventBus bus;
     yuzu::MetricsRegistry metrics;
@@ -289,7 +289,7 @@ TEST_CASE("send_to: __guard__.push_rules reaches a device whose OS switch is off
     CHECK(registry.send_to_all(push) == 1);
     CHECK(drained(registry) == std::vector<std::string>{"dev-A"});
 
-    const auto control = finalize(kTarSql, os_off.fn());
+    const auto control = finalize(kEchoSql, os_off.fn());
     CHECK_FALSE(registry.send_to("dev-A", control));
     CHECK(drained(registry).empty());
 }
@@ -334,13 +334,13 @@ TEST_CASE("every other action is still refused at each gate (regression guard)",
 
     const std::vector<std::string> ids{"dev-A", "dev-B"};
     CountingSwitch os_off{IdSet{"windows"}};
-    const auto withheld = wire(registry, finalize(kTarSql, os_off.fn()), ids);
+    const auto withheld = wire(registry, finalize(kEchoSql, os_off.fn()), ids);
     CHECK(withheld.kill_switched_os == std::vector<std::string>{"dev-A"});
     CHECK(withheld.sent == 1);
     CHECK(drained(registry) == std::vector<std::string>{"dev-B"});
 
     CountingSwitch no_os{IdSet{}};
-    const auto absent = wire(registry, finalize(kTarSql, no_os.fn()), ids);
+    const auto absent = wire(registry, finalize(kEchoSql, no_os.fn()), ids);
     CHECK(absent.unknown_plugin == std::vector<std::string>{"dev-A"});
 }
 
@@ -397,7 +397,7 @@ TEST_CASE("kill_switch_row_covers_protective: labels rows that can never gate di
     // Everything else is an ordinary, effective row.
     CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"__guard__", "get_status", ""}));
     CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "", ""}));
-    CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"tar", "sql", ""}));
+    CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"echo", "sql", ""}));
 
     // The audit-evidence detail both write surfaces share (their only other
     // bindings are [pg]-tagged and SKIP without a DSN).
@@ -406,7 +406,7 @@ TEST_CASE("kill_switch_row_covers_protective: labels rows that can never gate di
           "enabled=false, protective_exempt=true");
     CHECK(kill_switch_set_detail(KillSwitchScope{"__guard__", "", "linux"}, true) ==
           "enabled=true, protective_exempt=true");
-    CHECK(kill_switch_set_detail(KillSwitchScope{"tar", "sql", ""}, false) == "enabled=false");
+    CHECK(kill_switch_set_detail(KillSwitchScope{"echo", "sql", ""}, false) == "enabled=false");
 }
 
 TEST_CASE("configure_presence: reconfiguring resets the cache age so the next read uses the "

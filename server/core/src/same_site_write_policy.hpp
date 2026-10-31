@@ -93,9 +93,9 @@ struct SameSiteDecision {
 /// decision below); only a cookie session is held to the rule.
 inline constexpr std::array<std::string_view, 10> kFetchMetadataGuardedPaths{
     "/fragments/device/live/run",
-    "/fragments/tar/process-tree/run",
-    "/fragments/tar/process-tree/device-net",
-    "/fragments/tar/capture-sources/load",
+    "/fragments/echo/process-tree/run",
+    "/fragments/echo/process-tree/device-net",
+    "/fragments/echo/capture-sources/load",
     "/fragments/dex/device/perf",
     "/fragments/dex/device/procperf",
     "/fragments/auto/deploy/result",
