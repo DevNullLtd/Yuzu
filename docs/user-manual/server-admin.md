@@ -678,9 +678,11 @@ posture — the routes never granted approval, they simply had no gate to enforc
 remains the primary, and for a plain (untiered) session the ONLY, gate — this is not a new RBAC
 securable and does not change who can reach their own result sets; see
 [rbac.md's "Not RBAC-gated: per-operator result sets"](rbac.md#not-rbac-gated-per-operator-result-sets).
-The still-open, separately-tracked [#4309](https://github.com/Tr3kkR/Yuzu/issues/4309) gap — a
-plain RBAC session or an API token minted with no `mcp_tier` skips this belt entirely, on every
-transport, including MCP itself — is unaffected by this change.
+A plain RBAC session or an API token minted with no `mcp_tier` skips this belt on REST and the
+dashboard fragments, because those routes only apply it to a caller that carries a tier. The
+[#4309](https://github.com/Tr3kkR/Yuzu/issues/4309) gap on MCP itself is closed: `/mcp/v1/`
+refuses any credential with no MCP tier, so a plain session or an untiered token no longer
+reaches an MCP tool at all.
 
 **Who this affects.** Any integration that mints MCP-tiered bearer tokens (readonly/operator/
 supervised) and calls the JSON `/api/v1/result-sets*` routes or the dashboard fragments directly,

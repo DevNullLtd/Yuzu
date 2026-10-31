@@ -883,9 +883,33 @@ by each handler.
   plus a separate list of tools added after it (today two), legal only for a tool
   whose REST twin is `kRequired`, which a compile-time check ties to the REST
   table. Every pending tool with a `kRequired` twin is pending because no MCP
-  consumer enforces `kRequired` yet. PR 2 promotes pending rows; an MCP `kRequired` row will need a
-  design for the approval primitive first, because `decide_step_up` passes
-  an `mcp_token` caller unconditionally.
+  consumer enforces `kRequired` yet. PR 2 promotes pending rows; how it resolves the MCP rows
+  (no MCP `kRequired` row, because `decide_step_up` passes an `mcp_token`
+  caller unconditionally) is the decision recorded in the next bullet.
+- **Decision for the MCP arm (#6306, recorded 2026-10-29 for #6305 PR 2; a
+  decision record, no code change).** The MCP arm of this chokepoint is not
+  MFA step-up. An MCP caller presents a bearer credential with no browser
+  session and no factor proof, and `decide_step_up` passes `api_token` and
+  `mcp_token` sessions and denies engine principals, so a step-up proof is
+  never asked of an MCP caller. The controls for an MCP caller are the token
+  tier (`tier_allows`, evaluated before RBAC) and the one core-owned approval
+  primitive (`requires_approval` into the `ApprovalManager`
+  ticket-then-recall, decided by a person on an interactive session under
+  #6061/#6079; see "Approver assurance"). #4309 makes the tier total:
+  `/mcp/v1/` refuses every credential whose MCP tier is empty, so no cookie
+  session and no tierless token reaches a tool (`docs/mcp-server.md`,
+  "Admission: an MCP tier is required"). The table shape is unchanged:
+  `kMcpStepUpPolicy` stays data. PR 2 of #6305 resolves each pending row
+  whose REST twin is `kRequired` in one of two ways: (a) its
+  `(securable, operation)` pair is in `requires_approval`'s supervised list,
+  and the row is classified with a new MCP-only class (working name
+  `kApprovalGated`) whose compile-time check proves the pair is
+  approval-gated; or (b) the pair is not approval-gated, which is a
+  per-tool security decision (add the pair to `requires_approval`, or record
+  a `kExempt` reason). `kRequired` never appears in the MCP table. The
+  second-list and consistency-test criterion is already met by
+  `step_up_mcp_policy.hpp` and its test. Engine principals are out of scope
+  of this decision.
 - **Metrics and alerts.**
   `yuzu_auth_mfa_step_up_gate_total{outcome,source,surface}` (96 series
   pre-seeded to 0), the gauge `yuzu_auth_mfa_step_up_window_seconds`, and the
@@ -992,7 +1016,7 @@ Consequences, each deliberate:
   and normally evaluates nothing again (it evaluates afresh when no pass was consumed, for example when the
   central check is switched off with `--mfa-step-up-window-secs=0`), and then applies the approver rule on top.
 - **MCP can never approve.** The refusal is unconditional on the MCP transport, which runs no MFA step-up: the two MCP tools always
-  return the typed refusal, for a bearer token and for a cookie session that reaches `/mcp/v1/` alike. This is an exception recorded in ADR-1005's exception ledger (entry 2026-10-18, "human review
+  return the typed refusal, whatever tiered bearer token the caller used (a cookie session no longer reaches `/mcp/v1/` at all: it has no MCP tier and is refused at admission, #4309). This is an exception recorded in ADR-1005's exception ledger (entry 2026-10-18, "human review
   is a human-session act"; legacy REST rows `exception:#6061 revisit:2027-01-18`). The tools remain registered; listing pending approvals via MCP is unchanged. The MCP
   tier/permission mapping for both tools is `Approval:Approve` (it was mapped as `Approval:Write`;
   #3151).
