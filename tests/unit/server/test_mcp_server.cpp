@@ -1029,6 +1029,11 @@ struct McpTestServer {
     /// `execution_tracker_for_test`, exactly as production binds them.
     yuzu::server::ExecutionMutationPorts execution_mutation_ports_for_test{};
 
+    /// #2146: the platform event emitter for cancel_execution / record_execution_rerun /
+    /// execute_instruction_definition (the legacy routes' events). Unwired (the default) = no
+    /// event.
+    yuzu::server::EmitEventFn emit_event_fn_for_test{};
+
     /// #4030 Gate 8 fix: optionally wire a real WorkflowEngine so
     /// list_workflows/get_workflow/get_workflow_execution can be exercised
     /// end-to-end -- until this fix, no MCP test wired one at all (every
@@ -1774,6 +1779,7 @@ private:
         // the new fail-closed-when-unwired gate.
         mcp.set_authorize_dispatch_fn(authorize_dispatch_fn_for_test);
         mcp.set_instruction_execute_ports(instr_exec_ports_for_test);
+        mcp.set_emit_event_fn(emit_event_fn_for_test);
 
         // M5 remediation: the plugin-config/upload-grant stores ALSO ride
         // setters, same pattern as the two above — wire before the handlers
@@ -44068,6 +44074,92 @@ TEST_CASE("MCP cancel_execution: unconfined caller cancels; evidence first; noth
     CHECK(ts.audit_log.back() == "mcp.cancel_execution|success");
 }
 
+namespace {
+/// Collects the events the MCP tools publish (the legacy routes' events), via the server's
+/// EmitEventFn seam.
+struct McpEmitted {
+    struct Ev {
+        std::string type;
+        nlohmann::json attrs, payload;
+    };
+    std::vector<Ev> events;
+    bool throws{false};
+    yuzu::server::EmitEventFn fn() {
+        return [this](const std::string& type, const httplib::Request&, const nlohmann::json& attrs,
+                      const nlohmann::json& payload) {
+            events.push_back({type, attrs, payload});
+            if (throws)
+                throw std::runtime_error("analytics sink blew up");
+        };
+    }
+};
+} // namespace
+
+TEST_CASE("MCP cancel_execution / record_execution_rerun: each publishes its legacy event once on "
+          "success and none on a refusal",
+          "[mcp][execution][mutation][events][2146]") {
+    SECTION("cancel -> execution.completed, as the REST twin and the legacy route") {
+        McpExecFake fs;
+        fs.exec = mcp_exec("alice", 1);
+        McpEmitted em;
+        McpTestServer ts;
+        ts.execution_mutation_ports_for_test = fs.ports();
+        ts.emit_event_fn_for_test = em.fn();
+        ts.start("operator");
+        auto res = exec_tool_call(ts, "cancel_execution", R"({"execution_id":"exec-1"})");
+        REQUIRE(res);
+        REQUIRE(em.events.size() == 1);
+        CHECK(em.events[0].type == "execution.completed");
+        CHECK(em.events[0].attrs == nlohmann::json{{"status", "cancelled"}});
+        CHECK(em.events[0].payload == nlohmann::json{{"execution_id", "exec-1"}});
+    }
+    SECTION("rerun -> execution.created naming the new id and the parent") {
+        McpExecFake fs;
+        fs.exec = mcp_exec("alice", 1);
+        McpEmitted em;
+        McpTestServer ts;
+        ts.execution_mutation_ports_for_test = fs.ports();
+        ts.emit_event_fn_for_test = em.fn();
+        ts.start("operator");
+        auto res = exec_tool_call(ts, "record_execution_rerun", R"({"execution_id":"exec-1"})");
+        REQUIRE(res);
+        REQUIRE(em.events.size() == 1);
+        CHECK(em.events[0].type == "execution.created");
+        CHECK(em.events[0].attrs.is_null());
+        CHECK(em.events[0].payload == nlohmann::json{{"execution_id", "rerun-new-1"},
+                                                     {"parent_id", "exec-1"},
+                                                     {"trigger", "rerun"}});
+    }
+    for (const char* tool : {"cancel_execution", "record_execution_rerun"}) {
+        SECTION(std::string(tool) + ": unknown id publishes nothing") {
+            McpExecFake fs; // no execution
+            McpEmitted em;
+            McpTestServer ts;
+            ts.execution_mutation_ports_for_test = fs.ports();
+            ts.emit_event_fn_for_test = em.fn();
+            ts.start("operator");
+            auto res = exec_tool_call(ts, tool, R"({"execution_id":"exec-1"})");
+            REQUIRE(res);
+            CHECK(fs.effects() == 0);
+            CHECK(em.events.empty());
+        }
+        SECTION(std::string(tool) + ": a throwing emitter does not fail the call") {
+            McpExecFake fs;
+            fs.exec = mcp_exec("alice", 1);
+            McpEmitted em;
+            em.throws = true;
+            McpTestServer ts;
+            ts.execution_mutation_ports_for_test = fs.ports();
+            ts.emit_event_fn_for_test = em.fn();
+            ts.start("operator");
+            auto res = exec_tool_call(ts, tool, R"({"execution_id":"exec-1"})");
+            REQUIRE(res);
+            CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+            CHECK(em.events.size() == 1);
+        }
+    }
+}
+
 TEST_CASE("MCP cancel_execution: at the SUPERVISED tier it needs no approval ticket (risk-reducing, "
           "owner ruling 2026-10-30); record_execution_rerun still does",
           "[mcp][execution][mutation][approval][2146]") {
@@ -44587,6 +44679,68 @@ TEST_CASE("MCP execute_instruction_definition: the per-principal pending cap ref
     REQUIRE(ok);
     CHECK_FALSE(nlohmann::json::parse(ok->body).contains("error"));
     CHECK(rig.approvals.size() == 1);
+}
+
+TEST_CASE("MCP execute_instruction_definition: publishes instruction.executed on a dispatch and "
+          "approval.created on a pending approval, exactly once each, and nothing on a refusal",
+          "[mcp][integration][execute][idef][events]") {
+    SECTION("a dispatch -> instruction.executed with null attrs and payload (the legacy shape)") {
+        McpTestServer ts;
+        Rig rig;
+        McpEmitted em;
+        ts.emit_event_fn_for_test = em.fn();
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+        idef_start(ts, rig, "operator");
+        auto res = ts.call(idef_call({{"definition_id", "d"}}));
+        REQUIRE(res);
+        REQUIRE(rig.calls.size() == 1);
+        REQUIRE(em.events.size() == 1);
+        CHECK(em.events[0].type == "instruction.executed");
+        CHECK(em.events[0].attrs.is_null());
+        CHECK(em.events[0].payload.is_null());
+    }
+    SECTION("a pending approval -> approval.created, no instruction.executed") {
+        McpTestServer ts;
+        Rig rig;
+        McpEmitted em;
+        ts.emit_event_fn_for_test = em.fn();
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "always");
+        idef_start(ts, rig, "operator");
+        auto res = ts.call(idef_call({{"definition_id", "d"}}));
+        REQUIRE(res);
+        CHECK(rig.approvals.size() == 1);
+        CHECK(rig.calls.empty());
+        REQUIRE(em.events.size() == 1);
+        CHECK(em.events[0].type == "approval.created");
+    }
+    SECTION("refusals publish nothing: not found, cap reached, zero reach") {
+        McpTestServer ts;
+        Rig rig;
+        McpEmitted em;
+        ts.emit_event_fn_for_test = em.fn();
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "always");
+        rig.defs["z"] = yuzu::test::instr_exec::make_def("z");
+        idef_start(ts, rig, "operator");
+        (void)ts.call(idef_call({{"definition_id", "missing"}}));
+        rig.pending_for = yuzu::server::instruction_execute::kSubmitterPendingCap;
+        (void)ts.call(idef_call({{"definition_id", "d"}}, 2));
+        CHECK(rig.approvals.empty());
+        CHECK(em.events.empty());
+    }
+    SECTION("a throwing emitter does not fail the call") {
+        McpTestServer ts;
+        Rig rig;
+        McpEmitted em;
+        em.throws = true;
+        ts.emit_event_fn_for_test = em.fn();
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+        idef_start(ts, rig, "operator");
+        auto res = ts.call(idef_call({{"definition_id", "d"}}));
+        REQUIRE(res);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+        CHECK(rig.calls.size() == 1);
+        CHECK(em.events.size() == 1);
+    }
 }
 
 TEST_CASE("MCP execute_instruction_definition: params that violate the stored schema dispatch "

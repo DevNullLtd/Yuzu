@@ -3861,6 +3861,9 @@ void RestApiV1::register_routes(
     ExecutionMutationPorts execution_mutation_ports =
         execution_mutation_ports_.wired() ? execution_mutation_ports_
                                           : make_tracker_mutation_ports(execution_tracker);
+    // The legacy cancel/rerun events (execution.completed / execution.created), via the shared
+    // sequence; see set_emit_event_fn.
+    EmitEventFn emit_event_fn = emit_event_fn_;
 
     // #1788: resolve the caller's confinement set on a route whose PRIMARY
     // authorization is the per-target `scoped_perm_fn` gate — the Echo retention
@@ -12879,8 +12882,9 @@ void RestApiV1::register_routes(
     // all deliberate: an unresolved principal is refused (the legacy handlers fall back to
     // the user "unknown"), an `attempted` audit row is written BEFORE the effect and a
     // failed write refuses it (503 + Sec-Audit-Failed), the rerun input is the boolean
-    // `failed_only` (not scope="failed_only"), and no webhook event is emitted (the legacy
-    // routes emit execution.created / execution.completed; this function has no emit hook).
+    // `failed_only` (not scope="failed_only"). The events match the legacy routes: the shared
+    // sequence publishes execution.completed (cancel) / execution.created (rerun) through its
+    // optional hook, once, on success only (event_emit.hpp; set_emit_event_fn).
     //
     // step_up_policy.hpp classifies both routes (cancel kStopsEffect, rerun
     // kExecutionDispatch); body_cap_policy.hpp's catch-all caps the rerun body.
@@ -12981,8 +12985,9 @@ void RestApiV1::register_routes(
 
     sink.Post(
         R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/cancel)",
-        [perm_fn, fleet_read_fn, auth_fn, audit_fn, execution_mutation_ports,
-         finish_execution_mutation](const httplib::Request& req, httplib::Response& res) {
+        [perm_fn, fleet_read_fn, auth_fn, audit_fn, execution_mutation_ports, emit_event_fn,
+         metrics_registry, finish_execution_mutation](const httplib::Request& req,
+                                                      httplib::Response& res) {
             if (!perm_fn(req, res, "Execution", "Execute"))
                 return;
             const auto cid = detail::ensure_correlation_id(res);
@@ -13021,14 +13026,16 @@ void RestApiV1::register_routes(
                     // An unwired audit_fn is an audit-off deployment, not a failed write.
                     return !audit_fn ||
                            audit_fn(req, action, result, "execution", target, audit_detail);
-                });
+                },
+                bind_event_emit(emit_event_fn, req, metrics_registry));
             finish_execution_mutation(res, mreq.what, mreq, outcome);
         });
 
     sink.Post(
         R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/rerun)",
-        [perm_fn, fleet_read_fn, auth_fn, audit_fn, execution_mutation_ports,
-         finish_execution_mutation](const httplib::Request& req, httplib::Response& res) {
+        [perm_fn, fleet_read_fn, auth_fn, audit_fn, execution_mutation_ports, emit_event_fn,
+         metrics_registry, finish_execution_mutation](const httplib::Request& req,
+                                                      httplib::Response& res) {
             if (!perm_fn(req, res, "Execution", "Execute"))
                 return;
             const auto cid = detail::ensure_correlation_id(res);
@@ -13100,7 +13107,8 @@ void RestApiV1::register_routes(
                     // An unwired audit_fn is an audit-off deployment, not a failed write.
                     return !audit_fn ||
                            audit_fn(req, action, result, "execution", target, audit_detail);
-                });
+                },
+                bind_event_emit(emit_event_fn, req, metrics_registry));
             finish_execution_mutation(res, mreq.what, mreq, outcome);
         });
 

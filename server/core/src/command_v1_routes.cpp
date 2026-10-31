@@ -380,6 +380,14 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
         audit, req, res, "command.dispatch", "success", "command", outcome.command_id,
         what + " -> " + std::to_string(outcome.sent) + " agent(s) execution_id=" +
             audit_token(execution_id) + " correlation_id=" + cid);
+    // The legacy `POST /api/command` event, same attributes and payload (command_routes.cpp).
+    // Best effort, after the effect and its evidence row: it can never change the answer.
+    emit_event_guarded(bind_event_emit(d.emit_event_fn, req, d.metrics), "command.dispatched",
+                       nlohmann::json{{"target_count", outcome.sent}},
+                       nlohmann::json{{"plugin", plugin},
+                                      {"action", action},
+                                      {"command_id", outcome.command_id},
+                                      {"scope", scope}});
 
     nlohmann::json data{{"command_id", outcome.command_id},
                         {"execution_id", execution_id},

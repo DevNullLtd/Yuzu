@@ -46,6 +46,7 @@ struct Ctx {
     const Request& rq;
     const Ports& ports;
     const AuditHook& hook;
+    const EventEmitHook& emit;
     bool audit_dropped{false};
 
     void audit(std::string_view result, const std::string& detail) {
@@ -87,8 +88,9 @@ bool definition_needs_approval(std::string_view approval_mode, bool caller_is_ad
     return true;
 }
 
-PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& audit) {
-    Ctx c{rq, ports, audit};
+PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& audit,
+                       const EventEmitHook& emit) {
+    Ctx c{rq, ports, audit, emit};
 
     // 1. Definition lookup. A store fault is not "no such definition".
     if (!ports.lookup_definition) {
@@ -342,6 +344,7 @@ PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& a
         c.audit("pending", "approval_id=" + ::yuzu::log_token(*submitted) +
                                " mode=" + ::yuzu::log_token(def.approval_mode) +
                                " definition=" + def_token);
+        emit_event_guarded(c.emit, "approval.created"); // the legacy route's event
         return PrepareOutcome{PendingApproval{*submitted, def.approval_mode, rq.definition_id},
                               c.audit_dropped};
     }
@@ -530,6 +533,7 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
     c.audit("success", "command_id=" + ::yuzu::log_token(o.command_id) +
                            " execution_id=" + execution_id + " agents=" + std::to_string(o.sent) +
                            " definition=" + def_token);
+    emit_event_guarded(c.emit, "instruction.executed"); // the legacy route's event
     Dispatched d;
     d.command_id = o.command_id;
     d.execution_id = execution_id;
@@ -542,10 +546,11 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
 
 } // namespace
 
-Outcome run(const Request& rq, const Ports& ports, const AuditHook& audit) {
-    PrepareOutcome prep = prepare(rq, ports, audit);
+Outcome run(const Request& rq, const Ports& ports, const AuditHook& audit,
+            const EventEmitHook& emit) {
+    PrepareOutcome prep = prepare(rq, ports, audit, emit);
     if (auto* plan = std::get_if<Plan>(&prep.result)) {
-        Ctx c{rq, ports, audit};
+        Ctx c{rq, ports, audit, emit};
         c.audit_dropped = prep.audit_dropped;
         return dispatch_stage(c, std::move(*plan));
     }

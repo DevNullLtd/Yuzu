@@ -1,6 +1,7 @@
 #pragma once
 
 #include "authz_model.hpp"
+#include "event_emit.hpp"
 #include "execution_tracker.hpp"
 
 #include <expected>
@@ -49,6 +50,8 @@
 ///      may have landed. The effect has already happened by then, so a failed outcome row
 ///      does not undo it: it is reported as `audit_persisted=false` on an otherwise successful
 ///      outcome.
+///   6. on `kDone` only, the legacy-equivalent event (`execution.completed` for a cancel,
+///      `execution.created` for a rerun) through the optional `emit` hook; best effort.
 ///
 /// The ports below exist so this sequence is testable without Postgres; production binds them
 /// to the `ExecutionTracker` with `make_tracker_mutation_ports`.
@@ -126,9 +129,15 @@ using ExecutionMutationAuditFn = std::function<bool(const std::string& action,
                                                     const std::string& target_id,
                                                     const std::string& detail)>;
 
+/// `emit` (optional) publishes the event the LEGACY route of the same mutation publishes, once, on
+/// `kDone` only, after the outcome audit row (best effort: it can never change the outcome):
+///   - cancel -> `execution.completed`, attrs `{status:"cancelled"}`, payload `{execution_id}`
+///   - rerun  -> `execution.created`, attrs null, payload `{execution_id:<new>, parent_id:<old>,
+///     trigger:"rerun"}`
+/// A refusal, a denial, a store failure and an effect that threw emit nothing.
 [[nodiscard]] ExecutionMutationOutcome
 apply_execution_mutation(const ExecutionMutationPorts& ports, const ExecutionMutationRequest& req,
-                         const ExecutionMutationAuditFn& audit);
+                         const ExecutionMutationAuditFn& audit, const EventEmitHook& emit = {});
 
 /// The characters an execution id may contain on every surface (the REST route regex and the
 /// MCP schema both use this set), bounded at 128. Single definition so the two cannot drift.

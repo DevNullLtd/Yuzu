@@ -40,6 +40,7 @@
 #include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "network_perf_model.hpp"
+#include "event_emit.hpp"        // EmitEventFn: legacy-equivalent events for the execution twins
 #include "execution_mutation.hpp" // cancel_execution/record_execution_rerun test seam type
 #include "execution_tracker.hpp"
 #include "execution_statistics_model.hpp" // #2146 Batch B3: shared REST+MCP statistics builders
@@ -529,6 +530,13 @@ public:
     void set_execution_mutation_ports_for_test(ExecutionMutationPorts ports) {
         execution_mutation_ports_for_test_ = std::move(ports);
     }
+
+    /// The platform event emitter (`ServerImpl::emit_event`) for the tools whose LEGACY siblings
+    /// publish an event: cancel_execution -> `execution.completed`, record_execution_rerun ->
+    /// `execution.created`, execute_instruction_definition -> `approval.created` /
+    /// `instruction.executed`. Best effort, after the effect; unset = no event. MUST be called
+    /// before the server starts listening.
+    void set_emit_event_fn(EmitEventFn fn) { emit_event_fn_ = std::move(fn); }
 
     /// ADR-0031 operator surface (PR1.6c) — upload-grant store + the
     /// ADR-0017 list-admit resolver for list_upload_grants, backing
@@ -1338,6 +1346,7 @@ private:
     PluginConfigStore* plugin_config_store_{nullptr};
     config::Backing runtime_config_{};
     ExecutionMutationPorts execution_mutation_ports_for_test_{}; // see set_execution_mutation_ports_for_test
+    EmitEventFn emit_event_fn_;                                  // see set_emit_event_fn
     UploadGrantStore* upload_grant_store_{nullptr};
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.

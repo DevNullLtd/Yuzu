@@ -76,7 +76,8 @@ ExecutionMutationPorts make_tracker_mutation_ports(ExecutionTracker* tracker) {
 
 ExecutionMutationOutcome apply_execution_mutation(const ExecutionMutationPorts& ports,
                                                   const ExecutionMutationRequest& req,
-                                                  const ExecutionMutationAuditFn& audit) {
+                                                  const ExecutionMutationAuditFn& audit,
+                                                  const EventEmitHook& emit) {
     using Status = ExecutionMutationStatus;
     ExecutionMutationOutcome out;
     const char* const action = execution_mutation_audit_action(req.what);
@@ -180,6 +181,9 @@ ExecutionMutationOutcome apply_execution_mutation(const ExecutionMutationPorts& 
         }
         out.audit_persisted = write_audit(audit, action, "success", id, req.audit_context);
         out.status = Status::kDone;
+        // The legacy cancel route's event (execution_routes.cpp), after the evidence row.
+        emit_event_guarded(emit, "execution.completed", nlohmann::json{{"status", "cancelled"}},
+                           nlohmann::json{{"execution_id", id}});
         return out;
     }
 
@@ -229,6 +233,9 @@ ExecutionMutationOutcome apply_execution_mutation(const ExecutionMutationPorts& 
         with_context("rerun of " + safe_id + " failed_only=" + (req.failed_only ? "true" : "false"),
                      req.audit_context));
     out.status = Status::kDone;
+    // The legacy rerun route's event (execution_routes.cpp), after the evidence row.
+    emit_event_guarded(emit, "execution.created", nlohmann::json(),
+                       nlohmann::json{{"execution_id", *rerun}, {"parent_id", id}, {"trigger", "rerun"}});
     return out;
 }
 

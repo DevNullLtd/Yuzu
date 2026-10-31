@@ -1585,6 +1585,19 @@ public:
         for (const auto reason : yuzu::server::instruction_execute::kApprovalRefusedReasons)
             metrics_.counter(yuzu::server::instruction_execute::kApprovalRefusedMetric,
                              {{"reason", std::string(reason)}});
+        // Event emissions by the v1 / MCP twins that THREW (the request is unaffected). Closed
+        // `event` set, pre-seeded; the legacy emitters keep their own counters.
+        metrics_.describe(yuzu::server::kEventEmitFailedMetric,
+                          "Legacy-equivalent platform events (execution.created, "
+                          "execution.completed, command.dispatched, instruction.executed, "
+                          "approval.created) that the v1 REST and MCP twins tried to publish "
+                          "after a successful effect and that THREW. The request is unaffected "
+                          "(emission is best effort, after the effect); a non-zero rate points at "
+                          "the analytics event path, not at the caller.",
+                          "counter");
+        for (const auto event : yuzu::server::kEmittedEvents)
+            metrics_.counter(yuzu::server::kEventEmitFailedMetric,
+                             {{"event", std::string(event)}});
         // Wave 7 PR7.2: the Forensics single-target refusal — same routes as
         // its Destructive sibling above, since `evaluate_destructive_targeting`
         // is called generically for any classified capability on all of them
@@ -21599,6 +21612,8 @@ private:
         static_assert(std::is_same_v<RestApiV1::AuthorizeDispatchFn,
                                      mcp::McpServer::AuthorizeDispatchFn>,
                       "REST and MCP must take the identical authorize-dispatch callable type");
+        // Legacy-equivalent events for POST /api/v1/executions/{id}/cancel|rerun.
+        rest_api_v1_->set_emit_event_fn(emit_event_fn);
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)
@@ -22147,6 +22162,8 @@ private:
                                  return ok;
                              }},
                     .metrics = &metrics_,
+                    // The legacy /api/command's command.dispatched event.
+                    .emit_event_fn = emit_event_fn,
                 });
         }
 
@@ -22190,6 +22207,8 @@ private:
                     return derive_dispatch_caller(*s);
                 return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
             };
+            // The legacy route's approval.created / instruction.executed events.
+            instr_exec_deps.emit_event_fn = emit_event_fn;
             instr_exec_ports = yuzu::server::instruction_execute::make_ports(instr_exec_bindings);
             instr_exec_deps.ports = instr_exec_ports;
             HttplibRouteSink instr_exec_sink{*web_server_};
@@ -22297,6 +22316,9 @@ private:
             // #2146: execute_instruction_definition runs the SAME pipeline, over the SAME
             // bindings, as POST /api/v1/instructions/{id}/execute (instr_exec_ports above).
             mcp_server_->set_instruction_execute_ports(instr_exec_ports);
+            // Legacy-equivalent events for cancel_execution, record_execution_rerun and
+            // execute_instruction_definition (event_emit.hpp).
+            mcp_server_->set_emit_event_fn(emit_event_fn);
             // #3290 Phase 2 — the SAME fleet_read_fn lambda wired into the REST
             // registration's trailing fleet_read_fn param below, so the REST and MCP
             // query_installed_software twins cannot observe a different admit

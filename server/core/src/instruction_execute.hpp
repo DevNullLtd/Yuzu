@@ -60,6 +60,7 @@
 #include "dispatch_caller.hpp"
 #include "dispatch_confined_arms.hpp"    // ConfinedDispatchOutcome
 #include "dispatch_zero_reach.hpp"       // ZeroReachCause
+#include "event_emit.hpp"                // EventEmitHook
 #include "instruction_param_schema.hpp"  // instr::ParamValidatorCache
 #include "instruction_store.hpp"         // InstructionDefinition
 
@@ -272,10 +273,20 @@ struct PrepareOutcome {
 
 /// Steps 1-6. Writes an audit row only for a refusal or a pending approval. MCP calls this
 /// alone as its pre-mint probe, so a refused call mints no tier ticket.
-[[nodiscard]] PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& audit);
+///
+/// `emit` (optional, bound per request by the surface) publishes the events the LEGACY
+/// `POST /api/instructions/{id}/execute` publishes, so the twins match it: `approval.created`
+/// when this call created the pending approval (once, at the creation, so an MCP probe that
+/// answers `pending_approval` and a REST call emit exactly one each), and `instruction.executed`
+/// when a dispatch reached at least one agent. Both with null attributes and payload, as the
+/// legacy route does. A refusal, a zero-reach and a throwing dispatch emit nothing. Best effort,
+/// after the audit row; it can never change the outcome.
+[[nodiscard]] PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& audit,
+                                     const EventEmitHook& emit = {});
 
 /// Steps 1-9.
-[[nodiscard]] Outcome run(const Request& rq, const Ports& ports, const AuditHook& audit);
+[[nodiscard]] Outcome run(const Request& rq, const Ports& ports, const AuditHook& audit,
+                          const EventEmitHook& emit = {});
 
 /// The approval verdict for a definition, factored so tests pin the matrix without a store.
 /// `approval_mode` is the stored string; `caller_is_admin` is `principal_is_admin`.

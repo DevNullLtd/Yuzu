@@ -3700,6 +3700,8 @@ Omitting **both** `agent_ids` and `scope` targets every connected agent. Supplyi
 
 **Audit.** Action `instruction.execute`, target `instruction`/`{id}`: `denied` for a refusal, `pending` for a `202`, then `requested` written **before** dispatch, then `success` or `failure`. If the `requested` row cannot be stored the call is `503` `audit_unavailable` with `Sec-Audit-Failed: true` and **nothing is dispatched**. A later best-effort row that fails to store sets `Sec-Audit-Failed: true` on the response; the command already ran.
 
+**Events.** As the legacy route does, a dispatch that reached at least one agent publishes the platform event `instruction.executed`, and a call that creates a pending approval (the `202`) publishes `approval.created`, once each, after the audit row (no attributes or payload; see [analytics-events.md](../analytics-events.md)). A refusal, a zero-reach and a dispatch that threw publish nothing, and a failed publish never changes the answer.
+
 **Concurrency.** A definition whose `concurrency_mode` is `per-device` takes the per-device claim (ADR-1007) inside the dispatch, so a device already running it can be skipped.
 
 **`200` response** (dispatched):
@@ -6856,8 +6858,15 @@ An original that exists but cannot be read (store degraded, pool exhausted) answ
 legacy `POST /api/executions/{id}/rerun` still reads without that check and reports an unreadable
 original as `400 original execution not found`.)
 
-These routes do not emit the `execution.created` / `execution.completed` webhook events that the
-legacy routes emit.
+Like the legacy routes, a successful cancel publishes the platform event `execution.completed`
+(attributes `{status:"cancelled"}`, payload `{execution_id}`) and a successful rerun publishes
+`execution.created` (payload `{execution_id, parent_id, trigger:"rerun"}`), once each, after the
+`success` audit row. A refusal, a denial, a store failure and an effect that threw publish nothing,
+and a failure to publish never changes the answer (it is counted on
+`yuzu_server_event_emit_failed_total`). These are the analytics events documented in
+[analytics-events.md](../analytics-events.md); they are not the per-agent `execution.completed`
+webhook of the Webhooks section above, which fires from the agent response path for every
+execution regardless of route.
 
 #### `GET /api/v1/schedules`
 
@@ -11717,6 +11726,8 @@ with `Sec-Audit-Failed: true` and nothing is dispatched. An outcome row follows 
 `failure` with the reason); that row cannot undo a dispatch, so when it is lost the response
 carries `Sec-Audit-Failed: true` and the `requested` row remains the evidence. A refusal writes a
 `denied` row with `reason=`.
+
+**Event.** As `POST /api/command` does, a dispatch that reached at least one agent publishes the platform event `command.dispatched` (attributes `{target_count}`, payload `{plugin, action, command_id, scope}`; see [analytics-events.md](../analytics-events.md)) once, after the outcome row. A refusal, a zero-reach and a dispatch that threw publish nothing, and a failed publish never changes the answer (it is counted on `yuzu_server_event_emit_failed_total`).
 
 **Errors.** Every error is the A4 envelope with a machine-readable `error.reason`.
 

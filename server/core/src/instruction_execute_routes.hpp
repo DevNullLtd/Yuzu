@@ -63,6 +63,9 @@ struct RouteDeps {
     PermFn perm_fn;
     AuditFn audit_fn;
     CallerFn caller_fn;
+    /// `ServerImpl::emit_event`: publishes the legacy route's `approval.created` /
+    /// `instruction.executed` (see `prepare` in instruction_execute.hpp). Unset = no event.
+    EmitEventFn emit_event_fn;
     /// Everything impure (stores, dispatch, metrics); `audit` is bound per request below.
     Ports ports;
 };

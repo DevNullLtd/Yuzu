@@ -140,6 +140,28 @@ struct AuditRecorder {
     }
 };
 
+/// Records every event the sequence publishes, and where it fell relative to the audit rows.
+struct EmitRecorder {
+    struct Ev {
+        std::string type;
+        nlohmann::json attrs, payload;
+    };
+    FakeStore* store{nullptr};
+    std::vector<Ev> events;
+    bool throws{false};
+
+    EventEmitHook hook() {
+        return [this](std::string_view type, const nlohmann::json& attrs,
+                      const nlohmann::json& payload) {
+            events.push_back({std::string(type), attrs, payload});
+            if (store)
+                store->events.push_back("emit:" + std::string(type));
+            if (throws)
+                throw std::runtime_error("analytics sink blew up");
+        };
+    }
+};
+
 ExecutionMutationRequest req(ExecutionMutation what, const std::string& user,
                              authz::VisibleSet scope = std::nullopt) {
     ExecutionMutationRequest r;
@@ -505,6 +527,163 @@ TEST_CASE("is_valid_execution_id: the charset and bound both surfaces share",
     CHECK_FALSE(is_valid_execution_id("a=b"));
 }
 
+// ── the legacy-equivalent events (execution.completed / execution.created) ─────────────
+
+TEST_CASE("execution mutation: a successful cancel publishes the legacy execution.completed event "
+          "once, after the success row",
+          "[execution][mutation][events][2146]") {
+    FakeStore fs;
+    fs.exec = make_exec("alice", 1);
+    AuditRecorder audit{&fs};
+    EmitRecorder emit{&fs};
+    const auto out = apply_execution_mutation(fs.ports(), req(ExecutionMutation::kCancel, "bob"),
+                                              audit.fn(), emit.hook());
+    CHECK(out.status == S::kDone);
+    REQUIRE(emit.events.size() == 1);
+    CHECK(emit.events[0].type == "execution.completed");
+    // Exactly the legacy route's shape (execution_routes.cpp): attrs {status}, payload {execution_id}.
+    CHECK(emit.events[0].attrs == nlohmann::json{{"status", "cancelled"}});
+    CHECK(emit.events[0].payload == nlohmann::json{{"execution_id", "exec-1"}});
+    // Evidence first, then the effect, then the event.
+    const auto success = std::ranges::find(fs.events, "audit:success");
+    const auto event = std::ranges::find(fs.events, "emit:execution.completed");
+    REQUIRE(success != fs.events.end());
+    REQUIRE(event != fs.events.end());
+    CHECK(success < event);
+}
+
+TEST_CASE("execution mutation: a successful rerun publishes the legacy execution.created event "
+          "naming the NEW id and its parent",
+          "[execution][mutation][events][2146]") {
+    FakeStore fs;
+    fs.exec = make_exec("alice", 1);
+    AuditRecorder audit{&fs};
+    EmitRecorder emit{&fs};
+    const auto out = apply_execution_mutation(fs.ports(), req(ExecutionMutation::kRerun, "bob"),
+                                              audit.fn(), emit.hook());
+    CHECK(out.status == S::kDone);
+    REQUIRE(emit.events.size() == 1);
+    CHECK(emit.events[0].type == "execution.created");
+    CHECK(emit.events[0].attrs.is_null()); // legacy passes `{}`
+    CHECK(emit.events[0].payload == nlohmann::json{{"execution_id", "rerun-new-1"},
+                                                   {"parent_id", "exec-1"},
+                                                   {"trigger", "rerun"}});
+}
+
+TEST_CASE("execution mutation: no event on any refusal, denial, failure or throwing effect",
+          "[execution][mutation][events][2146]") {
+    for (const auto what : {ExecutionMutation::kCancel, ExecutionMutation::kRerun}) {
+        const char* const w = what == ExecutionMutation::kCancel ? "cancel" : "rerun";
+        SECTION(std::string(w) + ": empty principal") {
+            FakeStore fs;
+            fs.exec = make_exec("alice", 1);
+            AuditRecorder audit{&fs};
+            EmitRecorder emit{&fs};
+            (void)apply_execution_mutation(fs.ports(), req(what, ""), audit.fn(), emit.hook());
+            CHECK(emit.events.empty());
+        }
+        SECTION(std::string(w) + ": unknown id (unconfined)") {
+            FakeStore fs;
+            AuditRecorder audit{&fs};
+            EmitRecorder emit{&fs};
+            (void)apply_execution_mutation(fs.ports(), req(what, "bob"), audit.fn(), emit.hook());
+            CHECK(emit.events.empty());
+        }
+        SECTION(std::string(w) + ": hidden from a confined caller") {
+            FakeStore fs;
+            fs.exec = make_exec("alice", 1);
+            fs.statuses = {st("a"), st("b")};
+            AuditRecorder audit{&fs};
+            EmitRecorder emit{&fs};
+            const auto out = apply_execution_mutation(fs.ports(), req(what, "bob", scope_of({"a"})),
+                                                      audit.fn(), emit.hook());
+            CHECK(out.status == S::kNotFound);
+            CHECK(emit.events.empty());
+        }
+        SECTION(std::string(w) + ": degraded admission read") {
+            FakeStore fs;
+            fs.degrade_exec = true;
+            AuditRecorder audit{&fs};
+            EmitRecorder emit{&fs};
+            (void)apply_execution_mutation(fs.ports(), req(what, "bob"), audit.fn(), emit.hook());
+            CHECK(emit.events.empty());
+        }
+        SECTION(std::string(w) + ": the attempted row is not durable, so no effect and no event") {
+            FakeStore fs;
+            fs.exec = make_exec("alice", 1);
+            AuditRecorder audit{&fs};
+            audit.fail_result = "attempted";
+            EmitRecorder emit{&fs};
+            const auto out =
+                apply_execution_mutation(fs.ports(), req(what, "bob"), audit.fn(), emit.hook());
+            CHECK(out.status == S::kAuditFailed);
+            CHECK(fs.effects() == 0);
+            CHECK(emit.events.empty());
+        }
+        SECTION(std::string(w) + ": the effect throws") {
+            FakeStore fs;
+            fs.exec = make_exec("alice", 1);
+            fs.effect_throws = 1;
+            AuditRecorder audit{&fs};
+            EmitRecorder emit{&fs};
+            const auto out =
+                apply_execution_mutation(fs.ports(), req(what, "bob"), audit.fn(), emit.hook());
+            CHECK(out.status == S::kEffectThrew);
+            CHECK(emit.events.empty());
+        }
+    }
+    SECTION("cancel: already finished") {
+        FakeStore fs;
+        fs.exec = make_exec("alice", 1);
+        fs.cancel_outcome = Outcome::kNoOp;
+        AuditRecorder audit{&fs};
+        EmitRecorder emit{&fs};
+        (void)apply_execution_mutation(fs.ports(), req(ExecutionMutation::kCancel, "bob"),
+                                       audit.fn(), emit.hook());
+        CHECK(emit.events.empty());
+    }
+    SECTION("cancel: store failure") {
+        FakeStore fs;
+        fs.exec = make_exec("alice", 1);
+        fs.cancel_outcome = Outcome::kFailed;
+        AuditRecorder audit{&fs};
+        EmitRecorder emit{&fs};
+        (void)apply_execution_mutation(fs.ports(), req(ExecutionMutation::kCancel, "bob"),
+                                       audit.fn(), emit.hook());
+        CHECK(emit.events.empty());
+    }
+    for (const auto err : {ExecutionTracker::RerunError::kOriginalNotFound,
+                           ExecutionTracker::RerunError::kStoreDegraded,
+                           ExecutionTracker::RerunError::kWriteFailed}) {
+        FakeStore fs;
+        fs.exec = make_exec("alice", 1);
+        fs.rerun_result = std::unexpected(err);
+        AuditRecorder audit{&fs};
+        EmitRecorder emit{&fs};
+        (void)apply_execution_mutation(fs.ports(), req(ExecutionMutation::kRerun, "bob"),
+                                       audit.fn(), emit.hook());
+        CHECK(emit.events.empty());
+    }
+}
+
+TEST_CASE("execution mutation: a throwing event hook never changes the outcome (best effort)",
+          "[execution][mutation][events][2146]") {
+    for (const auto what : {ExecutionMutation::kCancel, ExecutionMutation::kRerun}) {
+        FakeStore fs;
+        fs.exec = make_exec("alice", 1);
+        AuditRecorder audit{&fs};
+        EmitRecorder emit{&fs};
+        emit.throws = true;
+        ExecutionMutationOutcome out;
+        REQUIRE_NOTHROW(out = apply_execution_mutation(fs.ports(), req(what, "bob"), audit.fn(),
+                                                       emit.hook()));
+        CHECK(out.status == S::kDone);
+        CHECK(out.audit_persisted);
+        CHECK(emit.events.size() == 1); // attempted once, never re-driven
+        CHECK(fs.effects() == 1);
+    }
+}
+
 // ── the REST v1 routes ──────────────────────────────────────────────────────
 
 namespace {
@@ -520,11 +699,26 @@ struct RestHarness {
     authz::VisibleSet scope{std::nullopt};
     std::string username{"bob"};
     int dispatch_calls{0};
+    struct Emitted {
+        std::string type;
+        nlohmann::json attrs, payload;
+    };
+    std::vector<Emitted> emitted;
+    bool emit_wired{true};
+    bool emit_throws{false};
     RestApiV1 api;
 
     explicit RestHarness(bool wire_ports = true, bool wire_fleet_read = true) {
         if (wire_ports)
             api.set_execution_mutation_ports_for_test(store.ports());
+        if (emit_wired)
+            api.set_emit_event_fn([this](const std::string& type, const httplib::Request&,
+                                         const nlohmann::json& attrs,
+                                         const nlohmann::json& payload) {
+                emitted.push_back({type, attrs, payload});
+                if (emit_throws)
+                    throw std::runtime_error("analytics sink blew up");
+            });
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -943,6 +1137,89 @@ TEST_CASE("REST POST cancel/rerun: the gates run before any store read",
             auto res = h.sink.Post(path, "");
             REQUIRE(res);
             CHECK(res->status == 503);
+        }
+    }
+}
+
+TEST_CASE("REST POST cancel/rerun: each publishes its legacy event exactly once on success",
+          "[rest][executions][mutation][events][2146]") {
+    SECTION("cancel -> execution.completed") {
+        RestHarness h;
+        h.store.exec = make_exec("alice", 1);
+        auto res = h.sink.Post("/api/v1/executions/exec-1/cancel", "");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        REQUIRE(h.emitted.size() == 1);
+        CHECK(h.emitted[0].type == "execution.completed");
+        CHECK(h.emitted[0].attrs == nlohmann::json{{"status", "cancelled"}});
+        CHECK(h.emitted[0].payload == nlohmann::json{{"execution_id", "exec-1"}});
+    }
+    SECTION("rerun -> execution.created") {
+        RestHarness h;
+        h.store.exec = make_exec("alice", 1);
+        auto res = h.sink.Post("/api/v1/executions/exec-1/rerun", "");
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        REQUIRE(h.emitted.size() == 1);
+        CHECK(h.emitted[0].type == "execution.created");
+        CHECK(h.emitted[0].payload["execution_id"] == "rerun-new-1");
+        CHECK(h.emitted[0].payload["parent_id"] == "exec-1");
+        CHECK(h.emitted[0].payload["trigger"] == "rerun");
+    }
+}
+
+TEST_CASE("REST POST cancel/rerun: no event on a refusal, and a throwing emitter never fails the "
+          "request",
+          "[rest][executions][mutation][events][2146]") {
+    for (const char* verb : {"cancel", "rerun"}) {
+        const std::string path = std::string("/api/v1/executions/exec-1/") + verb;
+        SECTION(std::string(verb) + ": unknown id") {
+            RestHarness h;
+            auto res = h.sink.Post(path, "");
+            REQUIRE(res);
+            CHECK(res->status == 404);
+            CHECK(h.emitted.empty());
+        }
+        SECTION(std::string(verb) + ": hidden from a confined caller") {
+            RestHarness h;
+            h.scope = scope_of({"a"});
+            h.store.exec = make_exec("alice", 1);
+            h.store.statuses = {st("a"), st("b")};
+            auto res = h.sink.Post(path, "");
+            REQUIRE(res);
+            CHECK(res->status == 404);
+            CHECK(h.emitted.empty());
+        }
+        SECTION(std::string(verb) + ": attempted row not durable") {
+            RestHarness h;
+            h.store.exec = make_exec("alice", 1);
+            h.audit_fail_result = "attempted";
+            auto res = h.sink.Post(path, "");
+            REQUIRE(res);
+            CHECK(res->status == 503);
+            CHECK(h.emitted.empty());
+        }
+        SECTION(std::string(verb) + ": gate refusal") {
+            RestHarness h;
+            h.perm_grant = false;
+            h.store.exec = make_exec("alice", 1);
+            auto res = h.sink.Post(path, "");
+            REQUIRE(res);
+            CHECK(res->status == 403);
+            CHECK(h.emitted.empty());
+        }
+        SECTION(std::string(verb) + ": a throwing emitter does not fail a successful request") {
+            RestHarness h;
+            h.emit_throws = true;
+            h.store.exec = make_exec("alice", 1);
+            auto res = h.sink.Post(path, "");
+            REQUIRE(res);
+            CHECK((res->status == 200 || res->status == 201));
+            CHECK(h.emitted.size() == 1);
+            CHECK(h.metrics.counter("yuzu_server_event_emit_failed_total",
+                                    {{"event", std::string(verb) == "cancel" ? "execution.completed"
+                                                                              : "execution.created"}})
+                      .value() == 1);
         }
     }
 }

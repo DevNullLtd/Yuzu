@@ -445,6 +445,146 @@ TEST_CASE("execute: the per-submitter pending cap (MCP) refuses before minting",
     CHECK(as_pending(run(rq, r.ports(), r.audit())));
 }
 
+// ---------------------------------------------------------------------------------------------
+// The legacy route's events (approval.created / instruction.executed), published by the twins.
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+struct CoreEmitted {
+    struct Ev {
+        std::string type;
+        json attrs, payload;
+    };
+    std::vector<Ev> events;
+    bool throws{false};
+    yuzu::server::EventEmitHook hook() {
+        return [this](std::string_view type, const json& attrs, const json& payload) {
+            events.push_back({std::string(type), attrs, payload});
+            if (throws)
+                throw std::runtime_error("analytics sink blew up");
+        };
+    }
+};
+} // namespace
+
+TEST_CASE("execute: a dispatch publishes instruction.executed once, with the legacy null shape",
+          "[instruction_execute][events]") {
+    Rig r;
+    r.defs["d"] = make_def("d");
+    CoreEmitted em;
+    auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit(),
+                   em.hook());
+    REQUIRE(as_dispatched(out));
+    REQUIRE(em.events.size() == 1);
+    CHECK(em.events[0].type == "instruction.executed");
+    CHECK(em.events[0].attrs.is_null());
+    CHECK(em.events[0].payload.is_null());
+    // The success row precedes the event (the outcome is already evidenced).
+    CHECK(r.audits.back().result == "success");
+}
+
+TEST_CASE("execute: a pending approval publishes approval.created once and no instruction.executed",
+          "[instruction_execute][events]") {
+    Rig r;
+    r.defs["d"] = make_def("d", "ping", "always");
+    CoreEmitted em;
+    auto out = run(r.request("d", json::object(), make_caller("u", false)), r.ports(), r.audit(),
+                   em.hook());
+    REQUIRE(as_pending(out));
+    REQUIRE(em.events.size() == 1);
+    CHECK(em.events[0].type == "approval.created");
+    CHECK(r.calls.empty());
+}
+
+TEST_CASE("execute: prepare() alone emits approval.created for a pending approval and nothing "
+          "for a Plan",
+          "[instruction_execute][events]") {
+    CoreEmitted em;
+    {
+        Rig r;
+        r.defs["d"] = make_def("d");
+        auto prep = prepare(r.request("d", json::object(), make_caller("u", true)), r.ports(),
+                            r.audit(), em.hook());
+        CHECK(std::holds_alternative<Plan>(prep.result));
+        CHECK(em.events.empty()); // the MCP probe on an auto definition: no event until dispatch
+    }
+    {
+        Rig r;
+        r.defs["d"] = make_def("d", "ping", "always");
+        auto prep = prepare(r.request("d", json::object(), make_caller("u", false)), r.ports(),
+                            r.audit(), em.hook());
+        CHECK(std::holds_alternative<PendingApproval>(prep.result));
+        REQUIRE(em.events.size() == 1);
+        CHECK(em.events[0].type == "approval.created");
+    }
+}
+
+TEST_CASE("execute: no event on a refusal, a cap, a zero-reach or a throwing dispatch",
+          "[instruction_execute][events]") {
+    SECTION("not found") {
+        Rig r;
+        CoreEmitted em;
+        (void)run(r.request("nope", json::object(), make_caller("u", true)), r.ports(), r.audit(),
+                  em.hook());
+        CHECK(em.events.empty());
+    }
+    SECTION("per-principal cap") {
+        Rig r;
+        r.pending_for = kSubmitterPendingCap;
+        r.defs["d"] = make_def("d", "ping", "always");
+        CoreEmitted em;
+        auto rq = r.request("d", json::object(), make_caller("u", false));
+        rq.submitter_pending_cap = kSubmitterPendingCap;
+        (void)run(rq, r.ports(), r.audit(), em.hook());
+        CHECK(r.approvals.empty());
+        CHECK(em.events.empty());
+    }
+    SECTION("approval store failure") {
+        Rig r;
+        r.approval_fails = true;
+        r.defs["d"] = make_def("d", "ping", "always");
+        CoreEmitted em;
+        (void)run(r.request("d", json::object(), make_caller("u", false)), r.ports(), r.audit(),
+                  em.hook());
+        CHECK(em.events.empty());
+    }
+    SECTION("the requested audit row cannot be stored") {
+        Rig r;
+        r.audit_requested_fails = true;
+        r.defs["d"] = make_def("d");
+        CoreEmitted em;
+        (void)run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit(),
+                  em.hook());
+        CHECK(r.calls.empty());
+        CHECK(em.events.empty());
+    }
+    SECTION("the dispatch throws") {
+        Rig r;
+        r.dispatch_throws = true;
+        r.defs["d"] = make_def("d");
+        CoreEmitted em;
+        (void)run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit(),
+                  em.hook());
+        CHECK(em.events.empty());
+    }
+}
+
+TEST_CASE("execute: a throwing event hook never changes the outcome", "[instruction_execute][events]") {
+    Rig r;
+    r.defs["d"] = make_def("d");
+    r.defs["a"] = make_def("a", "ping", "always");
+    CoreEmitted em;
+    em.throws = true;
+    auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit(),
+                   em.hook());
+    CHECK(as_dispatched(out));
+    CHECK(r.calls.size() == 1);
+    auto pend = run(r.request("a", json::object(), make_caller("u", false)), r.ports(), r.audit(),
+                    em.hook());
+    CHECK(as_pending(pend));
+    CHECK(em.events.size() == 2); // each attempted once
+}
+
 TEST_CASE("execute: the cap refusal is counted, creates no approval, and is per principal",
           "[instruction_execute][approval][metrics]") {
     Rig r;
@@ -935,6 +1075,12 @@ struct RouteRig {
     DispatchCaller caller = make_caller("alice", true);
     bool caller_wired{true};
     int audit_calls{0};
+    struct Emitted {
+        std::string type;
+        json attrs, payload;
+    };
+    std::vector<Emitted> emitted;
+    bool emit_throws{false};
 
     // `pre` arranges the core fake BEFORE the routes are registered: which seams are wired is a
     // construction-time fact (everything else is read live through `core`).
@@ -964,6 +1110,12 @@ struct RouteRig {
         };
         if (caller_wired)
             deps.caller_fn = [this](const httplib::Request&) { return caller; };
+        deps.emit_event_fn = [this](const std::string& type, const httplib::Request&,
+                                    const json& attrs, const json& payload) {
+            emitted.push_back({type, attrs, payload});
+            if (emit_throws)
+                throw std::runtime_error("analytics sink blew up");
+        };
         deps.ports = core.ports();
         register_instruction_execute_routes(sink, std::move(deps));
     }
@@ -1149,6 +1301,53 @@ TEST_CASE("REST execute: 202 pending_approval body, and nothing dispatched",
     // The same definition for an administrator dispatches.
     r.caller = make_caller("root", true);
     CHECK(r.post("d", "{}")->status == 200);
+}
+
+TEST_CASE("REST execute: publishes instruction.executed on 200 and approval.created on 202, "
+          "nothing on a refusal, and a throwing emitter does not fail the call",
+          "[instruction_execute][rest][events]") {
+    SECTION("200 -> instruction.executed once") {
+        RouteRig r;
+        r.core.defs["d"] = make_def("d");
+        auto res = r.post("d", "{}");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        REQUIRE(r.emitted.size() == 1);
+        CHECK(r.emitted[0].type == "instruction.executed");
+        CHECK(r.emitted[0].attrs.is_null());
+        CHECK(r.emitted[0].payload.is_null());
+    }
+    SECTION("202 -> approval.created once, no instruction.executed") {
+        RouteRig r;
+        r.core.defs["d"] = make_def("d", "ping", "role-gated");
+        r.caller = make_caller("bob", /*admin=*/false);
+        auto res = r.post("d", "{}");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        REQUIRE(r.emitted.size() == 1);
+        CHECK(r.emitted[0].type == "approval.created");
+    }
+    SECTION("refusals publish nothing") {
+        RouteRig r;
+        r.core.defs["d"] = make_def("d");
+        CHECK(r.post("nope", "{}")->status == 404);
+        CHECK(r.post("d", "[1]")->status == 400);
+        r.perm_grant = false;
+        CHECK(r.post("d", "{}")->status == 403);
+        CHECK(r.emitted.empty());
+    }
+    SECTION("a throwing emitter: still 200, the failure is counted") {
+        RouteRig r;
+        r.emit_throws = true;
+        r.core.defs["d"] = make_def("d");
+        auto res = r.post("d", "{}");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(r.emitted.size() == 1);
+        CHECK(r.core.counter("yuzu_server_event_emit_failed_total",
+                             {{"event", "instruction.executed"}}) == 1);
+        CHECK(r.core.counter("yuzu_server_event_emit_failed_total", {{"event", "other"}}) == 0);
+    }
 }
 
 TEST_CASE("REST execute: the per-principal pending-approval cap answers 429 and creates nothing",

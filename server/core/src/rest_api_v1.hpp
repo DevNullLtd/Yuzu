@@ -754,6 +754,13 @@ public:
         execution_mutation_ports_ = std::move(ports);
     }
 
+    /// The platform event emitter (`ServerImpl::emit_event`) for the routes whose LEGACY siblings
+    /// publish an event: POST /api/v1/executions/{id}/cancel -> `execution.completed`,
+    /// POST /api/v1/executions/{id}/rerun -> `execution.created` (see
+    /// `apply_execution_mutation`). Best effort; unset = no event. MUST be called BEFORE
+    /// `register_routes()`.
+    void set_emit_event_fn(EmitEventFn fn) { emit_event_fn_ = std::move(fn); }
+
     /// #5342 Gate 7 (C5) — an audit writer that stamps the principal
     /// EXPLICITLY instead of re-resolving it from the request's session.
     /// Wired from `AuthRoutes::audit_log_for_principal`. The password routes
@@ -866,6 +873,7 @@ private:
     ScopeEvaluateFn scope_evaluate_fn_;
     AllAgentIdsFn all_agent_ids_fn_;
     ExecutionMutationPorts execution_mutation_ports_; // see set_execution_mutation_ports_for_test
+    EmitEventFn emit_event_fn_;                       // see set_emit_event_fn
 };
 
 } // namespace yuzu::server

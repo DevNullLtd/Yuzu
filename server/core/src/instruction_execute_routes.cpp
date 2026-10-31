@@ -165,7 +165,8 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
                                  "instruction", definition_id, detail_text);
         };
 
-        const Outcome out = run(rq, deps.ports, audit);
+        const Outcome out =
+            run(rq, deps.ports, audit, bind_event_emit(deps.emit_event_fn, req, deps.ports.metrics));
         if (out.audit_dropped)
             res.set_header("Sec-Audit-Failed", "true");
 

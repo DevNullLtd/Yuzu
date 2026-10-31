@@ -81,6 +81,7 @@ struct RigOpts {
     bool session_writer = true;
     bool dispatch = true;
     bool visible_fn = true;
+    bool emit = true; // wire Deps::emit_event_fn
 };
 
 struct Rig {
@@ -120,6 +121,12 @@ struct Rig {
     std::vector<std::string> cancelled;
     std::vector<std::pair<std::string, int>> targeted;
     bool admit_service_scoped = false; // simulate a (hypothetical) allow-list entry at the gate
+    struct Emitted {
+        std::string type;
+        json attrs, payload;
+    };
+    std::vector<Emitted> emitted;
+    bool emit_throws = false;
 
     yuzu::server::test::TestRouteSink sink;
 
@@ -223,6 +230,13 @@ struct Rig {
             return true;
         };
         d.metrics = &metrics;
+        if (opts.emit)
+            d.emit_event_fn = [this](const std::string& type, const httplib::Request&,
+                                     const json& attrs, const json& payload) {
+                emitted.push_back({type, attrs, payload});
+                if (emit_throws)
+                    throw std::runtime_error("analytics sink blew up");
+            };
         cv1::register_command_v1_routes(sink, std::move(d));
     }
 
@@ -929,6 +943,102 @@ TEST_CASE("command_v1: a dispatch that throws is a 500 with no retry hint and a 
     CHECK(body_of(res)["error"]["retry_after_ms"].is_null());
     CHECK(rig.cancelled == std::vector<std::string>{"exec-1"});
     CHECK(rig.has_audit("failure", "reason=dispatch_exception"));
+}
+
+// ───────────────────────────── the legacy command.dispatched event ─────────────────────────────
+
+TEST_CASE("command_v1: a dispatch publishes the legacy command.dispatched event exactly once, with "
+          "the legacy attributes and payload, after the outcome row",
+          "[server][command_v1][events]") {
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    const auto res = rig.post({{"plugin", "os_info"}, {"action", "os_version"},
+                               {"agent_ids", json::array({kA, kB})}});
+    REQUIRE(res->status == 202);
+    REQUIRE(rig.emitted.size() == 1);
+    const auto& ev = rig.emitted[0];
+    CHECK(ev.type == "command.dispatched");
+    // /api/command's shape (command_routes.cpp): attrs {target_count}, payload {plugin, action,
+    // command_id, scope}.
+    CHECK(ev.attrs == json{{"target_count", 2}});
+    CHECK(ev.payload["plugin"] == "os_info");
+    CHECK(ev.payload["action"] == "os_version");
+    CHECK(ev.payload["command_id"] == body_of(res)["data"]["command_id"]);
+    CHECK(ev.payload["scope"] == "");
+    CHECK(ev.payload.size() == 4);
+    CHECK(rig.audits.back().result == "success");
+}
+
+TEST_CASE("command_v1: a scoped dispatch carries the caller's scope in the event payload",
+          "[server][command_v1][events]") {
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    const auto res = rig.post({{"plugin", "os_info"}, {"action", "os_version"}, {"scope", "__all__"}});
+    REQUIRE(res->status == 202);
+    REQUIRE(rig.emitted.size() == 1);
+    CHECK(rig.emitted[0].payload["scope"] == "__all__");
+    CHECK(rig.emitted[0].attrs["target_count"] == 4);
+}
+
+TEST_CASE("command_v1: no event on any refusal, a zero reach, a lost requested row or a throwing "
+          "dispatch",
+          "[server][command_v1][events]") {
+    SECTION("unclassified pair") {
+        Rig rig;
+        rig.facts = {.legacy_open = true};
+        CHECK(rig.post({{"plugin", "nope"}, {"action", "nothing"}})->status == 400);
+        CHECK(rig.emitted.empty());
+    }
+    SECTION("gate refusal") {
+        Rig rig;
+        rig.perm_denied.insert("Execution:Execute");
+        CHECK(rig.post(kRead)->status == 403);
+        CHECK(rig.emitted.empty());
+    }
+    SECTION("the requested row is lost: nothing is sent, nothing is emitted") {
+        Rig rig;
+        rig.facts = {.legacy_open = true};
+        rig.requested_row_persists = false;
+        CHECK(rig.post(kRead)->status == 503);
+        CHECK(rig.emitted.empty());
+    }
+    SECTION("zero reach") {
+        Rig rig;
+        rig.facts = {.legacy_open = true};
+        ConfinedDispatchOutcome o;
+        o.sent = 0;
+        rig.canned = o;
+        CHECK(rig.post(kRead)->status == 503);
+        CHECK(rig.emitted.empty());
+    }
+    SECTION("the dispatch throws") {
+        Rig rig;
+        rig.facts = {.legacy_open = true};
+        rig.dispatch_throws = true;
+        CHECK(rig.post(kRead)->status == 500);
+        CHECK(rig.emitted.empty());
+    }
+}
+
+TEST_CASE("command_v1: a throwing event emitter cannot fail an already-dispatched command",
+          "[server][command_v1][events]") {
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    rig.emit_throws = true;
+    const auto res = rig.post(kRead);
+    CHECK(res->status == 202);
+    CHECK(rig.sent() == Ids{kA, kB, kC, kDecoy});
+    CHECK(rig.emitted.size() == 1);
+    CHECK(rig.metrics.counter("yuzu_server_event_emit_failed_total",
+                              {{"event", "command.dispatched"}})
+              .value() == 1);
+}
+
+TEST_CASE("command_v1: an unwired emitter is simply no event", "[server][command_v1][events]") {
+    Rig rig(RigOpts{.emit = false});
+    rig.facts = {.legacy_open = true};
+    CHECK(rig.post(kRead)->status == 202);
+    CHECK(rig.emitted.empty());
 }
 
 // ───────────────────────────── execution row, wiring, pure helpers ─────────────────────────────

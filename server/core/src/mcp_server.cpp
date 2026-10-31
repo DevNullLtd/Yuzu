@@ -8418,7 +8418,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             probe, instr_exec_ports_,
                             [&](std::string_view result_status, const std::string& detail_text) {
                                 return mcp_audit(std::string(result_status), detail_text);
-                            });
+                            },
+                            bind_event_emit(emit_event_fn_, req, metrics));
                         if (const auto early = idef::render_unless_plan(prepared, probe_cid)) {
                             res.set_content(
                                 early->is_error
@@ -19100,7 +19101,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     rq, instr_exec_ports_,
                     [&](std::string_view result_status, const std::string& detail_text) {
                         return mcp_audit(std::string(result_status), detail_text);
-                    });
+                    },
+                    bind_event_emit(emit_event_fn_, req, metrics));
                 const auto rendered =
                     idef::render_outcome(out, yuzu::server::detail::make_correlation_id());
                 res.set_content(
@@ -25438,7 +25440,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         const std::string& target, const std::string& audit_detail) {
                         return yuzu::server::detail::try_persist_audit(
                             audit_fn, req, action, result, "execution", target, audit_detail);
-                    });
+                    },
+                    bind_event_emit(emit_event_fn_, req, metrics));
                 if (outcome.status != ExecutionMutationStatus::kDone) {
                     mcp_audit(outcome.status == ExecutionMutationStatus::kNotFound ||
                                       outcome.status == ExecutionMutationStatus::kAlreadyFinished
@@ -25529,7 +25532,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         const std::string& target, const std::string& audit_detail) {
                         return yuzu::server::detail::try_persist_audit(
                             audit_fn, req, action, result, "execution", target, audit_detail);
-                    });
+                    },
+                    bind_event_emit(emit_event_fn_, req, metrics));
                 if (outcome.status != ExecutionMutationStatus::kDone) {
                     mcp_audit(outcome.status == ExecutionMutationStatus::kNotFound ? "denied"
                                                                                     : "error",

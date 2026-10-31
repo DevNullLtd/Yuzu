@@ -46,6 +46,7 @@
 #include "dispatch_confined_arms.hpp" // ConfinedDispatchOutcome
 #include "dispatch_target_shape.hpp"  // BoundViolation
 #include "dispatch_zero_reach.hpp"    // ZeroReachCause
+#include "event_emit.hpp"             // EmitEventFn
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -123,6 +124,10 @@ struct Deps {
     VisibleAgentsFn visible_agents_fn;
     ExecutionOps execution;
     yuzu::MetricsRegistry* metrics = nullptr;
+    /// `ServerImpl::emit_event`: publishes `command.dispatched` (attrs `{target_count}`, payload
+    /// `{plugin, action, command_id, scope}`) after a successful dispatch, exactly as the
+    /// legacy `POST /api/command` does. Best effort; unset = no event.
+    EmitEventFn emit_event_fn;
 };
 
 /// Registers `POST /api/v1/commands`.
