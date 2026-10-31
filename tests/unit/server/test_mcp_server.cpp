@@ -31682,6 +31682,10 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
          nlohmann::json::parse(R"({"instruction_id":"os_info.version"})")},
         {"reevaluate_result_set", nlohmann::json::parse(R"({"id":"rs_test"})")},
         {"delete_result_set", nlohmann::json::parse(R"({"id":"rs_test"})")},
+        // #2146 batch B: record_execution_rerun is Execution:Execute, approval-gated like
+        // execute_instruction. cancel_execution shares the pair but is deliberately EXEMPT
+        // (kApprovalExemptTools), so it is absent from this map by design.
+        {"record_execution_rerun", nlohmann::json::parse(R"({"execution_id":"exec-1"})")},
         // #2146 Batch B1: delete_guardian_rule is Delete-class, gated at the
         // supervised tier like every other Delete-class tool above (the
         // mechanical requires_approval() rule, not a tool-specific opt-in).
@@ -31712,7 +31716,10 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
     std::set<std::string> gated;
     for (const auto& row : tool_security_rows_for_test())
         for (const char* tier : {"operator", "supervised"})
-            if (requires_approval(tier, std::string(row.securable), std::string(row.operation)))
+            // requires_approval_for_tool: cancel_execution is on the closed approval-exempt
+            // list (mcp_policy.hpp, owner ruling 2026-10-30), so it is NOT gated here.
+            if (requires_approval_for_tool(tier, std::string(row.name), std::string(row.securable),
+                                           std::string(row.operation)))
                 gated.insert(std::string(row.name));
     std::set<std::string> covered;
     for (const auto& [name, inst] : gated_instances)
