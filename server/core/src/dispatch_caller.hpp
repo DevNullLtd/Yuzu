@@ -97,12 +97,16 @@ struct DispatchCaller {
     ///      provenance here at send time (a re-authorized AlwaysApproval action
     ///      still clears the #1398 ExecuteGate because the approval that
     ///      admitted the occurrence already happened).
-    ///   2. MCP `execute_instruction` / `execute_instruction_definition` /
-    ///      `quarantine_device` handlers (`mcp_server.cpp`): `Ticket`, stamped only
-    ///      after `approval_ticket_just_consumed` is true (supervised tier).
-    ///      `execute_instruction_definition` (#2146) joined this site: it is a tier
-    ///      fact about the TOKEN only, and the definition's own `approval_mode` gate
-    ///      (`instruction_execute.hpp`) never reads it.
+    ///   2. MCP `execute_instruction` / `quarantine_device` handlers
+    ///      (`mcp_server.cpp`): `Ticket`, stamped only after
+    ///      `approval_ticket_just_consumed` is true (supervised tier).
+    ///      `execute_instruction_definition` (#2146) is NOT a stamping site and
+    ///      must never become one (sec-F1): its (plugin, action) comes from a
+    ///      STORED definition that an editor can repoint between approval and
+    ///      recall, while a C8 tier ticket binds only the call's arguments, so a
+    ///      stamp would let an approval granted for a benign pair lift the
+    ///      ExecuteGate of a gated one. The handler forces `None`; the pair's own
+    ///      gate decides (a non-admin caller on a gated pair is refused).
     ///   3. `DeploymentEngine` / `DeploymentRoutes` (`deployment_engine.cpp`
     ///      / `deployment_routes.cpp`) — `GovernedPipeline` on their
     ///      content_dist dispatches.

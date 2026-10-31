@@ -44758,31 +44758,26 @@ TEST_CASE("MCP execute_instruction_definition: supervised tier answers a non-aut
     ts.approval_manager_for_test = &appr;
     Rig rig;
     rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "always");
-    // `always` + a pair carrying AdminOrApproval: the probe tolerates ONLY approval_required.
-    rig.defs["g"] = yuzu::test::instr_exec::make_def("g", "gated", "always");
     idef_start(ts, rig, "supervised", /*admin=*/false);
-    for (const char* id : {"d", "g"}) {
-        auto res = ts.call(idef_call({{"definition_id", id}}));
-        REQUIRE(res);
-        const auto j = idef_payload(*res);
-        CHECK(j["status"] == "pending_approval");
-    }
+    auto res = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(res);
+    CHECK(idef_payload(*res)["status"] == "pending_approval");
     CHECK(appr.pending_count() == 0); // no mcp tier ticket was minted
-    CHECK(rig.approvals.size() == 2); // the definition's own approvals
+    CHECK(rig.approvals.size() == 1); // the definition's own approval
     CHECK(rig.calls.empty());
 }
 
 TEST_CASE("MCP execute_instruction_definition: supervised tier on an auto definition mints the tier "
-          "ticket, and the recall dispatches with Ticket provenance",
+          "ticket, and the recall dispatches with NO Ticket provenance",
           "[pg][mcp][integration][execute][idef][approval]") {
     yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
     McpTestServer ts;
     ts.approval_manager_for_test = &appr;
     Rig rig;
-    rig.defs["g"] = yuzu::test::instr_exec::make_def("g", "gated"); // AdminOrApproval pair, auto def
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping"); // ungated pair, auto def
     idef_start(ts, rig, "supervised", /*admin=*/false);
-    auto first = ts.call(idef_call({{"definition_id", "g"}}));
+    auto first = ts.call(idef_call({{"definition_id", "d"}}));
     REQUIRE(first);
     const auto fb = nlohmann::json::parse(first->body);
     REQUIRE(fb.contains("error"));
@@ -44790,11 +44785,96 @@ TEST_CASE("MCP execute_instruction_definition: supervised tier on an auto defini
     CHECK(rig.calls.empty());
     const std::string ticket = fb["error"]["data"]["approval_id"];
     REQUIRE(appr.approve(ticket, "admin", "ok").has_value());
+    auto second = ts.call(idef_call({{"definition_id", "d"}, {"approval_id", ticket}}, 2));
+    REQUIRE(second);
+    CHECK(idef_payload(*second)["agents_reached"] == 1);
+    REQUIRE(rig.calls.size() == 1);
+    // sec-F1: the tier ticket is NEVER stamped as approval provenance for this tool.
+    CHECK(rig.calls[0].provenance == yuzu::server::ApprovalProvenance::None);
+}
+
+// sec-F1 (#2146): a supervised token must not be able to run a gated (plugin, action) pair through
+// a tier ticket. Two shapes: refused up front, and the repoint-after-approval attack.
+TEST_CASE("MCP execute_instruction_definition: supervised non-admin on a gated pair is refused, no "
+          "ticket is minted and nothing is dispatched",
+          "[pg][mcp][integration][execute][idef][approval][security][sec-f1]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    Rig rig;
+    rig.defs["g"] = yuzu::test::instr_exec::make_def("g", "gated"); // AdminOrApproval pair, auto def
+    idef_start(ts, rig, "supervised", /*admin=*/false);
+    auto res = ts.call(idef_call({{"definition_id", "g"}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["data"]["reason"] == "approval_required");
+    // Permanent refusal: no retry hint, and the text must not advise a ticket flow that cannot work.
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+    CHECK(body["error"]["message"].get<std::string>().find("testplug.gated") != std::string::npos);
+    CHECK(body["error"]["message"].get<std::string>().find("does not accept an approval ticket") !=
+          std::string::npos);
+    CHECK(body["error"]["data"]["remediation"].get<std::string>().find("supervised-tier") ==
+          std::string::npos);
+    CHECK(appr.pending_count() == 0); // no tier ticket minted
+    CHECK(rig.calls.empty());
+}
+
+TEST_CASE("MCP execute_instruction_definition: an approved tier ticket for a benign pair cannot run "
+          "a gated pair the definition was repointed at before the recall",
+          "[pg][mcp][integration][execute][idef][approval][security][sec-f1]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "auto"); // benign, ungated
+    idef_start(ts, rig, "supervised", /*admin=*/false);
+    auto first = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(first);
+    const auto fb = nlohmann::json::parse(first->body);
+    REQUIRE(fb.contains("error"));
+    CHECK(fb["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    const std::string ticket = fb["error"]["data"]["approval_id"];
+    REQUIRE(appr.approve(ticket, "admin", "ok").has_value());
+
+    // An editor repoints the stored definition at a gated pair between approval and recall
+    // (update_definition edits in place; the ticket canon binds arguments, not the pair).
+    rig.defs["d"].action = "gated";
+
+    auto second = ts.call(idef_call({{"definition_id", "d"}, {"approval_id", ticket}}, 2));
+    REQUIRE(second);
+    const auto sb = nlohmann::json::parse(second->body);
+    REQUIRE(sb.contains("error")); // a refusal, not a success
+    CHECK(sb["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(sb["error"]["data"]["reason"] == "approval_required");
+    CHECK(rig.calls.empty()); // NOTHING reached the dispatch port: the exact send set is empty
+}
+
+TEST_CASE("MCP execute_instruction_definition: an administrator on the supervised tier still runs a "
+          "gated pair, via the pair's own admin gate and never a Ticket stamp",
+          "[pg][mcp][integration][execute][idef][approval][security][sec-f1]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    Rig rig;
+    rig.defs["g"] = yuzu::test::instr_exec::make_def("g", "gated");
+    idef_start(ts, rig, "supervised", /*admin=*/true);
+    auto first = ts.call(idef_call({{"definition_id", "g"}}));
+    REQUIRE(first);
+    const auto fb = nlohmann::json::parse(first->body);
+    REQUIRE(fb.contains("error"));
+    CHECK(fb["error"]["code"] == yuzu::server::mcp::kApprovalRequired); // the tier ladder is unchanged
+    const std::string ticket = fb["error"]["data"]["approval_id"];
+    REQUIRE(appr.approve(ticket, "admin", "ok").has_value());
     auto second = ts.call(idef_call({{"definition_id", "g"}, {"approval_id", ticket}}, 2));
     REQUIRE(second);
     CHECK(idef_payload(*second)["agents_reached"] == 1);
     REQUIRE(rig.calls.size() == 1);
-    CHECK(rig.calls[0].provenance == yuzu::server::ApprovalProvenance::Ticket);
+    CHECK(rig.calls[0].provenance == yuzu::server::ApprovalProvenance::None);
 }
 
 TEST_CASE("MCP execute_instruction_definition: an approved tier ticket cannot launder a definition "

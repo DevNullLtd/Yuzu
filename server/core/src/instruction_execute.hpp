@@ -48,8 +48,9 @@
 /// DispatchCaller CONSTRUCTION. This module never builds a `DispatchCaller`: the surface hands
 /// one in, derived from its own session (REST: `caller_from_session`; MCP: `caller_fn`). The only
 /// field it reads that carries approval authority is `principal_is_admin`, and it never writes
-/// `approval_provenance`; the MCP adapter stamps `Ticket` only after C8 consumed a ticket for
-/// this very request (dispatch_caller.hpp, stamping site 2).
+/// `approval_provenance`; NO adapter stamps `Ticket` for this capability, REST or MCP (sec-F1:
+/// a tier ticket binds arguments, not the stored definition's plugin/action, so it must never
+/// lift the pair's ExecuteGate; dispatch_caller.hpp, stamping site 2 excludes this tool).
 ///
 /// Everything impure arrives through `Ports` so the pipeline is testable without Postgres
 /// (InstructionStore, ApprovalManager and ExecutionTracker are all Postgres-backed).
@@ -104,11 +105,6 @@ struct Request {
     /// The caller, fully derived by the surface. `principal` is the audit/approval identity,
     /// `exec_visible` the confinement set, `principal_is_admin` the role-gated bypass.
     DispatchCaller caller;
-    /// True ONLY for the MCP pre-mint probe of a tier that will mint a C8 ticket (supervised):
-    /// the dry run then tolerates `ApprovalRequired`, because the ticket supplies that
-    /// provenance once consumed. It tolerates nothing else, and it is never an input to the
-    /// definition's own approval_mode.
-    bool tolerate_approval_required{false};
     /// 0 = no cap. The MCP surface bounds one principal's share of the global pending
     /// approval queue (an agentic loop must not fill the cap shared with every human).
     int submitter_pending_cap{0};

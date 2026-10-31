@@ -110,6 +110,18 @@ Rendered render_refusal(const Refusal& r, bool audit_dropped, const std::string&
         const auto text = describe_dispatch_denial(d.reason, r.plugin, r.action, d, DenialSurface::kMcp);
         message = text.message;
         remediation = text.remediation;
+        if (d.reason == yuzu::server::detail::DispatchDenialReason::ApprovalRequired) {
+            // The shared wording advises a supervised token's ticket flow, which is FALSE here:
+            // this tool never stamps Ticket provenance (sec-F1), so no ticket can lift the
+            // pair's gate. Permanent: retry_after_ms stays null.
+            message = "approval required for " + r.plugin + "." + r.action +
+                      ": this definition's action is gated (admin or approval) and "
+                      "execute_instruction_definition does not accept an approval ticket for a "
+                      "gated action";
+            remediation = "this call cannot succeed for this caller and retrying will not help; "
+                          "dispatch as an administrator, or ask an administrator to run it or to "
+                          "change the definition to a non-gated action";
+        }
         switch (text.cls) {
         case DispatchDenialClass::kInvalidParams:
             out.code = kInvalidParams;

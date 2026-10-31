@@ -15,8 +15,8 @@
 ///   (1) THE TIER LADDER (mcp_policy.hpp, enforced by the generic C8 gate in mcp_server.cpp
 ///       BEFORE any handler): readonly refuses `Execution:Execute`; OPERATOR tier admits it with
 ///       no ticket ("auto-approved"); SUPERVISED tier admits it only through a ticket
-///       (ticket-then-recall), after which the handler runs with
-///       `approval_provenance == Ticket`. This is a fact about the TOKEN.
+///       (ticket-then-recall). This is a fact about the TOKEN, and it is NEVER translated into
+///       `approval_provenance == Ticket` for this tool (see "NO TICKET PROVENANCE" below).
 ///   (2) THE DEFINITION'S OWN `approval_mode` (`auto` / `role-gated` / `always` / unknown =
 ///       approval): a fact about the DEFINITION.
 /// (1) NEVER satisfies (2). An operator-tier auto-approval and a supervised ticket that C8
@@ -26,10 +26,21 @@
 /// still needs its C8 ticket. The cost of putting the definition gate FIRST is that a
 /// supervised caller on a non-auto definition is answered `pending_approval` by the pre-mint
 /// probe (mcp_server.cpp C8 block) and never mints or burns a tier ticket for a call whose
-/// answer is already "needs approval". The probe tolerates `approval_required` from the
-/// chokepoint dry run (the ticket will supply that provenance) and nothing else.
-/// An administrator still reaches a `role-gated` definition: the token carries its creator's
-/// role, which is a ROLE fact (`principal_is_admin`), not a tier fact.
+/// answer is already "needs approval". The probe tolerates nothing: a caller whose (plugin,
+/// action) pair is gated by the ExecuteGate and who is not an administrator is refused there
+/// (`approval_required`, permanent, no retry hint), before any tier ticket exists.
+///
+/// NO TICKET PROVENANCE (sec-F1, architect ruling). The C8 tier ticket binds the call's
+/// ARGUMENTS (definition_id, params, targets). The (plugin, action) pair it would run comes from
+/// the STORED definition, which `update_definition` edits in place, so between approval and
+/// recall an editor can repoint the definition at a pair carrying `AdminOrApproval` /
+/// `AlwaysApproval`. Stamping `Ticket` would then lift that gate on an approval that was granted
+/// for a different action. This tool therefore never stamps it: the pair's own ExecuteGate
+/// decides, evaluated at the recall against the pair that will actually dispatch. Cost, accepted
+/// by the owner: a supervised token cannot use a ticket to run a definition whose pair is gated;
+/// it gets an `approval_required` refusal (permission denied, no retry hint), and only an
+/// administrator caller (a ROLE fact, `principal_is_admin`: the token carries its creator's
+/// role) still reaches a gated pair or a `role-gated` definition.
 ///
 /// `pending_approval` is a SUCCESS result, not `-32006`: that code's contract is a ticket the
 /// caller may redeem by re-calling with `approval_id`, and this ticket is minted with
@@ -37,8 +48,8 @@
 /// is no redemption path through this tool, and the description says so.
 ///
 /// DispatchCaller: this file constructs none. The caller comes from `McpServer::CallerFn`; the
-/// handler stamps `approval_provenance = Ticket` only after C8 consumed a ticket for THIS
-/// request (dispatch_caller.hpp, stamping site 2, which this tool joins by name).
+/// handler forces `approval_provenance = None` (dispatch_caller.hpp: this tool is NOT a stamping
+/// site).
 
 #include "instruction_execute.hpp"
 #include "mcp_input_bounds.hpp" // BoundViolation

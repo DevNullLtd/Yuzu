@@ -2563,9 +2563,13 @@ static const ToolDef kTools[] = {
      "approval_id argument (the recall refuses it), and do not poll it for a dispatch; an "
      "operator approves it out of band. An operator-tier token's auto-approval and a supervised "
      "token's consumed ticket never satisfy a definition's approval_mode. SUPERVISED tier: a "
-     "call whose definition is auto first returns the usual approval_required (-32006) tier "
-     "ticket; after an admin approves it re-call with that approval_id. A call whose definition "
-     "needs approval returns pending_approval at once and mints no tier ticket. "
+     "call whose definition is auto and whose plugin.action is not gated first returns the usual "
+     "approval_required (-32006) tier ticket; after an admin approves it re-call with that "
+     "approval_id. A tier ticket NEVER lifts the gate of a plugin.action that requires admin or "
+     "approval: a non-admin caller on such a definition is refused with a permission-denied "
+     "error whose error.data.reason is approval_required (permanent, retry_after_ms null, no "
+     "ticket minted); run it as an administrator instead. A call whose definition needs "
+     "approval returns pending_approval at once and mints no tier ticket. "
      "TARGETING: omit BOTH agent_ids and scope to target every connected agent; supplying either "
      "empty, or both, is rejected rather than widened. A Destructive-classified action requires "
      "explicit non-empty agent_ids (broadcast and scope are refused) and a Forensics-classified "
@@ -8371,9 +8375,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     // (owner ruling 2026-10-30; see mcp_instruction_execute.hpp for the whole
                     // composition). The probe runs the shared pipeline's steps 1-6, so a call
                     // that is going to be refused, or that needs the definition's approval
-                    // anyway, mints no tier ticket and burns none. It tolerates the chokepoint's
-                    // approval_required denial (this ticket is what will supply that
-                    // provenance) and nothing else. A Plan falls through to mint/recall.
+                    // anyway, mints no tier ticket and burns none. It tolerates NOTHING: this
+                    // tool never stamps Ticket provenance (sec-F1, #2146), so a pair gated by
+                    // the ExecuteGate (AdminOrApproval/AlwaysApproval) is refused here for a
+                    // non-admin caller BEFORE a ticket is minted, rather than being lifted by a
+                    // ticket whose canon binds the arguments and not the definition's pair.
+                    // A Plan falls through to mint/recall.
                     if (tool_name == "execute_instruction_definition") {
                         namespace idef = yuzu::server::mcp::instruction_definition;
                         if (auto bv = idef::check_args(args)) {
@@ -8396,7 +8403,6 @@ McpServer::HandlerFn McpServer::build_handler(
                                            ? caller_fn(*session)
                                            : DispatchCaller{.exec_visible =
                                                                 yuzu::server::authz::deny_all()};
-                        probe.tolerate_approval_required = true;
                         probe.submitter_pending_cap = idef::kSubmitterPendingCap;
                         const std::string probe_cid = yuzu::server::detail::make_correlation_id();
                         const auto prepared = yuzu::server::instruction_execute::prepare(
@@ -19026,10 +19032,10 @@ McpServer::HandlerFn McpServer::build_handler(
             // implemented here: the tier ladder ran in C8 (and the pre-mint probe above ran the
             // definition gate FIRST for supervised callers); this branch re-runs the whole
             // pipeline, so an operator-tier call (no ticket, so C8 never ran) reaches the same
-            // definition gate. `approval_provenance` is stamped Ticket ONLY when C8 consumed a
-            // ticket for THIS request, and the definition gate does not read it: neither an
-            // operator-tier auto-approval nor a consumed supervised ticket can skip a non-auto
-            // definition.
+            // definition gate. `approval_provenance` is NEVER stamped Ticket here (sec-F1): a
+            // consumed supervised ticket is a fact about the token and its arguments, not about
+            // the stored definition's (plugin, action), so it can neither skip a non-auto
+            // definition nor lift the pair's ExecuteGate.
             if (tool_name == "execute_instruction_definition") {
                 namespace idef = yuzu::server::mcp::instruction_definition;
                 if (!perm_fn(req, res, "Execution", "Execute"))
@@ -19059,9 +19065,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 rq.caller = caller_fn ? caller_fn(*session)
                                       : DispatchCaller{.exec_visible =
                                                            yuzu::server::authz::deny_all()};
-                rq.caller.approval_provenance = approval_ticket_just_consumed
-                                                    ? yuzu::server::ApprovalProvenance::Ticket
-                                                    : yuzu::server::ApprovalProvenance::None;
+                // sec-F1 (#2146): this tool is NOT an approval_provenance stamping site
+                // (dispatch_caller.hpp). The C8 tier ticket binds the call's ARGUMENTS only,
+                // while the (plugin, action) pair comes from the stored definition, which an
+                // editor can repoint between approval and recall; stamping Ticket here would let
+                // an approval granted for a benign pair lift the ExecuteGate of a gated one. The
+                // value is forced to None (not left to caller_fn) so no upstream stamp survives,
+                // and the pair's own gate decides: a non-admin caller on a gated pair is refused.
+                rq.caller.approval_provenance = yuzu::server::ApprovalProvenance::None;
                 rq.submitter_pending_cap = idef::kSubmitterPendingCap;
                 const auto out = yuzu::server::instruction_execute::run(
                     rq, instr_exec_ports_,

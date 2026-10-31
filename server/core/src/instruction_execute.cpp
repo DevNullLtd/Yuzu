@@ -123,22 +123,18 @@ PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& a
     }
     if (auto decision = ports.authorize(rq.caller, def.plugin, def.action); !decision) {
         const auto& denial = decision.error();
-        const bool tolerated = rq.tolerate_approval_required &&
-                               denial.reason == detail::DispatchDenialReason::ApprovalRequired;
-        if (!tolerated) {
-            const std::string reason(detail::to_string(denial.reason));
-            spdlog::warn("dispatch denied: {} reason={} securable={} caller={}", ident_pair(def),
-                         reason, denial.securable.empty() ? "(none)" : denial.securable,
-                         rq.caller.principal.empty() ? "(anonymous)"
-                                                     : ::yuzu::log_token(rq.caller.principal));
-            bump(ports, "yuzu_server_dispatch_denied_total", {{"reason", reason}});
-            c.audit("denied", "reason=" + reason + " definition=" + def_token);
-            Refusal r = make_refusal(RefusalKind::kDispatchDenied, reason, {});
-            r.denial = denial;
-            r.plugin = def.plugin;
-            r.action = def.action;
-            return refuse(c, std::move(r));
-        }
+        const std::string reason(detail::to_string(denial.reason));
+        spdlog::warn("dispatch denied: {} reason={} securable={} caller={}", ident_pair(def),
+                     reason, denial.securable.empty() ? "(none)" : denial.securable,
+                     rq.caller.principal.empty() ? "(anonymous)"
+                                                 : ::yuzu::log_token(rq.caller.principal));
+        bump(ports, "yuzu_server_dispatch_denied_total", {{"reason", reason}});
+        c.audit("denied", "reason=" + reason + " definition=" + def_token);
+        Refusal r = make_refusal(RefusalKind::kDispatchDenied, reason, {});
+        r.denial = denial;
+        r.plugin = def.plugin;
+        r.action = def.action;
+        return refuse(c, std::move(r));
     }
 
     // 3. Body shape. `check_targeting_shape` requires an OBJECT: nlohmann's contains() is false

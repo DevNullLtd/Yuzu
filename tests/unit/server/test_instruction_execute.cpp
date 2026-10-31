@@ -174,21 +174,27 @@ TEST_CASE("execute: an unwired dispatch is refused BEFORE the 'requested' audit 
     CHECK(r.rows.empty());
 }
 
-TEST_CASE("execute: tolerate_approval_required admits ONLY the approval-required denial",
+TEST_CASE("execute: prepare() refuses a gated pair for a non-admin and tolerates no denial",
           "[instruction_execute][security]") {
+    // sec-F1 (#2146): there is no tolerance switch any more. The MCP pre-mint probe is this same
+    // prepare(), so a gated pair is refused BEFORE a tier ticket can be minted for it.
     Rig r;
     r.defs["g"] = make_def("g", "gated");
-    auto rq = r.request("g", json::object(), make_caller("u", false));
-    rq.tolerate_approval_required = true;
-    // The pre-mint probe of a supervised call: the C8 ticket will supply the provenance.
-    auto prep = prepare(rq, r.ports(), r.audit());
-    CHECK(std::holds_alternative<Plan>(prep.result));
+    auto prep = prepare(r.request("g", json::object(), make_caller("u", false)), r.ports(), r.audit());
+    REQUIRE(std::holds_alternative<Refusal>(prep.result));
+    REQUIRE(std::get<Refusal>(prep.result).denial);
+    CHECK(std::get<Refusal>(prep.result).denial->reason == DispatchDenialReason::ApprovalRequired);
 
-    // ... but it tolerates nothing else (a Forbidden caller is still refused).
+    // An administrator clears the gate and gets a Plan.
+    auto ok = prepare(r.request("g", json::object(), make_caller("root", true)), r.ports(), r.audit());
+    CHECK(std::holds_alternative<Plan>(ok.result));
+
+    // A Forbidden caller is still refused.
     r.denied_securables.insert("Infrastructure");
-    auto prep2 = prepare(rq, r.ports(), r.audit());
+    auto prep2 = prepare(r.request("g", json::object(), make_caller("root", true)), r.ports(), r.audit());
     REQUIRE(std::holds_alternative<Refusal>(prep2.result));
     CHECK(std::get<Refusal>(prep2.result).denial->reason == DispatchDenialReason::Forbidden);
+    CHECK(r.calls.empty());
 }
 
 // ---------------------------------------------------------------------------------------------
