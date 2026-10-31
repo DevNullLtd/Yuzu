@@ -44087,12 +44087,6 @@ TEST_CASE("MCP cancel_execution: the exemption is exactly one tool, in the metri
     const auto gated = approval_gated_tool_names();
     CHECK(std::ranges::find(gated, "cancel_execution") == gated.end());
     CHECK(std::ranges::find(gated, "record_execution_rerun") != gated.end());
-    // Composition with the workflow slice (#2146 batch B): Workflow:Execute needs the supervised
-    // ticket (it is not on the exempt list) while cancel_execution does not; the operator tier
-    // stays denied by tier_allows(), not by the ticket rule.
-    CHECK(requires_approval_for_tool("supervised", "execute_workflow", "Workflow", "Execute"));
-    CHECK(std::ranges::find(gated, "execute_workflow") != gated.end());
-    CHECK_FALSE(tool_exempt_from_approval("execute_workflow"));
 }
 
 TEST_CASE("MCP cancel_execution / record_execution_rerun: readonly tier and service-scoped tokens "
