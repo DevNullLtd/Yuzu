@@ -2591,9 +2591,10 @@ static const ToolDef kTools[] = {
      "error.data.reason is one of unclassified, ambiguous, anonymous_operator, forbidden, "
      "approval_required, kill_switched. A per-device definition takes the ADR-1007 concurrency "
      "claim, so a device already running it may be skipped (no_agents_reached). "
-     "Every call is audit-logged (mcp.execute_instruction_definition) BEFORE dispatch; if that "
-     "row cannot be stored nothing is dispatched (-32603, retryable). Service-scoped API tokens "
-     "are refused. Mirrors POST /api/v1/instructions/{id}/execute. Requires Execution:Execute.",
+     "A 'requested' audit row (mcp.execute_instruction_definition) is written BEFORE dispatch; "
+     "if it cannot be stored nothing is dispatched (-32603, retryable). A refusal earlier than "
+     "that row is not always an audit row: an unknown definition and a store fault write none. "
+     "Service-scoped API tokens are refused. Mirrors POST /api/v1/instructions/{id}/execute. Requires Execution:Execute.",
      R"j({"type":"object","properties":{)j"
      R"j("definition_id":{"type":"string","minLength":1,"maxLength":128,"description":"Id of the stored instruction definition (discover_instructions lists them)"},)j"
      R"j("params":{"type":"object","description":"Parameters, validated against the definition's stored parameter_schema BEFORE anything else happens. Typed values are sent as JSON types (a number as a number); at most 32 keys, each key at most 256 bytes, each value at most 65536 bytes once serialised."},)j"

@@ -30,9 +30,11 @@
 /// There is NO CSRF check here: the central same-site write gate (`apply_same_site_write_gate`)
 /// covers every cookie-session write before routing.
 ///
-/// AUDIT: action `instruction.execute`, target `instruction`/`<definition id>`, rows `denied`
-/// (refusals), `pending`, `requested` (fail closed: 503 + `Sec-Audit-Failed`, nothing
-/// dispatched), then `success` or `failure`. A best-effort row that fails to persist sets
+/// AUDIT: action `instruction.execute`, target `instruction`/`<definition id>`. `requested` is
+/// the only row guaranteed BEFORE the effect (fail closed: 503 + `Sec-Audit-Failed`, nothing
+/// dispatched), then `success` or `failure`. A refusal earlier than it is a row (`denied`, or
+/// `failure`) only from the dispatch dry run on, and `pending` marks a 202; the gate, the depth
+/// guard, JSON parse, an unknown definition, a store fault and an unwired port write NO row. A best-effort row that fails to persist sets
 /// `Sec-Audit-Failed` on the response; the command already ran. An UNWIRED `audit_fn` is not
 /// "audit off": it is a 503 `audit_unavailable` + `Sec-Audit-Failed` (no retry hint, a server
 /// defect) right after the gate, before any body work or dispatch.

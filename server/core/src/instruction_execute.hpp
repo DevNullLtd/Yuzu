@@ -271,8 +271,11 @@ struct PrepareOutcome {
     bool audit_dropped{false};
 };
 
-/// Steps 1-6. Writes an audit row only for a refusal or a pending approval. MCP calls this
-/// alone as its pre-mint probe, so a refused call mints no tier ticket.
+/// Steps 1-6. Writes an audit row for a refusal from step 2 on (`denied`, or `failure` for an
+/// unusable stored schema or an approval that could not be queued) and for a pending approval.
+/// It writes NONE for step 1 (an unknown definition, a store fault), a missing port, or the
+/// classifier being unavailable: only `requested` (step 7) is guaranteed before the effect.
+/// MCP calls this alone as its pre-mint probe, so a refused call mints no tier ticket.
 ///
 /// `emit` (optional, bound per request by the surface) publishes the events the LEGACY
 /// `POST /api/instructions/{id}/execute` publishes, so the twins match it: `approval.created`
