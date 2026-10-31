@@ -495,6 +495,15 @@ ExecMutationMcpError exec_mutation_mcp_error(ExecutionMutation what,
                 cancel ? "cancel failed; execution store degraded"
                        : "rerun record could not be created; execution store degraded",
                 "retry once the server reports ready", mcp::kMcpStoreFaultRetryMs};
+    case S::kEffectThrew:
+        // The effect threw: whether it landed is unknown, so no retry hint on the wire and none
+        // in the prose (a blind retry could repeat a write that already happened).
+        return {kInternalError,
+                cancel ? "cancel failed unexpectedly; the execution may or may not have been "
+                         "cancelled"
+                       : "rerun failed unexpectedly; a rerun record may or may not have been "
+                         "created",
+                "read the execution to see its current state before issuing another call", -1};
     case S::kDone:
         break;
     }

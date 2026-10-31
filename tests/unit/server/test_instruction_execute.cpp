@@ -655,16 +655,44 @@ TEST_CASE("execute: no execution tracker still dispatches, with an empty executi
     CHECK(r.calls[0].execution_id.empty());
 }
 
-TEST_CASE("execute: a dispatch that throws cancels the execution row and reports 500-class",
+TEST_CASE("execute: a dispatch that throws (std or non-std) cancels the execution row, writes a "
+          "failure row, and advertises NO retry",
           "[instruction_execute]") {
+    for (const bool nonstd : {false, true}) {
+        INFO("nonstd=" << nonstd);
+        Rig r;
+        (nonstd ? r.dispatch_throws_nonstd : r.dispatch_throws) = true;
+        r.defs["d"] = make_def("d");
+        auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
+        const auto* ref = as_refusal(out);
+        REQUIRE(ref);
+        CHECK(ref->kind == RefusalKind::kDispatchFailed);
+        CHECK(ref->reason == "dispatch_failed");
+        // A thrown dispatch may have partially sent: no hint on the wire, none in the prose.
+        CHECK_FALSE(ref->retry_after_ms.has_value());
+        CHECK(ref->message.find("retry") == std::string::npos);
+        CHECK(ref->remediation.find("retry") == std::string::npos);
+        CHECK(r.cancelled == std::vector<std::string>{"exec-1"});
+        CHECK(r.targeted.empty());
+        CHECK(r.calls.size() == 1); // dispatched exactly once, never re-driven
+        REQUIRE(r.audits.size() == 2);
+        CHECK(r.audits[0].result == "requested");
+        CHECK(r.audits[1].result == "failure");
+        CHECK(r.audits[1].detail.find("reason=dispatch_exception") != std::string::npos);
+        CHECK_FALSE(out.audit_dropped);
+    }
+}
+
+TEST_CASE("execute: a lost failure row after a throwing dispatch is reported as audit_dropped",
+          "[instruction_execute][audit]") {
     Rig r;
-    r.dispatch_throws = true;
+    r.dispatch_throws_nonstd = true;
+    r.audit_other_fails = true;
     r.defs["d"] = make_def("d");
     auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
     REQUIRE(as_refusal(out));
     CHECK(as_refusal(out)->kind == RefusalKind::kDispatchFailed);
-    CHECK(r.cancelled == std::vector<std::string>{"exec-1"});
-    CHECK(r.targeted.empty());
+    CHECK(out.audit_dropped);
 }
 
 TEST_CASE("execute: a failed set_agents_targeted is counted, the dispatch still stands",
@@ -980,6 +1008,32 @@ TEST_CASE("REST execute: status mapping of every refusal", "[instruction_execute
         CHECK(j["meta"]["api_version"] == "v1");
         if (c.status == 503 && std::string(c.reason) == "audit_unavailable")
             CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    }
+}
+
+TEST_CASE("REST execute: a throwing dispatch is a 500 with NO retry hint (std and non-std), "
+          "Sec-Audit-Failed only when the failure row is lost",
+          "[instruction_execute][rest][security]") {
+    for (const bool nonstd : {false, true}) {
+        for (const bool lose_row : {false, true}) {
+            INFO("nonstd=" << nonstd << " lose_row=" << lose_row);
+            RouteRig r;
+            r.core.defs["d"] = make_def("d");
+            (nonstd ? r.core.dispatch_throws_nonstd : r.core.dispatch_throws) = true;
+            r.core.audit_other_fails = lose_row;
+            auto res = r.post("d", "{}");
+            REQUIRE(res);
+            CHECK(res->status == 500);
+            const auto err = json::parse(res->body)["error"];
+            CHECK(err["reason"] == "dispatch_failed");
+            CHECK(err["retry_after_ms"].is_null());
+            CHECK(err["message"].get<std::string>().find("retry") == std::string::npos);
+            CHECK(err.value("remediation", std::string{}).find("retry") == std::string::npos);
+            CHECK(r.core.calls.size() == 1);
+            REQUIRE(r.core.audits.size() == 2);
+            CHECK(r.core.audits[1].result == "failure");
+            CHECK(res->get_header_value("Sec-Audit-Failed") == (lose_row ? "true" : ""));
+        }
     }
 }
 

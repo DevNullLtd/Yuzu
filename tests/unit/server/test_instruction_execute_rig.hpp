@@ -138,6 +138,7 @@ struct Rig {
     std::vector<DispatchCall> calls;
     bool real_dispatch{false};
     bool dispatch_throws{false};
+    bool dispatch_throws_nonstd{false}; // throws an int, not a std::exception
     ConfinedDispatchOutcome stub_outcome{.sent = 1, .command_id = "cmd-1"};
     std::int64_t seq{0};
 
@@ -284,6 +285,8 @@ struct Rig {
             calls.push_back(c);
             if (dispatch_throws)
                 throw std::runtime_error("boom");
+            if (dispatch_throws_nonstd)
+                throw 42; // NOLINT: a non-std throw is the point
             if (real_dispatch)
                 return real(pl, ac, ids, sc, pa, ex, caller, def_id, mode);
             return stub_outcome;

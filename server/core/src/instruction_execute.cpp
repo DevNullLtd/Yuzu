@@ -430,16 +430,30 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
                                            ? std::string(kBroadcastScope)
                                            : plan.scope;
     ConfinedDispatchOutcome o;
+    bool threw = false;
     try {
         o = p.dispatch(def.plugin, def.action, plan.agent_ids, dispatch_scope, plan.params,
                        execution_id, rq.caller, def.id, def.concurrency_mode);
     } catch (const std::exception& e) {
         spdlog::error("instruction execute: dispatch failed for '{}': {}", def_token, e.what());
+        threw = true;
+    } catch (...) {
+        spdlog::error("instruction execute: dispatch failed for '{}': unknown exception",
+                      def_token);
+        threw = true;
+    }
+    if (threw) {
         cancel_row(c, execution_id);
         c.audit("failure", "reason=dispatch_exception definition=" + def_token +
                                " execution_id=" + execution_id);
+        // NO retry hint, on the wire or in prose: whether any agent already received the command
+        // is unknown once the dispatch has thrown, so a blind retry could dispatch it twice.
+        // (command_v1_routes.cpp's dispatch_exception arm drops it for the same reason.)
         return Outcome{make_refusal(RefusalKind::kDispatchFailed, "dispatch_failed",
-                                    "dispatch failed", "retry the request", kRetryAfterMs),
+                                    "dispatch failed",
+                                    "the dispatch failed part-way and some agents may already "
+                                    "have received the command; check the execution history for "
+                                    "this definition before running it again"),
                        c.audit_dropped};
     }
 
@@ -485,6 +499,10 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
             } catch (const std::exception& e) {
                 spdlog::warn("instruction execute: refresh_counts threw for execution_id={}: {}",
                              execution_id, e.what());
+            } catch (...) {
+                spdlog::warn("instruction execute: refresh_counts threw a non-standard exception "
+                             "for execution_id={}",
+                             execution_id);
             }
         }
     }

@@ -47,6 +47,9 @@ struct FakeStore {
     std::vector<AgentExecStatus> statuses;     // the COMPLETE cohort rows
     bool degrade_exec{false};
     bool degrade_statuses{false};
+    /// 0 = the effect returns normally, 1 = it throws std::runtime_error, 2 = it throws a
+    /// non-std type. The effect call is counted BEFORE it throws.
+    int effect_throws{0};
     Outcome cancel_outcome{Outcome::kCancelled};
     std::expected<std::string, std::string> rerun_result{std::string("rerun-new-1")};
 
@@ -54,6 +57,13 @@ struct FakeStore {
     std::string effect_user;
     bool effect_failed_only{false};
     std::vector<std::string> events; // "read", "effect:cancel", "effect:rerun", "audit:<result>"
+
+    void throw_if_armed() const {
+        if (effect_throws == 1)
+            throw std::runtime_error("effect blew up: PQerror secret internals");
+        if (effect_throws == 2)
+            throw 42; // NOLINT: a non-std throw is the point
+    }
 
     ExecutionMutationPorts ports() {
         ExecutionMutationPorts p;
@@ -76,6 +86,7 @@ struct FakeStore {
             ++cancel_calls;
             effect_user = user;
             events.emplace_back("effect:cancel");
+            throw_if_armed();
             return cancel_outcome;
         };
         p.create_rerun = [this](const std::string&, const std::string& user, bool failed_only)
@@ -84,6 +95,7 @@ struct FakeStore {
             effect_user = user;
             effect_failed_only = failed_only;
             events.emplace_back("effect:rerun");
+            throw_if_armed();
             return rerun_result;
         };
         return p;
@@ -368,6 +380,44 @@ TEST_CASE("execution mutation: cancel outcome mapping and its audit rows",
         CHECK(out.status == S::kStoreFailed);
         REQUIRE(audit.rows.size() == 2);
         CHECK(audit.rows[1].result == "failure");
+    }
+}
+
+TEST_CASE("execution mutation: a THROWING effect (std or non-std) writes a failure row, is not a "
+          "retryable store fault, and the exception never escapes",
+          "[execution][mutation][2146]") {
+    for (const auto what : {ExecutionMutation::kCancel, ExecutionMutation::kRerun}) {
+        for (const int kind : {1, 2}) {
+            INFO("what=" << (what == ExecutionMutation::kCancel ? "cancel" : "rerun")
+                         << " throw_kind=" << kind);
+            FakeStore fs;
+            fs.exec = make_exec("alice", 1);
+            fs.effect_throws = kind;
+            AuditRecorder audit{&fs};
+            ExecutionMutationOutcome out;
+            REQUIRE_NOTHROW(out = apply_execution_mutation(fs.ports(), req(what, "bob"), audit.fn()));
+            CHECK(out.status == S::kEffectThrew);
+            CHECK(out.audit_persisted);
+            CHECK(fs.effects() == 1); // attempted exactly once, never re-driven
+            REQUIRE(audit.rows.size() == 2);
+            CHECK(audit.rows[0].result == "attempted");
+            CHECK(audit.rows[1].result == "failure");
+            CHECK(audit.rows[1].action == execution_mutation_audit_action(what));
+            // The exception text is never echoed into the evidence row.
+            CHECK(audit.rows[1].detail.find("PQerror") == std::string::npos);
+            CHECK(out.new_execution_id.empty());
+        }
+    }
+    SECTION("a failing failure-row is reported, not hidden") {
+        FakeStore fs;
+        fs.exec = make_exec("alice", 1);
+        fs.effect_throws = 2;
+        AuditRecorder audit{&fs};
+        audit.fail_result = "failure";
+        const auto out = apply_execution_mutation(fs.ports(), req(ExecutionMutation::kCancel, "bob"),
+                                                  audit.fn());
+        CHECK(out.status == S::kEffectThrew);
+        CHECK_FALSE(out.audit_persisted);
     }
 }
 
@@ -676,6 +726,45 @@ TEST_CASE("REST POST cancel/rerun: an attempted row that cannot be saved refuses
         CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
         CHECK(h.store.effects() == 0);
         CHECK(body_of(*res)["error"]["retry_after_ms"] == 5000);
+    }
+}
+
+TEST_CASE("REST POST cancel/rerun: a throwing effect is a 500 with NO retry hint, a failure audit "
+          "row, and nothing dispatched",
+          "[rest][executions][mutation][2146]") {
+    for (const char* verb : {"cancel", "rerun"}) {
+        for (const int kind : {1, 2}) {
+            INFO("verb=" << verb << " throw_kind=" << kind);
+            RestHarness h;
+            h.store.exec = make_exec("alice", 1);
+            h.store.effect_throws = kind;
+            auto res = h.sink.Post(std::string("/api/v1/executions/exec-1/") + verb, "");
+            REQUIRE(res);
+            CHECK(res->status == 500);
+            CHECK(h.store.effects() == 1);
+            CHECK(h.dispatch_calls == 0);
+            const auto err = body_of(*res)["error"];
+            CHECK(err["retry_after_ms"].is_null());
+            CHECK(err["code"] == 500);
+            // No retry wording anywhere in the body, and no exception text.
+            CHECK(err["message"].get<std::string>().find("retry") == std::string::npos);
+            CHECK(err.value("remediation", std::string{}).find("retry") == std::string::npos);
+            CHECK(res->body.find("PQerror") == std::string::npos);
+            REQUIRE(h.audit_rows.size() == 2);
+            CHECK(h.audit_rows[0].result == "attempted");
+            CHECK(h.audit_rows[1].result == "failure");
+            CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+        }
+    }
+    SECTION("a lost failure row sets Sec-Audit-Failed but the error still stands") {
+        RestHarness h;
+        h.store.exec = make_exec("alice", 1);
+        h.store.effect_throws = 2;
+        h.audit_fail_result = "failure";
+        auto res = h.sink.Post("/api/v1/executions/exec-1/cancel", "");
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     }
 }
 

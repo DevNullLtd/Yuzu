@@ -3732,7 +3732,7 @@ Omitting **both** `agent_ids` and `scope` targets every connected agent. Supplyi
 
 **Zero agents reached** is an error, discriminated by `error.reason`: `invalid_scope` is `400`; `containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `quarantined`, `plugin_not_found`, `kill_switched_os` and `no_agents_reached` are `503`. `retry_after_ms` is `5000` for `containment_unreadable`, `route_unreadable`, `os_gate_unreadable` and `no_agents_reached`, and `null` for the permanent causes (`invalid_scope`, `quarantined`, `plugin_not_found`, `kill_switched_os`), where retrying the same request cannot succeed. The error object also carries `command_id`, `execution_id` (the cancelled execution row) and the counts `agents_quarantined`, `agents_unknown_plugin`, `agents_kill_switched_os`. `no_agents_reached` includes the case where a per-device claim excluded every target.
 
-Other errors use the A4 envelope with a `reason`: `500` `dispatch_failed` (the execution row is cancelled).
+Other errors use the A4 envelope with a `reason`: `500` `dispatch_failed` (the dispatch threw; the execution row is cancelled and a `failure` audit row with `reason=dispatch_exception` is written). It carries **no retry hint** (`retry_after_ms` is `null`, and the text does not suggest a retry), because a dispatch that threw may already have reached some agents and sending it again could run it twice; check the definition's execution history before running it again.
 
 ---
 
@@ -6822,7 +6822,7 @@ cannot be resolved is refused with a `503`; there is no fallback user.
 **Audit (fail closed).** Both write `execution.cancel` / `execution.rerun` rows. An `attempted` row
 is written **before** the change; if it cannot be saved the call answers `503` with
 `Sec-Audit-Failed: true` and changes nothing. The outcome then writes `success` (for rerun the target
-is the new record), `denied` (cancel `409`) or `failure` (`503`). If only the outcome row fails after
+is the new record), `denied` (cancel `409`) or `failure` (`503`, or `500` when the change itself threw). If only the outcome row fails after
 the change was applied, the success response carries `Sec-Audit-Failed: true`.
 
 **`POST /api/v1/executions/{id}/cancel`** takes no body. `200`:
@@ -6833,6 +6833,7 @@ the change was applied, the success response carries `Sec-Audit-Failed: true`.
 
 `409`: the execution already finished (`succeeded`, `completed` or `cancelled`); nothing changed.
 `503` (with `retry_after_ms`): the tracker or audit store is degraded; nothing changed.
+`500` (no `retry_after_ms`): the change itself threw, so whether the cancel landed is unknown; a `failure` row is written. Read the execution before issuing another request. The same `500` applies to rerun.
 
 **`POST /api/v1/executions/{id}/rerun`** takes an optional JSON object with one field,
 `failed_only` (boolean, default `false`; an empty body means `false`). `failed_only: true` sizes the

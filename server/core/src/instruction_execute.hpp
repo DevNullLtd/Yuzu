@@ -178,7 +178,8 @@ enum class RefusalKind : std::uint8_t {
     kClassifierUnavailable,///< 503: the destructive-targeting classifier is not wired
     kMisconfigured,        ///< 500: a required port is unwired
     kAuditUnavailable,     ///< 503 + Sec-Audit-Failed: nothing was dispatched without durable evidence
-    kDispatchFailed,       ///< 500: the dispatch threw; the execution row (if any) was cancelled
+    kDispatchFailed,       ///< 500: the dispatch threw (any exception type); the execution row (if any) was cancelled,
+                           ///< a `failure` audit row is written, and NO retry is advertised (agents may have been sent it)
 };
 
 struct Refusal {

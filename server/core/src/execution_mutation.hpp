@@ -44,7 +44,9 @@
 ///   4. the `attempted` audit row is written BEFORE the effect. If it is not durable the effect
 ///      is NOT performed (`kAuditFailed`, the surface answers 503 / `Sec-Audit-Failed`).
 ///   5. the effect, then the outcome row (`success` / `failure` / `denied` for the cancel
-///      state-guard refusal). The effect has already happened by then, so a failed outcome row
+///      state-guard refusal). An effect that THROWS (std::exception or not) is caught: it writes
+///      a `failure` row and answers `kEffectThrew`, a 500 with no retry hint, because the write
+///      may have landed. The effect has already happened by then, so a failed outcome row
 ///      does not undo it: it is reported as `audit_persisted=false` on an otherwise successful
 ///      outcome.
 ///
@@ -97,6 +99,8 @@ enum class ExecutionMutationStatus {
     kAuditFailed,     ///< the attempted row was not durable; the effect was NOT performed.
     kAlreadyFinished, ///< cancel only: unknown-by-now or already terminal; no state change.
     kStoreFailed,     ///< the effect itself failed; nothing changed.
+    kEffectThrew,     ///< the effect THREW: its outcome is unknown; a `failure` row is written and
+                      ///< NO retry is advertised (the write may have landed).
 };
 
 struct ExecutionMutationOutcome {

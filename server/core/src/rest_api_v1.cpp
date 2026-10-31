@@ -12938,6 +12938,23 @@ void RestApiV1::register_routes(
                                              {.retry_after_ms = 5000}),
                             "application/json");
             return;
+        case S::kEffectThrew:
+            // The effect threw, so whether it landed is unknown: a 500 with NO retry hint (a blind
+            // retry could repeat a write that already happened) and a remediation that sends the
+            // caller to read the execution first.
+            if (!outcome.audit_persisted)
+                res.set_header("Sec-Audit-Failed", "true");
+            res.status = 500;
+            res.set_content(
+                detail::a4_error(res,
+                                 is_cancel ? "cancel failed unexpectedly; the execution may or may "
+                                             "not have been cancelled"
+                                           : "rerun failed unexpectedly; a rerun record may or may "
+                                             "not have been created",
+                                 {.remediation = "read the execution to see its current state "
+                                                 "before issuing another request"}),
+                "application/json");
+            return;
         case S::kDone:
             break;
         }

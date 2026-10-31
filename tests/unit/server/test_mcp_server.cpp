@@ -43874,6 +43874,15 @@ struct McpExecFake {
     int exec_reads{0}, status_reads{0}, cancel_calls{0}, rerun_calls{0};
     std::string effect_user;
     bool effect_failed_only{false};
+    /// 0 = normal, 1 = the effect throws std::runtime_error, 2 = it throws a non-std type.
+    int effect_throws{0};
+
+    void throw_if_armed() const {
+        if (effect_throws == 1)
+            throw std::runtime_error("effect blew up: PQerror secret internals");
+        if (effect_throws == 2)
+            throw 42; // NOLINT: a non-std throw is the point
+    }
 
     yuzu::server::ExecutionMutationPorts ports() {
         yuzu::server::ExecutionMutationPorts p;
@@ -43890,6 +43899,7 @@ struct McpExecFake {
         p.mark_cancelled = [this](const std::string&, const std::string& user) {
             ++cancel_calls;
             effect_user = user;
+            throw_if_armed();
             return cancel_outcome;
         };
         p.create_rerun = [this](const std::string&, const std::string& user, bool failed_only)
@@ -43897,6 +43907,7 @@ struct McpExecFake {
             ++rerun_calls;
             effect_user = user;
             effect_failed_only = failed_only;
+            throw_if_armed();
             return std::string("rerun-new-1");
         };
         return p;
@@ -44291,6 +44302,49 @@ TEST_CASE("MCP cancel_execution: already finished is a terminal business error; 
     }
 }
 
+TEST_CASE("MCP cancel_execution / record_execution_rerun: a throwing effect is -32603 with NO "
+          "retry hint, a failure audit row, and nothing dispatched",
+          "[mcp][execution][mutation][security][2146]") {
+    for (const char* tool : {"cancel_execution", "record_execution_rerun"}) {
+        for (const int kind : {1, 2}) {
+            INFO("tool=" << tool << " throw_kind=" << kind);
+            McpExecFake fs;
+            fs.exec = mcp_exec("alice", 1);
+            fs.effect_throws = kind;
+            McpTestServer ts;
+            ts.execution_mutation_ports_for_test = fs.ports();
+            int dispatched = 0;
+            ts.start_with_dispatch(
+                [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                    const std::string&, const std::unordered_map<std::string, std::string>&,
+                    const std::string&, const yuzu::server::DispatchCaller&)
+                    -> yuzu::server::ConfinedDispatchOutcome {
+                    ++dispatched;
+                    return {};
+                },
+                "operator");
+            auto res = exec_tool_call(ts, tool, R"({"execution_id":"exec-1"})");
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+            const bool has_hint = body["error"].contains("data") &&
+                                  body["error"]["data"].contains("retry_after_ms") &&
+                                  !body["error"]["data"]["retry_after_ms"].is_null();
+            CHECK_FALSE(has_hint);
+            // The wire key is `retry_after_ms`, so the prose is checked field by field.
+            CHECK(body["error"]["message"].get<std::string>().find("retry") == std::string::npos);
+            CHECK(res->body.find("PQerror") == std::string::npos);
+            CHECK(fs.effects() == 1);
+            CHECK(dispatched == 0);
+            const std::string verb = std::string(tool) == "cancel_execution" ? "cancel" : "rerun";
+            REQUIRE(ts.audit_log.size() >= 2);
+            CHECK(ts.audit_log[0] == "execution." + verb + "|attempted");
+            CHECK(ts.audit_log[1] == "execution." + verb + "|failure");
+        }
+    }
+}
+
 TEST_CASE("MCP record_execution_rerun: failed_only is a strict boolean; the result says nothing "
           "was dispatched",
           "[mcp][execution][mutation][2146]") {
@@ -44589,6 +44643,33 @@ TEST_CASE("MCP execute_instruction_definition: the audit row is written BEFORE d
     CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
     CHECK(rig.calls.empty());
     CHECK(rig.rows.empty());
+}
+
+TEST_CASE("MCP execute_instruction_definition: a throwing dispatch (std or non-std) is -32603 "
+          "with NO retry hint and a failure audit row",
+          "[mcp][integration][execute][idef][audit][security]") {
+    for (const bool nonstd : {false, true}) {
+        INFO("nonstd=" << nonstd);
+        McpTestServer ts;
+        Rig rig;
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+        (nonstd ? rig.dispatch_throws_nonstd : rig.dispatch_throws) = true;
+        idef_start(ts, rig, "operator");
+        auto res = ts.call(idef_call({{"definition_id", "d"}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["reason"] == "dispatch_failed");
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(body["error"]["message"].get<std::string>().find("retry") == std::string::npos);
+        CHECK(body["error"]["data"].value("remediation", std::string{}).find("retry") ==
+              std::string::npos);
+        CHECK(rig.calls.size() == 1);
+        CHECK(idef_audited(ts, "requested"));
+        CHECK(idef_audited(ts, "failure"));
+        CHECK_FALSE(idef_audited(ts, "success"));
+    }
 }
 
 TEST_CASE("MCP execute_instruction_definition: a dropped success row is reported, not hidden",

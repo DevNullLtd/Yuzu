@@ -4,6 +4,8 @@
 
 #include <yuzu/log_token.hpp>
 
+#include <spdlog/spdlog.h>
+
 #include <exception>
 #include <utility>
 
@@ -135,10 +137,33 @@ ExecutionMutationOutcome apply_execution_mutation(const ExecutionMutationPorts& 
         return out;
     }
 
-    // 5. The effect, then the outcome row.
+    // 5. The effect, then the outcome row. A throwing effect (std::exception or not) leaves its
+    //    outcome UNKNOWN (the write may or may not have landed), so it is a `failure` row and a
+    //    distinct status that carries no retry hint: it is never reported as the benign
+    //    "store failed, nothing changed" of kStoreFailed.
+    const auto effect_threw = [&] {
+        out.audit_persisted =
+            write_audit(audit, action, "failure", id,
+                        with_context("effect threw; outcome unknown", req.audit_context));
+        out.status = Status::kEffectThrew;
+        return out;
+    };
     if (req.what == ExecutionMutation::kCancel) {
         using Outcome = ExecutionTracker::MarkCancelledOutcome;
-        switch (ports.mark_cancelled(id, req.username)) {
+        Outcome cancelled = Outcome::kFailed;
+        try {
+            cancelled = ports.mark_cancelled(id, req.username);
+        } catch (const std::exception& e) {
+            spdlog::error("execution mutation: cancel effect threw for execution_id={}: {}",
+                          safe_id, e.what());
+            return effect_threw();
+        } catch (...) {
+            spdlog::error("execution mutation: cancel effect threw a non-standard exception for "
+                          "execution_id={}",
+                          safe_id);
+            return effect_threw();
+        }
+        switch (cancelled) {
         case Outcome::kFailed:
             out.audit_persisted = write_audit(audit, action, "failure", id,
                                               with_context("store write failed", req.audit_context));
@@ -158,7 +183,19 @@ ExecutionMutationOutcome apply_execution_mutation(const ExecutionMutationPorts& 
         return out;
     }
 
-    auto rerun = ports.create_rerun(id, req.username, req.failed_only);
+    std::expected<std::string, std::string> rerun = std::unexpected(std::string{});
+    try {
+        rerun = ports.create_rerun(id, req.username, req.failed_only);
+    } catch (const std::exception& e) {
+        spdlog::error("execution mutation: rerun effect threw for execution_id={}: {}", safe_id,
+                      e.what());
+        return effect_threw();
+    } catch (...) {
+        spdlog::error("execution mutation: rerun effect threw a non-standard exception for "
+                      "execution_id={}",
+                      safe_id);
+        return effect_threw();
+    }
     if (!rerun) {
         // The store's text is never echoed (it can carry internals). "original execution not
         // found" can only mean the row vanished after the admission read above.
