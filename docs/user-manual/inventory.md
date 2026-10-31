@@ -1110,6 +1110,19 @@ sync, defeating the hash-skip protocol.
 - **VMs / serial-less hosts.** A device with no SMBIOS serial (many VMs) reports
   `serial`/`system_uuid` as the literal `"unknown"` — use `manufacturer`/`model`
   (e.g. "VMware, Inc."/"VMware7,1") to recognise it.
+- **Versioned record (v2).** The server also stores a versioned record that adds
+  chassis (type, serial, asset tag), baseboard (vendor, product, serial) and a hashed
+  machine-id, each with its source, plus typed per-device rows for CPUs, DIMMs, disks,
+  swap, volumes, partitions and storage topology, each section with its own status.
+  `blob_version` says which format an agent last sent. A device whose agent is still on
+  the original format has **no** section rows stored — read that as "not stored", not
+  "the device has none". A section reported `constrained` with reason `server_cap:<n>`
+  means the server kept only the first `n` rows; `server:machine_id_shape` on the
+  `machine_id` section means the reported machine ID was not a hash and was discarded.
+  Chassis, board and DIMM serial numbers are personal data on the same footing as the
+  device serial and system UUID. Agents keep working unchanged; upgrade the server
+  before the agents. No page or API reads the per-device rows yet: these values are stored
+  now and become visible when the device-CI read surface ships.
 
 The operator-facing read surface — the **Hardware** list's CI columns and the CI
 record's **Overview** lens — is live; see the **`/hardware`** bullet above for its
