@@ -95,13 +95,23 @@ using StmtPtr = std::unique_ptr<sqlite3_stmt, StmtDeleter>;
 // RAII: ROLLBACK on ANY early return between BEGIN and a successful COMMIT unless disarmed,
 // so a hand-rolled transaction stays balanced against a future added early-return
 // (cpp-safety review). Disarmed only after COMMIT succeeds. Shared by del_keys and
-// rename_plugin.
+// rename_plugin. A ROLLBACK that fails, or that leaves the connection inside a transaction, is
+// logged: SQLite clears the transaction on every ROLLBACK that has no live statement, and the
+// callers finalize theirs first, so no trigger is known - the line makes the impossible case
+// visible rather than silent (the next BEGIN on the connection would otherwise be the first
+// sign).
 struct TxnGuard {
     sqlite3* db;
     bool committed{false};
     ~TxnGuard() {
-        if (!committed)
-            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        if (committed)
+            return;
+        char* err = nullptr;
+        if (sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, &err) != SQLITE_OK)
+            spdlog::error("KvStore: ROLLBACK failed: {}", err ? err : "unknown");
+        sqlite3_free(err);
+        if (sqlite3_get_autocommit(db) == 0)
+            spdlog::error("KvStore: connection still inside a transaction after ROLLBACK");
     }
 };
 
@@ -816,9 +826,47 @@ int KvStore::del_keys(std::string_view plugin, const std::vector<std::string>& k
 }
 
 bool KvStore::rename_plugin(std::string_view from, std::string_view to) {
+    // A misuse guard, before any lock is taken. `from == to` would copy nothing (the INSERT is
+    // a no-op onto itself) and then delete every row; a name in the reserved `__x__` range
+    // (kReservedPluginNames: the Guardian baselines, epoch and journal, the sync state) is an
+    // agent-owned namespace that a rename must never move or overwrite. The only caller passes
+    // the literals tar and echo; this keeps a future caller from emptying a namespace.
+    if (from.empty() || to.empty() || from == to || from.starts_with("__") ||
+        to.starts_with("__")) {
+        spdlog::error("KvStore::rename_plugin refused: '{}' -> '{}'", from, to);
+        return false;
+    }
+
     CallLock lock(mu_);
     if (!db_)
         return false;
+
+    // Steady state, every boot after the first: nothing is stored under `from`. A read needs no
+    // write lock (WAL readers never wait for a writer), so look first and return without BEGIN;
+    // otherwise even the zero-row INSERT/DELETE below waits out a write transaction another
+    // process holds, up to the busy budget. A row written under `from` after this read is moved
+    // by the next call.
+    {
+        sqlite3_stmt* raw_probe = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT 1 FROM kv_store WHERE plugin = ?1 LIMIT 1", -1,
+                               &raw_probe, nullptr) != SQLITE_OK) {
+            spdlog::error("KvStore::rename_plugin probe prepare failed: {}", sqlite3_errmsg(db_));
+            return false;
+        }
+        StmtPtr probe(raw_probe);
+        if (sqlite3_bind_text(probe.get(), 1, from.data(), static_cast<int>(from.size()),
+                              SQLITE_STATIC) != SQLITE_OK) {
+            spdlog::error("KvStore::rename_plugin probe bind failed: {}", sqlite3_errmsg(db_));
+            return false;
+        }
+        const int probe_rc = sqlite3_step(probe.get());
+        if (probe_rc == SQLITE_DONE)
+            return true; // nothing to move
+        if (probe_rc != SQLITE_ROW) {
+            spdlog::error("KvStore::rename_plugin probe step failed: {}", sqlite3_errmsg(db_));
+            return false;
+        }
+    } // the probe statement is finalized here, before BEGIN
 
     if (sqlite3_exec(db_, "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK) {
         spdlog::error("KvStore::rename_plugin BEGIN failed: {}", sqlite3_errmsg(db_));

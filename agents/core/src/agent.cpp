@@ -856,9 +856,12 @@ public:
         // feature was renamed from TAR to Echo. Adopt a pre-rename tar.db as echo.db and re-key its
         // KV namespace, BEFORE any plugin init or dispatch (the plugin scan above only registers
         // descriptors and opens no database). This is the ONLY adopter - the plugins never
-        // rename - so nothing can have the database open while it moves, and
+        // rename - so within this process nothing has the database open while it moves, and
         // EchoDatabase::open refuses to create a fresh echo.db beside an unadopted tar.db.
-        // Neither step is fatal: a failed adoption leaves the echo plugin refusing to open.
+        // This step runs BEFORE the Guardian instance lock below, so it does not exclude a
+        // predecessor still shutting down during a service restart: on Windows its open handle
+        // can fail the rename. Neither step is fatal: a failed adoption leaves the echo plugin
+        // refusing to open for this run, and the next start resumes it (sidecars move first).
         //
         // Deferred while the plugin dir still holds only the retired tar plugin: OTA replaces the
         // agent binary alone, so the renamed plugin may not be installed yet. Adopting now would
@@ -879,8 +882,8 @@ public:
                 spdlog::error("Legacy tar.db adoption failed: {}", adopted.error());
             }
             if (kv_store_ && !kv_store_->rename_plugin("tar", "echo")) {
-                spdlog::warn(
-                    "KV namespace re-key tar -> echo failed; Echo health history restarts");
+                spdlog::warn("KV namespace re-key tar -> echo failed; Echo health history "
+                             "restarts until the next start retries it");
             }
         }
 
