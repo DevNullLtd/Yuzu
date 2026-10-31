@@ -1506,8 +1506,9 @@ public:
                           "Dispatch calls refused because a supplied targeting argument "
                           "named no device, plus dispatch-closure calls that named no target at "
                           "all (#2500), plus Destructive-class capabilities targeted without "
-                          "explicit agent_ids on REST (route=command), MCP execute_instruction "
-                          "(route=mcp) or the dashboard exec console (route=dashboard) (#3685). "
+                          "explicit agent_ids on REST (route=command, route=command_v1), MCP "
+                          "execute_instruction (route=mcp) or the dashboard exec console "
+                          "(route=dashboard) (#3685). "
                           "Both labels are closed sets; every reachable pair "
                           "is pre-seeded at boot so absent() stays meaningful. The "
                           "withhold reasons quarantined, unknown_plugin and "
@@ -1571,9 +1572,9 @@ public:
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonForensicUntargeted)}});
-        // #2557: `destructive_no_visible_target` is emitted ONLY by
-        // `/api/command`'s confine-to-visible-agents 404 arm today — unlike
-        // its `destructive_untargeted` sibling above, MCP's execute_instruction
+        // #2557: `destructive_no_visible_target` is emitted ONLY by the two REST
+        // routes' (`/api/command`, `POST /api/v1/commands`) confine-to-visible-agents
+        // 404 arm today — unlike its `destructive_untargeted` sibling above, MCP's execute_instruction
         // and the dashboard exec console have no equivalent post-authz
         // confinement step, so seeding those routes here would publish a
         // series claiming a reachability that does not exist (same rule the
