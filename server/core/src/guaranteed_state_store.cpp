@@ -1065,7 +1065,10 @@ enum class CensusOutcome {
     const char* sqlstate_p = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
     const bool rejected = sqlstate_p && std::string_view(sqlstate_p) == "23503";
     const std::string err = PQresultErrorMessage(res.get());
-    if (!control("ROLLBACK TO SAVEPOINT census_upsert"))
+    // ROLLBACK TO keeps the savepoint defined, so release it too: a batch otherwise stacks
+    // one live savepoint per failed row until the transaction ends.
+    if (!control("ROLLBACK TO SAVEPOINT census_upsert") ||
+        !control("RELEASE SAVEPOINT census_upsert"))
         return CensusOutcome::Abandoned;
     if (rejected) {
         spdlog::debug("GuaranteedStateStore: census write refused, rule not defined on this "

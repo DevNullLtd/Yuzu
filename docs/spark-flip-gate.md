@@ -2424,7 +2424,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   recovery after a spark re-arm is by code reading only, with no agent-level detach,
   re-arm, compliant-edge test (#5676); (c) the row timestamp is agent-asserted with no
   server clamp (`guardian_ingest.cpp:293`) and a `>=` tie rule
-  (`guaranteed_state_store.cpp:833-835`), so clock skew or a same-second tie across the
+  (the `ON CONFLICT ... WHERE EXCLUDED.updated_at >=` guard in `project_rule_status()`), so clock skew or a same-second tie across the
   lifecycle and compliance lanes can leave a false compliant (#5690; live today
   for guard.unhealthy; the agent-side hold, PR #5776, delays each overtake by up to
   H = 1 s and then permits up to N = 64, but cannot close the same-second tie); (d) the census is absent from the decommission cascade, so
@@ -2832,9 +2832,9 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   `GuardianSparkRuntime::drain_bounded()`. The earlier claim here that no consumer depends on
   strict cross-lane wire ordering is withdrawn: the server maps `guard.compliant` to
   `compliant` and `guard.errored`/`guard.unhealthy` to `errored`
-  (`guaranteed_state_store.cpp:202-213`) and keeps a row on `EXCLUDED.updated_at >=
-  stored` (`:835`) at one-second timestamp resolution (`guardian_ingest.cpp:293`), with the
-  equal-timestamp case pinned by `test_guaranteed_state_store.cpp:2866`, so an overtaking
+  (`event_state_from_type()` in `guaranteed_state_store.cpp`) and keeps a row on
+  `EXCLUDED.updated_at >= stored` (`project_rule_status()`) at one-second timestamp resolution (`guardian_ingest.cpp:293`), with the
+  equal-timestamp case pinned by the "equal timestamps, distinct event ids" section of the "guard.errored maps to the errored census state (C-1)" case in `test_guaranteed_state_store.cpp`, so an overtaking
   `errored` can leave a false compliant. That is #5690 (C-1 residual (c), above); the
   agent-side hold (PR #5776) delays each overtake by up to H = 1 s and then permits up to
   N = 64 launches, with no time bound until the lane finds no blocker or empties, so it

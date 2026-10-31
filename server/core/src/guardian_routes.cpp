@@ -767,10 +767,10 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     const int agents = static_cast<int>(online.size()); // connected agents (registry)
 
     // Census + "needs attention" in ONE pass over the LIVE rules, from the shared
-    // by_rule rollup. Orphan status rows for a deleted guard are simply never looked
-    // up, so the fleet total stays consistent with the By-Guard table; and because the
-    // rollup is the status table (not the prunable event log), a quiet guard does not
-    // vanish from "needs attention" once its events age out.
+    // by_rule rollup. A status row with no live guard (the guard was deleted between the
+    // two reads) is simply never looked up, so the fleet total stays consistent with the
+    // By-Guard table; and because the rollup is the status table (not the prunable event
+    // log), a quiet guard does not vanish from "needs attention" once its events age out.
     int64_t cc_ok = 0, cc_drift = 0, cc_err = 0, cc_unk = 0, cc_notimpl = 0;
     int guards_drifting = 0, drift_instances = 0, guards_errored = 0;
     for (const auto& r : rules) {
