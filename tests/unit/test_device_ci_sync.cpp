@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <string>
+#include <vector>
 
 using yuzu::agent::CiRecord;
 using yuzu::agent::core_identity_unavailable;
@@ -75,7 +76,79 @@ CiRecord dirty() {
     r.cpu_model = std::string(1100, 'Z');  // > kMaxFieldLen (1024) → truncated
     return r;
 }
+
+// v2 forward pin (server twin: kCrossPinHashV2 in test_device_inventory_store.cpp). The v2
+// agent's canonical bytes ARE the blob: 0x02, a 33-position scalar record (the 22 frozen
+// v1 fields + 11 appended chassis/board/machine-id scalars), then a status record per
+// registered section and one row per list kind, each 0x1F-joined and 0x1E-terminated. The
+// section id is the row-kind token ('partition', never the action name 'partitions').
+// Placeholder serials only; the DIMM serial is '-'. The literals here MUST be
+// byte-identical to the server twin; this is the layout the agent-side
+// device_ci_canonical_blob_v2 must reproduce.
+constexpr const char* kCrossPinHashV2 = "26037f18de08a8a21facd746eef7ec0a722479ee2009df9b6f14edea35ef0a62";
+
+std::string rec_bytes(const std::vector<std::string>& f) {
+    std::string b;
+    for (std::size_t i = 0; i < f.size(); ++i) {
+        if (i)
+            b += '\x1f';
+        b += f[i];
+    }
+    b += '\x1e';
+    return b;
+}
+
+std::string v2_blob_by_hand() {
+    const CiRecord r = sample();
+    std::vector<std::string> scalars = {
+        r.manufacturer, r.model,      r.serial,        r.system_uuid, r.hostname,
+        r.domain,       r.ou,         r.bios_vendor,   r.bios_version, r.bios_date,
+        r.cpu_model,    r.cpu_cores,  r.cpu_threads,   r.ram_bytes,   r.disks_summary,
+        r.primary_mac,  r.macs_summary, r.nic_count,   r.os_name,     r.os_version,
+        r.os_build,     r.arch,
+        // appended positions 22-32
+        "laptop", "CHS-0001", "AT-0001", "dmi", "Dell Inc.", "0K3CM7", "BRD-0001", "dmi",
+        "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899", "sha256-hmac",
+        "etc_machine_id"};
+    const std::vector<std::vector<std::string>> recs = {
+        {"status", "chassis", "ok", ""},
+        {"status", "baseboard", "ok", ""},
+        {"status", "machine_id", "ok", ""},
+        {"status", "cpu", "ok", ""},
+        {"cpu", "0", "Intel(R) Core(TM) i7-1185G7", "4", "8", "2800", "U3E1", "1"},
+        {"status", "dimm", "ok", ""},
+        {"dimm", "DIMM0", "8192", "DDR4", "3200", "Samsung", "M471A1K43", "-"},
+        {"status", "disk", "ok", ""},
+        {"disk", "0", "Samsung SSD 980", "512", "SSD", "NVMe"},
+        {"status", "swap", "ok", ""},
+        {"swap", "/swapfile", "2048", "proc_swaps"},
+        {"status", "volume", "ok", ""},
+        {"volume", "C:", "C:\\", "\\\\?\\Volume{1}", "NTFS", "511705088", "-"},
+        {"status", "partition", "ok", ""},
+        {"partition", "0", "1", "536870912", "EFI", "-", "-"},
+        {"status", "topology", "ok", ""},
+        {"topology", "lvm", "vg0", "uuid-0001", "sda2", "-"},
+    };
+    std::string b(1, '\x02');
+    b += rec_bytes(scalars);
+    for (const auto& rec : recs)
+        b += rec_bytes(rec);
+    return b;
+}
 } // namespace
+
+TEST_CASE("device_ci v2 blob layout hashes to the forward cross-pin", "[sync][device_ci][hash][v2]") {
+    // The v1 pins above are untouched; v2 is a NEW pin, hashed over the blob bytes.
+    CHECK(sha256_hex(v2_blob_by_hand()) == kCrossPinHashV2);
+}
+
+TEST_CASE("device_ci blob ceiling is the literal 96 KiB, equal to the server's",
+          "[sync][device_ci][v2]") {
+    // The agent and the server share no header, so each side pins its own constant to the SAME
+    // literal (the server twin is in tests/unit/server/test_device_inventory_store.cpp). A
+    // one-sided change fails one of the two; the server accepts everything the agent can send.
+    CHECK(yuzu::agent::kDeviceCiMaxBlobBytes == 98304u);
+}
 
 TEST_CASE("device_ci canonical hash matches the cross-pin", "[sync][device_ci][hash]") {
     CHECK(sha256_hex(device_ci_canonical_blob(sample())) == kCrossPinHash);

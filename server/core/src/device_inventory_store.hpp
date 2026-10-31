@@ -10,8 +10,9 @@
 /// COEXISTS with `SoftwareInventoryStore` (the `installed_software` projection)
 /// and `AppPerfDailyStore` (`app_perf`) — each daily-sync source that needs typed
 /// fleet reads gets its own born-on-PG store. Device-CI is **1:1 per agent**
-/// (unlike software's 1:N rows), so the projection is a single table, replaced
-/// wholesale on change.
+/// (unlike software's 1:N rows), so the parent is a single row, replaced wholesale on
+/// change. The v2 blob adds typed per-kind child tables (cpu, dimm, disk, swap, volume,
+/// partition, topology) and a per-section status table, replaced in the same transaction.
 ///
 /// Substrate contract (ADR-0008/0012): holds a `pg::PgPool&`, migrates at
 /// construction on a pinned lease, schema-qualifies every runtime statement, uses
@@ -62,7 +63,10 @@ public:
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
     /// Canonical content hash over a device-CI record — the SAME bytes the agent
-    /// hashes (`device_ci_canonical_blob` + SHA-256). The record's fields are
+    /// hashes. PER VERSION: v1 (`blob_version` 1) = positional 22-field join + SHA-256
+    /// (`device_ci_canonical_blob`, unchanged so old agents never loop on need_full); v2 =
+    /// the sha256 of the received blob that the parser pinned into `content_hash` (empty if
+    /// the digest failed; the full-ingest path then answers kError). The record's fields are
     /// assumed already UTF-8-scrubbed + clamped by the ingest seam's parse (mirrors
     /// `SoftwareInventoryStore::canonical_hash`, which trusts the seam's clamp), so
     /// this joins positionally + hashes; it does NOT re-clamp. Pure/deterministic.
@@ -73,8 +77,9 @@ public:
     ///    the stored hash. Match → bump last_seen (kTouched); no row or mismatch →
     ///    kNeedFull.
     ///  - `rec` set → full payload: the server **recomputes** the canonical hash
-    ///    from the record (never trusts `claimed_hash`) and upserts the single row →
-    ///    kStored. `first_seen` is preserved across updates; `last_seen` is the
+    ///    from the record (never trusts `claimed_hash`) and replaces the parent row and
+    ///    every v2 child row in ONE transaction under a per-agent advisory lock →
+    ///    kStored (any failure rolls back, previous set intact, kError). `first_seen` is preserved across updates; `last_seen` is the
     ///    server receipt time.
     /// `collected_at` is part of the contract (proto-carried) but drives no
     /// persisted timestamp (#1685). `rec` is taken by value (moved into the upsert).
@@ -93,6 +98,17 @@ public:
     /// capped at a hard ceiling regardless of `limit`. Authoritative: `std::nullopt`
     /// on a store/pool/query degrade, NEVER a silent empty. An empty value = no rows.
     [[nodiscard]] std::optional<std::vector<DeviceCiRecord>> list_device_ci(int limit);
+
+    /// One agent's v2 per-section statuses + list rows (cpu, dimm, disk, swap, volume,
+    /// partition, topology; chassis/baseboard/machine_id carry a status only), in the
+    /// registry order of `device_ci_kinds.hpp`. Read in ONE REPEATABLE READ transaction so
+    /// every section is from the same replace generation. An empty vector means nothing is
+    /// stored (a v1 agent, or no record) — NOT "the device has none"; a store/pool/query
+    /// failure is `std::unexpected(CiReadError::kDegraded)`, never an empty success.
+    /// Personal data (DIMM serials): no route serves this yet — the later REST change must
+    /// put it behind the same fail-closed audit as `inventory.device.ci` (ADR-0016).
+    [[nodiscard]] std::expected<std::vector<DeviceCiSection>, CiReadError>
+    get_device_ci_sections(std::string_view agent_id);
 
     /// Drop an agent's CI record (e.g. on agent removal). Returns true iff the
     /// DELETE executed (COMMAND_OK); false on a closed store, a lease timeout, or

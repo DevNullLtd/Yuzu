@@ -3312,6 +3312,15 @@ test('gateway abi-guard',
   suite: 'docs',
   timeout: 30,
 )
+# #6711: the Dockerfile.gateway platform marker + early arch guard, and the
+# pinned-index lint (scripts/ci/check-gateway-base-index.py) against fixture
+# indexes. Hermetic; the registry read runs in docker-healthcheck-invariants.yml.
+test('gateway base index lint',
+  _python3_test,
+  args: [files('test_gateway_base_index.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 test('qa-stack gateway crash signatures',
   _python3_test,
   args: [files('test_qa_stack_crash_pat.py')],
