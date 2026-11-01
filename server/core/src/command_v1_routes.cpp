@@ -19,6 +19,7 @@
 #include <cctype>
 #include <exception>
 #include <string>
+#include <mutex>
 #include <utility>
 
 namespace yuzu::server::command_v1 {
@@ -588,6 +589,13 @@ void register_command_v1_routes(HttpRouteSink& sink, Deps deps) {
         // dispatch. The session writer is checked here with the rest, so no row is ever written
         // through the re-resolving writer for a request this route accepts.
         if (!fully_wired(deps)) {
+            static std::once_flag logged; // once per process, not per request
+            std::call_once(logged, [] {
+                spdlog::error("POST /api/v1/commands: a required dependency is not wired (auth, "
+                              "permission, session audit, classifier, authorizer or caller "
+                              "derivation); refusing every request with 500 (server configuration "
+                              "defect)");
+            });
             res.status = 500;
             res.set_content(error_body(res, 500, "command dispatch is not configured",
                                        "not_configured"),

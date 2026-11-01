@@ -1380,7 +1380,7 @@ TEST_CASE("REST POST cancel/rerun: no event on a refusal, and a throwing emitter
             CHECK((res->status == 200 || res->status == 201));
             CHECK(h.emitted.size() == 1);
             CHECK(h.metrics.counter("yuzu_server_event_emit_failed_total",
-                                    {{"event", std::string(verb) == "cancel" ? "execution.completed"
+                                    {{"event_type", std::string(verb) == "cancel" ? "execution.completed"
                                                                               : "execution.created"}})
                       .value() == 1);
         }

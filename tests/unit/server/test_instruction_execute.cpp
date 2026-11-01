@@ -1535,8 +1535,8 @@ TEST_CASE("REST execute: publishes instruction.executed on 200 and approval.crea
         CHECK(res->status == 200);
         CHECK(r.emitted.size() == 1);
         CHECK(r.core.counter("yuzu_server_event_emit_failed_total",
-                             {{"event", "instruction.executed"}}) == 1);
-        CHECK(r.core.counter("yuzu_server_event_emit_failed_total", {{"event", "other"}}) == 0);
+                             {{"event_type", "instruction.executed"}}) == 1);
+        CHECK(r.core.counter("yuzu_server_event_emit_failed_total", {{"event_type", "other"}}) == 0);
     }
 }
 

@@ -1587,7 +1587,7 @@ public:
             metrics_.counter(yuzu::server::instruction_execute::kApprovalRefusedMetric,
                              {{"reason", std::string(reason)}});
         // Event emissions by the v1 / MCP twins that THREW (the request is unaffected). Closed
-        // `event` set, pre-seeded; the legacy emitters keep their own counters.
+        // `event_type` set, pre-seeded; the legacy emitters keep their own counters.
         metrics_.describe(yuzu::server::kEventEmitFailedMetric,
                           "Legacy-equivalent platform events (execution.created, "
                           "execution.completed, command.dispatched, instruction.executed, "
@@ -1598,7 +1598,7 @@ public:
                           "counter");
         for (const auto event : yuzu::server::kEmittedEvents)
             metrics_.counter(yuzu::server::kEventEmitFailedMetric,
-                             {{"event", std::string(event)}});
+                             {{"event_type", std::string(event)}});
         // Wave 7 PR7.2: the Forensics single-target refusal — same routes as
         // its Destructive sibling above, since `evaluate_destructive_targeting`
         // is called generically for any classified capability on all of them

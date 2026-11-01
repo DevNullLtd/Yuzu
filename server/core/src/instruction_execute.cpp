@@ -35,6 +35,14 @@ bool safe_audit(const AuditHook& hook, std::string_view result, const std::strin
     try {
         return hook(result, detail);
     } catch (...) {
+        // Silent here would hide the one signal that an audit row was lost to a throw (the
+        // caller sees only "did not persist"). Mirrors rest_audit.hpp's try_persist_audit.
+        try {
+            spdlog::error("instruction.execute audit hook threw (result '{}'); the row is treated "
+                          "as not persisted",
+                          ::yuzu::log_token(std::string(result)));
+        } catch (...) { // NOLINT(bugprone-empty-catch)
+        }
         return false;
     }
 }

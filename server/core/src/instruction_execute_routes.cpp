@@ -10,6 +10,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <mutex>
 #include <utility>
 
 namespace yuzu::server::instruction_execute {
@@ -119,6 +120,11 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
         // Gate first, the legacy route's own pair. Plain and global by design: see the header.
         if (!deps.perm_fn || !deps.perm_fn(req, res, "Execution", "Execute")) {
             if (!deps.perm_fn) { // unwired is misconfiguration, never "no gate"
+                static std::once_flag logged; // once per process, not per request
+                std::call_once(logged, [] {
+                    spdlog::error("POST /api/v1/instructions/{{id}}/execute: perm_fn is not wired; "
+                                  "refusing every request with 500 (server configuration defect)");
+                });
                 res.status = 500;
                 res.set_content(error_body(res, 500, "authorization not configured",
                                            "misconfigured", std::nullopt,
@@ -135,6 +141,11 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
         // and before any body work, store read or dispatch. No retry hint: an unwired sink is a
         // server defect, not a transient fault.
         if (!deps.audit_fn) {
+            static std::once_flag logged; // once per process, not per request
+            std::call_once(logged, [] {
+                spdlog::error("POST /api/v1/instructions/{{id}}/execute: audit_fn is not wired; "
+                              "refusing every request with 503 (server configuration defect)");
+            });
             res.status = 503;
             res.set_header("Sec-Audit-Failed", "true");
             res.set_content(error_body(res, 503, "audit subsystem not configured; nothing was sent",

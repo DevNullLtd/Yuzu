@@ -171,7 +171,10 @@ struct ApprovalSubmitError {
 struct Ports {
     /// Unset reads as "store unavailable".
     std::function<DefinitionLookup(const std::string&)> lookup_definition;
-    /// Required (the cache is shared with the legacy route in production).
+    /// Required (the cache is shared with the legacy route in production). NOT owned: in
+    /// production the pointee is `ServerImpl::param_validator_cache_`, a member declared BEFORE
+    /// `web_server_`, and `ServerImpl::stop()` halts the web server (so no handler holding these
+    /// ports can still run) before any member is destroyed.
     instr::ParamValidatorCache* validators{nullptr};
     /// The destructive-targeting classifier. Unset -> `ClassifierUnavailable` (fail closed).
     std::function<std::expected<CommandCapability, ClassificationError>(std::string_view,
@@ -200,6 +203,9 @@ struct Ports {
     std::function<bool(const std::string& id, int agents)> set_agents_targeted;
     std::function<void(const std::string& id)> refresh_counts;
     DispatchFn dispatch;
+    /// NOT owned: null (counting off) or `ServerImpl::metrics_`, a member that outlives the web
+    /// server for the same reason as `validators` above (`stop()` halts it before member
+    /// destruction).
     yuzu::MetricsRegistry* metrics{nullptr};
 };
 

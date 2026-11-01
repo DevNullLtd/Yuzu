@@ -1080,7 +1080,7 @@ TEST_CASE("command_v1: a throwing event emitter cannot fail an already-dispatche
     CHECK(rig.sent() == Ids{kA, kB, kC, kDecoy});
     CHECK(rig.emitted.size() == 1);
     CHECK(rig.metrics.counter("yuzu_server_event_emit_failed_total",
-                              {{"event", "command.dispatched"}})
+                              {{"event_type", "command.dispatched"}})
               .value() == 1);
 }
 

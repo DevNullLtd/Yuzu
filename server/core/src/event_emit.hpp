@@ -39,8 +39,10 @@ using EmitEventFn = std::function<void(const std::string& event_type, const http
 using EventEmitHook = std::function<void(std::string_view event_type, const nlohmann::json& attrs,
                                          const nlohmann::json& payload_data)>;
 
-/// `yuzu_server_event_emit_failed_total{event}`: an emission that THREW. The `event` label is a
-/// closed set (`kEmittedEvents`), pre-seeded at boot; any other name counts as `other`.
+/// `yuzu_server_event_emit_failed_total{event_type}`: an emission that THREW. The `event_type`
+/// label is a closed set (`kEmittedEvents`), pre-seeded at boot; any other name counts as
+/// `other`. NOT named `event`: docs/observability-conventions.md routes SIEM filters on a label
+/// called `event` (`event="security"`), and this counter must never match one.
 inline constexpr char kEventEmitFailedMetric[] = "yuzu_server_event_emit_failed_total";
 inline constexpr std::array<std::string_view, 6> kEmittedEvents{
     "execution.created", "execution.completed", "command.dispatched",
@@ -70,7 +72,7 @@ inline constexpr std::array<std::string_view, 6> kEmittedEvents{
                     for (const auto known : kEmittedEvents)
                         if (known == event)
                             label = std::string(known);
-                    metrics->counter(kEventEmitFailedMetric, {{"event", label}}).increment();
+                    metrics->counter(kEventEmitFailedMetric, {{"event_type", label}}).increment();
                 }
             } catch (...) { // NOLINT(bugprone-empty-catch)
             }

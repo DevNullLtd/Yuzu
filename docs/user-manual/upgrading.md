@@ -53,7 +53,7 @@ What an operator should know:
   or agentic worker that used the legacy route without a cap will meet it on the v1 route. The legacy
   `POST /api/instructions/{id}/execute` is unchanged.
 - **Metrics.** Two new counters, `yuzu_server_approval_submit_refused_total{reason}` and
-  `yuzu_server_event_emit_failed_total{event}`, are pre-seeded to `0`. `yuzu_server_dispatch_target_rejected_total`
+  `yuzu_server_event_emit_failed_total{event_type}`, are pre-seeded to `0`. `yuzu_server_dispatch_target_rejected_total`
   gains `route="command_v1"`, and `yuzu_server_instruction_param_rejected_total` gains `route="mcp"`
   (`metrics.md`). The platform events `command.dispatched`, `execution.created`, `execution.completed`,
   `approval.created` and `instruction.executed` are also published by the new twins (`analytics-events.md`).
