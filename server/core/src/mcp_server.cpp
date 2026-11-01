@@ -1832,8 +1832,8 @@ static const ToolDef kTools[] = {
      "else default. No per-agent identity (a distinct-device "
      "COUNT, never an agent_id) - not audited. A degraded read, including a stored policy that cannot be "
      "read within its staleness bound, is an error, never an empty list. "
-     "Mirrors GET /api/v1/dex/apps. Not audited beyond the generic tool-call row. A degraded read, "
-     "or one over the read budget, is a retryable error (retry_after_ms). Requires GuaranteedState:Read.",
+     "Mirrors GET /api/v1/dex/apps. Not audited beyond the generic tool-call row. A degraded read "
+     "is a retryable error (retry_after_ms). Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("platform":{"type":"string","enum":["all","windows","macos","linux"],"default":"all","description":"Platform scope of the counts and the online population."},)j"
      R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Look-back window for crash and hang signals."})j"
@@ -17356,8 +17356,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(error_response(id, kInvalidParams, *bad), "application/json");
                     return;
                 }
-                const std::string scope =
-                    dex_normalize_apps_scope(param_str(args, "platform", kDexAppsScopeAll));
+                // Present-but-non-string is invalid, never the default (`param_str` would
+                // turn `5` or `null` into the all-platform scope; same defect as #4644).
+                const auto platform = param_string_strict(args, "platform", kDexAppsScopeAll);
+                const std::string scope = platform ? dex_normalize_apps_scope(*platform) : "";
                 if (scope.empty()) {
                     res.set_content(
                         error_response(id, kInvalidParams,

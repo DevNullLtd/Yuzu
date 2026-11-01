@@ -10197,6 +10197,20 @@ TEST_CASE("MCP DEX: list_dex_apps platform selects the scope, off-enum -> invali
     REQUIRE(bad);
     CHECK(bad->body.find("invalid platform") != std::string::npos);
     CHECK(bad->body.find("-32602") != std::string::npos); // kInvalidParams
+
+    // A present non-string is invalid too, never the all-platform default.
+    int next_id = 985;
+    for (const char* wrong : {"5", "null", "true", "[]", "{}"}) {
+        auto r = ts.call(std::string{R"({"jsonrpc":"2.0","method":"tools/call","id":)"} +
+                         std::to_string(next_id++) +
+                         R"(,"params":{"name":"list_dex_apps","arguments":{"platform":)" + wrong +
+                         "}}}");
+        REQUIRE(r);
+        CAPTURE(wrong);
+        CHECK(r->body.find("invalid platform") != std::string::npos);
+        CHECK(r->body.find("-32602") != std::string::npos);
+        CHECK(r->body.find("all_online") == std::string::npos);
+    }
 }
 
 TEST_CASE("MCP DEX: get_dex_catalogue_group off-enum window -> invalid params, never a "
@@ -10692,13 +10706,16 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
         // The description names the policy, the profile marker, the refused-policy
         // fault and the staleness bound (concept words, so copy edits do not false-fail).
         const auto desc = t["description"].get<std::string>();
-        for (const char* concept_word : {"policy", "profile", "fault", "staleness bound"})
+        for (const char* concept_word : {"policy", "profile", "fault", "staleness bound", "platform",
+                                         "crash_source_coverage", "retry_after_ms"})
             CHECK(desc.find(concept_word) != std::string::npos);
         const auto& platform_in = t["inputSchema"]["properties"]["platform"];
         CHECK(platform_in["enum"] == nlohmann::json::array({"all", "windows", "macos", "linux"}));
         CHECK(platform_in["default"] == "all");
-        CHECK(platform_in.contains("description"));
-        CHECK(t["inputSchema"]["properties"]["window"].contains("description"));
+        CHECK(platform_in["description"].get<std::string>().find("Platform scope") !=
+              std::string::npos);
+        CHECK(t["inputSchema"]["properties"]["window"]["description"].get<std::string>().find(
+                  "Look-back window") != std::string::npos);
         REQUIRE(t.contains("outputSchema"));
         const auto& out = t["outputSchema"];
         CHECK(out["required"] ==
