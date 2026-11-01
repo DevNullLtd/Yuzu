@@ -54,8 +54,14 @@
 /// row lock and is re-checked. The fence's leader_state subquery is read under the
 /// statement snapshot and is NOT re-run when the UPDATE waited on that row lock, so the
 /// row's own columns carry the second check (they are re-evaluated after the wait):
-/// issuer_epoch (the highest epoch that has issued; `issuer_epoch <= $epoch`, an ORDERING comparison that assumes every leader mints in one epoch encoding: a downgrade past #6535 leaves a packed value that an older binary can never exceed, see upgrading.md) rejects a
-/// leader that a successor has already superseded, and `rules_version = $planned` rejects a
+/// issuer_epoch (the highest epoch that has issued; `issuer_epoch <= $epoch`) rejects a
+/// leader that a successor has already superseded. This is an ORDERING comparison, so it
+/// assumes every leader mints in one epoch encoding and that epochs only rise: since #6535
+/// the mint is floored by the surviving leader_state row, which keeps a restore / pg_upgrade
+/// / cutover from minting below an issuer_epoch restored in the same snapshot, but a
+/// downgrade past #6535 (an older binary mints small epochs), or a restore that loses
+/// leader_state while keeping this row, still wedges it until issuer_epoch is reset (see
+/// docs/user-manual/upgrading.md). Separately, `rules_version = $planned` rejects a
 /// batch planned before a rule or overlay write moved it. Nothing is written either way.
 /// The result tells them apart: Fenced is leadership lost (the fence failed or a successor
 /// has issued), StalePlan is a rules_version that moved while issuer_epoch has not passed

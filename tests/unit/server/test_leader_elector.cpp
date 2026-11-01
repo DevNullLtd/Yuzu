@@ -369,6 +369,249 @@ TEST_CASE("LeaderElector refuses a timeline outside 1..2^31-1 and does not consu
     CHECK(top.stats().leader);
 }
 
+// ── #6535 governance round: the surviving row is a FLOOR, and the real-timeline /
+//    refuse-to-open paths are observed (not just the override seam) ───────────────
+//
+// Faults are injected at the SQL level in the per-test cloned database. The two
+// "shadow" cases put a schema FIRST on the database's search_path so the mint's
+// unqualified pg_walfile_name / pg_current_wal_lsn resolve to a stub: that is how a
+// test on a timeline-1 cluster can tell the real-timeline read from a hard-coded 1,
+// from pg_control_checkpoint(), and from a hex-parse bug, and how it reaches the
+// "cannot read the timeline" refusal without a standby.
+
+namespace {
+
+// Insert (or overwrite) the leader_state row the way a restore / cutover leaves it.
+void seed_leader_row(PGconn* admin, const std::string& lock_name, const std::string& epoch_sql) {
+    exec_ok(admin, "DELETE FROM leader_elector.leader_state WHERE lock_key = '" + lock_name + "'");
+    exec_ok(admin, "INSERT INTO leader_elector.leader_state "
+                   "(lock_key, current_leader_epoch, holder_id) VALUES ('" +
+                       lock_name + "', " + epoch_sql + ", 'restored')");
+}
+
+std::string current_database_name(PGconn* conn) {
+    return scalar(conn, "SELECT current_database()");
+}
+
+} // namespace
+
+TEST_CASE("LeaderElector mint is floored by a surviving row from a HIGHER timeline (restore, pg_upgrade, cutover; #6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    const std::string lock_name = kServerBackgroundLeaderLock;
+    auto admin = connect(db.dsn());
+    // A dump taken from a cluster that had failed over to timeline 3, restored into a fresh
+    // cluster that starts on timeline 1: the row and the sequence come across, the timeline
+    // does not. issuer_epoch (plugin_config_store.enablement_meta) rides in the same dump and
+    // is ordered against the new epoch (`issuer_epoch <= epoch`).
+    const std::int64_t restored = (std::int64_t{3} << 32) + 41;
+    seed_leader_row(admin.get(), lock_name, "(3::bigint << 32) + 41");
+    exec_ok(admin.get(), "SELECT setval('leader_elector.leader_epoch_seq', 41, true)");
+
+    // The characterisation the floor exists for: WITHOUT it the packed mint on timeline 1 is
+    // BELOW the restored value, so an ordered consumer would reject the new leader forever.
+    CHECK(scalar(admin.get(), "SELECT ((1::bigint << 32) + 42) < ((3::bigint << 32) + 41)") == "t");
+
+    LeaderElector a(cfg_tl(db.dsn(), "holder-a", 1));
+    REQUIRE(a.try_acquire());
+    const std::int64_t e = *a.epoch();
+    CHECK(e == restored + 1);
+    CHECK(restored <= e); // the enablement store's ordering predicate: issuer_epoch <= epoch
+    auto claim = connect(db.dsn());
+    CHECK(eval_bool(claim.get(), LeaderElector::epoch_fence_sql(lock_name, e)));
+    CHECK_FALSE(eval_bool(claim.get(), LeaderElector::epoch_fence_sql(lock_name, restored)));
+
+    // Still strictly increasing afterwards.
+    a.resign();
+    REQUIRE(a.try_acquire());
+    CHECK(*a.epoch() == e + 1);
+}
+
+TEST_CASE("LeaderElector mint is floored when the sequence is OLDER than the row on the same timeline (#6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    const std::string lock_name = kServerBackgroundLeaderLock;
+    auto admin = connect(db.dsn());
+    // Table-only restore, a logical-replication cutover that skipped setval(), or the cap
+    // remedy (ALTER SEQUENCE ... RESTART): the sequence is behind the row.
+    seed_leader_row(admin.get(), lock_name, "(1::bigint << 32) + 500");
+    exec_ok(admin.get(), "SELECT setval('leader_elector.leader_epoch_seq', 10, true)");
+
+    LeaderElector a(cfg_tl(db.dsn(), "holder-a", 1));
+    REQUIRE(a.try_acquire());
+    const std::int64_t row = (std::int64_t{1} << 32) + 500;
+    CHECK(*a.epoch() == row + 1);
+    a.resign();
+    REQUIRE(a.try_acquire());
+    CHECK(*a.epoch() == row + 2);
+}
+
+TEST_CASE("LeaderElector mint over corrupt, foreign and legacy rows (#6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    const std::string lock_name = kServerBackgroundLeaderLock;
+    auto admin = connect(db.dsn());
+
+    SECTION("a row at INT64_MAX fails the mint loudly (bigint out of range), never wraps") {
+        seed_leader_row(admin.get(), lock_name, "9223372036854775807");
+        LeaderElector a(cfg_tl(db.dsn(), "holder-a", 1));
+        REQUIRE(a.is_open());
+        CHECK_FALSE(a.try_acquire());
+        CHECK_FALSE(a.is_leader());
+        CHECK(failed(a.stats(), AcquireFailure::EpochRecord) == 1);
+        // Repair is an operator action on the row; the lock was released.
+        seed_leader_row(admin.get(), lock_name, "(1::bigint << 32) + 1");
+        LeaderElector b(cfg_tl(db.dsn(), "holder-b", 1));
+        REQUIRE(b.is_open());
+        CHECK(b.try_acquire());
+    }
+    SECTION("a negative row does not lower the mint") {
+        seed_leader_row(admin.get(), lock_name, "-5");
+        LeaderElector a(cfg_tl(db.dsn(), "holder-a", 1));
+        REQUIRE(a.try_acquire());
+        CHECK((*a.epoch() >> 32) == 1);
+    }
+    SECTION("a pre-#6535 sequence-only row (small epoch) is superseded by the packed mint") {
+        seed_leader_row(admin.get(), lock_name, "57");
+        exec_ok(admin.get(), "SELECT setval('leader_elector.leader_epoch_seq', 57, true)");
+        LeaderElector a(cfg_tl(db.dsn(), "holder-a", 1));
+        REQUIRE(a.try_acquire());
+        CHECK(*a.epoch() == (std::int64_t{1} << 32) + 58);
+    }
+    SECTION("a row under ANOTHER lock_key never floors this lock's mint") {
+        exec_ok(admin.get(), "INSERT INTO leader_elector.leader_state "
+                             "(lock_key, current_leader_epoch, holder_id) "
+                             "VALUES ('other_lock', (9::bigint << 32), 'x')");
+        LeaderElector a(cfg_tl(db.dsn(), "holder-a", 1));
+        REQUIRE(a.try_acquire());
+        CHECK((*a.epoch() >> 32) == 1);
+    }
+}
+
+TEST_CASE("LeaderElector: ALTER SEQUENCE RESTART is a safe remedy once the cap is hit (#6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    auto admin = connect(db.dsn());
+    exec_ok(admin.get(), "SELECT setval('leader_elector.leader_epoch_seq', 4294967294, true)");
+
+    LeaderElector a(cfg_tl(db.dsn(), "holder-a", 1));
+    REQUIRE(a.try_acquire()); // draws the last representable value
+    const std::int64_t last = *a.epoch();
+    CHECK((last & kSeqMask) == 4294967295LL);
+    a.resign();
+
+    LeaderElector b(cfg_tl(db.dsn(), "holder-b", 1));
+    REQUIRE(b.is_open());
+    CHECK_FALSE(b.try_acquire()); // nextval raises at MAXVALUE: fail closed
+    CHECK(failed(b.stats(), AcquireFailure::EpochRecord) == 1);
+
+    exec_ok(admin.get(), "ALTER SEQUENCE leader_elector.leader_epoch_seq RESTART");
+    LeaderElector c(cfg_tl(db.dsn(), "holder-c", 1));
+    REQUIRE(c.try_acquire());
+    CHECK(*c.epoch() > last); // the floor: a restarted sequence cannot mint below the row
+}
+
+TEST_CASE("LeaderElector epoch stays increasing across two CONSECUTIVE lossy promotions (#6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    auto admin = connect(db.dsn());
+
+    LeaderElector l1(cfg_tl(db.dsn(), "leader-1", 1));
+    REQUIRE(l1.try_acquire());
+    const std::int64_t e1 = *l1.epoch();
+    l1.resign();
+
+    simulate_lost_mint(admin.get()); // promotion 1: the standby lacks E1's mint
+    LeaderElector l2(cfg_tl(db.dsn(), "leader-2", 2));
+    REQUIRE(l2.try_acquire());
+    const std::int64_t e2 = *l2.epoch();
+    l2.resign();
+
+    simulate_lost_mint(admin.get()); // promotion 2: the next standby lacks E2's mint
+    LeaderElector l3(cfg_tl(db.dsn(), "leader-3", 3));
+    REQUIRE(l3.try_acquire());
+    const std::int64_t e3 = *l3.epoch();
+
+    // All three drew the same sequence value; only the timeline separates them.
+    CHECK((e1 & kSeqMask) == (e2 & kSeqMask));
+    CHECK((e2 & kSeqMask) == (e3 & kSeqMask));
+    CHECK(e1 < e2);
+    CHECK(e2 < e3);
+}
+
+TEST_CASE("LeaderElector: an old (pre-#6535) minter in a mixed fleet and the next packed mint (#6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    const std::string lock_name = kServerBackgroundLeaderLock;
+    auto admin = connect(db.dsn());
+
+    LeaderElector fresh(cfg_tl(db.dsn(), "new-binary", 1));
+    REQUIRE(fresh.try_acquire());
+    const std::int64_t e_new = *fresh.epoch();
+    fresh.resign();
+
+    // A pre-#6535 binary wins the election and mints with the bare sequence.
+    exec_ok(admin.get(),
+            "WITH e AS (SELECT nextval('leader_elector.leader_epoch_seq') AS ep) "
+            "INSERT INTO leader_elector.leader_state (lock_key, current_leader_epoch, holder_id) "
+            "SELECT '" + lock_name + "', e.ep, 'old-binary' FROM e "
+            "ON CONFLICT (lock_key) DO UPDATE SET current_leader_epoch = EXCLUDED.current_leader_epoch");
+    const std::int64_t old_epoch = std::stoll(scalar(
+        admin.get(), "SELECT current_leader_epoch FROM leader_elector.leader_state"));
+    CHECK(old_epoch < (std::int64_t{1} << 32)); // small: the documented rolling-upgrade residual
+    CHECK(old_epoch != e_new);                   // the equality fence still tells them apart
+
+    // When the new binary leads again its epoch rises above anything it issued before.
+    LeaderElector again(cfg_tl(db.dsn(), "new-binary-2", 1));
+    REQUIRE(again.try_acquire());
+    CHECK(*again.epoch() > e_new);
+}
+
+TEST_CASE("LeaderElector reads the REAL timeline from the WAL file name, not a constant or the control file (#6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    auto admin = connect(db.dsn());
+    const std::string dbname = current_database_name(admin.get());
+    // A stub FIRST on the search_path: the mint's unqualified pg_walfile_name resolves to it.
+    // Timeline 0x0000000A = 10 also exercises the multi-digit hex parse. A mutant that read
+    // pg_control_checkpoint() or hard-coded 1 would mint timeline 1 here.
+    exec_ok(admin.get(), "CREATE SCHEMA shadow");
+    exec_ok(admin.get(), "CREATE FUNCTION shadow.pg_walfile_name(pg_lsn) RETURNS text "
+                         "LANGUAGE sql AS $$ SELECT '0000000A0000000000000001'::text $$");
+    exec_ok(admin.get(), "ALTER DATABASE \"" + dbname + "\" SET search_path = shadow, pg_catalog");
+
+    LeaderElector a(cfg(db.dsn(), "holder-a")); // NO override: the real probe + real mint
+    REQUIRE(a.is_open());
+    REQUIRE(a.try_acquire());
+    CHECK((*a.epoch() >> 32) == 10);
+}
+
+TEST_CASE("LeaderElector refuses to open when the timeline cannot be read, and heals once it can (#6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    auto admin = connect(db.dsn());
+    const std::string dbname = current_database_name(admin.get());
+    // Simulates a standby / a platform without WAL functions: pg_current_wal_lsn() raises.
+    exec_ok(admin.get(), "CREATE SCHEMA shadow");
+    exec_ok(admin.get(), "CREATE FUNCTION shadow.pg_current_wal_lsn() RETURNS pg_lsn "
+                         "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'recovery is in progress'; END $$");
+    exec_ok(admin.get(), "ALTER DATABASE \"" + dbname + "\" SET search_path = shadow, pg_catalog");
+
+    LeaderElector a(cfg(db.dsn(), "holder-a"));
+    CHECK_FALSE(a.is_open());
+    CHECK_FALSE(a.try_acquire());
+    CHECK_FALSE(a.is_leader());
+    CHECK_FALSE(a.epoch().has_value());
+    CHECK(failed(a.stats(), AcquireFailure::Connect) >= 1);
+
+    // Heal: the stub goes away; the next attempt reconnects on a fresh connection and leads,
+    // which also proves the failed probe left no advisory lock behind.
+    exec_ok(admin.get(), "DROP FUNCTION shadow.pg_current_wal_lsn()");
+    REQUIRE(a.try_acquire());
+    CHECK(a.is_leader());
+    CHECK((*a.epoch() >> 32) >= 1);
+}
+
 TEST_CASE("epoch_fence_sql predicate fences a stale ex-leader epoch (fail-closed)",
           "[pg][store][leader-elector]") {
     YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);

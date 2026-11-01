@@ -23,13 +23,19 @@
 ///     is in the epoch because a bare sequence is not monotonic across a LOSSY
 ///     promotion: the promoted standby can lack the latest mint and re-mint a
 ///     value a paused ex-leader holds. Every promotion starts a new timeline
-///     whatever WAL was lost, so the re-minted epoch differs. NOT covered: two
-///     live primaries (the fence is per database), a physical-snapshot restore
-///     without archive recovery, a logical restore, promotion tooling that skips
-///     the previous timeline's history, and a rolling upgrade while a pre-#6535
+///     whatever WAL was lost, so the re-minted epoch differs. The surviving
+///     `leader_state` row is also a FLOOR (`GREATEST(packed, prev_epoch + 1)`),
+///     so a restore / pg_upgrade / cutover onto a lower timeline, or an older
+///     sequence, can never mint below it (the enablement store orders epochs).
+///     NOT covered: two live primaries (the fence is per database), a restore
+///     that loses the leader_state row, a lossy promotion while the row pins a
+///     higher timeline than the real one (the elector warns), same-timeline loss
+///     (crash recovery with an unflushed mint), promotion tooling that skips the
+///     previous timeline's history, and a rolling upgrade while a pre-#6535
 ///     binary can lead (ADR-2002 §3 "Update (2026-11-01, #6535)").
 ///     Epochs are therefore >= 2^32; the sequence is capped at 2^32-1
-///     (migration v2) and a timeline outside 1..2^31-1 is refused, both as the
+///     (migration v2; `ALTER SEQUENCE ... RESTART` is a safe remedy because of
+///     the floor) and a timeline outside 1..2^31-1 is refused, both as the
 ///     `epoch_record` acquire failure.
 ///   * Every LEADER-DRIVEN side-effecting claim (the slice-3.3 command outbox,
 ///     on an ORDINARY pooled connection) embeds the `epoch_fence_sql()` predicate
@@ -285,8 +291,8 @@ public:
     [[nodiscard]] static std::string epoch_fence_sql(const std::string& lock_name,
                                                      std::int64_t epoch);
 
-    /// The schema migrations for this store (version 1: `leader_epoch_seq` +
-    /// `leader_state`). Exposed for tests and for the migration ladder.
+    /// The schema migrations for this store (v1: `leader_epoch_seq` + `leader_state`;
+    /// v2, #6535: the sequence's 32-bit MAXVALUE). Exposed for tests and the migration ladder.
     static const std::vector<pg::PgMigration>& migrations();
 
 private:
@@ -300,17 +306,22 @@ private:
     Config cfg_;
     bool name_valid_ = false;                 ///< cfg_.lock_name passed validation.
     pg::PgAdvisoryLockKey lock_key_;          ///< Derived from cfg_.lock_name.
+    /// The epoch-mint statement's bound parameters ($1 lock name, $2 holder, $3 test timeline
+    /// override as text or empty), built once in the constructor so no allocation can throw
+    /// between the advisory-lock grant and the mint in try_acquire().
+    std::vector<std::string> mint_params_;
 
     mutable std::mutex mu_;
     pg::PgConn conn_;                          ///< Dedicated, never-recycled (declared BEFORE the guard).
     std::optional<pg::PgSessionAdvisoryLockGuard> lock_guard_; ///< Held only while leader.
     std::optional<std::int64_t> epoch_;        ///< Epoch of the current leadership, if any (writer state, under mu_).
     bool open_ = false;
+    std::int64_t last_logged_timeline_ = 0;    ///< Last timeline logged at info (under mu_).
 
     /// Lock-free publish channel for `is_leader()`/`epoch()` (slice 3.2, #4013):
     /// `0` = not leader; `>= 1` = leader at that epoch (a minted epoch is >= 2^32 since
-    /// #6535 and always positive, so `0` is an unambiguous sentinel). The election loop stores this under
-    /// `mu_` whenever `epoch_` changes (acquire → the minted epoch; drop → 0),
+    /// #6535 and always positive, so `0` is an unambiguous sentinel). The election loop
+    /// stores this under `mu_` whenever `epoch_` changes (acquire → the minted epoch; drop → 0),
     /// release-ordered; readers load it with acquire and never touch `mu_`, so a
     /// libpq probe stalled under `mu_` cannot block a worker tick's leadership
     /// read. `epoch_` above stays the writer's authoritative state under `mu_`.

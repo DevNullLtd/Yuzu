@@ -75,6 +75,10 @@ std::optional<std::int64_t> parse_i64(const char* s) {
     return v;
 }
 
+// The epoch packs the timeline above the low 32 bits (#6535).
+constexpr std::int64_t kEpochTimelineUnit = std::int64_t{1} << 32;
+constexpr std::int64_t kEpochCountMask = kEpochTimelineUnit - 1;
+
 // The Postgres WAL timeline of the primary this connection is writing to (#6535).
 // The first 8 hex digits of the current WAL file name ARE the insertion timeline,
 // and unlike pg_control_checkpoint().timeline_id (the control file lags a fast
@@ -86,34 +90,51 @@ std::optional<std::int64_t> parse_i64(const char* s) {
 constexpr const char* kTimelineSql =
     "('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::bigint";
 
-/// The epoch mint: `epoch = (timeline << 32) + nextval(leader_epoch_seq)` (#6535).
+/// The epoch mint (#6535):
+///   epoch = GREATEST((timeline << 32) + nextval(leader_epoch_seq), prev_row_epoch + 1)
 ///
 /// Why the timeline is in the epoch: a lossy (asynchronous, or degraded
 /// non-strict-quorum) promotion can lose the latest mint -- the sequence advance
 /// AND the leader_state row -- so a bare sequence re-mints the value a paused
-/// ex-leader still holds and the equality fence admits both. Reading the
-/// surviving row cannot help (GREATEST(seq, row)+1 recomputes the same value),
-/// but every promotion starts a NEW timeline whatever WAL was lost.
+/// ex-leader still holds and the equality fence admits both. Every promotion
+/// starts a NEW timeline whatever WAL was lost, so the re-minted epoch differs.
 ///
-/// `+`, never `|`: at the sequence ceiling a bitwise OR would silently alias the
-/// timeline bits. The range test runs INSIDE the CTE that holds nextval(), so a
-/// refused mint burns no sequence value. The range keeps the result positive
-/// (`live_epoch_` reads 0 as "not leader", so a negative epoch would read as
-/// not-leader while leading) and below 2^63. $3 is the test-only timeline
-/// override as text ('' = none, read the real timeline).
+/// Why the surviving row is a FLOOR (`prev + 1`): the enablement store orders
+/// epochs (`issuer_epoch <= epoch`), and a logical restore / pg_upgrade /
+/// logical-replication cutover lands on a cluster whose timeline restarted at 1
+/// while the restored row and issuer_epoch still carry the old, higher timeline;
+/// a restored sequence can also be older than the row (`ALTER SEQUENCE ... RESTART`
+/// is the cap remedy). The floor keeps every mint strictly above the surviving
+/// row. It is the SAME schema, read under the advisory lock; the row alone
+/// cannot repair a lossy promotion (the promoted standby may have lost the row
+/// too), which is why the timeline stays. A row of INT64_MAX makes `prev + 1`
+/// raise (bigint out of range): a loud epoch_record failure, never a wrap.
+///
+/// `+`, never `|` for the pack (defence in depth: with the sequence capped at
+/// 2^32-1 they agree, but an OR aliases the timeline bits if the cap is ever
+/// raised). The range test runs INSIDE the CTE that holds nextval(), so a refused
+/// mint burns no sequence value. The range keeps the result positive
+/// (`live_epoch_` reads 0 as "not leader") and below 2^63. $3 is the test-only
+/// timeline override as text ('' = none, read the real timeline). The statement
+/// also returns the REAL timeline so a minted timeline part above it (a pinned
+/// timeline after a restore) can be reported.
 const std::string& epoch_mint_sql() {
     static const std::string kSql =
         std::string("WITH t AS (SELECT COALESCE(NULLIF($3, '')::bigint, ") + kTimelineSql +
         ") AS tl), "
-        "e AS (SELECT (t.tl << 32) + nextval('leader_elector.leader_epoch_seq') AS ep "
-        "      FROM t WHERE t.tl BETWEEN 1 AND 2147483647) "
-        "INSERT INTO leader_elector.leader_state "
+        "p AS (SELECT COALESCE((SELECT current_leader_epoch FROM leader_elector.leader_state "
+        "      WHERE lock_key = $1), 0) AS prev), "
+        "e AS (SELECT GREATEST((t.tl << 32) + nextval('leader_elector.leader_epoch_seq'), "
+        "                      p.prev + 1) AS ep "
+        "      FROM t, p WHERE t.tl BETWEEN 1 AND 2147483647), "
+        "ins AS (INSERT INTO leader_elector.leader_state "
         "  (lock_key, current_leader_epoch, holder_id, acquired_at) "
         "SELECT $1, e.ep, $2, now() FROM e "
         "ON CONFLICT (lock_key) DO UPDATE "
         "  SET current_leader_epoch = EXCLUDED.current_leader_epoch, "
         "      holder_id = EXCLUDED.holder_id, acquired_at = now() "
-        "RETURNING current_leader_epoch";
+        "RETURNING current_leader_epoch) "
+        "SELECT ins.current_leader_epoch, (SELECT tl FROM t) FROM ins";
     return kSql;
 }
 
@@ -150,7 +171,13 @@ const std::vector<pg::PgMigration>& LeaderElector::migrations() {
 LeaderElector::LeaderElector(Config cfg)
     : cfg_(std::move(cfg)),
       name_valid_(is_valid_lock_name(cfg_.lock_name)),
-      lock_key_(make_lock_key(cfg_.lock_name)) {
+      lock_key_(make_lock_key(cfg_.lock_name)),
+      mint_params_{cfg_.lock_name, cfg_.holder_id,
+                   cfg_.timeline_override_for_test ? std::to_string(*cfg_.timeline_override_for_test)
+                                                   : std::string{}} {
+    // Force the first-call static init of the mint SQL here, where a bad_alloc cannot land
+    // between the advisory-lock grant and the mint in try_acquire (cpp-safety C-1).
+    (void)epoch_mint_sql();
     if (!name_valid_) {
         spdlog::error("leader_elector: invalid lock_name; elector stays non-open (fail-closed)");
         return;
@@ -235,24 +262,40 @@ bool LeaderElector::connect_locked() {
         spdlog::error("leader_elector: schema migration failed; elector non-open");
         return false;
     }
-    // Probe the timeline the epoch mint will read (#6535) and log it. A platform
-    // whose WAL functions differ, or a DSN that resolved to a standby, would
-    // otherwise show up only as a rising epoch_record failure count; refusing to
-    // open here makes it a boot-time, attributable error. Skipped under the test
-    // override (the mint never reads the real timeline then).
+    // Probe the timeline the epoch mint will read (#6535). A platform whose WAL
+    // functions differ, or a DSN that resolved to a standby, would otherwise show up
+    // only as a rising epoch_record failure count; refusing to open here makes it an
+    // attributable error. It is counted as acquire_failures{cause="connect"} (the log
+    // line is the attribution). Skipped under the test override (the mint never reads
+    // the real timeline then).
     if (!cfg_.timeline_override_for_test.has_value()) {
         pg::PgResult tl = pg::exec_params(conn_.get(), timeline_probe_sql().c_str(),
                                           std::vector<std::string>{});
-        if (tl.status() != PGRES_TUPLES_OK || PQntuples(tl.get()) != 1 ||
-            PQgetisnull(tl.get(), 0, 0)) {
+        const std::optional<std::int64_t> observed =
+            (tl.status() == PGRES_TUPLES_OK && PQntuples(tl.get()) == 1 &&
+             !PQgetisnull(tl.get(), 0, 0))
+                ? parse_i64(PQgetvalue(tl.get(), 0, 0))
+                : std::nullopt;
+        if (!observed) {
+            std::string why = tl.get() != nullptr ? PQresultErrorMessage(tl.get()) : "no result";
+            while (!why.empty() && (why.back() == '\n' || why.back() == '\r'))
+                why.pop_back(); // libpq messages end in a newline
             spdlog::error("leader_elector: cannot read the Postgres timeline "
                           "(pg_walfile_name(pg_current_wal_lsn()) failed: {}); the fenced epoch "
                           "needs it, so the elector stays non-open. Is the DSN pointing at a "
                           "standby, or is this a Postgres platform without WAL functions?",
-                          tl.get() != nullptr ? PQresultErrorMessage(tl.get()) : "no result");
+                          why);
+            // Do not keep an idle, connected-but-closed connection between retries.
+            conn_ = pg::PgConn{};
             return false;
         }
-        spdlog::info("leader_elector: coordination timeline={}", PQgetvalue(tl.get(), 0, 0));
+        // Info only when the timeline changes (every reconnect would otherwise repeat it).
+        if (*observed != last_logged_timeline_) {
+            spdlog::info("leader_elector: coordination timeline={}", *observed);
+            last_logged_timeline_ = *observed;
+        } else {
+            spdlog::debug("leader_elector: coordination timeline={}", *observed);
+        }
     }
     open_ = true;
     return true;
@@ -377,13 +420,9 @@ bool LeaderElector::try_acquire() {
         return false;
     }
 
-    pg::PgResult ep = pg::exec_params(
-        conn_.get(), epoch_mint_sql().c_str(),
-        std::vector<std::string>{
-            cfg_.lock_name, cfg_.holder_id,
-            cfg_.timeline_override_for_test ? std::to_string(*cfg_.timeline_override_for_test)
-                                            : std::string{}});
-    if (ep.status() != PGRES_TUPLES_OK || PQntuples(ep.get()) != 1 || PQgetisnull(ep.get(), 0, 0)) {
+    pg::PgResult ep = pg::exec_params(conn_.get(), epoch_mint_sql().c_str(), mint_params_);
+    if (ep.status() != PGRES_TUPLES_OK || PQntuples(ep.get()) != 1 || PQgetisnull(ep.get(), 0, 0) ||
+        PQnfields(ep.get()) != 2 || PQgetisnull(ep.get(), 0, 1)) {
         spdlog::error("leader_elector: acquired lock but failed to record epoch; releasing");
         acquire_failed_[static_cast<std::size_t>(AcquireFailure::EpochRecord)].fetch_add(
             1, std::memory_order_relaxed);
@@ -391,30 +430,45 @@ bool LeaderElector::try_acquire() {
         return false;
     }
     auto parsed = parse_i64(PQgetvalue(ep.get(), 0, 0));
-    if (!parsed) {
-        spdlog::error("leader_elector: unparseable epoch; releasing");
+    auto real_tl = parse_i64(PQgetvalue(ep.get(), 0, 1));
+    // The SQL guarantees epoch >= (1 << 32) + 1; re-check here so a statement that ever
+    // stopped guaranteeing it cannot leave epoch_ set while live_epoch_ publishes a
+    // value the not-leader sentinel logic mishandles (cpp-safety C-3).
+    if (!parsed || !real_tl || *parsed <= kEpochTimelineUnit) {
+        spdlog::error("leader_elector: unparseable or out-of-range epoch; releasing");
         acquire_failed_[static_cast<std::size_t>(AcquireFailure::EpochRecord)].fetch_add(
             1, std::memory_order_relaxed);
         drop_leadership_locked();
         return false;
     }
     epoch_ = *parsed;
-    // Publish the minted epoch (slice 3.2, #4013). Minted epochs are >= 2^32 (the
-    // timeline is >= 1 and in the high bits, #6535), so a non-zero value unambiguously
-    // means "leader at this epoch" to a lock-free
-    // reader. Release-ordered to pair with the acquire loads in is_leader/epoch.
-    // The acquisition is counted and the answer stamped BEFORE the publish, so a
-    // lock-free reader that observes the new leadership also observes
+    // Publish the minted epoch (slice 3.2, #4013). A minted epoch is above 2^32 (the timeline
+    // is >= 1 and in the high bits, #6535), so a non-zero value unambiguously means "leader
+    // at this epoch" to a lock-free reader. Release-ordered to pair with the acquire loads
+    // in is_leader/epoch. The acquisition is counted and the answer stamped BEFORE the
+    // publish, so a lock-free reader that observes the new leadership also observes
     // acquired >= 1 and a non-zero last_ok (never is_leader=1 with acquired=0).
     acquired_.fetch_add(1, std::memory_order_relaxed);
     note_ok_locked();
     live_epoch_.store(*epoch_, std::memory_order_release);
+    // A minted timeline part ABOVE the real timeline means the surviving leader_state row
+    // (restored / copied from a higher timeline) is pinning the epoch: the lossy-promotion
+    // protection (the timeline) is reduced until the real timeline passes it (#6535).
+    if ((*parsed >> 32) > *real_tl) {
+        spdlog::warn("leader_elector: minted epoch's timeline part {} is above the real "
+                     "Postgres timeline {}: the surviving leader_state row carries a higher "
+                     "timeline (restore / pg_upgrade / cutover). Fencing within this timeline "
+                     "is unaffected, but the lossy-promotion protection is reduced until the "
+                     "real timeline exceeds {} (docs/user-manual/ha-postgres.md)",
+                     *parsed >> 32, *real_tl, *parsed >> 32);
+    }
     // holder_id (boot-random, not a secret) is logged once per acquire so a
     // `leader_state.holder_id` row is attributable to a process from its logs
     // (WS-11: it is deliberately NOT a metric label -- a per-boot value would be
     // unbounded series churn).
-    spdlog::info("leader_elector: acquired leadership '{}' at epoch {} (holder_id={})",
-                 cfg_.lock_name, *epoch_, cfg_.holder_id);
+    spdlog::info("leader_elector: acquired leadership '{}' at epoch {} (timeline_part={} count_part={}, "
+                 "holder_id={})",
+                 cfg_.lock_name, *epoch_, *epoch_ >> 32, *epoch_ & kEpochCountMask, cfg_.holder_id);
     return true;
 }
 
