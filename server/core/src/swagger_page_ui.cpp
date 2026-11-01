@@ -103,6 +103,8 @@ extern const char* const kSwaggerCss = R"SWG(.sw-page{padding:22px 28px 36px;dis
 .panel .sw-guide table{width:100%;border-collapse:collapse}
 .sw-unavail{display:flex;gap:10px;align-items:baseline;margin-top:12px;padding:8px 12px;border:1px solid color-mix(in srgb,var(--warn) 50%,var(--line2));border-radius:var(--rad-ctl);background:var(--mds-color-bg-warning-tinted);color:var(--ink2)}
 .sw-unavail .pill{flex:none}
+.sw-auth{display:flex;gap:10px;align-items:baseline;margin-top:12px;color:var(--ink2)}
+.sw-auth .pill{flex:none}
 .sw-alt{margin-top:6px;padding-left:10px;border-left:2px solid var(--line)}
 .sw-error .btn{margin-top:10px}
 .sw-sr{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0})SWG";
@@ -126,7 +128,7 @@ extern const char* const kSwaggerBody = R"SWG(
 <script>
 )SWG";
 
-// Renderer, part 1 of 2 (split at a line boundary).
+// Renderer, part 1 of 3 (split at a line boundary).
 extern const char* const kSwaggerJs1 = R"SWG((function () {
   'use strict';
   var SPEC_URL = '/api/v1/openapi.json?guides=true';
@@ -285,7 +287,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     var kids = [h('div', 'sw-resp-head', [pill(code, cls + ' mono'), h('span', 'sw-desc', [r.description || ''])])];
     if (r.headers) {
       kids.push(h('div', 'sw-hdrs', Object.keys(r.headers).map(function (k) {
-        return h('div', '', [mono(k), ' ', h('span', 'mut', [(r.headers[k].description || '')])]);
+        return h('div', '', [mono(k), ' ', h('span', 'mut', [hdrOf(r.headers[k]).description || ''])]);
       })));
     }
     if (r.content) {
@@ -307,9 +309,10 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     var base = o.path.indexOf('/v2/') === 0 ? '/api' : '/api/v1'; // the only v2 route is keyed /v2/... and served at /api/v2/...
     var mth = o.method.toUpperCase(), sends = mth === 'POST' || mth === 'PUT' || mth === 'PATCH';
     // -g: curl's URL globbing would rewrite the braces of a path parameter.
-    var curl = 'curl -s -g -X ' + mth + ' \\\n  -H "Authorization: Bearer $YUZU_TOKEN" \\\n' +
+    var curl = 'curl -s -g -X ' + mth + ' \\\n' + curlAuth(op, mth) +
       (sends ? '  -H "Content-Type: application/json" \\\n  -d \'{}\' \\\n' : '') + '  "' + location.origin + base + o.path + '"';
     kids.push(h('h3', '', ['Request']));
+    kids.push(authNote(op));
     kids.push(h('pre', '', [curl]));
     if (op.parameters && op.parameters.length) { kids.push(h('h3', '', ['Parameters'])); kids.push(paramsTable(op.parameters)); }
     var rb = op.requestBody;
@@ -333,6 +336,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
   var guides = dict();
   var SKIP_MODEL = dict();
   ['ApiMeta', 'ApiPagination', 'A4ErrorEnvelope', 'ApiEnvelope'].forEach(function (n) { SKIP_MODEL[n] = 1; });
+  var MODEL_CAP = 60;
   function collectRefs(node, acc) {
     if (!node || typeof node !== 'object') return;
     if (Array.isArray(node)) { node.forEach(function (n) { collectRefs(n, acc); }); return; }
@@ -343,13 +347,14 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     var seen = dict(), queue = dict(), order = [];
     list.forEach(function (o) { collectRefs(o.op.responses, queue); collectRefs(o.op.requestBody, queue); });
     var names = Object.keys(queue);
-    while (names.length && order.length < 60) {
+    while (names.length && order.length < MODEL_CAP) {
       var n = names.shift();
       if (seen[n] || SKIP_MODEL[n]) continue;
       seen[n] = 1; order.push(n);
       var sub = dict(); collectRefs(schemaOf(n), sub);
       Object.keys(sub).forEach(function (m) { if (!seen[m]) names.push(m); });
     }
+    order.cut = names.some(function (m) { return !seen[m] && !SKIP_MODEL[m]; });
     return order;
   }
   function plainTable(cols, rows) {
@@ -364,6 +369,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
   function modelBlock(names) {
     if (!names.length) return null;
     var kids = [h('h3', '', ['Data model'])];
+    if (names.cut) kids.push(h('p', 'mut sw-cap', ['Only the first ' + MODEL_CAP + ' models are listed.']));
     names.forEach(function (n) {
       var body = null;
       var btn = h('button', 'sw-model-h', [pill(n, 'info mono'), h('span', 'mut', ['Show fields'])]);
@@ -375,7 +381,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
         // Hide button above an empty body.
         if (open && !body) {
           try { body = schemaBlock({ $ref: '#/components/schemas/' + n }); }
-          catch (e) { body = h('div', 'sw-error', ['These fields could not be shown.']); }
+          catch (e) { note('model ' + n, e); body = h('div', 'sw-error', ['These fields could not be shown.']); }
           wrap.appendChild(body);
         }
         btn.setAttribute('aria-expanded', open ? 'true' : 'false');
@@ -415,10 +421,9 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     ops = []; tags = []; guides = dict(); st = { q: '', method: '', tag: '', typed: '' };
 )SWG";
 
-// Renderer, part 2 of 2.
+// Renderer, part 2 of 3.
 extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null tag, a guide that is not an object, a null path item) is
     // skipped, not allowed to take the whole page down.
-    function isObj(x) { return !!x && typeof x === 'object' && !Array.isArray(x); }
     (Array.isArray(spec.tags) ? spec.tags : []).forEach(function (t) {
       if (!isObj(t) || typeof t.name !== 'string') return;
       var g = t['x-yuzu-guide'];
@@ -439,6 +444,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null ta
 
     var typed = ops.filter(function (o) { return o.typed; }).length;
     var unavailable = ops.filter(function (o) { return o.unavail; }).length;
+    var own = ops.filter(function (o) { return Array.isArray(o.op.security); }).length;
     var q = h('input', 'sw-ctl'); q.type = 'search'; q.id = 'sw-q'; q.placeholder = 'Search path, summary or description'; q.setAttribute('aria-label', 'Search operations');
     var msel = h('select', 'sw-ctl', [h('option', '', ['All methods'])].concat(METHODS.map(function (m) { return h('option', '', [m.toUpperCase()]); }))); msel.id = 'sw-m'; msel.setAttribute('aria-label', 'Method');
     var tsel = h('select', 'sw-ctl', [h('option', '', ['All groups'])].concat(tags.map(function (t) { return h('option', '', [t]); }))); tsel.id = 'sw-t'; tsel.setAttribute('aria-label', 'Group');
@@ -450,7 +456,8 @@ extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null ta
       h('span', 'chip', ['Groups', h('b', '', [String(tags.length)])]),
       h('span', 'chip', ['Typed responses', h('b', '', [typed + ' (' + (ops.length ? Math.round(100 * typed / ops.length) : 0) + '%)'])]),
       unavailable ? h('span', 'chip', ['Unavailable', h('b', '', [String(unavailable)])]) : null,
-      h('span', 'chip', ['Auth', h('b', '', ['Bearer token, X-Yuzu-Token, or session cookie'])])
+      h('span', 'chip', ['Auth', h('b', '', [ways({}).length ? waysText(ways({})) : 'none declared'])]),
+      own ? h('span', 'chip', ['Own credentials', h('b', '', [String(own)])]) : null
     ]);
     var bar = h('div', 'sw-bar', [q, msel, tsel, ysel, count]);
 
@@ -479,7 +486,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null ta
           var open = force !== undefined ? force : gbtn.getAttribute('aria-expanded') !== 'true';
           if (open && !gbody) {
             try { gbody = guideBlock(g, ops.filter(function (o) { return o.tag === t; })); }
-            catch (e) { gbody = h('div', 'sw-guide', [h('div', 'sw-error', ['This guide could not be shown.'])]); }
+            catch (e) { note('guide ' + t, e); gbody = h('div', 'sw-guide', [h('div', 'sw-error', ['This guide could not be shown.'])]); }
             panel.insertBefore(gbody, list);
           }
           gbtn.setAttribute('aria-expanded', open ? 'true' : 'false');
@@ -506,7 +513,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null ta
       function toggle(force) {
         var open = force !== undefined ? force : head.getAttribute('aria-expanded') !== 'true';
         if (open && !body) {
-          try { body = detail(o); } catch (e) { body = h('div', 'sw-detail', [h('div', 'sw-error', ['This operation could not be shown.'])]); }
+          try { body = detail(o); } catch (e) { note('operation ' + o.key, e); body = h('div', 'sw-detail', [h('div', 'sw-error', ['This operation could not be shown.'])]); }
           row.appendChild(body);
         }
         head.setAttribute('aria-expanded', open ? 'true' : 'false');
@@ -592,6 +599,16 @@ extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null ta
   function headerCid(r) {
     try { return (r.headers && r.headers.get('X-Correlation-Id')) || ''; } catch (e) { return ''; }
   }
+  // Logged with what could not be drawn, since the page shows only a fixed line.
+  function note(what, e) { try { console.error('API reference page: could not draw ' + what, e); } catch (x) { /* no console */ } }
+  // A plain object, not null and not an array: the one test build() and load() share.
+  function isObj(x) { return !!x && typeof x === 'object' && !Array.isArray(x); }
+  // A response header is inline or a $ref into components.headers; own keys only.
+  function hdrOf(x) {
+    if (!x || typeof x.$ref !== 'string') return x || {};
+    var c = spec.components && spec.components.headers, n = refName(x.$ref);
+    return (c && Object.prototype.hasOwnProperty.call(c, n) && c[n]) || {};
+  }
   function load() {
     root.textContent = 'Loading the API description...';
     say('Loading the API description...');
@@ -618,7 +635,9 @@ extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null ta
         throw problem('The API description could not be reached. Check the network connection, then retry.', { raw: x });
       })
       .then(function (j) {
-        clearTimeout(timer); spec = j;
+        clearTimeout(timer);
+        if (!isObj(j) || !isObj(j.paths)) throw problem('The server answered, but not with an API description.');
+        spec = j;
         try { build(); } catch (x) { throw problem('The API description was loaded but could not be shown.', { raw: x }); }
       })
       .catch(function (e) {
@@ -629,6 +648,56 @@ extern const char* const kSwaggerJs2 = R"SWG(    // A malformed entry (a null ta
       });
   }
   load();
+)SWG";
+
+// Renderer, part 3 of 3: the schema flattening, kept apart so no piece nears the size gate.
+extern const char* const kSwaggerJs3 = R"SWG(  // ---- credentials (in this piece to keep the first under the size gate; declarations hoist) ----
+  // The document's top-level `security` is the default and an operation's own `security`
+  // replaces it; an empty list means the route takes no credential. Each entry is one acceptable
+  // way in, and the schemes inside one entry are all required together.
+  function schemeOf(n) {
+    var s = spec.components && spec.components.securitySchemes;
+    return isObj(s) && Object.prototype.hasOwnProperty.call(s, n) && isObj(s[n]) ? s[n] : null;
+  }
+  function isBearer(d) { return d.type === 'http' && String(d.scheme).toLowerCase() === 'bearer'; }
+  function isNamed(d) {
+    return d.type === 'apiKey' && typeof d.name === 'string' && /^[A-Za-z0-9_-]+$/.test(d.name) && (d.in === 'header' || d.in === 'cookie');
+  }
+  function ways(op) {
+    var s = Array.isArray(op.security) ? op.security : spec.security;
+    return (Array.isArray(s) ? s : []).filter(isObj).map(function (a) { return Object.keys(a); }).filter(function (a) { return a.length; });
+  }
+  function envOf(n) { return n.replace(/^x[-_]/i, '').replace(/-/g, '_').toUpperCase(); }
+  // True when an empty entry sits among the alternatives: the route also works with no credential.
+  function anon(op) {
+    var s = Array.isArray(op.security) ? op.security : spec.security;
+    return Array.isArray(s) && s.some(function (a) { return isObj(a) && !Object.keys(a).length; });
+  }
+  function shows(d) { return !!d && (isBearer(d) || isNamed(d)); }
+  function curlAuth(op, mth) {
+    var w = ways(op), first = w.length ? w[0] : [], cookie = false;
+    var lines = first.map(function (n) {
+      var d = schemeOf(n);
+      if (!shows(d)) return '';
+      if (isBearer(d)) return '  -H "Authorization: Bearer $YUZU_TOKEN" \\\n';
+      if (d.in === 'cookie') { cookie = true; return '  -b "' + d.name + '=$' + envOf(d.name) + '" \\\n'; }
+      return '  -H "' + d.name + ': $' + envOf(d.name) + '" \\\n';
+    }).join('');
+    // A write that carries the session cookie is refused unless it names the page's own origin.
+    return lines + (cookie && mth !== 'GET' && mth !== 'HEAD' ? '  -H "Origin: ' + location.origin + '" \\\n' : '');
+  }
+  function credName(n) {
+    var d = schemeOf(n);
+    if (d && isBearer(d)) return 'Bearer token';
+    return d && isNamed(d) ? d.name + (d.in === 'cookie' ? ' cookie' : ' header') : n;
+  }
+  function waysText(w) { return w.map(function (a) { return a.map(credName).join(' and '); }).join(', or '); }
+  function authNote(op) {
+    var w = ways(op), hidden = (w.length ? w[0] : []).filter(function (n) { return !shows(schemeOf(n)); });
+    var t = w.length ? 'Send ' + waysText(w) + (anon(op) ? ', or no credential' : '') : Array.isArray(op.security) ? 'No credential needed' : 'No credential declared';
+    return h('div', 'sw-auth', [pill('auth', 'idle'), h('span', '', [t + (hidden.length ? ' (the example below cannot show ' + hidden.map(credName).join(', ') + ')' : '')])]);
+  }
+
   // allOf -> one schema (in this piece to keep the first under the size gate; declarations
   // hoist). Members are followed through $ref; properties and required merge in order, the
   // first definition wins and a later one only fills a missing description or format; type,
@@ -676,7 +745,7 @@ extern const char* const kSwaggerTail = R"SWG(
 
 namespace {
 const std::string kSwaggerTemplate = std::string(kSwaggerHead) + kSwaggerCss + kSwaggerBody +
-                                     kSwaggerJs1 + kSwaggerJs2 + kSwaggerTail;
+                                     kSwaggerJs1 + kSwaggerJs2 + kSwaggerJs3 + kSwaggerTail;
 } // namespace
 
 // A page with no nav entry, like Help: the shell carries the title and no active key.
