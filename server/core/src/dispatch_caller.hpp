@@ -126,10 +126,13 @@ struct DispatchCaller {
     ///      only file that stamps it; `deployment_routes.cpp` reaches the engine and
     ///      stamps nothing itself.
     /// `BundleOrchestrator::dispatch()` (`bundle_orchestrator.cpp`) is NOT a
-    /// fourth stamping site — it is a pass-through conduit: REST/MCP
-    /// `execute_bundle` derive provenance at one of the three sites above
-    /// (site 2, via `approval_ticket_just_consumed`) and thread it in as a
-    /// parameter, same as `principal`/`exec_visible`. `ServerImpl::
+    /// fourth stamping site — it is a pass-through conduit. MCP `execute_bundle`
+    /// derives provenance at site 2 above (via `approval_ticket_just_consumed`)
+    /// and threads it in as a parameter, same as `principal`/`exec_visible`.
+    /// REST `execute_bundle` (`rest_api_v1.cpp`) stamps NOTHING: it threads only
+    /// `principal_is_admin` (REST has no ticket flow), so its provenance is always
+    /// `None` and a non-admin REST caller never reaches a gated bundle step.
+    /// `ServerImpl::
     /// derive_dispatch_caller_for_username` stamps ONLY `principal_is_admin`
     /// (see that field's comment above), never this one — do not confuse the
     /// two; a caller can be admin-stamped there and still reach the gate

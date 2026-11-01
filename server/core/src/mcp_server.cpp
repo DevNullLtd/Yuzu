@@ -8822,7 +8822,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         // agentic caller branches on a closed token and a SIEM pairs the row with
                         // the body. `retry_ms` < 0 is a null `retry_after_ms` (not retryable).
                         const auto mint_refusal = [&](int code, std::string_view message,
-                                                      std::string_view remediation, long retry_ms,
+                                                      std::string_view remediation,
+                                                      std::int64_t retry_ms,
                                                       std::string_view reason,
                                                       const std::string& refusal_cid,
                                                       bool audit_ok) {

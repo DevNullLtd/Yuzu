@@ -12,6 +12,7 @@
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params
 #include "web_utils.hpp"            // audit_token (CWE-117)
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/protective_actions.hpp>
 
 #include <spdlog/spdlog.h>
@@ -116,7 +117,10 @@ void count_dispatch_threw(yuzu::MetricsRegistry* metrics) {
 /// Everything after the gate. `first` is the session the route authenticated at entry.
 void handle_post(const Deps& d, const auth::Session& first, const httplib::Request& req,
                  httplib::Response& res) {
-    const std::string cid = detail::ensure_correlation_id(res);
+    // The id as it is embedded in audit rows: through `log_token` like instruction_execute.cpp's
+    // `cid_suffix`, so both twins write the same bytes (identical for any minted id). The BODY
+    // and the response header re-read the header value untouched (`a4_denial`).
+    const std::string cid = ::yuzu::log_token(detail::ensure_correlation_id(res));
 
     // The second resolution must name the SAME principal as the first: a request whose credentials
     // resolve to two principals was gated as one and would be attributed to, and dispatched as, the

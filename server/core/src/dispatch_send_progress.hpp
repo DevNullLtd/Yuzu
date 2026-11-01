@@ -60,8 +60,8 @@ public:
 
 private:
     [[nodiscard]] static SendProgress*& slot() noexcept {
-        thread_local SendProgress* current = nullptr;
-        return current;
+        thread_local SendProgress* open_scope = nullptr;
+        return open_scope;
     }
     SendProgress* previous_;
 };
