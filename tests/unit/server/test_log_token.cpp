@@ -93,7 +93,7 @@ TEST_CASE("log_token: bytes that are not well-formed UTF-8 map to '_' one per by
     CHECK(log_token("a\xF5\x80\x80\x80" "b") == "a____b"); // above U+10FFFF
     CHECK(log_token("a\xE2\x82") == "a__");               // truncated 3-byte lead
     CHECK(log_token("a\xE2" "b") == "a_b");                // lead followed by ASCII
-    for (const std::string s : {std::string("a\xFF\xFEb\xC0\xAF" "c\xED\xA0\x80" "d\xF5\x80\x80\x80" "e\xE2\x82"),
+    for (const std::string& s : {std::string("a\xFF\xFE" "b\xC0\xAF" "c\xED\xA0\x80" "d\xF5\x80\x80\x80" "e\xE2\x82"),
                                 std::string("x\xC2\x85y\xE2\x80\xA8z\xE2\x80\xA9"),
                                 std::string("caf\xC3\xA9 \xE2\x82\xAC\xF0\x9F\x98\x80")}) {
         CHECK(is_well_formed_utf8(log_token(s)));
