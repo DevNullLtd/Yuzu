@@ -4,7 +4,9 @@
 # Demonstrates, in one manual run, that the fenced leader epoch is higher after a
 # LOSSY promotion of a streaming standby: a promoted standby that never received
 # the latest leader election must not re-mint the epoch a paused former leader
-# still holds. It is evidence of one scenario on one rig, not a CI gate, and not
+# still holds. It was run once, against the first (timeline-only) form of the mint
+# and before the previous-epoch floor was added; re-run it before relying on it. It is
+# evidence of one scenario on one rig, not a CI gate, and not
 # a proof for every promotion path (ADR-2002 s3 lists what is not covered). It drives a REAL
 # yuzu-server (its LeaderElector, the unmodified mint) against the 3-node
 # Patroni rig in deploy/docker/docker-compose.ha-postgres.yml under
@@ -178,7 +180,7 @@ boot_and_lead() { # <epoch-to-differ-from> -- boots a server and waits until it 
 
 # The container names are fixed; refuse to adopt (and later `down -v`) another HA rig.
 if [[ -n "$(docker ps -a --filter 'name=yuzu-ha-' -q 2>/dev/null)" ]]; then
-    echo "a yuzu-ha-* container already exists; stop that rig first (this script runs 'docker compose down -v')" >&2
+    echo "a yuzu-ha-* container already exists; stop that rig first (this script runs 'docker compose down -v'; to clear leftovers of an aborted run: docker compose -f deploy/docker/docker-compose.ha-postgres.yml down -v)" >&2
     trap - EXIT
     rm -rf "$RIG"
     exit 2

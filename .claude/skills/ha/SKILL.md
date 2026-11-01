@@ -70,7 +70,7 @@ three-model adversarial review's strongest, unanimous finding:
 > admission gate, #6528, is separately unbuilt. The epoch fence across a lossy
 > asynchronous Postgres promotion, #6535, is fixed in code for a standby promotion by
 > the timeline-packed, row-floored epoch (demonstrated once by
-> `scripts/ha/ha-leader-epoch-lossy-promotion.sh`, a manual harness no workflow runs);
+> `scripts/ha/ha-leader-epoch-lossy-promotion.sh`, a manual harness no workflow runs, on the pre-floor mint);
 > its residuals (canonical list: ADR-2002 section 3 "Update (2026-11-01, #6535)") are
 > **not yet accepted**: the owner's acceptance is not recorded, and a "Decided" line is
 > required before the gate is lifted.)

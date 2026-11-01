@@ -7,7 +7,7 @@ three-model adversarial review (Fable + gpt-5.6-sol + Kimi-K2.7) surfaced as mis
 failback/rebalance, roadmap 7.1.1, #5759) was added 2026-10-13 as the pair to WS-13. If a row here
 disagrees with ADR-2002, the ADR wins.
 
-**Verified 2026-11-01 (status re-stamp against `origin/dev` at `2dcc2fcee`, with `gh`):** ONLY the WS-3 and
+**Verified 2026-11-01 (status re-stamp against the merge-base with `origin/dev`, `2dcc2fcee`, with `gh`):** ONLY the WS-3 and
 WS-11 rows were re-audited in this pass. The #4014 leader-observability subset is on `origin/dev` (PR #6542) and #4014 is
 closed; #6526, #6527 and #6528 are open. #6535 (the epoch fence across a lossy promotion) is addressed in code by the change that
 made this edit (the timeline-packed, row-floored epoch, recorded in the WS-3 row and the gate text; Refs #6535). **The issue stays open until the owner's acceptance of the residuals below is recorded on it.** Every other row was NOT re-audited
@@ -46,16 +46,16 @@ lands** —
 > gateway-fronted fleets, WS-13 is done.** (Shipping #4014 satisfies only that one clause; **the gate is
 > not lifted**, because other clauses are open, and a durable cluster-capability admission gate, #6528,
 > is separately unbuilt. The epoch fence across a lossy asynchronous Postgres promotion (#6535) is **fixed in code for
-> a lossy promotion of a streaming standby** by the timeline-packed epoch (`GREATEST((timeline << 32) + nextval, prev_row + 1)`;
+> a lossy promotion of a streaming standby** by the timeline-packed epoch (`GREATEST((GREATEST(timeline, prev_row >> 32) << 32) + nextval, prev_row + 1)`;
 > ADR-2002 section 3 "Update (2026-11-01, #6535)") and **demonstrated once** on the Patroni async rig by
-> `scripts/ha/ha-leader-epoch-lossy-promotion.sh` (a manual harness; no workflow runs it). The canonical not-covered
+> `scripts/ha/ha-leader-epoch-lossy-promotion.sh` (a manual harness; no workflow runs it; the one run predates the row floor). The canonical not-covered
 > list is that ADR update (two live primaries, a restore that loses `leader_state`, a lossy promotion while a restored
 > row pins a higher timeline, same-timeline loss, a physical-snapshot restore without archive recovery, promotion
-> tooling that skips timeline history, a rolling upgrade or downgrade across #6535). The owner's acceptance of these
+> tooling that skips timeline history or a PITR that reuses a timeline, a rolling upgrade or downgrade across #6535). The owner's acceptance of these
 > residuals is **not yet recorded** (a "Decided" line is required before the gate is lifted). **Owed before the gate
-> lifts (manual or follow-up, not in this change):** WS-9 rig legs for two consecutive async promotions, a
+> lifts (manual or follow-up, not in this change):** re-run the harness against the row-floored mint; WS-9 rig legs for two consecutive async promotions, a
 > restore/`pg_upgrade` leg and an old-binary leader leg; a test for the pinned-timeline warning; a two-connection
-> test of migration v2 racing a running old leader; CI wiring (or an explicit decision not to wire) for the harness.)
+> test of migration v2 racing a running old leader; an EnablementStore-level test of the restore case (the wedge is latent: nothing calls `set_desired_batch`); an assessment of the sibling bare-sequence ordering fences (`gateway_route_store` `connection_epoch`, `policy_store` `remediation_claim_seq`); CI wiring (or an explicit decision not to wire) for the harness.)
 > (Decided 2026-10-13: the last two clauses were added to the gate; before that this sentence omitted
 > both while the WS-3 note and the WS-13 row already treated them as gating. The rest of WS-11 does not
 > gate.)

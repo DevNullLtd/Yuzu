@@ -3686,8 +3686,9 @@ groups:
   #    restore that loses leader_state, a lossy promotion while a restored row pins
   #    a higher timeline, same-timeline loss, a physical snapshot restored without
   #    archive recovery, promotion tooling that skips the previous timeline's
-  #    history, or a rolling upgrade/downgrade across #6535 (the canonical list is
-  #    in docs/user-manual/ha-postgres.md and ADR-2002 section 3).
+  #    history or a PITR that reuses a timeline, or a rolling upgrade/downgrade
+  #    across #6535 (the canonical list is ADR-2002 section 3; ha-postgres.md
+  #    mirrors it).
   #  - Single replica (the supported default): SplitBrain cannot fire (one
   #    series), NoLeader fires only if the elector never leads (loops paused),
   #    Flapping usually does NOT see a single replica's restart loop (see that
