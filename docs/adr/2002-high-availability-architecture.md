@@ -382,6 +382,14 @@ cluster unit; intra-zone scale is more nodes.
 - **Agent-side:** agents are **pinned to their zone's cluster** (no cross-zone failover). Within a
   cluster they connect through a **cluster-front (VIP / DNS-multi / node list)** and reconnect on node
   loss. Both gateway endpoints are addressable by **VIP or node list — support both**.
+  *Update (2026-10-30, ADR-0074 D9 and D10; decided by Nathan Dornbrook on 2026-10-30): "no cross-zone
+  failover" now holds for fixed machines (servers, desktops) only. A roaming device (a laptop) is given
+  both the internal and the internet-facing gateways of its own tenant, and prefers an internal one
+  whenever one is reachable; it never fails over to another tenant's gateways. A gateway carries only
+  agents of its own tenant and zone (both zones for a roaming device), and the server refuses a route
+  claim outside that. The cluster unit is unchanged: one cluster per zone and region inside one
+  tenant's domain, and regions coordinate through the servers and Postgres. Who classifies a device
+  as roaming is open for ADR-0074's wave 4.*
 
 **Status (WS-4): 4.1 done; 4.2a (writer-path hardening) done; 4.2b (Tasks A–D: store layer, per-site
 fail-closed posture + renew correlation, dispatch-wiring, `route_unreadable` consumer + alert rule) done;
@@ -2272,6 +2280,7 @@ cause (the database pair), not of one bad server, and the runbook should say so.
 - **Section 8, PKI:** the CA issues SPIFFE-form identities, 24-hour agent certificates and 7-day gateway and server certificates, from an issuing intermediate under the Yuzu root (created at first boot; decided by Nathan Dornbrook on 2026-10-30) or a customer-signed intermediate. Gateways pull the CRL that `CaStore::publish_next_crl` publishes; the published CRL drops revoked certificates past their notAfter while `ca_issued`'s revoked rows stay append-only (the PKI routed-concern wording, and section 8's sentence that each CRL is a superset of the one before it and that numbering is `MAX(version)+1` with no gaps, are amended in ADR-0074's wave 1). CRL signing never waits for a standby, so losing a standby or a failover does not make gateways fail closed, and the CRL number never goes backwards or repeats across a failover: servers derive it from the signing time, and gateways keep the highest number they have seen from each CRL issuer in memory only and trust the first good CRL they fetch from an issuing intermediate after a restart (the root's CRL rule is set in ADR-0074's wave 1), so gateways stay stateless (decided by Nathan Dornbrook on 2026-10-30, ADR-0074 D7). The SPIFFE trust domain is a random UUID generated at install, unless the operator sets one at first boot (locked afterwards). Renewing every 12 hours means about 28 signatures per second at 1.2 million agents, so the signing path and CRL size must be measured before the agent edge changes (ADR-0074 D3, D4, D6, D7).
 - **Sections 11 and 13, Postgres (decided by Nathan Dornbrook on 2026-10-30, ADR-0074 conflict 8):** asynchronous replication by default, replacing ADR-0074's earlier proposal of one synchronous standby that never degrades; RPO zero for acknowledged writes is no longer a target, and each store's failover loss must meet the requirement ADR-0074 D13 sets for it in ADR-0074's wave 1 or wave 6; write downtime under 60 seconds; no standby reads in the first version; one DNS name or a multi-host DSN with `target_session_attrs=read-write`. Patroni is the on-premises reference (ADR-0074 D13). The shipped default is unchanged until ADR-0074's wave 6 changes it; see the dated updates at the end of sections 11 and 13.
 - **Gateway drain** is a new operator action through the server: weight zero, GOAWAY in staggered batches over a window, and results accepted through a different gateway than the one that carried the command (ADR-0074 D11). It relies on WS-0's durable command idempotency within its bounded ring, and needs new code: gateways forward results for commands they did not dispatch, and a re-drive for lost operator results (ADR-0074 D11.4). Drain is an explicit step before a stop; a bare stop runs a fast drain that fits the platform's stop grace, and ADR-0074's wave 4 sets an 11-minute stop grace in the shipped Compose files (today 40 seconds for a gateway and 210 for the server; decided by Nathan Dornbrook on 2026-10-30, ADR-0074 D11).
+- **Zones, regions and tenants (decided by Nathan Dornbrook on 2026-10-30):** one install may host several customers, and the tenant is a security boundary (a tenancy ADR is required before ADR-0074's wave 4). An agent's gateway list holds only its own tenant's gateways: a fixed machine gets its own zone's only, keeping section 7's "no cross-zone failover"; a roaming device gets both zones and prefers internal (section 7's dated update). A gateway carries only agents of its own tenant and zone, and the server refuses a route claim outside that (#5578's R-6). One cluster per region inside a domain, as section 7 says (ADR-0074 D9, D10).
 - **Gateway-to-gateway (decided by Nathan Dornbrook on 2026-10-30):** gateways link only inside one communication domain, a zone (internet-facing or internal) together with one organisation, over mutual TLS distribution with certificates naming both; a link across a domain is refused, and coordination across domains goes through the server (ADR-0074 D10). From ADR-0074's wave 4 this supersedes section 7b's statement that the distribution cookie is the security boundary; the cookie check stays as a boot refusal only.
 
 ### 8. PKI / CA high availability (Q8)
@@ -2699,7 +2708,8 @@ This ADR records the model and principles. Each area becomes a child ADR/issue:
 
 - **Read-replica query routing** (§10) — later, opt-in, per-query-class.
 - **Second coordination backend** (Redis/NATS) (§3) — built only when SaaS scale demands it.
-- **Cross-zone agent failover** (§7) — deliberately not offered.
+- **Cross-zone agent failover** (§7) — deliberately not offered. *Update (2026-10-30, ADR-0074 D9):
+  offered for roaming devices within their own tenant only; see the dated update in §7.*
 - **Finer intra-zone gateway sharding** (§7) — handled by adding nodes.
 
 ## Review findings incorporated — round 1 (pre-open)
