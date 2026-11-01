@@ -1107,17 +1107,25 @@ TEST_CASE("if_none_match_matches: RFC 9110 lists and weak comparison and * alone
         {"\"x\"W/\"abc\"", false},  {"\"x\" , ", false},
         {"\"a,\"abc\"", false},      {"x\"abc\"", false},        {"*,", false},
         {"*,\"abc\"", false},
+        // Inside a tag only etagc bytes are legal (RFC 9110 section 8.8.3): no space, control byte
+        // or DEL, so one such tag makes the whole header invalid even beside the right tag. Bytes
+        // from 0x80 up (obs-text) and punctuation are fine.
+        {"\"bad space\", \"abc\"", false},  {"\"abc\", \"bad space\"", false},
+        {"\"a\tb\", \"abc\"", false},      {"\"a\x7f\", \"abc\"", false},
+        {"\"a\x01\", \"abc\"", false},     {"\"\xc3\xa9\", \"abc\"", true},
+        {"\"a!#~\", \"abc\"", true},        {"\"\"", false},
     };
     for (const auto& c : cases) {
         INFO("If-None-Match: [" << c.header << "]");
         CHECK(if_none_match_matches(c.header, e) == c.matches);
     }
-    // A NUL byte inside a tag is a character like any other: it neither truncates the tag nor
-    // matches a different one.
+    // A NUL byte inside a tag is not an etagc byte: it neither truncates the tag nor matches, and
+    // a tag holding one makes the whole header invalid, beside the right tag or not.
     CHECK_FALSE(if_none_match_matches(std::string("\"a\0bc\"", 6), e));
+    CHECK_FALSE(if_none_match_matches(std::string("\"a\0bc\", \"abc\"", 12), e));
     const std::string nul_tag("\"a\0bc\"", 6);
-    CHECK(if_none_match_matches(nul_tag, nul_tag));
-    CHECK(if_none_match_matches("W/" + nul_tag, nul_tag));
+    CHECK_FALSE(if_none_match_matches(nul_tag, nul_tag));
+    CHECK_FALSE(if_none_match_matches("W/" + nul_tag, nul_tag));
     // A very long list is linear work and answers correctly at both ends.
     std::string big;
     for (int i = 0; i < 4000; ++i)
@@ -1212,13 +1220,42 @@ TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matchin
               std::string("W/"), std::string("\"unterminated"), full_etag + "x",
               "\"x" + lean_etag, lean_etag + "x", lean_etag + lean_etag, stale + " " + lean_etag,
               "w/" + lean_etag, "W/ " + lean_etag, std::string("*x"), std::string("* ,") + stale,
-              stale + ", *", "*, " + lean_etag, std::string()}) {
+              stale + ", *", "*, " + lean_etag, std::string(), "\"bad space\", " + lean_etag,
+              lean_etag + ", \"bad space\""}) {
             INFO(header);
             auto miss = sink.Get(lean_path, {{"If-None-Match", header}});
             REQUIRE(miss);
             CHECK(miss->status == 200);
             CHECK(miss->body == lean->body);
             CHECK(miss->get_header_value("ETag") == lean_etag);
+        }
+    }
+
+    SECTION("a field sent on several lines is read as one comma-joined list (RFC 9110 5.3)") {
+        // The occurrences are added in either order of the underlying multimap, so each case
+        // gives the same answer whichever line is read first.
+        const std::string stale = "\"0000000000000000\"";
+        struct Case {
+            std::string first;
+            std::string second;
+            int status;
+        };
+        const Case cases[] = {
+            {stale, lean_etag, 304},
+            {"W/" + lean_etag, stale, 304},
+            {stale, full_etag, 200},
+            {lean_etag, "garbage", 200},
+            {lean_etag, "\"bad space\"", 200},
+            {"*", stale, 200},
+        };
+        for (const auto& c : cases) {
+            INFO(c.first << " | " << c.second);
+            sink.repeated_headers = {{"If-None-Match", c.first}, {"If-None-Match", c.second}};
+            auto r = sink.Get(lean_path);
+            sink.repeated_headers.clear();
+            REQUIRE(r);
+            CHECK(r->status == c.status);
+            CHECK(r->body.empty() == (c.status == 304));
         }
     }
 

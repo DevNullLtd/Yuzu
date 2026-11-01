@@ -4041,7 +4041,12 @@ void RestApiV1::register_routes(
         // not store it for others.
         res.set_header("ETag", etag);
         res.set_header("Cache-Control", "no-cache, private");
-        if (if_none_match_matches(req.get_header_value("If-None-Match"), etag)) {
+        // A client or proxy may send the field on several lines; RFC 9110 section 5.3 reads
+        // them as one comma-joined list, as the If-Match handler above does.
+        std::string if_none_match;
+        for (size_t i = 0, n = req.get_header_value_count("If-None-Match"); i < n; ++i)
+            if_none_match += (i ? "," : "") + req.get_header_value("If-None-Match", "", i);
+        if (if_none_match_matches(if_none_match, etag)) {
             res.status = 304;
             return;
         }
