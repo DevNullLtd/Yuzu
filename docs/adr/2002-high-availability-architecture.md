@@ -1901,7 +1901,7 @@ unconditionally terminal by its classifier's own contract and needs no such chec
 
 **Third correction (2026-11-01, #2146 batch B Gate 8):** the four per-attempt synthesizing sites above sit INSIDE the
 per-command forward thread, so a command whose thread could never be started was outside every one of them. The
-other two (`unknown_cluster` and the null-pool branch) resolve in the dispatching thread, before any thread exists
+other two (`unknown_cluster` and the null-pool branch) resolve in the dispatching thread, before that command's own forward thread exists
 (`server.cpp`'s `forward_gateway_pending`, ahead of the spawn).
 `forward_gateway_pending` drains the queue and spawns one detached `std::thread` per command, and `send_to` had
 already counted each queued command as sent (it returns true at the queue push), so a throwing spawn

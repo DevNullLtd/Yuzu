@@ -2706,7 +2706,12 @@ groups:
             itself (the stuck sweep never closes a row an agent has answered), so
             close it with cancel_execution (POST /api/v1/executions/{id}/cancel);
             (3) no send was accepted, or none is known, and no agent has answered:
-            the row closes by itself, or close it with cancel_execution. Either way
+            the row closes by itself, or close it with cancel_execution; (4)
+            agents_sent is above 0, its targeted count was NOT stored, and no agent
+            has answered YET: the stuck sweep can mark that row cancelled after
+            about 30 minutes although agents may still be running the command (a
+            swept row means no agent answered, not that none received it), so
+            check the devices before trusting a cancelled status. Either way
             do NOT blindly re-run the command, because an agent may already be
             running it. For the audit-sink and post-dispatch-helper phases
             (success, denial, a named helper) a well-behaved sink/helper should
