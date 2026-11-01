@@ -1352,7 +1352,8 @@ TEST_CASE("execute: a dispatch that throws before any confirmed send records no 
     CHECK(r.audits[1].detail.find("agents_sent") == std::string::npos);
 }
 
-TEST_CASE("execute: a failed partial-count write is counted and keeps the generic remediation",
+TEST_CASE("execute: a failed partial-count write is counted, keeps agents_sent on the row and says "
+          "the record will not close by itself",
           "[instruction_execute][send_progress]") {
     Rig r;
     r.set_targeted_ok = false;
@@ -1369,9 +1370,86 @@ TEST_CASE("execute: a failed partial-count write is counted and keeps the generi
     CHECK(r.targeted[0].second == 2);
     CHECK(r.counter("yuzu_exec_tracker_bookkeeping_failed_total",
                     {{"op", "set_agents_targeted"}, {"surface", "rest"}}) == 1);
+    CHECK_FALSE(ref->retry_after_ms.has_value());
+    // The count is known even though the write failed: the row carries it (g5 / comp-c1).
+    REQUIRE(r.audits.size() == 2);
+    CHECK(r.audits[1].detail.find("agents_sent=2") != std::string::npos);
+    // The positive "will complete it" claim is NOT made; the honest one is: the server closes the
+    // record by itself ONLY if no agent ever answers, and cancel_execution closes it otherwise.
     CHECK(ref->remediation.find("will complete it") == std::string::npos);
-    CHECK(ref->remediation.find("some agents may already have received the command") !=
-          std::string::npos);
+    CHECK(ref->remediation.find("at least 2 agent(s) were sent the command") != std::string::npos);
+    CHECK(ref->remediation.find("could NOT be recorded") != std::string::npos);
+    CHECK(ref->remediation.find("ONLY if no agent ever responds") != std::string::npos);
+    CHECK(ref->remediation.find("will NOT close by itself") != std::string::npos);
+    CHECK(ref->remediation.find("cancel_execution") != std::string::npos);
+    CHECK(ref->remediation.find("retry") == std::string::npos);
+}
+
+TEST_CASE("execute: confirmed sends with no execution row still put agents_sent on the failure row",
+          "[instruction_execute][send_progress]") {
+    Rig r;
+    r.create_fails = true; // the ledger is wired but the row was not created: execution_id empty
+    r.defs["d"] = make_def("d");
+    r.custom_dispatch = [](const std::vector<std::string>& ids) {
+        return yuzu::test::dispatch_throwing_on_nth_send(ids, 3);
+    };
+    auto out = run(r.request("d", json{{"agent_ids", json::array({kA, kB, kC})}},
+                             make_caller("u", true)),
+                   r.ports(), r.audit());
+    const auto* ref = as_refusal(out);
+    REQUIRE(ref);
+    CHECK(r.targeted.empty()); // nothing to store the count on
+    REQUIRE(r.audits.size() == 2);
+    CHECK(r.audits[1].detail.find("agents_sent=2") != std::string::npos);
+    CHECK(ref->remediation.find("at least 2 agent(s) were sent the command") != std::string::npos);
+    CHECK(ref->remediation.find("no execution record was created") != std::string::npos);
+    CHECK(ref->remediation.find("cancel_execution") == std::string::npos); // there is no row
+}
+
+TEST_CASE("execute: the throw arm writes the failure row BEFORE it records the partial count, and a "
+          "lost row never skips the count",
+          "[instruction_execute][send_progress]") {
+    for (const bool row_lost : {false, true}) {
+        INFO("row_lost=" << row_lost);
+        Rig r;
+        r.audit_other_fails = row_lost; // the failure row is "other" than `requested`
+        r.defs["d"] = make_def("d");
+        r.custom_dispatch = [](const std::vector<std::string>& ids) {
+            return yuzu::test::dispatch_throwing_on_nth_send(ids, 3);
+        };
+        auto ports = r.ports();
+        std::vector<std::string> rows_when_counted;
+        ports.set_agents_targeted = [&](const std::string& id, int n) {
+            for (const auto& a : r.audits)
+                rows_when_counted.push_back(a.result);
+            r.targeted.emplace_back(id, n);
+            return true;
+        };
+        auto out = run(r.request("d", json{{"agent_ids", json::array({kA, kB, kC})}},
+                                 make_caller("u", true)),
+                       ports, r.audit());
+        REQUIRE(as_refusal(out));
+        // A later allocation failure in the count / metric steps must find the row already out.
+        CHECK(rows_when_counted == std::vector<std::string>{"requested", "failure"});
+        REQUIRE(r.targeted.size() == 1);
+        CHECK(r.targeted[0].second == 2);
+        CHECK(out.audit_dropped == row_lost);
+    }
+}
+
+TEST_CASE("execute: the generic throw remediation says the record closes by itself ONLY when no "
+          "agent responds",
+          "[instruction_execute][send_progress]") {
+    Rig r;
+    r.dispatch_throws = true;
+    r.defs["d"] = make_def("d");
+    auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
+    const auto* ref = as_refusal(out);
+    REQUIRE(ref);
+    CHECK(ref->remediation.find("ONLY if no agent ever responds") != std::string::npos);
+    CHECK(ref->remediation.find("will NOT close by itself") != std::string::npos);
+    CHECK(ref->remediation.find("cancel_execution") != std::string::npos);
+    CHECK(ref->remediation.find("retry") == std::string::npos);
 }
 
 TEST_CASE("execute: a throwing dispatch with no tracker wired records nothing",

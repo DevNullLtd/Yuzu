@@ -49,12 +49,19 @@ bool safe_audit(const AuditHook& hook, std::string_view result, const std::strin
     }
 }
 
-/// Observability must never fail a request.
-void bump(const Ports& ports, const char* family, yuzu::Labels labels) noexcept {
+/// Observability must never fail a request. The label vector is built INSIDE the try (the labels
+/// arrive as string_views and the caller allocates nothing), so a bad_alloc building them is
+/// swallowed here instead of unwinding out of a caller that is deliberately mid-recovery.
+using LabelViews = std::initializer_list<std::pair<std::string_view, std::string_view>>;
+void bump(const Ports& ports, const char* family, LabelViews labels) noexcept {
     if (!ports.metrics)
         return;
     try {
-        ports.metrics->counter(family, labels).increment();
+        yuzu::Labels built;
+        built.reserve(labels.size());
+        for (const auto& [k, v] : labels)
+            built.emplace_back(std::string(k), std::string(v));
+        ports.metrics->counter(family, std::move(built)).increment();
     } catch (...) { // NOLINT(bugprone-empty-catch)
     }
 }
@@ -74,13 +81,25 @@ struct Ctx {
     bool audit_dropped{false};
 
     /// A best-effort row; a lost one is reported through `audit_dropped`.
+    /// The row text is built here, inside a try: a bad_alloc concatenating it reads as "did not
+    /// persist" (the same as a hook that throws) instead of unwinding past a caller that is
+    /// mid-recovery, where skipping the next step (the targeted count) would be worse than a
+    /// lost row.
     void audit(std::string_view result, const std::string& detail) {
-        if (!safe_audit(hook, result, detail + cid_suffix(cid)))
-            audit_dropped = true;
+        try {
+            if (safe_audit(hook, result, detail + cid_suffix(cid)))
+                return;
+        } catch (...) { // NOLINT(bugprone-empty-catch): falls through to the dropped flag
+        }
+        audit_dropped = true;
     }
     /// The fail-closed row: the caller decides what a lost row means.
     bool audit_required(std::string_view result, const std::string& detail) {
-        return safe_audit(hook, result, detail + cid_suffix(cid));
+        try {
+            return safe_audit(hook, result, detail + cid_suffix(cid));
+        } catch (...) {
+            return false; // could not even build the row: the fail-closed gate reads "not persisted"
+        }
     }
     std::string route() const { return std::string(route_label(rq.surface)); }
 };
@@ -514,7 +533,7 @@ void cancel_row(Ctx& c, const std::string& execution_id) {
     if (!ok) {
         spdlog::error("instruction execute: mark_cancelled failed for execution_id={}", execution_id);
         bump(p, "yuzu_exec_tracker_bookkeeping_failed_total",
-             {{"op", "mark_cancelled"}, {"surface", std::string(bookkeeping_label(c.rq.surface))}});
+             {{"op", "mark_cancelled"}, {"surface", bookkeeping_label(c.rq.surface)}});
     }
 }
 
@@ -536,8 +555,7 @@ bool record_targeted(Ctx& c, const std::string& execution_id, int agents) {
         spdlog::error("instruction execute: set_agents_targeted failed for execution_id={}",
                       execution_id);
         bump(p, "yuzu_exec_tracker_bookkeeping_failed_total",
-             {{"op", "set_agents_targeted"},
-              {"surface", std::string(bookkeeping_label(c.rq.surface))}});
+             {{"op", "set_agents_targeted"}, {"surface", bookkeeping_label(c.rq.surface)}});
     }
     if (p.refresh_counts) {
         try {
@@ -647,8 +665,9 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
             "execution " + execution_id +
             " was left running, not cancelled, so results from any agent that did receive the "
             "command are still recorded against it; check that execution's per-agent results "
-            "before running the definition again (the server closes the record by itself if no "
-            "agent ever responds)";
+            "before running the definition again; the server closes the record by itself ONLY if no "
+            "agent ever responds, a record an agent has answered will NOT close by itself, and "
+            "cancel_execution (POST /api/v1/executions/{id}/cancel on REST) closes it";
     }
 
     ConfinedDispatchOutcome o;
@@ -667,9 +686,13 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
         threw = true;
     }
     if (threw) {
-        // Counted on the shared fan-out-throw family (one alert covers every dispatch surface).
-        bump(p, "yuzu_server_dispatch_fanout_throw_total",
-             {{"route", c.route()}, {"phase", "dispatch"}});
+        // ORDER matters, and each step is isolated from the others' allocation failures (a second
+        // bad_alloc here must never skip the failure row nor the targeted count):
+        //   1. the `failure` row, first, with strings that were pre-built before the dispatch;
+        //   2. the confirmed partial count (record_targeted never throws);
+        //   3. the upgraded remediation text (best effort: the pre-built text is the fallback);
+        //   4. the metric, last, with its labels built inside bump's own try.
+        //
         // The execution row is deliberately NOT cancelled (up8-3 / sg-5): a row marked
         // `cancelled` with agents_targeted 0 would tell every reader nothing was sent, and some
         // agents may hold the command. It stays `running` (the tracker has no `failed` status).
@@ -681,27 +704,52 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
         // excludes any row an agent has answered. With NO confirmed send the row stays at 0 and
         // the reaper cancels it if no agent ever answers. The count is a lower bound (see
         // dispatch_send_progress.hpp).
-        const bool recorded =
-            progress.sent > 0 && record_targeted(c, execution_id, progress.sent);
-        if (recorded) {
+        const bool any_sent = progress.sent > 0;
+        if (any_sent) {
+            // `agents_sent` is on the row whenever it is known, whether or not the count could
+            // be stored: it is the evidence of how far the fan-out got.
             try {
-                std::string detail_text = threw_detail + " agents_sent=" + std::to_string(progress.sent);
+                threw_detail += " agents_sent=" + std::to_string(progress.sent);
+            } catch (...) { // NOLINT(bugprone-empty-catch): the pre-built row text stands
+            }
+        }
+        c.audit("failure", threw_detail);
+        const bool recorded = any_sent && record_targeted(c, execution_id, progress.sent);
+        if (any_sent) {
+            try {
                 std::string remediation =
                     "the dispatch failed part-way: at least " + std::to_string(progress.sent) +
                     " agent(s) were sent the command before the failure, and others may also have "
-                    "received it; execution " +
-                    execution_id + " was left running (not cancelled) with " +
-                    std::to_string(progress.sent) +
-                    " agent(s) targeted, so results from those agents are still recorded against "
-                    "it and will complete it; check that execution's per-agent results before "
-                    "running the definition again, and close it with cancel_execution "
-                    "(POST /api/v1/executions/{id}/cancel on REST) if it should not wait";
-                threw_detail = std::move(detail_text);
+                    "received it; ";
+                if (execution_id.empty()) {
+                    remediation += "no execution record was created, so there are no per-agent "
+                                   "results to check; confirm on the devices before running the "
+                                   "definition again";
+                } else if (recorded) {
+                    remediation +=
+                        "execution " + execution_id + " was left running (not cancelled) with " +
+                        std::to_string(progress.sent) +
+                        " agent(s) targeted, so results from those agents are still recorded "
+                        "against it and will complete it; check that execution's per-agent "
+                        "results before running the definition again, and close it with "
+                        "cancel_execution (POST /api/v1/executions/{id}/cancel on REST) if it "
+                        "should not wait";
+                } else {
+                    remediation +=
+                        "execution " + execution_id +
+                        " was left running (not cancelled) but its targeted count could NOT be "
+                        "recorded; the server closes the record by itself ONLY if no agent ever "
+                        "responds, and a record an agent has answered will NOT close by itself; "
+                        "check that execution's per-agent results before running the definition "
+                        "again, and close it with cancel_execution (POST "
+                        "/api/v1/executions/{id}/cancel on REST)";
+                }
                 threw_remediation = std::move(remediation);
             } catch (...) { // NOLINT(bugprone-empty-catch): keep the pre-built generic strings
             }
         }
-        c.audit("failure", threw_detail);
+        bump(p, "yuzu_server_dispatch_fanout_throw_total",
+             {{"route", route_label(rq.surface)}, {"phase", "dispatch"}});
         return Outcome{make_refusal(RefusalKind::kDispatchFailed, "dispatch_exception",
                                     "dispatch failed", std::move(threw_remediation)),
                        c.audit_dropped};
