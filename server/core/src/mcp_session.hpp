@@ -80,10 +80,11 @@ static_assert(!std::is_convertible_v<const char*, McpSessionBinding>,
 //    class (authentication source, principal kind, MCP tier, service scope; not
 //    elevation state) does not include JIT admin elevation, which is per-request state:
 //    a non-elevated cookie session that obtains an elevated session's id could receive
-//    that session's replayed frames. Only cookie sessions can be elevated; such sessions
-//    are refused at /mcp/v1/ once the tierless-human refusal (#4309) lands, which is the
-//    planned closure. Until then the session id (128-bit, returned only in the
-//    initialize response header) must be protected like a credential.
+//    that session's replayed frames. Only cookie sessions can be elevated, and since
+//    #4309 a cookie session (empty tier) is refused at /mcp/v1/ admission
+//    (mcp_admission.hpp), so no elevated session can hold an MCP session. The session id
+//    (128-bit, returned only in the initialize response header) is still a bearer
+//    handle for its class and should be protected like a credential.
 //  - The class is not re-derived from the live credential on an open stream. The per-tick
 //    liveness check compares the attach-time binding the stream captured with the
 //    registry's stored binding, and the per-tick credential revalidation hook is

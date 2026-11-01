@@ -1,0 +1,1 @@
+- **An unrecognized stored role is no longer demoted silently (#4072).** `string_to_role()` still resolves any value other than `admin`/`user` (for example a `superadmin` left in `auth.users.role` by a botched migration or a manual edit) to the unprivileged `user` role, but now logs a warning naming the value so the corruption is visible.
