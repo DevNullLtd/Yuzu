@@ -1532,8 +1532,8 @@ static const ToolDef kTools[] = {
      "Guard. Use get_guardian_schemas to discover the spark/assertion/remediation type "
      "catalogue before authoring. Fleet-wide (a Guard has no single owning device/service); "
      "requires GuaranteedState:Write, denied outright to a service-scoped API token. REST's "
-     "twin applies an MFA step-up check; MCP applies none for a cookie-session caller "
-     "(architecture-wide gap, not specific to this tool - tracked in #4309).",
+     "twin applies an MFA step-up check; MCP applies none. Requires a tiered bearer token (a "
+     "tierless credential is refused at /mcp/v1/ admission).",
      R"j({"type":"object","properties":{)j"
      R"j("rule_id":{"type":"string","minLength":1,"maxLength":256,"pattern":"^[A-Za-z0-9._-]+$","description":"Unique Guard identifier"},)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Unique human-authored Guard name"},)j"
@@ -1571,8 +1571,8 @@ static const ToolDef kTools[] = {
      "Marked Destructive but NOT currently approval-gated despite that (tracked #4305) — "
      "do not assume a confirmation step exists. Fleet-wide; requires GuaranteedState:Write, "
      "denied outright to a service-scoped API token. REST's twin applies an MFA step-up "
-     "check; MCP applies none for a cookie-session caller (architecture-wide gap, not "
-     "specific to this tool - tracked in #4309).",
+     "check; MCP applies none. Requires a tiered bearer token (a tierless credential is "
+     "refused at /mcp/v1/ admission).",
      R"j({"type":"object","properties":{)j"
      R"j("rule_id":{"type":"string","minLength":1,"maxLength":256},)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256},)j"
@@ -1596,12 +1596,8 @@ static const ToolDef kTools[] = {
      "Destructive (GuaranteedState:Delete): approval-gated at the supervised MCP tier — the "
      "first call returns an approval ticket (kApprovalRequired), re-call with the returned "
      "approval_id to consume it. Fleet-wide; denied outright to a service-scoped API token. "
-     "An MCP-tier-less caller (empty mcp_tier - a cookie session, a plain non-MCP-tiered "
-     "API token, or an engine token) is DENIED outright rather than falling through to "
-     "RBAC-only enforcement, closing the #4309 gap for this tool specifically. The "
-     "architecture-wide gap remains open for create_guardian_rule/update_guardian_rule/ "
-     "push_guardian_rules (not approval-gated at any tier, so there is no approval to "
-     "bypass on those three) and every other approval-gated MCP tool not yet migrated.",
+     "Requires a tiered bearer token (supervised); a tierless credential is refused at "
+     "/mcp/v1/ admission.",
      R"({"type":"object","properties":{"rule_id":{"type":"string","minLength":1,"maxLength":256}},"required":["rule_id"]})",
      R"j({"type":"object","properties":{"deleted":{"const":true},"rule_id":{"type":"string"}},"required":["deleted","rule_id"]})j"},
 
@@ -1621,8 +1617,8 @@ static const ToolDef kTools[] = {
      "does not bump the policy generation, so a delta at the generation an agent already "
      "holds is not followed by an automatic full push. Fleet-wide; requires the distinct GuaranteedState:Push "
      "verb (not Write), denied outright to a service-scoped API token. REST's twin applies "
-     "an MFA step-up check; MCP applies none for a cookie-session caller (architecture-wide "
-     "gap, not specific to this tool - tracked in #4309).",
+     "an MFA step-up check; MCP applies none. Requires a tiered bearer token (a tierless "
+     "credential is refused at /mcp/v1/ admission).",
      R"j({"type":"object","properties":{)j"
      R"j("scope":{"type":"string","maxLength":2048,"default":"","description":"Scope DSL expression selecting target agents; empty = fleet-wide"},)j"
      R"j("full_sync":{"type":"boolean","default":false,"description":"Force a full re-sync of the enabled rule set to in-scope agents. When false the push is a merge that does not retry a still-unresolved rule it omits"})j"
@@ -1661,8 +1657,8 @@ static const ToolDef kTools[] = {
      "dedicated gate as assign_rbac_role, not a plain permission check) and the supervised MCP "
      "tier (Security:Write, approval-gated: the first call returns an approval ticket, re-call "
      "with the returned approval_id to consume it). Denied outright to a service-scoped API "
-     "token. An MCP-tier-less caller (empty mcp_tier) is denied outright; use the REST twin, "
-     "which applies an MFA step-up to an enrolled local account whose proof is stale, and to a "
+     "token. A tierless credential is refused at /mcp/v1/ admission; for a human session use "
+     "the REST twin, which applies an MFA step-up to an enrolled local account whose proof is stale, and to a "
      "single-sign-on session without an identity-provider MFA assertion only when --mfa-enforcement "
      "protects the role; an unenrolled local administrator and API-token sessions are not stepped "
      "up (see the MFA documentation). Every call is audited: an 'attempted' row is written before "
@@ -2749,18 +2745,17 @@ static const ToolDef kTools[] = {
      "never accepted as a caller argument. Requires ApiToken:Rotate (self-service, not an admin "
      "operation — unlike the engine credential arm's Security:Write, and deliberately distinct "
      "from the create/list/revoke ApiToken:Write axis; deliberately NOT approval-gated - "
-     "rotation is lifetime-neutral and cannot move authority). An MCP-tier-less caller "
-     "(empty mcp_tier - a cookie session, a plain non-MCP-tiered API token, or an engine "
-     "token) is DENIED outright rather than falling through unenforced, matching REST's "
-     "mandatory step-up on every rotate call including a re-serve; closes the #4309 gap "
-     "for this tool specifically. #2963: the shared ApiToken:Rotate permission gate is "
+     "rotation is lifetime-neutral and cannot move authority). Requires a tiered bearer "
+     "token; a tierless credential is refused at /mcp/v1/ admission (REST's twin applies a "
+     "mandatory step-up on every rotate call including a re-serve). "
+     "#2963: the shared ApiToken:Rotate permission gate is "
      "reachable by any non-admin owner under the default RBAC-off config (same legacy "
      "self-service allowlist REST uses); separately, the store's authority-inheritance "
      "guard now also admits a caller holding NO standing mcp_tier/scope_service to rotate "
-     "ANY of its own tokens regardless of that token's own tier/scope (moot for THIS tool, "
-     "since the #4309 gate above already requires a non-empty mcp_tier to invoke it at all — "
-     "the exception is reachable via the REST route's plain-cookie-session callers). A token "
-     "within 24h of its own expiry cannot be rotated (400/kInvalidParams) — mint a new one "
+     "ANY of its own tokens regardless of that token's own tier/scope (moot for THIS tool: "
+     "a non-empty mcp_tier is required here, so the exception applies only to the REST "
+     "route's plain-cookie-session callers). A token "
+     "within 24h of its own expiry cannot be rotated (400/kInvalidParams) - mint a new one "
      "instead. The returned token_id is "
      "the SUCCESSOR's (scoped exactly to the predecessor rotated, never any other in-flight "
      "rotation of the caller's — a caller may have several at once); overlap_expires_at is the "
@@ -2791,8 +2786,7 @@ static const ToolDef kTools[] = {
      "DELETE /api/v1/tokens/{token_id} — there is no engine-principal terminal route in play on "
      "this human-token arm, but the same per-credential (never per-principal) revoke discipline "
      "applies. Self-service ONLY, same owner-vs-nonexistent posture as rotate_api_token. Same "
-     "MCP-tier-less deny-outright as rotate_api_token above - closed for this tool "
-     "specifically (#4309). Same #2963 self-service allowlist + empty-tier/scope "
+     "tiered-bearer-token requirement as rotate_api_token above. Same #2963 self-service allowlist + empty-tier/scope "
      "exception as rotate_api_token above. Ownership + the raw successor secret "
      "(proof of possession) are the actual gates on who may confirm - NOT necessarily "
      "the same session that called rotate. The re-check is that the CALLER'S CURRENT "
@@ -2832,12 +2826,9 @@ static const ToolDef kTools[] = {
      "permission) — the SAME multi-store check (rbac_store + mgmt_store) the REST route runs; "
      "RBAC must be enabled for a scope_service token at all. The raw token is returned exactly "
      "once - store it now. Mirrors POST /api/v1/tokens. Requires ApiToken:Write (approval-gated "
-     "at the supervised MCP tier - maker-checker for self-service credential minting). A caller "
-     "with an empty mcp_tier (a cookie session, a plain non-MCP-tiered API token, or an engine "
-     "token - not exclusively an interactive session) is DENIED outright rather than falling "
-     "through to RBAC-only enforcement (kPermissionDenied, 'requires an MCP-tier bearer token'); "
-     "closes the #4309 interactive-session gap for this tool specifically, still open for other "
-     "approval-gated MCP tools. "
+     "at the supervised MCP tier - maker-checker for self-service credential minting). Requires "
+     "a tiered bearer token; a tierless credential is refused at /mcp/v1/ admission "
+     "(kPermissionDenied, 'requires an MCP-tier bearer token'). "
      "Additive: mints a new credential, overwrites nothing (not idempotent - each call mints a "
      "distinct token).",
      R"j({"type":"object","properties":{)j"
@@ -2854,8 +2845,7 @@ static const ToolDef kTools[] = {
      "not-owned token_id and a nonexistent one are INDISTINGUISHABLE (both report 'token not "
      "found') — not an enumeration oracle. Mirrors DELETE /api/v1/tokens/{id}. Requires "
      "ApiToken:Delete — approval-gated (supervised MCP tier maker-checker; Delete is always "
-     "destructive). Same interactive-session denial as create_api_token - closed for this tool "
-     "specifically (#4309). Destructive, idempotent per the store's own already-revoked handling.",
+     "destructive). Same tiered-bearer-token requirement as create_api_token. Destructive, idempotent per the store's own already-revoked handling.",
      R"j({"type":"object","properties":{)j"
      R"j("token_id":{"type":"string","minLength":1,"maxLength":64,"description":"Token id to revoke (from list_api_tokens/create_api_token)"})j"
      R"j(},"required":["token_id"]})j",
@@ -3275,8 +3265,8 @@ static const ToolDef kTools[] = {
      "clearing your own lockout is recoverable. Requires the Postgres auth store (AuthDB) — "
      "answers 'lockout subsystem unavailable' if it is not wired, same as the REST route. "
      "Mirrors POST /api/v1/users/{username}/unlock. Requires UserManagement:Write — approval-"
-     "gated (supervised MCP tier maker-checker). Same interactive-session denial as "
-     "create_api_token - closed for this tool specifically (#4309). Destructive: overwrites the "
+     "gated (supervised MCP tier maker-checker). Same tiered-bearer-token "
+     "requirement as create_api_token. Destructive: overwrites the "
      "account's existing lockout/failed-login state.",
      R"j({"type":"object","properties":{)j"
      R"j("username":{"type":"string","minLength":1,"maxLength":64,"description":"Local account username to unlock"})j"
@@ -3558,8 +3548,10 @@ static const ToolDef kTools[] = {
      "refused to an MCP-tier token with a permission error and an audit row: "
      "plugin_signing_required, audit_retention_days, dex_alert_routing, dex_blast_min_devices, "
      "dex_blast_window_seconds, dex_blast_cooldown_seconds, dex_cohort_export_key and the oidc_* "
-     "keys need an administrator account (an untiered administrator token is admitted, as on "
-     "REST); dex_score_policy has its own route and answers invalid params. Values are sent as "
+     "keys need an administrator account over REST: /mcp/v1/ requires a token that carries an "
+     "MCP tier, and even an administrator token with a tier cannot write them over MCP, so use "
+     "PUT /api/v1/config/{key} or the Settings pages; dex_score_policy has its own route and "
+     "answers invalid params. Values are sent as "
      "strings, e.g. \"90\"; key is 1 to 64 characters from a-z and _, value at most 256 bytes "
      "(a longer value, such as a long dex_alert_routing, goes through PUT /api/v1/config/{key}); "
      "extra arguments are refused. "
@@ -4187,7 +4179,7 @@ static const ToolDef kTools[] = {
      R"j("role":{"type":"string","description":"Persisted legacy role (admin or user)"},)j"
      R"j("principal_kind":{"type":"string","description":"human (the default for every non-engine session) or engine"},)j"
      R"j("auth_source":{"type":"string","description":"How the caller authenticated: local, oidc, saml, api_token, mcp_token or engine_token"},)j"
-     R"j("mcp_tier":{"type":"string","description":"readonly, operator or supervised; empty for a non-MCP session"},)j"
+     R"j("mcp_tier":{"type":"string","description":"readonly, operator or supervised; always present over MCP, which refuses a credential with no tier"},)j"
      R"j("scope_service":{"type":"string","description":"Service the token is scoped to; empty when unscoped. Always empty over MCP because a service-scoped token is refused"},)j"
      R"j("rbac_enabled":{"type":"boolean","description":"The server's cached view of the RBAC switch; can lag and does not report the degraded fail-closed state (#6033)"},)j"
      R"j("rbac_role":{"type":"string","description":"Deprecated display field: the first DIRECT role by role_name order, or for a human with none a legacy Administrator/Viewer label that is not a grant. Omitted for an engine principal with RBAC off or no engine grant, and when rbac_roles_resolved is false. Not an authority summary: call check_permission"},)j"
@@ -6379,6 +6371,38 @@ bool reject_unsupported_protocol_version(const httplib::Request& req, httplib::R
     return true;
 }
 
+// The one predicate for the stream-channel deny: "this caller holds a service-scoped API
+// token" (service-scoped confinement clause 4: extend, never fork). Other raw
+// token_scope_service.empty() checks belong to the C8 table and the scoped-gate layer, not
+// to this deny. A service-scoped token must never reach a fleet-wide surface unfiltered.
+// The usual gate does not fit the stream channel: require_permission's service branch is
+// only a role ceiling plus a seeded-empty global-safe allow-list, so it carries no
+// information about WHICH service the token is scoped to, and it needs a (securable,
+// operation) pair, which this handler has no securable to supply. The deny therefore
+// keys on the session's service scope directly.
+[[nodiscard]] bool is_service_scoped_caller(const auth::Session& session) {
+    return !session.token_scope_service.empty();
+}
+
+// The ONE audit-and-write sink for a service-scoped denial. Callers test
+// is_service_scoped_caller() first and hand over their own envelope body: the POST tool
+// path echoes the JSON-RPC id (its a4_error), the bodyless GET carries a null id.
+// `http_status` empty = leave res.status untouched (the POST tool path answers its
+// JSON-RPC error inside the HTTP status already on the response).
+template <typename AuditFn>
+void write_service_scoped_denial(const AuditFn& audit_fn, const httplib::Request& req,
+                                 httplib::Response& res, const std::string& action,
+                                 const std::string& result, const std::string& target_type,
+                                 const std::string& target_id, const std::string& audit_detail,
+                                 std::optional<int> http_status, const std::string& body) {
+    (void)yuzu::server::detail::try_persist_audit(audit_fn, req, action, result, target_type,
+                                                  target_id, audit_detail);
+    if (http_status.has_value()) {
+        res.status = *http_status;
+    }
+    res.set_content(body, "application/json");
+}
+
 // #3893 fix round (Doomgoose review, blocking findings 1+2): the ONE place
 // that names which MCP tools are dispatch-capable, for the C8 pre-mint dry
 // run and the per-tool main-handler pre-checks alike — issue #3687's own
@@ -6603,7 +6627,10 @@ McpServer::HandlerFn McpServer::build_handler(
         // Auth check — reuses the server's existing auth middleware pipeline
         auto session = auth_fn(req, res);
         if (!session)
-            return; // auth_fn already set 401
+            return; // auth_fn already set 401/403
+        // Derived once per request: the presented-session check, the initialize mint, the
+        // bridge reserve and the streamed-POST liveness check all use this one value.
+        auto binding = binding_for(*session);
 
         // Parse JSON-RPC envelope
         auto parsed = parse_request(req.body);
@@ -6616,14 +6643,16 @@ McpServer::HandlerFn McpServer::build_handler(
 
         // ── Presented session validation (Streamable HTTP) ──────────────────
         // Any method other than initialize that carries an Mcp-Session-Id must
-        // present a live, principal-bound one; unknown / expired / foreign → 404
-        // and the client re-initializes (no cross-principal oracle — the wrong
-        // principal is indistinguishable from a never-existed id, 15(a)/CH-8).
+        // present a live one bound to this principal AND credential class; unknown /
+        // expired / foreign / other-class → 404 and the client re-initializes (no
+        // cross-principal oracle: the wrong principal is indistinguishable from a
+        // never-existed id, 15(a)/CH-8; a same-principal class mismatch answers
+        // identically on the wire and differs only in the audit reason).
         if (streaming_on) {
             const auto sid = req.get_header_value("Mcp-Session-Id");
             if (!sid.empty() && rpc.method != "initialize") {
-                if (mcp_sessions->validate_and_touch(sid, session->username) !=
-                    McpSessionRegistry::ValidateResult::kValid) {
+                const auto presented = mcp_sessions->validate_and_touch(sid, binding);
+                if (presented != McpSessionRegistry::ValidateResult::kValid) {
                     const auto cid = yuzu::server::detail::make_correlation_id();
                     // #2917: the session id is an attacker-controlled HEADER until
                     // it validates, so the prefix that reaches an audit row is
@@ -6634,7 +6663,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     // through raw.
                     session_audit("mcp.session.reject", "failure",
                                   yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8)),
-                                  "reason=unknown_session cid=" + cid);
+                                  std::string("reason=") + session_reject_reason(presented) +
+                                      " cid=" + cid);
                     res.status = 404;
                     // Echo the request id — this is a post-parse error with a known
                     // id, and JSON-RPC 2.0 SHOULD echo it (governance CONS-S3).
@@ -6749,7 +6779,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // A client-supplied Mcp-Session-Id is never adopted here (no
             // fixation, 15(a)/CH-8).
             if (streaming_on) {
-                auto mint = mcp_sessions->mint(session->username);
+                auto mint = mcp_sessions->mint(binding);
                 if (!mint.ok) {
                     const auto cid = yuzu::server::detail::make_correlation_id();
                     session_audit("mcp.session.reject", "failure", "",
@@ -7695,7 +7725,11 @@ McpServer::HandlerFn McpServer::build_handler(
             // securable to perm_fn right after this deny — this helper's
             // deny decision itself is securable-agnostic, keyed only on
             // token_scope_service. `session` is already resolved once for
-            // the whole request above — no auth_fn call needed here.
+            // the whole request above, so no auth_fn call is needed here. The
+            // predicate and the audit-and-write sink are file-scope
+            // (is_service_scoped_caller, write_service_scoped_denial), shared
+            // with build_get_handler; this lambda only supplies the POST
+            // id-echoing envelope.
             // Routed through a4_error (defined just above) rather than a bare
             // error_response, so this denial carries the same correlation_id
             // /retry_after_ms/remediation envelope as every sibling MCP
@@ -7705,11 +7739,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 [&](const std::string& action, const std::string& target_type,
                     const std::string& audit_detail, const std::string& message,
                     const std::string& target_id = "") -> bool {
-                if (session->token_scope_service.empty())
+                if (!is_service_scoped_caller(*session))
                     return false;
-                (void)yuzu::server::detail::try_persist_audit(
-                    audit_fn, req, action, "denied", target_type, target_id, audit_detail);
-                res.set_content(a4_error(kPermissionDenied, message), "application/json");
+                write_service_scoped_denial(audit_fn, req, res, action, "denied", target_type,
+                                            target_id, audit_detail, std::nullopt,
+                                            a4_error(kPermissionDenied, message));
                 return true;
             };
 
@@ -11388,9 +11422,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #4353 follow-up (Gate 2 finding on #4364): ManagementGroup:Write
                 // IS approval-gated at supervised tier, but requires_approval()
                 // returns false for an EMPTY mcp_tier - and /mcp/v1/'s auth_fn
-                // (require_auth) admits a plain RBAC session or non-MCP-tiered
+                // (require_auth) admitted a plain RBAC session or non-MCP-tiered
                 // API token same as any REST route, so C8's validate() never
-                // runs for that caller class either. Checked ahead of the
+                // ran for that caller class either (refused at /mcp/v1/
+                // admission since #4309, mcp_admission.hpp; the guard is
+                // retained as defence in depth). Checked ahead of the
                 // store-availability gate below - a malformed request is a
                 // client error regardless of backend availability.
                 if (name.size() > kMgmtGroupNameMaxLen ||
@@ -11587,7 +11623,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #4353 follow-up (Gate 2 finding on #4364): see
                 // create_management_group's identical comment above -
                 // requires_approval() never fires for an EMPTY mcp_tier, and
-                // /mcp/v1/'s auth_fn admits that caller class same as REST.
+                // /mcp/v1/'s auth_fn admitted that caller class same as REST
+                // (refused at /mcp/v1/ admission since #4309, mcp_admission.hpp;
+                // guard retained as defence in depth).
                 if (group_id.size() > kMgmtGroupIdMaxLen) {
                     reject_field_too_large(
                         std::format("group_id must be at most {} bytes", kMgmtGroupIdMaxLen));
@@ -13497,10 +13535,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #5047 AC2 (mirrored verbatim at pin_result_set/
                 // unpin_result_set/delete_result_set below):
                 // (a) the EMPTY-tier gap -- a plain RBAC session or a
-                //     non-MCP-tiered API token skips C8's tier/approval belt
-                //     here too, same as it always has -- is a SEPARATE,
-                //     already-tracked, OPEN design question (#4309), not
-                //     attempted by this fix.
+                //     non-MCP-tiered API token skipping C8's tier/approval
+                //     belt -- was a SEPARATE question when this was written;
+                //     /mcp/v1/ admission (mcp_admission.hpp, #4309) now
+                //     refuses every empty-tier caller before any tool runs.
                 // (b) Infrastructure:Write is never approval-gated at ANY
                 //     tier (see the #4353 comment just below: it is absent
                 //     from requires_approval()'s Delete/Execution:Execute/
@@ -14835,7 +14873,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "pin_result_set") {
                 // #5047 AC2 — see create_result_set's identical comment
                 // above for the full (a)-(d) rationale: (a) the empty-tier
-                // gap is #4309's, not this fix's; (b) Infrastructure:Write
+                // gap is closed at /mcp/v1/ admission (#4309); (b) Infrastructure:Write
                 // is never approval-gated at any tier (confirmed by the
                 // #4353 comment just below); (c) no step_up_fn exists on
                 // this route family, so the deny-and-redirect-to-REST
@@ -14895,7 +14933,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "unpin_result_set") {
                 // #5047 AC2 — see create_result_set's identical comment
                 // above for the full (a)-(d) rationale: (a) the empty-tier
-                // gap is #4309's, not this fix's; (b) Infrastructure:Write
+                // gap is closed at /mcp/v1/ admission (#4309); (b) Infrastructure:Write
                 // is never approval-gated at any tier (confirmed by the
                 // #4353 comment just below); (c) no step_up_fn exists on
                 // this route family, so the deny-and-redirect-to-REST
@@ -14975,10 +15013,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 //     `mcp_tier`, and `/mcp/v1/`'s `auth_fn` (`require_auth`)
                 //     admits a plain RBAC session or non-MCP-tiered API
                 //     token the same as any REST route, so C8's `validate()`
-                //     never runs for that caller class on ANY transport — is
-                //     a SEPARATE, already-tracked, OPEN design question
-                //     (#4309), not attempted by this fix. This tool is one
-                //     more instance of it, no different from the rest.
+                //     never ran for that caller class on ANY transport - was
+                //     a SEPARATE question when this was written; /mcp/v1/
+                //     admission (mcp_admission.hpp, #4309) now refuses that
+                //     caller class before any tool runs.
                 // (b) N/A here — unlike create/pin/unpin, Infrastructure:
                 //     Delete DOES require approval at supervised tier (the
                 //     paragraph above).
@@ -16089,10 +16127,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                   session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "delete_guardian_rule requires an MCP-tier bearer token - an "
-                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
-                                 "API token, or an engine token) has neither the MFA step-up "
-                                 "REST's route applies nor a maker-checker approval ticket; "
+                                 "delete_guardian_rule requires an MCP-tier bearer token; "
                                  "use DELETE /api/v1/guaranteed-state/rules/{rule_id} instead",
                                  "use the equivalent REST v1 route from an authenticated browser "
                                  "session, or mint an MCP bearer token with an appropriate tier"),
@@ -16431,10 +16466,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(
                         a4_error(kPermissionDenied,
                                  "raise_guardian_policy_generation requires an MCP-tier bearer "
-                                 "token - an MCP-tier-less caller (a cookie session, a plain "
-                                 "non-MCP-tiered API token, or an engine token) has neither the "
-                                 "MFA step-up REST's route applies nor a maker-checker approval "
-                                 "ticket; use POST "
+                                 "token; use POST "
                                  "/api/v1/guaranteed-state/policy-generation/raise instead",
                                  "use the equivalent REST v1 route from an authenticated browser "
                                  "session, or mint an MCP bearer token with an appropriate tier"),
@@ -19089,10 +19121,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #1398: a supervised-tier call reaches here only after C8
                 // consumed a real ticket for THIS request
                 // (approval_ticket_just_consumed); an operator-tier call
-                // (auto-approved, no ticket ever minted) or a non-MCP-tiered
-                // caller relies solely on caller.principal_is_admin (already
-                // stamped by caller_fn/derive_dispatch_caller above) at the
-                // chokepoint's ExecuteGate::AdminOrApproval arm.
+                // (auto-approved, no ticket ever minted) relies solely on
+                // caller.principal_is_admin (already stamped by
+                // caller_fn/derive_dispatch_caller above) at the chokepoint's
+                // ExecuteGate::AdminOrApproval arm. A non-MCP-tiered caller
+                // used to rely on it too (refused at /mcp/v1/ admission since
+                // #4309, mcp_admission.hpp; the arm is retained as defence in
+                // depth).
                 caller.approval_provenance = approval_ticket_just_consumed
                                                  ? yuzu::server::ApprovalProvenance::Ticket
                                                  : yuzu::server::ApprovalProvenance::None;
@@ -19230,7 +19265,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_sessions != nullptr &&
                     mcp::transport::accept_wants_sse(req.get_header_value("Accept"));
                 if (bridge_eligible) {
-                    // The session id was validated (principal-bound) at handler
+                    // The session id was validated (principal- and class-bound) at handler
                     // entry; reserve re-checks it against the registry anyway
                     // (no TOCTOU widening - a dead session just degrades).
                     // GUARD: reserve allocates (make_shared + map insert); a
@@ -19271,7 +19306,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             }
                             stream_lease.emplace(std::move(acquired.lease));
                         }
-                        auto rr = bridge->reserve(bridge_sid, session->username, id,
+                        auto rr = bridge->reserve(bridge_sid, binding, id,
                                                   std::move(bridge_token),
                                                   /*streamed_intent=*/streamed_mode);
                         if (rr.ok) {
@@ -19957,7 +19992,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                 mcp::StreamAuditPrincipal audit_principal{
                                     .id = session->username,
                                     .role = auth::role_to_string(auth::effective_role(*session)),
-                                    .cls = session->principal_kind == "engine"
+                                    .cls = session->is_engine()
                                                ? std::string("engine")
                                                : std::string{}};
                                 auto req_copy = std::make_shared<httplib::Request>(req);
@@ -19981,8 +20016,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                 // Also the TTL slide: a live streamed POST keeps its
                                 // session alive exactly as a GET tick does.
                                 auto session_alive = [mcp_sessions, bridge_sid,
-                                                      principal = session->username] {
-                                    return mcp_sessions->validate_and_touch(bridge_sid, principal) ==
+                                                      binding = std::move(binding)] {
+                                    return mcp_sessions->validate_and_touch(bridge_sid, binding) ==
                                            McpSessionRegistry::ValidateResult::kValid;
                                 };
                                 auto take_batch = [bridge, record_key](bool cap_expired) {
@@ -20589,8 +20624,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     // consumed a real ticket for THIS request
                     // (approval_ticket_just_consumed); a non-MCP-tiered
                     // caller (requires_approval short-circuits false for an
-                    // empty tier, so no ticket is ever minted) relies solely
-                    // on principal_is_admin above. The background
+                    // empty tier, so no ticket was ever minted) relied solely
+                    // on principal_is_admin above (refused at /mcp/v1/
+                    // admission since #4309, mcp_admission.hpp; retained as
+                    // defence in depth). The background
                     // QuarantineContainmentReconciler's OWN redispatch calls
                     // through a SEPARATE `.system = true` closure
                     // (CommandDispatchFn, quarantine_containment_reconciler.hpp)
@@ -25453,10 +25490,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                        session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "assign_rbac_role requires an MCP-tier bearer token - an "
-                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
-                                 "API token, or an engine token) has neither the MFA step-up "
-                                 "REST's route applies nor a maker-checker approval ticket; use "
+                                 "assign_rbac_role requires an MCP-tier bearer token; use "
                                  "POST /api/v1/rbac/roles/{name}/assignments instead",
                                  "use the equivalent REST v1 route from an authenticated browser "
                                  "session, or mint an MCP bearer token with an appropriate tier"),
@@ -25726,10 +25760,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                        session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "unassign_rbac_role requires an MCP-tier bearer token - an "
-                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
-                                 "API token, or an engine token) has neither the MFA step-up "
-                                 "REST's route applies nor a maker-checker approval ticket; use "
+                                 "unassign_rbac_role requires an MCP-tier bearer token; use "
                                  "DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id} "
                                  "instead",
                                  "use the equivalent REST v1 route from an authenticated browser "
@@ -25889,10 +25920,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                        session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "set_rbac_enforcement requires an MCP-tier bearer token - an "
-                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
-                                 "API token, or an engine token) has neither the MFA step-up "
-                                 "REST's route applies nor a maker-checker approval ticket; use "
+                                 "set_rbac_enforcement requires an MCP-tier bearer token; use "
                                  "PUT /api/v1/rbac/enforcement instead",
                                  "use the equivalent REST v1 route from an authenticated browser "
                                  "session, or mint an MCP bearer token with an appropriate tier"),
@@ -26087,7 +26115,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // though it cannot mutate it. Declared once here, used by every
             // handler below.
             auto deny_if_engine_session = [&]() -> bool {
-                if (session->principal_kind != "engine" && session->auth_source != "engine_token")
+                if (!session->is_engine())
                     return false;
                 mcp_audit("denied", "engine-classed session on lifecycle surface");
                 res.set_content(
@@ -27041,10 +27069,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                   session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "rotate_api_token requires an MCP-tier bearer token - an "
-                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
-                                 "API token, or an engine token) has no MFA step-up REST's route "
-                                 "requires on every rotate call, including a re-serve; "
+                                 "rotate_api_token requires an MCP-tier bearer token; "
                                  "use POST /api/v1/tokens/{id}/rotate instead",
                                  kInteractiveSessionRemediation),
                         "application/json");
@@ -27307,10 +27332,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                   session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "confirm_api_token_rotation requires an MCP-tier bearer token - "
-                                 "an MCP-tier-less caller (a cookie session, a plain "
-                                 "non-MCP-tiered API token, or an engine token) has no MFA "
-                                 "step-up REST's route requires; "
+                                 "confirm_api_token_rotation requires an MCP-tier bearer token; "
                                  "use POST /api/v1/tokens/{id}/confirm instead",
                                  kInteractiveSessionRemediation),
                         "application/json");
@@ -27496,8 +27518,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // approval() itself no-ops on an empty tier) - mcp_policy.hpp's
                 // documented "not an MCP token -> allow everything, defer to
                 // RBAC" premise assumed that caller class is non-interactive,
-                // which #4309 disproves (an ordinary cookie session reaches
-                // this same MCP endpoint). Denying here restores that premise
+                // which #4309 disproved (an ordinary cookie session reached
+                // this same MCP endpoint; /mcp/v1/ admission now refuses it,
+                // and this guard stays as defence in depth). Denying here restores that premise
                 // for exactly the two operations (self-mint a persistent
                 // credential; the sibling revoke_api_token/unlock_account
                 // below) where REST has a control this transport otherwise
@@ -27513,10 +27536,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                   session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "create_api_token requires an MCP-tier bearer token - an "
-                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
-                                 "API token, or an engine token) has neither the MFA step-up "
-                                 "REST's route applies nor a maker-checker approval ticket; "
+                                 "create_api_token requires an MCP-tier bearer token; "
                                  "use POST /api/v1/tokens instead",
                                  kInteractiveSessionRemediation),
                         "application/json");
@@ -27733,10 +27753,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                   session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "revoke_api_token requires an MCP-tier bearer token - an "
-                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
-                                 "API token, or an engine token) has neither the MFA step-up "
-                                 "REST's route applies nor a maker-checker approval ticket; "
+                                 "revoke_api_token requires an MCP-tier bearer token; "
                                  "use DELETE /api/v1/tokens/{id} instead",
                                  kInteractiveSessionRemediation),
                         "application/json");
@@ -28622,10 +28639,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                   session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
-                                 "unlock_account requires an MCP-tier bearer token - an "
-                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
-                                 "API token, or an engine token) has neither the MFA step-up "
-                                 "REST's route applies nor a maker-checker approval ticket; "
+                                 "unlock_account requires an MCP-tier bearer token; "
                                  "use POST /api/v1/users/{username}/unlock instead",
                                  kInteractiveSessionRemediation),
                         "application/json");
@@ -28840,8 +28854,8 @@ McpServer::HandlerFn McpServer::build_handler(
 // mirroring build_handler's kill-switch treatment. GET is the session's live
 // server->client SSE channel - attach, replay, heartbeat, per-tick credential
 // revalidation (it was a 405 placeholder in PR 1 only; the 405 now survives just
-// under --mcp-no-streaming). DELETE terminates a principal-bound session (200)
-// or 404s an unknown/foreign one (no cross-principal oracle).
+// under --mcp-no-streaming). DELETE terminates a session bound to the caller's principal and
+// credential class (200) or 404s an unknown/foreign/other-class one (no cross-principal oracle).
 
 McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_fn,
                                                   const bool* mcp_disabled,
@@ -28903,20 +28917,45 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
         }
         auto session = auth_fn(req, res);
         if (!session)
-            return; // auth_fn already set 401
+            return; // auth_fn already set 401/403
+        // A service-scoped token never opens the stream channel (service-scoped
+        // confinement clause 4): the ring can hold another service's execution frames and
+        // this handler has no per-target parameter to scope them against. Decided before
+        // any session lookup, Accept negotiation or StreamBudget lease, so a refused
+        // caller reads and holds nothing. No `permission` field in the body (clause 5:
+        // no permission would, by itself, admit this caller). This precedes the
+        // missing-Mcp-Session-Id check, so a service-scoped GET without a session id
+        // answers 403 rather than the 400 it answered before.
+        if (is_service_scoped_caller(*session)) {
+            const auto cid = yuzu::server::detail::make_correlation_id();
+            if (metrics != nullptr) {
+                metrics->counter("yuzu_mcp_stream_rejects_total", {{"reason", "service_scoped"}})
+                    .increment();
+            }
+            write_service_scoped_denial(
+                audit_fn, req, res, "mcp.session.reject", "failure", "McpSession", std::string{},
+                "reason=service_scoped cid=" + cid, 403,
+                error_response_null_a4(kPermissionDenied,
+                                       "service-scoped tokens may not open the MCP stream channel",
+                                       cid,
+                                       "use a token without scope_service; durable results "
+                                       "remain fetchable by execution_id"));
+            return;
+        }
         // The SSE channel itself (session gate, Accept negotiation, replay, caps,
         // provider) lives in mcp_stream.cpp — this file stays wiring.
         // The actor is captured HERE, while the credential is still valid — the close
         // audit runs at teardown, when it may not resolve at all. All three fields must
         // come from the same live session, or the close row will disagree with the attach
         // row about who acted: principal_class in particular is re-stamped from
-        // principal_kind at request time, so an engine principal reads "engine" there and
-        // would read "agent" from bare credential presentation here.
+        // the session's engine classification at request time, so an engine
+        // principal reads "engine" there and would read "agent" from bare
+        // credential presentation here.
         mcp::StreamAuditPrincipal actor{
             .id = session->username,
             .role = auth::role_to_string(auth::effective_role(*session)),
-            .cls = session->principal_kind == "engine" ? std::string("engine") : std::string{}};
-        handle_get_tail(req, res, session->username, *sessions, stream_budget, revalidate_fn,
+            .cls = session->is_engine() ? std::string("engine") : std::string{}};
+        handle_get_tail(req, res, binding_for(*session), *sessions, stream_budget, revalidate_fn,
                         metrics, audit_fn, per_principal_cap, std::move(actor),
                         principal_audit_fn);
     };
@@ -28968,7 +29007,7 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
         }
         auto session = auth_fn(req, res);
         if (!session)
-            return; // auth_fn already set 401
+            return; // auth_fn already set 401/403
         const auto sid = req.get_header_value("Mcp-Session-Id");
         if (sid.empty()) {
             // Audit the malformed-request denial too so a SIEM watching DELETE
@@ -28990,18 +29029,23 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
         // mcp_stream.cpp already does this; DELETE takes the same untrusted input into
         // the same verbs and was passing it through raw.
         const auto audit_sid = yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8));
-        if (sessions->terminate(sid, session->username)) {
+        const auto terminated = sessions->terminate(sid, binding_for(*session));
+        if (terminated == McpSessionRegistry::ValidateResult::kValid) {
             session_audit("mcp.session.close", "success", audit_sid, "");
             res.status = 200;
         } else {
+            // Same 404 body for a never-existed id, a foreign principal and a
+            // same-principal different credential class; only the audit reason differs
+            // for the last, and the owner's session is left standing.
             const auto cid = yuzu::server::detail::make_correlation_id();
             session_audit("mcp.session.reject", "failure", audit_sid,
-                          "reason=unknown_session cid=" + cid);
+                          std::string("reason=") + session_reject_reason(terminated) +
+                              " cid=" + cid);
             res.status = 404;
             res.set_content(
                 error_response_null_a4(kMcpUnknownSession, "Unknown or expired session", cid,
-                                       "the session does not exist or is already terminated; no "
-                                       "action needed"),
+                                       "the session is unknown, expired or terminated; call "
+                                       "initialize to start a new session"),
                 "application/json");
         }
     };

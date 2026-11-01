@@ -200,6 +200,11 @@ public:
     /// (sorted) plus a count; all are logged individually.
     McpServer();
 
+    /// Resolves the request's session, or writes the refusal response and returns nullopt.
+    /// The PRODUCTION hook MUST be built with `mcp::make_admission_auth_fn`
+    /// (mcp_admission.hpp) so /mcp/v1/ refuses empty-tier credentials on every verb (#4309);
+    /// a harness that passes a bare resolver lacks that rule (McpTestServer deliberately does,
+    /// so the per-tool tier guards stay testable as defence in depth).
     using AuthFn =
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
     using PermFn =
@@ -1078,9 +1083,9 @@ public:
     /// Separate builders so tests can drive them without the httplib acceptor
     /// thread (#438), mirroring build_handler(). GET is the SSE channel (PR 2:
     /// heartbeats, Last-Event-ID resume, stream caps — the tail lives in
-    /// mcp_stream.cpp); DELETE terminates a principal-bound session. Both no-op
-    /// to 405 when streaming is disabled and to a kMcpDisabled JSON-RPC error
-    /// when MCP is disabled.
+    /// mcp_stream.cpp); DELETE terminates a session bound to the caller's principal
+    /// and credential class. Both no-op to 405 when streaming is disabled and to a
+    /// kMcpDisabled JSON-RPC error when MCP is disabled.
     ///
     /// `stream_budget` / `revalidate_fn` are trailing-defaulted for the test
     /// seams; PRODUCTION MUST WIRE BOTH — without the budget there is no

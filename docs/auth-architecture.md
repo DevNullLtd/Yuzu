@@ -883,9 +883,33 @@ by each handler.
   plus a separate list of tools added after it (today two), legal only for a tool
   whose REST twin is `kRequired`, which a compile-time check ties to the REST
   table. Every pending tool with a `kRequired` twin is pending because no MCP
-  consumer enforces `kRequired` yet. PR 2 promotes pending rows; an MCP `kRequired` row will need a
-  design for the approval primitive first, because `decide_step_up` passes
-  an `mcp_token` caller unconditionally.
+  consumer enforces `kRequired` yet. PR 2 promotes pending rows; how it resolves the MCP rows
+  (no MCP `kRequired` row, because `decide_step_up` passes an `mcp_token`
+  caller unconditionally) is the decision recorded in the next bullet.
+- **Decision for the MCP arm (#6306, recorded 2026-10-29 for #6305 PR 2; a
+  decision record, no code change).** The MCP arm of this chokepoint is not
+  MFA step-up. An MCP caller presents a bearer credential with no browser
+  session and no factor proof, and `decide_step_up` passes `api_token` and
+  `mcp_token` sessions and denies engine principals, so a step-up proof is
+  never asked of an MCP caller. The controls for an MCP caller are the token
+  tier (`tier_allows`, evaluated before RBAC) and the one core-owned approval
+  primitive (`requires_approval` into the `ApprovalManager`
+  ticket-then-recall, decided by a person on an interactive session under
+  #6061/#6079; see "Approver assurance"). #4309 makes the tier total:
+  `/mcp/v1/` refuses every credential whose MCP tier is empty, so no cookie
+  session and no tierless token reaches a tool (`docs/mcp-server.md`,
+  "Admission: an MCP tier is required"). The table shape is unchanged:
+  `kMcpStepUpPolicy` stays data. PR 2 of #6305 resolves each pending row
+  whose REST twin is `kRequired` in one of two ways: (a) its
+  `(securable, operation)` pair is in `requires_approval`'s supervised list,
+  and the row is classified with a new MCP-only class (working name
+  `kApprovalGated`) whose compile-time check proves the pair is
+  approval-gated; or (b) the pair is not approval-gated, which is a
+  per-tool security decision (add the pair to `requires_approval`, or record
+  a `kExempt` reason). `kRequired` never appears in the MCP table. The
+  second-list and consistency-test criterion is already met by
+  `step_up_mcp_policy.hpp` and its test. Engine principals are out of scope
+  of this decision.
 - **Metrics and alerts.**
   `yuzu_auth_mfa_step_up_gate_total{outcome,source,surface}` (96 series
   pre-seeded to 0), the gauge `yuzu_auth_mfa_step_up_window_seconds`, and the
@@ -992,7 +1016,7 @@ Consequences, each deliberate:
   and normally evaluates nothing again (it evaluates afresh when no pass was consumed, for example when the
   central check is switched off with `--mfa-step-up-window-secs=0`), and then applies the approver rule on top.
 - **MCP can never approve.** The refusal is unconditional on the MCP transport, which runs no MFA step-up: the two MCP tools always
-  return the typed refusal, for a bearer token and for a cookie session that reaches `/mcp/v1/` alike. This is an exception recorded in ADR-1005's exception ledger (entry 2026-10-18, "human review
+  return the typed refusal, whatever tiered bearer token the caller used (a cookie session no longer reaches `/mcp/v1/` at all: it has no MCP tier and is refused at admission, #4309). This is an exception recorded in ADR-1005's exception ledger (entry 2026-10-18, "human review
   is a human-session act"; legacy REST rows `exception:#6061 revisit:2027-01-18`). The tools remain registered; listing pending approvals via MCP is unchanged. The MCP
   tier/permission mapping for both tools is `Approval:Approve` (it was mapped as `Approval:Write`;
   #3151).
@@ -3804,9 +3828,9 @@ A **service-scoped API token** is bound to one IT service's agents (`session->to
 
 **MCP's mirror: the C8 `ServiceScopeClass` chokepoint (§3c).** Every `tools/call` dispatch consults a third field on the tool's `kToolSecurity` row — `denied` (the default), `confined` (a real downstream confinement mechanism exists — `deny_fleet_wide_service_scoped`, a `scoped_perm_fn` check, a fail-closed `exec_visible` derivation, or (as of #3290) `fleet_read_fn_`/`require_fleet_read`'s `meet(management-group, service-scope)` composition), or `global_safe` (boot-validated against the same `kServiceScopeGlobalSafe` table `require_permission` reads). `confined` is **not** a claim that the tool is actually usable by a service-scoped caller — most `confined` tools still deny downstream via their own `perm_fn`/`scoped_perm_fn` under the seeded-empty allow-list; it only means the C8 layer itself doesn't short-circuit before the tool's own (pre-existing) confinement runs. `query_installed_software` and, as of #1700, `get_agent_details` are the tools so far where `confined` means real usability, not just a non-short-circuiting label — see the Phase 2 progress note below. `resources/read` bypasses C8 structurally but calls `perm_fn` directly, so it is covered by the flip the same way any REST route is.
 
-**Explicit denies for gate-less routes (§3e).** A route that never calls `require_permission`/`require_scoped_permission`/C8 at all is untouched by the flip regardless of how the flip itself is tuned — these needed their own deny. `AuthRoutes::deny_service_scoped_session` is `server.cpp`'s shared gate for this shape (health-summary fragment, the legacy `/events` SSE stream, the instructions-list fragment, and the six result-set HTMX fragments); `ComplianceRoutes` and `WorkflowRoutes` carry their own file-local equivalents for the same reason every other route-owner class in this list does (below). A residual grep sweep of every `auth_fn`/`perm_fn` call site in `rest_api_v1.cpp` (74 sites) and `mcp_server.cpp` (3 sites) found four more real instances — three sharing one shape (`management-groups/{id}/roles` GET/POST/DELETE, plus the `POST /api/v1/tokens` service-scope minting check, all bypassing `require_permission` via a **direct** `rbac_store->check_permission` call) and the eight-route `/api/v1/result-sets*` REST family (the twin of the HTMX fragments above) — plus one **distinct, more severe, not service-scope-specific** bug in the same pass: `POST /api/v1/result-sets/from-inventory-query` had no authorization check of any kind (CWE-862), missed by an earlier fix that gated its three dispatch siblings. Full inventory, including document-only dispositions and the sweep's own accounting: `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
+**Explicit denies for gate-less routes (§3e).** A route that never calls `require_permission`/`require_scoped_permission`/C8 at all is untouched by the flip regardless of how the flip itself is tuned — these needed their own deny. `AuthRoutes::deny_service_scoped_session` is `server.cpp`'s shared gate for this shape (health-summary fragment, the legacy `/events` SSE stream, the instructions-list fragment, and the six result-set HTMX fragments); `ComplianceRoutes` and `WorkflowRoutes` carry their own file-local equivalents for the same reason every other route-owner class in this list does (below). `GET /mcp/v1/` (the MCP SSE stream channel) is on this list too (#4754): it refuses a service-scoped token with `403` / JSON-RPC `-32003` and no `permission` field, before any session lookup or stream-budget lease, audited as `mcp.session.reject` with `reason=service_scoped`; `POST` (still confined per tool by C8) and `DELETE` are unchanged, and the session is separately bound to its principal and credential class, not including elevation state (`docs/mcp-server.md`, "Session binding"). A residual grep sweep of every `auth_fn`/`perm_fn` call site in `rest_api_v1.cpp` (74 sites) and `mcp_server.cpp` (3 sites) found four more real instances — three sharing one shape (`management-groups/{id}/roles` GET/POST/DELETE, plus the `POST /api/v1/tokens` service-scope minting check, all bypassing `require_permission` via a **direct** `rbac_store->check_permission` call) and the eight-route `/api/v1/result-sets*` REST family (the twin of the HTMX fragments above) — plus one **distinct, more severe, not service-scope-specific** bug in the same pass: `POST /api/v1/result-sets/from-inventory-query` had no authorization check of any kind (CWE-862), missed by an earlier fix that gated its three dispatch siblings. Full inventory, including document-only dispositions and the sweep's own accounting: `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
 
-**The per-file `deny_service_scoped_*`/`deny_fleet_wide_service_scoped` helpers are now a SECOND, largely-redundant layer, not the primary defense.** For any route that also calls `require_permission`/`require_scoped_permission` (the vast majority), the flip above already denies a service-scoped token structurally — four of the remaining original in-handler deny sites (`list_schedules`, `list_dex_perf_devices`, `compare_app_perf_versions`, `list_network_devices`) are still double-denies, kept for now and scheduled for Phase 2 retirement. Two are retired: `query_installed_software`'s in the first Phase 2 migration (below) and `get_dex_group_app_perf`'s in #3290 Phase 2 bucket 1a (both were provably dead, fired after their route's own `perm_fn`). A THIRD group — `GET /api/v1/dex/signals/{obs_type}`+`GET /api/v1/dex/app`+`GET /api/v1/dex/overview` (REST) and their MCP twins `get_dex_signal_detail`/`get_dex_app`/`get_dex_overview` — stays on `perm_fn` + `deny_fleet_wide_service_scoped` (WS-A4 PR-1): these three routes' fields are all fleet-wide aggregates not yet confined per caller (ADR-0017 INV-3), so they stay global-only rather than moving onto `AuthRoutes::require_fleet_read` — see `docs/presentation-core-split-delivery-matrix.md`'s WS-A4 row; their `deny_fleet_wide_service_scoped` call sites are therefore LIVE again, fired BEFORE `perm_fn`/`tier_allows`, same class as the four sites below. The four sites that remain are live-but-redundant (their deny fires BEFORE `perm_fn`, so retiring them changes the observable response, not just deletes unreachable code — a different, more cautious backlog item). Same bucket-1a pass also retired `deny_service_scoped_schedule` (`schedule_routes.{hpp,cpp}`) entirely — its four call sites (`schedule.create`/`.list`/`.delete`/`.enable`) all fired after their route's own `require_permission`. The remaining per-file helpers (below) stay in place; they remain load-bearing **only** for routes with no other RBAC gate call at all (the §3e class above) — `EXTEND the pattern, do not fork a new copy` still applies to *that* subset. Current call sites, including this PR's additions: `deny_service_scoped_`/`deny_service_scoped_mutation_` (`guardian_routes.{hpp,cpp}`), `deny_service_scoped_` (`dex_routes.{hpp,cpp}`, `deployment_routes.{hpp,cpp}`, `preflight_routes.{hpp,cpp}`, and the new `compliance_routes.{hpp,cpp}`), `deny_service_scoped_schedule_list` + the new `deny_service_scoped_scope_estimate` (both local lambdas in `workflow_routes.cpp`), the shared `deny_fleet_wide_service_scoped` lambda in `rest_api_v1.cpp` (now covering the result-set REST family too) and `mcp_server.cpp`, the new `AuthRoutes::deny_service_scoped_session` (`server.cpp`'s shared gate for its own gate-less routes), plus inline checks in `device_routes.cpp` / `network_routes.cpp` / `inventory_routes.cpp` / `echo_tree_routes.cpp`.
+**The per-file `deny_service_scoped_*`/`deny_fleet_wide_service_scoped` helpers are now a SECOND, largely-redundant layer, not the primary defense.** For any route that also calls `require_permission`/`require_scoped_permission` (the vast majority), the flip above already denies a service-scoped token structurally — four of the remaining original in-handler deny sites (`list_schedules`, `list_dex_perf_devices`, `compare_app_perf_versions`, `list_network_devices`) are still double-denies, kept for now and scheduled for Phase 2 retirement. Two are retired: `query_installed_software`'s in the first Phase 2 migration (below) and `get_dex_group_app_perf`'s in #3290 Phase 2 bucket 1a (both were provably dead, fired after their route's own `perm_fn`). A THIRD group — `GET /api/v1/dex/signals/{obs_type}`+`GET /api/v1/dex/app`+`GET /api/v1/dex/overview` (REST) and their MCP twins `get_dex_signal_detail`/`get_dex_app`/`get_dex_overview` — stays on `perm_fn` + `deny_fleet_wide_service_scoped` (WS-A4 PR-1): these three routes' fields are all fleet-wide aggregates not yet confined per caller (ADR-0017 INV-3), so they stay global-only rather than moving onto `AuthRoutes::require_fleet_read` — see `docs/presentation-core-split-delivery-matrix.md`'s WS-A4 row; their `deny_fleet_wide_service_scoped` call sites are therefore LIVE again, fired BEFORE `perm_fn`/`tier_allows`, same class as the four sites below. The four sites that remain are live-but-redundant (their deny fires BEFORE `perm_fn`, so retiring them changes the observable response, not just deletes unreachable code — a different, more cautious backlog item). Same bucket-1a pass also retired `deny_service_scoped_schedule` (`schedule_routes.{hpp,cpp}`) entirely — its four call sites (`schedule.create`/`.list`/`.delete`/`.enable`) all fired after their route's own `require_permission`. The remaining per-file helpers (below) stay in place; they remain load-bearing **only** for routes with no other RBAC gate call at all (the §3e class above) — `EXTEND the pattern, do not fork a new copy` still applies to *that* subset. Current call sites, including this PR's additions: `deny_service_scoped_`/`deny_service_scoped_mutation_` (`guardian_routes.{hpp,cpp}`), `deny_service_scoped_` (`dex_routes.{hpp,cpp}`, `deployment_routes.{hpp,cpp}`, `preflight_routes.{hpp,cpp}`, and the new `compliance_routes.{hpp,cpp}`), `deny_service_scoped_schedule_list` + the new `deny_service_scoped_scope_estimate` (both local lambdas in `workflow_routes.cpp`), the shared `deny_fleet_wide_service_scoped` lambda in `rest_api_v1.cpp` (now covering the result-set REST family too), in `mcp_server.cpp` the file-scope `is_service_scoped_caller` / `write_service_scoped_denial` pair (the predicate and the audit-and-write sink, shared by the `POST` handler and `build_get_handler`, #4754; the `POST` lambda `deny_fleet_wide_service_scoped` there is now a thin wrapper that supplies the id-echoing envelope), the new `AuthRoutes::deny_service_scoped_session` (`server.cpp`'s shared gate for its own gate-less routes), plus inline checks in `device_routes.cpp` / `network_routes.cpp` / `inventory_routes.cpp` / `echo_tree_routes.cpp`.
 
 **Phase 2 progress (#3290).** The first migration landed: `GET /api/v1/inventory/software` + its MCP twin `query_installed_software` are now on `require_fleet_read` — both surfaces' `deny_fleet_wide_service_scoped`/blanket-deny call sites are retired for this tool pair (the REST call was already provably dead, firing after `perm_fn`; the MCP call was live and is now gone). `require_fleet_read` itself gained the elevated/engine/mcp_tier caller-class branches it was missing at Phase 0 (mirroring `require_list_read`'s ladder — see its own doc comment). Prioritization for this and future migrations is **documented reasoning, not the metric** — no production fleet exists yet, so `yuzu_auth_service_scope_default_denied_total` has no real traffic to rank by; the criterion-1 substitute and the ranked backlog live in `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`. The §3d `authorize_list_read` supersede→intersect migration (below) is a separate, not-yet-started stream.
 
@@ -3888,7 +3912,8 @@ resulting latency bounds.
   `require_list_read` (the last is the ADR-0017 admit-then-filter list-read
   gate, #3038 — see the Authentication/RBAC row in
   `.claude/routed-concerns-access-control.md`) all
-  branch on `session->principal_kind == "engine"` **before** falling through
+  branch on `session->is_engine()` (the stored `principal_kind` or an engine-token
+  `auth_source`, #2343) **before** falling through
   to the legacy pre-RBAC path or the MCP-tier/service-scoped resolution used
   for human and agent sessions. An engine session's authority is resolved
   **exclusively** against `RbacStore`:
@@ -3908,7 +3933,7 @@ resulting latency bounds.
   the concrete mechanism behind design §4.2's promise: *"An engine principal
   with no assignments can do nothing."*
 - **Audit attribution.** `AuthRoutes::make_audit_event` re-stamps
-  `principal_class="engine"` from the resolved session's `principal_kind`
+  `principal_class="engine"` when the resolved session `is_engine()`
   after the generic (credential-presentation-based) classification runs —
   an engine principal's bearer-token requests previously mislabelled as
   `"agent"` in the audit trail (design §6 / `adr-1005-execution-plan.md`
@@ -5096,7 +5121,14 @@ the list/scope reads), NEVER allow. Where a caller needs to distinguish "denied"
 from "store degraded" for a 403-vs-503 decision (e.g. `authorize_list_read`),
 that is exposed via a **separate** tri-state / `std::expected` accessor — the
 plain `bool` path stays deny-on-error so no existing chokepoint can regress to
-fail-open. This **closes the prior "fails open on a corrupt `rbac.db`" hole**:
+fail-open. `RbacStore::check_scoped_permission_checked` (#3739) is that accessor for the
+per-agent scoped gate: `true` is granted, `false` is a definitive denial, and
+`unexpected(msg)` means the answer is a deny *because a read failed* (the first
+failed read wins; an allow and an explicit deny-group hit are returned as such).
+`check_scoped_permission` is its `value_or(false)` wrapper, so every other
+caller is unchanged. `AuthRoutes::require_scoped_permission` uses it only to
+label the `auth.scoped_permission_required` audit row `(read degraded:
+mgmt_group_store|rbac_store)`; the response stays a fail-closed 403. This **closes the prior "fails open on a corrupt `rbac.db`" hole**:
 under SQLite a corrupt/unreadable RBAC store could fall through to an engaged
 allow at some call sites; the PostgreSQL `rbac_store` now denies on any degrade.
 

@@ -1,1 +1,0 @@
-- **Hardware-estate scaffold (agent).** `hardware` declares `chassis`, `baseboard`, `swap` and `machine_id`; `disk_actions` declares `partitions` and `topology`. Every new action answers one typed `status|<action>|unsupported|<os>:planned` row on every OS until its leg lands.

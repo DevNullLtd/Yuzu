@@ -20,6 +20,7 @@
 #include "agent_decommission.hpp"
 
 #include "app_perf_daily_store.hpp"
+#include "device_ci_kinds.hpp"
 #include "device_inventory_store.hpp"
 #include "inventory_ingest_outcome.hpp"
 #include "inventory_store.hpp"
@@ -41,6 +42,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -334,6 +336,21 @@ std::int64_t today_utc_midnight() {
     return (now / 86400) * 86400;
 }
 
+// Rows a device_ci child table holds for one agent (direct COUNT; -1 on any failure).
+long long child_rows(yuzu::server::pg::PgPool& pool, const std::string& table,
+                     const std::string& agent_id) {
+    auto lease = pool.acquire();
+    if (!lease)
+        return -1;
+    const std::string sql =
+        "SELECT count(*) FROM device_inventory_store." + table + " WHERE agent_id = $1";
+    auto res = yuzu::server::pg::exec_params(lease.get(), sql.c_str(),
+                                             std::vector<std::string>{agent_id});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+        return -1;
+    return std::atoll(PQgetvalue(res.get(), 0, 0));
+}
+
 // Populate one agent across all eight stores. `tag` distinguishes the target
 // agent from the bystander so the assertions can prove agent-scoping.
 void seed_agent(const std::string& agent_id, yuzu::server::InventoryStore& inv,
@@ -371,10 +388,23 @@ void seed_agent(const std::string& agent_id, yuzu::server::InventoryStore& inv,
                                         .ws_max_bytes = 2000}};
     REQUIRE(perf.apply_daily(agent_id, pr));
 
-    // Device-CI (1:1 per agent).
+    // Device-CI (1:1 per agent) — a v2 record carrying one row of EVERY list kind plus the
+    // three status-only sections, so the cascade is proven to reach all eight child tables
+    // through the device_ci FK (ON DELETE CASCADE), not just the parent row.
     DeviceCiRecord ci;
     ci.hostname = "host-" + agent_id;
     ci.system_uuid = "uuid-" + agent_id;
+    ci.blob_version = 2;
+    ci.content_hash = "cihash-" + agent_id;
+    ci.chassis_serial = "CHS-" + agent_id; // placeholder serials only
+    for (const auto& d : yuzu::server::kDeviceCiSections) {
+        yuzu::server::DeviceCiSection sec;
+        sec.kind = d.section;
+        sec.level = "ok";
+        if (d.table != nullptr)
+            sec.rows.push_back(std::vector<std::string>(static_cast<std::size_t>(d.n_fields), "-"));
+        ci.sections.push_back(std::move(sec));
+    }
     REQUIRE(dev.apply_device_ci(agent_id, "cihash-" + agent_id,
                                 std::optional<DeviceCiRecord>{ci}, 1000) ==
             InventoryIngestOutcome::kStored);
@@ -501,6 +531,16 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     REQUIRE(ci_del.has_value());        // no read degrade
     CHECK_FALSE(ci_del->has_value());   // record absent
 
+    // The v2 children went with the parent: nothing readable, and every child table is empty
+    // for the target (a direct COUNT, so a missed table cannot hide behind the read path).
+    auto ci_secs_del = device_inventory.get_device_ci_sections("agent-del");
+    REQUIRE(ci_secs_del.has_value());
+    CHECK(ci_secs_del->empty());
+    CHECK(child_rows(pool, "device_ci_section", "agent-del") == 0);
+    for (const auto& d : yuzu::server::kDeviceCiSections)
+        if (d.table != nullptr)
+            CHECK(child_rows(pool, d.table, "agent-del") == 0);
+
     auto lic_del = software_licensing.agent_licenses("agent-del");
     REQUIRE(lic_del.has_value());
     CHECK(lic_del->empty());
@@ -524,6 +564,12 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     auto ci_by = device_inventory.get_device_ci("agent-bystander");
     REQUIRE(ci_by.has_value());
     CHECK(ci_by->has_value());
+    auto ci_secs_by = device_inventory.get_device_ci_sections("agent-bystander");
+    REQUIRE(ci_secs_by.has_value());
+    CHECK(ci_secs_by->size() == yuzu::server::kDeviceCiSectionCount); // all 10 sections survive
+    for (const auto& d : yuzu::server::kDeviceCiSections)
+        if (d.table != nullptr)
+            CHECK(child_rows(pool, d.table, "agent-bystander") == 1);
 
     auto lic_by = software_licensing.agent_licenses("agent-bystander");
     REQUIRE(lic_by.has_value());
