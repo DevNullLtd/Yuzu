@@ -1277,11 +1277,11 @@ MCP (Model Context Protocol) tokens are API tokens with an additional `mcp_tier`
 |---|---|
 | `readonly` | Read-only tools only (list agents, query audit log, check compliance, etc.) |
 | `operator` | Read-only tools + tag writes + auto-approved instruction executions |
-| `supervised` | All operations, but destructive actions require admin approval via the approval workflow |
+| `supervised` | All operations, but destructive actions require admin approval via the approval workflow, except the closed exempt list of MCP tools (currently only `cancel_execution`; see "Tier details" in `mcp.md`) |
 
 Tier enforcement happens *before* RBAC checks. A tier can block an operation even when RBAC would permit it; conversely, if the tier permits but RBAC denies, the request is still blocked. Both layers must allow.
 
-The `supervised` tier marks destructive operations as approval-gated, and the behaviour now depends on the transport. On the MCP `/mcp/v1/` transport these run through the **ticket-then-recall** approval flow: the first call mints a pending approval, and after an admin approves it, a recall carrying the `approval_id` executes the operation. On a non-MCP transport (the REST API) an approval-gated operation is denied with an `auth.approval_required` audit; only Reads and trivially-allowed operations succeed there.
+The `supervised` tier marks destructive operations as approval-gated, except for a closed list of exempt MCP tools (currently only `cancel_execution`, which only marks a tracker record cancelled and sends nothing to a device; the exemption is MCP only, and "Tier details" in `mcp.md` explains it), and the behaviour now depends on the transport. On the MCP `/mcp/v1/` transport these run through the **ticket-then-recall** approval flow: the first call mints a pending approval, and after an admin approves it, a recall carrying the `approval_id` executes the operation. On a non-MCP transport (the REST API) an approval-gated operation is denied with an `auth.approval_required` audit; only Reads and trivially-allowed operations succeed there.
 
 ### Creating an MCP Token
 
