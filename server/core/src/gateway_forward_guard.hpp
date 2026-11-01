@@ -3,7 +3,6 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <utility>
 
 /// @file gateway_forward_guard.hpp
 /// The spawn/setup guard around `ServerImpl::forward_gateway_pending`'s per-command body,

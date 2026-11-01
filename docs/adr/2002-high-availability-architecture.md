@@ -1908,7 +1908,7 @@ already counted each queued command as sent (it returns true at the queue push),
 (`std::system_error` or `bad_alloc`) unwound the loop, destroyed every not-yet-spawned drained command with no
 terminal response, and left its execution row `running` with a targeted count it could never complete (the
 stuck-execution sweep skips a row whose targeted count is above 0). The whole per-command body, from the first
-allocating statement through the spawn, is now one try statement: a failure resolves THAT command through
+allocating statement through the spawn, now runs as the `forward_one` lambda under `guarded_forward` (`server/core/src/gateway_forward_guard.hpp`, which also holds the reason constant and the stored detail text), so one try statement covers it: a failure resolves THAT command through
 `apply_gateway_forward_terminal_failure` with the reason code `gateway_forward_spawn_failed` and the loop continues.
 That resolution is best effort: the resolver allocates too, so under the same resource pressure it can fail as well;
 that is logged at error level (an operator `cancel_execution` is then the only way to close the row), and an
