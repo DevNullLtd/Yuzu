@@ -1056,7 +1056,6 @@ TEST_CASE("POST /api/settings/mfa/disable reports a failed session delete and au
           "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
     StoreScope scope(h);
-    auto& sessions = scope.sessions;
 
     auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
@@ -1191,7 +1190,6 @@ TEST_CASE("POST /api/settings/mfa/disable says the state is unknown when neither
           "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
     StoreScope scope(h);
-    auto& sessions = scope.sessions;
     auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     auto bytes = mfa::base32_decode(init->secret_base32);
@@ -2181,7 +2179,7 @@ TEST_CASE(
     const auto call = src.find("detail::run_in_handler_step_up(", wired);
     REQUIRE(call != std::string::npos);
     CHECK(call - wired < 2500);
-    // The out-parameter is a real admission, not the nullptr the 34 kRequired rows pass.
+    // The out-parameter is a real admission, not the nullptr the 35 kRequired rows pass.
     const auto args = src.substr(call, 800);
     CHECK(args.find("&admitted") != std::string::npos);
 }

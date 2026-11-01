@@ -157,7 +157,7 @@ AuthoredTimes authored_from(PGresult* res, int i) {
 // same), so the two cannot drift. A write of a proof or identity column that
 // does not advance the bind sequence leaves the proof UNBOUND (factor generation 0),
 // whatever the new values.
-// FROZEN: shipped in migration v2 and pinned byte-for-byte by the boot check; changing it
+// FROZEN: shipped in migration v3 and pinned byte-for-byte by the boot check; changing it
 // needs a NEW migration (CREATE OR REPLACE) and an accepted (old,new) pair in the check, or
 // every migrated replica refuses to boot.
 constexpr std::string_view kRebindGuardBody =
@@ -169,10 +169,11 @@ constexpr std::string_view kRebindGuardBody =
     "END ";
 
 std::string migration_v3_sql() {
-    // lock_timeout bounds ALTER TABLE / CREATE TRIGGER waiting on a busy sessions table
-    // (a row lock held by a long-lived writer), so a stalled holder fails the migration
-    // loudly (retried on restart) rather than hanging boot (precedent: ca_store v3/v4).
-    return "SET LOCAL lock_timeout = '30s'; "
+    // The 3 s lock_timeout is the same short cap v2 uses: while the ALTER TABLE / CREATE
+    // TRIGGER queues behind a long transaction, every new sessions query on a running peer
+    // queues behind it, so a short cap keeps that stall short. A failed attempt rolls the
+    // whole migration back and the next boot retries it.
+    return "SET LOCAL lock_timeout = '3s'; "
            "ALTER TABLE sessions ADD COLUMN mfa_factor_gen BIGINT NOT NULL DEFAULT 0, "
            "ADD COLUMN mfa_bind_seq BIGINT NOT NULL DEFAULT 0; "
            "CREATE FUNCTION sessions_mfa_rebind_guard() RETURNS trigger LANGUAGE plpgsql AS $$" +
@@ -191,8 +192,9 @@ std::string migration_v3_sql() {
 enum class GuardCheck { kOk, kFailed, kInconclusive };
 
 // Is the rebind guard in force for every writer? Reads the catalog: the trigger exists,
-// is ENABLE ALWAYS ('A'), is a ROW BEFORE UPDATE trigger (tgtype & 19 = 19) with no WHEN
-// clause, lists all five guarded columns, and calls the pinned function body. A missing
+// is ENABLE ALWAYS ('A'), is a ROW BEFORE UPDATE trigger and nothing else (tgtype & 127 = 19: no
+// INSERT, DELETE, TRUNCATE or INSTEAD bit, as AuthDB's check) with no WHEN clause, lists all five
+// guarded columns, and calls the pinned function body. A missing
 // sessions table (a rename fault, a drop) is INCONCLUSIVE rather than a failure: it is
 // not evidence about the trigger and every session query fails on it anyway. When `cause` is
 // given, an inconclusive result describes why (SQLSTATE and server message, or the row count).
@@ -200,7 +202,7 @@ GuardCheck check_rebind_guard(PGconn* conn, std::string* cause = nullptr) {
     PgResult r = exec_params(
         conn,
         "SELECT COALESCE(t.tgenabled = 'A' "
-        "  AND (t.tgtype & 19) = 19 AND t.tgqual IS NULL "
+        "  AND (t.tgtype & 127) = 19 AND t.tgqual IS NULL "
         "  AND (SELECT count(*) FROM pg_attribute a WHERE a.attrelid = c.oid "
         "AND NOT a.attisdropped "
         "         AND a.attname IN ('mfa_verified_ms','mfa_factor_gen','username','auth_source',"

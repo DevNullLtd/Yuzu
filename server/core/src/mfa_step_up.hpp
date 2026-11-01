@@ -36,10 +36,12 @@
 ///   - `window_secs <= 0`: operator-disabled the gate (escape hatch
 ///     for diagnostic / break-glass scenarios; emits a startup WARN
 ///     in main.cpp).
-/// Two rows are the exception to all three skips (`StepUpClass::kFactorCredential`: recovery
-/// codes, disable MFA): the window is the approver window whatever is configured (the hatch never
-/// applies), and only a LOCAL session may pass (any other auth source is a 403,
-/// `reason=factor_credential_requires_local_session`).
+/// Two rows are the exception to the first and third skips (`StepUpClass::kFactorCredential`:
+/// recovery codes, disable MFA): the window is the approver window whatever is configured (the
+/// hatch never applies), and only a LOCAL session may pass (any other auth source, a bearer
+/// principal included, is a 403, `reason=factor_credential_requires_local_session`). The
+/// un-enrolled skip is NOT excepted: `decide_step_up` still passes a local caller with no enrolled
+/// factor and returns the admission, so a provisional enrolment can be cancelled.
 ///
 /// Requires step-up (returns false) when:
 ///   - principal is a local session ("local" auth_source) AND user is
@@ -126,7 +128,7 @@ using StepUpAuditFn = std::function<bool(const httplib::Request&,
 /// inside the window on the database clock as well as the cached anchor); no other caller
 /// ever reads it. Null (or empty) is fail-closed: such a caller is refused 503, never
 /// judged without the proof. `admitted`, when not null, receives what a PASS admitted for
-/// a local account (`StepUpAdmission`); pass nullptr for the 34 `kRequired` rows. The row's
+/// a local account (`StepUpAdmission`); pass nullptr for the 35 `kRequired` rows. The row's
 /// class is resolved from `action_label` (`step_up_policy_for_label`), so the two
 /// `kFactorCredential` labels get the approver window with no hatch, the local-session-only
 /// rule and the admission here exactly as the central chokepoint gives them; an unknown

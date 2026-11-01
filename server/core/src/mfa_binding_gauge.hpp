@@ -1,7 +1,7 @@
 #pragma once
 
 /**
- * mfa_binding_gauge.hpp -- the binding-enforcement health gauge (#6079).
+ * mfa_binding_gauge.hpp: the binding-enforcement health gauge (#6079).
  *
  * `yuzu_auth_mfa_binding_enforcement_ok{store="auth"|"session"}` is 1 while the factor-generation
  * trigger (`auth`) and the session rebind guard (`session`) have not been observed failing, and
@@ -13,7 +13,9 @@
  * request-driven (`AuthDB::mfa_status`, `SessionStore::find`, behind a 60 s memo), so a tamper
  * that no request has observed yet still reads 1. While it reads 0, every local MFA binding
  * decision (the central step-up check, the in-handler gate, the approver gate) answers
- * store-unavailable with `reason=mfa_binding_unenforced`.
+ * store-unavailable: with `reason=mfa_binding_unenforced` for `store="auth"`, and with
+ * `reason=mfa_proof_unavailable` for `store="session"` (the stored generation is then not
+ * trustworthy, so the durable read is unavailable).
  *
  * Pure decision plus a metrics write: no I/O, no store access beyond the two atomic reads.
  */

@@ -1480,7 +1480,7 @@ TEST_CASE("chokepoint (kFactorCredential): the window-0 hatch admits neither a s
         CHECK(detail::consume_step_up_pass(req, *rig.session, route.label, &got));
         CHECK(got.local);
         CHECK(got.factor_gen == 6);
-        // A nullptr out-parameter is allowed for the 34 rows that ignore it.
+        // A nullptr out-parameter is allowed for the 35 rows that ignore it.
         detail::clear_step_up_pass();
         httplib::Response res3;
         REQUIRE(detail::apply_step_up_chokepoint(req, res3, rig.deps()) ==

@@ -550,10 +550,11 @@ int main(int argc, char* argv[]) {
                    "is neither refused nor recorded, SAML sessions pass, and the auth store is "
                    "not read; engine denials and unwired-store refusals still apply and are "
                    "recorded. Two route classes are NOT switched off by <= 0: approval "
-                   "approve/reject always need an enrolled factor and a proof within "
-                   "min(this value, 300) seconds, and the two factor-credential routes "
-                   "(regenerate recovery codes, disable MFA) always need a local session with a "
-                   "proof inside min(this value, 300) seconds")
+                   "approve/reject always need an enrolled factor and a proof within the "
+                   "approver window, and the two factor-credential routes (regenerate recovery "
+                   "codes, disable MFA) always need a local session with a proof inside the "
+                   "approver window. The approver window is 300 seconds when this value is <= 0, "
+                   "otherwise the smaller of this value and 300")
         ->default_val(300)
         ->envname("YUZU_MFA_STEP_UP_WINDOW_SECS");
     app.add_option("--mfa-login-pending-secs", cfg.mfa_login_pending_secs,

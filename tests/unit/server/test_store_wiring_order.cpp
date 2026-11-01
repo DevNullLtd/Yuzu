@@ -145,6 +145,7 @@
 #include "confined_sink_scan.hpp"
 #include "source_scan.hpp"
 
+using yuzu::test::source_scan::comment_free_source;
 using yuzu::test::source_scan::line_of;
 using yuzu::test::source_scan::read_text_file;
 using yuzu::test::source_scan::strip_comments;
@@ -535,6 +536,44 @@ TEST_CASE("kBypassForRecovery is passed only by the two recovery one-shots in ma
     REQUIRE(hits.contains("main.cpp"));
     CHECK(hits["main.cpp"] == 2);
     CHECK_FALSE(hits.contains("server.cpp"));
+}
+
+// The binding-enforcement gauge (#6079) has no unit seam that sees the wiring: ServerImpl is not
+// unit-constructible, and the alert `YuzuMfaBindingNotEnforced` can fire only if the series are
+// published. Dropping either publish site (boot, or the 15 s health sweep) leaves every unit test
+// green and the alert silent, so pin that server.cpp describes the gauge and publishes it from
+// both sites, each handed the real store pair. LEXICAL: comments are stripped (a mention in a
+// comment does not count) and whitespace is ignored, but a macro or an alias is invisible.
+TEST_CASE("server.cpp describes the MFA binding gauge and publishes it at boot and in the health "
+          "sweep",
+          "[wiring_order]") {
+    std::string text = comment_free_source("server.cpp");
+    std::erase_if(text, [](unsigned char c) { return std::isspace(c) != 0; });
+    const auto count = [&](std::string_view needle) {
+        int n = 0;
+        for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1))
+            ++n;
+        return n;
+    };
+    CHECK(count("describe_mfa_binding_gauge(metrics_);") == 1);
+    // Two sites, both with the live stores (a nullptr argument publishes nothing for that label).
+    CHECK(count("publish_mfa_binding_gauges(metrics_,auth_db_.get(),session_store_.get());") == 2);
+    CHECK(count("publish_mfa_binding_gauges(") == 2);
+}
+
+// The recovery bypass selector (#6079): the bootstrap AuthDB in main.cpp opens past a damaged MFA
+// trigger only for the two host recovery one-shots, and enforces for every other mode, serving
+// included. The token-count pin above sees that `kBypassForRecovery` appears twice, not WHICH
+// predicate selects it, so a widened predicate (or the arms swapped) would pass it. This pins the
+// predicate and the ternary's shape. LEXICAL: comments stripped, whitespace ignored.
+TEST_CASE("main.cpp selects kBypassForRecovery only for --mfa-reset and --break-glass-arm",
+          "[wiring_order]") {
+    std::string text = comment_free_source("main.cpp");
+    std::erase_if(text, [](unsigned char c) { return std::isspace(c) != 0; });
+    CHECK(text.find("constboolrecovery_oneshot=!mfa_reset_user.empty()||break_glass_arm;") !=
+          std::string::npos);
+    CHECK(text.find("recovery_oneshot?yuzu::server::MfaBindingCheck::kBypassForRecovery:"
+                    "yuzu::server::MfaBindingCheck::kEnforce") != std::string::npos);
 }
 
 // The matcher against small engineered inputs, independent of whatever

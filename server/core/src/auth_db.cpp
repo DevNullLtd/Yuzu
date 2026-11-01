@@ -274,7 +274,7 @@ constexpr std::string_view kUsersMfaFactorGenBody =
 // meant for a fresh database.
 std::string migration_v3_sql() {
     std::string sql;
-    sql += "SET LOCAL lock_timeout = '30s'; ";
+    sql += "SET LOCAL lock_timeout = '3s'; ";
     sql += "ALTER TABLE users ADD COLUMN mfa_factor_gen BIGINT NOT NULL DEFAULT 0; ";
     sql += "CREATE FUNCTION users_mfa_factor_gen() RETURNS trigger LANGUAGE plpgsql AS $$";
     sql += kUsersMfaFactorGenBody;
@@ -474,9 +474,10 @@ const std::vector<pg::PgMigration>& migrations() {
         // on every change of `mfa_enrolled_at`, so "which factor is enrolled right now" is a
         // monotonic value no repeated or skewed enrolment timestamp can forge. Every existing row
         // starts at 0 (a hard cutover: no seed, see migration_v3_sql). A legacy binary ignores the
-        // column but its enrol and clear UPDATEs still fire the trigger. The lock_timeout bounds
-        // the ALTER and CREATE TRIGGER waits, so boot fails loudly and retries on restart
-        // rather than hanging behind a stalled holder (the ca_store v3/v4 precedent).
+        // column but its enrol and clear UPDATEs still fire the trigger. The 3 s lock_timeout
+        // bounds the ALTER and CREATE TRIGGER waits: while they queue behind a long transaction,
+        // every new users query on a running peer queues behind them, so a short cap keeps that
+        // stall short. A failed attempt rolls back and the next boot retries it.
         {3, migration_v3_sql()},
     };
     return kMigrations;
@@ -621,8 +622,9 @@ decrypt_mfa_secret(pg::SecretCodec& codec, const LoadedMfaRow& row) {
 // migration history: the trigger must exist, be ENABLE ALWAYS (tgenabled = 'A', so it also fires
 // under `session_replication_role = replica`), be a BEFORE UPDATE row trigger whose column list
 // contains both columns (a superset passes: the `@>` test; it still fires on every change to
-// either), with the INSERT/DELETE/TRUNCATE bits clear and no WHEN clause, and call a function whose
-// body is byte-identical to the pinned constant. `tgtype` bits (pg_trigger.h): ROW 1, BEFORE 2,
+// either), with the INSERT/DELETE/TRUNCATE bits clear and no WHEN clause, and call the plpgsql
+// function of that name, in the table's schema, whose body is byte-identical to the pinned
+// constant. `tgtype` bits (pg_trigger.h): ROW 1, BEFORE 2,
 // INSERT 4, DELETE 8, UPDATE 16, TRUNCATE 32, INSTEAD 64.
 enum class BindingCheck : std::uint8_t {
     Valid,   // the query ran and the trigger is in force
@@ -639,6 +641,9 @@ enum class BindingCheck : std::uint8_t {
         "AND t.tgattr::int2[] @> ARRAY(SELECT attnum FROM pg_attribute "
         "                              WHERE attrelid = t.tgrelid "
         "                                AND attname IN ('mfa_enrolled_at','mfa_factor_gen')) "
+        "AND p.proname = 'users_mfa_factor_gen' "
+        "AND p.pronamespace = (SELECT relnamespace FROM pg_class WHERE oid = t.tgrelid) "
+        "AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql') "
         "AND p.prosrc = $1::text "
         "FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid "
         "WHERE t.tgrelid = 'auth.users'::regclass AND t.tgname = 'users_mfa_factor_gen' "

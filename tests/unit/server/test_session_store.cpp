@@ -1053,6 +1053,13 @@ TEST_CASE("SessionStore v3: the store refuses to open when the guard is not prov
           "(false) "
           "EXECUTE FUNCTION session_store.sessions_mfa_rebind_guard()",
           "ALTER TABLE session_store.sessions ENABLE ALWAYS TRIGGER sessions_mfa_rebind_guard"}},
+        {"trigger recreated to also fire on INSERT",
+         {"DROP TRIGGER sessions_mfa_rebind_guard ON session_store.sessions",
+          "CREATE TRIGGER sessions_mfa_rebind_guard BEFORE INSERT OR UPDATE OF mfa_verified_ms, "
+          "mfa_factor_gen, "
+          "username, auth_source, principal_kind ON session_store.sessions FOR EACH ROW "
+          "EXECUTE FUNCTION session_store.sessions_mfa_rebind_guard()",
+          "ALTER TABLE session_store.sessions ENABLE ALWAYS TRIGGER sessions_mfa_rebind_guard"}},
         {"trigger recreated as AFTER",
          {"DROP TRIGGER sessions_mfa_rebind_guard ON session_store.sessions",
           "CREATE TRIGGER sessions_mfa_rebind_guard AFTER UPDATE OF mfa_verified_ms, "
@@ -1180,9 +1187,17 @@ TEST_CASE("SessionStore v3: concurrent validation latches when the trigger is di
                 start.arrive_and_wait();
                 read_phase(phase1_latched, /*expect_in_force=*/true);
                 start.arrive_and_wait();
-                if (t == 0 && !exec_ok(pool, "ALTER TABLE session_store.sessions DISABLE TRIGGER "
-                                             "sessions_mfa_rebind_guard"))
-                    ++ddl_failures;
+                if (t == 0) {
+                    if (!exec_ok(pool, "ALTER TABLE session_store.sessions DISABLE TRIGGER "
+                                       "sessions_mfa_rebind_guard"))
+                        ++ddl_failures;
+                    // One read completes the validation that observes the disabled trigger and
+                    // latches the flag, so the barrier below publishes a finished observation:
+                    // concurrent readers of the same expiry elect ONE validator and the losers
+                    // proceed on the previous flag, which would make "every reader sees it
+                    // latched" racy.
+                    (void)store.find("none");
+                }
                 start.arrive_and_wait();
                 read_phase(phase2_in_force, /*expect_in_force=*/false);
                 start.arrive_and_wait();

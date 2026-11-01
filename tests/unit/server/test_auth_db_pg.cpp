@@ -3324,10 +3324,12 @@ TEST_CASE("AuthDB recovery consume takes the users row lock first, bounded, and 
         std::atomic<int> errors{0};
         std::atomic<std::int64_t> gen_seen{-1};
         // The stop token lets a jthread that is unwinding (a later construction threw) leave the
-        // start spin instead of waiting for a `go` that will never be set.
+        // start spin instead of waiting for a `go` that will never be set. `go` is re-read with
+        // the stop test: the scope exit requests a stop right after `go` is set, and a thread
+        // that saw `go` false just before must still run its consume, not return.
         auto fire = [&](std::stop_token st) {
             while (!go.load(std::memory_order_acquire)) {
-                if (st.stop_requested())
+                if (st.stop_requested() && !go.load(std::memory_order_acquire))
                     return;
                 std::this_thread::yield();
             }

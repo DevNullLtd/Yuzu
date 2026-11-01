@@ -92,6 +92,13 @@ struct ApproverRouteFixture {
         approval::register_approval_routes(sink, deps);
     }
 
+    // The stored route handlers capture `this` (audits, window_secs): a copy or move would
+    // leave them pointing at the old object.
+    ApproverRouteFixture(const ApproverRouteFixture&) = delete;
+    ApproverRouteFixture& operator=(const ApproverRouteFixture&) = delete;
+    ApproverRouteFixture(ApproverRouteFixture&&) = delete;
+    ApproverRouteFixture& operator=(ApproverRouteFixture&&) = delete;
+
     std::string submit() {
         static int n = 0;
         auto s = mgr->submit("def-binding-" + std::to_string(++n), "submitter1", "group:x", "",

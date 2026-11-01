@@ -117,7 +117,7 @@ run_pre_request_stage(const httplib::Request& req, httplib::Response& res,
 ///      rule and admission here too).
 /// `auth_db` is read per request by the caller, so a store that is nulled answers 503.
 /// `durable_proof` is the stored-proof read a local enrolled caller is judged on (null is
-/// fail-closed 503 for such a caller); `admitted` may be nullptr for the 34 `kRequired` rows.
+/// fail-closed 503 for such a caller); `admitted` may be nullptr for the 35 `kRequired` rows.
 [[nodiscard]] inline bool
 run_in_handler_step_up(const httplib::Request& req, httplib::Response& res,
                        const auth::Session& session, const std::string& action_label,

@@ -88,11 +88,6 @@
  * own statement before the check-and-delete, and it is capped + guarded.
  */
 
-// Real header, not a forward-declare of PGconn (see pg_migration_runner.hpp).
-#include <libpq-fe.h>
-
-#include "yuzu/server/mfa_binding_check.hpp"
-
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -100,6 +95,11 @@
 #include <optional>
 #include <string>
 #include <vector>
+
+// Real header, not a forward-declare of PGconn (see pg_migration_runner.hpp).
+#include <libpq-fe.h>
+
+#include "yuzu/server/mfa_binding_check.hpp"
 
 namespace yuzu::server::pg {
 class PgPool;

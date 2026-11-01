@@ -2071,7 +2071,7 @@ TEST_CASE("wiring: server.cpp's in-handler StepUpFn and the pre-request deps nam
     CHECK(db < window);
     CHECK(window < enforcement);
     CHECK(enforcement < metrics);
-    // ...then the stored-proof read and no out-parameter (the 34 kRequired rows ignore the
+    // ...then the stored-proof read and no out-parameter (the 35 kRequired rows ignore the
     // admission; the two factor-credential rows get theirs from the pass the chokepoint armed).
     const auto durable = args.find("&durable,");
     REQUIRE(durable != std::string::npos);
