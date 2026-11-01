@@ -15,7 +15,8 @@
 /// proven by a **monotonically-increasing epoch**:
 ///
 ///   * On each successful acquire, the elector mints a fresh epoch,
-///     `(timeline << 32) + nextval(leader_epoch_seq)`, and records it as
+///     `GREATEST((GREATEST(timeline, prev >> 32) << 32) + nextval(leader_epoch_seq),
+///     prev + 1)` (the packed term; see below), and records it as
 ///     `leader_state.current_leader_epoch` — done ON the lock-owning
 ///     connection, so mutual exclusion guarantees only the true holder writes
 ///     it, and each new leader's epoch is strictly greater than any prior one.

@@ -408,8 +408,10 @@ TEST_CASE("LeaderElector mint is floored by a surviving row from a HIGHER timeli
     seed_leader_row(admin.get(), lock_name, "(3::bigint << 32) + 41");
     exec_ok(admin.get(), "SELECT setval('leader_elector.leader_epoch_seq', 41, true)");
 
-    // The characterisation the floor exists for: WITHOUT it the packed mint on timeline 1 is
-    // BELOW the restored value, so an ordered consumer would reject the new leader forever.
+    // The characterisation behind the whole case: a mint packed from the REAL timeline alone is
+    // BELOW the restored value, so an ordered consumer would reject the new leader forever. (The
+    // packed term now takes the row\'s timeline too, so this case pins that term; the +1 floor
+    // itself is pinned by the older-sequence, RESTART and INT64_MAX cases below.)
     CHECK(scalar(admin.get(), "SELECT ((1::bigint << 32) + 42) < ((3::bigint << 32) + 41)") == "t");
 
     LeaderElector a(cfg_tl(db.dsn(), "holder-a", 1));
@@ -473,6 +475,42 @@ TEST_CASE("LeaderElector mint is floored when the sequence is OLDER than the row
     a.resign();
     REQUIRE(a.try_acquire());
     CHECK(*a.epoch() == row + 2);
+}
+
+TEST_CASE("LeaderElector repairs a sequence that is BEHIND the stored row so the pinned window stays separated (#6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    const std::string lock_name = kServerBackgroundLeaderLock;
+    auto admin = connect(db.dsn());
+    // A logical-replication cutover does not carry sequences: the row pins timeline 5 with
+    // count 500 on a real timeline 1, and the fresh sequence is at 1. Without a repair every
+    // mint there is exactly row+1, so a lossy promotion that loses the latest mint re-mints
+    // the value the paused ex-leader holds. The floored mint therefore advances the sequence
+    // to its own count part, and the NEXT mint is separated by the sequence again.
+    seed_leader_row(admin.get(), lock_name, "(5::bigint << 32) + 500");
+    LeaderElector a(cfg_tl(db.dsn(), "first", 1));
+    REQUIRE(a.try_acquire());
+    CHECK(*a.epoch() == (std::int64_t{5} << 32) + 501); // the floor won: this first mint is deterministic
+    CHECK(scalar(admin.get(), "SELECT last_value FROM leader_elector.leader_epoch_seq") == "501");
+    a.resign();
+
+    LeaderElector b(cfg_tl(db.dsn(), "second", 1));
+    REQUIRE(b.try_acquire());
+    const std::int64_t e_b = *b.epoch();
+    CHECK(e_b == (std::int64_t{5} << 32) + 502);
+    // The sequence now tracks the epochs (it would still be at ~3 without the repair).
+    CHECK(scalar(admin.get(), "SELECT last_value FROM leader_elector.leader_epoch_seq") == "502");
+    b.resign();
+
+    // The promoted standby lacks B's mint: the row is A's, and its sequence resumes past the
+    // pre-logged horizon. The new leader's epoch must differ from B's (it would equal it, at
+    // exactly row+1, if the sequence had never been repaired).
+    seed_leader_row(admin.get(), lock_name, "(5::bigint << 32) + 501");
+    exec_ok(admin.get(), "SELECT setval('leader_elector.leader_epoch_seq', 530, true)");
+    LeaderElector c(cfg_tl(db.dsn(), "after-promotion", 1));
+    REQUIRE(c.try_acquire());
+    CHECK(*c.epoch() == (std::int64_t{5} << 32) + 531);
+    CHECK(*c.epoch() != e_b);
 }
 
 TEST_CASE("LeaderElector mint over corrupt, foreign and legacy rows (#6535)",
