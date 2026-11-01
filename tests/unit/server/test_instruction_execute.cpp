@@ -1913,6 +1913,7 @@ struct RouteRig {
     DispatchCaller caller = make_caller("alice", true);
     bool caller_wired{true};
     int audit_calls{0};
+    std::vector<std::string> target_ids; // the `target_id` column value of every audit row
     struct Emitted {
         std::string type;
         json attrs, payload;
@@ -1940,6 +1941,7 @@ struct RouteRig {
                                    const std::string& result, const std::string& type,
                                    const std::string& id, const std::string& detail_text) {
                 ++audit_calls;
+                target_ids.push_back(id);
                 CHECK(action == "instruction.execute");
                 CHECK(type == "instruction");
                 core.audits.push_back({result, detail_text + " [id=" + id + "]"});
@@ -2038,6 +2040,55 @@ TEST_CASE("REST execute: a definition id with a control byte is a 400 invalid_de
     auto res = ok.post("d", "{}");
     REQUIRE(res);
     CHECK(res->status == 200);
+}
+
+// sec p4-sg1: the row's `target_id` column used to carry the hostile id verbatim (the detail text
+// was cleaned, the column was not), and sanitize_pg_text repairs only invalid UTF-8 and NUL.
+TEST_CASE("REST execute: a hostile definition id never reaches the audit target_id with a control "
+          "byte; a normal id is stored unchanged",
+          "[instruction_execute][rest][security]") {
+    const auto has_control = [](const std::string& v) {
+        for (const char ch : v) {
+            const auto b = static_cast<unsigned char>(ch);
+            if (b < 0x20 || b == 0x7F)
+                return true;
+        }
+        return false;
+    };
+    for (const auto& id : {std::string("d\r\nforged"), std::string("d\x1b[31m"),
+                                 std::string("d\x7f"), std::string("d\0xyz", 5)}) {
+        INFO(id.size());
+        RouteRig r;
+        r.core.defs["d"] = make_def("d");
+        auto res = r.post(id, "{}");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        REQUIRE_FALSE(r.target_ids.empty());
+        for (const auto& t : r.target_ids) {
+            CHECK_FALSE(has_control(t));
+            CHECK_FALSE(t.empty());
+        }
+    }
+    // The pre-core refusals (unparseable body) write through the same lambda.
+    {
+        RouteRig r;
+        r.core.defs["d"] = make_def("d");
+        auto res = r.post(std::string("d\r\nx"), "{not json");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        REQUIRE_FALSE(r.target_ids.empty());
+        for (const auto& t : r.target_ids)
+            CHECK_FALSE(has_control(t));
+    }
+    // Positive control: a normal id (with a character log_token would neutralise) is unchanged.
+    RouteRig ok;
+    ok.core.defs["my def=1,v"] = make_def("my def=1,v");
+    auto res = ok.post("my def=1,v", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE_FALSE(ok.target_ids.empty());
+    for (const auto& t : ok.target_ids)
+        CHECK(t == "my def=1,v");
 }
 
 TEST_CASE("REST execute: 400 for a nested or malformed body before any lookup",

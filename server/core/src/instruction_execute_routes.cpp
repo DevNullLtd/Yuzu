@@ -6,6 +6,8 @@
 #include "rest_a4_envelope.hpp"
 #include "rest_a4_envelope_http.hpp"
 
+#include <yuzu/log_token.hpp>
+
 #include <spdlog/spdlog.h>
 
 #include <nlohmann/json.hpp>
@@ -175,9 +177,15 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
         const AuditHook audit = [&](std::string_view result, const std::string& detail_text) {
             if (!deps.audit_fn)
                 return false; // unreachable past the guard above; never "audit off"
+            // `target_id` keeps the id as-is (bounded) so a normal id is byte-identical to the
+            // row's subject, but a hostile id (CR/LF/ESC/DEL...) must not reach the column raw:
+            // sanitize_pg_text only repairs invalid UTF-8 and NUL, so every OTHER control byte
+            // would be stored verbatim. Cleaned only when the id carries one.
+            std::string target = bounded_definition_id(definition_id);
+            if (definition_id_has_control_byte(definition_id))
+                target = ::yuzu::log_token(target);
             return deps.audit_fn(req, std::string(kAuditAction), std::string(result),
-                                 "instruction", bounded_definition_id(definition_id),
-                                 detail_text);
+                                 "instruction", target, detail_text);
         };
         // A refusal before the core runs still leaves a `denied` row (command_v1 does the same
         // for its body-depth and JSON-parse refusals); a lost row sets Sec-Audit-Failed, and the
