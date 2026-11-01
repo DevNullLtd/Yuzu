@@ -240,7 +240,7 @@ read as "the epoch is monotonic across any promotion"; every other document defe
    repeat needs the lost mint to have crossed a 32-value boundary). A sequence that is BEHIND the row's low
    32 bits (a logical-replication cutover or a table-only restore does not carry it) would make every mint
    exactly the row plus one, so the elector advances the sequence to the minted count part at the first such
-   (floored) mint, best-effort and never lowering it (a runtime role without `UPDATE` on the sequence cannot,
+   (floored) mint, best-effort and never lowering it below its current value (clamped one below the cap so the repair cannot park the sequence there; a runtime role without `SELECT` and `UPDATE` on the sequence cannot run it,
    and then every election stays at the stored epoch plus one). The first election, and the election after it
    (`setval` resets Postgres' sequence pre-logging, so that one always crosses a pre-log boundary), remain
    exposed, as does any election whose `setval` record a lossy promotion also loses; the elector logs a

@@ -494,8 +494,10 @@ bool LeaderElector::try_acquire() {
         // The sequence is BEHIND the stored row (a logical-replication cutover or a table-only
         // restore does not carry it), so this mint was exactly `prev + 1` and the next ones
         // would be too: a lossy promotion would re-mint them. Advance the sequence to this
-        // epoch's count part (never lower it) so the NEXT mint is separated by the sequence
-        // again. Best-effort, on the lock-owning connection; only this first mint stays exposed.
+        // epoch's count part (never below its current value, except that it is clamped one below
+        // the cap so the repair cannot itself park the sequence there) so later mints are
+        // separated by the sequence again. Best-effort, on the lock-owning connection; this
+        // election and the next stay exposed (setval resets Postgres' sequence pre-logging).
         // LEAST(.., cap - 1): never park the sequence AT its MAXVALUE (the next nextval would
         // raise), even for a pathological row whose count part is 2^32-2.
         pg::PgResult fix = pg::exec_params(
