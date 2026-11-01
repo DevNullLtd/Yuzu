@@ -195,7 +195,8 @@ Surfaced as `plugin_result_status` on the command response.
 ### Where the data goes
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response, land in the ResponseStore (90-day default retention), and are queryable at `/api/responses/{id}`, aggregatable (`smart` by `health`, `volumes` by `device`) and exportable as JSON from `/api/responses/{id}/export`.
-- **Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics. Nothing runs on a schedule.
+- **Daily-sync consumer for three of the four actions.** The `device_ci` daily-sync source (ADR-0016) invokes `volumes`, `partitions` and `topology` in-process via `LocalDispatcher` on every cycle and reports them as the `volume`, `partition` and `topology` sections of its device record, each with its own status, so a planned leg's `unsupported` status (`<os>:planned`) is recorded even though it has no rows. `smart` is not part of that record. A host without this plugin reports the three sections as unavailable (`agent:plugin_not_loaded`).
+- **Not consumed by** the Echo warehouse, DEX, or metrics. Nothing else runs on a schedule.
 - **Sensitivity.** Rows identify hardware, not people: drive models, volume GUIDs and BSD names are device-level identifiers (asset-inventory class, like `device_ci`), and nothing in them names a user, a file or an application.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("crossplatform.storage.smart")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 - **Siblings:** `device.hardware.disks` (physical inventory), `crossplatform.storage.mounts` (logical mounts, true filesystem capacity), `crossplatform.storage.free`.

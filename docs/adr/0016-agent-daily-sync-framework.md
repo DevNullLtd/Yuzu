@@ -597,13 +597,14 @@ re-measured when the storage legs land (`swap` has no capture either, its legs b
 its floor is its shortest possible row). `topology`'s cap is 96, not the 192 starting target,
 because 192 x 144 B would put the registry-derived total past the 80% line.
 
-**A host over the caps (sender contract).** No agent v2 writer exists in this change; this is
-the contract it is built to. The sender keeps the first N rows of each kind (N = the kind's row
+**A host over the caps (sender contract).** The agent v2 writer implements this contract (see
+the 2026-11-01 entry below). The sender keeps the first N rows of each kind (N = the kind's row
 cap) in a fixed sorted order, so the blob and its hash are stable day to day, and marks the
 section `constrained` with kept-of-total counts in its reason (a token distinct from the
 server's own `server_cap:<cap>`). If the blob would still exceed the ceiling it trims whole
 sections' tail rows, least valuable first: `topology`, `partition`, `volume`, `dimm`, `disk`,
-`cpu`, each trimmed section staying `constrained` with its kept-of-total. The scalar record and
+`cpu`, `swap` (swap last; see the 2026-11-01 entry), each trimmed section staying `constrained`
+with its kept-of-total. The scalar record and
 the per-section status records are never trimmed (together about 2-3 KiB, budgeted at 3 KiB), so
 a record always fits and the base fields always land. Trimmed rows are not stored: the daily
 record is a bounded summary, the live actions return the full data, and the daily record keeps
@@ -736,7 +737,11 @@ follow it. Against a pre-v2 server:
   land with the manufacturer prefixed by the `0x02` byte, and the appended scalars and every
   section are ignored. The full path stores the server-recomputed hash without comparing the
   claimed one, so the next daily hash-only report mismatches and is nacked once, and the agent
-  resends in full about 30 s later. That is one extra hash-only report and one full resend per
-  daily cycle, not an exponential climb.
+  resends in full 30 s plus a per-agent jitter of up to 5 minutes later. That is one extra
+  hash-only report and one full resend per daily cycle, not an exponential climb.
 - A blob over 64 KiB is dropped and nacked every time, so that agent sits on the `need_full`
-  backoff ladder (30 s doubling toward about 24 h) until the server is upgraded.
+  backoff ladder (30 s doubling toward about 10 minutes, plus the same per-agent jitter, so a
+  retry roughly every 10 to 15 minutes) until the server is upgraded. Each retry is a full
+  re-upload of a blob of up to 96 KiB. A pre-v2 server shows this as a `warn` log line,
+  `device_ci: oversized blob from agent=<id> (<n> B > 65536 B) — dropping + nacking`, and a count
+  on `yuzu_inventory_ingest_total{source="device_ci",outcome="dropped"}` for every rejection.

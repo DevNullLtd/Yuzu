@@ -342,8 +342,13 @@ TEST_CASE("device_ci v2: nothing from a failed capture is projected", "[sync][de
     in.chassis = cap("chassis|laptop|CHS-0001|AT-0001|dmi", YUZU_RESULT_STATUS_PERMISSION_DENIED,
                      "linux:dmi:denied");
     in.volumes = cap(wide_rows("volume", 6, 2, 4), YUZU_RESULT_STATUS_CONSTRAINED, "linux:partial");
+    // A refusal on a ROW-bearing section: well-formed rows in the capture, none on the wire.
+    in.disks = cap(wide_rows("disk", 5, 3, 4), YUZU_RESULT_STATUS_PERMISSION_DENIED,
+                   "linux:disks:denied");
     const auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
 
+    CHECK(p.status.at("disk") == Rec{"permission_denied", "linux:disks:denied"});
+    CHECK(p.rows.count("disk") == 0);
     CHECK(level_of(p, "partition") == "unavailable"); // never promoted to constrained
     CHECK(p.rows.count("partition") == 0);
     CHECK(level_of(p, "topology") == "unavailable");
@@ -474,7 +479,7 @@ TEST_CASE("device_ci v2 row projection", "[sync][device_ci][v2]") {
     }
 }
 
-TEST_CASE("device_ci v2: rows are sorted, capped first-N, and the cap is disclosed",
+TEST_CASE("device_ci v2: rows are sorted and capped first-N with the cap disclosed",
           "[sync][device_ci][v2]") {
     auto in = all_ok_inputs();
     // 140 topology rows in reverse order -> the first 96 in lexicographic order are kept.
@@ -524,6 +529,15 @@ TEST_CASE("device_ci v2: the ceiling trim removes whole kinds in order and discl
                                                      {"disk", 128},     {"cpu", 32},
                                                      {"swap", 16}};
     const auto small = parse_blob(device_ci_canonical_blob_v2(sample(), all_ok_inputs()));
+    // The survivors of any trim are the FIRST N rows in wire order (a tail pop, never a head
+    // erase): wide_rows() numbers its rows from 0000, so N survivors are 0000..N-1.
+    const auto expect_first_n = [](const Parsed& parsed, const char* kind) {
+        const auto& rows = parsed.rows.at(kind);
+        char last[16];
+        std::snprintf(last, sizeof last, "%04zu", rows.size() - 1);
+        CHECK(rows.front()[0] == "0000");
+        CHECK(rows.back()[0] == last);
+    };
 
     for (const int width : {120, 400}) {
         CAPTURE(width);
@@ -538,6 +552,8 @@ TEST_CASE("device_ci v2: the ceiling trim removes whole kinds in order and discl
         for (const char* kind : kCiV2TrimOrder) {
             CAPTURE(kind);
             const std::size_t kept = p.rows.count(kind) ? p.rows.at(kind).size() : 0;
+            if (kept > 0)
+                expect_first_n(p, kind);
             if (boundary) {
                 CHECK(kept == caps.at(kind));
                 continue;
@@ -569,6 +585,7 @@ TEST_CASE("device_ci v2: the ceiling trim removes whole kinds in order and discl
     CHECK(wide.status.at("topology") == Rec{"constrained", "agent_cap:0/106"});
     REQUIRE(wide.rows.count("disk") == 1);
     CHECK(wide.rows.at("disk").size() < 128);
+    expect_first_n(wide, "disk");
     CHECK(wide.rows.at("cpu").size() == 32);
 
     // With no disks at all the trim runs on into cpu; swap (last in the order) is still whole.
@@ -578,6 +595,7 @@ TEST_CASE("device_ci v2: the ceiling trim removes whole kinds in order and discl
     CHECK(deep.rows.count("dimm") == 0);
     REQUIRE(deep.rows.count("cpu") == 1);
     CHECK(deep.rows.at("cpu").size() < 32);
+    expect_first_n(deep, "cpu");
     CHECK(count_of(reason_of(deep, "cpu"), "agent_cap:") == 1);
     CHECK(deep.rows.at("swap").size() == 16);
 }
@@ -739,7 +757,7 @@ TEST_CASE("device_ci collect(): a failing section action never aborts the cycle"
     }
 }
 
-TEST_CASE("device_ci collect(): a required action failing still aborts, before any section action",
+TEST_CASE("device_ci collect(): a required action failing still aborts before any section action",
           "[sync][device_ci][v2][collect]") {
     reset_ci_fakes();
     g_ci[0].rc["model"] = 1;
