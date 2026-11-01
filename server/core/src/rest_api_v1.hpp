@@ -24,6 +24,7 @@
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
 #include "network_perf_model.hpp"
+#include "event_emit.hpp"     // EmitEventFn: the httplib adapter half (execution_mutation.hpp takes only the request-free hook)
 #include "execution_mutation.hpp" // cancel/rerun twins: the shared admit-audit-effect sequence + its test seam
 #include "execution_tracker.hpp"
 #include "guaranteed_state_store.hpp"

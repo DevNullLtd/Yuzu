@@ -1,7 +1,7 @@
 #pragma once
 
 #include "authz_model.hpp"
-#include "event_emit.hpp"
+#include "event_emit_hook.hpp"
 #include "execution_tracker.hpp"
 
 #include <expected>

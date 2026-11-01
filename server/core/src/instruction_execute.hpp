@@ -60,7 +60,7 @@
 #include "dispatch_caller.hpp"
 #include "dispatch_confined_arms.hpp"    // ConfinedDispatchOutcome
 #include "dispatch_zero_reach.hpp"       // ZeroReachCause
-#include "event_emit.hpp"                // EventEmitHook
+#include "event_emit_hook.hpp"           // EventEmitHook (request-free: no httplib)
 #include "instruction_param_schema.hpp"  // instr::ParamValidatorCache
 #include "instruction_store.hpp"         // InstructionDefinition
 

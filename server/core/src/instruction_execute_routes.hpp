@@ -39,6 +39,7 @@
 /// "audit off": it is a 503 `audit_unavailable` + `Sec-Audit-Failed` (no retry hint, a server
 /// defect) right after the gate, before any body work or dispatch.
 
+#include "event_emit.hpp" // EmitEventFn / bind_event_emit: the httplib adapter half
 #include "instruction_execute.hpp"
 
 #include <httplib.h>
