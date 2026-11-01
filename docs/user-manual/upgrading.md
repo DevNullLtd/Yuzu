@@ -736,10 +736,11 @@ alone. It is not an upgrade path and widens nothing else.
    Set `BREAKGLASS_USER` before you run it under `sso-only`. A deactivated enrolled account is skipped by the
    query on purpose: the command refuses it (`user '<name>' not found`), so reset it after it is reactivated. The
    `FAILED:` lines (and a `QUERY FAILED` line) are kept in `$FAILED_LOG` for step 5; a clean run prints none. A
-`FAILED:` line does not mean the account was left untouched. If the failure comes after the clear, for example the
-`session_store` migration or the session delete cannot get its table lock within the 3 second cap above, the factor
-is already cleared, the audit row is `partial`, the exit is non-zero and the account's old sessions stay valid until
-you end them. If the clear itself reported an error, its state is unknown (audit `error`).
+   `FAILED:` line does not mean the account was left untouched. If the failure comes after the clear, for example
+   the `session_store` migration cannot get its table lock within the 3 second cap above, or the session delete
+   waits out the pool's lock timeout (10 seconds by default), the factor is already cleared, the audit row is
+   `partial`, the exit is non-zero and the account's old sessions stay valid until you end them. If the clear
+   itself reported an error, its state is unknown (audit `error`).
 4. Start the new build (unmask the service first if you masked it). Set `--mfa-enforcement` now (the server reads
    it at this start). The migrations run at the first start if step 3 did not already apply them, and seed
    nothing. The user enrols again at next sign-in only under `--mfa-enforcement=required`, or `admin-only` for an
@@ -764,6 +765,7 @@ you end them. If the clear itself reported an error, its state is unknown (audit
    clears idempotently and ends the account's sessions; if the cause was a lock, find the holder as the table-locks
    paragraph above says). Until that re-run exits `0`, the account's old sessions may still be valid. If the file has
    a `QUERY FAILED` line, no account was reset: re-run the whole loop.
+
    Then revoke the administrator API token you minted before the cutover.
 
 **Tell your users.** A reset that exits `0` ends the account's sessions, so each such user is signed out (an account in
