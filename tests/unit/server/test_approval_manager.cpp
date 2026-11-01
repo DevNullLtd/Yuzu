@@ -2664,6 +2664,39 @@ TEST_CASE("ApprovalManager: pending_count_for_checked fails closed when the stor
         CHECK(*empty == 0);
         CHECK(mgr.pending_count_for("alice") == 2);
     }
+    SECTION("a pending row older than the TTL is not counted even before submit's sweep expires it") {
+        yuzu::test::ApprovalManagerPg mgr_bundle;
+        ApprovalManager& mgr = *mgr_bundle;
+        REQUIRE(mgr.submit("d1", "alice", "s1", "", ApprovalOrigin::kInstruction).has_value());
+        {
+            auto lease = mgr_bundle.pool().acquire();
+            REQUIRE(lease);
+            // 25 stale rows for alice (aged past the TTL) and one just inside the window: only
+            // the unexpired ones may count.
+            pg::PgResult res = pg::exec_params(
+                lease.get(),
+                "INSERT INTO approval_manager.approvals "
+                "(id, definition_id, status, submitted_by, submitted_at) "
+                "SELECT 'stale-' || gs, 'def-stale', 'pending', 'alice', "
+                "extract(epoch from now())::bigint - $1::bigint - 60 "
+                "FROM generate_series(1, 25) AS gs",
+                std::vector<std::string>{std::to_string(yuzu::server::kApprovalTicketTtlSeconds)});
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+            pg::PgResult edge = pg::exec_params(
+                lease.get(),
+                "INSERT INTO approval_manager.approvals "
+                "(id, definition_id, status, submitted_by, submitted_at) "
+                "VALUES ('edge-1', 'def-edge', 'pending', 'alice', "
+                "extract(epoch from now())::bigint - $1::bigint + 300)",
+                std::vector<std::string>{std::to_string(yuzu::server::kApprovalTicketTtlSeconds)});
+            REQUIRE(edge.status() == PGRES_COMMAND_OK);
+        }
+        auto a = mgr.pending_count_for_checked("alice");
+        REQUIRE(a.has_value());
+        CHECK(*a == 2); // d1 and the row 300 s inside the window; the 25 stale ones do not count
+        // The sweep has NOT run (no submit since): the stale rows are still status 'pending'.
+        CHECK(mgr.pending_count() == 27);
+    }
     SECTION("a query failure is an error, while the legacy shape still reads 0") {
         yuzu::test::ApprovalManagerPg mgr_bundle;
         ApprovalManager& mgr = *mgr_bundle;

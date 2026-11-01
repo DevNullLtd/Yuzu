@@ -1115,11 +1115,18 @@ ApprovalManager::pending_count_for_checked(const std::string& submitted_by) cons
             StoreReadError{"approval store temporarily unavailable (pool exhausted)"});
     }
 
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
+    // UNEXPIRED pending rows only. submit()'s lazy sweep flips a pending row past the TTL to
+    // 'expired' (`submitted_at < db_now - ttl`), but only when a submit runs: until then a stale
+    // row is still `pending` and would count against the cap, locking a principal with 25 of them
+    // out of every approval-gated tool even though all of them are stale. The predicate is
+    // the exact complement of the sweep's, on the same database clock.
+    const std::string count_sql =
         "SELECT COUNT(*) FROM approval_manager.approvals "
-        "WHERE status = 'pending' AND submitted_by = $1",
-        std::vector<std::string>{submitted_by});
+        "WHERE status = 'pending' AND submitted_by = $1 "
+        "AND submitted_at >= (" + std::string(kDbNowEpochSql) + " - $2::bigint)";
+    pg::PgResult res = pg::exec_params(
+        lease.get(), count_sql.c_str(),
+        std::vector<std::string>{submitted_by, std::to_string(kApprovalTicketTtlSeconds)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn("ApprovalManager::pending_count_for_checked degraded: query failed: {}",
                      PQresultErrorMessage(res.get()));

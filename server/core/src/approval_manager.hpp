@@ -804,7 +804,11 @@ public:
     int pending_count_for(const std::string& submitted_by) const;
 
     /// `pending_count_for` with the store fault kept apart from a genuine zero, in the shape of
-    /// `pending_count_checked`. An empty `submitted_by` is a genuine 0.
+    /// `pending_count_checked`. An empty `submitted_by` is a genuine 0. Counts UNEXPIRED pending rows
+    /// only: a row older than `kApprovalTicketTtlSeconds` (database clock) is excluded even if
+    /// `submit()`'s lazy sweep has not yet flipped it to 'expired'. That sweep only runs inside a
+    /// submit the cap itself would refuse, so counting a stale row would lock a principal out of
+    /// every approval-gated tool until someone else happened to submit.
     std::expected<int, StoreReadError>
     pending_count_for_checked(const std::string& submitted_by) const;
 
