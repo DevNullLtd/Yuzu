@@ -1018,6 +1018,18 @@ TEST_CASE("command_v1: a scoped dispatch carries the caller's scope in the event
     CHECK(rig.emitted[0].attrs["target_count"] == 4);
 }
 
+TEST_CASE("command_v1: a broadcast (no targets sent) publishes the legacy event scope \"\", not the "
+          "internal __all__ default",
+          "[server][command_v1][events]") {
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    const auto res = rig.post({{"plugin", "os_info"}, {"action", "os_version"}});
+    REQUIRE(res->status == 202);
+    REQUIRE(rig.emitted.size() == 1);
+    // /api/command sends the scope the caller supplied, "" when omitted; the v1 twin must too.
+    CHECK(rig.emitted[0].payload["scope"] == "");
+}
+
 TEST_CASE("command_v1: no event on any refusal, a zero reach, a lost requested row or a throwing "
           "dispatch",
           "[server][command_v1][events]") {

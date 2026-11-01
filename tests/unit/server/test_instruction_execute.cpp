@@ -1028,7 +1028,7 @@ TEST_CASE("execute: a dispatch that throws (std or non-std) leaves the execution
         const auto* ref = as_refusal(out);
         REQUIRE(ref);
         CHECK(ref->kind == RefusalKind::kDispatchFailed);
-        CHECK(ref->reason == "dispatch_failed");
+        CHECK(ref->reason == "dispatch_exception");
         // A thrown dispatch may have partially sent: no hint on the wire, none in the prose.
         CHECK_FALSE(ref->retry_after_ms.has_value());
         CHECK(ref->message.find("retry") == std::string::npos);
@@ -1369,7 +1369,7 @@ TEST_CASE("REST execute: 400 for a nested or malformed body before any lookup",
     auto res = r.post("d", deep);
     REQUIRE(res);
     CHECK(res->status == 400);
-    CHECK(json::parse(res->body)["error"]["reason"] == "body_too_deep");
+    CHECK(json::parse(res->body)["error"]["reason"] == "body_depth");
     auto res2 = r.post("d", "{not json");
     CHECK(res2->status == 400);
     CHECK(json::parse(res2->body)["error"]["reason"] == "invalid_json");
@@ -1407,7 +1407,7 @@ TEST_CASE("REST execute: status mapping of every refusal", "[instruction_execute
         {"dispatch denied (unclassified)",
          [](RouteRig& r) { r.core.defs["d"].action = "mystery"; }, "d", "{}", 400, "unclassified"},
         {"audit unavailable", [](RouteRig& r) { r.core.audit_requested_fails = true; }, "d", "{}", 503, "audit_unavailable"},
-        {"dispatch throws", [](RouteRig& r) { r.core.dispatch_throws = true; }, "d", "{}", 500, "dispatch_failed"},
+        {"dispatch throws", [](RouteRig& r) { r.core.dispatch_throws = true; }, "d", "{}", 500, "dispatch_exception"},
     };
     for (const auto& c : cases) {
         INFO(c.what);
@@ -1442,7 +1442,7 @@ TEST_CASE("REST execute: a throwing dispatch is a 500 with NO retry hint (std an
             REQUIRE(res);
             CHECK(res->status == 500);
             const auto err = json::parse(res->body)["error"];
-            CHECK(err["reason"] == "dispatch_failed");
+            CHECK(err["reason"] == "dispatch_exception");
             CHECK(err["retry_after_ms"].is_null());
             CHECK(err["message"].get<std::string>().find("retry") == std::string::npos);
             CHECK(err.value("remediation", std::string{}).find("retry") == std::string::npos);

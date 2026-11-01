@@ -183,6 +183,9 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
     // An omitted target is the fleet; a SUPPLIED one that resolved to nothing is never widened.
     // check_command_v1_request already refuses those shapes, so this is the second line of defence
     // at the one place a bypass would turn a specific-looking target list into the whole fleet.
+    // The legacy `POST /api/command` event carries the scope the CALLER sent ("" when omitted),
+    // never the `__all__` default applied below, so the twin's event payload is identical.
+    const std::string event_scope = scope;
     if (scope.empty() && agent_ids.empty()) {
         if (targeting_supplied(body)) {
             refuse(400, body.contains("agent_ids") ? kReasonAgentIdsEmpty : kReasonScopeEmpty,
@@ -431,7 +434,7 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
                        nlohmann::json{{"plugin", plugin},
                                       {"action", action},
                                       {"command_id", outcome.command_id},
-                                      {"scope", scope}});
+                                      {"scope", event_scope}});
 
     nlohmann::json data{{"command_id", outcome.command_id},
                         {"execution_id", execution_id},

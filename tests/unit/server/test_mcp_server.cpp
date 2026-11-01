@@ -45119,7 +45119,7 @@ TEST_CASE("MCP execute_instruction_definition: a throwing dispatch (std or non-s
         const auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
-        CHECK(body["error"]["data"]["reason"] == "dispatch_failed");
+        CHECK(body["error"]["data"]["reason"] == "dispatch_exception");
         CHECK(body["error"]["data"]["retry_after_ms"].is_null());
         CHECK(body["error"]["message"].get<std::string>().find("retry") == std::string::npos);
         CHECK(body["error"]["data"].value("remediation", std::string{}).find("retry") ==

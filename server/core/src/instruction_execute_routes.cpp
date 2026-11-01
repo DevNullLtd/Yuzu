@@ -149,7 +149,7 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
         // `params` cannot crash the dump below.
         if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
             res.status = 400;
-            res.set_content(error_body(res, 400, "request body nests too deeply", "body_too_deep",
+            res.set_content(error_body(res, 400, "request body nests too deeply", "body_depth",
                                        std::nullopt),
                             "application/json");
             return;

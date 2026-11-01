@@ -562,7 +562,7 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
                            "execution's per-agent results before running the definition again "
                            "(the server closes the record by itself if no agent ever responds)";
         }
-        return Outcome{make_refusal(RefusalKind::kDispatchFailed, "dispatch_failed",
+        return Outcome{make_refusal(RefusalKind::kDispatchFailed, "dispatch_exception",
                                     "dispatch failed", std::move(remediation)),
                        c.audit_dropped};
     }
