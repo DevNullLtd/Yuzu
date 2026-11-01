@@ -1097,6 +1097,23 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      and the cap lowered, when the comparison can read the two gates as the same
      kind. Tracking: programme #2146. This is the ruling the 2026-10-23 entry
      above requires before a pin is raised.
+   - **2026-10-31 - `cancel_execution` at the supervised MCP tier is exempt from
+     the approval ticket.** Owner ruling. Originally given 2026-10-30 as a
+     "risk-reducing STOP"; re-confirmed by the owner 2026-10-31 after that premise
+     was corrected: `cancel_execution` marks the tracker row cancelled and sends
+     nothing to any device (step-up class `kCancelsRecord`), so it does not stop
+     anything running on a device. The exemption is the closed list
+     `kApprovalExemptTools` in `server/core/src/mcp_policy.hpp`, read through
+     `requires_approval_for_tool()` by the generic C8 gate. Asymmetry: MCP is
+     looser than REST for this one tool. The REST mirror
+     (`POST /api/v1/executions/{id}/cancel`) is still gated, and gate-parity
+     check 6 compares labels and cannot see approval tiers, so it does not
+     flag it. Residual: a supervised credential holding no ticket can irreversibly
+     mark another record cancelled while that execution's devices may still be
+     running it; the `attempted` row written before the effect and the `success`
+     row after it are the mitigation. Adding a name to `kApprovalExemptTools` is
+     a security decision, recorded where the tool is classified, never a
+     convenience.
 
 ## Interim rules (until the named follow-ups ship)
 
