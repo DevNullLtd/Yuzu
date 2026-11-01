@@ -1593,9 +1593,11 @@ public:
                           "Legacy-equivalent platform events (execution.created, "
                           "execution.completed, command.dispatched, instruction.executed, "
                           "approval.created) that the v1 REST and MCP twins tried to publish "
-                          "after a successful effect and that THREW. The request is unaffected "
-                          "(emission is best effort, after the effect); a non-zero rate points at "
-                          "the analytics event path, not at the caller.",
+                          "after a successful effect and whose emit hook THREW (a payload "
+                          "serialisation or hook defect). NOT an analytics-drop signal: the "
+                          "analytics emit itself is fail-soft, so an event that is dropped (for "
+                          "example when no analytics store is wired) does not move this counter. The "
+                          "request is unaffected (emission is best effort, after the effect).",
                           "counter");
         for (const auto event : yuzu::server::kEmittedEvents)
             metrics_.counter(yuzu::server::kEventEmitFailedMetric,
@@ -1700,7 +1702,7 @@ public:
         // at boot — an oversight this closes now that `command_routes.cpp`'s
         // shared `guarded()` catch block also feeds this same series, widening
         // `phase` from the wrapper's original two values to every `guarded()`
-        // post-dispatch site name. `route` is `command` only today (the one
+        // post-dispatch site name. For those phases `route` is `command` only (the one
         // surface either emitter wraps). `phase` is a closed set spelled out
         // here rather than iterated from a shared array — unlike the `reason`
         // constants above, these are hardcoded per-call-site string literals
@@ -1715,8 +1717,10 @@ public:
             "yuzu_server_dispatch_fanout_throw_total",
             "POST /api/command post-dispatch side effects (the audit sink, or any "
             "guarded() post-dispatch helper) that THREW rather than failing cleanly, "
-            "by which one. A well-behaved sink/helper should fail via its own return "
-            "value, not an exception; a non-zero rate points at a bug in that sink/"
+            "by which one; and, with phase=\"dispatch\" on route command_v1, "
+            "instruction_execute or mcp, the dispatch call itself throwing (its execution "
+            "row is left running). A well-behaved sink/helper should fail via its own "
+            "return value, not an exception; a non-zero rate points at a bug in that sink/"
             "helper rather than at ordinary degradation.",
             "counter");
         for (const char* phase : {"success", "denial", "audit_quarantine_dispatch_fail_closed",
@@ -1728,6 +1732,13 @@ public:
                                   "thead_for_plugin"})
             metrics_.counter("yuzu_server_dispatch_fanout_throw_total",
                              {{"route", "command"}, {"phase", phase}});
+        // `phase="dispatch"` is the dispatch call ITSELF throwing (not a post-dispatch helper),
+        // counted by the three v1/MCP surfaces that catch it: POST /api/v1/commands, the
+        // instruction-definition execute twins (REST + MCP). The legacy /api/command route does
+        // not catch a throwing dispatch, so it has no such series. The same alert covers them.
+        for (const char* route : {"command_v1", "instruction_execute", "mcp"})
+            metrics_.counter("yuzu_server_dispatch_fanout_throw_total",
+                             {{"route", route}, {"phase", "dispatch"}});
 
         // The containment gate's own outcome series, seeded across its whole
         // closed label set for the same reason. Without this, `absent()` on

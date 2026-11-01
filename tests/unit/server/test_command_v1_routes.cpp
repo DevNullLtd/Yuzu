@@ -974,6 +974,11 @@ TEST_CASE("command_v1: a dispatch that throws (std or non-std) is a 500 with no 
         CHECK(rig.cancelled.empty());
         CHECK(rig.dispatch_calls == 1);
         CHECK(rig.has_audit("failure", "reason=dispatch_exception"));
+        // sre-b1: counted on the shared fan-out-throw family under this route's label.
+        CHECK(rig.metrics
+                  .counter("yuzu_server_dispatch_fanout_throw_total",
+                           {{"route", "command_v1"}, {"phase", "dispatch"}})
+                  .value() == 1);
     }
 }
 

@@ -667,6 +667,9 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
         threw = true;
     }
     if (threw) {
+        // Counted on the shared fan-out-throw family (one alert covers every dispatch surface).
+        bump(p, "yuzu_server_dispatch_fanout_throw_total",
+             {{"route", c.route()}, {"phase", "dispatch"}});
         // The execution row is deliberately NOT cancelled (up8-3 / sg-5): a row marked
         // `cancelled` with agents_targeted 0 would tell every reader nothing was sent, and some
         // agents may hold the command. It stays `running` (the tracker has no `failed` status).

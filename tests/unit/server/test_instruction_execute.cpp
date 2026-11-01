@@ -1259,6 +1259,11 @@ TEST_CASE("execute: a dispatch that throws (std or non-std) leaves the execution
         CHECK(r.audits[1].detail.find("reason=dispatch_exception") != std::string::npos);
         CHECK(r.audits[1].detail.find("execution_id=exec-1") != std::string::npos);
         CHECK_FALSE(out.audit_dropped);
+        // sre-b1: counted on the shared fan-out-throw family, once, under this surface's route.
+        CHECK(r.counter("yuzu_server_dispatch_fanout_throw_total",
+                        {{"route", "instruction_execute"}, {"phase", "dispatch"}}) == 1);
+        CHECK(r.counter("yuzu_server_dispatch_fanout_throw_total",
+                        {{"route", "mcp"}, {"phase", "dispatch"}}) == 0);
     }
 }
 

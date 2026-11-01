@@ -45382,6 +45382,11 @@ TEST_CASE("MCP execute_instruction_definition: a throwing dispatch (std or non-s
         CHECK(idef_audited(ts, "requested"));
         CHECK(idef_audited(ts, "failure"));
         CHECK_FALSE(idef_audited(ts, "success"));
+        // sre-b1: a dispatch that throws is counted on the shared fan-out-throw family.
+        CHECK(rig.counter("yuzu_server_dispatch_fanout_throw_total",
+                          {{"route", "mcp"}, {"phase", "dispatch"}}) == 1);
+        CHECK(rig.counter("yuzu_server_dispatch_fanout_throw_total",
+                          {{"route", "instruction_execute"}, {"phase", "dispatch"}}) == 0);
     }
 }
 

@@ -2687,7 +2687,11 @@ groups:
             specific post-dispatch helper in command_routes.cpp's guarded()
             wrapper that threw instead — e.g. phase=forward_gateway_pending
             means the gateway-forward step itself threw, not the audit sink;
-            check the named helper, not AuditStore, for that case. Either way
+            check the named helper, not AuditStore, for that case. phase=dispatch
+            (route=command_v1, instruction_execute or mcp) means the dispatch call
+            itself threw: the execution row was left running, so look for the
+            dispatch_exception failure audit row and the server log line naming the
+            exception. Either way
             a well-behaved sink/helper should report failure via its own
             return value, not an exception; a non-zero rate here points at a
             bug in that specific sink/helper (e.g. an allocation failure

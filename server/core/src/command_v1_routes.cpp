@@ -71,6 +71,21 @@ void count_bookkeeping_failed(yuzu::MetricsRegistry* metrics, const char* op) {
     }
 }
 
+/// A dispatch that THREW (any exception type), counted on the shared fan-out-throw family so one
+/// alert (YuzuDispatchFanoutThrew) covers every dispatch surface. `phase` is `dispatch`.
+void count_dispatch_threw(yuzu::MetricsRegistry* metrics) {
+    if (metrics == nullptr)
+        return;
+    try {
+        metrics
+            ->counter("yuzu_server_dispatch_fanout_throw_total",
+                      {{"route", "command_v1"}, {"phase", "dispatch"}})
+            .increment();
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+        // observability must never fail the request
+    }
+}
+
 /// The A4 envelope plus the machine-readable `reason` (and any extra string/int fields) inside
 /// the `error` object. One builder, so every refusal of this route has the one shape.
 [[nodiscard]] std::string error_body(httplib::Response& res, int status, std::string_view message,
@@ -386,6 +401,7 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
         threw = true;
     }
     if (threw) {
+        count_dispatch_threw(d.metrics);
         // The execution row is deliberately NOT cancelled (up8-3 / sg-5): whether any agent
         // already received the command is unknown, and a `cancelled` row with agents_targeted 0
         // would tell every reader nothing was sent. It stays `running` (the tracker has no
