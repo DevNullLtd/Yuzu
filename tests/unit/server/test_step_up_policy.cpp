@@ -296,11 +296,12 @@ TEST_CASE("step-up policy: every kExempt reason is one of the named exempt class
           "[stepup][policy]") {
     using namespace step_up_detail;
     const std::set<std::string_view> classes = {
-        kPreSession,         kStepUpProofEndpoint,  kSelfSignOut,       kSelfPrivilegeReduction,
-        kExecutionDispatch,  kApprovalGatedElsewhere, kOperationalData, kReadShaped,
-        kSyncTrigger,        kAgentUploadProtocol,  kScimBearer,        kMcpTransport,
-        kContentAuthoring,   kPolicyLifecycle,      kEvidenceCapture,   kCancelsRecord,
-        kCreatesRerunRecord, kAlertingConfig,     kMfaEnrolment,         kSchedulingGatedWork, kSelfNotificationState};
+        kPreSession,           kStepUpProofEndpoint,    kSelfSignOut,     kSelfPrivilegeReduction,
+        kExecutionDispatch,    kApprovalGatedElsewhere, kOperationalData, kReadShaped,
+        kSyncTrigger,          kAgentUploadProtocol,    kScimBearer,      kMcpTransport,
+        kContentAuthoring,     kPolicyLifecycle,        kEvidenceCapture, kCancelsRecord,
+        kCreatesRerunRecord,   kAlertingConfig,         kMfaEnrolment,    kSchedulingGatedWork,
+        kSelfNotificationState};
     std::set<std::string_view> used;
     for (const auto& e : kStepUpPolicy) {
         if (e.cls != StepUpClass::kExempt)

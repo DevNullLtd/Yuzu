@@ -1125,26 +1125,34 @@ TEST_CASE("execute: every refusal writes exactly ONE row, stamped with the outco
          [](Rig& r) { r.create_throws = true; }, json::object(), true, "failure",
          "reason=execution_record_exception"},
     };
-    for (const auto& c : cases) {
-        INFO(c.what);
-        Rig r;
-        r.defs["d"] = make_def("d");
-        c.arrange(r);
-        auto rq = r.request(std::string(c.what) == "unknown definition" ? "nope" : "d", c.body,
-                            make_caller("u", c.admin));
-        rq.correlation_id = std::string("cid-") + std::to_string(&c - cases);
-        rq.submitter_pending_cap = kSubmitterPendingCap;
-        const auto out = run(rq, r.ports(), r.audit());
-        REQUIRE(as_refusal(out));
-        CHECK(out.correlation_id == rq.correlation_id);
-        // The execution-row failure is the one case with a `requested` row before it.
-        const std::size_t expect = std::string(c.what) == "execution row throws" ? 2 : 1;
-        REQUIRE(r.audits.size() == expect);
-        const auto& row = r.audits.back();
-        CHECK(row.result == c.row_result);
-        CHECK(row.detail.find(c.reason) != std::string::npos);
-        for (const auto& a : r.audits)
-            CHECK(trailing_cid(a.detail) == rq.correlation_id);
+    // Twice: with a healthy sink, and with every best-effort row LOST (qe-b3). Every refusal in
+    // the table owes a best-effort row, so a lost one must surface as `audit_dropped` (REST
+    // Sec-Audit-Failed, MCP audit_persisted:false) without changing the refusal.
+    for (const bool lose_rows : {false, true}) {
+        INFO("lose_rows=" << lose_rows);
+        for (const auto& c : cases) {
+            INFO(c.what);
+            Rig r;
+            r.defs["d"] = make_def("d");
+            c.arrange(r);
+            r.audit_other_fails = lose_rows;
+            auto rq = r.request(std::string(c.what) == "unknown definition" ? "nope" : "d", c.body,
+                                make_caller("u", c.admin));
+            rq.correlation_id = std::string("cid-") + std::to_string(&c - cases);
+            rq.submitter_pending_cap = kSubmitterPendingCap;
+            const auto out = run(rq, r.ports(), r.audit());
+            REQUIRE(as_refusal(out));
+            CHECK(out.correlation_id == rq.correlation_id);
+            CHECK(out.audit_dropped == lose_rows);
+            // The execution-row failure is the one case with a `requested` row before it.
+            const std::size_t expect = std::string(c.what) == "execution row throws" ? 2 : 1;
+            REQUIRE(r.audits.size() == expect);
+            const auto& row = r.audits.back();
+            CHECK(row.result == c.row_result);
+            CHECK(row.detail.find(c.reason) != std::string::npos);
+            for (const auto& a : r.audits)
+                CHECK(trailing_cid(a.detail) == rq.correlation_id);
+        }
     }
 }
 
@@ -1162,6 +1170,7 @@ TEST_CASE("execute: audit_pre_core_denial writes ONE denied row, cleans hostile 
     CHECK(audit_pre_core_denial(r2.audit(), "cid-pre", "invalid_json", "d\nresult=success"));
     REQUIRE(r2.audits.size() == 1);
     CHECK(r2.audits[0].detail.find('\n') == std::string::npos);
+    CHECK(r2.audits[0].detail.find("result=success") == std::string::npos); // no forged field
 
     Rig lost;
     lost.audit_other_fails = true;
@@ -2063,6 +2072,55 @@ TEST_CASE("REST execute: status mapping of every refusal", "[instruction_execute
         CHECK(j["meta"]["api_version"] == "v1");
         if (c.status == 503 && std::string(c.reason) == "audit_unavailable")
             CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    }
+}
+
+// qe-b3: a core refusal owes a best-effort row; when it is lost the REST route adds
+// Sec-Audit-Failed to the unchanged refusal, and a healthy sink adds nothing.
+TEST_CASE("REST execute: a LOST refusal row sets Sec-Audit-Failed on core refusals, the status "
+          "stands",
+          "[instruction_execute][rest][audit][security]") {
+    struct Case {
+        const char* what;
+        std::function<void(RouteRig&)> arrange;
+        std::string body;
+        int status;
+        const char* reason;
+    };
+    const Case cases[] = {
+        {"forbidden", [](RouteRig& r) { r.core.denied_securables.insert("Infrastructure"); }, "{}",
+         403, "forbidden"},
+        {"destructive untargeted", [](RouteRig& r) { r.core.defs["d"].action = "wipe"; }, "{}", 400,
+         "destructive_untargeted"},
+        {"approval cap reached",
+         [](RouteRig& r) {
+             r.core.defs["d"].approval_mode = "always";
+             r.core.pending_for = kSubmitterPendingCap;
+         },
+         "{}", 429, "approval_cap_reached"},
+        {"approval queue full",
+         [](RouteRig& r) {
+             r.core.defs["d"].approval_mode = "always";
+             r.core.approval_queue_full = true;
+         },
+         "{}", 503, "approval_queue_full"},
+    };
+    for (const bool lose_rows : {false, true}) {
+        for (const auto& c : cases) {
+            INFO(c.what << " lose_rows=" << lose_rows);
+            RouteRig r;
+            r.core.defs["d"] = make_def("d");
+            c.arrange(r);
+            r.core.audit_other_fails = lose_rows;
+            // The caller of the "forbidden" case must not be an administrator.
+            if (std::string(c.what) == "forbidden")
+                r.caller = make_caller("alice", false);
+            auto res = r.post("d", c.body);
+            REQUIRE(res);
+            CHECK(res->status == c.status);
+            CHECK(json::parse(res->body)["error"]["reason"] == c.reason);
+            CHECK(res->get_header_value("Sec-Audit-Failed") == (lose_rows ? "true" : ""));
+        }
     }
 }
 

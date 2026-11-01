@@ -688,8 +688,11 @@ TEST_CASE("execution mutation: every refusal that writes a denial/failure row ca
           "(ca8-2), and a refusal that owes no row reports persisted",
           "[execution][mutation][security][2146][ca8-2]") {
     for (const auto what : {ExecutionMutation::kCancel, ExecutionMutation::kRerun}) {
-        INFO("what=" << (what == ExecutionMutation::kCancel ? "cancel" : "rerun"));
-        SECTION("confined caller probing a nonexistent id: the denied row is lost") {
+        // The loop value is IN each SECTION's name: Catch2 identifies a section by its name, so
+        // identically named sections in a loop run on the first iteration only (qe-b1).
+        const std::string w = what == ExecutionMutation::kCancel ? "cancel" : "rerun";
+        INFO("what=" << w);
+        SECTION(w + ": confined caller probing a nonexistent id: the denied row is lost") {
             FakeStore fs; // no execution at all
             AuditRecorder audit{&fs};
             audit.fail_result = "denied";
@@ -698,7 +701,7 @@ TEST_CASE("execution mutation: every refusal that writes a denial/failure row ca
             CHECK(out.status == S::kNotFound);
             CHECK_FALSE(out.audit_persisted);
         }
-        SECTION("confined caller probing a hidden id: the denied row is lost") {
+        SECTION(w + ": confined caller probing a hidden id: the denied row is lost") {
             FakeStore fs;
             fs.exec = make_exec("alice", 1);
             fs.statuses = {st("hidden")};
@@ -710,7 +713,7 @@ TEST_CASE("execution mutation: every refusal that writes a denial/failure row ca
             CHECK_FALSE(out.audit_persisted);
             CHECK(fs.effects() == 0);
         }
-        SECTION("control: the same probe with a healthy sink reports persisted") {
+        SECTION(w + ": control: the same probe with a healthy sink reports persisted") {
             FakeStore fs;
             AuditRecorder audit{&fs};
             const auto out =
@@ -718,7 +721,7 @@ TEST_CASE("execution mutation: every refusal that writes a denial/failure row ca
             CHECK(out.status == S::kNotFound);
             CHECK(out.audit_persisted);
         }
-        SECTION("an unconfined unknown id owes no row, so a failing sink changes nothing") {
+        SECTION(w + ": an unconfined unknown id owes no row, so a failing sink changes nothing") {
             FakeStore fs;
             AuditRecorder audit{&fs};
             audit.fail_result = "denied";
@@ -1076,7 +1079,8 @@ TEST_CASE("REST POST cancel/rerun: a lost denial/failure row on a refusal sets S
     for (const char* verb : {"cancel", "rerun"}) {
         const std::string path = std::string("/api/v1/executions/exec-1/") + verb;
         INFO("verb=" << verb);
-        SECTION("a confined caller probing a hidden id, denied row lost") {
+        // The verb is IN each SECTION's name (identically named sections in a loop run once).
+        SECTION(std::string(verb) + ": a confined caller probing a hidden id, denied row lost") {
             RestHarness h;
             h.scope = scope_of({"a"});
             h.audit_fail_result = "denied";
@@ -1088,7 +1092,7 @@ TEST_CASE("REST POST cancel/rerun: a lost denial/failure row on a refusal sets S
             CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
             CHECK(h.store.effects() == 0);
         }
-        SECTION("a confined caller probing a nonexistent id, denied row lost") {
+        SECTION(std::string(verb) + ": a confined caller probing a nonexistent id, denied row lost") {
             RestHarness h;
             h.scope = scope_of({"a"});
             h.audit_fail_result = "denied";
@@ -1097,7 +1101,7 @@ TEST_CASE("REST POST cancel/rerun: a lost denial/failure row on a refusal sets S
             CHECK(res->status == 404);
             CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
         }
-        SECTION("control: the same probe with a healthy sink carries no header") {
+        SECTION(std::string(verb) + ": control: the same probe with a healthy sink carries no header") {
             RestHarness h;
             h.scope = scope_of({"a"});
             h.store.exec = make_exec("alice", 1);

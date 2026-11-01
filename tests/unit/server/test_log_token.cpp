@@ -439,6 +439,30 @@ TEST_CASE("log_token: classifies UTF-8 validity exactly like sanitize_utf8_stric
             for (unsigned c = 0; c < 256; ++c)
                 check(std::string{static_cast<char>(a), static_cast<char>(b), static_cast<char>(c)});
 
+    // The 4-byte boundaries and the overlong 2-byte leads, pinned EXPLICITLY (the seeded sample
+    // below only hits them by chance): F0 80..8F is overlong, F0 90 is the first valid, F4 8F is the
+    // last valid code point (U+10FFFF), F4 90 and F5..F7 are above it; C0/C1 are always overlong.
+    {
+        struct Vector {
+            std::string bytes;
+            bool valid;
+        };
+        const Vector vectors[] = {
+            {"\xF0\x8F\xBF\xBF", false}, {"\xF0\x90\x80\x80", true},  // U+10000
+            {"\xF4\x8F\xBF\xBF", true},                                  // U+10FFFF
+            {"\xF4\x90\x80\x80", false}, {"\xF5\x80\x80\x80", false},
+            {"\xC0\x80", false},           {"\xC1\xBF", false},
+        };
+        for (const auto& v : vectors) {
+            check(v.bytes);
+            INFO("bytes=" << v.bytes.size() << " valid=" << v.valid);
+            if (v.valid)
+                CHECK(log_token(v.bytes) == v.bytes);
+            else
+                CHECK(log_token(v.bytes) == std::string(v.bytes.size(), '_')); // one '_' per byte
+        }
+    }
+
     // A seeded sample of 4-byte sequences, biased to the leads and continuations that matter.
     std::mt19937 rng(0x5EEDC0DEu);
     std::uniform_int_distribution<unsigned> any(0, 255);
