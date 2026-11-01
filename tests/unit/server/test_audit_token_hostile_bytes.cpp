@@ -271,7 +271,7 @@ TEST_CASE("CH-12: a hostile definition id neither 503s the execute core nor lose
         {"invalid", invalid_utf8()},
     };
 
-    std::size_t hook_calls = 0, hook_failures = 0;
+    std::size_t hook_calls = 0, hook_failures = 0, min_rows = 0;
     for (const auto& h : ids) {
         INFO(h.label);
         Rig r;
@@ -296,9 +296,20 @@ TEST_CASE("CH-12: a hostile definition id neither 503s the execute core nor lose
         fact(std::string(h.label) + " outcome=" + (ref ? ("refusal:" + ref->reason) : "not-a-refusal"));
         const bool audit_503 = (ref != nullptr) && (ref->kind == RefusalKind::kAuditUnavailable);
         CHECK_FALSE(audit_503);
-        CHECK(r.calls.size() == 1); // the dispatch went ahead: the `requested` row was durable
+        if (definition_id_is_malformed(h.bytes)) {
+            // Invalid UTF-8 is refused at step 0 (unhappy p4-3): a 400 `invalid_definition_id`,
+            // never a retryable 503 from a Postgres 22021, never a dispatch; the ONE `denied` row
+            // is durable even though its target_id is raw (sanitize_pg_text repairs it).
+            REQUIRE(ref);
+            CHECK(ref->reason == "invalid_definition_id");
+            CHECK(r.calls.empty());
+            min_rows += 1;
+        } else {
+            CHECK(r.calls.size() == 1); // the dispatch went ahead: the `requested` row was durable
+            min_rows += 2;              // `requested` and the outcome row
+        }
     }
-    CHECK(hook_calls >= ids.size() * 2); // `requested` and the outcome row, per case
+    CHECK(hook_calls >= min_rows);
     CHECK(hook_failures == 0);
 
     auto rows = store.query();

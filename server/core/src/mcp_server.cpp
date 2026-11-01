@@ -2579,7 +2579,7 @@ static const ToolDef kTools[] = {
      "execute_instruction: that tool runs a raw plugin.action with no definition, no "
      "approval_mode and no parameter schema; this one enforces the definition's own rules. "
      "ORDER OF CHECKS, none of which dispatches, mints or consumes anything before it passes: "
-     "the definition_id holds no control character (else -32602 invalid_definition_id); the definition exists; the caller may run its plugin.action; the arguments are well formed "
+     "the definition_id holds no control character and is valid UTF-8 (else -32602 invalid_definition_id); the definition exists; the caller may run its plugin.action; the arguments are well formed "
      "(params is an object, agent_ids and scope are not empty and not both given); params match "
      "the definition's stored parameter_schema (a violation is -32602 and nothing is queued for "
      "approval); a Destructive or Forensics action names explicit agent_ids; then the "

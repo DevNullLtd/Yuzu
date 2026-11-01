@@ -160,8 +160,10 @@ TEST_CASE("execute: a definition id with a control byte is refused before any st
         CHECK(r.audits[0].result == "denied");
         CHECK(r.audits[0].detail.find("reason=invalid_definition_id") != std::string::npos);
         // The row text carries no raw control byte (log_token cleans the echoed id).
-        for (const char ch : r.audits[0].detail)
+        for (const char ch : r.audits[0].detail) {
             CHECK(static_cast<unsigned char>(ch) >= 0x20);
+            CHECK(static_cast<unsigned char>(ch) != 0x7F);
+        }
     }
     SECTION("a normal id (positive control, including a UTF-8 id) is untouched") {
         for (const std::string& id : std::vector<std::string>{"d", "my-def_1.v2", "d\xC3\xA9"}) {
@@ -177,6 +179,69 @@ TEST_CASE("execute: a definition id with a control byte is refused before any st
     CHECK(definition_id_has_control_byte(std::string_view("a\0b", 3)));
     CHECK(definition_id_has_control_byte("a\x1f"));
     CHECK(definition_id_has_control_byte("a\x7f"));
+}
+
+// unhappy p4-3: httplib percent-decodes the path, so %C0%80 / %FF arrive as raw bytes. Handed to the
+// store they raise SQLSTATE 22021, which used to read as a retryable 503 for an input that can never
+// succeed. The same step-0 refusal now covers them, with the same denied row and no store read.
+TEST_CASE("execute: a definition id that is not valid UTF-8 is refused at step 0 like a control byte, "
+          "a valid multibyte id is not",
+          "[instruction_execute][security]") {
+    struct Bad {
+        const char* label;
+        std::string id;
+    };
+    const std::vector<Bad> bad{{"overlong NUL C0 80", std::string("d\xC0\x80")},
+                               {"lone 0xFF", std::string("d\xFF")},
+                               {"truncated 2-byte lead", std::string("d\xC3")},
+                               {"truncated 3-byte", std::string("d\xE2\x82")},
+                               {"surrogate ED A0 80", std::string("d\xED\xA0\x80")},
+                               {"above U+10FFFF F4 90 80 80", std::string("d\xF4\x90\x80\x80")},
+                               {"stray continuation", std::string("\x80" "d")}};
+    for (const auto& b : bad) {
+        INFO(b.label);
+        CHECK(definition_id_is_invalid_utf8(b.id));
+        CHECK(definition_id_is_malformed(b.id));
+        CHECK_FALSE(definition_id_has_control_byte(b.id)); // the NEW half, not the old predicate
+        Rig r;
+        r.defs["d"] = make_def("d");
+        auto out = run(r.request(b.id, json::object(), make_caller("u", true)), r.ports(), r.audit());
+        const auto* ref = as_refusal(out);
+        REQUIRE(ref);
+        CHECK(ref->kind == RefusalKind::kBadRequest);
+        CHECK(ref->reason == "invalid_definition_id");
+        CHECK_FALSE(ref->retry_after_ms.has_value()); // never a retry hint: it can never succeed
+        CHECK(r.lookups == 0);
+        CHECK(r.calls.empty());
+        REQUIRE(r.audits.size() == 1);
+        CHECK(r.audits[0].result == "denied");
+        CHECK(r.audits[0].detail.find("reason=invalid_definition_id") != std::string::npos);
+        // The cleaned echo is itself valid UTF-8 (log_token folds the bad bytes).
+        CHECK_FALSE(definition_id_is_invalid_utf8(r.audits[0].detail));
+    }
+    SECTION("a valid multibyte id (U+00E9, CJK, 4-byte) is NOT malformed: it reaches the lookup") {
+        for (const std::string& id : std::vector<std::string>{"d\xC3\xA9", "d\xE4\xB8\xAD",
+                                                               "d\xF0\x9F\x98\x80"}) {
+            INFO(id);
+            CHECK_FALSE(definition_id_is_malformed(id));
+            Rig r; // no such definition: the refusal is not_found, from the lookup
+            auto out = run(r.request(id, json::object(), make_caller("u", true)), r.ports(), r.audit());
+            const auto* ref = as_refusal(out);
+            REQUIRE(ref);
+            CHECK(ref->kind == RefusalKind::kNotFound);
+            CHECK(r.lookups == 1);
+        }
+    }
+    SECTION("an over-long VALID ascii id still reaches the lookup (the 128-byte audit clamp, not "
+            "this check, bounds its text)") {
+        const std::string id(4096, 'a');
+        CHECK_FALSE(definition_id_is_malformed(id));
+        Rig r;
+        auto out = run(r.request(id, json::object(), make_caller("u", true)), r.ports(), r.audit());
+        const auto* ref = as_refusal(out);
+        REQUIRE(ref);
+        CHECK(ref->kind == RefusalKind::kNotFound);
+    }
 }
 
 TEST_CASE("execute: the chokepoint dry run refuses BEFORE any body work or ticket",
@@ -2089,6 +2154,36 @@ TEST_CASE("REST execute: a hostile definition id never reaches the audit target_
     REQUIRE_FALSE(ok.target_ids.empty());
     for (const auto& t : ok.target_ids)
         CHECK(t == "my def=1,v");
+}
+
+TEST_CASE("REST execute: a definition id that is not valid UTF-8 is a 400 invalid_definition_id "
+          "with no retry hint, ONE denied row and no store read; a valid multibyte id is looked up",
+          "[instruction_execute][rest][security]") {
+    for (const auto& id : {std::string("d\xC0\x80"), std::string("d\xFF"), std::string("d\xE2\x82"),
+                           std::string("d\xED\xA0\x80")}) {
+        INFO(id.size());
+        RouteRig r;
+        r.core.defs["d"] = make_def("d");
+        auto res = r.post(id, "{}");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        const auto j = json::parse(res->body);
+        CHECK(j["error"]["reason"] == "invalid_definition_id");
+        CHECK(j["error"]["retry_after_ms"].is_null());
+        CHECK(r.core.lookups == 0);
+        CHECK(r.core.calls.empty());
+        REQUIRE(r.core.audits.size() == 1);
+        CHECK(r.core.audits[0].result == "denied");
+        // The stored target_id is valid UTF-8 (the hostile bytes were folded by log_token).
+        REQUIRE_FALSE(r.target_ids.empty());
+        for (const auto& t : r.target_ids)
+            CHECK_FALSE(definition_id_is_invalid_utf8(t));
+    }
+    RouteRig ok; // positive control: U+00E9 reaches the lookup and not_found comes from it
+    auto res = ok.post("d\xC3\xA9", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(ok.core.lookups == 1);
 }
 
 TEST_CASE("REST execute: 400 for a nested or malformed body before any lookup",

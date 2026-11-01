@@ -180,9 +180,10 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
             // `target_id` keeps the id as-is (bounded) so a normal id is byte-identical to the
             // row's subject, but a hostile id (CR/LF/ESC/DEL...) must not reach the column raw:
             // sanitize_pg_text only repairs invalid UTF-8 and NUL, so every OTHER control byte
-            // would be stored verbatim. Cleaned only when the id carries one.
+            // would be stored verbatim. Cleaned only when the id is malformed (a control byte or
+            // invalid UTF-8, the step-0 refusal's own predicate).
             std::string target = bounded_definition_id(definition_id);
-            if (definition_id_has_control_byte(definition_id))
+            if (definition_id_is_malformed(definition_id))
                 target = ::yuzu::log_token(target);
             return deps.audit_fn(req, std::string(kAuditAction), std::string(result),
                                  "instruction", target, detail_text);

@@ -64,6 +64,8 @@
 #include "instruction_param_schema.hpp"  // instr::ParamValidatorCache
 #include "instruction_store.hpp"         // InstructionDefinition
 
+#include <yuzu/log_token.hpp> // utf8_sequence_length (definition_id_is_invalid_utf8)
+
 #include <nlohmann/json.hpp>
 
 #include <array>
@@ -352,8 +354,8 @@ inline constexpr std::size_t kAuditDefinitionIdMax = 128;
 /// True when `id` holds a byte below 0x20 or equal to 0x7F (NUL included). Such an id is refused
 /// (`invalid_definition_id`, 400 / -32602) before the store is read: the Postgres binding passes
 /// the id as a C string, so `"foo\0xyz"` would resolve the definition `foo` while every audit row
-/// and log line records a different string. One predicate, used by the shared core only, so REST
-/// and MCP cannot drift.
+/// and log line records a different string. Use `definition_id_is_malformed` for the full step-0
+/// test; this is its control-byte half.
 [[nodiscard]] constexpr bool definition_id_has_control_byte(std::string_view id) noexcept {
     for (const char ch : id) {
         const auto b = static_cast<unsigned char>(ch);
@@ -361,6 +363,34 @@ inline constexpr std::size_t kAuditDefinitionIdMax = 128;
             return true;
     }
     return false;
+}
+
+/// True when `id` is not well-formed UTF-8 in the sense PostgreSQL's UTF8 encoding accepts (no
+/// overlong forms, no surrogates, nothing above U+10FFFF, no truncated sequence). The route's path
+/// capture is percent-decoded by httplib, so `%C0%80` or `%FF` arrive as raw bytes; handed to the
+/// store they raise SQLSTATE 22021, which would read as a retryable 503 `store_unavailable` for an
+/// input that can never succeed. Reuses `yuzu::utf8_sequence_length` (log_token.hpp), the ONE
+/// server-side copy of those rules; this adds no UTF-8 logic of its own.
+[[nodiscard]] inline bool definition_id_is_invalid_utf8(std::string_view id) noexcept {
+    for (std::size_t i = 0; i < id.size();) {
+        if (static_cast<unsigned char>(id[i]) < 0x80) {
+            ++i;
+            continue;
+        }
+        const std::size_t len = ::yuzu::utf8_sequence_length(id, i);
+        if (len == 0)
+            return true;
+        i += len;
+    }
+    return false;
+}
+
+/// The step-0 predicate: the id holds a control byte OR is not well-formed UTF-8. Such an id is
+/// refused (`invalid_definition_id`, 400 / -32602) before ANY store read. One predicate, used by
+/// the shared core (and the REST route's audit target cleaning) only, so REST and MCP cannot
+/// drift. A valid multibyte id (U+00E9, CJK, ...) is NOT malformed and goes to the lookup.
+[[nodiscard]] inline bool definition_id_is_malformed(std::string_view id) noexcept {
+    return definition_id_has_control_byte(id) || definition_id_is_invalid_utf8(id);
 }
 
 /// The `denied` row for a refusal that happens BEFORE the core runs and so before it could stamp

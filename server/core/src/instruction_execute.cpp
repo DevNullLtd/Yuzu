@@ -170,14 +170,19 @@ PrepareOutcome prepare_impl(Ctx& c) {
     const Request& rq = c.rq;
     const Ports& ports = c.ports;
 
-    // 0. A control byte in the id (NUL included) is refused before ANY store read: the Postgres
-    //    binding passes the id as a C string, so "foo\0xyz" would resolve `foo` while the audit
-    //    row and the log record a different string. The row/log text is cleaned and bounded.
-    if (definition_id_has_control_byte(rq.definition_id)) {
+    // 0. A control byte (NUL included) or a byte sequence that is not well-formed UTF-8 in the id
+    //    is refused before ANY store read. NUL: the Postgres binding passes the id as a C string,
+    //    so "foo\0xyz" would resolve `foo` while the audit row and the log record a different
+    //    string. Invalid UTF-8 (httplib percent-decodes the path, so %C0%80 / %FF arrive raw):
+    //    Postgres raises 22021, which would answer a retryable 503 for an input that can never
+    //    succeed. The `detail` text and the log are cleaned (log_token) and bounded; the REST
+    //    route cleans the `target_id` column the same way for such an id.
+    if (definition_id_is_malformed(rq.definition_id)) {
         c.audit("denied", "reason=invalid_definition_id definition=" +
                               ::yuzu::log_token(bounded_definition_id(rq.definition_id)));
         return refuse(c, make_refusal(RefusalKind::kBadRequest, "invalid_definition_id",
-                                      "definition id must not contain control characters",
+                                      "definition id must be valid UTF-8 without control "
+                                      "characters",
                                       "re-call with the definition id exactly as the list "
                                       "endpoint returns it"));
     }
