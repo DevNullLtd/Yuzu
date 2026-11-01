@@ -46,6 +46,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <optional>
@@ -89,6 +90,13 @@ GuaranteedStateRuleRow make_rule(std::string rule_id, std::string name) {
     r.created_by = "alice";
     r.updated_by = "alice";
     return r;
+}
+
+// The census table has a foreign key to the rule table (schema v3), so a census row needs its
+// rule to exist first.
+void create_rules(GuaranteedStateStore& store, std::initializer_list<const char*> ids) {
+    for (const char* id : ids)
+        REQUIRE(store.create_rule(make_rule(id, std::string("guard-") + id)));
 }
 
 GuaranteedStateEventRow make_event(std::string event_id, std::string rule_id,
@@ -1196,6 +1204,8 @@ TEST_CASE("GuaranteedStateStore: ruleless crash observation skips the compliance
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
+    // The census row has a foreign key to the rule (schema v3), so the rule must exist.
+    REQUIRE(store.create_rule(make_rule("rule-1", "guard-one")));
     // A normal rule-bound drift (drift.remediated) -> updates the census.
     REQUIRE(store.insert_event(make_event("evt-drift", "rule-1", "agent-A")));
 
@@ -1243,6 +1253,10 @@ TEST_CASE("GuaranteedStateStore: a reserved sentinel rule_id never updates the c
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
+    // A rule row with the reserved id is created so the census foreign key would ACCEPT a
+    // row for it: without this the key refuses the write on its own and the test could not
+    // tell whether the store's reserved-id skip is still in place.
+    REQUIRE(store.create_rule(make_rule("__observation__", "reserved-id-rule")));
     GuaranteedStateEventRow abuse;
     abuse.event_id = "__observation__-abuse-1";
     abuse.rule_id = "__observation__";
@@ -1267,6 +1281,7 @@ TEST_CASE("GuaranteedStateStore: a reserved sentinel rule_id never updates the c
     // Regression guard: the skip is EXACT-match, NOT a "__"-prefix. A legitimately
     // authored guard whose name slugifies to a "__"-prefixed rule_id (e.g. "__foo-<hex>")
     // is a REAL rule-bound id and MUST keep its compliance census.
+    REQUIRE(store.create_rule(make_rule("__foo-abc123", "guard-foo")));
     GuaranteedStateEventRow real;
     real.event_id = "evt-real-1";
     real.rule_id = "__foo-abc123"; // not the exact sentinel
@@ -1351,27 +1366,30 @@ TEST_CASE("GuaranteedStateStore: a hostile rule_id is neutralised on a failed "
     GuaranteedStateStore store(pool);
 
     // A CHECK constraint the public API can never violate on its own — added
-    // directly so upsert_rule_status's INSERT...ON CONFLICT genuinely fails,
-    // exercising the real "status upsert failed" warn path rather than
-    // mocking the log call.
+    // directly so the census INSERT...ON CONFLICT genuinely fails (SQLSTATE 23514, not
+    // the 23503 foreign-key refusal), exercising the real "census upsert failed" error
+    // path rather than mocking the log call.
     exec_sql(db.dsn(),
              "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
              "ADD CONSTRAINT chk_test_no_newline_rule_id "
              "CHECK (rule_id NOT LIKE '%' || chr(10) || '%')");
 
     const std::string hostile_rule_id = "rule\ninjected-line";
-    yuzu::test::LogCapture cap(spdlog::level::warn);
+    yuzu::test::LogCapture cap(spdlog::level::err);
     // drift.remediated -> "compliant" state, so the census upsert fires.
     REQUIRE(store.insert_event(make_event("evt-census-1", hostile_rule_id, "agent-A")));
     cap.stop();
 
     const std::string logs = cap.text();
-    CHECK(logs.find("status upsert failed") != std::string::npos);
+    CHECK(logs.find("census upsert failed") != std::string::npos);
     // log_id_token(rule_id) is inserted correctly at the rule_id= field: the
     // embedded newline is folded to '_' rather than splitting the log line
     // or leaking a second, forged rule_id= token.
     CHECK(logs.find("rule_id=rule_injected-line") != std::string::npos);
     CHECK(logs.find("rule_id=rule\ninjected-line") == std::string::npos);
+    // The database error text echoes the failing row, including the raw newline; the
+    // logged message folds it too, so no second log line can start with the hostile text.
+    CHECK(logs.find("\ninjected-line") == std::string::npos);
 }
 
 TEST_CASE("GuaranteedStateStore: a hostile event_id is neutralised on a failed "
@@ -2530,6 +2548,9 @@ TEST_CASE("GuaranteedStateStore: batch ingest never pollutes the census with the
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
+    // The reserved-id rule row exists on purpose: the census foreign key would otherwise
+    // refuse the sentinel row on its own and hide the store's reserved-id skip.
+    create_rules(store, {"rule-real", "__observation__"});
     std::vector<GuaranteedStateEventRow> batch;
     // A real rule's drift (SHOULD create a census row) + a hostile sentinel row
     // with a census-mapping event_type (must NOT) in the same batch.
@@ -3373,6 +3394,7 @@ TEST_CASE("GuaranteedStateStore: per-(agent,rule) compliance census (Slice B)",
         return m;
     };
 
+    create_rules(store, {"r1", "r2", "r3", "r5"});
     // (a1,r1): compliant → drift → remediated  ⇒ final "compliant".
     REQUIRE(store.insert_event(ev("c1", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
     REQUIRE(store.insert_event(ev("c2", "r1", "a1", "drift.detected", "2026-06-04T10:01:00Z")));
@@ -3426,15 +3448,7 @@ TEST_CASE("GuaranteedStateStore: per-(agent,rule) compliance census (Slice B)",
         CHECK(all->size() == 3); // unfiltered = whole fleet
     }
     SECTION("deleting a rule drops its status rows (no orphan census inflation)") {
-        GuaranteedStateRuleRow r;
-        r.rule_id = "r1";
-        r.name = "rule-one";
-        r.yaml_source = "x";
-        r.enforcement_mode = "audit";
-        r.severity = "high";
-        r.created_at = "2026-06-04T09:00:00Z";
-        r.updated_at = r.created_at;
-        REQUIRE(store.create_rule(r)); // r1 already has a1/a2 status rows from above
+        // r1 and r2 exist (created above) and r1 has a1/a2 status rows.
         REQUIRE(census().count({"a1", "r1"}) == 1);
 
         REQUIRE(store.delete_rule("r1"));
@@ -3470,6 +3484,7 @@ TEST_CASE("GuaranteedStateStore: guard.errored maps to the errored census state 
             m[{s.agent_id, s.rule_id}] = s.state;
         return m;
     };
+    create_rules(store, {"r1", "r2"});
 
     SECTION("D1: a later guard.errored replaces a compliant verdict") {
         REQUIRE(store.insert_event(ev("d1a", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
@@ -3566,9 +3581,10 @@ TEST_CASE("GuaranteedStateStore::errored_rule_count — ADR-0017 INV-3 SQL-level
     REQUIRE(store.insert_event(ev("e1", "r1", "a1", "guard.unhealthy")));
     REQUIRE(store.insert_event(ev("e2", "r1", "a2", "guard.unhealthy")));
     REQUIRE(store.insert_event(ev("e3", "r2", "a1", "guard.unhealthy")));
-    // r-orphan has a census row but was never created as a rule — the SQL JOIN
-    // against guaranteed_state_rules must exclude it (mirrors the C++
-    // rule_names.count() intersection the route used to do post-fetch).
+    // r-orphan was never created as a rule: the foreign key refuses its census write, so
+    // the event is stored but no census row exists, and the counts below must not include
+    // it. (The SQL JOIN against guaranteed_state_rules is the second line of defence; the
+    // route-level test with the key removed exercises that.)
     REQUIRE(store.insert_event(ev("e4", "r-orphan", "a1", "guard.unhealthy")));
     // r1 also compliant on a3 — must not contribute.
     REQUIRE(store.insert_event(ev("e5", "r1", "a3", "guard.compliant")));
@@ -3600,4 +3616,394 @@ TEST_CASE("GuaranteedStateStore::errored_rule_count — ADR-0017 INV-3 SQL-level
         REQUIRE(n.has_value());
         CHECK(*n == 0); // a3's only row is compliant, not errored
     }
+}
+
+// ── #5674 — the census write is atomic with the event, and tied to the rule ────
+
+namespace {
+
+// A trigger on the census table that raises a non-foreign-key error (SQLSTATE XX000) for any
+// row whose state is 'drifted'. The public API cannot produce such a failure on its own.
+void install_census_failure_trigger(const std::string& dsn) {
+    exec_sql(dsn,
+             "CREATE FUNCTION guaranteed_state_store.yuzu_test_census_fail() RETURNS trigger "
+             "LANGUAGE plpgsql AS $$ BEGIN "
+             "IF NEW.state = 'drifted' THEN "
+             "RAISE EXCEPTION 'forced census failure' USING ERRCODE = 'XX000'; END IF; "
+             "RETURN NEW; END $$");
+    exec_sql(dsn,
+             "CREATE TRIGGER yuzu_test_census_fail BEFORE INSERT OR UPDATE ON "
+             "guaranteed_state_store.guardian_agent_rule_status FOR EACH ROW "
+             "EXECUTE FUNCTION guaranteed_state_store.yuzu_test_census_fail()");
+}
+
+GuaranteedStateEventRow make_drift(std::string event_id, std::string rule_id, std::string agent_id,
+                                   std::string timestamp) {
+    auto e = make_event(std::move(event_id), std::move(rule_id), std::move(agent_id), "high",
+                        std::move(timestamp));
+    e.event_type = "drift.detected"; // census state 'drifted'
+    return e;
+}
+
+std::string census_state(const std::string& dsn, const std::string& agent, const std::string& rule) {
+    return query_scalar(dsn, "SELECT state FROM guaranteed_state_store.guardian_agent_rule_status "
+                             "WHERE agent_id = '" + agent + "' AND rule_id = '" + rule + "'");
+}
+
+std::string census_count(const std::string& dsn) {
+    return query_scalar(dsn,
+                        "SELECT COUNT(*) FROM guaranteed_state_store.guardian_agent_rule_status");
+}
+
+} // namespace
+
+TEST_CASE("GuaranteedStateStore: delete_rule removes the rule's census rows with it",
+          "[pg][guaranteed_state_store][rules][census]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.create_rule(make_rule("r2", "guard-two")));
+    REQUIRE(store.insert_event(make_event("e1", "r1", "agent-A")));
+    REQUIRE(store.insert_event(make_event("e2", "r1", "agent-B")));
+    REQUIRE(store.insert_event(make_event("e3", "r2", "agent-A")));
+    REQUIRE(census_count(db.dsn()) == "3");
+
+    REQUIRE(store.delete_rule("r1"));
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store.guaranteed_state_rules "
+                                 "WHERE rule_id = 'r1'") == "0");
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store."
+                                 "guardian_agent_rule_status WHERE rule_id = 'r1'") == "0");
+    CHECK(census_state(db.dsn(), "agent-A", "r2") == "compliant");
+    // The event log is an audit stream: it outlives the rule.
+    CHECK(store.event_count() == 3);
+
+    // A delete of a rule that is not there keeps its existing error and touches nothing.
+    auto again = store.delete_rule("r1");
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error().starts_with("not found"));
+    CHECK(census_count(db.dsn()) == "1");
+}
+
+TEST_CASE("GuaranteedStateStore: the census foreign key cascades a rule deleted out of band",
+          "[pg][guaranteed_state_store][rules][census]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.insert_event(make_event("e1", "r1", "agent-A")));
+    REQUIRE(census_count(db.dsn()) == "1");
+    exec_sql(db.dsn(), "DELETE FROM guaranteed_state_store.guaranteed_state_rules WHERE rule_id = 'r1'");
+    CHECK(census_count(db.dsn()) == "0");
+}
+
+TEST_CASE("GuaranteedStateStore: a census write for a deleted rule keeps the event and is not a fault",
+          "[pg][guaranteed_state_store][events][census]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+
+    SECTION("single event") {
+        const auto r = store.insert_event_classified(make_event("e1", "no-such-rule", "agent-A"));
+        CHECK(r.outcome == EventInsertOutcome::Inserted);
+        CHECK(store.event_count() == 1);
+        CHECK(census_count(db.dsn()) == "0");
+        CHECK(store.census_proj_failures_total() == 0);
+        CHECK(store.events_ingest_errors_total() == 0);
+    }
+
+    SECTION("batch") {
+        REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+        auto n = store.insert_events({make_event("e1", "r1", "agent-A"),
+                                      make_event("e2", "no-such-rule", "agent-A"),
+                                      make_event("e3", "r1", "agent-B")});
+        REQUIRE(n.has_value());
+        CHECK(*n == 3);
+        CHECK(store.event_count() == 3);
+        // Only the rows whose rule exists reached the census; the refused one did not
+        // take the batch with it.
+        CHECK(census_count(db.dsn()) == "2");
+        CHECK(store.census_proj_failures_total() == 0);
+    }
+}
+
+TEST_CASE("GuaranteedStateStore: a failed census write keeps the event, is counted once, and "
+          "leaves the old census row and the transaction intact",
+          "[pg][guaranteed_state_store][events][census]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.insert_event(make_event("e1", "r1", "agent-A", "high", "2026-04-19T12:00:00Z")));
+    REQUIRE(census_state(db.dsn(), "agent-A", "r1") == "compliant");
+    install_census_failure_trigger(db.dsn());
+
+    SECTION("single event") {
+        const auto r = store.insert_event_classified(
+            make_drift("e2", "r1", "agent-A", "2026-04-19T12:05:00Z"));
+        CHECK(r.outcome == EventInsertOutcome::Inserted);
+        CHECK(store.event_count() == 2); // the event committed although the census write failed
+        CHECK(store.census_proj_failures_total() == 1);
+        CHECK(store.events_ingest_errors_total() == 0);
+        CHECK(census_state(db.dsn(), "agent-A", "r1") == "compliant");
+        CHECK(query_scalar(db.dsn(), "SELECT updated_at FROM guaranteed_state_store."
+                                     "guardian_agent_rule_status WHERE agent_id = 'agent-A'") ==
+              "2026-04-19T12:00:00Z");
+
+        // The connection pool still serves a working store afterwards.
+        REQUIRE(store.insert_event(make_event("e3", "r1", "agent-A", "high", "2026-04-19T12:10:00Z")));
+        CHECK(store.census_proj_failures_total() == 1);
+        CHECK(query_scalar(db.dsn(), "SELECT updated_at FROM guaranteed_state_store."
+                                     "guardian_agent_rule_status WHERE agent_id = 'agent-A'") ==
+              "2026-04-19T12:10:00Z");
+    }
+
+    SECTION("batch: rows before and after the failed one still land") {
+        auto n = store.insert_events({make_event("b1", "r1", "agent-B", "high", "2026-04-19T12:01:00Z"),
+                                      make_drift("b2", "r1", "agent-A", "2026-04-19T12:06:00Z"),
+                                      make_event("b3", "r1", "agent-C", "high", "2026-04-19T12:02:00Z")});
+        REQUIRE(n.has_value());
+        CHECK(*n == 3);
+        CHECK(store.event_count() == 4);
+        CHECK(store.census_proj_failures_total() == 1);
+        CHECK(census_state(db.dsn(), "agent-A", "r1") == "compliant");
+        CHECK(census_state(db.dsn(), "agent-B", "r1") == "compliant");
+        CHECK(census_state(db.dsn(), "agent-C", "r1") == "compliant");
+    }
+}
+
+TEST_CASE("GuaranteedStateStore: an abandoned census savepoint stores nothing, is an ingest error "
+          "and logs the census error",
+          "[pg][guaranteed_state_store][events][census]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.insert_event(make_event("e1", "r1", "agent-A", "high", "2026-04-19T12:00:00Z")));
+    // A drifted census row ends the writing backend, so the census statement fails and the
+    // ROLLBACK TO and RELEASE that follow cannot run: the Abandoned outcome.
+    exec_sql(db.dsn(),
+             "CREATE FUNCTION guaranteed_state_store.yuzu_test_census_kill() RETURNS trigger "
+             "LANGUAGE plpgsql AS $$ BEGIN "
+             "IF NEW.state = 'drifted' THEN "
+             "PERFORM pg_terminate_backend(pg_backend_pid()); PERFORM pg_sleep(5); END IF; "
+             "RETURN NEW; END $$");
+    exec_sql(db.dsn(),
+             "CREATE TRIGGER yuzu_test_census_kill BEFORE INSERT OR UPDATE ON "
+             "guaranteed_state_store.guardian_agent_rule_status FOR EACH ROW "
+             "EXECUTE FUNCTION guaranteed_state_store.yuzu_test_census_kill()");
+
+    yuzu::test::LogCapture cap(spdlog::level::err);
+    const auto r = store.insert_event_classified(
+        make_drift("e2", "r1", "agent-A", "2026-04-19T12:05:00Z"));
+    cap.stop();
+
+    CHECK(r.outcome == EventInsertOutcome::Error);
+    // The caller reports the failure and does not go on to commit.
+    CHECK(r.error.find("census savepoint failed") != std::string::npos);
+    CHECK(store.events_ingest_errors_total() == 1);
+    CHECK(store.census_proj_failures_total() == 0);
+    // Nothing of the abandoned transaction was committed: not the event, not the census row.
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store."
+                                 "guaranteed_state_events") == "1");
+    CHECK(census_state(db.dsn(), "agent-A", "r1") == "compliant");
+    // The census error that started it is logged with the event, agent and rule.
+    CHECK(cap.text().find("census write abandoned") != std::string::npos);
+    CHECK(cap.text().find("savepoint could not be rolled back and released") !=
+          std::string::npos);
+    // ... and so is the error of the census statement itself, not only the control statement's:
+    // the line ends in the libpq text, whatever its wording on this libpq version.
+    {
+        const std::string log = cap.text();
+        const std::string tail_key = "rule_id=r1: ";
+        const auto at = log.find(tail_key);
+        REQUIRE(at != std::string::npos);
+        CHECK(log.size() > at + tail_key.size());
+    }
+    CHECK(cap.text().find("event_id=e2") != std::string::npos);
+    CHECK(cap.text().find("rule_id=r1") != std::string::npos);
+
+    // The pool serves a working store afterwards.
+    exec_sql(db.dsn(), "DROP TRIGGER yuzu_test_census_kill ON "
+                       "guaranteed_state_store.guardian_agent_rule_status");
+    REQUIRE(store.insert_event(make_drift("e3", "r1", "agent-A", "2026-04-19T12:10:00Z")));
+    CHECK(census_state(db.dsn(), "agent-A", "r1") == "drifted");
+}
+
+TEST_CASE("GuaranteedStateStore: redelivery returns before the census write and repairs nothing",
+          "[pg][guaranteed_state_store][events][census]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    const auto ev = make_event("e1", "r1", "agent-A");
+    REQUIRE(store.insert_event_classified(ev).outcome == EventInsertOutcome::Inserted);
+    exec_sql(db.dsn(), "UPDATE guaranteed_state_store.guardian_agent_rule_status "
+                       "SET state = 'errored' WHERE agent_id = 'agent-A'");
+
+    CHECK(store.insert_event_classified(ev).outcome == EventInsertOutcome::Redelivered);
+    CHECK(census_state(db.dsn(), "agent-A", "r1") == "errored");
+    CHECK(store.census_proj_failures_total() == 0);
+}
+
+TEST_CASE("GuaranteedStateStore: migration v3 deletes orphan census rows and adds the cascade key",
+          "[pg][guaranteed_state_store][db][census]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        GuaranteedStateStore store(pool);
+        REQUIRE(store.is_open());
+        REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+        REQUIRE(store.insert_event(make_event("e1", "r1", "agent-A")));
+    }
+    // Put the database back to its pre-v3 shape: no key, an orphan row, version 2.
+    exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                       "DROP CONSTRAINT guardian_agent_rule_status_rule_fk");
+    exec_sql(db.dsn(), "INSERT INTO guaranteed_state_store.guardian_agent_rule_status "
+                       "(agent_id, rule_id, state, updated_at) "
+                       "VALUES ('agent-A', 'gone', 'drifted', '2026-04-19T12:00:00Z')");
+    exec_sql(db.dsn(), "UPDATE public.schema_meta SET version = 2 "
+                       "WHERE store = 'guaranteed_state_store'");
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    CHECK(query_scalar(db.dsn(), "SELECT version FROM public.schema_meta "
+                                 "WHERE store = 'guaranteed_state_store'") == "3");
+    CHECK(census_count(db.dsn()) == "1");
+    CHECK(census_state(db.dsn(), "agent-A", "r1") == "compliant");
+    CHECK(query_scalar(db.dsn(), "SELECT confdeltype FROM pg_constraint WHERE conname = "
+                                 "'guardian_agent_rule_status_rule_fk'") == "c");
+}
+
+TEST_CASE("GuaranteedStateStore: migration v3 text is safe to run again over an existing key",
+          "[pg][guaranteed_state_store][db][census]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        GuaranteedStateStore store(pool);
+        REQUIRE(store.is_open());
+    }
+    exec_sql(db.dsn(), "UPDATE public.schema_meta SET version = 2 "
+                       "WHERE store = 'guaranteed_state_store'");
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    GuaranteedStateStore store(pool);
+    CHECK(store.is_open());
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM pg_constraint WHERE conname = "
+                                 "'guardian_agent_rule_status_rule_fk'") == "1");
+}
+
+TEST_CASE("GuaranteedStateStore: a database carrying a different schema v3 is refused, not opened",
+          "[pg][guaranteed_state_store][db][census]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        GuaranteedStateStore store(pool);
+        REQUIRE(store.is_open());
+    }
+
+    SECTION("the discarded design: census-order columns and no cascade key") {
+        exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                           "ADD COLUMN updated_at_ns BIGINT");
+        exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guaranteed_state_events "
+                           "ADD COLUMN census_order_ns BIGINT");
+        exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                           "DROP CONSTRAINT guardian_agent_rule_status_rule_fk");
+    }
+    SECTION("no cascade key although the version row reads 3") {
+        exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                           "DROP CONSTRAINT guardian_agent_rule_status_rule_fk");
+    }
+    SECTION("a cascade key on the wrong column") {
+        exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                           "DROP CONSTRAINT guardian_agent_rule_status_rule_fk");
+        exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                           "ADD CONSTRAINT guardian_agent_rule_status_rule_fk "
+                           "FOREIGN KEY (agent_id) REFERENCES "
+                           "guaranteed_state_store.guaranteed_state_rules(rule_id) "
+                           "ON DELETE CASCADE");
+    }
+    SECTION("a deferrable cascade key") {
+        exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                           "DROP CONSTRAINT guardian_agent_rule_status_rule_fk");
+        exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                           "ADD CONSTRAINT guardian_agent_rule_status_rule_fk "
+                           "FOREIGN KEY (rule_id) REFERENCES "
+                           "guaranteed_state_store.guaranteed_state_rules(rule_id) "
+                           "ON DELETE CASCADE DEFERRABLE");
+    }
+
+    yuzu::test::LogCapture cap(spdlog::level::err);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    GuaranteedStateStore store(pool);
+    cap.stop();
+    CHECK_FALSE(store.is_open());
+    // The refusal names its cause and says the server will not start (the operator sees
+    // only this line before the generic "Refusing to start" one).
+    CHECK(cap.text().find("unsupported schema, refusing to start") != std::string::npos);
+    CHECK(cap.text().find("no ON DELETE CASCADE foreign key") != std::string::npos);
+}
+
+TEST_CASE("GuaranteedStateStore: the documented remedy reopens a database with a wrong-shaped key",
+          "[pg][guaranteed_state_store][db][census]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        GuaranteedStateStore store(pool);
+        REQUIRE(store.is_open());
+    }
+    exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                       "DROP CONSTRAINT guardian_agent_rule_status_rule_fk");
+    SECTION("a deferrable key") {
+        exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                           "ADD CONSTRAINT guardian_agent_rule_status_rule_fk "
+                           "FOREIGN KEY (rule_id) REFERENCES "
+                           "guaranteed_state_store.guaranteed_state_rules(rule_id) "
+                           "ON DELETE CASCADE DEFERRABLE");
+    }
+    SECTION("a key on the wrong column") {
+        exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                           "ADD CONSTRAINT guardian_agent_rule_status_rule_fk "
+                           "FOREIGN KEY (agent_id) REFERENCES "
+                           "guaranteed_state_store.guaranteed_state_rules(rule_id) "
+                           "ON DELETE CASCADE");
+    }
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        GuaranteedStateStore store(pool);
+        REQUIRE_FALSE(store.is_open());
+    }
+    // The two statements the refusal names, in the order it names them.
+    exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                       "DROP CONSTRAINT IF EXISTS guardian_agent_rule_status_rule_fk");
+    exec_sql(db.dsn(), "UPDATE public.schema_meta SET version = 2 "
+                       "WHERE store = 'guaranteed_state_store'");
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    CHECK(query_scalar(db.dsn(), "SELECT condeferrable FROM pg_constraint WHERE conname = "
+                                 "'guardian_agent_rule_status_rule_fk'") == "f");
+    CHECK(query_scalar(db.dsn(), "SELECT a.attname FROM pg_constraint c JOIN pg_attribute a ON "
+                                 "a.attrelid = c.conrelid AND a.attnum = c.conkey[1] WHERE "
+                                 "c.conname = 'guardian_agent_rule_status_rule_fk'") == "rule_id");
+}
+
+TEST_CASE("GuaranteedStateStore: columns a later schema version adds do not stop the store opening",
+          "[pg][guaranteed_state_store][db][census]") {
+    // The boot check looks only at the cascade key, so a later migration can add columns to
+    // the census and event tables (the locked ordering work does) without this schema's
+    // check refusing the database it produced.
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        GuaranteedStateStore store(pool);
+        REQUIRE(store.is_open());
+    }
+    exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+                       "ADD COLUMN updated_at_ns BIGINT");
+    exec_sql(db.dsn(), "ALTER TABLE guaranteed_state_store.guaranteed_state_events "
+                       "ADD COLUMN census_order_ns BIGINT");
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    GuaranteedStateStore store(pool);
+    CHECK(store.is_open());
 }
