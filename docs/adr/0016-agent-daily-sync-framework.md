@@ -671,3 +671,75 @@ agent's next full report on the upgraded server.
 serial/UUID/MAC behavioural-PII tier. The sections read has no REST/MCP/UI route yet; the
 later REST read-surface change must serve it behind the same fail-closed audit as the
 audited `inventory.device.ci` read.
+
+### 2026-11-01 — `device_ci` blob v2 (agent writer)
+
+The agent now emits the v2 record defined in the 2026-10-29 entry. This entry records
+what the writer does and the rollout behaviour that was verified against a server without the
+v2 store.
+
+**v2 is emitted unconditionally.** There is no capability negotiation and no agent-side
+fallback flag; this supersedes the 2026-10-29 sentence that the agent change "may
+additionally gate emission on an ack-advertised capability". The class "a host that cannot
+produce v2" is empty by construction: an older hardware plugin (`unknown action`, rc 1), a
+missing `disk_actions` plugin and every planned leg each become a typed section status, so the
+22 base fields always land. The v1 writer is unchanged and stays byte-pinned; the v2 scalar
+record is the same clamp-join over 33 fields, and its first 22 fields equal the v1 blob.
+
+**Independent optional sections.** The 15 original actions keep abort-on-failure (a failed
+required action skips the cycle). The seven added with v2 (`chassis`, `baseboard`, `swap`,
+`machine_id`, and `disk_actions` `volumes`, `partitions`, `topology`) never abort it. All ten
+section-bearing actions, including the three that already existed (`processors`, `memory`,
+`disks`), map to a section status from the ABI4 typed result:
+
+| Source | Level | Reason |
+|---|---|---|
+| typed OK or undeclared | `ok` | typed provenance, else the plugin's own status-row token (`-` is empty), else empty |
+| typed CONSTRAINED | `constrained` | same |
+| typed UNAVAILABLE | `unavailable` | same (a planned leg reads `<os>:planned`) |
+| typed PERMISSION_DENIED | `permission_denied` | same |
+| rc != 0 | `unavailable` | `agent:action_absent` when the output starts `unknown action`, else `agent:rc=<n>` |
+| capture truncated | `unavailable` | `agent:truncated` |
+| `disk_actions` not loaded | `unavailable` | `agent:plugin_not_loaded` |
+
+**No rows from a failed section.** A section whose level is `unavailable` or
+`permission_denied` carries its status record and no rows, and its appended scalar positions
+stay blank. Nothing from a failed, truncated, absent or refused capture is projected, and the
+cap token below can never promote such a section to `constrained`.
+
+**Caps and the reserved reason slot.** Rows are projected to the wire columns, sorted
+lexicographically on the wire row (so the blob and its hash do not depend on the plugin's
+emission order), and the first N are kept (N = the kind's row cap, equal to the server's). A
+section over its cap is `constrained` with ONE token, `agent_cap:<kept>/<total>`, appended to the
+reason after `;` when a reason exists. The base reason is clamped to the field clamp minus the
+token's maximum width, so the composed reason always fits the 1,024-byte field contract and the
+server's clamp cannot cut the disclosure. A later ceiling trim replaces the token; a record never
+carries two. The token is distinct from the server's own `server_cap:<n>`. `swap` drops
+`used_mb` (volatile); the hardware disk sentinel row and the `disk_actions` volume
+placeholder (volume name `-`) are not rows.
+
+**Ceiling trim.** If the blob still exceeds the 96 KiB ceiling, tail rows are popped kind by
+kind in the order `topology`, `partition`, `volume`, `dimm`, `disk`, `cpu`, `swap`, each trimmed
+kind `constrained` with its final kept-of-total. This clarifies the six-kind order recorded
+above: `swap` is appended last so the sender's termination proof holds for every registered
+row-bearing kind (the scalar record and status records are never trimmed, and their clamp-bound
+worst case is `static_assert`ed under the ceiling on both sides). In practice the earlier kinds
+absorb any realistic overflow first, so `swap` is a defensive tail.
+
+**Rollout against a server without the v2 store (verified in code).** Agents are served by
+the server, so upgrading the server first is the normal order; an out-of-band agent install must
+follow it. Against a pre-v2 server:
+
+- Every upgraded agent's first v2 report is a full upload with no nack: the changed content
+  hash selects the full path in the scheduler.
+- A blob of 64 KiB or less (the old server's cap) is parsed as v1: the first record's 22 positions
+  land with the manufacturer prefixed by the `0x02` byte, and the appended scalars and every
+  section are ignored. The full path stores the server-recomputed hash without comparing the
+  claimed one, so the next daily hash-only report mismatches and is nacked once, and the agent
+  resends in full about 30 s later. That is one extra hash-only report and one full resend per
+  daily cycle, not an exponential climb.
+- A blob over 64 KiB is dropped and nacked every time, so that agent sits on the `need_full`
+  backoff ladder (30 s doubling toward about 24 h) until the server is upgraded.
+
+**Personal data.** Unchanged: chassis, board and DIMM serials stay in the behavioural-PII tier
+exactly as the 2026-10-29 entry states.

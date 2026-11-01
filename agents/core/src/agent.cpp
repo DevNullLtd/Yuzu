@@ -2267,6 +2267,9 @@ public:
                     const YuzuPluginDescriptor* devid_descriptor = nullptr;
                     const YuzuPluginDescriptor* osinfo_descriptor = nullptr;
                     const YuzuPluginDescriptor* netcfg_descriptor = nullptr;
+                    // Optional fifth device_ci plugin: disk_actions (volume / partition /
+                    // topology sections). Absent -> those sections report plugin_not_loaded.
+                    const YuzuPluginDescriptor* diskact_descriptor = nullptr;
                     // SLE (ADR-0024): the software_licensing source's backing plugin.
                     const YuzuPluginDescriptor* license_descriptor = nullptr;
                     // Wave 7 PR7.2: the app_usage source's backing plugin (last-used
@@ -2288,6 +2291,8 @@ public:
                             osinfo_descriptor = handle.descriptor();
                         else if (pname == "network_config")
                             netcfg_descriptor = handle.descriptor();
+                        else if (pname == "disk_actions")
+                            diskact_descriptor = handle.descriptor();
                         else if (pname == "license_scan")
                             license_descriptor = handle.descriptor();
                         else if (pname == "app_usage")
@@ -2306,8 +2311,8 @@ public:
                     auto sync_stub = pb::AgentService::NewStub(channel);
                     sync_thread_ = std::thread([this, sync_plugins, echo_descriptor, hw_descriptor,
                                                 devid_descriptor, osinfo_descriptor,
-                                                netcfg_descriptor, license_descriptor,
-                                                app_usage_descriptor,
+                                                netcfg_descriptor, diskact_descriptor,
+                                                license_descriptor, app_usage_descriptor,
                                                 sync_stub = std::move(sync_stub)]() {
                         auto should_stop = [this]() {
                             return stop_requested_.load(std::memory_order_acquire) ||
@@ -2390,10 +2395,12 @@ public:
                         // being loaded (null descriptor → idle).
                         scheduler.add_source(make_app_perf_source(echo_descriptor));
                         // ADR-0016 device-CI inventory: stable hardware/OS identity (CMDB
-                        // CI record). Idles unless all four source plugins are loaded.
+                        // CI record). Idles unless the four identity plugins are loaded;
+                        // disk_actions is optional (its sections report plugin_not_loaded).
                         scheduler.add_source(make_device_ci_source(hw_descriptor, devid_descriptor,
                                                                    osinfo_descriptor,
-                                                                   netcfg_descriptor));
+                                                                   netcfg_descriptor,
+                                                                   diskact_descriptor));
                         // SLE (ADR-0024): detected software licences. Idles when the
                         // license_scan plugin isn't loaded (null descriptor). The
                         // per-user user_ref knob (Decision 11) and its persisted

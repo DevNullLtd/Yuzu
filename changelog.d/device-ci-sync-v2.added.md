@@ -1,0 +1,1 @@
+- Device-CI daily sync: the agent now sends the versioned device-identity record - chassis, baseboard and hashed machine id, plus typed CPU, DIMM, disk, swap, volume, partition and storage-topology rows, each section with its own status so one unavailable section never stops the rest. Upgrade servers before agents.
