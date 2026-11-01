@@ -7,12 +7,15 @@
  * the ids that need it.
  */
 
+#include "utf8_sanitize.hpp"
 #include "web_utils.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <yuzu/log_token.hpp>
 
+#include <cstdint>
+#include <random>
 #include <string>
 
 using yuzu::is_valid_rule_id;
@@ -352,4 +355,109 @@ TEST_CASE("is_valid_rule_id: length is bounded by kRuleIdMaxLength, boundary inc
     // The constant is its own thing, not a re-export of the log-rendering cap (they happen to
     // share a value today, but a reader must not assume that persists).
     CHECK(kRuleIdMaxLength == 256);
+}
+
+namespace {
+
+// Reference model of log_token built ONLY from the server's strict UTF-8 sanitiser
+// (server/core/src/utf8_sanitize.hpp, the exact set PostgreSQL accepts) and a code point decode:
+// a byte is valid iff it starts a prefix that sanitize_utf8_strict leaves unchanged; the smallest
+// such prefix of 2..4 bytes is the one sequence (the lead byte fixes the length).
+std::string reference_log_token(const std::string& s) {
+    std::string out;
+    for (std::size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80) {
+            const bool structural = c < 0x20 || c == 0x7F || c == ' ' || c == '=' || c == ',';
+            out.push_back(structural ? '_' : static_cast<char>(c));
+            ++i;
+            continue;
+        }
+        std::size_t len = 0;
+        for (std::size_t l = 2; l <= 4 && i + l <= s.size(); ++l) {
+            const std::string cand = s.substr(i, l);
+            if (yuzu::server::sanitize_utf8_strict(cand) == cand) {
+                len = l;
+                break;
+            }
+        }
+        if (len == 0) {
+            out.push_back('_'); // invalid byte: one '_' per byte
+            ++i;
+            continue;
+        }
+        std::uint32_t cp = 0;
+        const unsigned char c0 = c;
+        if (len == 2)
+            cp = ((c0 & 0x1Fu) << 6) | (static_cast<unsigned char>(s[i + 1]) & 0x3Fu);
+        else if (len == 3)
+            cp = ((c0 & 0x0Fu) << 12) | ((static_cast<unsigned char>(s[i + 1]) & 0x3Fu) << 6) |
+                 (static_cast<unsigned char>(s[i + 2]) & 0x3Fu);
+        else
+            cp = ((c0 & 0x07u) << 18) | ((static_cast<unsigned char>(s[i + 1]) & 0x3Fu) << 12) |
+                 ((static_cast<unsigned char>(s[i + 2]) & 0x3Fu) << 6) |
+                 (static_cast<unsigned char>(s[i + 3]) & 0x3Fu);
+        if ((cp >= 0x80 && cp <= 0x9F) || cp == 0x2028 || cp == 0x2029)
+            out.push_back('_');
+        else
+            out.append(s, i, len);
+        i += len;
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("log_token: classifies UTF-8 validity exactly like sanitize_utf8_strict (differential)",
+          "[log_token][differential]") {
+    std::size_t mismatches = 0;
+    const auto check = [&](const std::string& s) {
+        const std::string got = log_token(s);
+        if (got != reference_log_token(s) || yuzu::server::sanitize_utf8_strict(got) != got) {
+            if (++mismatches <= 5) {
+                std::string hex;
+                for (const unsigned char ch : s) {
+                    static const char* d = "0123456789ABCDEF";
+                    hex.push_back(d[ch >> 4]);
+                    hex.push_back(d[ch & 15]);
+                    hex.push_back(' ');
+                }
+                FAIL_CHECK("log_token diverges from the reference for bytes: " << hex);
+            }
+        }
+    };
+
+    // Every 1-byte value, every 2-byte sequence.
+    for (unsigned a = 0; a < 256; ++a) {
+        check(std::string(1, static_cast<char>(a)));
+        for (unsigned b = 0; b < 256; ++b)
+            check(std::string{static_cast<char>(a), static_cast<char>(b)});
+    }
+    // Every 3-byte sequence whose lead is 0xE0-0xEF.
+    for (unsigned a = 0xE0; a <= 0xEF; ++a)
+        for (unsigned b = 0; b < 256; ++b)
+            for (unsigned c = 0; c < 256; ++c)
+                check(std::string{static_cast<char>(a), static_cast<char>(b), static_cast<char>(c)});
+
+    // A seeded sample of 4-byte sequences, biased to the leads and continuations that matter.
+    std::mt19937 rng(0x5EEDC0DEu);
+    std::uniform_int_distribution<unsigned> any(0, 255);
+    std::uniform_int_distribution<unsigned> lead(0xF0, 0xF7);
+    std::uniform_int_distribution<unsigned> cont(0x80, 0xBF);
+    for (int n = 0; n < 100000; ++n) {
+        const bool plausible = (n % 2) == 0;
+        check(std::string{static_cast<char>(lead(rng)),
+                          static_cast<char>(plausible ? cont(rng) : any(rng)),
+                          static_cast<char>(plausible ? cont(rng) : any(rng)),
+                          static_cast<char>(plausible ? cont(rng) : any(rng))});
+    }
+    // Seeded random short strings mixing ASCII, valid and invalid bytes.
+    for (int n = 0; n < 20000; ++n) {
+        std::string s;
+        const unsigned len = 1 + any(rng) % 12;
+        for (unsigned k = 0; k < len; ++k)
+            s.push_back(static_cast<char>(any(rng)));
+        check(s);
+    }
+    CHECK(mismatches == 0);
 }

@@ -154,6 +154,22 @@ TEST_CASE("CH-12: the shared tokens emit valid UTF-8 and fold every line separat
     // Cut on a code point boundary: the whole character is dropped, never half of it kept.
     CHECK(clipped == std::string(127, 'a') + "...");
 
+    // The same clip landing at every interior offset of a 2-byte (U+00E9), 3-byte (U+20AC) and
+    // 4-byte (U+1F600) character: the whole character is dropped, never half of it kept.
+    for (const std::string& ch : {std::string("\xC3\xA9"), std::string("\xE2\x82\xAC"),
+                                 std::string("\xF0\x9F\x98\x80")}) {
+        for (std::size_t inside = 1; inside < ch.size(); ++inside) {
+            INFO("char bytes=" << ch.size() << " cut after " << inside << " byte(s)");
+            const std::string in = std::string(128 - inside, 'a') + ch + "tail";
+            const auto t = software_sync::audit_token(in);
+            CHECK(valid_utf8(t));
+            CHECK(t == std::string(128 - inside, 'a') + "...");
+        }
+        // The character ends exactly on the cap: kept whole.
+        const auto kept = software_sync::audit_token(std::string(128 - ch.size(), 'a') + ch + "tail");
+        CHECK(kept == std::string(128 - ch.size(), 'a') + ch + "...");
+    }
+
     // A character that ENDS exactly on the cap survives whole.
     const std::string fits = std::string(125, 'a') + "\xE2\x82\xAC" + "tail";
     CHECK(software_sync::audit_token(fits) == std::string(125, 'a') + "\xE2\x82\xAC" + "...");

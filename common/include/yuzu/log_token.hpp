@@ -21,11 +21,12 @@
  * point of having a separate, more permissive function:
  *   - log_token(s): control bytes, DEL, space, '=' and ',' -> '_'. A byte >= 0x80 that is part of
  *     a well-formed UTF-8 sequence (no overlong form, no surrogate, nothing above U+10FFFF, the
- *     exact set PostgreSQL's UTF8 accepts) passes through, EXCEPT the sequences a line splitter
- *     treats as a line break, which fold to ONE '_' per code point: the C1 controls U+0080-U+009F
- *     (`C2 80`..`C2 9F`, NEL U+0085 among them), LINE SEPARATOR U+2028 (`E2 80 A8`) and PARAGRAPH
- *     SEPARATOR U+2029 (`E2 80 A9`) -- the same three log_key_token folds, for the same reason
- *     (Python's str.splitlines(), used by the evidence readers, breaks a line on each). A byte
+ *     exact set PostgreSQL's UTF8 accepts) passes through, EXCEPT these, which fold to ONE '_' per
+ *     code point: all 32 C1 controls U+0080-U+009F (`C2 80`..`C2 9F`), LINE SEPARATOR U+2028
+ *     (`E2 80 A8`) and PARAGRAPH SEPARATOR U+2029 (`E2 80 A9`). That is a SUPERSET of
+ *     log_key_token's three folds (NEL U+0085, U+2028, U+2029). Only those three are line breaks
+ *     to a splitlines()-style reader (Python's str.splitlines(), used by the evidence readers);
+ *     the other 31 C1 controls are folded as controls, not as line breaks. A byte
  *     that is not part of a well-formed sequence (a stray continuation byte, an overlong or
  *     surrogate form, a truncated lead) maps to '_' too, one per byte, so the output is ALWAYS
  *     valid UTF-8. No length cap. This is the structured-audit-detail neutraliser (audit_token in
@@ -102,7 +103,7 @@ static_assert(kGuardianLogIdMaxBytes > kGuardianLogIdTailBytes + 1,
         return j < n && (static_cast<unsigned char>(s[j]) & 0xC0) == 0x80;
     };
     const unsigned char c = static_cast<unsigned char>(s[i]);
-    const unsigned char c1 = i + 1 < n ? static_cast<unsigned char>(s[i + 1]) : 0;
+    const unsigned char c1 = i + 1 < n ? static_cast<unsigned char>(s[i + 1]) : static_cast<unsigned char>(0);
     if (c >= 0xC2 && c <= 0xDF)
         return cont(i + 1) ? 2 : 0;
     if (c == 0xE0)

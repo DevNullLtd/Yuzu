@@ -69,7 +69,7 @@ Every audit event contains the following fields:
 `detail` is assembled as space-separated `key=value` fields, and a caller-supplied value (a definition id, a plugin or action name, an execution id) is neutralised before it goes in, so it cannot forge a neighbouring field or start a new line:
 
 - Control bytes, DEL, space, `=` and `,` become `_`.
-- The Unicode characters a line splitter treats as a line break also become `_` (one per character): the C1 controls U+0080 to U+009F (including NEL, U+0085), LINE SEPARATOR U+2028 and PARAGRAPH SEPARATOR U+2029. Every other well-formed UTF-8 character (accented letters, CJK, emoji) is kept as written.
+- The C1 controls U+0080 to U+009F (all 32, including NEL, U+0085), LINE SEPARATOR U+2028 and PARAGRAPH SEPARATOR U+2029 also become `_` (one per character). Of these only NEL, U+2028 and U+2029 are line breaks to a splitlines-style reader; the other C1 controls are folded as controls. Every other well-formed UTF-8 character (accented letters, CJK, emoji) is kept as written.
 - A byte that is not part of a well-formed UTF-8 sequence becomes `_` (one per byte), so the neutralised value is always valid UTF-8. A folded line-separator character becomes a single `_`.
 - Where a value is length-bounded (the software sync routes cap it at 128 bytes and append `...`), the cut falls on a character boundary: a character that would straddle the cap is dropped whole, never kept as half a character.
 
