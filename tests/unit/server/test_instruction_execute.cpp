@@ -1910,6 +1910,73 @@ TEST_CASE("REST execute: an unknown definition writes ONE denied row with the re
           json::parse(res->body)["error"]["correlation_id"].get<std::string>());
 }
 
+// Gate 8 pass 2 (sre-b2): the REST id is the raw path capture, kilobytes long, and used to land
+// unclipped in `target_id` and the `definition=` detail of every row.
+TEST_CASE("bounded_definition_id: a short id is untouched, a long one is cut on a code point "
+          "boundary and marked",
+          "[instruction_execute][audit]") {
+    CHECK(bounded_definition_id("d") == "d");
+    const std::string exact(kAuditDefinitionIdMax, 'a');
+    CHECK(bounded_definition_id(exact) == exact);
+    CHECK(bounded_definition_id(exact + "b") == exact + "...");
+    // A 2-byte character that straddles the limit is dropped whole, never half kept.
+    const std::string straddle = std::string(kAuditDefinitionIdMax - 1, 'a') + "\xC3\xA9" + "tail";
+    CHECK(bounded_definition_id(straddle) == std::string(kAuditDefinitionIdMax - 1, 'a') + "...");
+    // A 4-byte character that straddles it (3 of its 4 bytes inside) is dropped whole too.
+    const std::string four = std::string(kAuditDefinitionIdMax - 3, 'a') + "\xF0\x9F\x98\x80" + "x";
+    CHECK(bounded_definition_id(four) == std::string(kAuditDefinitionIdMax - 3, 'a') + "...");
+    // A character that ends exactly on the limit is kept.
+    const std::string fits = std::string(kAuditDefinitionIdMax - 2, 'a') + "\xC3\xA9" + "x";
+    CHECK(bounded_definition_id(fits) == std::string(kAuditDefinitionIdMax - 2, 'a') + "\xC3\xA9...");
+}
+
+TEST_CASE("REST execute: a 4 KiB definition id writes bounded audit rows (denied, requested, success) "
+          "yet is still looked up by the raw id",
+          "[instruction_execute][rest][audit]") {
+    const std::string long_id(4096, 'x');
+    const auto id_of = [](const std::string& detail) {
+        const auto at = detail.rfind("[id=");
+        REQUIRE(at != std::string::npos);
+        return detail.substr(at + 4, detail.size() - at - 5);
+    };
+    const auto bounded = [](const std::string& detail) {
+        // The whole row (detail text + the fake's "[id=...]" suffix) stays small: nothing carries
+        // the 4 KiB id.
+        return detail.size() < 400 && detail.find(std::string(200, 'x')) == std::string::npos;
+    };
+    SECTION("an unknown definition (core denied row)") {
+        RouteRig r;
+        auto res = r.post(long_id, "{}");
+        REQUIRE(res);
+        CHECK(res->status == 404);
+        REQUIRE(r.core.audits.size() == 1);
+        CHECK(bounded(r.core.audits[0].detail));
+        CHECK(id_of(r.core.audits[0].detail).size() == kAuditDefinitionIdMax + 3);
+    }
+    SECTION("a body refusal before the core (audit_pre_core_denial)") {
+        RouteRig r;
+        auto res = r.post(long_id, "{not json");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        REQUIRE(r.core.audits.size() == 1);
+        CHECK(bounded(r.core.audits[0].detail));
+        CHECK(id_of(r.core.audits[0].detail).size() == kAuditDefinitionIdMax + 3);
+    }
+    SECTION("an existing definition with that id: looked up raw, rows bounded") {
+        RouteRig r;
+        r.core.defs[long_id] = make_def(long_id);
+        auto res = r.post(long_id, "{}");
+        REQUIRE(res);
+        CHECK(res->status == 200); // found by the RAW id and dispatched
+        REQUIRE(r.core.audits.size() == 2);
+        for (const auto& a : r.core.audits) {
+            INFO(a.result);
+            CHECK(bounded(a.detail));
+        }
+        CHECK(r.core.calls.size() == 1);
+    }
+}
+
 TEST_CASE("REST execute: requested and success share the response's correlation id; an error body "
           "after the requested row joins it",
           "[instruction_execute][rest][audit][correlation]") {

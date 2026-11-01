@@ -111,11 +111,26 @@ std::string resolve_cid(const Request& rq) {
 
 } // namespace
 
+std::string bounded_definition_id(std::string_view id) {
+    if (id.size() <= kAuditDefinitionIdMax)
+        return std::string(id);
+    // id[cut] is the first byte EXCLUDED from the head. A continuation byte there means the head
+    // ends mid-sequence: step back (at most 3 bytes, the longest sequence minus its lead) onto the
+    // lead byte, which is then excluded too. Garbage input just stops the walk after 3 steps.
+    std::size_t cut = kAuditDefinitionIdMax;
+    for (int back = 0; back < 3 && cut > 0 && (static_cast<unsigned char>(id[cut]) & 0xC0) == 0x80;
+         ++back)
+        --cut;
+    std::string out(id.substr(0, cut));
+    out += "...";
+    return out;
+}
+
 bool audit_pre_core_denial(const AuditHook& audit, std::string_view correlation_id,
                            std::string_view reason, std::string_view definition_id) {
     return safe_audit(audit, "denied",
                       "reason=" + ::yuzu::log_token(std::string(reason)) +
-                          " definition=" + ::yuzu::log_token(std::string(definition_id)) +
+                          " definition=" + ::yuzu::log_token(bounded_definition_id(definition_id)) +
                           cid_suffix(correlation_id));
 }
 
@@ -146,7 +161,8 @@ PrepareOutcome prepare_impl(Ctx& c) {
     auto looked_up = ports.lookup_definition(rq.definition_id);
     if (!looked_up) {
         spdlog::warn("instruction execute: definition lookup failed for '{}': {}",
-                     ::yuzu::log_token(rq.definition_id), looked_up.error());
+                     ::yuzu::log_token(bounded_definition_id(rq.definition_id)),
+                     looked_up.error());
         return refuse(c, make_refusal(RefusalKind::kStoreUnavailable, "store_unavailable",
                                       "instruction store not available",
                                       "retry shortly; the definition store is unavailable",
@@ -156,13 +172,14 @@ PrepareOutcome prepare_impl(Ctx& c) {
         // A `denied` row (command_v1 writes one for its unknown-definition class too). The audit
         // log is operator-only evidence, not a caller-visible existence oracle: the 404 itself
         // already tells the caller the id is unknown.
-        c.audit("denied", "reason=not_found definition=" + ::yuzu::log_token(rq.definition_id));
+        c.audit("denied", "reason=not_found definition=" +
+                             ::yuzu::log_token(bounded_definition_id(rq.definition_id)));
         return refuse(c, make_refusal(RefusalKind::kNotFound, "not_found",
                                       "instruction definition not found",
                                       "list definitions and re-call with a valid definition id"));
     }
     InstructionDefinition def = std::move(**looked_up);
-    const std::string def_token = ::yuzu::log_token(rq.definition_id);
+    const std::string def_token = ::yuzu::log_token(bounded_definition_id(rq.definition_id));
 
     // 2. The shared chokepoint's dry run for the definition's own (plugin, action), BEFORE any
     //    body work: a caller who may not run this pair learns nothing about its parameters, and
@@ -541,7 +558,7 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
     const Ports& p = c.ports;
     const Request& rq = c.rq;
     const InstructionDefinition& def = plan.def;
-    const std::string def_token = ::yuzu::log_token(rq.definition_id);
+    const std::string def_token = ::yuzu::log_token(bounded_definition_id(rq.definition_id));
 
     if (!p.dispatch) {
         return Outcome{make_refusal(RefusalKind::kMisconfigured, "dispatch_unconfigured",

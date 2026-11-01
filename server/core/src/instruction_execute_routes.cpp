@@ -164,7 +164,8 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
             if (!deps.audit_fn)
                 return false; // unreachable past the guard above; never "audit off"
             return deps.audit_fn(req, std::string(kAuditAction), std::string(result),
-                                 "instruction", definition_id, detail_text);
+                                 "instruction", bounded_definition_id(definition_id),
+                                 detail_text);
         };
         // A refusal before the core runs still leaves a `denied` row (command_v1 does the same
         // for its body-depth and JSON-parse refusals); a lost row sets Sec-Audit-Failed, and the

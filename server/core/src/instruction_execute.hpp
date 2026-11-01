@@ -329,6 +329,17 @@ struct PrepareOutcome {
 [[nodiscard]] Outcome run(const Request& rq, const Ports& ports, const AuditHook& audit,
                           const EventEmitHook& emit = {});
 
+/// Longest definition id (bytes) that is ever written to an audit row (`target_id`, `definition=`)
+/// or a log line. The REST route's id is the raw `([^/]+)` path capture (kilobytes), the MCP tool
+/// already refuses more than this; the definition is still LOOKED UP by the raw id.
+inline constexpr std::size_t kAuditDefinitionIdMax = 128;
+
+/// `id` bounded for audit and logs: at most `kAuditDefinitionIdMax` bytes, cut on a UTF-8 code
+/// point boundary (a character that straddles the limit is dropped whole, never half kept), with
+/// "..." appended when anything was cut. NOT neutralised: the `target_id` column keeps the id
+/// as-is; a value embedded in a `key=value` detail line still goes through `log_token`.
+[[nodiscard]] std::string bounded_definition_id(std::string_view id);
+
 /// The `denied` row for a refusal that happens BEFORE the core runs and so before it could stamp
 /// one itself: today the REST route's body-too-deep and unparseable-JSON refusals (the MCP twin's
 /// equivalents are its argument-bound refusals, written by the MCP adapter with the same
