@@ -1739,6 +1739,46 @@ TEST_CASE("AuthDB MFA: regenerate refuses a deactivated account (no live codes)"
     CHECK_FALSE(h.db.mfa_status("gone").has_value());
 }
 
+// #4058 residual: a deactivated account's recovery code must not be consumable.
+// remove_user() DELETEs the codes, which would hide the gap, so this deactivates
+// by raw UPDATE and leaves the code rows in place — the out-of-band state the
+// `is_active` guard exists for. The SELECT and the UPDATE both carry the
+// guard; this end-to-end case cannot tell which one acted (the UPDATE-side window
+// between them is not deterministically reachable from a unit test).
+TEST_CASE("AuthDB MFA: recovery code is not consumable on an inactive account (#4058)",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("deadrec", "h", "s", yuzu::server::auth::Role::user).has_value());
+    auto codes = h.db.mfa_regenerate_recovery_codes("deadrec");
+    REQUIRE(codes.has_value());
+    REQUIRE(codes->size() == 10);
+
+    const char* v[] = {"deadrec"};
+    auto exec = [&](const char* sql) {
+        PgResult r{PQexecParams(h.conn.get(), sql, 1, nullptr, v, nullptr, nullptr, 0)};
+        REQUIRE(r.ok());
+        return r;
+    };
+    exec("UPDATE auth.users SET is_active = FALSE WHERE username = $1");
+
+    // Inactive: a valid, unconsumed code is refused as "no match" (not an error).
+    auto refused = h.db.mfa_consume_recovery_code("deadrec", codes->front());
+    REQUIRE(refused.has_value());
+    CHECK_FALSE(*refused);
+
+    // ...and the row was not burned.
+    auto unconsumed = exec("SELECT COUNT(*) FROM auth.mfa_recovery_codes "
+                           "WHERE username = $1 AND consumed_at IS NULL");
+    CHECK(std::string(PQgetvalue(unconsumed.get(), 0, 0)) == "10");
+
+    // Reactivated: the same code works again (the guard keys on is_active, nothing else).
+    exec("UPDATE auth.users SET is_active = TRUE WHERE username = $1");
+    auto accepted = h.db.mfa_consume_recovery_code("deadrec", codes->front());
+    REQUIRE(accepted.has_value());
+    CHECK(*accepted);
+}
+
 // ── MFA enroll -> verify round trip THROUGH SecretCodec ──────────────────
 
 TEST_CASE("AuthDB MFA enroll -> verify round trip is envelope-encrypted end to end",
