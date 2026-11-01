@@ -41,6 +41,7 @@ the Windows event log shows one of these, and they mean different things:
 | `SecretCodec::init() failed` … `kek_orphaned: stored secret blobs reference KEK version(s) […] absent from kek_meta` | A stored secret blob (for example one account's TOTP secret) names a key-encryption-key version that is not registered in `secrets.kek_meta` | [Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version) |
 | `AuthDB: the MFA factor-generation trigger (auth.users_mfa_factor_gen) is missing, not ENABLE ALWAYS, or altered - auth store disabled`, followed by `Failed to open the Postgres auth store (migration or MFA trigger check failed; see the preceding AuthDB log line)` | The trigger that binds an MFA proof to the account's factor generation is not in force | [MFA binding enforcement failed](#mfa-binding-enforcement-failed) |
 | `SessionStore: sessions_mfa_rebind_guard is missing, not ENABLE ALWAYS, or altered; refusing to open …`, followed by `[PG] Refusing to start: session store migration/open failed` | The session rebind guard trigger is not in force | [MFA binding enforcement failed](#mfa-binding-enforcement-failed) |
+| `PgMigrationRunner: migration v3 failed for auth: …` or `PgMigrationRunner: migration v3 failed for session_store: …`, ending `canceling statement due to lock timeout` (SQLSTATE `55P03`), followed by the refusal line for that store; or the same line printed by the first `yuzu-server --mfa-reset` | The migration could not get its table lock within 3 seconds because another session holds a lock on `auth.users` or `session_store.sessions`; it rolled back whole and changed nothing | [Migration lock timeout](#migration-lock-timeout) |
 | `[auth] Refusing to start: the 'engine:' namespace …` | An `engine:`-prefixed principal collides with the reserved namespace | `docs/ops-runbooks/engine-principal-store-recovery.md` |
 
 A server that refuses to start serves no `/metrics`, so the two binding gauges below cannot report this
@@ -142,6 +143,29 @@ opened. Usual causes, in likelihood order:
    restore of the `auth` schema" rule in [Backup - the KEK pairing rule](#backup--the-kek-pairing-rule)): a rebuilt
    `auth.users` restarts its factor-generation counter, while the proofs in `session_store.sessions` survive
    the drop, so a stale stored proof could equal a new generation and count as bound.
+
+### Migration lock timeout
+
+The `PgMigrationRunner` line above means another session held a lock on `auth.users` (the `auth` v3 migration) or
+`session_store.sessions` (the `session_store` v3 migration) for longer than the migration's 3 second wait. Nothing
+was applied. Find the holder:
+
+```bash
+psql "$YUZU_POSTGRES_DSN" -c "SELECT a.pid, a.usename, a.application_name, a.state, a.wait_event_type,
+       a.xact_start, l.relation::regclass AS locked_table, l.mode, left(a.query, 80) AS query
+  FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+ WHERE l.granted AND l.relation IN ('auth.users'::regclass, 'session_store.sessions'::regclass)
+   AND a.pid <> pg_backend_pid()
+ ORDER BY a.xact_start;"
+```
+
+Typical holders are a running `pg_dump`, a report or an open `psql` transaction (`state = 'idle in transaction'`).
+A prepared transaction has no `pid`, so it does not appear in that result: check `pg_prepared_xacts` as well. Let the
+holder finish, or end it with your usual procedure (`pg_terminate_backend(<pid>)` only for a session you know is
+safe to cut), then start the server again or re-run the `--mfa-reset`. Under the shipped systemd unit three failed
+starts within 60 seconds leave it `failed`: run `systemctl reset-failed yuzu-server` once the holder is gone, then
+`systemctl restart yuzu-server`. For a failed `--mfa-reset`, read its exit status and audit row first: see
+"Finding a clear that ended `error` or `partial`" under [Emergency MFA disable](#emergency-mfa-disable-break-glass).
 
 ### KEK missing or unreadable
 
@@ -1673,7 +1697,10 @@ trigger validation) and **no** retry hint for the three sticky causes, whose rem
 enforcement procedure below: the account-store trigger observed not in force
 (`mfa_binding_unenforced`), the session store's rebind guard latched not in force
 (`mfa_proof_unavailable`), and an enrolled account whose factor generation is not positive
-(`mfa_proof_unavailable`). None of those three clears by retrying. A different `503` from the same route is the clock-skew refusal of an
+(`mfa_proof_unavailable`). None of those three clears by retrying. The remediation text says what to do for each: an
+account enrolled before the upgrade (factor generation not positive) is repaired by an administrator with
+`yuzu-server --mfa-reset <user>` after checking `mfa_factor_gen <= 0` (check first, then reset); otherwise restore the
+auth store's MFA binding triggers and restart the server. A different `503` from the same route is the clock-skew refusal of an
 OIDC approver (`retry_after_ms` is null, audit `result=error` with `detail` `approver_assurance:mfa_proof_clock_skew`, not
 counted on `route="approval"`); it is not a store fault, and its entry is
 [OIDC approvers refused with a clock-skew 503](#oidc-approvers-refused-with-a-clock-skew-503).
@@ -1947,8 +1974,12 @@ alert on the unit being `failed` or on `up == 0` as well.
    ```
 
    Two rows with `tgenabled = A` are **necessary, not sufficient**: the boot check also requires the
-   trigger to be a `BEFORE UPDATE` row trigger over the guarded columns with no `WHEN` clause, calling a
-   function whose body is byte-identical to the pinned text. A missing row, or `O`, `R` or `D`, is a
+   trigger to be a `BEFORE UPDATE` row trigger over the guarded columns with no `WHEN` clause (`tgtype` must be
+   `19`: row, before, update, and nothing else; `no_when_clause` must be `t`), calling a function of the pinned
+   name, in the same schema as the table, in language `plpgsql`, whose body is byte-identical to the pinned text. So
+   `A` and `t` alone do not prove the boot check will pass, and the body comparison below checks the body only. If
+   `tgtype` is not `19`, or the function's name, schema or language is in doubt, use the repair below: it recreates the
+   function schema-qualified in the right schema, drops the trigger and creates it again. A missing row, or `O`, `R` or `D`, is a
    fault. For a row that reads `A`, compare the function bodies with the statements under
    [Function body comparison](#function-body-comparison) below. If you cannot tell, the repair
    below is idempotent and the boot check is the judge. Find out who changed

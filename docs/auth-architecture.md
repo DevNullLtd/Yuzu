@@ -1081,6 +1081,8 @@ gate applied.
   `AuthRoutes::durable_mfa_proof_for` applies `AuthManager::stored_binding_trustworthy()` to a local
   session. A SIEM rule must key on both tokens. **Sticky versus transient at the approver:** the approver
   `503` carries no `retry_after_ms` and a remediation that points at the MFA binding enforcement runbook
+  (an account enrolled before the upgrade is reset with `yuzu-server --mfa-reset <user>` after checking
+  `mfa_factor_gen <= 0`; otherwise restore the auth store's MFA binding triggers and restart)
   for the three causes that do not clear by themselves, namely an auth trigger observed not in force (or
   a recovery bypass), the session store's rebind guard latched not in force, and an enrolled row whose
   factor generation is not positive; every transient cause (an unreadable enrolment or stored-proof read,

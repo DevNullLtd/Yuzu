@@ -631,7 +631,7 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
     `--mfa-step-up-window-secs=0` (or when the account is removed in the middle of the request). Either way, sign in again or contact an administrator.
   - **OIDC single sign-on.** There is no local factor to check. The sign-in must have carried an MFA
     method claim (`amr`) from your identity provider, on an ID token issued within the approver window
-    (at most 300 seconds, and shorter if `--mfa-step-up-window-secs` is lower). "Fresh" here means the
+    (at most 300 seconds, and shorter if `--mfa-step-up-window-secs` is set between `1` and `299`). "Fresh" here means the
     provider issued an ID token with an MFA `amr` within the window; the MFA itself may predate the token,
     because the provider can reuse its own session. You are **not** asked for a
     second factor again when you approve; real re-authentication at approval time is a planned

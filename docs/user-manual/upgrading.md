@@ -523,8 +523,9 @@ advances it only from the next enrolment change. So an account that was already 
 `0`, is refused `503` (audit `reason=mfa_proof_unavailable`; sticky, no `retry_after_ms`) on the 37 step-up routes (the 35
 ordinary rows, approve and reject among them, and the 2 factor-credential routes) and on the 3 JIT-elevation
 routes (they probe the same factor state), and stays refused until `yuzu-server --mfa-reset <user>` clears its
-factor. The 35 ordinary rows refuse only while `--mfa-step-up-window-secs` is above 0 (at 0 they pass without
-reading the store); approve and reject, the 2 factor-credential routes and the elevation routes refuse regardless. Settings self-disable and recovery-code regeneration are
+factor. The central check on the 35 ordinary rows refuses only while `--mfa-step-up-window-secs` is above 0 (at 0 it
+passes them without reading the store); approve and reject are two of those 35 but also run the approver rule in their
+own handler, which refuses regardless of the setting, as do the 2 factor-credential routes and the elevation routes. Settings self-disable and recovery-code regeneration are
 two of those routes, so such an account cannot use them to recover. An administrator API token passes the 35
 ordinary rows at the central check (issuing it was the step-up moment), but is refused `403` on the 2
 factor-credential routes and cannot approve or reject; and an administrator at generation `0` cannot mint one while
@@ -533,7 +534,18 @@ the window is above 0, because creating a token is itself an ordinary step-up ro
 **Downtime.** Every replica is down from step 1 (stop) until step 4 (start): there is no rolling window. Endpoint agents
 need no change and reconnect when the server serves again. The step 3 loop is serial, one `yuzu-server --mfa-reset`
 process per account; the first reset applies both migrations and later ones find them applied, so the time grows linearly
-with the number of enrolled accounts. Rehearse it (below) to get your own figure before you pick the window.
+with the number of enrolled accounts. Resetting the break-glass account under `sso-only` needs one extra restart
+(standard mode, enrol, then `sso-only`; see "Break-glass account under `sso-only`" below). Rehearse it (below) to get
+your own figure before you pick the window.
+
+**Table locks.** Each migration waits at most 3 seconds for its table lock (`auth.users`, `session_store.sessions`).
+One that cannot get it fails the boot, or the first `--mfa-reset`, and is rolled back whole and retried on the next
+start, so do not run a long transaction (a `pg_dump`, a report, an open `psql` session) against those two tables
+during the cutover. Under the shipped systemd unit (`deploy/systemd/yuzu-server.service`: `Restart=on-failure`,
+`RestartSec=5`, `StartLimitIntervalSec=60`, `StartLimitBurst=3`) three failed starts within 60 seconds leave the unit
+`failed`; once the lock holder is gone, run `systemctl reset-failed yuzu-server` and start it again. To find the
+holder, see the lock-timeout row of the symptom table in the
+[auth store recovery runbook](../ops-runbooks/auth-db-recovery.md).
 
 **Not affected.** Accounts that are not enrolled are not refused by the binding (nothing is seeded for them). API-token
 and MCP-token callers pass the 35 ordinary rows as before, and a reset does not touch API tokens (the 2 factor-credential
@@ -706,6 +718,7 @@ alone. It is not an upgrade path and widens nothing else.
    many accounts, run this in a root shell (the loop writes its failures to a file under the backup directory):
 
    ```bash
+   : "${YUZU_POSTGRES_DSN:?set YUZU_POSTGRES_DSN}"
    STAMP=<the STAMP from step 2>   # unset in a new shell
    FAILED_LOG=/var/backups/yuzu/mfa-reset-failed-$STAMP.txt
    BG="${BREAKGLASS_USER:-}"   # set to the --break-glass-user name under --auth-mode=sso-only, else leave empty
@@ -722,7 +735,11 @@ alone. It is not an upgrade path and widens nothing else.
 
    Set `BREAKGLASS_USER` before you run it under `sso-only`. A deactivated enrolled account is skipped by the
    query on purpose: the command refuses it (`user '<name>' not found`), so reset it after it is reactivated. The
-   `FAILED:` lines (and a `QUERY FAILED` line) are kept in `$FAILED_LOG` for step 5; a clean run prints none.
+   `FAILED:` lines (and a `QUERY FAILED` line) are kept in `$FAILED_LOG` for step 5; a clean run prints none. A
+`FAILED:` line does not mean the account was left untouched. If the failure comes after the clear, for example the
+`session_store` migration or the session delete cannot get its table lock within the 3 second cap above, the factor
+is already cleared, the audit row is `partial`, the exit is non-zero and the account's old sessions stay valid until
+you end them. If the clear itself reported an error, its state is unknown (audit `error`).
 4. Start the new build (unmask the service first if you masked it). Set `--mfa-enforcement` now (the server reads
    it at this start). The migrations run at the first start if step 3 did not already apply them, and seed
    nothing. The user enrols again at next sign-in only under `--mfa-enforcement=required`, or `admin-only` for an
@@ -743,9 +760,14 @@ alone. It is not an upgrade path and widens nothing else.
      FROM auth.users u WHERE u.is_active AND u.mfa_enrolled_at IS NULL ORDER BY u.username;
    ```
 
+   Then work through `$FAILED_LOG`: for every user in it, fix the cause, then re-run `--mfa-reset <user>` (a re-run
+   clears idempotently and ends the account's sessions; if the cause was a lock, find the holder as the table-locks
+   paragraph above says). Until that re-run exits `0`, the account's old sessions may still be valid. If the file has
+   a `QUERY FAILED` line, no account was reset: re-run the whole loop.
    Then revoke the administrator API token you minted before the cutover.
 
-**Tell your users.** A reset ends the account's sessions, so each reset user is signed out. Under
+**Tell your users.** A reset that exits `0` ends the account's sessions, so each such user is signed out (an account in
+`$FAILED_LOG` is not, until its re-run succeeds). Under
 `--mfa-enforcement=required` (or `admin-only`, for an administrator) they enrol their authenticator again at next
 sign-in; under `optional` they are password-only until they enrol. A non-administrator cannot enrol itself under
 `optional` or `admin-only`, so an administrator must enrol each non-admin approver
@@ -756,20 +778,18 @@ can adapt:
 > password and, if you are asked, set up your authenticator app again. If you approve requests or request elevation and
 > are not asked, tell an administrator: you cannot set it up yourself and are refused until they do.
 
-Each migration waits at most 3 seconds for its table lock (`auth.users`, `session_store.sessions`). One that cannot get
-it fails the boot, or the first `--mfa-reset`, and is rolled back whole and retried on the next start, so do not run a
-long transaction (a `pg_dump`, a report, an open `psql` session) against those two tables during the cutover.
-
 Until a reset has been done for an account, the 37 step-up routes (approve and reject included) and the 3 JIT-elevation
-routes answer `503` (audit `reason=mfa_proof_unavailable`) for it, the 35 ordinary rows only while `--mfa-step-up-window-secs` is
-above 0 (at 0 they pass without reading the store). After the cutover, reconcile the `mfa.reset.breakglass` rows
+routes answer `503` (audit `reason=mfa_proof_unavailable`) for it. At the central check the 35 ordinary rows do so only
+while `--mfa-step-up-window-secs` is above 0 (at 0 it passes them without reading the store), but approve and reject
+still answer `503` from their own approver rule at 0. After the cutover, reconcile the `mfa.reset.breakglass` rows
 against the `mfa.enroll.verified` rows per operator. This lists every operator with a reset and no enrolment since
 (expected under `optional`; under `required`, or `admin-only` for an administrator, it should empty as people sign
 in; after a restore it also lists operators whose reset rows remain in the audit store although their enrolments
 came back with the restored `auth` schema). A `partial` reset cleared the factor and only its session delete failed, so it
 counts; a reset that ended `error` is not listed because its state is unknown (the factor may or may not be cleared):
 find those with the runbook query "Finding a clear that ended `error` or `partial`" in
-[Emergency MFA disable](../ops-runbooks/auth-db-recovery.md#emergency-mfa-disable-break-glass):
+[Emergency MFA disable](../ops-runbooks/auth-db-recovery.md#emergency-mfa-disable-break-glass) (it looks back only
+seven days, so widen its `interval '7 days'` predicate if you reconcile later than that):
 
 ```sql
 SELECT r.target_id AS operator, to_timestamp(max(r.timestamp)) AT TIME ZONE 'UTC' AS last_reset_utc
@@ -840,15 +860,16 @@ the session store it uses to end the account's sessions the same way.
   (or "the approver's MFA state could not be read, so the decision was not recorded", with a retry hint, when the
   cause is transient), and an `approver_assurance:mfa_store_unavailable` audit row. The message does not say
   whether the cause is permanent. It is persistent for a pre-cutover (generation 0) account, which is the expected
-  cause right after the cutover (the post-start query in step 5 lists it; then run `yuzu-server --mfa-reset <user>`
-  on the host) and for a binding trigger that is not in force (`reason=mfa_binding_unenforced` for the account
-  store). It is transient for a failed read, an inconclusive trigger validation (the `binding_inconclusive` latch,
+  cause right after the cutover (the post-start query in step 5 lists it; an administrator then runs
+  `yuzu-server --mfa-reset <user>` on the host, after checking that the account reads `mfa_factor_gen <= 0`, see the
+  runbook) and for a binding trigger that is not in force (`reason=mfa_binding_unenforced` for the account store;
+  restore the auth store's MFA binding triggers and restart the server). It is transient for a failed read, an inconclusive trigger validation (the `binding_inconclusive` latch,
   which clears on the next valid check) or an unusable database clock reading. The audit `reason=` token and the
   server log (a warning is logged once per inconclusive episode) tell the causes apart; the
   `yuzu_auth_mfa_binding_enforcement_ok` gauge shows only the sticky trigger case (it still reads 1 while the
   latch is set, and only `YuzuStepUpGateUnavailable` fires), and the step 5 query shows only generation-0
-  accounts. Retry once; if it persists, follow the runbook, and do not run `--mfa-reset` for an account on the
-  strength of this message alone. A `503` whose message is "authentication store is temporarily unavailable" is
+  accounts. Retry once; if it persists, follow the runbook and check first: reset only an account that reads
+  `mfa_factor_gen <= 0`, and do not run `--mfa-reset` on the strength of this message alone. A `503` whose message is "authentication store is temporarily unavailable" is
   the plain transient one.
 - **Clearing a factor is unchanged apart from the generation check.** `yuzu-server --mfa-reset` and Disable in
   Settings still write an `attempted` intent row first and an outcome row after, clear the factor and the
