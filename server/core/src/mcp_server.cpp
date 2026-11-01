@@ -3,6 +3,7 @@
 #include "http_route_sink.hpp" // HttpRouteSink / HttplibRouteSink — #2542 PR-6 seam migration
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
 #include "approver_assurance.hpp" // #6061: approve/reject are human-session acts (typed refusal)
+#include "checked_pending_count.hpp" // approval mint: throw-folding pending-count wrapper
 #include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
 #include "dispatch_denial_text.hpp" // shared describe_dispatch_denial (#6065 PR-Q; was an anonymous-namespace local here)
 #include "engine_no_admin_audit.hpp"      // the shared no-admin auditor (REST + MCP)
@@ -8856,19 +8857,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         // A count that THROWS (a bad_alloc building its SQL, a driver fault)
                         // is the same unreadable count: folded into the branch below so it can
                         // not unwind this handler before the refusal row is written.
-                        const auto pending_now =
-                            [&]() -> std::expected<int, yuzu::server::StoreReadError> {
-                            try {
-                                return approval_manager->pending_count_for_checked(
-                                    session->username);
-                            } catch (...) {
-                                // Empty strings: the error is built inside a handler for an
-                                // exception that may itself have been bad_alloc, so it must
-                                // not allocate here (and this lambda is deliberately not
-                                // noexcept, so any other throw cannot terminate the server).
-                                return std::unexpected(yuzu::server::StoreReadError{{}, {}});
-                            }
-                        }();
+                        // The try/catch lives in checked_pending_count (checked_pending_count.hpp).
+                        const auto pending_now = yuzu::server::checked_pending_count([&] {
+                            return approval_manager->pending_count_for_checked(session->username);
+                        });
                         if (!pending_now) {
                             if (metrics != nullptr) {
                                 try {
