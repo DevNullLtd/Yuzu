@@ -1,8 +1,8 @@
 # ADR-0074: Gateway transport security and topology: mutual TLS on every hop, SPIFFE identities, many gateways, many servers
 
-- **Status:** Proposed. The owner's decisions below were taken on 2026-10-28, 2026-10-29 and 2026-10-30; the whole ADR needs the owner's sign-off at the end of wave 0.
+- **Status:** Proposed. The owner's decisions below were taken between 2026-10-28 and 2026-11-01; the whole ADR needs the owner's sign-off at the end of wave 0.
 - **Shipped:** nothing in D1 to D13; of D14, only the memory measures in its last paragraphs are on `dev`. Today the agent-to-gateway hop is one-way TLS (see Context). Do not cite this ADR as a current capability.
-- **Date:** 2026-10-28 (wave 0 decisions folded in 2026-10-29; the decisions of 2026-10-30 on replication, CRL signing and the protective set, and Nathan Dornbrook's answers of 2026-10-30 to the remaining governance questions, folded in 2026-10-30)
+- **Date:** 2026-10-28 (wave 0 decisions folded in 2026-10-29; the decisions of 2026-10-30 on replication, CRL signing and the protective set, and Nathan Dornbrook's answers of 2026-10-30 to the remaining governance questions, folded in 2026-10-30; his answers of 2026-10-30 to 2026-11-01 to the fold-in questions, on tenancy, zones, revocation, clocks, TLS defaults, the CA and evidence retention, folded in 2026-11-01)
 - **Authors:** Nathan Dornbrook
 - **Supersedes:** nothing. Amends ADR-2002 (see its section 7h, added with this ADR). Amends ADR-2004 (the server identity form and the `mgmt_peer_auth_mode` default; see "Rules this design re-opens").
 - **Related:**
@@ -446,7 +446,7 @@ Resolved in wave 0 (2026-10-29): the SPIFFE trust domain (D3), D5's scope, and w
 
 - **For wave 2:** whether to move kTLS handshakes out of the Erlang VM, so a memory-safety bug costs only the handshakes in flight rather than the gateway. No project surveyed runs a process per handshake; the form to measure is a small pool of handshake OS processes that hand the established socket and its kTLS state back to the gateway.
 - **For wave 1:** checking a customer intermediate's revocation: the leaf only, or the customer's root CRL as well (D7).
-- **For wave 2:** the KeyUpdate policy on kTLS main ports (refuse, require a kernel with rekey support, or keep the receive side in user space), and the exact KeyUpdate limit on both TLS paths, decided as a few per hour before the connection is closed (D8).
+- **For wave 2:** the KeyUpdate policy on kTLS main ports (refuse, require a kernel with rekey support, or keep the receive side in user space), and the exact KeyUpdate limit on each TLS path (on the OTP fallback, decided as closing a connection that asks for more than a few per hour) (D8).
 - The ephemeral-port limit on load generators for wave 7: one source address to one gateway port gives about 16,000 connections on macOS defaults.
 - **For wave 2:** whether the direct agent-to-server port of single-server installs gets the same enrollment and main port split (D2).
 - **For wave 1:** whether servers check gateway certificates against the `ca_issued` revoked set rather than the published CRL (D7).
