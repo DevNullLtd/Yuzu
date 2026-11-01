@@ -607,8 +607,8 @@ agent_test_exe = executable(
     'unit/test_mgmt_posture_parsers.cpp',           # mgmt_posture: pure sssd/ipa/profiles parsers, plane classifier, row formatters; portable
     'unit/test_mgmt_posture_legs.cpp',              # mgmt_posture: OS-free posture_linux/posture_macos decision seams over injected fakes; portable
     'unit/test_mgmt_posture_local_dispatcher.cpp',  # mgmt_posture: real plugin via LocalDispatcher + execute seam, unguarded on every OS
-    'unit/test_shares_parsers.cpp',                 # shares: pure exports/smb.conf parsers + row formatters over labelled fixtures; portable
-    'unit/test_shares_legs.cpp',                    # shares: OS-free list_linux/list_windows decision seams over injected fakes; portable
+    'unit/test_shares_parsers.cpp',                 # shares: pure exports/smb.conf/BSD exports/sharing JSON parsers + row formatters over labelled fixtures; portable
+    'unit/test_shares_legs.cpp',                    # shares: OS-free list_linux/list_windows/list_macos decision seams over injected fakes; portable
     'unit/test_shares_posix_fs.cpp',                # shares: the real POSIX fs binding under a TempDir (symlink/FIFO/cap/dirfd); body #if !defined(_WIN32)
     'unit/test_shares_local_dispatcher.cpp',        # shares: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_remote_access_audit_config_parsers.cpp',  # remote_access_audit: pure sshd_config/Include/service parsers over REAL CAPTURE + labelled fixtures; portable
@@ -3638,7 +3638,8 @@ test('mgmt_posture definition columns',
 
 # shares' definition-column contract (content/definitions/shares.yaml): row_kind first, then the
 # generic field_1..field_7 sequence pinned to the wire rows shares_parsers.hpp emits (the test
-# holds the expected literals; it does not read the C++).
+# holds the expected literals), plus the macOS best-effort disclosure phrases (it reads
+# shares_plugin.cpp as plain text for one of them, with no C++ parsing).
 test('shares definition columns',
   _python3_test,
   args: [files('test_shares_definition.py')],
@@ -4066,6 +4067,14 @@ test('same-site gate production wiring lexical gate',
   args: [files('test_same_site_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
+)
+# #4160: pins the sso-only runtime-wiring check + provider gauges in ServerImpl (source-text only;
+# its own in-file selftest mutates each pinned statement, so no separate selftest entry).
+test('sso-only runtime wiring lexical gate',
+  _python3_test,
+  args: [files('test_sso_runtime_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 test('same-site gate production wiring lexical selftest',
   _python3_test,

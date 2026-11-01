@@ -1417,7 +1417,7 @@ account policy)"* — this ships **both** halves.
   - **OIDC** — both `--oidc-issuer` **and** `--oidc-client-id` (the same
     predicate the OIDC provider's `is_enabled()` uses; issuer-without-client-id
     leaves SSO silently non-functional, review #1735 HIGH-1); **or**
-  - **SAML** (non-Windows) — all five SP fields (`--saml-idp-sso-url`,
+  - **SAML** (non-Windows) — all five SAML settings (`--saml-idp-sso-url`,
     `--saml-idp-cert`, `--saml-sp-entity-id`, `--saml-sp-acs-url`,
     `--saml-idp-entity-id`) **and HTTPS enabled**. HTTPS is part of the gate, not
     deferred to runtime: `server.cpp` leaves the SAML provider disabled under
@@ -1428,11 +1428,82 @@ account policy)"* — this ships **both** halves.
     stub there (it can never mint a session; running the *server* on Windows is
     out of scope regardless).
 
-  The gate checks config **presence**, not runtime validity: a SAML config whose
-  IdP cert / SP key is unreadable, oversized, or non-RSA still passes the boot
-  guard and is then disabled **loudly** by `server.cpp` — exactly as OIDC
-  issuer/JWKS runtime validity is not gate-checked either. The active SSO
-  path(s) are named in the boot banner for CC6.3 evidence.
+  That first gate (in `main.cpp`, before the server is built) checks config
+  **presence** only. A second, runtime-wiring check (#4160) runs inside the
+  `ServerImpl` constructor once the providers have been wired:
+  `sso_only_runtime_providers_ok` (same file) takes the *outcome* — provider
+  constructed and `is_enabled()` — and the server **refuses to start**
+  (`startup_failed_`, non-zero exit, `[SSO] Refusing to start` in the log) when
+  **no** provider is up. In practice this is the SAML leg: an IdP certificate
+  that is unreadable, over 64 KiB, not a PEM certificate, or of a key type
+  xmlsec cannot verify with (for example Ed25519), a bad or non-RSA SP signing
+  key, would otherwise leave a sole SAML provider that looks enabled while every
+  assertion fails. The cause is the preceding `error` log line. The certificate
+  is judged by the **verifier's own loader**: `SamlProvider` loads the pinned
+  certificate once at construction through the same `load_idp_key` helper that
+  `validate_response` uses on every assertion, and exposes the result as
+  `idp_cert_configured_but_broken()` (deliberately separate from
+  `is_enabled()`, a config-presence test that existing tests satisfy with
+  placeholder certificate strings). An earlier draft parsed the file with a
+  different loader and disagreed with the verifier in both directions
+  (`BEGIN TRUSTED CERTIFICATE` rejected, Ed25519 accepted), so the single shared
+  helper is load-bearing: do not add a second certificate probe.
+
+  Deliberate limits of that second check:
+  - **Local only — no network.** OIDC discovery and signing-key fetches stay
+    lazy (first use, #5692), so OIDC issuer/JWKS *reachability* is **not**
+    probed at boot. An IdP outage during a restart must not stop the server
+    booting: break-glass is the documented recovery for exactly that outage,
+    and this check does not regress it.
+  - **OIDC credential *readability* is already fail-closed elsewhere.** An
+    unreadable, oversized or empty `--oidc-client-secret-file` makes the server
+    refuse to start at flag-resolution time (`main.cpp`, `secret_file.hpp`),
+    in every auth mode. That, not this runtime check, is the OIDC counterpart
+    of the SAML certificate check; an empty secret supplied directly is a
+    legitimate public client and is not refused.
+  - **The OIDC leg of the runtime check is thin by construction.** In the shipped binary
+    `--oidc-nat64-prefix` is validated at flag-parse time (`main.cpp`), so
+    wiring leaves OIDC null only for a `Config` assembled outside the CLI. OIDC
+    and SAML are still judged by the *same* predicate (did wiring leave a usable
+    provider) so neither is treated as more trustworthy, but the practical
+    coverage is on the SAML side.
+  - **It proves the certificate LOADS, not that it is the right one.** A valid
+    but stale (pre-rotation) certificate, the wrong certificate (for example the
+    SP's own), or a certificate bundle (which may load using only its first certificate), loads fine and
+    still fails every sign-in. On the OIDC side `enabled` means issuer and client
+    id are set; a wrong client secret or redirect URI is found only at sign-in.
+    Both belong to the IdP-validated class the local-only rule excludes.
+  - **Break-glass cannot recover a refused start.** There is no running server to
+    sign in to; arming covers an IdP outage *after* a successful start. After a
+    refusal: fix the file and restart, or use `--auth-mode=standard` as a last
+    resort (which brings local-password login back for every account, stale ones
+    included, so rotate or disable leavers' passwords afterwards).
+  - **Replicas sharing one certificate fail together.** A bad file stops every
+    replica that reads it; validate the file before a rolling restart.
+  - **One working provider is enough.** With both providers configured and one
+    broken, the server starts, logs the failure loudly, and the broken one
+    reports `..._provider_configured 1` / `..._provider_enabled 0`.
+  - **Break-glass is not an SSO provider.** Configuring it does not satisfy the
+    check.
+  - **The refusal stops the whole server**, including the agent gRPC plane and
+    API-token automation, not only operator sign-in (it uses the same
+    `startup_failed_` mechanism as the other boot refusals). Under a restart
+    policy a late-mounted certificate volume therefore shows as a short restart
+    loop; the refusal text names `--auth-mode=standard` as a last resort and
+    states that it re-enables local-password login for every account.
+
+  `yuzu_auth_{oidc,saml}_provider_configured` / `..._enabled` (four unlabelled
+  0/1 gauges, see `docs/user-manual/metrics.md`) expose "configured but disabled
+  at runtime" for alerting: **`configured 1, enabled 0`** is the alertable state,
+  because a bare `enabled 0` is also "not configured" (normal in `standard`
+  mode). One shared publisher (`publish_*_provider_gauges`) writes them at
+  startup, and the Settings OIDC save republishes the OIDC pair so it cannot go
+  stale. They are startup/reconfigure state, not IdP health. Not wired into
+  `/readyz`: a refused sole provider never reaches it, and a broken *secondary*
+  provider is degraded, not unready. No alert rule ships yet (tracked as #6821) — it would read
+  `configured == 1 and enabled == 0` and still needs a decision on the
+  standard-mode case. The active SSO path(s) are named in the boot banner for
+  CC6.3 evidence.
 - **Break-glass account.** `--break-glass-user <name>` (`YUZU_BREAK_GLASS_USER`)
   designates the single local account exempt from `sso-only`, exempt **only
   while armed**. "Armed" is `users.break_glass_armed_until` (migration v4) — a
@@ -1487,7 +1558,8 @@ called from a thin wrapper in `main.cpp` alongside the flags + arm one-shot;
 `Config::auth_mode` / `break_glass_user` / `break_glass_window_secs` in
 `server.hpp`. Tests: `tests/unit/server/test_auth_break_glass.cpp` (DB
 accessors) + `test_auth_routes_hardened.cpp` (login-gate wire path) +
-`test_sso_boot_guard.cpp` (boot-guard predicate — OIDC/SAML/HTTPS/platform).
+`test_sso_boot_guard.cpp` (boot-guard predicate — OIDC/SAML/HTTPS/platform —
+and the runtime-wiring decision table, #4160).
 
 ## RBAC group provisioning (#1832)
 
@@ -2188,7 +2260,11 @@ its in-process PKCE state and its browser-binding digest.
 ### Rotating the IdP signing certificate
 
 Update `--saml-idp-cert` and **restart the server** — there is no hot-reload
-for the IdP cert in this release.
+for the IdP cert in this release. **Validate the replacement file first** (a PEM
+certificate, at most 64 KiB, with a key type the SAML verifier can load; RSA
+works, Ed25519 does not): on an
+`--auth-mode=sso-only` server whose only SSO provider is SAML, an unloadable
+certificate now stops the whole server at start-up (#4160, "Boot guard" above).
 
 ### AuthnRequest signing
 

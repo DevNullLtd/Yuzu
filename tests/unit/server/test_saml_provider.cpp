@@ -1141,9 +1141,118 @@ static std::string generate_rsa_pss_key_pem() {
     return std::string(bptr->data, bptr->length);
 }
 
+enum class CertKeyKind { Rsa, Ed25519 };
+
+/// A fresh self-signed certificate PEM over a new key of `kind`. `trusted`
+/// writes OpenSSL's "BEGIN TRUSTED CERTIFICATE" form (PEM_write_bio_X509_AUX),
+/// which xmlsec's loader (PEM_read_bio_X509_AUX) accepts but a plain
+/// PEM_read_bio_X509 rejects (#4160 false-reject regression input).
+static std::string make_self_signed_cert_pem(CertKeyKind kind, bool trusted) {
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(
+        kind == CertKeyKind::Rsa ? EVP_PKEY_RSA : EVP_PKEY_ED25519, nullptr);
+    REQUIRE(ctx != nullptr);
+    struct CtxGuard { EVP_PKEY_CTX* c; ~CtxGuard() { if (c) EVP_PKEY_CTX_free(c); } } cg{ctx};
+    REQUIRE(EVP_PKEY_keygen_init(ctx) == 1);
+    if (kind == CertKeyKind::Rsa)
+        REQUIRE(EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) == 1);
+    EVP_PKEY* pkey = nullptr;
+    REQUIRE(EVP_PKEY_keygen(ctx, &pkey) == 1);
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard { EVP_PKEY* k; ~PkeyGuard() { if (k) EVP_PKEY_free(k); } } pg{pkey};
+
+    X509* cert = X509_new();
+    REQUIRE(cert != nullptr);
+    struct CertGuard { X509* c; ~CertGuard() { if (c) X509_free(c); } } certg{cert};
+    X509_set_version(cert, 2);
+    ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
+    X509_gmtime_adj(X509_getm_notBefore(cert), 0);
+    X509_gmtime_adj(X509_getm_notAfter(cert), 60LL * 60 * 24 * 365);
+    X509_set_pubkey(cert, pkey);
+    X509_NAME* name = X509_get_subject_name(cert);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                               reinterpret_cast<const unsigned char*>("Probe IdP"), -1, -1, 0);
+    X509_set_issuer_name(cert, name);
+    // Ed25519 signs without a separate digest (md = nullptr).
+    REQUIRE(X509_sign(cert, pkey, kind == CertKeyKind::Rsa ? EVP_sha256() : nullptr) > 0);
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    REQUIRE(bio != nullptr);
+    struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } } bg{bio};
+    REQUIRE((trusted ? PEM_write_bio_X509_AUX(bio, cert) : PEM_write_bio_X509(bio, cert)) == 1);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bio, &bptr);
+    return std::string(bptr->data, bptr->length);
+}
+
+/// An otherwise complete, enabled SamlConfig carrying `cert_pem` as the pinned
+/// IdP certificate — the shape server.cpp builds.
+static SamlConfig config_with_idp_cert(std::string cert_pem) {
+    SamlConfig cfg;
+    cfg.enabled         = true;
+    cfg.idp_entity_id   = "https://idp.example.com/entity";
+    cfg.idp_sso_url     = "https://idp.example.com/sso";
+    cfg.sp_entity_id    = "https://yuzu.example.com/sp";
+    cfg.sp_acs_url      = "https://yuzu.example.com/saml/acs";
+    cfg.idp_cert_pem    = std::move(cert_pem);
+    return cfg;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TEST CASES
 // ─────────────────────────────────────────────────────────────────────────────
+
+// #4160: the boot-time IdP-certificate probe must use the SAME loader as
+// assertion verification (load_idp_key), so it neither false-rejects nor
+// false-accepts. These five inputs are the ones the two loaders disagreed on.
+
+TEST_CASE("SAML: IdP cert probe — a normal RSA certificate PEM is usable", "[saml][4160]") {
+    SamlProvider p{config_with_idp_cert(make_self_signed_cert_pem(CertKeyKind::Rsa, false))};
+    CHECK_FALSE(p.idp_cert_configured_but_broken());
+    CHECK(p.idp_cert_init_error().empty());
+    CHECK(p.is_enabled());
+}
+
+TEST_CASE("SAML: IdP cert probe — a TRUSTED CERTIFICATE PEM is accepted (as the verifier does)",
+          "[saml][4160]") {
+    // Regression: a plain-OpenSSL parse (PEM_read_bio_X509) rejects this form,
+    // which would have disabled a previously working SAML deployment at boot.
+    const std::string pem = make_self_signed_cert_pem(CertKeyKind::Rsa, true);
+    REQUIRE(pem.find("BEGIN TRUSTED CERTIFICATE") != std::string::npos);
+    SamlProvider p{config_with_idp_cert(pem)};
+    CHECK_FALSE(p.idp_cert_configured_but_broken());
+}
+
+// NOTE: this asserts a NEGATIVE capability of the pinned xmlsec (1.3.9 has no EdDSA key
+// support). If a future xmlsec bump gains Ed25519, this case will fail loudly: that is a
+// cue to delete or invert it (and the "for example Ed25519" wording in the error text),
+// not a bug in the probe, which always agrees with whatever the verifier can load.
+TEST_CASE("SAML: IdP cert probe — an Ed25519 certificate is reported broken", "[saml][4160]") {
+    // Regression: it parses as X.509 but xmlsec cannot adopt its key, so every
+    // assertion would fail while the provider still looked enabled.
+    SamlProvider p{config_with_idp_cert(make_self_signed_cert_pem(CertKeyKind::Ed25519, false))};
+    CHECK(p.idp_cert_configured_but_broken());
+    CHECK_FALSE(p.idp_cert_init_error().empty());
+    CHECK(p.idp_cert_init_error().find("BEGIN") == std::string::npos); // never echoes PEM bytes
+    // Deliberately a SEPARATE flag: is_enabled() stays the config-presence test.
+    CHECK(p.is_enabled());
+}
+
+TEST_CASE("SAML: IdP cert probe — garbage and empty certificate text are reported broken",
+          "[saml][4160]") {
+    for (const char* bad : {"not-a-real-cert", "-----BEGIN CERTIFICATE-----\nnot base64!\n"
+                                               "-----END CERTIFICATE-----\n", ""}) {
+        SamlProvider p{config_with_idp_cert(bad)};
+        INFO("input: [" << bad << "]");
+        CHECK(p.idp_cert_configured_but_broken());
+    }
+}
+
+TEST_CASE("SAML: IdP cert probe — a disabled provider is not probed", "[saml][4160]") {
+    SamlConfig cfg = config_with_idp_cert("not-a-real-cert");
+    cfg.enabled = false;
+    SamlProvider p{cfg};
+    CHECK_FALSE(p.idp_cert_configured_but_broken());
+}
 
 TEST_CASE("SAML: provider not enabled returns false", "[saml]") {
     SamlConfig cfg;
