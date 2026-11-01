@@ -2673,7 +2673,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "POST /api/command's audit sink or a post-dispatch helper is throwing, not degrading cleanly"
+          summary: "A dispatch surface's audit sink, post-dispatch helper or dispatch call itself threw, not degrading cleanly"
           description: >-
             yuzu_server_dispatch_fanout_throw_total is non-zero on
             {{ $labels.route }} (phase={{ $labels.phase }}).
@@ -2688,10 +2688,19 @@ groups:
             wrapper that threw instead — e.g. phase=forward_gateway_pending
             means the gateway-forward step itself threw, not the audit sink;
             check the named helper, not AuditStore, for that case. phase=dispatch
-            (route=command_v1, instruction_execute or mcp) means the dispatch call
-            itself threw: the execution row was left running, so look for the
-            dispatch_exception failure audit row and the server log line naming the
-            exception. Either way
+            counts the dispatch call ITSELF throwing, on route=command_v1
+            (POST /api/v1/commands), route=instruction_execute
+            (POST /api/v1/instructions/{id}/execute) and route=mcp
+            (execute_instruction_definition). The execution row was left running,
+            NOT cancelled, because some agents may already hold the command.
+            Runbook for phase=dispatch: find the dispatch_exception failure audit
+            row (it names the execution_id and, when known, agents_sent, a lower
+            bound) and the server log line naming the exception; check that
+            execution's per-agent results (the error body carries it as
+            error.execution_id, error.data.execution_id on MCP); if no agent has answered and the row still runs,
+            close it with cancel_execution (POST /api/v1/executions/{id}/cancel);
+            do NOT blindly re-run the command, because an agent may already be
+            running it. Either way
             a well-behaved sink/helper should report failure via its own
             return value, not an exception; a non-zero rate here points at a
             bug in that specific sink/helper (e.g. an allocation failure

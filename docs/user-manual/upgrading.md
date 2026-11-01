@@ -52,9 +52,15 @@ What an operator should know:
 - **A dispatch that throws part-way.** On `POST /api/v1/commands` and the instruction execute twins the execution
   row is left `running`, never cancelled, because some agents may already hold the command; no retry is
   advertised. When the server had confirmed sending to at least one agent it stores that number as the row's
-  targeted count (the `failure` audit row carries `agents_sent=<n>`), so those agents' results complete the row;
-  otherwise the row stays `running` until the stuck-execution sweep closes it, and `cancel_execution` closes it at
-  once.
+  targeted count (the `failure` audit row carries `agents_sent=<n>`), so those agents' results complete the row.
+  `agents_sent` is a LOWER BOUND: a send that was in flight when the dispatch threw is not counted, and a count
+  that is too low lets the row close as soon as that many agents have answered, before an uncounted agent has.
+  With no confirmed send the row stays `running` with a targeted count of 0 until the stuck-execution sweep
+  (about every 15 minutes) cancels it. The sweep closes ONLY a row that is still `running`, has a targeted count
+  of 0, has no per-agent response at all and no pending command-outbox delivery, and was dispatched more than
+  about 30 minutes ago; it declines a pass in which a majority of the running executions (at 20 or more) look
+  stuck. So a swept row means "no agent answered", not "no agent received the command": an agent that was sent the
+  command but was not counted (or has not answered yet) may still run it. `cancel_execution` closes a row at once.
 - **Supervised MCP tokens.** `cancel_execution` is exempt from the supervised-tier approval ticket (it only
   updates the tracker record), the one tool on a closed exempt list; the REST route still refuses a
   supervised-tier token. `record_execution_rerun` and `execute_instruction_definition` need a ticket as any

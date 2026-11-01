@@ -902,15 +902,18 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      test-existence tripwire (each registry tool's test file must name the tool
      and assert a schema and an audit row), and a Catch2 case checks that every
      registry tool is both a ledger `mcp_twin` and a `kExpectedTwins` row. Each
-     check carries a size-pinned, shrink-only allowlist seeded from the tree as
-     it stood. The gate-parity table (`GATE_PARITY_KNOWN_MISMATCHES`) holds
+     check carries a size-pinned allowlist seeded from the tree as it stood. The
+     pin is an exact count that goes down when an entry is fixed; it goes up
+     only by a recorded owner ruling (see the 2026-10-31 gate-parity entry
+     below), so "shrink-only" describes the intended direction, not a
+     mechanical cap. The gate-parity table (`GATE_PARITY_KNOWN_MISMATCHES`) holds
      the six rows (seven since the 2026-10-31 entry below) whose REST and MCP gates still differ, or whose agreement
      the check cannot prove, after it learned two shapes (a REST handler that
      refuses a service-scoped token before its gate, and an MCP handler whose
      own fleet read confines), with a
      one-line reason each in the script; a second table
      (`GATE_PARITY_NO_GATE_ALLOWED`) holds routes whose gate the script cannot
-     read. Both shrink only: a fix removes its entry and lowers the pin, and
+     read. Both are meant to shrink: a fix removes its entry and lowers the pin, and
      adding an entry or raising a pin is a reviewed deferral that needs a
      reason, a tracking issue and a ruling recorded in this ADR. These are
      tripwires, not proofs: the check compares gate labels, not effect (REST
@@ -1086,7 +1089,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      gate-parity table `GATE_PARITY_KNOWN_MISMATCHES` gains the entry
      `("POST", "/api/v1/commands", "execute_instruction")` and its pin
      `GATE_PARITY_KNOWN_MISMATCHES_MAX` is raised from 6 to 7 (the script pins the
-     count: the table size must equal it, so it is not a shrink-only cap). The REST route is read
+     count: the table size must equal it, so the pin is an exact value, not a
+     shrink-only cap; it goes down when an entry is fixed and up only by a ruling
+     like this one). The REST route is read
      as `plain:Execution:Execute` and the tool's declared pair as
      `confined:Execution:Execute`, so the lexical comparison cannot agree. Both
      surfaces call the same `require_permission(Execution, Execute)`, whose
@@ -1097,7 +1102,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      agreement: the check compares labels and cannot see this. It is removed,
      and the pin lowered, when the comparison can read the two gates as the same
      kind. Tracking: programme #2146. This is the ruling the 2026-10-23 entry
-     above requires before a pin is raised.
+     above requires before a pin is raised. The ruling is recorded in the
+     governance ledger fragment
+     `governance.d/2146-batch-b-dispatch-core.DbkUcG.jsonl`, adjudicated by the
+     repository owner.
    - **2026-10-31 - `cancel_execution` at the supervised MCP tier is exempt from
      the approval ticket.** Owner ruling. Originally given 2026-10-30 as a
      "risk-reducing STOP"; re-confirmed by the owner 2026-10-31 after that premise
