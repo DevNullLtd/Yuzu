@@ -117,4 +117,31 @@ void guarded_forward(ForwardAttempt& attempt, Body&& body, FallbackCmdId&& fallb
     }
 }
 
+/// Resolve every drained command of a branch that never reaches the per-command forwarding
+/// body (the "gateway mgmt pool configured but unusable" drain), one guarded resolution each.
+///
+///   resolve_one(item)   the terminal write for one command (may throw: it allocates)
+///   log_failed(item)    error line naming the item's ids, for a resolution that threw
+///
+/// A throw from `resolve_one` is logged and the loop CONTINUES with the next item; it is never
+/// retried, because the terminal write goes through `process_gateway_response`, which is not
+/// idempotent (a part-way failure retried would resolve twice). Dispatch has already counted
+/// each drained command as SENT, so an escape would leave every later command with no terminal
+/// response and its execution `running` with a targeted count the reaper never closes.
+/// A throwing logger is swallowed too: nothing may escape this function.
+template <class Range, class ResolveOne, class LogFailed>
+void for_each_resolution_guarded(Range&& commands, ResolveOne&& resolve_one,
+                                 LogFailed&& log_failed) {
+    for (auto& item : commands) {
+        try {
+            resolve_one(item);
+        } catch (...) {
+            try {
+                log_failed(item);
+            } catch (...) { // NOLINT(bugprone-empty-catch): last resort; the loop continues
+            }
+        }
+    }
+}
+
 } // namespace yuzu::server

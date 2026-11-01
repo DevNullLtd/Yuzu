@@ -13974,13 +13974,30 @@ private:
                 // per-command retry loop below uses, so this path is no
                 // longer a silent exception to the "always reaches a
                 // terminal state" contract.
-                for (auto& gp : gw_pending) {
-                    apply_gateway_forward_terminal_failure(
-                        &agent_service_, gp.agent_id, gp.cmd.command_id(), "gateway_unavailable",
-                        "Gateway command forwarding is configured but not usable "
-                        "(mutual-TLS credential construction likely failed at boot) "
-                        "— command not delivered");
-                }
+                // Each resolution runs under its own guard (up-2): one throw (bad_alloc
+                // building the response, or process_gateway_response failing) must not
+                // unwind this loop and leave every later drained command, already counted as
+                // SENT, with no terminal response. A failed resolution is logged and NOT
+                // retried (process_gateway_response is not idempotent).
+                yuzu::server::for_each_resolution_guarded(
+                    gw_pending,
+                    [&](auto& gp) {
+                        apply_gateway_forward_terminal_failure(
+                            &agent_service_, gp.agent_id, gp.cmd.command_id(),
+                            "gateway_unavailable",
+                            "Gateway command forwarding is configured but not usable "
+                            "(mutual-TLS credential construction likely failed at boot) "
+                            "— command not delivered");
+                    },
+                    [&](auto& gp) {
+                        spdlog::error(
+                            "Gateway SendCommand for agent {} command {}: the unusable-pool "
+                            "terminal write threw; not retried (process_gateway_response is "
+                            "not idempotent), so the command may be left unresolved and its "
+                            "execution can stay running until an operator cancels it",
+                            ::yuzu::log_id_token(gp.agent_id),
+                            ::yuzu::log_id_token(gp.cmd.command_id()));
+                    });
             }
             return;
         }

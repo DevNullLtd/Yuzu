@@ -24,6 +24,7 @@
 #include <vector>
 
 using yuzu::server::ForwardAttempt;
+using yuzu::server::for_each_resolution_guarded;
 using yuzu::server::guarded_forward;
 using yuzu::server::kGatewayForwardSpawnFailedDetail;
 using yuzu::server::kGatewayForwardSpawnFailedReason;
@@ -457,4 +458,100 @@ TEST_CASE("gateway forward guard: reset clears every field", "[gateway_forward_g
     CHECK(a.cmd_id.empty());
     CHECK(a.agent_id.empty());
     CHECK_FALSE(a.resolve_attempted);
+}
+
+// ---- for_each_resolution_guarded: the unusable-pool drain loop (p5-up-2) ----
+
+namespace {
+
+struct DrainedItem {
+    std::string agent_id;
+    std::string cmd_id;
+};
+
+// Mirrors the real call site: a resolver and a logger over the same drained list. `throw_on`
+// names the command ids whose resolution throws (bad_alloc by default, an int when
+// `non_std`), `logger_throws` makes the failure logger throw as well.
+struct DrainHarness {
+    std::vector<std::string> resolved; // cmd ids in the order resolve_one was called
+    std::vector<DrainedItem> logged;   // items handed to log_failed
+    std::vector<std::string> throw_on;
+    bool non_std = false;
+    bool logger_throws = false;
+
+    void run(std::vector<DrainedItem>& items) {
+        for_each_resolution_guarded(
+            items,
+            [&](DrainedItem& it) {
+                resolved.push_back(it.cmd_id);
+                for (const auto& id : throw_on) {
+                    if (id == it.cmd_id) {
+                        if (non_std)
+                            throw 7;
+                        throw std::bad_alloc();
+                    }
+                }
+            },
+            [&](DrainedItem& it) {
+                if (logger_throws)
+                    throw std::runtime_error("logger");
+                logged.push_back(it);
+            });
+    }
+};
+
+} // namespace
+
+TEST_CASE("for_each_resolution_guarded: nothing throws, every item resolved in order, no log",
+          "[gateway_forward_guard]") {
+    DrainHarness h;
+    std::vector<DrainedItem> items{{"a1", "c1"}, {"a2", "c2"}, {"a3", "c3"}};
+    h.run(items);
+    CHECK(h.resolved == std::vector<std::string>{"c1", "c2", "c3"});
+    CHECK(h.logged.empty());
+}
+
+TEST_CASE("for_each_resolution_guarded: a throwing middle item is logged once, not retried, "
+          "and its neighbours are still resolved",
+          "[gateway_forward_guard]") {
+    DrainHarness h;
+    h.throw_on = {"c2"};
+    std::vector<DrainedItem> items{{"a1", "c1"}, {"a2", "c2"}, {"a3", "c3"}};
+    REQUIRE_NOTHROW(h.run(items));
+    // c2 appears exactly once: the non-idempotent resolution is never retried.
+    CHECK(h.resolved == std::vector<std::string>{"c1", "c2", "c3"});
+    REQUIRE(h.logged.size() == 1);
+    CHECK(h.logged[0].agent_id == "a2");
+    CHECK(h.logged[0].cmd_id == "c2");
+}
+
+TEST_CASE("for_each_resolution_guarded: a throwing logger is swallowed and the loop continues",
+          "[gateway_forward_guard]") {
+    DrainHarness h;
+    h.throw_on = {"c1", "c2"};
+    h.logger_throws = true;
+    std::vector<DrainedItem> items{{"a1", "c1"}, {"a2", "c2"}, {"a3", "c3"}};
+    REQUIRE_NOTHROW(h.run(items));
+    CHECK(h.resolved == std::vector<std::string>{"c1", "c2", "c3"});
+    CHECK(h.logged.empty());
+}
+
+TEST_CASE("for_each_resolution_guarded: a non-std throw is caught too",
+          "[gateway_forward_guard]") {
+    DrainHarness h;
+    h.throw_on = {"c1"};
+    h.non_std = true;
+    std::vector<DrainedItem> items{{"a1", "c1"}, {"a2", "c2"}};
+    REQUIRE_NOTHROW(h.run(items));
+    CHECK(h.resolved == std::vector<std::string>{"c1", "c2"});
+    REQUIRE(h.logged.size() == 1);
+    CHECK(h.logged[0].cmd_id == "c1");
+}
+
+TEST_CASE("for_each_resolution_guarded: an empty list calls nothing", "[gateway_forward_guard]") {
+    DrainHarness h;
+    std::vector<DrainedItem> items;
+    REQUIRE_NOTHROW(h.run(items));
+    CHECK(h.resolved.empty());
+    CHECK(h.logged.empty());
 }
