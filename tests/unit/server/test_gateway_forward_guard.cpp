@@ -59,6 +59,9 @@ struct Harness {
     bool resolver_throws = false;
     bool setup_logger_throws = false;
     bool not_retried_logger_throws = false;
+    bool resolver_throws_non_std = false;
+    bool setup_logger_throws_non_std = false;
+    bool not_retried_logger_throws_non_std = false;
 
     template <class Body> void run(ForwardAttempt& attempt, Entry& entry, Body&& body) {
         guarded_forward(
@@ -75,16 +78,22 @@ struct Harness {
                 std::string_view detail) {
                 if (resolver_throws)
                     throw std::bad_alloc();
+                if (resolver_throws_non_std)
+                    throw 7;
                 resolves.push_back({aid, cid, std::string(reason), std::string(detail)});
             },
             [&](const std::string& aid, const std::string& cid, bool resolved) {
                 if (setup_logger_throws)
                     throw std::runtime_error("logger");
+                if (setup_logger_throws_non_std)
+                    throw 7;
                 setup_logs.push_back({aid, cid, resolved});
             },
             [&](const std::string& cid) {
                 if (not_retried_logger_throws)
                     throw std::runtime_error("logger");
+                if (not_retried_logger_throws_non_std)
+                    throw 7;
                 not_retried_logs.push_back(cid);
             });
     }
@@ -172,6 +181,30 @@ TEST_CASE("gateway forward guard: a throw after the ids are assigned uses the ho
     REQUIRE(h.setup_logs.size() == 1);
     CHECK(h.setup_logs[0].cmd_id == "cmd-hoisted");
     CHECK(h.setup_logs[0].agent_id == "agent-hoisted");
+}
+
+TEST_CASE("gateway forward guard: a throw with only the cmd id assigned mixes hoisted and fallback",
+          "[gateway_forward_guard]") {
+    // The real unknown-cluster state: cmd_id is assigned before the !resolution.stub check,
+    // expected_agent_id only after it. The command id must come from the attempt and the agent id
+    // from the entry, each exactly as its own hoisted copy dictates.
+    Harness h;
+    ForwardAttempt attempt;
+    Entry e{"cmd-entry", "agent-entry"};
+    h.run(attempt, e, [&](ForwardAttempt& a) {
+        a.cmd_id = "cmd-hoisted-only";
+        throw std::runtime_error("between the two assignments");
+    });
+    REQUIRE(h.resolves.size() == 1);
+    CHECK(h.resolves[0].cmd_id == "cmd-hoisted-only");
+    CHECK(h.resolves[0].agent_id == "agent-entry");
+    CHECK(h.fallback_cmd_calls == 0);
+    // Evaluated once for the resolver and once for the setup-failed log line.
+    CHECK(h.fallback_agent_calls == 2);
+    REQUIRE(h.setup_logs.size() == 1);
+    CHECK(h.setup_logs[0].cmd_id == "cmd-hoisted-only");
+    CHECK(h.setup_logs[0].agent_id == "agent-entry");
+    CHECK(h.setup_logs[0].resolved);
 }
 
 TEST_CASE("gateway forward guard: a throw at the spawn point resolves the command once",
@@ -300,6 +333,72 @@ TEST_CASE("gateway forward guard: a logger that throws is swallowed on both arms
         REQUIRE_NOTHROW(h.run(attempt, e, [&](ForwardAttempt&) { throw std::bad_alloc(); }));
         CHECK(h.resolves.empty());
         CHECK(h.setup_logs.empty());
+    }
+}
+
+TEST_CASE("gateway forward guard: non-std exceptions are contained like std ones",
+          "[gateway_forward_guard]") {
+    struct NotAnException {};
+    SECTION("the body throws a non-std type before the ids are assigned") {
+        Harness h;
+        ForwardAttempt attempt;
+        Entry e{"cmd-n1", "agent-n1"};
+        REQUIRE_NOTHROW(h.run(attempt, e, [&](ForwardAttempt&) { throw 5; }));
+        REQUIRE(h.resolves.size() == 1);
+        CHECK(h.resolves[0].cmd_id == "cmd-n1");
+        CHECK(h.resolves[0].agent_id == "agent-n1");
+        REQUIRE(h.setup_logs.size() == 1);
+        CHECK(h.setup_logs[0].resolved);
+        CHECK(h.not_retried_logs.empty());
+    }
+    SECTION("the body throws a non-std type after the resolve flag is up") {
+        Harness h;
+        ForwardAttempt attempt;
+        Entry e{"cmd-n2", "agent-n2"};
+        REQUIRE_NOTHROW(h.run(attempt, e, [&](ForwardAttempt& a) {
+            a.cmd_id = e.cmd_id;
+            a.agent_id = e.agent_id;
+            a.resolve_attempted = true;
+            throw NotAnException{};
+        }));
+        CHECK(h.resolves.empty());
+        CHECK(h.setup_logs.empty());
+        REQUIRE(h.not_retried_logs.size() == 1);
+        CHECK(h.not_retried_logs[0] == "cmd-n2");
+    }
+    SECTION("the resolver throws a non-std type") {
+        Harness h;
+        h.resolver_throws_non_std = true;
+        ForwardAttempt attempt;
+        Entry e{"cmd-n3", "agent-n3"};
+        REQUIRE_NOTHROW(h.run(attempt, e, [&](ForwardAttempt&) { throw 5; }));
+        CHECK(h.resolves.empty());
+        REQUIRE(h.setup_logs.size() == 1);
+        CHECK_FALSE(h.setup_logs[0].resolved);
+        CHECK(h.setup_logs[0].cmd_id == "cmd-n3");
+    }
+    SECTION("the setup-failed logger throws a non-std type") {
+        Harness h;
+        h.setup_logger_throws_non_std = true;
+        ForwardAttempt attempt;
+        Entry e{"cmd-n4", "agent-n4"};
+        REQUIRE_NOTHROW(h.run(attempt, e, [&](ForwardAttempt&) { throw 5; }));
+        CHECK(h.resolves.size() == 1);
+        CHECK(h.setup_logs.empty());
+    }
+    SECTION("the not-retried logger throws a non-std type") {
+        Harness h;
+        h.not_retried_logger_throws_non_std = true;
+        ForwardAttempt attempt;
+        Entry e{"cmd-n5", "agent-n5"};
+        REQUIRE_NOTHROW(h.run(attempt, e, [&](ForwardAttempt& a) {
+            a.cmd_id = e.cmd_id;
+            a.agent_id = e.agent_id;
+            a.resolve_attempted = true;
+            throw NotAnException{};
+        }));
+        CHECK(h.resolves.empty());
+        CHECK(h.not_retried_logs.empty());
     }
 }
 
