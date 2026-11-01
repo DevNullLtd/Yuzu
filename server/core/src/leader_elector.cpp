@@ -91,7 +91,8 @@ constexpr const char* kTimelineSql =
     "('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::bigint";
 
 /// The epoch mint (#6535):
-///   epoch = GREATEST((timeline << 32) + nextval(leader_epoch_seq), prev_row_epoch + 1)
+///   epoch = GREATEST((GREATEST(timeline, prev_row_epoch >> 32) << 32) + nextval(seq),
+///                    prev_row_epoch + 1)
 ///
 /// Why the timeline is in the epoch: a lossy (asynchronous, or degraded
 /// non-strict-quorum) promotion can lose the latest mint -- the sequence advance
@@ -99,16 +100,22 @@ constexpr const char* kTimelineSql =
 /// ex-leader still holds and the equality fence admits both. Every promotion
 /// starts a NEW timeline whatever WAL was lost, so the re-minted epoch differs.
 ///
-/// Why the surviving row is a FLOOR (`prev + 1`): the enablement store orders
-/// epochs (`issuer_epoch <= epoch`), and a logical restore / pg_upgrade /
-/// logical-replication cutover lands on a cluster whose timeline restarted at 1
-/// while the restored row and issuer_epoch still carry the old, higher timeline;
-/// a restored sequence can also be older than the row (`ALTER SEQUENCE ... RESTART`
-/// is the cap remedy). The floor keeps every mint strictly above the surviving
-/// row. It is the SAME schema, read under the advisory lock; the row alone
-/// cannot repair a lossy promotion (the promoted standby may have lost the row
-/// too), which is why the timeline stays. A row of INT64_MAX makes `prev + 1`
-/// raise (bigint out of range): a loud epoch_record failure, never a wrap.
+/// Why the surviving row is read TWICE (it is the same schema, read under the advisory
+/// lock): the enablement store orders epochs (`issuer_epoch <= epoch`), and a logical
+/// restore / pg_upgrade / logical-replication cutover lands on a cluster whose timeline
+/// restarted at 1 while the restored row and issuer_epoch still carry the old, higher
+/// timeline; a restored sequence can also be older than the row (`ALTER SEQUENCE ...
+/// RESTART` is the cap remedy). (1) `prev + 1` is a FLOOR: every mint is strictly above
+/// the surviving row. (2) `GREATEST(timeline, prev >> 32)` in the packed term keeps the
+/// sequence part live while the row pins a higher timeline than the real one: with the
+/// floor alone every mint there would be exactly `prev + 1`, deterministic, and a lossy
+/// promotion that loses the latest mint would re-mint the very value the paused
+/// ex-leader holds (a window worse than the pre-#6535 bare sequence, which Postgres
+/// pre-logs 32 values ahead). The row alone cannot repair a lossy promotion (the
+/// promoted standby may have lost the row too), which is why the REAL timeline stays.
+/// A row of INT64_MAX makes `prev + 1` raise (bigint out of range): a loud epoch_record
+/// failure, never a wrap. The floor assumes no writer other than the lock holder
+/// (a manual UPDATE racing a mint can still be overwritten, as before #6535).
 ///
 /// `+`, never `|` for the pack (defence in depth: with the sequence capped at
 /// 2^32-1 they agree, but an OR aliases the timeline bits if the cap is ever
@@ -124,8 +131,8 @@ const std::string& epoch_mint_sql() {
         ") AS tl), "
         "p AS (SELECT COALESCE((SELECT current_leader_epoch FROM leader_elector.leader_state "
         "      WHERE lock_key = $1), 0) AS prev), "
-        "e AS (SELECT GREATEST((t.tl << 32) + nextval('leader_elector.leader_epoch_seq'), "
-        "                      p.prev + 1) AS ep "
+        "e AS (SELECT GREATEST((GREATEST(t.tl, p.prev >> 32) << 32) + "
+        "                      nextval('leader_elector.leader_epoch_seq'), p.prev + 1) AS ep "
         "      FROM t, p WHERE t.tl BETWEEN 1 AND 2147483647), "
         "ins AS (INSERT INTO leader_elector.leader_state "
         "  (lock_key, current_leader_epoch, holder_id, acquired_at) "
@@ -175,8 +182,11 @@ LeaderElector::LeaderElector(Config cfg)
       mint_params_{cfg_.lock_name, cfg_.holder_id,
                    cfg_.timeline_override_for_test ? std::to_string(*cfg_.timeline_override_for_test)
                                                    : std::string{}} {
-    // Force the first-call static init of the mint SQL here, where a bad_alloc cannot land
-    // between the advisory-lock grant and the mint in try_acquire (cpp-safety C-1).
+    // Force the first-call static init of the mint SQL here, so it cannot throw between the
+    // advisory-lock grant and the mint in try_acquire (cpp-safety C-1). exec_params still
+    // copies the parameters per call: a bad_alloc there is caught by the election loop and
+    // the next attempt re-grants the re-entrant lock (one guard owns it), a ~1 interval
+    // leaderless window, LOW.
     (void)epoch_mint_sql();
     if (!name_valid_) {
         spdlog::error("leader_elector: invalid lock_name; elector stays non-open (fail-closed)");
@@ -458,8 +468,9 @@ bool LeaderElector::try_acquire() {
         spdlog::warn("leader_elector: minted epoch's timeline part {} is above the real "
                      "Postgres timeline {}: the surviving leader_state row carries a higher "
                      "timeline (restore / pg_upgrade / cutover). Fencing within this timeline "
-                     "is unaffected, but the lossy-promotion protection is reduced until the "
-                     "real timeline exceeds {} (docs/user-manual/ha-postgres.md)",
+                     "is unaffected, but the timeline protection against a lossy promotion is "
+                     "absent (only the sequence separates epochs) until the real timeline "
+                     "reaches {} (docs/user-manual/ha-postgres.md)",
                      *parsed >> 32, *real_tl, *parsed >> 32);
     }
     // holder_id (boot-random, not a secret) is logged once per acquire so a

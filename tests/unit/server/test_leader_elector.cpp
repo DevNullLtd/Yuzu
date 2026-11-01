@@ -427,6 +427,35 @@ TEST_CASE("LeaderElector mint is floored by a surviving row from a HIGHER timeli
     CHECK(*a.epoch() == e + 1);
 }
 
+TEST_CASE("LeaderElector keeps the sequence live while a restored row pins a HIGHER timeline (lossy promotion inside the pinned window; #6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    const std::string lock_name = kServerBackgroundLeaderLock;
+    auto admin = connect(db.dsn());
+    // A cluster restored from timeline 5 onto a real timeline 1. With the row floor alone every
+    // mint would be exactly row+1, so a lossy promotion that loses the latest mint would
+    // re-mint the value the paused ex-leader holds. The packed term therefore takes
+    // GREATEST(real timeline, row timeline), and the SEQUENCE keeps separating epochs.
+    seed_leader_row(admin.get(), lock_name, "(5::bigint << 32) + 40");
+    exec_ok(admin.get(), "SELECT setval('leader_elector.leader_epoch_seq', 40, true)");
+    LeaderElector a(cfg_tl(db.dsn(), "ex-leader", 1));
+    REQUIRE(a.try_acquire());
+    const std::int64_t e_a = *a.epoch();
+    CHECK(e_a == (std::int64_t{5} << 32) + 41);
+    a.resign(); // its backend died with the old primary
+
+    // The promoted standby lacks A's mint: the row is as before, and its sequence resumes
+    // past the pre-logged horizon (Postgres WAL-logs a sequence 32 values ahead).
+    seed_leader_row(admin.get(), lock_name, "(5::bigint << 32) + 40");
+    exec_ok(admin.get(), "SELECT setval('leader_elector.leader_epoch_seq', 72, true)");
+    LeaderElector b(cfg_tl(db.dsn(), "new-leader", 1));
+    REQUIRE(b.try_acquire());
+    CHECK(*b.epoch() == (std::int64_t{5} << 32) + 73);
+    CHECK(*b.epoch() != e_a);
+    auto claim = connect(db.dsn());
+    CHECK_FALSE(eval_bool(claim.get(), LeaderElector::epoch_fence_sql(lock_name, e_a)));
+}
+
 TEST_CASE("LeaderElector mint is floored when the sequence is OLDER than the row on the same timeline (#6535)",
           "[pg][store][leader-elector]") {
     YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
@@ -592,6 +621,8 @@ TEST_CASE("LeaderElector refuses to open when the timeline cannot be read, and h
     auto admin = connect(db.dsn());
     const std::string dbname = current_database_name(admin.get());
     // Simulates a standby / a platform without WAL functions: pg_current_wal_lsn() raises.
+    // One stub per clone: a LANGUAGE sql pg_walfile_name stub is inlined and drops its unused
+    // argument, so a stubbed pg_current_wal_lsn would never be evaluated alongside it.
     exec_ok(admin.get(), "CREATE SCHEMA shadow");
     exec_ok(admin.get(), "CREATE FUNCTION shadow.pg_current_wal_lsn() RETURNS pg_lsn "
                          "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'recovery is in progress'; END $$");

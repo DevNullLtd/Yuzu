@@ -24,15 +24,18 @@
 ///     promotion: the promoted standby can lack the latest mint and re-mint a
 ///     value a paused ex-leader holds. Every promotion starts a new timeline
 ///     whatever WAL was lost, so the re-minted epoch differs. The surviving
-///     `leader_state` row is also a FLOOR (`GREATEST(packed, prev_epoch + 1)`),
-///     so a restore / pg_upgrade / cutover onto a lower timeline, or an older
+///     `leader_state` row is also a FLOOR (`GREATEST(packed, prev_epoch + 1)`,
+///     with the packed timeline itself `GREATEST(real, prev_epoch >> 32)`), so a
+///     restore / pg_upgrade / cutover onto a lower timeline, or an older
 ///     sequence, can never mint below it (the enablement store orders epochs).
-///     NOT covered: two live primaries (the fence is per database), a restore
-///     that loses the leader_state row, a lossy promotion while the row pins a
-///     higher timeline than the real one (the elector warns), same-timeline loss
-///     (crash recovery with an unflushed mint), promotion tooling that skips the
-///     previous timeline's history, and a rolling upgrade while a pre-#6535
-///     binary can lead (ADR-2002 §3 "Update (2026-11-01, #6535)").
+///     NOT covered (canonical list: ADR-2002 §3 "Update (2026-11-01, #6535)"):
+///     two live primaries (the fence is per database), a restore that loses the
+///     leader_state row, a lossy promotion while the row pins a higher timeline
+///     than the real one (only the sequence separates epochs there; the elector
+///     warns), same-timeline loss (crash recovery with an unflushed mint), a
+///     physical-snapshot restore without archive recovery, promotion tooling that
+///     skips the previous timeline's history or a PITR that reuses a timeline, and
+///     a rolling upgrade or downgrade across #6535.
 ///     Epochs are therefore >= 2^32; the sequence is capped at 2^32-1
 ///     (migration v2; `ALTER SEQUENCE ... RESTART` is a safe remedy because of
 ///     the floor) and a timeline outside 1..2^31-1 is refused, both as the
@@ -307,8 +310,8 @@ private:
     bool name_valid_ = false;                 ///< cfg_.lock_name passed validation.
     pg::PgAdvisoryLockKey lock_key_;          ///< Derived from cfg_.lock_name.
     /// The epoch-mint statement's bound parameters ($1 lock name, $2 holder, $3 test timeline
-    /// override as text or empty), built once in the constructor so no allocation can throw
-    /// between the advisory-lock grant and the mint in try_acquire().
+    /// override as text or empty), built once in the constructor (exec_params still copies
+    /// them per call; see the constructor note on the residual bad_alloc window).
     std::vector<std::string> mint_params_;
 
     mutable std::mutex mu_;
