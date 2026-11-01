@@ -271,8 +271,12 @@ TEST_CASE("CH-12: a hostile definition id neither 503s the execute core nor lose
         {"invalid", invalid_utf8()},
     };
 
+    // The "invalid" row below must take the step-0 refusal arm, or its exact-row assertion is moot.
+    CHECK(definition_id_is_malformed(invalid_utf8()));
+
     std::size_t hook_calls = 0, hook_failures = 0, min_rows = 0;
     for (const auto& h : ids) {
+        const std::size_t calls_before = hook_calls;
         INFO(h.label);
         Rig r;
         r.defs[h.bytes] = make_def(h.bytes);
@@ -303,6 +307,7 @@ TEST_CASE("CH-12: a hostile definition id neither 503s the execute core nor lose
             REQUIRE(ref);
             CHECK(ref->reason == "invalid_definition_id");
             CHECK(r.calls.empty());
+            CHECK(hook_calls - calls_before == 1); // exactly the ONE `denied` row, no more
             min_rows += 1;
         } else {
             CHECK(r.calls.size() == 1); // the dispatch went ahead: the `requested` row was durable

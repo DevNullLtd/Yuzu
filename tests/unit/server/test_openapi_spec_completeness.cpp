@@ -530,6 +530,15 @@ TEST_CASE("openapi_spec_json(): POST /instructions/{id}/execute documents the au
     CHECK(rsp["429"].value("description", "").find("about 25 pending approvals") !=
           std::string::npos);
     CHECK(rsp["400"].value("description", "").find("invalid_definition_id") != std::string::npos);
+    // The id refusal names invalid UTF-8 beside the control character, in the 400 text and in the
+    // "Order:" prose (both were once control-character-only).
+    CHECK(rsp["400"].value("description", "").find("invalid UTF-8") != std::string::npos);
+    const auto order_at = desc.find("Order: body depth and JSON parse, the definition id");
+    REQUIRE(order_at != std::string::npos);
+    CHECK(desc.find("invalid_definition_id for a control character or invalid UTF-8", order_at) !=
+          std::string::npos);
+    // The gateway caveat on the lower-bound count.
+    CHECK(desc.find("counts once queued for forwarding, which can still fail") != std::string::npos);
 }
 
 // The command twin's 500 carries the same typed fields as the instruction twin's (docs-writer p4-1):

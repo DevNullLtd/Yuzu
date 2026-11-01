@@ -241,6 +241,14 @@ TEST_CASE("execute: a definition id that is not valid UTF-8 is refused at step 0
         const auto* ref = as_refusal(out);
         REQUIRE(ref);
         CHECK(ref->kind == RefusalKind::kNotFound);
+        CHECK(r.lookups == 1); // step 0 did not refuse it: the lookup ran
+        // The clamp the section name claims: the denied row holds the bounded id (128 bytes plus
+        // "..."), never the 4096-byte original.
+        REQUIRE(r.audits.size() == 1);
+        CHECK(r.audits[0].detail.find(std::string(kAuditDefinitionIdMax + 1, 'a')) ==
+              std::string::npos);
+        CHECK(r.audits[0].detail.find(std::string(kAuditDefinitionIdMax, 'a') + "...") !=
+              std::string::npos);
     }
 }
 
@@ -2142,6 +2150,7 @@ TEST_CASE("REST execute: a hostile definition id never reaches the audit target_
         auto res = r.post(std::string("d\r\nx"), "{not json");
         REQUIRE(res);
         CHECK(res->status == 400);
+        CHECK(json::parse(res->body)["error"]["reason"] == "invalid_json");
         REQUIRE_FALSE(r.target_ids.empty());
         for (const auto& t : r.target_ids)
             CHECK_FALSE(has_control(t));
