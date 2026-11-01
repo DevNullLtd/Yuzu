@@ -22196,9 +22196,8 @@ private:
                              [this](const std::string& id, int reached) {
                                  if (!execution_tracker_)
                                      return false;
-                                 const bool ok = execution_tracker_->set_agents_targeted(id, reached);
-                                 execution_tracker_->refresh_counts(id);
-                                 return ok;
+                                 return yuzu::server::command_v1::set_targeted_then_refresh(
+                                     *execution_tracker_, id, reached);
                              }},
                     .metrics = &metrics_,
                     // The legacy /api/command's command.dispatched event.

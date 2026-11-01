@@ -53,8 +53,10 @@
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <cstdint>
+#include <exception>
 #include <expected>
 #include <functional>
 #include <optional>
@@ -78,11 +80,38 @@ struct ExecutionOps {
         const std::string& dispatched_by, const std::string& scope_expression,
         const std::string& parameter_values_json)>
         create;
-    /// Mark the row cancelled (zero reach, or a dispatch that threw). False = bookkeeping failed.
+    /// Mark the row cancelled (zero reach ONLY: a dispatch that threw leaves the row running, see
+    /// the throw arm of the route). False = bookkeeping failed.
     std::function<bool(const std::string& execution_id, const std::string& by)> mark_cancelled;
-    /// Record how many agents were reached and refresh the counts. False = bookkeeping failed.
+    /// Record how many agents were reached and refresh the counts. False = the COUNT WRITE failed
+    /// (a refresh failure is not reported here: see `set_targeted_then_refresh`).
     std::function<bool(const std::string& execution_id, int agents_reached)> set_targeted;
 };
+
+/// The server's binding of `ExecutionOps::set_targeted` over an execution tracker: store the
+/// targeted count, then refresh the row's counters so a response that arrived BEFORE the count
+/// can promote it. The return value reflects the COUNT WRITE only: a refresh that throws is
+/// logged and swallowed, because the count is stored and the route's `recorded` flag (and the
+/// `bookkeeping_failed{op=set_agents_targeted}` counter that hangs off it) would otherwise
+/// report a write failure that did not happen. A throw from the count write itself propagates
+/// (the route catches it).
+template <class Tracker>
+[[nodiscard]] bool set_targeted_then_refresh(Tracker& tracker, const std::string& execution_id,
+                                             int agents_reached) {
+    const bool ok = tracker.set_agents_targeted(execution_id, agents_reached);
+    try {
+        tracker.refresh_counts(execution_id);
+    } catch (const std::exception& e) {
+        spdlog::warn("set_agents_targeted: refresh_counts threw for execution_id={} (the count "
+                     "write {}): {}",
+                     execution_id, ok ? "succeeded" : "failed", e.what());
+    } catch (...) {
+        spdlog::warn("set_agents_targeted: refresh_counts threw a non-standard exception for "
+                     "execution_id={}",
+                     execution_id);
+    }
+    return ok;
+}
 
 struct Deps {
     using AuthFn =

@@ -374,9 +374,9 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
     // arm upgrades them when it learns a partial count, and keeps these if that cannot allocate.
     // No retry hint in either: whether any agent received the command is unknown, and a blind
     // retry could dispatch it twice.
-    std::string threw_detail = "reason=dispatch_exception " + what +
-                               " execution_id=" + audit_token(execution_id) +
-                               " correlation_id=" + cid;
+    const std::string cid_tail = " correlation_id=" + cid; // kept apart: agents_sent goes BEFORE it
+    std::string threw_detail =
+        "reason=dispatch_exception " + what + " execution_id=" + audit_token(execution_id) + cid_tail;
     std::string threw_remediation =
         execution_id.empty()
             ? "the dispatch failed part-way and some agents may already have received the "
@@ -385,7 +385,9 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
             : "the dispatch failed part-way and some agents may already have received the "
               "command; the execution was left running, not cancelled, so results from any agent "
               "that did receive it are still recorded against it: check its per-agent results "
-              "before sending it again";
+              "before sending it again; the server closes the record by itself ONLY if no agent "
+              "ever responds, a record an agent has answered will NOT close by itself, and "
+              "cancel_execution (POST /api/v1/executions/{id}/cancel) closes it";
 
     ConfinedDispatchOutcome outcome;
     SendProgress progress; // sends confirmed before a throw (dispatch_send_progress.hpp)
@@ -414,8 +416,9 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
         // stuck-execution reaper excludes any row an agent has answered). With NO confirmed send
         // the row stays at 0 and the reaper cancels it if no agent ever answers. The count is a
         // lower bound (see dispatch_send_progress.hpp).
+        const bool any_sent = progress.sent > 0;
         bool recorded = false;
-        if (progress.sent > 0 && !execution_id.empty() && d.execution.set_targeted) {
+        if (any_sent && !execution_id.empty() && d.execution.set_targeted) {
             try {
                 recorded = d.execution.set_targeted(execution_id, progress.sent);
             } catch (...) {
@@ -428,19 +431,41 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
                 count_bookkeeping_failed(d.metrics, "set_agents_targeted");
             }
         }
-        if (recorded) {
+        if (any_sent) {
+            // `agents_sent` is on the row and in the body whenever it is known, whether or not
+            // the count could be stored: it is the evidence of how far the fan-out got. The
+            // remediation claims "will complete it" only when the count really was stored.
             try {
-                std::string detail_text = threw_detail + " agents_sent=" + std::to_string(progress.sent);
+                threw_detail.insert(threw_detail.size() - cid_tail.size(),
+                                    " agents_sent=" + std::to_string(progress.sent));
+            } catch (...) { // NOLINT(bugprone-empty-catch): the pre-built row text stands
+            }
+            try {
                 std::string remediation =
                     "the dispatch failed part-way: at least " + std::to_string(progress.sent) +
                     " agent(s) were sent the command before the failure, and others may also have "
-                    "received it; the execution was left running (not cancelled) with " +
-                    std::to_string(progress.sent) +
-                    " agent(s) targeted, so results from those agents are still recorded against "
-                    "it and will complete it: check its per-agent results before sending it "
-                    "again, and close it with cancel_execution (POST "
-                    "/api/v1/executions/{id}/cancel) if it should not wait";
-                threw_detail = std::move(detail_text);
+                    "received it; ";
+                if (execution_id.empty()) {
+                    remediation += "no execution record was created, so there are no per-agent "
+                                   "results to check; confirm on the devices before sending it "
+                                   "again";
+                } else if (recorded) {
+                    remediation +=
+                        "the execution was left running (not cancelled) with " +
+                        std::to_string(progress.sent) +
+                        " agent(s) targeted, so results from those agents are still recorded "
+                        "against it and will complete it: check its per-agent results before "
+                        "sending it again, and close it with cancel_execution (POST "
+                        "/api/v1/executions/{id}/cancel) if it should not wait";
+                } else {
+                    remediation +=
+                        "the execution was left running (not cancelled) but its targeted count "
+                        "could NOT be recorded; the server closes the record by itself ONLY if "
+                        "no agent ever responds, and a record an agent has answered will NOT "
+                        "close by itself: check its per-agent results before sending it again, "
+                        "and close it with cancel_execution (POST "
+                        "/api/v1/executions/{id}/cancel)";
+                }
                 threw_remediation = std::move(remediation);
             } catch (...) { // NOLINT(bugprone-empty-catch): keep the pre-built generic strings
             }
@@ -448,11 +473,12 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
         (void)detail::emit_behavioral_audit(audit, req, res, "command.dispatch", "failure",
                                             "command", "", threw_detail);
         res.status = 500;
-        res.set_content(
-            error_body(res, 500, "dispatch failed", "dispatch_exception",
-                       {.remediation = std::move(threw_remediation)},
-                       nlohmann::json{{"execution_id", execution_id}}),
-            "application/json");
+        nlohmann::json threw_extra{{"execution_id", execution_id}};
+        if (any_sent)
+            threw_extra["agents_sent"] = progress.sent; // a lower bound, present only when known
+        res.set_content(error_body(res, 500, "dispatch failed", "dispatch_exception",
+                                   {.remediation = std::move(threw_remediation)}, threw_extra),
+                        "application/json");
         return;
     }
 

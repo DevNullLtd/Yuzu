@@ -114,6 +114,7 @@ struct Rig {
     bool set_targeted_ok = true;
     bool create_throws = false;
     bool create_throws_nonstd = false;
+    bool create_fails = false; ///< the tracker answers an error: the dispatch runs with execution_id ""
     int dispatch_calls = 0;
     DispatchCaller last_caller;
     std::string last_execution_id;
@@ -235,6 +236,8 @@ struct Rig {
                 throw std::runtime_error("create boom");
             if (create_throws_nonstd)
                 throw 42; // NOLINT(hicpp-exception-baseclass): a non-std throw is the point
+            if (create_fails)
+                return std::unexpected(std::string("no execution tracker"));
             return "exec-" + std::to_string(++exec_created);
         };
         d.execution.mark_cancelled = [this](const std::string& id, const std::string&) {
@@ -1006,10 +1009,22 @@ TEST_CASE("command_v1: a dispatch that throws after confirmed sends records that
     CHECK(rem.find("retry") == std::string::npos);
     CHECK(rig.has_audit("failure", "reason=dispatch_exception"));
     CHECK(rig.has_audit("failure", "agents_sent=1"));
+    // The typed field, so an agent branches on a number rather than parsing prose.
+    CHECK(err["agents_sent"] == 1);
+    // `agents_sent` sits BEFORE the trailing correlation_id token every row of a call carries.
+    for (const auto& a : rig.audits) {
+        if (a.result != "failure")
+            continue;
+        const auto at = a.detail.find("agents_sent=1");
+        const auto cid = a.detail.rfind(" correlation_id=");
+        REQUIRE(at != std::string::npos);
+        REQUIRE(cid != std::string::npos);
+        CHECK(at < cid);
+    }
 }
 
 TEST_CASE("command_v1: a dispatch that throws before any confirmed send records no count; a failed "
-          "count write keeps the generic remediation",
+          "count write still reports agents_sent and says the record will not close by itself",
           "[server][command_v1][dispatch][send_progress]") {
     SECTION("first send throws") {
         Rig rig;
@@ -1020,9 +1035,14 @@ TEST_CASE("command_v1: a dispatch that throws before any confirmed send records 
         CHECK(res->status == 500);
         CHECK(rig.targeted.empty());
         CHECK(rig.cancelled.empty());
-        CHECK(body_of(res)["error"]["remediation"].get<std::string>().find("not cancelled") !=
-              std::string::npos);
+        const auto rem = body_of(res)["error"]["remediation"].get<std::string>();
+        CHECK(rem.find("not cancelled") != std::string::npos);
+        // The generic text states the record closes by itself ONLY if no agent ever responds.
+        CHECK(rem.find("ONLY if no agent ever responds") != std::string::npos);
+        CHECK(rem.find("will NOT close by itself") != std::string::npos);
+        CHECK(rem.find("cancel_execution") != std::string::npos);
         CHECK_FALSE(rig.has_audit("failure", "agents_sent"));
+        CHECK_FALSE(body_of(res)["error"].contains("agents_sent"));
     }
     SECTION("the count write fails") {
         Rig rig;
@@ -1034,8 +1054,87 @@ TEST_CASE("command_v1: a dispatch that throws before any confirmed send records 
         CHECK(res->status == 500);
         REQUIRE(rig.targeted.size() == 1);
         CHECK(rig.targeted[0].second == 2);
-        CHECK(body_of(res)["error"]["remediation"].get<std::string>().find("will complete it") ==
-              std::string::npos);
+        // The failed write is counted (qe-c3), as the shared core's equivalent test does.
+        CHECK(rig.metrics
+                  .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                           {{"op", "set_agents_targeted"}, {"surface", "rest"}})
+                  .value() == 1);
+        const auto err = body_of(res)["error"];
+        const auto rem = err["remediation"].get<std::string>();
+        CHECK(rem.find("will complete it") == std::string::npos);
+        CHECK(rem.find("at least 2 agent(s) were sent the command") != std::string::npos);
+        CHECK(rem.find("could NOT be recorded") != std::string::npos);
+        CHECK(rem.find("ONLY if no agent ever responds") != std::string::npos);
+        CHECK(rem.find("cancel_execution") != std::string::npos);
+        // The count is known although it could not be stored: row and body still carry it.
+        CHECK(rig.has_audit("failure", "agents_sent=2"));
+        CHECK(err["agents_sent"] == 2);
+    }
+    SECTION("confirmed sends but no execution record") {
+        Rig rig;
+        rig.facts = {.legacy_open = true};
+        rig.throw_on_nth_send = 3;
+        rig.create_fails = true;
+        const auto res = rig.post({{"plugin", "os_info"}, {"action", "os_version"},
+                                   {"agent_ids", Ids{kA, kB, kC}}});
+        CHECK(res->status == 500);
+        CHECK(rig.targeted.empty()); // nothing to store the count on
+        const auto err = body_of(res)["error"];
+        const auto rem = err["remediation"].get<std::string>();
+        CHECK(rig.has_audit("failure", "agents_sent=2"));
+        CHECK(err["agents_sent"] == 2);
+        CHECK(rem.find("at least 2 agent(s) were sent the command") != std::string::npos);
+        CHECK(rem.find("no execution record was created") != std::string::npos);
+        CHECK(rem.find("cancel_execution") == std::string::npos); // there is no row
+    }
+}
+
+namespace {
+/// A tracker whose refresh_counts throws after a successful (or failed) count write.
+struct FakeTracker {
+    bool write_ok{true};
+    bool refresh_throws{false};
+    int writes{0};
+    int refreshes{0};
+    bool set_agents_targeted(const std::string&, int) {
+        ++writes;
+        return write_ok;
+    }
+    void refresh_counts(const std::string&) {
+        ++refreshes;
+        if (refresh_throws)
+            throw std::runtime_error("refresh boom");
+    }
+};
+} // namespace
+
+TEST_CASE("command_v1: set_targeted_then_refresh reports the COUNT WRITE only; a refresh that throws "
+          "is swallowed, never read as a failed write",
+          "[server][command_v1][dispatch][send_progress]") {
+    using yuzu::server::command_v1::set_targeted_then_refresh;
+    SECTION("write ok, refresh throws: still true") {
+        FakeTracker t;
+        t.refresh_throws = true;
+        CHECK(set_targeted_then_refresh(t, "exec-1", 2));
+        CHECK(t.writes == 1);
+        CHECK(t.refreshes == 1);
+    }
+    SECTION("write failed, refresh throws: false (the write failure is the report)") {
+        FakeTracker t;
+        t.write_ok = false;
+        t.refresh_throws = true;
+        CHECK_FALSE(set_targeted_then_refresh(t, "exec-1", 2));
+    }
+    SECTION("the refresh still runs after a failed write") {
+        FakeTracker t;
+        t.write_ok = false;
+        CHECK_FALSE(set_targeted_then_refresh(t, "exec-1", 2));
+        CHECK(t.refreshes == 1);
+    }
+    SECTION("happy path") {
+        FakeTracker t;
+        CHECK(set_targeted_then_refresh(t, "exec-1", 2));
+        CHECK(t.refreshes == 1);
     }
 }
 
