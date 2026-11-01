@@ -905,6 +905,9 @@ struct McpTestServer {
     // Non-empty: only an audit row whose `result` equals this (e.g. "denied") reports a
     // persistence failure; every other row persists.
     std::string audit_fail_result_;
+    /// Fail only the audit row whose "<action>|<result>" equals this (unlike audit_fail_result_,
+    /// which fails every row with that result, including the tool-level mcp.<tool> row).
+    std::string audit_fail_action_result_;
     bool audit_throws_{false};          // true → AuditFn throws (bad_alloc-class) (#1647)
     bool read_only_mode_{false};        // captured by ref by build_handler
     bool mcp_disabled_{false};          // captured by ref by build_handler
@@ -1579,6 +1582,8 @@ private:
             if (audit_throws_)
                 throw std::runtime_error("audit DB write blew up"); // bad_alloc-class (#1647)
             if (!audit_fail_result_.empty() && result == audit_fail_result_)
+                return false;
+            if (!audit_fail_action_result_.empty() && action + "|" + result == audit_fail_action_result_)
                 return false;
             if (audit_succeeds_for_action_)
                 return audit_succeeds_for_action_(action);
@@ -44366,6 +44371,106 @@ TEST_CASE("MCP cancel_execution / record_execution_rerun: the attempted audit ro
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
         CHECK(fs.effects() == 0);
+    }
+}
+
+TEST_CASE("MCP cancel_execution / record_execution_rerun: a lost denial/failure row on a refusal "
+          "is flagged as error.data.audit_persisted:false, and an intact one leaves the error "
+          "byte-for-byte as before (ca8-2)",
+          "[mcp][execution][mutation][security][2146][ca8-2]") {
+    for (const char* tool : {"cancel_execution", "record_execution_rerun"}) {
+        INFO("tool=" << tool);
+        const std::string args = R"({"execution_id":"exec-1"})";
+        SECTION("a confined caller probing a hidden id, denied row lost") {
+            McpExecFake fs;
+            fs.exec = mcp_exec("alice", 1);
+            fs.statuses = {mcp_exec_status("hidden")};
+            McpTestServer ts;
+            ts.execution_mutation_ports_for_test = fs.ports();
+            ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                           const std::string&, const std::string&)
+                -> yuzu::server::authz::FleetReadGate {
+                return {true, mcp_exec_scope({"a"})};
+            };
+            // Only the SEQUENCE's denied row is lost (the tool-level mcp.<tool> row persists), so
+            // this isolates the outcome's audit_persisted from the handler's own audit result.
+            ts.audit_fail_action_result_ =
+                std::string(std::string_view(tool) == "cancel_execution" ? "execution.cancel"
+                                                                         : "execution.rerun") +
+                "|denied";
+            ts.start("operator");
+            auto res = exec_tool_call(ts, tool, args);
+            REQUIRE(res);
+            const auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            REQUIRE(body["error"].contains("data"));
+            CHECK(body["error"]["data"]["audit_persisted"] == false);
+            CHECK(fs.effects() == 0);
+        }
+        SECTION("control: the same probe with a healthy sink has no data object") {
+            McpExecFake fs;
+            fs.exec = mcp_exec("alice", 1);
+            fs.statuses = {mcp_exec_status("hidden")};
+            McpTestServer ts;
+            ts.execution_mutation_ports_for_test = fs.ports();
+            ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                           const std::string&, const std::string&)
+                -> yuzu::server::authz::FleetReadGate {
+                return {true, mcp_exec_scope({"a"})};
+            };
+            ts.start("operator");
+            auto res = exec_tool_call(ts, tool, args);
+            REQUIRE(res);
+            const auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK_FALSE(body["error"].contains("data"));
+        }
+    }
+    SECTION("rerun: the original vanished after admission, denied row lost") {
+        McpExecFake fs;
+        fs.exec = mcp_exec("alice", 1);
+        fs.rerun_result = std::unexpected(yuzu::server::ExecutionTracker::RerunError::kOriginalNotFound);
+        McpTestServer ts;
+        ts.execution_mutation_ports_for_test = fs.ports();
+        ts.audit_fail_action_result_ = "execution.rerun|denied";
+        ts.start("operator");
+        auto res = exec_tool_call(ts, "record_execution_rerun", R"({"execution_id":"exec-1"})");
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        REQUIRE(body["error"].contains("data"));
+        CHECK(body["error"]["data"]["audit_persisted"] == false);
+    }
+    SECTION("only the tool-level mcp.<tool> row is lost: the refusal is flagged too") {
+        McpExecFake fs;
+        fs.exec = mcp_exec("alice", 1);
+        fs.cancel_outcome = yuzu::server::ExecutionTracker::MarkCancelledOutcome::kNoOp;
+        McpTestServer ts;
+        ts.execution_mutation_ports_for_test = fs.ports();
+        ts.audit_fail_action_result_ = "mcp.cancel_execution|denied";
+        ts.start("operator");
+        auto res = exec_tool_call(ts, "cancel_execution", R"({"execution_id":"exec-1"})");
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["data"]["audit_persisted"] == false);
+    }
+    SECTION("rerun: an unreadable store, failure row lost, keeps its retry hint") {
+        McpExecFake fs;
+        fs.exec = mcp_exec("alice", 1);
+        fs.rerun_result = std::unexpected(yuzu::server::ExecutionTracker::RerunError::kStoreDegraded);
+        McpTestServer ts;
+        ts.execution_mutation_ports_for_test = fs.ports();
+        ts.audit_fail_action_result_ = "execution.rerun|failure";
+        ts.start("operator");
+        auto res = exec_tool_call(ts, "record_execution_rerun", R"({"execution_id":"exec-1"})");
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(body["error"]["data"]["audit_persisted"] == false);
     }
 }
 

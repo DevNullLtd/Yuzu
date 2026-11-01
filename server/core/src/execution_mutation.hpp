@@ -114,7 +114,13 @@ struct ExecutionMutationOutcome {
     ExecutionMutationStatus status{ExecutionMutationStatus::kStoreDegraded};
     /// Rerun + kDone: the id of the new pending record.
     std::string new_execution_id;
-    /// False when the OUTCOME audit row failed to persist after the effect had happened.
+    /// False when the audit row that records THIS outcome failed to persist: the outcome row after
+    /// the effect had happened (`kDone`, `kStoreFailed`, `kAlreadyFinished`, `kEffectThrew`), or the
+    /// `denied` / `failure` row of a refusal that wrote one (`kNotFound` for a confined caller,
+    /// the rerun `kNotFound` / `kStoreDegraded`). True when no row was owed (no principal, an
+    /// unreadable store before any row, an unconfined unknown id). Every non-`kDone` status
+    /// carries it, and every surface must signal a lost row (REST `Sec-Audit-Failed`, MCP
+    /// `error.data.audit_persisted:false`); `kAuditFailed` is itself the lost-row answer.
     bool audit_persisted{true};
 };
 

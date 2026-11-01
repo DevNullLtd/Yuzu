@@ -12907,13 +12907,21 @@ void RestApiV1::register_routes(
                 "application/json");
             return;
         case S::kStoreDegraded:
+            // A rerun whose store went unreadable after the `attempted` row writes a `failure`
+            // row; a lost one is signalled like every other refusal row (ca8-2).
+            if (!outcome.audit_persisted)
+                res.set_header("Sec-Audit-Failed", "true");
             res.status = 503;
             res.set_content(detail::a4_error(res, "execution tracker degraded",
                                              {.retry_after_ms = 5000}),
                             "application/json");
             return;
         case S::kNotFound:
-            // Identical for a nonexistent id and one hidden from this caller.
+            // Identical for a nonexistent id and one hidden from this caller. The confined
+            // caller's `denied` row is the evidence of the probe: when it is lost the response
+            // says so (ca8-2) without changing its shape.
+            if (!outcome.audit_persisted)
+                res.set_header("Sec-Audit-Failed", "true");
             res.status = 404;
             res.set_content(detail::a4_error(res, "execution not found"), "application/json");
             return;

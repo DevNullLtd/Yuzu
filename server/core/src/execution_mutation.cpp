@@ -112,9 +112,12 @@ ExecutionMutationOutcome apply_execution_mutation(const ExecutionMutationPorts& 
             // One deny shape for nonexistent, zero-visible, partial and incomplete-cohort: a
             // distinct status or detail for "partial visibility" would be a hidden-cohort
             // oracle (#3789). The row says so without saying which.
-            (void)write_audit(audit, action, "denied", id,
-                              with_context("not found or outside caller's fleet-read scope",
-                                           req.audit_context));
+            // ca8-2: the surfaces signal a lost row (Sec-Audit-Failed / audit_persisted:false),
+            // so the result is carried on the outcome rather than dropped.
+            out.audit_persisted =
+                write_audit(audit, action, "denied", id,
+                            with_context("not found or outside caller's fleet-read scope",
+                                         req.audit_context));
             out.status = Status::kNotFound;
             return out;
         }

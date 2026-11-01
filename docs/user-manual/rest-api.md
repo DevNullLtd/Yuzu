@@ -6817,13 +6817,13 @@ asks for a fresh MFA proof.
 **Confinement.** A caller confined to management groups may use these only on an execution they
 dispatched that no device has reported on yet, or one whose complete targeted device list is visible
 to them. Every other case, including an id that does not exist, answers the same `404` body and
-writes the same `denied` audit row, so a hidden execution cannot be told from a missing one.
+writes the same `denied` audit row (when that row is lost the `404` carries `Sec-Audit-Failed: true`), so a hidden execution cannot be told from a missing one.
 An unconfined caller naming an unknown id gets the `404` and no audit row. A caller whose identity
 cannot be resolved is refused with a `503` and no `retry_after_ms` (the credential names no principal, so retrying with it cannot succeed; use a different credential); there is no fallback user.
 
 **Audit (fail closed).** Both write `execution.cancel` / `execution.rerun` rows. An `attempted` row
 is written **before** the change; if it cannot be saved the call answers `503` with
-`Sec-Audit-Failed: true` and changes nothing. A server with no audit sink wired is treated the same
+`Sec-Audit-Failed: true` and changes nothing. Every refusal that writes its own `denied` or `failure` row (the confined `404`, a rerun whose original vanished or whose store went unreadable) carries `Sec-Audit-Failed: true` when that row is lost, without changing the status or body. A server with no audit sink wired is treated the same
 way (`503`, `Sec-Audit-Failed: true`, no `retry_after_ms`: a configuration defect, not a transient
 fault), never as "audit off". The outcome then writes `success` (for rerun the target
 is the new record), `denied` (cancel `409`) or `failure` (`503`, or `500` when the change itself threw). If only the outcome row fails after

@@ -25522,15 +25522,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     },
                     bind_event_emit(emit_event_fn_, req, metrics));
                 if (outcome.status != ExecutionMutationStatus::kDone) {
-                    mcp_audit(outcome.status == ExecutionMutationStatus::kNotFound ||
-                                      outcome.status == ExecutionMutationStatus::kAlreadyFinished
-                                  ? "denied"
-                                  : "error",
-                              audit_caller_id(*exec_id));
+                    const bool tool_audit_ok = mcp_audit(
+                        outcome.status == ExecutionMutationStatus::kNotFound ||
+                                outcome.status == ExecutionMutationStatus::kAlreadyFinished
+                            ? "denied"
+                            : "error",
+                        audit_caller_id(*exec_id));
                     const auto err = exec_mutation_mcp_error(mreq.what, outcome, *exec_id);
-                    res.set_content(err.retry_after_ms >= 0 || err.envelope
+                    // ca8-2: a lost denial/failure row (the sequence's or this tool's own) is
+                    // signalled on EVERY refusal as error.data.audit_persisted:false, the
+                    // instruction twin's convention; a refusal with intact rows is byte-unchanged.
+                    const bool audit_ok = tool_audit_ok && outcome.audit_persisted;
+                    res.set_content(!audit_ok || err.retry_after_ms >= 0 || err.envelope
                                         ? a4_error(err.code, err.message, err.remediation,
-                                                   err.retry_after_ms)
+                                                   err.retry_after_ms, {}, audit_ok)
                                         : error_response(id, err.code, err.message),
                                     "application/json");
                     return;
@@ -25614,13 +25619,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     },
                     bind_event_emit(emit_event_fn_, req, metrics));
                 if (outcome.status != ExecutionMutationStatus::kDone) {
-                    mcp_audit(outcome.status == ExecutionMutationStatus::kNotFound ? "denied"
-                                                                                    : "error",
-                              audit_caller_id(*exec_id));
+                    const bool tool_audit_ok = mcp_audit(
+                        outcome.status == ExecutionMutationStatus::kNotFound ? "denied" : "error",
+                        audit_caller_id(*exec_id));
                     const auto err = exec_mutation_mcp_error(mreq.what, outcome, *exec_id);
-                    res.set_content(err.retry_after_ms >= 0 || err.envelope
+                    // ca8-2: see cancel_execution above.
+                    const bool audit_ok = tool_audit_ok && outcome.audit_persisted;
+                    res.set_content(!audit_ok || err.retry_after_ms >= 0 || err.envelope
                                         ? a4_error(err.code, err.message, err.remediation,
-                                                   err.retry_after_ms)
+                                                   err.retry_after_ms, {}, audit_ok)
                                         : error_response(id, err.code, err.message),
                                     "application/json");
                     return;

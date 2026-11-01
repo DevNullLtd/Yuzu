@@ -684,6 +684,74 @@ TEST_CASE("execution mutation: a throwing event hook never changes the outcome (
     }
 }
 
+TEST_CASE("execution mutation: every refusal that writes a denial/failure row carries its persistence "
+          "(ca8-2), and a refusal that owes no row reports persisted",
+          "[execution][mutation][security][2146][ca8-2]") {
+    for (const auto what : {ExecutionMutation::kCancel, ExecutionMutation::kRerun}) {
+        INFO("what=" << (what == ExecutionMutation::kCancel ? "cancel" : "rerun"));
+        SECTION("confined caller probing a nonexistent id: the denied row is lost") {
+            FakeStore fs; // no execution at all
+            AuditRecorder audit{&fs};
+            audit.fail_result = "denied";
+            const auto out =
+                apply_execution_mutation(fs.ports(), req(what, "bob", scope_of({"a"})), audit.fn());
+            CHECK(out.status == S::kNotFound);
+            CHECK_FALSE(out.audit_persisted);
+        }
+        SECTION("confined caller probing a hidden id: the denied row is lost") {
+            FakeStore fs;
+            fs.exec = make_exec("alice", 1);
+            fs.statuses = {st("hidden")};
+            AuditRecorder audit{&fs};
+            audit.fail_result = "denied";
+            const auto out =
+                apply_execution_mutation(fs.ports(), req(what, "bob", scope_of({"a"})), audit.fn());
+            CHECK(out.status == S::kNotFound);
+            CHECK_FALSE(out.audit_persisted);
+            CHECK(fs.effects() == 0);
+        }
+        SECTION("control: the same probe with a healthy sink reports persisted") {
+            FakeStore fs;
+            AuditRecorder audit{&fs};
+            const auto out =
+                apply_execution_mutation(fs.ports(), req(what, "bob", scope_of({"a"})), audit.fn());
+            CHECK(out.status == S::kNotFound);
+            CHECK(out.audit_persisted);
+        }
+        SECTION("an unconfined unknown id owes no row, so a failing sink changes nothing") {
+            FakeStore fs;
+            AuditRecorder audit{&fs};
+            audit.fail_result = "denied";
+            const auto out = apply_execution_mutation(fs.ports(), req(what, "bob"), audit.fn());
+            CHECK(out.status == S::kNotFound);
+            CHECK(out.audit_persisted);
+            CHECK(audit.rows.empty());
+        }
+    }
+    SECTION("rerun: the original vanished after admission, the denied row is lost") {
+        FakeStore fs;
+        fs.exec = make_exec("alice", 1);
+        fs.rerun_result = std::unexpected(ExecutionTracker::RerunError::kOriginalNotFound);
+        AuditRecorder audit{&fs};
+        audit.fail_result = "denied";
+        const auto out = apply_execution_mutation(
+            fs.ports(), req(ExecutionMutation::kRerun, "bob"), audit.fn());
+        CHECK(out.status == S::kNotFound);
+        CHECK_FALSE(out.audit_persisted);
+    }
+    SECTION("rerun: an unreadable store, the failure row is lost") {
+        FakeStore fs;
+        fs.exec = make_exec("alice", 1);
+        fs.rerun_result = std::unexpected(ExecutionTracker::RerunError::kStoreDegraded);
+        AuditRecorder audit{&fs};
+        audit.fail_result = "failure";
+        const auto out = apply_execution_mutation(
+            fs.ports(), req(ExecutionMutation::kRerun, "bob"), audit.fn());
+        CHECK(out.status == S::kStoreDegraded);
+        CHECK_FALSE(out.audit_persisted);
+    }
+}
+
 // ── the REST v1 routes ──────────────────────────────────────────────────────
 
 namespace {
@@ -999,6 +1067,76 @@ TEST_CASE("REST POST cancel/rerun: a throwing effect is a 500 with NO retry hint
         REQUIRE(res);
         CHECK(res->status == 500);
         CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    }
+}
+
+TEST_CASE("REST POST cancel/rerun: a lost denial/failure row on a refusal sets Sec-Audit-Failed "
+          "without changing the refusal (ca8-2)",
+          "[rest][executions][mutation][security][2146][ca8-2]") {
+    for (const char* verb : {"cancel", "rerun"}) {
+        const std::string path = std::string("/api/v1/executions/exec-1/") + verb;
+        INFO("verb=" << verb);
+        SECTION("a confined caller probing a hidden id, denied row lost") {
+            RestHarness h;
+            h.scope = scope_of({"a"});
+            h.audit_fail_result = "denied";
+            h.store.exec = make_exec("alice", 1);
+            h.store.statuses = {st("hidden")};
+            auto res = h.sink.Post(path, "");
+            REQUIRE(res);
+            CHECK(res->status == 404);
+            CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+            CHECK(h.store.effects() == 0);
+        }
+        SECTION("a confined caller probing a nonexistent id, denied row lost") {
+            RestHarness h;
+            h.scope = scope_of({"a"});
+            h.audit_fail_result = "denied";
+            auto res = h.sink.Post(path, "");
+            REQUIRE(res);
+            CHECK(res->status == 404);
+            CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        }
+        SECTION("control: the same probe with a healthy sink carries no header") {
+            RestHarness h;
+            h.scope = scope_of({"a"});
+            h.store.exec = make_exec("alice", 1);
+            h.store.statuses = {st("hidden")};
+            auto res = h.sink.Post(path, "");
+            REQUIRE(res);
+            CHECK(res->status == 404);
+            CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+        }
+    }
+    SECTION("rerun: the original vanished after admission, denied row lost") {
+        RestHarness h;
+        h.audit_fail_result = "denied";
+        h.store.exec = make_exec("alice", 4);
+        h.store.rerun_result = std::unexpected(ExecutionTracker::RerunError::kOriginalNotFound);
+        auto res = h.sink.Post("/api/v1/executions/exec-1/rerun", "");
+        REQUIRE(res);
+        CHECK(res->status == 404);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    }
+    SECTION("rerun: an unreadable store, failure row lost") {
+        RestHarness h;
+        h.audit_fail_result = "failure";
+        h.store.exec = make_exec("alice", 4);
+        h.store.rerun_result = std::unexpected(ExecutionTracker::RerunError::kStoreDegraded);
+        auto res = h.sink.Post("/api/v1/executions/exec-1/rerun", "");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(body_of(*res)["error"]["retry_after_ms"] == 5000);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    }
+    SECTION("an unreadable admission read writes no row, so there is nothing to flag") {
+        RestHarness h;
+        h.audit_fail_result = "denied";
+        h.store.degrade_exec = true;
+        auto res = h.sink.Post("/api/v1/executions/exec-1/cancel", "");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed").empty());
     }
 }
 
