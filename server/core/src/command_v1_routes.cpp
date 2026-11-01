@@ -262,9 +262,10 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
             break;
         }
         if (denial.reason == detail::DispatchDenialReason::ApprovalRequired)
-            text.remediation = "dispatch as an administrator, or run this action through "
-                               "POST /api/instructions/{id}/execute, which supports the approval "
-                               "workflow";
+            text.remediation = "this route creates no approval ticket and accepts none: dispatch "
+                               "as an administrator. POST /api/instructions/{id}/execute "
+                               "dispatches through the same gate, and an approval created there "
+                               "cannot be redeemed yet (#6064)";
         spdlog::warn("dispatch denied: {} reason={} securable={} caller={}", what, reason,
                      audit_token(denial.securable), audit_token(session.username));
         if (d.metrics != nullptr) {

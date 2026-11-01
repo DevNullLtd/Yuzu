@@ -325,7 +325,9 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
      kDefinitions},
     {"Product packs", "installed bundles of instruction/policy/workflow content", kProductPacks},
     {"Command responses", "query and aggregate stored command/instruction responses", kResponses},
-    {"Executions & audit", "execution status/history and the who-did-what audit log",
+    {"Executions & audit",
+     "execution status/history, cancelling an execution record or recording a rerun (neither "
+     "sends anything to a device), and the who-did-what audit log",
      kExecutionsAudit},
     {"Inventory & software",
      "collected inventory tables, installed software, hardware CI records, and licenses",

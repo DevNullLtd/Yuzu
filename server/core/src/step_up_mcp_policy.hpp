@@ -62,10 +62,11 @@ inline constexpr std::string_view kReadOnlyOperation =
 
 /// The closed list of reasons a kExempt MCP row may carry. A new reason is a new constant in
 /// `step_up_policy.hpp` (or above) AND an entry here: the class name is the review record.
-inline constexpr std::array<std::string_view, 6> kMcpExemptReasons = {
+inline constexpr std::array<std::string_view, 7> kMcpExemptReasons = {
     step_up_detail::kExecutionDispatch, step_up_detail::kOperationalData,
     step_up_detail::kSyncTrigger,       step_up_detail::kEvidenceCapture,
-    step_up_detail::kCancelsRecord,      kReadOnlyOperation,
+    step_up_detail::kCancelsRecord,     step_up_detail::kCreatesRerunRecord,
+    kReadOnlyOperation,
 };
 
 [[nodiscard]] constexpr McpStepUpPolicyEntry exempt(std::string_view tool, std::string_view reason,
@@ -102,7 +103,7 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::exempt ("create_result_set_from_instruction_result", step_up_detail::kOperationalData, "POST", R"(/api/v1/result-sets/from-instruction-result)"),
     step_up_mcp_detail::exempt ("execute_bundle",                       step_up_detail::kExecutionDispatch, "POST",   R"(/api/v1/bundles)"),
     step_up_mcp_detail::exempt ("execute_instruction",                  step_up_detail::kExecutionDispatch, "POST",   R"(/api/v1/commands)"),
-    step_up_mcp_detail::exempt ("record_execution_rerun",               step_up_detail::kExecutionDispatch, "POST",   R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/rerun)"),
+    step_up_mcp_detail::exempt ("record_execution_rerun",               step_up_detail::kCreatesRerunRecord, "POST",  R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/rerun)"),
     step_up_mcp_detail::exempt ("execute_instruction_definition",       step_up_detail::kExecutionDispatch, "POST",   R"(/api/v1/instructions/([^/]+)/execute)"),
     step_up_mcp_detail::exempt ("reevaluate_result_set",                step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/(rs_[0-9a-f]+)/re-eval)"),
     step_up_mcp_detail::exempt ("sync_hardware_software",               step_up_detail::kSyncTrigger,       "POST",   R"(/api/v1/hardware/sync)"),

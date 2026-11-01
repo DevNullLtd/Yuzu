@@ -6798,8 +6798,9 @@ When the 100-row (scoped) cap drops rows, `data.result_truncated_by_cap` is adde
 #### `POST /api/v1/executions/{id}/cancel` and `POST /api/v1/executions/{id}/rerun` (#2146 batch B)
 
 REST v1 twins of the legacy `POST /api/executions/{id}/cancel` and `.../rerun` documented above;
-MCP twins `cancel_execution` and `record_execution_rerun`. All of them run the same
-admit, audit, change, audit sequence (`execution_mutation.hpp`).
+MCP twins `cancel_execution` and `record_execution_rerun`. The four v1 and MCP twins run the same
+admit, audit, change, audit sequence (`execution_mutation.hpp`); the legacy routes are untouched and
+keep their own handlers (the legacy cancel and rerun write no `attempted` row).
 
 **Neither route sends anything to any device.** Cancel only marks the execution's tracker record
 cancelled: a command a device has already received is not stopped or recalled. Rerun only creates a
@@ -6811,8 +6812,8 @@ To run the work again on devices, dispatch it.
 the fleet-read gate), in that order. A service-scoped API token is refused (`403`). A supervised-tier
 MCP token that calls these REST routes is refused (`403`, approval required on this transport); the
 MCP `cancel_execution` tool is the one that is exempt from the approval ticket (see `docs/mcp-server.md`).
-Step-up: cancel is classified "cancels a pending record" (it sends nothing to any device) and rerun "execution dispatch"; neither
-asks for a fresh MFA proof.
+Step-up: cancel is classified "cancels a pending record" and the v1 rerun "creates a pending rerun record" (each sends nothing
+to any device; the legacy rerun route keeps the class "execution dispatch"); none asks for a fresh MFA proof.
 
 **Confinement.** A caller confined to management groups may use these only on an execution they
 dispatched that no device has reported on yet, or one whose complete targeted device list is visible
@@ -11671,12 +11672,17 @@ with a redeemed approval ticket via the governed path, is not subject to this de
 The REST v1 twin of `POST /api/command` and of the MCP tool `execute_instruction`. It sends one
 plugin action to connected agents through the same confined dispatch seam, creates an execution row
 and returns its `execution_id`, so the result is collected with the execution routes. It has no UI
-fields (no `thead_html`, no `HX-Trigger`, no event published to the dashboard).
+fields (no `thead_html`, no `HX-Trigger`). A dispatch that reaches an agent does publish the
+platform event `command.dispatched` (see **Event** below), as `POST /api/command` does.
 
 Requires `Execution:Execute`. A service-scoped API token is refused at that gate (`403`); the
 service-scope allow-list is empty. Every agent the command reaches is also intersected with the
 caller's own visible set, so a caller confined by management group or by tag never reaches an agent
 outside it. An engine principal holds no authority here unless an RBAC grant gives it one.
+
+**Body size.** The route has its own `commands` body-cap class (4 MiB, `requires_measurable`, see the body
+cap table): a body that cannot be measured in advance (chunked `Transfer-Encoding`, or no `Content-Length`) is
+refused `411`, which the legacy `POST /api/command` (default class, no measurability requirement) does not do.
 
 **Request body** (a JSON object; any field not listed is refused with `reason: "unknown_field"`,
 so a legacy `stagger` or `delay` is never silently dropped):
@@ -11739,7 +11745,7 @@ carries `Sec-Audit-Failed: true` and the `requested` row remains the evidence. A
 | `400` | `destructive_untargeted`, `forensic_untargeted` | See above. |
 | `400` | `unclassified`, `ambiguous` | The `plugin`/`action` pair is not in the capability catalogue. |
 | `401` | `principal_changed` | The request's credentials resolved to two different principals; retry. |
-| `403` | `forbidden`, `approval_required`, `kill_switched`, `anonymous_operator` | The dispatch check refused the caller; `approval_required` means this route mints no approval ticket, so use an administrator or `POST /api/instructions/{id}/execute`. No `permission` field is returned. |
+| `403` | `forbidden`, `approval_required`, `kill_switched`, `anonymous_operator` | The dispatch check refused the caller; `approval_required` means this route creates no approval ticket and accepts none, so dispatch as an administrator; `POST /api/instructions/{id}/execute` dispatches through the same gate, and an approval created there cannot be redeemed yet (#6064). No `permission` field is returned. |
 | `404` | `destructive_no_visible_target` | See above. |
 | `503` | `audit_unavailable` | The `requested` row could not be stored; nothing was sent. Carries `retry_after_ms`. |
 | `500` | `dispatch_exception` | The dispatch threw. No retry hint: whether an agent received the command is unknown, so the execution row is left `running` (not cancelled) and `error.execution_id` names it; results from any agent that did receive the command are still recorded against it. |

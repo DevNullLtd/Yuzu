@@ -37,12 +37,16 @@ What an operator should know:
 
 - **Audit first, fail closed.** `POST /api/v1/commands`, the instruction execute twins and the cancel and rerun
   twins write their audit row before the effect, and refuse (`503` with `Sec-Audit-Failed: true` on the dispatch
-  routes; nothing sent or changed) when it cannot be stored. The instruction route also answers `503`
-  (`audit_unavailable`, no retry hint) rather than run without a durable audit sink if the sink is not wired at
-  boot, which a correctly started server never is. Two result
-  values are new in the audit log: `requested` (the row written before a dispatch) and `pending` (an instruction
-  execute held for approval). A SIEM rule that treats `result != "success"` as a failure now also matches them;
-  key on the outcome row, as for `attempted` (`audit-log.md`, "Result vocabulary").
+  routes; nothing sent or changed) when it cannot be stored. The REST cancel, rerun and instruction-execute routes
+  also answer `503` with `Sec-Audit-Failed: true` (`audit_unavailable`, no retry hint; nothing changed or sent)
+  rather than run without a durable audit sink if the sink is not wired, which a correctly started server never
+  is. The MCP twins rely on the production wiring instead: the server builds its audit callback unconditionally
+  and refuses to boot when the audit store cannot be opened. Two result values are newly written by these verbs
+  (other verbs already write them, for example `inventory.sync.request`): `requested` (the row written before a
+  dispatch) and `pending` (an instruction execute held for approval). A SIEM rule that treats
+  `result != "success"` as a failure now also matches them on these verbs; key on the outcome row, as for
+  `attempted` (`audit-log.md`, "Result vocabulary"). Every `instruction.execute` row now ends with a
+  `correlation_id=` that pairs a `requested` row with its outcome row and with the response the caller saw.
 - **Supervised MCP tokens.** `cancel_execution` is exempt from the supervised-tier approval ticket (it only
   updates the tracker record), the one tool on a closed exempt list; the REST route still refuses a
   supervised-tier token. `record_execution_rerun` and `execute_instruction_definition` need a ticket as any
@@ -52,6 +56,11 @@ What an operator should know:
   pending approvals with `429` (`approval_cap_reached`), the cap the MCP tools already applied. A looping script
   or agentic worker that used the legacy route without a cap will meet it on the v1 route. The legacy
   `POST /api/instructions/{id}/execute` is unchanged.
+- **Body cap on `POST /api/v1/commands`.** The route has its own `commands` body-cap class (4 MiB, and the body
+  must be measurable in advance): a request with a chunked `Transfer-Encoding` body or no `Content-Length` is
+  refused with `411`. The legacy `POST /api/command` falls under the default 4 MiB class, which does not
+  require a measurable body, so a client that streams chunked bodies to the legacy route needs to send a
+  `Content-Length` to use the v1 route.
 - **Metrics.** Two new counters, `yuzu_server_approval_submit_refused_total{reason}` and
   `yuzu_server_event_emit_failed_total{event_type}`, are pre-seeded to `0`. `yuzu_server_dispatch_target_rejected_total`
   gains `route="command_v1"`, and `yuzu_server_instruction_param_rejected_total` gains `route="mcp"`

@@ -300,7 +300,7 @@ TEST_CASE("step-up policy: every kExempt reason is one of the named exempt class
         kExecutionDispatch,  kApprovalGatedElsewhere, kOperationalData, kReadShaped,
         kSyncTrigger,        kAgentUploadProtocol,  kScimBearer,        kMcpTransport,
         kContentAuthoring,   kPolicyLifecycle,      kEvidenceCapture,   kCancelsRecord,
-        kAlertingConfig,     kMfaEnrolment,         kSchedulingGatedWork, kSelfNotificationState};
+        kCreatesRerunRecord, kAlertingConfig,     kMfaEnrolment,         kSchedulingGatedWork, kSelfNotificationState};
     std::set<std::string_view> used;
     for (const auto& e : kStepUpPolicy) {
         if (e.cls != StepUpClass::kExempt)

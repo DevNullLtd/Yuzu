@@ -105,6 +105,11 @@ inline constexpr std::string_view kEvidenceCapture = "evidence capture under its
 /// effect; do not reword it into a claim that it does (#2146 CA-4).
 inline constexpr std::string_view kCancelsRecord =
     "cancels a pending record; sends nothing to any device and starts no work";
+/// The v1 / MCP rerun twins only create a `pending` record linked through `rerun_of`; they send
+/// NOTHING to any device (the legacy `POST /api/executions/{id}/rerun` is a different route and
+/// keeps kExecutionDispatch). Exempt for the same reason as kCancelsRecord: no new work starts.
+inline constexpr std::string_view kCreatesRerunRecord =
+    "creates a pending rerun record; sends nothing to any device and starts no work";
 inline constexpr std::string_view kAlertingConfig = "alerting and notification configuration";
 inline constexpr std::string_view kMfaEnrolment =
     "MFA enrolment flow: cannot replace or remove an enabled factor";
@@ -299,7 +304,7 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     // rest_api_v1.cpp
     step_up_detail::exempt("POST",  R"(/api/v1/bundles)",                                                         step_up_detail::kExecutionDispatch),
     step_up_detail::exempt("POST",  R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/cancel)",                        step_up_detail::kCancelsRecord),
-    step_up_detail::exempt("POST",  R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/rerun)",                         step_up_detail::kExecutionDispatch),
+    step_up_detail::exempt("POST",  R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/rerun)",                         step_up_detail::kCreatesRerunRecord),
     // command_v1_routes.cpp: the REST v1 twin of /api/command and MCP execute_instruction (kExecutionDispatch, like both)
     step_up_detail::exempt("POST",  R"(/api/v1/commands)",                                                        step_up_detail::kExecutionDispatch),
     step_up_detail::pending("POST",  R"(/api/v1/echo/retention-paused/purge)"),

@@ -9140,7 +9140,8 @@ TEST_CASE("MCP: discover_instructions advertises input_schema and chaining guida
     const auto desc = (*tool)["description"].get<std::string>();
     for (const char* needle :
          {"canonical JSON Schema the server enforces", "CHAIN:", "plugin and action",
-          "string-valued", "enforced only by POST /api/instructions/{id}/execute",
+          "string-valued", "call execute_instruction_definition with definition_id",
+          "looks up no definition and enforces no stored schema",
           "no filter arguments", "count 0", "InstructionDefinition:Read",
           "input_schema_budget_exceeded", "can still be refused at execute", "at 5000 entries"})
         CHECK(desc.find(needle) != std::string::npos);

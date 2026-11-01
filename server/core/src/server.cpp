@@ -1587,7 +1587,8 @@ public:
             metrics_.counter(yuzu::server::instruction_execute::kApprovalRefusedMetric,
                              {{"reason", std::string(reason)}});
         // Event emissions by the v1 / MCP twins that THREW (the request is unaffected). Closed
-        // `event_type` set, pre-seeded; the legacy emitters keep their own counters.
+        // `event_type` set, pre-seeded. Only the v1 / MCP twins count here (event_emit_hook.hpp);
+        // the legacy routes' own emit calls do not touch this counter.
         metrics_.describe(yuzu::server::kEventEmitFailedMetric,
                           "Legacy-equivalent platform events (execution.created, "
                           "execution.completed, command.dispatched, instruction.executed, "
