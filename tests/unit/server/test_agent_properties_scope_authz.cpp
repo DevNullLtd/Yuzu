@@ -38,6 +38,7 @@
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp" // PgConn/PgResult for the mid-flight mgmt-store degrade injection
 #include "rbac_store.hpp"
 #include "test_api_token_pg_helper.hpp"  // ApiTokenStorePg
 #include "test_mgmt_group_pg_helper.hpp" // ManagementGroupStorePg
@@ -195,21 +196,95 @@ TEST_CASE("require_scoped_permission(Infrastructure,Read): group-confined operat
     CHECK_FALSE(r.ar->require_scoped_permission(req, res, "Infrastructure", "Read", "a_s"));
     CHECK(res.status == 403);
 
-    // A real denial audit row IS written (was unverifiable with the
-    // nullptr audit_store the first version of this rig used). NOT
-    // asserting target_type/target_id field placement here: the ordinary-
-    // RBAC denial branch (auth_routes.cpp ~:1124) passes agent_id
-    // positionally into the audit_log wrapper's target_type slot and its
-    // reason string into target_id, leaving detail empty -- the same
-    // slot-swap class cc93f499c fixed for confine_agent_target, but this
-    // call site was never fixed. Pre-existing, not touched by #3700's
-    // diff (auth_routes.cpp is unmodified here) -- tracked as issue #3219
-    // rather than asserted (right or wrong) by this test.
+    // A real denial audit row IS written (was unverifiable with the nullptr audit_store the
+    // first version of this rig used). #3739 also pins the field placement: the reason is in
+    // `detail`, the agent is `target_type="Agent"` / `target_id=<id>` (the call site used to
+    // pass the id and the reason positionally into target_type/target_id, #3219).
     auto rows = r.audit_store.query({});
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
     CHECK((*rows)[0].action == "auth.scoped_permission_required");
     CHECK((*rows)[0].result == "denied");
+    CHECK((*rows)[0].target_type == "Agent");
+    CHECK((*rows)[0].target_id == "a_s");
+    // A genuine no-grant: the plain "denied" form, NOT the degraded one.
+    CHECK((*rows)[0].detail == "RBAC denied Infrastructure:Read");
+}
+
+// #3739 acceptance: a denial caused by a management-group store degrade is distinguishable in
+// the audit row from a genuine no-grant denial. Same principal, same agent, same grant -- the
+// only change between the allow and the deny is the injected fault.
+TEST_CASE("require_scoped_permission: a mgmt-group store degrade is audited as degraded, "
+          "not as a genuine no-grant denial (#3739)",
+          "[pg][auth_routes][authz_gates][properties_authz][degrade]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_props_scope_tpl);
+    PropsScopeRig r{rbac_db_.dsn()};
+    r.group_assign(r.gP, "operator", "InfraReader");
+    auto req = bearer_request(r.mint());
+
+    // Healthy baseline: the in-scope agent IS admitted, so the denial below is attributable to
+    // the fault and not to an absent grant. (An allow writes no audit row.)
+    {
+        httplib::Response ok;
+        REQUIRE(r.ar->require_scoped_permission(req, ok, "Infrastructure", "Read", "a_c1"));
+    }
+
+    // Isolate the fault to the management-group store only; RBAC itself stays healthy.
+    {
+        yuzu::server::pg::PgConn c{PQconnectdb(r.mgmt_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult dr{PQexec(
+            c.get(), "DROP TABLE management_group_store.management_group_members CASCADE")};
+        REQUIRE(dr.ok());
+    }
+
+    httplib::Response res;
+    CHECK_FALSE(r.ar->require_scoped_permission(req, res, "Infrastructure", "Read", "a_c1"));
+    CHECK(res.status == 403); // still the fail-closed 403 (ADR-0041), not a 503
+
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].action == "auth.scoped_permission_required");
+    CHECK((*rows)[0].result == "denied");
+    CHECK((*rows)[0].target_type == "Agent");
+    CHECK((*rows)[0].target_id == "a_c1");
+    CHECK((*rows)[0].detail ==
+          "RBAC denied Infrastructure:Read (read degraded: mgmt_group_store)");
+}
+
+// Same chaos scenario through the OTHER mgmt-store source: the assignments read
+// (`management_group_roles`) fails FIRST in a real management-group outage, before the member
+// and ancestor reads are reached. It must be labelled as the management-group store too.
+TEST_CASE("require_scoped_permission: a mgmt-group ASSIGNMENTS-read degrade is labelled "
+          "mgmt_group_store, not rbac_store (#3739)",
+          "[pg][auth_routes][authz_gates][properties_authz][degrade]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_props_scope_tpl);
+    PropsScopeRig r{rbac_db_.dsn()};
+    r.group_assign(r.gP, "operator", "InfraReader");
+    auto req = bearer_request(r.mint());
+    {
+        httplib::Response ok;
+        REQUIRE(r.ar->require_scoped_permission(req, ok, "Infrastructure", "Read", "a_c1"));
+    }
+    {
+        yuzu::server::pg::PgConn c{PQconnectdb(r.mgmt_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult dr{PQexec(
+            c.get(), "DROP TABLE management_group_store.management_group_roles CASCADE")};
+        REQUIRE(dr.ok());
+    }
+
+    httplib::Response res;
+    CHECK_FALSE(r.ar->require_scoped_permission(req, res, "Infrastructure", "Read", "a_c1"));
+    CHECK(res.status == 403);
+
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].action == "auth.scoped_permission_required");
+    CHECK((*rows)[0].detail ==
+          "RBAC denied Infrastructure:Read (read degraded: mgmt_group_store)");
 }
 
 TEST_CASE("require_scoped_permission(Infrastructure,Write): group-confined operator "

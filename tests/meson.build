@@ -1819,6 +1819,7 @@ if build_server
       'unit/server/test_dashboard_destructive_gate.cpp', # PR6.0b: the same gate wired into POST /api/dashboard/execute
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_route_registration.cpp', # #2542 PR-6: McpServer register_routes(HttpRouteSink&, ...) seam — registration shape + kill-switch-before-auth ordering + server.cpp wiring tripwire
+      'unit/server/test_mcp_admission.cpp', # #4309: /mcp/v1/ refuses an empty-tier credential - predicate matrix, admit() effects, and the real routes behind make_admission_auth_fn on all three verbs
       'unit/server/test_mcp_server.cpp',
       'unit/server/test_mcp_session.cpp',
       'unit/server/test_mcp_stream.cpp',
@@ -3418,6 +3419,18 @@ test('echo timeline script behaviour',
   timeout: 60,
 )
 
+# MCP stdio adapter (scripts/mcp-http-adapter.js, #4309): runs the real script under node against a
+# stdlib HTTP stub on an ephemeral 127.0.0.1 port. Pins the id:null tier refusal re-addressed to the
+# request id, the synthesized -32000 for non-JSON-RPC HTTP errors, one sanitised stderr line, no token
+# or cookie leak, odd stdin lines, in-flight replies surviving stdin close, the total per-request
+# deadline and the in-flight cap. ~8 s of real waits (SSE deadline, 40 slow requests). Skips (77) without node.
+test('mcp http adapter behaviour',
+  _python3_test,
+  args: [files('test_mcp_http_adapter_behaviour.py')],
+  suite: ['server', 'docs'],
+  timeout: 120,
+)
+
 # README Docker Compose quickstart (#5419): the compose the README downloads must
 # pull released images at ${YUZU_VERSION}, persist /etc/yuzu/certs, publish 8443,
 # and take the headless admin seed at the image's --config path. Stdlib only;
@@ -4053,6 +4066,14 @@ test('same-site gate production wiring lexical gate',
   args: [files('test_same_site_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
+)
+# #4160: pins the sso-only runtime-wiring check + provider gauges in ServerImpl (source-text only;
+# its own in-file selftest mutates each pinned statement, so no separate selftest entry).
+test('sso-only runtime wiring lexical gate',
+  _python3_test,
+  args: [files('test_sso_runtime_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 test('same-site gate production wiring lexical selftest',
   _python3_test,

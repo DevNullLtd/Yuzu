@@ -1419,10 +1419,26 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // `check_scoped_permission` on the dead handle rather than falling through to
     // the legacy Read-allow.
     if (rbac_store_ && rbac_enforcement_in_effect(rbac_store_)) {
-        if (!rbac_store_->check_scoped_permission(session->username, securable_type, operation,
-                                                  agent_id, mgmt_group_store_)) {
-            audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
-                      "RBAC denied " + securable_type + ":" + operation);
+        // #3739: the checked variant tells a degrade-driven deny (a store read failed) from a
+        // definitive one, so the durable audit row can too. The RESPONSE is unchanged either way:
+        // a degraded scoped check is still a fail-closed 403 (ADR-0041 deny-on-degrade), not a 503.
+        // The detail keeps the `RBAC denied` prefix (a denial either way) and adds a greppable
+        // `read degraded:` token that does NOT reuse the 503 forms' "RBAC read degraded resolving
+        // the ITServiceOwner ceiling" phrase (upgrading.md's runbook keys on that phrase).
+        const auto scoped = rbac_store_->check_scoped_permission_checked(
+            session->username, securable_type, operation, agent_id, mgmt_group_store_);
+        if (!scoped.has_value() || !*scoped) {
+            std::string denial_detail = "RBAC denied " + securable_type + ":" + operation;
+            if (!scoped.has_value()) {
+                const char* source =
+                    scoped.error() == kRbacErrMgmtGroupReadDegraded ? "mgmt_group_store"
+                                                                    : "rbac_store";
+                denial_detail += std::string(" (read degraded: ") + source + ")";
+            }
+            // target_type/target_id/detail spelled out: passing the id and the message
+            // positionally lands the id in `target_type` and the message in `target_id` (#3219).
+            audit_log(req, "auth.scoped_permission_required", "denied", "Agent", agent_id,
+                      denial_detail);
             res.status = 403;
             const std::string perm = securable_type + ":" + operation;
             res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
@@ -3163,6 +3179,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         bool store_unavailable = false;
         bool already_enrolled = false;
         bool credential_changed = false;
+        bool enrollment_cancelled = false;
         if (is_totp) {
             // #5342 Gate 8 (F2): bind the enrolment to the credential this
             // pending login PROVED (the B4 hash carry) — a password change or
@@ -3180,10 +3197,18 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // race (or it was enrolled before this pending token committed).
                 // NOT a wrong code and NOT an outage — handled distinctly below so
                 // it neither burns a pending attempt nor emits a false
-                // store-unavailable signal (#3777, CC7.2). (A bare disable+re-init
-                // WITHOUT a subsequent winning verify leaves mfa_enrolled_at NULL,
-                // so it does NOT reach here — it stays fail-closed WriteFailed→503.)
+                // store-unavailable signal (#3777, CC7.2).
                 already_enrolled = true;
+            } else if (r.error() == AuthDBError::MfaEnrollmentCancelled) {
+                // The provisional secret this code was verified against is no longer
+                // the stored one (#3808): cleared or replaced by a disable, a
+                // re-init, the stale-provisional sweep, `--mfa-reset` or a KEK
+                // rewrap. The database cannot tell those apart, so nothing below
+                // may name a cause. Benign: nothing was enrolled. NOT a store
+                // outage — MfaEnrollmentCancelled is outside is_store_unavailable(),
+                // so no 503 / degrade counter — and NOT a wrong code. Handled
+                // distinctly below.
+                enrollment_cancelled = true;
             } else if (is_store_unavailable(r.error())) {
                 // ★ SECURITY (architect BLOCK): a decrypt/store failure must
                 // NEVER be treated as "wrong code" here either — same
@@ -3221,6 +3246,26 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                     "enrollment");
             res.status = 409;
             res.set_content(detail::a4_error(res, "MFA is already enrolled on this account"),
+                            "application/json");
+            return;
+        }
+
+        if (enrollment_cancelled) {
+            // The provisional enrollment changed under this verify. The pending
+            // token was move-erased on take-ownership above and is NOT
+            // re-inserted: its provisional secret is gone or replaced, so it is
+            // spent and the operator must sign in again to start over. No session
+            // is minted. Audited as its own benign outcome — never mfa.enroll.failed
+            // (a bad code) nor the kCritical store-unavailable event. The detail
+            // states only the observed fact, in the key=value style of
+            // `step_up_proof=...`: a SIEM or auditor reading a named cause would
+            // look for a matching mfa.disabled row that may never have existed.
+            audit_log_for_principal(req, "mfa.enroll.cancelled", "ok", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "reason=provisional_secret_changed; nothing enrolled");
+            res.status = 409;
+            res.set_content(detail::a4_error(res, "MFA enrollment was cancelled or replaced; "
+                                                  "sign in again to start over"),
                             "application/json");
             return;
         }
