@@ -2631,7 +2631,7 @@ static const ToolDef kTools[] = {
      "dispatch_exception (-32603; the dispatch failed part-way, retry_after_ms is null on "
      "purpose because some agents may already hold the command, so do NOT re-send: "
      "error.data.execution_id names the execution left running and error.data.agents_sent the "
-     "lower-bound count of agents already sent the command when known; inspect that execution "
+     "lower-bound count of agents already sent the command when known (a gateway-routed agent counts once queued for forwarding, which can still fail); inspect that execution "
      "and close it with cancel_execution if it should not wait). "
      "Service-scoped API tokens are refused. Mirrors POST /api/v1/instructions/{id}/execute. Requires Execution:Execute.",
      R"j({"type":"object","properties":{)j"

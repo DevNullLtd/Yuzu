@@ -257,8 +257,8 @@ struct Refusal {
     std::string plugin;
     std::string action;
     /// Set for kDispatchFailed only (a dispatch that THREW): the execution row the call left
-    /// running ("" when no row exists) and the lower-bound count of agents the sink confirmed a
-    /// send to before the throw (0 = none known). Both surface as typed fields on the wire
+    /// running ("" when no row exists) and the lower-bound count of agents the sink counted an
+    /// accepted send to before the throw (0 = none known). Both surface as typed fields on the wire
     /// (REST `error.execution_id` / `error.agents_sent`, MCP `error.data` likewise), exactly as
     /// POST /api/v1/commands does, so a caller reads them without parsing the remediation prose.
     std::string execution_id;
@@ -369,8 +369,9 @@ inline constexpr std::size_t kAuditDefinitionIdMax = 128;
 /// overlong forms, no surrogates, nothing above U+10FFFF, no truncated sequence). The route's path
 /// capture is percent-decoded by httplib, so `%C0%80` or `%FF` arrive as raw bytes; handed to the
 /// store they raise SQLSTATE 22021, which would read as a retryable 503 `store_unavailable` for an
-/// input that can never succeed. Reuses `yuzu::utf8_sequence_length` (log_token.hpp), the ONE
-/// server-side copy of those rules; this adds no UTF-8 logic of its own.
+/// input that can never succeed. Reuses `yuzu::utf8_sequence_length` (log_token.hpp), the documented
+/// copy of the rules whose server-side original is utf8_sanitize.hpp; this adds no UTF-8 logic of
+/// its own.
 [[nodiscard]] inline bool definition_id_is_invalid_utf8(std::string_view id) noexcept {
     for (std::size_t i = 0; i < id.size();) {
         if (static_cast<unsigned char>(id[i]) < 0x80) {

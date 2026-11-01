@@ -85,7 +85,7 @@ std::string error_data(const std::string& cid, const std::optional<int>& retry,
                                                          : nlohmann::json(remediation)}};
     if (!reason.empty())
         d["reason"] = reason;
-    // A dispatch that threw: the row it left running and the confirmed send count, as typed
+    // A dispatch that threw: the row it left running and the accepted send count, as typed
     // fields (the REST twin and POST /api/v1/commands carry the same two).
     if (refusal != nullptr && refusal->kind == RefusalKind::kDispatchFailed) {
         d["execution_id"] = refusal->execution_id;

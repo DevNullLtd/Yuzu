@@ -559,7 +559,7 @@ void cancel_row(Ctx& c, const std::string& execution_id) {
 /// Records how many agents hold the command and re-evaluates the row's counters (responses that
 /// arrived BEFORE the count was set could not move it to terminal). Returns whether the count was
 /// stored; a failure is logged and counted, never thrown. Shared by the success path and the
-/// throwing-dispatch arm, which stores the confirmed partial count.
+/// throwing-dispatch arm, which stores the partial count of sends accepted by the send path.
 bool record_targeted(Ctx& c, const std::string& execution_id, int agents) {
     const Ports& p = c.ports;
     if (!p.set_agents_targeted || execution_id.empty())
@@ -696,7 +696,7 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
     threw_refusal.execution_id = execution_id;
 
     ConfinedDispatchOutcome o;
-    SendProgress progress; // sends confirmed before a throw (dispatch_send_progress.hpp)
+    SendProgress progress; // sends accepted by the send path before a throw (dispatch_send_progress.hpp)
     bool threw = false;
     try {
         const SendProgressScope send_scope(progress);
@@ -714,7 +714,7 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
         // ORDER matters, and each step is isolated from the others' allocation failures (a second
         // bad_alloc here must never skip the failure row nor the targeted count):
         //   1. the `failure` row, first, with strings that were pre-built before the dispatch;
-        //   2. the confirmed partial count (record_targeted never throws);
+        //   2. the partial count of accepted sends (record_targeted never throws);
         //   3. the upgraded remediation text (best effort: the pre-built text is the fallback);
         //   4. the metric, last, with its labels built inside bump's own try.
         //
@@ -722,11 +722,11 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
         // `cancelled` with agents_targeted 0 would tell every reader nothing was sent, and some
         // agents may hold the command. It stays `running` (the tracker has no `failed` status).
         //
-        // When the sink confirmed sends before the throw, that count is stored as the row's
+        // When the send path accepted sends before the throw, that count is stored as the row's
         // `agents_targeted` and the counters refreshed, so the results of those agents complete
         // the row through the ordinary refresh_counts path. Without it the row could never close:
         // refresh_counts promotes only when agents_targeted > 0, and the stuck-execution reaper
-        // excludes any row an agent has answered. With NO confirmed send the row stays at 0 and
+        // excludes any row an agent has answered. With NO accepted send the row stays at 0 and
         // the reaper cancels it if no agent ever answers. The count is a lower bound (see
         // dispatch_send_progress.hpp).
         const bool any_sent = progress.sent > 0;

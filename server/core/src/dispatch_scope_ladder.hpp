@@ -466,7 +466,7 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
         [&registry](const std::vector<std::string>& candidates) {
             return registry.has_remote_presence(candidates);
         }};
-    // Counts confirmed sends into the caller's SendProgressScope when one is open (the
+    // Counts sends accepted by the send path into the caller's SendProgressScope when one is open (the
     // instruction-execute core and POST /api/v1/commands), so a throw mid fan-out still tells
     // them how many agents hold the command. Identity otherwise.
     const yuzu::server::ConfinedDispatchSink sink = yuzu::server::instrument_sink(std::move(raw_sink));

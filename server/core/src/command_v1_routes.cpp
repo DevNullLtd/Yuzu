@@ -394,7 +394,7 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
               "cancel_execution (POST /api/v1/executions/{id}/cancel) closes it";
 
     ConfinedDispatchOutcome outcome;
-    SendProgress progress; // sends confirmed before a throw (dispatch_send_progress.hpp)
+    SendProgress progress; // sends accepted by the send path before a throw (dispatch_send_progress.hpp)
     bool threw = false;
     try {
         const SendProgressScope send_scope(progress);
@@ -413,11 +413,11 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
         // would tell every reader nothing was sent. It stays `running` (the tracker has no
         // `failed` status).
         //
-        // When the sink confirmed sends before the throw, that count is stored as the row's
+        // When the send path accepted sends before the throw, that count is stored as the row's
         // `agents_targeted` (set_targeted also refreshes the counters), so those agents' results
         // complete the row through the ordinary refresh_counts path; without it the row could
         // never close (refresh_counts promotes only when agents_targeted > 0 and the
-        // stuck-execution reaper excludes any row an agent has answered). With NO confirmed send
+        // stuck-execution reaper excludes any row an agent has answered). With NO accepted send
         // the row stays at 0 and the reaper cancels it if no agent ever answers. The count is a
         // lower bound (see dispatch_send_progress.hpp).
         const bool any_sent = progress.sent > 0;

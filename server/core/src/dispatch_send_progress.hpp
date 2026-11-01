@@ -10,8 +10,8 @@
 /// row to terminal when `agents_targeted > 0`, and the stuck-execution reaper deliberately
 /// excludes any row that has a per-agent response. The instruction-execute core
 /// (`instruction_execute.cpp`) and `POST /api/v1/commands` (`command_v1_routes.cpp`) therefore
-/// open a `SendProgressScope` around the dispatch call; when it throws they record the confirmed
-/// count with `set_agents_targeted` so those agents' results complete the row normally.
+/// open a `SendProgressScope` around the dispatch call; when it throws they record the count of
+/// sends accepted by the send path with `set_agents_targeted` so those agents' results complete the row normally.
 ///
 /// HOW. A thread-local slot, not a parameter: the dispatch is synchronous on the calling thread
 /// (`ServerImpl::dispatch_confined` -> `wire_and_dispatch_confined` -> the arms' sink calls), and
@@ -41,7 +41,9 @@ namespace yuzu::server {
 struct SendProgress {
     /// Sends accepted by the send path (a `send_to` that returned true, or the count a
     /// `send_to_all_unfiltered` returned). For a gateway-routed agent that means queued for
-    /// forwarding, which can still fail afterwards: a lower bound on delivery, never a receipt.
+    /// forwarding, which can still fail afterwards. So this is a lower bound on the sends actually
+    /// made, NOT on deliveries: accepted sends can exceed the agents that received the command.
+    /// Never a receipt.
     int sent{0};
 };
 
