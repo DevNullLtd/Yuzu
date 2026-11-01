@@ -74,8 +74,10 @@ What an operator should know:
   has `retry_after_ms` null, and mints no ticket. The store binds the id as a C string, so `foo\0xyz` would
   otherwise have resolved the definition `foo` while the audit row recorded another string, and an invalid UTF-8 id would otherwise have reached Postgres and read as a retryable `503`. The legacy
   `POST /api/instructions/{id}/execute` is unchanged. On REST the audit row's `target_id` and `definition=` carry the
-  folded id for such an id (and for one holding a C1 control, U+2028 or U+2029, which is still valid and looked up as
-  usual); the fold is lossy, so read the row's `reason`. A client that sends ids exactly as `GET /api/v1/definitions`
+  same folded string for such an id (each unsafe byte becomes `_`, as does space, `=` and `,`) and for one holding a C1
+  control, U+2028 or U+2029 code point (still valid and looked up as usual); the fold is lossy: only a malformed id's
+  row says so (`reason=invalid_definition_id`), while a valid id of the second kind has the same `target_id`,
+  `definition=` and `reason` as the legitimate folded name. A client that sends ids exactly as `GET /api/v1/definitions`
   lists them is unaffected.
 - **Supervised MCP tokens.** `cancel_execution` is exempt from the supervised-tier approval ticket (it only
   updates the tracker record), the one tool on a closed exempt list; the REST route still refuses a
