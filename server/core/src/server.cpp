@@ -13833,14 +13833,24 @@ private:
     /// than closing this issue's own scope. See `forward_gateway_pending`'s
     /// doc comment for the resulting, deliberate design boundary: every
     /// branch here resolves IMMEDIATELY rather than rescheduling.
+    static void apply_gateway_forward_terminal_response(
+        detail::AgentServiceImpl* svc, const std::string& agent_id,
+        const ::yuzu::agent::v1::CommandResponse& resp) {
+        svc->process_gateway_response(agent_id, resp);
+    }
+
+    /// Build-then-apply wrapper over the two halves above/below: the build allocates (it can
+    /// throw), `apply_gateway_forward_terminal_response` is the only non-idempotent part. A call
+    /// site that must know whether the apply half was reached builds the response itself first.
     static void apply_gateway_forward_terminal_failure(detail::AgentServiceImpl* svc,
                                                         const std::string& agent_id,
                                                         const std::string& command_id,
                                                         const std::string& reason_code,
                                                         const std::string& detail_msg) {
-        svc->process_gateway_response(
-            agent_id, yuzu::server::build_gateway_forward_terminal_failure(
-                          command_id, reason_code, detail_msg));
+        apply_gateway_forward_terminal_response(
+            svc, agent_id,
+            yuzu::server::build_gateway_forward_terminal_failure(command_id, reason_code,
+                                                                  detail_msg));
     }
 
     /// Forward any commands queued for gateway-connected agents.
@@ -13856,9 +13866,9 @@ private:
     /// said "four", undercounting the pre-existing "other" branch this same
     /// PR also fixed — see `gateway_mgmt_stub_pool.hpp`'s reason-code list)
     /// now calls `apply_gateway_forward_terminal_failure` exactly once
-    /// before giving up (a SIXTH site, the spawn/setup guard around the whole
-    /// per-command body, resolves a command whose forwarding thread could not
-    /// be started with `gateway_forward_spawn_failed`; it is best effort, since
+    /// before giving up (a SIXTH reason code, at a further call site: the spawn/setup guard around
+    /// the whole per-command body, resolves a command whose forwarding could not be set up
+    /// or started with `gateway_forward_spawn_failed`; it is best effort, since
     /// the resolver allocates too and can fail under the same pressure, which
     /// is logged at error level), gated on `applied_terminal` so a genuinely
     /// unresolved command_id ALWAYS eventually reaches a terminal state —
@@ -14009,11 +14019,18 @@ private:
                 // --gateway-cluster-addr, which time alone does not fix.
                 // Resolve the command_id terminally now rather than leaving
                 // it stuck forever.
-                resolve_attempted = true; // a resolver that throws is NOT retried by the handler
-                apply_gateway_forward_terminal_failure(
-                    &agent_service_, gp.agent_id, cmd_id, "gateway_unknown_cluster",
-                    "No configured mgmt address for cluster '" +
-                        gp.cluster_id.value_or("<none>") + "' — command not delivered");
+                // Every allocation (the detail text, the protobuf) happens BEFORE the flag is set:
+                // a bad_alloc there leaves the flag false, so the handler below still resolves
+                // the command. The flag goes up immediately before the one non-idempotent step,
+                // process_gateway_response, whose partial failure is NOT retried by the handler.
+                const auto unknown_cluster_response =
+                    yuzu::server::build_gateway_forward_terminal_failure(
+                        cmd_id, "gateway_unknown_cluster",
+                        "No configured mgmt address for cluster '" +
+                            gp.cluster_id.value_or("<none>") + "' — command not delivered");
+                resolve_attempted = true;
+                apply_gateway_forward_terminal_response(&agent_service_, gp.agent_id,
+                                                        unknown_cluster_response);
                 continue;
             }
             auto* stub = resolution.stub;
@@ -14341,8 +14358,9 @@ private:
                                                                        : expected_agent_id;
                     apply_gateway_forward_terminal_failure(
                         &agent_service_, aid, cid, "gateway_forward_spawn_failed",
-                        "The server could not start the thread that forwards this command to "
-                        "the gateway (resource exhaustion), command not delivered");
+                        "The server could not set up or start the thread that forwards this "
+                        "command to the gateway (resource exhaustion), command not "
+                        "delivered");
                     resolved = true;
                 } catch (...) { // NOLINT(bugprone-empty-catch): reported just below
                 }
@@ -14361,7 +14379,8 @@ private:
             } else {
                 try {
                     spdlog::error("Gateway SendCommand for command {}: the unknown-cluster "
-                                  "terminal write threw; it is not retried",
+                                  "terminal write threw part-way; not retried "
+                                  "(process_gateway_response is not idempotent)",
                                   ::yuzu::log_id_token(cmd_id));
                 } catch (...) { // NOLINT(bugprone-empty-catch): last resort; the loop continues
                 }

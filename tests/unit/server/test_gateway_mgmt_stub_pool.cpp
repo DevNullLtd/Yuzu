@@ -353,10 +353,11 @@ TEST_CASE("build_gateway_forward_terminal_failure: each of the six forward reaso
           "round-trips distinctly",
           "[server][gateway_mgmt_stub_pool][4672]") {
     // Mirrors the reason_code literals server.cpp's forward_gateway_pending
-    // passes at each of its six terminal-failure call sites (four named in
+    // passes: six reason codes (four named in
     // #4672's own issue, plus the pre-existing unnamed generic grpc-status
     // branch the same PR also fixed, "gateway_forward_failed", plus the
-    // spawn/setup guard's "gateway_forward_spawn_failed", #2146) — a change to
+    // spawn/setup guard's "gateway_forward_spawn_failed", #2146), at seven call
+    // sites ("gateway_unavailable" is passed at two) — a change to
     // one of those literals without updating this list is a doc/observability
     // drift, not a functional break, but pinning the set here catches an
     // accidental typo/duplicate at the source of truth. Gate 4 consistency-
