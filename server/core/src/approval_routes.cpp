@@ -223,10 +223,11 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
             write_a4(res, 503,
                      "the approver's MFA binding cannot be verified, so the decision was not "
                      "recorded",
-                     "ask an administrator to follow the MFA binding enforcement runbook (an "
-                     "account enrolled before the upgrade needs `yuzu-server --mfa-reset`; "
-                     "otherwise restore the auth store's MFA triggers and restart the server); "
-                     "the approval ticket is unchanged and still pending");
+                     "ask an administrator to follow the MFA binding enforcement runbook (if the "
+                     "account was enrolled before the upgrade, so its factor generation is not "
+                     "positive, the administrator resets it with `yuzu-server --mfa-reset "
+                     "<user>`; otherwise they restore the auth store's MFA binding triggers and "
+                     "restart the server); the approval ticket is unchanged and still pending");
             return;
         }
         write_a4(res, 503,

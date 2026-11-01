@@ -3501,6 +3501,33 @@ TEST_CASE("AuthDB refuses to open when the generation trigger is not in force",
              std::string(kRestoreTriggerSql),
          "DROP TRIGGER users_mfa_factor_gen ON auth.users; " + recreate_trigger + "; " +
              kRestoreTriggerSql},
+        {"recreated to also fire on INSERT (tgtype 23, not 19)",
+         "DROP TRIGGER users_mfa_factor_gen ON auth.users; CREATE TRIGGER users_mfa_factor_gen "
+         "BEFORE INSERT OR UPDATE OF mfa_enrolled_at, mfa_factor_gen ON auth.users FOR EACH ROW "
+         "EXECUTE FUNCTION auth.users_mfa_factor_gen(); " +
+             std::string(kRestoreTriggerSql),
+         "DROP TRIGGER users_mfa_factor_gen ON auth.users; " + recreate_trigger + "; " +
+             kRestoreTriggerSql},
+        {"re-pointed at a byte-identical function under a different name",
+         "CREATE FUNCTION auth.users_mfa_factor_gen_shadow() RETURNS trigger LANGUAGE plpgsql AS "
+         "$$" +
+             std::string(kBindingFnBody) +
+             "$$; DROP TRIGGER users_mfa_factor_gen ON auth.users; CREATE TRIGGER "
+             "users_mfa_factor_gen BEFORE UPDATE OF mfa_enrolled_at, mfa_factor_gen ON auth.users "
+             "FOR EACH ROW EXECUTE FUNCTION auth.users_mfa_factor_gen_shadow(); " +
+             std::string(kRestoreTriggerSql),
+         "DROP TRIGGER users_mfa_factor_gen ON auth.users; " + recreate_trigger + "; " +
+             kRestoreTriggerSql + "; DROP FUNCTION auth.users_mfa_factor_gen_shadow()"},
+        {"re-pointed at a byte-identical function of the same name in another schema",
+         "CREATE SCHEMA yuzu_test_shadow; CREATE FUNCTION yuzu_test_shadow.users_mfa_factor_gen() "
+         "RETURNS trigger LANGUAGE plpgsql AS $$" +
+             std::string(kBindingFnBody) +
+             "$$; DROP TRIGGER users_mfa_factor_gen ON auth.users; CREATE TRIGGER "
+             "users_mfa_factor_gen BEFORE UPDATE OF mfa_enrolled_at, mfa_factor_gen ON auth.users "
+             "FOR EACH ROW EXECUTE FUNCTION yuzu_test_shadow.users_mfa_factor_gen(); " +
+             std::string(kRestoreTriggerSql),
+         "DROP TRIGGER users_mfa_factor_gen ON auth.users; " + recreate_trigger + "; " +
+             kRestoreTriggerSql + "; DROP SCHEMA yuzu_test_shadow CASCADE"},
         {"no longer covers the instant column",
          "DROP TRIGGER users_mfa_factor_gen ON auth.users; CREATE TRIGGER users_mfa_factor_gen "
          "BEFORE "
