@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # ha-leader-epoch-lossy-promotion.sh -- WS-9 failover scenario for #6535 (HA WS-3, ADR-2002 s3).
 #
-# Proves the fenced leader epoch stays monotonic across a LOSSY promotion: a
-# promoted standby that never received the latest leader election must not
-# re-mint the epoch a paused former leader still holds. It drives a REAL
+# Demonstrates, in one manual run, that the fenced leader epoch is higher after a
+# LOSSY promotion of a streaming standby: a promoted standby that never received
+# the latest leader election must not re-mint the epoch a paused former leader
+# still holds. It is evidence of one scenario on one rig, not a CI gate, and not
+# a proof for every promotion path (ADR-2002 s3 lists what is not covered). It drives a REAL
 # yuzu-server (its LeaderElector, the unmodified mint) against the 3-node
 # Patroni rig in deploy/docker/docker-compose.ha-postgres.yml under
 # YUZU_PG_DURABILITY=async.
@@ -33,8 +35,10 @@
 #
 # Requires: docker, docker compose, curl, python3, openssl, and a built
 # yuzu-server. Container names, IPs and the network are FIXED (not salted) like
-# ha-pg-failover-cycles.sh: this is a MANUAL harness (no workflow runs it) and
-# docs/uat-environment.md's rule of one rig at a time applies.
+# ha-pg-failover-cycles.sh: this is a MANUAL harness (no workflow runs it), it
+# runs `docker compose down -v` on that fixed project when it finishes, and it
+# REFUSES to start if any yuzu-ha-* container already exists, so it cannot
+# destroy another HA rig. No bash 4 features are needed (no associative arrays).
 #
 # usage: ha-leader-epoch-lossy-promotion.sh [--server-bin PATH]
 set -uo pipefail
@@ -52,7 +56,7 @@ export BUILDX_BUILDER="${YUZU_HA_BUILDER:-default}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --server-bin) SERVER_BIN="$2"; shift 2 ;;
-        -h|--help) sed -n '2,42p' "$0"; exit 0 ;;
+        -h|--help) awk 'NR>1 && /^#/ {print; next} NR>1 {exit}' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -71,7 +75,7 @@ RIG="$(mktemp -d -t yuzu_ha_epoch.XXXXXX)"
 SERVER_PID=""
 FAILS=0
 INCONCLUSIVE=0
-declare -A NODE_IP
+NODE_IPS=("" "" "") # parallel to NODES (indexed arrays: stock macOS bash 3.2 has no `declare -A`)
 
 pass() { echo "  PASS  $*"; }
 fail() { echo "  FAIL  $*"; FAILS=$((FAILS + 1)); }
@@ -79,9 +83,9 @@ inconclusive() { echo "  INCONCLUSIVE  $*"; INCONCLUSIVE=$((INCONCLUSIVE + 1)); 
 
 stop_server() { [[ -n "$SERVER_PID" ]] && { kill -KILL "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""; }; }
 reconnect_nodes() { # idempotent: `network connect` on an already-connected node just fails, which we ignore
-    local c
-    for c in "${NODES[@]}"; do
-        [[ -n "${NODE_IP[$c]:-}" ]] && docker network connect --ip "${NODE_IP[$c]}" "${NETWORK}" "$c" >/dev/null 2>&1
+    local i
+    for i in 0 1 2; do
+        [[ -n "${NODE_IPS[$i]}" ]] && docker network connect --ip "${NODE_IPS[$i]}" "${NETWORK}" "${NODES[$i]}" >/dev/null 2>&1
     done
     return 0
 }
@@ -133,7 +137,7 @@ timeline_of() { supersql "$1" "SELECT ('x' || substr(pg_walfile_name(pg_current_
 leader_epoch() { # <container> -- the stored epoch on that node (hot standby reads work)
     supersql "$1" "SELECT current_leader_epoch FROM leader_elector.leader_state WHERE lock_key = '${LOCK_NAME}'" "${APP_DB}" 2>/dev/null
 }
-# The equality predicate the claim sites embed (LeaderElector::epoch_fence_sql).
+# The equality predicate the claim sites embed (a hand copy of LeaderElector::epoch_fence_sql; keep in sync).
 fence_admits() { # <epoch> -- through HAProxy, so it runs on whichever node is primary
     appsql "SELECT COALESCE((SELECT current_leader_epoch FROM leader_elector.leader_state WHERE lock_key = '${LOCK_NAME}') = $1, false)"
 }
@@ -172,6 +176,13 @@ boot_and_lead() { # <epoch-to-differ-from> -- boots a server and waits until it 
     return 1
 }
 
+# The container names are fixed; refuse to adopt (and later `down -v`) another HA rig.
+if [[ -n "$(docker ps -a --filter 'name=yuzu-ha-' -q 2>/dev/null)" ]]; then
+    echo "a yuzu-ha-* container already exists; stop that rig first (this script runs 'docker compose down -v')" >&2
+    trap - EXIT
+    rm -rf "$RIG"
+    exit 2
+fi
 echo "== bring up the 3-node cluster (YUZU_PG_DURABILITY=async)"
 docker compose -f "${COMPOSE_FILE}" -f "${RIG}/port-override.yml" up -d --build >/dev/null || { echo "compose up failed" >&2; exit 2; }
 PRIMARY=""
@@ -180,8 +191,8 @@ for i in $(seq 1 60); do
     sleep 2; [[ "$i" -eq 60 ]] && { echo "cluster not write-ready within 120s" >&2; exit 2; }
 done
 wait_full_health "$PRIMARY" 2 || { echo "standbys never caught up" >&2; exit 2; }
-for c in "${NODES[@]}"; do
-    NODE_IP[$c]="$(docker inspect -f '{{ (index .NetworkSettings.Networks "'"${NETWORK}"'").IPAddress }}' "$c")"
+for i in 0 1 2; do
+    NODE_IPS[$i]="$(docker inspect -f '{{ (index .NetworkSettings.Networks "'"${NETWORK}"'").IPAddress }}' "${NODES[$i]}")"
 done
 STANDBYS=(); for c in "${NODES[@]}"; do [[ "$c" != "$PRIMARY" ]] && STANDBYS+=("$c"); done
 echo "  primary=$PRIMARY standbys=${STANDBYS[*]}"
