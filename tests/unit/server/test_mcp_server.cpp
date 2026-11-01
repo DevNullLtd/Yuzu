@@ -45237,6 +45237,36 @@ TEST_CASE("MCP execute_instruction_definition: an unknown definition is -32602 a
     CHECK(rig.calls.empty());
 }
 
+TEST_CASE("MCP execute_instruction_definition: a definition_id with a control byte is -32602 "
+          "invalid_definition_id before any store read; a normal id still dispatches",
+          "[mcp][integration][execute][idef][security]") {
+    for (const std::string id : {std::string("d\0xyz", 5), std::string("d\x7f"), std::string("d\x1f")}) {
+        INFO(id.size());
+        McpTestServer ts;
+        Rig rig;
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+        idef_start(ts, rig, "operator");
+        auto res = ts.call(idef_call({{"definition_id", id}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["data"]["reason"] == "invalid_definition_id");
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(rig.lookups == 0);
+        CHECK(rig.calls.empty());
+        CHECK(idef_audited(ts, "denied"));
+        CHECK_FALSE(idef_audited(ts, "requested"));
+    }
+    McpTestServer ts;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+    idef_start(ts, rig, "operator");
+    auto res = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(res);
+    CHECK(nlohmann::json::parse(res->body).contains("result"));
+}
+
 TEST_CASE("MCP execute_instruction_definition: an unknown definition writes ONE denied row whose "
           "correlation id is the error body's",
           "[mcp][integration][execute][idef][audit][correlation]") {

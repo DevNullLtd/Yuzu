@@ -342,6 +342,20 @@ inline constexpr std::size_t kAuditDefinitionIdMax = 128;
 /// as-is; a value embedded in a `key=value` detail line still goes through `log_token`.
 [[nodiscard]] std::string bounded_definition_id(std::string_view id);
 
+/// True when `id` holds a byte below 0x20 or equal to 0x7F (NUL included). Such an id is refused
+/// (`invalid_definition_id`, 400 / -32602) before the store is read: the Postgres binding passes
+/// the id as a C string, so `"foo\0xyz"` would resolve the definition `foo` while every audit row
+/// and log line records a different string. One predicate, used by the shared core only, so REST
+/// and MCP cannot drift.
+[[nodiscard]] constexpr bool definition_id_has_control_byte(std::string_view id) noexcept {
+    for (const char ch : id) {
+        const auto b = static_cast<unsigned char>(ch);
+        if (b < 0x20 || b == 0x7F)
+            return true;
+    }
+    return false;
+}
+
 /// The `denied` row for a refusal that happens BEFORE the core runs and so before it could stamp
 /// one itself: today the REST route's body-too-deep and unparseable-JSON refusals (the MCP twin's
 /// equivalents are its argument-bound refusals, written by the MCP adapter with the same

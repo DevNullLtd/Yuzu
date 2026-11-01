@@ -170,6 +170,18 @@ PrepareOutcome prepare_impl(Ctx& c) {
     const Request& rq = c.rq;
     const Ports& ports = c.ports;
 
+    // 0. A control byte in the id (NUL included) is refused before ANY store read: the Postgres
+    //    binding passes the id as a C string, so "foo\0xyz" would resolve `foo` while the audit
+    //    row and the log record a different string. The row/log text is cleaned and bounded.
+    if (definition_id_has_control_byte(rq.definition_id)) {
+        c.audit("denied", "reason=invalid_definition_id definition=" +
+                              ::yuzu::log_token(bounded_definition_id(rq.definition_id)));
+        return refuse(c, make_refusal(RefusalKind::kBadRequest, "invalid_definition_id",
+                                      "definition id must not contain control characters",
+                                      "re-call with the definition id exactly as the list "
+                                      "endpoint returns it"));
+    }
+
     // 1. Definition lookup. A store fault is not "no such definition".
     if (!ports.lookup_definition) {
         return refuse(c, make_refusal(RefusalKind::kStoreUnavailable, "store_unavailable",

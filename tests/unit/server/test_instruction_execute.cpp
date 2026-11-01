@@ -123,6 +123,57 @@ TEST_CASE("execute: an unknown definition is NotFound and dispatches nothing",
     CHECK(r.audits[0].detail.find("reason=not_found definition=nope") != std::string::npos);
 }
 
+// up-c4: the Postgres binding passes the id as a C string, so "foo\0xyz" used to resolve the
+// definition `foo` while every audit row recorded a different string. A control byte is refused
+// before any store read, on every surface (the predicate and the refusal live in the one core).
+TEST_CASE("execute: a definition id with a control byte is refused before any store read, a normal "
+          "id still dispatches",
+          "[instruction_execute][security]") {
+    struct Hostile {
+        const char* label;
+        std::string id;
+    };
+    const std::vector<Hostile> hostile{{"NUL", std::string("d\0xyz", 5)},
+                                       {"0x7F", std::string("d\x7f")},
+                                       {"0x1F", std::string("d\x1f")},
+                                       {"0x01 leading", std::string("\x01") + "d"},
+                                       {"LF", std::string("d\nx")}};
+    for (const auto& h : hostile) {
+        INFO(h.label);
+        Rig r;
+        r.defs["d"] = make_def("d"); // the C-string prefix of the NUL case resolves to this
+        auto out = run(r.request(h.id, json::object(), make_caller("u", true)), r.ports(), r.audit());
+        const auto* ref = as_refusal(out);
+        REQUIRE(ref);
+        CHECK(ref->kind == RefusalKind::kBadRequest);
+        CHECK(ref->reason == "invalid_definition_id");
+        CHECK_FALSE(ref->retry_after_ms.has_value());
+        CHECK(r.lookups == 0); // refused BEFORE the store was read
+        CHECK(r.calls.empty());
+        CHECK(r.rows.empty());
+        REQUIRE(r.audits.size() == 1);
+        CHECK(r.audits[0].result == "denied");
+        CHECK(r.audits[0].detail.find("reason=invalid_definition_id") != std::string::npos);
+        // The row text carries no raw control byte (log_token cleans the echoed id).
+        for (const char ch : r.audits[0].detail)
+            CHECK(static_cast<unsigned char>(ch) >= 0x20);
+    }
+    SECTION("a normal id (positive control, including a UTF-8 id) is untouched") {
+        for (const std::string& id : std::vector<std::string>{"d", "my-def_1.v2", "d\xC3\xA9"}) {
+            INFO(id);
+            Rig r;
+            r.defs[id] = make_def(id);
+            auto out = run(r.request(id, json::object(), make_caller("u", true)), r.ports(), r.audit());
+            CHECK(as_dispatched(out));
+        }
+    }
+    CHECK_FALSE(definition_id_has_control_byte("abc"));
+    CHECK_FALSE(definition_id_has_control_byte("\xC3\xA9"));
+    CHECK(definition_id_has_control_byte(std::string_view("a\0b", 3)));
+    CHECK(definition_id_has_control_byte("a\x1f"));
+    CHECK(definition_id_has_control_byte("a\x7f"));
+}
+
 TEST_CASE("execute: the chokepoint dry run refuses BEFORE any body work or ticket",
           "[instruction_execute][security]") {
     Rig r;
@@ -1920,6 +1971,35 @@ TEST_CASE("REST execute: a denied gate runs nothing", "[instruction_execute][res
     CHECK(res->status == 403);
     CHECK(r.core.calls.empty());
     CHECK(r.core.audits.empty());
+}
+
+TEST_CASE("REST execute: a definition id with a control byte is a 400 invalid_definition_id with ONE "
+          "denied row and no store read; a normal id still runs",
+          "[instruction_execute][rest][security]") {
+    for (const std::string id : {std::string("d\0xyz", 5), std::string("d\x7f"), std::string("d\x1f")}) {
+        INFO(id.size());
+        RouteRig r;
+        r.core.defs["d"] = make_def("d");
+        auto res = r.post(id, "{}");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        const auto j = json::parse(res->body);
+        CHECK(j["error"]["reason"] == "invalid_definition_id");
+        CHECK(j["error"]["retry_after_ms"].is_null());
+        CHECK(r.core.lookups == 0);
+        CHECK(r.core.calls.empty());
+        REQUIRE(r.core.audits.size() == 1);
+        CHECK(r.core.audits[0].result == "denied");
+        CHECK(r.core.audits[0].detail.find("reason=invalid_definition_id") != std::string::npos);
+        CHECK(r.core.audits[0].detail.find("correlation_id=" +
+                                           j["error"]["correlation_id"].get<std::string>()) !=
+              std::string::npos);
+    }
+    RouteRig ok;
+    ok.core.defs["d"] = make_def("d");
+    auto res = ok.post("d", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 200);
 }
 
 TEST_CASE("REST execute: 400 for a nested or malformed body before any lookup",
