@@ -112,7 +112,11 @@ TEST_CASE("execute: an unknown definition is NotFound and dispatches nothing",
     CHECK(ref->kind == RefusalKind::kNotFound);
     CHECK_FALSE(ref->retry_after_ms.has_value());
     CHECK(r.calls.empty());
-    CHECK(r.audits.empty()); // no existence oracle in the audit log either
+    // A `denied` row, like command_v1's unknown-definition refusal (co-2): the 404 already
+    // tells the caller the id is unknown, and the audit log is operator-only evidence.
+    REQUIRE(r.audits.size() == 1);
+    CHECK(r.audits[0].result == "denied");
+    CHECK(r.audits[0].detail.find("reason=not_found definition=nope") != std::string::npos);
 }
 
 TEST_CASE("execute: the chokepoint dry run refuses BEFORE any body work or ticket",
@@ -958,6 +962,211 @@ TEST_CASE("execute: a dropped best-effort audit row is reported, the dispatch st
     CHECK(out.audit_dropped);
 }
 
+// ---------------------------------------------------------------------------------------------
+// ONE correlation id per call (UP-9 / co-3 / er-5, co-2). Every row the call writes carries it as
+// the trailing `correlation_id=<id>` token (command_v1's spelling), so an orphan `requested` row
+// pairs with its outcome row and with the error body the caller saw.
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+/// The `correlation_id=` token at the END of a detail string ("" when absent or not trailing).
+std::string trailing_cid(const std::string& detail) {
+    constexpr std::string_view kKey = " correlation_id=";
+    const auto p = detail.rfind(kKey);
+    if (p == std::string::npos)
+        return {};
+    const std::string cid = detail.substr(p + kKey.size());
+    return cid.find(' ') == std::string::npos ? cid : std::string{};
+}
+
+} // namespace
+
+TEST_CASE("execute: requested and success carry the SAME correlation id, the supplied one",
+          "[instruction_execute][audit][correlation]") {
+    Rig r;
+    r.defs["d"] = make_def("d");
+    auto rq = r.request("d", json::object(), make_caller("u", true));
+    rq.correlation_id = "cid-supplied-1";
+    const auto out = run(rq, r.ports(), r.audit());
+    REQUIRE(as_dispatched(out));
+    CHECK(out.correlation_id == "cid-supplied-1");
+    REQUIRE(r.audits.size() == 2);
+    CHECK(r.audits[0].result == "requested");
+    CHECK(r.audits[1].result == "success");
+    CHECK(trailing_cid(r.audits[0].detail) == "cid-supplied-1");
+    CHECK(trailing_cid(r.audits[1].detail) == "cid-supplied-1");
+}
+
+TEST_CASE("execute: with no supplied id the core mints ONE, shared by every row and the outcome",
+          "[instruction_execute][audit][correlation]") {
+    Rig r;
+    r.defs["d"] = make_def("d");
+    const auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
+    REQUIRE(as_dispatched(out));
+    CHECK_FALSE(out.correlation_id.empty());
+    REQUIRE(r.audits.size() == 2);
+    CHECK(trailing_cid(r.audits[0].detail) == out.correlation_id);
+    CHECK(trailing_cid(r.audits[1].detail) == out.correlation_id);
+    // A second call mints a different one.
+    Rig r2;
+    r2.defs["d"] = make_def("d");
+    const auto out2 =
+        run(r2.request("d", json::object(), make_caller("u", true)), r2.ports(), r2.audit());
+    CHECK(out2.correlation_id != out.correlation_id);
+}
+
+TEST_CASE("execute: a dispatch that throws pairs its requested and failure rows by correlation id",
+          "[instruction_execute][audit][correlation]") {
+    Rig r;
+    r.defs["d"] = make_def("d");
+    r.dispatch_throws = true;
+    auto rq = r.request("d", json::object(), make_caller("u", true));
+    rq.correlation_id = "cid-throw";
+    const auto out = run(rq, r.ports(), r.audit());
+    REQUIRE(as_refusal(out));
+    REQUIRE(r.audits.size() == 2);
+    CHECK(r.audits[0].result == "requested");
+    CHECK(r.audits[1].result == "failure");
+    CHECK(trailing_cid(r.audits[0].detail) == "cid-throw");
+    CHECK(trailing_cid(r.audits[1].detail) == "cid-throw");
+    CHECK(out.correlation_id == "cid-throw");
+}
+
+TEST_CASE("execute: a zero-reach outcome pairs requested and failure by correlation id",
+          "[instruction_execute][audit][correlation]") {
+    Rig r;
+    r.defs["d"] = make_def("d");
+    r.stub_outcome = ConfinedDispatchOutcome{.sent = 0, .command_id = "cmd-0"};
+    auto rq = r.request("d", json::object(), make_caller("u", true));
+    rq.correlation_id = "cid-zero";
+    const auto out = run(rq, r.ports(), r.audit());
+    REQUIRE(as_zero(out));
+    REQUIRE(r.audits.size() == 2);
+    CHECK(trailing_cid(r.audits[0].detail) == "cid-zero");
+    CHECK(trailing_cid(r.audits[1].detail) == "cid-zero");
+}
+
+TEST_CASE("execute: a pending approval's row carries the correlation id",
+          "[instruction_execute][audit][correlation]") {
+    Rig r;
+    r.defs["d"] = make_def("d", "ping", "always");
+    auto rq = r.request("d", json::object(), make_caller("u", true));
+    rq.correlation_id = "cid-pending";
+    const auto out = run(rq, r.ports(), r.audit());
+    REQUIRE(as_pending(out));
+    REQUIRE(r.audits.size() == 1);
+    CHECK(r.audits[0].result == "pending");
+    CHECK(trailing_cid(r.audits[0].detail) == "cid-pending");
+    CHECK(out.correlation_id == "cid-pending");
+}
+
+TEST_CASE("execute: every refusal writes exactly ONE row, stamped with the outcome's correlation id",
+          "[instruction_execute][audit][correlation][security]") {
+    struct Case {
+        const char* what;
+        std::function<void(Rig&)> arrange;
+        json body;
+        bool admin;
+        const char* row_result;
+        const char* reason; // substring of the detail
+    };
+    const Case cases[] = {
+        {"unknown definition", [](Rig&) {}, json::object(), true, "denied", "reason=not_found"},
+        {"dispatch denied",
+         [](Rig& r) { r.denied_securables.insert("Infrastructure"); }, json::object(), false,
+         "denied", "reason=forbidden"},
+        {"body not an object", [](Rig&) {}, json::array(), true, "denied", "reason=body_type"},
+        {"empty agent_ids", [](Rig&) {}, json{{"agent_ids", json::array()}}, true, "denied",
+         "reason=agent_ids_empty"},
+        {"param violation",
+         [](Rig& r) { r.defs["d"].parameter_schema = kLevelSchema; }, json::object(), true,
+         "denied", "reason=param_schema"},
+        {"unpreparable schema",
+         [](Rig& r) { r.defs["d"].parameter_schema = R"({"type":"zzz"})"; }, json::object(), true,
+         "failure", "reason=param_schema_invalid"},
+        {"destructive untargeted", [](Rig& r) { r.defs["d"].action = "wipe"; }, json::object(),
+         true, "denied", "reason=destructive_untargeted"},
+        {"destructive none visible",
+         [](Rig& r) {
+             r.defs["d"].action = "wipe";
+             r.visible_agents = std::vector<std::string>{};
+         },
+         json{{"agent_ids", {"agent-A"}}}, true, "denied", "reason=destructive_no_visible_target"},
+        {"approval cap",
+         [](Rig& r) {
+             r.defs["d"].approval_mode = "always";
+             r.pending_for = kSubmitterPendingCap;
+         },
+         json::object(), true, "denied", "reason=approval_cap_reached"},
+        {"approval queue full",
+         [](Rig& r) {
+             r.defs["d"].approval_mode = "always";
+             r.approval_queue_full = true;
+         },
+         json::object(), true, "denied", "reason=approval_queue_full"},
+        {"approval submit failed",
+         [](Rig& r) {
+             r.defs["d"].approval_mode = "always";
+             r.approval_fails = true;
+         },
+         json::object(), true, "failure", "reason=approval_submit_failed"},
+        {"pending count unreadable",
+         [](Rig& r) {
+             r.defs["d"].approval_mode = "always";
+             r.pending_count_fault = 1;
+         },
+         json::object(), true, "failure", "cause=pending_count_unreadable"},
+        {"execution row throws",
+         [](Rig& r) { r.create_throws = true; }, json::object(), true, "failure",
+         "reason=execution_record_exception"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.what);
+        Rig r;
+        r.defs["d"] = make_def("d");
+        c.arrange(r);
+        auto rq = r.request(std::string(c.what) == "unknown definition" ? "nope" : "d", c.body,
+                            make_caller("u", c.admin));
+        rq.correlation_id = std::string("cid-") + std::to_string(&c - cases);
+        rq.submitter_pending_cap = kSubmitterPendingCap;
+        const auto out = run(rq, r.ports(), r.audit());
+        REQUIRE(as_refusal(out));
+        CHECK(out.correlation_id == rq.correlation_id);
+        // The execution-row failure is the one case with a `requested` row before it.
+        const std::size_t expect = std::string(c.what) == "execution row throws" ? 2 : 1;
+        REQUIRE(r.audits.size() == expect);
+        const auto& row = r.audits.back();
+        CHECK(row.result == c.row_result);
+        CHECK(row.detail.find(c.reason) != std::string::npos);
+        for (const auto& a : r.audits)
+            CHECK(trailing_cid(a.detail) == rq.correlation_id);
+    }
+}
+
+TEST_CASE("execute: audit_pre_core_denial writes ONE denied row, cleans hostile bytes, and reports a "
+          "lost row",
+          "[instruction_execute][audit][correlation][security]") {
+    Rig r;
+    CHECK(audit_pre_core_denial(r.audit(), "cid-pre", "body_depth", "d"));
+    REQUIRE(r.audits.size() == 1);
+    CHECK(r.audits[0].result == "denied");
+    CHECK(r.audits[0].detail == "reason=body_depth definition=d correlation_id=cid-pre");
+
+    // CWE-117: a hostile definition id (it is a URL path segment) cannot forge a second field.
+    Rig r2;
+    CHECK(audit_pre_core_denial(r2.audit(), "cid-pre", "invalid_json", "d\nresult=success"));
+    REQUIRE(r2.audits.size() == 1);
+    CHECK(r2.audits[0].detail.find('\n') == std::string::npos);
+
+    Rig lost;
+    lost.audit_other_fails = true;
+    CHECK_FALSE(audit_pre_core_denial(lost.audit(), "cid-pre", "body_depth", "d"));
+    Rig throws;
+    throws.audit_throws = true;
+    CHECK_FALSE(audit_pre_core_denial(throws.audit(), "cid-pre", "body_depth", "d"));
+}
+
 TEST_CASE("execute: the execution row carries definition_id and a REDACTED parameter copy; dispatch "
           "carries the claim parameters and the raw params",
           "[instruction_execute]") {
@@ -1374,6 +1583,101 @@ TEST_CASE("REST execute: 400 for a nested or malformed body before any lookup",
     CHECK(res2->status == 400);
     CHECK(json::parse(res2->body)["error"]["reason"] == "invalid_json");
     CHECK(r.core.calls.empty());
+}
+
+namespace {
+/// The `correlation_id=` token at the end of an audit detail (RouteRig appends " [id=...]").
+std::string rest_row_cid(const std::string& detail_with_id_suffix) {
+    std::string d = detail_with_id_suffix;
+    if (const auto p = d.rfind(" [id="); p != std::string::npos)
+        d.erase(p);
+    return trailing_cid(d);
+}
+} // namespace
+
+TEST_CASE("REST execute: a body-depth or unparseable-JSON refusal writes ONE denied row whose "
+          "correlation id is the response's",
+          "[instruction_execute][rest][audit][correlation]") {
+    std::string deep;
+    for (int i = 0; i < 200; ++i)
+        deep += "[";
+    const std::pair<std::string, std::string> cases[] = {{deep, "body_depth"},
+                                                          {"{not json", "invalid_json"}};
+    for (const auto& [body, reason] : cases) {
+        INFO(reason);
+        RouteRig r;
+        r.core.defs["d"] = make_def("d");
+        auto res = r.post("d", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        const auto j = json::parse(res->body);
+        REQUIRE(r.core.audits.size() == 1);
+        CHECK(r.core.audits[0].result == "denied");
+        CHECK(r.core.audits[0].detail.find("reason=" + reason + " definition=d") !=
+              std::string::npos);
+        const std::string cid = j["error"]["correlation_id"].get<std::string>();
+        CHECK_FALSE(cid.empty());
+        CHECK(rest_row_cid(r.core.audits[0].detail) == cid);
+        CHECK(res->get_header_value("X-Correlation-Id") == cid);
+        CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+        CHECK(r.core.calls.empty());
+    }
+}
+
+TEST_CASE("REST execute: a LOST body-refusal denied row sets Sec-Audit-Failed, the 400 stands",
+          "[instruction_execute][rest][audit][correlation][security]") {
+    RouteRig r;
+    r.core.defs["d"] = make_def("d");
+    r.core.audit_other_fails = true;
+    auto res = r.post("d", "{not json");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(json::parse(res->body)["error"]["reason"] == "invalid_json");
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("REST execute: an unknown definition writes ONE denied row with the response's id",
+          "[instruction_execute][rest][audit][correlation]") {
+    RouteRig r;
+    auto res = r.post("nope", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    REQUIRE(r.core.audits.size() == 1);
+    CHECK(r.core.audits[0].result == "denied");
+    CHECK(rest_row_cid(r.core.audits[0].detail) ==
+          json::parse(res->body)["error"]["correlation_id"].get<std::string>());
+}
+
+TEST_CASE("REST execute: requested and success share the response's correlation id; an error body "
+          "after the requested row joins it",
+          "[instruction_execute][rest][audit][correlation]") {
+    {
+        RouteRig r;
+        r.core.defs["d"] = make_def("d");
+        auto res = r.post("d", "{}");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const std::string cid = res->get_header_value("X-Correlation-Id");
+        CHECK_FALSE(cid.empty());
+        REQUIRE(r.core.audits.size() == 2);
+        CHECK(rest_row_cid(r.core.audits[0].detail) == cid);
+        CHECK(rest_row_cid(r.core.audits[1].detail) == cid);
+    }
+    {
+        // A throwing dispatch: `requested` is already written, the error body must be the
+        // same id so the orphan row can be paired.
+        RouteRig r;
+        r.core.defs["d"] = make_def("d");
+        r.core.dispatch_throws = true;
+        auto res = r.post("d", "{}");
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        const std::string cid = json::parse(res->body)["error"]["correlation_id"].get<std::string>();
+        REQUIRE(r.core.audits.size() == 2);
+        CHECK(r.core.audits[0].result == "requested");
+        CHECK(rest_row_cid(r.core.audits[0].detail) == cid);
+        CHECK(rest_row_cid(r.core.audits[1].detail) == cid);
+    }
 }
 
 TEST_CASE("REST execute: status mapping of every refusal", "[instruction_execute][rest]") {

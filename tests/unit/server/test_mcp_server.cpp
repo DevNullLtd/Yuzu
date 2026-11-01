@@ -30939,6 +30939,18 @@ TEST_CASE("MCP approval mint enforces a per-submitter pending sub-cap",
     CHECK(appr.pending_count() == 25); // not 26
     // The C8 mint's cap refusal feeds the same counter as the shared execute core.
     CHECK(cap_metrics.counter(cap_metric, cap_label).value() == 1);
+    // ca8-10: the error data carries the same closed `reason` token the counter label does, and
+    // the `denied` row's detail names it (not free text), joined to the body by correlation id.
+    CHECK(capped["error"]["data"]["reason"] == "approval_cap_reached");
+    CHECK(capped["error"]["data"]["retry_after_ms"].is_null());
+    const std::string cap_cid = capped["error"]["data"]["correlation_id"].get<std::string>();
+    std::string cap_row;
+    for (std::size_t i = ts.audit_log.size(); i-- > 0;)
+        if (ts.audit_log[i] == "mcp.delete_tag|denied") {
+            cap_row = ts.audit_details[i];
+            break;
+        }
+    CHECK(cap_row == "reason=approval_cap_reached correlation_id=" + cap_cid);
 }
 
 // up8-1 / sre-2: the same mint with an approval store whose count cannot be READ. The cap used to
@@ -44129,6 +44141,23 @@ bool idef_audited(const McpTestServer& ts, const std::string& result) {
     return false;
 }
 
+/// "<result>|<trailing correlation_id>" for every mcp.execute_instruction_definition row, in
+/// order (a row with no trailing correlation_id token reads "<result>|").
+std::vector<std::string> idef_row_cids(const McpTestServer& ts) {
+    std::vector<std::string> out;
+    const std::string prefix = "mcp.execute_instruction_definition|";
+    constexpr std::string_view kKey = " correlation_id=";
+    for (std::size_t i = 0; i < ts.audit_log.size() && i < ts.audit_details.size(); ++i) {
+        if (ts.audit_log[i].rfind(prefix, 0) != 0)
+            continue;
+        const std::string& d = ts.audit_details[i];
+        const auto p = d.rfind(kKey);
+        out.push_back(ts.audit_log[i].substr(prefix.size()) + "|" +
+                      (p == std::string::npos ? std::string{} : d.substr(p + kKey.size())));
+    }
+    return out;
+}
+
 } // namespace
 
 TEST_CASE("MCP cancel_execution / record_execution_rerun: registered with truthful annotations and "
@@ -45106,6 +45135,109 @@ TEST_CASE("MCP execute_instruction_definition: an unknown definition is -32602 a
     CHECK(rig.calls.empty());
 }
 
+TEST_CASE("MCP execute_instruction_definition: an unknown definition writes ONE denied row whose "
+          "correlation id is the error body's",
+          "[mcp][integration][execute][idef][audit][correlation]") {
+    McpTestServer ts;
+    Rig rig;
+    idef_start(ts, rig, "operator");
+    auto res = ts.call(idef_call({{"definition_id", "nope"}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    const std::string cid = body["error"]["data"]["correlation_id"].get<std::string>();
+    CHECK_FALSE(cid.empty());
+    const auto rows = idef_row_cids(ts);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "denied|" + cid);
+    CHECK(res->get_header_value("X-Correlation-Id") == cid);
+    CHECK_FALSE(body["error"]["data"].contains("audit_persisted"));
+}
+
+TEST_CASE("MCP execute_instruction_definition: a LOST denied row is reported as audit_persisted:false",
+          "[mcp][integration][execute][idef][audit][correlation][security]") {
+    McpTestServer ts;
+    Rig rig;
+    ts.audit_fail_result_ = "denied";
+    idef_start(ts, rig, "operator");
+    auto res = ts.call(idef_call({{"definition_id", "nope"}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["data"]["audit_persisted"] == false);
+    // The bound-violation refusal reports a lost row the same way.
+    auto res2 = ts.call(idef_call({{"definition_id", ""}}, 2));
+    REQUIRE(res2);
+    const auto body2 = nlohmann::json::parse(res2->body);
+    REQUIRE(body2.contains("error"));
+    CHECK(body2["error"]["data"]["audit_persisted"] == false);
+}
+
+TEST_CASE("MCP execute_instruction_definition: an argument-bound refusal's row carries the error "
+          "body's correlation id",
+          "[mcp][integration][execute][idef][audit][correlation]") {
+    McpTestServer ts;
+    Rig rig;
+    idef_start(ts, rig, "operator");
+    auto res = ts.call(idef_call({{"definition_id", ""}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    const std::string cid = body["error"]["data"]["correlation_id"].get<std::string>();
+    const auto rows = idef_row_cids(ts);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "denied|" + cid);
+}
+
+TEST_CASE("MCP execute_instruction_definition: requested, the outcome row and the error body of ONE "
+          "call share one correlation id",
+          "[mcp][integration][execute][idef][audit][correlation]") {
+    SECTION("success: requested and success pair") {
+        McpTestServer ts;
+        Rig rig;
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+        idef_start(ts, rig, "operator");
+        auto res = ts.call(idef_call({{"definition_id", "d"}}));
+        REQUIRE(res);
+        const std::string cid = res->get_header_value("X-Correlation-Id");
+        CHECK_FALSE(cid.empty());
+        const auto rows = idef_row_cids(ts);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0] == "requested|" + cid);
+        CHECK(rows[1] == "success|" + cid);
+    }
+    SECTION("a throwing dispatch: the error body's id joins the orphaned requested row (er-5)") {
+        McpTestServer ts;
+        Rig rig;
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+        rig.dispatch_throws = true;
+        idef_start(ts, rig, "operator");
+        auto res = ts.call(idef_call({{"definition_id", "d"}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        const std::string cid = body["error"]["data"]["correlation_id"].get<std::string>();
+        const auto rows = idef_row_cids(ts);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0] == "requested|" + cid);
+        CHECK(rows[1] == "failure|" + cid);
+    }
+    SECTION("a refused approval: the pending-cap denial's row is the body's id") {
+        McpTestServer ts;
+        Rig rig;
+        rig.pending_for = yuzu::server::instruction_execute::kSubmitterPendingCap;
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "always");
+        idef_start(ts, rig, "operator");
+        auto res = ts.call(idef_call({{"definition_id", "d"}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        const auto rows = idef_row_cids(ts);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == "denied|" + body["error"]["data"]["correlation_id"].get<std::string>());
+    }
+}
+
 TEST_CASE("MCP execute_instruction_definition: the audit row is written BEFORE dispatch and its "
           "loss dispatches nothing",
           "[mcp][integration][execute][idef][audit][security]") {
@@ -45403,6 +45535,10 @@ TEST_CASE("MCP execute_instruction_definition: supervised non-admin on a gated p
           std::string::npos);
     CHECK(appr.pending_count() == 0); // no tier ticket minted
     CHECK(rig.calls.empty());
+    // The pre-mint probe (the supervised path) stamps the same call-wide id on its row.
+    const auto rows = idef_row_cids(ts);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "denied|" + body["error"]["data"]["correlation_id"].get<std::string>());
 }
 
 TEST_CASE("MCP execute_instruction_definition: an approved tier ticket for a benign pair cannot run "

@@ -137,6 +137,15 @@ struct Request {
     /// share of the global pending approval queue (an agentic loop or a script must not fill the
     /// cap shared with every human). Only a test leaves it 0.
     int submitter_pending_cap{0};
+    /// The ONE correlation id of this call. Every audit row the core writes for the call
+    /// (`denied`, `requested`, `pending`, `success`, `failure`) carries it as the trailing
+    /// `correlation_id=<id>` detail token, the same spelling `POST /api/v1/commands` uses, so an
+    /// orphan `requested` row can be paired with its outcome row and with the error body the
+    /// caller saw. A surface passes the id it already put on its response (REST: the
+    /// `X-Correlation-Id` header; MCP: the same header, shared by the pre-mint probe and the
+    /// handler, so one call is one id). Empty -> the core mints one; either way the id used comes
+    /// back in `Outcome::correlation_id` / `PrepareOutcome::correlation_id`.
+    std::string correlation_id;
 };
 
 using DefinitionLookup = std::expected<std::optional<InstructionDefinition>, std::string>;
@@ -279,6 +288,9 @@ struct Outcome {
     /// did not persist. The surface reports it (REST: `Sec-Audit-Failed`; MCP:
     /// `audit_persisted:false`). The fail-closed `requested` row is a Refusal instead.
     bool audit_dropped{false};
+    /// The correlation id stamped on every row this call wrote (see `Request::correlation_id`).
+    /// A surface renders its error body with THIS value so the body joins the rows.
+    std::string correlation_id{};
 };
 
 /// What `prepare` hands to the dispatch stage.
@@ -292,12 +304,15 @@ struct Plan {
 struct PrepareOutcome {
     std::variant<Refusal, PendingApproval, Plan> result;
     bool audit_dropped{false};
+    std::string correlation_id{}; ///< see `Outcome::correlation_id`
 };
 
-/// Steps 1-6. Writes an audit row for a refusal from step 2 on (`denied`, or `failure` for an
-/// unusable stored schema or an approval that could not be queued) and for a pending approval.
-/// It writes NONE for step 1 (an unknown definition, a store fault), a missing port, or the
-/// classifier being unavailable: only `requested` (step 7) is guaranteed before the effect.
+/// Steps 1-6. Writes an audit row for a refusal from step 1 on (`denied`, or `failure` for an
+/// unusable stored schema or an approval that could not be queued) and for a pending approval:
+/// an unknown definition writes `denied reason=not_found`. It writes NO `instruction.execute`
+/// row for a definition-store fault (step 1), a missing port (an unwired lookup, authorizer,
+/// validator cache or classifier), or the classifier being unavailable: only `requested` (step 7)
+/// is guaranteed before the effect. Every row carries `correlation_id=` (`Request::correlation_id`).
 /// MCP calls this alone as its pre-mint probe, so a refused call mints no tier ticket.
 ///
 /// `emit` (optional, bound per request by the surface) publishes the events the LEGACY
@@ -313,6 +328,16 @@ struct PrepareOutcome {
 /// Steps 1-9.
 [[nodiscard]] Outcome run(const Request& rq, const Ports& ports, const AuditHook& audit,
                           const EventEmitHook& emit = {});
+
+/// The `denied` row for a refusal that happens BEFORE the core runs and so before it could stamp
+/// one itself: today the REST route's body-too-deep and unparseable-JSON refusals (the MCP twin's
+/// equivalents are its argument-bound refusals, written by the MCP adapter with the same
+/// `correlation_id=` token). Detail is `reason=<reason> definition=<id> correlation_id=<id>`, each
+/// value through `log_token` (CWE-117). Returns whether the row persisted (a hook that throws
+/// reads as not persisted); the caller reports a lost row the way the core's own best-effort rows
+/// are reported (REST `Sec-Audit-Failed`).
+[[nodiscard]] bool audit_pre_core_denial(const AuditHook& audit, std::string_view correlation_id,
+                                         std::string_view reason, std::string_view definition_id);
 
 /// The approval verdict for a definition, factored so tests pin the matrix without a store.
 /// `approval_mode` is the stored string; `caller_is_admin` is `principal_is_admin`.

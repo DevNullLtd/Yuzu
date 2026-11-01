@@ -3,6 +3,7 @@
 #include "dispatch_denial_text.hpp"
 #include "dispatch_destructive_gate.hpp"
 #include "dispatch_target_shape.hpp"
+#include "rest_a4_envelope.hpp" // detail::make_correlation_id
 #include "sensitive_instruction_params.hpp"
 
 #include <yuzu/log_token.hpp>
@@ -57,16 +58,28 @@ void bump(const Ports& ports, const char* family, yuzu::Labels labels) noexcept 
     }
 }
 
+/// The trailing token every row of one call carries (command_v1_routes.cpp's spelling and
+/// position), on a `log_token`-cleaned value.
+std::string cid_suffix(std::string_view cid) {
+    return " correlation_id=" + ::yuzu::log_token(std::string(cid));
+}
+
 struct Ctx {
     const Request& rq;
     const Ports& ports;
     const AuditHook& hook;
     const EventEmitHook& emit;
+    std::string cid; ///< the call's ONE correlation id; never empty (the entry points mint it)
     bool audit_dropped{false};
 
+    /// A best-effort row; a lost one is reported through `audit_dropped`.
     void audit(std::string_view result, const std::string& detail) {
-        if (!safe_audit(hook, result, detail))
+        if (!safe_audit(hook, result, detail + cid_suffix(cid)))
             audit_dropped = true;
+    }
+    /// The fail-closed row: the caller decides what a lost row means.
+    bool audit_required(std::string_view result, const std::string& detail) {
+        return safe_audit(hook, result, detail + cid_suffix(cid));
     }
     std::string route() const { return std::string(route_label(rq.surface)); }
 };
@@ -83,14 +96,27 @@ Refusal make_refusal(RefusalKind kind, std::string reason, std::string message,
 }
 
 PrepareOutcome refuse(Ctx& c, Refusal r) {
-    return PrepareOutcome{std::move(r), c.audit_dropped};
+    return PrepareOutcome{std::move(r), c.audit_dropped, {}};
 }
 
 std::string ident_pair(const InstructionDefinition& d) {
     return ::yuzu::log_token(d.plugin) + ":" + ::yuzu::log_token(d.action);
 }
 
+std::string resolve_cid(const Request& rq) {
+    return rq.correlation_id.empty() ? ::yuzu::server::detail::make_correlation_id()
+                                     : rq.correlation_id;
+}
+
 } // namespace
+
+bool audit_pre_core_denial(const AuditHook& audit, std::string_view correlation_id,
+                           std::string_view reason, std::string_view definition_id) {
+    return safe_audit(audit, "denied",
+                      "reason=" + ::yuzu::log_token(std::string(reason)) +
+                          " definition=" + ::yuzu::log_token(std::string(definition_id)) +
+                          cid_suffix(correlation_id));
+}
 
 bool definition_needs_approval(std::string_view approval_mode, bool caller_is_admin) noexcept {
     if (approval_mode == "auto")
@@ -103,9 +129,11 @@ bool definition_needs_approval(std::string_view approval_mode, bool caller_is_ad
     return true;
 }
 
-PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& audit,
-                       const EventEmitHook& emit) {
-    Ctx c{rq, ports, audit, emit};
+namespace {
+
+PrepareOutcome prepare_impl(Ctx& c) {
+    const Request& rq = c.rq;
+    const Ports& ports = c.ports;
 
     // 1. Definition lookup. A store fault is not "no such definition".
     if (!ports.lookup_definition) {
@@ -124,6 +152,10 @@ PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& a
                                       kRetryAfterMs));
     }
     if (!*looked_up) {
+        // A `denied` row (command_v1 writes one for its unknown-definition class too). The audit
+        // log is operator-only evidence, not a caller-visible existence oracle: the 404 itself
+        // already tells the caller the id is unknown.
+        c.audit("denied", "reason=not_found definition=" + ::yuzu::log_token(rq.definition_id));
         return refuse(c, make_refusal(RefusalKind::kNotFound, "not_found",
                                       "instruction definition not found",
                                       "list definitions and re-call with a valid definition id"));
@@ -400,10 +432,20 @@ PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& a
                                " definition=" + def_token);
         emit_event_guarded(c.emit, "approval.created"); // the legacy route's event
         return PrepareOutcome{PendingApproval{*submitted, def.approval_mode, rq.definition_id},
-                              c.audit_dropped};
+                              c.audit_dropped, {}};
     }
 
-    return PrepareOutcome{std::move(plan), c.audit_dropped};
+    return PrepareOutcome{std::move(plan), c.audit_dropped, {}};
+}
+
+} // namespace
+
+PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& audit,
+                       const EventEmitHook& emit) {
+    Ctx c{rq, ports, audit, emit, resolve_cid(rq)};
+    PrepareOutcome out = prepare_impl(c);
+    out.correlation_id = c.cid;
+    return out;
 }
 
 namespace {
@@ -472,10 +514,11 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
     }
 
     // 7. Audit BEFORE the side effect, fail closed (house v1 dispatch pattern).
-    if (!safe_audit(c.hook, "requested",
-                    "definition=" + def_token + " " + ident_pair(def) +
-                        " targets=" + (plan.agent_ids.empty() ? std::string(plan.scope.empty() ? "all" : "scope")
-                                                              : std::to_string(plan.agent_ids.size())))) {
+    if (!c.audit_required(
+            "requested",
+            "definition=" + def_token + " " + ident_pair(def) + " targets=" +
+                (plan.agent_ids.empty() ? std::string(plan.scope.empty() ? "all" : "scope")
+                                        : std::to_string(plan.agent_ids.size())))) {
         return Outcome{make_refusal(RefusalKind::kAuditUnavailable, "audit_unavailable",
                                     "audit subsystem unavailable: refusing to dispatch without "
                                     "durable evidence",
@@ -592,7 +635,7 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
         z.agents_kill_switched_os = o.kill_switched_os_count;
         c.audit("failure", "reason=" + std::string(zero_reach_token(cause)) +
                                " definition=" + def_token + " execution_id=" + execution_id);
-        return Outcome{std::move(z), c.audit_dropped};
+        return Outcome{std::move(z), c.audit_dropped, {}};
     }
 
     // 9. Success. Record the targeted count, then re-evaluate counters: responses that arrived
@@ -635,22 +678,26 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
     d.definition_id = rq.definition_id;
     d.plugin = def.plugin;
     d.action = def.action;
-    return Outcome{std::move(d), c.audit_dropped};
+    return Outcome{std::move(d), c.audit_dropped, {}};
 }
 
 } // namespace
 
 Outcome run(const Request& rq, const Ports& ports, const AuditHook& audit,
             const EventEmitHook& emit) {
-    PrepareOutcome prep = prepare(rq, ports, audit, emit);
+    // ONE id for the whole call: resolved once here, stamped by both stages through one Ctx.
+    Ctx c{rq, ports, audit, emit, resolve_cid(rq)};
+    PrepareOutcome prep = prepare_impl(c);
+    Outcome out;
     if (auto* plan = std::get_if<Plan>(&prep.result)) {
-        Ctx c{rq, ports, audit, emit};
-        c.audit_dropped = prep.audit_dropped;
-        return dispatch_stage(c, std::move(*plan));
+        out = dispatch_stage(c, std::move(*plan));
+    } else if (auto* pending = std::get_if<PendingApproval>(&prep.result)) {
+        out = Outcome{std::move(*pending), c.audit_dropped, {}};
+    } else {
+        out = Outcome{std::move(std::get<Refusal>(prep.result)), c.audit_dropped, {}};
     }
-    if (auto* pending = std::get_if<PendingApproval>(&prep.result))
-        return Outcome{std::move(*pending), prep.audit_dropped};
-    return Outcome{std::move(std::get<Refusal>(prep.result)), prep.audit_dropped};
+    out.correlation_id = c.cid;
+    return out;
 }
 
 } // namespace yuzu::server::instruction_execute

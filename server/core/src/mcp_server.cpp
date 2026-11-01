@@ -75,6 +75,7 @@
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
+#include "rest_a4_envelope_http.hpp"    // detail::ensure_correlation_id (the call-wide id, #2146)
 #include "forensics_read_audit.hpp"     // #4990: response.forensics.read
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
 #include "web_utils.hpp"                // audit_token (H1 — neutralise k=v audit-field forgery)
@@ -8417,15 +8418,19 @@ McpServer::HandlerFn McpServer::build_handler(
                     // A Plan falls through to mint/recall.
                     if (tool_name == "execute_instruction_definition") {
                         namespace idef = yuzu::server::mcp::instruction_definition;
+                        // ONE correlation id per call: the response header, this probe's rows,
+                        // the handler's rows below and every error body carry the same value.
+                        const std::string call_cid =
+                            yuzu::server::detail::ensure_correlation_id(res);
                         if (auto bv = idef::check_args(args)) {
-                            const std::string cid = yuzu::server::detail::make_correlation_id();
                             count_denial("yuzu_mcp_tool_args_too_large_total", bv->reason);
-                            mcp_audit("denied", std::string("input bound exceeded: ") + bv->reason +
-                                                    " correlation_id=" + cid);
+                            const bool audit_ok =
+                                mcp_audit("denied", std::string("input bound exceeded: ") +
+                                                        bv->reason + " correlation_id=" + call_cid);
                             res.set_content(a4_error(kInvalidParams, bv->message,
                                                      "correct the argument and re-call; no "
                                                      "approval ticket was created or consumed",
-                                                     -1, cid),
+                                                     -1, call_cid, audit_ok),
                                             "application/json");
                             return;
                         }
@@ -8438,14 +8443,14 @@ McpServer::HandlerFn McpServer::build_handler(
                                            : DispatchCaller{.exec_visible =
                                                                 yuzu::server::authz::deny_all()};
                         probe.submitter_pending_cap = idef::kSubmitterPendingCap;
-                        const std::string probe_cid = yuzu::server::detail::make_correlation_id();
+                        probe.correlation_id = call_cid;
                         const auto prepared = yuzu::server::instruction_execute::prepare(
                             probe, instr_exec_ports_,
                             [&](std::string_view result_status, const std::string& detail_text) {
                                 return mcp_audit(std::string(result_status), detail_text);
                             },
                             bind_event_emit(emit_event_fn_, req, metrics));
-                        if (const auto early = idef::render_unless_plan(prepared, probe_cid)) {
+                        if (const auto early = idef::render_unless_plan(prepared, prepared.correlation_id)) {
                             res.set_content(
                                 early->is_error
                                     ? error_response(id, early->code, early->message,
@@ -8829,12 +8834,31 @@ McpServer::HandlerFn McpServer::build_handler(
                                 } catch (...) { // NOLINT(bugprone-empty-catch)
                                 }
                             }
-                            mcp_audit("denied", "per-submitter pending-approval cap reached");
+                            // The same closed token the metric label, the shared core's rows
+                            // and mcp_instruction_execute.cpp's error data carry: the row
+                            // detail names the reason and the error data repeats it, so an
+                            // agentic caller branches on a token, not on prose.
+                            const std::string cap_cid =
+                                yuzu::server::detail::ensure_correlation_id(res);
+                            const bool audit_ok = mcp_audit(
+                                "denied",
+                                std::string("reason=") +
+                                    yuzu::server::instruction_execute::kReasonApprovalCapReached +
+                                    " correlation_id=" + cap_cid);
+                            nlohmann::json cap_data{
+                                {"correlation_id", cap_cid},
+                                {"retry_after_ms", nullptr},
+                                {"remediation", "wait for your pending approvals to be reviewed"},
+                                {"reason",
+                                 yuzu::server::instruction_execute::kReasonApprovalCapReached}};
+                            if (!audit_ok)
+                                cap_data["audit_persisted"] = false;
                             res.set_content(
-                                a4_error(kTierDenied,
-                                         "too many pending approvals for this principal; approve or "
-                                         "let existing requests expire before creating more",
-                                         "wait for your pending approvals to be reviewed"),
+                                error_response(
+                                    id, kTierDenied,
+                                    "too many pending approvals for this principal; approve or "
+                                    "let existing requests expire before creating more",
+                                    cap_data.dump()),
                                 "application/json");
                             return;
                         }
@@ -19194,8 +19218,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 namespace idef = yuzu::server::mcp::instruction_definition;
                 if (!perm_fn(req, res, "Execution", "Execute"))
                     return;
+                // The same id the supervised pre-mint probe used (the response header is the
+                // call-wide carrier), so one call is one id across every row and body.
+                const std::string call_cid = yuzu::server::detail::ensure_correlation_id(res);
                 if (auto bv = idef::check_args(args)) {
-                    const std::string cid = yuzu::server::detail::make_correlation_id();
                     if (metrics != nullptr) {
                         try {
                             metrics
@@ -19205,10 +19231,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         } catch (...) { // NOLINT(bugprone-empty-catch)
                         }
                     }
-                    mcp_audit("denied", std::string("input bound exceeded: ") + bv->reason +
-                                            " correlation_id=" + cid);
+                    const bool audit_ok =
+                        mcp_audit("denied", std::string("input bound exceeded: ") + bv->reason +
+                                                " correlation_id=" + call_cid);
                     res.set_content(a4_error(kInvalidParams, bv->message,
-                                             "correct the argument and re-call", -1, cid),
+                                             "correct the argument and re-call", -1, call_cid,
+                                             audit_ok),
                                     "application/json");
                     return;
                 }
@@ -19228,14 +19256,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // and the pair's own gate decides: a non-admin caller on a gated pair is refused.
                 rq.caller.approval_provenance = yuzu::server::ApprovalProvenance::None;
                 rq.submitter_pending_cap = idef::kSubmitterPendingCap;
+                rq.correlation_id = call_cid;
                 const auto out = yuzu::server::instruction_execute::run(
                     rq, instr_exec_ports_,
                     [&](std::string_view result_status, const std::string& detail_text) {
                         return mcp_audit(std::string(result_status), detail_text);
                     },
                     bind_event_emit(emit_event_fn_, req, metrics));
-                const auto rendered =
-                    idef::render_outcome(out, yuzu::server::detail::make_correlation_id());
+                const auto rendered = idef::render_outcome(out, out.correlation_id);
                 res.set_content(
                     rendered.is_error
                         ? error_response(id, rendered.code, rendered.message, rendered.data_json)

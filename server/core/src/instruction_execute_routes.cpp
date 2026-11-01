@@ -156,28 +156,44 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
             return;
         }
 
+        // The call's ONE correlation id: the response header, the error body, and the
+        // `correlation_id=` token of every `instruction.execute` row this call writes.
+        const std::string cid = detail::ensure_correlation_id(res);
+        const std::string definition_id = req.matches[1].str();
+        const AuditHook audit = [&](std::string_view result, const std::string& detail_text) {
+            if (!deps.audit_fn)
+                return false; // unreachable past the guard above; never "audit off"
+            return deps.audit_fn(req, std::string(kAuditAction), std::string(result),
+                                 "instruction", definition_id, detail_text);
+        };
+        // A refusal before the core runs still leaves a `denied` row (command_v1 does the same
+        // for its body-depth and JSON-parse refusals); a lost row sets Sec-Audit-Failed, and the
+        // 400 itself stands.
+        const auto refuse_body = [&](const char* message, const char* reason) {
+            if (!audit_pre_core_denial(audit, cid, reason, definition_id))
+                res.set_header("Sec-Audit-Failed", "true");
+            res.status = 400;
+            res.set_content(error_body(res, 400, message, reason, std::nullopt),
+                            "application/json");
+        };
+
         // #2437-class guard: raw-text depth check BEFORE parse, so a pathologically nested
         // `params` cannot crash the dump below.
         if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
-            res.status = 400;
-            res.set_content(error_body(res, 400, "request body nests too deeply", "body_depth",
-                                       std::nullopt),
-                            "application/json");
+            refuse_body("request body nests too deeply", "body_depth");
             return;
         }
         auto body = nlohmann::json::parse(req.body, nullptr, /*allow_exceptions=*/false);
         if (body.is_discarded()) {
-            res.status = 400;
-            res.set_content(
-                error_body(res, 400, "invalid request body", "invalid_json", std::nullopt),
-                "application/json");
+            refuse_body("invalid request body", "invalid_json");
             return;
         }
 
         Request rq;
         rq.surface = Surface::kRest;
-        rq.definition_id = req.matches[1].str();
+        rq.definition_id = definition_id;
         rq.body = std::move(body);
+        rq.correlation_id = cid;
         // Unwired caller derivation fails CLOSED on visibility: a present-EMPTY set, never the
         // default VisibleSet (nullopt = unfiltered).
         rq.caller = deps.caller_fn ? deps.caller_fn(req)
@@ -186,14 +202,6 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
         // The same per-principal share of the pending-approval queue MCP has: a script looping on
         // an approval-gated definition must not fill the cap every other principal shares.
         rq.submitter_pending_cap = kSubmitterPendingCap;
-
-        const std::string definition_id = rq.definition_id;
-        const AuditHook audit = [&](std::string_view result, const std::string& detail_text) {
-            if (!deps.audit_fn)
-                return false; // unreachable past the guard above; never "audit off"
-            return deps.audit_fn(req, std::string(kAuditAction), std::string(result),
-                                 "instruction", definition_id, detail_text);
-        };
 
         const Outcome out =
             run(rq, deps.ports, audit, bind_event_emit(deps.emit_event_fn, req, deps.ports.metrics));
