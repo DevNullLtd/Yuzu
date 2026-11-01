@@ -215,8 +215,9 @@ carries the one coordinate every promotion advances regardless of what WAL was l
   `GREATEST(timeline, prev_row_epoch >> 32)` so the **sequence stays live** while a restored row pins a higher
   timeline than the real one: with the floor alone every mint there would be exactly `prev + 1`, and a lossy
   promotion that loses the latest mint would re-mint the very epoch a paused ex-leader holds. A row of
-  `INT64_MAX` makes the mint fail loudly (`bigint out of range`), never wrap; repair is to set the row below
-  2^63 (or delete it, then run the `issuer_epoch` reset). The floor assumes the lock holder is the only writer
+  `INT64_MAX` makes the mint fail loudly (`bigint out of range`), never wrap; repair is to delete the row (or
+  `UPDATE` it to a value no higher than the epoch you want next), then run the `issuer_epoch` reset from
+  `docs/user-manual/upgrading.md`. The floor assumes the lock holder is the only writer
   of the row: a manual `UPDATE` racing a mint can still be overwritten, as before #6535.
 * Refusals enforced rather than assumed: the sequence is capped at `MAXVALUE 4294967295` (migration v2; at
   the cap `nextval` raises, and `ALTER SEQUENCE ... RESTART` is a safe remedy because of the floor), and a
@@ -236,8 +237,12 @@ read as "the epoch is monotonic across any promotion"; every other document defe
    until `issuer_epoch` is reset (`docs/user-manual/upgrading.md`);
 3. a lossy promotion while the surviving row pins a HIGHER timeline than the real one (a restored cluster):
    the timeline cannot separate epochs there, so only the sequence does, which is the pre-#6535 protection (a
-   repeat needs the lost mint to have crossed a 32-value boundary); the elector logs a warning at every such
-   acquisition until the real timeline reaches the pinned one;
+   repeat needs the lost mint to have crossed a 32-value boundary). A sequence that is BEHIND the row's low
+   32 bits (a logical-replication cutover or a table-only restore does not carry it) would make every mint
+   exactly the row plus one, so the elector advances the sequence to the minted count part at the first such
+   (floored) mint; only that first election stays deterministic, and the elector logs a warning at every
+   acquisition until the real timeline reaches the pinned one (the promotion that reaches it is itself still
+   unprotected);
 4. same-timeline loss: a crash recovery that loses an unflushed mint (`synchronous_commit=off`, `fsync=off`)
    keeps the timeline;
 5. a physical-snapshot restore started without archive recovery, which keeps its timeline while the sequence

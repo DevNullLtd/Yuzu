@@ -1069,7 +1069,8 @@ that holds it).
   role can run `pg_current_wal_lsn()` and `pg_walfile_name()`; this affects a
   single-replica server too; `cause="epoch_record"` rising means the sequence cap was reached
   (`ALTER SEQUENCE leader_elector.leader_epoch_seq RESTART` is safe) or the
-  `leader_state` row was corrupted to near 9223372036854775807: see
+  `leader_state` row was corrupted to exactly 9223372036854775807 (the log line
+  `failed to record epoch ... (server said: ...)` names which): see
   [Upgrading](upgrading.md#behaviour-change-the-leader-epoch-now-carries-the-postgres-timeline-ha-6535)); then, in
   Postgres,
   `SELECT a.pid, a.client_addr, a.state, a.backend_start, a.state_change FROM pg_locks l JOIN pg_stat_activity a USING (pid) WHERE l.locktype = 'advisory' AND l.classid = 1735291205;`
@@ -4951,7 +4952,7 @@ docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
   --role=yuzu -U postgres --dbname=yuzu < "yuzu-pg-YYYY-MM-DD.dump"
 ```
 
-**Leader epoch after a restore.** The leader epoch packs the Postgres timeline of the cluster that minted it, and a restore into a fresh cluster may start on a lower timeline (it does when the source cluster had ever failed over). The server floors every new epoch by the `leader_elector.leader_state` row the dump carries, so the restore works as written; while the stored epoch carries a higher timeline than the new cluster's, the server logs a `leader_elector: minted epoch's timeline part ... is above the real Postgres timeline` warning at each election (only the sequence, not the timeline, separates epochs against a lossy promotion until the cluster's timeline reaches it: see `ha-postgres.md`). Only if `leader_elector.leader_state` was lost or recreated while `plugin_config_store.enablement_meta` was restored, run the `issuer_epoch` reset from [Upgrading](upgrading.md#behaviour-change-the-leader-epoch-now-carries-the-postgres-timeline-ha-6535).
+**Leader epoch after a restore.** The leader epoch packs the Postgres timeline of the cluster that minted it, and a restore into a fresh cluster may start on a lower timeline (it does when the source cluster had ever failed over). The server floors every new epoch by the `leader_elector.leader_state` row the dump carries, so the restore works as written; while the stored epoch carries a higher timeline than the new cluster's, the server logs a `leader_elector: minted epoch's timeline part ... is above the real Postgres timeline` warning at each election (only the sequence, not the timeline, separates epochs against a lossy promotion until the cluster's timeline reaches it, and a sequence behind the stored epoch is advanced automatically: see `ha-postgres.md`). Only if `leader_elector.leader_state` was lost or recreated while `plugin_config_store.enablement_meta` was restored, run the `issuer_epoch` reset from [Upgrading](upgrading.md#behaviour-change-the-leader-epoch-now-carries-the-postgres-timeline-ha-6535).
 
 Restore `enablement-anchor` with the `--data-dir` files. Restoring a dump onto the data directory it came from is consistent; restoring an OLDER dump under a newer anchor starts the server with enablement regressed by design, and a restore onto a host with no anchor is reported as unwitnessed, as is a restore-then-upgrade while nothing has yet been issued (the anchor names the old store id, both counters are `0`). See [Enablement continuity anchor](#enablement-continuity-anchor) for what each means and for the exit.
 

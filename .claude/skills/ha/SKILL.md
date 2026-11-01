@@ -144,7 +144,7 @@ failback/rebalance, roadmap 7.1.1, #5759) was added 2026-10-13 as WS-13's pair.
 `377cc7700` and `gh`); no other row was. The WS-11 leader-observability subset shipped (metrics published at
 scrape time from a lock-free `LeaderElector::Stats`, the `yuzu-ha-leader` alerts; leadership and the elector
 being open stay out of `/readyz`). Follow-ups: #6526 (remediation-claim lifecycle counters), #6527 (CRL
-freshness gauge), #6528 (durable cluster-capability admission gate), #6535 (epoch fence across a lossy async promotion: fixed in code for a standby promotion by the timeline-packed, row-floored epoch, demonstrated once on a manual rig; the owner's acceptance of its residuals is NOT yet recorded, a "Decided" line is required). The safe-to-scale gate is NOT lifted.
+freshness gauge), #6528 (durable cluster-capability admission gate), #6535 (epoch fence across a lossy async promotion: fixed in code for a standby promotion by the timeline-packed, row-floored epoch, demonstrated once on a manual rig (on the pre-floor mint); the owner's acceptance of its residuals is NOT yet recorded, a "Decided" line is required). The safe-to-scale gate is NOT lifted.
 
 **WS-6 re-stamped 2026-09-23 (PR #4833):** slice 6.1 (cross-replica CRL publication, #4126) in
 review; 6.1b / 6.2 / 6.3 planned; the operator decisions (shared CA key custody, not

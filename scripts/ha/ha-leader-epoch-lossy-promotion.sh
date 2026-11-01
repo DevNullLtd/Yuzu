@@ -180,7 +180,7 @@ boot_and_lead() { # <epoch-to-differ-from> -- boots a server and waits until it 
 
 # The container names are fixed; refuse to adopt (and later `down -v`) another HA rig.
 if [[ -n "$(docker ps -a --filter 'name=yuzu-ha-' -q 2>/dev/null)" ]]; then
-    echo "a yuzu-ha-* container already exists; stop that rig first (this script runs 'docker compose down -v'; to clear leftovers of an aborted run: docker compose -f deploy/docker/docker-compose.ha-postgres.yml down -v)" >&2
+    echo "a yuzu-ha-* container already exists; stop that rig first (this script runs 'docker compose down -v'; to clear leftovers of an aborted run: YUZU_SUPERUSER_PASSWORD=x YUZU_PG_REPLICATION_PASSWORD=y YUZU_DB_PASSWORD=z docker compose -f deploy/docker/docker-compose.ha-postgres.yml down -v)" >&2
     trap - EXIT
     rm -rf "$RIG"
     exit 2
