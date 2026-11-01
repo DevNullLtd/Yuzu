@@ -10162,6 +10162,62 @@ TEST_CASE("MCP DEX: list_dex_apps off-enum window -> invalid params, never a "
     CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
 }
 
+TEST_CASE("MCP DEX: list_dex_apps platform selects the scope, off-enum -> invalid params "
+          "(parity with REST GET /api/v1/dex/apps?platform=)",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "w1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "m1", "MAC-1", "process.crashed", "Safari", "macos",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto subjects = [&](const char* platform) {
+        auto res = ts.call(std::string{R"({"jsonrpc":"2.0","method":"tools/call","id":983,"params":{"name":"list_dex_apps","arguments":{"window":"all","platform":")"} +
+                           platform + R"("}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+        std::pair<std::string, std::set<std::string>> out{payload["population_basis"], {}};
+        for (const auto& a : payload["apps"])
+            out.second.insert(a["subject"].get<std::string>());
+        return out;
+    };
+    const auto all = subjects("all");
+    CHECK(all.first == "all_online");
+    CHECK(all.second == std::set<std::string>{"chrome.exe", "Safari"});
+    const auto win = subjects("windows");
+    CHECK(win.first == "windows_online");
+    CHECK(win.second == std::set<std::string>{"chrome.exe"});
+    const auto mac = subjects("macos");
+    CHECK(mac.first == "macos_online");
+    CHECK(mac.second == std::set<std::string>{"Safari"});
+    CHECK(subjects("linux").second.empty());
+
+    auto bad = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":984,"params":{"name":"list_dex_apps","arguments":{"platform":"solaris"}}})");
+    REQUIRE(bad);
+    CHECK(bad->body.find("invalid platform") != std::string::npos);
+    CHECK(bad->body.find("-32602") != std::string::npos); // kInvalidParams
+
+    // A present non-string is invalid too, never the all-platform default.
+    int next_id = 985;
+    for (const char* wrong : {"5", "null", "true", "[]", "{}"}) {
+        auto r = ts.call(std::string{R"({"jsonrpc":"2.0","method":"tools/call","id":)"} +
+                         std::to_string(next_id++) +
+                         R"(,"params":{"name":"list_dex_apps","arguments":{"platform":)" + wrong +
+                         "}}}");
+        REQUIRE(r);
+        CAPTURE(wrong);
+        CHECK(r->body.find("invalid platform") != std::string::npos);
+        CHECK(r->body.find("-32602") != std::string::npos);
+        CHECK(r->body.find("all_online") == std::string::npos);
+    }
+}
+
 TEST_CASE("MCP DEX: get_dex_catalogue_group off-enum window -> invalid params, never a "
           "silently-defaulted 7d (parity with REST GET /api/v1/dex/catalogue/group)",
           "[pg][mcp][integration][dex]") {
@@ -10435,7 +10491,8 @@ TEST_CASE("MCP DEX: list_dex_apps returns the stability list, no audit (aggregat
         return k;
     };
     CHECK(keys(payload) == keys(shared));
-    CHECK(payload["population_basis"] == "windows_online");
+    // No platform argument: every platform, like the REST default.
+    CHECK(payload["population_basis"] == "all_online");
     CHECK(keys(payload["apps"][0]) == keys(shared["apps"][0]));
     CHECK(keys(payload["apps"][0]["versions"][0]) == keys(shared["apps"][0]["versions"][0]));
 }
@@ -10654,13 +10711,22 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
         // The description names the policy, the profile marker, the refused-policy
         // fault and the staleness bound (concept words, so copy edits do not false-fail).
         const auto desc = t["description"].get<std::string>();
-        for (const char* concept_word : {"policy", "profile", "fault", "staleness bound"})
+        for (const char* concept_word : {"policy", "profile", "fault", "staleness bound", "platform",
+                                         "crash_source_coverage", "retry_after_ms", "get_dex_app", "-32602"})
             CHECK(desc.find(concept_word) != std::string::npos);
+        const auto& platform_in = t["inputSchema"]["properties"]["platform"];
+        CHECK(platform_in["enum"] == nlohmann::json::array({"all", "windows", "macos", "linux"}));
+        CHECK(platform_in["default"] == "all");
+        CHECK(platform_in["description"].get<std::string>().find("Platform scope") !=
+              std::string::npos);
+        CHECK(t["inputSchema"]["properties"]["window"]["description"].get<std::string>().find(
+                  "Look-back window") != std::string::npos);
         REQUIRE(t.contains("outputSchema"));
         const auto& out = t["outputSchema"];
         CHECK(out["required"] ==
               nlohmann::json::array({"window", "apps", "policy", "population", "population_basis",
-                                     "apps_total", "apps_truncated"}));
+                                     "crash_source_coverage", "apps_total", "apps_truncated"}));
+        CHECK(out["properties"].contains("crash_source_coverage"));
         const auto& policy = out["properties"]["policy"];
         CHECK(policy["required"] == nlohmann::json::array({"source", "revision", "fault", "tiers"}));
         CHECK(policy["properties"]["source"]["enum"] == nlohmann::json::array({"default", "custom"}));

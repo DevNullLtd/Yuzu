@@ -144,7 +144,8 @@ public:
     [[nodiscard]] virtual DexAppsModel apps(const std::string& window,
                                             const std::string& platform_scope) const = 0;
 
-    /// The Windows scope: today's behaviour, unchanged.
+    /// The Windows scope, the behaviour before the platform argument. REST and MCP pass the scope
+    /// explicitly and default to all; this form is for callers that mean Windows.
     [[nodiscard]] DexAppsModel apps(const std::string& window) const {
         return apps(window, kDexAppsScopeWindows);
     }

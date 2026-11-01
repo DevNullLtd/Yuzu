@@ -115,6 +115,14 @@ inline std::string dex_perf_os_from_session(std::string_view raw) {
     return "";
 }
 
+/// The Apps/Overview fleet label for an agent-reported OS string: the
+/// dex_perf_os_from_session token (prefix match, as guaranteed_state_store.cpp's
+/// starts_with on the write side), and an unknown token passes through raw.
+inline std::string dex_fleet_os_label(std::string_view raw) {
+    const auto n = dex_perf_os_from_session(raw);
+    return n.empty() ? std::string(raw) : n;
+}
+
 /// Does this normalized OS token (see dex_perf_os_from_session) have a real
 /// heartbeat perf collector today? Windows and Linux both do (Echo perf
 /// capture source, `echo_perf.cpp`); macOS is `kPlanned` (all-invalid stub)
