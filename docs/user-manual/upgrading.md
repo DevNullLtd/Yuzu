@@ -25,8 +25,8 @@ The `GET` deny runs after the kill switches, the `Origin` check, the protocol-ve
 
 ## New: v1 REST and MCP twins for command dispatch, execution cancel and rerun, and stored-definition execute (#2146)
 
-Additive: no existing route, tool, permission or audit action changes, and no action is needed to keep a
-deployment working. The new surfaces are `POST /api/v1/commands` (the REST v1 twin of `POST /api/command` and
+Additive, apart from one change to existing behaviour (the MCP approval-ticket mint's pending-approval cap, below); no
+action is needed to keep a deployment working. The new surfaces are `POST /api/v1/commands` (the REST v1 twin of `POST /api/command` and
 the MCP `execute_instruction`; it creates an execution row and returns `execution_id`),
 `POST /api/v1/executions/{id}/cancel` and `.../rerun` with the MCP tools `cancel_execution` and
 `record_execution_rerun`, and `POST /api/v1/instructions/{id}/execute` with the MCP tool
@@ -45,17 +45,37 @@ What an operator should know:
   (other verbs already write them, for example `inventory.sync.request`): `requested` (the row written before a
   dispatch) and `pending` (an instruction execute held for approval). A SIEM rule that treats
   `result != "success"` as a failure now also matches them on these verbs; key on the outcome row, as for
-  `attempted` (`audit-log.md`, "Result vocabulary"). Every `instruction.execute` row now ends with a
-  `correlation_id=` that pairs a `requested` row with its outcome row and with the response the caller saw.
+  `attempted` (`audit-log.md`, "Result vocabulary"). Every row the new execute routes write
+  (`POST /api/v1/instructions/{id}/execute`, and the shared pipeline behind the MCP twin) ends with a
+  `correlation_id=` that pairs a `requested` row with its outcome row and with the response the caller saw; the
+  legacy `POST /api/instructions/{id}/execute` rows are unchanged and carry none.
+- **A dispatch that throws part-way.** On `POST /api/v1/commands` and the instruction execute twins the execution
+  row is left `running`, never cancelled, because some agents may already hold the command; no retry is
+  advertised. When the server had confirmed sending to at least one agent it stores that number as the row's
+  targeted count (the `failure` audit row carries `agents_sent=<n>`), so those agents' results complete the row;
+  otherwise the row stays `running` until the stuck-execution sweep closes it, and `cancel_execution` closes it at
+  once.
 - **Supervised MCP tokens.** `cancel_execution` is exempt from the supervised-tier approval ticket (it only
   updates the tracker record), the one tool on a closed exempt list; the REST route still refuses a
   supervised-tier token. `record_execution_rerun` and `execute_instruction_definition` need a ticket as any
   other `Execution:Execute` write does. A definition whose own `approval_mode` is not `auto` still cannot be
   run through the execute routes or tools: its approval can be recorded but nothing redeems it (#6064).
-- **Pending-approval cap.** `POST /api/v1/instructions/{id}/execute` refuses a principal that already holds 25
-  pending approvals with `429` (`approval_cap_reached`), the cap the MCP tools already applied. A looping script
-  or agentic worker that used the legacy route without a cap will meet it on the v1 route. The legacy
-  `POST /api/instructions/{id}/execute` is unchanged.
+- **Pending-approval cap.** `POST /api/v1/instructions/{id}/execute` refuses a principal that already holds about
+  25 pending approvals with `429` (`approval_cap_reached`), the soft bound the MCP tools already applied (the count
+  is read and then the approval submitted, so concurrent requests from one principal can briefly exceed it). A
+  looping script or agentic worker that used the legacy route without a cap will meet it on the v1 route. The
+  legacy `POST /api/instructions/{id}/execute` does not apply it.
+- **Changed: the MCP approval-ticket mint's cap now fails closed.** The supervised-tier ticket mint of every
+  approval-gated tool read the principal's pending count with a call that returned `0` when the approval store
+  could not be read, so a struggling store admitted every principal; the mint now refuses with `-32603`
+  `approval_unavailable` (`retry_after_ms` 5000) and creates no ticket. A full shared queue (1000 pending) is now
+  `-32603` `approval_queue_full` with `retry_after_ms: null`, where it used to read as a retryable store failure
+  (`approval_submit_failed`, `retry_after_ms` 5000), so a client that retried it on a timer will stop. The count
+  no longer includes pending rows older than the 7-day approval window, and the mint's refusals now carry
+  `error.data.reason` and an audit detail of `reason=<token> correlation_id=<id>` (a full queue is a `denied`
+  row). What to do: for `approval_queue_full` a reviewer must decide pending approvals (or they expire after 7
+  days); for `approval_unavailable` check the health of the approval store
+  (`yuzu_server_approval_submit_refused_total{reason="approval_unavailable"}`).
 - **Body cap on `POST /api/v1/commands`.** The route has its own `commands` body-cap class (4 MiB, and the body
   must be measurable in advance): a request with a chunked `Transfer-Encoding` body or no `Content-Length` is
   refused with `411`. The legacy `POST /api/command` falls under the default 4 MiB class, which does not
@@ -63,17 +83,33 @@ What an operator should know:
   `Content-Length` to use the v1 route.
 - **Metrics.** Two new counters, `yuzu_server_approval_submit_refused_total{reason}` and
   `yuzu_server_event_emit_failed_total{event_type}`, are pre-seeded to `0`. `yuzu_server_dispatch_target_rejected_total`
-  gains `route="command_v1"`, and `yuzu_server_instruction_param_rejected_total` gains `route="mcp"`
-  (`metrics.md`). The platform events `command.dispatched`, `execution.created`, `execution.completed`,
+  gains `route="command_v1"`, `yuzu_server_instruction_param_rejected_total` gains `route="mcp"`, and
+  `yuzu_server_dispatch_fanout_throw_total` gains `phase="dispatch"` for the routes `command_v1`,
+  `instruction_execute` and `mcp` (`metrics.md`). The platform events `command.dispatched`, `execution.created`, `execution.completed`,
   `approval.created` and `instruction.executed` are also published by the new twins (`analytics-events.md`).
+
+**Rolling upgrade.** Every check here is per replica. A replica that has not been upgraded does not serve the new
+REST routes (`404`) or the new MCP tools, so a client or load balancer can meet either behaviour during the roll:
+adopt the new routes only once every replica is upgraded. The mint-cap change above, and the new `requested` and
+`pending` audit results, likewise appear only from upgraded replicas, so a mixed-version roll writes the old mint
+rows and the new ones side by side.
+
+**Rollback.** Rolling back to the previous build removes the new routes and tools (clients get `404`, or the tool
+is unavailable) and restores the old fail-open mint cap and its old refusal wording. This change adds no database
+migration or schema change in either direction; execution rows, approvals and audit rows already written stay in
+place.
 
 ## Behaviour change: result-set producers refuse a gated definition action for a non-administrator (#2146)
 
-**What changed.** `create_result_set_from_instruction_result` and `reevaluate_result_set` (MCP) no longer treat a consumed supervised-tier approval ticket as approval for the `plugin.action` of the stored definition they run. If that action is gated (admin or approval), a non-administrator caller is refused with `-32003` and `error.data.reason = approval_required` (permanent, `retry_after_ms` null), and no execution record is created. `create_result_set_from_echo_query` and `execute_bundle` are unchanged.
+**What changed.** `create_result_set_from_instruction_result` and `reevaluate_result_set` (MCP) no longer stamp ticket provenance on the dispatch, so a consumed supervised-tier approval ticket is no longer approval for the `plugin.action` of the stored definition they run. If that action is gated (admin or approval), a non-administrator caller is refused with `-32003` and `error.data.reason = approval_required` (permanent, `retry_after_ms` null), and no execution record is created. `create_result_set_from_echo_query` and `execute_bundle` are unchanged.
 
 **Who is affected.** Supervised-tier (ticket-then-recall) tokens that ran a gated action through these two tools: the ticket is still minted and approved, but the recall now refuses, and the ticket is spent. Operator-tier tokens whose owner is not an administrator were already refused by the dispatch gate and now receive the explicit reason instead of a generic "no agents reached" error.
 
 **What to do.** Run the call with an administrator token, or ask an administrator to change the definition to a non-gated action.
+
+**Rolling upgrade.** The check is enforced per replica. A replica that has not been upgraded still honours a consumed supervised-tier ticket on these two tools, so the fix holds across the cluster only once every replica is upgraded; until then the same recall can run on one replica and be refused (`-32003`, `approval_required`) on another.
+
+**Rollback.** Rolling back restores the old behaviour: a ticket again lifts the gate of a stored definition's action, including one repointed after the ticket was approved. No data changes in either direction.
 
 ## Behaviour change: the activity-record feature is renamed Echo (tar.db adopted as echo.db; stored references migrated)
 
