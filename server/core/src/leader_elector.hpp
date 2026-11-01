@@ -16,7 +16,7 @@
 ///
 ///   * On each successful acquire, the elector mints a fresh epoch,
 ///     `GREATEST((GREATEST(timeline, prev >> 32) << 32) + nextval(leader_epoch_seq),
-///     prev + 1)` (the packed term; see below), and records it as
+///     prev + 1)` (the packed term, `(GREATEST(timeline, prev >> 32) << 32) + nextval`), and records it as
 ///     `leader_state.current_leader_epoch` — done ON the lock-owning
 ///     connection, so mutual exclusion guarantees only the true holder writes
 ///     it, and each new leader's epoch is strictly greater than any prior one.
@@ -29,6 +29,8 @@
 ///     with the packed timeline itself `GREATEST(real, prev_epoch >> 32)`), so a
 ///     restore / pg_upgrade / cutover onto a lower timeline, or an older
 ///     sequence, can never mint below it (the enablement store orders epochs).
+///     A sequence BEHIND the row (a cutover or table-only restore) is advanced at the first
+///     floored mint, best-effort; that election and the next stay exposed.
 ///     NOT covered (canonical list: ADR-2002 §3 "Update (2026-11-01, #6535)"):
 ///     two live primaries (the fence is per database), a restore that loses the
 ///     leader_state row, a lossy promotion while the row pins a higher timeline

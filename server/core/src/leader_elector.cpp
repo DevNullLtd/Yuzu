@@ -496,17 +496,20 @@ bool LeaderElector::try_acquire() {
         // would be too: a lossy promotion would re-mint them. Advance the sequence to this
         // epoch's count part (never lower it) so the NEXT mint is separated by the sequence
         // again. Best-effort, on the lock-owning connection; only this first mint stays exposed.
+        // LEAST(.., cap - 1): never park the sequence AT its MAXVALUE (the next nextval would
+        // raise), even for a pathological row whose count part is 2^32-2.
         pg::PgResult fix = pg::exec_params(
             conn_.get(),
             "SELECT setval('leader_elector.leader_epoch_seq', "
-            "GREATEST($1::bigint, (SELECT last_value FROM leader_elector.leader_epoch_seq), 1), "
-            "true)",
+            "LEAST(GREATEST($1::bigint, (SELECT last_value FROM leader_elector.leader_epoch_seq), "
+            "1), 4294967294), true)",
             std::vector<std::string>{std::to_string(*parsed & kEpochCountMask)});
-        if (fix.status() == PGRES_TUPLES_OK) {
+        if (fix.status() == PGRES_TUPLES_OK && PQntuples(fix.get()) == 1 &&
+            !PQgetisnull(fix.get(), 0, 0)) {
             spdlog::warn("leader_elector: the leader_epoch_seq sequence was behind the stored "
                          "leader_state epoch (restore / cutover without sequences); advanced it "
-                         "to {} so the next election is separated by the sequence again",
-                         *parsed & kEpochCountMask);
+                         "to {} so later elections are separated by the sequence again",
+                         PQgetvalue(fix.get(), 0, 0));
         } else {
             spdlog::warn("leader_elector: the leader_epoch_seq sequence is behind the stored "
                          "leader_state epoch and could not be advanced; set it with setval to "

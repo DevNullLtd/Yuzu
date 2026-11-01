@@ -410,7 +410,7 @@ TEST_CASE("LeaderElector mint is floored by a surviving row from a HIGHER timeli
 
     // The characterisation behind the whole case: a mint packed from the REAL timeline alone is
     // BELOW the restored value, so an ordered consumer would reject the new leader forever. (The
-    // packed term now takes the row\'s timeline too, so this case pins that term; the +1 floor
+    // packed term now takes the row's timeline too, so this case pins that term; the +1 floor
     // itself is pinned by the older-sequence, RESTART and INT64_MAX cases below.)
     CHECK(scalar(admin.get(), "SELECT ((1::bigint << 32) + 42) < ((3::bigint << 32) + 41)") == "t");
 
@@ -502,15 +502,35 @@ TEST_CASE("LeaderElector repairs a sequence that is BEHIND the stored row so the
     CHECK(scalar(admin.get(), "SELECT last_value FROM leader_elector.leader_epoch_seq") == "502");
     b.resign();
 
-    // The promoted standby lacks B's mint: the row is A's, and its sequence resumes past the
-    // pre-logged horizon. The new leader's epoch must differ from B's (it would equal it, at
-    // exactly row+1, if the sequence had never been repaired).
+    // The promoted standby lacks B's mint: the row is A's, and the REPAIRED sequence (502, with its
+    // pre-logged horizon) survived. The new leader's epoch must differ from B's: it would equal it
+    // (row+1 = +502) if the sequence had never been repaired.
     seed_leader_row(admin.get(), lock_name, "(5::bigint << 32) + 501");
-    exec_ok(admin.get(), "SELECT setval('leader_elector.leader_epoch_seq', 530, true)");
     LeaderElector c(cfg_tl(db.dsn(), "after-promotion", 1));
     REQUIRE(c.try_acquire());
-    CHECK(*c.epoch() == (std::int64_t{5} << 32) + 531);
+    CHECK(*c.epoch() == (std::int64_t{5} << 32) + 503);
     CHECK(*c.epoch() != e_b);
+}
+
+TEST_CASE("LeaderElector still leads when the sequence repair cannot run (#6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    const std::string lock_name = kServerBackgroundLeaderLock;
+    auto admin = connect(db.dsn());
+    const std::string dbname = current_database_name(admin.get());
+    // A stub setval that raises stands in for a role with USAGE but no UPDATE on the sequence.
+    exec_ok(admin.get(), "CREATE SCHEMA shadow");
+    exec_ok(admin.get(), "CREATE FUNCTION shadow.setval(regclass, bigint, boolean) RETURNS bigint "
+                         "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'permission denied'; END $$");
+    exec_ok(admin.get(), "ALTER DATABASE \"" + dbname + "\" SET search_path = shadow, pg_catalog");
+    seed_leader_row(admin.get(), lock_name, "(5::bigint << 32) + 500");
+
+    LeaderElector a(cfg_tl(db.dsn(), "holder-a", 1));
+    REQUIRE(a.try_acquire()); // best-effort: the failed repair must not drop leadership
+    CHECK(a.is_leader());
+    CHECK(*a.epoch() == (std::int64_t{5} << 32) + 501);
+    CHECK(failed(a.stats(), AcquireFailure::EpochRecord) == 0);
+    CHECK(scalar(admin.get(), "SELECT last_value FROM leader_elector.leader_epoch_seq") == "1");
 }
 
 TEST_CASE("LeaderElector mint over corrupt, foreign and legacy rows (#6535)",
@@ -526,8 +546,8 @@ TEST_CASE("LeaderElector mint over corrupt, foreign and legacy rows (#6535)",
         CHECK_FALSE(a.try_acquire());
         CHECK_FALSE(a.is_leader());
         CHECK(failed(a.stats(), AcquireFailure::EpochRecord) == 1);
-        // Repair is an operator action on the row; the lock was released.
-        seed_leader_row(admin.get(), lock_name, "(1::bigint << 32) + 1");
+        // The documented repair is deleting the row; the lock was released.
+        exec_ok(admin.get(), "DELETE FROM leader_elector.leader_state WHERE lock_key = '" + lock_name + "'");
         LeaderElector b(cfg_tl(db.dsn(), "holder-b", 1));
         REQUIRE(b.is_open());
         CHECK(b.try_acquire());
