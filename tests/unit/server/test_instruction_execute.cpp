@@ -2187,6 +2187,47 @@ TEST_CASE("REST execute: a definition id that is not valid UTF-8 is a 400 invali
     CHECK(ok.core.lookups == 1);
 }
 
+// compliance p5-c3: log_token also folds C1 controls, U+2028 and U+2029, but step 0 lets them
+// through (they are valid UTF-8, not control BYTES). The audit target_id must be folded like the
+// detail token anyway, while the id itself stays valid and reaches the lookup.
+TEST_CASE("REST execute: an id holding a C1 control, U+2028 or U+2029 is folded in the audit "
+          "target_id but is NOT refused at step 0",
+          "[instruction_execute][rest][security]") {
+    for (const auto& id : {std::string("d\xC2\x85x"), std::string("d\xE2\x80\xA8x"),
+                           std::string("d\xE2\x80\xA9x"), std::string("d\xC2\x9F")}) {
+        INFO(id.size());
+        CHECK(definition_id_needs_audit_fold(id));
+        CHECK_FALSE(definition_id_is_malformed(id)); // step 0 must not widen
+        RouteRig r;                                  // no definitions: the lookup answers not_found
+        auto res = r.post(id, "{}");
+        REQUIRE(res);
+        CHECK(res->status == 404);
+        CHECK(json::parse(res->body)["error"]["reason"] != "invalid_definition_id");
+        CHECK(r.core.lookups == 1); // it went to the lookup
+        REQUIRE_FALSE(r.target_ids.empty());
+        for (const auto& t : r.target_ids) {
+            CHECK(t.find('\xC2') == std::string::npos);
+            CHECK(t.find('\xE2') == std::string::npos);
+            CHECK(t.substr(0, 2) == "d_");
+        }
+    }
+    // Positive controls: a normal id and a valid multibyte id outside the folded set are not
+    // folded (the predicate is false and target_id is the id itself).
+    CHECK_FALSE(definition_id_needs_audit_fold("my def=1,v"));
+    CHECK_FALSE(definition_id_needs_audit_fold("d\xC3\xA9"));       // U+00E9
+    CHECK_FALSE(definition_id_needs_audit_fold("d\xE2\x80\xA7"));   // U+2027, one below U+2028
+    CHECK_FALSE(definition_id_needs_audit_fold("d\xE2\x80\xAA"));   // U+202A, one above U+2029
+    CHECK_FALSE(definition_id_needs_audit_fold("d\xC2\xA0"));       // U+00A0, one above U+009F
+    RouteRig ok;
+    ok.core.defs["d\xC3\xA9"] = make_def("d\xC3\xA9");
+    auto res = ok.post("d\xC3\xA9", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE_FALSE(ok.target_ids.empty());
+    for (const auto& t : ok.target_ids)
+        CHECK(t == "d\xC3\xA9");
+}
+
 TEST_CASE("REST execute: 400 for a nested or malformed body before any lookup",
           "[instruction_execute][rest]") {
     RouteRig r;

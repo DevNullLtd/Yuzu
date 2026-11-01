@@ -181,9 +181,11 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
             // row's subject, but a hostile id (CR/LF/ESC/DEL...) must not reach the column raw:
             // sanitize_pg_text only repairs invalid UTF-8 and NUL, so every OTHER control byte
             // would be stored verbatim. Cleaned only when the id is malformed (a control byte or
-            // invalid UTF-8, the step-0 refusal's own predicate).
+            // invalid UTF-8, the step-0 refusal's own predicate) or holds a code point log_token
+            // folds that step 0 lets through (C1 controls, U+2028, U+2029): those ids stay valid
+            // and reach the lookup, but their audit subject is folded like the detail token.
             std::string target = bounded_definition_id(definition_id);
-            if (definition_id_is_malformed(definition_id))
+            if (definition_id_needs_audit_fold(definition_id))
                 target = ::yuzu::log_token(target);
             return deps.audit_fn(req, std::string(kAuditAction), std::string(result),
                                  "instruction", target, detail_text);

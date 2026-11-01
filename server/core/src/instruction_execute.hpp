@@ -393,6 +393,34 @@ inline constexpr std::size_t kAuditDefinitionIdMax = 128;
     return definition_id_has_control_byte(id) || definition_id_is_invalid_utf8(id);
 }
 
+/// True when `id` holds a code point `yuzu::log_token` folds that is NOT refused at step 0: a C1
+/// control (U+0080..U+009F, `C2 80`..`C2 9F`), U+2028 or U+2029 (`E2 80 A8` / `E2 80 A9`).
+/// Meaningful for a well-formed id (a malformed one is caught by `definition_id_is_malformed`
+/// first). Such an id stays VALID: it reaches the lookup (and, if absent, `not_found`) exactly as
+/// today. This predicate exists ONLY so the REST route's audit `target_id` cleaning can fold it
+/// the way the `definition=` detail token is already folded; it must NOT be added to step 0.
+[[nodiscard]] inline bool definition_id_has_log_folded_codepoint(std::string_view id) noexcept {
+    for (std::size_t i = 0; i + 1 < id.size(); ++i) {
+        const auto c = static_cast<unsigned char>(id[i]);
+        const auto c1 = static_cast<unsigned char>(id[i + 1]);
+        if (c == 0xC2 && c1 <= 0x9F)
+            return true;
+        if (c == 0xE2 && c1 == 0x80 && i + 2 < id.size()) {
+            const auto c2 = static_cast<unsigned char>(id[i + 2]);
+            if (c2 == 0xA8 || c2 == 0xA9)
+                return true;
+        }
+    }
+    return false;
+}
+
+/// The REST route's audit `target_id` predicate: the id is malformed (step-0 refusal) OR holds a
+/// code point `log_token` folds. A normal id is neither, so its `target_id` stays byte-identical
+/// to the id. Used ONLY by the route's target cleaning, never by step 0.
+[[nodiscard]] inline bool definition_id_needs_audit_fold(std::string_view id) noexcept {
+    return definition_id_is_malformed(id) || definition_id_has_log_folded_codepoint(id);
+}
+
 /// The `denied` row for a refusal that happens BEFORE the core runs and so before it could stamp
 /// one itself: today the REST route's body-too-deep and unparseable-JSON refusals (the MCP twin's
 /// equivalents are its argument-bound refusals, written by the MCP adapter with the same
