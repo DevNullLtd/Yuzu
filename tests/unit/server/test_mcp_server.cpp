@@ -30954,6 +30954,17 @@ TEST_CASE("MCP approval mint enforces a per-submitter pending sub-cap",
     CHECK(cap_row == "reason=approval_cap_reached correlation_id=" + cap_cid);
 }
 
+namespace {
+/// The detail of the LAST `mcp.<tool>|<result>` audit row (a marker string when none).
+std::string mint_row_detail(const McpTestServer& ts, const std::string& tool, const std::string& result) {
+    const std::string key = "mcp." + tool + "|" + result;
+    for (std::size_t i = ts.audit_log.size(); i-- > 0;)
+        if (ts.audit_log[i] == key && i < ts.audit_details.size())
+            return ts.audit_details[i];
+    return "<no such row>";
+}
+} // namespace
+
 // up8-1 / sre-2: the same mint with an approval store whose count cannot be READ. The cap used to
 // read an unreadable count as zero and admit every principal exactly when the store was struggling.
 TEST_CASE("MCP approval mint refuses, retryable and counted, when the per-submitter pending count "
@@ -30991,6 +31002,88 @@ TEST_CASE("MCP approval mint refuses, retryable and counted, when the per-submit
     const std::string metric(yuzu::server::instruction_execute::kApprovalRefusedMetric);
     CHECK(reg.counter(metric, {{"reason", "approval_unavailable"}}).value() == 1);
     CHECK(reg.counter(metric, {{"reason", "approval_cap_reached"}}).value() == 0);
+    // Gate 8 pass 2 (co-b1): the row carries the closed reason and the body's correlation id, and
+    // the body repeats the reason, like the cap arm and the shared core.
+    CHECK(body["error"]["data"]["reason"] == "approval_unavailable");
+    const std::string cid = body["error"]["data"]["correlation_id"].get<std::string>();
+    CHECK_FALSE(cid.empty());
+    CHECK(mint_row_detail(ts, "delete_tag", "failure") ==
+          "reason=approval_unavailable cause=pending_count_unreadable correlation_id=" + cid);
+    CHECK_FALSE(body["error"]["data"].contains("audit_persisted"));
+}
+
+TEST_CASE("MCP approval mint: a LOST refusal row on the unreadable-count arm adds audit_persisted:false",
+          "[pg][mcp][integration][approval][security][up8-1]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                    const std::string&, const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = appr_bundle.get();
+    ts.audit_fail_result_ = "failure";
+    ts.start("operator");
+    {
+        auto lease = appr_bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult drop = pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                                            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":254,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-0","key":"role"}}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["data"]["audit_persisted"] == false);
+}
+
+// co-b1 / cb-4: a store fault while inserting the ticket, with the count readable. The refusal row
+// carries `reason=approval_submit_failed` and the body's correlation id, as the core's does.
+TEST_CASE("MCP approval mint: a failed ticket insert carries reason and a joined correlation id",
+          "[pg][mcp][integration][approval][security]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                    const std::string&, const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = appr_bundle.get();
+    ts.start("operator");
+    {
+        auto lease = appr_bundle.pool().acquire();
+        REQUIRE(lease);
+        // The count (a SELECT) still works; every INSERT is refused by the store.
+        pg::PgResult fn = pg::exec_params(
+            lease.get(),
+            "CREATE FUNCTION approval_manager.refuse_insert() RETURNS trigger AS $$ BEGIN "
+            "RAISE EXCEPTION 'insert refused for test'; END $$ LANGUAGE plpgsql",
+            std::vector<std::string>{});
+        REQUIRE(fn.status() == PGRES_COMMAND_OK);
+        pg::PgResult trg = pg::exec_params(
+            lease.get(),
+            "CREATE TRIGGER refuse_insert BEFORE INSERT ON approval_manager.approvals "
+            "FOR EACH ROW EXECUTE FUNCTION approval_manager.refuse_insert()",
+            std::vector<std::string>{});
+        REQUIRE(trg.status() == PGRES_COMMAND_OK);
+    }
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":255,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-0","key":"role"}}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(body["error"]["data"]["reason"] == "approval_submit_failed");
+    const std::string cid = body["error"]["data"]["correlation_id"].get<std::string>();
+    CHECK(mint_row_detail(ts, "delete_tag", "failure") ==
+          "reason=approval_submit_failed correlation_id=" + cid);
+    const std::string metric(yuzu::server::instruction_execute::kApprovalRefusedMetric);
+    CHECK(reg.counter(metric, {{"reason", "approval_submit_failed"}}).value() == 1);
 }
 
 // sre-1 / ca8-9 / up8-8: the GLOBAL queue being full at the C8 mint is its own refusal, not the
@@ -31028,6 +31121,13 @@ TEST_CASE("MCP approval mint reports a FULL global queue as such: counted, no re
     const std::string metric(yuzu::server::instruction_execute::kApprovalRefusedMetric);
     CHECK(reg.counter(metric, {{"reason", "approval_queue_full"}}).value() == 1);
     CHECK(reg.counter(metric, {{"reason", "approval_submit_failed"}}).value() == 0);
+    // co-b1 / cb-4: a capacity refusal is `denied` (as in the core, not `failure`), carries the
+    // closed reason in the row and the body, and the row joins the body by correlation id.
+    CHECK(body["error"]["data"]["reason"] == "approval_queue_full");
+    const std::string cid = body["error"]["data"]["correlation_id"].get<std::string>();
+    CHECK(mint_row_detail(ts, "delete_tag", "denied") ==
+          "reason=approval_queue_full correlation_id=" + cid);
+    CHECK(mint_row_detail(ts, "delete_tag", "failure") == "<no such row>");
 }
 
 // The production Ports binding (make_ports) over a REAL approval store: the full-queue kind and the

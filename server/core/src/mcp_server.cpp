@@ -8814,6 +8814,27 @@ McpServer::HandlerFn McpServer::build_handler(
                         // any single principal's share far below that global cap.
                         constexpr int kMcpSubmitterPendingCap =
                             yuzu::server::instruction_execute::kSubmitterPendingCap;
+                        // Every refusal of this ticket mint answers like the shared execute core's
+                        // (instruction_execute.cpp): the row detail is `reason=<token> ...
+                        // correlation_id=<id>` and error.data carries the SAME `reason` token and
+                        // the SAME id, plus `audit_persisted:false` when the row was lost, so an
+                        // agentic caller branches on a closed token and a SIEM pairs the row with
+                        // the body. `retry_ms` < 0 is a null `retry_after_ms` (not retryable).
+                        const auto mint_refusal = [&](int code, std::string_view message,
+                                                      std::string_view remediation, long retry_ms,
+                                                      std::string_view reason,
+                                                      const std::string& refusal_cid,
+                                                      bool audit_ok) {
+                            nlohmann::json data{
+                                {"correlation_id", refusal_cid},
+                                {"retry_after_ms",
+                                 retry_ms >= 0 ? nlohmann::json(retry_ms) : nlohmann::json(nullptr)},
+                                {"remediation", std::string(remediation)},
+                                {"reason", std::string(reason)}};
+                            if (!audit_ok)
+                                data["audit_persisted"] = false;
+                            return error_response(id, code, message, data.dump());
+                        };
                         // up8-1 / sre-2: an unreadable count refuses (a store fault, retryable);
                         // it must never read as zero, which would admit every principal exactly
                         // when the approval store is struggling. Nothing has been minted.
@@ -8843,14 +8864,23 @@ McpServer::HandlerFn McpServer::build_handler(
                                 } catch (...) { // NOLINT(bugprone-empty-catch)
                                 }
                             }
+                            const std::string unreadable_cid =
+                                yuzu::server::detail::ensure_correlation_id(res);
                             const bool audit_ok = mcp_audit(
-                                "failure", "approval_unavailable cause=pending_count_unreadable");
+                                "failure",
+                                std::string("reason=") +
+                                    yuzu::server::instruction_execute::kReasonApprovalUnavailable +
+                                    " cause=pending_count_unreadable correlation_id=" +
+                                    unreadable_cid);
                             res.set_content(
-                                a4_error(kInternalError,
-                                         "approval system unavailable: the pending-approval count "
-                                         "could not be read; no approval ticket was created",
-                                         "retry shortly; the approval store could not be read",
-                                         mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                                mint_refusal(
+                                    kInternalError,
+                                    "approval system unavailable: the pending-approval count "
+                                    "could not be read; no approval ticket was created",
+                                    "retry shortly; the approval store could not be read",
+                                    mcp::kMcpStoreFaultRetryMs,
+                                    yuzu::server::instruction_execute::kReasonApprovalUnavailable,
+                                    unreadable_cid, audit_ok),
                                 "application/json");
                             return;
                         }
@@ -8878,20 +8908,14 @@ McpServer::HandlerFn McpServer::build_handler(
                                 std::string("reason=") +
                                     yuzu::server::instruction_execute::kReasonApprovalCapReached +
                                     " correlation_id=" + cap_cid);
-                            nlohmann::json cap_data{
-                                {"correlation_id", cap_cid},
-                                {"retry_after_ms", nullptr},
-                                {"remediation", "wait for your pending approvals to be reviewed"},
-                                {"reason",
-                                 yuzu::server::instruction_execute::kReasonApprovalCapReached}};
-                            if (!audit_ok)
-                                cap_data["audit_persisted"] = false;
                             res.set_content(
-                                error_response(
-                                    id, kTierDenied,
+                                mint_refusal(
+                                    kTierDenied,
                                     "too many pending approvals for this principal; approve or "
                                     "let existing requests expire before creating more",
-                                    cap_data.dump()),
+                                    "wait for your pending approvals to be reviewed", -1,
+                                    yuzu::server::instruction_execute::kReasonApprovalCapReached,
+                                    cap_cid, audit_ok),
                                 "application/json");
                             return;
                         }
@@ -8916,19 +8940,32 @@ McpServer::HandlerFn McpServer::build_handler(
                                 } catch (...) { // NOLINT(bugprone-empty-catch)
                                 }
                             }
-                            mcp_audit("failure",
-                                      "approval submit failed: " + submitted.error().message);
+                            // The row mirrors the core's: a full global queue is `denied`
+                            // (a capacity refusal, not a fault), anything else is `failure`.
+                            const std::string submit_cid =
+                                yuzu::server::detail::ensure_correlation_id(res);
+                            const char* const submit_reason =
+                                queue_full
+                                    ? yuzu::server::instruction_execute::kReasonApprovalQueueFull
+                                    : yuzu::server::instruction_execute::kReasonApprovalSubmitFailed;
+                            spdlog::error("MCP approval ticket mint for {} failed ({}): {}",
+                                          tool_name, submit_reason, submitted.error().message);
+                            const bool audit_ok = mcp_audit(
+                                queue_full ? "denied" : "failure",
+                                std::string("reason=") + submit_reason +
+                                    " correlation_id=" + submit_cid);
                             if (queue_full) {
                                 // The GLOBAL pending queue is full: only a human reviewer
                                 // deciding a pending approval, or the 7-day expiry, frees a
                                 // slot, so no retry hint (a retry loop cannot succeed).
                                 res.set_content(
-                                    a4_error(kInternalError,
-                                             "the approval queue is full: no approval ticket "
-                                             "could be created",
-                                             "a human reviewer must decide pending approvals (or "
-                                             "the oldest expire) before a new approval request "
-                                             "can be created; retrying will not help"),
+                                    mint_refusal(kInternalError,
+                                                 "the approval queue is full: no approval ticket "
+                                                 "could be created",
+                                                 "a human reviewer must decide pending approvals "
+                                                 "(or the oldest expire) before a new approval "
+                                                 "request can be created; retrying will not help",
+                                                 -1, submit_reason, submit_cid, audit_ok),
                                     "application/json");
                                 return;
                             }
@@ -8941,9 +8978,10 @@ McpServer::HandlerFn McpServer::build_handler(
                             // fault — the same transient-store-fault class as the
                             // rest of this handler family.
                             res.set_content(
-                                a4_error(kInternalError, "failed to create approval request",
-                                         "retry later, or use the REST API / dashboard",
-                                         mcp::kMcpStoreFaultRetryMs),
+                                mint_refusal(kInternalError, "failed to create approval request",
+                                             "retry later, or use the REST API / dashboard",
+                                             mcp::kMcpStoreFaultRetryMs, submit_reason, submit_cid,
+                                             audit_ok),
                                 "application/json");
                             return;
                         }
