@@ -1974,7 +1974,7 @@ TEST_CASE_METHOD(DurableFixture,
                  "cached session, is compared with the current factor",
                  "[pg][mfa][stepup][approver][durable][binding]") {
     // The cached session was minted a moment ago and is fresh. The factor is then replaced (the
-    // enrolment instant moves, so the generation advances), and the durable proof, 100 s old and
+    // enrolment instant moves, so the generation changes), and the durable proof, 100 s old and
     // inside the 300 s window, is bound to the factor that is gone: only the binding can refuse it.
     set_durable_proof_age(100'000);
     REQUIRE(run_durable().outcome.kind == Kind::kPass); // sanity: bound to the current factor

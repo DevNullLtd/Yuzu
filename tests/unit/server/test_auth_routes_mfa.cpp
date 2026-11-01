@@ -1930,7 +1930,7 @@ SessionRow stored_row(AuthRoutesHarness& h, const std::string& token) {
     return (*found)->row;
 }
 
-/// Replace `user`'s factor: clear and re-enrol, so the generation moves by two.
+/// Replace `user`'s factor: clear and re-enrol, so the generation changes twice.
 void rotate_factor(AuthRoutesHarness& h, const std::string& user) {
     REQUIRE(h.auth_db->mfa_disable(user).has_value());
     (void)h.enroll_mfa(user);

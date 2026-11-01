@@ -3385,7 +3385,7 @@ public:
         // docs/observability-conventions.md so increase() sees the first event of each series.
         metrics_.describe("yuzu_auth_mfa_stamp_denied_total",
                           "MFA step-up proofs cleared right after being stamped, by reason "
-                          "(factor_changed: the account's factor generation moved between the "
+                          "(factor_changed: the account's factor generation changed between the "
                           "verification and the stamp; unverifiable: the generation could not be "
                           "read to check it)",
                           "counter");

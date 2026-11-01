@@ -732,11 +732,13 @@ public:
         std::string disabled_at;
         int recovery_codes_remaining{0};
         /// #6079: the account's factor generation (`auth.users.mfa_factor_gen`), read in the same
-        /// statement as the rest of the row. Database-owned: a row trigger advances it on EVERY
-        /// change of `mfa_enrolled_at`, whichever binary issued the write, so it is a monotonic
-        /// stand-in for "which factor is enrolled right now" that a repeated or skewed enrolment
-        /// timestamp cannot forge. Read for an un-enrolled account too (0 for one never enrolled,
-        /// g for one cleared g times): a factor-credential gate carries it to the mutation.
+        /// statement as the rest of the row. Database-owned: a row trigger assigns a fresh random
+        /// positive value on EVERY change of `mfa_enrolled_at`, whichever binary issued the write,
+        /// so it is an opaque stand-in for "which factor is enrolled right now" that a repeated or
+        /// skewed enrolment timestamp cannot forge and that is never reissued in practice, even if
+        /// the row is restored to an older state. Compare it for equality only. Read for an
+        /// un-enrolled account too (0 for one never assigned, otherwise the value left by the
+        /// last change): a factor-credential gate carries it to the mutation.
         std::int64_t factor_gen{0};
         /// The database clock (`now()`, epoch milliseconds) at this read: the same clock domain as
         /// `session_store.sessions.mfa_verified_ms`. Never the replica's own clock.

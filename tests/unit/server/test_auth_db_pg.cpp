@@ -3161,6 +3161,7 @@ TEST_CASE("AuthDB verifiers return the generation and an instant captured BEFORE
         h.db.set_enrolment_pre_txn_hook_for_test(nullptr);
         REQUIRE(e.has_value());
         CHECK(e->factor_gen > 0);
+        CHECK(e->factor_gen == gen_of(h.conn.get(), "v1"));
         CHECK(e->verified_ms >= lo);
         CHECK(e->verified_ms <= hook_now);
         const std::int64_t enrolled_ms = std::stoll(
@@ -3279,6 +3280,7 @@ TEST_CASE("AuthDB verifiers publish success only after COMMIT (a failing COMMIT 
         auto retry = h.db.mfa_verify_enrollment("c1", code, std::nullopt);
         REQUIRE(retry.has_value());
         CHECK(retry->factor_gen > 0);
+        CHECK(retry->factor_gen == gen_of(h.conn.get(), "c1"));
     }
 }
 

@@ -1595,7 +1595,7 @@ TEST_CASE(
     const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
     REQUIRE_FALSE(token.empty());
     // The hook must NOT delete the session (the stamp would match zero rows and the recheck
-    // would never run); it replaces the factor, moving the generation by two.
+    // would never run); it replaces the factor, changing the generation twice.
     h.routes.set_stamp_fault_hook_for_test([&h] { replace_factor_keeping_sessions(h); });
     yuzu::test::ScopeExit clear_hook{[&h] { h.routes.set_stamp_fault_hook_for_test(nullptr); }};
 

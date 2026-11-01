@@ -987,7 +987,10 @@ gate applied.
   60 bits, from `gen_random_uuid`, always different from the value it replaces) whenever
   `mfa_enrolled_at` changes: enrolment, clear, soft delete, or a direct UPDATE by any binary. It is not a
   counter, so a value is never reissued in practice: after an auth-only restore over a newer session store,
-  a re-enrolment cannot land on a generation a surviving stored proof carries. Application
+  a re-enrolment cannot land on a generation a surviving stored proof carries. A logical-replication or
+  apply-based consumer would fire this `ENABLE ALWAYS` trigger on the subscriber and draw its own value
+  there; that fails closed (proofs bound on the publisher mismatch and users prove MFA again), and
+  physical streaming replication is unaffected. Application
   code never writes it, and the trigger reverts a direct write. It is not changed by a provisional secret, a TOTP counter advance, recovery-code
   regeneration or a `SecretCodec` re-encryption. The migration seeds nothing (a hard cutover, see "Rollout and cutover" below): every existing row
   starts at `0` ("never assigned") and the trigger assigns a value from the next enrolment change, so an account that was already
