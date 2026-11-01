@@ -677,8 +677,9 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
     std::string threw_remediation =
         "the dispatch failed part-way and some agents may already have received the command; ";
     if (execution_id.empty()) {
-        threw_remediation += "no execution record was created, so there are no per-agent results "
-                             "to check; confirm on the devices before running it again";
+        threw_remediation += "no execution record was created, so there is no execution record to "
+                             "attach per-agent results to; confirm on the devices before "
+                             "running it again";
     } else {
         threw_remediation +=
             "execution " + execution_id +
@@ -746,9 +747,9 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
                     " agent(s) were sent the command before the failure, and others may also have "
                     "received it; ";
                 if (execution_id.empty()) {
-                    remediation += "no execution record was created, so there are no per-agent "
-                                   "results to check; confirm on the devices before running the "
-                                   "definition again";
+                    remediation += "no execution record was created, so there is no execution "
+                                   "record to attach per-agent results to; confirm on the "
+                                   "devices before running the definition again";
                 } else if (recorded) {
                     remediation +=
                         "execution " + execution_id + " was left running (not cancelled) with " +

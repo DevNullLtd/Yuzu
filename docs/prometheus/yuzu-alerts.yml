@@ -2697,15 +2697,26 @@ groups:
             row (it names the execution_id and, when known, agents_sent, a lower
             bound) and the server log line naming the exception; check that
             execution's per-agent results (the error body carries it as
-            error.execution_id, error.data.execution_id on MCP); if no agent has answered and the row still runs,
+            error.execution_id, error.data.execution_id on MCP). Three cases for
+            the row: (1) agents_sent is above 0 and its targeted count was stored,
+            so the answers of those agents complete it; (2) agents_sent is above 0
+            but the targeted count could NOT be stored
+            (yuzu_exec_tracker_bookkeeping_failed_total{op="set_agents_targeted"}),
+            and an agent HAS answered: the row stays running and will not close by
+            itself (the stuck sweep never closes a row an agent has answered), so
             close it with cancel_execution (POST /api/v1/executions/{id}/cancel);
+            (3) no send was accepted, or none is known, and no agent has answered:
+            the row closes by itself, or close it with cancel_execution. Either way
             do NOT blindly re-run the command, because an agent may already be
-            running it. Either way
-            a well-behaved sink/helper should report failure via its own
-            return value, not an exception; a non-zero rate here points at a
-            bug in that specific sink/helper (e.g. an allocation failure
-            surfacing as bad_alloc, or a logic error) rather than at ordinary
-            store degradation. BE PRECISE ABOUT for: 2m (governance round 1, SRE-2):
+            running it. For the audit-sink and post-dispatch-helper phases
+            (success, denial, a named helper) a well-behaved sink/helper should
+            report failure via its own return value, not an exception, so a
+            non-zero rate there points at a bug in that specific sink/helper
+            (e.g. an allocation failure surfacing as bad_alloc, or a logic error)
+            rather than at ordinary store degradation; for phase=dispatch the
+            exception came from the dispatch call itself, so look at the
+            exception the server log names (a bad_alloc, a store or send-path
+            fault), not at a sink. BE PRECISE ABOUT for: 2m (governance round 1, SRE-2):
             it delays the page by two minutes, it does NOT require a
             sustained episode. increase()[15m] stays true for ~15 minutes
             after a single increment, so one throw still pages, two minutes

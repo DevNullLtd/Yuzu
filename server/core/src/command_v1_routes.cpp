@@ -384,8 +384,8 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
     std::string threw_remediation =
         execution_id.empty()
             ? "the dispatch failed part-way and some agents may already have received the "
-              "command; no execution record was created, so confirm on the devices before "
-              "sending it again"
+              "command; no execution record was created to attach per-agent results to, so "
+              "confirm on the devices before sending it again"
             : "the dispatch failed part-way and some agents may already have received the "
               "command; the execution was left running, not cancelled, so results from any agent "
               "that did receive it are still recorded against it: check its per-agent results "
@@ -450,9 +450,9 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
                     " agent(s) were sent the command before the failure, and others may also have "
                     "received it; ";
                 if (execution_id.empty()) {
-                    remediation += "no execution record was created, so there are no per-agent "
-                                   "results to check; confirm on the devices before sending it "
-                                   "again";
+                    remediation += "no execution record was created, so there is no execution "
+                                   "record to attach per-agent results to; confirm on the "
+                                   "devices before sending it again";
                 } else if (recorded) {
                     remediation +=
                         "the execution was left running (not cancelled) with " +

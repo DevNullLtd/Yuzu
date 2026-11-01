@@ -759,7 +759,7 @@ see §5 for which chokepoints apply.
    handler makes, and in the other direction a gate call in a derived MCP handler for a pair other than
    the tool's declared one is a finding too (for rows with a REST object twin; an MCP-only tool or a
    handler that shares a dispatch branch is not held to it); a route whose gate the script cannot read
-   fails closed unless it is in `GATE_PARITY_NO_GATE_ALLOWED`; both tables are shrink-only) and `scripts/ci/check-mcp-retry-hints.py` (a new tool's handler
+   fails closed unless it is in `GATE_PARITY_NO_GATE_ALLOWED`; that table and `GATE_PARITY_KNOWN_MISMATCHES` are each pinned to an exact size, `GATE_PARITY_NO_GATE_MAX` and `GATE_PARITY_KNOWN_MISMATCHES_MAX`: a pin is lowered in the change that retires an entry and raised only under a ruling recorded in ADR-1005) and `scripts/ci/check-mcp-retry-hints.py` (a new tool's handler
    block, and a new or changed `mcp_tool*.hpp`: a store/query-fault branch needs a retry hint or a
    `// retry-hint-exempt:` comment).
    For a destructive action-twin, also decide `requires_approval()` (§3's "fifth registration
