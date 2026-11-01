@@ -11,7 +11,7 @@
 ///   * Lane routing (`is_lane1` / `is_os_native`) — ADR-0018 §"three lanes".
 ///     Lane 1 = distro package managers (rpm/deb/apk/pacman) that we resolve to
 ///     a CPE identity. OS-native software (Windows/macOS apps, macOS pkgutil receipts, Homebrew
-///     formulae/casks, Windows optional features) are Lane 3:
+///     formulae/casks, Windows optional features, IBM MQ middleware) are Lane 3:
 ///     identified but NOT assessed in v1 (zero guessing, zero false positives).
 ///   * Product normalization + the curated-map CSV parse. `normalize_product`
 ///     is the LOW-confidence fallback (a best-effort prefix token); the curated
@@ -73,7 +73,7 @@ inline bool is_lane1(std::string_view eco) {
 }
 
 /// Lane 3 — OS-native software (GUI apps, non-distro package managers incl. Snap
-/// and Flatpak, Windows optional features, machine-context MSI products) that v1 identifies but does NOT
+/// and Flatpak, Windows optional features, machine-context MSI products, IBM MQ installations) that v1 identifies but does NOT
 /// assess: `kind` app/feat OR an OS-native ecosystem. `pkg` is routed by its
 /// ecosystem, not as a kind-level trigger. See ADR-0023 §2 (update 2026-10-04).
 inline bool is_os_native(const SoftwareEntry& e) {
@@ -81,7 +81,7 @@ inline bool is_os_native(const SoftwareEntry& e) {
     const std::string eco = yuzu::server::detail::to_lower_ascii(cpe_trim_view(e.ecosystem));
     return kind == "app" || kind == "feat" || eco == "windows" || eco == "macos" ||
            eco == "macos_pkgutil" || eco == "brew" || eco == "optional_feature" ||
-           eco == "snap" || eco == "flatpak" || eco == "msi";
+           eco == "snap" || eco == "flatpak" || eco == "msi" || eco == "ibm_mq";
 }
 
 // ---------------------------------------------------------------------------

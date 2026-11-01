@@ -43,6 +43,8 @@ EMITTER_GLOBS = [
     "agents/plugins/installed_apps/src/*.cpp",
     "agents/plugins/installed_apps/src/*.hpp",
     "agents/core/src/sync_source_installed_software.*",
+    # the middleware product table is the emitter of its ecosystems; the collector maps through it
+    "agents/shared/middleware_products.hpp",
 ]
 MCP_SRC = "server/core/src/mcp_server.cpp"
 OPENAPI_SRC = "server/core/src/rest_api_v1.cpp"

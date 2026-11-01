@@ -355,7 +355,7 @@ TEST_CASE("crypto params: MCP strict argument checks", "[crypto]") {
     }
     // The ecosystem vocabulary is the software catalogue's published set, plus "".
     for (const char* ok : {"rpm", "deb", "apk", "pacman", "snap", "flatpak", "windows", "macos",
-                           "macos_pkgutil", "brew", "optional_feature", "msi", ""}) {
+                           "macos_pkgutil", "brew", "optional_feature", "msi", "ibm_mq", ""}) {
         CHECK_FALSE(cl::strict_summary_args_error(json{{"ecosystem", ok}}));
         CHECK_FALSE(cl::strict_devices_args_error(json{{"family", "nss"}, {"ecosystem", ok}}));
     }

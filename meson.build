@@ -570,6 +570,7 @@ if build_agent
   subdir('agents/plugins/shares')  # configured SMB/NFS shares (Linux leg; macOS and Windows planned)
   subdir('agents/plugins/remote_access_audit')  # SSH inbound-access audit (Linux + macOS legs; Windows planned)
   subdir('agents/plugins/runtimes')  # Wave 10 PR10.1-b
+  subdir('agents/plugins/middleware')  # SAM.2: table-driven middleware inventory (Linux leg; Windows + macOS planned)
   subdir('agents/plugins/browser_inventory')  # Wave 10 P2a
   subdir('agents/plugins/local_security_policy')  # Wave 8 PR8.3
   subdir('agents/plugins/privacy_permissions')  # Wave 8 PR8.5
