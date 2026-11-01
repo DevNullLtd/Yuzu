@@ -769,8 +769,10 @@ public:
     /// Idempotent on already-enrolled rows: returns MfaAlreadyEnrolled.
     /// Returns SecretUnavailable if the provisional secret fails to decrypt
     /// (never silently rejects the code as wrong). Returns MfaEnrollmentCancelled
-    /// (#3808) when a concurrent disable / disable + re-init made the secret the
-    /// code was verified against no longer the stored one — nothing is enrolled.
+    /// (#3808) when the provisional secret the code was verified against is no
+    /// longer the stored one — nothing is enrolled. The cause is NOT distinguished
+    /// (a disable, a re-init, the stale-provisional sweep, `--mfa-reset` or a KEK
+    /// rewrap all look the same); see `AuthDBError::MfaEnrollmentCancelled`.
     ///
     /// `expected_password_hash_hex` (#5342 Gate 8, F2/F4 — REQUIRED, no
     /// default, so every caller decides) is the CREDENTIAL ANCHOR, always

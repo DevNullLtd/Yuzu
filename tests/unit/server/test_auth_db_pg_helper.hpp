@@ -487,8 +487,10 @@ template <class Victim>
     // From here the txn is open. Every exit before the explicit COMMIT below
     // (including a throw) must release the row lock BEFORE the victim thread is joined,
     // or the join waits on a victim that is itself blocked on the holder's lock until
-    // the pool's lock_timeout fires. `Scope` is that guarantee: a ROLLBACK (a no-op
-    // after the COMMIT) then the join, in that order, on every path. Closing the
+    // the pool's lock_timeout fires. `Scope` is that guarantee: a ROLLBACK then the
+    // join, in that order, on every path. After the explicit COMMIT the ROLLBACK changes
+    // nothing, though libpq's default notice processor prints a harmless "there is no
+    // transaction in progress" warning to stderr for it. Closing the
     // connection would roll the txn back too; the explicit ROLLBACK just makes the
     // ordering deterministic.
     struct Scope {
