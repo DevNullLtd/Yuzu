@@ -180,7 +180,7 @@ inline constexpr const char* kCiV2TrimOrder[] = {"topology", "partition", "volum
                                                  "disk",     "cpu",       "swap"};
 
 namespace detail {
-inline constexpr std::size_t kCiClampField = 1024; ///< == kMaxFieldLen in the .cpp
+inline constexpr std::size_t kCiClampField = 1024;
 inline constexpr std::size_t kCiScalarFields = 33;
 
 /// The part of a blob the sender never trims, at its clamp-bound worst case: version byte, a

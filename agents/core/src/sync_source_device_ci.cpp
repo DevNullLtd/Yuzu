@@ -24,7 +24,7 @@ namespace {
 // parse never truncates differently from what this source hashed. The blob cap
 // (kDeviceCiMaxBlobBytes, sync_source_device_ci.hpp) must stay <= the server's (server >= agent):
 // the server accepts everything this source can send; the two are equal by contract.
-constexpr std::size_t kMaxFieldLen = 1024;
+constexpr std::size_t kMaxFieldLen = detail::kCiClampField;
 
 // ── UTF-8 scrub + field clamp ───────────────────────────────────────────────
 // sanitize_utf8_strict / clamp_field live in sync_canonical.{hpp,cpp} — one
@@ -511,22 +511,21 @@ SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,
         // receives the action's typed result for its section status.
         auto run = [&](const YuzuPluginDescriptor* d, const char* action,
                        CiActionResult* meta) -> std::optional<std::string> {
-            LocalDispatcher::Result r = dispatcher.run(d, action);
-            if (r.rc != 0) {
+            CiActionResult a = to_action_result(dispatcher.run(d, action));
+            if (a.rc != 0) {
                 spdlog::warn("sync: device_ci action '{}' rc={} — skipping this cycle", action,
-                             r.rc);
+                             a.rc);
                 return std::nullopt;
             }
-            if (r.truncated) {
+            if (a.truncated) {
                 spdlog::warn("sync: device_ci action '{}' output truncated — skipping this cycle",
                              action);
                 return std::nullopt;
             }
-            if (meta) {
-                *meta = CiActionResult{r.rc, r.truncated, r.result_status, r.result_provenance,
-                                       r.captured};
-            }
-            return std::move(r.captured);
+            std::string out = a.captured;
+            if (meta)
+                *meta = std::move(a);
+            return out;
         };
 
         CiPluginOutputs o;
