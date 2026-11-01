@@ -2935,8 +2935,8 @@ void remove_commit_failer(PGconn* c, const std::string& table) {
 
 } // namespace
 
-TEST_CASE("AuthDB migrates v2 -> v3: enrolled accounts seed at generation 1, the trigger is ENABLE "
-          "ALWAYS",
+TEST_CASE("AuthDB migrates v2 -> v3: existing rows start at generation 0 (hard cutover, no seed) and "
+          "the trigger is ENABLE ALWAYS",
           "[pg][auth_db][migration][mfa_binding]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
@@ -2963,16 +2963,17 @@ TEST_CASE("AuthDB migrates v2 -> v3: enrolled accounts seed at generation 1, the
 
     CHECK(second_store_opens(db.dsn())); // applies v3
     CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "3");
-    // The seed ran BEFORE the trigger existed: created first, the trigger would have overridden
-    // it to 0 (the instant is unchanged, so it takes the ELSE arm).
-    CHECK(gen_of(conn.get(), "seed_enrolled") == 1);
+    // No seed: a row that was already enrolled when the migration ran reads generation 0, which
+    // every gate refuses until the account is re-enrolled (the cutover starts from a fresh
+    // database). The next enrolment change advances it from there.
+    CHECK(gen_of(conn.get(), "seed_enrolled") == 0);
     CHECK(gen_of(conn.get(), "seed_never") == 0);
     CHECK(scalar(conn.get(),
                  "SELECT tgenabled FROM pg_trigger WHERE tgname = 'users_mfa_factor_gen' "
                  "AND tgrelid = 'auth.users'::regclass") == "A");
     // Re-opening is a no-op migration and the trigger stays in force.
     CHECK(second_store_opens(db.dsn()));
-    CHECK(gen_of(conn.get(), "seed_enrolled") == 1);
+    CHECK(gen_of(conn.get(), "seed_enrolled") == 0);
 }
 
 TEST_CASE("AuthDB factor generation advances on every change of mfa_enrolled_at, whoever writes it",
@@ -3100,7 +3101,7 @@ TEST_CASE("AuthDB verifiers return the generation and an instant captured BEFORE
         auto e = h.db.mfa_verify_enrollment("v1", code, std::nullopt);
         h.db.set_enrolment_pre_txn_hook_for_test(nullptr);
         REQUIRE_FALSE(e.has_value());
-        CHECK(e.error() == AuthDBError::WriteFailed);
+        CHECK(e.error() == AuthDBError::MfaEnrollmentCancelled);
         CHECK_FALSE(h.db.mfa_status("v1")->enrolled);
         CHECK(code_ids(h.conn.get(), "v1").empty());
     }
@@ -3789,8 +3790,15 @@ TEST_CASE("AuthDB trigger validation under 8 concurrent readers latches when the
                 start.arrive_and_wait();
                 read_phase(phase1_unenforced, /*expect_enforced=*/true);
                 start.arrive_and_wait();
-                if (t == 0)
+                if (t == 0) {
                     ddl("ALTER TABLE auth.users DISABLE TRIGGER users_mfa_factor_gen");
+                    // One read completes the validation that observes the disabled trigger and
+                    // latches the flag, so the barrier below publishes a finished observation:
+                    // concurrent readers of the same expiry elect ONE validator and the losers
+                    // proceed on the previous flag, which would make "every read is
+                    // not-enforced" racy.
+                    (void)reader.mfa_status("cc");
+                }
                 start.arrive_and_wait();
                 read_phase(phase2_enforced, /*expect_enforced=*/false);
                 start.arrive_and_wait();

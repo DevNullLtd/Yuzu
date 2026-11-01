@@ -267,14 +267,15 @@ constexpr std::string_view kUsersMfaFactorGenBody =
     "  RETURN NEW;\n"
     "END\n";
 
-// v3 statement order is LOAD-BEARING: the seed UPDATE runs BEFORE the trigger exists. Created
-// first, the trigger would override the seed to 0 (the enrolment instant is unchanged, so it takes
-// the ELSE arm) and every enrolled account would read as unbound at both gates.
+// v3 is a hard cutover (no upgrade path, no seed): the column starts at 0 for every existing row
+// and the trigger advances it from the next enrolment change. An enrolled account that already
+// exists when this migration runs therefore reads generation 0, which every gate refuses (503
+// `mfa_proof_unavailable`) until `yuzu-server --mfa-reset <user>` re-enrols it, so the cutover is
+// meant for a fresh database.
 std::string migration_v3_sql() {
     std::string sql;
     sql += "SET LOCAL lock_timeout = '30s'; ";
     sql += "ALTER TABLE users ADD COLUMN mfa_factor_gen BIGINT NOT NULL DEFAULT 0; ";
-    sql += "UPDATE users SET mfa_factor_gen = 1 WHERE mfa_enrolled_at IS NOT NULL; ";
     sql += "CREATE FUNCTION users_mfa_factor_gen() RETURNS trigger LANGUAGE plpgsql AS $$";
     sql += kUsersMfaFactorGenBody;
     sql += "$$; ";
@@ -470,12 +471,11 @@ const std::vector<pg::PgMigration>& migrations() {
 
         // v3 (#6079): a database-owned factor generation on `users`. The row trigger advances it
         // on every change of `mfa_enrolled_at`, so "which factor is enrolled right now" is a
-        // monotonic value no repeated or skewed enrolment timestamp can forge. Accounts enrolled
-        // before this migration are seeded at 1 (BEFORE the trigger exists, see migration_v3_sql);
-        // never-enrolled accounts stay 0. A legacy binary ignores the column but its enrol and
-        // clear UPDATEs still fire the trigger. The lock_timeout bounds the ALTER and CREATE
-        // TRIGGER waits, so boot fails loudly and retries on restart rather than hanging behind a
-        // stalled holder (the ca_store v3/v4 precedent).
+        // monotonic value no repeated or skewed enrolment timestamp can forge. Every existing row
+        // starts at 0 (a hard cutover: no seed, see migration_v3_sql). A legacy binary ignores the
+        // column but its enrol and clear UPDATEs still fire the trigger. The lock_timeout bounds
+        // the ALTER and CREATE TRIGGER waits, so boot fails loudly and retries on restart
+        // rather than hanging behind a stalled holder (the ca_store v3/v4 precedent).
         {3, migration_v3_sql()},
     };
     return kMigrations;

@@ -510,6 +510,16 @@ TEST_CASE("SessionStore: touch_activity is monotonic — a now() stamp never reg
     CHECK((*store.find("h"))->row.last_activity_ms == future); // NOT regressed
 }
 
+// Put the schema back to what a v2 database holds: drop the v3 binding objects so a re-run of the
+// migration (the #2343 tests below reset schema_meta to 1 and construct a store again) applies
+// v2 and then v3 over a clean table instead of failing on columns that already exist.
+static bool undo_binding_migration(PgPool& pool) {
+    return exec_ok(pool, "DROP TRIGGER IF EXISTS sessions_mfa_rebind_guard ON session_store.sessions") &&
+           exec_ok(pool, "DROP FUNCTION IF EXISTS session_store.sessions_mfa_rebind_guard()") &&
+           exec_ok(pool, "ALTER TABLE session_store.sessions DROP COLUMN IF EXISTS mfa_factor_gen, "
+                         "DROP COLUMN IF EXISTS mfa_bind_seq");
+}
+
 // ── #2343: the v2 migration and the principal_kind CHECK ─────────────────────────────────────
 
 namespace {
@@ -607,9 +617,10 @@ TEST_CASE("SessionStore v2: upgrading a v1 database removes the inconsistent row
                                 std::vector<std::string>{})
                     .status() == PGRES_COMMAND_OK);
     }
+    REQUIRE(undo_binding_migration(pool));
     const std::int64_t gen_before = write_generation(pool);
 
-    SessionStore upgraded{pool}; // runs v2
+    SessionStore upgraded{pool}; // runs v2, then v3
     REQUIRE(upgraded.is_open());
 
     auto present = [&](const char* hash) {
@@ -651,9 +662,10 @@ TEST_CASE("SessionStore v2: a clean upgrade deletes nothing and leaves the write
                                 std::vector<std::string>{})
                     .status() == PGRES_COMMAND_OK);
     }
+    REQUIRE(undo_binding_migration(pool));
     const std::int64_t gen_before = write_generation(pool);
 
-    SessionStore upgraded{pool}; // runs v2 over a table with only consistent rows
+    SessionStore upgraded{pool}; // runs v2 over a table with only consistent rows, then v3
     REQUIRE(upgraded.is_open());
     auto got = upgraded.find("keep-human");
     REQUIRE(got.has_value());

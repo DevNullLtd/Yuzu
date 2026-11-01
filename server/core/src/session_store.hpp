@@ -59,7 +59,7 @@
  * owns the durable side (mutations bump; `read_generation()` reads); the cache
  * itself lives in AuthManager.
  *
- * LOCAL MFA FACTOR BINDING (#6079, schema v2). A local MFA proof is stored with the
+ * LOCAL MFA FACTOR BINDING (#6079, schema v3). A local MFA proof is stored with the
  * per-account factor generation it was verified under (`mfa_factor_gen`, authored by
  * `auth.users`, which this store never reads) and a bind sequence (`mfa_bind_seq`).
  * A BEFORE UPDATE row trigger (`sessions_mfa_rebind_guard`, ENABLE ALWAYS so it fires

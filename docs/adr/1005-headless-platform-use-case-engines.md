@@ -1093,7 +1093,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
   - **2026-10-28 (ruling of 2026-10-24) - MFA factor binding ships as a hard
     cutover (#6079 PR 2).**
     **STATUS: DRAFT, not accepted until the maintainer approves it.**
-    The factor-generation binding (`auth` schema v3, `session_store` schema v2)
+    The factor-generation binding (`auth` schema v3, `session_store` schema v3)
     is introduced with no upgrade path: an account that was already enrolled
     reads factor generation `0`, and every gate that compares a proof with the
     factor refuses it. This entry supersedes the operator wording of the

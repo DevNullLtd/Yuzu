@@ -1926,8 +1926,8 @@ int main(int argc, char* argv[]) {
         }
         // Audit is MANDATORY for break-glass: the whole point of #1226 is to
         // replace the manual-SQL path that left no evidence (SOC 2 CC6.6). The
-        // fail-closed gate is the owner's audit INSERT inside the clear's transaction:
-        // if the audit store will not accept it, the whole clear rolls back. This
+        // fail-closed gate is the INTENT row written below, before anything is
+        // mutated: if the audit store will not accept it, nothing is cleared. This
         // open-and-verify step only avoids a pointless attempt and gives the
         // operator an actionable error instead of a buried warning during a
         // stressful recovery.

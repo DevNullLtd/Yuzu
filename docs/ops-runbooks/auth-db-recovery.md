@@ -47,9 +47,9 @@ A server that refuses to start serves no `/metrics`, so the two binding gauges b
 state: alert on the unit being `failed` or on `up == 0` for the instance. The one-shot modes
 `--mfa-reset` and `--break-glass-arm` open their bootstrap `AuthDB` **without** the binding refusal and
 print a loud `WARN` naming the bypass and the trigger state, so they remain usable while the serving
-process refuses to start; only those two recovery one-shots open without the refusal (and only the
-`AuthDB`: the session store has no bypass), and serving and every other mode that opens the bootstrap
-store (for example `--generate-tokens`) still refuse.
+process refuses to start; only those two recovery one-shots open without the refusal (`--mfa-reset` also
+for the `SessionStore` it opens to end the account's sessions), and serving and every other mode that opens
+the bootstrap store (for example `--generate-tokens`) still refuse.
 
 If the shipped systemd unit is in use it retries `StartLimitBurst=3` times
 within `StartLimitIntervalSec=60`, then enters `failed`:
@@ -325,10 +325,10 @@ until they expire. A failover to a standby that was behind loses the same recent
    `password_hash` (the table holds no password-change time, so a password
    changed since the dump has reverted unless step 3 re-applied it). Where the
    audit store survived, or in the SIEM copy, also look for `mfa.disabled` (an
-   administrator cleared their own factor, `result=ok`; a refused or failed attempt
-   writes the same action with `result=denied` or `result=error` and cleared nothing),
-   `mfa.reset.breakglass` (an operator cleared one with
-   the `--mfa-reset` CLI), `mfa.enroll.verified` and `mfa.recovery_code.used`
+   administrator cleared their own factor; each clear writes an `attempted` row first and an outcome row after it,
+   failed attempts write the outcome `result=error`, and `result=partial` means the factor was cleared but its
+   sessions were not ended), `mfa.reset.breakglass` (an operator cleared one with
+   the `--mfa-reset` CLI, with the same two rows), `mfa.enroll.verified` and `mfa.recovery_code.used`
    rows after the dump's timestamp. Then clear again or enrol again as
    intended (see "Enrolling a non-admin approver" below). The same restore can
    bring back other account state changed since the dump, such as a role
@@ -375,7 +375,7 @@ administrator password in the product right after such a rebuild.
 
 After any restore, before declaring the incident closed:
 
-**Skip this checklist for the previous build.** After the documented restore of a pre-cutover backup (the sequence in the cutover section of `docs/user-manual/upgrading.md`), expect `public.schema_meta` `auth` 2 and `session_store` 1, no `users_mfa_factor_gen` or `sessions_mfa_rebind_guard` trigger and no `yuzu_auth_mfa_binding_enforcement_ok` series, so skip steps 2, 4 and 5 below (they expect `auth` 3, `session_store` 2, both triggers and both gauges); steps 1, 3 and 6 still apply.
+**Skip this checklist for the previous build.** After the documented restore of a pre-cutover backup (the sequence in the cutover section of `docs/user-manual/upgrading.md`), expect `public.schema_meta` `auth` 2 and `session_store` 2, no `users_mfa_factor_gen` or `sessions_mfa_rebind_guard` trigger and no `yuzu_auth_mfa_binding_enforcement_ok` series, so skip steps 2, 4 and 5 below (they expect `auth` 3, `session_store` 3, both triggers and both gauges); steps 1, 3 and 6 still apply.
 
 ```bash
 # 1. The server started and is serving. (/health and /readyz are on the web
@@ -384,7 +384,7 @@ systemctl status yuzu-server
 curl -fsS http://127.0.0.1:8080/health
 
 # 2. The auth schemas are at the expected migration versions: auth 3 and
-#    session_store 2 (the MFA factor binding, #6079).
+#    session_store 3 (the MFA factor binding, #6079).
 psql "$YUZU_POSTGRES_DSN" -c "SELECT store, version FROM public.schema_meta WHERE store IN ('auth','scim_store','session_store');"
 
 # 3. The KEK resolved — this must be ZERO, or absent entirely. A non-zero
@@ -702,7 +702,7 @@ for the detection query; `--mfa-reset <user>` below is the fix.
 `yuzu-server --mfa-reset <username>` clears the user's MFA enrolment and exits
 **without starting the server**. It also ends the account's sessions, and it
 writes audit rows (`mfa.reset.breakglass`, principal = the OS account that ran
-it): one success row, written inside the same database transaction as the clear.
+it): an `attempted` intent row before it clears anything, and an outcome row after.
 
 **It needs the Postgres DSN and the keys directory.** This changed with the
 Postgres migration and is the most common reason the command fails today:
@@ -753,99 +753,84 @@ access* as equivalent to MFA-reset authority over every account:
 
 **Audit is mandatory and fail-closed.** The CLI first checks that the audit store opens (if it does not, it prints
 `error: audit store unavailable; refusing to clear MFA without an audit record` and exits `1` without touching the account;
-the server log adds a pointer to your documented break-glass SQL path). The `mfa.reset.breakglass` row
-(`MFA enrollment cleared via --mfa-reset CLI (os_identity=<account>, sessions_ended=<n>)`) is then inserted INSIDE the
-clear's own transaction, so the clear and its evidence commit or abort together; there is no separate intent row and no
-partial outcome. If the audit INSERT fails, the whole clear rolls back and the command prints `error: MFA was not
-cleared (the audit record could not be written); nothing was changed; see the direct-SQL fallback in
-docs/ops-runbooks/auth-db-recovery.md` and exits `1`; that line points at "Fallback: direct SQL" below, for the
+the server log adds a pointer to your documented break-glass SQL path), then writes the
+`attempted` intent row (`MFA clear requested via --mfa-reset CLI (os_identity=<account>)`) BEFORE it clears any MFA. If
+the audit store does not accept that row, the command prints `error: audit store did not accept the intent row; nothing
+was changed` and exits `1` without touching the account; a second stderr line points at "Fallback: direct SQL" below, for the
 case where an operator is locked out and the audit store cannot be restored. The whole point is to replace the unaudited SQL path. A
-`{"status":"ok",…}` line with exit code 0 means the clear and its audit row both committed.
+`{"status":"ok",…}` line with exit code 0 means both the intent row and the outcome row persisted.
 
-**It ends the account's sessions, in the same transaction.** The factor clear, the deletion of the
-account's recovery codes, the deletion of every durable session of the account, the audit row and the
-session write-generation bump commit or abort TOGETHER, in one database transaction on one connection
-(`MfaDisableOwner`, `docs/auth-architecture.md`). The generation is bumped last, and only when the session-delete
-step ran, so every replica drops its cached copy of the account's sessions on its next refresh and, within
-that cache bound (about a second, up to 30 seconds while a replica's poll is failing), the account does not
-stay signed in on any replica, apart from one cached entry that a request already past its durable read can
-re-insert (R14, until the next generation advance). The
-number of sessions deleted is recorded as `sessions_ended=<n>` at the end of the audit row's `detail`
-(`... (os_identity=<account>, sessions_ended=<n>)`); `<n>` counts every durable session row deleted for the
-account, rows that had already expired but were not yet reaped included, so it is not a count of sessions
-that were still usable. The command's stdout line is unchanged. There is no half-done state to repair: if
-any step fails, the audit INSERT included, the whole transaction rolls back, nothing is cleared and
-nothing is deleted, and the command exits 1 with `error: MFA was not cleared (<reason>); nothing was
-changed`, where `<reason>` is `the account was not found`, `the audit record could not be written` or
-`the store could not complete the reset`. A deactivated account is rejected earlier still, as
-`error: user '<name>' not found` (the lookup matches active accounts only), with nothing changed. The store-failure message instead ends `unless the connection was
-lost at COMMIT, in which case it may have committed: check the account's MFA status and the
-mfa.reset.breakglass audit row before re-running`: in that one case the database may have committed the
-whole transaction (every effect landed together: the clear, the recovery codes, the session delete and the
-`mfa.reset.breakglass` row) before the acknowledgement was lost. The audit-unavailable message also points
-at the [direct-SQL fallback](#fallback-direct-sql). A failed audit INSERT rolls the clear back.
-Disabling MFA from Settings
-uses the same transaction: for an account with a verified factor it ends **every** session of the account,
-the caller's included, writes `mfa.disabled` with `result=ok` and `sessions_ended=<n>` inside the
-transaction, and sends the browser to the landing page. If the transaction fails the page says "Could not
-disable MFA because of a temporary storage problem. Nothing was changed unless you were signed out; try
-again." and the handler records `mfa.disabled` with `result=error` and `disable failed`. That wording is
-deliberate: when the connection is lost at COMMIT the transaction may have committed, every effect
-having landed together (the clear, the recovery codes, the session delete and the owner's `ok` row), and
-the handler writes its `error` row regardless, so **both rows can exist for one clear**. If the audit row
-could not be written the page says "Could not disable MFA because the audit record could not be written.
-Nothing was changed." (the Settings clear is fail-closed on its audit row);
-if the account vanished or was deactivated after the request was admitted the page says "Could not disable
-MFA: the account was not found. Nothing was changed." and **no audit row is written** for that outcome;
-if no owner is wired (a construction fault, not a production shape) the page says "MFA backend
-unavailable" and nothing is changed;
-and a factor that changed between the step-up check and the clear is refused with `result=denied` and
+**It ends the account's sessions.** After clearing the factor the one-shot
+deletes the account's durable sessions (`SessionStore::invalidate_user`), which
+bumps the session generation so every replica drops its cached copy on its next
+refresh; the account is signed out everywhere. The number of sessions deleted is
+recorded as `sessions_ended=<n>` at the end of the outcome row's `detail`
+(`... (os_identity=<account>, sessions_ended=<n>)`, `result=success`); `<n>` counts every durable
+session row deleted for the account, rows that had already expired but were not yet
+reaped included, so it is not a count of sessions that were still usable. The
+command's stdout line is unchanged. If ending the sessions fails, the factor is already cleared: the
+command exits non-zero with `error: MFA cleared but the account's sessions were
+not ended`; the server log carries `--mfa-reset: MFA cleared for '<name>' but ending its
+sessions failed (<cause>). End them now with DELETE /api/v1/sessions?username=<name> and
+record the reset.` The outcome row is still written, with `result=partial` and `sessions_ended=failed`. Treat
+that as an incomplete reset and end the sessions as described under "Ending the
+sessions by hand" below. If the clear itself fails, the command ends no session and exits `1` with
+`error: failed to clear MFA; the state is unknown, check the account's status and re-run`, and the outcome row is
+`result=error` (`MFA clear failed; state unknown, re-run after checking status (os_identity=<account>)`). The commit
+acknowledgement may have been lost, so the clear MAY have landed. Re-run `--mfa-reset`: a re-run clears again
+idempotently, ends the account's sessions and needs no admin session (do it only if the account has not re-enrolled
+since, because a re-run also clears a newly enrolled factor). Alternatively, when an administrator session exists, check the
+account's `mfa_enrolled_at` (null means no enrolled factor): if it is null the clear landed, and because the CLI ends no
+session after a failed clear (the Settings route does), end the account's sessions by hand with
+`DELETE /api/v1/sessions?username=<name>` (see "Ending the sessions by hand" below). Disabling MFA from Settings ends **every** session of the
+account, the caller's included, and sends the browser to the landing page. If the
+durable delete fails there, the audit row is `mfa.disabled` with `result=partial` and
+`sessions_ended=failed`, the page says "MFA was disabled, but the account's sessions
+could not be ended. Ask an administrator to end them.", and there is **no retry
+control**: after the clear the page shows the not-enrolled view, and the Disable form
+exists only in the enrolled view. If the clear itself fails on an account that had a
+verified factor, the sessions are still ended (the clear may have committed with its
+acknowledgement lost) and the audit row is `mfa.disabled` with `result=error` and
+`disable failed (sessions_ended=<n>|failed)`; the user is signed out when the delete
+succeeded, and when the delete failed too the page says "Could not confirm MFA was
+disabled, and the account's sessions could not be ended. Its state is unknown: ask an
+administrator to check it and end the sessions." (check the account's enrolment state
+and end its sessions as below). A factor that changed between the step-up check and the clear is refused with `result=denied` and
 `reason=factor_changed expected_gen=<n>`, clearing nothing. Cancelling an enrolment that was never
-verified ends no session and does not bump the write-generation (`result=ok`, `no verified factor to
-clear`). Neither path
+verified ends no session (`result=ok`, `no verified factor to clear`). Settings
+writes the same two rows. The `attempted` intent row (`MFA clear requested via Settings`) is written first and fails
+closed: if the audit store does not accept it, the response is `503` with `Sec-Audit-Failed: true` and `Retry-After: 5`, the
+message "Audit store unavailable; MFA was not changed." is shown as a toast on both Settings pages (an error toast has a close button; on Security and
+sign-in the message also appears in the Two-factor sign-in panel) and nothing is cleared. Retry once the audit store has recovered, or tell the operator that the audit store needs attention. This guarantee on the Settings route relies on the audit store having opened and on the audit writer being wired into the route; server boot requires both (it refuses to start when the audit store cannot open, and binds the writer at boot). The CLI checks the intent write's result directly. The outcome row is written after the changes and cannot undo them: if it cannot be
+written the request still completes and the server logs an error. A failed audit write also increments
+`yuzu_server_audit_emit_failed_total`, which the `YuzuAuditPersistFailures` alert (critical) fires on, so a failed
+outcome write after a clear pages. The factor clear and the session delete are two separate database commits, so a
+process kill between them leaves the factor cleared, the sessions live and an `attempted` row with no outcome
+row. Neither path
 ends API tokens: an administrator revokes a token with
 `DELETE /api/v1/tokens/{token_id}` (the global administrator role may revoke any
 token; the owner lists token ids with `GET /api/v1/tokens`).
 
-**`--mfa-reset` prepares the `session_store` schema.** The transaction deletes from
-`session_store.sessions`, so the command first applies the `session_store` migrations
-(`SessionStore::ensure_schema`: migrations only, no store instance and no trigger check). It therefore works on
-a database the server has never run against; if the migrations cannot be applied the reset exits 1 with
-nothing changed.
-
-**The one-shots bypass the binding refusal, for the `AuthDB` only.** `--mfa-reset` and `--break-glass-arm`
-open their bootstrap `AuthDB` without refusing on a missing or altered binding trigger, and print a loud
-`WARN` naming the bypass and the trigger state (`AuthDB: recovery bypass of the MFA factor-generation
-trigger check (trigger state: <in force | missing, not ENABLE ALWAYS, or altered | unreadable>); this
-one-shot process does not enforce factor binding`), so they stay usable when the serving process refuses to
-start. That is the only recovery `WARN`: the session store has no bypass. While the factor trigger is
-absent a clear made here does not advance the factor generation. The account's sessions are deleted in
-the same transaction, but a TOTP sign-in made under the old factor that straddles the window between the
-delete and the commit would pass, because nothing then distinguishes the old factor from the cleared one.
-Repair the trigger first when you can
+**The one-shots bypass the binding refusal.** `--mfa-reset` and `--break-glass-arm` open their bootstrap
+`AuthDB` without refusing on a missing or altered binding trigger, and `--mfa-reset` opens the `SessionStore` it
+uses to end the sessions the same way. Each prints a loud `WARN` naming the bypass and the trigger state (`AuthDB:
+recovery bypass of the MFA factor-generation trigger check (trigger state: <in force | missing, not ENABLE ALWAYS,
+or altered | unreadable>); this one-shot process does not enforce factor binding`, and the `SessionStore:` twin for
+the rebind guard), so they stay usable when the serving process refuses to start. While the factor trigger is
+absent a clear made here does not advance the factor generation, so the session delete that follows is the only
+barrier: a TOTP sign-in made under the old factor that completes after the delete would pass, because nothing then
+distinguishes the old factor from the cleared one. Repair the trigger first when you can
 ([MFA binding enforcement failed](#mfa-binding-enforcement-failed)); otherwise repair it straight afterwards
 and then end every session of every account you cleared in that window (step 3 of that section). A bypassed process reports the binding
 as not enforced for its whole life; it is not an MFA bypass for login (login still requires the TOTP code).
 Serving mode, and every other mode that opens the bootstrap store (for example `--generate-tokens`), still
 refuses to start on a missing or altered trigger; only these two one-shots bypass.
 
-**Re-running `--mfa-reset`.** Do not re-run it blindly after a failure. A failure whose message says nothing
-was changed is safe to repeat, but the store-failure message (`unless the connection was lost at COMMIT`) means
-the clear may have landed, and a re-run clears any factor the user has enrolled in the gap. First check:
-
-```bash
-psql -q "$YUZU_POSTGRES_DSN" -c \
-  "SELECT username, mfa_enrolled_at IS NULL AS factor_cleared, mfa_disabled_at
-     FROM auth.users WHERE username = 'alice';" -c \
-  "SELECT to_timestamp(timestamp) AT TIME ZONE 'UTC' AS at_utc, result, detail
-     FROM audit_store.audit_events
-    WHERE action = 'mfa.reset.breakglass' AND target_id = 'alice'
-    ORDER BY timestamp DESC LIMIT 5;"
-```
-
-If `mfa_enrolled_at` is null and a fresh `mfa.reset.breakglass` row exists, the clear landed: do not re-run.
-Re-run only when the factor is still enrolled and no new row exists, and only before the user enrols again;
-once they have, end the sessions with `DELETE /api/v1/sessions?username=<name>` instead.
+**Re-running `--mfa-reset`.** Running it again after a `sessions_ended=failed`
+is safe for sessions (the delete is idempotent), but it also clears any factor
+the user has enrolled in the meantime. Re-run it only before the user enrols
+again; once they have, end the sessions with
+`DELETE /api/v1/sessions?username=<name>` instead.
 
 **Ending the sessions by hand.** `DELETE /api/v1/sessions?username=<name>` needs
 `UserManagement:Write`. Calling it on your own username is permitted (the audit row
@@ -855,46 +840,10 @@ account has no enrolled factor skip the step-up. A sole administrator who has ju
 cleared their own factor cannot use their own session for this (the clear deleted it), so they need an API
 token or another administrator. A
 sole-administrator lockout where no administrator session or token is left is covered
-by running `--mfa-reset` (after the check under "Re-running `--mfa-reset`" above, and before the user
-enrols again) or, if no `yuzu-server`
+by re-running `--mfa-reset` (before the user enrols again) or, if no `yuzu-server`
 binary is available, by the single transaction under
 [Fallback: direct SQL](#fallback-direct-sql). Treat `db_persisted: false` in the
 response as a failed delete and call it again.
-
-**When the clear is for a suspected compromise, end the sessions yourself.** The two enrolment routes
-(`POST /api/settings/mfa/init` and `/verify`) take no password and no step-up, so they re-confirm the
-session cookie against its durable row on every call. A session that another replica still holds in its
-validated-session cache can therefore no longer enrol an authenticator on the freshly cleared account: it is
-refused with `401` and an empty body, exactly like a request with no session. If that durable read itself
-fails the page answers "MFA backend unavailable" (status `200`), nothing is written, and
-`yuzu_auth_session_store_degrade_total{op="validate"}` counts it. What remains is the cache bound described
-below: during it, a cached session on another replica can still use the OTHER routes its role reaches, as it
-could before the clear (the accepted cache bound in the SOC 2 note). It does not reach approvals, because the
-approver gate reads the durable proof on every decision. The Settings replica drops its own cache straight
-after the commit and the CLI is a one-shot with no cache, so the exposure is the OTHER replicas (and, for one
-cached entry on any replica, a request already past its durable read, which lasts until the next generation
-advance). To close that
-remaining window at once, restart the other replicas or run the delete below and confirm the count.
-
-**Reactivating a deactivated account ends its sessions first.** Deactivating an account
-(`AuthDB::remove_user`, `RbacStore::deactivate_account`) clears its factor and recovery codes in the
-account transaction, and ends its sessions in a SEPARATE step. If that step failed, the outcome is
-`deactivated_but_session_wipe_failed` (also the `outcome` label of `yuzu_scim_compensation_failed_total`).
-Reactivation (`AuthManager::reactivate_user`) now deletes the account's cached and durable sessions BEFORE it
-sets the account active again, and drops this server's cached copy again after the durable delete, so no durable row of
-a session that survived the failed wipe remains when the account can sign in. Cached copies on this replica and every
-other are bounded by the session cache bound (R14: the generation poll, about 1 s, up to 30 s while a replica's
-session-generation poll is failing), including one entry re-inserted by a request already past its durable read.
-The wipe is unconditional (it also ends the sessions of an already-active account; real SCIM callers pass inactive
-accounts only). It does not restore any factor. If the durable wipe itself
-fails, the reactivation logs an error, returns false and leaves the account inactive; SCIM turns that into a
-`500` with an audit failure row (`scim.user.reactivated` or `scim.user.provisioned`, `result=failure`), so the
-IdP retries. For a reactivation made any other way, retry it. After a deactivation that reported
-`deactivated_but_session_wipe_failed`, or after any reactivation, ending the account's sessions by hand
-(`DELETE /api/v1/sessions?username=<name>` and the "Check that no session remains" query) is still available when a
-stricter guarantee is wanted. Deactivation itself still commits
-the factor clear and the session wipe in two separate steps, so a failed deactivation wipe leaves the
-sessions until the wipe is retried or the account is reactivated.
 
 **Check that no session remains.** After ending the sessions, confirm that no live
 row is left for the account:
@@ -919,89 +868,99 @@ reader answered by nodes holding different counters clears the cache on every
 flip, at most once per replica per second; see
 [Sessions are durable](#sessions-are-durable).
 
-**Finding a failed clear.** A Settings clear that did not commit leaves no `mfa.disabled` `result=ok` row.
-The handler records `result=error` (`disable failed`) for a storage failure, `result=denied` for a factor
-that changed under it, and `result=error` with `blocked: mfa_enforcement=<mode>` when policy forbids
-disabling MFA on that account (a policy refusal, not a failed clear). It writes **no row** when the audit
-store was the failure, or when the account was not found (the page says "Could not disable MFA: the
-account was not found. Nothing was changed."). The `--mfa-reset` command writes no row when it fails, except when
-the connection was lost at COMMIT (the clear and its `mfa.reset.breakglass` row may then have landed, and its
-message says to check the account's MFA status and that row before re-running), and
-emits no metric at all: its exit status and its stderr and log line are the signal. A Settings clear
-is counted: `yuzu_auth_mfa_disable_total{result}` (`ok|not_found|factor_changed|store_unavailable|audit_unavailable`)
-adds one per outcome, so a rise in `store_unavailable` or `audit_unavailable` is the cheap first signal that
-clears are failing; the audit rows below remain the evidence. This query lists the
-last seven days of refused or failed Settings clears:
+**Finding a partial result.** A failed session delete from Settings increments
+`yuzu_auth_session_store_degrade_total{op="invalidate_user"}`, but a single event
+does not reliably page: `YuzuSessionStoreDegraded` fires on
+`increase(yuzu_auth_session_store_degrade_total[10m]) > 0` held for 10 minutes, so it
+needs the database to keep failing. The `--mfa-reset` command emits no metric at all.
+Look for the audit rows instead. This query lists the last seven days of rows whose
+sessions were not ended:
 
 ```bash
 psql -q "$YUZU_POSTGRES_DSN" -c \
   "SELECT to_timestamp(timestamp) AT TIME ZONE 'UTC' AS at_utc, principal, action, result, target_id, detail
      FROM audit_store.audit_events
-    WHERE action = 'mfa.disabled'
-      AND result IN ('error', 'denied')
+    WHERE action IN ('mfa.disabled', 'mfa.reset.breakglass')
+      AND (result = 'partial' OR detail LIKE '%sessions_ended=failed%')
       AND timestamp >= extract(epoch FROM now() - interval '7 days')
     ORDER BY timestamp DESC;"
 ```
 
-Each row names the account in `target_id`. Read the rows as follows. A `denied` row means nothing was
-cleared. A `blocked: mfa_enforcement` row means nothing was cleared and the refusal was policy. An `error`
-row (`disable failed`) with **no** matching `result=ok` row for the same target means nothing changed. An
-`error` row with a paired `ok` row within seconds means the clear **landed**: the connection was lost at
-COMMIT, the transaction had committed, and the handler wrote its `error` row anyway; the factor, the
-recovery codes and the sessions are gone. Confirm with `auth.users.mfa_enrolled_at IS NULL` for the
-account. The query is read-only.
+Each row names the account in `target_id`. End its sessions, run the check above, and
+record the manual deletion in your change-management system. The query is read-only.
 
-**An empty result is not proof that nothing failed.** When Postgres itself is failing, the handler's own
-audit write can fail too, and the page, the spdlog error line (`mfa.disabled for '<user>' did not commit`)
-and the process log are then the only record. The Settings path counts its outcomes in `yuzu_auth_mfa_disable_total{result}`, but that is a first
-signal only: a lost-COMMIT acknowledgement is counted `store_unavailable` even if the clear landed. The
-`--mfa-reset` CLI still exports nothing. The evidence is the audit rows, that log line, and `yuzu_server_audit_emit_failed_total` when the audit
-INSERT was reached.
-The 1500 ms write timeout is a bound on each lock wait inside the transaction (`lock_timeout`), not on the
-whole transaction. The owner sets no `statement_timeout` of its own; the pool's per-connection default of 30 s
-bounds each statement (the serving pool and the `--mfa-reset` pool both use it, unless the DSN's `options`
-overrides it), so the transaction is bounded per statement and per lock wait, not as a whole, and a stalled
-statement is bounded by that default, not by the 1500 ms figure.
-
-**Reconciling a clear whose acknowledgement may have been lost.** A clear is one transaction that writes its own
-audit row, so there is no `attempted` intent row, no `partial` outcome and no clear that is "started, outcome
-unknown" except one: the connection was lost at COMMIT, and Postgres may have committed the whole transaction
-(the clear, the recovery codes, the session delete and the audit row) before the acknowledgement was lost.
-A Settings clear then leaves BOTH the owner's `result=ok` row and the handler's `result=error` row (`disable
-failed`); `--mfa-reset` writes no `error` row at all and says so in its message (`... it may have committed: check
-the account's MFA status and the mfa.reset.breakglass audit row before re-running`). This query pairs every
-Settings `error` row of the last seven days with an `ok` row for the same account within 30 seconds (the
-`blocked:` self-target refusals are `error` rows for a request that changed nothing, and are left out):
+**Finding a clear whose outcome is unknown.** Every clear writes an `attempted` intent row first, so a clear that was
+requested but never reported its outcome (the process died after the clear, or the outcome write failed) leaves an
+`attempted` row with no outcome row after it. This query lists, per action and account, the `attempted` rows that
+outnumber the outcome rows over the last seven days, leaving out the last minute, where a request may simply be in
+flight. A `blocked:` row (the Settings self-target guard) is written with no `attempted` row, so it is not counted as an
+outcome:
 
 ```bash
 psql -q "$YUZU_POSTGRES_DSN" -c \
-  "SELECT e.target_id,
-          to_timestamp(e.timestamp) AT TIME ZONE 'UTC' AS error_at_utc,
-          (o.id IS NOT NULL) AS clear_landed,
-          to_timestamp(o.timestamp) AT TIME ZONE 'UTC' AS ok_at_utc
-     FROM audit_store.audit_events e
-     LEFT JOIN audit_store.audit_events o
-            ON o.action = e.action AND o.target_id = e.target_id AND o.result = 'ok'
-           AND o.timestamp BETWEEN e.timestamp - 30 AND e.timestamp + 30
-    WHERE e.action = 'mfa.disabled' AND e.result = 'error' AND e.detail NOT LIKE 'blocked:%'
-      AND e.timestamp >= extract(epoch FROM now() - interval '7 days')
-    ORDER BY e.timestamp DESC;"
+  "SELECT action, target_id,
+          count(*) FILTER (WHERE result = 'attempted') AS attempted,
+          count(*) FILTER (WHERE result <> 'attempted' AND detail NOT LIKE 'blocked:%') AS outcome,
+          to_timestamp(max(timestamp)) AT TIME ZONE 'UTC' AS last_at_utc
+     FROM audit_store.audit_events
+    WHERE action IN ('mfa.disabled', 'mfa.reset.breakglass')
+      AND timestamp >= extract(epoch FROM now() - interval '7 days')
+      AND timestamp <  extract(epoch FROM now() - interval '1 minute')
+    GROUP BY action, target_id
+   HAVING count(*) FILTER (WHERE result = 'attempted')
+        > count(*) FILTER (WHERE result <> 'attempted' AND detail NOT LIKE 'blocked:%')
+    ORDER BY max(timestamp) DESC;"
 ```
 
-`clear_landed = false` means the clear did not commit (nothing was changed). `clear_landed = true` means it did, and
-everything landed together, the account's sessions included: there is nothing to repair and nothing to end by
-hand. The pairing is by account and time, not by a shared identifier, so confirm a listed account with
-`auth.users.mfa_enrolled_at IS NULL` (a cleared factor; it is also NULL if the user was never enrolled or has
-since been cleared again). For a `--mfa-reset` run that reported the lost-COMMIT message, run the check in
-"Re-running `--mfa-reset`" above: a null `mfa_enrolled_at` together with a fresh `mfa.reset.breakglass` row
-means the clear landed, with its session delete, and the command must not be run again (a re-run would clear any
-factor the user has enrolled in the gap).
+A listed account is suspect, not proven: read its rows in `id` order (`timestamp` is whole seconds), check
+`auth.users.mfa_enrolled_at` (null means the factor is cleared), and if it is cleared end the account's sessions as
+above. The comparison is by count, so an old row from before the window can offset a lost one, and an outcome row written inside the window by a build that
+predates the intent row can offset a lone `attempted` row for the same account (a mixed-version window); it also lists a pair whose
+`attempted` row falls inside the window and whose outcome row falls just after it. A requested clear can also leave
+the factor intact: if the process dies between the intent write and the clear, the account is unchanged, so read the
+`attempted` row as "requested, outcome unknown", not as proof that the factor was cleared. That query does **not** list
+a pair whose outcome row is `error`, because an `error` row counts as an outcome there; the next query does.
+
+**Finding a clear that ended `error` or `partial`.** A `result=error` outcome row means the clear reported a failure
+and its state is unknown (the commit acknowledgement may have been lost, so the clear may have landed); a
+`result=partial` row means the factor was cleared but its sessions were not ended. This query lists the last seven days
+of both, for either action, leaving out the `blocked:` self-target refusals (which are `error` rows for a request that
+changed nothing) and never matching the `attempted` intent rows:
+
+```bash
+psql -q "$YUZU_POSTGRES_DSN" -c \
+  "SELECT to_timestamp(timestamp) AT TIME ZONE 'UTC' AS at_utc, principal, action, result, target_id, detail
+     FROM audit_store.audit_events
+    WHERE action IN ('mfa.disabled', 'mfa.reset.breakglass')
+      AND result IN ('partial', 'error')
+      AND detail NOT LIKE 'blocked:%'
+      AND timestamp >= extract(epoch FROM now() - interval '7 days')
+    ORDER BY timestamp DESC;"
+```
+
+For each listed account check `auth.users.mfa_enrolled_at`. If it is NULL the clear landed: end the account's sessions
+by re-running `--mfa-reset` (a re-run clears again idempotently, ends the account's sessions and needs no admin session) or,
+when an administrator session exists, by hand with `DELETE /api/v1/sessions?username=<name>` (the CLI ends no session after a
+failed clear, while the Settings route does), then run the "Check that no session remains" query. If it is not NULL the factor
+is intact, unless the account re-enrolled since a clear that did land; in that case end its sessions anyway with the
+`DELETE` call. Re-run the clear only if it is still wanted. A SIEM rule can use the same predicate.
 
 **Detective control.** Because the CLI exits without serving, it emits no
 Prometheus metric — the audit row is the only signal. Alert on
 `mfa.reset.breakglass` in `audit_events`; an unexpected one is an
-authentication-downgrade event and should page on-call. The row is written in the same transaction as the
-clear, so it exists exactly when the clear committed.
+authentication-downgrade event and should page on-call. Also alert on `mfa.disabled`
+and `mfa.reset.breakglass` rows with `result=partial` or a `detail` containing `sessions_ended=failed`: each is an
+account whose second factor is cleared and whose sessions may still be live. A database fault that fails
+the session delete can fail the outcome audit write too, and a process kill between the two commits
+leaves an `attempted` row with no outcome row (the query above finds them); if `YuzuAuditPersistFailures` fired or
+`yuzu_auth_session_store_degrade_total{op="invalidate_user"}` rose in the same minutes, treat a
+missing outcome row as unknown and end the sessions of any account that disabled MFA then.
+
+Every clear now writes two rows, the `attempted` intent row and then the outcome row, so a SIEM rule that counts these
+actions once per clear counts twice, and a rule written as `result <> 'success'` (or `result != 'ok'`) matches every
+intent row and every `blocked:` row. Exclude `result = 'attempted'` and `detail LIKE 'blocked:%'` from rules that look for
+failures, and key failure rules on `result IN ('partial','error')` as in the query above. Order the two rows by the audit
+`id` (`timestamp` is whole seconds).
 
 It is safe to run while the server is up: the one-shot opens its own pool and
 does not talk to the running process.
@@ -1013,9 +972,9 @@ Use it in three cases: no `yuzu-server` binary is available on the host;
 key version that is not registered and that header is corrupt (see
 [Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version),
 where a restore of the paired backup comes first when the version once existed); or
-`--mfa-reset` refuses because the audit store does not open or does not accept the audit row
+`--mfa-reset` refuses because the audit store does not open or does not accept the intent row
 (`error: audit store unavailable; refusing to clear MFA without an audit record`, or
-`error: MFA was not cleared (...)` naming the audit row) while an
+`error: audit store did not accept the intent row; nothing was changed`) while an
 operator is locked out and the audit store cannot be restored in the time available.
 **Last resort. It writes no audit row.** In the third case restore the audit store first
 and re-run `--mfa-reset`, which is the audited path; use this SQL only when that cannot be done,
@@ -1051,9 +1010,10 @@ COMMIT;
 SQL
 ```
 
-These run in ONE transaction on purpose, as the server's own clear does (`MfaDisableOwner`): an
-interruption cannot leave the factor cleared with the sessions live, or the secret cleared with the
-old recovery codes still valid. `ON_ERROR_STOP` makes `psql` stop and exit non-zero if a statement
+These run in ONE transaction on purpose. Unlike the server's own two commits (the
+factor clear, then the session delete), an interruption cannot leave the factor
+cleared with the sessions live, or the secret cleared with the old recovery codes
+still valid. `ON_ERROR_STOP` makes `psql` stop and exit non-zero if a statement
 fails, so a failed statement cannot turn the `COMMIT` into a silent rollback with
 exit status 0. A session made under the old factor may hold an MFA proof from it,
 which is why the session delete is part of the same transaction.
@@ -1791,9 +1751,8 @@ covers it is `YuzuAuditPersistFailures` (`docs/prometheus/yuzu-alerts.yml`), whi
 fires on `increase(yuzu_server_audit_emit_failed_total[5m]) > 0` held for 2
 minutes, so allow for the 15 second refresh plus that hold. In that outage the
 refusal rows are lost and the counters are the only record. The same alert covers the audit rows of an MFA clear
-done in Settings: a clear whose audit row the audit store refuses (the whole clear rolls back, the page says the audit
-record could not be written, and nothing is changed) and an `error` or `denied` row the handler fails to write both
-increment `yuzu_server_audit_emit_failed_total`. `yuzu-server --mfa-reset` runs as
+done in Settings: an intent row the audit store refuses (the disable answers `503` and changes nothing) and an outcome
+row that is lost after a clear both increment `yuzu_server_audit_emit_failed_total`. `yuzu-server --mfa-reset` runs as
 its own process and exports no metric, so a refusal there is seen only in the command's output and exit status.
 
 **Probes during a stall.** `/livez` and `/login` stay fast (milliseconds,
@@ -2025,10 +1984,10 @@ alert on the unit being `failed` or on `up == 0` as well.
    section.
 
    **A clear made while the `users_mfa_factor_gen` trigger was absent or disabled needs this step even
-   though the clear already deleted the account's sessions.** If a clear (Settings Disable or
-   `--mfa-reset`) ran in that window, the factor generation did not advance. The clear's own transaction deletes
-   the account's sessions, but a TOTP sign-in that straddled the clear (made under the old factor, committed
-   between the delete and the COMMIT) can survive it and hold a proof equal to the unadvanced generation; once the
+   though the clear also deleted the account's sessions.** If a clear (Settings Disable or
+   `--mfa-reset`) ran in that window, the factor generation did not advance. The clear ends the account's
+   sessions in a later, separate step, and a TOTP sign-in that was in flight when that delete ran (made under the old
+   factor) can survive it and hold a proof equal to the unadvanced generation; once the
    trigger is repaired that proof reads as bound to the cleared factor. After repairing the trigger, END EVERY
    SESSION of every account whose factor was cleared in that window. The simplest way is to end all sessions with
    the emergency procedure in [Sessions are durable](#sessions-are-durable); per account,
@@ -2071,7 +2030,7 @@ SQL
 
 ### Repair statements
 
-Run as the table owner, only for the store that failed. These are the statements of `migration_v3_sql()` (`server/core/src/auth_db.cpp`) and `migration_v2_sql()` (`server/core/src/session_store.cpp`), schema-qualified, with the `DROP TRIGGER` added. Copy them from this file's source rather than from a rendering that may strip the trailing space after `END` in the session function.
+Run as the table owner, only for the store that failed. These are the statements of `migration_v3_sql()` (`server/core/src/auth_db.cpp`) and `migration_v3_sql()` (`server/core/src/session_store.cpp`), schema-qualified, with the `DROP TRIGGER` added. Copy them from this file's source rather than from a rendering that may strip the trailing space after `END` in the session function.
 
 Start each block with `SET lock_timeout = '10s';` (already in the blocks below). `DROP TRIGGER` and `ALTER TABLE ... ENABLE ALWAYS TRIGGER` queue behind a long transaction such as a running `pg_dump`, and without a timeout the repair waits silently while every other query on the table queues behind it; with it the statement fails after 10 seconds, `ON_ERROR_STOP` rolls the transaction back and nothing has changed, so retry once the backup has finished.
 

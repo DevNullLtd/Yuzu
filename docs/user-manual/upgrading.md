@@ -563,7 +563,7 @@ the window is above 0, because creating a token is itself an ordinary step-up ro
   SELECT store, version FROM public.schema_meta WHERE store IN ('auth', 'session_store') ORDER BY store;
   ```
 
-  A build without this change records `auth` 2 and `session_store` 1.
+  A build without this change records `auth` 2 and `session_store` 2.
 - Mint an administrator API token now and keep it, with a SHORT expiry (a day or two), and revoke it after step 5
   (it is also a pre-cutover credential: do not leave it standing). It is for ending sessions by hand and other
   administrator work while the enrolled administrators are refused; it cannot reach the 2 factor-credential routes or
@@ -619,7 +619,7 @@ alone. It is not an upgrade path and widens nothing else.
    section, and rehearse it on a scratch database first. Do **not** use `pg_restore --clean --if-exists` over the
    migrated schemas: the two trigger functions the migrations create are not in the dump, so `DROP SCHEMA auth`
    and `DROP SCHEMA session_store` fail (`pg_restore` exits non-zero), the old tables are not recreated cleanly,
-   and `public.schema_meta` keeps `auth` at 3 and `session_store` at 2, so a later start of the new build skips
+   and `public.schema_meta` keeps `auth` at 3 and `session_store` at 3, so a later start of the new build skips
    both migrations against tables that lack `mfa_factor_gen` and its trigger and refuses to boot. Use this
    sequence instead, as root, with every replica stopped (add the `--role` and connection options your own
    backup recipe uses). Set `STAMP`, `DUMP` and `KEYS` explicitly, check the target database by name, and
@@ -656,7 +656,7 @@ alone. It is not an upgrade path and widens nothing else.
    pg_restore --single-transaction --no-owner --exit-on-error --dbname="$YUZU_POSTGRES_DSN" "$DUMP" &&
    psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" \
      -c "UPDATE public.schema_meta SET version = 2 WHERE store = 'auth';" \
-     -c "UPDATE public.schema_meta SET version = 1 WHERE store = 'session_store';" \
+     -c "UPDATE public.schema_meta SET version = 2 WHERE store = 'session_store';" \
      -c "DELETE FROM session_store.sessions;" &&
    tar -xzpf "$KEYS" -C /etc/yuzu &&
    echo "OK: restored; the previous build can be started"
@@ -664,8 +664,8 @@ alone. It is not an upgrade path and widens nothing else.
 
    `CASCADE` removes only the objects inside those two schemas (the tables and the two functions
    `auth.users_mfa_factor_gen()` and `session_store.sessions_mfa_rebind_guard()`, with their triggers). Use the
-   two version numbers you recorded before the cutover if they differ from 2 and 1; without the `UPDATE`
-   statements the restored tables would sit under `schema_meta` rows that still say 3 and 2. The `DELETE` ends
+   two version numbers you recorded before the cutover if they differ from 2 and 2; without the `UPDATE`
+   statements the restored tables would sit under `schema_meta` rows that still say 3 and 3. The `DELETE` ends
    every session: the restored rows (including ones that were revoked after the dump was taken) would otherwise
    be valid until you end them by hand; run it now, with the replicas stopped, before the previous build starts.
    The `tar` command restores the keys directory from the same pair (`certs` under `/etc/yuzu`, ownership and
@@ -673,13 +673,14 @@ alone. It is not an upgrade path and widens nothing else.
    [restore steps](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule) ("A restore rolls credentials
    and sessions back to the dump": re-apply password changes, notify users whose MFA enrolment came back) and run
    only the checks of its [Post-restore verification](../ops-runbooks/auth-db-recovery.md#post-restore-verification)
-   that apply to the previous build: expect `auth` 2 and `session_store` 1, no binding trigger and no binding
+   that apply to the previous build: expect `auth` 2 and `session_store` 2, no binding trigger and no binding
    gauge there. The dump has no binding triggers, so there is nothing to check for them on the previous-build path.
    Starting the new build again afterwards re-runs the two migrations from the restored versions.
 3. Install the new build but do not start any replica yet, then run `yuzu-server --mfa-reset <user>` on the host
    for each enrolled operator, administrators first. This works before any replica has served: the command opens
-   the auth store itself (which applies the `auth` v3 migration) and applies the `session_store` v2 migration before
-   it clears anything, so no enrolled account is ever refused by a serving replica. Two consequences: the first
+   the auth store itself (which applies the `auth` v3 migration), clears the factor, and then opens the session
+   store (which applies the `session_store` v3 migration) to end the account's sessions, so no enrolled account is
+   ever refused by a serving replica. Two consequences: the first
    reset migrates the database, so from that point the previous build can no longer be started without the
    restore in step 2, and a reset ends that account's sessions. The command takes one user per run, needs a host
    shell, the Postgres DSN and the keys directory (`docs/ops-runbooks/auth-db-recovery.md`, "The `--mfa-reset` CLI
@@ -779,15 +780,15 @@ account's current one, so disabling MFA and enrolling again, or an administrator
 with `yuzu-server --mfa-reset`, makes every earlier proof stop counting. The generic check also holds a
 local proof to the window on the database clock, to the millisecond, as well as on the server's own
 clock. Two schema migrations run at the first start: `auth` v3 adds `users.mfa_factor_gen` (every row
-starts at `0`) and a trigger that advances it, and `session_store` v2 adds two columns and a trigger that
+starts at `0`) and a trigger that advances it, and `session_store` v3 adds two columns and a trigger that
 unbinds a proof written without a generation. Both triggers are checked at every start: a server whose
 database does not have them in force refuses to start (the log says `Failed to open the Postgres auth
 store (migration or MFA trigger check failed; see the preceding AuthDB log line)` or `session store
 migration/open failed`). Only the two host-CLI one-shots `yuzu-server --mfa-reset` and
 `--break-glass-arm` open their bootstrap `AuthDB` past a missing or altered binding trigger (with a loud
 `WARN`; see [MFA binding enforcement failed](../ops-runbooks/auth-db-recovery.md#mfa-binding-enforcement-failed));
-serving and every other mode, `--generate-tokens` for example, refuse to start, and the session store has no
-such bypass.
+serving and every other mode, `--generate-tokens` for example, refuse to start; `--mfa-reset` also opens
+the session store it uses to end the account's sessions the same way.
 
 **What you will see.**
 
@@ -811,15 +812,15 @@ such bypass.
   accounts. Retry once; if it persists, follow the runbook, and do not run `--mfa-reset` for an account on the
   strength of this message alone. A `503` whose message is "authentication store is temporarily unavailable" is
   the plain transient one.
-- **Clearing a factor is one transaction.** `yuzu-server --mfa-reset` and Disable in Settings clear the
-  factor, delete the recovery codes, end every session of the account and write the audit row together
-  (`MfaDisableOwner`); a failed audit write rolls the whole clear back, so the Settings Disable is
-  fail-closed on its audit row (a failed Settings clear answers HTTP `200` with an inline error message, no longer `503` with `Sec-Audit-Failed` and `Retry-After`). `--mfa-reset` constructs no session store; it applies the
-  `session_store` schema migrations first, and if that step fails it exits `1` with nothing changed. A
-  connection lost at COMMIT may have committed the whole clear: the `--mfa-reset` message then says to check the
-  account's MFA status and the `mfa.reset.breakglass` audit row before re-running, and the Settings page says
-  "Nothing was changed unless you were signed out", with both an `error` and an `ok` audit row possible for one
-  clear.
+- **Clearing a factor is unchanged apart from the generation check.** `yuzu-server --mfa-reset` and Disable in
+  Settings still write an `attempted` intent row first and an outcome row after, clear the factor and the
+  recovery codes in one transaction and end the account's sessions in a separate step (a failed session delete
+  is `result=partial` and `--mfa-reset` then exits non-zero), exactly as described in the `--mfa-reset` notice
+  below. The Settings Disable additionally compares the factor generation the step-up check admitted with the
+  account's current one under the row lock and refuses with `409` (audit `denied`, `reason=factor_changed
+  expected_gen=<n>`) if they differ. `--mfa-reset` opens its bootstrap auth store and the session store it
+  uses to end the sessions without refusing on a missing or altered binding trigger, and prints a `WARN`
+  for each.
 - **Regenerating recovery codes and disabling MFA are local-session-only.** An API token or an SSO
   session that reached these two Settings routes before now gets `403`, and `--mfa-step-up-window-secs=0`
   no longer switches their step-up off (they use a window of at most 300 seconds). A request whose factor
@@ -1228,7 +1229,7 @@ A refused request writes no quarantine record and releases none. The `403` bodie
 5. A SAML deployment has no approver path (#6098); give those approvers a local or OIDC account first.
 6. Have at least two enrolled approvers: a submitter cannot review their own request, so a single enrolled approver cannot decide that approver's own requests.
 7. After the upgrade, run the approvals-refused query (step 6 of "After upgrading, verify approvals on a test request" below) to see whether approvals are being refused and why.
-8. Owners of scripts that run `yuzu-server --mfa-reset`, and of SIEM rules on `mfa.disabled` or `mfa.reset.breakglass`: `--mfa-reset` exits `1` with `error: MFA was not cleared (<reason>); ...` whenever the clear does not complete (nothing is changed, except after a connection lost at COMMIT, where the message says it may have committed and to check before re-running); every clear writes ONE audit row, inside the clear's own transaction, so there is no `attempted` intent row and no `result=partial` (details in the `--mfa-reset` notice below and in the cutover section above).
+8. Owners of scripts that run `yuzu-server --mfa-reset`, and of SIEM rules on `mfa.disabled` or `mfa.reset.breakglass`: `--mfa-reset` now exits `1` when ending the sessions fails (`result=partial`), when the audit store refuses its intent row, and when the clear itself fails; every clear writes two audit rows; a failed session delete is `result=partial`, not `success` (details in the `--mfa-reset` notice below).
 
 **What changed.** Approve and reject (`POST /api/approvals/{id}/approve`, `POST /api/approvals/{id}/reject`,
 the dashboard Approvals page, and the MCP tools `approve_request` / `reject_request`) now require all of:
@@ -1298,18 +1299,15 @@ principal and not an engine principal. The existing rule that the reviewer canno
     submitter: until then nothing can be approved. A seeded administrator that has never enrolled is in the same position. Self-service
     enrolment for non-admins is a planned follow-up and is not part of this change. `yuzu-server --mfa-reset`
     ends the account's sessions, and disabling MFA in Settings ends every session of the account, the one you
-    are using included (neither ends API tokens). **`--mfa-reset` exits `1` whenever the clear does not complete**
-    (`error: MFA was not cleared (<reason>); nothing was changed`): the factor clear, the recovery codes, the
-    session delete and the audit row commit or abort together, so a failed session delete or a refused audit row
-    leaves the factor intact, and scripts that treat exit `0` as success need no extra handling for a half-done
-    clear. When the audit store refuses the row, the message points at the runbook's "Fallback: direct SQL"
-    section. A connection lost at COMMIT may have committed the whole clear; the message then says to check the
-    account and the `mfa.reset.breakglass` row before re-running. Every reset, and every Settings disable, writes
-    ONE row (no `attempted` row, no `result=partial`): a Settings clear whose commit acknowledgement was lost can
-    leave an `error` row and an `ok` row for the same account, so key failure rules on `result IN ('error',
-    'denied')` and pair an `error` row with an `ok` row for the same target within seconds before treating it as a
-    failed clear (the runbook's "Reconciling a clear whose acknowledgement may have been lost" has the query);
-    exclude `detail LIKE 'blocked:%'` rows, which are refusals that changed nothing. **With RBAC enforcement off (the shipped default),** the legacy gate requires the `admin` role for
+    are using included (neither ends API tokens). **`--mfa-reset` now exits non-zero when ending the sessions fails**
+    (the factor is already cleared; it records `result=partial` in its audit row): scripts that run it and treat exit `0`
+    as success must handle that, and end the sessions by hand. It also exits `1` with
+    `error: audit store did not accept the intent row; nothing was changed` when the audit store refuses its `attempted`
+    intent row (nothing is cleared; a second line on stderr points at the runbook's "Fallback: direct SQL" section), and `1`
+    when the clear itself fails. Every reset, and every Settings disable, now
+    writes an extra `attempted` row before the outcome row, so a SIEM rule that counts one row per clear sees two; do
+    not match on `result <> 'success'` without excluding `attempted` and `detail LIKE 'blocked:%'` rows, and key
+    failure rules on `result IN ('partial','error')`. Order the pair by the audit `id`. **With RBAC enforcement off (the shipped default),** the legacy gate requires the `admin` role for
     approving, so a non-admin is refused `403` "admin role required" before the MFA check and enrolling a non-admin
     approver achieves nothing until RBAC enforcement is turned on.
   - **When the approver rule's own read fails** (an unreadable stored session proof for any approver, or, for a local
@@ -1726,7 +1724,7 @@ customer-distribution lane. Before switching lanes, read the
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The built-in server certificate is re-issued once with a server identity URI (#6016).** Same root, same key, so existing `mgmt_peer_pins` stay valid and the gateway needs no action for the re-issue. The gateway in this release can also admit the server by that identity (`mgmt_peer_auth_mode`, `mgmt_peer_identity`, `mgmt_peer_denied`; new reasons on `yuzu_gw_mgmt_auth_rejected_total`, new counter `yuzu_gw_mgmt_auth_admitted_total`, new alert `YuzuServerIdentityUriAbsent`): the identity is an explicit opt-in: the shipped reference configs and an unset mode are all `pin`, so nothing changes until you set `identity_or_pin` or `identity`. The old certificate shows as revoked with reason `superseded` in the CA inventory and the next CRL (bookkeeping, not a compromise). New audit action `server.default_certs_server_identity_upgraded`, new gauge `yuzu_server_identity_uri_present`. See [Authorizing the server by its identity](gateway.md#authorizing-the-server-by-its-identity) and "Behaviour change: the built-in server certificate is re-issued once with a server identity URI". |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Breaking, fresh deployment only: stored responses of Forensics-tier plugins are served only to callers holding `Forensics:Read` (#4990).** Applies to every stored-response read path (REST, MCP, dashboard) and to the server-side consumers of those rows (bundle collation, result-set membership, policy checks, the live output stream, execution error text), with the limits listed under "Known limits" in that section; other readers see the rows as absent, with counts and caps computed over what they may read, so an empty result no longer implies no data. Viewer, Operator, PlatformEngineer and ITServiceOwner, and with RBAC off every non-administrator session, no longer see these rows. New built-in `ForensicsAnalyst` role (read-only, assign it fleet-wide with RBAC on) and new audit action `response.forensics.read`. A read whose authority cannot be determined is refused with a retryable error rather than a partial result. This release is a hard cutover: it supports initial deployment into a fresh database only and provides no upgrade path from an earlier server's database (see "Deployment contract" in the section; the agent and gateway columns above are the minimum agent and gateway versions, not a supported upgrade starting point for the database). See "Behaviour change: stored responses of Forensics-tier plugins need `Forensics:Read` (#4990, fresh deployment only)". |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **MFA step-up is enforced by one central check on 37 named routes, before the route's own checks (breaking order of checks; server restart only, no agent or gateway change, no migration).** A stale or missing MFA proof is now answered with the `401` step-up envelope before the route's own `403` (permission, `token_session`, `not_local`; a cross-site cookie write is answered `403` by the server-wide same-site check before the step-up check); engine principals receive `403` on every step-up-gated route regardless of grants (audited as `mfa.step_up.required`, no longer as the per-route handler denial row); a server with no wired authentication store answers `503` on these routes, and an unreadable store answers `503` to local sessions; `POST /api/settings/mfa/recovery-codes` and `POST /api/settings/mfa/disable` are newly gated; SAML sessions still cannot satisfy step-up (`403`, unless the window is disabled with `--mfa-step-up-window-secs 0`). The server now exits with status `1` at boot when a mutating route has no step-up classification, which can only happen on a fork or custom build (a restart policy turns it into a restart loop; roll back to recover). Other mutating routes and all MCP tools are not MFA-step-up gated in this release. New metric `yuzu_auth_mfa_step_up_gate_total` and alerts `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled`. See [Breaking: MFA step-up is checked once](#breaking-mfa-step-up-is-checked-once-before-the-routes-own-checks-and-two-more-routes-need-a-fresh-proof). |
-| 0.15.x (next) | 0.12.0 | 0.12.0 | **MFA proofs are bound to the factor they were earned with, and approve and reject require an enrolled factor (hard cutover; migration required: `auth` v3 and `session_store` v2; no rollback; no agent or gateway change; #6079).** No rolling or mixed-version window: stop every server replica, back up the `auth` and `session_store` schemas, run `yuzu-server --mfa-reset <user>` for each enrolled operator (before you start the new build, or afterwards for each account listed by the post-start check), because an account that was already enrolled is refused `503` (audit `reason=mfa_proof_unavailable`) on the 37 step-up routes until then. See "Breaking: MFA proofs are bound to the factor they were earned with" above. |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **MFA proofs are bound to the factor they were earned with, and approve and reject require an enrolled factor (hard cutover; migration required: `auth` v3 and `session_store` v3; no rollback; no agent or gateway change; #6079).** No rolling or mixed-version window: stop every server replica, back up the `auth` and `session_store` schemas, run `yuzu-server --mfa-reset <user>` for each enrolled operator (before you start the new build, or afterwards for each account listed by the post-start check), because an account that was already enrolled is refused `503` (audit `reason=mfa_proof_unavailable`) on the 37 step-up routes until then. See "Breaking: MFA proofs are bound to the factor they were earned with" above. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Seven runtime-config keys are administrator-only on `PUT /api/config/{key}` (breaking for non-administrator and MCP-tier callers; server restart only, no agent or gateway change, no migration).** `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`, `dex_cohort_export_key` and `audit_retention_days` now answer `403` to a supervised-tier MCP token and, with RBAC on, to a non-administrator role that holds `Infrastructure:Write`; every other config key is unchanged. Server restart only; see the first section on this page. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The runtime-configuration read shows a caller only the overrides it could write (breaking for MCP-tier and non-administrator readers; server restart only, no agent or gateway change, no migration).** `GET /api/config`, `GET /api/v1/config` and the MCP tool `get_runtime_config` leave out the `oidc_*`, `plugin_signing_required`, DEX alert and `audit_retention_days` overrides unless the caller could write them; an administrator account's `GET /api/config` body is unchanged apart from `log_level` reading `warn`. `heartbeat_timeout` is limited to 30 to 86400 seconds on every write route. Mixed-version fleets are not a concern (server-side only). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The activity-record feature is renamed Echo (breaking; hard cut, no aliases).** The agent plugin is `echo` (was `tar`), and the REST routes, MCP tools, metrics, audit actions, instruction ids, heartbeat tags and the result-set matcher kind carry the new name. **Upgrade the server before the agents:** the server accepts an agent that still reports `tar` and writes the old name on the wire to it (an upgrade-window shim, also on the gateway directory route), but an upgraded agent talking to a server that has not been upgraded has no fallback and every Echo dispatch to it is refused with `plugin_not_found`. Deliver the agent by package installer: an OTA update replaces the binary only, and the agent defers adopting `tar.db` as `echo.db` until `echo.<ext>` is installed. A carried-forward server database (not a supported upgrade path under the deployment contract) has its stored references rewritten in eleven stores on the first start. See "Behaviour change: the activity-record feature is renamed Echo (tar.db adopted as echo.db; stored references migrated)". |

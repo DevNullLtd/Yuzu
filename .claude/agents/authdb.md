@@ -206,8 +206,9 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   trigger and does not open if it fails (the two host recovery one-shots,
   `--mfa-reset` and `--break-glass-arm`, may open their bootstrap `AuthDB`
   with `MfaBindingCheck::kBypassForRecovery`: warn, binding reported not
-  enforced for the process life; it exists ONLY on the `AuthDB` constructor,
-  `SessionStore` has no bypass, the serving binary never passes it, any other
+  enforced for the process life; it exists ONLY on the `AuthDB` and `SessionStore`
+  constructors, `--mfa-reset` passes it to both (the session delete) and
+  `--break-glass-arm` to `AuthDB`, the serving binary never passes it, any other
   use is CRITICAL); `mfa_status` re-validates behind a
   request-driven 60 s memo and a trigger observed not in force is STICKY
   (`MfaStatus::binding_enforced == false`; a check that could not run instead latches
@@ -216,26 +217,19 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   a defect). `mfa_regenerate_recovery_codes` takes a REQUIRED
   `expected_factor_gen` and compares it under the `auth.users` row lock
   before writing (`FactorChanged`, deliberately NOT a store-unavailable error);
-  a new factor mutation does the same. **`MfaDisableOwner`
-  (`mfa_disable_owner.{hpp,cpp}`) is the only writer of the Settings Disable and
-  `--mfa-reset` clear:** ONE transaction on one
-  lease (lock the `auth.users` row, compare the admitted generation, clear the
-  factor, delete the recovery codes and every durable session, insert the
-  audit row, bump the session write-generation last and only when the
-  session-delete step ran), where any failure, the
-  audit INSERT included, rolls everything back. Account deactivation also clears
-  the factor and the recovery codes, through `auth_sql::soft_delete_user_in_txn`,
-  and ends sessions in a separate step (outcome `deactivated_but_session_wipe_failed`);
-  `AuthManager::reactivate_user` ends the account's cached and durable sessions BEFORE
-  it reactivates, dropping the cached copies again after the durable wipe and
-  before `AuthDB::reactivate_user` (a failed durable wipe returns false and leaves the
-  account inactive; no durable row survives, while cached copies on this replica and every
-  other are bounded by the cache bound, R14: poll about 1 s, up to 30 s while it fails,
-  including one entry re-inserted by a request already past its durable read) and restores
-  no factor. A NEW factor-clear path outside the owner or the
-  deactivation helper, or a
-  clear split across transactions, is CRITICAL; `AuthDB::mfa_disable` is a
-  test-fixture un-enrol with no route or CLI caller.** The auth v3 migration
+  a new factor mutation does the same. **The Settings Disable clears through
+  `AuthDB::mfa_disable_report`, which compares the admitted generation under the
+  `auth.users` row lock (`FactorChanged`: nothing cleared) and clears the factor
+  and deletes the recovery codes in ONE transaction; `--mfa-reset` clears through
+  `AuthDB::mfa_disable` (no expected generation).** Both end the account's durable
+  sessions in a separate, later step (`AuthManager::invalidate_user_sessions`; the
+  CLI opens a `SessionStore` and calls `invalidate_user`), so a failed session delete
+  leaves the factor cleared and is recorded as `partial` / `sessions_ended=failed`.
+  Account deactivation also clears the factor and the recovery codes, through
+  `auth_sql::soft_delete_user_in_txn`, and ends sessions in a separate step
+  (outcome `deactivated_but_session_wipe_failed`). **A NEW route-reachable factor-clear path
+  that skips the generation compare, or that clears the factor and deletes the recovery
+  codes in separate transactions, is CRITICAL.** The auth v3 migration
   seeds nothing (a hard cutover with no upgrade path, mixed-version window or rollback): every existing row
   starts at generation `0`. **A PR that writes `mfa_factor_gen`,
   weakens the trigger or its pinned-body check, publishes a verifier's success
@@ -258,11 +252,10 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   session-persistence method on `AuthDB` is a design regression** — raise it
   as a HIGH finding requiring an explicit decision (this was a deliberate
   drop, not an oversight; see `docs/auth-architecture.md` "AuthDB —
-  persistent authentication store"). The cross-store writers are the
+  persistent authentication store"). The one cross-store writer is the
   credential-change owner (`CredentialChangeOwner`, #5342), which deletes a
   user's `session_store` rows in the same transaction as its `auth.users`
-  credential write, and `MfaDisableOwner` (#6079), which does the same for a
-  factor clear — through `session_store_sql_helpers.hpp`, never an
+  credential write — through `session_store_sql_helpers.hpp`, never an
   `AuthDB` method.
 
 - **Cleanup thread now sweeps ONLY stale provisional MFA enrollments** (the
