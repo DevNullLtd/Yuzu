@@ -1089,21 +1089,39 @@ std::expected<int, StoreReadError> ApprovalManager::pending_count_checked() cons
     return static_cast<int>(to_i64(col(res.get(), 0, 0)));
 }
 
-int ApprovalManager::pending_count_for(const std::string& submitted_by) const {
-    if (!open_ || submitted_by.empty())
+std::expected<int, StoreReadError>
+ApprovalManager::pending_count_for_checked(const std::string& submitted_by) const {
+    if (!open_) {
+        spdlog::warn("ApprovalManager::pending_count_for_checked degraded: store not open");
+        return std::unexpected(StoreReadError{"database not open"});
+    }
+    // No principal can hold a pending approval under an empty name: a genuine zero, not a fault.
+    if (submitted_by.empty())
         return 0;
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
-        return 0;
+    if (!lease) {
+        spdlog::warn("ApprovalManager::pending_count_for_checked degraded: pool exhausted");
+        return std::unexpected(
+            StoreReadError{"approval store temporarily unavailable (pool exhausted)"});
+    }
 
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT COUNT(*) FROM approval_manager.approvals "
         "WHERE status = 'pending' AND submitted_by = $1",
         std::vector<std::string>{submitted_by});
-    if (res.status() != PGRES_TUPLES_OK)
-        return 0;
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ApprovalManager::pending_count_for_checked degraded: query failed: {}",
+                     PQresultErrorMessage(res.get()));
+        return std::unexpected(StoreReadError{
+            std::string("read failed: ") + PQresultErrorMessage(res.get()), result_sqlstate(res)});
+    }
     return static_cast<int>(to_i64(col(res.get(), 0, 0)));
+}
+
+int ApprovalManager::pending_count_for(const std::string& submitted_by) const {
+    auto r = pending_count_for_checked(submitted_by);
+    return r ? *r : 0; // FAILS OPEN by design of this legacy shape: see the header
 }
 
 // ---------------------------------------------------------------------------

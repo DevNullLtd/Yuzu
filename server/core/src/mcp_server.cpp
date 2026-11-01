@@ -8786,8 +8786,36 @@ McpServer::HandlerFn McpServer::build_handler(
                         // any single principal's share far below that global cap.
                         constexpr int kMcpSubmitterPendingCap =
                             yuzu::server::instruction_execute::kSubmitterPendingCap;
-                        if (approval_manager->pending_count_for(session->username) >=
-                            kMcpSubmitterPendingCap) {
+                        // up8-1 / sre-2: an unreadable count refuses (a store fault, retryable);
+                        // it must never read as zero, which would admit every principal exactly
+                        // when the approval store is struggling. Nothing has been minted.
+                        const auto pending_now =
+                            approval_manager->pending_count_for_checked(session->username);
+                        if (!pending_now) {
+                            if (metrics != nullptr) {
+                                try {
+                                    metrics
+                                        ->counter(yuzu::server::instruction_execute::
+                                                      kApprovalRefusedMetric,
+                                                  {{"reason",
+                                                    yuzu::server::instruction_execute::
+                                                        kReasonApprovalUnavailable}})
+                                        .increment();
+                                } catch (...) { // NOLINT(bugprone-empty-catch)
+                                }
+                            }
+                            const bool audit_ok = mcp_audit(
+                                "failure", "approval_unavailable cause=pending_count_unreadable");
+                            res.set_content(
+                                a4_error(kInternalError,
+                                         "approval system unavailable: the pending-approval count "
+                                         "could not be read; no approval ticket was created",
+                                         "retry shortly; the approval store could not be read",
+                                         mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                                "application/json");
+                            return;
+                        }
+                        if (*pending_now >= kMcpSubmitterPendingCap) {
                             if (metrics != nullptr) {
                                 try {
                                     metrics

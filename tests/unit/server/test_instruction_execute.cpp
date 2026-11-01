@@ -684,6 +684,44 @@ TEST_CASE("execute: a cap with an unwired pending counter fails closed, never un
                     {{"reason", "approval_unavailable"}}) == 1);
 }
 
+TEST_CASE("execute: an UNREADABLE pending count refuses (never admits), counted, retryable, "
+          "creates no approval",
+          "[instruction_execute][approval][security][up8-1]") {
+    for (const int fault : {1, 2}) {
+        INFO("fault=" << fault << (fault == 1 ? " (nullopt)" : " (throws)"));
+        Rig r;
+        r.pending_count_fault = fault;
+        r.defs["d"] = make_def("d", "ping", "always");
+        auto rq = r.request("d", json::object(), make_caller("u", false), Surface::kRest);
+        rq.submitter_pending_cap = kSubmitterPendingCap;
+        auto out = run(rq, r.ports(), r.audit());
+        const auto* ref = as_refusal(out);
+        REQUIRE(ref);
+        CHECK(ref->kind == RefusalKind::kApprovalUnavailable);
+        CHECK(ref->reason == "approval_unavailable");
+        // A store fault, not a wiring defect: a retry can succeed, unlike the unwired refusals.
+        REQUIRE(ref->retry_after_ms.has_value());
+        CHECK(ref->remediation.find("retrying will not help") == std::string::npos);
+        CHECK(r.approvals.empty());
+        CHECK(r.calls.empty());
+        CHECK(r.counter(std::string(kApprovalRefusedMetric), {{"reason", "approval_unavailable"}}) == 1);
+        CHECK(r.counter(std::string(kApprovalRefusedMetric), {{"reason", "approval_cap_reached"}}) == 0);
+        REQUIRE_FALSE(r.audits.empty());
+        CHECK(r.audits.back().result == "failure");
+        CHECK(r.audits.back().detail.find("cause=pending_count_unreadable") != std::string::npos);
+    }
+}
+
+TEST_CASE("execute: an unreadable pending count is not consulted when no cap is requested",
+          "[instruction_execute][approval]") {
+    Rig r;
+    r.pending_count_fault = 1;
+    r.defs["d"] = make_def("d", "ping", "always");
+    auto rq = r.request("d", json::object(), make_caller("u", false)); // submitter_pending_cap == 0
+    auto out = run(rq, r.ports(), r.audit());
+    CHECK(as_pending(out));
+}
+
 TEST_CASE("execute: approval store failure and a missing approval manager are counted",
           "[instruction_execute][approval][metrics]") {
     Rig r;
@@ -1462,6 +1500,23 @@ TEST_CASE("REST execute: publishes instruction.executed on 200 and approval.crea
                              {{"event", "instruction.executed"}}) == 1);
         CHECK(r.core.counter("yuzu_server_event_emit_failed_total", {{"event", "other"}}) == 0);
     }
+}
+
+TEST_CASE("REST execute: an unreadable pending count answers 503 approval_unavailable with a retry "
+          "hint and creates nothing",
+          "[instruction_execute][rest][approval][security][up8-1]") {
+    RouteRig r([](Rig& c) { c.pending_count_fault = 1; });
+    r.core.defs["d"] = make_def("d", "ping", "always");
+    r.caller = make_caller("bob", /*admin=*/false);
+    auto res = r.post("d", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    const auto j = json::parse(res->body);
+    CHECK(j["error"]["reason"] == "approval_unavailable");
+    CHECK(j["error"]["retry_after_ms"] == 5000);
+    CHECK(r.core.approvals.empty());
+    CHECK(r.core.counter(std::string(kApprovalRefusedMetric),
+                         {{"reason", "approval_unavailable"}}) == 1);
 }
 
 TEST_CASE("REST execute: the per-principal pending-approval cap answers 429 and creates nothing",

@@ -325,8 +325,34 @@ PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& a
                                           "approval-gated instruction",
                                           std::string(kMisconfiguredRemediation)));
         }
-        if (rq.submitter_pending_cap > 0 &&
-            ports.pending_count_for(rq.caller.principal) >= rq.submitter_pending_cap) {
+        std::optional<int> pending_now;
+        if (rq.submitter_pending_cap > 0) {
+            // up8-1 / sre-2: an unreadable count must refuse, not read as zero. The cap exists to
+            // bound one principal's share of the global pending queue, and a store that cannot
+            // be counted is exactly when every principal would otherwise be admitted.
+            try {
+                pending_now = ports.pending_count_for(rq.caller.principal);
+            } catch (...) {
+                pending_now = std::nullopt;
+            }
+            if (!pending_now) {
+                spdlog::error("instruction '{}': the pending-approval count could not be read; "
+                              "refusing rather than running without the per-principal cap",
+                              def_token);
+                bump(ports, kApprovalRefusedMetric, {{"reason", kReasonApprovalUnavailable}});
+                c.audit("failure", "reason=approval_unavailable cause=pending_count_unreadable "
+                                   "definition=" + def_token);
+                // A store fault (pool timeout or query failure), not a wiring defect: unlike the
+                // unwired-port refusals above, a retry can succeed.
+                return refuse(c, make_refusal(RefusalKind::kApprovalUnavailable,
+                                              kReasonApprovalUnavailable,
+                                              "approval system unavailable: the pending-approval "
+                                              "count could not be read",
+                                              "retry shortly; the approval store could not be read",
+                                              kRetryAfterMs));
+            }
+        }
+        if (rq.submitter_pending_cap > 0 && *pending_now >= rq.submitter_pending_cap) {
             bump(ports, kApprovalRefusedMetric,
                  {{"reason", kReasonApprovalCapReached}});
             c.audit("denied", "reason=approval_cap_reached definition=" + def_token);

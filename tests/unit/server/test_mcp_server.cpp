@@ -30940,6 +30940,45 @@ TEST_CASE("MCP approval mint enforces a per-submitter pending sub-cap",
     CHECK(cap_metrics.counter(cap_metric, cap_label).value() == 1);
 }
 
+// up8-1 / sre-2: the same mint with an approval store whose count cannot be READ. The cap used to
+// read an unreadable count as zero and admit every principal exactly when the store was struggling.
+TEST_CASE("MCP approval mint refuses, retryable and counted, when the per-submitter pending count "
+          "cannot be read",
+          "[pg][mcp][integration][approval][security][up8-1]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                    const std::string&, const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+    {
+        auto lease = appr_bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult drop = pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                                            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":252,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-0","key":"role"}}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("no approval ticket was created") !=
+          std::string::npos);
+    CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    const std::string metric(yuzu::server::instruction_execute::kApprovalRefusedMetric);
+    CHECK(reg.counter(metric, {{"reason", "approval_unavailable"}}).value() == 1);
+    CHECK(reg.counter(metric, {{"reason", "approval_cap_reached"}}).value() == 0);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // #2405 — C8 pre-approval input-schema validation.
 //

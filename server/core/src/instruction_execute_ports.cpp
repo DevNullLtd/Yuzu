@@ -34,7 +34,13 @@ Ports make_ports(const StoreBindings& b) {
             return am->submit(definition_id, submitted_by, scope_expression, "",
                               ApprovalOrigin::kInstruction, plugin, action);
         };
-        p.pending_count_for = [am](const std::string& user) { return am->pending_count_for(user); };
+        // nullopt = the count could not be read (the cap then refuses, it never admits).
+        p.pending_count_for = [am](const std::string& user) -> std::optional<int> {
+            auto n = am->pending_count_for_checked(user);
+            if (!n)
+                return std::nullopt;
+            return *n;
+        };
     }
     if (auto* mg = b.mgmt_store) {
         p.visible_agents = [mg](const std::string& user) { return mg->get_visible_agents(user); };

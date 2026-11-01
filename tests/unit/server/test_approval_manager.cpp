@@ -2641,6 +2641,48 @@ TEST_CASE("ApprovalManager: query_checked and pending_count_checked report a gen
     CHECK(!count_checked.error().sqlstate.empty());
 }
 
+TEST_CASE("ApprovalManager: pending_count_for_checked fails closed when the store never opened "
+          "or a query fails, and counts per submitter otherwise (up8-1)",
+          "[pg][approval_manager][approval][up8-1]") {
+    SECTION("happy path: per submitter, pending only, empty name is a genuine zero") {
+        yuzu::test::ApprovalManagerPg mgr_bundle;
+        ApprovalManager& mgr = *mgr_bundle;
+        REQUIRE(mgr.submit("d1", "alice", "s1", "", ApprovalOrigin::kInstruction).has_value());
+        REQUIRE(mgr.submit("d2", "alice", "s2", "", ApprovalOrigin::kMcp).has_value());
+        REQUIRE(mgr.submit("d3", "bob", "s3", "", ApprovalOrigin::kInstruction).has_value());
+        auto a = mgr.pending_count_for_checked("alice");
+        REQUIRE(a.has_value());
+        CHECK(*a == 2); // all origins count: the cap bounds the principal's share of the queue
+        auto b = mgr.pending_count_for_checked("bob");
+        REQUIRE(b.has_value());
+        CHECK(*b == 1);
+        auto none = mgr.pending_count_for_checked("carol");
+        REQUIRE(none.has_value());
+        CHECK(*none == 0);
+        auto empty = mgr.pending_count_for_checked("");
+        REQUIRE(empty.has_value());
+        CHECK(*empty == 0);
+        CHECK(mgr.pending_count_for("alice") == 2);
+    }
+    SECTION("a query failure is an error, while the legacy shape still reads 0") {
+        yuzu::test::ApprovalManagerPg mgr_bundle;
+        ApprovalManager& mgr = *mgr_bundle;
+        REQUIRE(mgr.is_open());
+        {
+            auto lease = mgr_bundle.pool().acquire();
+            REQUIRE(lease);
+            pg::PgResult res = pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                                               std::vector<std::string>{});
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+        }
+        auto checked = mgr.pending_count_for_checked("alice");
+        REQUIRE_FALSE(checked.has_value());
+        CHECK(checked.error().message.find("read failed") != std::string::npos);
+        CHECK(!checked.error().sqlstate.empty());
+        CHECK(mgr.pending_count_for("alice") == 0); // the fail-open contrast this twin exists to fix
+    }
+}
+
 TEST_CASE("ApprovalManager: query_checked happy path matches query()'s fields",
           "[pg][approval_manager][approval]") {
     yuzu::test::ApprovalManagerPg mgr_bundle;

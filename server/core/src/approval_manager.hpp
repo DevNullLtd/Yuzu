@@ -786,7 +786,17 @@ public:
     /// mint's per-submitter sub-cap (governance sec8-MEDIUM-1): dedup alone does
     /// not stop an adaptive flood (a nonce key defeats the args-hash), so the
     /// mint bounds any single supervised token's share of the GLOBAL cap.
+    ///
+    /// **FAILS OPEN**: returns 0 for "not open" / "pool exhausted" / "query failed", identical to
+    /// a genuinely empty principal. Never use it for an admission decision (a cap that reads 0
+    /// on a fault admits everyone exactly when the store is struggling); both cap sites
+    /// (REST/MCP instruction execute, the MCP tier-ticket mint) use `pending_count_for_checked`.
     int pending_count_for(const std::string& submitted_by) const;
+
+    /// `pending_count_for` with the store fault kept apart from a genuine zero, in the shape of
+    /// `pending_count_checked`. An empty `submitted_by` is a genuine 0.
+    std::expected<int, StoreReadError>
+    pending_count_for_checked(const std::string& submitted_by) const;
 
     std::expected<void, std::string> approve(const std::string& id, const std::string& reviewer,
                                              const std::string& comment);

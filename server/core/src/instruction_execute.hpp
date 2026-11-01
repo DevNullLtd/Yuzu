@@ -176,8 +176,10 @@ struct Ports {
         const std::string& definition_id, const std::string& submitted_by,
         const std::string& scope_expression, const std::string& plugin, const std::string& action)>
         submit_approval;
-    /// `ApprovalManager::pending_count_for`; only consulted when `submitter_pending_cap > 0`.
-    std::function<int(const std::string&)> pending_count_for;
+    /// `ApprovalManager::pending_count_for_checked`; only consulted when `submitter_pending_cap
+    /// > 0`. `nullopt` = the count could not be read: the cap then REFUSES (503
+    /// `approval_unavailable`, a retryable store fault), it never reads as zero and admits.
+    std::function<std::optional<int>(const std::string&)> pending_count_for;
     /// `ManagementGroupStore::get_visible_agents`. nullopt = absent or degraded = FAIL CLOSED
     /// (the opposite of `authz::VisibleSet`'s nullopt, see DestructiveVisibleAgents).
     std::function<std::optional<std::vector<std::string>>(const std::string&)> visible_agents;
@@ -197,7 +199,8 @@ enum class RefusalKind : std::uint8_t {
     kNoVisibleTarget,      ///< 404: a destructive pair whose named targets are all out of scope
     kDispatchDenied,       ///< the chokepoint dry run refused; see Refusal::denial
     kSchemaInvalid,        ///< 500: the stored parameter_schema cannot be prepared (fail closed)
-    kApprovalUnavailable,  ///< 503: no approval manager (a server defect: NO retry hint)
+    kApprovalUnavailable,  ///< 503: no approval manager (a server defect: NO retry hint), or the pending count
+                           ///< could not be read (a store fault: retryable)
     kApprovalSubmitFailed, ///< 500: the approval store could not take the ticket
     kApprovalCapReached,   ///< 429-class: this principal already holds the cap of pending approvals
     kClassifierUnavailable,///< 503: the destructive-targeting classifier is not wired

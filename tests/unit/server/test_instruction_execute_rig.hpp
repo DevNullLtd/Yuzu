@@ -124,6 +124,8 @@ struct Rig {
     /// accepted for that user, so a loop of real submits walks into the per-principal cap and
     /// another principal's count stays independent (the production counter is per submitter).
     bool pending_counts_submitted{false};
+    /// 0 = readable; 1 = the counter reports it could not be read (nullopt); 2 = it throws.
+    int pending_count_fault{0};
     struct ApprovalCall {
         std::string def, user, scope, plugin, action;
     };
@@ -254,7 +256,11 @@ struct Rig {
                 approvals.push_back({d, u, s, pl, ac});
                 return std::string("appr-") + std::to_string(approvals.size());
             };
-            p.pending_count_for = [this](const std::string& user) {
+            p.pending_count_for = [this](const std::string& user) -> std::optional<int> {
+                if (pending_count_fault == 1)
+                    return std::nullopt;
+                if (pending_count_fault == 2)
+                    throw std::runtime_error("count boom");
                 int n = pending_for;
                 if (pending_counts_submitted)
                     for (const auto& a : approvals)
