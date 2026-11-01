@@ -33,8 +33,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "/etc/sssd/sssd.conf + /etc/sssd/conf.d/*.conf active domains, /etc/ipa/default.conf "
          "and /etc/krb5.keytab presence (bounded file reads)",
          "configuration as written, not the live join state; sssd.conf is root 0600, so an "
-         "unprivileged agent reports permission_denied (plane unknown), never not-joined; "
-         "a privileged agent reads it in full"},
+         "agent without CAP_DAC_READ_SEARCH reports permission_denied (plane unknown), never "
+         "not-joined; an agent with it (or root) reads it in full"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:/usr/bin/profiles status -type enrollment",
          "MDM enrolment only; AD binding is device_identity.domain; Jamf not read"},

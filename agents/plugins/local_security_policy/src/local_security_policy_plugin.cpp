@@ -88,8 +88,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1, "/etc/audit/audit.rules (bounded file read)",
          "rule counts and -e state of the rule file only, not the live kernel rules (auditctl -l) "
-         "and not /etc/audit/rules.d; the file is 0640 root, so an unprivileged agent reports "
-         "permission_denied"
+         "and not /etc/audit/rules.d; the file is 0640 root, so an agent without "
+         "CAP_DAC_READ_SEARCH reports permission_denied"
          "; in a container (deploy/docker/Dockerfile.agent) these are the image's files, not "
          "the host's"},
         /* .macos_leg   = */

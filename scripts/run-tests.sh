@@ -11,6 +11,8 @@
 #   ./scripts/run-tests.sh erlang-perf        # Erlang performance tests only
 #   ./scripts/run-tests.sh integration        # Full-stack integration tests
 #   ./scripts/run-tests.sh all                # Everything (same as no args)
+#
+# Not run here: scripts/test/agent-unit-capcheck.sh is CI-only (needs systemd as PID 1 and root), see ci.yml.
 
 set -euo pipefail
 
