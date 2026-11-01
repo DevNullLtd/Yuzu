@@ -123,6 +123,12 @@ YUZU_EXPORT std::string device_ci_canonical_blob(const CiRecord& rec);
 // truncated, absent or refused capture is ever projected, and the cap token can never promote
 // such a section to `constrained`.
 //
+// ROW PROJECTION: only real data rows become wire rows. Empty-result placeholders are dropped: the
+// hardware disk sentinel (`unknown|0`), the dimm sentinel (`dimm|unknown|0|...`) and the
+// disk_actions volume placeholder (volume `-`). The memory summary row (`dimm|total|<mb>|...`,
+// slot `total`) is NOT a placeholder: it is the hardware plugin's documented memory row on macOS
+// and its Linux /proc/meminfo fallback, carries the host's real capacity, and is kept as a dimm row.
+//
 // RESERVED REASON SLOT: the base reason is clamped to kMaxFieldLen - kCiAgentCapReserve bytes so
 // the single `agent_cap:` token (appended after `;` when the base is non-empty) always fits in the
 // field contract, and the server's clamp can never cut the disclosure. A later ceiling trim

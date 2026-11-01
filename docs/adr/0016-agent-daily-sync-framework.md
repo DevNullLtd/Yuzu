@@ -740,6 +740,3 @@ follow it. Against a pre-v2 server:
   daily cycle, not an exponential climb.
 - A blob over 64 KiB is dropped and nacked every time, so that agent sits on the `need_full`
   backoff ladder (30 s doubling toward about 24 h) until the server is upgraded.
-
-**Personal data.** Unchanged: chassis, board and DIMM serials stay in the behavioural-PII tier
-exactly as the 2026-10-29 entry states.

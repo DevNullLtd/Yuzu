@@ -6,6 +6,7 @@
 // through fake plugin descriptors.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "sync_canonical.hpp" // yuzu::agent::sha256_hex
 #include "sync_source_device_ci.hpp"
@@ -449,6 +450,17 @@ TEST_CASE("device_ci v2 row projection", "[sync][device_ci][v2]") {
         CHECK(level_of(p, "volume") == "constrained");
         CHECK(reason_of(p, "volume") == "linux:empty");
     }
+    SECTION("the dimm empty-result sentinel is no row; the memory summary row is kept") {
+        in.memory = cap("dimm|unknown|0|unknown|0|-|-|-");
+        auto p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
+        CHECK(p.rows.count("dimm") == 0);
+        CHECK(level_of(p, "dimm") == "ok");
+        in.memory = cap("dimm|total|16384|unknown|0|-|-|-");
+        p = parse_blob(device_ci_canonical_blob_v2(sample(), in));
+        REQUIRE(p.rows.at("dimm").size() == 1);
+        CHECK(p.rows.at("dimm")[0][0] == "total");
+        CHECK(p.rows.at("dimm")[0][1] == "16384");
+    }
     SECTION("every column is scrubbed and clamped") {
         std::string euro;
         for (int i = 0; i < 367; ++i)
@@ -739,13 +751,42 @@ TEST_CASE("device_ci collect(): a required action failing still aborts, before a
 
 TEST_CASE("device_ci collect(): the existing actions' typed metadata reaches the writer",
           "[sync][device_ci][v2][collect]") {
+    // One row of each of the three pre-existing section actions, each with its own provenance.
+    struct Existing {
+        const char* action;
+        const char* section;
+        const char* provenance;
+    };
+    constexpr Existing kExisting[] = {{"processors", "cpu", "windows:wmi_partial"},
+                                      {"memory", "dimm", "linux:meminfo_only"},
+                                      {"disks", "disk", "macos:iokit_partial"}};
+    const auto& e = kExisting[GENERATE(0, 1, 2)];
+    CAPTURE(e.action);
     reset_ci_fakes();
-    g_ci[0].typed["processors"] = {YUZU_RESULT_STATUS_CONSTRAINED, "windows:wmi_partial"};
+    g_ci[0].typed[e.action] = {YUZU_RESULT_STATUS_CONSTRAINED, e.provenance};
     const auto r = collect_ci();
     REQUIRE(r.has_value());
     const auto p = parse_blob(r->first);
-    CHECK(p.status.at("cpu") == Rec{"constrained", "windows:wmi_partial"});
-    CHECK(p.rows.at("cpu").size() == 1);
+    CHECK(p.status.at(e.section) == Rec{"constrained", e.provenance});
+    CHECK(p.rows.at(e.section).size() == 1); // a CONSTRAINED capture is still projected
+    for (const auto& k : kExisting) { // the other two stay ok, with no provenance bleed
+        if (std::string(k.section) != e.section)
+            CHECK(p.status.at(k.section) == Rec{"ok", ""});
+    }
+}
+
+TEST_CASE("device_ci collect(): an UNAVAILABLE section action puts no rows on the wire",
+          "[sync][device_ci][v2][collect]") {
+    reset_ci_fakes();
+    // The capture still carries a well-formed swap row; the typed UNAVAILABLE result outranks it.
+    REQUIRE(g_ci[0].out.at("swap").starts_with("swap|"));
+    g_ci[0].typed["swap"] = {YUZU_RESULT_STATUS_UNAVAILABLE, "linux:swap_unreadable"};
+    const auto r = collect_ci();
+    REQUIRE(r.has_value());
+    const auto p = parse_blob(r->first);
+    CHECK(p.status.at("swap") == Rec{"unavailable", "linux:swap_unreadable"});
+    CHECK(p.rows.count("swap") == 0);
+    CHECK(p.status.at("cpu") == Rec{"ok", ""}); // the other sections are unaffected
 }
 
 TEST_CASE("device_ci collect(): a null disk_actions descriptor reports plugin_not_loaded",

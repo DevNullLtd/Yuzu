@@ -8,6 +8,8 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
+#include <cassert>
 #include <charconv>
 #include <cstdint>
 #include <optional>
@@ -97,10 +99,6 @@ bool meaningful_mac(std::string_view mac) {
     return false;
 }
 
-} // namespace
-
-namespace {
-
 // The clamp-join shared by the v1 blob and the v2 scalar record: each field scrubbed + clamped,
 // 0x1F-joined, one 0x1E terminator. ONE loop, so the v2 scalar record's first 22 fields can never
 // drift from the frozen v1 bytes.
@@ -115,12 +113,13 @@ std::string clamp_join_record(const std::string* fields, std::size_t n) {
     return canon;
 }
 
-} // namespace
+constexpr std::size_t kV1Fields = 22;
 
-std::string device_ci_canonical_blob(const CiRecord& rec) {
-    // POSITIONAL — field order is the contract (see CiRecord). Each field is
-    // scrub+clamp'd here; the server re-clamps on parse (idempotent) and rejoins.
-    const std::string fields[] = {
+// The frozen v1 positions, in wire order -- the ONE list behind both the v1 blob and the v2 scalar
+// record's first 22 fields. POSITIONAL: field order is the contract (see CiRecord). The return type
+// pins the count at compile time (CTAD deduces std::array<std::string, N> from the initialisers).
+std::array<std::string, kV1Fields> v1_fields(const CiRecord& rec) {
+    return std::array{
         rec.manufacturer, rec.model,       rec.serial,        rec.system_uuid,
         rec.hostname,     rec.domain,      rec.ou,            rec.bios_vendor,
         rec.bios_version, rec.bios_date,   rec.cpu_model,     rec.cpu_cores,
@@ -128,7 +127,15 @@ std::string device_ci_canonical_blob(const CiRecord& rec) {
         rec.macs_summary, rec.nic_count,   rec.os_name,       rec.os_version,
         rec.os_build,     rec.arch,
     };
-    return clamp_join_record(fields, std::size(fields));
+}
+
+} // namespace
+
+std::string device_ci_canonical_blob(const CiRecord& rec) {
+    // Each field is scrub+clamp'd in the join; the server re-clamps on parse (idempotent) and
+    // rejoins.
+    const auto fields = v1_fields(rec);
+    return clamp_join_record(fields.data(), fields.size());
 }
 
 // ── v2 writer ───────────────────────────────────────────────────────────────
@@ -167,7 +174,10 @@ SectionStatus section_status_of(const CiActionResult& r, std::string_view action
     if (!plugin_loaded)
         return make(kLevelUnavailable, "agent:plugin_not_loaded");
     if (r.rc != 0) {
-        // A plugin that predates the action answers `unknown action: <name>` at rc 1.
+        // A plugin that predates the action answers `unknown action: <name>` at rc 1. That prefix
+        // is the convention of the hardware and disk_actions plugins, not the plugin ABI: a plugin
+        // that answers differently maps to `agent:rc=<n>` -- the section is unavailable either way,
+        // only the reason token is less specific.
         return make(kLevelUnavailable, std::string_view(r.captured).starts_with("unknown action")
                                            ? "agent:action_absent"
                                            : "agent:rc=" + std::to_string(r.rc));
@@ -207,6 +217,9 @@ std::optional<std::string> project_row(const CiV2Section& sec, std::string_view 
     if (sec.token == std::string_view("disk") && t.size() >= 4 && t[2] == "unknown" &&
         t[3] == "0")
         return std::nullopt; // the hardware disk sentinel (same predicate as build_device_ci_record)
+    if (sec.token == std::string_view("dimm") && t.size() >= 3 && t[1] == "unknown" &&
+        t[2] == "0")
+        return std::nullopt; // the hardware empty-result dimm sentinel (not a DIMM)
     if (sec.token == std::string_view("volume") && t.size() >= 2 && t[1] == "-")
         return std::nullopt; // the disk_actions empty-result placeholder (volume name "-")
     const bool swap = sec.token == std::string_view("swap");
@@ -268,12 +281,14 @@ struct SectionBuild {
 } // namespace
 
 std::string device_ci_canonical_blob_v2(const CiRecord& rec, const CiSectionInputs& in) {
-    // Section inputs, parallel to kCiV2Sections: result, the status-row action name, the plugin's
-    // data-row token, and whether the owning plugin is loaded.
+    // Section inputs, POSITIONALLY parallel to kCiV2Sections: result, the status-row action name,
+    // the section token (the plugin's data-row kind), and whether the owning plugin is loaded.
+    // The per-section loop asserts each token against the registry entry it is paired with, so a
+    // reordered registry fails every writer test rather than silently misrouting rows.
     struct Src {
         const CiActionResult* res;
         const char* action;
-        const char* row_kind;
+        const char* token;
         bool loaded;
     };
     const Src srcs[kCiV2SectionCount] = {
@@ -292,11 +307,12 @@ std::string device_ci_canonical_blob_v2(const CiRecord& rec, const CiSectionInpu
     std::vector<SectionBuild> sections(kCiV2SectionCount);
     for (std::size_t i = 0; i < kCiV2SectionCount; ++i) {
         const auto& def = kCiV2Sections[i];
+        assert(std::string_view(srcs[i].token) == def.token);
         auto& b = sections[i];
         b.st = section_status_of(*srcs[i].res, srcs[i].action, srcs[i].loaded);
         // Failure provenance: a failed section projects nothing.
         if (def.row_cap > 0 && rows_allowed(b.st)) {
-            b.rows = project_rows(def, srcs[i].row_kind, srcs[i].res->captured);
+            b.rows = project_rows(def, def.token, srcs[i].res->captured);
             b.total = b.rows.size();
             if (b.rows.size() > static_cast<std::size_t>(def.row_cap)) {
                 b.rows.resize(static_cast<std::size_t>(def.row_cap));
@@ -308,14 +324,16 @@ std::string device_ci_canonical_blob_v2(const CiRecord& rec, const CiSectionInpu
 
     // Scalar record: the 22 v1 fields, then positions 22-32 from the first chassis / baseboard /
     // machine_id row, only when that section is readable (blank = not reported).
-    std::string f[detail::kCiScalarFields] = {
-        rec.manufacturer, rec.model,       rec.serial,        rec.system_uuid,
-        rec.hostname,     rec.domain,      rec.ou,            rec.bios_vendor,
-        rec.bios_version, rec.bios_date,   rec.cpu_model,     rec.cpu_cores,
-        rec.cpu_threads,  rec.ram_bytes,   rec.disks_summary, rec.primary_mac,
-        rec.macs_summary, rec.nic_count,   rec.os_name,       rec.os_version,
-        rec.os_build,     rec.arch,
-    };
+    std::array<std::string, detail::kCiScalarFields> f;
+    {
+        auto v1 = v1_fields(rec);
+        std::move(v1.begin(), v1.end(), f.begin());
+    }
+    constexpr std::size_t kChassisFirst = kV1Fields;
+    constexpr std::size_t kBaseboardFirst = kChassisFirst + 4;
+    constexpr std::size_t kMachineIdFirst = kBaseboardFirst + 4;
+    static_assert(kMachineIdFirst + 3 == detail::kCiScalarFields,
+                  "device_ci v2: the appended scalar groups must exactly fill the scalar record");
     const auto fill = [&](std::size_t sec, std::string_view kind, std::size_t first,
                           std::size_t n) {
         if (!rows_allowed(sections[sec].st))
@@ -325,10 +343,10 @@ std::string device_ci_canonical_blob_v2(const CiRecord& rec, const CiSectionInpu
             if (c + 1 < t.size())
                 f[first + c] = std::string(t[c + 1]);
     };
-    fill(0, "chassis", 22, 4);   // type, serial, asset_tag, source
-    fill(1, "baseboard", 26, 4); // vendor, product, serial, source
-    fill(2, "machine_id", 30, 3); // hash, algorithm, source
-    const std::string scalar_record = clamp_join_record(f, detail::kCiScalarFields);
+    fill(0, "chassis", kChassisFirst, 4);     // type, serial, asset_tag, source
+    fill(1, "baseboard", kBaseboardFirst, 4); // vendor, product, serial, source
+    fill(2, "machine_id", kMachineIdFirst, 3); // hash, algorithm, source
+    const std::string scalar_record = clamp_join_record(f.data(), f.size());
 
     std::size_t total = 1 + scalar_record.size();
     for (const auto& b : sections) {
@@ -340,7 +358,7 @@ std::string device_ci_canonical_blob_v2(const CiRecord& rec, const CiSectionInpu
     // Ceiling trim: pop tail rows kind by kind in kCiV2TrimOrder until the blob fits. Running
     // total, so a pop costs O(1) plus one status re-render. Scalar and status records are never
     // popped; the header static_assert is the termination proof.
-    std::size_t trim_idx[std::size(kCiV2TrimOrder)];
+    std::size_t trim_idx[std::size(kCiV2TrimOrder)]{};
     for (std::size_t t = 0; t < std::size(kCiV2TrimOrder); ++t)
         for (std::size_t i = 0; i < kCiV2SectionCount; ++i)
             if (std::string_view(kCiV2Sections[i].token) == kCiV2TrimOrder[t])
@@ -522,10 +540,11 @@ SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,
                              action);
                 return std::nullopt;
             }
-            std::string out = a.captured;
-            if (meta)
+            if (meta) { // the three actions with a section keep both copies
                 *meta = std::move(a);
-            return out;
+                return meta->captured;
+            }
+            return std::move(a.captured);
         };
 
         CiPluginOutputs o;
