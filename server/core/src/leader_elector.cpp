@@ -75,6 +75,53 @@ std::optional<std::int64_t> parse_i64(const char* s) {
     return v;
 }
 
+// The Postgres WAL timeline of the primary this connection is writing to (#6535).
+// The first 8 hex digits of the current WAL file name ARE the insertion timeline,
+// and unlike pg_control_checkpoint().timeline_id (the control file lags a fast
+// promotion until the post-promotion checkpoint completes) it is already the NEW
+// timeline when the first write after a promotion runs. On a standby
+// pg_current_wal_lsn() raises, so a mint against a standby fails closed. Both
+// functions are PUBLIC-execute; the 8 hex digits zero-extend through bit(32).
+// A LITERAL, never built from input: it is spliced into the mint statement below.
+constexpr const char* kTimelineSql =
+    "('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::bigint";
+
+/// The epoch mint: `epoch = (timeline << 32) + nextval(leader_epoch_seq)` (#6535).
+///
+/// Why the timeline is in the epoch: a lossy (asynchronous, or degraded
+/// non-strict-quorum) promotion can lose the latest mint -- the sequence advance
+/// AND the leader_state row -- so a bare sequence re-mints the value a paused
+/// ex-leader still holds and the equality fence admits both. Reading the
+/// surviving row cannot help (GREATEST(seq, row)+1 recomputes the same value),
+/// but every promotion starts a NEW timeline whatever WAL was lost.
+///
+/// `+`, never `|`: at the sequence ceiling a bitwise OR would silently alias the
+/// timeline bits. The range test runs INSIDE the CTE that holds nextval(), so a
+/// refused mint burns no sequence value. The range keeps the result positive
+/// (`live_epoch_` reads 0 as "not leader", so a negative epoch would read as
+/// not-leader while leading) and below 2^63. $3 is the test-only timeline
+/// override as text ('' = none, read the real timeline).
+const std::string& epoch_mint_sql() {
+    static const std::string kSql =
+        std::string("WITH t AS (SELECT COALESCE(NULLIF($3, '')::bigint, ") + kTimelineSql +
+        ") AS tl), "
+        "e AS (SELECT (t.tl << 32) + nextval('leader_elector.leader_epoch_seq') AS ep "
+        "      FROM t WHERE t.tl BETWEEN 1 AND 2147483647) "
+        "INSERT INTO leader_elector.leader_state "
+        "  (lock_key, current_leader_epoch, holder_id, acquired_at) "
+        "SELECT $1, e.ep, $2, now() FROM e "
+        "ON CONFLICT (lock_key) DO UPDATE "
+        "  SET current_leader_epoch = EXCLUDED.current_leader_epoch, "
+        "      holder_id = EXCLUDED.holder_id, acquired_at = now() "
+        "RETURNING current_leader_epoch";
+    return kSql;
+}
+
+const std::string& timeline_probe_sql() {
+    static const std::string kSql = std::string("SELECT ") + kTimelineSql;
+    return kSql;
+}
+
 } // namespace
 
 const std::vector<pg::PgMigration>& LeaderElector::migrations() {
@@ -91,6 +138,11 @@ const std::vector<pg::PgMigration>& LeaderElector::migrations() {
          "  holder_id            TEXT NOT NULL,"
          "  acquired_at          TIMESTAMPTZ NOT NULL DEFAULT now()"
          ");"},
+        // v2 (#6535): the epoch packs the sequence into its low 32 bits (see
+        // epoch_mint_sql). Cap the sequence so nextval() ERRORS at the boundary
+        // (the existing epoch_record acquire failure, fail closed) instead of a
+        // 33rd bit ever reaching the timeline. NO CYCLE is the default. Idempotent.
+        {2, "ALTER SEQUENCE leader_epoch_seq MAXVALUE 4294967295;"},
     };
     return kMigrations;
 }
@@ -182,6 +234,25 @@ bool LeaderElector::connect_locked() {
     if (!pg::PgMigrationRunner::run(conn_.get(), kLeaderElectorStore, migrations())) {
         spdlog::error("leader_elector: schema migration failed; elector non-open");
         return false;
+    }
+    // Probe the timeline the epoch mint will read (#6535) and log it. A platform
+    // whose WAL functions differ, or a DSN that resolved to a standby, would
+    // otherwise show up only as a rising epoch_record failure count; refusing to
+    // open here makes it a boot-time, attributable error. Skipped under the test
+    // override (the mint never reads the real timeline then).
+    if (!cfg_.timeline_override_for_test.has_value()) {
+        pg::PgResult tl = pg::exec_params(conn_.get(), timeline_probe_sql().c_str(),
+                                          std::vector<std::string>{});
+        if (tl.status() != PGRES_TUPLES_OK || PQntuples(tl.get()) != 1 ||
+            PQgetisnull(tl.get(), 0, 0)) {
+            spdlog::error("leader_elector: cannot read the Postgres timeline "
+                          "(pg_walfile_name(pg_current_wal_lsn()) failed: {}); the fenced epoch "
+                          "needs it, so the elector stays non-open. Is the DSN pointing at a "
+                          "standby, or is this a Postgres platform without WAL functions?",
+                          tl.get() != nullptr ? PQresultErrorMessage(tl.get()) : "no result");
+            return false;
+        }
+        spdlog::info("leader_elector: coordination timeline={}", PQgetvalue(tl.get(), 0, 0));
     }
     open_ = true;
     return true;
@@ -307,16 +378,11 @@ bool LeaderElector::try_acquire() {
     }
 
     pg::PgResult ep = pg::exec_params(
-        conn_.get(),
-        "WITH e AS (SELECT nextval('leader_elector.leader_epoch_seq') AS ep) "
-        "INSERT INTO leader_elector.leader_state "
-        "  (lock_key, current_leader_epoch, holder_id, acquired_at) "
-        "SELECT $1, e.ep, $2, now() FROM e "
-        "ON CONFLICT (lock_key) DO UPDATE "
-        "  SET current_leader_epoch = EXCLUDED.current_leader_epoch, "
-        "      holder_id = EXCLUDED.holder_id, acquired_at = now() "
-        "RETURNING current_leader_epoch",
-        std::vector<std::string>{cfg_.lock_name, cfg_.holder_id});
+        conn_.get(), epoch_mint_sql().c_str(),
+        std::vector<std::string>{
+            cfg_.lock_name, cfg_.holder_id,
+            cfg_.timeline_override_for_test ? std::to_string(*cfg_.timeline_override_for_test)
+                                            : std::string{}});
     if (ep.status() != PGRES_TUPLES_OK || PQntuples(ep.get()) != 1 || PQgetisnull(ep.get(), 0, 0)) {
         spdlog::error("leader_elector: acquired lock but failed to record epoch; releasing");
         acquire_failed_[static_cast<std::size_t>(AcquireFailure::EpochRecord)].fetch_add(
@@ -333,8 +399,9 @@ bool LeaderElector::try_acquire() {
         return false;
     }
     epoch_ = *parsed;
-    // Publish the minted epoch (slice 3.2, #4013). Minted epochs are >= 1, so a
-    // non-zero value unambiguously means "leader at this epoch" to a lock-free
+    // Publish the minted epoch (slice 3.2, #4013). Minted epochs are >= 2^32 (the
+    // timeline is >= 1 and in the high bits, #6535), so a non-zero value unambiguously
+    // means "leader at this epoch" to a lock-free
     // reader. Release-ordered to pair with the acquire loads in is_leader/epoch.
     // The acquisition is counted and the answer stamped BEFORE the publish, so a
     // lock-free reader that observes the new leadership also observes

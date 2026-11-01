@@ -199,6 +199,176 @@ TEST_CASE("LeaderElector epoch is strictly monotonic across handover",
     CHECK(*a.epoch() > e2);
 }
 
+// ── #6535: the epoch carries the Postgres timeline ──────────────────────────────
+//
+// epoch = (timeline << 32) + nextval(leader_epoch_seq). A lossy asynchronous
+// promotion can lose the latest mint (the sequence advance AND the leader_state
+// row), so the promoted standby re-mints the SAME sequence value. The timeline
+// is the coordinate every promotion advances regardless of what WAL was lost, so
+// the re-minted epoch differs from the paused ex-leader's and the equality fence
+// rejects it. These cases simulate the loss by rolling the sequence and the row
+// back by hand and bumping the (test-only) timeline.
+
+namespace {
+
+LeaderElector::Config cfg_tl(const std::string& dsn, std::string holder, std::int64_t timeline) {
+    return LeaderElector::Config{
+        .dsn = dsn, .holder_id = std::move(holder), .timeline_override_for_test = timeline};
+}
+
+void exec_ok(PGconn* conn, const std::string& sql) {
+    PgResult r{PQexec(conn, sql.c_str())};
+    INFO(sql);
+    REQUIRE((r.status() == PGRES_COMMAND_OK || r.status() == PGRES_TUPLES_OK));
+}
+
+std::string scalar(PGconn* conn, const std::string& sql) {
+    PgResult r{PQexec(conn, sql.c_str())};
+    INFO(sql);
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) == 1);
+    return PQgetisnull(r.get(), 0, 0) != 0 ? std::string{} : std::string{PQgetvalue(r.get(), 0, 0)};
+}
+
+// Put the coordination state back to "no mint ever happened": the exact state a
+// promoted standby is in when it never received the leader's mint.
+void simulate_lost_mint(PGconn* admin) {
+    exec_ok(admin, "SELECT setval('leader_elector.leader_epoch_seq', 1, false)");
+    exec_ok(admin, "DELETE FROM leader_elector.leader_state");
+}
+
+constexpr std::int64_t kSeqMask = 0xFFFFFFFFLL;
+
+} // namespace
+
+TEST_CASE("LeaderElector epoch survives a lossy promotion that re-mints the same sequence value (#6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    const std::string lock_name = kServerBackgroundLeaderLock;
+    auto admin = connect(db.dsn());
+
+    // The ex-leader mints on timeline 1 and is then "paused" holding that epoch.
+    LeaderElector old_leader(cfg_tl(db.dsn(), "ex-leader", 1));
+    REQUIRE(old_leader.try_acquire());
+    const std::int64_t e_old = *old_leader.epoch();
+    old_leader.resign(); // its backend died with the old primary
+
+    // The promoted standby never received that mint: sequence and row are as they
+    // were before it. A new leader mints on the NEXT timeline.
+    simulate_lost_mint(admin.get());
+    LeaderElector new_leader(cfg_tl(db.dsn(), "new-leader", 2));
+    REQUIRE(new_leader.try_acquire());
+    const std::int64_t e_new = *new_leader.epoch();
+
+    // The simulation really did reproduce the hole: both mints drew the SAME
+    // sequence value. Without the timeline the two epochs would be identical.
+    REQUIRE((e_old & kSeqMask) == (e_new & kSeqMask));
+
+    CHECK(e_new > e_old);
+    auto claim = connect(db.dsn()); // an ordinary pooled-style claim connection
+    CHECK_FALSE(eval_bool(claim.get(), LeaderElector::epoch_fence_sql(lock_name, e_old)));
+    CHECK(eval_bool(claim.get(), LeaderElector::epoch_fence_sql(lock_name, e_new)));
+}
+
+TEST_CASE("LeaderElector: with the timeline pinned the same lossy re-mint IS admitted (negative control, #6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    const std::string lock_name = kServerBackgroundLeaderLock;
+    auto admin = connect(db.dsn());
+
+    LeaderElector old_leader(cfg_tl(db.dsn(), "ex-leader", 1));
+    REQUIRE(old_leader.try_acquire());
+    const std::int64_t e_old = *old_leader.epoch();
+    old_leader.resign();
+
+    simulate_lost_mint(admin.get());
+    LeaderElector new_leader(cfg_tl(db.dsn(), "new-leader", 1)); // NO promotion
+    REQUIRE(new_leader.try_acquire());
+
+    // This is the pre-fix behaviour, kept as a control: it proves the test above
+    // discriminates (it is the timeline, not the harness, that separates them).
+    CHECK(*new_leader.epoch() == e_old);
+    auto claim = connect(db.dsn());
+    CHECK(eval_bool(claim.get(), LeaderElector::epoch_fence_sql(lock_name, e_old)));
+}
+
+TEST_CASE("LeaderElector reads the real Postgres timeline into the epoch (#6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    auto admin = connect(db.dsn());
+    // Independent of the code under test: the WAL file name's first 8 hex digits.
+    const std::int64_t real_tl = std::stoll(
+        scalar(admin.get(),
+               "SELECT ('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::bigint"));
+    REQUIRE(real_tl >= 1);
+
+    LeaderElector a(cfg(db.dsn(), "holder-a")); // default config: no override
+    REQUIRE(a.try_acquire());
+    const std::int64_t e = *a.epoch();
+    CHECK((e >> 32) == real_tl);
+    CHECK((e & kSeqMask) >= 1);
+    CHECK(e > kSeqMask); // strictly above every pre-#6535 (sequence-only) epoch
+}
+
+TEST_CASE("LeaderElector refuses to mint once the sequence reaches its 32-bit ceiling (#6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    auto admin = connect(db.dsn());
+
+    SECTION("the last representable value still packs without touching the timeline bits") {
+        exec_ok(admin.get(), "SELECT setval('leader_elector.leader_epoch_seq', 4294967294, true)");
+        LeaderElector a(cfg_tl(db.dsn(), "holder-a", 1));
+        REQUIRE(a.try_acquire());
+        const std::int64_t e = *a.epoch();
+        CHECK((e >> 32) == 1); // a `|` pack would have aliased the timeline here
+        CHECK((e & kSeqMask) == 4294967295LL);
+    }
+
+    SECTION("one past the ceiling fails closed and does not leak the lock") {
+        exec_ok(admin.get(), "SELECT setval('leader_elector.leader_epoch_seq', 4294967295, true)");
+        LeaderElector a(cfg_tl(db.dsn(), "holder-a", 1));
+        REQUIRE(a.is_open());
+        CHECK_FALSE(a.try_acquire());
+        CHECK_FALSE(a.is_leader());
+        CHECK(failed(a.stats(), AcquireFailure::EpochRecord) == 1);
+
+        // The lock was released: another elector acquires once the sequence is reset.
+        exec_ok(admin.get(), "ALTER SEQUENCE leader_elector.leader_epoch_seq RESTART");
+        LeaderElector b(cfg_tl(db.dsn(), "holder-b", 1));
+        REQUIRE(b.is_open());
+        CHECK(b.try_acquire());
+    }
+}
+
+TEST_CASE("LeaderElector refuses a timeline outside 1..2^31-1 and does not consume the sequence (#6535)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);
+    auto admin = connect(db.dsn());
+    const std::string before = scalar(admin.get(),
+        "SELECT last_value::text || ':' || is_called::text FROM leader_elector.leader_epoch_seq");
+
+    for (const std::int64_t bad : {std::int64_t{0}, std::int64_t{-1}, std::int64_t{2147483648LL}}) {
+        INFO("timeline " << bad);
+        LeaderElector a(cfg_tl(db.dsn(), "holder-a", bad));
+        REQUIRE(a.is_open());
+        CHECK_FALSE(a.try_acquire());
+        CHECK_FALSE(a.is_leader());
+        CHECK(failed(a.stats(), AcquireFailure::EpochRecord) == 1);
+    }
+    // The range check runs before nextval(): a refused mint burns no sequence value.
+    CHECK(scalar(admin.get(),
+        "SELECT last_value::text || ':' || is_called::text FROM leader_elector.leader_epoch_seq") ==
+          before);
+
+    // The largest legal timeline gives a POSITIVE epoch: live_epoch_ uses 0 as the
+    // "not leader" sentinel and a negative value would read as not-leader.
+    LeaderElector top(cfg_tl(db.dsn(), "holder-top", 2147483647LL));
+    REQUIRE(top.try_acquire());
+    CHECK(*top.epoch() > 0);
+    CHECK(top.is_leader());
+    CHECK(top.stats().leader);
+}
+
 TEST_CASE("epoch_fence_sql predicate fences a stale ex-leader epoch (fail-closed)",
           "[pg][store][leader-elector]") {
     YUZU_REQUIRE_PG_DB_TPL(db, leader_elector_tpl);

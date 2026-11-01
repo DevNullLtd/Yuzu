@@ -14,11 +14,23 @@
 /// primary failover). So leadership is NOT proven by "I hold the lock" — it is
 /// proven by a **monotonically-increasing epoch**:
 ///
-///   * On each successful acquire, the elector mints a fresh epoch from a
-///     Postgres SEQUENCE (`leader_epoch_seq`) and records it as
+///   * On each successful acquire, the elector mints a fresh epoch,
+///     `(timeline << 32) + nextval(leader_epoch_seq)`, and records it as
 ///     `leader_state.current_leader_epoch` — done ON the lock-owning
 ///     connection, so mutual exclusion guarantees only the true holder writes
 ///     it, and each new leader's epoch is strictly greater than any prior one.
+///     The TIMELINE (the Postgres WAL timeline of the primary written to, #6535)
+///     is in the epoch because a bare sequence is not monotonic across a LOSSY
+///     promotion: the promoted standby can lack the latest mint and re-mint a
+///     value a paused ex-leader holds. Every promotion starts a new timeline
+///     whatever WAL was lost, so the re-minted epoch differs. NOT covered: two
+///     live primaries (the fence is per database), a physical-snapshot restore
+///     without archive recovery, a logical restore, promotion tooling that skips
+///     the previous timeline's history, and a rolling upgrade while a pre-#6535
+///     binary can lead (ADR-2002 §3 "Update (2026-11-01, #6535)").
+///     Epochs are therefore >= 2^32; the sequence is capped at 2^32-1
+///     (migration v2) and a timeline outside 1..2^31-1 is refused, both as the
+///     `epoch_record` acquire failure.
 ///   * Every LEADER-DRIVEN side-effecting claim (the slice-3.3 command outbox,
 ///     on an ORDINARY pooled connection) embeds the `epoch_fence_sql()` predicate
 ///     (`current_leader_epoch == expected_epoch`) INTO its claim's WRITE
@@ -159,6 +171,12 @@ public:
         /// The logical leadership key. Validated to `[a-z][a-z0-9_]{0,47}`;
         /// an invalid value leaves the elector permanently non-open (fail-closed).
         std::string lock_name = kServerBackgroundLeaderLock;
+        /// TEST SEAM (#6535) -- production never sets this (`server.cpp` leaves it
+        /// `nullopt`). Replaces the Postgres timeline the epoch mint reads, so a
+        /// test can simulate a promotion (timeline bump) without a second cluster.
+        /// A bound integer, never SQL text: nothing here can be spliced into the
+        /// mint statement.
+        std::optional<std::int64_t> timeline_override_for_test;
     };
 
     explicit LeaderElector(Config cfg);
@@ -290,8 +308,8 @@ private:
     bool open_ = false;
 
     /// Lock-free publish channel for `is_leader()`/`epoch()` (slice 3.2, #4013):
-    /// `0` = not leader; `>= 1` = leader at that epoch (minted epochs start at 1,
-    /// so `0` is an unambiguous sentinel). The election loop stores this under
+    /// `0` = not leader; `>= 1` = leader at that epoch (a minted epoch is >= 2^32 since
+    /// #6535 and always positive, so `0` is an unambiguous sentinel). The election loop stores this under
     /// `mu_` whenever `epoch_` changes (acquire → the minted epoch; drop → 0),
     /// release-ordered; readers load it with acquire and never touch `mu_`, so a
     /// libpq probe stalled under `mu_` cannot block a worker tick's leadership
