@@ -20,7 +20,8 @@ The fetched index body is hashed against the pinned digest before it is trusted.
 
 Exit codes: 0 consistent; 1 a supported platform disagrees (or has no usable entry);
 2 the registry could not be read (outage, rate limit, digest mismatch); 3 the Dockerfile
-or the index has a shape this script does not understand (a lint defect, not a verdict).
+or the index has a shape this script does not understand, or the command line is wrong
+(a lint defect, not a verdict).
 
 Usage:
     check-gateway-base-index.py [--dockerfile PATH] [--index-file PATH]
@@ -216,8 +217,16 @@ def fetch_index(repo, digest):
         raise RegistryError(f"the pinned index is not JSON: {exc}", transient=None)
 
 
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse exits 2 by default, which this script reserves for "registry unreadable".
+        self.print_usage(sys.stderr)
+        print(f"FATAL: {self.prog}: {message}", file=sys.stderr)
+        sys.exit(3)
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap = _Parser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--dockerfile", type=Path, default=DEFAULT_DOCKERFILE)
     ap.add_argument("--index-file", type=Path, help="read the index JSON from this file instead of the registry")
     args = ap.parse_args(argv)
