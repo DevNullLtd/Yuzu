@@ -1645,6 +1645,69 @@ TEST_CASE("SettingsRoutes POST role: a lock-timeout store failure whose durable 
     CHECK(durable_sessions_of_bob() == 1); // still there: the repeat is not a convergence path
 }
 
+namespace {
+/// #4068: hold every connection of the harness pool so the next AuthDB lookup cannot lease one
+/// (AuthDB::get_user -> a store error, the state get_user_role() reports as DbError).
+std::vector<yuzu::server::pg::PgPool::Lease> drain_pool(yuzu::server::pg::PgPool& pool) {
+    std::vector<yuzu::server::pg::PgPool::Lease> held;
+    for (int i = 0; i < 64; ++i) {
+        auto lease = pool.try_acquire_for(std::chrono::milliseconds(50));
+        if (!lease)
+            break;
+        held.push_back(std::move(lease));
+    }
+    // The harness pool has 4 connections (AuthDbPg): a short drain would let the route succeed
+    // and turn the 503 assertions into a flake, so say so loudly instead.
+    REQUIRE(held.size() == 4);
+    return held;
+}
+} // namespace
+
+TEST_CASE("SettingsRoutes POST role: an AuthDB store error is a 503 audited store_unavailable, "
+          "not a 404 user_not_found (#4068)",
+          "[pg][settings][users][role][store-error]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+
+    std::unique_ptr<httplib::Response> res;
+    {
+        auto held = drain_pool(h.auth_db.pool());
+        REQUIRE_FALSE(held.empty());
+        res = h.set_role("bob", "admin");
+    }
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK_FALSE(h.has_audit("user.role_change", "denied", "User", "bob"));
+    CHECK(h.has_audit("user.role_change", "failure", "User", "bob"));
+    CHECK(h.audit_detail("user.role_change", "failure", "bob") == "store_unavailable");
+    CHECK(h.auth_mgr.get_user_role("bob") == auth::Role::user); // nothing changed
+
+    // A genuinely absent user is still the 404 / user_not_found.
+    auto missing = h.set_role("nobody_here", "admin");
+    REQUIRE(missing);
+    CHECK(missing->status == 404);
+    CHECK(h.audit_detail("user.role_change", "denied", "nobody_here") == "user_not_found");
+}
+
+TEST_CASE("SettingsRoutes POST /users: an AuthDB store error on the duplicate check is a 503, "
+          "creation does not proceed (#4068)",
+          "[pg][settings][users][create][store-error]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+
+    std::unique_ptr<httplib::Response> res;
+    {
+        auto held = drain_pool(h.auth_db.pool());
+        REQUIRE_FALSE(held.empty());
+        res = h.sink.Post("/api/settings/users", "username=newuser&password=anotherpassword1",
+                          "application/x-www-form-urlencoded");
+    }
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(h.audit_detail("user.create", "failure", "newuser") == "store_unavailable");
+    CHECK_FALSE(h.auth_mgr.get_user_role("newuser").has_value()); // never created
+}
+
 TEST_CASE("SettingsRoutes DELETE: a failed durable session wipe after the deactivation is a "
           "503 partial that says the account IS deactivated (#4966)",
           "[pg][settings][users][lifecycle_guard][wipefailed]") {
