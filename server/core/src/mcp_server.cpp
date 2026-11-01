@@ -8837,20 +8837,51 @@ McpServer::HandlerFn McpServer::build_handler(
                                 "application/json");
                             return;
                         }
-                        auto submitted = approval_manager->submit(
+                        auto submitted = approval_manager->submit_typed(
                             definition_id, session->username, canon,
                             /*schedule_id=*/"", ApprovalOrigin::kMcp);
                         if (!submitted) {
-                            mcp_audit("failure", "approval submit failed: " + submitted.error());
+                            const bool queue_full =
+                                submitted.error().kind == SubmitFailure::kQueueFull;
+                            if (metrics != nullptr) {
+                                try {
+                                    metrics
+                                        ->counter(yuzu::server::instruction_execute::
+                                                      kApprovalRefusedMetric,
+                                                  {{"reason",
+                                                    queue_full
+                                                        ? yuzu::server::instruction_execute::
+                                                              kReasonApprovalQueueFull
+                                                        : yuzu::server::instruction_execute::
+                                                              kReasonApprovalSubmitFailed}})
+                                        .increment();
+                                } catch (...) { // NOLINT(bugprone-empty-catch)
+                                }
+                            }
+                            mcp_audit("failure",
+                                      "approval submit failed: " + submitted.error().message);
+                            if (queue_full) {
+                                // The GLOBAL pending queue is full: only a human reviewer
+                                // deciding a pending approval, or the 7-day expiry, frees a
+                                // slot, so no retry hint (a retry loop cannot succeed).
+                                res.set_content(
+                                    a4_error(kInternalError,
+                                             "the approval queue is full: no approval ticket "
+                                             "could be created",
+                                             "a human reviewer must decide pending approvals (or "
+                                             "the oldest expire) before a new approval request "
+                                             "can be created; retrying will not help"),
+                                    "application/json");
+                                return;
+                            }
                             // #3344: was a bare -1/null despite the remediation
                             // already saying "retry later" — an oversight, not a
                             // deliberate non-retryable classification.
-                            // ApprovalManager::submit()'s only reachable failures
-                            // at this call site (definition_id and
-                            // session->username are both non-empty here) are
-                            // store-not-open, queue-full, or a SQLite
-                            // prepare/insert fault — the same transient-store-fault
-                            // class as the rest of this handler family.
+                            // The remaining reachable failures at this call site
+                            // (definition_id and session->username are both
+                            // non-empty here) are store-not-open or a Postgres
+                            // fault — the same transient-store-fault class as the
+                            // rest of this handler family.
                             res.set_content(
                                 a4_error(kInternalError, "failed to create approval request",
                                          "retry later, or use the REST API / dashboard",

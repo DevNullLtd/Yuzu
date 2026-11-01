@@ -96,16 +96,20 @@ inline constexpr int kSubmitterPendingCap = 25;
 /// row and the wire `reason` carry. CLOSED set, every member pre-seeded at boot in server.cpp from
 /// this array. `approval_cap_reached` is the per-principal cap above; `approval_unavailable` is
 /// "no approval manager wired" (a server defect: 503 with a null `retry_after_ms`);
-/// `approval_submit_failed` is the store refusing the row (which includes the global queue being
-/// full). Only refusals at the approval-submit step count: a
+/// `approval_queue_full` is the GLOBAL 1000-row pending queue being full (nobody can submit
+/// until a human reviewer decides a pending approval or the 7-day expiry clears one: a retry
+/// loop cannot help, so it carries no `retry_after_ms`); `approval_submit_failed` is any other
+/// store fault refusing the row (retryable). Only refusals at the approval-submit step count: a
 /// refusal earlier in `prepare` (targeting, params, gate) creates no approval and counts under
 /// its own family.
 inline constexpr char kApprovalRefusedMetric[] = "yuzu_server_approval_submit_refused_total";
 inline constexpr char kReasonApprovalCapReached[] = "approval_cap_reached";
 inline constexpr char kReasonApprovalUnavailable[] = "approval_unavailable";
 inline constexpr char kReasonApprovalSubmitFailed[] = "approval_submit_failed";
-inline constexpr std::array<std::string_view, 3> kApprovalRefusedReasons{
-    kReasonApprovalCapReached, kReasonApprovalUnavailable, kReasonApprovalSubmitFailed};
+inline constexpr char kReasonApprovalQueueFull[] = "approval_queue_full";
+inline constexpr std::array<std::string_view, 4> kApprovalRefusedReasons{
+    kReasonApprovalCapReached, kReasonApprovalUnavailable, kReasonApprovalSubmitFailed,
+    kReasonApprovalQueueFull};
 
 /// `route` label of `yuzu_server_dispatch_target_rejected_total` and
 /// `yuzu_server_instruction_param_rejected_total` for a surface. Both are pre-seeded in
@@ -157,6 +161,13 @@ using DispatchFn = std::function<ConfinedDispatchOutcome(
 /// the row persisted. Never throws (the core also guards it).
 using AuditHook = std::function<bool(std::string_view result, const std::string& detail)>;
 
+/// Why an approval submit failed, as much as the surface needs to answer it truthfully: a full
+/// global queue is not a store fault (only a reviewer or the expiry clears it).
+struct ApprovalSubmitError {
+    bool queue_full{false};
+    std::string message;
+};
+
 struct Ports {
     /// Unset reads as "store unavailable".
     std::function<DefinitionLookup(const std::string&)> lookup_definition;
@@ -172,7 +183,7 @@ struct Ports {
         authorize;
     /// `ApprovalManager::submit(def, user, scope, "", kInstruction, plugin, action)`. Unset means
     /// there is no approval manager: a non-auto definition then answers `ApprovalUnavailable`.
-    std::function<std::expected<std::string, std::string>(
+    std::function<std::expected<std::string, ApprovalSubmitError>(
         const std::string& definition_id, const std::string& submitted_by,
         const std::string& scope_expression, const std::string& plugin, const std::string& action)>
         submit_approval;
@@ -201,7 +212,8 @@ enum class RefusalKind : std::uint8_t {
     kSchemaInvalid,        ///< 500: the stored parameter_schema cannot be prepared (fail closed)
     kApprovalUnavailable,  ///< 503: no approval manager (a server defect: NO retry hint), or the pending count
                            ///< could not be read (a store fault: retryable)
-    kApprovalSubmitFailed, ///< 500: the approval store could not take the ticket
+    kApprovalSubmitFailed, ///< 500: the approval store could not take the ticket (a store fault; retryable)
+    kApprovalQueueFull,    ///< 503: the global pending queue is full (only a reviewer or the expiry clears it: NO retry hint)
     kApprovalCapReached,   ///< 429-class: this principal already holds the cap of pending approvals
     kClassifierUnavailable,///< 503: the destructive-targeting classifier is not wired
     kMisconfigured,        ///< 500: a required port is unwired (a server defect: NO retry hint, ever)

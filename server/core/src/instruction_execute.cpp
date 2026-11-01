@@ -364,7 +364,21 @@ PrepareOutcome prepare(const Request& rq, const Ports& ports, const AuditHook& a
         auto submitted = ports.submit_approval(rq.definition_id, rq.caller.principal, plan.scope,
                                                def.plugin, def.action);
         if (!submitted) {
-            spdlog::error("approval submit failed for '{}': {}", def_token, submitted.error());
+            spdlog::error("approval submit failed for '{}': {}", def_token, submitted.error().message);
+            if (submitted.error().queue_full) {
+                // The GLOBAL queue is full: only a human reviewer deciding a pending approval, or
+                // the 7-day expiry, frees a slot. Not a store fault, so no retry hint (a retry
+                // loop cannot succeed) and its own reason (ca8-9 / sre-1 / up8-8).
+                bump(ports, kApprovalRefusedMetric, {{"reason", kReasonApprovalQueueFull}});
+                c.audit("denied", "reason=approval_queue_full definition=" + def_token);
+                return refuse(c, make_refusal(RefusalKind::kApprovalQueueFull,
+                                              kReasonApprovalQueueFull,
+                                              "the approval queue is full: no approval request "
+                                              "can be created right now",
+                                              "a human reviewer must decide pending approvals "
+                                              "(or the oldest expire) before a new approval "
+                                              "request can be created; retrying will not help"));
+            }
             bump(ports, kApprovalRefusedMetric,
                  {{"reason", kReasonApprovalSubmitFailed}});
             c.audit("failure", "reason=approval_submit_failed definition=" + def_token);

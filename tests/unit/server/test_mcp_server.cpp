@@ -52,6 +52,7 @@
 #include "event_bus.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
+#include "instruction_execute_ports.hpp"
 #include "instruction_store.hpp"
 #include "product_pack_model.hpp" // #4029: shared row/detail builders
 #include "product_pack_store.hpp"
@@ -30979,6 +30980,81 @@ TEST_CASE("MCP approval mint refuses, retryable and counted, when the per-submit
     CHECK(reg.counter(metric, {{"reason", "approval_cap_reached"}}).value() == 0);
 }
 
+// sre-1 / ca8-9 / up8-8: the GLOBAL queue being full at the C8 mint is its own refusal, not the
+// retryable "failed to create approval request".
+TEST_CASE("MCP approval mint reports a FULL global queue as such: counted, no retry hint, a "
+          "reviewer remediation, and no ticket",
+          "[pg][mcp][integration][approval][security][queue-full]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    yuzu::test::seed_pending(appr_bundle.pool(), "full-",
+                             yuzu::server::ApprovalManager::kMaxPendingApprovals,
+                             /*age_seconds=*/60);
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                    const std::string&, const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":253,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-0","key":"role"}}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+    CHECK(body["error"]["data"]["remediation"].get<std::string>().find("human reviewer must decide") !=
+          std::string::npos);
+    CHECK(body["error"]["message"].get<std::string>().find("queue is full") != std::string::npos);
+    CHECK(appr.pending_count() == yuzu::server::ApprovalManager::kMaxPendingApprovals); // no ticket
+    const std::string metric(yuzu::server::instruction_execute::kApprovalRefusedMetric);
+    CHECK(reg.counter(metric, {{"reason", "approval_queue_full"}}).value() == 1);
+    CHECK(reg.counter(metric, {{"reason", "approval_submit_failed"}}).value() == 0);
+}
+
+// The production Ports binding (make_ports) over a REAL approval store: the full-queue kind and the
+// unreadable pending count must survive the binding, which the Rig-based tests cannot show.
+TEST_CASE("instruction-execute production ports: a full queue maps to queue_full, a dropped table "
+          "to nullopt, a store fault to queue_full=false",
+          "[pg][approval][security][queue-full][up8-1]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    yuzu::server::ApprovalManager& mgr = *bundle;
+    yuzu::server::instruction_execute::StoreBindings b;
+    b.approval_manager = &mgr;
+    const auto ports = yuzu::server::instruction_execute::make_ports(b);
+    REQUIRE(ports.submit_approval);
+    REQUIRE(ports.pending_count_for);
+
+    auto first = ports.submit_approval("d", "alice", "s", "ping", "ping");
+    REQUIRE(first.has_value());
+    auto count = ports.pending_count_for("alice");
+    REQUIRE(count.has_value());
+    CHECK(*count == 1);
+
+    yuzu::test::seed_pending(bundle.pool(), "pq-", yuzu::server::ApprovalManager::kMaxPendingApprovals,
+                             /*age_seconds=*/60);
+    auto full = ports.submit_approval("d2", "alice", "s2", "ping", "ping");
+    REQUIRE_FALSE(full.has_value());
+    CHECK(full.error().queue_full);
+
+    {
+        auto lease = bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult drop = pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                                            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+    CHECK_FALSE(ports.pending_count_for("alice").has_value());
+    auto fault = ports.submit_approval("d3", "alice", "s3", "ping", "ping");
+    REQUIRE_FALSE(fault.has_value());
+    CHECK_FALSE(fault.error().queue_full);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // #2405 — C8 pre-approval input-schema validation.
 //
@@ -45186,6 +45262,28 @@ TEST_CASE("MCP execute_instruction_definition: input bounds and targeting shape 
         CHECK(rig.calls.empty());
         CHECK(rig.approvals.empty()); // refused BEFORE the approval step
     }
+}
+
+TEST_CASE("MCP execute_instruction_definition: a full global approval queue is -32603 "
+          "approval_queue_full with a null retry_after_ms and a reviewer remediation",
+          "[mcp][idef][approval][queue-full]") {
+    McpTestServer ts;
+    Rig rig;
+    rig.approval_queue_full = true;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "always");
+    idef_start(ts, rig, "operator", /*admin=*/false);
+    auto res = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["reason"] == "approval_queue_full");
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+    CHECK(body["error"]["data"]["remediation"].get<std::string>().find("human reviewer must decide") !=
+          std::string::npos);
+    CHECK(rig.calls.empty());
+    CHECK(rig.counter(std::string(yuzu::server::instruction_execute::kApprovalRefusedMetric),
+                      {{"reason", "approval_queue_full"}}) == 1);
 }
 
 TEST_CASE("MCP execute_instruction_definition: bounds counters are pre-registered for the tool",

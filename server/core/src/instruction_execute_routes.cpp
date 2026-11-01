@@ -43,6 +43,7 @@ void send_refusal(httplib::Response& res, const Refusal& r) {
     switch (r.kind) {
     case RefusalKind::kStoreUnavailable:
     case RefusalKind::kApprovalUnavailable:
+    case RefusalKind::kApprovalQueueFull:
     case RefusalKind::kClassifierUnavailable:
         status = 503;
         break;

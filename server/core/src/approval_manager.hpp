@@ -674,6 +674,16 @@ public:
            ApprovalOrigin origin, std::string target_plugin = {},
            std::string target_action = {});
 
+    /// `submit()` with the refusal kept TYPED (`SubmitFailure`), for a caller that must answer a
+    /// full queue (`kQueueFull`: only a reviewer or the 7-day expiry clears it) differently from
+    /// a store fault (`kStoreError`: a retry may succeed). The same mint body: `submit()` is a
+    /// thin wrapper that drops the kind.
+    [[nodiscard]] std::expected<std::string, SubmitError>
+    submit_typed(const std::string& definition_id, const std::string& submitted_by,
+                 const std::string& scope_expression, const std::string& schedule_id,
+                 ApprovalOrigin origin, std::string target_plugin = {},
+                 std::string target_action = {});
+
     /// Mint a ticket that BINDS the exact reviewed effect (#6062, four-eyes MVP PR2).
     /// `bound.request_json` and its SHA-256 digest (computed here, so the two cannot
     /// disagree) and `bound.excluded_roots` are frozen on the row at INSERT; no later

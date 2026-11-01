@@ -2683,6 +2683,28 @@ TEST_CASE("ApprovalManager: pending_count_for_checked fails closed when the stor
     }
 }
 
+TEST_CASE("ApprovalManager: submit_typed reports a full queue as kQueueFull and a good submit as "
+          "an id; submit() keeps its message-only shape",
+          "[pg][approval_manager][approval][queue-full]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    auto ok = mgr.submit_typed("d-ok", "alice", "s", "", ApprovalOrigin::kMcp);
+    REQUIRE(ok.has_value());
+    // A surface that binds a request cannot be minted unbound, typed as an invalid request.
+    auto bound = mgr.submit_typed("d-b", "alice", "s", "", ApprovalOrigin::kGuardianDeploy);
+    REQUIRE_FALSE(bound.has_value());
+    CHECK(bound.error().kind == SubmitFailure::kInvalidRequest);
+
+    yuzu::test::seed_pending(bundle.pool(), "qf-", ApprovalManager::kMaxPendingApprovals,
+                             /*age_seconds=*/60);
+    auto full = mgr.submit_typed("d-full", "alice", "s2", "", ApprovalOrigin::kInstruction);
+    REQUIRE_FALSE(full.has_value());
+    CHECK(full.error().kind == SubmitFailure::kQueueFull);
+    auto legacy = mgr.submit("d-full2", "alice", "s3", "", ApprovalOrigin::kInstruction);
+    REQUIRE_FALSE(legacy.has_value());
+    CHECK(legacy.error().find("queue is full") != std::string::npos);
+}
+
 TEST_CASE("ApprovalManager: query_checked happy path matches query()'s fields",
           "[pg][approval_manager][approval]") {
     yuzu::test::ApprovalManagerPg mgr_bundle;

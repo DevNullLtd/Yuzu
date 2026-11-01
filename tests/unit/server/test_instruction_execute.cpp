@@ -722,6 +722,39 @@ TEST_CASE("execute: an unreadable pending count is not consulted when no cap is 
     CHECK(as_pending(out));
 }
 
+TEST_CASE("execute: a FULL global approval queue is its own refusal: counted, no retry hint, "
+          "a remediation that names the reviewer, and never approval_submit_failed",
+          "[instruction_execute][approval][metrics][queue-full]") {
+    Rig r;
+    r.approval_queue_full = true;
+    r.defs["d"] = make_def("d", "ping", "always");
+    auto out = run(r.request("d", json::object(), make_caller("u", false)), r.ports(), r.audit());
+    const auto* ref = as_refusal(out);
+    REQUIRE(ref);
+    CHECK(ref->kind == RefusalKind::kApprovalQueueFull);
+    CHECK(ref->reason == "approval_queue_full");
+    CHECK_FALSE(ref->retry_after_ms.has_value()); // only a reviewer or the expiry clears it
+    CHECK(ref->remediation.find("human reviewer must decide pending approvals") != std::string::npos);
+    CHECK(ref->remediation.find("retrying will not help") != std::string::npos);
+    CHECK(r.calls.empty());
+    CHECK(r.counter(std::string(kApprovalRefusedMetric), {{"reason", "approval_queue_full"}}) == 1);
+    CHECK(r.counter(std::string(kApprovalRefusedMetric), {{"reason", "approval_submit_failed"}}) == 0);
+    REQUIRE_FALSE(r.audits.empty());
+    CHECK(r.audits.back().result == "denied");
+    CHECK(r.audits.back().detail.find("reason=approval_queue_full") != std::string::npos);
+
+    // A genuine store fault keeps the retryable submit-failed answer.
+    Rig f;
+    f.approval_fails = true;
+    f.defs["d"] = make_def("d", "ping", "always");
+    auto fo = run(f.request("d", json::object(), make_caller("u", false)), f.ports(), f.audit());
+    REQUIRE(as_refusal(fo));
+    CHECK(as_refusal(fo)->kind == RefusalKind::kApprovalSubmitFailed);
+    CHECK(as_refusal(fo)->retry_after_ms.has_value());
+    CHECK(f.counter(std::string(kApprovalRefusedMetric), {{"reason", "approval_submit_failed"}}) == 1);
+    CHECK(f.counter(std::string(kApprovalRefusedMetric), {{"reason", "approval_queue_full"}}) == 0);
+}
+
 TEST_CASE("execute: approval store failure and a missing approval manager are counted",
           "[instruction_execute][approval][metrics]") {
     Rig r;
@@ -744,7 +777,12 @@ TEST_CASE("the shared cap constant is ONE value across REST, MCP and the C8 mint
     CHECK(kSubmitterPendingCap == 25);
     CHECK(yuzu::server::mcp::instruction_definition::kSubmitterPendingCap == kSubmitterPendingCap);
     // The closed reason set the boot seed iterates.
-    CHECK(kApprovalRefusedReasons.size() == 3);
+    CHECK(kApprovalRefusedReasons.size() == 4);
+    // Exactly these four, in this order (the boot seed iterates it).
+    CHECK(kApprovalRefusedReasons[0] == "approval_cap_reached");
+    CHECK(kApprovalRefusedReasons[1] == "approval_unavailable");
+    CHECK(kApprovalRefusedReasons[2] == "approval_submit_failed");
+    CHECK(kApprovalRefusedReasons[3] == "approval_queue_full");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1517,6 +1555,23 @@ TEST_CASE("REST execute: an unreadable pending count answers 503 approval_unavai
     CHECK(r.core.approvals.empty());
     CHECK(r.core.counter(std::string(kApprovalRefusedMetric),
                          {{"reason", "approval_unavailable"}}) == 1);
+}
+
+TEST_CASE("REST execute: a full global approval queue answers 503 approval_queue_full with a null "
+          "retry_after_ms and a reviewer remediation",
+          "[instruction_execute][rest][approval][queue-full]") {
+    RouteRig r([](Rig& c) { c.approval_queue_full = true; });
+    r.core.defs["d"] = make_def("d", "ping", "always");
+    r.caller = make_caller("bob", /*admin=*/false);
+    auto res = r.post("d", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    const auto j = json::parse(res->body);
+    CHECK(j["error"]["reason"] == "approval_queue_full");
+    CHECK(j["error"]["retry_after_ms"].is_null());
+    CHECK(j["error"]["remediation"].get<std::string>().find("human reviewer") != std::string::npos);
+    CHECK(r.core.counter(std::string(kApprovalRefusedMetric),
+                         {{"reason", "approval_queue_full"}}) == 1);
 }
 
 TEST_CASE("REST execute: the per-principal pending-approval cap answers 429 and creates nothing",

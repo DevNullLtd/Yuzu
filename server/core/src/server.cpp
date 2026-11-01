@@ -1578,9 +1578,10 @@ public:
                           "Approval-gated execute calls refused at the approval-submit step, by "
                           "reason: approval_cap_reached (this principal already holds 25 pending "
                           "approvals, HTTP 429 / MCP tier-denied), approval_unavailable (no "
-                          "approval manager), approval_submit_failed (the approval store refused "
-                          "the row, including the global queue being full). No approval row is "
-                          "created on a refusal.",
+                          "approval manager, or the pending count could not be read), "
+                          "approval_queue_full (the global pending queue is full: only a reviewer "
+                          "or the expiry clears it), approval_submit_failed (the approval store "
+                          "otherwise refused the row). No approval row is created on a refusal.",
                           "counter");
         for (const auto reason : yuzu::server::instruction_execute::kApprovalRefusedReasons)
             metrics_.counter(yuzu::server::instruction_execute::kApprovalRefusedMetric,

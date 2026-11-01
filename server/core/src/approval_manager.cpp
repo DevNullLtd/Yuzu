@@ -661,15 +661,25 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
                         const std::string& scope_expression, const std::string& schedule_id,
                         ApprovalOrigin origin, std::string target_plugin,
                         std::string target_action) {
-    // A surface whose tickets bind a request cannot be minted unbound: the redeemer
-    // would find an empty request_json and nothing for the reviewer to have seen.
-    if (requires_bound_request(origin))
-        return std::unexpected(std::string{kBoundRequestRequiredMessage});
-    auto r = submit_impl(definition_id, submitted_by, scope_expression, schedule_id, origin,
-                         /*bound=*/nullptr, std::move(target_plugin), std::move(target_action));
+    auto r = submit_typed(definition_id, submitted_by, scope_expression, schedule_id, origin,
+                          std::move(target_plugin), std::move(target_action));
     if (!r)
         return std::unexpected(std::move(r.error().message));
     return std::move(*r);
+}
+
+std::expected<std::string, SubmitError>
+ApprovalManager::submit_typed(const std::string& definition_id, const std::string& submitted_by,
+                              const std::string& scope_expression, const std::string& schedule_id,
+                              ApprovalOrigin origin, std::string target_plugin,
+                              std::string target_action) {
+    // A surface whose tickets bind a request cannot be minted unbound: the redeemer
+    // would find an empty request_json and nothing for the reviewer to have seen.
+    if (requires_bound_request(origin))
+        return std::unexpected(
+            SubmitError{SubmitFailure::kInvalidRequest, std::string{kBoundRequestRequiredMessage}});
+    return submit_impl(definition_id, submitted_by, scope_expression, schedule_id, origin,
+                       /*bound=*/nullptr, std::move(target_plugin), std::move(target_action));
 }
 
 std::expected<std::string, SubmitError>

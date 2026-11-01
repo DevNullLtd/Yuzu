@@ -27,12 +27,17 @@ Ports make_ports(const StoreBindings& b) {
     if (auto* am = b.approval_manager) {
         p.submit_approval = [am](const std::string& definition_id, const std::string& submitted_by,
                                  const std::string& scope_expression, const std::string& plugin,
-                                 const std::string& action) {
+                                 const std::string& action)
+            -> std::expected<std::string, ApprovalSubmitError> {
             // ApprovalOrigin::kInstruction: refused at the MCP recall (origin_redeemable_as), and
             // no interactive redemption exists. plugin/action are snapshotted so a future
             // redemption inherits the definition-mutation protection (#1398 hardening).
-            return am->submit(definition_id, submitted_by, scope_expression, "",
-                              ApprovalOrigin::kInstruction, plugin, action);
+            auto r = am->submit_typed(definition_id, submitted_by, scope_expression, "",
+                                      ApprovalOrigin::kInstruction, plugin, action);
+            if (!r)
+                return std::unexpected(ApprovalSubmitError{
+                    r.error().kind == SubmitFailure::kQueueFull, std::move(r.error().message)});
+            return std::move(*r);
         };
         // nullopt = the count could not be read (the cap then refuses, it never admits).
         p.pending_count_for = [am](const std::string& user) -> std::optional<int> {

@@ -119,6 +119,7 @@ struct Rig {
 
     bool approvals_wired{true};
     bool approval_fails{false};
+    bool approval_queue_full{false}; // the store reports the GLOBAL queue full (kQueueFull)
     int pending_for{0};
     /// When set, `pending_count_for(user)` is `pending_for` plus the approvals THIS rig has
     /// accepted for that user, so a loop of real submits walks into the per-principal cap and
@@ -250,9 +251,14 @@ struct Rig {
         if (approvals_wired) {
             p.submit_approval = [this](const std::string& d, const std::string& u,
                                        const std::string& s, const std::string& pl,
-                                       const std::string& ac) -> std::expected<std::string, std::string> {
+                                       const std::string& ac)
+                -> std::expected<std::string, yuzu::server::instruction_execute::ApprovalSubmitError> {
+                if (approval_queue_full)
+                    return std::unexpected(yuzu::server::instruction_execute::ApprovalSubmitError{
+                        true, "approval queue is full (1000 pending)"});
                 if (approval_fails)
-                    return std::unexpected(std::string("queue full"));
+                    return std::unexpected(yuzu::server::instruction_execute::ApprovalSubmitError{
+                        false, "insert failed (pool degraded or transaction failed)"});
                 approvals.push_back({d, u, s, pl, ac});
                 return std::string("appr-") + std::to_string(approvals.size());
             };

@@ -138,6 +138,7 @@ Rendered render_refusal(const Refusal& r, bool audit_dropped, const std::string&
     case RefusalKind::kStoreUnavailable:
     case RefusalKind::kSchemaInvalid:
     case RefusalKind::kApprovalUnavailable:
+    case RefusalKind::kApprovalQueueFull:
     case RefusalKind::kApprovalSubmitFailed:
     case RefusalKind::kClassifierUnavailable:
     case RefusalKind::kMisconfigured:
