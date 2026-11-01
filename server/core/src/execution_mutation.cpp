@@ -142,28 +142,35 @@ ExecutionMutationOutcome apply_execution_mutation(const ExecutionMutationPorts& 
     //    outcome UNKNOWN (the write may or may not have landed), so it is a `failure` row and a
     //    distinct status that carries no retry hint: it is never reported as the benign
     //    "store failed, nothing changed" of kStoreFailed.
+    // Built BEFORE the effect: an allocation failure here happens while nothing has changed yet,
+    // and the failure row below then needs no allocation of its own.
+    const std::string threw_detail = with_context("effect threw; outcome unknown", req.audit_context);
     const auto effect_threw = [&] {
-        out.audit_persisted =
-            write_audit(audit, action, "failure", id,
-                        with_context("effect threw; outcome unknown", req.audit_context));
+        out.audit_persisted = write_audit(audit, action, "failure", id, threw_detail);
         out.status = Status::kEffectThrew;
         return out;
     };
     if (req.what == ExecutionMutation::kCancel) {
         using Outcome = ExecutionTracker::MarkCancelledOutcome;
         Outcome cancelled = Outcome::kFailed;
+        // The handlers only note that the effect threw; the failure row (whose detail string
+        // allocates) is built AFTER the handler, so a second throw while building it cannot
+        // escape a catch block with no `failure` row written.
+        bool threw = false;
         try {
             cancelled = ports.mark_cancelled(id, req.username);
         } catch (const std::exception& e) {
             spdlog::error("execution mutation: cancel effect threw for execution_id={}: {}",
                           safe_id, e.what());
-            return effect_threw();
+            threw = true;
         } catch (...) {
             spdlog::error("execution mutation: cancel effect threw a non-standard exception for "
                           "execution_id={}",
                           safe_id);
-            return effect_threw();
+            threw = true;
         }
+        if (threw)
+            return effect_threw();
         switch (cancelled) {
         case Outcome::kFailed:
             out.audit_persisted = write_audit(audit, action, "failure", id,
@@ -189,18 +196,21 @@ ExecutionMutationOutcome apply_execution_mutation(const ExecutionMutationPorts& 
 
     using RerunError = ExecutionTracker::RerunError;
     std::expected<std::string, RerunError> rerun = std::unexpected(RerunError::kWriteFailed);
+    bool rerun_threw = false; // see the cancel arm: the failure row is built outside the handler
     try {
         rerun = ports.create_rerun(id, req.username, req.failed_only);
     } catch (const std::exception& e) {
         spdlog::error("execution mutation: rerun effect threw for execution_id={}: {}", safe_id,
                       e.what());
-        return effect_threw();
+        rerun_threw = true;
     } catch (...) {
         spdlog::error("execution mutation: rerun effect threw a non-standard exception for "
                       "execution_id={}",
                       safe_id);
-        return effect_threw();
+        rerun_threw = true;
     }
+    if (rerun_threw)
+        return effect_threw();
     if (!rerun) {
         // The store's text is never echoed (it can carry internals). kOriginalNotFound can only
         // mean the row vanished after the admission read above; an unreadable store is its own

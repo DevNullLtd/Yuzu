@@ -300,8 +300,36 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
 
     std::string execution_id;
     if (d.execution.create) {
-        auto created = d.execution.create(session.username, scope,
-                                          nlohmann::json(redact_sensitive_instruction_params(params)).dump());
+        // The port may throw (a pool or driver fault). The `requested` row is already written
+        // and nothing has been dispatched, so a throw answers 503 after a `failure` row rather
+        // than unwinding with no outcome row.
+        std::expected<std::string, std::string> created;
+        bool create_threw = false;
+        try {
+            created = d.execution.create(
+                session.username, scope,
+                nlohmann::json(redact_sensitive_instruction_params(params)).dump());
+        } catch (const std::exception& e) {
+            spdlog::error("POST /api/v1/commands: create_execution threw: {}", e.what());
+            create_threw = true;
+        } catch (...) {
+            spdlog::error("POST /api/v1/commands: create_execution threw an unknown exception");
+            create_threw = true;
+        }
+        if (create_threw) {
+            (void)detail::emit_behavioral_audit(audit, req, res, "command.dispatch", "failure",
+                                                "command", "",
+                                                "reason=execution_record_exception " + what +
+                                                    " correlation_id=" + cid);
+            res.status = 503;
+            res.set_content(error_body(res, 503,
+                                       "execution history unavailable: nothing was dispatched",
+                                       "execution_record_unavailable",
+                                       {.retry_after_ms = kRetryAfterMs,
+                                        .remediation = "retry the request"}),
+                            "application/json");
+            return;
+        }
         if (created.has_value()) {
             execution_id = *created;
         } else {
@@ -332,7 +360,11 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
         threw = true;
     }
     if (threw) {
-        cancel_execution();
+        // The execution row is deliberately NOT cancelled (up8-3 / sg-5): whether any agent
+        // already received the command is unknown, and a `cancelled` row with agents_targeted 0
+        // would tell every reader that nothing was sent. Left `running`, a response from any agent
+        // that did receive it is still recorded, and the stuck-execution reaper closes the row
+        // only when no agent ever answered. The tracker has no `failed` execution status.
         (void)detail::emit_behavioral_audit(audit, req, res, "command.dispatch", "failure",
                                             "command", "",
                                             "reason=dispatch_exception " + what +
@@ -341,8 +373,20 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
         // No retry hint: whether any agent received the command is unknown, and a blind retry
         // could dispatch it twice.
         res.status = 500;
-        res.set_content(error_body(res, 500, "dispatch failed", "dispatch_exception"),
-                        "application/json");
+        res.set_content(
+            error_body(res, 500, "dispatch failed", "dispatch_exception",
+                       {.remediation =
+                            execution_id.empty()
+                                ? "the dispatch failed part-way and some agents may already have "
+                                  "received the command; no execution record was created, so "
+                                  "confirm on the devices before sending it again"
+                                : "the dispatch failed part-way and some agents may already have "
+                                  "received the command; the execution was left running, not "
+                                  "cancelled, so results from any agent that did receive it are "
+                                  "still recorded against it: check its per-agent results before "
+                                  "sending it again"},
+                       nlohmann::json{{"execution_id", execution_id}}),
+            "application/json");
         return;
     }
 

@@ -446,7 +446,30 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
         row.parameter_values =
             nlohmann::json(redact_sensitive_instruction_params(plan.params)).dump();
         row.dispatched_by = rq.caller.principal;
-        if (auto created = p.create_execution(row); created.has_value())
+        // up8-3: the port may throw (a pool or driver fault). The `requested` row is already
+        // written, so an unwound exception would leave it with no outcome row. Nothing has been
+        // dispatched yet, so this refuses (retryable) after writing the `failure` row.
+        bool create_threw = false;
+        std::optional<std::string> created;
+        try {
+            created = p.create_execution(row);
+        } catch (const std::exception& e) {
+            spdlog::error("instruction execute: create_execution failed for '{}': {}", def_token,
+                          e.what());
+            create_threw = true;
+        } catch (...) {
+            spdlog::error("instruction execute: create_execution failed for '{}': unknown exception",
+                          def_token);
+            create_threw = true;
+        }
+        if (create_threw) {
+            c.audit("failure", "reason=execution_record_exception definition=" + def_token);
+            return Outcome{make_refusal(RefusalKind::kStoreUnavailable, "execution_record_unavailable",
+                                        "execution history unavailable: nothing was dispatched",
+                                        "retry the request", kRetryAfterMs),
+                           c.audit_dropped};
+        }
+        if (created.has_value())
             execution_id = *created;
         else
             spdlog::warn("instruction execute: execution row not created for '{}'; dispatching "
@@ -474,17 +497,33 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
         threw = true;
     }
     if (threw) {
-        cancel_row(c, execution_id);
+        // up8-3 / sg-5: the execution row is deliberately NOT cancelled. Whether any agent
+        // already received the command is unknown once the dispatch has thrown, and a row marked
+        // `cancelled` (agents_targeted 0) would tell every reader that nothing was sent. Left at
+        // `running`, a response from any agent that did receive it is still recorded against the
+        // row (update_agent_status), and the stuck-execution reaper
+        // (ExecutionTracker::reap_stuck_running_executions: status 'running', agents_targeted 0,
+        // no agent response) closes it as cancelled only when no agent ever answered. The
+        // tracker has no `failed` execution status, so `running` is the honest "unknown" state.
         c.audit("failure", "reason=dispatch_exception definition=" + def_token +
                                " execution_id=" + execution_id);
         // NO retry hint, on the wire or in prose: whether any agent already received the command
         // is unknown once the dispatch has thrown, so a blind retry could dispatch it twice.
         // (command_v1_routes.cpp's dispatch_exception arm drops it for the same reason.)
+        std::string remediation =
+            "the dispatch failed part-way and some agents may already have received the command; ";
+        if (execution_id.empty()) {
+            remediation += "no execution record was created, so there are no per-agent results "
+                           "to check; confirm on the devices before running it again";
+        } else {
+            remediation += "execution " + execution_id +
+                           " was left running, not cancelled, so results from any agent that did "
+                           "receive the command are still recorded against it; check that "
+                           "execution's per-agent results before running the definition again "
+                           "(the server closes the record by itself if no agent ever responds)";
+        }
         return Outcome{make_refusal(RefusalKind::kDispatchFailed, "dispatch_failed",
-                                    "dispatch failed",
-                                    "the dispatch failed part-way and some agents may already "
-                                    "have received the command; check the execution history for "
-                                    "this definition before running it again"),
+                                    "dispatch failed", std::move(remediation)),
                        c.audit_dropped};
     }
 

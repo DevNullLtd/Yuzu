@@ -106,6 +106,9 @@ struct Rig {
     ContainmentGate gate = ContainmentGate::exempt_control_plugin();
     std::optional<ConfinedDispatchOutcome> canned; // overrides the real seam for one outcome
     bool dispatch_throws = false;
+    bool dispatch_throws_nonstd = false;
+    bool create_throws = false;
+    bool create_throws_nonstd = false;
     int dispatch_calls = 0;
     DispatchCaller last_caller;
     std::string last_execution_id;
@@ -219,6 +222,10 @@ struct Rig {
                                     const std::string& params_json)
             -> std::expected<std::string, std::string> {
             exec_params.push_back(params_json);
+            if (create_throws)
+                throw std::runtime_error("create boom");
+            if (create_throws_nonstd)
+                throw 42; // NOLINT(hicpp-exception-baseclass): a non-std throw is the point
             return "exec-" + std::to_string(++exec_created);
         };
         d.execution.mark_cancelled = [this](const std::string& id, const std::string&) {
@@ -252,6 +259,8 @@ struct Rig {
         dispatched_scope = scope;
         if (dispatch_throws)
             throw std::runtime_error("boom");
+        if (dispatch_throws_nonstd)
+            throw 42; // NOLINT(hicpp-exception-baseclass): a non-std throw is the point
         const std::string command_id = plugin + "-cmd-" + std::to_string(dispatch_calls);
         if (canned) {
             auto out = *canned;
@@ -932,17 +941,46 @@ TEST_CASE("command_v1: real zero-reach causes through the real seam",
     }
 }
 
-TEST_CASE("command_v1: a dispatch that throws is a 500 with no retry hint and a cancelled row",
+TEST_CASE("command_v1: a dispatch that throws (std or non-std) is a 500 with no retry hint, the "
+          "execution row is left running (NOT cancelled) and the remediation says so",
           "[server][command_v1][dispatch]") {
-    Rig rig;
-    rig.facts = {.legacy_open = true};
-    rig.dispatch_throws = true;
-    const auto res = rig.post(kRead);
-    CHECK(res->status == 500);
-    CHECK(reason_of(res) == "dispatch_exception");
-    CHECK(body_of(res)["error"]["retry_after_ms"].is_null());
-    CHECK(rig.cancelled == std::vector<std::string>{"exec-1"});
-    CHECK(rig.has_audit("failure", "reason=dispatch_exception"));
+    for (const bool nonstd : {false, true}) {
+        INFO("nonstd=" << nonstd);
+        Rig rig;
+        rig.facts = {.legacy_open = true};
+        (nonstd ? rig.dispatch_throws_nonstd : rig.dispatch_throws) = true;
+        const auto res = rig.post(kRead);
+        CHECK(res->status == 500);
+        CHECK(reason_of(res) == "dispatch_exception");
+        const auto err = body_of(res)["error"];
+        CHECK(err["retry_after_ms"].is_null());
+        CHECK(err["execution_id"] == "exec-1");
+        CHECK(err["remediation"].get<std::string>().find("not cancelled") != std::string::npos);
+        CHECK(err["remediation"].get<std::string>().find("retry") == std::string::npos);
+        // up8-3: whether any agent holds the command is unknown, so the row must not read
+        // `cancelled` with agents_targeted 0.
+        CHECK(rig.cancelled.empty());
+        CHECK(rig.dispatch_calls == 1);
+        CHECK(rig.has_audit("failure", "reason=dispatch_exception"));
+    }
+}
+
+TEST_CASE("command_v1: an execution-record create that throws writes a failure row, dispatches "
+          "nothing and is retryable",
+          "[server][command_v1][dispatch]") {
+    for (const bool nonstd : {false, true}) {
+        INFO("nonstd=" << nonstd);
+        Rig rig;
+        rig.facts = {.legacy_open = true};
+        (nonstd ? rig.create_throws_nonstd : rig.create_throws) = true;
+        const auto res = rig.post(kRead);
+        CHECK(res->status == 503);
+        CHECK(reason_of(res) == "execution_record_unavailable");
+        CHECK(body_of(res)["error"]["retry_after_ms"] == 5000);
+        CHECK(rig.dispatch_calls == 0);
+        CHECK(rig.has_audit("requested"));
+        CHECK(rig.has_audit("failure", "reason=execution_record_exception"));
+    }
 }
 
 // ───────────────────────────── the legacy command.dispatched event ─────────────────────────────

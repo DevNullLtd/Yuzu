@@ -3734,7 +3734,7 @@ Omitting **both** `agent_ids` and `scope` targets every connected agent. Supplyi
 
 **Zero agents reached** is an error, discriminated by `error.reason`: `invalid_scope` is `400`; `containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `quarantined`, `plugin_not_found`, `kill_switched_os` and `no_agents_reached` are `503`. `retry_after_ms` is `5000` for `containment_unreadable`, `route_unreadable`, `os_gate_unreadable` and `no_agents_reached`, and `null` for the permanent causes (`invalid_scope`, `quarantined`, `plugin_not_found`, `kill_switched_os`), where retrying the same request cannot succeed. The error object also carries `command_id`, `execution_id` (the cancelled execution row) and the counts `agents_quarantined`, `agents_unknown_plugin`, `agents_kill_switched_os`. `no_agents_reached` includes the case where a per-device claim excluded every target.
 
-Other errors use the A4 envelope with a `reason`: `500` `dispatch_failed` (the dispatch threw; the execution row is cancelled and a `failure` audit row with `reason=dispatch_exception` is written). It carries **no retry hint** (`retry_after_ms` is `null`, and the text does not suggest a retry), because a dispatch that threw may already have reached some agents and sending it again could run it twice; check the definition's execution history before running it again.
+Other errors use the A4 envelope with a `reason`: `500` `dispatch_failed` (the dispatch threw; a `failure` audit row with `reason=dispatch_exception` is written). The execution row is **not** cancelled: whether any agent already received the command is unknown, so the row is left `running`, results from any agent that did receive it are still recorded against it, and the server closes the row by itself if no agent ever responds (the remediation names the `execution_id`). It carries **no retry hint** (`retry_after_ms` is `null`, and the text does not suggest a retry), because a dispatch that threw may already have reached some agents and sending it again could run it twice; check that execution's per-agent results before running the definition again. If the execution row cannot be created (the store throws), nothing is dispatched: the answer is `503` `execution_record_unavailable` with `retry_after_ms: 5000` and a `failure` audit row with `reason=execution_record_exception`.
 
 ---
 
@@ -11742,7 +11742,8 @@ carries `Sec-Audit-Failed: true` and the `requested` row remains the evidence. A
 | `403` | `forbidden`, `approval_required`, `kill_switched`, `anonymous_operator` | The dispatch check refused the caller; `approval_required` means this route mints no approval ticket, so use an administrator or `POST /api/instructions/{id}/execute`. No `permission` field is returned. |
 | `404` | `destructive_no_visible_target` | See above. |
 | `503` | `audit_unavailable` | The `requested` row could not be stored; nothing was sent. Carries `retry_after_ms`. |
-| `500` | `dispatch_exception` | The dispatch threw. No retry hint: whether an agent received the command is unknown. |
+| `500` | `dispatch_exception` | The dispatch threw. No retry hint: whether an agent received the command is unknown, so the execution row is left `running` (not cancelled) and `error.execution_id` names it; results from any agent that did receive the command are still recorded against it. |
+| `503` | `execution_record_unavailable` | The execution row could not be created (the store threw); nothing was dispatched. Carries `retry_after_ms`. |
 
 When the command reaches no agent (`sent == 0`) the answer is one of these, chosen by a fixed
 priority order (the first that applies) and carrying `command_id`, `execution_id` (the row is

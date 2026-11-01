@@ -143,6 +143,8 @@ struct Rig {
     bool real_dispatch{false};
     bool dispatch_throws{false};
     bool dispatch_throws_nonstd{false}; // throws an int, not a std::exception
+    bool create_throws{false};          // create_execution throws a std::exception
+    bool create_throws_nonstd{false};   // ... or an int
     ConfinedDispatchOutcome stub_outcome{.sent = 1, .command_id = "cmd-1"};
     std::int64_t seq{0};
 
@@ -264,6 +266,10 @@ struct Rig {
         p.visible_agents = [this](const std::string&) { return visible_agents; };
         if (ledger_wired) {
             p.create_execution = [this](const ExecutionRow& r) -> std::optional<std::string> {
+                if (create_throws)
+                    throw std::runtime_error("create boom");
+                if (create_throws_nonstd)
+                    throw 42; // NOLINT(hicpp-exception-baseclass): a non-std throw is the point
                 if (create_fails)
                     return std::nullopt;
                 rows.push_back(r);

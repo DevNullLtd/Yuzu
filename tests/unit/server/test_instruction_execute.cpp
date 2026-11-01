@@ -940,8 +940,8 @@ TEST_CASE("execute: no execution tracker still dispatches, with an empty executi
     CHECK(r.calls[0].execution_id.empty());
 }
 
-TEST_CASE("execute: a dispatch that throws (std or non-std) cancels the execution row, writes a "
-          "failure row, and advertises NO retry",
+TEST_CASE("execute: a dispatch that throws (std or non-std) leaves the execution row running (NOT "
+          "cancelled), writes a failure row, advertises NO retry and says so in the remediation",
           "[instruction_execute]") {
     for (const bool nonstd : {false, true}) {
         INFO("nonstd=" << nonstd);
@@ -957,13 +957,55 @@ TEST_CASE("execute: a dispatch that throws (std or non-std) cancels the executio
         CHECK_FALSE(ref->retry_after_ms.has_value());
         CHECK(ref->message.find("retry") == std::string::npos);
         CHECK(ref->remediation.find("retry") == std::string::npos);
-        CHECK(r.cancelled == std::vector<std::string>{"exec-1"});
+        // up8-3 / sg-5: some agent may hold the command, so the row must not read `cancelled`
+        // with agents_targeted 0. The remediation names the row and says it was left running.
+        CHECK(r.cancelled.empty());
         CHECK(r.targeted.empty());
+        CHECK(ref->remediation.find("exec-1") != std::string::npos);
+        CHECK(ref->remediation.find("left running, not cancelled") != std::string::npos);
         CHECK(r.calls.size() == 1); // dispatched exactly once, never re-driven
         REQUIRE(r.audits.size() == 2);
         CHECK(r.audits[0].result == "requested");
         CHECK(r.audits[1].result == "failure");
         CHECK(r.audits[1].detail.find("reason=dispatch_exception") != std::string::npos);
+        CHECK(r.audits[1].detail.find("execution_id=exec-1") != std::string::npos);
+        CHECK_FALSE(out.audit_dropped);
+    }
+}
+
+TEST_CASE("execute: a dispatch that throws with no execution tracker says no record exists",
+          "[instruction_execute]") {
+    Rig r;
+    r.ledger_wired = false;
+    r.dispatch_throws = true;
+    r.defs["d"] = make_def("d");
+    auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
+    const auto* ref = as_refusal(out);
+    REQUIRE(ref);
+    CHECK(ref->kind == RefusalKind::kDispatchFailed);
+    CHECK(ref->remediation.find("no execution record was created") != std::string::npos);
+    CHECK(ref->remediation.find("left running") == std::string::npos);
+}
+
+TEST_CASE("execute: a create_execution that throws (std or non-std) writes a failure row, "
+          "dispatches nothing and is retryable",
+          "[instruction_execute]") {
+    for (const bool nonstd : {false, true}) {
+        INFO("nonstd=" << nonstd);
+        Rig r;
+        (nonstd ? r.create_throws_nonstd : r.create_throws) = true;
+        r.defs["d"] = make_def("d");
+        auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
+        const auto* ref = as_refusal(out);
+        REQUIRE(ref);
+        CHECK(ref->kind == RefusalKind::kStoreUnavailable);
+        CHECK(ref->reason == "execution_record_unavailable");
+        CHECK(ref->retry_after_ms.has_value()); // nothing was sent: a retry is safe
+        CHECK(r.calls.empty());
+        REQUIRE(r.audits.size() == 2);
+        CHECK(r.audits[0].result == "requested");
+        CHECK(r.audits[1].result == "failure");
+        CHECK(r.audits[1].detail.find("reason=execution_record_exception") != std::string::npos);
         CHECK_FALSE(out.audit_dropped);
     }
 }
