@@ -42,9 +42,14 @@ Key characteristics:
 - **Protocol version**: negotiated on `initialize` — `2025-03-26` (default) or
   `2025-06-18`. A client that requests neither is answered `2025-03-26`; a
   present-but-unsupported `MCP-Protocol-Version` header is rejected with `400`.
-- **Authentication**: Same as all Yuzu API endpoints -- session cookie, Bearer
-  token, or `X-Yuzu-Token` header. Auth is per-request on every method; an
-  `Mcp-Session-Id` is transport affinity only, never a credential, and it
+- **Authentication**: an API token that carries an MCP tier, sent as
+  `Authorization: Bearer` (or in the `X-Yuzu-Token` header). A credential with
+  no MCP tier is refused on every method with `403` / `-32003`: that covers a
+  browser session cookie and an API token minted without `mcp_tier` (see
+  [Authorization Tiers](#authorization-tiers)). Do not send a session cookie
+  alongside the token: the server resolves a live cookie first, so the request
+  would be classed as the cookie and refused. Auth is per-request on every
+  method; an `Mcp-Session-Id` is transport affinity only, never a credential, and it
   only works for the principal and credential class that created it (the
   class is the authentication source, principal kind, MCP tier and service
   scope; not elevation state; see
@@ -88,7 +93,7 @@ EOF
 ```
 
 The `Origin` header on these REST examples is for the REST routes only; do not send it to `/mcp/v1/` unless it is listed in `--mcp-allowed-origin`.
-A browser-cookie MCP client must send a same-site `Referer`, or an `Origin` that both the server-wide same-site check and the endpoint's allowlist accept, or its write is refused `403` before the MCP handler runs. That `403` is the REST error envelope (`cross-site request refused`), not a JSON-RPC error. Clients authenticated only by a token are not affected.
+The token-mint request above is a cookie-session write on a REST route, so it needs the same-site `Origin` (or `Referer`); the MCP calls that follow use only the token.
 
 The response includes a `token` field (prefixed `yuzu_`). Copy it immediately --
 it is shown exactly once.
@@ -190,42 +195,37 @@ change: a notification POST now answers `202` instead of `204`).
   the authentication source (`local`, `oidc`, `saml`, `api_token`, `mcp_token`
   or `engine_token`), the principal kind, the MCP tier and the service scope.
   For example, a `readonly` token cannot use a session
-  created by a `supervised` token, and a cookie session or tierless token
-  cannot use a session created by a token with a tier; an `api_token` and an
-  `mcp_token` of one user are different classes, and so are a user's `local`,
-  `oidc` and `saml` cookie sessions. This applies on a `GET`
+  created by a `supervised` token. This applies on a `GET`
   attach or resume, a `POST` that reuses the session, and a `DELETE`. The
   refusal does not end the original session, and the client simply re-runs
   `initialize` with the credential it is using; an SDK client that follows the
   MCP specification and re-runs `initialize` on a `404` recovers on its own, and
   doing so is safe because it never terminates the original session. Rotating an
   API token, or signing in again with the same login method, keeps the same
-  class, so an existing session survives both. A request that carries both a
-  session cookie and a Bearer token is classed by the cookie while the cookie is
-  valid, so when that cookie expires the client flips to the token's class and
-  its next request answers `404`: send one credential per session.
-  Two credentials of the same class belonging to one user remain
-  interchangeable on a session. The class does not include JIT admin
-  elevation, which is per-request state: a non-elevated cookie session that
-  obtains an elevated session's id could receive that session's replayed
-  frames. Only cookie sessions can be elevated. Sessions of that kind are
-  refused at `/mcp/v1/` once the tierless-human refusal (#4309) lands, which is
-  the planned closure. Until then the session id (128-bit, returned only in the
-  `initialize` response header) must be protected like a credential. Stream
+  class, so an existing session survives both. A request that carries a live
+  session cookie alongside a Bearer token is classed by the cookie, which has no
+  MCP tier, and is refused at admission (see **Authentication** above): send only
+  the `Authorization` header. Two credentials of the same class belonging to one
+  user remain interchangeable on a session. The class does not include JIT admin
+  elevation, which is per-request state, and only cookie sessions can be
+  elevated. A cookie session can no longer hold a session at `/mcp/v1/` at all
+  (it has no MCP tier and is refused at admission, #4309), so an elevated cookie
+  session's id cannot be replayed from a non-elevated one. The session id
+  (128-bit, returned only in the `initialize` response header) is still a
+  bearer-like value and should be protected like a credential. Stream
   liveness is principal-level: the class is checked when the stream attaches
   and is not re-derived from the live credential afterwards (the per-tick
   credential recheck compares the principal only, and the per-tick session
   check compares the class captured at attach). Sessions are
   in-memory per server replica, so a server restart drops them
   (re-initialize). During a rolling upgrade, a replica not yet upgraded does not
-  enforce the class binding or the service-scope deny; finish the roll
-  promptly.
+  enforce the class binding, the service-scope deny or the tier requirement;
+  finish the roll promptly.
 - **`DELETE /mcp/v1/`** with the `Mcp-Session-Id` header ends a session (`200`; a
   second `DELETE` of the same id → `404`).
 - **`Origin`** is validated on every method when streaming is on (`-32008` / `403` if a
   present Origin is not allowlisted; see `--mcp-allowed-origin`); with
-  `--mcp-no-streaming` this MCP-level check does not run, but the server-wide rule that
-  cookie-session writes need a same-site `Origin` or `Referer` applies either way;
+  `--mcp-no-streaming` this MCP-level check does not run;
   **`MCP-Protocol-Version`** is
   negotiated (`-32009` / `400` for an unsupported value); the per-principal/global
   session cap returns `-32010` / `429` on `initialize` when full.
@@ -268,9 +268,7 @@ change: a notification POST now answers `202` instead of `204`).
   **API token** is not instantaneous: the token cache is per-process, so a revoke
   handled by one replica does not reach a stream held by another until that replica's
   own cache entry expires and it re-reads the store — up to the 60 s cache TTL plus one
-  tick. (Cookie sessions are per-process and in-memory, so a cookie-authenticated
-  stream simply does not exist on another replica; the bound above is an API-token
-  property.) Streams end with a JSON-RPC `notifications/yuzu.stream_closed` notification
+  tick. Streams end with a JSON-RPC `notifications/yuzu.stream_closed` notification
   carried as a normal `message` on the stream (not a bespoke `event: stream-closed` frame),
   whose `params` carry the reason in an A4 envelope — `client_disconnect`,
   `superseded`, `session_terminated`, `credential_revoked`, or `auth_unavailable` (the
@@ -316,7 +314,9 @@ The `--mcp-no-streaming` kill switch disables all of the above (no minting;
 `GET`/`DELETE` → `405`; plain POST only), useful behind a buffering reverse proxy.
 Session open/close and every denial are audited (`mcp.session.open` /
 `mcp.session.close` / `mcp.session.reject`; a rejected session shows `reason=service_scoped`
-or `reason=credential_mismatch` in the `detail`, see `docs/user-manual/audit-log.md`), and
+or `reason=credential_mismatch` in the `detail`, see `docs/user-manual/audit-log.md`;
+`reason=tier_required` rows are rate-limited per principal, while the refused counter is
+complete), and
 each stream attach/close is audited
 too (`mcp.stream.attach` / `mcp.stream.close`, the latter carrying the close reason).
 
@@ -349,6 +349,31 @@ MCP tokens use a **tier** system that restricts what operations are available,
 independent of the underlying RBAC role. The tier check runs *before* RBAC:
 even if the token creator has the Administrator role, a `readonly` tier blocks
 all writes.
+
+**Every request to `/mcp/v1/` must carry a tier (#4309).** `GET`, `POST` and
+`DELETE` on `/mcp/v1/` refuse any authenticated credential whose MCP tier is
+empty, for every principal, with HTTP `403` and JSON-RPC `-32003`, message
+`/mcp/v1/ requires an MCP-tier bearer token`. The credentials that carry no tier
+are a browser session cookie (local, OIDC or SAML) and an API token minted
+without `mcp_tier`. A token minted with `mcp_tier` (`readonly`, `operator` or
+`supervised`) is admitted, and so is an engine token, whose tier is always
+`readonly`; there is no special case for engines. The check runs once the request
+is authenticated and before any JSON-RPC body or `Mcp-Session-Id` is read, so an
+unauthenticated request still gets `401`, a tierless request gets `403` even when
+it also lacks a session id, and the kill switches, the `Origin` check and the
+protocol-version check still answer first where they apply. The refusal is
+audited as `mcp.session.reject` with `reason=tier_required` and counted on
+`yuzu_mcp_admission_refused_total{reason="tier_required"}`. The `403` body has no
+`permission` field and carries a remediation hint: a human operator must mint an
+API token with `mcp_tier` `readonly`, `operator` or `supervised` (the lowest tier
+that covers the tools needed) and an `expires_at` at most 90 days out (unix
+seconds), via Settings > API Tokens or `POST /api/v1/tokens`, then configure the
+client to send only `Authorization: Bearer <token>`, with no session cookie. The
+`403` and the counter are never limited; the audit row is rate-limited per
+principal (see the note on audit rows in
+[Troubleshooting](#-32003-permission-denied-rbac)). There is no flag that turns this check off. The
+per-tool tier-less guards listed under [Available Tools](#available-tools) remain
+as defence in depth; a tier-less caller no longer reaches them.
 
 | Tier | Read | Tag Write/Delete | Execute Instructions | Policy/Security/Group Write | Delete (any) |
 |---|---|---|---|---|---|
@@ -438,6 +463,13 @@ MCP tokens use the same `yuzu_` prefix as standard API tokens. They are
 authenticated the same way -- via `Authorization: Bearer <token>` or
 `X-Yuzu-Token: <token>` headers.
 
+The `curl -b cookies.txt` calls in this section and in Quick Start are cookie-session
+calls to the REST token routes, which is correct for them. The calls you then make to
+`/mcp/v1/` must carry **only** the token header and no session cookie: `/mcp/v1/`
+refuses a credential with no MCP tier, and the server resolves a live cookie before a
+Bearer token, so a request carrying both is classed as the cookie and refused with
+`403` / `-32003`.
+
 ### Listing and revoking tokens
 
 Use the standard token management endpoints:
@@ -458,6 +490,15 @@ The MCP server exposes the tools below (`tools/list` is the authoritative
 catalogue). Each tool maps to a specific RBAC
 securable type and operation. The tier check and RBAC check both must pass
 for the tool to execute.
+
+Several rows below describe a per-tool guard that denies a caller with an empty
+`mcp_tier` outright, and some say the same gap remains open for other tools. Since
+#4309 that gap is closed at admission for every tool: `/mcp/v1/` refuses any
+credential with no tier before a tool is reached (see
+[Authorization Tiers](#authorization-tiers)). The per-tool guards stay as defence
+in depth, and where a row below mentions a cookie session, a plain API token or an
+engine token reaching a tool with an empty tier, read it as a state the
+admission check now prevents.
 
 > **Tool annotations (2g PR 2).** Every tool now advertises the four standard
 > MCP annotation hints — `readOnlyHint`, `destructiveHint`, `idempotentHint`,
@@ -611,11 +652,11 @@ for the tool to execute.
 | 104 | `get_guardian_device_guards` (#4037) | Per-device all-guards view: every Guard's state for ONE device, unscoped to any one Baseline (contrast with `device-compliance`, which is scoped to one named Baseline). Mirrors the new `GET /api/v1/guaranteed-state/agents/{agent_id}/rules` exactly, same `guardian_device_all_guards` builder. Per-device scoped (management-group aware) via the same `scoped_perm_fn` gate `device-compliance` and the per-agent status routes already use — a correctly-scoped service-scoped token IS admitted for its own device (`ServiceScopeClass::confined`). Audited `guardian.device.view`, `audit_persisted:false` posture. | `GuaranteedState:Read` |
 | 105 | `issue_code_signing_cert` (gap-matrix #10) | Issue a code-signing-only leaf from the internal CA via CSR custody — the operator holds the private key and submits `csr_pem`/`label`/`validity_days`?; the server signs and returns only `{certificate_pem, chain_pem, serial_hex, not_after, purpose:"code-signing"}`. Usage is hard-pinned to `codeSigning` only (never `clientAuth`/`serverAuth`), and the subject CN is the validated `label` — never an agent-style URI SAN — so this can never collide with the #1118 agent-identity gate. The CSR's subject key must meet a strength floor (RSA 2048-16384 or EC P-256/P-384/P-521; Ed25519/Ed448 rejected — `openssl cms -sign` cannot use them). Audited `ca.cert.issued` (`target_type=CodeSigningCertificate`) — same audit family `revoke_certificate` (above) uses for the matching `ca.cert.revoked` event, both deriving `target_type` from the same shared helper so the pair is never mis-audited relative to each other. Mirrors `POST /api/v1/ca/issue-code-signing`. Destructive-in-effect (mints trust material) — like every other `Security:Write` MCP tool, supervised-tier + approval-gated. Fails closed on an audit-persist failure: the certificate is withheld from the response (never returned in an unaudited 200/success) even though it is already durably recorded in `ca_store` and discoverable via `list_issued_certs`. `validity_days`, when present, must be a JSON integer from 1 to 730 (`-32602` otherwise, and nothing is issued: `4294967297` used to wrap to a 1-day certificate, and a string, float or `null` silently took the 365-day default); omit it for the default. Unlike the REST twin, an explicit `null` is rejected, not read as omitted. | `Security:Write` |
 | 106 | `get_execution_children` (#2146 A2-R1) | List an execution's child executions (spawned reruns, workflow-step fan-out, or other lineage). **Confined:** gated by `require_fleet_read`; an invisible or nonexistent parent `execution_id` returns the same not-found error, and - per #3789 - a visible parent does NOT by itself disclose a child dispatched by, or targeting, someone else: each child independently passes the same visible-agent-or-owner test the parent did (one batched per-child status lookup, never N+1, ADR-0017 INV-10). Mirrors `GET /api/v1/executions/{id}/children` and the legacy `GET /api/executions/{id}/children` - all three call the same `execution_child_row_json` shared builder (`docs/api-twin-recipe.md` Rule 1). Audited on every successful call as `mcp.get_execution_children`/`success` (`target_type=mcp_tool`, `target_id=get_execution_children`, `detail=<parent execution_id>`) - unlike the legacy route's/REST v1 twin's own audited-denial-only posture, closing a prior Gate 2 finding; a confined denial is still audited as `execution.read` (detail `"MCP children query: not found or outside caller's fleet-read scope"`, no correlation id) only under an engaged scope. The underlying query is hard-capped at 100 rows (governance Gate 8 re-review fix, #2146 A2-R1; no caller-visible limit/cursor), with the cap now pushed down TOGETHER WITH the caller's own visibility scope, before `LIMIT` - a confined caller's cap applies to their own visible children, not the fleet-wide raw row set, so an invisible sibling can no longer displace a visible child out of the capped window; `result_truncated_by_cap:true` in the result means that scoped row set exceeded the cap. | `Execution:Read` |
-| 107 | `create_guardian_rule` (#2146 Batch B1) | Create a new Guaranteed State rule (Guard) from a YAML/JSON spec. Mirrors `POST /api/v1/guaranteed-state/rules` exactly, same store write and validation. Fleet-wide rule catalogue (no single owning device/service); a service-scoped API token is refused outright. Audited `guaranteed_state.rule.create`. REST's twin applies an MFA step-up check; the MCP surface applies none for a cookie-session caller (architecture-wide gap, not specific to this tool - tracked in #4309). `version` is a JSON integer from 1 to 2147483647 (default 1; the declared `inputSchema` carries `maximum: 2147483647`); anything else, including `4294967296` and an unsigned value above the signed 64-bit range, is `-32602` (the update path bumps the stored version by one, so an unbounded caller value would overflow it). A `enabled` that is not a JSON boolean is `-32602` (it used to be a bare HTTP 500). | `GuaranteedState:Write` |
+| 107 | `create_guardian_rule` (#2146 Batch B1) | Create a new Guaranteed State rule (Guard) from a YAML/JSON spec. Mirrors `POST /api/v1/guaranteed-state/rules` exactly, same store write and validation. Fleet-wide rule catalogue (no single owning device/service); a service-scoped API token is refused outright. Audited `guaranteed_state.rule.create`. REST's twin applies an MFA step-up check; the MCP surface applies none (its callers hold a tiered bearer token, not a browser session, since `/mcp/v1/` refuses a tierless credential at admission, #4309). `version` is a JSON integer from 1 to 2147483647 (default 1; the declared `inputSchema` carries `maximum: 2147483647`); anything else, including `4294967296` and an unsigned value above the signed 64-bit range, is `-32602` (the update path bumps the stored version by one, so an unbounded caller value would overflow it). A `enabled` that is not a JSON boolean is `-32602` (it used to be a bare HTTP 500). | `GuaranteedState:Write` |
 | 108 | `get_guardian_rule` (#2146 Batch B1) | Get one rule's full body (`yaml_source`/`spec_json`) plus metadata by `rule_id`. Mirrors `GET /api/v1/guaranteed-state/rules/{id}` exactly. Unknown `rule_id` errors (`kInvalidParams`, "rule not found"). | `GuaranteedState:Read` |
-| 109 | `update_guardian_rule` (#2146 Batch B1) | Update an existing rule; the server bumps `version` on every successful update (not caller-supplied, though there is no optimistic-concurrency check against concurrent writers today — tracked in #4303). Mirrors `PUT /api/v1/guaranteed-state/rules/{id}` exactly. Also re-triggers the heartbeat reconcile path for any agent whose applied generation trails, beyond just the version counter - NOT idempotent (a blind retry can fan out a second reconcile cycle). No MCP-side step-up check for a cookie-session caller, unlike its REST twin (tracked in #4309). A `enabled` that is not a JSON boolean is `-32602` (it used to be a bare HTTP 500). | `GuaranteedState:Write` |
-| 110 | `delete_guardian_rule` (#2146 Batch B1) | Delete a rule from the catalogue. Does NOT automatically push an unarm to agents already enforcing it — already-armed agents keep enforcing the deleted rule until the next push cycle (tracked in #4304). Mirrors `DELETE /api/v1/guaranteed-state/rules/{id}` exactly. This tool is approval-gated at the supervised MCP tier. **An MCP-tier-less caller (empty `mcp_tier` - a cookie session, a plain non-MCP-tiered API token, or an engine token) is DENIED outright** rather than falling through to RBAC-only enforcement, closing the #4309 gap for this tool specifically (#2146 Batch B1, follow-up review round). The architecture-wide gap remains open for `create_guardian_rule`/`update_guardian_rule`/`push_guardian_rules` above (not approval-gated at any tier, so there is no approval to bypass on those three) and every other approval-gated MCP tool not yet migrated. | `GuaranteedState:Delete` |
-| 111 | `push_guardian_rules` (#2146 Batch B1) | Push the current rule set to a scope of agents (optionally `full_sync`, default `false`; a `full_sync=false` push merges into the agent's rule set and does not retry a still-unresolved rule it omits; only a full push or a push naming the rule does). Genuinely non-idempotent — two identical calls each re-dispatch. Uses a scope-string push mechanism (`GuardianPushFn`), not the shared `command_dispatch_fn`/`check_targeting_shape` chokepoint. Mirrors `POST /api/v1/guaranteed-state/push` exactly, same gate. No MCP-side step-up check for a cookie-session caller, unlike its REST twin (tracked in #4309). A `full_sync` that is not a JSON boolean is `-32602` (it used to be a bare HTTP 500). A store read the push depends on that cannot be answered (policy generation, rules, Baseline deployed set, tag or custom-property store, or a `group:` scope's membership) sends nothing and returns a JSON-RPC internal error with a retry hint, audited `denied` with detail `store degraded`. The error message reads `guaranteed-state store degraded: a store the push depends on is degraded (guaranteed-state, Baseline, tag, custom-property or management-group)`. | `GuaranteedState:Push` |
+| 109 | `update_guardian_rule` (#2146 Batch B1) | Update an existing rule; the server bumps `version` on every successful update (not caller-supplied, though there is no optimistic-concurrency check against concurrent writers today — tracked in #4303). Mirrors `PUT /api/v1/guaranteed-state/rules/{id}` exactly. Also re-triggers the heartbeat reconcile path for any agent whose applied generation trails, beyond just the version counter - NOT idempotent (a blind retry can fan out a second reconcile cycle). No MCP-side step-up check, unlike its REST twin (its callers hold a tiered bearer token, not a browser session; #4309). A `enabled` that is not a JSON boolean is `-32602` (it used to be a bare HTTP 500). | `GuaranteedState:Write` |
+| 110 | `delete_guardian_rule` (#2146 Batch B1) | Delete a rule from the catalogue. Does NOT automatically push an unarm to agents already enforcing it — already-armed agents keep enforcing the deleted rule until the next push cycle (tracked in #4304). Mirrors `DELETE /api/v1/guaranteed-state/rules/{id}` exactly. This tool is approval-gated at the supervised MCP tier. **An MCP-tier-less caller (empty `mcp_tier` - a cookie session, a plain non-MCP-tiered API token, or an engine token) is DENIED outright** rather than falling through to RBAC-only enforcement (#2146 Batch B1, follow-up review round). This is now defence in depth: `/mcp/v1/` refuses an empty-tier credential at admission for every tool, including `create_guardian_rule`/`update_guardian_rule`/`push_guardian_rules` above and every other approval-gated MCP tool (#4309). | `GuaranteedState:Delete` |
+| 111 | `push_guardian_rules` (#2146 Batch B1) | Push the current rule set to a scope of agents (optionally `full_sync`, default `false`; a `full_sync=false` push merges into the agent's rule set and does not retry a still-unresolved rule it omits; only a full push or a push naming the rule does). Genuinely non-idempotent — two identical calls each re-dispatch. Uses a scope-string push mechanism (`GuardianPushFn`), not the shared `command_dispatch_fn`/`check_targeting_shape` chokepoint. Mirrors `POST /api/v1/guaranteed-state/push` exactly, same gate. No MCP-side step-up check, unlike its REST twin (its callers hold a tiered bearer token, not a browser session; #4309). A `full_sync` that is not a JSON boolean is `-32602` (it used to be a bare HTTP 500). A store read the push depends on that cannot be answered (policy generation, rules, Baseline deployed set, tag or custom-property store, or a `group:` scope's membership) sends nothing and returns a JSON-RPC internal error with a retry hint, audited `denied` with detail `store degraded`. The error message reads `guaranteed-state store degraded: a store the push depends on is degraded (guaranteed-state, Baseline, tag, custom-property or management-group)`. | `GuaranteedState:Push` |
 | 112 | `get_guardian_agent_status` (#2146 Batch B1) | Per-agent Guaranteed State status: `total_rules` (rules with ANY census entry for this agent, intersected against the live rule catalogue — never the fleet catalogue size), `errored_rules` (real); `compliant_rules`/`drifted_rules` stay 0 until full status ingest lands. Mirrors `GET /api/v1/guaranteed-state/status/{agent_id}` exactly, same `guardian_agent_status_rollup` builder, same `scoped_perm_fn` confinement. An agent_id with no census rows returns a legitimate all-zero rollup, not an error — indistinguishable from a genuinely compliant agent at this level of detail. | `GuaranteedState:Read` |
 | 113 | `get_guardian_device_compliance` (#2146 Batch B1) | Is this device compliant with ONE named Baseline — requires both `baseline` and `agent_id`. Mirrors `GET /api/v1/guaranteed-state/device-compliance` exactly, same `guardian_device_compliance_rollup` builder (all four underlying reads complete before the access audit fires, so a degrade can never surface after an audited "success"), same `scoped_perm_fn` confinement. `assessable:false` when the response carries no compliance signal to act on (draft Baseline, or no applicable Guard reported for this device) — a consumer must not compute a compliance percentage when `assessable` is false. | `GuaranteedState:Read` |
 | 114 | `list_result_sets` (#2146 Batch B2) | List the caller's own result sets (scope-walking artifacts, `docs/scope-walking-design.md`). Owner-scoped: only sets owned by the calling principal are returned; a service-scoped API token is denied outright at the generic C8 gate (`ServiceScopeClass::denied` — owner-scoping by `session->username` is not a service-scope confinement mechanism). No RBAC gate in the handler (matches the REST twin's owner-scoped-only posture) — the registered `Infrastructure:Read` pair drives MCP tier classification only. Mirrors `GET /api/v1/result-sets`; both call the shared `result_set_json()` builder (`result_set_model.hpp`). | `Infrastructure:Read` |
@@ -643,10 +684,10 @@ for the tool to execute.
 | 136 | `list_management_group_roles` (#2146 Batch B4) | List a management group's role-assignment grants (who holds ITServiceOwner/Operator/Viewer on this group) - authorization topology, not group metadata. Mirrors `GET /api/v1/management-groups/{id}/roles` exactly: `ManagementGroup:Read` is a LEADING gate (the caller must be allowed to see the group at all), then EITHER the fleet-wide `UserManagement:Read` permission OR the caller holding ITServiceOwner on THIS group - the ITServiceOwner fallback is skipped for a service-scoped MCP token, matching REST. | `ManagementGroup:Read` |
 | 137 | `assign_management_group_role` (#2146 Batch B4) | Delegate a group-scoped role (ITServiceOwner-of-this-group can only delegate Operator or Viewer, never ITServiceOwner itself or any fleet-wide/admin role) to a user/group/engine principal on this group. Mirrors `POST /api/v1/management-groups/{id}/roles`. Gate is compound, mirrored exactly: the fleet-wide `ManagementGroup:Write` permission OR the caller already holding ITServiceOwner on THIS group (skipped for a service-scoped MCP token). `role_name` is restricted to `"Operator"`/`"Viewer"` only. Idempotent (assigning a grant that already exists is a no-op). Approval-gated (supervised MCP tier maker-checker). Additive: extends the grant set, overwrites nothing. | `ManagementGroup:Write` |
 | 138 | `list_api_tokens` (#2146 Batch B4) | List the calling principal's OWN API tokens (raw secrets never returned). Unconditionally self-scoped - there is no admin/all-owners view on this route, on either REST or MCP. Mirrors `GET /api/v1/tokens`. | `ApiToken:Read` |
-| 139 | `create_api_token` (#2146 Batch B4) | Mint a new API token for the calling principal - always self-issued, like its REST twin (no operator-mints-for-another-user path). An `mcp_tier` or `scope_service` token MUST carry `expires_at` (90-day cap for an `mcp_tier` token). A `scope_service` token additionally requires the caller to hold ITServiceOwner on the `Service: <scope_service>` management group (or fleet-wide `ManagementGroup:Write`) - the same multi-store check REST runs; RBAC must be enabled for a `scope_service` token at all. The raw token is returned exactly once. Mirrors `POST /api/v1/tokens`. **Approval-gated at the supervised MCP tier. A caller with an empty `mcp_tier` - a cookie session, a plain non-MCP-tiered API token, or an engine token, not exclusively an interactive session - is DENIED outright (`PermissionDenied`, "requires an MCP-tier bearer token") rather than falling through to RBAC-only enforcement, closing the #4309 interactive-session gap for this tool specifically. The architecture-wide gap remains open for every other approval-gated MCP tool (e.g. `execute_instruction`/`quarantine_device`/`revoke_certificate`) and for the four `ManagementGroup:Write` mutations in this same batch, none of which carry this guard.** Additive: mints a new credential, not idempotent. `expires_at`, when present, must be `0` (never expires, where the tier allows it) or a future unix epoch; a negative or past value is `-32602` and mints nothing (it used to mint a token that never expires). | `ApiToken:Write` |
-| 140 | `revoke_api_token` (#2146 Batch B4) | Revoke one of the calling principal's OWN API tokens by `token_id` (or, for an elevated/admin session, any token - same JIT-elevation allowance as `DELETE /api/v1/tokens/{id}`). A not-owned `token_id` and a nonexistent one are indistinguishable (both report "token not found") - not an enumeration oracle. Mirrors `DELETE /api/v1/tokens/{id}`. **Approval-gated at the supervised MCP tier. Same interactive-session denial as `create_api_token` above - closed for this tool specifically (#4309).** Destructive, idempotent per the store's own already-revoked handling. | `ApiToken:Delete` |
+| 139 | `create_api_token` (#2146 Batch B4) | Mint a new API token for the calling principal - always self-issued, like its REST twin (no operator-mints-for-another-user path). An `mcp_tier` or `scope_service` token MUST carry `expires_at` (90-day cap for an `mcp_tier` token). A `scope_service` token additionally requires the caller to hold ITServiceOwner on the `Service: <scope_service>` management group (or fleet-wide `ManagementGroup:Write`) - the same multi-store check REST runs; RBAC must be enabled for a `scope_service` token at all. The raw token is returned exactly once. Mirrors `POST /api/v1/tokens`. **Approval-gated at the supervised MCP tier. A caller with an empty `mcp_tier` - a cookie session, a plain non-MCP-tiered API token, or an engine token, not exclusively an interactive session - is DENIED outright (`PermissionDenied`, "requires an MCP-tier bearer token") rather than falling through to RBAC-only enforcement. This per-tool guard is now defence in depth: `/mcp/v1/` refuses an empty-tier credential at admission for every tool, including every other approval-gated MCP tool (e.g. `execute_instruction`/`quarantine_device`/`revoke_certificate`) and the four `ManagementGroup:Write` mutations in this same batch, none of which carry the per-tool guard (#4309).** Additive: mints a new credential, not idempotent. `expires_at`, when present, must be `0` (never expires, where the tier allows it) or a future unix epoch; a negative or past value is `-32602` and mints nothing (it used to mint a token that never expires). | `ApiToken:Write` |
+| 140 | `revoke_api_token` (#2146 Batch B4) | Revoke one of the calling principal's OWN API tokens by `token_id` (or, for an elevated/admin session, any token - same JIT-elevation allowance as `DELETE /api/v1/tokens/{id}`). A not-owned `token_id` and a nonexistent one are indistinguishable (both report "token not found") - not an enumeration oracle. Mirrors `DELETE /api/v1/tokens/{id}`. **Approval-gated at the supervised MCP tier. Same empty-tier denial as `create_api_token` above, now also refused at admission (#4309).** Destructive, idempotent per the store's own already-revoked handling. | `ApiToken:Delete` |
 | 141 | `check_permission` (#2146 Batch B4) | Check whether the calling principal holds a specific RBAC permission (`securable_type` + `operation`) - a self-check, not a lookup of another principal's grants. Deliberately open to any authenticated caller (no RBAC gate on the check itself, matching `POST /api/v1/rbac/check` exactly); the answer can legitimately be `false`. If RBAC is not enabled or the store is unavailable, mirrors the store's own fail-open/legacy posture rather than erroring. Mirrors `POST /api/v1/rbac/check`. | none (open to any authenticated caller) |
-| 142 | `unlock_account` (#2146 Batch B4) | Clear a local account's failed-login lockout counter (SOC 2 CC6.3 operability path - the lockout also auto-expires on its own). Self-target is permitted. Requires the Postgres auth store (AuthDB) - answers "lockout subsystem unavailable" if not wired, same as REST. Mirrors `POST /api/v1/users/{username}/unlock`. **Approval-gated at the supervised MCP tier. Same interactive-session denial as `create_api_token` above - closed for this tool specifically (#4309).** Destructive: overwrites the account's existing lockout/failed-login state. | `UserManagement:Write` |
+| 142 | `unlock_account` (#2146 Batch B4) | Clear a local account's failed-login lockout counter (SOC 2 CC6.3 operability path - the lockout also auto-expires on its own). Self-target is permitted. Requires the Postgres auth store (AuthDB) - answers "lockout subsystem unavailable" if not wired, same as REST. Mirrors `POST /api/v1/users/{username}/unlock`. **Approval-gated at the supervised MCP tier. Same empty-tier denial as `create_api_token` above, now also refused at admission (#4309).** Destructive: overwrites the account's existing lockout/failed-login state. | `UserManagement:Write` |
 | 143 | `list_offload_targets` (#2146 Batch B5) | List configured response-offload targets (event-forwarding webhooks that mirror fleet events out to an external system). Mirrors `GET /api/v1/offload-targets`. Never returns credential material - only `has_credential` (bool). | `Infrastructure:Read` |
 | 144 | `create_offload_target` (#2146 Batch B5) | Register a new offload target: fleet events matching `event_types` are POSTed to `url` (optionally batched, optionally authenticated). Mirrors `POST /api/v1/offload-targets`. `auth_credential` is envelope-encrypted at rest (ADR-0010) and never echoed back by any tool - only `has_credential` is ever readable afterward. `url` must be `http://`/`https://` without embedded `user:password@` (and no field may contain control characters; both are refused as invalid params) but is NOT restricted to external hosts - a caller with `Infrastructure:Write` can point deliveries at any reachable address, including the server's own loopback/internal network (no SSRF guard on this field today, same posture as REST's twin). Additive (mints a new target) but a duplicate `name` is rejected. `batch_size` is a JSON integer from 1 to 10000 (the declared schema range, now enforced); `0`, a negative, `10001` or anything larger, including `4294967296` and `18446744073709551615`, is `-32602` (a saturated huge value would have let the buffer grow without bound before its first flush). The `offload_target.create` audit row records `name=<n> url=<scheme>://<host> url_fp=<12 hex>`, the same as the REST route (the URL is a bearer secret, so its path and query are never recorded). A `result=attempted` row is written first; if it cannot be stored the call fails with a retryable internal error and nothing is created. The caller-supplied `name` is neutralised (`audit_token`, CWE-117) wherever it is written to an audit row, as on the REST twin. A refused `batch_size` leaves a `result=denied` row, as on REST (see `offload_target.create` in the audit log reference). | `Infrastructure:Write` |
 | 145 | `get_offload_target` (#2146 Batch B5) | Get one offload target's config (no credential material - only `has_credential`). Mirrors `GET /api/v1/offload-targets/{id}`. | `Infrastructure:Read` |
@@ -704,7 +745,7 @@ for the tool to execute.
 | 197 | `set_crypto_dashboard_layout` | **Replace your own** `/crypto` dashboard layout with `widgets` (array of catalogue ids, display order; at most 64, no repeats; an empty list is a valid, empty dashboard). Adding or removing a widget is a full replace with the new list. Optional `expected_version` (integer, `0` or more): the save is refused unless the stored version is still that value (`0` = only if nothing is saved) with a non-retryable `kInvalidParams` (-32602) whose remediation names the stored version: read the layout again, then save. Omit it only for a first save: without it the save succeeds only when nothing is stored, and over a stored layout it is the same non-retryable conflict naming the stored version. Ids another server version stored are kept after yours. Mirrors REST `PUT /api/v1/crypto/dashboard/layout`. **Strict input:** a missing `widgets`, a non-array, a non-string id, an id outside the catalogue (`widgets[i] is not a catalogue widget id`), a repeat, more than 64 ids, a bad `expected_version` or any other argument is refused with `kInvalidParams`. **Audit:** no audit row, no mutation: `crypto.dashboard.layout.update` `attempted` is written first (if it cannot persist the layout is not changed and the call returns `kInternalError`), then `success` (with the new `version`) or `failure` (detail `widgets=<n>` and the outcome), plus `mcp.set_crypto_dashboard_layout`; `audit_persisted: false` when the outcome row is lost. A degraded store is a retryable `kInternalError`; a save whose commit outcome is unknown (the connection dropped after it was sent) is a retryable `kInternalError` that says `save outcome unknown — reload to check`. Annotated **destructive** (`destructiveHint: true`, idempotent): it overwrites your previous layout; no data, no permission and no other operator is touched. Blocked in `--mcp-read-only` mode and below the `supervised` tier (`Infrastructure:Write`). | `Infrastructure:Write` (tier class; no RBAC securable) |
 | 198 | `get_crypto_ca_stats` | Counts of **certificates issued by Yuzu's own internal CA** (the agent, server, gateway, HTTPS and code-signing certificates Yuzu minted; never the fleet's certificates), each against `as_of`, the database clock at read time (epoch seconds and `as_of_iso`). Facts only; the only built-in checks are the ADR-0070 D13 named windows, each with its criterion: `active` (status active, issued on or before `as_of`, `not_after` on or after it); `expiring_within_days` 3, 7, 14, 21, 30 and 60 and `expired_within_days` 7, 30, 60 and 90, status active only (valid through `notAfter`, inclusive; a revoked certificate counts only in the revoked windows); `revoked_within_days` 7, 30, 60 and 90, three entries per window by recorded reason (`superseded`, `unpublished`, `other`), never summed; `issued_within_days` (7, excluding `unpublished`); and `weeks`: issued and revoked (three buckets) per ISO week for the last 52 weeks, oldest first, zero-filled, the week containing `as_of` flagged `partial`. Every count object carries `rule_id`, `criterion`, `rule_set_version`, `as_of` and `count`, plus `threshold` (the window in days), `week` or `bucket` where it applies; `scope_note` and `window_edge_note` state the scope and the clock caveat. Every call reads at request time, never cached (bounded by the `/crypto` read admission limit). Nothing is stored or graded: recompute any count from `list_issued_certs` with the same `kind`/`days`/`week`/`bucket` and `as_of` (needs `Security:Read`). Takes no arguments. Mirrors REST `GET /api/v1/crypto/ca/stats`. Read-only, idempotent. **Access:** `Inventory:Read`; a caller whose view is confined is refused `kPermissionDenied` (-32003) with no permission named, never given a narrowed count (ADR-0070 R2). A degraded CA store (`Yuzu CA read degraded`) or `/crypto` read capacity in use is a retryable `kInternalError`, **never** zeros. **Audit:** `crypto.ca.stats.view` (detail `ws=<window set> as_of=<epoch>`; a degraded read writes a `failure` row, a confined refusal a `denied` row; set-and-proceed, `audit_persisted: false` when lost) and `mcp.get_crypto_ca_stats`. | `Inventory:Read` |
 | 199 | `get_runtime_config` | The server's runtime configuration, as `GET /api/v1/config`: the effective values (`heartbeat_timeout`, `response_retention_days`, `audit_retention_days`, `guardian_event_retention_days`, `auto_approve_enabled`, `log_level`), the stored overrides (a secret key reports `is_set`, never its value), `allowed_keys`, and `read_only_keys` (allowed keys with their own writer). **Scoped to the caller:** the override of every key the caller could not write with `set_runtime_config` (the administrator-only and `oidc_*` keys, for an MCP-tier token) is withheld, as is the effective `audit_retention_days`, and `withheld_keys` lists them, so a missing key means "not shown to you". The values are what is stored: the three retention values, `audit_retention_days` included, are not the enforced windows (those come from the command-line flags). A store that cannot be read is an error, never an empty list. Platform configuration, not agent-scoped data: a service-scoped token is refused. Read-only. See [`GET /api/v1/config`](rest-api.md#get-apiv1config). | `Infrastructure:Read` |
-| 200 | `set_runtime_config` | Set one runtime configuration override (`key` 1 to 64 characters from `a-z` and `_`, `value` a string of at most 256 bytes), as `PUT /api/v1/config/{param}`. The readonly and operator tiers cannot call it. A supervised-tier token reaches only `heartbeat_timeout` (30 to 86400 seconds), `response_retention_days`, `guardian_event_retention_days`, `auto_approve_enabled` and `log_level`; `plugin_signing_required`, `audit_retention_days`, the `dex_*` alert keys and the `oidc_*` keys need an administrator account, so an MCP-tier token gets a permission error (audited as `config.update` / `denied`) while an untiered administrator token is admitted as on REST, and `dex_score_policy` has its own route (invalid params). Audited before the change (`config.update` / `attempted`); if that row cannot be saved, nothing changes. Not approval-gated. Destructive (overwrites), idempotent. `applied: true` means accepted and stored, not in use: `effect` says `immediate` (`heartbeat_timeout`, `log_level`), `deferred` (the `dex_*` keys wait for the next DEX Alerts save or a restart; `oidc_admin_group` and `oidc_redirect_uri` wait for a restart) or `stored_only` (nothing consumes it: the retention values, which are not enforced even after a restart (#483), `auto_approve_enabled`, `plugin_signing_required`, which records intent and hardens nothing, and the other `oidc_*` keys). Extra arguments are refused; a value longer than 256 bytes goes through the REST route. Returns `{key, value, applied, effect}` (plus `audit_persisted: false` when only the outcome audit row was lost); a secret key's value is never returned. See [`PUT /api/v1/config/{param}`](rest-api.md#put-apiv1configparam). | `Infrastructure:Write` |
+| 200 | `set_runtime_config` | Set one runtime configuration override (`key` 1 to 64 characters from `a-z` and `_`, `value` a string of at most 256 bytes), as `PUT /api/v1/config/{param}`. The readonly and operator tiers cannot call it. A supervised-tier token reaches only `heartbeat_timeout` (30 to 86400 seconds), `response_retention_days`, `guardian_event_retention_days`, `auto_approve_enabled` and `log_level`; `plugin_signing_required`, `audit_retention_days`, the `dex_*` alert keys and the `oidc_*` keys need an administrator account, so an MCP-tier token gets a permission error (audited as `config.update` / `denied`). A token must carry an MCP tier to reach `/mcp/v1/` at all (#4309), and an administrator token with a tier still cannot reach the administrator-only keys, so those are changed over REST or the Settings pages. `dex_score_policy` has its own route (invalid params). Audited before the change (`config.update` / `attempted`); if that row cannot be saved, nothing changes. Not approval-gated. Destructive (overwrites), idempotent. `applied: true` means accepted and stored, not in use: `effect` says `immediate` (`heartbeat_timeout`, `log_level`), `deferred` (the `dex_*` keys wait for the next DEX Alerts save or a restart; `oidc_admin_group` and `oidc_redirect_uri` wait for a restart) or `stored_only` (nothing consumes it: the retention values, which are not enforced even after a restart (#483), `auto_approve_enabled`, `plugin_signing_required`, which records intent and hardens nothing, and the other `oidc_*` keys). Extra arguments are refused; a value longer than 256 bytes goes through the REST route. Returns `{key, value, applied, effect}` (plus `audit_persisted: false` when only the outcome audit row was lost); a secret key's value is never returned. See [`PUT /api/v1/config/{param}`](rest-api.md#put-apiv1configparam). | `Infrastructure:Write` |
 | 201 | `get_me` (#2146) | Describe the calling session: who you are, how you authenticated and which roles are assigned to you. Takes no arguments. Read-only, idempotent. Mirrors `GET /api/v1/me` and returns the same keys; the key table is in [rest-api.md](rest-api.md#get-apiv1me). Use it to learn your own identity; use `check_permission` to ask whether you may do a specific thing. `rbac_roles` lists DIRECT role assignments only (group grants are not listed) and is not access-review evidence, which the access-review export (`AccessReview:Read`) provides. `role` and `effective_role` are the legacy session view, not a summary of authority; with RBAC on, authority is decided per permission. For an MCP token `can_access_settings` is always `false` and `effective_role` equals `role`. `rbac_enabled` is the server's cached view of the switch and can lag. If the role-store read fails the call still succeeds with `rbac_roles_resolved: false` and no role keys: treat an absent list as unknown. **Service-scoped tokens are refused**; read `GET /api/v1/me` over REST instead, which lets such a token describe itself. Audited as `mcp.get_me` (set-and-proceed, `audit_persisted: false`). During a rolling upgrade an older replica has no `get_me` and answers unknown-tool. | `Infrastructure:Read` (MCP tier gate only; no RBAC check) |
 
 > The `list_echo_*` tools and `create_result_set_from_echo_query` were named `list_tar_*` and `create_result_set_from_tar_query` before 2026-10. There is no alias for the old names; see the Echo section of [Upgrading](upgrading.md).
@@ -844,8 +885,9 @@ for the tool to execute.
 > durable Administrator is still denied (`administrator role required`).
 > **All three tools additionally deny an empty-`mcp_tier` caller outright**
 > (`PermissionDenied`, "requires an MCP-tier bearer token") — unlike
-> `assign_engine_role`/`unassign_engine_role`, which still carry this gap —
-> because `tier_allows("")`/`requires_approval("")` both no-op on an empty
+> `assign_engine_role`/`unassign_engine_role`, which have no per-tool guard
+> and rely on the admission check alone (`/mcp/v1/` refuses an empty tier for
+> every tool, #4309) — because `tier_allows("")`/`requires_approval("")` both no-op on an empty
 > tier, and all three tools mint/revoke/gate standing human Administrator
 > authority, a more sensitive operation than most of the tools already
 > carrying this guard (#4309).
@@ -1351,9 +1393,8 @@ HTTP `404`.
 to a different principal, or was created by a different credential class of the
 same principal (authentication source, principal kind, MCP tier or service scope
 differs; all collapse to the same response — no cross-principal oracle). A
-client that sends both a session cookie and a Bearer token changes class when
-the cookie expires. Sessions are in-memory, so a **server restart** also drops
-them. A class mismatch is visible in the audit log (filter
+token whose MCP tier differs from the one that created the session is the usual
+case. Sessions are in-memory, so a **server restart** also drops them. A class mismatch is visible in the audit log (filter
 `mcp.session.reject` for `reason=credential_mismatch`) and, on a `GET` attach
 or resume only, also on the counter
 `yuzu_mcp_stream_rejects_total{reason="credential_mismatch"}`; a `POST` or
@@ -1419,7 +1460,7 @@ never evicted to make room.
 
 The per-principal cap (fixed at 8; there is no flag for it) counts sessions per
 principal, not per credential class. A client that switches class (for example
-from a cookie to a token, or to a token with a different tier) strands its
+from one token to a token with a different tier) strands its
 old-class sessions: they stay counted until the 30-minute idle TTL passes (a
 stranded session that still has an attached stream is kept alive by the stream's
 per-tick liveness check, which slides the TTL, until that stream disconnects),
@@ -1679,7 +1720,38 @@ token returns `-32003` / HTTP `403`, audited as `mcp.session.reject` with
 body carries no `permission` field, because no permission grant would admit the
 caller. **Fix**: use a token without `scope_service` for the stream channel.
 
-The last two of those are deliberately indistinguishable from a replay in this
+A fourth cause is also not a tool call: any `/mcp/v1/` request (`GET`, `POST` or
+`DELETE`) made with a credential that carries no MCP tier, such as a browser
+session cookie or an API token minted without `mcp_tier`, returns `-32003` /
+HTTP `403` with the message `/mcp/v1/ requires an MCP-tier bearer token`, an
+`id` of `null`, and no `permission` field. It is audited as `mcp.session.reject`
+with `reason=tier_required` and counted on
+`yuzu_mcp_admission_refused_total{reason="tier_required"}`. **Fix**: mint an API
+token with `mcp_tier` `readonly`, `operator` or `supervised` (the lowest tier
+that covers the tools needed) and an `expires_at` at most 90 days out (unix
+seconds), via Settings > API Tokens or `POST /api/v1/tokens`, then configure the
+client to send only `Authorization: Bearer <token>`. Send no session cookie with
+it: the server resolves a live cookie first, so the request is classed as the
+cookie and refused even though it also carries a valid token. The `remediation`
+in the `403` body says the same: this credential has no MCP tier and retrying will
+not help, and a human operator must mint the token.
+
+Every refusal is answered and counted, but the audit row is budgeted per key
+`tier_required|<auth_source>|<principal>`: at most 10 rows per key per 10-second
+window (up to twice that across a window boundary), at most 64 distinct keys per
+window with the rest sharing one overflow bucket (also 10 rows per window). The
+first refusal of each tracked key (the first 64 `(source, principal)` keys in a
+window) writes its row, but further principals share the one overflow bucket, so a
+new principal's first refusal can be suppressed. One budget serves `GET`, `POST`
+and `DELETE`. Every refusal whose row is suppressed increments
+`yuzu_mcp_admission_audit_suppressed_total`; the aggregate warning with the
+suppressed count is logged when the NEXT refusal opens a new window, so a burst
+followed by silence is never logged (use that counter for it). Read the refused
+counter, not the row count, for how many requests were turned away.
+
+The last two ticket-recall causes (a ticket minted through a different Yuzu
+surface, or presented by a principal other than its submitter) are deliberately
+indistinguishable from a replay in this
 response: reporting either separately would turn the recall into a probe for
 which surface minted a ticket, or for whether a given ticket id exists and who
 owns it. Server-side they are distinguishable — the audit row records

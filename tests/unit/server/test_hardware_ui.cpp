@@ -663,3 +663,26 @@ TEST_CASE("hardware list fragment: degrade banners live inside #hw-results, once
         }
     }
 }
+
+TEST_CASE("software lens links into the Software host view", "[hardware][ui]") {
+    HwSyncAffordance sync;
+    const std::string id = "a b&c#1";
+    const std::string link = "href=\"/software#host=a%20b%26c%231\">Open in Software</a>";
+    const std::vector<SoftwareEntry> one{SoftwareEntry{}};
+    SECTION("populated") {
+        CHECK(render_hardware_software_lens(id, one, false, true, sync, 1700000000).find(link) !=
+              std::string::npos);
+    }
+    SECTION("offline, never synced") {
+        CHECK(render_hardware_software_lens(id, std::vector<SoftwareEntry>{}, false, false, sync, 0)
+                  .find(link) != std::string::npos);
+    }
+    SECTION("online, synced but empty") {
+        CHECK(render_hardware_software_lens(id, std::vector<SoftwareEntry>{}, false, true, sync, 0)
+                  .find(link) != std::string::npos);
+    }
+    SECTION("degraded read has no link") {
+        CHECK(render_hardware_software_lens(id, std::nullopt, false, true, sync, std::nullopt)
+                  .find("/software#host=") == std::string::npos);
+    }
+}

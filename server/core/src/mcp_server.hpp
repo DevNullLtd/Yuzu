@@ -200,6 +200,11 @@ public:
     /// (sorted) plus a count; all are logged individually.
     McpServer();
 
+    /// Resolves the request's session, or writes the refusal response and returns nullopt.
+    /// The PRODUCTION hook MUST be built with `mcp::make_admission_auth_fn`
+    /// (mcp_admission.hpp) so /mcp/v1/ refuses empty-tier credentials on every verb (#4309);
+    /// a harness that passes a bare resolver lacks that rule (McpTestServer deliberately does,
+    /// so the per-tool tier guards stay testable as defence in depth).
     using AuthFn =
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
     using PermFn =

@@ -13,6 +13,7 @@
 #include <cctype>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // The shared full-page shell /software is served from (guardian_page_ui.cpp, global scope).
@@ -235,17 +236,29 @@ TEST_CASE("software page: search box carries the CSP-safe htmx wiring", "[invent
         REQUIRE(h.substr(p, h.find('"', p + 12) - p).find('[') == std::string::npos);
 }
 
-TEST_CASE("software page: kind control, ecosystem and found-by chips", "[inventory][ui]") {
+TEST_CASE("software page: kind control and the ecosystem and found-by chips", "[inventory][ui]") {
     SoftwarePageFilters f;
     f.kind = "pkg";
     f.ecosystem = "brew";
     f.source = "pkg_inventory.packages";
     const std::string h = full(f, page());
     REQUIRE(has(h, "<button type=\"button\" class=\"inv-chip\" data-g=\"kind\" data-v=\"\""));
-    REQUIRE(has(h, "class=\"inv-chip\" data-g=\"kind\" data-v=\"pkg\" aria-pressed=\"true\" "
-                   "title=\"macOS pkgutil and Homebrew packages\""));
     REQUIRE(has(h, "data-g=\"kind\" data-v=\"\" aria-pressed=\"false\""));
-    REQUIRE(has(h, "title=\"OS packages (rpm, deb, apk, pacman)\""));
+    // One kind chip per kSoftwareKinds entry, in table order; the tooltip is the table's.
+    std::size_t kpos = 0;
+    for (const auto& k : software_catalog::kSoftwareKinds) {
+        const std::string pre = "data-g=\"kind\" data-v=\"" + std::string(k.value) +
+                                "\" aria-pressed=\"" + (k.value == "pkg" ? "true" : "false") +
+                                "\" title=\"" + std::string(k.tooltip) + "\"";
+        const auto p = h.find(pre);
+        REQUIRE(p != std::string::npos);
+        REQUIRE(p > kpos);
+        kpos = p;
+        // The visible label is the table's title, matched inside this chip's own button.
+        const auto end = h.find("</button>", p);
+        REQUIRE(end != std::string::npos);
+        REQUIRE(h.substr(p, end - p).ends_with(">" + std::string(k.title)));
+    }
     // One ecosystem chip per kEcosystemFamilies entry, in table order.
     std::size_t last = 0;
     for (const auto& e : software_catalog::kEcosystemFamilies) {
@@ -253,11 +266,82 @@ TEST_CASE("software page: kind control, ecosystem and found-by chips", "[invento
         REQUIRE(p != std::string::npos);
         REQUIRE(p > last);
         last = p;
+        // The family colour cue, hard-coded here rather than derived from the page's mapping.
+        const std::string cls = e.family == "windows" ? "win"
+                                : e.family == "macos" ? "mac"
+                                : e.family == "linux" ? "lin"
+                                                      : "oth";
+        const auto end = h.find("</button>", p);
+        REQUIRE(end != std::string::npos);
+        REQUIRE(has(h.substr(p, end - p), "data-f=\"" + cls + "\""));
     }
     REQUIRE(has(h, "data-g=\"eco\" data-v=\"brew\" aria-pressed=\"true\""));
-    REQUIRE(has(h, "data-g=\"src\" data-v=\"installed_apps.list_inventory\" aria-pressed=\"false\""));
-    REQUIRE(has(h, "data-g=\"src\" data-v=\"windows_optional_features.list\""));
-    REQUIRE(count_of(h, "data-g=\"src\"") == 4);
+    // One Found-by chip per kSoftwareSources entry, in table order (managers before packages).
+    std::size_t spos = 0;
+    for (const auto& src : software_catalog::kSoftwareSources) {
+        const std::string pre = "data-g=\"src\" data-v=\"" + std::string(src.value) +
+                                "\" aria-pressed=\"" +
+                                (src.value == "pkg_inventory.packages" ? "true" : "false") +
+                                "\" title=\"" + std::string(src.tooltip) + "\"";
+        const auto p = h.find(pre);
+        REQUIRE(p != std::string::npos);
+        REQUIRE(p > spos);
+        spos = p;
+        REQUIRE(has(h, ">" + std::string(src.title) + "</button>"));
+    }
+    REQUIRE(count_of(h, "data-g=\"src\"") == software_catalog::kSoftwareSources.size());
+    REQUIRE(has(h, "data-g=\"src\" data-v=\"pkg_inventory.store_packages\""));
+    REQUIRE(has(h, "data-g=\"src\" data-v=\"msi_packages.list_inventory\""));
+    // Ecosystem chips carry the family cue; the label stays the raw name.
+    REQUIRE(has(h, "data-g=\"eco\" data-v=\"brew\" aria-pressed=\"true\" title=\"brew\" data-f=\"mac\""));
+}
+
+TEST_CASE("software page: every Found-by chip selects and clears its own source",
+          "[inventory][ui]") {
+    // The button for one source chip, from its data-v to its closing tag.
+    const auto chip = [](const std::string& h, std::string_view value) {
+        const auto p = h.find("data-g=\"src\" data-v=\"" + std::string(value) + "\"");
+        REQUIRE(p != std::string::npos);
+        return h.substr(p, h.find("</button>", p) - p);
+    };
+    for (const auto& src : software_catalog::kSoftwareSources) {
+        const std::string want = "source=" + std::string(src.value);
+        // Unselected: the chip's request sets its source and keeps the other filters.
+        SoftwarePageFilters f;
+        f.kind = "pkg";
+        f.ecosystem = "brew";
+        const auto off = chip(full(f, page()), src.value);
+        REQUIRE(has(off, "aria-pressed=\"false\""));
+        REQUIRE(has(off, want));
+        REQUIRE(has(off, "kind=pkg"));
+        REQUIRE(has(off, "ecosystem=brew"));
+        // Selected: pressed, and the chip's request clears the source but keeps the rest.
+        f.source = std::string(src.value);
+        const auto on = chip(full(f, page()), src.value);
+        REQUIRE(has(on, "aria-pressed=\"true\""));
+        REQUIRE_FALSE(has(on, "source="));
+        REQUIRE(has(on, "kind=pkg"));
+        REQUIRE(has(on, "ecosystem=brew"));
+    }
+}
+
+TEST_CASE("software page: an unknown source leaves every Found-by chip unpressed",
+          "[inventory][ui]") {
+    SoftwarePageFilters f;
+    f.source = "nope.not_a_source";
+    const auto h = full(f, page());
+    REQUIRE(count_of(h, "data-g=\"src\" data-v=") == software_catalog::kSoftwareSources.size());
+    // Each chip's pressed state sits in its own tag: none of the src chips is "true".
+    std::size_t pos = 0, pressed = 0;
+    while ((pos = h.find("data-g=\"src\"", pos)) != std::string::npos) {
+        const auto end = h.find('>', pos);
+        if (h.substr(pos, end - pos).find("aria-pressed=\"true\"") != std::string::npos) ++pressed;
+        pos = end;
+    }
+    REQUIRE(pressed == 0);
+    // The value still shows in the active pill and the hidden state input.
+    REQUIRE(has(h, "found by: nope.not_a_source"));
+    REQUIRE(has(h, "name=\"source\" value=\"nope.not_a_source\""));
 }
 
 TEST_CASE("software page: controls reuse hx-include and never embed q or agent_id",
@@ -830,4 +914,52 @@ TEST_CASE("software page: Inventory sources host loads with the full page only",
                       "/fragments/inventory/sources"));
     REQUIRE_FALSE(has(render_software_page({}, d, SoftwarePageMode::Rows),
                       "/fragments/inventory/sources"));
+}
+
+TEST_CASE("software page: title rows and drill controls are keyboard-operable", "[inventory][ui]") {
+    const std::string h = full({}, page());
+    // aria-expanded sits on a button role with a tab stop and the Enter/Space handler.
+    REQUIRE(has(h, "aria-expanded=\"false\" data-tog=\"v\" role=\"button\" tabindex=\"0\" "
+                   "onkeydown=\"swKey(event,this)\""));
+    REQUIRE(has(h, "<button type=\"button\" class=\"inv-devbtn\" data-vers>"));
+    REQUIRE(has(h, "<button type=\"button\" class=\"inv-devbtn\" data-devs"));
+    REQUIRE_FALSE(has(h, "<span class=\"inv-devbtn\""));
+    REQUIRE(has(h, "button.inv-devbtn{background:none;border:0;padding:0;font:inherit}"));
+    const std::string v =
+        render_software_versions_expansion({}, "Chrome", {{{"1.0", 3, true}}}, false);
+    REQUIRE(has(v, "<button type=\"button\" class=\"inv-devbtn\" data-vdevs"));
+    REQUIRE_FALSE(has(v, "<span class=\"inv-devbtn\""));
+    const std::string sc = software_page_script();
+    // The script: swKey ignores nested buttons and drives the row's click. Load-more focus is set
+    // by the request's own htmx:afterRequest (so an empty final page and a failure are covered and
+    // an unrelated swap cannot consume the marker); it lands on the first visible new row, else the
+    // new Load-more button, else the devices filter.
+    REQUIRE(has(sc, "function swKey(e, el)"));
+    REQUIRE(has(sc, "e.target.closest('button')"));
+    REQUIRE(has(sc, "e.preventDefault(); el.click();"));  // Space must not scroll the page
+    REQUIRE(has(sc, "window.__swMore = { tb: tr.parentNode, i: tr.sectionRowIndex, btn: el }"));
+    REQUIRE(has(sc, "addEventListener('htmx:afterRequest'"));
+    REQUIRE(has(sc, "rc.elt !== mo.btn"));
+    // Failed Load more: focus goes back to the re-enabled button.
+    REQUIRE(has(sc, "if (mo.btn.isConnected) mo.btn.focus()"));
+    // An active devices filter is re-applied before choosing the first visible new row.
+    REQUIRE(has(sc, "gpSearch(flt)"));
+    // The script stays well under MSVC's 16,380-byte raw-literal cap (10.5 KB today).
+    REQUIRE(sc.size() < 15000);
+    REQUIRE(has(sc, "rows[i].style.display !== 'none'"));
+    REQUIRE(has(sc, "rows[mo.i].classList.contains('inv-more')"));
+    REQUIRE(has(sc, "box.querySelector('.inv-devfilter')"));
+    REQUIRE_FALSE(has(sc, "swMoreFail"));
+    REQUIRE_FALSE(has(sc, "mo.tb.rows[mo.i]"));
+    // The expansion toggle reads data-tog from the request's element (htmx 2 detail.elt is the target).
+    REQUIRE(has(sc, "el = (rc && rc.elt) || e.detail.elt"));
+    REQUIRE(has(sc, "location.assign('/login')"));
+}
+
+TEST_CASE("software page: the device pointer names the Hardware route in full", "[inventory][ui]") {
+    REQUIRE(has(full({}, page()), "<a href=\"/hardware\">Hardware</a> &rarr; Installed software "
+                                  "&rarr; Open in Software"));
+    SoftwarePageData d = page();
+    d.confined = true;
+    REQUIRE(has(full({}, d), "Hardware \xE2\x86\x92 Installed software \xE2\x86\x92 Open in Software"));
 }

@@ -883,9 +883,33 @@ by each handler.
   plus a separate list of tools added after it (today two), legal only for a tool
   whose REST twin is `kRequired`, which a compile-time check ties to the REST
   table. Every pending tool with a `kRequired` twin is pending because no MCP
-  consumer enforces `kRequired` yet. PR 2 promotes pending rows; an MCP `kRequired` row will need a
-  design for the approval primitive first, because `decide_step_up` passes
-  an `mcp_token` caller unconditionally.
+  consumer enforces `kRequired` yet. PR 2 promotes pending rows; how it resolves the MCP rows
+  (no MCP `kRequired` row, because `decide_step_up` passes an `mcp_token`
+  caller unconditionally) is the decision recorded in the next bullet.
+- **Decision for the MCP arm (#6306, recorded 2026-10-29 for #6305 PR 2; a
+  decision record, no code change).** The MCP arm of this chokepoint is not
+  MFA step-up. An MCP caller presents a bearer credential with no browser
+  session and no factor proof, and `decide_step_up` passes `api_token` and
+  `mcp_token` sessions and denies engine principals, so a step-up proof is
+  never asked of an MCP caller. The controls for an MCP caller are the token
+  tier (`tier_allows`, evaluated before RBAC) and the one core-owned approval
+  primitive (`requires_approval` into the `ApprovalManager`
+  ticket-then-recall, decided by a person on an interactive session under
+  #6061/#6079; see "Approver assurance"). #4309 makes the tier total:
+  `/mcp/v1/` refuses every credential whose MCP tier is empty, so no cookie
+  session and no tierless token reaches a tool (`docs/mcp-server.md`,
+  "Admission: an MCP tier is required"). The table shape is unchanged:
+  `kMcpStepUpPolicy` stays data. PR 2 of #6305 resolves each pending row
+  whose REST twin is `kRequired` in one of two ways: (a) its
+  `(securable, operation)` pair is in `requires_approval`'s supervised list,
+  and the row is classified with a new MCP-only class (working name
+  `kApprovalGated`) whose compile-time check proves the pair is
+  approval-gated; or (b) the pair is not approval-gated, which is a
+  per-tool security decision (add the pair to `requires_approval`, or record
+  a `kExempt` reason). `kRequired` never appears in the MCP table. The
+  second-list and consistency-test criterion is already met by
+  `step_up_mcp_policy.hpp` and its test. Engine principals are out of scope
+  of this decision.
 - **Metrics and alerts.**
   `yuzu_auth_mfa_step_up_gate_total{outcome,source,surface}` (96 series
   pre-seeded to 0), the gauge `yuzu_auth_mfa_step_up_window_seconds`, and the
@@ -992,7 +1016,7 @@ Consequences, each deliberate:
   and normally evaluates nothing again (it evaluates afresh when no pass was consumed, for example when the
   central check is switched off with `--mfa-step-up-window-secs=0`), and then applies the approver rule on top.
 - **MCP can never approve.** The refusal is unconditional on the MCP transport, which runs no MFA step-up: the two MCP tools always
-  return the typed refusal, for a bearer token and for a cookie session that reaches `/mcp/v1/` alike. This is an exception recorded in ADR-1005's exception ledger (entry 2026-10-18, "human review
+  return the typed refusal, whatever tiered bearer token the caller used (a cookie session no longer reaches `/mcp/v1/` at all: it has no MCP tier and is refused at admission, #4309). This is an exception recorded in ADR-1005's exception ledger (entry 2026-10-18, "human review
   is a human-session act"; legacy REST rows `exception:#6061 revisit:2027-01-18`). The tools remain registered; listing pending approvals via MCP is unchanged. The MCP
   tier/permission mapping for both tools is `Approval:Approve` (it was mapped as `Approval:Write`;
   #3151).
@@ -1390,7 +1414,7 @@ account policy)"* — this ships **both** halves.
   - **OIDC** — both `--oidc-issuer` **and** `--oidc-client-id` (the same
     predicate the OIDC provider's `is_enabled()` uses; issuer-without-client-id
     leaves SSO silently non-functional, review #1735 HIGH-1); **or**
-  - **SAML** (non-Windows) — all five SP fields (`--saml-idp-sso-url`,
+  - **SAML** (non-Windows) — all five SAML settings (`--saml-idp-sso-url`,
     `--saml-idp-cert`, `--saml-sp-entity-id`, `--saml-sp-acs-url`,
     `--saml-idp-entity-id`) **and HTTPS enabled**. HTTPS is part of the gate, not
     deferred to runtime: `server.cpp` leaves the SAML provider disabled under
@@ -1401,11 +1425,82 @@ account policy)"* — this ships **both** halves.
     stub there (it can never mint a session; running the *server* on Windows is
     out of scope regardless).
 
-  The gate checks config **presence**, not runtime validity: a SAML config whose
-  IdP cert / SP key is unreadable, oversized, or non-RSA still passes the boot
-  guard and is then disabled **loudly** by `server.cpp` — exactly as OIDC
-  issuer/JWKS runtime validity is not gate-checked either. The active SSO
-  path(s) are named in the boot banner for CC6.3 evidence.
+  That first gate (in `main.cpp`, before the server is built) checks config
+  **presence** only. A second, runtime-wiring check (#4160) runs inside the
+  `ServerImpl` constructor once the providers have been wired:
+  `sso_only_runtime_providers_ok` (same file) takes the *outcome* — provider
+  constructed and `is_enabled()` — and the server **refuses to start**
+  (`startup_failed_`, non-zero exit, `[SSO] Refusing to start` in the log) when
+  **no** provider is up. In practice this is the SAML leg: an IdP certificate
+  that is unreadable, over 64 KiB, not a PEM certificate, or of a key type
+  xmlsec cannot verify with (for example Ed25519), a bad or non-RSA SP signing
+  key, would otherwise leave a sole SAML provider that looks enabled while every
+  assertion fails. The cause is the preceding `error` log line. The certificate
+  is judged by the **verifier's own loader**: `SamlProvider` loads the pinned
+  certificate once at construction through the same `load_idp_key` helper that
+  `validate_response` uses on every assertion, and exposes the result as
+  `idp_cert_configured_but_broken()` (deliberately separate from
+  `is_enabled()`, a config-presence test that existing tests satisfy with
+  placeholder certificate strings). An earlier draft parsed the file with a
+  different loader and disagreed with the verifier in both directions
+  (`BEGIN TRUSTED CERTIFICATE` rejected, Ed25519 accepted), so the single shared
+  helper is load-bearing: do not add a second certificate probe.
+
+  Deliberate limits of that second check:
+  - **Local only — no network.** OIDC discovery and signing-key fetches stay
+    lazy (first use, #5692), so OIDC issuer/JWKS *reachability* is **not**
+    probed at boot. An IdP outage during a restart must not stop the server
+    booting: break-glass is the documented recovery for exactly that outage,
+    and this check does not regress it.
+  - **OIDC credential *readability* is already fail-closed elsewhere.** An
+    unreadable, oversized or empty `--oidc-client-secret-file` makes the server
+    refuse to start at flag-resolution time (`main.cpp`, `secret_file.hpp`),
+    in every auth mode. That, not this runtime check, is the OIDC counterpart
+    of the SAML certificate check; an empty secret supplied directly is a
+    legitimate public client and is not refused.
+  - **The OIDC leg of the runtime check is thin by construction.** In the shipped binary
+    `--oidc-nat64-prefix` is validated at flag-parse time (`main.cpp`), so
+    wiring leaves OIDC null only for a `Config` assembled outside the CLI. OIDC
+    and SAML are still judged by the *same* predicate (did wiring leave a usable
+    provider) so neither is treated as more trustworthy, but the practical
+    coverage is on the SAML side.
+  - **It proves the certificate LOADS, not that it is the right one.** A valid
+    but stale (pre-rotation) certificate, the wrong certificate (for example the
+    SP's own), or a certificate bundle (which may load using only its first certificate), loads fine and
+    still fails every sign-in. On the OIDC side `enabled` means issuer and client
+    id are set; a wrong client secret or redirect URI is found only at sign-in.
+    Both belong to the IdP-validated class the local-only rule excludes.
+  - **Break-glass cannot recover a refused start.** There is no running server to
+    sign in to; arming covers an IdP outage *after* a successful start. After a
+    refusal: fix the file and restart, or use `--auth-mode=standard` as a last
+    resort (which brings local-password login back for every account, stale ones
+    included, so rotate or disable leavers' passwords afterwards).
+  - **Replicas sharing one certificate fail together.** A bad file stops every
+    replica that reads it; validate the file before a rolling restart.
+  - **One working provider is enough.** With both providers configured and one
+    broken, the server starts, logs the failure loudly, and the broken one
+    reports `..._provider_configured 1` / `..._provider_enabled 0`.
+  - **Break-glass is not an SSO provider.** Configuring it does not satisfy the
+    check.
+  - **The refusal stops the whole server**, including the agent gRPC plane and
+    API-token automation, not only operator sign-in (it uses the same
+    `startup_failed_` mechanism as the other boot refusals). Under a restart
+    policy a late-mounted certificate volume therefore shows as a short restart
+    loop; the refusal text names `--auth-mode=standard` as a last resort and
+    states that it re-enables local-password login for every account.
+
+  `yuzu_auth_{oidc,saml}_provider_configured` / `..._enabled` (four unlabelled
+  0/1 gauges, see `docs/user-manual/metrics.md`) expose "configured but disabled
+  at runtime" for alerting: **`configured 1, enabled 0`** is the alertable state,
+  because a bare `enabled 0` is also "not configured" (normal in `standard`
+  mode). One shared publisher (`publish_*_provider_gauges`) writes them at
+  startup, and the Settings OIDC save republishes the OIDC pair so it cannot go
+  stale. They are startup/reconfigure state, not IdP health. Not wired into
+  `/readyz`: a refused sole provider never reaches it, and a broken *secondary*
+  provider is degraded, not unready. No alert rule ships yet (tracked as #6821) — it would read
+  `configured == 1 and enabled == 0` and still needs a decision on the
+  standard-mode case. The active SSO path(s) are named in the boot banner for
+  CC6.3 evidence.
 - **Break-glass account.** `--break-glass-user <name>` (`YUZU_BREAK_GLASS_USER`)
   designates the single local account exempt from `sso-only`, exempt **only
   while armed**. "Armed" is `users.break_glass_armed_until` (migration v4) — a
@@ -1460,7 +1555,8 @@ called from a thin wrapper in `main.cpp` alongside the flags + arm one-shot;
 `Config::auth_mode` / `break_glass_user` / `break_glass_window_secs` in
 `server.hpp`. Tests: `tests/unit/server/test_auth_break_glass.cpp` (DB
 accessors) + `test_auth_routes_hardened.cpp` (login-gate wire path) +
-`test_sso_boot_guard.cpp` (boot-guard predicate — OIDC/SAML/HTTPS/platform).
+`test_sso_boot_guard.cpp` (boot-guard predicate — OIDC/SAML/HTTPS/platform —
+and the runtime-wiring decision table, #4160).
 
 ## RBAC group provisioning (#1832)
 
@@ -2161,7 +2257,11 @@ its in-process PKCE state and its browser-binding digest.
 ### Rotating the IdP signing certificate
 
 Update `--saml-idp-cert` and **restart the server** — there is no hot-reload
-for the IdP cert in this release.
+for the IdP cert in this release. **Validate the replacement file first** (a PEM
+certificate, at most 64 KiB, with a key type the SAML verifier can load; RSA
+works, Ed25519 does not): on an
+`--auth-mode=sso-only` server whose only SSO provider is SAML, an unloadable
+certificate now stops the whole server at start-up (#4160, "Boot guard" above).
 
 ### AuthnRequest signing
 
@@ -5097,7 +5197,14 @@ the list/scope reads), NEVER allow. Where a caller needs to distinguish "denied"
 from "store degraded" for a 403-vs-503 decision (e.g. `authorize_list_read`),
 that is exposed via a **separate** tri-state / `std::expected` accessor — the
 plain `bool` path stays deny-on-error so no existing chokepoint can regress to
-fail-open. This **closes the prior "fails open on a corrupt `rbac.db`" hole**:
+fail-open. `RbacStore::check_scoped_permission_checked` (#3739) is that accessor for the
+per-agent scoped gate: `true` is granted, `false` is a definitive denial, and
+`unexpected(msg)` means the answer is a deny *because a read failed* (the first
+failed read wins; an allow and an explicit deny-group hit are returned as such).
+`check_scoped_permission` is its `value_or(false)` wrapper, so every other
+caller is unchanged. `AuthRoutes::require_scoped_permission` uses it only to
+label the `auth.scoped_permission_required` audit row `(read degraded:
+mgmt_group_store|rbac_store)`; the response stays a fail-closed 403. This **closes the prior "fails open on a corrupt `rbac.db`" hole**:
 under SQLite a corrupt/unreadable RBAC store could fall through to an engaged
 allow at some call sites; the PostgreSQL `rbac_store` now denies on any degrade.
 
