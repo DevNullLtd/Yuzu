@@ -4,8 +4,8 @@
 # Demonstrates, in one manual run, that the fenced leader epoch is higher after a
 # LOSSY promotion of a streaming standby: a promoted standby that never received
 # the latest leader election must not re-mint the epoch a paused former leader
-# still holds. It was run once, against the first (timeline-only) form of the mint
-# and before the previous-epoch floor was added; re-run it before relying on it. It is
+# still holds. It passed on 2026-11-01 against the final mint (the previous-epoch floor
+# included) on a 3-node Patroni async rig, and earlier against the timeline-only form. It is
 # evidence of one scenario on one rig, not a CI gate, and not
 # a proof for every promotion path (ADR-2002 s3 lists what is not covered). It drives a REAL
 # yuzu-server (its LeaderElector, the unmodified mint) against the 3-node

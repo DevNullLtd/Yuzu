@@ -264,9 +264,7 @@ nothing in the server calls `EnablementStore::set_desired_batch`; re-derive its 
 first adds a production caller.
 
 Epochs are now `>= 2^32`. The evidence is the `[leader-elector]` Catch2 cases (deterministic SQL-level
-simulation of the loss) and **one** manual run of the WS-9 script on a 3-node Patroni async rig, made against
-the first, timeline-only form of the mint (before the row floor) and not repeated since; no workflow runs it. This update does **not** lift the safe-to-scale gate; the owner's acceptance of the residuals
-above is **not yet recorded** (a "Decided" line is required before the gate is lifted).
+simulation of the loss) and **one** manual scenario of the WS-9 script on a 3-node Patroni async rig (passed on 2026-11-01 against the final, row-floored mint, and earlier against the timeline-only form); no workflow runs it. This update does **not** lift the safe-to-scale gate. **Decided (2026-11-01):** the project lead accepted the residuals above for this change. They are tracked as #6845 (Patroni stale-timeline promotion and consecutive lossy promotions), #6846 (database restore), #6847 (`issuer_epoch` after a downgrade), #6848 (managed-Postgres probe), #6849 (tests for the timeline source and the probe refusal), #6851 (sibling sequence fences) and #6852 (observability and test follow-ups).
 
 ### 4. Operator sessions — durable in Postgres, absolute wall-clock (Q4)
 Sessions move from the in-memory map (`AuthManager::sessions_`, `steady_clock`) to durable Postgres
