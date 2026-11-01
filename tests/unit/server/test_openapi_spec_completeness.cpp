@@ -1122,7 +1122,7 @@ TEST_CASE("if_none_match_matches: RFC 9110 lists and weak comparison and * alone
     // A NUL byte inside a tag is not an etagc byte: it neither truncates the tag nor matches, and
     // a tag holding one makes the whole header invalid, beside the right tag or not.
     CHECK_FALSE(if_none_match_matches(std::string("\"a\0bc\"", 6), e));
-    CHECK_FALSE(if_none_match_matches(std::string("\"a\0bc\", \"abc\"", 12), e));
+    CHECK_FALSE(if_none_match_matches(std::string("\"a\0bc\", \"abc\"", 13), e));
     const std::string nul_tag("\"a\0bc\"", 6);
     CHECK_FALSE(if_none_match_matches(nul_tag, nul_tag));
     CHECK_FALSE(if_none_match_matches("W/" + nul_tag, nul_tag));
@@ -1232,8 +1232,8 @@ TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matchin
     }
 
     SECTION("a field sent on several lines is read as one comma-joined list (RFC 9110 5.3)") {
-        // The occurrences are added in either order of the underlying multimap, so each case
-        // gives the same answer whichever line is read first.
+        // The occurrences are added in whatever order the underlying unordered multimap keeps,
+        // so each case gives the same answer whichever line is read first.
         const std::string stale = "\"0000000000000000\"";
         struct Case {
             std::string first;
