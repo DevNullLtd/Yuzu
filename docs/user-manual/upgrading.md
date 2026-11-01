@@ -4472,24 +4472,64 @@ steps apply as written to a Postgres-backed AuthDB.
 
 ## Hardened auth mode (`--auth-mode=sso-only`) — opt-in (SOC 2 CC6.3/CC6.6)
 
-**No operator action on upgrade.** Existing deployments default to
-`--auth-mode=standard` and behave exactly as before. This release adds the
-*option* to disable local-password login fleet-wide so only an SSO provider can mint a
-session.
+**Hardened mode is opt-in.** A server on the default `--auth-mode=standard` is unaffected
+by this section (apart from the standard-mode note in the behaviour change below).
+`--auth-mode=sso-only` disables local-password login fleet-wide, so only an SSO
+provider can mint a session; the start-up checks below apply to it.
 
 If you intend to enable `sso-only`, do this **first** — the server **fails
 closed (non-zero exit, refuses to serve)** otherwise:
 
 1. Configure OIDC (`--oidc-issuer` + the related flags) and confirm SSO works in
-   `standard` mode. `sso-only` without an SSO provider (OIDC, or a complete SAML
-   SP config on Linux/macOS with HTTPS) refuses to start (it would lock every
-   operator out).
+   `standard` mode. `sso-only` refuses to start without an SSO provider (OIDC, or a
+   complete SAML SP config on Linux/macOS with HTTPS), or when no provider can start
+   (it would lock every operator out).
 2. (Recommended) Create a single break-glass local account and **enroll MFA on
    it** (Settings → Security and sign-in → Two-factor sign-in). Point `--break-glass-user` at
    it. `sso-only` refuses to start if the named break-glass user doesn't exist or
    has no MFA enrolled — a break-glass account must carry a second factor.
 3. Restart with `--auth-mode=sso-only`. Local-password login is now rejected for
    everyone except the break-glass account, and only **while armed**.
+
+**⚠️ Behaviour change (#4160): `sso-only` now refuses to start when no SSO provider is usable.**
+The server previously checked only that a provider was *configured*. It now also checks that a
+provider actually came up during startup, and when none did it exits non-zero with
+`[SSO] Refusing to start` in the log. The cause is the `error` line logged just before the
+refusal. The case that matters in practice is SAML: an IdP certificate file that is missing,
+over 64 KiB, not a PEM certificate, or a certificate whose key type cannot verify signatures
+here (for example Ed25519), or an unusable SAML signing key. Such a server used to start and
+only the armed break-glass account could sign in. A refusal stops the **whole** server,
+including agent connections and API-token automation, not just operator sign-in. Under
+Docker's `restart: unless-stopped` it keeps retrying until the configuration is fixed; the
+shipped systemd unit gives up after 3 starts in 60 seconds (`systemctl status` shows
+`failed`), so once the file is fixed it needs `systemctl reset-failed yuzu-server` and then `systemctl restart yuzu-server`.
+
+- **Who is affected:** an `--auth-mode=sso-only` server whose only SSO provider has a credential
+  that cannot be used. To diagnose, read the `error` lines SAML logs at start-up: `SAML: cannot read IdP cert PEM from ...` (missing or mistyped path), `SAML: IdP cert PEM ... exceeds 65536 bytes`, `SamlProvider: SAML IdP certificate could not be loaded ...` followed by `SAML disabled: ...` (unusable certificate), or `SAML disabled: ...` for an unusable SP signing key. The gauges
+  show `..._provider_enabled 0` while `..._provider_configured` is `1`, but on an `sso-only`
+  server that is only visible when another provider is up, because otherwise the server
+  refuses to start and serves no metrics.
+- **Standard mode:** a SAML IdP certificate that cannot be loaded is disabled at start-up
+  (`SAML disabled` in the log, `..._configured 1` with `..._enabled 0`) regardless of
+  `--auth-mode`; the server still starts.
+- The check proves the SAML certificate **loads**, not that it is the IdP's current one: a
+  stale or wrong-but-valid certificate still fails every sign-in, and `..._oidc_provider_enabled`
+  means only "issuer and client id are set". The armed break-glass account covers an IdP outage
+  after a successful start, but it cannot recover a refused start (there is no server to sign in
+  to). Replicas that share one certificate file all stop together, so validate the file before
+  a rolling restart. Under an orchestrator that restarts failed containers (for example
+  Kubernetes) the container exits non-zero and restarts with backoff until the file is fixed; when
+  restarting replicas one at a time, keep the other replicas serving until the restarted one
+  passes its readiness check, because a replica that cannot start never becomes ready.
+- With both OIDC and SAML configured, one working provider is enough: the server starts, logs
+  the failure, and the broken provider reports `..._configured 1` with `..._enabled 0`.
+- OIDC issuer reachability is **not** checked at startup (discovery happens on first sign-in),
+  so an IdP outage during a restart does not stop the server from starting; the armed
+  break-glass account remains the recovery for that.
+- As a last resort `--auth-mode=standard` starts the server, but it **re-enables
+  local-password login for every account**, including accounts of people who have left; fix the
+  credential, return to `sso-only` as soon as you can, and rotate or disable stale local
+  passwords.
 
 **Breaking the glass (IdP outage).** The break-glass account is dormant until
 armed out-of-band on the server host: `yuzu-server --break-glass-arm

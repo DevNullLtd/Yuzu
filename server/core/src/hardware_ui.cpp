@@ -819,12 +819,15 @@ std::string render_hardware_software_lens(const std::string& agent_id,
     if (!software)
         return "<div class=\"gp-banner hw-degrade\"><b>Installed software unavailable.</b> The software "
                "inventory store could not be read. Retry shortly.</div>";
+    // The Software page's host view for this device (the hash is read client-side).
+    const std::string open_link = "<a class=\"gp-link\" href=\"/software#host=" +
+                                  url_query_value(agent_id) + "\">Open in Software</a>";
     if (software->empty()) {
         if (!online)
             return "<div class=\"hw-empty\">No installed-software inventory on record (device is "
-                   "offline and has not synced).</div>";
-        return "<div class=\"hw-empty\">No installed-software inventory synced yet for this device."
-               "<div style=\"margin-top:.5rem\">" +
+                   "offline and has not synced). " + open_link + "</div>";
+        return "<div class=\"hw-empty\">No installed-software inventory synced yet for this device. " +
+               open_link + "<div style=\"margin-top:.5rem\">" +
                sync_button(agent_id, "installed_software", "software", sync, "Sync now") +
                "</div></div>";
     }
@@ -842,7 +845,7 @@ std::string render_hardware_software_lens(const std::string& agent_id,
     else
         summary += ", last synced " + esc(format_iso_utc(*software_last_seen));
     std::string h = "<div class=\"hw-panel\"><div class=\"hw-page\" id=\"hw-sw-summary\">" + summary +
-                    (truncated ? " (list truncated)" : "") + "</div>"
+                    (truncated ? " (list truncated)" : "") + " &middot; " + open_link + "</div>"
                     "<div class=\"hw-tools\"><input class=\"hw-search\" "
                     "placeholder=\"Filter installed software…\" oninput=\"gpSearch(this)\" "
                     "data-gpf=\"hwsw\"></div>";

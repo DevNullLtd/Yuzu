@@ -4786,6 +4786,17 @@ public:
                             spdlog::error("SAML disabled: {}",
                                          saml_provider_->signing_init_error());
                             saml_provider_.reset();
+                        } else if (saml_provider_ && saml_provider_->idp_cert_configured_but_broken()) {
+                            // #4160: the pinned IdP certificate is readable but the
+                            // verifier's OWN loader cannot use it (not a PEM
+                            // certificate, or a key type xmlsec cannot verify with).
+                            // Without this the provider would stay "enabled" and
+                            // /auth/saml/start would work while every assertion failed
+                            // — the lockout --auth-mode=sso-only must not boot into.
+                            spdlog::error("SAML disabled: {} (cert file '{}')",
+                                          saml_provider_->idp_cert_init_error(),
+                                          cfg_.saml_idp_cert);
+                            saml_provider_.reset();
                         } else if (saml_provider_ && saml_provider_->is_enabled()) {
                             // sre-S2: log the group→role flags alongside the
                             // existing endpoint fields. Both values are
@@ -4823,6 +4834,34 @@ public:
             }
         }
 #endif
+
+        // #4160: surface "configured but disabled at runtime" and, under
+        // --auth-mode=sso-only, fail closed rather than boot into a lockout.
+        // Both providers are judged identically — "did wiring leave a usable
+        // provider" — read from the provider pointers (the SAML failure paths
+        // above reset() it), never from config. On Windows saml_provider_ is a
+        // compile-time stub and never constructed, so its `enabled` gauge is a
+        // truthful 0. LOCAL ONLY: no IdP network probe (OIDC discovery stays
+        // lazy, #5692); see sso_only_runtime_providers_ok in sso_boot_guard.hpp.
+        // The gauges come from the SAME publisher the Settings OIDC save uses, so
+        // a runtime reconfigure keeps them truthful.
+        {
+            const bool oidc_up = oidc_provider_ && oidc_provider_->is_enabled();
+            const bool saml_up = saml_provider_ && saml_provider_->is_enabled();
+            publish_oidc_provider_gauges(metrics_, oidc_config_complete(cfg_), oidc_up);
+            publish_saml_provider_gauges(metrics_, saml_config_complete(cfg_), saml_up);
+
+            if (auto runtime = sso_only_runtime_providers_ok(cfg_, oidc_up, saml_up); !runtime) {
+                spdlog::error("[SSO] Refusing to start: {}", runtime.error());
+                startup_failed_ = true;
+            } else if (cfg_.auth_mode == "sso-only") {
+                // The main.cpp "Hardened auth mode ACTIVE" banner is logged BEFORE this
+                // constructor runs, so on its own it cannot show which providers actually
+                // came up. This line is the post-wiring evidence of the real state.
+                spdlog::info("[SSO] sso-only providers up after startup: OIDC={}, SAML={}",
+                             oidc_up ? "yes" : "no", saml_up ? "yes" : "no");
+            }
+        }
 
         // Setup file logger.
         //
