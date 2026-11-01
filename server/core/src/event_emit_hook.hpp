@@ -2,9 +2,11 @@
 
 /// @file event_emit_hook.hpp
 /// The REQUEST-FREE half of the best-effort event hook the v1 REST and MCP twins use to publish
-/// the SAME events their legacy routes publish (#2146). No `<httplib.h>`: the transport-free
-/// cores (`instruction_execute.hpp`, `execution_mutation.hpp`) take an `EventEmitHook` and must
-/// not pull the HTTP library in. The adapter that binds the legacy 4-argument emitter to one
+/// the SAME events their legacy routes publish (#2146). No DIRECT `<httplib.h>` include: the
+/// transport-free cores (`instruction_execute.hpp`, `execution_mutation.hpp`) take an
+/// `EventEmitHook` and this header adds no dependency on the HTTP library. (It is not absent from
+/// those cores' include graph: `instruction_execute.hpp` still reaches `<httplib.h>` transitively
+/// through `agent_registry.hpp` -> `event_bus.hpp`, which predates this header.) The adapter that binds the legacy 4-argument emitter to one
 /// request (`EmitEventFn`, `bind_event_emit`) needs `httplib::Request` and lives in
 /// `event_emit.hpp`, which includes this file.
 ///

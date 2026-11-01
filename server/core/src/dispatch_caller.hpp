@@ -121,9 +121,10 @@ struct DispatchCaller {
     ///      stamp would let an approval granted for a benign pair lift the
     ///      ExecuteGate of a gated one. The handler forces `None`; the pair's own
     ///      gate decides (a non-admin caller on a gated pair is refused).
-    ///   3. `DeploymentEngine` / `DeploymentRoutes` (`deployment_engine.cpp`
-    ///      / `deployment_routes.cpp`) — `GovernedPipeline` on their
-    ///      content_dist dispatches.
+    ///   3. `DeploymentEngine` (`deployment_engine.cpp`, the pipeline caller it
+    ///      builds for its content_dist dispatches) — `GovernedPipeline`. It is the
+    ///      only file that stamps it; `deployment_routes.cpp` reaches the engine and
+    ///      stamps nothing itself.
     /// `BundleOrchestrator::dispatch()` (`bundle_orchestrator.cpp`) is NOT a
     /// fourth stamping site — it is a pass-through conduit: REST/MCP
     /// `execute_bundle` derive provenance at one of the three sites above

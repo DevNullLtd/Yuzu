@@ -552,8 +552,9 @@ struct OldValue {
 /// Neutralises untrusted text for an `audit|k=v|...` line: invalid UTF-8 -> '?', control bytes, DEL, space, '=' and
 /// ',' (yuzu::log_token) -> '_', and '|' -> '_' (log_token does not map the field separator).
 /// log_token already folds the C1 controls U+0080-U+009F (NEL U+0085 among them), U+2028 and U+2029 to '_'; the
-/// fold_line_breaks call below is a now-redundant belt-and-braces fold, kept so the output stays byte-identical to
-/// what this plugin has always emitted. A trailing backslash becomes '_'. Over `cap` bytes it is cut on a character boundary
+/// fold_line_breaks call below is a now-redundant belt-and-braces fold. The output is NOT byte-identical to what this
+/// plugin emitted before log_token folded the C1 controls: U+0080-U+009F other than U+0085 passed through then and
+/// are '_' now. A trailing backslash becomes '_'. Over `cap` bytes it is cut on a character boundary
 /// and gets `~<total length>`; the cap and `~<total>` are measured after folding.
 [[nodiscard]] inline std::string audit_token(std::string_view s, std::size_t cap = kAuditTokenCap) {
     std::string t;

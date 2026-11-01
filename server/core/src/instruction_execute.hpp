@@ -60,7 +60,7 @@
 #include "dispatch_caller.hpp"
 #include "dispatch_confined_arms.hpp"    // ConfinedDispatchOutcome
 #include "dispatch_zero_reach.hpp"       // ZeroReachCause
-#include "event_emit_hook.hpp"           // EventEmitHook (request-free: no httplib)
+#include "event_emit_hook.hpp"           // EventEmitHook (request-free: no DIRECT <httplib.h> include)
 #include "instruction_param_schema.hpp"  // instr::ParamValidatorCache
 #include "instruction_store.hpp"         // InstructionDefinition
 
@@ -95,7 +95,9 @@ inline constexpr int kSubmitterPendingCap = 25;
 /// `reason` label of `yuzu_server_approval_submit_refused_total`, and the same token the audit
 /// row and the wire `reason` carry. CLOSED set, every member pre-seeded at boot in server.cpp from
 /// this array. `approval_cap_reached` is the per-principal cap above; `approval_unavailable` is
-/// "no approval manager wired" (a server defect: 503 with a null `retry_after_ms`);
+/// "no approval manager wired" (or a cap requested with its counter unwired: a server defect,
+/// 503 with a null `retry_after_ms`) and also "the pending count could not be read" (a store
+/// fault: 503 with `retry_after_ms` 5000);
 /// `approval_queue_full` is the GLOBAL 1000-row pending queue being full (nobody can submit
 /// until a human reviewer decides a pending approval or the 7-day expiry clears one: a retry
 /// loop cannot help, so it carries no `retry_after_ms`); `approval_submit_failed` is any other
