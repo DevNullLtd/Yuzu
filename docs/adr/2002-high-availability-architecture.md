@@ -240,9 +240,12 @@ read as "the epoch is monotonic across any promotion"; every other document defe
    repeat needs the lost mint to have crossed a 32-value boundary). A sequence that is BEHIND the row's low
    32 bits (a logical-replication cutover or a table-only restore does not carry it) would make every mint
    exactly the row plus one, so the elector advances the sequence to the minted count part at the first such
-   (floored) mint; only that first election stays deterministic, and the elector logs a warning at every
-   acquisition until the real timeline reaches the pinned one (the promotion that reaches it is itself still
-   unprotected);
+   (floored) mint, best-effort and never lowering it (a runtime role without `UPDATE` on the sequence cannot,
+   and then every election stays at the stored epoch plus one). The first election, and the election after it
+   (`setval` resets Postgres' sequence pre-logging, so that one always crosses a pre-log boundary), remain
+   exposed, as does any election whose `setval` record a lossy promotion also loses; the elector logs a
+   warning at every acquisition until the real timeline reaches the pinned one (the promotion that reaches
+   it is itself still unprotected);
 4. same-timeline loss: a crash recovery that loses an unflushed mint (`synchronous_commit=off`, `fsync=off`)
    keeps the timeline;
 5. a physical-snapshot restore started without archive recovery, which keeps its timeline while the sequence
