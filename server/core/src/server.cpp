@@ -14349,9 +14349,10 @@ private:
                 try {
                     spdlog::error("Gateway SendCommand for agent {} command {}: forwarding could "
                                   "not be set up (thread creation or allocation failed); {}",
-                                  ::yuzu::log_token(expected_agent_id.empty() ? gp.agent_id
-                                                                              : expected_agent_id),
-                                  ::yuzu::log_token(cmd_id.empty() ? gp.cmd.command_id() : cmd_id),
+                                  ::yuzu::log_id_token(expected_agent_id.empty() ? gp.agent_id
+                                                                                 : expected_agent_id),
+                                  ::yuzu::log_id_token(cmd_id.empty() ? gp.cmd.command_id()
+                                                                      : cmd_id),
                                   resolved ? "the command was resolved as failed"
                                            : "the terminal write ALSO failed, so the execution "
                                              "stays running until an operator cancels it");
@@ -14361,7 +14362,7 @@ private:
                 try {
                     spdlog::error("Gateway SendCommand for command {}: the unknown-cluster "
                                   "terminal write threw; it is not retried",
-                                  ::yuzu::log_token(cmd_id));
+                                  ::yuzu::log_id_token(cmd_id));
                 } catch (...) { // NOLINT(bugprone-empty-catch): last resort; the loop continues
                 }
             }
