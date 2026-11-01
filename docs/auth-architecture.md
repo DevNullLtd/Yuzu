@@ -981,13 +981,16 @@ gate's window on the database clock. This replaces the earlier comparison of the
 the enrolment instant, which a repeated or skewed timestamp could defeat and which only the approver
 gate applied.
 
-- **The generation is database-owned.** `auth.users.mfa_factor_gen` (auth migration v3) is advanced
+- **The generation is database-owned.** `auth.users.mfa_factor_gen` (auth migration v3) is assigned
   by the row trigger `users_mfa_factor_gen` (`BEFORE UPDATE OF mfa_enrolled_at, mfa_factor_gen`, created
-  `ENABLE ALWAYS` so it fires under every `session_replication_role`) by exactly one whenever
-  `mfa_enrolled_at` changes: enrolment, clear, soft delete, or a direct UPDATE by any binary. Application
-  code never writes it. It is not advanced by a provisional secret, a TOTP counter advance, recovery-code
+  `ENABLE ALWAYS` so it fires under every `session_replication_role`) a fresh random positive value (about
+  60 bits, from `gen_random_uuid`, always different from the value it replaces) whenever
+  `mfa_enrolled_at` changes: enrolment, clear, soft delete, or a direct UPDATE by any binary. It is not a
+  counter, so a value is never reissued in practice: after an auth-only restore over a newer session store,
+  a re-enrolment cannot land on a generation a surviving stored proof carries. Application
+  code never writes it, and the trigger reverts a direct write. It is not changed by a provisional secret, a TOTP counter advance, recovery-code
   regeneration or a `SecretCodec` re-encryption. The migration seeds nothing (a hard cutover, see "Rollout and cutover" below): every existing row
-  starts at `0` and the trigger advances it from the next enrolment change, so an account that was already
+  starts at `0` ("never assigned") and the trigger assigns a value from the next enrolment change, so an account that was already
   enrolled on a carried-over database reads generation `0`, is refused `503` (audit `reason=mfa_proof_unavailable`), and
   must have its factor cleared with `yuzu-server --mfa-reset <user>` (under `--mfa-enforcement=required`, or `admin-only` for an administrator, the user enrols again at next sign-in).
 - **The session side is guarded too.** `session_store.sessions.mfa_factor_gen` and `mfa_bind_seq`
@@ -1031,7 +1034,7 @@ gate applied.
   the session before the token is released and the login answers `401` with audit
   `reason=session_mint_failed;cause=factor_changed`
   (`yuzu_auth_role_recheck_post_mint_denied_total{reason="factor"}`). At a step-up stamp,
-  `post_stamp_factor_recheck` runs after the stamp commits; if the generation moved, the proof just
+  `post_stamp_factor_recheck` runs after the stamp commits; if the generation changed, the proof just
   stamped is cleared and the route answers `401` `factor_changed_during_step_up`
   (`yuzu_auth_mfa_stamp_denied_total`); a Settings enrolment confirm records
   `step_up_proof=not_stamped;factor_changed` and the enrolment still stands. A clear that fails after the
@@ -1050,7 +1053,7 @@ gate applied.
   records `denied` with detail `reason=factor_changed expected_gen=<n>` on `mfa.recovery_codes.generated`
   or `mfa.disabled`, and counts `yuzu_auth_mfa_factor_changed_total{route}`. Each compare is one `auth`
   transaction. An account admitted un-enrolled at generation `g` that was
-  enrolled in between reads `g+1` and is refused, so a cancel can never strip a factor that did not exist
+  enrolled in between reads a different generation and is refused, so a cancel can never strip a factor that did not exist
   when the request was admitted. Enrolment init and confirm have their own identity predicates and are not
   gated; `--mfa-reset` and tests pass no generation (break-glass, no gate).
 - **Enforcement of the triggers is checked, not assumed.** At boot each store verifies that its trigger
@@ -1110,7 +1113,7 @@ operators; it discards local accounts, passwords, MFA enrolments and sessions.
 
 | State | Behaviour |
 |---|---|
-| Fresh database | Full closure on every gate. Every row starts at generation `0` and the trigger advances it from the first enrolment. |
+| Fresh database | Full closure on every gate. Every row starts at generation `0` and the trigger assigns a fresh random value at the first enrolment. |
 | Carried-over database with an already-enrolled account | The `auth` v3 migration seeds nothing, so the account reads generation `0` and is refused `503` (audit `reason=mfa_proof_unavailable`) until `yuzu-server --mfa-reset <user>` clears its factor (under `--mfa-enforcement=required`, or `admin-only` for an administrator, the user enrols again at next sign-in). |
 | Trigger dropped, disabled, replica-only or body replaced | Boot refuses (only `--mfa-reset` and `--break-glass-arm` open their bootstrap `AuthDB` past it, and report the binding not enforced). While running, a validation that observes it fails every local binding decision closed (sticky). Changes made while it was not firing are not reconstructable: end the affected accounts' sessions (runbook). |
 | Coherent offline restore | The accepted ADR-2002 checkpoint class. After ANY restore of the auth schema end every session (a restart does not). |
@@ -1134,7 +1137,7 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
     (`mfa_verified_at`) within the approver window that is **bound to the factor enrolled now**: the
     generation stored with the proof must equal the account's current `mfa_factor_gen`, both read
     from Postgres for this request (see "Factor-generation binding of MFA proofs" above). Disabling
-    MFA and enrolling again advances the generation, so older proofs no longer match. The three
+    MFA and enrolling again gives the account a fresh generation, so older proofs no longer match. The three
     refusals are the step-up `401` with a `reason=` token in the audit detail: `mfa_proof_missing`
     (the session has no stored proof), `proof_factor_unbound` (the proof has no generation: unbound by
     the session rebind guard) and

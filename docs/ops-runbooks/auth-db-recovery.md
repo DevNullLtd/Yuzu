@@ -140,9 +140,10 @@ opened. Usual causes, in likelihood order:
    ```
    On restart the server re-seeds the admin account from `yuzu-server.cfg`.
    Then end every session before anyone signs in (the "End every session after any
-   restore of the `auth` schema" rule in [Backup - the KEK pairing rule](#backup--the-kek-pairing-rule)): a rebuilt
-   `auth.users` restarts its factor-generation counter, while the proofs in `session_store.sessions` survive
-   the drop, so a stale stored proof could equal a new generation and count as bound.
+   restore of the `auth` schema" rule in [Backup - the KEK pairing rule](#backup--the-kek-pairing-rule)): the
+   proofs in `session_store.sessions` survive the drop. A rebuilt `auth.users` starts every account at
+   generation `0` and assigns a fresh random value at its next enrolment, so no earlier proof can match it,
+   but the surviving sessions belong to accounts and credentials the rebuild discarded.
 
 ### Migration lock timeout
 
@@ -368,9 +369,13 @@ until they expire. A failover to a standby that was behind loses the same recent
    **End every session after any restore of the `auth` schema (a restart is not
    enough).** An account's factor generation lives in `auth.users`, so a table-scoped
    restore of `auth` rewinds it, while the MFA proof a session holds is a durable row
-   in `session_store.sessions` that the restore does not touch. A proof earned under
-   a later factor can then equal a regenerated number and count as bound to the
-   factor enrolled now. Ending every session (step 2, or the emergency procedure in
+   in `session_store.sessions` that the restore does not touch. The generation is a
+   fresh random value assigned at each enrolment change and never reissued in practice,
+   so the restore cannot walk it back onto the value a surviving stored proof carries:
+   a re-enrolment after the restore gets a value no earlier proof has. The rule stays
+   because the restore still rolls passwords, lockout state and MFA enrolments back
+   under sessions that survive it. A restore of both stores to one consistent point
+   returns proofs and generations together. Ending every session (step 2, or the emergency procedure in
    [Sessions are durable](#sessions-are-durable)) makes each operator prove again;
    restarting a replica does not, because the proof is a row, not a cache entry.
 
@@ -847,7 +852,7 @@ uses to end the sessions the same way. Each prints a loud `WARN` naming the bypa
 recovery bypass of the MFA factor-generation trigger check (trigger state: <in force | missing, not ENABLE ALWAYS,
 or altered | unreadable>); this one-shot process does not enforce factor binding`, and the `SessionStore:` twin for
 the rebind guard), so they stay usable when the serving process refuses to start. While the factor trigger is
-absent a clear made here does not advance the factor generation, so the session delete that follows is the only
+absent a clear made here does not change the factor generation, so the session delete that follows is the only
 barrier: a TOTP sign-in made under the old factor that completes after the delete would pass, because nothing then
 distinguishes the old factor from the cleared one. Repair the trigger first when you can
 ([MFA binding enforcement failed](#mfa-binding-enforcement-failed)); otherwise repair it straight afterwards
@@ -1902,7 +1907,7 @@ bind an MFA proof to the account's factor is no longer in force:
 
 | `store` | Object | Healthy state |
 |---|---|---|
-| `auth` | trigger `users_mfa_factor_gen` on `auth.users` (advances `mfa_factor_gen` on every change of `mfa_enrolled_at`) | `pg_trigger.tgenabled = 'A'` |
+| `auth` | trigger `users_mfa_factor_gen` on `auth.users` (assigns a fresh random `mfa_factor_gen` on every change of `mfa_enrolled_at`) | `pg_trigger.tgenabled = 'A'` |
 | `session` | trigger `sessions_mfa_rebind_guard` on `session_store.sessions` (unbinds a proof written without a rebind) | `pg_trigger.tgenabled = 'A'` |
 
 **What stops, what keeps working.** While the gauge reads `0`, every binding decision for a local
@@ -1921,7 +1926,7 @@ the binding as not enforced (the gauge reads `0` and `YuzuMfaBindingNotEnforced`
 answers `503` on every enrolled-local step-up route, on the 3 JIT-elevation routes and on approve and reject. Repairing
 the trigger alone does not clear the latch: **every replica must be restarted**, and a restarted replica refuses to
 start until the trigger reads `A` again. Do the session step below **before** the restarts: a clear and re-enrolment
-made while the trigger did not fire (disabled, or skipped under `session_replication_role = replica`) did not advance
+made while the trigger did not fire (disabled, or skipped under `session_replication_role = replica`) did not change
 the factor generation, so a proof earned before that window would count again once the trigger is repaired and the
 replicas are back. `DELETE /api/v1/sessions` is itself a step-up row, so while the latch is set an enrolled-local
 administrator gets `503` on it: end the sessions with the SQL path in [Sessions are durable](#sessions-are-durable)
@@ -2008,8 +2013,8 @@ alert on the unit being `failed` or on `up == 0` as well.
    the columns exist. If the tables came back from a dump taken before the cutover they do not, and this section
    is the wrong tool: use the restore sequence in the cutover section of `docs/user-manual/upgrading.md`, which also
    resets `public.schema_meta`. The full statements for each store are under [Repair statements](#repair-statements) below.
-3. **End the sessions that cannot be trusted.** Generation changes made while the trigger was not
-   firing were not counted, so a proof bound before such a change still equals the unchanged
+3. **End the sessions that cannot be trusted.** Factor changes made while the trigger was not
+   firing did not change the generation, so a proof bound before such a change still equals the unchanged
    generation. End the sessions of **every account whose factor changed in the window**
    (`DELETE /api/v1/sessions?username=<name>`; see [Sessions are durable](#sessions-are-durable)). The
    window cannot have begun before the last start of a server whose boot check passed (that
@@ -2022,9 +2027,9 @@ alert on the unit being `failed` or on `up == 0` as well.
 
    **A clear made while the `users_mfa_factor_gen` trigger was absent or disabled needs this step even
    though the clear also deleted the account's sessions.** If a clear (Settings Disable or
-   `--mfa-reset`) ran in that window, the factor generation did not advance. The clear ends the account's
+   `--mfa-reset`) ran in that window, the factor generation did not change. The clear ends the account's
    sessions in a later, separate step, and a TOTP sign-in that was in flight when that delete ran (made under the old
-   factor) can survive it and hold a proof equal to the unadvanced generation; once the
+   factor) can survive it and hold a proof equal to the unchanged generation; once the
    trigger is repaired that proof reads as bound to the cleared factor. After repairing the trigger, END EVERY
    SESSION of every account whose factor was cleared in that window. The simplest way is to end all sessions with
    the emergency procedure in [Sessions are durable](#sessions-are-durable); per account,
@@ -2056,7 +2061,7 @@ Each statement must return `t`. The session body ends with `END` followed by one
 
 ```bash
 psql "$YUZU_POSTGRES_DSN" <<'SQL'
-SELECT p.prosrc = E'\nBEGIN\n  IF NEW.mfa_enrolled_at IS DISTINCT FROM OLD.mfa_enrolled_at THEN\n    NEW.mfa_factor_gen := OLD.mfa_factor_gen + 1;\n  ELSE\n    NEW.mfa_factor_gen := OLD.mfa_factor_gen;\n  END IF;\n  RETURN NEW;\nEND\n' AS auth_body_exact
+SELECT p.prosrc = E'\nBEGIN\n  IF NEW.mfa_enrolled_at IS DISTINCT FROM OLD.mfa_enrolled_at THEN\n    NEW.mfa_factor_gen := (''x'' || substr(replace(gen_random_uuid()::text, ''-'', ''''), 18, 15))::bit(60)::bigint + 1;\n    IF NEW.mfa_factor_gen = OLD.mfa_factor_gen THEN\n      NEW.mfa_factor_gen := OLD.mfa_factor_gen + 1;\n    END IF;\n  ELSE\n    NEW.mfa_factor_gen := OLD.mfa_factor_gen;\n  END IF;\n  RETURN NEW;\nEND\n' AS auth_body_exact
   FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid
  WHERE t.tgrelid = 'auth.users'::regclass AND t.tgname = 'users_mfa_factor_gen' AND NOT t.tgisinternal;
 SELECT p.prosrc = E'\nBEGIN\n  IF NOT (NEW.mfa_bind_seq > OLD.mfa_bind_seq) THEN\n    NEW.mfa_factor_gen := 0;\n  END IF;\n  RETURN NEW;\nEND ' AS session_body_exact
@@ -2080,7 +2085,10 @@ BEGIN;
 CREATE OR REPLACE FUNCTION auth.users_mfa_factor_gen() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF NEW.mfa_enrolled_at IS DISTINCT FROM OLD.mfa_enrolled_at THEN
-    NEW.mfa_factor_gen := OLD.mfa_factor_gen + 1;
+    NEW.mfa_factor_gen := ('x' || substr(replace(gen_random_uuid()::text, '-', ''), 18, 15))::bit(60)::bigint + 1;
+    IF NEW.mfa_factor_gen = OLD.mfa_factor_gen THEN
+      NEW.mfa_factor_gen := OLD.mfa_factor_gen + 1;
+    END IF;
   ELSE
     NEW.mfa_factor_gen := OLD.mfa_factor_gen;
   END IF;

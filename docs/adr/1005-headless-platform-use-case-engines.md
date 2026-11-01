@@ -1149,6 +1149,12 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
       `--auth-mode=standard`. No minimum-version check exists, so nothing stops
       an earlier binary being pointed at a migrated database; such a binary
       does not run the new gate.
+      The generation is a fresh random positive value assigned by the trigger
+      on every change of `mfa_enrolled_at`, not a counter, so a restore of the
+      `auth` schema over a newer session store cannot make a later
+      re-enrolment land on a value a surviving stored proof carries: that
+      restore-reuse exposure, which a counter would have had, is closed by the
+      random token and is not among the residual exposures put forward here.
     - **Revisit** when an in-product re-enrolment path for a reset operator
       exists, or when a minimum-version admission check exists, whichever comes
       first, and in any case at the monthly review at the end of November 2026

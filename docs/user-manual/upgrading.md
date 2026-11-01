@@ -519,7 +519,7 @@ taken in step 2 below, which puts the previous build's data back (it does not un
 carry-over procedure below only carries an existing deployment's data across the cutover; it is not an upgrade path and does not
 change the fresh-deployment contract stated for the Forensics tier elsewhere in this guide.
 The `auth` v3 migration seeds nothing and starts every existing row at factor generation `0`; the trigger
-advances it only from the next enrolment change. So an account that was already enrolled reads generation
+assigns a value only from the next enrolment change. So an account that was already enrolled reads generation
 `0`, is refused `503` (audit `reason=mfa_proof_unavailable`; sticky, no `retry_after_ms`) on the 37 step-up routes (the 35
 ordinary rows, approve and reject among them, and the 2 factor-credential routes) and on the 3 JIT-elevation
 routes (they probe the same factor state), and stays refused until `yuzu-server --mfa-reset <user>` clears its
@@ -840,7 +840,7 @@ account's current one, so disabling MFA and enrolling again, or an administrator
 with `yuzu-server --mfa-reset`, makes every earlier proof stop counting. The generic check also holds a
 local proof to the window on the database clock, to the millisecond, as well as on the server's own
 clock. Two schema migrations run at the first start: `auth` v3 adds `users.mfa_factor_gen` (every row
-starts at `0`) and a trigger that advances it, and `session_store` v3 adds two columns and a trigger that
+starts at `0`) and a trigger that assigns it a fresh random value on every enrolment change, and `session_store` v3 adds two columns and a trigger that
 unbinds a proof written without a generation. Both triggers are checked at every start: a server whose
 database does not have them in force refuses to start (the log says `Failed to open the Postgres auth
 store (migration or MFA trigger check failed; see the preceding AuthDB log line)` or `session store
@@ -1585,7 +1585,7 @@ dispatches.
    [OIDC approvers refused with a clock-skew 503](../ops-runbooks/auth-db-recovery.md#oidc-approvers-refused-with-a-clock-skew-503)).
 
 **Schema and agents.** The approver-assurance change adds two schema migrations, in the `auth` schema (a
-`users.mfa_factor_gen` column and a trigger that advances it) and in the session store (the `mfa_factor_gen`
+`users.mfa_factor_gen` column and a trigger that assigns it) and in the session store (the `mfa_factor_gen`
 and `mfa_bind_seq` columns on `sessions` and a guard trigger). Neither drops or rewrites existing data. The
 separate scheduled-approval change (#6096, below) adds a data-only approvals step and a command-outbox index.
 
