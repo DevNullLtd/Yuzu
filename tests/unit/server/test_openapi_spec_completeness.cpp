@@ -495,6 +495,40 @@ TEST_CASE("openapi_spec_json(): the RBAC role reads document 403/404/503 and the
     CHECK(perms.value("description", "").find("retry_after_ms") != std::string::npos);
 }
 
+TEST_CASE("openapi_spec_json(): POST /instructions/{id}/execute documents the audit header, the "
+          "unreadable pending count, the misconfigured arm and the dispatch_exception fields",
+          "[openapi][instruction_execute]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/instructions/{id}/execute"));
+    const auto& op = spec["paths"]["/instructions/{id}/execute"]["post"];
+    const auto& rsp = op["responses"];
+    // Sec-Audit-Failed is a typed response header on every status that can carry a lost
+    // best-effort row, not prose alone.
+    for (const char* code : {"200", "202", "400"}) {
+        INFO(code);
+        REQUIRE(rsp.contains(code));
+        REQUIRE(rsp[code].contains("headers"));
+        REQUIRE(rsp[code]["headers"].contains("Sec-Audit-Failed"));
+        CHECK(rsp[code]["headers"]["Sec-Audit-Failed"]["schema"]["enum"] == json::array({"true"}));
+    }
+    const std::string d503 = rsp["503"].value("description", "");
+    CHECK(d503.find("pending-approval count unreadable") != std::string::npos);
+    CHECK(d503.find("retry_after_ms 5000") != std::string::npos);
+    const std::string d500 = rsp["500"].value("description", "");
+    CHECK(d500.find("dispatch_unconfigured") != std::string::npos);
+    CHECK(d500.find("dispatch_exception") != std::string::npos);
+    CHECK(d500.find("error.execution_id") != std::string::npos);
+    CHECK(d500.find("error.agents_sent") != std::string::npos);
+    // The cap is a soft bound everywhere the manual says so.
+    const std::string desc = op.value("description", "");
+    CHECK(desc.find("about 25 pending approvals") != std::string::npos);
+    CHECK(desc.find("soft bound") != std::string::npos);
+    CHECK(rsp["429"].value("description", "").find("about 25 pending approvals") !=
+          std::string::npos);
+    CHECK(rsp["400"].value("description", "").find("invalid_definition_id") != std::string::npos);
+}
+
 TEST_CASE("openapi_spec_json(): POST /hardware/sync documents the fan-out request and every refusal",
           "[openapi][hardware][sync_fanout]") {
     json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);

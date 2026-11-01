@@ -45223,6 +45223,29 @@ TEST_CASE("MCP execute_instruction_definition: a chokepoint denial names the def
     CHECK(rig.calls.empty());
 }
 
+TEST_CASE("MCP execute_instruction_definition: the description lists the machine-branchable approval "
+          "and dispatch refusals and the five wiring gaps that write no audit row",
+          "[mcp][integration][execute][idef]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    std::string desc;
+    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"])
+        if (t["name"] == "execute_instruction_definition")
+            desc = t["description"].get<std::string>();
+    REQUIRE_FALSE(desc.empty());
+    for (const char* token : {"approval_cap_reached", "approval_queue_full", "approval_unavailable",
+                              "dispatch_exception", "error.data.execution_id",
+                              "error.data.agents_sent", "cancel_execution", "invalid_definition_id"}) {
+        INFO(token);
+        CHECK(desc.find(token) != std::string::npos);
+    }
+    // The five unwired components that write no row, exactly as the docs list them.
+    CHECK(desc.find("unwired definition lookup, authorizer, validator cache, classifier or "
+                    "dispatch write none") != std::string::npos);
+}
+
 TEST_CASE("MCP execute_instruction_definition: an unknown definition is -32602 and dispatches nothing",
           "[mcp][integration][execute][idef]") {
     McpTestServer ts;
