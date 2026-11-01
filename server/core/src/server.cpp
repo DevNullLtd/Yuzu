@@ -4013,6 +4013,16 @@ public:
                           "model row is lost. >0 means /dex is under-counting - investigate "
                           "(commonly a stale-schema dev DB; see docs/user-manual/dex.md).",
                           "counter");
+        metrics_.describe("yuzu_server_guardian_census_proj_failures_total",
+                          "Compliance-census (guardian_agent_rule_status) writes that failed "
+                          "for a reason other than the rule not existing. The failure does not "
+                          "discard the source event; only the census row update is lost, so "
+                          "the pair keeps its previous state until a later state-changing "
+                          "event for it arrives. >0 means the census may be stale; the server "
+                          "log line 'census upsert failed' names the agent and rule. A write "
+                          "refused because the rule is not defined on this server (SQLSTATE "
+                          "23503) is a normal outcome and is not counted.",
+                          "counter");
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
                           "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
@@ -9847,6 +9857,9 @@ public:
                     metrics_.gauge("yuzu_server_guardian_proj_failures_total")
                         .set(static_cast<double>(
                             guaranteed_state_store_->observations_proj_failures_total()));
+                    metrics_.gauge("yuzu_server_guardian_census_proj_failures_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->census_proj_failures_total()));
                     metrics_.gauge("yuzu_server_guardian_observations_reaped_total")
                         .set(static_cast<double>(
                             guaranteed_state_store_->observations_reaped_total()));

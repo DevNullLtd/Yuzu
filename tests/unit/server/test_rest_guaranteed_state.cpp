@@ -815,7 +815,7 @@ struct RestGsHarness {
     }
 
     // Seed one device's reported verdict for a Guard via the status feed
-    // (insert_event → upsert_rule_status). event_type maps to state per
+    // (insert_event → project_rule_status). event_type maps to state per
     // event_state_from_type: guard.compliant/drift.remediated→compliant,
     // drift.detected→drifted, remediation.failed/guard.unhealthy/guard.errored→errored.
     // NOTE: the upsert keeps the row only when excluded.updated_at >= the existing
@@ -843,7 +843,7 @@ struct RestGsHarness {
     // Ported from a raw sqlite3 connection (ADR-0038): unconditional
     // INSERT ... ON CONFLICT DO UPDATE (no updated_at guard) — this helper
     // wants to FORCE the state regardless, unlike the store's own
-    // upsert_rule_status, which only advances on a newer timestamp.
+    // project_rule_status, which only advances on a newer timestamp.
     void seed_raw_status(const std::string& agent, const std::string& rule_id,
                          const std::string& state, const std::string& ts) {
         yuzu::server::pg::PgConn conn{PQconnectdb(gs_db_pg->dsn().c_str())};
@@ -1989,19 +1989,19 @@ TEST_CASE("REST gs.status: errored_rules is real, census-derived and DISTINCT-ru
     CHECK(j["data"]["total_rules"].get<int>() == 3);
 }
 
-TEST_CASE("REST gs.status: an errored census row for a DELETED rule is excluded (not counted)",
+TEST_CASE("REST gs.status: an event for a rule that does not exist adds no census row (not counted)",
           "[pg][rest][guaranteed_state][status]") {
-    // Adversarial-review finding: delete_rule's own status-table cleanup is
-    // explicitly best-effort (no changes-count check, warn-only on failure) with no
-    // FK — so a census row can outlive its rule. errored_rules must intersect
-    // against the live catalogue, or a deleted rule inflates the count forever.
+    // Schema v3: guardian_agent_rule_status has a foreign key to
+    // guaranteed_state_rules, so a census row for a missing rule is refused and
+    // cannot be arranged. This pins the observable result (errored_rules counts the
+    // live rule only); the live-catalogue intersection in the route remains as
+    // defense in depth.
     RestGsHarness h;
     REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r-live", "live"))
                 ->status == 201);
     h.seed_status("e1", "WS-1", "r-live", "guard.unhealthy", "2026-06-20T10:00:00Z");
-    // r-orphan has a census row but was NEVER created as a rule (models the
-    // best-effort-cleanup-failed / late-event-after-delete case without needing to
-    // race the actual delete path).
+    // r-orphan was NEVER created as a rule: the event is stored, its census write
+    // is refused by the foreign key.
     h.seed_status("e2", "WS-1", "r-orphan", "guard.unhealthy", "2026-06-20T10:00:00Z");
 
     auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
@@ -2009,6 +2009,37 @@ TEST_CASE("REST gs.status: an errored census row for a DELETED rule is excluded 
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
     CHECK(j["data"]["errored_rules"].get<int>() == 1); // r-live only
+    CHECK(j["data"]["total_rules"].get<int>() == 1);
+}
+
+TEST_CASE("REST gs.status: with the foreign key removed, an errored census row for a deleted rule "
+          "is still excluded",
+          "[pg][rest][guaranteed_state][status]") {
+    // The route intersects the census with the live rule catalogue as defense in depth in
+    // case the schema v3 foreign key is ever missing. The key is dropped here so an orphan
+    // census row can be arranged and that intersection observed; with the key in place the
+    // test above cannot reach it.
+    RestGsHarness h;
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r-live", "live"))
+                ->status == 201);
+    h.seed_status("e1", "WS-1", "r-live", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult res = yuzu::server::pg::exec_params(
+            conn.get(),
+            "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+            "DROP CONSTRAINT guardian_agent_rule_status_rule_fk",
+            std::vector<std::string>{});
+        REQUIRE(PQresultStatus(res.get()) == PGRES_COMMAND_OK);
+    }
+    h.seed_raw_status("WS-1", "r-orphan", "errored", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["errored_rules"].get<int>() == 1); // r-live only; r-orphan intersected out
     CHECK(j["data"]["total_rules"].get<int>() == 1);
 }
 
@@ -2250,8 +2281,9 @@ TEST_CASE("REST gs.status: a guard.errored lifecycle event counts as an errored 
     CHECK(j["data"]["compliant_rules"].get<int>() == 0);
 }
 
-TEST_CASE("REST gs.status/{agent_id}: an errored census row for a DELETED rule is excluded",
+TEST_CASE("REST gs.status/{agent_id}: an event for a rule that does not exist adds no census row",
           "[pg][rest][guaranteed_state][status]") {
+    // Schema v3: the foreign key refuses the census row for the missing rule.
     RestGsHarness h;
     REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r-live", "live"))
                 ->status == 201);
@@ -5474,31 +5506,28 @@ TEST_CASE("REST gs.device-compliance: unrecognized stored state folds into pendi
     CHECK(d["guards"][0]["updated_at"].get<std::string>() == "2026-06-20T10:00:00Z");
 }
 
-TEST_CASE("REST gs.device-compliance: snapshot guard with no rule row falls back to rule_id name",
+TEST_CASE("REST gs.device-compliance: a snapshot guard whose rule was deleted drops out with its census row",
           "[pg][rest][guaranteed_state][baseline]") {
     RestGsHarness h;
     h.seed_rule("r1", "Real Guard");
-    // r-gone is in the deployed snapshot but its rule row was never created (e.g. the
-    // Guard was deleted after deploy) -> name falls back to the rule_id. The device
-    // reported BOTH guards, so both are applicable.
+    h.seed_rule("r-gone", "Doomed Guard");
+    // r-gone is in the deployed snapshot and the device reported it, then the Guard was
+    // deleted after deploy. The census row has a foreign key to the rule (schema v3,
+    // #5674), so deleting the rule removes it and the device no longer reports r-gone; a
+    // census row with no rule row, which this test used to arrange to exercise the
+    // rule_id name fallback, can no longer exist.
     h.seed_deployed_baseline("B", {"r1", "r-gone"});
     h.seed_status("e1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
     h.seed_status("e2", "WS-1", "r-gone", "drift.detected", "2026-06-20T10:00:00Z");
+    REQUIRE(h.store->delete_rule("r-gone"));
 
     auto res = h.sink.Get("/api/v1/guaranteed-state/device-compliance?baseline=B&agent_id=WS-1");
     REQUIRE(res);
     auto j = nlohmann::json::parse(res->body);
     auto& d = j["data"];
-    CHECK(d["total_guards"].get<int>() == 2);
-    bool saw_fallback = false;
-    for (auto& g : d["guards"]) {
-        if (g["rule_id"].get<std::string>() == "r-gone") {
-            CHECK(g["name"].get<std::string>() == "r-gone"); // fallback to rule_id
-            CHECK(g["status"].get<std::string>() == "drifted");
-            saw_fallback = true;
-        }
-    }
-    CHECK(saw_fallback);
+    CHECK(d["total_guards"].get<int>() == 1);
+    for (auto& g : d["guards"])
+        CHECK(g["rule_id"].get<std::string>() != "r-gone");
 }
 
 TEST_CASE("REST gs.device-compliance: rule_names_for chunks the IN-list past 500 (perf-2/UP-6)",
