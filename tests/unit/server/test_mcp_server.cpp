@@ -64,6 +64,7 @@
 #include "test_forensics_tier_fixture.hpp" // #4990: the Forensics tier fixture
 #include "test_route_sink.hpp"  // M.9 PR-2b: in-process sink for that REST half
 #include "test_instruction_execute_rig.hpp" // #2146: Ports rig (no Postgres) for execute_instruction_definition
+#include "test_partial_send_dispatch.hpp" // dispatch_throwing_on_nth_send
 #include "test_principal_lock_gate.hpp" // SqlFault: a REAL table moved aside in the throwaway DB
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
@@ -45418,7 +45419,40 @@ TEST_CASE("MCP execute_instruction_definition: a throwing dispatch (std or non-s
                           {{"route", "mcp"}, {"phase", "dispatch"}}) == 1);
         CHECK(rig.counter("yuzu_server_dispatch_fanout_throw_total",
                           {{"route", "instruction_execute"}, {"phase", "dispatch"}}) == 0);
+        // cb-c1: the row the throw left running is a typed error.data field.
+        CHECK(body["error"]["data"]["execution_id"] == "exec-1");
+        CHECK_FALSE(body["error"]["data"].contains("agents_sent"));
     }
+}
+
+TEST_CASE("MCP execute_instruction_definition: a dispatch that throws after confirmed sends carries "
+          "execution_id and agents_sent as typed error.data fields",
+          "[mcp][integration][execute][idef][send_progress]") {
+    McpTestServer ts;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+    rig.custom_dispatch = [](const std::vector<std::string>& ids) {
+        return yuzu::test::dispatch_throwing_on_nth_send(ids, 3);
+    };
+    idef_start(ts, rig, "operator");
+    auto res = ts.call(idef_call({{"definition_id", "d"},
+                                  {"agent_ids", nlohmann::json::array({"agent-A", "agent-B", "agent-C"})}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["reason"] == "dispatch_exception");
+    CHECK(body["error"]["data"]["execution_id"] == "exec-1");
+    CHECK(body["error"]["data"]["agents_sent"] == 2);
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+    // Another refusal class carries neither.
+    McpTestServer ts2;
+    Rig rig2;
+    idef_start(ts2, rig2, "operator");
+    auto nf = ts2.call(idef_call({{"definition_id", "nope"}}));
+    REQUIRE(nf);
+    const auto nfb = nlohmann::json::parse(nf->body);
+    CHECK_FALSE(nfb["error"]["data"].contains("execution_id"));
 }
 
 TEST_CASE("MCP execute_instruction_definition: a dropped success row is reported, not hidden",

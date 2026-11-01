@@ -24,7 +24,8 @@ constexpr std::string_view kAuditAction = "instruction.execute";
 /// nullable `retry_after_ms` keep it A4-complete.
 std::string error_body(httplib::Response& res, int code, const std::string& message,
                        const std::string& reason, std::optional<int> retry_after_ms,
-                       const std::string& remediation = {}) {
+                       const std::string& remediation = {},
+                       const nlohmann::json& extra = nlohmann::json::object()) {
     nlohmann::json err{{"code", code},
                        {"message", message},
                        {"retry_after_ms", retry_after_ms ? nlohmann::json(*retry_after_ms)
@@ -34,6 +35,8 @@ std::string error_body(httplib::Response& res, int code, const std::string& mess
         err["reason"] = reason;
     if (!remediation.empty())
         err["remediation"] = remediation;
+    for (const auto& [k, v] : extra.items())
+        err[k] = v;
     return nlohmann::json{{"error", std::move(err)}, {"meta", {{"api_version", "v1"}}}}.dump();
 }
 
@@ -88,8 +91,17 @@ void send_refusal(httplib::Response& res, const Refusal& r) {
         break;
     }
     res.status = status;
-    res.set_content(error_body(res, status, message, r.reason, r.retry_after_ms, remediation),
-                    "application/json");
+    // A dispatch that threw names the row it left running as a TYPED field (command_v1 does the
+    // same), and `agents_sent` when the sink confirmed a send: nothing to parse out of prose.
+    nlohmann::json extra = nlohmann::json::object();
+    if (r.kind == RefusalKind::kDispatchFailed) {
+        extra["execution_id"] = r.execution_id;
+        if (r.agents_sent > 0)
+            extra["agents_sent"] = r.agents_sent;
+    }
+    res.set_content(
+        error_body(res, status, message, r.reason, r.retry_after_ms, remediation, extra),
+        "application/json");
 }
 
 void send_zero_reach(httplib::Response& res, const ZeroReach& z) {

@@ -762,9 +762,11 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
         }
         bump(p, "yuzu_server_dispatch_fanout_throw_total",
              {{"route", route_label(rq.surface)}, {"phase", "dispatch"}});
-        return Outcome{make_refusal(RefusalKind::kDispatchFailed, "dispatch_exception",
-                                    "dispatch failed", std::move(threw_remediation)),
-                       c.audit_dropped};
+        Refusal threw_refusal = make_refusal(RefusalKind::kDispatchFailed, "dispatch_exception",
+                                             "dispatch failed", std::move(threw_remediation));
+        threw_refusal.execution_id = execution_id;
+        threw_refusal.agents_sent = any_sent ? progress.sent : 0;
+        return Outcome{std::move(threw_refusal), c.audit_dropped};
     }
 
     if (o.sent == 0) {

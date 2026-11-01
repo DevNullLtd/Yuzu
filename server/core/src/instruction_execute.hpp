@@ -254,6 +254,13 @@ struct Refusal {
     /// for testplug.gated"), so the renderers must not pass empty strings.
     std::string plugin;
     std::string action;
+    /// Set for kDispatchFailed only (a dispatch that THREW): the execution row the call left
+    /// running ("" when no row exists) and the lower-bound count of agents the sink confirmed a
+    /// send to before the throw (0 = none known). Both surface as typed fields on the wire
+    /// (REST `error.execution_id` / `error.agents_sent`, MCP `error.data` likewise), exactly as
+    /// POST /api/v1/commands does, so a caller reads them without parsing the remediation prose.
+    std::string execution_id;
+    int agents_sent{0};
 };
 
 struct PendingApproval {

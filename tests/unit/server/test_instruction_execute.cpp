@@ -2304,7 +2304,49 @@ TEST_CASE("REST execute: a throwing dispatch is a 500 with NO retry hint (std an
             REQUIRE(r.core.audits.size() == 2);
             CHECK(r.core.audits[1].result == "failure");
             CHECK(res->get_header_value("Sec-Audit-Failed") == (lose_row ? "true" : ""));
+            // cb-c1: the row the throw left running is a TYPED field (as in POST /api/v1/commands);
+            // no send was confirmed, so there is no agents_sent.
+            CHECK(err["execution_id"] == "exec-1");
+            CHECK_FALSE(err.contains("agents_sent"));
         }
+    }
+}
+
+TEST_CASE("REST execute: a dispatch that throws after confirmed sends carries execution_id and "
+          "agents_sent as typed error fields, and none for other refusals",
+          "[instruction_execute][rest][send_progress]") {
+    SECTION("confirmed sends") {
+        RouteRig r;
+        r.core.defs["d"] = make_def("d");
+        r.core.custom_dispatch = [](const std::vector<std::string>& ids) {
+            return yuzu::test::dispatch_throwing_on_nth_send(ids, 3);
+        };
+        auto res = r.post("d", R"({"agent_ids":["agent-A","agent-B","agent-C"]})");
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        const auto err = json::parse(res->body)["error"];
+        CHECK(err["reason"] == "dispatch_exception");
+        CHECK(err["execution_id"] == "exec-1");
+        CHECK(err["agents_sent"] == 2);
+        CHECK(err["retry_after_ms"].is_null());
+    }
+    SECTION("no execution record: execution_id is the empty string, still present") {
+        RouteRig r([](Rig& c) { c.ledger_wired = false; });
+        r.core.defs["d"] = make_def("d");
+        r.core.dispatch_throws = true;
+        auto res = r.post("d", "{}");
+        REQUIRE(res);
+        const auto err = json::parse(res->body)["error"];
+        REQUIRE(err.contains("execution_id"));
+        CHECK(err["execution_id"] == "");
+    }
+    SECTION("an unrelated refusal carries neither field") {
+        RouteRig r;
+        auto res = r.post("nope", "{}");
+        REQUIRE(res);
+        const auto err = json::parse(res->body)["error"];
+        CHECK_FALSE(err.contains("execution_id"));
+        CHECK_FALSE(err.contains("agents_sent"));
     }
 }
 

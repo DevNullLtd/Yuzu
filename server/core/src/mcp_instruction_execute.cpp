@@ -77,13 +77,21 @@ nlohmann::json core_body(const nlohmann::json& args) {
 namespace {
 
 std::string error_data(const std::string& cid, const std::optional<int>& retry,
-                       const std::string& reason, const std::string& remediation, bool audit_dropped) {
+                       const std::string& reason, const std::string& remediation, bool audit_dropped,
+                       const Refusal* refusal = nullptr) {
     nlohmann::json d{{"correlation_id", cid},
                      {"retry_after_ms", retry ? nlohmann::json(*retry) : nlohmann::json(nullptr)},
                      {"remediation", remediation.empty() ? nlohmann::json(nullptr)
                                                          : nlohmann::json(remediation)}};
     if (!reason.empty())
         d["reason"] = reason;
+    // A dispatch that threw: the row it left running and the confirmed send count, as typed
+    // fields (the REST twin and POST /api/v1/commands carry the same two).
+    if (refusal != nullptr && refusal->kind == RefusalKind::kDispatchFailed) {
+        d["execution_id"] = refusal->execution_id;
+        if (refusal->agents_sent > 0)
+            d["agents_sent"] = refusal->agents_sent;
+    }
     if (audit_dropped)
         d["audit_persisted"] = false;
     return d.dump();
@@ -148,7 +156,7 @@ Rendered render_refusal(const Refusal& r, bool audit_dropped, const std::string&
         break;
     }
     out.message = message;
-    out.data_json = error_data(cid, r.retry_after_ms, r.reason, remediation, audit_dropped);
+    out.data_json = error_data(cid, r.retry_after_ms, r.reason, remediation, audit_dropped, &r);
     return out;
 }
 
