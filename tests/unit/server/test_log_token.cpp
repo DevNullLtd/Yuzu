@@ -451,6 +451,7 @@ TEST_CASE("log_token: classifies UTF-8 validity exactly like sanitize_utf8_stric
             {"\xF0\x8F\xBF\xBF", false}, {"\xF0\x90\x80\x80", true},  // U+10000
             {"\xF4\x8F\xBF\xBF", true},                                  // U+10FFFF
             {"\xF4\x90\x80\x80", false}, {"\xF5\x80\x80\x80", false},
+            {"\xF6\x80\x80\x80", false}, {"\xF7\x80\x80\x80", false},
             {"\xC0\x80", false},           {"\xC1\xBF", false},
         };
         for (const auto& v : vectors) {

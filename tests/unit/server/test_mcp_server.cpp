@@ -45851,6 +45851,16 @@ TEST_CASE("MCP execute_instruction_definition: an approved tier ticket cannot la
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+namespace {
+/// "No execution row exists", proven by a CHECKED read: the unchecked query_executions() turns a
+/// read fault into an empty list, which would make this assertion pass on a degraded store.
+inline void check_no_execution_rows(const yuzu::server::ExecutionTracker& tracker) {
+    const auto rows = tracker.query_executions_checked(yuzu::server::ExecutionQuery{}, std::nullopt);
+    REQUIRE(rows.has_value()); // the read itself succeeded
+    CHECK(rows->empty());
+}
+} // namespace
+
 // sg-1 (#2146), the sec-F1 class: the definition-resolved result-set producers
 // (create_result_set_from_instruction_result, reevaluate_result_set) never carry Ticket
 // approval provenance. Their (plugin, action) comes from a STORED definition an editor can
@@ -46039,7 +46049,7 @@ TEST_CASE("MCP create_result_set_from_instruction_result: an approved tier ticke
         // after C8 consumed the ticket (measured: consumed_at != 0). Not a regression of sg-1,
         // which only guarantees the repointed pair is never sent.
         // The refusal precedes every side effect: no execution row to cancel, no result-set row.
-        CHECK(tracker_bundle.get()->query_executions({}).empty());
+        check_no_execution_rows(*tracker_bundle.get());
         std::string next;
         CHECK(rs_bundle.get()->list_by_owner("test-user", "", 100, next).empty());
     }
@@ -46119,7 +46129,7 @@ TEST_CASE("MCP reevaluate_result_set: an approved tier ticket for a benign pair 
         CHECK(log.dispatch_calls == 0);
         CHECK(log.sent.empty());
         // No execution row, and the owner's result sets are exactly the seeded one.
-        CHECK(tracker_bundle.get()->query_executions({}).empty());
+        check_no_execution_rows(*tracker_bundle.get());
         std::string next;
         CHECK(rs_bundle.get()->list_by_owner("test-user", "", 100, next).size() == 1);
     }
@@ -46186,7 +46196,7 @@ TEST_CASE("MCP create_result_set_from_instruction_result: an unwired dispatch au
     CHECK(body["error"]["message"].get<std::string>().find(
               "dispatch authorization is unavailable") != std::string::npos);
     CHECK(log.dispatch_calls == 0);
-    CHECK(tracker_bundle.get()->query_executions({}).empty());
+    check_no_execution_rows(*tracker_bundle.get());
     std::string next;
     CHECK(rs_bundle.get()->list_by_owner("test-user", "", 100, next).empty());
 }

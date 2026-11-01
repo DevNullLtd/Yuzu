@@ -3,8 +3,9 @@
  * (POST /api/v1/instructions/{id}/execute) of the instruction-definition execute capability.
  * Ledger row post.api-instructions-param-execute (#2146).
  *
- * NO POSTGRES, except the one [pg] case that drives a throwing dispatch through the production
- * make_ports binding over a REAL ExecutionTracker. InstructionStore, ApprovalManager and ExecutionTracker are all Postgres-backed,
+ * NO POSTGRES, except the [pg]-tagged cases (the throwing-dispatch wedge tests), which drive a
+ * throwing dispatch through the production make_ports binding over a REAL ExecutionTracker and,
+ * for the zero-sent case, the real stuck-execution reaper. InstructionStore, ApprovalManager and ExecutionTracker are all Postgres-backed,
  * so every one of them is a std::function SEAM on instruction_execute::Ports and is faked here.
  * What this file therefore does NOT prove (and the senior should know): the real store
  * round-trip (definition read, approval row, execution row, the ADR-1007 claim INSERT/UPDATE
@@ -16,6 +17,7 @@
  */
 
 #include "agent_registry.hpp"
+#include "command_outbox_store.hpp" // the reaper reads the outbox schema
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
 #include "dispatch_destructive_gate.hpp"
@@ -26,6 +28,8 @@
 #include "instruction_execute_ports.hpp"
 #include "instruction_execute_routes.hpp"
 #include "mcp_instruction_execute.hpp" // kSubmitterPendingCap alias
+#include "pg/pg_exec.hpp"
+#include "pg/pg_pool.hpp"
 #include "service_scope_policy.hpp"
 
 #include "../test_helpers.hpp"
@@ -39,6 +43,7 @@
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
 #include <array>
@@ -1511,9 +1516,17 @@ TEST_CASE("execute: a throwing dispatch with no tracker wired records nothing",
     r.custom_dispatch = [](const std::vector<std::string>& ids) {
         return yuzu::test::dispatch_throwing_on_nth_send(ids, 2);
     };
+    // The count port IS wired (the ledger flag only unwires the create/cancel/refresh ports), so
+    // the empty-execution_id guard in the throw arm is what keeps the count from being stored
+    // against a row that does not exist. With the port unwired this assertion could not fail.
+    auto ports = r.ports();
+    ports.set_agents_targeted = [&r](const std::string& id, int n) {
+        r.targeted.emplace_back(id, n);
+        return true;
+    };
     auto out = run(r.request("d", json{{"agent_ids", json::array({kA, kB})}},
                              make_caller("u", true)),
-                   r.ports(), r.audit());
+                   ports, r.audit());
     REQUIRE(as_refusal(out));
     CHECK(r.targeted.empty());
     CHECK(as_refusal(out)->remediation.find("no execution record was created") !=
@@ -1618,6 +1631,31 @@ TEST_CASE("execute: [pg] a dispatch that throws on the 1st send leaves the row r
     CHECK(row->agents_targeted == 0);
     CHECK(row->status == "running"); // not cancelled: the first send is indeterminate
     CHECK(r.audits[1].detail.find("agents_sent") == std::string::npos);
+
+    // The row's whole recovery story is the stuck-execution reaper: no agent ever answered and
+    // nothing was targeted, so once it is older than the reaper's window the sweep cancels it.
+    // The reaper's candidate query reads the outbox schema too, so it is migrated into the SAME
+    // database; the row is aged with the test-only UPDATE the tracker tests use.
+    yuzu::server::pg::PgPool pool{{.conninfo = tracker.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    yuzu::server::CommandOutboxStore outbox{pool};
+    REQUIRE(outbox.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto aged = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.executions SET dispatched_at = dispatched_at - $1 "
+            "WHERE id = $2",
+            std::vector<std::string>{"3600", id});
+        REQUIRE(aged.status() == PGRES_COMMAND_OK);
+    }
+    const auto reaped = tracker->reap_stuck_running_executions();
+    REQUIRE(reaped.has_value());
+    CHECK(reaped->cancelled == 1);
+    const auto after = tracker->get_execution(id);
+    REQUIRE(after.has_value());
+    CHECK(after->status == "cancelled");
 }
 
 TEST_CASE("send progress: instrument_sink is the identity outside a scope, counts inside one, and "
@@ -1669,12 +1707,12 @@ TEST_CASE("send progress: wire_and_dispatch_confined counts the sends it actuall
         CHECK(out.sent == 3);
     }
     CHECK(progress.sent == 3);
-    // Outside a scope the same call is uncounted and unchanged.
-    SendProgress untouched;
+    // Outside the scope the same call still sends but is NOT counted: the scope's progress is
+    // unchanged (this assertion fails if the instrumented sink outlives its scope).
     CHECK(r.real("testplug", "ping", {kA}, "", {}, "exec-y", make_caller("u", true), "d",
                  "per-device")
               .sent == 1);
-    CHECK(untouched.sent == 0);
+    CHECK(progress.sent == 3);
 }
 
 TEST_CASE("execute: a create_execution that throws (std or non-std) writes a failure row, "
