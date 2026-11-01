@@ -30,6 +30,7 @@
 #include "mcp_policy.hpp"
 #include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log (enrol-confirm stamp log)
 #include "oidc_writer_gate.hpp" // writer priority for the OIDC lock (#5692 UP-13)
+#include "sso_boot_guard.hpp" // oidc_config_complete + publish_oidc_provider_gauges (#4160)
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
@@ -4161,6 +4162,12 @@ void SettingsRoutes::register_routes(
             cfg_->oidc_skip_tls_verify = skip_tls;
             retire_on_exit.unpublished = std::move(*oidc_provider_);
             *oidc_provider_ = std::move(new_provider);
+            // #4160: keep the provider gauges truthful across a runtime reconfigure
+            // (they are otherwise only written at boot). Same publisher as server.cpp.
+            if (metrics_registry_) {
+                publish_oidc_provider_gauges(*metrics_registry_, oidc_config_complete(*cfg_),
+                                             *oidc_provider_ && (*oidc_provider_)->is_enabled());
+            }
         }
         spdlog::info("OIDC provider reinitialized via Settings UI (issuer={})", issuer);
 
