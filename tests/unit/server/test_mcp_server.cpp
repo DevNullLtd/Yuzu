@@ -45542,6 +45542,36 @@ TEST_CASE("MCP execute_instruction_definition: supervised non-admin on a gated p
     CHECK(rows[0] == "denied|" + body["error"]["data"]["correlation_id"].get<std::string>());
 }
 
+// Gate 8 pass 2 (sg-b1): the supervised pre-mint probe reads the stored definition and writes rows,
+// so it must run AFTER the Execution:Execute check, not before it.
+TEST_CASE("MCP execute_instruction_definition: a supervised token without Execution:Execute is "
+          "refused BEFORE the pre-mint probe: no definition read, no row, no approval, no ticket",
+          "[pg][mcp][integration][execute][idef][approval][security][sg-b1]") {
+    for (const bool exists : {true, false}) {
+        INFO("definition exists=" << exists);
+        yuzu::test::ApprovalManagerPg appr_bundle;
+        yuzu::server::ApprovalManager& appr = *appr_bundle;
+        McpTestServer ts;
+        ts.approval_manager_for_test = &appr;
+        ts.perm_override_for_test = [](const std::string& sec, const std::string& op) {
+            return !(sec == "Execution" && op == "Execute");
+        };
+        Rig rig;
+        // "always": a permitted caller would get a pending approval; "auto" would mint a ticket.
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "always");
+        idef_start(ts, rig, "supervised", /*admin=*/false);
+        auto res = ts.call(idef_call({{"definition_id", exists ? "d" : "ghost"}}));
+        REQUIRE(res);
+        CHECK(res->status == 403); // the permission refusal, identical for a known and an unknown id
+        CHECK(rig.lookups == 0);   // the stored definition was never read
+        CHECK(rig.calls.empty());
+        CHECK(rig.audits.empty());                // no instruction.execute row of any kind
+        CHECK(rig.approvals.empty());             // no definition approval
+        CHECK(appr.pending_count() == 0);         // no tier ticket either
+        CHECK(idef_row_cids(ts).empty());         // no mcp.execute_instruction_definition row
+    }
+}
+
 TEST_CASE("MCP execute_instruction_definition: an approved tier ticket for a benign pair cannot run "
           "a gated pair the definition was repointed at before the recall",
           "[pg][mcp][integration][execute][idef][approval][security][sec-f1]") {

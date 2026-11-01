@@ -115,6 +115,7 @@ struct Rig {
 
     std::map<std::string, InstructionDefinition> defs;
     bool store_error{false};
+    int lookups{0}; ///< definition-store reads the pipeline made (a pre-RBAC probe must make none)
     bool store_unwired{false};
 
     bool approvals_wired{true};
@@ -225,6 +226,7 @@ struct Rig {
         Ports p;
         if (!store_unwired) {
             p.lookup_definition = [this](const std::string& id) -> DefinitionLookup {
+                ++lookups;
                 if (store_error)
                     return std::unexpected(std::string("db down"));
                 if (auto it = defs.find(id); it != defs.end())

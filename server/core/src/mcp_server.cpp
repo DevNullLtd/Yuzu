@@ -8429,6 +8429,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     // A Plan falls through to mint/recall.
                     if (tool_name == "execute_instruction_definition") {
                         namespace idef = yuzu::server::mcp::instruction_definition;
+                        // RBAC BEFORE the probe (Gate 8 pass 2, sg-b1). The probe reads the
+                        // stored definition and writes rows (a pre-RBAC `denied` row, and a
+                        // pending approval for a definition that needs one), so running it ahead
+                        // of the handler's own Execution:Execute check let a supervised token
+                        // whose principal lacks that permission learn whether a definition
+                        // exists and what its schema says, and create approval rows. This is the
+                        // SAME gate, refusal shape and audit (perm_fn writes its own
+                        // auth.permission_required row) as the handler below; the tier ladder
+                        // already ran above, so the order is tier -> RBAC -> probe -> mint.
+                        if (!perm_fn(req, res, "Execution", "Execute"))
+                            return;
                         // ONE correlation id per call: the response header, this probe's rows,
                         // the handler's rows below and every error body carry the same value.
                         const std::string call_cid =
