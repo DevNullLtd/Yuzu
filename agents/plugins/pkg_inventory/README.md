@@ -248,5 +248,4 @@ status|store_packages|supported|-
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_pkg_inventory.hpp`
 - Tests: `tests/unit/test_pkg_inventory_linux_parsers.cpp` · `tests/unit/test_pkg_inventory_local_dispatcher.cpp` · `tests/unit/test_pkg_inventory_macos_parsers.cpp` · `tests/unit/test_pkg_inventory_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-14-pkg_inventory-linux-store-packages.added.md`
 <!-- END GENERATED -->

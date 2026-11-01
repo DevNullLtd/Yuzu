@@ -343,9 +343,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_update_source_trust.hpp"
     ],
-    "changelog": [
-      "changelog.d/wave10-pr10.1d-update_source_trust.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/update_source_trust.yaml"
     ],
