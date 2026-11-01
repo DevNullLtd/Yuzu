@@ -509,7 +509,8 @@ ExecMutationMcpError exec_mutation_mcp_error(ExecutionMutation what,
                          "cancelled"
                        : "rerun failed unexpectedly; a rerun record may or may not have been "
                          "created",
-                "read the execution to see its current state before issuing another call", -1};
+                "read the execution to see its current state before issuing another call", -1,
+                /*envelope=*/true};
     case S::kDone:
         break;
     }

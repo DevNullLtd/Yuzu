@@ -44655,6 +44655,15 @@ TEST_CASE("MCP cancel_execution / record_execution_rerun: a throwing effect is -
                                   body["error"]["data"].contains("retry_after_ms") &&
                                   !body["error"]["data"]["retry_after_ms"].is_null();
             CHECK_FALSE(has_hint);
+            // The A4 data object is sent (not a bare error_response): `retry_after_ms` is present
+            // and null, and the remediation tells the agent to read the execution first.
+            REQUIRE(body["error"].contains("data"));
+            REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+            CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+            REQUIRE(body["error"]["data"]["remediation"].is_string());
+            const auto remediation = body["error"]["data"]["remediation"].get<std::string>();
+            CHECK(remediation.find("read the execution") != std::string::npos);
+            CHECK(remediation.find("retry") == std::string::npos);
             // The wire key is `retry_after_ms`, so the prose is checked field by field.
             CHECK(body["error"]["message"].get<std::string>().find("retry") == std::string::npos);
             CHECK(res->body.find("PQerror") == std::string::npos);
