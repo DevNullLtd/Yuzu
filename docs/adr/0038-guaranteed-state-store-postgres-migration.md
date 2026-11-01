@@ -221,6 +221,21 @@ premise as every other
 store here; if that premise is ever locally wrong for a Guardian install specifically,
 the operator's actual protection posture is what's at stake, not just convenience.
 
+## Update (2026-10-31) - census write in the event transaction (#5674)
+
+The "Status upserts: fail-soft with the same counter" decision above is superseded for the
+compliance census (`guardian_agent_rule_status`). Schema v3 adds a foreign key from the census
+table to `guaranteed_state_rules` with `ON DELETE CASCADE`, so a rule delete removes its census
+rows in the same statement and the database refuses a census write for a rule that does not
+exist (SQLSTATE 23503). The census upsert now runs inside the event's transaction under
+`SAVEPOINT census_upsert`: a refused or failed write rolls back to the savepoint and does not
+discard the event. A failure other than the 23503 refusal is counted on its own counter,
+`yuzu_server_guardian_census_proj_failures_total`, and logged at error. If a savepoint control
+statement itself fails, the transaction is abandoned and the event is not stored (on the
+single-event path the ingest error counter moves). The store constructor also checks, after the migrations, that the cascade
+key exists and refuses to open otherwise, because the migration runner cannot tell this schema's
+v3 from another branch's v3. Status reads are unchanged.
+
 ## Follow-ups
 
 - #2634-parity counters land here from day one (this ADR's retention section).
