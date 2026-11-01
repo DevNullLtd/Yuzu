@@ -1464,6 +1464,31 @@ TEST_CASE("openapi documents: x-yuzu-guide is on every tag in the guides form on
     }
 }
 
+TEST_CASE("openapi documents: every tag an operation uses is declared in the tag list",
+          "[openapi][structure][guides]") {
+    // An undeclared tag renders in a viewer with no description and, in the guides form, no
+    // guide. The Commands tag was used for a release's worth of review before anyone noticed.
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        std::set<std::string> declared;
+        for (const auto& tag : spec["tags"])
+            declared.insert(tag.at("name").get<std::string>());
+        std::set<std::string> used;
+        for (const auto& o : all_operations(spec)) {
+            for (const auto& t : o.op.value("tags", json::array()))
+                used.insert(t.get<std::string>());
+        }
+        std::set<std::string> undeclared;
+        for (const auto& t : used) {
+            if (!declared.contains(t))
+                undeclared.insert(t);
+        }
+        CHECK(undeclared == std::set<std::string>{});
+        CHECK(declared.size() == 48);
+    }
+}
+
 TEST_CASE("openapi documents: all but two operations declare a typed success response",
           "[openapi][structure][typed]") {
     // These two answer 204 with no body, so there is nothing to type. A third name here is a
