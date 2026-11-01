@@ -14085,11 +14085,11 @@ private:
                 bool applied_terminal = false;
 
                 // Retry up to 3 times on transient connection failures
-                for (int attempt = 0; attempt < 3; ++attempt) {
-                    if (attempt > 0) {
+                for (int try_no = 0; try_no < 3; ++try_no) {
+                    if (try_no > 0) {
                         spdlog::info("Retrying gateway SendCommand for {} (attempt {})", cmd_id,
-                                     attempt + 1);
-                        std::this_thread::sleep_for(std::chrono::seconds(1 << attempt));
+                                     try_no + 1);
+                        std::this_thread::sleep_for(std::chrono::seconds(1 << try_no));
                     }
 
                     grpc::ClientContext ctx;
@@ -14320,7 +14320,7 @@ private:
                         return; // non-transient error — don't retry
                     }
                     spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
-                                 cmd_id, attempt + 1,
+                                 cmd_id, try_no + 1,
                                  ::yuzu::log_key_token(status.error_message()));
                 }
                 spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
