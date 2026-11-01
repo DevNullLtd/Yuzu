@@ -1,1 +1,0 @@
-- **`registry`: the canonical-name check behind every mutating action fails closed on a key name that holds a lone UTF-16 surrogate or a NUL.** The compare used a lossy conversion, so a key one code unit away from the one named could pass the fast open; such a name now declines to the component walk, which refuses. Hardening: no exploitable path was shown.

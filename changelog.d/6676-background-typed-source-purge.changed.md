@@ -1,1 +1,0 @@
-- The server's boot-time purge of stray typed-source rows from the generic inventory store now runs in the background in bounded batches instead of blocking startup with one unbounded delete per source. New counters `yuzu_inventory_typed_purge_rows_total` and `yuzu_inventory_typed_purge_failures_total`.

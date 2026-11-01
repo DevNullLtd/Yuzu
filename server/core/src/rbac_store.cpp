@@ -3005,20 +3005,53 @@ bool RbacStore::check_scoped_permission(const std::string& username,
                                         const std::string& securable_type,
                                         const std::string& operation, const std::string& agent_id,
                                         const ManagementGroupStore* mgmt_store) const {
-    // 1. Global permission first (a global ALLOW short-circuits, #1715(b)).
-    if (check_permission(username, securable_type, operation))
-        return true;
+    return check_scoped_permission_checked(username, securable_type, operation, agent_id,
+                                           mgmt_store)
+        .value_or(false);
+}
+
+std::expected<bool, std::string> RbacStore::check_scoped_permission_checked(
+    const std::string& username, const std::string& securable_type, const std::string& operation,
+    const std::string& agent_id, const ManagementGroupStore* mgmt_store) const {
+    // #3739: a `false` reached AFTER a read degraded is "could not be determined", not a
+    // definitive denial. The FIRST degrade seen is remembered and surfaced only if the decision
+    // would otherwise be a plain `false`; an ALLOW and an explicit deny-group hit are returned
+    // as such, and the control flow is otherwise identical to the pre-#3739 Boolean
+    // implementation, so the Boolean wrapper's answers do not change. (A deny-group hit after an
+    // earlier degraded GLOBAL read is reported as a plain deny: the unread global grant, which
+    // could have overridden it, is not named. Accepted residual, recorded in the #3739 ledger.)
+    std::optional<std::string> degraded;
+    const auto note_degrade = [&degraded](std::string why) {
+        if (!degraded)
+            degraded = std::move(why);
+    };
+    const auto deny = [&degraded]() -> std::expected<bool, std::string> {
+        if (degraded)
+            return std::unexpected(*degraded);
+        return false;
+    };
+
+    // 1. Global permission first (a global ALLOW short-circuits, #1715(b)). A failed global read
+    //    does NOT end the check (the scoped path still runs, as before) but is remembered.
+    if (auto global = check_permission_checked(username, securable_type, operation)) {
+        if (*global)
+            return true;
+    } else {
+        note_degrade(std::move(global.error()));
+    }
 
     // 2. No mgmt store or agent → cannot do the scoped check.
     if (!mgmt_store || agent_id.empty())
-        return false;
+        return deny();
 
     // 3. Resolve allow/deny groups via the shared INV-7 resolver, intersect
     //    with the agent's reachable groups. Deny wins within the scoped set.
-    //    Fail-closed: any store error → false.
+    //    Fail-closed: any store error → deny (degraded).
     auto pg = resolve_perm_groups(username, securable_type, operation, mgmt_store);
-    if (!pg)
-        return false;
+    if (!pg) {
+        note_degrade(std::move(pg.error()));
+        return deny();
+    }
 
     // CONFINEMENT reads are now degrade-distinguishable (ADR-0042): a `nullopt`
     // means the mgmt-store degraded (store-not-open / pool-acquire timeout /
@@ -3026,27 +3059,31 @@ bool RbacStore::check_scoped_permission(const std::string& username,
     // silent empty here would drop the agent's reachable groups and could admit
     // a scoped grant that a DENY assignment should have blocked (fail-open).
     auto groups = mgmt_store->get_agent_groups(agent_id);
-    if (!groups)
-        return false; // mgmt-store degrade → deny
+    if (!groups) {
+        note_degrade(std::string(kRbacErrMgmtGroupReadDegraded));
+        return deny(); // mgmt-store degrade → deny
+    }
     std::unordered_set<std::string> reachable;
     for (const auto& gid : *groups) {
         reachable.insert(gid);
         auto ancestors = mgmt_store->get_ancestor_ids(gid);
-        if (!ancestors)
-            return false; // mgmt-store degrade → deny
+        if (!ancestors) {
+            note_degrade(std::string(kRbacErrMgmtGroupReadDegraded));
+            return deny(); // mgmt-store degrade → deny
+        }
         for (const auto& aid : *ancestors)
             reachable.insert(aid);
     }
     if (reachable.empty())
-        return false;
+        return deny();
 
     for (const auto& g : pg->deny_groups)
         if (reachable.contains(g))
-            return false;
+            return false; // explicit deny is definitive even after an earlier degraded read
     for (const auto& g : pg->allow_groups)
         if (reachable.contains(g))
             return true;
-    return false;
+    return deny();
 }
 
 // ── ADR-0017 admit-then-filter list gate ─────────────────────────────────────
@@ -3159,8 +3196,15 @@ RbacStore::resolve_perm_groups(const std::string& username, const std::string& s
         return std::unexpected(rbac_groups.error());
 
     auto assignments = mgmt_store->get_assignments_for_principal(username, *rbac_groups);
-    if (!assignments)
-        return std::unexpected(assignments.error());
+    if (!assignments) {
+        // #3739: this read belongs to the MANAGEMENT-GROUP store (it counts
+        // yuzu_server_mgmt_group_read_degrade_total itself), so its failure carries that
+        // store's token, not the forwarded text -- which is ambiguous ("query failed: ..." is
+        // shared with the RBAC reads) and would be labelled as an RBAC-side fault by
+        // `check_scoped_permission_checked`'s callers. Every caller of this helper only tests
+        // for failure; none consumes the text.
+        return std::unexpected(std::string(kRbacErrMgmtGroupReadDegraded));
+    }
 
     auto role_effect_r = role_effects_for(securable_type, operation);
     if (!role_effect_r)

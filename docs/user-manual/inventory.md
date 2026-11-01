@@ -635,7 +635,10 @@ place, **Hardware** and **Software**, each its own page:
     as pills with a Clear all, the URL hash carries them (so a view can be bookmarked or shared), and the
     exact REST call the view corresponds to is shown with a copy button. The filter box on an
     expanded devices table filters only the rows already loaded; the catalogue search
-    and chips are server-side.
+    and chips are server-side. Rows and the **versions** and **devices** controls work from the
+    keyboard (Tab, then Enter or Space), and pressing an open control again closes its drill.
+    The chip rows are built from the server's vocabulary tables, so **Found by** lists every
+    collector source and each **Kind** and **Found by** chip's tooltip says what it covers.
   - **The table** lists titles most-installed first, 100 at a time with a keyset
     **Load more**. **Installs** is the exact number of distinct devices carrying the
     title under the active filters (a device carrying one title through two sources
@@ -697,10 +700,13 @@ place, **Hardware** and **Software**, each its own page:
   - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to
     a management group, so the fleet view, the strip and the version counts need an
     unfiltered `Inventory:Read`; a management-group-scoped account is told so and refused
-    (audited as denied); the notice points to Hardware and carries a
+    (audited as denied); the notice points to Hardware (open the device from
+    Hardware, **Installed software**, **Open in Software**) and carries a
     **Clear all filters and reload** link. A scoped account can still use the host view
-    and the devices tables for devices in its scope, but only through a hand-typed
-    `/software#host=<agent_id>` address, which has no host-name type-ahead; there the "newest in fleet" mark is
+    and the devices tables for devices in its scope, through that **Open in Software**
+    link on a device's Hardware **Installed software** lens (it opens
+    `/software#host=<agent_id>`) or a hand-typed address of the same form; the page has no
+    host-name type-ahead for them; there the "newest in fleet" mark is
     blanked, no fleet
     figures are read, and device counts omit "of M". A scope wider than 10,000 devices is
     applied after the read in at most four bounded reads, so a devices page can come back short or
@@ -1110,6 +1116,19 @@ sync, defeating the hash-skip protocol.
 - **VMs / serial-less hosts.** A device with no SMBIOS serial (many VMs) reports
   `serial`/`system_uuid` as the literal `"unknown"` — use `manufacturer`/`model`
   (e.g. "VMware, Inc."/"VMware7,1") to recognise it.
+- **Versioned record (v2).** The server also stores a versioned record that adds
+  chassis (type, serial, asset tag), baseboard (vendor, product, serial) and a hashed
+  machine-id, each with its source, plus typed per-device rows for CPUs, DIMMs, disks,
+  swap, volumes, partitions and storage topology, each section with its own status.
+  `blob_version` says which format an agent last sent. A device whose agent is still on
+  the original format has **no** section rows stored — read that as "not stored", not
+  "the device has none". A section reported `constrained` with reason `server_cap:<n>`
+  means the server kept only the first `n` rows; `server:machine_id_shape` on the
+  `machine_id` section means the reported machine ID was not a hash and was discarded.
+  Chassis, board and DIMM serial numbers are personal data on the same footing as the
+  device serial and system UUID. Agents keep working unchanged; upgrade the server
+  before the agents. No page or API reads the per-device rows yet: these values are stored
+  now and become visible when the device-CI read surface ships.
 
 The operator-facing read surface — the **Hardware** list's CI columns and the CI
 record's **Overview** lens — is live; see the **`/hardware`** bullet above for its

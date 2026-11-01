@@ -198,6 +198,7 @@
 #include "legacy_events_routes.hpp" // #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
 #include "instruction_fragment_routes.hpp" // #2542 PR-12: the 2-route Instructions HTMX fragment pair, extracted onto the HttpRouteSink seam
 #include "approvals_fragment_routes.hpp" // #2542 PR-12: the Approvals HTMX fragment, extracted onto the HttpRouteSink seam
+#include "mcp_admission.hpp" // #4309: /mcp/v1/ refuses an empty-tier credential (admit())
 #include "mcp_disabled_routes.hpp" // #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
@@ -1009,6 +1010,18 @@ public:
                           // refused, not by surface.
                           "MCP SSE stream denials by reason - GET attach denials plus "
                           "streamed-POST admission denials",
+                          "counter");
+        // Answers a different question from the family above: who was turned away at
+        // the /mcp/v1/ door (any verb, before a session or stream exists), not which
+        // stream check refused a channel. Closed label set: tier_required.
+        metrics_.describe("yuzu_mcp_admission_refused_total",
+                          "Requests refused at /mcp/v1/ admission by reason - tier_required is "
+                          "a credential with no MCP tier (cookie session or tierless token)",
+                          "counter");
+        metrics_.describe("yuzu_mcp_admission_audit_suppressed_total",
+                          "Audit rows not written for tier_required refusals at /mcp/v1/ "
+                          "admission (suppressed by the per-key budget or a budget failure); "
+                          "the refused counter is complete",
                           "counter");
         metrics_.describe("yuzu_mcp_initialize_protocol_total",
                           "MCP initialize handshakes by negotiated protocol revision", "counter");
@@ -1965,7 +1978,7 @@ public:
         for (auto reason : {"missing_session_header", "unknown_session", "not_acceptable",
                             "per_principal_stream_cap", "global_stream_cap",
                             "stream_handover_pending", "replay_window_exceeded", "origin",
-                            }) {
+                            "service_scoped", "credential_mismatch"}) {
             metrics_.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}});
         }
         // 2f PR 3b streamed-POST admission denials, derived from the bridge's own
@@ -1976,6 +1989,10 @@ public:
         for (auto reason : mcp::McpStreamBridge::kPostRejectReasons) {
             metrics_.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}});
         }
+        // #4309: the admission refusal family (mcp_admission.hpp), pre-seeded so a
+        // dashboard reads "0" before the first refusal. Closed set: tier_required.
+        metrics_.counter("yuzu_mcp_admission_refused_total", {{"reason", "tier_required"}});
+        metrics_.counter("yuzu_mcp_admission_audit_suppressed_total");
         // Pre-seed both supported MCP protocol revisions to 0 so a
         // revision-deprecation dashboard reads "0" (not absent) for an unused
         // revision (observability-conventions.md; 2g PR 1). Values mirror the
@@ -3996,6 +4013,16 @@ public:
                           "model row is lost. >0 means /dex is under-counting - investigate "
                           "(commonly a stale-schema dev DB; see docs/user-manual/dex.md).",
                           "counter");
+        metrics_.describe("yuzu_server_guardian_census_proj_failures_total",
+                          "Compliance-census (guardian_agent_rule_status) writes that failed "
+                          "for a reason other than the rule not existing. The failure does not "
+                          "discard the source event; only the census row update is lost, so "
+                          "the pair keeps its previous state until a later state-changing "
+                          "event for it arrives. >0 means the census may be stale; the server "
+                          "log line 'census upsert failed' names the agent and rule. A write "
+                          "refused because the rule is not defined on this server (SQLSTATE "
+                          "23503) is a normal outcome and is not counted.",
+                          "counter");
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
                           "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
@@ -4759,6 +4786,17 @@ public:
                             spdlog::error("SAML disabled: {}",
                                          saml_provider_->signing_init_error());
                             saml_provider_.reset();
+                        } else if (saml_provider_ && saml_provider_->idp_cert_configured_but_broken()) {
+                            // #4160: the pinned IdP certificate is readable but the
+                            // verifier's OWN loader cannot use it (not a PEM
+                            // certificate, or a key type xmlsec cannot verify with).
+                            // Without this the provider would stay "enabled" and
+                            // /auth/saml/start would work while every assertion failed
+                            // — the lockout --auth-mode=sso-only must not boot into.
+                            spdlog::error("SAML disabled: {} (cert file '{}')",
+                                          saml_provider_->idp_cert_init_error(),
+                                          cfg_.saml_idp_cert);
+                            saml_provider_.reset();
                         } else if (saml_provider_ && saml_provider_->is_enabled()) {
                             // sre-S2: log the group→role flags alongside the
                             // existing endpoint fields. Both values are
@@ -4796,6 +4834,34 @@ public:
             }
         }
 #endif
+
+        // #4160: surface "configured but disabled at runtime" and, under
+        // --auth-mode=sso-only, fail closed rather than boot into a lockout.
+        // Both providers are judged identically — "did wiring leave a usable
+        // provider" — read from the provider pointers (the SAML failure paths
+        // above reset() it), never from config. On Windows saml_provider_ is a
+        // compile-time stub and never constructed, so its `enabled` gauge is a
+        // truthful 0. LOCAL ONLY: no IdP network probe (OIDC discovery stays
+        // lazy, #5692); see sso_only_runtime_providers_ok in sso_boot_guard.hpp.
+        // The gauges come from the SAME publisher the Settings OIDC save uses, so
+        // a runtime reconfigure keeps them truthful.
+        {
+            const bool oidc_up = oidc_provider_ && oidc_provider_->is_enabled();
+            const bool saml_up = saml_provider_ && saml_provider_->is_enabled();
+            publish_oidc_provider_gauges(metrics_, oidc_config_complete(cfg_), oidc_up);
+            publish_saml_provider_gauges(metrics_, saml_config_complete(cfg_), saml_up);
+
+            if (auto runtime = sso_only_runtime_providers_ok(cfg_, oidc_up, saml_up); !runtime) {
+                spdlog::error("[SSO] Refusing to start: {}", runtime.error());
+                startup_failed_ = true;
+            } else if (cfg_.auth_mode == "sso-only") {
+                // The main.cpp "Hardened auth mode ACTIVE" banner is logged BEFORE this
+                // constructor runs, so on its own it cannot show which providers actually
+                // came up. This line is the post-wiring evidence of the real state.
+                spdlog::info("[SSO] sso-only providers up after startup: OIDC={}, SAML={}",
+                             oidc_up ? "yes" : "no", saml_up ? "yes" : "no");
+            }
+        }
 
         // Setup file logger.
         //
@@ -9791,6 +9857,9 @@ public:
                     metrics_.gauge("yuzu_server_guardian_proj_failures_total")
                         .set(static_cast<double>(
                             guaranteed_state_store_->observations_proj_failures_total()));
+                    metrics_.gauge("yuzu_server_guardian_census_proj_failures_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->census_proj_failures_total()));
                     metrics_.gauge("yuzu_server_guardian_observations_reaped_total")
                         .set(static_cast<double>(
                             guaranteed_state_store_->observations_reaped_total()));
@@ -22400,8 +22469,20 @@ private:
             }
             mcp_server_->register_routes(
                 *web_server_,
-                [this](const httplib::Request& req, httplib::Response& res)
-                    -> std::optional<auth::Session> { return require_auth(req, res); },
+                // #4309: credential-class admission. Every MCP verb resolves its
+                // session through this one hook, so refusing an empty tier here covers
+                // GET, POST and DELETE before any JSON-RPC parse. The factory resolves
+                // the session, then runs admit() (audit + counter + 403) on the same
+                // request; see mcp_admission.hpp. This is the only call site.
+                mcp::make_admission_auth_fn(
+                    [this](const httplib::Request& req, httplib::Response& res)
+                        -> std::optional<auth::Session> { return require_auth(req, res); },
+                    [this](const httplib::Request& req, const std::string& action,
+                           const std::string& result, const std::string& target_type,
+                           const std::string& target_id, const std::string& detail) -> bool {
+                        return audit_log(req, action, result, target_type, target_id, detail);
+                    },
+                    &metrics_),
                 [this](const httplib::Request& req, httplib::Response& res, const std::string& type,
                        const std::string& op) -> bool {
                     return require_permission(req, res, type, op);
@@ -23801,8 +23882,9 @@ private:
     RateLimiter api_rate_limiter_;
     RateLimiter login_rate_limiter_;
 
-    // Per-principal quota cap (PR 4.4) — gates principal_kind=="engine"
-    // sessions only, at the pre-routing chokepoint. See principal_quota.hpp.
+    // Per-principal quota cap (PR 4.4) — gates engine-classed sessions only
+    // (stored principal_kind "engine" or an engine_token source), at the
+    // pre-routing chokepoint. See principal_quota.hpp.
     PrincipalQuota principal_quota_;
 };
 

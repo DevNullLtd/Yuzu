@@ -382,5 +382,4 @@ sudoers|/etc/sudoers.d/90-ops|defaults|user:ops|-|-|!authenticate
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_local_security_policy.hpp`
 - Tests: `tests/unit/test_local_security_policy_local_dispatcher.cpp` · `tests/unit/test_local_security_policy_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-09-29-local_security_policy-windows-sudoers.added.md` · `changelog.d/5069-local_security_policy.added.md`
 <!-- END GENERATED -->

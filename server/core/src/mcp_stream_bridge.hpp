@@ -210,6 +210,7 @@
 //   post-visit teardown_claimed (under bridge_mu_), preserving exactly-once.
 
 #include "execution_event_bus.hpp"
+#include "mcp_session.hpp" // McpSessionBinding: the BridgeRecord stores one by value
 
 #include <nlohmann/json.hpp>
 
@@ -515,7 +516,7 @@ public:
     /// #2740 they are no longer permanent: an at-cap admission RECLAIMS one
     /// rather than refusing (see `select_displaceable_pin_locked`). A transient
     /// over-count still rejects fail-closed (A5/C3).
-    ReserveResult reserve(const std::string& session_id, const std::string& principal,
+    ReserveResult reserve(const std::string& session_id, McpSessionBinding binding,
                           const nlohmann::json& jsonrpc_id,
                           std::optional<nlohmann::json> progress_token, bool streamed_intent);
 
@@ -939,7 +940,11 @@ private:
         // it; see the .cpp field-by-field notes). Safe to read lock-free AFTER
         // observing a post-write phase via the record mutex.
         std::string session_id;
-        std::string principal;
+        /// The caller's principal AND credential class, as presented at reserve(). The
+        /// session-liveness sweep re-checks the session against exactly this binding, so a
+        /// record whose session now belongs to another class reads as dead; the audit
+        /// actor and the per-principal accounting use `binding.principal`.
+        McpSessionBinding binding;
         nlohmann::json jsonrpc_id;
         std::string key;               ///< session_id + '\n' + jsonrpc_id.dump()
         bool streamed_intent = false;

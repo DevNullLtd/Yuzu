@@ -695,6 +695,22 @@ when the matrix is skipped, and fails red rather than hanging if the classifier
 itself dies. **Only with that stub are the five contexts safe to add to branch
 protection.**
 
+**`gateway-base-index` job (#6711).** The same workflow also runs one plain (non-matrix)
+job, "Gateway builder index matches runtime Alpine", whenever the classifier says the
+image surface changed. It runs `scripts/ci/check-gateway-base-index.py` on a hosted
+runner with no Docker: it fetches the pinned `erlang:28-alpine` index from Docker Hub
+(anonymous, retried, body hashed against the pinned digest) and fails when a platform
+on `Dockerfile.gateway`'s `# yuzu:gateway-platforms` marker (today `linux/amd64`) is not
+annotated as built on the runtime stage's Alpine release. That is the early check on a
+Dependabot digest refresh; the build's abi-guard stays the build-time enforcement.
+Exit 1 is a mismatch, 2 an unreadable registry or a body that is not the pinned digest (the
+log says whether a re-run can help), 3 an input the script does not understand. A skipped
+plain job satisfies a required check, so it needs no stub. To disable the networked
+check, put `if: false` on the job (and take it out of branch protection first if it was
+ever made required). Keep the script, `tests/test_gateway_base_index.py` and
+the `docs-lint.yml` "Gateway base index lint" step: that test also holds the executed
+arch-guard contract for `Dockerfile.gateway`.
+
 The PR matrix reuses release.yml's local buildcache **read-only** (`cache-from`
 with no `cache-to`), so it never evicts release layers and adds no cache directory
 `cache-prune.yml` doesn't know about. Inside `release.yml` the verification build
@@ -2497,9 +2513,12 @@ test file or script itself, not behind a meson guard. Those nine carry the
 
 Linux selects `--suite docs … --suite platform`; Windows selects `--suite platform`
 (not `docs`) with `--exclude-suite docs` on its coverage guard; macOS runs
-everything but `--no-suite docs`. The two dual-labelled node tests
-(`shell bell script behaviour`, `tokens page rotate behaviour`; `['server', 'docs']`)
-therefore no longer run on Windows or macOS, by intent.
+everything but `--no-suite docs`. The five dual-labelled node tests
+(`shell bell script behaviour`, `tokens page rotate behaviour`,
+`echo timeline script behaviour`, `mcp http adapter behaviour` and
+`swagger page behaviour`; `['server', 'docs']`)
+therefore no longer run on Windows or macOS, by intent. Like its siblings, the
+`mcp http adapter behaviour` test skips (exit 77) wherever `node` is absent.
 Before moving an entry, grep the docs-suite tests, Python and shell, for a
 Windows- or macOS-positive branch: `skipUnless(... win32`,
 `if sys.platform == "win32":` guarding assertions, a Python ternary on

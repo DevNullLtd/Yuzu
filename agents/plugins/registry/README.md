@@ -781,5 +781,4 @@ registry|unsupported|Windows registry is not available on this platform
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
 - Tests: `tests/test_registry_definition.py` · `tests/unit/test_registry_core.cpp` · `tests/unit/test_registry_local_dispatcher.cpp` · `tests/unit/test_registry_parsers.cpp` · `tests/unit/test_registry_plan.cpp` · `tests/unit/test_registry_win_internals.cpp` · `tests/unit/test_registry_write_local_dispatcher.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-22-registry-typed-writes.added.md` · `changelog.d/2026-10-22-registry-typed-writes.changed.md` · `changelog.d/2026-10-26-registry-recursion-user-apply.added.md` · `changelog.d/2026-10-26-registry-recursion-user-apply.changed.md` · `changelog.d/6487-registry-kernel-name-fail-closed.security.md` · `changelog.d/6490-registry-get-value-bound.changed.md` · `changelog.d/6491-registry-output-line-breaks.fixed.md`
 <!-- END GENERATED -->
