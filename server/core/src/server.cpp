@@ -14001,8 +14001,12 @@ private:
             auto cluster_label = resolution.label;
             spdlog::debug("Forwarding command {} to gateway (cluster '{}') for agent {}", cmd_id,
                          cluster_label, gp.agent_id);
-            std::thread([stub, svc, metrics, gp = std::move(gp), cmd_id, expected_agent_id,
-                        cluster_label]() {
+            // The worker is a NAMED closure so the spawn can be guarded below without
+            // re-indenting the body: std::thread's constructor throws std::system_error when the
+            // OS refuses a thread (or bad_alloc), and an unguarded throw here would unwind this
+            // loop, destroying every not-yet-spawned drained command with no terminal response.
+            auto forward_worker = [stub, svc, metrics, gp = std::move(gp), cmd_id,
+                                   expected_agent_id, cluster_label]() {
                 ::yuzu::server::v1::SendCommandRequest req;
                 req.add_agent_ids(gp.agent_id);
                 *req.mutable_command() = gp.cmd;
@@ -14291,7 +14295,29 @@ private:
                         svc, expected_agent_id, cmd_id, "gateway_unavailable",
                         "Gateway unreachable after 3 attempts — command not delivered");
                 }
-            }).detach();
+            };
+            try {
+                std::thread(std::move(forward_worker)).detach();
+            } catch (...) {
+                // Dispatch has already counted this command as SENT (send_to returned true at
+                // the queue push), so an unresolved command_id here would leave its execution
+                // row `running` with a targeted count it can never complete (the reaper skips
+                // rows with agents_targeted > 0). Resolve it terminally now, exactly like every
+                // other no-delivery branch of this function, and keep going: every later
+                // drained command gets its own spawn attempt and, failing that, its own
+                // terminal response. cmd_id / expected_agent_id are copies taken before the
+                // closure captured the moved-from `gp`.
+                try {
+                    spdlog::error("Gateway SendCommand for {} could not start its forward thread "
+                                  "(thread creation failed) — resolving the command as failed",
+                                  cmd_id);
+                    apply_gateway_forward_terminal_failure(
+                        &agent_service_, expected_agent_id, cmd_id, "gateway_forward_spawn_failed",
+                        "The server could not start the thread that forwards this command to "
+                        "the gateway (resource exhaustion) — command not delivered");
+                } catch (...) { // NOLINT(bugprone-empty-catch): the next command still proceeds
+                }
+            }
         }
     }
 
