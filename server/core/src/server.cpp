@@ -1576,8 +1576,9 @@ public:
         // an absent() alert reads "never happened", not "no series yet".
         metrics_.describe(yuzu::server::instruction_execute::kApprovalRefusedMetric,
                           "Approval-gated execute calls refused at the approval-submit step, by "
-                          "reason: approval_cap_reached (this principal already holds 25 pending "
-                          "approvals, HTTP 429 / MCP tier-denied), approval_unavailable (no "
+                          "reason: approval_cap_reached (this principal already holds about 25 pending "
+                          "approvals, a per-principal soft bound; HTTP 429 on REST, JSON-RPC -32004 "
+                          "with error.data.reason approval_cap_reached on MCP), approval_unavailable (no "
                           "approval manager, or the pending count could not be read), "
                           "approval_queue_full (the global pending queue is full: only a reviewer "
                           "or the expiry clears it), approval_submit_failed (the approval store "
@@ -1612,7 +1613,7 @@ public:
                               {"reason", std::string(yuzu::server::kReasonForensicUntargeted)}});
         // #2557: `destructive_no_visible_target` is emitted by the two REST
         // routes' (`/api/command`, `POST /api/v1/commands`) confine-to-visible-agents
-        // 404 arm and, since #2146, by the instruction-definition execute twins (below) —
+        // 404 arm and, since #2146, by the instruction-definition execute twins (below),
         // unlike its `destructive_untargeted` sibling above, MCP's raw execute_instruction
         // and the dashboard exec console have no equivalent post-authz
         // confinement step, so seeding those routes here would publish a
