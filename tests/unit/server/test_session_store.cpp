@@ -660,6 +660,8 @@ TEST_CASE("SessionStore v2: a clean upgrade deletes nothing and leaves the write
     CHECK(got->has_value());
     CHECK(write_generation(pool) == gen_before); // no rows deleted, so peers keep their caches
     CHECK(insert_raw_session(pool, "again", "engine_token", "human") == kCheckViolation);
+}
+
 // ── #6079: factor-generation binding (schema v3) ─────────────────────────────
 
 TEST_CASE("SessionStore v3: create and mark_mfa round-trip factor generation and bind sequence",

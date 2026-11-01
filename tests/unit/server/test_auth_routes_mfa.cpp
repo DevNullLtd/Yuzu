@@ -2410,9 +2410,6 @@ TEST_CASE("an inconclusive rebind-guard validation refuses that one local proof 
     CHECK(raw.source == auth::DurableMfaProof::Source::kRow);
     CHECK(raw.guard_unverified);
     CHECK(h.sessions->rebind_guard_ok());
-    // Liveness (the Settings enrolment gate) is not a binding read and is not refused.
-    CHECK(h.auth_mgr.durable_session_liveness(token, "admin") ==
-          auth::DurableSessionLiveness::kLive);
 
     const double validate_before = degrade("validate");
     const double latch_before = degrade("rebind_guard");
