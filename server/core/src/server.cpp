@@ -13803,7 +13803,9 @@ private:
         }
     }
 
-    /// #4672: synthesize and apply a terminal FAILURE `CommandResponse` for a
+    /// #4672: apply a terminal FAILURE `CommandResponse` (built by
+    /// `yuzu::server::build_gateway_forward_terminal_failure`, the free function in the
+    /// gateway-forward response header) for a
     /// gateway-forwarded command whose delivery will never otherwise resolve
     /// (`forward_gateway_pending`'s `unauthenticated` / exhausted
     /// `unavailable` / `unknown_cluster` / no-legitimate-resolution
@@ -13839,9 +13841,11 @@ private:
         svc->process_gateway_response(agent_id, resp);
     }
 
-    /// Build-then-apply wrapper over the two halves above/below: the build allocates (it can
-    /// throw), `apply_gateway_forward_terminal_response` is the only non-idempotent part. A call
-    /// site that must know whether the apply half was reached builds the response itself first.
+    /// Build-then-apply wrapper: it calls the free function
+    /// `yuzu::server::build_gateway_forward_terminal_failure` (the build half, which allocates
+    /// and can throw) and then `apply_gateway_forward_terminal_response` above (the apply half,
+    /// the only non-idempotent part). A call site that must know whether the apply half was
+    /// reached builds the response itself first.
     static void apply_gateway_forward_terminal_failure(detail::AgentServiceImpl* svc,
                                                         const std::string& agent_id,
                                                         const std::string& command_id,
@@ -13865,8 +13869,11 @@ private:
     /// FortitudeEtc/Codex+Kimi, MINOR, 2026-09-22: this comment previously
     /// said "four", undercounting the pre-existing "other" branch this same
     /// PR also fixed — see `gateway_mgmt_stub_pool.hpp`'s reason-code list)
-    /// now calls `apply_gateway_forward_terminal_failure` exactly once
-    /// before giving up (a SIXTH reason code, at a further call site: the spawn/setup guard around
+    /// now resolves the command terminally exactly once before giving up: four of them
+    /// through `apply_gateway_forward_terminal_failure`, and the unknown-cluster branch by
+    /// building the response itself and calling `apply_gateway_forward_terminal_response`
+    /// directly (so the handler can tell whether the apply half was reached). (A SIXTH
+    /// reason code, at a further call site: the spawn/setup guard around
     /// the whole per-command body, resolves a command whose forwarding could not be set up
     /// or started with `gateway_forward_spawn_failed`; it is best effort, since
     /// the resolver allocates too and can fail under the same pressure, which
@@ -14380,7 +14387,9 @@ private:
                 try {
                     spdlog::error("Gateway SendCommand for command {}: the unknown-cluster "
                                   "terminal write threw part-way; not retried "
-                                  "(process_gateway_response is not idempotent)",
+                                  "(process_gateway_response is not idempotent), so the command "
+                                  "may be left unresolved and its execution can stay running "
+                                  "until an operator cancels it",
                                   ::yuzu::log_id_token(cmd_id));
                 } catch (...) { // NOLINT(bugprone-empty-catch): last resort; the loop continues
                 }

@@ -318,7 +318,7 @@ struct PrepareOutcome {
     std::string correlation_id{}; ///< see `Outcome::correlation_id`
 };
 
-/// Steps 1-6. Writes an audit row for a refusal from step 1 on (`denied`, or `failure` for an
+/// Steps 0-6. Writes an audit row for a refusal from step 0 on (`denied`, or `failure` for an
 /// unusable stored schema or an approval that could not be queued) and for a pending approval:
 /// an unknown definition writes `denied reason=not_found`. It writes NO `instruction.execute`
 /// row for a definition-store fault (step 1), a missing port (an unwired lookup, authorizer,

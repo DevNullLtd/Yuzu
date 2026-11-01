@@ -11,7 +11,8 @@
 /// excludes any row that has a per-agent response. The instruction-execute core
 /// (`instruction_execute.cpp`) and `POST /api/v1/commands` (`command_v1_routes.cpp`) therefore
 /// open a `SendProgressScope` around the dispatch call; when it throws they record the count of
-/// sends accepted by the send path with `set_agents_targeted` so those agents' results complete the row normally.
+/// sends accepted by the send path with `set_agents_targeted` so those agents' results complete
+/// the row normally.
 ///
 /// HOW. A thread-local slot, not a parameter: the dispatch is synchronous on the calling thread
 /// (`ServerImpl::dispatch_confined` -> `wire_and_dispatch_confined` -> the arms' sink calls), and

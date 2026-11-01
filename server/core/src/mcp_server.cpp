@@ -8433,7 +8433,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // #2146 execute_instruction_definition: the definition's OWN approval_mode
                     // is evaluated FIRST, before the tier ticket below is minted or consumed
                     // (owner ruling 2026-10-30; see mcp_instruction_execute.hpp for the whole
-                    // composition). The probe runs the shared pipeline's steps 1-6, so a call
+                    // composition). The probe runs the shared pipeline's steps 0-6, so a call
                     // that is going to be refused, or that needs the definition's approval
                     // anyway, mints no tier ticket and burns none. It tolerates NOTHING: this
                     // tool never stamps Ticket provenance (sec-F1, #2146), so a pair gated by

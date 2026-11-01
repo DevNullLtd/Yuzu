@@ -94,7 +94,7 @@ void send_refusal(httplib::Response& res, const Refusal& r) {
     }
     res.status = status;
     // A dispatch that threw names the row it left running as a TYPED field (command_v1 does the
-    // same), and `agents_sent` when the sink confirmed a send: nothing to parse out of prose.
+    // same), and `agents_sent` when the send path accepted a send: nothing to parse out of prose.
     nlohmann::json extra = nlohmann::json::object();
     if (r.kind == RefusalKind::kDispatchFailed) {
         extra["execution_id"] = r.execution_id;

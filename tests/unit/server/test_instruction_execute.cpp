@@ -1421,8 +1421,8 @@ TEST_CASE("execute: a dispatch that throws with no execution tracker says no rec
 
 // The wedge this closes: a dispatch that throws mid fan-out used to leave agents_targeted at 0, and
 // refresh_counts only promotes a row to terminal when agents_targeted > 0 while the reaper skips
-// any row an agent has answered, so the row could never close. The sink's confirmed-send count is
-// now stored on the throw.
+// any row an agent has answered, so the row could never close. The send path's accepted-send
+// count is now stored on the throw.
 TEST_CASE("execute: a dispatch that throws after confirmed sends records that count so the row "
           "can complete",
           "[instruction_execute][send_progress]") {
@@ -1438,7 +1438,7 @@ TEST_CASE("execute: a dispatch that throws after confirmed sends records that co
     REQUIRE(ref);
     CHECK(ref->kind == RefusalKind::kDispatchFailed);
     CHECK_FALSE(ref->retry_after_ms.has_value());
-    // The first send was confirmed before the second threw: ONE agent holds the command.
+    // The first send was accepted before the second threw: ONE agent holds the command.
     REQUIRE(r.targeted.size() == 1);
     CHECK(r.targeted[0] == std::pair<std::string, int>{"exec-1", 1});
     REQUIRE(r.refreshed.size() == 1); // responses that beat the count can now close the row
@@ -1495,7 +1495,7 @@ TEST_CASE("execute: a failed partial-count write is counted, keeps agents_sent o
                    r.ports(), r.audit());
     const auto* ref = as_refusal(out);
     REQUIRE(ref);
-    REQUIRE(r.targeted.size() == 1); // two sends were confirmed; the store refused the write
+    REQUIRE(r.targeted.size() == 1); // two sends were accepted; the store refused the write
     CHECK(r.targeted[0].second == 2);
     CHECK(r.counter("yuzu_exec_tracker_bookkeeping_failed_total",
                     {{"op", "set_agents_targeted"}, {"surface", "rest"}}) == 1);
@@ -1655,7 +1655,7 @@ TEST_CASE("execute: [pg] a dispatch that throws on the 2nd of 3 sends leaves a r
 
     auto row = tracker->get_execution(id);
     REQUIRE(row.has_value());
-    CHECK(row->agents_targeted == 1); // the one send confirmed before the throw
+    CHECK(row->agents_targeted == 1); // the one send accepted before the throw
     CHECK(row->status == "running");  // NOT cancelled: that agent holds the command
     CHECK(ref->remediation.find(id) != std::string::npos);
 
@@ -2540,7 +2540,7 @@ TEST_CASE("REST execute: a throwing dispatch is a 500 with NO retry hint (std an
             CHECK(r.core.audits[1].result == "failure");
             CHECK(res->get_header_value("Sec-Audit-Failed") == (lose_row ? "true" : ""));
             // cb-c1: the row the throw left running is a TYPED field (as in POST /api/v1/commands);
-            // no send was confirmed, so there is no agents_sent.
+            // no send was accepted, so there is no agents_sent.
             CHECK(err["execution_id"] == "exec-1");
             CHECK_FALSE(err.contains("agents_sent"));
         }

@@ -1001,7 +1001,7 @@ TEST_CASE("command_v1: a dispatch that throws after confirmed sends records that
     const auto err = body_of(res)["error"];
     CHECK(err["retry_after_ms"].is_null());
     CHECK(err["execution_id"] == "exec-1");
-    // One send was confirmed before the second threw: that is the row's target count.
+    // One send was accepted before the second threw: that is the row's target count.
     REQUIRE(rig.targeted.size() == 1);
     CHECK(rig.targeted[0] == std::pair<std::string, int>{"exec-1", 1});
     CHECK(rig.cancelled.empty());
