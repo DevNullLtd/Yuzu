@@ -1084,8 +1084,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
    - **2026-10-31 - gate parity (check 6) pins one more known mismatch for
      `POST /api/v1/commands` and `execute_instruction`.** Owner ruling: the
      gate-parity table `GATE_PARITY_KNOWN_MISMATCHES` gains the entry
-     `("POST", "/api/v1/commands", "execute_instruction")` and its cap
-     `GATE_PARITY_KNOWN_MISMATCHES_MAX` rises from 6 to 7. The REST route is read
+     `("POST", "/api/v1/commands", "execute_instruction")` and its pin
+     `GATE_PARITY_KNOWN_MISMATCHES_MAX` is raised from 6 to 7 (the script pins the
+     count: the table size must equal it, so it is not a shrink-only cap). The REST route is read
      as `plain:Execution:Execute` and the tool's declared pair as
      `confined:Execution:Execute`, so the lexical comparison cannot agree. Both
      surfaces call the same `require_permission(Execution, Execute)`, whose
@@ -1094,7 +1095,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      label is the C8 `ServiceScopeClass`, and is not a claim that the tool is
      usable by a service-scoped caller. The entry is a deferral, not a proof of
      agreement: the check compares labels and cannot see this. It is removed,
-     and the cap lowered, when the comparison can read the two gates as the same
+     and the pin lowered, when the comparison can read the two gates as the same
      kind. Tracking: programme #2146. This is the ruling the 2026-10-23 entry
      above requires before a pin is raised.
    - **2026-10-31 - `cancel_execution` at the supervised MCP tier is exempt from
@@ -1113,7 +1114,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      running it; the `attempted` row written before the effect and the `success`
      row after it are the mitigation. Adding a name to `kApprovalExemptTools` is
      a security decision, recorded where the tool is classified, never a
-     convenience.
+     convenience. The owner ruling is recorded in the governance ledger fragment
+     `governance.d/2146-batch-b-dispatch-core.DbkUcG.jsonl`, adjudicated by the
+     repository owner.
 
 ## Interim rules (until the named follow-ups ship)
 
