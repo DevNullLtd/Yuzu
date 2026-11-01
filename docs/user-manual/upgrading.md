@@ -67,12 +67,12 @@ What an operator should know:
   about 30 minutes ago; it declines a pass in which a majority of the running executions (at 20 or more) look
   stuck. So a swept row means "no agent answered", not "no agent received the command": an agent that was sent the
   command but was not counted (or has not answered yet) may still run it. `cancel_execution` closes a row at once.
-- **Changed: a definition id with a control character is refused.** `POST /api/v1/instructions/{id}/execute` answers
+- **Changed: a definition id with a control character or invalid UTF-8 is refused.** `POST /api/v1/instructions/{id}/execute` answers
   `400` and the MCP tool `execute_instruction_definition` answers `-32602`, both with `reason`
-  `invalid_definition_id`, when the id holds any byte below `0x20` or equal to `0x7F` (NUL included). The check runs
+  `invalid_definition_id`, when the id holds any byte below `0x20` or equal to `0x7F` (NUL included) or is not valid UTF-8 (on REST, for example an overlong `%C0%80` or a lone `%FF`; the MCP JSON transport already rejects ill-formed UTF-8). The check runs
   before the definition lookup, writes a `denied` audit row (`reason=invalid_definition_id definition=<cleaned id>`),
   has `retry_after_ms` null, and mints no ticket. The store binds the id as a C string, so `foo\0xyz` would
-  otherwise have resolved the definition `foo` while the audit row recorded another string. The legacy
+  otherwise have resolved the definition `foo` while the audit row recorded another string, and an invalid UTF-8 id would otherwise have reached Postgres and read as a retryable `503`. The legacy
   `POST /api/instructions/{id}/execute` is unchanged. A client that sends ids exactly as `GET /api/v1/definitions`
   lists them is unaffected.
 - **Supervised MCP tokens.** `cancel_execution` is exempt from the supervised-tier approval ticket (it only
