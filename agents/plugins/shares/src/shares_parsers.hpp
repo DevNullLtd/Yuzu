@@ -6,8 +6,10 @@
 // portable so the unit tests run on every host; no file I/O, no subprocess, no OS header.
 //
 //   parse_exports       Linux exports(5) grammar (/etc/exports, /etc/exports.d/*.exports)
+//   parse_bsd_exports   macOS exports(5) grammar modelled on Apple's mountd
 //   parse_smb_conf      Samba smb.conf: share sections, synonyms, `copy =` and [global]
 //                       inheritance, plus detection of the parts this plugin does not read
+//   parse_sharing_json  macOS `sharing -l -f json` share points (SMB)
 //
 // NAMES AND PATHS ONLY, NEVER ACLs. NFS client host lists are never emitted: a share carries
 // `clients_<n>` and an `anonymous` flag only. Every parser charges a caller-owned
@@ -17,6 +19,7 @@
 // The `status|list|...` row is NOT built here; shares_legs.hpp's report_list owns it.
 
 #include <ini_parse.hpp>
+#include <nlohmann/json.hpp>
 #include <row_byte_budget.hpp>
 #include <wire_utf8.hpp>
 #include <yuzu/string_utils.hpp>
@@ -24,6 +27,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <string>
@@ -50,8 +55,9 @@ struct Share {
     std::string path;
     Access access = Access::unknown;
     std::optional<bool> anonymous;
-    /// closed vocabulary: hidden, unavailable, special, no_root_squash, clients_<n>, and the
-    /// Windows share kind (exactly one per row): disk, print, device, ipc, other; temporary.
+    /// closed vocabulary: hidden, unavailable, special, sealed (macOS: SMB encryption
+    /// required), no_root_squash, clients_<n>, and the Windows share kind (exactly one per
+    /// row): disk, print, device, ipc, other; temporary.
     /// Windows `hidden` is a non-special share whose name ends in `$`
     std::vector<std::string> flags;
     std::string source;
@@ -462,6 +468,564 @@ inline void parse_exports(std::string_view text, std::string_view source,
 }
 
 // ---------------------------------------------------------------------------
+// BSD / macOS exports(5)
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+/// One field as Apple's mountd `nextfield` bounds it: blanks (space, tab) skipped, a leading
+/// single or double quote runs to the matching unescaped quote or the end of the entry (a
+/// backslash makes the next character literal), an unquoted field ends at the first
+/// unescaped space or tab. The raw field is returned, quotes kept; empty at end of entry.
+inline std::string_view bsd_nextfield(std::string_view s, std::size_t& i) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t'))
+        ++i;
+    const std::size_t b = i;
+    if (i >= s.size())
+        return {};
+    const char q = s[i];
+    if (q == '\'' || q == '"') {
+        ++i;
+        bool esc = false;
+        for (; i < s.size(); ++i) {
+            if (esc)
+                esc = false;
+            else if (s[i] == '\\')
+                esc = true;
+            else if (s[i] == q)
+                break;
+        }
+        if (i < s.size())
+            ++i; // the closing quote
+        return s.substr(b, i - b);
+    }
+    for (; i < s.size(); ++i) {
+        if (s[i] == '\\') {
+            if (++i >= s.size())
+                break;
+        } else if (s[i] == ' ' || s[i] == '\t') {
+            break;
+        }
+    }
+    return s.substr(b, i - b);
+}
+
+/// mountd `clean_pathname`: quotes removed, escapes resolved, an unquoted path ends at the
+/// first blank, trailing slashes stripped (`/` itself is kept).
+inline std::string bsd_clean_path(std::string_view f) {
+    std::string s;
+    char q = '\0';
+    std::size_t p = 0;
+    if (!f.empty() && (f[0] == '\'' || f[0] == '"')) {
+        q = f[0];
+        p = 1;
+    }
+    bool esc = false;
+    for (; p < f.size(); ++p) {
+        const char c = f[p];
+        if (esc) {
+            s += c;
+            esc = false;
+        } else if (q != '\0' && c == q) {
+            break;
+        } else if (c == '\\') {
+            esc = true;
+        } else if (q == '\0' && (c == ' ' || c == '\t')) {
+            break;
+        } else {
+            s += c;
+        }
+    }
+    while (s.size() > 1 && s.back() == '/')
+        s.pop_back();
+    return s;
+}
+
+/// macOS libc `inet_pton4`: exactly four decimal octets 0-255, nothing stray. A leading zero
+/// is accepted (`01` is 1), as the macOS libc reads it (measured on 26.6.2). nullopt when the
+/// value is invalid, else whether every octet is zero (the decoded bytes are never needed).
+inline std::optional<bool> parse_dotted_quad(std::string_view s) {
+    std::size_t octets = 0;
+    unsigned cur = 0;
+    bool saw_digit = false;
+    bool zero = true;
+    for (const char c : s) {
+        if (c >= '0' && c <= '9') {
+            cur = cur * 10 + static_cast<unsigned>(c - '0');
+            if (cur > 255)
+                return std::nullopt;
+            if (!saw_digit) {
+                if (++octets > 4)
+                    return std::nullopt;
+                saw_digit = true;
+            }
+        } else if (c == '.' && saw_digit) {
+            if (octets == 4)
+                return std::nullopt;
+            zero = zero && cur == 0;
+            cur = 0;
+            saw_digit = false;
+        } else {
+            return std::nullopt;
+        }
+    }
+    if (octets < 4)
+        return std::nullopt;
+    return zero && cur == 0;
+}
+
+/// macOS libc `inet_pton(AF_INET6)` as mountd's `get_net` calls it: a group is hex digits whose
+/// value fits 16 bits (leading zeros are free, so `00000::` is valid), at most one `::`
+/// (standing for at least one zero group), a dotted-quad tail only as the last 32 bits,
+/// nothing stray. nullopt when the value is invalid, else whether every group is zero: a caller
+/// needs the validity and the all-zero test, never the decoded address. Pure and portable (no
+/// socket header); the Linux `is_v6` shape check is a different, stricter reading for a
+/// different parser.
+inline std::optional<bool> parse_v6(std::string_view s) {
+    constexpr std::size_t kBytes = 16;
+    std::size_t tp = 0; // bytes decoded so far
+    bool dc = false;    // a `::` was seen
+    bool zero = true;
+    std::size_t i = 0;
+    if (!s.empty() && s[0] == ':') {
+        if (s.size() < 2 || s[1] != ':')
+            return std::nullopt; // a lone leading colon
+        i = 1;
+    }
+    std::size_t curtok = i; // start of the current group
+    unsigned val = 0;
+    bool saw_xdigit = false;
+    for (; i < s.size(); ++i) {
+        const char c = s[i];
+        if (std::isxdigit(static_cast<unsigned char>(c)) != 0) {
+            const unsigned d = c <= '9' ? static_cast<unsigned>(c - '0')
+                                        : static_cast<unsigned>((c | 0x20) - 'a') + 10;
+            val = (val << 4) | d;
+            if (val > 0xffff)
+                return std::nullopt;
+            saw_xdigit = true;
+        } else if (c == ':') {
+            curtok = i + 1;
+            if (!saw_xdigit) {
+                if (dc)
+                    return std::nullopt;
+                dc = true;
+                continue;
+            }
+            if (i + 1 == s.size() || tp + 2 > kBytes)
+                return std::nullopt; // a trailing single colon, or too many groups
+            tp += 2;
+            zero = zero && val == 0;
+            saw_xdigit = false;
+            val = 0;
+        } else if (c == '.' && tp + 4 <= kBytes) {
+            const auto v4_zero = parse_dotted_quad(s.substr(curtok));
+            if (!v4_zero)
+                return std::nullopt;
+            tp += 4;
+            zero = zero && *v4_zero;
+            saw_xdigit = false;
+            break; // the tail ran to the end of the value
+        } else {
+            return std::nullopt;
+        }
+    }
+    if (saw_xdigit) {
+        if (tp + 2 > kBytes)
+            return std::nullopt;
+        tp += 2;
+        zero = zero && val == 0;
+    }
+    if (dc) {
+        if (tp == kBytes)
+            return std::nullopt; // `::` must stand for at least one group
+        tp = kBytes;
+    }
+    if (tp != kBytes)
+        return std::nullopt;
+    return zero;
+}
+
+/// Whether libc `inet_network` accepts a digit-led value (get_net's `isdigit(*cp)` branch):
+/// 1-4 dot-separated parts, each decimal, octal (`0` prefix, no 8 or 9) or hex (`0x` / `0X`,
+/// or a bare `x` after a dot), every part's 32-bit-wrapped value at most 0xff, and after the
+/// last part the end of the value or a whitespace byte (a CR from a CRLF file is one, so a
+/// trailing network or mask still parses there, unlike an IPv6 one). This is the macOS libc
+/// reading (measured on 26.6.2): `0x0a` is valid, `0x0a000000` is not. The parts are packed one
+/// byte each, as inet_network packs them, because get_net refuses the one packed value equal to
+/// INADDR_NONE: four parts that are all 0xff (`255.255.255.255`, `0xff.0xff.0xff.0xff`,
+/// `0377.0377.0377.0377`) are rejected, `255.255.255.254` is not. Past that check only the family
+/// and validity matter here: an IPv4 network is never the world.
+inline bool bsd_v4_literal(std::string_view v) {
+    if (v.empty() || std::isdigit(static_cast<unsigned char>(v[0])) == 0)
+        return false;
+    std::size_t i = 0;
+    std::uint32_t packed = 0;
+    for (std::size_t parts = 0;; ++parts) {
+        std::uint32_t val = 0;
+        std::uint32_t base = 10;
+        bool digit = false;
+        if (i < v.size() && v[i] == '0') {
+            digit = true;
+            base = 8;
+            ++i;
+        }
+        if (i < v.size() && (v[i] == 'x' || v[i] == 'X')) {
+            base = 16;
+            ++i;
+        }
+        for (; i < v.size(); ++i) {
+            const char c = v[i];
+            std::uint32_t d = 0;
+            if (c >= '0' && c <= '9') {
+                if (base == 8 && c >= '8')
+                    return false;
+                d = static_cast<std::uint32_t>(c - '0');
+            } else if (base == 16 && std::isxdigit(static_cast<unsigned char>(c)) != 0) {
+                d = static_cast<std::uint32_t>((c | 0x20) - 'a') + 10;
+            } else {
+                break;
+            }
+            val = val * base + d;
+            digit = true;
+        }
+        if (!digit || parts >= 4 || val > 0xff)
+            return false;
+        packed = (packed << 8) | val;
+        if (i < v.size() && v[i] == '.') {
+            ++i;
+            continue;
+        }
+        return (i == v.size() || std::isspace(static_cast<unsigned char>(v[i])) != 0) &&
+               packed != 0xffffffffU; // INADDR_NONE: get_net's error value
+    }
+}
+
+/// The family of a `-network` / `-mask` value in mountd's `get_net` order: an IPv6 literal
+/// (`parse_v6`), a digit-led IPv4 form (inet_network), else a network name. A name is
+/// classified by shape only and NEVER resolved (no resolver I/O here), so an unresolvable name
+/// still counts as one client. A digit-led value that is no IPv4 form (`0.0.0.0/0`), an empty
+/// value and a non-name (`::/0`) are ones Apple rejects, the whole line with them.
+enum class BsdNetKind { v4, v6, name, rejected };
+
+inline BsdNetKind bsd_net_kind(std::string_view v) {
+    if (parse_v6(v).has_value())
+        return BsdNetKind::v6;
+    if (bsd_v4_literal(v))
+        return BsdNetKind::v4;
+    if (v.empty() || std::isdigit(static_cast<unsigned char>(v[0])) != 0)
+        return BsdNetKind::rejected;
+    // A name must be one getnetbyname could hold; anything else (`::/0`, `a/b`) Apple rejects.
+    const bool plain = std::ranges::all_of(v, [](unsigned char c) {
+        return std::isalnum(c) != 0 || c == '-' || c == '_' || c == '.';
+    });
+    return plain ? BsdNetKind::name : BsdNetKind::rejected;
+}
+
+/// Whether a `-network` / `-mask` pair admits every client under Apple's matching. An IPv6
+/// network with no mask, or a mask whose groups are all zero (`::`, `0:0:0:0:0:0:0:0`,
+/// `::0.0.0.0`), is the world: mountd zero-fills an absent IPv6 mask and both its masked
+/// compare and the kernel's radix lookup (a zero mask is the default entry) then match every
+/// address. An IPv4 network never is: a zero or absent IPv4 mask is replaced by the classful
+/// one, so `0.0.0.0` exports 0.0.0.0/8. A named network or mask never is. `net` / `mask` are
+/// empty when not given.
+inline bool bsd_net_is_world(std::string_view net, std::string_view mask) {
+    if (net.empty() || !parse_v6(net).has_value())
+        return false;
+    if (mask.empty())
+        return true;
+    return parse_v6(mask).value_or(false); // an invalid mask is not an all-zero one
+}
+
+/// Whether the user part of a `-maproot` / `-mapall` credential is root, as mountd's
+/// `parsecred` resolves it: a digit- or `-`-led user is `getpwuid(atoi(user))`, so `0`, `00`,
+/// `0x0` (atoi stops at the `x`) and `-0` are uid 0; any other user is root only when it is
+/// the literal `root`. `atoi` is `(int)strtol`: only the low 32 bits of the value survive and
+/// strtol saturates beyond +-2^63 (LONG_MIN truncates to 0, LONG_MAX to -1). `strtoll` is that
+/// 64-bit strtol on every platform (`long` is 32-bit on LLP64 Windows). No account lookup is
+/// made: a lone user (numeric or named) is never looked up, so one with no account still yields
+/// a row though mountd drops the entry, and a non-root-named account that is uid 0 is not seen.
+inline bool is_root_user(std::string_view user) {
+    if (user.empty() || ((user[0] < '0' || user[0] > '9') && user[0] != '-'))
+        return user == "root";
+    return static_cast<int>(std::strtoll(std::string(user).c_str(), nullptr, 10)) == 0;
+}
+
+/// Darwin MAXPATHLEN: do_opt copies an `-fspath` value with strlcpy into a buffer this size and
+/// refuses one whose length is this long or longer.
+inline constexpr std::size_t kBsdMaxPathLen = 1024;
+
+/// RPCMNT_NAMELEN: get_exportlist drops the whole entry when a cleaned directory path is longer
+/// than this. It is not the `-fspath` bound above.
+inline constexpr std::size_t kBsdNameLen = 255;
+
+/// Whether parsecred can accept a `-maproot` / `-mapall` credential `user[:group...]` on any
+/// host: the user is not empty and does not start with a quote (do_opt never strips quotes from
+/// an option value, so `"0"` reaches getpwnam with its quote; an account name starting with a
+/// quote is treated as unresolvable, the same premise as the empty user), and a group list that
+/// is present is not made only of empty names (an empty name never resolves, so no group is
+/// found and parsecred fails). A named user or group is host data and is not looked up.
+inline bool bsd_cred_valid(std::string_view cred) {
+    const auto colon = cred.find(':');
+    const auto user = cred.substr(0, colon);
+    if (user.empty() || user[0] == '"' || user[0] == '\'')
+        return false;
+    if (colon == std::string_view::npos)
+        return true;
+    const auto groups = cred.substr(colon + 1);
+    return groups.empty() || groups.find_first_not_of(':') != std::string_view::npos;
+}
+
+/// Whether mountd's `get_sec_flavors` accepts a `-sec` value: colon-separated flavours, an empty
+/// component skipped, a repeat of an accepted flavour skipped, and a component that is not
+/// `sys` / `krb5` / `krb5i` / `krb5p` (exact case) voids the whole list, so `sys:bogus` is as bad
+/// as `bogus`. At least one flavour must be accepted: `-sec=` and `-sec=:` are rejected. Apple's
+/// scan also stops at NX_MAX_SEC_FLAVORS (5), which four distinct flavours can never reach, so
+/// the cap is not modelled.
+inline bool bsd_sec_valid(std::string_view v) {
+    bool any = false;
+    for (const auto flavor : split(v, ':')) {
+        if (flavor.empty())
+            continue;
+        if (flavor != "sys" && flavor != "krb5" && flavor != "krb5i" && flavor != "krb5p")
+            return false;
+        any = true;
+    }
+    return any;
+}
+
+/// Whether do_opt accepts an `-fspath` value: it starts with `/` and is shorter than MAXPATHLEN.
+inline bool bsd_fspath_valid(std::string_view v) {
+    return !v.empty() && v[0] == '/' && v.size() < kBsdMaxPathLen;
+}
+
+/// Whether do_opt accepts an `-fsuuid` value: sixteen pairs of hex digits, one `-` allowed
+/// before each pair. Nothing is tested after the sixteenth pair, so trailing text is accepted;
+/// a short value runs into the terminator, which is no hex digit. do_opt's later `HEXTOC < 0`
+/// check cannot fail once the hex-digit test has passed, so it is not modelled separately.
+inline bool bsd_fsuuid_valid(std::string_view v) {
+    const auto hex_at = [v](std::size_t k) {
+        return k < v.size() && std::isxdigit(static_cast<unsigned char>(v[k])) != 0;
+    };
+    std::size_t i = 0;
+    for (int pair = 0; pair < 16; ++pair, i += 2) {
+        if (i < v.size() && v[i] == '-')
+            ++i;
+        if (!hex_at(i) || !hex_at(i + 1))
+            return false;
+    }
+    return true;
+}
+
+/// What one accepted entry exports: its distinct paths and the facts they share.
+struct BsdEntry {
+    std::vector<std::string> paths;
+    bool ro = false;
+    bool offline = false;
+    bool root = false;
+    std::size_t hosts = 0;
+    bool world = false;
+    std::size_t clients = 0;
+};
+
+/// Parses one joined entry. false => Apple rejects it (no row, no token): an option or host
+/// before any path, a path after an option or host, a repeated -network / -mask, a -network
+/// together with a host, a malformed network or mask value (a name is never resolved, so an
+/// unresolvable one is still accepted; an all-ones IPv4 value is INADDR_NONE, which get_net
+/// refuses), mismatched families, a -mask without a -network, -maproot (or -root / -r) together
+/// with -mapall (mountd `check_options`), a -maproot / -mapall / -root / -r credential parsecred
+/// cannot accept on any host (an empty or quote-led user, a group list of only empty names; see
+/// bsd_cred_valid), a bad -sec, -fspath or -fsuuid value (do_opt), and a cleaned path longer than
+/// 255 bytes (get_exportlist).
+inline bool parse_bsd_entry(std::string_view entry, BsdEntry& e) {
+    std::size_t i = 0;
+    std::string_view f = bsd_nextfield(entry, i);
+    if (f.empty() || f[0] == '#')
+        return false; // a comment or empty entry: no row, and no error either
+    bool got_nondir = false;
+    bool have_net = false;
+    bool have_mask = false;
+    bool have_maproot = false;
+    bool have_mapall = false;
+    std::string net;
+    std::string mask;
+    BsdNetKind net_kind = BsdNetKind::name;
+    BsdNetKind mask_kind = BsdNetKind::name;
+    for (; !f.empty(); f = bsd_nextfield(entry, i)) {
+        if (f[0] == '-') {
+            if (e.paths.empty())
+                return false;
+            got_nondir = true;
+            // do_opt: comma-separated `name` / `name=value`; the LAST item without `=` takes
+            // the next field as its value when that field exists and does not start with `-`.
+            const auto items = split(f.substr(1), ',');
+            for (std::size_t k = 0; k < items.size(); ++k) {
+                std::string_view item = items[k];
+                std::string_view arg;
+                bool has_arg = false;
+                bool from_next = false;
+                std::size_t after_next = i;
+                if (const auto eq = item.find('='); eq != std::string_view::npos) {
+                    arg = item.substr(eq + 1);
+                    item = item.substr(0, eq);
+                    has_arg = true;
+                } else if (k + 1 == items.size()) {
+                    std::size_t j = i;
+                    const auto nf = bsd_nextfield(entry, j);
+                    if (!nf.empty() && nf[0] != '-') {
+                        arg = nf;
+                        has_arg = from_next = true;
+                        after_next = j;
+                    }
+                }
+                bool used_next = false;
+                if (item == "ro" || item == "o") {
+                    e.ro = true;
+                } else if (has_arg && (item == "maproot" || item == "mapall" || item == "root" ||
+                                       item == "r")) { // mountd do_opt: the credential-taking names
+                    // parsecred resets the credential on every call, so the LAST mapping wins.
+                    // A credential no host can satisfy (see bsd_cred_valid) fails do_opt and
+                    // mountd drops the entry; a named user or group depends on the host and is
+                    // not modelled.
+                    if (!bsd_cred_valid(arg))
+                        return false;
+                    e.root = is_root_user(arg.substr(0, arg.find(':')));
+                    if (item == "mapall")
+                        have_mapall = true;
+                    else
+                        have_maproot = true;
+                    used_next = from_next;
+                } else if (has_arg && (item == "mask" || item == "m")) {
+                    if (have_mask)
+                        return false;
+                    mask_kind = bsd_net_kind(arg);
+                    if (mask_kind == BsdNetKind::rejected)
+                        return false;
+                    mask.assign(arg);
+                    have_mask = true;
+                    used_next = from_next;
+                } else if (has_arg && (item == "network" || item == "n")) {
+                    if (have_net)
+                        return false;
+                    net_kind = bsd_net_kind(arg);
+                    if (net_kind == BsdNetKind::rejected)
+                        return false;
+                    net.assign(arg);
+                    have_net = true;
+                    used_next = from_next;
+                } else if (has_arg && item == "sec") {
+                    if (!bsd_sec_valid(arg))
+                        return false;
+                    used_next = from_next;
+                } else if (item == "offline") {
+                    e.offline = true;
+                } else if (item == "fspath" || item == "fsuuid") {
+                    // A value is checked, and a bad one rejects the entry; one taken from the
+                    // next field is NOT consumed (mountd leaves it to be read as a field of its
+                    // own, so a valid `-fspath /x` still leaves `/x` a path after an option). No
+                    // value is only a warning.
+                    if (has_arg &&
+                        !(item == "fspath" ? bsd_fspath_valid(arg) : bsd_fsuuid_valid(arg)))
+                        return false;
+                } else if (item == "alldirs" || item == "32bitclients" || item == "manglednames") {
+                    // accepted and ignored; a next-field value is NOT consumed
+                } else {
+                    break; // unrecognised (or a value-taking name with no value): the rest of
+                           // this option field is dropped, as mountd drops it
+                }
+                if (used_next) {
+                    i = after_next;
+                    break;
+                }
+            }
+        } else if (f[0] == '/' || ((f[0] == '\'' || f[0] == '"') && f.size() > 1 && f[1] == '/')) {
+            if (got_nondir)
+                return false; // "Directories must be first"
+            auto p = bsd_clean_path(f);
+            if (p.size() > kBsdNameLen)
+                return false; // get_exportlist: "pathname too long", the whole entry is dropped
+            // >kMaxShareRows paths already truncate; this stops the duplicate scan going quadratic.
+            if (e.paths.size() <= kMaxShareRows && std::ranges::find(e.paths, p) == e.paths.end())
+                e.paths.push_back(std::move(p));
+        } else {
+            if (e.paths.empty())
+                return false;
+            got_nondir = true;
+            ++e.hosts; // a host or netgroup: counted, never resolved or emitted
+        }
+    }
+    if (e.paths.empty())
+        return false;
+    if (have_net && e.hosts > 0)
+        return false;
+    if (have_maproot && have_mapall)
+        return false; // check_options: "-mapall and -maproot mutually exclusive"
+    if (have_mask && !have_net)
+        return false; // check_options: "-mask requires -network", hosts or not
+    // get_net tries getnetbyname first and a resolved name is always AF_INET (an unresolved one
+    // fails every later branch), so a name counts as IPv4 here and a v6 partner is a mismatch.
+    if (have_net && have_mask && (net_kind == BsdNetKind::v6) != (mask_kind == BsdNetKind::v6))
+        return false;
+    e.clients = e.hosts + (have_net ? 1 : 0);
+    e.world = (e.hosts == 0 && !have_net) || bsd_net_is_world(net, mask);
+    return true;
+}
+
+} // namespace detail
+
+/// macOS exports(5), modelled on Apple's mountd (best-effort: the rejections that need a host
+/// lookup are not modelled): `<path>... [-opts] [hosts | -network net [-mask mask]]`. Entries
+/// are joined as get_export_entry joins them (trailing spaces, tabs and backslashes stripped,
+/// and NOT a CR, which stays in the last field; a stripped backslash appends the next physical
+/// line directly; a continuation still open at end of file loses its entry), a field starting
+/// `#` makes the entry a comment, and fields are bounded by nextfield (single or double quotes,
+/// backslash escapes). One share per distinct path; hosts and netgroups are counted, never
+/// emitted. Access is `ro` for `-ro` / `-o`, else `rw`; `-offline` flags the share
+/// `unavailable`; `no_root_squash` follows the LAST `-maproot` / `-mapall` / `-root` / `-r`
+/// credential and is raised when its user is root (see detail::is_root_user). Anonymous is
+/// Apple's world test (see detail::bsd_net_is_world). A line Apple rejects yields no row and no
+/// token, as the Linux parser skips a malformed line.
+inline void parse_bsd_exports(std::string_view text, std::string_view source,
+                              yuzu::shared::RowByteBudget& budget, ExportsParse& out) {
+    std::string entry;
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        auto nl = text.find('\n', pos);
+        if (nl == std::string_view::npos)
+            nl = text.size();
+        std::string_view raw = text.substr(pos, nl - pos);
+        pos = nl + 1;
+        bool cont = false;
+        // get_export_entry's strip set: space, tab, newline (already split on) and backslash.
+        // Not CR: on a CRLF file Apple keeps it in the last field, and a `\` before it is no
+        // continuation.
+        while (!raw.empty() && (raw.back() == ' ' || raw.back() == '\t' || raw.back() == '\\')) {
+            cont = cont || raw.back() == '\\';
+            raw.remove_suffix(1);
+        }
+        entry.append(raw);
+        if (cont || entry.empty())
+            continue;
+        detail::BsdEntry e;
+        const bool ok = detail::parse_bsd_entry(entry, e);
+        entry.clear();
+        if (!ok)
+            continue;
+        for (const auto& p : e.paths) {
+            std::vector<std::string> flags;
+            if (e.offline)
+                flags.emplace_back("unavailable");
+            if (e.root)
+                flags.emplace_back("no_root_squash");
+            flags.emplace_back("clients_" + std::to_string(e.clients));
+            if (!detail::emit_nfs_share(out, budget, source, p, e.ro ? Access::ro : Access::rw,
+                                        e.world, std::move(flags)))
+                return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Samba smb.conf
 // ---------------------------------------------------------------------------
 
@@ -708,6 +1272,98 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
 }
 
 // ---------------------------------------------------------------------------
+// macOS `sharing -l -f json`
+// ---------------------------------------------------------------------------
+
+/// What `sharing -l` prints when no share point exists. Taken from the tool's string table
+/// (/usr/sbin/sharing), not observed live: an empty-host capture may widen what is recognised.
+inline constexpr std::string_view kNoSharePoints = "No share point records.";
+
+struct SharingParse {
+    std::vector<Share> shares;
+    bool recognised = false; ///< a JSON object, `{}` or the exact no-records text
+    std::size_t malformed_records = 0;
+    bool truncated = false;
+    bool field_oversized = false;
+};
+
+namespace detail {
+
+/// An integer member as a number; nullopt when absent or any other type.
+inline std::optional<long long> json_flag(const nlohmann::json& rec, const char* key) {
+    const auto it = rec.find(key);
+    if (it == rec.end())
+        return std::nullopt;
+    if (it->is_number_integer())
+        return it->get<long long>();
+    return std::nullopt;
+}
+
+} // namespace detail
+
+/// The JSON object `sharing -l -f json` prints, keyed by record name. Each member must be an
+/// object with a string `path`, else it is counted in malformed_records and skipped (valid
+/// siblings are still emitted). The name is `smb_name` when a string, else the key. A record
+/// with `smb_shared` 0 is flagged `unavailable`, `smb_sealed` 1 (encryption required) `sealed`;
+/// `smb_read_only` gives the access, `smb_guest_access` the anonymous flag. Empty or
+/// whitespace-only text is NOT recognised: no capture shows what an empty host prints, so it is
+/// a named failure upstream, never an empty success. ACLs and permissions are never read.
+inline SharingParse parse_sharing_json(std::string_view text, yuzu::shared::RowByteBudget& budget) {
+    SharingParse out;
+    constexpr std::string_view kBlanks = " \t\r\n";
+    const auto b = text.find_first_not_of(kBlanks);
+    if (b == std::string_view::npos)
+        return out;
+    const auto trimmed = text.substr(b, text.find_last_not_of(kBlanks) - b + 1);
+    if (trimmed == kNoSharePoints) {
+        out.recognised = true;
+        return out;
+    }
+    const auto j = nlohmann::json::parse(text.begin(), text.end(), nullptr, false);
+    if (j.is_discarded() || !j.is_object())
+        return out;
+    out.recognised = true;
+    for (const auto& [key, rec] : j.items()) {
+        if (!rec.is_object()) {
+            ++out.malformed_records;
+            continue;
+        }
+        const auto pit = rec.find("path");
+        if (pit == rec.end() || !pit->is_string()) {
+            ++out.malformed_records;
+            continue;
+        }
+        const std::string& path = pit->get_ref<const std::string&>();
+        std::string_view name = key;
+        if (const auto n = rec.find("smb_name"); n != rec.end() && n->is_string())
+            name = n->get_ref<const std::string&>();
+        std::vector<std::string> flags;
+        if (const auto v = detail::json_flag(rec, "smb_shared"); v && *v == 0)
+            flags.emplace_back("unavailable");
+        if (const auto v = detail::json_flag(rec, "smb_sealed"); v && *v == 1)
+            flags.emplace_back("sealed");
+        if (!detail::charge_share(budget, name.size(), path.size(), detail::flags_bytes(flags))) {
+            out.truncated = true;
+            break;
+        }
+        Share s;
+        s.proto = Proto::smb;
+        s.source = "sharing";
+        s.name = detail::cut(name, out.field_oversized);
+        s.path = detail::cut(path, out.field_oversized);
+        s.flags = std::move(flags);
+        if (const auto v = detail::json_flag(rec, "smb_read_only"); v && *v == 1)
+            s.access = Access::ro;
+        else if (v && *v == 0)
+            s.access = Access::rw;
+        if (const auto v = detail::json_flag(rec, "smb_guest_access"); v && (*v == 0 || *v == 1))
+            s.anonymous = *v == 1;
+        out.shares.push_back(std::move(s));
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Row formatters
 // ---------------------------------------------------------------------------
 
@@ -749,7 +1405,7 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
     return r;
 }
 
-/// `source|<exports|exports_d|smb_conf|netshareenum>|<state>|<share count or ->`
+/// `source|<exports|exports_d|smb_conf|netshareenum|sharing>|<state>|<share count or ->`
 [[nodiscard]] inline std::string source_row(std::string_view kind, SourceState state,
                                             std::optional<std::size_t> count = std::nullopt) {
     std::string r = "source|";

@@ -201,6 +201,7 @@
 #include "legacy_events_routes.hpp" // #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
 #include "instruction_fragment_routes.hpp" // #2542 PR-12: the 2-route Instructions HTMX fragment pair, extracted onto the HttpRouteSink seam
 #include "approvals_fragment_routes.hpp" // #2542 PR-12: the Approvals HTMX fragment, extracted onto the HttpRouteSink seam
+#include "mcp_admission.hpp" // #4309: /mcp/v1/ refuses an empty-tier credential (admit())
 #include "mcp_disabled_routes.hpp" // #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
@@ -1013,6 +1014,18 @@ public:
                           // refused, not by surface.
                           "MCP SSE stream denials by reason - GET attach denials plus "
                           "streamed-POST admission denials",
+                          "counter");
+        // Answers a different question from the family above: who was turned away at
+        // the /mcp/v1/ door (any verb, before a session or stream exists), not which
+        // stream check refused a channel. Closed label set: tier_required.
+        metrics_.describe("yuzu_mcp_admission_refused_total",
+                          "Requests refused at /mcp/v1/ admission by reason - tier_required is "
+                          "a credential with no MCP tier (cookie session or tierless token)",
+                          "counter");
+        metrics_.describe("yuzu_mcp_admission_audit_suppressed_total",
+                          "Audit rows not written for tier_required refusals at /mcp/v1/ "
+                          "admission (suppressed by the per-key budget or a budget failure); "
+                          "the refused counter is complete",
                           "counter");
         metrics_.describe("yuzu_mcp_initialize_protocol_total",
                           "MCP initialize handshakes by negotiated protocol revision", "counter");
@@ -2037,6 +2050,10 @@ public:
         for (auto reason : mcp::McpStreamBridge::kPostRejectReasons) {
             metrics_.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}});
         }
+        // #4309: the admission refusal family (mcp_admission.hpp), pre-seeded so a
+        // dashboard reads "0" before the first refusal. Closed set: tier_required.
+        metrics_.counter("yuzu_mcp_admission_refused_total", {{"reason", "tier_required"}});
+        metrics_.counter("yuzu_mcp_admission_audit_suppressed_total");
         // Pre-seed both supported MCP protocol revisions to 0 so a
         // revision-deprecation dashboard reads "0" (not absent) for an unused
         // revision (observability-conventions.md; 2g PR 1). Values mirror the
@@ -3380,18 +3397,20 @@ public:
                           "between the verify read and the row-locked recheck",
                           "counter");
         metrics_.counter("yuzu_auth_credential_changed_during_verify_total");
-        // Gate 5 chaos-injector CH-3/UP-6 follow-up (#4020): the ONE
-        // caller-visible signal that get_user_role() is about to floor a
-        // legacy-API-token-authenticated request's role to Role::user
-        // (auth_routes.cpp's `.value_or(Role::user)`) on a genuine AuthDB
-        // store error - not a plain not-found. Single call site, single
-        // failure shape reaches it (AuthDBError::QueryFailed; UserNotFound/
-        // InvalidUsername are excluded before the increment), so no label
+        // Gate 5 chaos-injector CH-3/UP-6 follow-up (#4020): the caller-visible
+        // signal that get_user_role() hit a genuine AuthDB store error - not a
+        // plain not-found. Counts EVERY caller (#4068): the legacy-API-token
+        // session synthesis floors the request to Role::user, the Settings
+        // create-user / role-change routes and SCIM active:false answer 503,
+        // and the SCIM create-race re-read records it in its audit detail (the
+        // answer stays 500, #6837). Any AuthDBError other than UserNotFound /
+        // InvalidUsername reaches it (in practice QueryFailed), so no label
         // set - pre-seeded to 0 so an increase() alert is meaningful.
         metrics_.describe("yuzu_auth_get_user_role_store_error_total",
-                          "get_user_role() AuthDB lookups that failed on a genuine store error "
-                          "(not a plain not-found/invalid-username miss) - each one floors the "
-                          "caller's legacy-API-token-authenticated request to Role::user",
+                          "get_user_role() AuthDB lookups (any caller) that failed on a genuine "
+                          "store error (not a plain not-found/invalid-username miss); the "
+                          "legacy-API-token path floors that request to Role::user, the "
+                          "Settings and SCIM active:false callers refuse with 503",
                           "counter");
         metrics_.counter("yuzu_auth_get_user_role_store_error_total");
         // HA WS-1/1a: durable SessionStore degradation on the auth hot path
@@ -4056,6 +4075,16 @@ public:
                           "(degrade-don't-destroy); only the derived guardian_observations read "
                           "model row is lost. >0 means /dex is under-counting - investigate "
                           "(commonly a stale-schema dev DB; see docs/user-manual/dex.md).",
+                          "counter");
+        metrics_.describe("yuzu_server_guardian_census_proj_failures_total",
+                          "Compliance-census (guardian_agent_rule_status) writes that failed "
+                          "for a reason other than the rule not existing. The failure does not "
+                          "discard the source event; only the census row update is lost, so "
+                          "the pair keeps its previous state until a later state-changing "
+                          "event for it arrives. >0 means the census may be stale; the server "
+                          "log line 'census upsert failed' names the agent and rule. A write "
+                          "refused because the rule is not defined on this server (SQLSTATE "
+                          "23503) is a normal outcome and is not counted.",
                           "counter");
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
@@ -4820,6 +4849,17 @@ public:
                             spdlog::error("SAML disabled: {}",
                                          saml_provider_->signing_init_error());
                             saml_provider_.reset();
+                        } else if (saml_provider_ && saml_provider_->idp_cert_configured_but_broken()) {
+                            // #4160: the pinned IdP certificate is readable but the
+                            // verifier's OWN loader cannot use it (not a PEM
+                            // certificate, or a key type xmlsec cannot verify with).
+                            // Without this the provider would stay "enabled" and
+                            // /auth/saml/start would work while every assertion failed
+                            // — the lockout --auth-mode=sso-only must not boot into.
+                            spdlog::error("SAML disabled: {} (cert file '{}')",
+                                          saml_provider_->idp_cert_init_error(),
+                                          cfg_.saml_idp_cert);
+                            saml_provider_.reset();
                         } else if (saml_provider_ && saml_provider_->is_enabled()) {
                             // sre-S2: log the group→role flags alongside the
                             // existing endpoint fields. Both values are
@@ -4857,6 +4897,34 @@ public:
             }
         }
 #endif
+
+        // #4160: surface "configured but disabled at runtime" and, under
+        // --auth-mode=sso-only, fail closed rather than boot into a lockout.
+        // Both providers are judged identically — "did wiring leave a usable
+        // provider" — read from the provider pointers (the SAML failure paths
+        // above reset() it), never from config. On Windows saml_provider_ is a
+        // compile-time stub and never constructed, so its `enabled` gauge is a
+        // truthful 0. LOCAL ONLY: no IdP network probe (OIDC discovery stays
+        // lazy, #5692); see sso_only_runtime_providers_ok in sso_boot_guard.hpp.
+        // The gauges come from the SAME publisher the Settings OIDC save uses, so
+        // a runtime reconfigure keeps them truthful.
+        {
+            const bool oidc_up = oidc_provider_ && oidc_provider_->is_enabled();
+            const bool saml_up = saml_provider_ && saml_provider_->is_enabled();
+            publish_oidc_provider_gauges(metrics_, oidc_config_complete(cfg_), oidc_up);
+            publish_saml_provider_gauges(metrics_, saml_config_complete(cfg_), saml_up);
+
+            if (auto runtime = sso_only_runtime_providers_ok(cfg_, oidc_up, saml_up); !runtime) {
+                spdlog::error("[SSO] Refusing to start: {}", runtime.error());
+                startup_failed_ = true;
+            } else if (cfg_.auth_mode == "sso-only") {
+                // The main.cpp "Hardened auth mode ACTIVE" banner is logged BEFORE this
+                // constructor runs, so on its own it cannot show which providers actually
+                // came up. This line is the post-wiring evidence of the real state.
+                spdlog::info("[SSO] sso-only providers up after startup: OIDC={}, SAML={}",
+                             oidc_up ? "yes" : "no", saml_up ? "yes" : "no");
+            }
+        }
 
         // Setup file logger.
         //
@@ -9852,6 +9920,9 @@ public:
                     metrics_.gauge("yuzu_server_guardian_proj_failures_total")
                         .set(static_cast<double>(
                             guaranteed_state_store_->observations_proj_failures_total()));
+                    metrics_.gauge("yuzu_server_guardian_census_proj_failures_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->census_proj_failures_total()));
                     metrics_.gauge("yuzu_server_guardian_observations_reaped_total")
                         .set(static_cast<double>(
                             guaranteed_state_store_->observations_reaped_total()));
@@ -22706,8 +22777,20 @@ private:
             }
             mcp_server_->register_routes(
                 *web_server_,
-                [this](const httplib::Request& req, httplib::Response& res)
-                    -> std::optional<auth::Session> { return require_auth(req, res); },
+                // #4309: credential-class admission. Every MCP verb resolves its
+                // session through this one hook, so refusing an empty tier here covers
+                // GET, POST and DELETE before any JSON-RPC parse. The factory resolves
+                // the session, then runs admit() (audit + counter + 403) on the same
+                // request; see mcp_admission.hpp. This is the only call site.
+                mcp::make_admission_auth_fn(
+                    [this](const httplib::Request& req, httplib::Response& res)
+                        -> std::optional<auth::Session> { return require_auth(req, res); },
+                    [this](const httplib::Request& req, const std::string& action,
+                           const std::string& result, const std::string& target_type,
+                           const std::string& target_id, const std::string& detail) -> bool {
+                        return audit_log(req, action, result, target_type, target_id, detail);
+                    },
+                    &metrics_),
                 [this](const httplib::Request& req, httplib::Response& res, const std::string& type,
                        const std::string& op) -> bool {
                     return require_permission(req, res, type, op);
