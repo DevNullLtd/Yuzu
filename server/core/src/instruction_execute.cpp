@@ -50,8 +50,11 @@ bool safe_audit(const AuditHook& hook, std::string_view result, const std::strin
 }
 
 /// Observability must never fail a request. The label vector is built INSIDE the try (the labels
-/// arrive as string_views and the caller allocates nothing), so a bad_alloc building them is
-/// swallowed here instead of unwinding out of a caller that is deliberately mid-recovery.
+/// arrive as string_views, and no call site builds a std::string just to pass one: a reason that
+/// is already a string_view or a literal is passed as is, the route through route_label), so a
+/// bad_alloc building them is swallowed here instead of unwinding out of a caller that is
+/// deliberately mid-recovery. The one allocation left at a call site is a reason that was already
+/// a std::string before the call (the chokepoint denial's), which is only viewed, not copied.
 using LabelViews = std::initializer_list<std::pair<std::string_view, std::string_view>>;
 void bump(const Ports& ports, const char* family, LabelViews labels) noexcept {
     if (!ports.metrics)
@@ -101,7 +104,6 @@ struct Ctx {
             return false; // could not even build the row: the fail-closed gate reads "not persisted"
         }
     }
-    std::string route() const { return std::string(route_label(rq.surface)); }
 };
 
 Refusal make_refusal(RefusalKind kind, std::string reason, std::string message,
@@ -246,14 +248,14 @@ PrepareOutcome prepare_impl(Ctx& c) {
     //    broadcast to the whole fleet.
     if (!rq.body.is_object()) {
         bump(ports, "yuzu_server_dispatch_target_rejected_total",
-             {{"route", c.route()}, {"reason", std::string(kReasonBodyType)}});
+             {{"route", route_label(rq.surface)}, {"reason", kReasonBodyType}});
         c.audit("denied", "reason=" + std::string(kReasonBodyType) + " definition=" + def_token);
         return refuse(c, make_refusal(RefusalKind::kBadRequest, std::string(kReasonBodyType),
                                       "request body must be a JSON object"));
     }
     if (auto bv = check_targeting_shape(rq.body)) {
         bump(ports, "yuzu_server_dispatch_target_rejected_total",
-             {{"route", c.route()}, {"reason", bv->reason}});
+             {{"route", route_label(rq.surface)}, {"reason", bv->reason}});
         c.audit("denied", std::string("reason=") + bv->reason + " definition=" + def_token);
         return refuse(c, make_refusal(RefusalKind::kBadRequest, bv->reason, bv->message,
                                       "correct the targeting arguments and re-call; nothing was "
@@ -274,7 +276,7 @@ PrepareOutcome prepare_impl(Ctx& c) {
     // 4. Stored parameter_schema, strict. BEFORE the approval step so a refused call never queues
     //    an approval (a ticket does not bind the params), creates an execution row or dispatches.
     {
-        const std::string pr = c.route();
+        const std::string_view pr = route_label(rq.surface);
         const auto count_reject = [&](const char* reason) {
             bump(ports, "yuzu_server_instruction_param_rejected_total",
                  {{"route", pr}, {"reason", reason}});
@@ -365,8 +367,8 @@ PrepareOutcome prepare_impl(Ctx& c) {
                 confine_destructive_targets(plan.agent_ids, DestructiveVisibleAgents{std::move(vis)});
             if (plan.agent_ids.empty()) {
                 bump(ports, "yuzu_server_dispatch_target_rejected_total",
-                     {{"route", c.route()},
-                      {"reason", std::string(kReasonDestructiveNoVisibleTarget)}});
+                     {{"route", route_label(rq.surface)},
+                      {"reason", kReasonDestructiveNoVisibleTarget}});
                 c.audit("denied", "reason=" + std::string(kReasonDestructiveNoVisibleTarget) +
                                       " definition=" + def_token);
                 return refuse(c, make_refusal(RefusalKind::kNoVisibleTarget,
@@ -377,7 +379,7 @@ PrepareOutcome prepare_impl(Ctx& c) {
         }
         case DestructiveTargetingVerdict::RefuseUntargeted: {
             bump(ports, "yuzu_server_dispatch_target_rejected_total",
-                 {{"route", c.route()}, {"reason", std::string(gate.refusal_reason)}});
+                 {{"route", route_label(rq.surface)}, {"reason", gate.refusal_reason}});
             c.audit("denied", "reason=" + std::string(gate.refusal_reason) +
                                   " definition=" + def_token);
             return refuse(c, make_refusal(RefusalKind::kBadRequest, std::string(gate.refusal_reason),
@@ -686,6 +688,11 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
             "agent ever responds, a record an agent has answered will NOT close by itself, and "
             "cancel_execution (POST /api/v1/executions/{id}/cancel on REST) closes it";
     }
+    // The refusal itself is built here too, so the throw arm below only MOVES into it (a string
+    // move-assign and an int store): no allocation is left between the bookkeeping and the return.
+    Refusal threw_refusal = make_refusal(RefusalKind::kDispatchFailed, "dispatch_exception",
+                                         "dispatch failed", std::move(threw_remediation));
+    threw_refusal.execution_id = execution_id;
 
     ConfinedDispatchOutcome o;
     SendProgress progress; // sends confirmed before a throw (dispatch_send_progress.hpp)
@@ -761,15 +768,12 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
                         "again, and close it with cancel_execution (POST "
                         "/api/v1/executions/{id}/cancel on REST)";
                 }
-                threw_remediation = std::move(remediation);
+                threw_refusal.remediation = std::move(remediation); // noexcept move-assign
             } catch (...) { // NOLINT(bugprone-empty-catch): keep the pre-built generic strings
             }
         }
         bump(p, "yuzu_server_dispatch_fanout_throw_total",
              {{"route", route_label(rq.surface)}, {"phase", "dispatch"}});
-        Refusal threw_refusal = make_refusal(RefusalKind::kDispatchFailed, "dispatch_exception",
-                                             "dispatch failed", std::move(threw_remediation));
-        threw_refusal.execution_id = execution_id;
         threw_refusal.agents_sent = any_sent ? progress.sent : 0;
         return Outcome{std::move(threw_refusal), c.audit_dropped};
     }
