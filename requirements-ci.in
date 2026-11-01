@@ -19,7 +19,7 @@ pyyaml==6.0.3
 # gcovr is the coverage report generator used by the nightly coverage job
 # (.github/workflows/nightly.yml). Pinned + hashed for Scorecard
 # Pinned-Dependencies; previously installed unpinned at job runtime.
-gcovr==8.6
+gcovr==8.7
 # jsonschema validates the CycloneDX 1.7 CBOM export goldens against the
 # vendored official schema (tests/test_cbom_schema.py, docs-lint "CBOM schema"
 # job). Its transitive deps are locked with hashes in requirements-ci.txt.

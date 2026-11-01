@@ -29,6 +29,8 @@ related: >-
 
 > **Implementation status (2026-09-07 ADR reconciliation):** Accepted — mitigated, not solved. The shipped fix is a `StreamBudget` admission cap (`stream_budget.hpp`, wired at `server.cpp:12172`) over the existing thread-per-connection httplib pool (`server.cpp:12091-12125`), not the Drogon rewrite this ADR's Decision 4 target architecture describes (conditional on G10, framework port separately estimated, per frontmatter `deciders:`).
 
+> **Update (2026-10-29, #4754):** the `GET /mcp/v1/` row in the table below dates from the original decision and says "principal-bound session". Today the session is bound to the principal and the credential class that minted it, and the channel refuses a service-scoped token; see `docs/mcp-server.md`, "GET channel posture" and "Session binding". The held-open-connection decision itself is unchanged.
+
 ## Context
 
 The server's HTTP surface is cpp-httplib, which is **thread-per-connection**. A response

@@ -883,9 +883,33 @@ by each handler.
   plus a separate list of tools added after it (today two), legal only for a tool
   whose REST twin is `kRequired`, which a compile-time check ties to the REST
   table. Every pending tool with a `kRequired` twin is pending because no MCP
-  consumer enforces `kRequired` yet. PR 2 promotes pending rows; an MCP `kRequired` row will need a
-  design for the approval primitive first, because `decide_step_up` passes
-  an `mcp_token` caller unconditionally.
+  consumer enforces `kRequired` yet. PR 2 promotes pending rows; how it resolves the MCP rows
+  (no MCP `kRequired` row, because `decide_step_up` passes an `mcp_token`
+  caller unconditionally) is the decision recorded in the next bullet.
+- **Decision for the MCP arm (#6306, recorded 2026-10-29 for #6305 PR 2; a
+  decision record, no code change).** The MCP arm of this chokepoint is not
+  MFA step-up. An MCP caller presents a bearer credential with no browser
+  session and no factor proof, and `decide_step_up` passes `api_token` and
+  `mcp_token` sessions and denies engine principals, so a step-up proof is
+  never asked of an MCP caller. The controls for an MCP caller are the token
+  tier (`tier_allows`, evaluated before RBAC) and the one core-owned approval
+  primitive (`requires_approval` into the `ApprovalManager`
+  ticket-then-recall, decided by a person on an interactive session under
+  #6061/#6079; see "Approver assurance"). #4309 makes the tier total:
+  `/mcp/v1/` refuses every credential whose MCP tier is empty, so no cookie
+  session and no tierless token reaches a tool (`docs/mcp-server.md`,
+  "Admission: an MCP tier is required"). The table shape is unchanged:
+  `kMcpStepUpPolicy` stays data. PR 2 of #6305 resolves each pending row
+  whose REST twin is `kRequired` in one of two ways: (a) its
+  `(securable, operation)` pair is in `requires_approval`'s supervised list,
+  and the row is classified with a new MCP-only class (working name
+  `kApprovalGated`) whose compile-time check proves the pair is
+  approval-gated; or (b) the pair is not approval-gated, which is a
+  per-tool security decision (add the pair to `requires_approval`, or record
+  a `kExempt` reason). `kRequired` never appears in the MCP table. The
+  second-list and consistency-test criterion is already met by
+  `step_up_mcp_policy.hpp` and its test. Engine principals are out of scope
+  of this decision.
 - **Metrics and alerts.**
   `yuzu_auth_mfa_step_up_gate_total{outcome,source,surface}` (96 series
   pre-seeded to 0), the gauge `yuzu_auth_mfa_step_up_window_seconds`, and the
@@ -992,7 +1016,7 @@ Consequences, each deliberate:
   and normally evaluates nothing again (it evaluates afresh when no pass was consumed, for example when the
   central check is switched off with `--mfa-step-up-window-secs=0`), and then applies the approver rule on top.
 - **MCP can never approve.** The refusal is unconditional on the MCP transport, which runs no MFA step-up: the two MCP tools always
-  return the typed refusal, for a bearer token and for a cookie session that reaches `/mcp/v1/` alike. This is an exception recorded in ADR-1005's exception ledger (entry 2026-10-18, "human review
+  return the typed refusal, whatever tiered bearer token the caller used (a cookie session no longer reaches `/mcp/v1/` at all: it has no MCP tier and is refused at admission, #4309). This is an exception recorded in ADR-1005's exception ledger (entry 2026-10-18, "human review
   is a human-session act"; legacy REST rows `exception:#6061 revisit:2027-01-18`). The tools remain registered; listing pending approvals via MCP is unchanged. The MCP
   tier/permission mapping for both tools is `Approval:Approve` (it was mapped as `Approval:Write`;
   #3151).
@@ -1390,7 +1414,7 @@ account policy)"* — this ships **both** halves.
   - **OIDC** — both `--oidc-issuer` **and** `--oidc-client-id` (the same
     predicate the OIDC provider's `is_enabled()` uses; issuer-without-client-id
     leaves SSO silently non-functional, review #1735 HIGH-1); **or**
-  - **SAML** (non-Windows) — all five SP fields (`--saml-idp-sso-url`,
+  - **SAML** (non-Windows) — all five SAML settings (`--saml-idp-sso-url`,
     `--saml-idp-cert`, `--saml-sp-entity-id`, `--saml-sp-acs-url`,
     `--saml-idp-entity-id`) **and HTTPS enabled**. HTTPS is part of the gate, not
     deferred to runtime: `server.cpp` leaves the SAML provider disabled under
@@ -1401,11 +1425,82 @@ account policy)"* — this ships **both** halves.
     stub there (it can never mint a session; running the *server* on Windows is
     out of scope regardless).
 
-  The gate checks config **presence**, not runtime validity: a SAML config whose
-  IdP cert / SP key is unreadable, oversized, or non-RSA still passes the boot
-  guard and is then disabled **loudly** by `server.cpp` — exactly as OIDC
-  issuer/JWKS runtime validity is not gate-checked either. The active SSO
-  path(s) are named in the boot banner for CC6.3 evidence.
+  That first gate (in `main.cpp`, before the server is built) checks config
+  **presence** only. A second, runtime-wiring check (#4160) runs inside the
+  `ServerImpl` constructor once the providers have been wired:
+  `sso_only_runtime_providers_ok` (same file) takes the *outcome* — provider
+  constructed and `is_enabled()` — and the server **refuses to start**
+  (`startup_failed_`, non-zero exit, `[SSO] Refusing to start` in the log) when
+  **no** provider is up. In practice this is the SAML leg: an IdP certificate
+  that is unreadable, over 64 KiB, not a PEM certificate, or of a key type
+  xmlsec cannot verify with (for example Ed25519), a bad or non-RSA SP signing
+  key, would otherwise leave a sole SAML provider that looks enabled while every
+  assertion fails. The cause is the preceding `error` log line. The certificate
+  is judged by the **verifier's own loader**: `SamlProvider` loads the pinned
+  certificate once at construction through the same `load_idp_key` helper that
+  `validate_response` uses on every assertion, and exposes the result as
+  `idp_cert_configured_but_broken()` (deliberately separate from
+  `is_enabled()`, a config-presence test that existing tests satisfy with
+  placeholder certificate strings). An earlier draft parsed the file with a
+  different loader and disagreed with the verifier in both directions
+  (`BEGIN TRUSTED CERTIFICATE` rejected, Ed25519 accepted), so the single shared
+  helper is load-bearing: do not add a second certificate probe.
+
+  Deliberate limits of that second check:
+  - **Local only — no network.** OIDC discovery and signing-key fetches stay
+    lazy (first use, #5692), so OIDC issuer/JWKS *reachability* is **not**
+    probed at boot. An IdP outage during a restart must not stop the server
+    booting: break-glass is the documented recovery for exactly that outage,
+    and this check does not regress it.
+  - **OIDC credential *readability* is already fail-closed elsewhere.** An
+    unreadable, oversized or empty `--oidc-client-secret-file` makes the server
+    refuse to start at flag-resolution time (`main.cpp`, `secret_file.hpp`),
+    in every auth mode. That, not this runtime check, is the OIDC counterpart
+    of the SAML certificate check; an empty secret supplied directly is a
+    legitimate public client and is not refused.
+  - **The OIDC leg of the runtime check is thin by construction.** In the shipped binary
+    `--oidc-nat64-prefix` is validated at flag-parse time (`main.cpp`), so
+    wiring leaves OIDC null only for a `Config` assembled outside the CLI. OIDC
+    and SAML are still judged by the *same* predicate (did wiring leave a usable
+    provider) so neither is treated as more trustworthy, but the practical
+    coverage is on the SAML side.
+  - **It proves the certificate LOADS, not that it is the right one.** A valid
+    but stale (pre-rotation) certificate, the wrong certificate (for example the
+    SP's own), or a certificate bundle (which may load using only its first certificate), loads fine and
+    still fails every sign-in. On the OIDC side `enabled` means issuer and client
+    id are set; a wrong client secret or redirect URI is found only at sign-in.
+    Both belong to the IdP-validated class the local-only rule excludes.
+  - **Break-glass cannot recover a refused start.** There is no running server to
+    sign in to; arming covers an IdP outage *after* a successful start. After a
+    refusal: fix the file and restart, or use `--auth-mode=standard` as a last
+    resort (which brings local-password login back for every account, stale ones
+    included, so rotate or disable leavers' passwords afterwards).
+  - **Replicas sharing one certificate fail together.** A bad file stops every
+    replica that reads it; validate the file before a rolling restart.
+  - **One working provider is enough.** With both providers configured and one
+    broken, the server starts, logs the failure loudly, and the broken one
+    reports `..._provider_configured 1` / `..._provider_enabled 0`.
+  - **Break-glass is not an SSO provider.** Configuring it does not satisfy the
+    check.
+  - **The refusal stops the whole server**, including the agent gRPC plane and
+    API-token automation, not only operator sign-in (it uses the same
+    `startup_failed_` mechanism as the other boot refusals). Under a restart
+    policy a late-mounted certificate volume therefore shows as a short restart
+    loop; the refusal text names `--auth-mode=standard` as a last resort and
+    states that it re-enables local-password login for every account.
+
+  `yuzu_auth_{oidc,saml}_provider_configured` / `..._enabled` (four unlabelled
+  0/1 gauges, see `docs/user-manual/metrics.md`) expose "configured but disabled
+  at runtime" for alerting: **`configured 1, enabled 0`** is the alertable state,
+  because a bare `enabled 0` is also "not configured" (normal in `standard`
+  mode). One shared publisher (`publish_*_provider_gauges`) writes them at
+  startup, and the Settings OIDC save republishes the OIDC pair so it cannot go
+  stale. They are startup/reconfigure state, not IdP health. Not wired into
+  `/readyz`: a refused sole provider never reaches it, and a broken *secondary*
+  provider is degraded, not unready. No alert rule ships yet (tracked as #6821) — it would read
+  `configured == 1 and enabled == 0` and still needs a decision on the
+  standard-mode case. The active SSO path(s) are named in the boot banner for
+  CC6.3 evidence.
 - **Break-glass account.** `--break-glass-user <name>` (`YUZU_BREAK_GLASS_USER`)
   designates the single local account exempt from `sso-only`, exempt **only
   while armed**. "Armed" is `users.break_glass_armed_until` (migration v4) — a
@@ -1460,7 +1555,8 @@ called from a thin wrapper in `main.cpp` alongside the flags + arm one-shot;
 `Config::auth_mode` / `break_glass_user` / `break_glass_window_secs` in
 `server.hpp`. Tests: `tests/unit/server/test_auth_break_glass.cpp` (DB
 accessors) + `test_auth_routes_hardened.cpp` (login-gate wire path) +
-`test_sso_boot_guard.cpp` (boot-guard predicate — OIDC/SAML/HTTPS/platform).
+`test_sso_boot_guard.cpp` (boot-guard predicate — OIDC/SAML/HTTPS/platform —
+and the runtime-wiring decision table, #4160).
 
 ## RBAC group provisioning (#1832)
 
@@ -2161,7 +2257,11 @@ its in-process PKCE state and its browser-binding digest.
 ### Rotating the IdP signing certificate
 
 Update `--saml-idp-cert` and **restart the server** — there is no hot-reload
-for the IdP cert in this release.
+for the IdP cert in this release. **Validate the replacement file first** (a PEM
+certificate, at most 64 KiB, with a key type the SAML verifier can load; RSA
+works, Ed25519 does not): on an
+`--auth-mode=sso-only` server whose only SSO provider is SAML, an unloadable
+certificate now stops the whole server at start-up (#4160, "Boot guard" above).
 
 ### AuthnRequest signing
 
@@ -3804,9 +3904,9 @@ A **service-scoped API token** is bound to one IT service's agents (`session->to
 
 **MCP's mirror: the C8 `ServiceScopeClass` chokepoint (§3c).** Every `tools/call` dispatch consults a third field on the tool's `kToolSecurity` row — `denied` (the default), `confined` (a real downstream confinement mechanism exists — `deny_fleet_wide_service_scoped`, a `scoped_perm_fn` check, a fail-closed `exec_visible` derivation, or (as of #3290) `fleet_read_fn_`/`require_fleet_read`'s `meet(management-group, service-scope)` composition), or `global_safe` (boot-validated against the same `kServiceScopeGlobalSafe` table `require_permission` reads). `confined` is **not** a claim that the tool is actually usable by a service-scoped caller — most `confined` tools still deny downstream via their own `perm_fn`/`scoped_perm_fn` under the seeded-empty allow-list; it only means the C8 layer itself doesn't short-circuit before the tool's own (pre-existing) confinement runs. `query_installed_software` and, as of #1700, `get_agent_details` are the tools so far where `confined` means real usability, not just a non-short-circuiting label — see the Phase 2 progress note below. `resources/read` bypasses C8 structurally but calls `perm_fn` directly, so it is covered by the flip the same way any REST route is.
 
-**Explicit denies for gate-less routes (§3e).** A route that never calls `require_permission`/`require_scoped_permission`/C8 at all is untouched by the flip regardless of how the flip itself is tuned — these needed their own deny. `AuthRoutes::deny_service_scoped_session` is `server.cpp`'s shared gate for this shape (health-summary fragment, the legacy `/events` SSE stream, the instructions-list fragment, and the six result-set HTMX fragments); `ComplianceRoutes` and `WorkflowRoutes` carry their own file-local equivalents for the same reason every other route-owner class in this list does (below). A residual grep sweep of every `auth_fn`/`perm_fn` call site in `rest_api_v1.cpp` (74 sites) and `mcp_server.cpp` (3 sites) found four more real instances — three sharing one shape (`management-groups/{id}/roles` GET/POST/DELETE, plus the `POST /api/v1/tokens` service-scope minting check, all bypassing `require_permission` via a **direct** `rbac_store->check_permission` call) and the eight-route `/api/v1/result-sets*` REST family (the twin of the HTMX fragments above) — plus one **distinct, more severe, not service-scope-specific** bug in the same pass: `POST /api/v1/result-sets/from-inventory-query` had no authorization check of any kind (CWE-862), missed by an earlier fix that gated its three dispatch siblings. Full inventory, including document-only dispositions and the sweep's own accounting: `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
+**Explicit denies for gate-less routes (§3e).** A route that never calls `require_permission`/`require_scoped_permission`/C8 at all is untouched by the flip regardless of how the flip itself is tuned — these needed their own deny. `AuthRoutes::deny_service_scoped_session` is `server.cpp`'s shared gate for this shape (health-summary fragment, the legacy `/events` SSE stream, the instructions-list fragment, and the six result-set HTMX fragments); `ComplianceRoutes` and `WorkflowRoutes` carry their own file-local equivalents for the same reason every other route-owner class in this list does (below). `GET /mcp/v1/` (the MCP SSE stream channel) is on this list too (#4754): it refuses a service-scoped token with `403` / JSON-RPC `-32003` and no `permission` field, before any session lookup or stream-budget lease, audited as `mcp.session.reject` with `reason=service_scoped`; `POST` (still confined per tool by C8) and `DELETE` are unchanged, and the session is separately bound to its principal and credential class, not including elevation state (`docs/mcp-server.md`, "Session binding"). A residual grep sweep of every `auth_fn`/`perm_fn` call site in `rest_api_v1.cpp` (74 sites) and `mcp_server.cpp` (3 sites) found four more real instances — three sharing one shape (`management-groups/{id}/roles` GET/POST/DELETE, plus the `POST /api/v1/tokens` service-scope minting check, all bypassing `require_permission` via a **direct** `rbac_store->check_permission` call) and the eight-route `/api/v1/result-sets*` REST family (the twin of the HTMX fragments above) — plus one **distinct, more severe, not service-scope-specific** bug in the same pass: `POST /api/v1/result-sets/from-inventory-query` had no authorization check of any kind (CWE-862), missed by an earlier fix that gated its three dispatch siblings. Full inventory, including document-only dispositions and the sweep's own accounting: `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
 
-**The per-file `deny_service_scoped_*`/`deny_fleet_wide_service_scoped` helpers are now a SECOND, largely-redundant layer, not the primary defense.** For any route that also calls `require_permission`/`require_scoped_permission` (the vast majority), the flip above already denies a service-scoped token structurally — four of the remaining original in-handler deny sites (`list_schedules`, `list_dex_perf_devices`, `compare_app_perf_versions`, `list_network_devices`) are still double-denies, kept for now and scheduled for Phase 2 retirement. Two are retired: `query_installed_software`'s in the first Phase 2 migration (below) and `get_dex_group_app_perf`'s in #3290 Phase 2 bucket 1a (both were provably dead, fired after their route's own `perm_fn`). A THIRD group — `GET /api/v1/dex/signals/{obs_type}`+`GET /api/v1/dex/app`+`GET /api/v1/dex/overview` (REST) and their MCP twins `get_dex_signal_detail`/`get_dex_app`/`get_dex_overview` — stays on `perm_fn` + `deny_fleet_wide_service_scoped` (WS-A4 PR-1): these three routes' fields are all fleet-wide aggregates not yet confined per caller (ADR-0017 INV-3), so they stay global-only rather than moving onto `AuthRoutes::require_fleet_read` — see `docs/presentation-core-split-delivery-matrix.md`'s WS-A4 row; their `deny_fleet_wide_service_scoped` call sites are therefore LIVE again, fired BEFORE `perm_fn`/`tier_allows`, same class as the four sites below. The four sites that remain are live-but-redundant (their deny fires BEFORE `perm_fn`, so retiring them changes the observable response, not just deletes unreachable code — a different, more cautious backlog item). Same bucket-1a pass also retired `deny_service_scoped_schedule` (`schedule_routes.{hpp,cpp}`) entirely — its four call sites (`schedule.create`/`.list`/`.delete`/`.enable`) all fired after their route's own `require_permission`. The remaining per-file helpers (below) stay in place; they remain load-bearing **only** for routes with no other RBAC gate call at all (the §3e class above) — `EXTEND the pattern, do not fork a new copy` still applies to *that* subset. Current call sites, including this PR's additions: `deny_service_scoped_`/`deny_service_scoped_mutation_` (`guardian_routes.{hpp,cpp}`), `deny_service_scoped_` (`dex_routes.{hpp,cpp}`, `deployment_routes.{hpp,cpp}`, `preflight_routes.{hpp,cpp}`, and the new `compliance_routes.{hpp,cpp}`), `deny_service_scoped_schedule_list` + the new `deny_service_scoped_scope_estimate` (both local lambdas in `workflow_routes.cpp`), the shared `deny_fleet_wide_service_scoped` lambda in `rest_api_v1.cpp` (now covering the result-set REST family too) and `mcp_server.cpp`, the new `AuthRoutes::deny_service_scoped_session` (`server.cpp`'s shared gate for its own gate-less routes), plus inline checks in `device_routes.cpp` / `network_routes.cpp` / `inventory_routes.cpp` / `echo_tree_routes.cpp`.
+**The per-file `deny_service_scoped_*`/`deny_fleet_wide_service_scoped` helpers are now a SECOND, largely-redundant layer, not the primary defense.** For any route that also calls `require_permission`/`require_scoped_permission` (the vast majority), the flip above already denies a service-scoped token structurally — four of the remaining original in-handler deny sites (`list_schedules`, `list_dex_perf_devices`, `compare_app_perf_versions`, `list_network_devices`) are still double-denies, kept for now and scheduled for Phase 2 retirement. Two are retired: `query_installed_software`'s in the first Phase 2 migration (below) and `get_dex_group_app_perf`'s in #3290 Phase 2 bucket 1a (both were provably dead, fired after their route's own `perm_fn`). A THIRD group — `GET /api/v1/dex/signals/{obs_type}`+`GET /api/v1/dex/app`+`GET /api/v1/dex/overview` (REST) and their MCP twins `get_dex_signal_detail`/`get_dex_app`/`get_dex_overview` — stays on `perm_fn` + `deny_fleet_wide_service_scoped` (WS-A4 PR-1): these three routes' fields are all fleet-wide aggregates not yet confined per caller (ADR-0017 INV-3), so they stay global-only rather than moving onto `AuthRoutes::require_fleet_read` — see `docs/presentation-core-split-delivery-matrix.md`'s WS-A4 row; their `deny_fleet_wide_service_scoped` call sites are therefore LIVE again, fired BEFORE `perm_fn`/`tier_allows`, same class as the four sites below. The four sites that remain are live-but-redundant (their deny fires BEFORE `perm_fn`, so retiring them changes the observable response, not just deletes unreachable code — a different, more cautious backlog item). Same bucket-1a pass also retired `deny_service_scoped_schedule` (`schedule_routes.{hpp,cpp}`) entirely — its four call sites (`schedule.create`/`.list`/`.delete`/`.enable`) all fired after their route's own `require_permission`. The remaining per-file helpers (below) stay in place; they remain load-bearing **only** for routes with no other RBAC gate call at all (the §3e class above) — `EXTEND the pattern, do not fork a new copy` still applies to *that* subset. Current call sites, including this PR's additions: `deny_service_scoped_`/`deny_service_scoped_mutation_` (`guardian_routes.{hpp,cpp}`), `deny_service_scoped_` (`dex_routes.{hpp,cpp}`, `deployment_routes.{hpp,cpp}`, `preflight_routes.{hpp,cpp}`, and the new `compliance_routes.{hpp,cpp}`), `deny_service_scoped_schedule_list` + the new `deny_service_scoped_scope_estimate` (both local lambdas in `workflow_routes.cpp`), the shared `deny_fleet_wide_service_scoped` lambda in `rest_api_v1.cpp` (now covering the result-set REST family too), in `mcp_server.cpp` the file-scope `is_service_scoped_caller` / `write_service_scoped_denial` pair (the predicate and the audit-and-write sink, shared by the `POST` handler and `build_get_handler`, #4754; the `POST` lambda `deny_fleet_wide_service_scoped` there is now a thin wrapper that supplies the id-echoing envelope), the new `AuthRoutes::deny_service_scoped_session` (`server.cpp`'s shared gate for its own gate-less routes), plus inline checks in `device_routes.cpp` / `network_routes.cpp` / `inventory_routes.cpp` / `echo_tree_routes.cpp`.
 
 **Phase 2 progress (#3290).** The first migration landed: `GET /api/v1/inventory/software` + its MCP twin `query_installed_software` are now on `require_fleet_read` — both surfaces' `deny_fleet_wide_service_scoped`/blanket-deny call sites are retired for this tool pair (the REST call was already provably dead, firing after `perm_fn`; the MCP call was live and is now gone). `require_fleet_read` itself gained the elevated/engine/mcp_tier caller-class branches it was missing at Phase 0 (mirroring `require_list_read`'s ladder — see its own doc comment). Prioritization for this and future migrations is **documented reasoning, not the metric** — no production fleet exists yet, so `yuzu_auth_service_scope_default_denied_total` has no real traffic to rank by; the criterion-1 substitute and the ranked backlog live in `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`. The §3d `authorize_list_read` supersede→intersect migration (below) is a separate, not-yet-started stream.
 
@@ -3888,7 +3988,8 @@ resulting latency bounds.
   `require_list_read` (the last is the ADR-0017 admit-then-filter list-read
   gate, #3038 — see the Authentication/RBAC row in
   `.claude/routed-concerns-access-control.md`) all
-  branch on `session->principal_kind == "engine"` **before** falling through
+  branch on `session->is_engine()` (the stored `principal_kind` or an engine-token
+  `auth_source`, #2343) **before** falling through
   to the legacy pre-RBAC path or the MCP-tier/service-scoped resolution used
   for human and agent sessions. An engine session's authority is resolved
   **exclusively** against `RbacStore`:
@@ -3908,7 +4009,7 @@ resulting latency bounds.
   the concrete mechanism behind design §4.2's promise: *"An engine principal
   with no assignments can do nothing."*
 - **Audit attribution.** `AuthRoutes::make_audit_event` re-stamps
-  `principal_class="engine"` from the resolved session's `principal_kind`
+  `principal_class="engine"` when the resolved session `is_engine()`
   after the generic (credential-presentation-based) classification runs —
   an engine principal's bearer-token requests previously mislabelled as
   `"agent"` in the audit trail (design §6 / `adr-1005-execution-plan.md`
@@ -5096,7 +5197,14 @@ the list/scope reads), NEVER allow. Where a caller needs to distinguish "denied"
 from "store degraded" for a 403-vs-503 decision (e.g. `authorize_list_read`),
 that is exposed via a **separate** tri-state / `std::expected` accessor — the
 plain `bool` path stays deny-on-error so no existing chokepoint can regress to
-fail-open. This **closes the prior "fails open on a corrupt `rbac.db`" hole**:
+fail-open. `RbacStore::check_scoped_permission_checked` (#3739) is that accessor for the
+per-agent scoped gate: `true` is granted, `false` is a definitive denial, and
+`unexpected(msg)` means the answer is a deny *because a read failed* (the first
+failed read wins; an allow and an explicit deny-group hit are returned as such).
+`check_scoped_permission` is its `value_or(false)` wrapper, so every other
+caller is unchanged. `AuthRoutes::require_scoped_permission` uses it only to
+label the `auth.scoped_permission_required` audit row `(read degraded:
+mgmt_group_store|rbac_store)`; the response stays a fail-closed 403. This **closes the prior "fails open on a corrupt `rbac.db`" hole**:
 under SQLite a corrupt/unreadable RBAC store could fall through to an engaged
 allow at some call sites; the PostgreSQL `rbac_store` now denies on any degrade.
 
