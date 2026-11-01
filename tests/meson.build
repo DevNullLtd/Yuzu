@@ -4068,6 +4068,14 @@ test('same-site gate production wiring lexical gate',
   suite: 'docs',
   timeout: 30,
 )
+# #4160: pins the sso-only runtime-wiring check + provider gauges in ServerImpl (source-text only;
+# its own in-file selftest mutates each pinned statement, so no separate selftest entry).
+test('sso-only runtime wiring lexical gate',
+  _python3_test,
+  args: [files('test_sso_runtime_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
+)
 test('same-site gate production wiring lexical selftest',
   _python3_test,
   args: [files('test_same_site_wiring_lexical_selftest.py')],
