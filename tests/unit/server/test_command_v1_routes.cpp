@@ -112,6 +112,7 @@ struct Rig {
     /// throws (test_partial_send_dispatch.hpp).
     int throw_on_nth_send = 0;
     bool set_targeted_ok = true;
+    bool set_targeted_throws = false; ///< the count write THROWS (the success path's bookkeeping)
     bool create_throws = false;
     bool create_throws_nonstd = false;
     bool create_fails = false; ///< the tracker answers an error: the dispatch runs with execution_id ""
@@ -246,6 +247,8 @@ struct Rig {
         };
         d.execution.set_targeted = [this](const std::string& id, int n) {
             targeted.emplace_back(id, n);
+            if (set_targeted_throws)
+                throw std::runtime_error("count write boom");
             return set_targeted_ok;
         };
         d.metrics = &metrics;
@@ -1261,6 +1264,37 @@ TEST_CASE("command_v1: a throwing event emitter cannot fail an already-dispatche
     CHECK(rig.metrics.counter("yuzu_server_event_emit_failed_total",
                               {{"event_type", "command.dispatched"}})
               .value() == 1);
+}
+
+// unhappy p4-5: the success path's count write had no try. A throw after a COMPLETE dispatch is a
+// failed bookkeeping write (counted), never a failure of the dispatch (a generic 500 for a command
+// every agent already holds, with no success row).
+TEST_CASE("command_v1: a count write that THROWS after a complete dispatch is counted as failed "
+          "bookkeeping, and the dispatch still answers 202 with its success row",
+          "[server][command_v1][dispatch][unhappy]") {
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    rig.set_targeted_throws = true;
+    const auto res = rig.post(kRead);
+    CHECK(res->status == 202);
+    CHECK(rig.sent() == Ids{kA, kB, kC, kDecoy});
+    REQUIRE(rig.targeted.size() == 1); // the write was attempted
+    CHECK(rig.has_audit("success"));
+    CHECK_FALSE(rig.has_audit("failure"));
+    CHECK(body_of(res)["data"]["agents_reached"] == 4);
+    CHECK(rig.metrics
+              .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                       {{"op", "set_agents_targeted"}, {"surface", "rest"}})
+              .value() == 1);
+    // Positive control: the same request without the throw counts nothing.
+    Rig ok;
+    ok.facts = {.legacy_open = true};
+    const auto res2 = ok.post(kRead);
+    CHECK(res2->status == 202);
+    CHECK(ok.metrics
+              .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                       {{"op", "set_agents_targeted"}, {"surface", "rest"}})
+              .value() == 0);
 }
 
 TEST_CASE("command_v1: an unwired emitter is simply no event", "[server][command_v1][events]") {

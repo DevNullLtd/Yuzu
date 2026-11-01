@@ -508,11 +508,21 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
         return;
     }
 
-    if (!execution_id.empty() && d.execution.set_targeted &&
-        !d.execution.set_targeted(execution_id, outcome.sent)) {
-        spdlog::error("POST /api/v1/commands: set_agents_targeted failed for execution_id={}",
-                      execution_id);
-        count_bookkeeping_failed(d.metrics, "set_agents_targeted");
+    if (!execution_id.empty() && d.execution.set_targeted) {
+        // The dispatch is COMPLETE and cannot be undone: a throw from the count write (a
+        // bad_alloc, a hook defect) is the same failed bookkeeping a `false` return is, never a
+        // failure of the dispatch itself (which would answer a generic 500 for a command every
+        // agent already holds, and skip the success row).
+        bool count_stored = false;
+        try {
+            count_stored = d.execution.set_targeted(execution_id, outcome.sent);
+        } catch (...) { // NOLINT(bugprone-empty-catch): reported just below as a failed write
+        }
+        if (!count_stored) {
+            spdlog::error("POST /api/v1/commands: set_agents_targeted failed for execution_id={}",
+                          execution_id);
+            count_bookkeeping_failed(d.metrics, "set_agents_targeted");
+        }
     }
     // The `requested` row is the fail-closed evidence; this outcome row is best effort (the
     // dispatch cannot be undone), and the helper sets Sec-Audit-Failed if it is lost.
