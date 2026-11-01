@@ -8842,14 +8842,17 @@ McpServer::HandlerFn McpServer::build_handler(
                         // A count that THROWS (a bad_alloc building its SQL, a driver fault)
                         // is the same unreadable count: folded into the branch below so it can
                         // not unwind this handler before the refusal row is written.
-                        const auto pending_now = [&]() noexcept
-                            -> std::expected<int, yuzu::server::StoreReadError> {
+                        const auto pending_now =
+                            [&]() -> std::expected<int, yuzu::server::StoreReadError> {
                             try {
                                 return approval_manager->pending_count_for_checked(
                                     session->username);
                             } catch (...) {
-                                return std::unexpected(
-                                    yuzu::server::StoreReadError{"pending count threw", {}});
+                                // Empty strings: the error is built inside a handler for an
+                                // exception that may itself have been bad_alloc, so it must
+                                // not allocate here (and this lambda is deliberately not
+                                // noexcept, so any other throw cannot terminate the server).
+                                return std::unexpected(yuzu::server::StoreReadError{{}, {}});
                             }
                         }();
                         if (!pending_now) {
