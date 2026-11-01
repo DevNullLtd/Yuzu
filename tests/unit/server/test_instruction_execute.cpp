@@ -40,6 +40,7 @@
 
 #include "agent.pb.h"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -2202,8 +2203,15 @@ TEST_CASE("REST execute: a definition id that is not valid UTF-8 is a 400 invali
 TEST_CASE("REST execute: an id holding a C1 control, U+2028 or U+2029 is folded in the audit "
           "target_id but is NOT refused at step 0",
           "[instruction_execute][rest][security]") {
-    for (const auto& id : {std::string("d\xC2\x85x"), std::string("d\xE2\x80\xA8x"),
-                           std::string("d\xE2\x80\xA9x"), std::string("d\xC2\x9F")}) {
+    // log_token folds ONE '_' per folded code point (not per byte), so the expected target_id is
+    // exact: the audit subject and the `definition=` detail token are the same folded string.
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {"d\xC2\x85x", "d_x"},     // U+0085
+        {"d\xE2\x80\xA8x", "d_x"}, // U+2028
+        {"d\xE2\x80\xA9x", "d_x"}, // U+2029
+        {"d\xC2\x9F", "d_"},       // U+009F
+    };
+    for (const auto& [id, folded] : cases) {
         INFO(id.size());
         CHECK(definition_id_needs_audit_fold(id));
         CHECK_FALSE(definition_id_is_malformed(id)); // step 0 must not widen
@@ -2211,14 +2219,11 @@ TEST_CASE("REST execute: an id holding a C1 control, U+2028 or U+2029 is folded 
         auto res = r.post(id, "{}");
         REQUIRE(res);
         CHECK(res->status == 404);
-        CHECK(json::parse(res->body)["error"]["reason"] != "invalid_definition_id");
+        CHECK(json::parse(res->body)["error"]["reason"] == "not_found");
         CHECK(r.core.lookups == 1); // it went to the lookup
         REQUIRE_FALSE(r.target_ids.empty());
-        for (const auto& t : r.target_ids) {
-            CHECK(t.find('\xC2') == std::string::npos);
-            CHECK(t.find('\xE2') == std::string::npos);
-            CHECK(t.substr(0, 2) == "d_");
-        }
+        for (const auto& t : r.target_ids)
+            CHECK(t == folded);
     }
     // Positive controls: a normal id and a valid multibyte id outside the folded set are not
     // folded (the predicate is false and target_id is the id itself).
@@ -2235,6 +2240,45 @@ TEST_CASE("REST execute: an id holding a C1 control, U+2028 or U+2029 is folded 
     REQUIRE_FALSE(ok.target_ids.empty());
     for (const auto& t : ok.target_ids)
         CHECK(t == "d\xC3\xA9");
+}
+
+// The predicate decides whether the REST route folds the audit target_id; log_token decides what
+// the detail token folds. They must agree on every well-formed code point in the region log_token
+// folds (and its neighbours), so a future widening of log_token's fold set that forgets the
+// predicate fails here instead of leaving an unfolded target_id next to a folded definition=.
+TEST_CASE("definition_id_has_log_folded_codepoint agrees with log_token on C1, U+2028 and U+2029",
+          "[instruction_execute][security]") {
+    const auto utf8 = [](unsigned cp) {
+        std::string o;
+        if (cp < 0x800) {
+            o.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            o.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+            o.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            o.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            o.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+        return o;
+    };
+    std::vector<unsigned> cps;
+    for (unsigned cp = 0x80; cp <= 0x9F; ++cp)
+        cps.push_back(cp);
+    cps.push_back(0x2028);
+    cps.push_back(0x2029);
+    for (const unsigned cp : cps) {
+        const std::string id = "d" + utf8(cp) + "x";
+        INFO("U+" << std::hex << cp);
+        REQUIRE_FALSE(definition_id_is_malformed(id)); // a valid id: only the fold decision differs
+        CHECK(yuzu::log_token(id) != id);              // log_token folds it
+        CHECK(definition_id_has_log_folded_codepoint(id) == (yuzu::log_token(id) != id));
+    }
+    // Neighbours log_token leaves alone: the predicate must stay false for exactly these.
+    for (const unsigned cp : {0xA0u, 0x7FFu, 0x2027u, 0x202Au}) {
+        const std::string id = "d" + utf8(cp) + "x";
+        INFO("U+" << std::hex << cp);
+        CHECK(yuzu::log_token(id) == id);
+        CHECK(definition_id_has_log_folded_codepoint(id) == (yuzu::log_token(id) != id));
+    }
 }
 
 TEST_CASE("REST execute: 400 for a nested or malformed body before any lookup",
