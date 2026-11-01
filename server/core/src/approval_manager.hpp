@@ -792,23 +792,19 @@ public:
     /// identical to a real "zero pending approvals" state.
     std::expected<int, StoreReadError> pending_count_checked() const;
 
-    /// Count of PENDING approvals submitted by one principal. Backs the MCP
-    /// mint's per-submitter sub-cap (governance sec8-MEDIUM-1): dedup alone does
-    /// not stop an adaptive flood (a nonce key defeats the args-hash), so the
-    /// mint bounds any single supervised token's share of the GLOBAL cap.
+    /// Count of UNEXPIRED PENDING approvals submitted by one principal, with a store fault kept
+    /// apart from a genuine zero (an empty `submitted_by` is a genuine 0). Backs the per-principal
+    /// sub-cap (governance sec8-MEDIUM-1) at both cap sites (REST/MCP instruction execute, the MCP
+    /// tier-ticket mint): dedup alone does not stop an adaptive flood (a nonce key defeats the
+    /// args-hash), so the cap bounds any single principal's share of the GLOBAL queue.
     ///
-    /// **FAILS OPEN**: returns 0 for "not open" / "pool exhausted" / "query failed", identical to
-    /// a genuinely empty principal. Never use it for an admission decision (a cap that reads 0
-    /// on a fault admits everyone exactly when the store is struggling); both cap sites
-    /// (REST/MCP instruction execute, the MCP tier-ticket mint) use `pending_count_for_checked`.
-    int pending_count_for(const std::string& submitted_by) const;
-
-    /// `pending_count_for` with the store fault kept apart from a genuine zero, in the shape of
-    /// `pending_count_checked`. An empty `submitted_by` is a genuine 0. Counts UNEXPIRED pending rows
-    /// only: a row older than `kApprovalTicketTtlSeconds` (database clock) is excluded even if
-    /// `submit()`'s lazy sweep has not yet flipped it to 'expired'. That sweep only runs inside a
-    /// submit the cap itself would refuse, so counting a stale row would lock a principal out of
-    /// every approval-gated tool until someone else happened to submit.
+    /// A pending row older than `kApprovalTicketTtlSeconds` (database clock) is excluded even if
+    /// `submit()`'s lazy sweep has not yet flipped it to 'expired': it is stale (nobody reviewed
+    /// it within the window), and since the sweep only runs inside a submit that the cap itself
+    /// would refuse, counting it would lock a principal out of every approval-gated tool until
+    /// someone else happened to submit. The admission decision is FAIL-CLOSED on a fault (a cap
+    /// that read 0 on a fault would admit everyone exactly when the store is struggling); there is
+    /// deliberately no fail-open sibling.
     std::expected<int, StoreReadError>
     pending_count_for_checked(const std::string& submitted_by) const;
 

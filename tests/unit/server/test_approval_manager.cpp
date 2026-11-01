@@ -2662,7 +2662,6 @@ TEST_CASE("ApprovalManager: pending_count_for_checked fails closed when the stor
         auto empty = mgr.pending_count_for_checked("");
         REQUIRE(empty.has_value());
         CHECK(*empty == 0);
-        CHECK(mgr.pending_count_for("alice") == 2);
     }
     SECTION("a pending row older than the TTL is not counted even before submit's sweep expires it") {
         yuzu::test::ApprovalManagerPg mgr_bundle;
@@ -2697,7 +2696,7 @@ TEST_CASE("ApprovalManager: pending_count_for_checked fails closed when the stor
         // The sweep has NOT run (no submit since): the stale rows are still status 'pending'.
         CHECK(mgr.pending_count() == 27);
     }
-    SECTION("a query failure is an error, while the legacy shape still reads 0") {
+    SECTION("a query failure is an error") {
         yuzu::test::ApprovalManagerPg mgr_bundle;
         ApprovalManager& mgr = *mgr_bundle;
         REQUIRE(mgr.is_open());
@@ -2712,7 +2711,6 @@ TEST_CASE("ApprovalManager: pending_count_for_checked fails closed when the stor
         REQUIRE_FALSE(checked.has_value());
         CHECK(checked.error().message.find("read failed") != std::string::npos);
         CHECK(!checked.error().sqlstate.empty());
-        CHECK(mgr.pending_count_for("alice") == 0); // the fail-open contrast this twin exists to fix
     }
 }
 

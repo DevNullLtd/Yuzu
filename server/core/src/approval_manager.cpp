@@ -1136,11 +1136,6 @@ ApprovalManager::pending_count_for_checked(const std::string& submitted_by) cons
     return static_cast<int>(to_i64(col(res.get(), 0, 0)));
 }
 
-int ApprovalManager::pending_count_for(const std::string& submitted_by) const {
-    auto r = pending_count_for_checked(submitted_by);
-    return r ? *r : 0; // FAILS OPEN by design of this legacy shape: see the header
-}
-
 // ---------------------------------------------------------------------------
 // Get by id (#289 — MCP approval-ticket recall)
 // ---------------------------------------------------------------------------

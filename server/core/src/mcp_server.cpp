@@ -7663,7 +7663,7 @@ McpServer::HandlerFn McpServer::build_handler(
             //
             // CH-1 (recorded here per the issue's request): this counter does NOT
             // interact with the kMcpSubmitterPendingCap 25-slot cap —
-            // pending_count_for() counts only status='pending' rows, and
+            // pending_count_for_checked() counts only unexpired status='pending' rows, and
             // consume_ticket() never touches `status` (only consumed_at/
             // consumed_by); a ticket already left the pending bucket at
             // ADMIN-APPROVAL time, before it could ever reach this burn class. So a
@@ -8817,8 +8817,19 @@ McpServer::HandlerFn McpServer::build_handler(
                         // up8-1 / sre-2: an unreadable count refuses (a store fault, retryable);
                         // it must never read as zero, which would admit every principal exactly
                         // when the approval store is struggling. Nothing has been minted.
-                        const auto pending_now =
-                            approval_manager->pending_count_for_checked(session->username);
+                        // A count that THROWS (a bad_alloc building its SQL, a driver fault)
+                        // is the same unreadable count: folded into the branch below so it can
+                        // not unwind this handler before the refusal row is written.
+                        const auto pending_now = [&]() noexcept
+                            -> std::expected<int, yuzu::server::StoreReadError> {
+                            try {
+                                return approval_manager->pending_count_for_checked(
+                                    session->username);
+                            } catch (...) {
+                                return std::unexpected(
+                                    yuzu::server::StoreReadError{"pending count threw", {}});
+                            }
+                        }();
                         if (!pending_now) {
                             if (metrics != nullptr) {
                                 try {
