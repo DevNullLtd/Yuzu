@@ -51,16 +51,17 @@ What an operator should know:
   legacy `POST /api/instructions/{id}/execute` rows are unchanged and carry none.
 - **A dispatch that throws part-way.** On `POST /api/v1/commands` and the instruction execute twins the execution
   row is left `running`, never cancelled, because some agents may already hold the command; no retry is
-  advertised. The error names the row and the confirmed count as typed fields: `error.execution_id` (an empty string
+  advertised. The error names the row and the accepted-send count as typed fields: `error.execution_id` (an empty string
   when no row exists) and `error.agents_sent` (only when it is at least 1); on MCP they are `error.data.execution_id`
-  and `error.data.agents_sent`. When the server had confirmed sending to at least one agent it stores that number as the
+  and `error.data.agents_sent`. When the send path had accepted a send to at least one agent it stores that number as the
   row's targeted count, so those agents' results complete the row. The `failure` audit row carries `agents_sent=<n>`
-  (before `correlation_id=`) whenever a send was confirmed, even if the count could not be stored; if it could not,
+  (before `correlation_id=`) whenever a send was accepted by the send path, even if the count could not be stored; if it could not,
   the remediation says the server closes the record by itself ONLY if no agent ever responds, that a record an agent
   has answered will NOT close by itself, and that `cancel_execution` closes it.
   `agents_sent` is a LOWER BOUND: a send that was in flight when the dispatch threw is not counted, and a count
   that is too low lets the row close as soon as that many agents have answered, before an uncounted agent has.
-  With no confirmed send the row stays `running` with a targeted count of 0 until the stuck-execution sweep
+  A send counts once the send path accepts it; for a gateway-routed agent that means queued for forwarding, which can still fail, so `agents_sent` bounds the sends, not the deliveries.
+  With no accepted send the row stays `running` with a targeted count of 0 until the stuck-execution sweep
   (about every 15 minutes) cancels it. The sweep closes ONLY a row that is still `running`, has a targeted count
   of 0, has no per-agent response at all and no pending command-outbox delivery, and was dispatched more than
   about 30 minutes ago; it declines a pass in which a majority of the running executions (at 20 or more) look

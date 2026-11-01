@@ -1097,16 +1097,22 @@ namespace {
 struct FakeTracker {
     bool write_ok{true};
     bool refresh_throws{false};
+    bool refresh_throws_nonstd{false}; ///< a non-std throw reaches the helper's catch(...) arm
+    bool write_throws{false};
     int writes{0};
     int refreshes{0};
     bool set_agents_targeted(const std::string&, int) {
         ++writes;
+        if (write_throws)
+            throw std::runtime_error("write boom");
         return write_ok;
     }
     void refresh_counts(const std::string&) {
         ++refreshes;
         if (refresh_throws)
             throw std::runtime_error("refresh boom");
+        if (refresh_throws_nonstd)
+            throw 42; // NOLINT(hicpp-exception-baseclass): a non-std throw is the point
     }
 };
 } // namespace
@@ -1133,6 +1139,24 @@ TEST_CASE("command_v1: set_targeted_then_refresh reports the COUNT WRITE only; a
         t.write_ok = false;
         CHECK_FALSE(set_targeted_then_refresh(t, "exec-1", 2));
         CHECK(t.refreshes == 1);
+    }
+    SECTION("a NON-std throw from the refresh is swallowed too (the catch(...) arm)") {
+        FakeTracker t;
+        t.refresh_throws_nonstd = true;
+        CHECK(set_targeted_then_refresh(t, "exec-1", 2));
+        CHECK(t.refreshes == 1);
+        FakeTracker failed;
+        failed.write_ok = false;
+        failed.refresh_throws_nonstd = true;
+        CHECK_FALSE(set_targeted_then_refresh(failed, "exec-1", 2));
+    }
+    SECTION("a throw from the count write ITSELF propagates (the route's call sites catch it) and "
+            "the refresh is not attempted") {
+        FakeTracker t;
+        t.write_throws = true;
+        CHECK_THROWS_AS(set_targeted_then_refresh(t, "exec-1", 2), std::runtime_error);
+        CHECK(t.writes == 1);
+        CHECK(t.refreshes == 0);
     }
     SECTION("happy path") {
         FakeTracker t;

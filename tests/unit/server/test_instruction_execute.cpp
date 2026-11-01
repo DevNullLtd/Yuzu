@@ -1581,9 +1581,10 @@ TEST_CASE("execute: a throwing dispatch with no tracker wired records nothing",
     r.custom_dispatch = [](const std::vector<std::string>& ids) {
         return yuzu::test::dispatch_throwing_on_nth_send(ids, 2);
     };
-    // The count port IS wired (the ledger flag only unwires the create/cancel/refresh ports), so
-    // the empty-execution_id guard in the throw arm is what keeps the count from being stored
-    // against a row that does not exist. With the port unwired this assertion could not fail.
+    // The rig unwires set_agents_targeted TOGETHER with the rest of the ledger, so the port is
+    // re-wired here: the empty-execution_id guard in the throw arm is then what keeps the count
+    // from being stored against a row that does not exist. With the port left unwired this
+    // assertion could not fail.
     auto ports = r.ports();
     ports.set_agents_targeted = [&r](const std::string& id, int n) {
         r.targeted.emplace_back(id, n);

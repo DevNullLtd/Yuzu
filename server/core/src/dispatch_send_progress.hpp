@@ -39,8 +39,9 @@
 namespace yuzu::server {
 
 struct SendProgress {
-    /// Sends confirmed delivered (a `send_to` that returned true, or the count a
-    /// `send_to_all_unfiltered` returned).
+    /// Sends accepted by the send path (a `send_to` that returned true, or the count a
+    /// `send_to_all_unfiltered` returned). For a gateway-routed agent that means queued for
+    /// forwarding, which can still fail afterwards: a lower bound on delivery, never a receipt.
     int sent{0};
 };
 

@@ -93,8 +93,9 @@ struct ExecutionOps {
 /// can promote it. The return value reflects the COUNT WRITE only: a refresh that throws is
 /// logged and swallowed, because the count is stored and the route's `recorded` flag (and the
 /// `bookkeeping_failed{op=set_agents_targeted}` counter that hangs off it) would otherwise
-/// report a write failure that did not happen. A throw from the count write itself propagates
-/// (the route catches it).
+/// report a write failure that did not happen. A throw from the count write itself propagates to
+/// the caller; each of the route's two call sites (the dispatch-throw arm and the success path)
+/// catches it and treats it as a failed count write.
 template <class Tracker>
 [[nodiscard]] bool set_targeted_then_refresh(Tracker& tracker, const std::string& execution_id,
                                              int agents_reached) {

@@ -45448,6 +45448,28 @@ TEST_CASE("MCP execute_instruction_definition: a throwing dispatch (std or non-s
     }
 }
 
+// cb p4-r: with no execution tracker wired the throw arm has no row to name; the typed field is
+// present and EMPTY (a caller keys on its presence), never omitted and never a stale id.
+TEST_CASE("MCP execute_instruction_definition: a throwing dispatch with the execution ledger "
+          "unwired answers error.data.execution_id as an empty string",
+          "[mcp][integration][execute][idef][audit]") {
+    McpTestServer ts;
+    Rig rig;
+    rig.ledger_wired = false;
+    rig.dispatch_throws = true;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+    idef_start(ts, rig, "operator");
+    auto res = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["data"]["reason"] == "dispatch_exception");
+    REQUIRE(body["error"]["data"].contains("execution_id"));
+    CHECK(body["error"]["data"]["execution_id"] == "");
+    CHECK(rig.rows.empty());
+    CHECK(rig.calls.size() == 1);
+}
+
 TEST_CASE("MCP execute_instruction_definition: a dispatch that throws after confirmed sends carries "
           "execution_id and agents_sent as typed error.data fields",
           "[mcp][integration][execute][idef][send_progress]") {
@@ -45733,6 +45755,37 @@ TEST_CASE("MCP execute_instruction_definition: supervised non-admin on a gated p
     const auto rows = idef_row_cids(ts);
     REQUIRE(rows.size() == 1);
     CHECK(rows[0] == "denied|" + body["error"]["data"]["correlation_id"].get<std::string>());
+}
+
+// unhappy p4: the supervised pre-mint probe runs the SAME step-0 refusal as the dispatch, so a
+// hostile id is refused BEFORE a tier ticket exists (a ticket binds the arguments, and an approved
+// ticket for an id the core would refuse is a burned one-time capability).
+TEST_CASE("MCP execute_instruction_definition: supervised tier refuses a hostile definition_id "
+          "at the pre-mint probe: no ticket is minted and nothing is read or dispatched",
+          "[pg][mcp][integration][execute][idef][approval][security]") {
+    for (const std::string id : {std::string("d\0xyz", 5), std::string("d\x7f"), std::string("d\x1f"),
+                                 std::string("d\r\nforged")}) {
+        INFO(id.size());
+        yuzu::test::ApprovalManagerPg appr_bundle;
+        yuzu::server::ApprovalManager& appr = *appr_bundle;
+        McpTestServer ts;
+        ts.approval_manager_for_test = &appr;
+        Rig rig;
+        rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+        idef_start(ts, rig, "supervised");
+        auto res = ts.call(idef_call({{"definition_id", id}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["data"]["reason"] == "invalid_definition_id");
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(appr.pending_count() == 0); // no ticket minted
+        CHECK(rig.lookups == 0);
+        CHECK(rig.calls.empty());
+        CHECK(idef_audited(ts, "denied"));
+        CHECK_FALSE(idef_audited(ts, "requested"));
+    }
 }
 
 // Gate 8 pass 2 (sg-b1): the supervised pre-mint probe reads the stored definition and writes rows,

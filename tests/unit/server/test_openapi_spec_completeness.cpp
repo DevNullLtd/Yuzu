@@ -512,6 +512,9 @@ TEST_CASE("openapi_spec_json(): POST /instructions/{id}/execute documents the au
         REQUIRE(rsp[code]["headers"].contains("Sec-Audit-Failed"));
         CHECK(rsp[code]["headers"]["Sec-Audit-Failed"]["schema"]["enum"] == json::array({"true"}));
     }
+    REQUIRE(rsp.contains("503"));
+    REQUIRE(rsp.contains("500"));
+    REQUIRE(rsp.contains("429"));
     const std::string d503 = rsp["503"].value("description", "");
     CHECK(d503.find("pending-approval count unreadable") != std::string::npos);
     CHECK(d503.find("retry_after_ms 5000") != std::string::npos);
@@ -527,6 +530,25 @@ TEST_CASE("openapi_spec_json(): POST /instructions/{id}/execute documents the au
     CHECK(rsp["429"].value("description", "").find("about 25 pending approvals") !=
           std::string::npos);
     CHECK(rsp["400"].value("description", "").find("invalid_definition_id") != std::string::npos);
+}
+
+// The command twin's 500 carries the same typed fields as the instruction twin's (docs-writer p4-1):
+// the sent count is a lower bound recorded as the targeted count only when the write succeeds.
+TEST_CASE("openapi_spec_json(): POST /commands documents the dispatch_exception fields and the "
+          "lower-bound, write-dependent targeted count",
+          "[openapi][command_v1]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/commands"));
+    const auto& rsp = spec["paths"]["/commands"]["post"]["responses"];
+    REQUIRE(rsp.contains("500"));
+    const std::string d500 = rsp["500"].value("description", "");
+    CHECK(d500.find("dispatch_exception") != std::string::npos);
+    CHECK(d500.find("error.execution_id") != std::string::npos);
+    CHECK(d500.find("error.agents_sent") != std::string::npos);
+    CHECK(d500.find("lower bound") != std::string::npos);
+    CHECK(d500.find("only when the write succeeds") != std::string::npos);
+    CHECK(d500.find("cancel_execution") != std::string::npos);
 }
 
 TEST_CASE("openapi_spec_json(): POST /hardware/sync documents the fan-out request and every refusal",
