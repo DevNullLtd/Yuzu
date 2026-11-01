@@ -1725,7 +1725,11 @@ groups:
             the non-alerting generation_refresh_failed_within_bound reason,
             and denies nobody). Check Postgres availability and the
             server RbacStore warnings. See docs/auth-architecture.md
-            "RbacStore — the authorization substrate".
+            "RbacStore — the authorization substrate". A refusal by a
+            per-agent scoped permission gate that follows such a read leaves
+            an audit row with action auth.scoped_permission_required whose
+            detail ends "(read degraded: rbac_store)" (a 403, unlike the
+            503 ceiling forms of the same action).
           runbook_url: "https://docs.yuzu.io/runbooks/rbac-read-degraded"
 
       - alert: YuzuRbacBreakerOpen
@@ -5154,7 +5158,11 @@ groups:
             means the store failed to open at boot. Do not read a scoped
             operator's short/empty list, an empty app-perf/VERIFY cohort, a
             zero-reach dispatch, or a Pre-flight "no visible devices" refusal,
-            as authoritative while this fires.
+            as authoritative while this fires. A caller who depends on a
+            management-group scoped grant is refused fail-closed (403) by the
+            per-agent scoped permission gates meanwhile; such a refusal is
+            an audit row with action auth.scoped_permission_required whose
+            detail ends "(read degraded: mgmt_group_store)".
           runbook_url: "https://docs.yuzu.io/runbooks/management-groups"
       - alert: YuzuAnalyticsStoreNotOpen
         # AnalyticsEventStore (ADR-0049) failed to open at boot and is

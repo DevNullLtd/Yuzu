@@ -2945,6 +2945,152 @@ TEST_CASE("RbacStore: check_scoped_permission denied without scope", "[rbac_stor
     CHECK_FALSE(rbac.check_scoped_permission("alice", "Tag", "Write", "agent-other", &mgmt));
 }
 
+// #3739: `check_scoped_permission_checked` tells a degrade-driven deny from a definitive one;
+// the Boolean wrapper must answer exactly `value_or(false)` in every case.
+namespace {
+// Runs ONE caller-supplied DDL statement (e.g. a DROP TABLE) against a management-group
+// table on the per-test clone, so RBAC itself stays healthy.
+void break_mgmt_table(const std::string& dsn, const std::string& sql) {
+    yuzu::server::pg::PgConn c{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult dr{PQexec(c.get(), sql.c_str())};
+    REQUIRE(dr.ok());
+}
+} // namespace
+
+TEST_CASE("RbacStore: check_scoped_permission_checked separates a genuine deny from a mgmt-store "
+          "degrade (#3739)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(rbac);
+    YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore mgmt{pool};
+
+    ManagementGroup g;
+    g.name = "Service: CRM";
+    g.membership_type = "static";
+    auto group_id = mgmt.create_group(g);
+    REQUIRE(group_id.has_value());
+    REQUIRE(mgmt.add_member(*group_id, "agent-crm-1").has_value());
+    GroupRoleAssignment a;
+    a.group_id = *group_id;
+    a.principal_type = "user";
+    a.principal_id = "alice";
+    a.role_name = "ITServiceOwner";
+    REQUIRE(mgmt.assign_role(a).has_value());
+
+    const auto checked = [&](const std::string& user, const std::string& agent,
+                             const ManagementGroupStore* store) {
+        return rbac.check_scoped_permission_checked(user, "Tag", "Write", agent, store);
+    };
+
+    // Healthy: allow, and genuine denials are a plain `false` (a value, not an error).
+    auto allowed = checked("alice", "agent-crm-1", &mgmt);
+    REQUIRE(allowed.has_value());
+    CHECK(*allowed);
+    auto no_scope = checked("alice", "agent-other", &mgmt);
+    REQUIRE(no_scope.has_value());
+    CHECK_FALSE(*no_scope);
+    auto no_grant = checked("bob", "agent-crm-1", &mgmt);
+    REQUIRE(no_grant.has_value());
+    CHECK_FALSE(*no_grant);
+    // No mgmt store wired / empty agent id, with every read healthy, is a definitive deny.
+    auto unwired = checked("alice", "agent-crm-1", nullptr);
+    REQUIRE(unwired.has_value());
+    CHECK_FALSE(*unwired);
+    auto no_agent = checked("alice", "", &mgmt);
+    REQUIRE(no_agent.has_value());
+    CHECK_FALSE(*no_agent);
+
+    // RBAC-side fault only: a store whose pool cannot connect. The error is NOT the
+    // management-group token (the label must say `rbac_store`), with or without a mgmt store.
+    {
+        // 127.0.0.1:1 refuses immediately and stays off the network (repo precedent).
+        PgPool bad{
+            {.conninfo = "host=127.0.0.1 port=1 dbname=x user=x connect_timeout=1", .size = 1}};
+        RbacStore broken{bad};
+        REQUIRE_FALSE(broken.is_open());
+        const ManagementGroupStore* none = nullptr;
+        const ManagementGroupStore* some = &mgmt;
+        for (const ManagementGroupStore* store : {none, some}) {
+            auto r = broken.check_scoped_permission_checked("alice", "Tag", "Write",
+                                                            "agent-crm-1", store);
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() != kRbacErrMgmtGroupReadDegraded);
+            CHECK_FALSE(broken.check_scoped_permission("alice", "Tag", "Write", "agent-crm-1",
+                                                       store));
+        }
+    }
+
+    // A global ALLOW still wins over a mgmt store that is about to break (no scoped read).
+    REQUIRE(rbac.assign_role({"user", "admin_user", "Administrator"}).has_value());
+
+    // Break ONLY the management-group store, one read source at a time. The FIRST failing read
+    // is the assignments read (`management_group_roles`), the common outage path: it must carry
+    // the management-group token, not the RBAC one.
+    break_mgmt_table(db.dsn(), "DROP TABLE management_group_store.management_group_roles CASCADE");
+    auto roles_down = checked("alice", "agent-crm-1", &mgmt);
+    REQUIRE_FALSE(roles_down.has_value());
+    CHECK(roles_down.error() == kRbacErrMgmtGroupReadDegraded);
+    // The Boolean wrapper is unchanged: fail-closed false.
+    CHECK_FALSE(rbac.check_scoped_permission("alice", "Tag", "Write", "agent-crm-1", &mgmt));
+
+    // The global ALLOW holder is unaffected by the broken mgmt store.
+    auto global = checked("admin_user", "agent-crm-1", &mgmt);
+    REQUIRE(global.has_value());
+    CHECK(*global);
+}
+
+TEST_CASE("RbacStore: check_scoped_permission_checked reports a member or ancestor lookup "
+          "failure as a mgmt-store degrade (#3739)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(rbac);
+    YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore mgmt{pool};
+
+    ManagementGroup parent;
+    parent.name = "Parent";
+    parent.membership_type = "static";
+    auto pid = mgmt.create_group(parent);
+    REQUIRE(pid.has_value());
+    ManagementGroup child;
+    child.name = "Child";
+    child.membership_type = "static";
+    child.parent_id = *pid;
+    auto cid = mgmt.create_group(child);
+    REQUIRE(cid.has_value());
+    REQUIRE(mgmt.add_member(*cid, "agent-c1").has_value());
+    GroupRoleAssignment a;
+    a.group_id = *pid;
+    a.principal_type = "user";
+    a.principal_id = "alice";
+    a.role_name = "ITServiceOwner";
+    REQUIRE(mgmt.assign_role(a).has_value());
+
+    // Healthy: the child's agent is reachable from the grant on its PARENT (ancestor-aware).
+    auto ok = rbac.check_scoped_permission_checked("alice", "Tag", "Write", "agent-c1", &mgmt);
+    REQUIRE(ok.has_value());
+    CHECK(*ok);
+
+    SECTION("member source down: the assignments read still works, get_agent_groups fails") {
+        break_mgmt_table(db.dsn(),
+                         "DROP TABLE management_group_store.management_group_members CASCADE");
+    }
+    SECTION("group table down: the member read works, the ancestor lookup is what fails") {
+        // CASCADE drops only the foreign keys that reference the table; the members and roles
+        // tables stay readable, so the first failing read is get_ancestor_ids' recursive CTE
+        // (the child has a group, so the CTE runs).
+        break_mgmt_table(db.dsn(),
+                         "DROP TABLE management_group_store.management_groups CASCADE");
+    }
+
+    auto down = rbac.check_scoped_permission_checked("alice", "Tag", "Write", "agent-c1", &mgmt);
+    REQUIRE_FALSE(down.has_value());
+    CHECK(down.error() == kRbacErrMgmtGroupReadDegraded);
+    CHECK_FALSE(rbac.check_scoped_permission("alice", "Tag", "Write", "agent-c1", &mgmt));
+}
+
 // fable (Gate 4, #2703, HIGH): the scoped/confinement path has the SAME
 // dual-role hazard as the global one above — role_effects_for() maps a
 // role's effect for (type,op) into resolve_perm_groups()'s deny_groups,
