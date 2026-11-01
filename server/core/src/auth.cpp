@@ -164,7 +164,22 @@ std::string role_to_string(Role r) {
 }
 
 Role string_to_role(const std::string& s) {
-    return s == "admin" ? Role::admin : Role::user;
+    if (s == "admin")
+        return Role::admin;
+    if (s == "user")
+        return Role::user;
+    // #4072: role_to_string() only ever returns "admin" or "user", so anything else
+    // is drift (a botched migration, a hand edit of auth.users.role, a corrupt cfg
+    // line), never a legitimate value. It still floors to Role::user - failing safe,
+    // never granting - but must not do so silently: a quiet demotion hides the
+    // corruption. log_key_token (not log_token): the value is DB/file-sourced and is
+    // logged inside quotes, so it must be length-capped and have control bytes and
+    // Unicode line separators folded (CWE-117).
+    spdlog::warn("string_to_role: unrecognized role value '{}' - resolving to Role::user "
+                 "(fail-safe); check the stored role source (auth.users.role, a session row "
+                 "or the legacy config file) for corruption or a migration gap",
+                 ::yuzu::log_key_token(s));
+    return Role::user;
 }
 
 std::filesystem::path default_config_path() {

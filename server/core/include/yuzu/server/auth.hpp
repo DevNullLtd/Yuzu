@@ -1790,6 +1790,9 @@ std::filesystem::path default_config_path();
 std::filesystem::path default_cert_dir();
 
 std::string role_to_string(Role r);
+/// "admin" -> Role::admin, "user" -> Role::user. Any other value (incl. empty) fails
+/// safe to Role::user and logs a warning naming it (#4072) - never grants elevated
+/// privilege, but the drift is not silent.
 Role string_to_role(const std::string& s);
 
 /// Shared group→role resolution for federated (OIDC/SAML) session creation.

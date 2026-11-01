@@ -421,6 +421,54 @@ TEST_CASE("POST /api/settings/mfa/verify on an already-enrolled account audits m
     CHECK_FALSE(h.has_audit("mfa.enroll.verified"));
 }
 
+TEST_CASE("POST /api/settings/mfa/verify tells the operator to start again and audits "
+          "mfa.enroll.cancelled when a concurrent disable lands mid-verify (#3808)",
+          "[pg][mfa][routes][settings]") {
+    // The REAL race (see run_enroll_verify_race): a committed MFA disable lands between the
+    // verify's secret load and its guarded UPDATE. Before #3808 this graded WriteFailed, which
+    // the route reported as "authentication store is temporarily unavailable" and counted as a
+    // secret-unavailable degrade; the store was fine and the enrolment had simply been cancelled.
+    MfaSettingsHarness h;
+    const auto code = begin_admin_enrolment(h);
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+
+    std::unique_ptr<httplib::Response> res;
+    REQUIRE(yuzu::test::run_enroll_verify_race(
+        h.auth_db.dsn(), "admin",
+        {"UPDATE auth.users SET mfa_totp_secret = NULL, mfa_enrolled_at = NULL WHERE "
+         "username = $1"},
+        [&] { res = post_verify_with_cookie(h, code, token); }));
+
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("cancelled or replaced") != std::string::npos);
+    // Honest about what happened: not the store-outage wording, not "code rejected".
+    CHECK(res->body.find("temporarily unavailable") == std::string::npos);
+    CHECK(res->body.find("Code rejected") == std::string::npos);
+    // RECOVERABLE: the operator is told to start again, so the page must OFFER that. A
+    // non-empty `enrollment_pending_for_verify` forced the provisional confirm form instead
+    // (a code box whose secret is gone, a "wait for the next code" hint, no Set-up button;
+    // under enforcement not even Cancel). The not-enrolled state has the Set-up button.
+    CHECK(res->body.find("Set up two-factor") != std::string::npos);
+    CHECK(res->body.find("wait for the next code") == std::string::npos);
+    CHECK(res->body.find("Confirm code") == std::string::npos);
+    // The audit detail states only the observed fact and NEVER a cause: a named "disable"
+    // sends an auditor looking for an mfa.disabled row that may not exist (the stale-
+    // provisional sweep, `--mfa-reset` and a KEK rewrap reach this path with no disable).
+    CHECK(h.audit_detail("mfa.enroll.cancelled") ==
+          "reason=provisional_secret_changed; nothing enrolled");
+    CHECK(h.audit_detail("mfa.enroll.cancelled").find("disable") == std::string::npos);
+    CHECK_FALSE(has_step_up_proof(h, token)); // nothing enrolled, so no proof is earned
+    CHECK(h.has_audit("mfa.enroll.cancelled", "ok", "admin"));
+    CHECK_FALSE(h.has_audit("mfa.enroll.failed"));
+    CHECK_FALSE(h.has_audit("mfa.enroll.race"));
+    CHECK_FALSE(h.has_audit("mfa.enroll.verified"));
+    auto status = h.auth_db->mfa_status("admin");
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->enrolled);
+}
+
 
 TEST_CASE("POST /api/settings/mfa/verify success stamps a step-up proof on the current session",
           "[pg][mfa][routes][settings][stepup]") {

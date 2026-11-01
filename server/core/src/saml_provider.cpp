@@ -40,6 +40,14 @@ const std::string& SamlProvider::signing_init_error() const {
     return signing_init_error_; // always empty on Windows
 }
 
+bool SamlProvider::idp_cert_configured_but_broken() const {
+    return false; // N4: the IdP certificate is never loaded on Windows
+}
+
+const std::string& SamlProvider::idp_cert_init_error() const {
+    return idp_cert_init_error_; // always empty on Windows
+}
+
 std::expected<SamlAssertion, std::string>
 SamlProvider::validate_response(const std::string& /*saml_response_b64*/,
                                 const std::string& /*cookie_secret*/) {
@@ -139,6 +147,28 @@ static void ensure_xmlsec_initialized() {
     if (!g_xmlsec_init_ok) {
         throw std::runtime_error("xmlsec1 initialization failed");
     }
+}
+
+/// The ONE definition of "this pinned IdP certificate is usable": load it as an
+/// xmlsec verification key exactly as assertion verification does. Used by
+/// validate_response() (every assertion) AND by the constructor's boot-time
+/// probe (#4160), so the probe can never accept what the verifier rejects or
+/// reject what it accepts — they were two different loaders (OpenSSL
+/// PEM_read_bio_X509 vs xmlsec's PEM_read_bio_X509_AUX), which false-rejected a
+/// `BEGIN TRUSTED CERTIFICATE` file and false-accepted an Ed25519 certificate.
+/// Returns an OWNED key (caller must xmlSecKeyDestroy or hand it to a context),
+/// or nullptr. Precondition: ensure_xmlsec_initialized() has succeeded.
+/// The xmlSecSize narrowing is safe because server.cpp caps the certificate
+/// file at kSamlCertMaxBytes (64 KiB) before it reaches SamlConfig; the guard
+/// below keeps the helper safe for any other caller.
+static xmlSecKeyPtr load_idp_key(const std::string& idp_cert_pem) {
+    constexpr std::size_t kMaxPemBytes = 1u << 20; // 1 MiB, far above any real certificate
+    if (idp_cert_pem.empty() || idp_cert_pem.size() > kMaxPemBytes) return nullptr;
+    return xmlSecOpenSSLAppKeyLoadMemory(
+        reinterpret_cast<const xmlSecByte*>(idp_cert_pem.data()),
+        static_cast<xmlSecSize>(idp_cert_pem.size()),
+        xmlSecKeyDataFormatCertPem,
+        nullptr, nullptr, nullptr);
 }
 
 // ── Standard base64 codec (not URL-safe) ────────────────────────────────────
@@ -648,6 +678,29 @@ SamlProvider::SamlProvider(SamlConfig config) : config_(std::move(config)) {
         config_.enabled = false;
     }
 
+    // #4160: probe the pinned IdP certificate ONCE, at construction, with the
+    // verifier's own loader. A certificate that cannot be loaded here would fail
+    // every assertion later while is_enabled() (a field-presence test) stayed
+    // true — under --auth-mode=sso-only that is a silent fleet-wide lockout.
+    // server.cpp reads idp_cert_configured_but_broken() and disables SAML at
+    // boot. The probe key is owned by a unique_ptr and destroyed at the end of the
+    // `if` below; nothing is retained.
+    if (config_.enabled) {
+        std::unique_ptr<xmlSecKey, decltype(&xmlSecKeyDestroy)> probe{
+            load_idp_key(config_.idp_cert_pem), &xmlSecKeyDestroy};
+        if (!probe) {
+            // xmlsec pushes onto the thread-local OpenSSL error queue; clear it so
+            // this failure does not leak into unrelated later diagnostics.
+            ERR_clear_error();
+            idp_cert_init_failed_ = true;
+            idp_cert_init_error_  = "SAML IdP certificate could not be loaded as a "
+                                    "signature-verification key (not a PEM certificate, "
+                                    "or a key type that cannot verify signatures here, "
+                                    "for example Ed25519)";
+            spdlog::error("SamlProvider: {}", idp_cert_init_error_);
+        }
+    }
+
     // Parse the SP AuthnRequest signing key (if configured) exactly once, at
     // construction — never per-request. Configured-but-broken (malformed PEM,
     // or a non-RSA key) sets signing_init_failed_ rather than falling back to
@@ -719,6 +772,14 @@ bool SamlProvider::signing_configured_but_broken() const {
 
 const std::string& SamlProvider::signing_init_error() const {
     return signing_init_error_;
+}
+
+bool SamlProvider::idp_cert_configured_but_broken() const {
+    return idp_cert_init_failed_;
+}
+
+const std::string& SamlProvider::idp_cert_init_error() const {
+    return idp_cert_init_error_;
 }
 
 bool SamlProvider::is_enabled() const {
@@ -966,11 +1027,7 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
     // and skips KeyInfo processing entirely if it is already set. This means
     // ANY keys embedded in the document's <ds:KeyInfo> are never consulted,
     // eliminating the key-substitution attack class.
-    xmlSecKeyPtr sign_key = xmlSecOpenSSLAppKeyLoadMemory(
-        reinterpret_cast<const xmlSecByte*>(config_.idp_cert_pem.data()),
-        static_cast<xmlSecSize>(config_.idp_cert_pem.size()),
-        xmlSecKeyDataFormatCertPem,
-        nullptr, nullptr, nullptr);
+    xmlSecKeyPtr sign_key = load_idp_key(config_.idp_cert_pem);
     if (!sign_key) return std::unexpected("failed to load pinned IdP certificate");
 
     // ── 10. Create DSig context, set the pinned key, verify ──────────────────
