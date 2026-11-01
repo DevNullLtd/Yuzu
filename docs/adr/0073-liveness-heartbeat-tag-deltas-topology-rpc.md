@@ -1086,7 +1086,8 @@ relayed by the gateway like any command (no new gateway state).
     (plus one kill-switch read per issuance, inside `build_classified_command`). At
     the defaults, overlapping, that is up to about 12,400 operations per second per replica (four per reattach, two per issuance; from
     ADR-0074 wave 2 each reattach adds the `challenge_pending` clear on the route row and the
-    challenge's own kill-switch read and record, so seven, about 18,400 per second) against
+    challenge's own record, so six, about 16,400 per second; the challenge is a protective pair,
+    so it makes no kill-switch read) against
     the default `--postgres-pool-size` of 16. Agents that re-register instead (`NO_RECORD`) add one
     registration-record transaction each (D14). It is unmeasured. It is to be measured against the
     pool size alongside ADR-0074's wave-2 measurement of a mass re-enrollment after an outage,
@@ -1535,7 +1536,7 @@ count-valued histograms here are not latencies, so they declare their own:
   slice 11 is counted `unsigned`, not `absent` (D16), so the rollout check is this gauge and
   `yuzu_server_agents_state_unsigned` both at 0;
 - `yuzu_server_reattach_admission_refused_total{reason}` (slice 11), a counter with the closed
-  `reason` set `kill_switched|revocation_degraded`: reattaches paced server-wide at admission
+  `reason` set `revocation_degraded`: reattaches paced server-wide at admission
   (D14), registered at 0;
 - `yuzu_server_gateway_refused_total{reason}` (slice 11), a counter with the closed `reason` set
   `pre_wave2`, unlabelled by gateway (the peer is in the WARN line and the audit row);
@@ -1563,7 +1564,7 @@ count-valued histograms here are not latencies, so they declare their own:
   `bad_signature|unsigned|replayed|unverified_session` from ADR-0074 wave 2 (D7, D16; `parse` also moves
   the parse counter above);
 - `yuzu_server_reattach_challenge_total{outcome}`, with
-  `verified|bad_signature|cert_invalid|expired|degraded|send_failed|superseded|unsupported|capacity|kill_switched`; the
+  `verified|bad_signature|cert_invalid|expired|degraded|send_failed|superseded|unsupported|capacity`; the
   counter
   `yuzu_server_reattach_challenge_extra_answer_total` (answers after the first, dropped
   unverified); and the gauges `yuzu_server_reattach_challenge_pending` and
@@ -1704,7 +1705,7 @@ on the sustained condition and staying quiet on the expected one.
   `expired`; quiet with `unsigned` stragglers; fires on one `bad_signature`, on an `expired`
   share above the threshold, and on a sustained `unverified_session` share.
 - `YuzuReattachChallengeDegraded` (ticket; slice 11): the share of
-  `yuzu_server_reattach_challenge_total{outcome=~"degraded|send_failed|capacity|kill_switched|cert_invalid|unsupported"}` above 0.2 of challenges
+  `yuzu_server_reattach_challenge_total{outcome=~"degraded|send_failed|capacity|cert_invalid|unsupported"}` above 0.2 of challenges
   resolved for 15 min, with at least 100 resolved, or
   `yuzu_server_reattach_challenge_oldest_pending_seconds` above 360 for 10 min (a sweep that is
   not resolving: the age of the oldest `challenge_pending` session, 0 when none is pending,
@@ -1712,12 +1713,11 @@ on the sustained condition and staying quiet on the expected one.
   re-tuned when either flag is changed, because a rule cannot read a flag).
   Meaning: reattached agents are not being verified because the revocation read or store is
   degraded, or the gateway management plane is failing forwards, or CONNECTED re-announces are
-  late, or challenge concurrency is undersized (`capacity`), or a kill switch is set on
-  `__session__.challenge` (`kill_switched`), or agents' certificates are invalid
+  late, or challenge concurrency is undersized (`capacity`), or agents' certificates are invalid
   (`cert_invalid`: renewal) or too old to answer (`unsupported`: upgrade them); their state is
   not flowing. Responder, by the dominant outcome: the revocation/CA read and
   `YuzuPgPoolSaturated`; the gateway management plane and its notify-queue depth;
-  `--reattach-challenge-concurrency`; the plugin configuration's kill switch; certificate
+  `--reattach-challenge-concurrency`; certificate
   renewal; the agent version. Tests: quiet through a post-restart wave; fires on a sustained
   share of each outcome, and on an oldest-pending age held past the bound with no resolutions.
 - `YuzuGatewayRefusedPreWave2` (ticket; slice 11):
@@ -1984,20 +1984,36 @@ message ReattachResponse {
     enumerator (`session_challenge`; `kSystemReservedPushes` grows to 7, with its SCOPE OF THE
     BYPASS entry), refused to every operator surface by `classify_and_authorize_dispatch`. Its id
     is minted fresh per challenge, so the agent's dedup claim (the safe default; `__guard__`
-    stays the only bypass) is harmless. It is not a protective action (the protective set stays
-    the closed list in `protective_actions.hpp`; widening it is a security decision this ADR does
-    not take), so `build_classified_command`'s kill-switch read applies: a whole-action or per-OS
-    switch on `__session__.challenge`, or an unreadable switch, resolves the challenge
-    `kill_switched` (uninstalled, the record kept, not audited per agent, never in the per-agent
-    back-off), and every gateway session whose challenge has not yet verified stays unroutable
-    until the switch is cleared, which is the point of a switch. That includes protective delivery
-    (the quarantine control actions and `__guard__.push_rules`) to a gateway agent that reattaches
-    or registers while the switch is set or its read fails; a session already verified is
-    unaffected. Whether the carrier should instead be exempt from the switch, so that no
-    enablement gate can hold the protective set back this way, is an open owner decision; slice 11
-    does not ship until it is taken; `YuzuReattachChallengeDegraded` names it. A slice-11 test sets the
-    switch during a reattach wave and asserts `kill_switched` only, no back-off entries, and
-    verification resuming once it is cleared. `notify_exec_tracker` skips its prefix, and its reply is
+    stays the only bypass) is harmless. It is exempt from every enablement gate (*decided by the owner on 2026-11-01*): no whole-action or
+    per-OS kill switch, and no unreadable switch, may hold it back, because every gateway session whose
+    challenge has not verified stays unroutable, and that would hold back protective delivery (the
+    quarantine control actions and `__guard__.push_rules`) in breach of the protective-set rule
+    (quarantine routed concern, clause 3). The exemption is made by adding `__session__.challenge`
+    to the one protective-set predicate in `protective_actions.hpp` (`is_protective_action`), and
+    `__session__` to its companion `plugin_owns_protective_actions` in the same header (so a
+    plugin-level switch row on `__session__` is never audited as an effective stop), with the
+    exhaustive table in `tests/unit/test_protective_actions.cpp` extended; never by a second list.
+    That widening is the security decision this paragraph records. It changes what can hold the
+    push back, never who can send it: the predicate is read only on enablement paths, after
+    `classify_and_authorize_dispatch`, which still refuses the carrier to every operator surface.
+    Because the same predicate drives every enablement gate, the challenge is also exempt from the
+    send-time per-OS withhold and its presence read (`kill_switch_denial` returns no withheld OS
+    for a protective pair, and the issuer's shared `send_to` check takes the withheld-OS set from
+    it, never re-deriving one) and from the plugin-presence filter (`ids_missing_plugin` exempts
+    protective pairs). It is NOT what carries the challenge past the #881 containment gate, which
+    keys on `is_quarantine_control_plugin` alone: the challenge reaches a contained gateway agent
+    because it is a `SystemReservedPush` sent through `send_system_reserved` (*Security*), and a
+    quarantined gateway agent must still verify before its containment can be re-applied. Slice 11
+    amends every text that enumerates the set: the `protective_actions.hpp` header and predicate
+    docs, the quarantine routed concern's clause 3, the `kill_switch_denial` comment in
+    `agent_registry.hpp`, `plugin_config_parsers.hpp`, `enablement_units.hpp`, the reconciler
+    comment in `server.cpp` (which also wrongly credits the predicate with the #881 bypass),
+    `mcp_server.cpp`, ADR 3005 and the `docs/mcp-server.md` cascade bullet. An operator who
+    wants challenges to stop stops the gateway. A slice-11 test sets a whole-action switch, a per-OS
+    switch and an unreadable switch on `__session__.challenge` during a reattach wave and asserts that
+    every challenge is still issued and verified, on a gateway agent and a direct agent; another
+    asserts every operator surface (MCP `execute_instruction`, `/api/command`, the legacy
+    forwarder, the dashboard) still refuses `__session__.challenge` after the widening. `notify_exec_tracker` skips its prefix, and its reply is
     dropped at both ingest paths before the provenance lookup, keyed on the response's plugin
     field as the `__resync__` reply is, and handed to the challenge verifier instead. A
     direct-connected agent gets it on its Subscribe stream. For a gateway agent there is no
@@ -2074,7 +2090,7 @@ message ReattachResponse {
     for new starts only, never cancelling a call in flight. The global and per-gateway counts are
     owned by the call table: a slot is charged at start to the upstream peer recorded on the call
     object (the peer whose adopt installed the session) and released only when that call's final tag returns, never at resolution; any
-    resolution while the call is still in flight (`superseded`, `kill_switched`, `capacity`,
+    resolution while the call is still in flight (`superseded`, `capacity`,
     `expired`) calls `TryCancel` on it, so the slot is held for the cancel latency, not the client
     deadline. The 40-gateway blackhole test asserts the in-flight count per peer never exceeds its
     cap, across a re-target included, and a test with one peer asserting 40 `gateway_node` values
@@ -2158,7 +2174,8 @@ message ReattachResponse {
     issuer's `send_system_reserved` variant (D8) with the challenge flag, never a fourth send
     path. The issuer treats such a session as not installed (D8);
   - `challenge_pending` is an authentication gate, not an enablement gate, so it refuses the
-    protective actions too: the quarantine row's rule that no enablement gate refuses the
+    protective actions too (the challenge itself excepted, by its flag, not by its protective
+    status): the quarantine row's rule that no enablement gate refuses the
     protective set does not reach it, because a send to an unverified session may be a send to a
     gateway impersonating the device. A quarantine stored before or during the window is
     re-applied on verification from the stored record through `redispatch_stored_containment`,
@@ -2186,8 +2203,8 @@ message ReattachResponse {
     `send_to_all` already read routing fields under; slice 11 amends the `AgentSession`
     publication-discipline comment in `agent_registry.hpp` to list them. Resolving a challenge is
     one transition, from `pending` to `verified` or to any one terminal outcome (`bad_signature`,
-    `cert_invalid`, `expired`, `degraded`, `send_failed`, `superseded`, `unsupported`, `capacity`
-    or `kill_switched`), taken under that lock; only the winner runs its side effects, so a late
+    `cert_invalid`, `expired`, `degraded`, `send_failed`, `superseded`, `unsupported` or
+    `capacity`), taken under that lock; only the winner runs its side effects, so a late
     answer cannot revive an expired session and an expiry cannot tear down a verified one. A
     gateway session's state is written `pending` when it is constructed, before it is inserted
     into the session map under `mu_`, never afterwards, so no send can observe it in an admitted
@@ -2235,14 +2252,14 @@ message ReattachResponse {
     never counted, because the revocation read is the server's own and a `degraded` is never the
     agent's fault, and `capacity` and `superseded` are never counted either. The uncounted
     server-side causes are instead paced at reattach admission, server-wide: before the adopt CAS,
-    while the challenge carrier's kill switch is set or unreadable, or the replica's revocation-read
-    breaker is open, a reattach answers `RATE_LIMITED` with a jittered `retry_after_ms` of 30 to
-    60 s and writes nothing, counted on
-    `yuzu_server_reattach_admission_refused_total{reason="kill_switched|revocation_degraded"}`
-    (registered at 0), so a set switch or a degraded store produces no adopt-and-uninstall churn
-    and no route writes into a degraded pool; a slice-11 test holds the switch set for 10 min and
-    asserts the adopt writes stay bounded by that pacing and verification resumes within one
-    `retry_after_ms` of clearing it. The per-agent count is kept
+    while the replica's revocation-read breaker is open, a reattach answers `RATE_LIMITED` with a
+    jittered `retry_after_ms` of 30 to 60 s and writes nothing, counted on
+    `yuzu_server_reattach_admission_refused_total{reason="revocation_degraded"}`
+    (registered at 0), so a degraded store produces no adopt-and-uninstall churn and no route
+    writes into a degraded pool (a kill switch is not a cause: the challenge carrier is a
+    protective pair, which no switch holds back); a slice-11 test holds the breaker open for
+    10 min and asserts the adopt writes stay bounded by that pacing and verification resumes
+    within one `retry_after_ms` of its closing. The per-agent count is kept
     in a map kept apart from the session (it survives the uninstall that each counted outcome
     causes), reset on `verified`, an entry expiring 30 min after its last failure (twice the
     back-off cap, so an agent held at the cap keeps its count), and the map
@@ -2261,7 +2278,7 @@ message ReattachResponse {
     bounds it); a stop with challenges pending leaves them to the restart path, and a slice-11
     test checks `stop()` joins cleanly with one pending;
   - every outcome is counted (`yuzu_server_reattach_challenge_total{outcome}`, with
-    `verified|bad_signature|cert_invalid|expired|degraded|send_failed|superseded|unsupported|capacity|kill_switched`, and
+    `verified|bad_signature|cert_invalid|expired|degraded|send_failed|superseded|unsupported|capacity`, and
     the gauge `yuzu_server_reattach_challenge_pending`, at most min(`--reattach-rate` ×
     (`--reattach-connected-wait` + expiry), the sessions held), and the gauge
     `yuzu_server_reattach_challenge_oldest_pending_seconds`). Every `bad_signature` writes an `agent.reattach.challenge` audit row through
@@ -3022,7 +3039,11 @@ per replica, for N agents whose heartbeats reach it (estimates, unmeasured; slic
     it reaches a contained device. It only arms a full-tag heartbeat or a topology report; no code
     runs. It is counted on `yuzu_server_system_reserved_push_total` under its own capability label,
     and not audited, as the other pushes are, one label per action. The `echo.fleet_snapshot` push is no longer sent
-    (D10). `docs/user-manual/security-hardening.md`'s list of channels that reach a contained
+    (D10);
+  - from slice 11, `session_challenge` (`__session__.challenge`) is a `SystemReservedPush` too and
+    reaches a contained device the same way; its passage past the containment gate comes from
+    that bypass, not from the protective predicate, which exempts it only from enablement gates.
+    It carries a nonce to sign; no code runs. `docs/user-manual/security-hardening.md`'s list of channels that reach a contained
     device changes with it.
 
 ### Privacy
@@ -3279,7 +3300,9 @@ of every ~30 s. The content is unchanged.
   contained device (`__resync__` added, `echo.fleet_snapshot` no longer sent; *Security*); and
   from slice 11, the signed state content and the post-reattach challenge (D14, D16), and in
   the quarantine section that an unverified reattached session receives no containment push
-  until its challenge verifies, after which the stored containment is re-applied.
+  until its challenge verifies, after which the stored containment is re-applied, and that the
+  protective set gains `__session__.challenge`, which no kill switch holds back, and that it is
+  a channel reaching a contained device (*Security*).
 - From slice 11: the customer-assurance set (the security whitepaper, the architecture overview,
   the questionnaire answers on the integrity of agent-reported state, and the shared-responsibility
   matrix), in the wording and limits *Security* gives; `docs/user-manual/gateway.md`
@@ -3524,7 +3547,11 @@ renewal (D16, *key*).
       `challenge_pending` output-schema arm, `agents_challenge_pending` and its `retry_after_ms`
       (with `check-mcp-retry-hints.py`), and the A4 reason on `/api/command` and the legacy
       forwarder; the D6 rule that a refused heartbeat refreshes liveness only; the old-gateway
-      refusal and `yuzu_server_gateway_refused_total`; the `kill_switched` outcome; the
+      refusal and `yuzu_server_gateway_refused_total`; the carrier's entries in
+      `is_protective_action` and `plugin_owns_protective_actions` (no kill-switch outcome), with
+      `tests/unit/test_protective_actions.cpp` gaining both rows and `__session__` in its tie
+      loop (its "quarantine control set plus `__guard__.push_rules` only" test renamed), and
+      every set-enumerating text amended (the carrier paragraph lists them); the
       `gateway.upstream.refused` verb; state-path audit rows queued to the issuer drain and
       `yuzu_server_audit_state_rows_total`; zero-registration of every alerted series;
       `YuzuGatewayRefusedPreWave2` and `YuzuStateAuditRowsDropped`.
@@ -3546,7 +3573,9 @@ renewal (D16, *key*).
       reattach after an expiry, a bounded forwarder count with a blackholed management plane,
       the challenge surviving a gateway relay byte for byte, verification racing expiry under
       TSan, an uninstall during an in-flight verify under ASan, two copies of one payload applied
-      once, `stop()` with a challenge pending); S1 and S2 re-run with slice 11 on. Signing and
+      once, `stop()` with a challenge pending); the three-switch exemption test (whole-action,
+      per-OS and unreadable switch on `__session__.challenge`, every challenge still issued and
+      verified) and the operator-surface refusal test; S1 and S2 re-run with slice 11 on. Signing and
       verification costs are measured on the wave-2 rig at the heartbeat rate.
 
 ## Open points for the owner
@@ -3582,7 +3611,8 @@ make a new choice.
     Lands in ADR-0074 wave 2 (slice 11). Kept here, numbered, so references stay stable.
 13. **How reattach meets ADR-0074 D5's per-session signature** (D14). *Decided by the owner on
     2026-10-30:* after a reattach the server sends a signed challenge, and the agent must answer it
-    before the route is published or any command is routed to it. Lands in ADR-0074 wave 2
+    before the route is published or any command is routed to it; its carrier is exempt from every
+    enablement gate (point 21, decided 2026-11-01). Lands in ADR-0074 wave 2
     (slice 11). Kept here, numbered, so references stay stable.
 14. **Per-RPC balancing of `GatewayUpstream`** (*Server stores*). As written, the per-replica,
     in-memory delta base needs every heartbeat of one agent session to reach one replica for the
@@ -3621,3 +3651,8 @@ make a new choice.
     `SendCommandRequest` (a proto addition), or one forward per agent from the bounded forwarder
     set (which, at 8 in flight and a 10 s deadline, drops a silent-target cluster's rate to well
     under one agent per second). The owner decides, before wave 2.
+21. **The challenge carrier and the enablement gates** (D14). *Decided by the owner on
+    2026-11-01:* `__session__.challenge` joins the protective set (`is_protective_action`), so no
+    kill switch, and no unreadable switch, can hold it back, and containment always reaches
+    gateway agents. Lands in ADR-0074 wave 2 (slice 11). Kept here, numbered, so references stay
+    stable.
