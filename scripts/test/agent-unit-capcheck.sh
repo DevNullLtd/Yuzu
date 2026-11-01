@@ -440,9 +440,12 @@ else
 
         threads=0 bad=0
         for t in /proc/"$pid"/task/*/status; do
-            inh=$(awk '$1 == "CapInh:" {print $2}' "$t" 2>/dev/null || true)
-            amb=$(awk '$1 == "CapAmb:" {print $2}' "$t" 2>/dev/null || true)
-            [[ -n $inh ]] || continue   # thread exited while scanning
+            # One read of the thread's status file: two opens could straddle the thread's
+            # exit and count a healthy agent as an offender.
+            st=$(cat "$t" 2>/dev/null) || continue   # thread exited while scanning
+            inh=$(awk '$1 == "CapInh:" {print $2}' <<<"$st")
+            amb=$(awk '$1 == "CapAmb:" {print $2}' <<<"$st")
+            [[ -n $inh && -n $amb ]] || continue
             threads=$((threads + 1))
             if [[ $inh != "$CAP_NONE" || $amb != "$CAP_NONE" ]]; then
                 bad=$((bad + 1))
