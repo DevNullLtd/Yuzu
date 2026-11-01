@@ -2101,7 +2101,7 @@ TEST_CASE("a factor replaced between verification and mint denies the mint on ev
         CHECK(res->status == 401);
         CHECK(res->get_header_value("Set-Cookie").empty());
         REQUIRE(seen.size() == 1);
-        CHECK(seen[0].proof.factor_gen < h.auth_db->mfa_status("admin")->factor_gen);
+        CHECK(seen[0].proof.factor_gen != h.auth_db->mfa_status("admin")->factor_gen);
         // The code was genuinely consumed, so its true row stands; the login row is an honest
         // failure.
         CHECK(h.count_audits("mfa.login.verified", "admin") >= 1);

@@ -776,7 +776,7 @@ public:
         kStoreError,    ///< the durable write (or the recheck) hit a store error: nothing admitted
         kInvalidProof,  ///< a proof needs an instant > 0 and a non-negative generation
         kFutureDated,   ///< the carried instant was later than the DB clock: stored as no proof
-        kFactorChanged, ///< the account's factor generation moved after the stamp: cleared
+        kFactorChanged, ///< the account's factor generation changed after the stamp: cleared
     };
 
     /// Create a session for a user who has already cleared the password, with NO MFA proof
@@ -846,7 +846,7 @@ public:
     /// The durable write stores `proof` as given (`{0, v > 0}` is a legal UNBOUND proof); an
     /// instant later than the writing statement's `now()` stores NO proof and NO binding
     /// (`kFutureDated`). A bound proof is then rechecked under the account's `auth.users` row
-    /// lock (comparison only): if the factor generation moved since the verification, the
+    /// lock (comparison only): if the factor generation changed since the verification, the
     /// stamp is cleared after the lock releases (`kFactorChanged`); a failed clear leaves a
     /// proof bound to the OLD generation, which a binding gate refuses by equality, and this
     /// replica's cached copy is dropped regardless. Nothing is admitted on any non-`kStamped`

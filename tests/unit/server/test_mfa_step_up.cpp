@@ -1373,10 +1373,11 @@ TEST_CASE_METHOD(BindingFixture,
     CHECK(before.db_now_ms > 0);
     CHECK(std::llabs(before.db_now_ms - wall_ms) < 60'000); // same clock domain, never the cache's
 
-    // Every change of the enrolment instant advances the generation by exactly one.
+    // Every change of the enrolment instant assigns a fresh, different, positive generation.
     backdate_enrolment("alice", seconds(7200));
     const auto after = probe_mfa_factor(make_session("alice", "local", system_clock::now()), *db);
-    CHECK(after.factor_gen == before.factor_gen + 1);
+    CHECK(after.factor_gen > 0);
+    CHECK(after.factor_gen != before.factor_gen);
 
     // Every non-enrolled-local state carries none of it.
     for (const auto& p : {probe_mfa_factor(make_session("bob", "local"), *db),
@@ -1433,10 +1434,10 @@ TEST_CASE_METHOD(BindingFixture,
                  "require_enrolled_fresh_mfa: a proof bound to another generation "
                  "is a 401 proof_factor_mismatch, fresh or not",
                  "[pg][mfa][stepup][approver][binding]") {
-    backdate_enrolment("alice", seconds(7200)); // gen >= 3, so g - 1 and g - 2 are real generations
+    backdate_enrolment("alice", seconds(7200));
     backdate_enrolment("alice", seconds(3600));
     const auto g = gen_of("alice");
-    REQUIRE(g >= 3);
+    REQUIRE(g > 2); // a random positive token; the others below only need to differ from it
     const auto cached = make_session("alice", "local", system_clock::now());
     for (const std::int64_t other : {g - 1, g - 2, g + 1, g + 1000}) {
         INFO("proof gen=" << other << " current=" << g);

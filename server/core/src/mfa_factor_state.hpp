@@ -107,7 +107,7 @@ judge_local_mfa_binding(const auth::DurableMfaProof& durable, std::int64_t curre
         return {LocalMfaBinding::kUnavailable, "mfa_proof_unavailable"};
     if (!binding_enforced)
         return {LocalMfaBinding::kUnenforced, "mfa_binding_unenforced"};
-    // An enrolled account always has a positive generation (the trigger advances it on enrolment),
+    // An enrolled account always has a positive generation (the trigger assigns one on enrolment),
     // so a non-positive one is a read that cannot be trusted, not a statement about the proof:
     // undecidable, answered as unavailable (503) rather than a 401 the caller can never clear.
     if (current_factor_gen <= 0)

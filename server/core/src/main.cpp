@@ -2002,9 +2002,9 @@ int main(int argc, char* argv[]) {
         // End the account's durable sessions in the same one-shot (#6079). While the
         // generation trigger is in force a surviving proof made under the factor just cleared
         // is already refused: it records the old factor generation and the next enrolment
-        // advances it, so equality fails (no clock is involved). With the trigger ABSENT (the
-        // recovery bypass) the clear does not advance the generation, so this delete is the
-        // only barrier. Either way it removes the password access a live session made under
+        // assigns a different one, so equality fails (no clock is involved). With the trigger
+        // ABSENT (the recovery bypass) the clear does not change the generation, so this delete
+        // is the only barrier. Either way it removes the password access a live session made under
         // the cleared factor keeps. The delete bumps the durable generation, so
         // every replica drops its cached copy on its next refresh. A failure here is loud and
         // non-zero: the factor is already cleared, so the operator must end the sessions by

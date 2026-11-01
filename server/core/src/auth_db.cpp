@@ -251,8 +251,15 @@ constexpr std::chrono::milliseconds kAcquireRetryTimeout{150};
 // (the text between the `$$` delimiters, which Postgres stores verbatim as `pg_proc.prosrc`) and
 // the validation query (`prosrc = $1`), so the two cannot drift: a function replaced with any
 // other body is reported as tampering. Application code never writes `mfa_factor_gen`; the trigger
-// advances it on EVERY change of `mfa_enrolled_at`, whichever binary issued the UPDATE. The strict
-// `OLD + 1` form keeps two updates of one row in one transaction distinct.
+// assigns it on EVERY change of `mfa_enrolled_at`, whichever binary issued the UPDATE.
+// The value is an opaque token, not a counter: each change draws a fresh random value in
+// [1, 2^60], the last 15 hex digits of a version-4 UUID from `gen_random_uuid()` (a CSPRNG, core
+// in PostgreSQL 13+), which sit past the UUID's fixed version and variant nibbles. Consumers only
+// compare it for equality, and 0 means "never assigned". Why random: after an auth-only database
+// restore over a newer `session_store`, a counter would walk back onto a value that a surviving
+// stored proof carries, and that stale proof would match again; a random value is not reproduced
+// by replaying enrolments on the restored row. The distinctness guard keeps two changes of one
+// row in one transaction different even in the one-in-2^60 case of a repeated draw.
 // FROZEN: shipped in migration v3 and pinned byte-for-byte by the boot check; changing it needs a
 // NEW migration (CREATE OR REPLACE) and an accepted (old,new) pair in the check, or every migrated
 // replica refuses to boot.
@@ -260,7 +267,11 @@ constexpr std::string_view kUsersMfaFactorGenBody =
     "\n"
     "BEGIN\n"
     "  IF NEW.mfa_enrolled_at IS DISTINCT FROM OLD.mfa_enrolled_at THEN\n"
-    "    NEW.mfa_factor_gen := OLD.mfa_factor_gen + 1;\n"
+    "    NEW.mfa_factor_gen := ('x' || substr(replace(gen_random_uuid()::text, '-', ''), 18, 15))"
+    "::bit(60)::bigint + 1;\n"
+    "    IF NEW.mfa_factor_gen = OLD.mfa_factor_gen THEN\n"
+    "      NEW.mfa_factor_gen := OLD.mfa_factor_gen + 1;\n"
+    "    END IF;\n"
     "  ELSE\n"
     "    NEW.mfa_factor_gen := OLD.mfa_factor_gen;\n"
     "  END IF;\n"
@@ -268,10 +279,10 @@ constexpr std::string_view kUsersMfaFactorGenBody =
     "END\n";
 
 // v3 is a hard cutover (no upgrade path, no seed): the column starts at 0 for every existing row
-// and the trigger advances it from the next enrolment change. An enrolled account that already
-// exists when this migration runs therefore reads generation 0, which every gate refuses (503
-// `mfa_proof_unavailable`) until `yuzu-server --mfa-reset <user>` re-enrols it, so the cutover is
-// meant for a fresh database.
+// and the trigger assigns a fresh value at the next enrolment change. An enrolled account that
+// already exists when this migration runs therefore reads generation 0, which every gate refuses
+// (503 `mfa_proof_unavailable`) until `yuzu-server --mfa-reset <user>` re-enrols it, so the
+// cutover is meant for a fresh database.
 std::string migration_v3_sql() {
     std::string sql;
     sql += "SET LOCAL lock_timeout = '3s'; ";
@@ -470,9 +481,10 @@ const std::vector<pg::PgMigration>& migrations() {
          "  imported_by TEXT NOT NULL DEFAULT ''"
          ");"},
 
-        // v3 (#6079): a database-owned factor generation on `users`. The row trigger advances it
-        // on every change of `mfa_enrolled_at`, so "which factor is enrolled right now" is a
-        // monotonic value no repeated or skewed enrolment timestamp can forge. Every existing row
+        // v3 (#6079): a database-owned factor generation on `users`. The row trigger assigns a
+        // fresh random token on every change of `mfa_enrolled_at`, so "which factor is enrolled
+        // right now" is a value no repeated or skewed enrolment timestamp can forge and no
+        // restored row can re-issue (see kUsersMfaFactorGenBody). Every existing row
         // starts at 0 (a hard cutover: no seed, see migration_v3_sql). A legacy binary ignores the
         // column but its enrol and clear UPDATEs still fire the trigger. The 3 s lock_timeout
         // bounds the ALTER and CREATE TRIGGER waits: while they queue behind a long transaction,

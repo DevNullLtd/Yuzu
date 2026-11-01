@@ -20,6 +20,7 @@
 
 #include "acquire_retry.hpp"
 #include "key_provider.hpp"
+#include "mfa_factor_state.hpp" // judge_local_mfa_binding: a stale proof must not re-match (#6079)
 #include "mfa_binding_gauge.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -46,6 +47,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -2799,16 +2801,17 @@ TEST_CASE("AuthDB enrolment stamps mfa_enrolled_at with the database instant tha
     auto st = h.db.mfa_status("d2");
     REQUIRE(st.has_value());
     REQUIRE(st->enrolled);
-    CHECK(st->factor_gen == 1);
+    CHECK(st->factor_gen > 0);
     const std::int64_t at = enrolled_column_ms(h.conn.get(), "d2");
     CHECK(at >= lo);
     CHECK(at <= hi);
     CHECK(at > 0);
 }
 
-TEST_CASE("AuthDB::mfa_status reports not enrolled after mfa_disable and a later generation and "
-          "instant on re-enrolment",
-          "[pg][authdb][mfa]") {
+TEST_CASE(
+    "AuthDB::mfa_status reports not enrolled after mfa_disable and a different generation and "
+    "a later instant on re-enrolment",
+    "[pg][authdb][mfa]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("d3", "h", "s", yuzu::server::auth::Role::user).has_value());
@@ -2832,7 +2835,8 @@ TEST_CASE("AuthDB::mfa_status reports not enrolled after mfa_disable and a later
     auto again = h.db.mfa_status("d3");
     REQUIRE(again.has_value());
     CHECK(again->enrolled);
-    CHECK(again->factor_gen > first->factor_gen);
+    CHECK(again->factor_gen > 0);
+    CHECK(again->factor_gen != first->factor_gen);
     const std::int64_t again_at = enrolled_column_ms(h.conn.get(), "d3");
     CHECK(again_at >= lo);
     CHECK(again_at > first_at);
@@ -2840,11 +2844,13 @@ TEST_CASE("AuthDB::mfa_status reports not enrolled after mfa_disable and a later
 
 // ── #6079: database-owned MFA factor generation (auth v3) ────────────────────
 //
-// The generation is advanced by a row trigger on EVERY change of `mfa_enrolled_at`, whichever
-// binary issued the write, so "which factor is enrolled right now" cannot be forged by a repeated
-// or skewed enrolment timestamp. The three verifiers return the generation read under the row lock
-// plus the DATABASE instant captured by the statement that loaded the secret (or the recovery
-// candidates), before any cryptographic check, and publish success only after COMMIT.
+// The generation is assigned a fresh random positive token by a row trigger on EVERY change of
+// `mfa_enrolled_at`, whichever binary issued the write, so "which factor is enrolled right now"
+// cannot be forged by a repeated or skewed enrolment timestamp, and a restored row cannot
+// re-issue a value a surviving stored proof carries. Consumers compare it for equality only. The
+// three verifiers return the generation read under the row lock plus the DATABASE instant captured
+// by the statement that loaded the secret (or the recovery candidates), before any cryptographic
+// check, and publish success only after COMMIT.
 
 namespace {
 
@@ -2854,7 +2860,11 @@ namespace {
 constexpr const char* kBindingFnBody =
     "\nBEGIN\n"
     "  IF NEW.mfa_enrolled_at IS DISTINCT FROM OLD.mfa_enrolled_at THEN\n"
-    "    NEW.mfa_factor_gen := OLD.mfa_factor_gen + 1;\n"
+    "    NEW.mfa_factor_gen := ('x' || substr(replace(gen_random_uuid()::text, '-', ''), 18, 15))"
+    "::bit(60)::bigint + 1;\n"
+    "    IF NEW.mfa_factor_gen = OLD.mfa_factor_gen THEN\n"
+    "      NEW.mfa_factor_gen := OLD.mfa_factor_gen + 1;\n"
+    "    END IF;\n"
     "  ELSE\n"
     "    NEW.mfa_factor_gen := OLD.mfa_factor_gen;\n"
     "  END IF;\n"
@@ -2968,7 +2978,7 @@ TEST_CASE(
     CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "3");
     // No seed: a row that was already enrolled when the migration ran reads generation 0, which
     // every gate refuses until the account is re-enrolled (the cutover starts from a fresh
-    // database). The next enrolment change advances it from there.
+    // database). The next enrolment change assigns it a fresh value.
     CHECK(gen_of(conn.get(), "seed_enrolled") == 0);
     CHECK(gen_of(conn.get(), "seed_never") == 0);
     CHECK(scalar(conn.get(),
@@ -2979,11 +2989,20 @@ TEST_CASE(
     CHECK(gen_of(conn.get(), "seed_enrolled") == 0);
 }
 
-TEST_CASE("AuthDB factor generation advances on every change of mfa_enrolled_at, whoever writes it",
+TEST_CASE("AuthDB factor generation is a fresh positive token on every change of mfa_enrolled_at, "
+          "whoever writes it",
           "[pg][auth_db][mfa_binding]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("g1", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    // Every value the column is ever assigned for this row: positive, and never seen before.
+    std::set<std::int64_t> issued;
+    const auto issue = [&](std::int64_t g) {
+        INFO("generation " << g);
+        CHECK(g > 0);
+        CHECK(issued.insert(g).second);
+    };
 
     // Never enrolled, and a provisional secret: generation 0 (mfa_init is not a factor change).
     CHECK(h.db.mfa_status("g1")->factor_gen == 0);
@@ -2993,57 +3012,116 @@ TEST_CASE("AuthDB factor generation advances on every change of mfa_enrolled_at,
     CHECK(gen_of(h.conn.get(), "g1") == 0); // NULL -> NULL is not a change
 
     auto f1 = enroll_full(h.db, "g1");
-    CHECK(f1.result.factor_gen == 1);
-    CHECK(h.db.mfa_status("g1")->factor_gen == 1);
+    issue(f1.result.factor_gen);
+    CHECK(h.db.mfa_status("g1")->factor_gen == f1.result.factor_gen);
     const std::string f1_instant =
         scalar(h.conn.get(), "SELECT mfa_enrolled_at::text FROM auth.users WHERE username = 'g1'");
 
-    // Not bumped: a login counter advance, a recovery-code regeneration, a lockout counter.
+    // Not changed: a login counter advance, a recovery-code regeneration, a lockout counter.
     auto login = h.db.mfa_verify_login_code("g1", code_for(f1.secret_b32, true));
     REQUIRE(login.has_value());
     CHECK(login->ok);
-    CHECK(login->factor_gen == 1);
+    CHECK(login->factor_gen == f1.result.factor_gen);
     REQUIRE(h.db.mfa_regenerate_recovery_codes("g1", std::nullopt).has_value());
-    CHECK(gen_of(h.conn.get(), "g1") == 1);
+    CHECK(gen_of(h.conn.get(), "g1") == f1.result.factor_gen);
 
-    REQUIRE(h.db.mfa_disable("g1").has_value()); // clear: 1 -> 2, readable while un-enrolled
-    CHECK(h.db.mfa_status("g1")->factor_gen == 2);
+    REQUIRE(h.db.mfa_disable("g1").has_value()); // clear: a change, readable while un-enrolled
+    const std::int64_t cleared = h.db.mfa_status("g1")->factor_gen;
+    issue(cleared);
     CHECK_FALSE(h.db.mfa_status("g1")->enrolled);
-    auto f2 = enroll_full(h.db, "g1"); // 3
-    CHECK(f2.result.factor_gen == 3);
+    auto f2 = enroll_full(h.db, "g1");
+    issue(f2.result.factor_gen);
 
     // THE repeated-timestamp case: put F1's exact enrolment instant back. The timestamp alone
-    // would read "F1 is enrolled again"; the generation reads 4, which no earlier proof carries.
+    // would read "F1 is enrolled again"; the generation is a new value no earlier proof carries.
     run_sql(h.conn.get(), "UPDATE auth.users SET mfa_enrolled_at = '" + f1_instant +
                               "'::timestamptz WHERE username = 'g1'");
     CHECK(scalar(h.conn.get(),
                  "SELECT mfa_enrolled_at::text FROM auth.users WHERE username = 'g1'") ==
           f1_instant);
-    CHECK(gen_of(h.conn.get(), "g1") == f2.result.factor_gen + 1);
-    CHECK(gen_of(h.conn.get(), "g1") != f1.result.factor_gen);
+    issue(gen_of(h.conn.get(), "g1"));
 
-    // A direct write of the generation column is overridden; one that also changes the instant
-    // advances by exactly one; a no-op write of the instant does not advance.
+    // A direct write of the generation column is reverted; one that also changes the instant
+    // gets a fresh token, not the written value; a no-op write of the instant changes nothing.
+    const std::int64_t before_direct = gen_of(h.conn.get(), "g1");
     run_sql(h.conn.get(), "UPDATE auth.users SET mfa_factor_gen = 999 WHERE username = 'g1'");
-    CHECK(gen_of(h.conn.get(), "g1") == 4);
+    CHECK(gen_of(h.conn.get(), "g1") == before_direct);
     run_sql(h.conn.get(), "UPDATE auth.users SET mfa_factor_gen = 999, mfa_enrolled_at = now() "
                           "WHERE username = 'g1'");
-    CHECK(gen_of(h.conn.get(), "g1") == 5);
+    CHECK(gen_of(h.conn.get(), "g1") != 999);
+    issue(gen_of(h.conn.get(), "g1"));
+    const std::int64_t before_noop = gen_of(h.conn.get(), "g1");
     run_sql(h.conn.get(),
             "UPDATE auth.users SET mfa_enrolled_at = mfa_enrolled_at WHERE username = 'g1'");
-    CHECK(gen_of(h.conn.get(), "g1") == 5);
+    CHECK(gen_of(h.conn.get(), "g1") == before_noop);
 
-    // Two changes of one row in one transaction stay distinct (strict OLD + 1).
+    // Two changes of one row in one transaction stay distinct, each drawing its own value.
     run_sql(h.conn.get(), "BEGIN");
     run_sql(h.conn.get(), "UPDATE auth.users SET mfa_enrolled_at = now() - interval '1 day' "
                           "WHERE username = 'g1'");
+    const std::int64_t in_txn_a = gen_of(h.conn.get(), "g1");
     run_sql(h.conn.get(), "UPDATE auth.users SET mfa_enrolled_at = now() WHERE username = 'g1'");
+    const std::int64_t in_txn_b = gen_of(h.conn.get(), "g1");
     run_sql(h.conn.get(), "COMMIT");
-    CHECK(gen_of(h.conn.get(), "g1") == 7);
+    CHECK(in_txn_a != in_txn_b);
+    issue(in_txn_a);
+    issue(in_txn_b);
+    CHECK(gen_of(h.conn.get(), "g1") == in_txn_b);
 
     // Soft delete clears the enrolment: a change.
     REQUIRE(h.db.remove_user("g1").has_value());
-    CHECK(gen_of(h.conn.get(), "g1") == 8);
+    issue(gen_of(h.conn.get(), "g1"));
+}
+
+// The restore case the random token exists for. An auth-only database restore (from a backup taken
+// before an enrolment) over a newer session_store leaves a stored session proof bound to G1 while
+// the restored users row is back at the earlier state. With a counter the row's next enrolment
+// would issue G1 again and the stale proof would re-match by equality; a random token does not
+// walk back onto it.
+TEST_CASE("AuthDB factor generation: re-enrolling a restored row does not re-issue a value a "
+          "surviving proof carries",
+          "[pg][auth_db][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("rr", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    auto f1 = enroll_full(h.db, "rr");
+    const std::int64_t g1 = f1.result.factor_gen;
+    REQUIRE(g1 > 0);
+
+    // The restore: not enrolled, generation one below G1 (the worst case for a counter, where the
+    // next change lands exactly on G1). The trigger is switched off for the write only, in one
+    // transaction, and put back ENABLE ALWAYS as migration v3 leaves it.
+    REQUIRE(h.db.mfa_disable("rr").has_value());
+    run_sql(h.conn.get(), "BEGIN; ALTER TABLE auth.users DISABLE TRIGGER users_mfa_factor_gen; "
+                          "UPDATE auth.users SET mfa_factor_gen = " +
+                              std::to_string(g1 - 1) +
+                              " WHERE username = 'rr'; "
+                              "ALTER TABLE auth.users ENABLE ALWAYS TRIGGER users_mfa_factor_gen; "
+                              "COMMIT");
+    REQUIRE(gen_of(h.conn.get(), "rr") == g1 - 1);
+    REQUIRE_FALSE(h.db.mfa_status("rr")->enrolled);
+
+    auto f2 = enroll_full(h.db, "rr");
+    CHECK(f2.result.factor_gen > 0);
+    CHECK(f2.result.factor_gen != g1);
+    const auto st = h.db.mfa_status("rr");
+    REQUIRE(st.has_value());
+    REQUIRE(st->enrolled);
+    CHECK(st->factor_gen == f2.result.factor_gen);
+
+    // The surviving session proof, bound to G1, is a mismatch against the re-enrolled factor; a
+    // proof bound to the current one is the control that the judgement is not vacuous.
+    yuzu::server::auth::DurableMfaProof proof;
+    proof.source = yuzu::server::auth::DurableMfaProof::Source::kRow;
+    proof.db_now_ms = st->db_now_ms;
+    proof.mfa_verified_ms = st->db_now_ms - 1'000;
+    proof.mfa_factor_gen = g1;
+    CHECK(yuzu::server::judge_local_mfa_binding(proof, st->factor_gen, st->binding_enforced).kind ==
+          yuzu::server::LocalMfaBinding::kMismatch);
+    proof.mfa_factor_gen = f2.result.factor_gen;
+    CHECK(yuzu::server::judge_local_mfa_binding(proof, st->factor_gen, st->binding_enforced).kind ==
+          yuzu::server::LocalMfaBinding::kBound);
 }
 
 TEST_CASE("AuthDB::mfa_status carries the database clock and reports the binding as enforced",
@@ -3082,7 +3160,7 @@ TEST_CASE("AuthDB verifiers return the generation and an instant captured BEFORE
         auto e = h.db.mfa_verify_enrollment("v1", code, std::nullopt);
         h.db.set_enrolment_pre_txn_hook_for_test(nullptr);
         REQUIRE(e.has_value());
-        CHECK(e->factor_gen == 1);
+        CHECK(e->factor_gen > 0);
         CHECK(e->verified_ms >= lo);
         CHECK(e->verified_ms <= hook_now);
         const std::int64_t enrolled_ms = std::stoll(
@@ -3200,7 +3278,7 @@ TEST_CASE("AuthDB verifiers publish success only after COMMIT (a failing COMMIT 
         remove_commit_failer(h.conn.get(), "auth.mfa_recovery_codes");
         auto retry = h.db.mfa_verify_enrollment("c1", code, std::nullopt);
         REQUIRE(retry.has_value());
-        CHECK(retry->factor_gen == 1);
+        CHECK(retry->factor_gen > 0);
     }
 }
 
@@ -3390,13 +3468,14 @@ TEST_CASE(
     CHECK(*cleared); // it was enrolled
     CHECK_FALSE(h.db.mfa_status("m1")->enrolled);
 
-    // The provisional cancel: admitted UN-ENROLLED at generation g+1, then an enrolment lands in
-    // between (g+2): the cancel is refused and must not strip a factor that did not exist at the
-    // gate.
+    // The provisional cancel: admitted UN-ENROLLED at the generation the clear assigned, then an
+    // enrolment lands in between and assigns another: the cancel is refused and must not strip a
+    // factor that did not exist at the gate.
     const std::int64_t admitted = h.db.mfa_status("m1")->factor_gen;
-    CHECK(admitted == g + 1);
+    CHECK(admitted > 0);
+    CHECK(admitted != g);
     auto f2 = enroll_full(h.db, "m1");
-    CHECK(f2.result.factor_gen == admitted + 1);
+    CHECK(f2.result.factor_gen != admitted);
     auto refused = h.db.mfa_disable_report("m1", admitted);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error() == AuthDBError::FactorChanged);
@@ -3964,7 +4043,7 @@ TEST_CASE("AuthDB generation trigger fires under session_replication_role = repl
     const auto gen = gen_of(h.conn.get(), "rp");
     run_sql(h.conn.get(), "RESET session_replication_role");
     CHECK(ctrl == "7"); // the origin trigger did NOT fire under replica
-    CHECK(gen == 1);    // the ENABLE ALWAYS generation trigger DID
+    CHECK(gen > 0);     // the ENABLE ALWAYS generation trigger DID (assigned a token)
 }
 
 #endif // YUZU_TEST_ENABLE_PG

@@ -926,7 +926,8 @@ public:
     /// value on an active row is `FactorChanged` with nothing cleared and the recovery codes
     /// untouched. This is the atomic "still at the admitted generation" condition for BOTH the
     /// enrolled clear and the provisional cancel: an account admitted un-enrolled at generation g
-    /// and enrolled in between reads g+1 and is refused. `mfa_disable` passes `std::nullopt`.
+    /// and enrolled in between reads a different value and is refused. `mfa_disable` passes
+    /// `std::nullopt`.
     [[nodiscard]] std::expected<bool, AuthDBError>
     mfa_disable_report(const std::string& username,
                        std::optional<std::int64_t> expected_factor_gen);

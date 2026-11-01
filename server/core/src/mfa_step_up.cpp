@@ -133,9 +133,9 @@ MfaFactorProbe probe_mfa_factor(const auth::Session& session, AuthDB& auth_db) {
     }
     if (!status->enrolled)
         return {MfaFactorState::kNotEnrolled};
-    // `enrolled` implies a database-owned generation of at least 1 (the trigger advances it on
-    // every enrolment). A non-positive value is an unreadable row (fail closed): it would make
-    // the binding comparison vacuous.
+    // `enrolled` implies a database-owned generation of at least 1 (the trigger assigns a
+    // positive value on every enrolment). A non-positive value is an unreadable row (fail closed):
+    // it would make the binding comparison vacuous.
     if (status->factor_gen <= 0)
         return {.state = MfaFactorState::kStoreUnavailable, .unusable_row = true};
     return {MfaFactorState::kEnrolledLocal, status->factor_gen, status->db_now_ms,

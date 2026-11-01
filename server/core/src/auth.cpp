@@ -1011,7 +1011,7 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
     // (not just the read half above) cross-replica-correct too.
     //
     // #6079 factor generation. The same locked read also returns the account's
-    // `mfa_factor_gen`, which a database trigger advances on EVERY change of
+    // `mfa_factor_gen`, which a database trigger sets to a fresh value on EVERY change of
     // `mfa_enrolled_at` (clear, re-enrol, soft delete, whichever binary writes it) and
     // which every such writer changes under this same row lock. A BOUND proof carries the
     // generation its verifier read under that lock; a difference here means the factor
@@ -1113,7 +1113,7 @@ AuthManager::StampRecheck AuthManager::post_stamp_factor_recheck(const std::stri
     //       the stamp is cleared;
     //   (2) W holds the row lock -> this read WAITS for W's commit, then sees the new
     //       generation -> cleared (a plain read would have seen the old one);
-    //   (3) W has not taken the lock yet -> the read admits, and W's generation bump lands
+    //   (3) W has not taken the lock yet -> the read admits, and W's new generation lands
     //       after the stamp, so the stored (old) generation no longer equals the account's:
     //       a binding gate refuses the proof by equality. Nothing relies on the cleanup
     //       below succeeding.

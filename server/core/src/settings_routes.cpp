@@ -7032,7 +7032,7 @@ void SettingsRoutes::register_routes(
                   // produced and the database instant its loading statement captured before the
                   // TOTP check (so it precedes `mfa_enrolled_at`), never the stamp's now(). The
                   // stamp refuses a future-dated instant and, after it commits, clears itself if
-                  // the factor generation moved since (`factor_changed`); the enrolment and the
+                  // the factor generation changed since (`factor_changed`); the enrolment and the
                   // codes below stand either way.
                   bool proof_stamped = false;
                   const char* not_stamped_why = "";
