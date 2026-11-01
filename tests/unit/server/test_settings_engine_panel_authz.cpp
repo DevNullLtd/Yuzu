@@ -7,7 +7,7 @@
  *        EnginePrincipal:Read with the quiet probe, the route with the loud `require_permission`,
  *        and server.cpp binds exactly these functions. Each difference is stricter, a different
  *        refusal, a different rendering of a store failure, or a different audit record; none
- *        admits a caller the route refuses. They are SEVEN, numbered 1 to 7 in the handler
+ *        admits a caller the route refuses. They are SEVEN, numbered from 1 in the handler
  *        comment in settings_routes.cpp and listed once, with rationale, in
  *        docs/user-manual/upgrading.md.
  *

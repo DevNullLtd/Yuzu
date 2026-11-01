@@ -45,11 +45,11 @@ Engine Principals panel difference list (#5882; a doc-and-comment pin, not serve
      It must be numbered 1..N without a gap, and the same count (as a word: SEVEN, seven) must be
      stated by the handler comment in settings_routes.cpp, the comment in settings_routes.hpp and
      the header of test_settings_engine_panel_authz.cpp; the handler comment must also number its
-     own items 1..N. The count is stated as a word in those three places, and one item is cited by
-     number (`(difference 7)` in settings_routes.cpp); no manual page cites the count or a number.
+     own items 1..N. The count is stated as a word in those three places, and items are cited by
+     number or ordinal word in settings_routes.cpp (`(difference 7)`) and in
+     test_settings_engine_panel_authz.cpp; no manual page cites the count or a number.
      A list that gains or loses an item without those following is a silent drift (G8-32). Not
-     gated: the count also appears in docs/test-coverage.md and the handler comment's "pins 1 to 3,
-     6 and 7" claim, which this test does not read.
+     gated: the count also appears in docs/test-coverage.md, which this test does not read.
 
 `//` comments are stripped and whitespace collapsed before matching. Lexical only: it cannot see
 a relocation that keeps the tokens (review-enforced). The self-test applies in-memory mutations
@@ -282,7 +282,7 @@ def difference_list_problems(md, cpp, hpp, test_src):
     for name, text, pattern in (
         ("settings_routes.cpp handler comment", cpp, r"There are ([A-Za-z]+), listed once"),
         ("settings_routes.hpp comment", hpp, r"its ([A-Za-z]+) differences"),
-        ("test_settings_engine_panel_authz.cpp header", test_src, r"They are ([A-Za-z]+), numbered 1 to"),
+        ("test_settings_engine_panel_authz.cpp header", test_src, r"They are ([A-Za-z]+), numbered from 1 in"),
     ):
         stated = count_word(text, pattern)
         if stated is None:
