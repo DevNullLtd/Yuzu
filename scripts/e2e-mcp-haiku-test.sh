@@ -43,7 +43,55 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# The MCP endpoint refuses session cookies (and API tokens without an MCP tier),
+# so the agent is handed a tiered bearer token minted over the login cookie. The
+# cookie is used here only for the REST token mint/revoke and the metrics read;
+# it is never exported to the agent (a live cookie would win session resolution
+# over the bearer token and be refused). The adapter reads YUZU_MCP_TOKEN.
+SESSION_COOKIE=""
+MCP_TOKEN=""
+MCP_TOKEN_ID=""
+# The token is named "${MCP_TOKEN_NAME_PREFIX}token". The exit trap revokes by id
+# and, as a fallback, every live token whose name starts with the prefix (the
+# create reply has no token_id, so the id lookup can come back empty). The
+# trailing "-" keeps the prefix from matching another run's pid.
+MCP_TOKEN_NAME_PREFIX="e2e-mcp-haiku-$$-"
+SITE_REFERER="$(sed -E 's,^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#@]*@)?([^/?#]*).*,\1\3,' <<< "$SERVER_URL")/"
+
+# _revoke_token_id ID: cookie-session write, so it carries the same-site Referer.
+# A status other than 200 prints one stderr WARNING naming the id (a short display
+# id, never the secret). Never fails.
+_revoke_token_id() {
+    local code
+    code=$(curl -s -m 10 -o /dev/null -w "%{http_code}" -b "yuzu_session=$SESSION_COOKIE" \
+        -H "Referer: $SITE_REFERER" \
+        -X DELETE "$SERVER_URL/api/v1/tokens/$1" 2>/dev/null) || code="000"
+    if [ "$code" != "200" ]; then
+        echo "WARNING: could not revoke MCP token id=$1 (HTTP $code); revoke it by hand" >&2
+    fi
+    return 0
+}
+
 cleanup() {
+    if [ -n "$SESSION_COOKIE" ]; then
+        local tid listed
+        if [ -n "$MCP_TOKEN_ID" ]; then
+            _revoke_token_id "$MCP_TOKEN_ID"
+        fi
+        listed=$(curl -s -m 10 -b "yuzu_session=$SESSION_COOKIE" "$SERVER_URL/api/v1/tokens" 2>/dev/null \
+            | python3 -c '
+import json, sys
+try:
+    for t in json.load(sys.stdin).get("data", []):
+        if t.get("name", "").startswith(sys.argv[1]) and not t.get("revoked"):
+            print(t["token_id"])
+except Exception:
+    pass
+' "$MCP_TOKEN_NAME_PREFIX" 2>/dev/null) || listed=""
+        for tid in $listed; do
+            _revoke_token_id "$tid"
+        done
+    fi
     if $DO_TEARDOWN; then
         echo -e "\n${CYAN}Tearing down UAT stack...${NC}"
         docker compose -f "$YUZU_ROOT/docker-compose.local.yml" down -v 2>/dev/null || true
@@ -83,7 +131,7 @@ if ! curl -sf "http://localhost:8081/healthz" >/dev/null 2>&1; then
 fi
 echo -e "${GREEN}Server and gateway healthy${NC}"
 
-# ── Get session cookie for MCP auth ──────────────────────────────────────
+# ── Log in (session cookie: token mint/revoke and metrics only) ──────────
 
 COOKIE_JAR=$(mktemp /tmp/yuzu-mcp-haiku.XXXXXX)
 curl -s -c "$COOKIE_JAR" -X POST "$SERVER_URL/login" \
@@ -110,6 +158,53 @@ if [ "$AGENT_COUNT" -eq 0 ]; then
 fi
 echo -e "${GREEN}${AGENT_COUNT} agent(s) connected${NC}"
 
+# ── Mint a tiered MCP bearer token ───────────────────────────────────────
+
+# The agent dispatches commands via execute_instruction and reads the results
+# back. At the supervised tier execute_instruction is approval-gated (the first
+# call mints a ticket, -32006, instead of running), so the default is operator,
+# where Execution:Execute is auto-approved. YUZU_MCP_TIER=supervised exercises the
+# approval-ticket path instead (the agent's Phase 3 will then stop at tickets).
+MCP_TIER="${YUZU_MCP_TIER:-operator}"
+MCP_TOKEN_NAME="${MCP_TOKEN_NAME_PREFIX}token"
+MINT_BODY=$(mktemp /tmp/yuzu-mcp-haiku-mint.XXXXXX)
+MINT_STATUS=$(curl -s -m 10 -o "$MINT_BODY" -w "%{http_code}" \
+    -b "yuzu_session=$SESSION_COOKIE" \
+    -H "Referer: $SITE_REFERER" \
+    -X POST -H "Content-Type: application/json" \
+    -d "$(printf '{"name":"%s","mcp_tier":"%s","expires_at":%d}' \
+        "$MCP_TOKEN_NAME" "$MCP_TIER" "$(( $(date +%s) + 86400 ))")" \
+    "$SERVER_URL/api/v1/tokens" 2>/dev/null) || MINT_STATUS="000"
+MCP_TOKEN=$(python3 -c '
+import json, sys
+try:
+    print(json.load(open(sys.argv[1]))["data"]["token"])
+except Exception:
+    print("")
+' "$MINT_BODY" 2>/dev/null || echo "")
+rm -f "$MINT_BODY"
+# The create reply carries the secret but no token_id: find it by name.
+MCP_TOKEN_ID=$(curl -s -m 10 -b "yuzu_session=$SESSION_COOKIE" "$SERVER_URL/api/v1/tokens" 2>/dev/null \
+    | python3 -c '
+import json, sys
+try:
+    for t in json.load(sys.stdin).get("data", []):
+        if t.get("name") == sys.argv[1] and not t.get("revoked"):
+            print(t["token_id"])
+            break
+except Exception:
+    pass
+' "$MCP_TOKEN_NAME" 2>/dev/null || echo "")
+if [ "$MINT_STATUS" != "201" ] || [ -z "$MCP_TOKEN" ]; then
+    echo -e "${RED}Failed to mint an MCP ${MCP_TIER} token (HTTP ${MINT_STATUS})${NC}"
+    exit 1
+fi
+echo -e "${GREEN}Minted ${MCP_TIER} MCP token${NC}"
+if [ -z "$MCP_TOKEN_ID" ]; then
+    echo -e "${YELLOW}WARNING: minted token '${MCP_TOKEN_NAME}' but could not look up its id." \
+            "It will be revoked by name prefix on exit; if that fails, revoke it by hand.${NC}" >&2
+fi
+
 # ── Run the Haiku agent ──────────────────────────────────────────────────
 
 echo ""
@@ -117,7 +212,7 @@ echo -e "${BOLD}${CYAN}Launching MCP UAT tester agent (Haiku)...${NC}"
 echo -e "${BOLD}This will exercise all MCP tools against the live stack.${NC}"
 echo ""
 
-export YUZU_MCP_COOKIE="yuzu_session=${SESSION_COOKIE}"
+export YUZU_MCP_TOKEN="${MCP_TOKEN}"
 export YUZU_MCP_URL="${SERVER_URL}/mcp/v1/"
 
 # Run the Claude Code agent

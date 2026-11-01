@@ -11,6 +11,7 @@
 
 #include "rbac_store.hpp"
 #include "test_auth_db_pg_helper.hpp"
+#include "../test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -131,6 +132,43 @@ TEST_CASE("string_to_role", "[auth][role]") {
     REQUIRE(string_to_role("admin") == Role::admin);
     REQUIRE(string_to_role("user") == Role::user);
     REQUIRE(string_to_role("unknown") == Role::user); // default
+}
+
+TEST_CASE("string_to_role logs unrecognized values and stays silent for valid ones",
+          "[auth][role]") {
+    // #4072: fail-safe floor to Role::user is unchanged; the drift must be visible.
+    yuzu::test::LogCapture cap;
+    CHECK(string_to_role("admin") == Role::admin);
+    CHECK(string_to_role("user") == Role::user);
+    cap.stop();
+    CHECK(cap.text().empty());
+
+    yuzu::test::LogCapture cap2;
+    CHECK(string_to_role("superadmin") == Role::user);
+    CHECK(string_to_role("Admin") == Role::user); // case-sensitive: never promotes
+    CHECK(string_to_role("") == Role::user);
+    cap2.stop();
+    const auto out = cap2.text();
+    CHECK(out.find("superadmin") != std::string::npos);
+    CHECK(out.find("Admin") != std::string::npos);
+    CHECK(out.find("unrecognized role value") != std::string::npos);
+    // The empty string is also drift (a NULL/blank column) and must name itself: the
+    // value is logged between quotes, so an empty role reads "value ''".
+    CHECK(out.find("value ''") != std::string::npos);
+
+    // CWE-117: a stored value carrying a line break must not forge a second log line,
+    // and an over-long value must be length-capped rather than logged verbatim.
+    yuzu::test::LogCapture cap3;
+    CHECK(string_to_role("evil\nrole") == Role::user);
+    CHECK(string_to_role(std::string(10000, 'x')) == Role::user);
+    cap3.stop();
+    const auto out3 = cap3.text();
+    CHECK(out3.find("evil_role") != std::string::npos);
+    CHECK(out3.find("evil\nrole") == std::string::npos);
+    CHECK(out3.size() < 2000);
+    // The logged value is capped at 256 bytes (log_key_token; the exact head/tail split
+    // is pinned in test_log_token.cpp), so no run of 257 identical bytes may survive.
+    CHECK(out3.find(std::string(257, 'x')) == std::string::npos);
 }
 
 TEST_CASE("pending_status_to_string", "[auth][role]") {
