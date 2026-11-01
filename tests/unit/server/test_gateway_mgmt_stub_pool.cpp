@@ -349,13 +349,14 @@ TEST_CASE("build_gateway_forward_terminal_failure: sets command_id, FAILURE stat
     CHECK(resp.error().message() == "[gateway_unauthenticated] rejected by mgmt-plane peer pin");
 }
 
-TEST_CASE("build_gateway_forward_terminal_failure: each of the five #4672 reason codes "
+TEST_CASE("build_gateway_forward_terminal_failure: each of the six forward reason codes "
           "round-trips distinctly",
           "[server][gateway_mgmt_stub_pool][4672]") {
     // Mirrors the reason_code literals server.cpp's forward_gateway_pending
-    // passes at each of its five terminal-failure call sites (four named in
+    // passes at each of its six terminal-failure call sites (four named in
     // #4672's own issue, plus the pre-existing unnamed generic grpc-status
-    // branch the same PR also fixed, "gateway_forward_failed") — a change to
+    // branch the same PR also fixed, "gateway_forward_failed", plus the
+    // spawn/setup guard's "gateway_forward_spawn_failed", #2146) — a change to
     // one of those literals without updating this list is a doc/observability
     // drift, not a functional break, but pinning the set here catches an
     // accidental typo/duplicate at the source of truth. Gate 4 consistency-
@@ -368,6 +369,7 @@ TEST_CASE("build_gateway_forward_terminal_failure: each of the five #4672 reason
         "gateway_unknown_cluster",
         "gateway_agent_mismatch",
         "gateway_forward_failed",
+        "gateway_forward_spawn_failed",
     };
     for (const auto& reason : reasons) {
         INFO("reason=" << reason);

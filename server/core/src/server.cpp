@@ -13806,7 +13806,10 @@ private:
     /// gateway-forwarded command whose delivery will never otherwise resolve
     /// (`forward_gateway_pending`'s `unauthenticated` / exhausted
     /// `unavailable` / `unknown_cluster` / no-legitimate-resolution
-    /// `agent_mismatch` branches — see that function's own comments). Routes
+    /// `agent_mismatch` branches, the generic "other" branch, and the
+    /// spawn/setup guard `gateway_forward_spawn_failed` that resolves a
+    /// command whose forward thread could not be started — see that
+    /// function's own comments). Routes
     /// through `process_gateway_response` — the SAME mechanism every real
     /// gateway response already takes at this function's other call sites —
     /// so the command_id resolves via the one established
@@ -13852,7 +13855,11 @@ private:
     /// said "four", undercounting the pre-existing "other" branch this same
     /// PR also fixed — see `gateway_mgmt_stub_pool.hpp`'s reason-code list)
     /// now calls `apply_gateway_forward_terminal_failure` exactly once
-    /// before giving up, gated on `applied_terminal` so a genuinely
+    /// before giving up (a SIXTH site, the spawn/setup guard around the whole
+    /// per-command body, resolves a command whose forwarding thread could not
+    /// be started with `gateway_forward_spawn_failed`; it is best effort, since
+    /// the resolver allocates too and can fail under the same pressure, which
+    /// is logged at error level), gated on `applied_terminal` so a genuinely
     /// unresolved command_id ALWAYS eventually reaches a terminal state —
     /// "ALWAYS" describes the per-command retry loop below; the null/empty
     /// `gw_mgmt_pool_` short-circuit above this function's retry loop, and
@@ -13862,8 +13869,8 @@ private:
     /// (see that branch's own comment); the latter is not, and is tracked.
     ///
     /// DELIBERATELY immediate-terminal, not a durable outbox re-drive, for
-    /// ALL FIVE branches — including the transient-looking exhausted-
-    /// `unavailable` case, which ADR-2002 §7's design note originally
+    /// ALL FIVE branches (and the spawn/setup guard) — including the
+    /// transient-looking exhausted-`unavailable` case, which ADR-2002 §7's design note originally
     /// intended to "stay pending... and be re-driven [with backoff]" the way
     /// WS-3 3.3's `command_outbox_store`/`command_outbox_delivery` already
     /// does for `route_unreadable`/`containment_unreadable`. Two independent
@@ -13958,7 +13965,20 @@ private:
             }
             return;
         }
-        for (auto& gp : gw_pending) {
+        // The loop body is ONE try-statement (`for (...) try { ... } catch (...)`): everything
+        // from the first allocating statement (the resolution's label copy, the id copies, the
+        // closure captures) through the thread spawn can throw bad_alloc / system_error under
+        // exactly the resource pressure that makes a spawn fail, and an escape would unwind this
+        // loop and destroy every not-yet-forwarded drained command with no terminal response
+        // (dispatch already counted each as SENT). These three live OUTSIDE the try so the
+        // handler can name the command it is resolving.
+        std::string cmd_id;
+        std::string expected_agent_id;
+        bool resolve_attempted = false;
+        for (auto& gp : gw_pending) try {
+            cmd_id.clear();
+            expected_agent_id.clear();
+            resolve_attempted = false;
             // HA WS-4 4.3: resolve per-command, against the eager pool built
             // at boot — see GatewayMgmtStubPool's file header for the
             // two-mode resolution rule (single-cluster mode ignores
@@ -13967,7 +13987,7 @@ private:
             // mirroring the pre-existing UNAUTHENTICATED "retry cannot help"
             // treatment).
             auto resolution = gw_mgmt_pool_->resolve(gp.cluster_id);
-            auto cmd_id = gp.cmd.command_id();
+            cmd_id = gp.cmd.command_id();
             if (!resolution.stub) {
                 spdlog::error(
                     "Gateway SendCommand for {} DROPPED: no configured mgmt address for "
@@ -13988,6 +14008,7 @@ private:
                 // --gateway-cluster-addr, which time alone does not fix.
                 // Resolve the command_id terminally now rather than leaving
                 // it stuck forever.
+                resolve_attempted = true; // a resolver that throws is NOT retried by the handler
                 apply_gateway_forward_terminal_failure(
                     &agent_service_, gp.agent_id, cmd_id, "gateway_unknown_cluster",
                     "No configured mgmt address for cluster '" +
@@ -13997,7 +14018,7 @@ private:
             auto* stub = resolution.stub;
             auto* svc = &agent_service_;
             auto* metrics = &metrics_;
-            auto expected_agent_id = gp.agent_id;
+            expected_agent_id = gp.agent_id;
             auto cluster_label = resolution.label;
             spdlog::debug("Forwarding command {} to gateway (cluster '{}') for agent {}", cmd_id,
                          cluster_label, gp.agent_id);
@@ -14296,26 +14317,51 @@ private:
                         "Gateway unreachable after 3 attempts — command not delivered");
                 }
             };
-            try {
-                std::thread(std::move(forward_worker)).detach();
-            } catch (...) {
-                // Dispatch has already counted this command as SENT (send_to returned true at
-                // the queue push), so an unresolved command_id here would leave its execution
-                // row `running` with a targeted count it can never complete (the reaper skips
-                // rows with agents_targeted > 0). Resolve it terminally now, exactly like every
-                // other no-delivery branch of this function, and keep going: every later
-                // drained command gets its own spawn attempt and, failing that, its own
-                // terminal response. cmd_id / expected_agent_id are copies taken before the
-                // closure captured the moved-from `gp`.
+            std::thread(std::move(forward_worker)).detach();
+        } catch (...) {
+            // Best effort, and honest about it. Dispatch has already counted this command as SENT
+            // (send_to returned true at the queue push), so an unresolved command_id here leaves
+            // its execution row `running` with a targeted count it can never complete (the
+            // reaper skips rows with agents_targeted > 0). Resolve it terminally now, exactly like
+            // every other no-delivery branch of this function, and keep going: every later drained
+            // command gets its own attempt. The resolver allocates too, so under the same pressure
+            // it can fail as well; that is logged at error level (with the ids) rather than
+            // swallowed, because a command left unresolved here is only closed by an operator
+            // cancel. A command whose unknown-cluster resolution already ran (`resolve_attempted`)
+            // is never resolved a second time: process_gateway_response is not idempotent.
+            // `cmd_id` / `expected_agent_id` are copies taken before the closure captured the
+            // moved-from `gp`; when the throw came before they were assigned, `gp` itself has not
+            // been moved yet and is the source.
+            if (!resolve_attempted) {
+                bool resolved = false;
                 try {
-                    spdlog::error("Gateway SendCommand for {} could not start its forward thread "
-                                  "(thread creation failed) — resolving the command as failed",
-                                  cmd_id);
+                    const std::string& cid = cmd_id.empty() ? gp.cmd.command_id() : cmd_id;
+                    const std::string& aid = expected_agent_id.empty() ? gp.agent_id
+                                                                       : expected_agent_id;
                     apply_gateway_forward_terminal_failure(
-                        &agent_service_, expected_agent_id, cmd_id, "gateway_forward_spawn_failed",
+                        &agent_service_, aid, cid, "gateway_forward_spawn_failed",
                         "The server could not start the thread that forwards this command to "
-                        "the gateway (resource exhaustion) — command not delivered");
-                } catch (...) { // NOLINT(bugprone-empty-catch): the next command still proceeds
+                        "the gateway (resource exhaustion), command not delivered");
+                    resolved = true;
+                } catch (...) { // NOLINT(bugprone-empty-catch): reported just below
+                }
+                try {
+                    spdlog::error("Gateway SendCommand for agent {} command {}: forwarding could "
+                                  "not be set up (thread creation or allocation failed); {}",
+                                  ::yuzu::log_token(expected_agent_id.empty() ? gp.agent_id
+                                                                              : expected_agent_id),
+                                  ::yuzu::log_token(cmd_id.empty() ? gp.cmd.command_id() : cmd_id),
+                                  resolved ? "the command was resolved as failed"
+                                           : "the terminal write ALSO failed, so the execution "
+                                             "stays running until an operator cancels it");
+                } catch (...) { // NOLINT(bugprone-empty-catch): last resort; the loop continues
+                }
+            } else {
+                try {
+                    spdlog::error("Gateway SendCommand for command {}: the unknown-cluster "
+                                  "terminal write threw; it is not retried",
+                                  ::yuzu::log_token(cmd_id));
+                } catch (...) { // NOLINT(bugprone-empty-catch): last resort; the loop continues
                 }
             }
         }
