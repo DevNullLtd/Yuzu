@@ -97,9 +97,23 @@ struct DispatchCaller {
     ///      provenance here at send time (a re-authorized AlwaysApproval action
     ///      still clears the #1398 ExecuteGate because the approval that
     ///      admitted the occurrence already happened).
-    ///   2. MCP `execute_instruction` / `quarantine_device` handlers
-    ///      (`mcp_server.cpp`): `Ticket`, stamped only after
-    ///      `approval_ticket_just_consumed` is true (supervised tier).
+    ///   2. MCP `execute_instruction` / `quarantine_device` / `execute_bundle`
+    ///      handlers and the echo-query arm of the result-set producers'
+    ///      shared `rs_run_async` (`mcp_server.cpp`): `Ticket`, stamped only
+    ///      after `approval_ticket_just_consumed` is true (supervised tier).
+    ///      Each is safe because the (plugin, action) pair(s) it dispatches are
+    ///      bound by the ticket: `execute_instruction` takes them from its own
+    ///      arguments, `execute_bundle` from its `steps` argument (the C8 canon
+    ///      is the whole argument object and the recall rejects a row whose canon
+    ///      differs), `quarantine_device` dispatches one fixed pair, and the echo
+    ///      arm one fixed pair (`echo.sql`).
+    ///      `create_result_set_from_instruction_result` and
+    ///      `reevaluate_result_set` (the `kInstructionResult` arm of
+    ///      `rs_run_async`) are NOT stamping sites and must never become one
+    ///      (sg-1, the sec-F1 class): their pair is read from a STORED definition
+    ///      an editor can repoint between approval and recall, and
+    ///      `dispatch_pairs_for` returns no pair for them, so the ticket binds
+    ///      no pair. They force `None`; the pair's own gate decides.
     ///      `execute_instruction_definition` (#2146) is NOT a stamping site and
     ///      must never become one (sec-F1): its (plugin, action) comes from a
     ///      STORED definition that an editor can repoint between approval and

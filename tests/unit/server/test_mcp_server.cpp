@@ -45212,3 +45212,292 @@ TEST_CASE("MCP execute_instruction_definition: an approved tier ticket cannot la
     REQUIRE(row);
     CHECK(row->consumed_at == 0);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// sg-1 (#2146), the sec-F1 class: the definition-resolved result-set producers
+// (create_result_set_from_instruction_result, reevaluate_result_set) never carry Ticket
+// approval provenance. Their (plugin, action) comes from a STORED definition an editor can
+// repoint between ticket approval and recall; the C8 ticket canon binds only the call's
+// arguments. The authorizer and the dispatch port below both run the REAL chokepoint
+// (classify_and_authorize_dispatch) over a two-row fixture, so the exact send set is observable.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+const yuzu::server::CommandCapabilityRegistry& rs_gate_registry() {
+    using yuzu::server::CommandCapability;
+    using yuzu::server::ExecuteGate;
+    static constexpr std::array<CommandCapability, 2> kRows{{
+        {
+            .plugin = "os_info",
+            .action = "version",
+            .dispatch_class = yuzu::server::DispatchClass::ReadOnly,
+            .mutability = yuzu::server::Mutability::None,
+            .securable = "Execution",
+            .operation = yuzu::server::authz::Operation::Read,
+            .risk_tier = yuzu::server::authz::RiskTier::Low,
+            .system_reserved = false,
+            .execute_gate = ExecuteGate::None,
+        },
+        {
+            .plugin = "registry",
+            .action = "set_value",
+            .dispatch_class = yuzu::server::DispatchClass::Mutating,
+            .mutability = yuzu::server::Mutability::Reversible,
+            .securable = "Infrastructure",
+            .operation = yuzu::server::authz::Operation::Write,
+            .risk_tier = yuzu::server::authz::RiskTier::Medium,
+            .system_reserved = false,
+            .execute_gate = ExecuteGate::AdminOrApproval,
+        },
+    }};
+    static const yuzu::server::CommandCapabilityRegistry reg{
+        std::span<const CommandCapability>(kRows)};
+    return reg;
+}
+
+struct RsGateLog {
+    std::vector<std::string> sent; // "plugin.action" of every dispatch that was ALLOWED through
+    std::vector<yuzu::server::ApprovalProvenance> provenance;
+    int dispatch_calls = 0;
+};
+
+void rs_gate_wire(McpTestServer& ts, RsGateLog& log, bool admin) {
+    const auto allow = [](std::string_view, std::string_view, yuzu::server::authz::Operation) {
+        return true;
+    };
+    ts.caller_fn_for_test = [admin](const auth::Session& s) -> yuzu::server::DispatchCaller {
+        yuzu::server::DispatchCaller c;
+        c.principal = s.username;
+        c.principal_role = admin ? "admin" : "operator";
+        c.principal_is_admin = admin;
+        c.exec_visible = yuzu::server::authz::VisibleSet{}; // unfiltered
+        return c;
+    };
+    ts.authorize_dispatch_fn_for_test =
+        [allow](const yuzu::server::DispatchCaller& c, std::string_view p, std::string_view a) {
+            return yuzu::server::detail::classify_and_authorize_dispatch(rs_gate_registry(), c, p,
+                                                                         a, allow);
+        };
+    ts.start_with_dispatch(
+        [&log, allow](const std::string& plugin, const std::string& action,
+                      const std::vector<std::string>&, const std::string&,
+                      const std::unordered_map<std::string, std::string>&, const std::string&,
+                      const yuzu::server::DispatchCaller& caller)
+            -> yuzu::server::ConfinedDispatchOutcome {
+            ++log.dispatch_calls;
+            if (!yuzu::server::detail::classify_and_authorize_dispatch(rs_gate_registry(), caller,
+                                                                       plugin, action, allow))
+                return {.sent = 0, .command_id = "cmd-denied"};
+            log.sent.push_back(plugin + "." + action);
+            log.provenance.push_back(caller.approval_provenance);
+            return {.sent = 1, .command_id = "cmd-rs"};
+        },
+        "supervised");
+}
+
+std::string rs_tool_call(const std::string& tool, const nlohmann::json& arguments, int id) {
+    return nlohmann::json{{"jsonrpc", "2.0"},
+                          {"method", "tools/call"},
+                          {"id", id},
+                          {"params", {{"name", tool}, {"arguments", arguments}}}}
+        .dump();
+}
+
+// Mint a C8 tier ticket for `tool(args)`, approve it as a different principal, and return its id.
+std::string rs_mint_and_approve(McpTestServer& ts, yuzu::server::ApprovalManager& appr,
+                                const std::string& tool, const nlohmann::json& args) {
+    auto first = ts.call(rs_tool_call(tool, args, 1));
+    REQUIRE(first);
+    const auto fb = nlohmann::json::parse(first->body);
+    REQUIRE(fb.contains("error"));
+    REQUIRE(fb["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    const std::string ticket = fb["error"]["data"]["approval_id"];
+    REQUIRE(appr.approve(ticket, "admin", "ok").has_value());
+    return ticket;
+}
+
+void rs_repoint_to_gated(yuzu::server::InstructionStore& instr, const std::string& id) {
+    auto got = instr.get_definition(id);
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    auto def = **got;
+    def.plugin = "registry";
+    def.action = "set_value";
+    def.parameter_schema.clear(); // update_definition: empty KEEPS the stored schema
+    REQUIRE(instr.update_definition(def).has_value());
+}
+
+std::string rs_make_definition(yuzu::server::InstructionStore& instr) {
+    yuzu::server::InstructionDefinition def;
+    def.name = "Get OS Version";
+    def.version = "1.0";
+    def.plugin = "os_info";
+    def.action = "version";
+    def.type = "question";
+    def.description = "test";
+    def.enabled = true;
+    auto created = instr.create_definition(def);
+    REQUIRE(created.has_value());
+    return *created;
+}
+
+void check_gated_refusal(const httplib::Response& res) {
+    const auto body = nlohmann::json::parse(res.body);
+    REQUIRE(body.contains("error")); // a refusal, not a success
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "approval_required");
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null()); // permanent
+    CHECK(body["error"]["message"].get<std::string>().find("registry.set_value") !=
+          std::string::npos);
+    CHECK(body["error"]["message"].get<std::string>().find("does not accept an approval ticket") !=
+          std::string::npos);
+    // The shared wording advises a supervised ticket flow; that advice is false here.
+    CHECK(body["error"]["data"]["remediation"].get<std::string>().find("supervised-tier") ==
+          std::string::npos);
+}
+
+} // namespace
+
+TEST_CASE("MCP create_result_set_from_instruction_result: an approved tier ticket for a benign pair "
+          "cannot run a gated pair the definition was repointed at before the recall",
+          "[pg][mcp][integration][result-sets][approval][security][sg-1]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
+    REQUIRE(instr.is_open());
+    const std::string iid = rs_make_definition(instr);
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = appr_bundle.get();
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.instruction_store_for_test = &instr;
+    RsGateLog log;
+
+    SECTION("non-admin: repointed after approval is refused and nothing is sent") {
+        rs_gate_wire(ts, log, /*admin=*/false);
+        const nlohmann::json args = {{"instruction_id", iid}};
+        const auto ticket = rs_mint_and_approve(ts, *appr_bundle.get(),
+                                                "create_result_set_from_instruction_result", args);
+        rs_repoint_to_gated(instr, iid);
+        auto args2 = args;
+        args2["approval_id"] = ticket;
+        auto res = ts.call(rs_tool_call("create_result_set_from_instruction_result", args2, 2));
+        REQUIRE(res);
+        check_gated_refusal(*res);
+        CHECK(log.dispatch_calls == 0); // the exact send set is empty
+        CHECK(log.sent.empty());
+    }
+
+    SECTION("non-admin: a non-repointed benign definition still runs, with NO Ticket provenance") {
+        rs_gate_wire(ts, log, /*admin=*/false);
+        const nlohmann::json args = {{"instruction_id", iid}};
+        const auto ticket = rs_mint_and_approve(ts, *appr_bundle.get(),
+                                                "create_result_set_from_instruction_result", args);
+        auto args2 = args;
+        args2["approval_id"] = ticket;
+        auto res = ts.call(rs_tool_call("create_result_set_from_instruction_result", args2, 2));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        REQUIRE(log.sent.size() == 1);
+        CHECK(log.sent[0] == "os_info.version");
+        CHECK(log.provenance[0] == yuzu::server::ApprovalProvenance::None);
+    }
+
+    SECTION("administrator: still runs a gated pair via the pair's own admin gate, never a Ticket") {
+        rs_gate_wire(ts, log, /*admin=*/true);
+        rs_repoint_to_gated(instr, iid);
+        const nlohmann::json args = {{"instruction_id", iid}};
+        const auto ticket = rs_mint_and_approve(ts, *appr_bundle.get(),
+                                                "create_result_set_from_instruction_result", args);
+        auto args2 = args;
+        args2["approval_id"] = ticket;
+        auto res = ts.call(rs_tool_call("create_result_set_from_instruction_result", args2, 2));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        REQUIRE(log.sent.size() == 1);
+        CHECK(log.sent[0] == "registry.set_value");
+        CHECK(log.provenance[0] == yuzu::server::ApprovalProvenance::None);
+    }
+}
+
+TEST_CASE("MCP reevaluate_result_set: an approved tier ticket for a benign pair cannot re-run a "
+          "gated pair the definition was repointed at before the recall",
+          "[pg][mcp][integration][result-sets][approval][security][sg-1]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
+    REQUIRE(instr.is_open());
+    const std::string iid = rs_make_definition(instr);
+
+    CreateRequest cr;
+    cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    cr.name = "seed";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = nlohmann::json{{"instruction_id", iid}}.dump();
+    auto seeded = rs_bundle.get()->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = appr_bundle.get();
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.instruction_store_for_test = &instr;
+    RsGateLog log;
+    const nlohmann::json args = {{"id", seeded->id}};
+
+    SECTION("non-admin: repointed after approval is refused and nothing is sent") {
+        rs_gate_wire(ts, log, /*admin=*/false);
+        const auto ticket =
+            rs_mint_and_approve(ts, *appr_bundle.get(), "reevaluate_result_set", args);
+        rs_repoint_to_gated(instr, iid);
+        auto args2 = args;
+        args2["approval_id"] = ticket;
+        auto res = ts.call(rs_tool_call("reevaluate_result_set", args2, 2));
+        REQUIRE(res);
+        check_gated_refusal(*res);
+        CHECK(log.dispatch_calls == 0);
+        CHECK(log.sent.empty());
+    }
+
+    SECTION("non-admin: a non-repointed benign definition still re-runs, with NO Ticket provenance") {
+        rs_gate_wire(ts, log, /*admin=*/false);
+        const auto ticket =
+            rs_mint_and_approve(ts, *appr_bundle.get(), "reevaluate_result_set", args);
+        auto args2 = args;
+        args2["approval_id"] = ticket;
+        auto res = ts.call(rs_tool_call("reevaluate_result_set", args2, 2));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        REQUIRE(log.sent.size() == 1);
+        CHECK(log.sent[0] == "os_info.version");
+        CHECK(log.provenance[0] == yuzu::server::ApprovalProvenance::None);
+    }
+
+    SECTION("administrator: still re-runs a gated pair via the pair's own admin gate") {
+        rs_gate_wire(ts, log, /*admin=*/true);
+        rs_repoint_to_gated(instr, iid);
+        const auto ticket =
+            rs_mint_and_approve(ts, *appr_bundle.get(), "reevaluate_result_set", args);
+        auto args2 = args;
+        args2["approval_id"] = ticket;
+        auto res = ts.call(rs_tool_call("reevaluate_result_set", args2, 2));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        REQUIRE(log.sent.size() == 1);
+        CHECK(log.sent[0] == "registry.set_value");
+        CHECK(log.provenance[0] == yuzu::server::ApprovalProvenance::None);
+    }
+}

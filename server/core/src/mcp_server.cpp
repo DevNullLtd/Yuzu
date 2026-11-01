@@ -1432,7 +1432,12 @@ static const ToolDef kTools[] = {
      "or discover_instructions — do not guess. If the definition runs a Forensics-tier "
      "plugin (an action on the Forensics securable) the set materializes with no members "
      "for every creator, because the materializer never reads Forensics-tier output; an "
-     "empty set from such a definition says nothing about the fleet. REST v1 twin: POST "
+     "empty set from such a definition says nothing about the fleet. A definition whose "
+     "plugin.action is gated (admin or approval) is refused for a non-admin caller with a "
+     "permission-denied error whose error.data.reason is approval_required (permanent, "
+     "retry_after_ms null): an approval ticket never lifts that gate for this tool, so a "
+     "supervised-tier token cannot run a gated action through it; an administrator can. "
+     "REST v1 twin: POST "
      "/api/v1/result-sets/from-instruction-result. NEVER re-send this call on a timeout or "
      "an ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
      "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
@@ -1460,6 +1465,10 @@ static const ToolDef kTools[] = {
      "narrowed to a parent set at creation time and that parent has since been deleted, this "
      "REFUSES (RESULT_SET_BAD_REQUEST, reason=parent_gone) rather than silently broadcasting "
      "to every visible device (#4306) — create a new set from the intended parent instead. "
+     "An instruction_result source whose definition's plugin.action is gated (admin or "
+     "approval) is refused for a non-admin caller (permission denied, "
+     "error.data.reason=approval_required, retry_after_ms null): an approval ticket never "
+     "lifts that gate here. "
      "REST v1 twin: POST "
      "/api/v1/result-sets/{id}/re-eval. "
      "NEVER re-send this call on a timeout or an ambiguous/post-dispatch error - it "
@@ -7853,7 +7862,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // why that stays a dedicated shape rather than widening a4_error.
             auto deny_dispatch_authorization =
                 [&](const std::string& plugin, const std::string& action,
-                    const yuzu::server::detail::DispatchDenial& denial) {
+                    const yuzu::server::detail::DispatchDenial& denial,
+                    const std::optional<std::pair<std::string, std::string>>& text_override =
+                        std::nullopt) {
                     const std::string_view reason_label =
                         yuzu::server::detail::to_string(denial.reason);
                     if (metrics != nullptr) {
@@ -7888,8 +7899,14 @@ McpServer::HandlerFn McpServer::build_handler(
                                       yuzu::server::detail::sanitize_detail_value(plugin) + ":" +
                                       yuzu::server::detail::sanitize_detail_value(action) +
                                       " correlation_id=" + cid);
-                    const auto text = describe_dispatch_denial(denial.reason, plugin, action,
-                                                               denial, DenialSurface::kMcp);
+                    auto text = describe_dispatch_denial(denial.reason, plugin, action, denial,
+                                                         DenialSurface::kMcp);
+                    // A caller whose surface cannot honour the shared wording (it advises a
+                    // supervised token's ticket flow) supplies its own message and remediation.
+                    if (text_override) {
+                        text.message = text_override->first;
+                        text.remediation = text_override->second;
+                    }
                     int text_code = kInternalError;
                     switch (text.cls) {
                     case DispatchDenialClass::kInvalidParams:
@@ -13467,9 +13484,56 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto caller = caller_fn(*session);
-                caller.approval_provenance = approval_ticket_just_consumed
-                                                 ? yuzu::server::ApprovalProvenance::Ticket
-                                                 : yuzu::server::ApprovalProvenance::None;
+                // sg-1 (#2146), the sec-F1 class: the (plugin, action) pair of a
+                // kInstructionResult producer (create_result_set_from_instruction_result and
+                // reevaluate_result_set) comes from a STORED definition that an editor can
+                // repoint between ticket approval and recall, while the C8 ticket canon binds
+                // only the call's arguments (dispatch_pairs_for returns {} for these tools).
+                // A Ticket stamp would lift the ExecuteGate of a pair nobody approved, so a
+                // definition-resolved producer NEVER carries Ticket: the pair's own gate decides.
+                // Only the echo-query source keeps the stamp: its pair is the fixed
+                // echo.sql, not read from anything an editor can change.
+                const bool definition_resolved = src_kind != source_kind::kEchoQuery;
+                caller.approval_provenance =
+                    (approval_ticket_just_consumed && !definition_resolved)
+                        ? yuzu::server::ApprovalProvenance::Ticket
+                        : yuzu::server::ApprovalProvenance::None;
+                if (definition_resolved) {
+                    // Refuse a gated pair up front with text that is true for this tool, and
+                    // BEFORE any execution row exists (nothing to cancel). dispatch_fn would
+                    // refuse the same pair at the chokepoint but only as a bare "no agents
+                    // reached", which hides the cause.
+                    if (!authorize_dispatch_fn_) {
+                        const std::string cid = yuzu::server::detail::make_correlation_id();
+                        mcp_audit("denied", std::string("dispatch authorizer unavailable "
+                                                        "correlation_id=") +
+                                                cid);
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "dispatch authorization is unavailable; " + tool_name +
+                                         " is refused until it is restored",
+                                     kClassifierUnavailableRemediation, -1, cid),
+                            "application/json");
+                        return;
+                    }
+                    if (auto authz_decision = authorize_dispatch_fn_(caller, plugin, action);
+                        !authz_decision) {
+                        std::optional<std::pair<std::string, std::string>> text;
+                        if (authz_decision.error().reason ==
+                            yuzu::server::detail::DispatchDenialReason::ApprovalRequired) {
+                            text.emplace(
+                                "approval required for " + plugin + "." + action +
+                                    ": this definition's action is gated (admin or approval) "
+                                    "and " + tool_name +
+                                    " does not accept an approval ticket for a gated action",
+                                "this call cannot succeed for this caller and retrying will not "
+                                "help; dispatch as an administrator, or ask an administrator to "
+                                "run it or to change the definition to a non-gated action");
+                        }
+                        deny_dispatch_authorization(plugin, action, authz_decision.error(), text);
+                        return;
+                    }
+                }
 
                 // Same rule as REST's run_async: OMIT parent_id to broadcast
                 // deliberately. A SUPPLIED parent_id must name a parent —
@@ -21461,6 +21525,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // quarantine_caller does, so an already-ticket-consumed
                 // supervised-tier bundle call doesn't get denied ApprovalRequired
                 // again by the pre-check below.
+                //
+                // sg-1 (#2146) analysis, why this IS a legitimate stamp and the result-set
+                // producers are not: the bundle's (plugin, action) pairs are the call's own
+                // `steps` argument, not read from a stored definition. The C8 ticket canon is
+                // canonical_args(args) (steps, agent_id and every param included) and the
+                // recall's consume precondition rejects any row whose canon differs
+                // (`row.scope_expression != canon`), so the pair set a ticket approved is the
+                // pair set that dispatches; there is nothing an editor can repoint in between.
                 if (approval_ticket_just_consumed)
                     caller.approval_provenance = yuzu::server::ApprovalProvenance::Ticket;
                 if (!yuzu::server::authz::in_scope(caller.exec_visible, agent_id)) {

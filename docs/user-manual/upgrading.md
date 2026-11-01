@@ -58,6 +58,14 @@ What an operator should know:
   (`metrics.md`). The platform events `command.dispatched`, `execution.created`, `execution.completed`,
   `approval.created` and `instruction.executed` are also published by the new twins (`analytics-events.md`).
 
+## Behaviour change: result-set producers refuse a gated definition action for a non-administrator (#2146)
+
+**What changed.** `create_result_set_from_instruction_result` and `reevaluate_result_set` (MCP) no longer treat a consumed supervised-tier approval ticket as approval for the `plugin.action` of the stored definition they run. If that action is gated (admin or approval), a non-administrator caller is refused with `-32003` and `error.data.reason = approval_required` (permanent, `retry_after_ms` null), and no execution record is created. `create_result_set_from_echo_query` and `execute_bundle` are unchanged.
+
+**Who is affected.** Supervised-tier (ticket-then-recall) tokens that ran a gated action through these two tools: the ticket is still minted and approved, but the recall now refuses, and the ticket is spent. Operator-tier tokens whose owner is not an administrator were already refused by the dispatch gate and now receive the explicit reason instead of a generic "no agents reached" error.
+
+**What to do.** Run the call with an administrator token, or ask an administrator to change the definition to a non-gated action.
+
 ## Behaviour change: the activity-record feature is renamed Echo (tar.db adopted as echo.db; stored references migrated)
 
 **What changed.** The feature that records endpoint activity was called TAR and is now called Echo, with no aliases for the old names except the upgrade-window shim below. The agent plugin is `echo` (`echo.dll`, `echo.so`, `echo.dylib`; the Windows installer removes the old `tar.dll`). REST routes move from `/api/v1/tar/...` to `/api/v1/echo/...`, MCP tools from `*_tar_*` to `*_echo_*` (for example `list_tar_retention_paused` is now `list_echo_retention_paused`, and `create_result_set_from_tar_query` is now `create_result_set_from_echo_query`), metrics from `yuzu_tar_*` to `yuzu_echo_*`, audit actions from `tar.*` to `echo.*`, instruction ids from `crossplatform.tar.*` to `crossplatform.echo.*`, the agent heartbeat tags from `yuzu.plugin.tar.*` to `yuzu.plugin.echo.*`, and the result-set matcher kind from `tar_rows_ge` to `echo_rows_ge` (a request that still sends the old kind to `POST /api/v1/result-sets/from-instruction-result` or its MCP twin is now refused with an error naming the kind, as is any other unrecognised kind, instead of being accepted into a set that never matches anything). The OpenAPI `operationId` and tag changes are listed in the OpenAPI note further down this page.
