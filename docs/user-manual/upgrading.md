@@ -472,8 +472,10 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   rolling deployment halts because the new replica never becomes ready. **This can only happen on a
   fork or a custom build:** every stock build is checked by compiled and source-scan tests before it
   ships, so a release binary never trips it. The fix is a row in `step_up_policy.hpp` and a rebuild,
-  never a flag. To recover a deployment in the meantime, roll back to the previous binary or image;
-  nothing is migrated, so a rollback needs no data step.
+  never a flag. Rolling back to the previous binary or
+  image is not a data-free step on this build: the authentication and session stores are opened before this check, so the
+  `auth` v3 and `session_store` v3 migrations have already run, and the previous build needs the restore sequence in the
+  [hard-cutover section](#breaking-mfa-proofs-are-bound-to-the-factor-they-were-earned-with-hard-cutover-with-no-upgrade-path-or-rollback-6079).
 - **How a refusal appears in the dashboard.** A refused htmx request (on a dashboard route or an
   `/api/v1/` route, such as Settings > Users "Revoke sessions") now carries an `HX-Trigger` error
   toast, so the button no longer appears to do nothing; MCP never gets one. The Guardian page's
@@ -528,8 +530,23 @@ ordinary rows at the central check (issuing it was the step-up moment), but is r
 factor-credential routes and cannot approve or reject; and an administrator at generation `0` cannot mint one while
 the window is above 0, because creating a token is itself an ordinary step-up row.
 
+**Downtime.** Every replica is down from step 1 (stop) until step 4 (start): there is no rolling window. Endpoint agents
+need no change and reconnect when the server serves again. The step 3 loop is serial, one `yuzu-server --mfa-reset`
+process per account; the first reset applies both migrations and later ones find them applied, so the time grows linearly
+with the number of enrolled accounts. Rehearse it (below) to get your own figure before you pick the window.
+
+**Not affected.** Accounts that are not enrolled are not refused by the binding (nothing is seeded for them). API-token
+and MCP-token callers pass the 35 ordinary rows as before, and a reset does not touch API tokens (the 2 factor-credential
+routes and approval refuse them, as described above). OIDC sessions are judged on their
+identity-provider assertion, not on the local factor generation, and the session store's rebind guard does not apply to
+them. Endpoint agents and gateways are unchanged.
+
 **Before you cut over.** While the previous build is still running:
 
+- Rehearse the whole procedure (steps 1 to 5 and the restore sequence in step 2) on a scratch copy of the database first:
+  restore a dump of the production `auth` and `session_store` schemas (with the matching keys directory) into a scratch
+  Postgres, run it against a scratch server, and time the reset loop. The migrations, the resets and the restore are the
+  parts that change data, and you want their timings and failures before the real window.
 - Keep the previous build's binary or image (its package file or tag) to hand. Restoring the backup is the only
   way back, and it works only with the build that matches the restored data.
 - List the accounts that are enrolled (that build has no `mfa_factor_gen` column, so the query cannot test it;
@@ -728,18 +745,36 @@ alone. It is not an upgrade path and widens nothing else.
 
    Then revoke the administrator API token you minted before the cutover.
 
+**Tell your users.** A reset ends the account's sessions, so each reset user is signed out. Under
+`--mfa-enforcement=required` (or `admin-only`, for an administrator) they enrol their authenticator again at next
+sign-in; under `optional` they are password-only until they enrol. A non-administrator cannot enrol itself under
+`optional` or `admin-only`, so an administrator must enrol each non-admin approver
+([Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver)). A message you
+can adapt:
+
+> Your account's two-factor sign-in was reset during maintenance and you were signed out. Sign in again with your
+> password and, if you are asked, set up your authenticator app again. If you approve requests or request elevation and
+> are not asked, tell an administrator: you cannot set it up yourself and are refused until they do.
+
+Each migration waits at most 3 seconds for its table lock (`auth.users`, `session_store.sessions`). One that cannot get
+it fails the boot, or the first `--mfa-reset`, and is rolled back whole and retried on the next start, so do not run a
+long transaction (a `pg_dump`, a report, an open `psql` session) against those two tables during the cutover.
+
 Until a reset has been done for an account, the 37 step-up routes (approve and reject included) and the 3 JIT-elevation
 routes answer `503` (audit `reason=mfa_proof_unavailable`) for it, the 35 ordinary rows only while `--mfa-step-up-window-secs` is
 above 0 (at 0 they pass without reading the store). After the cutover, reconcile the `mfa.reset.breakglass` rows
 against the `mfa.enroll.verified` rows per operator. This lists every operator with a reset and no enrolment since
 (expected under `optional`; under `required`, or `admin-only` for an administrator, it should empty as people sign
 in; after a restore it also lists operators whose reset rows remain in the audit store although their enrolments
-came back with the restored `auth` schema):
+came back with the restored `auth` schema). A `partial` reset cleared the factor and only its session delete failed, so it
+counts; a reset that ended `error` is not listed because its state is unknown (the factor may or may not be cleared):
+find those with the runbook query "Finding a clear that ended `error` or `partial`" in
+[Emergency MFA disable](../ops-runbooks/auth-db-recovery.md#emergency-mfa-disable-break-glass):
 
 ```sql
 SELECT r.target_id AS operator, to_timestamp(max(r.timestamp)) AT TIME ZONE 'UTC' AS last_reset_utc
   FROM audit_store.audit_events r
- WHERE r.action = 'mfa.reset.breakglass' AND r.result = 'success'
+ WHERE r.action = 'mfa.reset.breakglass' AND r.result IN ('success', 'partial')
    AND NOT EXISTS (SELECT 1 FROM audit_store.audit_events e
                     WHERE e.action = 'mfa.enroll.verified' AND e.result = 'ok'
                       AND e.target_id = r.target_id AND e.timestamp >= r.timestamp)
@@ -772,6 +807,9 @@ a restart under `--auth-mode=standard`. Choose one:
   and the account can still sign in during an IdP outage, but at generation `0` it is refused `503` on the 37
   step-up routes and the 3 elevation routes, so it can do little that is privileged until it is reset later in a
   planned, time-boxed `standard`-mode window as above.
+  Do not take this option if an identity-provider outage is plausible before that window: during an outage the
+  account's break-glass login would be at generation `0` and get `503` on the step-up and elevation routes, so it
+  could not do the privileged work it exists for. Reset and re-enrol it first, in the order above.
 
 **What changed.** A step-up proof of a local, MFA-enrolled account now counts only for the factor
 that was enrolled when the code was verified. The central step-up check (the 35 ordinary rows), JIT

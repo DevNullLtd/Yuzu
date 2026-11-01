@@ -198,11 +198,13 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
 - **MFA proofs bind to a DATABASE-OWNED factor generation (#6079).**
   `auth.users.mfa_factor_gen` is advanced only by the row trigger
   `users_mfa_factor_gen` (`ENABLE ALWAYS`, auth migration v3) on every change
-  of `mfa_enrolled_at`; application code never writes it. The three verifiers
-  return `{ok, factor_gen, verified_ms}`: the instant is the database `now()`
-  of the statement that LOADED the secret or candidates (before any crypto
-  check) and `ok` is published only after COMMIT (a failed or unacknowledged
-  COMMIT is `WriteFailed`, never a proof). The constructor validates the
+  of `mfa_enrolled_at`; application code never writes it. The TOTP and recovery-code
+  verifiers return `MfaVerification{ok, factor_gen, verified_ms}` and
+  `mfa_verify_enrollment` returns `MfaEnrolment{recovery_codes, factor_gen,
+  verified_ms}`: the instant is the database `now()` of the statement that
+  LOADED the secret or candidates (before any crypto check) and success is
+  published only after COMMIT (a failed or unacknowledged COMMIT is
+  `WriteFailed`, never a proof). The constructor validates the
   trigger and does not open if it fails (the two host recovery one-shots,
   `--mfa-reset` and `--break-glass-arm`, may open their bootstrap `AuthDB`
   with `MfaBindingCheck::kBypassForRecovery`: warn, binding reported not
@@ -239,6 +241,15 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   and elevation pre-check read it without that flag legitimately.**
   Runbook: `docs/ops-runbooks/auth-db-recovery.md` "MFA binding enforcement
   failed".
+
+- **The SessionStore half of the same invariant (#6079).** The durable proof lives in
+  `session_store.sessions` (`mfa_verified_ms`, `mfa_factor_gen`), guarded by the
+  `sessions_mfa_rebind_guard` trigger (`ENABLE ALWAYS`, session_store migration v3) and the
+  `mfa_bind_seq` column. Any `SessionStore` writer of `mfa_verified_ms`, `mfa_factor_gen`,
+  `username`, `auth_source` or `principal_kind` MUST advance `mfa_bind_seq` in the SAME
+  statement, or the trigger zeroes `mfa_factor_gen` and the proof reads unbound. A PR that
+  adds such a writer without it, or weakens the boot and `find` guard validation
+  (`check_rebind_guard`, the pinned function body, `ENABLE ALWAYS`), is CRITICAL.
 
 - **No session surface on `AuthDB` at all.** `create_session` /
   `validate_session` / `invalidate_session` / `invalidate_all_sessions` /

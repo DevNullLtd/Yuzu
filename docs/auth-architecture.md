@@ -5380,15 +5380,21 @@ OIDC/SAML's own post-mint recheck discloses, `docs/adr/2001-scim-oidc-identity-l
 "Known residuals").
 
 A denied mint is audited via `auth.login` `result=failure`,
-`detail=reason=session_mint_failed;cause=undifferentiated[;method=...]`
-(`auth_routes.cpp`) and counted in `yuzu_auth_login_session_mint_denied_total`
-— undifferentiated not just between a genuine role divergence and a
-post-mint store error, but also against a plain `SessionStore` persist
-failure (an ordinary availability event, unrelated to the role recheck at
-all), since `create_local_session`'s caller-facing contract (an empty
-string) collapses all three into one sentinel. Unlike the OIDC/SAML
-counters' genuine-vs-store-unavailable split, this counter is not a
-role-recheck-specific signal and must not be alerted on as one.
+`detail=reason=session_mint_failed;cause=<cause>[;method=...]`
+(`auth_routes.cpp`) and counted in `yuzu_auth_login_session_mint_denied_total`.
+The plain password sign-in (`POST /login`) still writes the literal
+`cause=undifferentiated` with no `method`: it does not receive the mint's
+denial, so a genuine role divergence, a post-mint store error and a plain
+`SessionStore` persist failure (an ordinary availability event, unrelated to
+the role recheck at all) all look the same there, since `create_local_session`'s
+empty-string return collapses them. The MFA mints (`POST /login/mfa`, with `method=password+totp` or
+`password+recovery`, and `POST /login/mfa/enroll`, with `method=password+totp-enroll`) pass the mint's `MintDenial` through
+`mint_denial_cause` and name the cause: `persist_failed`,
+`verification_future_dated`, `role_changed`, `credential_changed`,
+`factor_changed` or `recheck_unavailable` (`undifferentiated` only for a denial
+the mint did not name). Unlike the OIDC/SAML counters' genuine-vs-store-unavailable
+split, this counter is not a role-recheck-specific signal and must not be
+alerted on as one.
 
 ## RbacStore — the authorization substrate (Postgres, ADR-0041 — SQLite `rbac.db` retired)
 

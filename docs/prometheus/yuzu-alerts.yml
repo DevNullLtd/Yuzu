@@ -6250,7 +6250,10 @@ groups:
             transient: an inconclusive trigger validation (a catalog check that
             could not run) latches the binding as not enforced until a later
             check succeeds, and the binding gauge still reads 1 while it is
-            set, so this alert is then the only signal.
+            set, so this alert is then the only signal, and it needs the
+            refusals to hold its rate (at least three in ten minutes on one
+            surface, for five minutes): a replica with less MFA traffic than
+            that raises no alert while the latch is set.
       # The window gauge is the configured --mfa-step-up-window-secs. 0 or less
       # is the documented recovery lever (it disables the stale-proof requirement
       # on the 35 ordinary step-up routes, and also lets SAML sessions through

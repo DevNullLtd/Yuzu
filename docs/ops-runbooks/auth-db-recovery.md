@@ -138,6 +138,10 @@ opened. Usual causes, in likelihood order:
    sudo systemctl restart yuzu-server
    ```
    On restart the server re-seeds the admin account from `yuzu-server.cfg`.
+   Then end every session before anyone signs in (the "End every session after any
+   restore of the `auth` schema" rule in [Backup - the KEK pairing rule](#backup--the-kek-pairing-rule)): a rebuilt
+   `auth.users` restarts its factor-generation counter, while the proofs in `session_store.sessions` survive
+   the drop, so a stale stored proof could equal a new generation and count as bound.
 
 ### KEK missing or unreadable
 
@@ -293,6 +297,8 @@ until they expire. A failover to a standby that was behind loses the same recent
    everywhere**, an admin force-logout, or the SQL below) is not guaranteed to
    take effect on all replicas in that case; the worst case is bounded by the
    8-hour absolute session lifetime.
+   Check the two binding triggers first (the "Check that both MFA binding triggers survived the
+   restore" paragraph below): a replica restarted over a demoted trigger refuses to start.
 2. Revoke every operator session (`DELETE /api/v1/sessions?username=<name>` per
    account, or the SQL in [Sessions are durable](#sessions-are-durable)). Do it
    straight after the restarts: a session row restored from the dump is valid
@@ -1913,7 +1919,7 @@ inconclusive validation latches `binding_inconclusive`: EVERY read reports the b
 returns valid, and the next read retries the check at once. A reader arriving while the first-ever inconclusive check
 is still in flight sees the previous state, a window bounded by one catalog query. The transition logs a warning
 naming the inconclusive trigger validation once per episode, and the gauge `yuzu_auth_mfa_binding_enforcement_ok{store="auth"}`
-still reads `1` while the latch is set (only `YuzuStepUpGateUnavailable` fires). The session store does not refuse on
+still reads `1` while the latch is set (only `YuzuStepUpGateUnavailable` fires, and only when the refusals hold its rate: at least 3 in 10 minutes on one `surface`, sustained for 5 minutes, so a replica with less MFA traffic than that raises no alert while the latch is set). The session store does not refuse on
 such a query: it serves the row and retries the check on the next read.
 
 **What the gauge can and cannot tell you.** It reads an in-process flag that a request-driven
